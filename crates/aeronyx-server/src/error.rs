@@ -25,6 +25,7 @@
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial error definitions
+//! v0.1.1 - Fixed: SocketAddr cannot be #[source], changed to String
 
 use std::net::SocketAddr;
 
@@ -136,8 +137,8 @@ pub enum ServerError {
     /// Invalid packet received.
     #[error("Invalid packet from {source}: {reason}")]
     InvalidPacket {
-        /// Packet source
-        source: SocketAddr,
+        /// Packet source (as string to avoid #[source] issue)
+        source: String,
         /// Why it's invalid
         reason: String,
     },
@@ -216,7 +217,7 @@ impl ServerError {
     /// Creates an `InvalidPacket` error.
     pub fn invalid_packet(source: SocketAddr, reason: impl Into<String>) -> Self {
         Self::InvalidPacket {
-            source,
+            source: source.to_string(),
             reason: reason.into(),
         }
     }
