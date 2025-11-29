@@ -20,11 +20,12 @@
 //!
 //! ## ⚠️ Important Note for Next Developer
 //! - SessionId is security-critical - always use cryptographically secure random
-//! - All types must implement Zeroize for security
+//! - SessionId implements Zeroize but NOT Copy (has destructor)
 //! - Maintain backward-compatible serialization formats
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial type definitions
+//! v0.1.1 - Fixed: Removed Copy from SessionId (incompatible with ZeroizeOnDrop)
 
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -51,7 +52,8 @@ pub const SESSION_ID_SIZE: usize = 16;
 /// # Security Properties
 /// - Generated using cryptographically secure random number generator
 /// - Fixed 16-byte size (128 bits of entropy)
-/// - Implements `Zeroize` for secure memory cleanup
+/// - Implements `Zeroize` and `ZeroizeOnDrop` for secure memory cleanup
+/// - Does NOT implement `Copy` due to secure drop behavior
 ///
 /// # Wire Format
 /// ```text
@@ -74,7 +76,7 @@ pub const SESSION_ID_SIZE: usize = 16;
 ///
 /// assert_eq!(session_id, restored);
 /// ```
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, PartialEq, Eq, Hash, Zeroize, ZeroizeOnDrop)]
 pub struct SessionId([u8; SESSION_ID_SIZE]);
 
 impl SessionId {
@@ -438,5 +440,12 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let restored: SessionId = serde_json::from_str(&json).unwrap();
         assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn test_session_id_clone() {
+        let original = SessionId::generate();
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
     }
 }
