@@ -1,0 +1,66 @@
+# ============================================
+# File: crates/aeronyx-common/Cargo.toml
+# ============================================
+# AeroNyx Common - Shared Utilities Crate
+# ============================================
+# Creation Reason: Provides foundational types, utilities, and abstractions
+#                  shared across all AeroNyx crates.
+#
+# Main Functionality:
+# - Common type definitions (IDs, addresses, etc.)
+# - Time utilities and atomic time primitives
+# - Metrics definitions and collectors
+# - Error type foundations
+#
+# Dependencies:
+# - Used by: aeronyx-core, aeronyx-transport, aeronyx-server
+# - Depends on: No internal crates (leaf dependency)
+#
+# ⚠️ Important Note for Next Developer:
+# - This crate should have MINIMAL dependencies
+# - Changes here affect ALL other crates
+# - Keep types generic and reusable
+#
+# Last Modified: v0.1.0 - Initial common utilities
+# ============================================
+
+[package]
+name = "aeronyx-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Common utilities and types for AeroNyx privacy network"
+keywords = ["aeronyx", "utilities", "types"]
+categories = ["data-structures"]
+
+[dependencies]
+# Serialization
+serde = { workspace = true }
+base64 = { workspace = true }
+
+# Time handling
+tokio = { workspace = true, features = ["time", "sync"] }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utilities
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+
+# Security
+zeroize = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
