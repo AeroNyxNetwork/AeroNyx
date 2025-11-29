@@ -1,0 +1,84 @@
+# ============================================
+# File: crates/aeronyx-core/Cargo.toml
+# ============================================
+# AeroNyx Core - Protocol & Cryptography Crate
+# ============================================
+# Creation Reason: Contains the core protocol definitions, message types,
+#                  and cryptographic operations for the AeroNyx privacy network.
+#
+# Main Functionality:
+# - Protocol message definitions (ClientHello, ServerHello, etc.)
+# - Cryptographic primitives (Ed25519, X25519, ChaCha20-Poly1305)
+# - Message codec (serialization/deserialization)
+# - Key management and derivation
+#
+# Dependencies:
+# - Used by: aeronyx-server, aeronyx-transport
+# - Depends on: aeronyx-common
+#
+# Security Note:
+# This crate contains security-critical code. All cryptographic
+# implementations use audited RustCrypto libraries.
+#
+# ⚠️ Important Note for Next Developer:
+# - Do NOT implement custom cryptographic primitives
+# - All keys must implement Zeroize
+# - Protocol changes must maintain backward compatibility
+#
+# Last Modified: v0.1.0 - Initial protocol and crypto implementation
+# ============================================
+
+[package]
+name = "aeronyx-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Core protocol and cryptography for AeroNyx privacy network"
+keywords = ["aeronyx", "protocol", "cryptography", "ed25519", "chacha20"]
+categories = ["cryptography", "network-programming"]
+
+[dependencies]
+# Internal
+aeronyx-common = { workspace = true }
+
+# Cryptography
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+rand_core = { workspace = true }
+zeroize = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+base64 = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utilities
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+proptest = { workspace = true }
+test-case = { workspace = true }
+hex = "0.4"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Enable additional validation and debug output (disable in production)
+debug-crypto = []
