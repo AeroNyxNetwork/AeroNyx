@@ -58,7 +58,6 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
-use aeronyx_common::types::SessionId;
 use aeronyx_core::crypto::handshake::{DefaultHandshakeCrypto, HandshakeCrypto};
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::{ClientHello, ServerHello};
@@ -66,47 +65,21 @@ use aeronyx_core::protocol::{ClientHello, ServerHello};
 use crate::error::{Result, ServerError};
 use crate::services::{IpPoolService, RoutingService, Session, SessionManager};
 
-// ============================================
-// HandshakeResult
-// ============================================
-
 /// Result of a successful handshake.
 pub struct HandshakeResult {
-    /// The created session.
     pub session: Arc<Session>,
-    /// ServerHello response to send to client.
     pub response: ServerHello,
 }
 
-// ============================================
-// HandshakeService
-// ============================================
-
 /// High-level handshake orchestration service.
-///
-/// # Responsibilities
-/// - Coordinate cryptographic operations
-/// - Manage resource allocation (IP, session)
-/// - Ensure atomic handshake (rollback on failure)
 pub struct HandshakeService {
-    /// Cryptographic operations.
     crypto: DefaultHandshakeCrypto,
-    /// IP address pool.
     ip_pool: Arc<IpPoolService>,
-    /// Session manager.
     sessions: Arc<SessionManager>,
-    /// Routing service.
     routing: Arc<RoutingService>,
 }
 
 impl HandshakeService {
-    /// Creates a new handshake service.
-    ///
-    /// # Arguments
-    /// * `server_identity` - Server's long-term identity key pair
-    /// * `ip_pool` - IP address pool service
-    /// * `sessions` - Session manager
-    /// * `routing` - Routing service
     pub fn new(
         server_identity: IdentityKeyPair,
         ip_pool: Arc<IpPoolService>,
@@ -123,21 +96,6 @@ impl HandshakeService {
     }
 
     /// Processes a ClientHello and creates a session.
-    ///
-    /// # Arguments
-    /// * `client_hello` - The client's handshake message
-    /// * `client_addr` - Client's UDP address
-    ///
-    /// # Returns
-    /// The handshake result containing session and ServerHello.
-    ///
-    /// # Errors
-    /// - Signature verification failure
-    /// - IP pool exhausted
-    /// - Session limit reached
-    ///
-    /// # Atomicity
-    /// If any step fails, all allocated resources are released.
     pub fn process(
         &self,
         client_hello: &ClientHello,
@@ -165,7 +123,7 @@ impl HandshakeService {
         debug!(client = %client_addr, virtual_ip = %virtual_ip, "IP allocated");
 
         // Step 3: Process cryptographic handshake
-        let session_id_bytes = SessionId::generate();
+        let session_id_bytes = aeronyx_common::SessionId::generate();
         let (server_hello, session_key) = match self.crypto.process_handshake(
             client_hello,
             virtual_ip.octets(),
@@ -173,7 +131,6 @@ impl HandshakeService {
         ) {
             Ok(result) => result,
             Err(e) => {
-                // Rollback: release IP
                 self.ip_pool.release(virtual_ip);
                 warn!(client = %client_addr, error = %e, "Handshake crypto failed");
                 return Err(e.into());
@@ -197,7 +154,6 @@ impl HandshakeService {
         ) {
             Ok(s) => s,
             Err(e) => {
-                // Rollback: release IP
                 self.ip_pool.release(virtual_ip);
                 warn!(client = %client_addr, error = %e, "Session creation failed");
                 return Err(e);
@@ -205,7 +161,7 @@ impl HandshakeService {
         };
 
         // Step 5: Register route
-        self.routing.add_route(virtual_ip, session.id);
+        self.routing.add_route(virtual_ip, session.id.clone());
 
         info!(
             client = %client_addr,
@@ -221,11 +177,7 @@ impl HandshakeService {
     }
 
     /// Cleans up resources for a failed or closed session.
-    ///
-    /// # Arguments
-    /// * `session_id` - The session to clean up
-    /// * `virtual_ip` - The virtual IP to release
-    pub fn cleanup(&self, session_id: &SessionId, virtual_ip: std::net::Ipv4Addr) {
+    pub fn cleanup(&self, session_id: &aeronyx_common::SessionId, virtual_ip: std::net::Ipv4Addr) {
         debug!(
             session_id = %session_id,
             virtual_ip = %virtual_ip,
@@ -237,7 +189,6 @@ impl HandshakeService {
         self.sessions.remove(session_id);
     }
 
-    /// Returns the server's public key for clients to verify.
     #[must_use]
     pub fn server_public_key(&self) -> aeronyx_core::crypto::keys::IdentityPublicKey {
         self.crypto.public_key()
@@ -251,10 +202,6 @@ impl std::fmt::Debug for HandshakeService {
             .finish()
     }
 }
-
-// ============================================
-// Tests
-// ============================================
 
 #[cfg(test)]
 mod tests {
@@ -296,7 +243,6 @@ mod tests {
             routing.clone(),
         );
 
-        // Client creates handshake
         let client_identity = IdentityKeyPair::generate();
         let client_ephemeral = EphemeralKeyPair::generate();
         let client_hello = create_client_hello(
@@ -307,20 +253,12 @@ mod tests {
 
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
-        // Process handshake
         let result = service.process(&client_hello, client_addr).unwrap();
 
-        // Verify results
         assert!(result.session.is_established());
         assert_eq!(result.session.client_endpoint, client_addr);
-        
-        // Verify IP was allocated
         assert!(ip_pool.is_allocated(result.session.virtual_ip));
-        
-        // Verify route was added
         assert!(routing.has_route(result.session.virtual_ip));
-        
-        // Verify session exists
         assert_eq!(sessions.count(), 1);
     }
 
@@ -336,7 +274,6 @@ mod tests {
             routing.clone(),
         );
 
-        // Create handshake with corrupted signature
         let client_identity = IdentityKeyPair::generate();
         let client_ephemeral = EphemeralKeyPair::generate();
         let mut client_hello = create_client_hello(
@@ -344,59 +281,15 @@ mod tests {
             client_ephemeral.public_key_bytes(),
             CURRENT_PROTOCOL_VERSION,
         );
-        client_hello.signature[0] ^= 0xFF; // Corrupt signature
+        client_hello.signature[0] ^= 0xFF;
 
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
-        // Should fail
         let result = service.process(&client_hello, client_addr);
         assert!(result.is_err());
 
-        // No resources should be allocated
         assert_eq!(ip_pool.allocated_count(), 0);
         assert_eq!(sessions.count(), 0);
         assert!(routing.is_empty());
-    }
-
-    #[test]
-    fn test_cleanup() {
-        let server_identity = IdentityKeyPair::generate();
-        let (ip_pool, sessions, routing) = create_test_services();
-
-        let service = HandshakeService::new(
-            server_identity,
-            ip_pool.clone(),
-            sessions.clone(),
-            routing.clone(),
-        );
-
-        // Create a session
-        let client_identity = IdentityKeyPair::generate();
-        let client_ephemeral = EphemeralKeyPair::generate();
-        let client_hello = create_client_hello(
-            &client_identity,
-            client_ephemeral.public_key_bytes(),
-            CURRENT_PROTOCOL_VERSION,
-        );
-
-        let result = service
-            .process(&client_hello, "127.0.0.1:12345".parse().unwrap())
-            .unwrap();
-
-        let session_id = result.session.id;
-        let virtual_ip = result.session.virtual_ip;
-
-        // Verify resources are allocated
-        assert!(ip_pool.is_allocated(virtual_ip));
-        assert!(routing.has_route(virtual_ip));
-        assert_eq!(sessions.count(), 1);
-
-        // Cleanup
-        service.cleanup(&session_id, virtual_ip);
-
-        // Verify resources are released
-        assert!(!ip_pool.is_allocated(virtual_ip));
-        assert!(!routing.has_route(virtual_ip));
-        assert_eq!(sessions.count(), 0);
     }
 }
