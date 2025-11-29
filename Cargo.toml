@@ -1,0 +1,159 @@
+# ============================================
+# File: Cargo.toml (Workspace Root)
+# ============================================
+# AeroNyx Privacy Network - Workspace Configuration
+# ============================================
+# Creation Reason: Define the monorepo workspace structure for the AeroNyx
+#                  privacy network server implementation.
+#
+# Main Functionality:
+# - Defines workspace members (crates)
+# - Centralizes dependency versions
+# - Configures workspace-wide settings
+#
+# Architecture Overview:
+# ┌─────────────────────────────────────────────────────────────┐
+# │  aeronyx-server    - Main server binary & orchestration     │
+# │  aeronyx-core      - Protocol definitions & cryptography    │
+# │  aeronyx-transport - Network I/O & TUN device abstraction   │
+# │  aeronyx-common    - Shared utilities & types               │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ⚠️ Important Note for Next Developer:
+# - Keep dependency versions synchronized across all crates
+# - Use workspace inheritance for common dependencies
+# - All crates should use the same async runtime (tokio)
+#
+# Last Modified: v0.1.0 - Initial workspace setup
+# ============================================
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/aeronyx-core",
+    "crates/aeronyx-transport",
+    "crates/aeronyx-server",
+    "crates/aeronyx-common",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aeronyx/aeronyx-server"
+authors = ["AeroNyx Contributors"]
+keywords = ["privacy", "network", "encryption", "tunnel"]
+categories = ["network-programming", "cryptography"]
+
+[workspace.dependencies]
+# ============================================
+# Async Runtime & Utilities
+# ============================================
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# ============================================
+# Cryptography (RustCrypto - security audited)
+# ============================================
+ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets", "serde"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
+# ============================================
+# Serialization & Configuration
+# ============================================
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+base64 = "0.22"
+bytes = "1.7"
+
+# ============================================
+# Error Handling
+# ============================================
+thiserror = "1.0"
+anyhow = "1.0"
+
+# ============================================
+# Logging & Observability
+# ============================================
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# ============================================
+# Networking
+# ============================================
+socket2 = { version = "0.5", features = ["all"] }
+
+# ============================================
+# System & Platform
+# ============================================
+nix = { version = "0.29", features = ["net", "ioctl", "fs"] }
+libc = "0.2"
+
+# ============================================
+# CLI
+# ============================================
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# ============================================
+# Utilities
+# ============================================
+parking_lot = "0.12"
+dashmap = "6.0"
+arc-swap = "1.7"
+pin-project-lite = "0.2"
+
+# ============================================
+# Testing
+# ============================================
+criterion = "0.5"
+proptest = "1.5"
+test-case = "3.3"
+
+# ============================================
+# Internal Crates
+# ============================================
+aeronyx-core = { path = "crates/aeronyx-core" }
+aeronyx-transport = { path = "crates/aeronyx-transport" }
+aeronyx-server = { path = "crates/aeronyx-server" }
+aeronyx-common = { path = "crates/aeronyx-common" }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+
+# ============================================
+# Build Profiles
+# ============================================
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+debug = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.dev-optimized]
+inherits = "dev"
+opt-level = 2
