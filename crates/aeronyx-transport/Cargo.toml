@@ -1,0 +1,82 @@
+# ============================================
+# File: crates/aeronyx-transport/Cargo.toml
+# ============================================
+# AeroNyx Transport - Network I/O Layer
+# ============================================
+# Creation Reason: Abstracts network transport operations including
+#                  UDP sockets and TUN device management.
+#
+# Main Functionality:
+# - UDP socket management for client communication
+# - TUN device creation and management
+# - Transport trait abstractions for testability
+# - Platform-specific implementations
+#
+# Dependencies:
+# - Used by: aeronyx-server
+# - Depends on: aeronyx-common
+#
+# Platform Support:
+# - Linux: Full support (TUN via /dev/net/tun)
+# - macOS: Limited (utun devices)
+# - Windows: Not supported (would need WinTun)
+#
+# ⚠️ Important Note for Next Developer:
+# - TUN operations require root/CAP_NET_ADMIN
+# - Platform-specific code is isolated in submodules
+# - Mock implementations provided for testing
+#
+# Last Modified: v0.1.0 - Initial transport layer
+# ============================================
+
+[package]
+name = "aeronyx-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Network transport layer for AeroNyx privacy network"
+keywords = ["aeronyx", "transport", "udp", "tun", "networking"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+# Internal
+aeronyx-common = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "fs"] }
+async-trait = { workspace = true }
+
+# Networking
+socket2 = { workspace = true }
+
+# System/Platform
+nix = { workspace = true }
+libc = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3.12"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux-specific dependencies if needed
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Enable mock implementations for testing without real devices
+mock = []
