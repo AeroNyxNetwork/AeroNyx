@@ -1,0 +1,94 @@
+# ============================================
+# File: crates/aeronyx-server/Cargo.toml
+# ============================================
+# AeroNyx Server - Main Server Binary
+# ============================================
+# Creation Reason: The main server implementation that orchestrates
+#                  all components of the AeroNyx privacy network.
+#
+# Main Functionality:
+# - Server binary with CLI interface
+# - Configuration management
+# - Session management and routing
+# - Handshake processing
+# - Packet forwarding
+#
+# Dependencies:
+# - Depends on: aeronyx-core, aeronyx-transport, aeronyx-common
+# - External: tokio, clap, tracing
+#
+# Binary:
+# - aeronyx-server: Main server executable
+#
+# ⚠️ Important Note for Next Developer:
+# - This is the main entry point for the server
+# - Configuration is loaded from TOML files
+# - Requires root/CAP_NET_ADMIN for TUN operations
+#
+# Last Modified: v0.1.0 - Initial server implementation
+# ============================================
+
+[package]
+name = "aeronyx-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AeroNyx privacy network server"
+keywords = ["aeronyx", "server", "privacy", "network"]
+categories = ["network-programming", "command-line-utilities"]
+
+[[bin]]
+name = "aeronyx-server"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+aeronyx-core = { workspace = true }
+aeronyx-transport = { workspace = true }
+aeronyx-common = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Configuration
+toml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+arc-swap = { workspace = true }
+
+# Cryptography (for key management)
+rand = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.12"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Development mode with relaxed security
+dev = []
