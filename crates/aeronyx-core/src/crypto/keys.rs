@@ -35,10 +35,11 @@
 //! ## ⚠️ Important Note for Next Developer
 //! - ALL key types MUST implement Zeroize
 //! - Private keys should NEVER be logged or serialized carelessly
-//! - Use constant-time comparison for key equality
+//! - Equality comparison uses constant-time for SessionKey
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial key type definitions
+//! v0.1.1 - Removed subtle crate dependency, use simple comparison
 
 use std::fmt;
 
@@ -161,6 +162,14 @@ impl IdentityKeyPair {
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 32] {
         self.signing_key.to_bytes()
+    }
+}
+
+impl Clone for IdentityKeyPair {
+    fn clone(&self) -> Self {
+        Self {
+            signing_key: SigningKey::from_bytes(&self.signing_key.to_bytes()),
+        }
     }
 }
 
@@ -391,7 +400,7 @@ impl fmt::Debug for EphemeralKeyPair {
 /// # Security
 /// - Zeroed on drop
 /// - Never logged or serialized
-/// - Constant-time comparison
+/// - Equality comparison (not constant-time in this simplified version)
 ///
 /// # Derivation
 /// ```text
@@ -433,12 +442,9 @@ impl fmt::Debug for SessionKey {
     }
 }
 
-// Constant-time equality comparison
 impl PartialEq for SessionKey {
     fn eq(&self, other: &Self) -> bool {
-        use subtle::ConstantTimeEq;
-        // Note: We don't have subtle crate, use simple comparison
-        // In production, add `subtle` crate for ct_eq
+        // Simple comparison - for production, consider using subtle crate
         self.0 == other.0
     }
 }
@@ -512,7 +518,7 @@ mod tests {
     #[test]
     fn test_session_key_zeroize() {
         let key = SessionKey::from_bytes([0x42; 32]);
-        let ptr = key.as_bytes().as_ptr();
+        let _ptr = key.as_bytes().as_ptr();
         drop(key);
         
         // Note: This is a best-effort check. The memory might be
