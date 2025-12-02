@@ -28,12 +28,12 @@
 //! │  │  │ Receive    │  │ Read       │  │ Expire       │   │   │
 //! │  │  │ packets    │  │ packets    │  │ sessions     │   │   │
 //! │  │  │            │  │            │  │              │   │   │
-//! │  │  └─────┬──────┘  └─────┬──────┘  └──────────────┘   │   │
+//! │  │  └─────┬──────┘  └─────┴──────┘  └──────────────┘   │   │
 //! │  │        │               │                            │   │
 //! │  │        ▼               ▼                            │   │
-//! │  │  ┌─────────────────────────────────────────────┐   │   │
+//! │  │  ┌─────────────────────────────────────────────────┐   │   │
 //! │  │  │            Packet Handler                    │   │   │
-//! │  │  └─────────────────────────────────────────────┘   │   │
+//! │  │  └─────────────────────────────────────────────────┘   │   │
 //! │  │                                                      │   │
 //! │  └─────────────────────────────────────────────────────┘   │
 //! │                                                             │
@@ -62,6 +62,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -305,21 +306,52 @@ impl Server {
 
                                 let data = &buf[..len];
                                 
+                                // ========== DEBUG LOG: Raw packet received ==========
+                                debug!(
+                                    "[UDP_RX] Received {} bytes from {}, first_byte=0x{:02X}",
+                                    len,
+                                    source.addr,
+                                    data.get(0).copied().unwrap_or(0)
+                                );
+                                
                                 // Check message type
                                 match ProtocolCodec::peek_message_type(data) {
                                     Ok(MessageType::ClientHello) => {
+                                        // ========== DEBUG LOG: ClientHello received ==========
+                                        info!(
+                                            "[HANDSHAKE] ClientHello received from {}",
+                                            source.addr
+                                        );
+                                        
                                         // Handle handshake
                                         match decode_client_hello(data) {
                                             Ok(client_hello) => {
                                                 match handshake.process(&client_hello, source.addr) {
                                                     Ok(result) => {
+                                                        // ========== DEBUG LOG: New session created ==========
+                                                        info!(
+                                                            "[HANDSHAKE] ✅ Session created for {}, SessionID={}",
+                                                            source.addr,
+                                                            BASE64.encode(&result.response.session_id)
+                                                        );
+                                                        
                                                         let response = encode_server_hello(&result.response);
                                                         if let Err(e) = udp.send(&response, &source.addr).await {
                                                             warn!("Failed to send ServerHello: {}", e);
+                                                        } else {
+                                                            debug!(
+                                                                "[HANDSHAKE] ServerHello sent to {}, response_len={}",
+                                                                source.addr,
+                                                                response.len()
+                                                            );
                                                         }
                                                     }
                                                     Err(e) => {
-                                                        debug!("Handshake failed from {}: {}", source.addr, e);
+                                                        warn!(
+                                                            "[HANDSHAKE] ❌ Failed from {}: {}",
+                                                            source.addr,
+                                                            e
+                                                        );
                                                     }
                                                 }
                                             }
@@ -329,16 +361,48 @@ impl Server {
                                         }
                                     }
                                     Ok(MessageType::Data) | Err(_) => {
+                                        // ========== DEBUG LOG: Data packet session ID ==========
+                                        if data.len() >= 16 {
+                                            let received_session_id = &data[0..16];
+                                            debug!(
+                                                "[DATA_RX] Data packet from {}, SessionID={}, len={}",
+                                                source.addr,
+                                                BASE64.encode(received_session_id),
+                                                len
+                                            );
+                                        } else {
+                                            warn!(
+                                                "[DATA_RX] Packet too short from {}, len={}",
+                                                source.addr,
+                                                len
+                                            );
+                                        }
+                                        
                                         // Try to handle as data packet
                                         match packet_handler.handle_udp_packet(data) {
                                             Ok((_session, ip_packet)) => {
+                                                debug!(
+                                                    "[DATA_RX] ✅ Packet decrypted, IP packet len={}",
+                                                    ip_packet.len()
+                                                );
+                                                
                                                 #[cfg(target_os = "linux")]
                                                 if let Err(e) = tun.write(&ip_packet).await {
                                                     debug!("TUN write error: {}", e);
                                                 }
                                             }
                                             Err(e) => {
-                                                debug!("Packet handling error from {}: {}", source.addr, e);
+                                                // ========== DEBUG LOG: Session not found ==========
+                                                if data.len() >= 16 {
+                                                    warn!(
+                                                        "[DATA_RX] ❌ Packet handling FAILED from {}, SessionID={}, error: {}",
+                                                        source.addr,
+                                                        BASE64.encode(&data[0..16]),
+                                                        e
+                                                    );
+                                                } else {
+                                                    debug!("Packet handling error from {}: {}", source.addr, e);
+                                                }
                                             }
                                         }
                                     }
