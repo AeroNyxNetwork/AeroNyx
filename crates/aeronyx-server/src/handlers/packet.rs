@@ -73,8 +73,9 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::{Bytes, BytesMut};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace, warn, info};
 
 use aeronyx_common::types::SessionId;
 use aeronyx_core::crypto::transport::{DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD};
@@ -147,17 +148,72 @@ impl PacketHandler {
             ));
         }
 
+        // ========== DEBUG LOG: Raw session ID bytes ==========
+        let raw_session_id = &data[0..16];
+        debug!(
+            "[PACKET_HANDLER] Processing packet, raw SessionID bytes: {:02X?}",
+            raw_session_id
+        );
+        debug!(
+            "[PACKET_HANDLER] SessionID (base64): {}",
+            BASE64.encode(raw_session_id)
+        );
+
         // Decode packet header
         let packet = decode_data_packet(data)?;
 
+        // ========== DEBUG LOG: Decoded session ID ==========
+        debug!(
+            "[PACKET_HANDLER] Decoded packet.session_id (base64): {}",
+            BASE64.encode(&packet.session_id)
+        );
+
         // Lookup session
         let session_id = SessionId::from_bytes(&packet.session_id)
-            .ok_or_else(|| ServerError::invalid_packet(
-                "0.0.0.0:0".parse().unwrap(),
-                "Invalid session ID",
-            ))?;
+            .ok_or_else(|| {
+                warn!(
+                    "[PACKET_HANDLER] ❌ Invalid session ID format: {:02X?}",
+                    &packet.session_id
+                );
+                ServerError::invalid_packet(
+                    "0.0.0.0:0".parse().unwrap(),
+                    "Invalid session ID",
+                )
+            })?;
 
-        let session = self.sessions.get_or_error(&session_id)?;
+        // ========== DEBUG LOG: Looking up session ==========
+        debug!(
+            "[PACKET_HANDLER] Looking up SessionID: {}",
+            session_id
+        );
+
+        // ========== DEBUG LOG: List all active sessions ==========
+        let active_sessions = self.sessions.list_active_session_ids();
+        debug!(
+            "[PACKET_HANDLER] Active sessions in manager (count={}): {:?}",
+            active_sessions.len(),
+            active_sessions.iter().map(|id| BASE64.encode(id.as_bytes())).collect::<Vec<_>>()
+        );
+
+        let session = match self.sessions.get(&session_id) {
+            Some(s) => {
+                debug!(
+                    "[PACKET_HANDLER] ✅ Session FOUND: {}, virtual_ip={}, endpoint={}",
+                    session_id,
+                    s.virtual_ip,
+                    s.client_endpoint
+                );
+                s
+            }
+            None => {
+                warn!(
+                    "[PACKET_HANDLER] ❌ Session NOT FOUND: {} (base64: {})",
+                    session_id,
+                    BASE64.encode(session_id.as_bytes())
+                );
+                return Err(self.sessions.get_or_error(&session_id).unwrap_err());
+            }
+        };
 
         // Validate counter (replay protection)
         if !session.validate_rx_counter(packet.counter) {
