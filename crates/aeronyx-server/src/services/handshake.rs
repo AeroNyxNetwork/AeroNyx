@@ -122,12 +122,20 @@ impl HandshakeService {
 
         debug!(client = %client_addr, virtual_ip = %virtual_ip, "IP allocated");
 
-        // Step 3: Process cryptographic handshake
-        let session_id_bytes = aeronyx_common::SessionId::generate();
+        // Step 3: Generate session ID (只生成一次！)
+        let session_id = aeronyx_common::SessionId::generate();
+        
+        debug!(
+            client = %client_addr,
+            session_id = %session_id,
+            "Generated session ID"
+        );
+
+        // Step 4: Process cryptographic handshake (使用同一个 session_id)
         let (server_hello, session_key) = match self.crypto.process_handshake(
             client_hello,
             virtual_ip.octets(),
-            *session_id_bytes.as_bytes(),
+            *session_id.as_bytes(),  // ← 使用生成的 session_id
         ) {
             Ok(result) => result,
             Err(e) => {
@@ -137,7 +145,7 @@ impl HandshakeService {
             }
         };
 
-        // Step 4: Create session
+        // Step 5: Create session (传入同一个 session_id)
         let client_public_key = aeronyx_core::crypto::keys::IdentityPublicKey::from_bytes(
             &client_hello.client_public_key,
         )
@@ -147,6 +155,7 @@ impl HandshakeService {
         })?;
 
         let session = match self.sessions.create(
+            session_id.clone(),  // ← 传入同一个 session_id
             client_public_key,
             session_key,
             virtual_ip,
@@ -160,7 +169,7 @@ impl HandshakeService {
             }
         };
 
-        // Step 5: Register route
+        // Step 6: Register route
         self.routing.add_route(virtual_ip, session.id.clone());
 
         info!(
@@ -254,6 +263,13 @@ mod tests {
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
         let result = service.process(&client_hello, client_addr).unwrap();
+
+        // 验证 session ID 与 ServerHello 中的一致
+        assert_eq!(
+            result.session.id.as_bytes(),
+            &result.response.session_id,
+            "Session ID mismatch between Session and ServerHello!"
+        );
 
         assert!(result.session.is_established());
         assert_eq!(result.session.client_endpoint, client_addr);
