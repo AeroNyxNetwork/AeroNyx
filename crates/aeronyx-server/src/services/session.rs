@@ -227,9 +227,20 @@ impl SessionManager {
         }
     }
 
-    /// Creates and registers a new session.
+    /// Creates and registers a new session with a specific session ID.
+    ///
+    /// # Arguments
+    /// * `session_id` - The session ID to use (must match the one sent to client)
+    /// * `client_public_key` - Client's identity public key
+    /// * `session_key` - Derived session key for encryption
+    /// * `virtual_ip` - Assigned virtual IP address
+    /// * `client_endpoint` - Client's UDP endpoint
+    ///
+    /// # Errors
+    /// Returns `SessionLimitReached` if max sessions exceeded.
     pub fn create(
         &self,
+        session_id: SessionId,  // ← 修改：接受外部传入的 SessionId
         client_public_key: IdentityPublicKey,
         session_key: SessionKey,
         virtual_ip: Ipv4Addr,
@@ -241,7 +252,7 @@ impl SessionManager {
             });
         }
 
-        let session_id = SessionId::generate();
+        // 使用传入的 session_id，而不是生成新的
         let session = Arc::new(Session::new(
             session_id.clone(),
             client_public_key,
@@ -386,8 +397,10 @@ mod tests {
     fn test_session_manager_create() {
         let manager = SessionManager::new(100, Duration::from_secs(300));
         let identity = IdentityKeyPair::generate();
+        let session_id = SessionId::generate();  // ← 修改：先生成 ID
         
         let session = manager.create(
+            session_id.clone(),  // ← 修改：传入 ID
             identity.public_key(),
             SessionKey::from_bytes([0x42; 32]),
             Ipv4Addr::new(100, 64, 0, 2),
@@ -395,6 +408,7 @@ mod tests {
         ).unwrap();
         
         assert_eq!(manager.count(), 1);
+        assert_eq!(session.id, session_id);  // ← 新增：验证 ID 一致
         
         let retrieved = manager.get(&session.id).unwrap();
         assert_eq!(retrieved.virtual_ip, Ipv4Addr::new(100, 64, 0, 2));
@@ -406,6 +420,7 @@ mod tests {
         let identity = IdentityKeyPair::generate();
         
         manager.create(
+            SessionId::generate(),
             identity.public_key(),
             SessionKey::from_bytes([0x42; 32]),
             Ipv4Addr::new(100, 64, 0, 2),
@@ -413,6 +428,7 @@ mod tests {
         ).unwrap();
         
         manager.create(
+            SessionId::generate(),
             identity.public_key(),
             SessionKey::from_bytes([0x42; 32]),
             Ipv4Addr::new(100, 64, 0, 3),
@@ -420,6 +436,7 @@ mod tests {
         ).unwrap();
         
         let result = manager.create(
+            SessionId::generate(),
             identity.public_key(),
             SessionKey::from_bytes([0x42; 32]),
             Ipv4Addr::new(100, 64, 0, 4),
