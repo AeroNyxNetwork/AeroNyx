@@ -187,12 +187,10 @@ impl PacketHandler {
             session_id
         );
 
-        // ========== DEBUG LOG: List all active sessions ==========
-        let active_sessions = self.sessions.list_active_session_ids();
+        // ========== DEBUG LOG: Session count ==========
         debug!(
-            "[PACKET_HANDLER] Active sessions in manager (count={}): {:?}",
-            active_sessions.len(),
-            active_sessions.iter().map(|id| BASE64.encode(id.as_bytes())).collect::<Vec<_>>()
+            "[PACKET_HANDLER] Active sessions count: {}",
+            self.sessions.count()
         );
 
         let session = match self.sessions.get(&session_id) {
