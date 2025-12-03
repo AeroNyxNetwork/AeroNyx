@@ -1,16 +1,35 @@
 # ============================================
-# File: Cargo.toml (Workspace Root) - Production Version
+# File: Cargo.toml (Workspace Root)
 # ============================================
-# Modification Notes: Downgraded cryptography libraries to match client
-# 
-# Issue: Client is constrained by solana-sdk, requiring older versions:
-#   - ed25519-dalek 1.0 (not 2.x)
-#   - x25519-dalek 1.1 (not 2.x)  
-#   - chacha20poly1305 0.9 (not 0.10)
-#   - rand 0.7 (not 0.8)
-#   - zeroize 1.3 (not 1.8)
+# AeroNyx Privacy Network - Workspace Configuration
+# ============================================
+# Modification Reason: Downgrade crypto library versions to match client
 #
-# Solution: Server downgraded to match client compatibility
+# CRITICAL VERSION ALIGNMENT:
+# The client (Flutter/iOS) is constrained by solana-sdk dependencies:
+#   - ed25519-dalek 1.0 (NOT 2.x)
+#   - x25519-dalek 1.1 (NOT 2.x)
+#   - chacha20poly1305 0.9 (NOT 0.10)
+#   - rand 0.7 (NOT 0.8)
+#   - zeroize 1.3 (NOT 1.8)
+#
+# Solution: Server must use the same versions to ensure crypto compatibility
+#
+# Architecture Overview:
+# ┌─────────────────────────────────────────────────────────────┐
+# │  aeronyx-server    - Main server binary & orchestration     │
+# │  aeronyx-core      - Protocol definitions & cryptography    │
+# │  aeronyx-transport - Network I/O & TUN device abstraction   │
+# │  aeronyx-common    - Shared utilities & types               │
+# └─────────────────────────────────────────────────────────────┘
+#
+# ⚠️ Important Note for Next Developer:
+# - Keep dependency versions synchronized with client
+# - All crypto library versions MUST match exactly
+# - Use workspace inheritance for common dependencies
+# - All crates should use the same async runtime (tokio)
+#
+# Last Modified: Version alignment fix for client compatibility
 # ============================================
 
 [workspace]
@@ -42,17 +61,27 @@ async-trait = "0.1"
 futures = "0.3"
 
 # ============================================
-# Cryptography - Downgraded to match client (solana-sdk constraints)
+# Cryptography (RustCrypto - security audited)
 # ============================================
-# ⚠️ IMPORTANT: These versions MUST match the client exactly!
-ed25519-dalek = "1.0"           # Downgraded from 2.1 to 1.0
-x25519-dalek = "1.1"            # Downgraded from 2.0 to 1.1
-chacha20poly1305 = "0.9"        # Downgraded from 0.10 to 0.9
+# ⚠️ CRITICAL: These versions MUST match client exactly!
+# Client is constrained by solana-sdk which requires older versions.
+# DO NOT upgrade these without also upgrading client dependencies.
+#
+# Version mapping (Server ← must match → Client):
+#   ed25519-dalek:      1.0  ←→  1.0  ✓
+#   x25519-dalek:       1.1  ←→  1.1  ✓
+#   chacha20poly1305:   0.9  ←→  0.9  ✓
+#   rand:               0.7  ←→  0.7  ✓
+#   zeroize:            1.3  ←→  1.3  ✓
+# ============================================
+ed25519-dalek = "1.0"
+x25519-dalek = "1.1"
+chacha20poly1305 = "0.9"
 hkdf = "0.12"
 sha2 = "0.10"
-rand = "0.7"                    # Downgraded from 0.8 to 0.7
-rand_core = "0.5"               # Downgraded from 0.6 to 0.5
-zeroize = { version = "1.3", features = ["zeroize_derive"] }  # Downgraded from 1.8 to 1.3
+rand = "0.7"
+rand_core = "0.5"
+zeroize = { version = "1.3", features = ["zeroize_derive"] }
 
 # ============================================
 # Serialization & Configuration
@@ -60,9 +89,9 @@ zeroize = { version = "1.3", features = ["zeroize_derive"] }  # Downgraded from 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
-base64 = "0.21"                 # Downgraded from 0.22 to 0.21
+base64 = "0.21"
 bytes = "1.7"
-hex = "0.4"                     # Added for debug logging
+hex = "0.4"
 
 # ============================================
 # Error Handling
