@@ -37,11 +37,26 @@
 use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroize;
-use tracing::{debug, info, trace};
+use tracing::{debug, info};
 
 use super::{CHACHA20_KEY_SIZE, ED25519_PUBLIC_KEY_SIZE, HKDF_INFO_PREFIX, HKDF_SALT};
 use crate::crypto::SessionKey;
 use crate::error::{CoreError, Result};
+
+// ============================================
+// Helper function for hex encoding (no external crate needed)
+// ============================================
+
+/// Convert bytes to hex string for debug logging
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        result.push(HEX_CHARS[(byte >> 4) as usize] as char);
+        result.push(HEX_CHARS[(byte & 0x0f) as usize] as char);
+    }
+    result
+}
 
 // ============================================
 // Key Derivation
@@ -82,26 +97,26 @@ pub fn derive_session_key(
     // Log all inputs
     info!(
         "[CRYPTO-DEBUG] Input - Shared Secret: {}",
-        hex::encode(shared_secret)
+        to_hex(shared_secret)
     );
     info!(
         "[CRYPTO-DEBUG] Input - Client Public Key: {}",
-        hex::encode(client_public)
+        to_hex(client_public)
     );
     info!(
         "[CRYPTO-DEBUG] Input - Server Public Key: {}",
-        hex::encode(server_public)
+        to_hex(server_public)
     );
     
     // Log HKDF parameters
     debug!(
         "[CRYPTO-DEBUG] HKDF Salt: {} (\"{}\")",
-        hex::encode(HKDF_SALT),
+        to_hex(HKDF_SALT),
         String::from_utf8_lossy(HKDF_SALT)
     );
     debug!(
         "[CRYPTO-DEBUG] HKDF Info Prefix: {} (\"{}\")",
-        hex::encode(HKDF_INFO_PREFIX),
+        to_hex(HKDF_INFO_PREFIX),
         String::from_utf8_lossy(HKDF_INFO_PREFIX)
     );
 
@@ -115,7 +130,7 @@ pub fn derive_session_key(
     
     debug!(
         "[CRYPTO-DEBUG] HKDF Info (full): {} ({} bytes)",
-        hex::encode(&info),
+        to_hex(&info),
         info.len()
     );
     debug!(
@@ -124,17 +139,17 @@ pub fn derive_session_key(
     debug!(
         "[CRYPTO-DEBUG]   - Prefix ({} bytes): {}",
         HKDF_INFO_PREFIX.len(),
-        hex::encode(HKDF_INFO_PREFIX)
+        to_hex(HKDF_INFO_PREFIX)
     );
     debug!(
         "[CRYPTO-DEBUG]   - Client Public ({} bytes): {}",
         ED25519_PUBLIC_KEY_SIZE,
-        hex::encode(client_public)
+        to_hex(client_public)
     );
     debug!(
         "[CRYPTO-DEBUG]   - Server Public ({} bytes): {}",
         ED25519_PUBLIC_KEY_SIZE,
-        hex::encode(server_public)
+        to_hex(server_public)
     );
 
     // Perform HKDF-SHA256
@@ -157,7 +172,7 @@ pub fn derive_session_key(
 
     info!(
         "[CRYPTO-DEBUG] Output - Derived Session Key: {}",
-        hex::encode(&key_bytes)
+        to_hex(&key_bytes)
     );
 
     // Clear sensitive intermediate data
@@ -170,19 +185,19 @@ pub fn derive_session_key(
     info!("[CRYPTO-DEBUG] ====== KEY DERIVATION SUMMARY ======");
     info!(
         "[CRYPTO-DEBUG]   Shared Secret:     {}",
-        hex::encode(shared_secret)
+        to_hex(shared_secret)
     );
     info!(
         "[CRYPTO-DEBUG]   Client Public:     {}",
-        hex::encode(client_public)
+        to_hex(client_public)
     );
     info!(
         "[CRYPTO-DEBUG]   Server Public:     {}",
-        hex::encode(server_public)
+        to_hex(server_public)
     );
     info!(
         "[CRYPTO-DEBUG]   Derived Key:       {}",
-        hex::encode(&key_bytes)
+        to_hex(&key_bytes)
     );
     info!("[CRYPTO-DEBUG] ====================================");
 
@@ -211,17 +226,17 @@ pub fn hkdf_expand(
     debug!("[CRYPTO-DEBUG] ========== hkdf_expand START ==========");
     debug!(
         "[CRYPTO-DEBUG] Input - shared_secret: {} ({} bytes)",
-        hex::encode(shared_secret),
+        to_hex(shared_secret),
         shared_secret.len()
     );
     debug!(
         "[CRYPTO-DEBUG] Input - salt: {} ({} bytes)",
-        hex::encode(salt),
+        to_hex(salt),
         salt.len()
     );
     debug!(
         "[CRYPTO-DEBUG] Input - info: {} ({} bytes)",
-        hex::encode(info),
+        to_hex(info),
         info.len()
     );
     debug!("[CRYPTO-DEBUG] Input - output_len: {} bytes", output_len);
@@ -233,7 +248,7 @@ pub fn hkdf_expand(
         Ok(()) => {
             debug!(
                 "[CRYPTO-DEBUG] Output: {} ({} bytes)",
-                hex::encode(&output),
+                to_hex(&output),
                 output.len()
             );
             debug!("[CRYPTO-DEBUG] ========== hkdf_expand SUCCESS ==========");
