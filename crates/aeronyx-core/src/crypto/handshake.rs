@@ -58,6 +58,21 @@ use aeronyx_common::time::Timestamp;
 use tracing::{debug, info, trace};
 
 // ============================================
+// Helper function for hex encoding (no external crate needed)
+// ============================================
+
+/// Convert bytes to hex string for debug logging
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        result.push(HEX_CHARS[(byte >> 4) as usize] as char);
+        result.push(HEX_CHARS[(byte & 0x0f) as usize] as char);
+    }
+    result
+}
+
+// ============================================
 // HandshakeCrypto Trait
 // ============================================
 
@@ -133,7 +148,7 @@ impl DefaultHandshakeCrypto {
         info!("[CRYPTO-DEBUG] DefaultHandshakeCrypto::new() - Creating handshake crypto instance");
         debug!(
             "[CRYPTO-DEBUG] Server Identity Public Key: {}",
-            hex::encode(identity.public_key_bytes())
+            to_hex(&identity.public_key_bytes())
         );
         Self {
             identity,
@@ -171,9 +186,8 @@ impl DefaultHandshakeCrypto {
         data.extend_from_slice(&msg.timestamp.to_le_bytes());
         
         trace!(
-            "[CRYPTO-DEBUG] client_hello_sign_data constructed: {} bytes, hash: {}",
-            data.len(),
-            hex::encode(&sha256_hash(&data)[..8])
+            "[CRYPTO-DEBUG] client_hello_sign_data constructed: {} bytes",
+            data.len()
         );
         
         data
@@ -202,9 +216,8 @@ impl DefaultHandshakeCrypto {
         data.extend_from_slice(client_public);
         
         trace!(
-            "[CRYPTO-DEBUG] server_hello_sign_data constructed: {} bytes, hash: {}",
-            data.len(),
-            hex::encode(&sha256_hash(&data)[..8])
+            "[CRYPTO-DEBUG] server_hello_sign_data constructed: {} bytes",
+            data.len()
         );
         
         data
@@ -224,16 +237,16 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         debug!("[CRYPTO-DEBUG]   version: {}", msg.version);
         debug!(
             "[CRYPTO-DEBUG]   client_public_key: {}",
-            hex::encode(&msg.client_public_key)
+            to_hex(&msg.client_public_key)
         );
         debug!(
             "[CRYPTO-DEBUG]   client_ephemeral_key: {}",
-            hex::encode(&msg.client_ephemeral_key)
+            to_hex(&msg.client_ephemeral_key)
         );
         debug!("[CRYPTO-DEBUG]   timestamp: {}", msg.timestamp);
         debug!(
             "[CRYPTO-DEBUG]   signature: {}",
-            hex::encode(&msg.signature)
+            to_hex(&msg.signature)
         );
 
         // 1. Validate timestamp
@@ -264,7 +277,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         );
         debug!(
             "[CRYPTO-DEBUG] Sign data hex: {}",
-            hex::encode(&sign_data)
+            to_hex(&sign_data)
         );
         
         let client_public = IdentityPublicKey::from_bytes(&msg.client_public_key)?;
@@ -298,15 +311,15 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         );
         debug!(
             "[CRYPTO-DEBUG] Input - session_id: {}",
-            hex::encode(&session_id)
+            to_hex(&session_id)
         );
         debug!(
             "[CRYPTO-DEBUG] Input - client_public_key: {}",
-            hex::encode(&client_hello.client_public_key)
+            to_hex(&client_hello.client_public_key)
         );
         debug!(
             "[CRYPTO-DEBUG] Input - client_ephemeral_key: {}",
-            hex::encode(&client_hello.client_ephemeral_key)
+            to_hex(&client_hello.client_ephemeral_key)
         );
 
         // 1. Generate ephemeral key pair for this session
@@ -315,7 +328,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         let server_ephemeral_public = ephemeral.public_key_bytes();
         debug!(
             "[CRYPTO-DEBUG] Server Ephemeral Public Key: {}",
-            hex::encode(&server_ephemeral_public)
+            to_hex(&server_ephemeral_public)
         );
 
         // 2. Perform key exchange
@@ -323,18 +336,18 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         let shared_secret = ephemeral.exchange(&client_hello.client_ephemeral_key);
         info!(
             "[CRYPTO-DEBUG] *** Shared Secret: {} ***",
-            hex::encode(&shared_secret)
+            to_hex(&shared_secret)
         );
 
         // 3. Derive session key
         info!("[CRYPTO-DEBUG] Step 3: Deriving session key...");
         info!(
             "[CRYPTO-DEBUG] *** Client Identity Public Key (for KDF): {} ***",
-            hex::encode(&client_hello.client_public_key)
+            to_hex(&client_hello.client_public_key)
         );
         info!(
             "[CRYPTO-DEBUG] *** Server Identity Public Key (for KDF): {} ***",
-            hex::encode(&self.identity.public_key_bytes())
+            to_hex(&self.identity.public_key_bytes())
         );
         
         let session_key = derive_session_key(
@@ -345,7 +358,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         
         info!(
             "[CRYPTO-DEBUG] *** Derived Session Key: {} ***",
-            hex::encode(session_key.as_bytes())
+            to_hex(session_key.as_bytes())
         );
 
         // 4. Build ServerHello (unsigned)
@@ -365,11 +378,11 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         debug!("[CRYPTO-DEBUG]   version: {}", server_hello.version);
         debug!(
             "[CRYPTO-DEBUG]   server_public_key: {}",
-            hex::encode(&server_hello.server_public_key)
+            to_hex(&server_hello.server_public_key)
         );
         debug!(
             "[CRYPTO-DEBUG]   server_ephemeral_key: {}",
-            hex::encode(&server_hello.server_ephemeral_key)
+            to_hex(&server_hello.server_ephemeral_key)
         );
         debug!(
             "[CRYPTO-DEBUG]   assigned_ip: {}.{}.{}.{}",
@@ -380,7 +393,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         );
         debug!(
             "[CRYPTO-DEBUG]   session_id: {}",
-            hex::encode(&server_hello.session_id)
+            to_hex(&server_hello.session_id)
         );
 
         // 5. Sign ServerHello
@@ -395,48 +408,36 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         );
         debug!(
             "[CRYPTO-DEBUG] ServerHello sign_data hex: {}",
-            hex::encode(&sign_data)
+            to_hex(&sign_data)
         );
         
         server_hello.signature = self.identity.sign(&sign_data);
         debug!(
             "[CRYPTO-DEBUG] ServerHello signature: {}",
-            hex::encode(&server_hello.signature)
+            to_hex(&server_hello.signature)
         );
 
         info!("[CRYPTO-DEBUG] ========== process_handshake SUCCESS ==========");
         info!("[CRYPTO-DEBUG] Summary:");
         info!(
             "[CRYPTO-DEBUG]   Shared Secret: {}",
-            hex::encode(&shared_secret)
+            to_hex(&shared_secret)
         );
         info!(
             "[CRYPTO-DEBUG]   Client Identity Public: {}",
-            hex::encode(&client_hello.client_public_key)
+            to_hex(&client_hello.client_public_key)
         );
         info!(
             "[CRYPTO-DEBUG]   Server Identity Public: {}",
-            hex::encode(&self.identity.public_key_bytes())
+            to_hex(&self.identity.public_key_bytes())
         );
         info!(
             "[CRYPTO-DEBUG]   Derived Session Key: {}",
-            hex::encode(session_key.as_bytes())
+            to_hex(session_key.as_bytes())
         );
 
         Ok((server_hello, session_key))
     }
-}
-
-// ============================================
-// Helper function for debug logging
-// ============================================
-
-/// Compute SHA256 hash for debug logging purposes
-fn sha256_hash(data: &[u8]) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hasher.finalize().into()
 }
 
 // ============================================
@@ -462,11 +463,11 @@ pub fn verify_server_hello(
     debug!("[CRYPTO-DEBUG]   version: {}", server_hello.version);
     debug!(
         "[CRYPTO-DEBUG]   server_public_key: {}",
-        hex::encode(&server_hello.server_public_key)
+        to_hex(&server_hello.server_public_key)
     );
     debug!(
         "[CRYPTO-DEBUG]   server_ephemeral_key: {}",
-        hex::encode(&server_hello.server_ephemeral_key)
+        to_hex(&server_hello.server_ephemeral_key)
     );
     debug!(
         "[CRYPTO-DEBUG]   assigned_ip: {}.{}.{}.{}",
@@ -477,15 +478,15 @@ pub fn verify_server_hello(
     );
     debug!(
         "[CRYPTO-DEBUG]   session_id: {}",
-        hex::encode(&server_hello.session_id)
+        to_hex(&server_hello.session_id)
     );
     debug!(
         "[CRYPTO-DEBUG]   signature: {}",
-        hex::encode(&server_hello.signature)
+        to_hex(&server_hello.signature)
     );
     debug!(
         "[CRYPTO-DEBUG] Client public key (for binding): {}",
-        hex::encode(client_public)
+        to_hex(client_public)
     );
 
     let sign_data = DefaultHandshakeCrypto::server_hello_sign_data(
@@ -499,7 +500,7 @@ pub fn verify_server_hello(
     );
     debug!(
         "[CRYPTO-DEBUG] Sign data hex: {}",
-        hex::encode(&sign_data)
+        to_hex(&sign_data)
     );
     
     let server_public = IdentityPublicKey::from_bytes(&server_hello.server_public_key)?;
@@ -538,11 +539,11 @@ pub fn create_client_hello(
     
     debug!(
         "[CRYPTO-DEBUG] Client Identity Public Key: {}",
-        hex::encode(&identity.public_key_bytes())
+        to_hex(&identity.public_key_bytes())
     );
     debug!(
         "[CRYPTO-DEBUG] Client Ephemeral Public Key: {}",
-        hex::encode(&ephemeral_public)
+        to_hex(&ephemeral_public)
     );
     debug!("[CRYPTO-DEBUG] Timestamp: {}", timestamp);
     debug!("[CRYPTO-DEBUG] Version: {}", version);
@@ -564,13 +565,13 @@ pub fn create_client_hello(
     );
     debug!(
         "[CRYPTO-DEBUG] ClientHello sign_data hex: {}",
-        hex::encode(&sign_data)
+        to_hex(&sign_data)
     );
     
     msg.signature = identity.sign(&sign_data);
     debug!(
         "[CRYPTO-DEBUG] ClientHello signature: {}",
-        hex::encode(&msg.signature)
+        to_hex(&msg.signature)
     );
 
     info!("[CRYPTO-DEBUG] ========== create_client_hello SUCCESS ==========");
