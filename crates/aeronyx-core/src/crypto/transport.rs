@@ -3,9 +3,14 @@
 // ============================================
 //! # Transport Encryption
 //!
-//! ## Creation Reason
-//! Provides authenticated encryption for data packets using
-//! ChaCha20-Poly1305 AEAD cipher.
+//! ## Modification Reason
+//! Adapted for chacha20poly1305 0.9 API to match client library version
+//! (constrained by solana-sdk).
+//!
+//! ## API Version Notes
+//! - chacha20poly1305 0.9: Uses `NewAead` trait, `new()` method
+//! - chacha20poly1305 0.10: Uses `KeyInit` trait, `new_from_slice()` method
+//! This implementation uses 0.9 API for client compatibility.
 //!
 //! ## Main Functionality
 //! - `TransportCrypto`: Trait for transport encryption/decryption
@@ -15,15 +20,15 @@
 //!
 //! ## Packet Format
 //! ```text
-//! ┌────────────────────────────────────────────────────┐
-//! │ Session ID (16 bytes)          │ ← AAD (authenticated) │
-//! ├────────────────────────────────────────────────────┤
-//! │ Counter (8 bytes)              │ ← Used for nonce      │
-//! ├────────────────────────────────────────────────────┤
-//! │ Encrypted Payload (variable)   │ ← ChaCha20 ciphertext │
-//! │ ├─ IP packet data              │                       │
-//! │ └─ Poly1305 Tag (16 bytes)     │ ← Authentication tag  │
-//! └────────────────────────────────────────────────────┘
+//! ┌────────────────────────────────────────────────────────────┐
+//! │ Session ID (16 bytes)          │ ← AAD (authenticated)    │
+//! ├────────────────────────────────────────────────────────────┤
+//! │ Counter (8 bytes)              │ ← Used for nonce         │
+//! ├────────────────────────────────────────────────────────────┤
+//! │ Encrypted Payload (variable)   │ ← ChaCha20 ciphertext    │
+//! │ ├─ IP packet data              │                          │
+//! │ └─ Poly1305 Tag (16 bytes)     │ ← Authentication tag     │
+//! └────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! ## Nonce Construction
@@ -40,14 +45,19 @@
 //! - Counter MUST be unique per packet per session key
 //! - Never reuse (key, nonce) pair - catastrophic security failure
 //! - Counter overflow should trigger session rekeying
+//! - DO NOT upgrade to chacha20poly1305 0.10 without client upgrade
 //!
 //! ## Last Modified
-//! v0.1.0 - Initial transport crypto implementation
+//! v0.1.1 - Adapted for chacha20poly1305 0.9 API
 
+// chacha20poly1305 0.9 API (different from 0.10)
+// - 0.9: NewAead trait, Payload struct
+// - 0.10: KeyInit trait, different API
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, NewAead, Payload},
     ChaCha20Poly1305, Nonce,
 };
+use chacha20poly1305::aead::generic_array::GenericArray;
 
 use crate::crypto::keys::SessionKey;
 use crate::error::{CoreError, Result};
@@ -132,6 +142,11 @@ pub trait TransportCrypto: Send + Sync {
 // ============================================
 
 /// Default implementation using ChaCha20-Poly1305.
+///
+/// # Implementation Notes
+/// Uses chacha20poly1305 0.9 API for client compatibility:
+/// - `ChaCha20Poly1305::new(key)` instead of `new_from_slice()`
+/// - `Payload { msg, aad }` for associated data
 #[derive(Debug, Default, Clone)]
 pub struct DefaultTransportCrypto;
 
@@ -149,11 +164,15 @@ impl DefaultTransportCrypto {
     /// nonce[0..8]  = counter (little-endian)
     /// nonce[8..12] = 0x00000000 (padding)
     /// ```
+    ///
+    /// # Security
+    /// The counter ensures unique nonces for each packet within a session.
+    /// Combined with the session key, this prevents nonce reuse attacks.
     fn make_nonce(counter: u64) -> Nonce {
         let mut nonce = [0u8; CHACHA20_NONCE_SIZE];
         nonce[..8].copy_from_slice(&counter.to_le_bytes());
         // nonce[8..12] remains zero (implicit padding)
-        Nonce::from(nonce)
+        *Nonce::from_slice(&nonce)
     }
 }
 
@@ -177,16 +196,18 @@ impl TransportCrypto for DefaultTransportCrypto {
             });
         }
 
-        // Create cipher and nonce
-        let cipher = ChaCha20Poly1305::new_from_slice(key.as_bytes())
-            .map_err(|_| CoreError::Encryption {
-                context: "Failed to create cipher".into(),
-            })?;
+        // Create cipher using chacha20poly1305 0.9 API
+        // Note: 0.9 uses NewAead::new(), 0.10 uses KeyInit::new_from_slice()
+        let cipher_key = GenericArray::from_slice(key.as_bytes());
+        let cipher = ChaCha20Poly1305::new(cipher_key);
+        
         let nonce = Self::make_nonce(counter);
 
-        // Encrypt with session_id as associated data
+        // Encrypt with session_id as associated data (AAD)
+        // The AAD is authenticated but not encrypted, binding the
+        // ciphertext to this specific session
         let ciphertext = cipher
-            .encrypt(&nonce, chacha20poly1305::aead::Payload {
+            .encrypt(&nonce, Payload {
                 msg: plaintext,
                 aad: session_id,
             })
@@ -219,14 +240,17 @@ impl TransportCrypto for DefaultTransportCrypto {
             return Err(CoreError::Decryption);
         }
 
-        // Create cipher and nonce
-        let cipher = ChaCha20Poly1305::new_from_slice(key.as_bytes())
-            .map_err(|_| CoreError::Decryption)?;
+        // Create cipher using chacha20poly1305 0.9 API
+        let cipher_key = GenericArray::from_slice(key.as_bytes());
+        let cipher = ChaCha20Poly1305::new(cipher_key);
+        
         let nonce = Self::make_nonce(counter);
 
-        // Decrypt with session_id as associated data
+        // Decrypt with session_id as associated data (AAD)
+        // If AAD doesn't match what was used during encryption,
+        // authentication will fail
         let plaintext = cipher
-            .decrypt(&nonce, chacha20poly1305::aead::Payload {
+            .decrypt(&nonce, Payload {
                 msg: ciphertext,
                 aad: session_id,
             })
@@ -372,7 +396,7 @@ mod tests {
 
         let ciphertext = encrypt_packet(&key, counter, &session_id1, plaintext).unwrap();
         
-        // Decryption with wrong session_id should fail
+        // Decryption with wrong session_id should fail (AAD mismatch)
         let result = decrypt_packet(&key, counter, &session_id2, &ciphertext);
         assert!(matches!(result, Err(CoreError::Decryption)));
     }
@@ -431,8 +455,35 @@ mod tests {
         // Different counters should produce different nonces
         assert_ne!(nonce1.as_slice(), nonce2.as_slice());
         
-        // Counter 1 should be at start of nonce
+        // Counter 1 should be at start of nonce (little-endian)
         let expected: [u8; 12] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(nonce1.as_slice(), &expected);
+    }
+
+    #[test]
+    fn test_nonce_counter_overflow_safety() {
+        // Test that large counter values work correctly
+        let nonce = DefaultTransportCrypto::make_nonce(u64::MAX);
+        let expected: [u8; 12] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
+        assert_eq!(nonce.as_slice(), &expected);
+    }
+
+    #[test]
+    fn test_transport_crypto_trait() {
+        let crypto = DefaultTransportCrypto::new();
+        let key = test_key();
+        let session_id = [0x01u8; 16];
+        let counter = 1u64;
+        let plaintext = b"Test message";
+        
+        let mut ciphertext = vec![0u8; plaintext.len() + crypto.overhead()];
+        let ct_len = crypto.encrypt(&key, counter, &session_id, plaintext, &mut ciphertext).unwrap();
+        ciphertext.truncate(ct_len);
+        
+        let mut decrypted = vec![0u8; ciphertext.len()];
+        let pt_len = crypto.decrypt(&key, counter, &session_id, &ciphertext, &mut decrypted).unwrap();
+        decrypted.truncate(pt_len);
+        
+        assert_eq!(decrypted, plaintext);
     }
 }
