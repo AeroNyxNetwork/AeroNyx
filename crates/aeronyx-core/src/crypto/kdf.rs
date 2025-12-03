@@ -1,23 +1,43 @@
 // ============================================
 // File: crates/aeronyx-core/src/crypto/kdf.rs
 // ============================================
-//! # Key Derivation Functions (Enhanced Debug Version)
+//! # Key Derivation Functions
 //!
-//! ## Modification Reason
-//! Added extensive debugging to diagnose session key derivation issues
+//! ## Creation Reason
+//! Provides secure key derivation using HKDF-SHA256 for deriving
+//! session keys from shared secrets.
 //!
 //! ## Main Functionality
 //! - `derive_session_key`: Derives session key from X25519 shared secret
 //! - Domain separation via salt and info parameters
-//! - **ENHANCED**: Detailed KDF debugging
+//!
+//! ## HKDF Construction
+//! ```text
+//! HKDF-SHA256(
+//!     IKM:  X25519 shared secret (32 bytes)
+//!     Salt: "aeronyx-v1" (protocol identifier)
+//!     Info: client_public || server_public (key binding)
+//!     L:    32 bytes (ChaCha20 key size)
+//! )
+//! ```
+//!
+//! ## Security Properties
+//! - **Key Binding**: Info parameter binds key to specific endpoints
+//! - **Domain Separation**: Salt ensures keys differ across protocols
+//! - **Uniformity**: HKDF output is indistinguishable from random
+//!
+//! ## ⚠️ Important Note for Next Developer
+//! - Never change HKDF_SALT without protocol version bump
+//! - Info parameter order matters for key derivation
+//! - Always include both public keys in info for key binding
 //!
 //! ## Last Modified
-//! v0.1.1 - Enhanced KDF debugging for troubleshooting
+//! v0.1.0 - Initial KDF implementation
 
 use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroize;
-use tracing::info;
+use tracing::{debug, info, trace};
 
 use super::{CHACHA20_KEY_SIZE, ED25519_PUBLIC_KEY_SIZE, HKDF_INFO_PREFIX, HKDF_SALT};
 use crate::crypto::SessionKey;
@@ -42,23 +62,48 @@ use crate::error::{CoreError, Result};
 /// 1. Keys are bound to the specific session participants
 /// 2. Man-in-the-middle attacks are detectable
 /// 3. Key reuse across different pairs is prevented
+///
+/// # Example
+/// ```ignore
+/// let shared = alice_ephemeral.exchange(&bob_ephemeral_public);
+/// let session_key = derive_session_key(
+///     &shared,
+///     &alice_identity_public,
+///     &bob_identity_public,
+/// )?;
+/// ```
 pub fn derive_session_key(
     shared_secret: &[u8; 32],
     client_public: &[u8; ED25519_PUBLIC_KEY_SIZE],
     server_public: &[u8; ED25519_PUBLIC_KEY_SIZE],
 ) -> Result<SessionKey> {
-    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    info!("[KDF] 🔑 DERIVING SESSION KEY");
-    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    info!("[CRYPTO-DEBUG] ========== derive_session_key START ==========");
     
-    info!("[KDF] 📥 Input parameters:");
-    info!("[KDF]   Shared Secret (hex): {}", hex::encode(shared_secret));
-    info!("[KDF]   Client Public (hex): {}", hex::encode(client_public));
-    info!("[KDF]   Server Public (hex): {}", hex::encode(server_public));
+    // Log all inputs
+    info!(
+        "[CRYPTO-DEBUG] Input - Shared Secret: {}",
+        hex::encode(shared_secret)
+    );
+    info!(
+        "[CRYPTO-DEBUG] Input - Client Public Key: {}",
+        hex::encode(client_public)
+    );
+    info!(
+        "[CRYPTO-DEBUG] Input - Server Public Key: {}",
+        hex::encode(server_public)
+    );
     
-    info!("[KDF] 🧂 HKDF parameters:");
-    info!("[KDF]   Salt: {:?}", std::str::from_utf8(HKDF_SALT).unwrap_or("<binary>"));
-    info!("[KDF]   Info Prefix: {:?}", std::str::from_utf8(HKDF_INFO_PREFIX).unwrap_or("<binary>"));
+    // Log HKDF parameters
+    debug!(
+        "[CRYPTO-DEBUG] HKDF Salt: {} (\"{}\")",
+        hex::encode(HKDF_SALT),
+        String::from_utf8_lossy(HKDF_SALT)
+    );
+    debug!(
+        "[CRYPTO-DEBUG] HKDF Info Prefix: {} (\"{}\")",
+        hex::encode(HKDF_INFO_PREFIX),
+        String::from_utf8_lossy(HKDF_INFO_PREFIX)
+    );
 
     // Build info parameter: prefix || client_public || server_public
     let mut info = Vec::with_capacity(
@@ -67,48 +112,79 @@ pub fn derive_session_key(
     info.extend_from_slice(HKDF_INFO_PREFIX);
     info.extend_from_slice(client_public);
     info.extend_from_slice(server_public);
-
-    info!("[KDF] 📋 Constructed Info parameter:");
-    info!("[KDF]   Length: {} bytes", info.len());
-    info!("[KDF]   Info (hex): {}", hex::encode(&info));
-    info!("[KDF]   Info structure:");
-    info!("[KDF]     - Prefix ({} bytes): {}", 
-        HKDF_INFO_PREFIX.len(), 
+    
+    debug!(
+        "[CRYPTO-DEBUG] HKDF Info (full): {} ({} bytes)",
+        hex::encode(&info),
+        info.len()
+    );
+    debug!(
+        "[CRYPTO-DEBUG] HKDF Info breakdown:"
+    );
+    debug!(
+        "[CRYPTO-DEBUG]   - Prefix ({} bytes): {}",
+        HKDF_INFO_PREFIX.len(),
         hex::encode(HKDF_INFO_PREFIX)
     );
-    info!("[KDF]     - Client Public ({} bytes): {}", 
-        ED25519_PUBLIC_KEY_SIZE, 
+    debug!(
+        "[CRYPTO-DEBUG]   - Client Public ({} bytes): {}",
+        ED25519_PUBLIC_KEY_SIZE,
         hex::encode(client_public)
     );
-    info!("[KDF]     - Server Public ({} bytes): {}", 
-        ED25519_PUBLIC_KEY_SIZE, 
+    debug!(
+        "[CRYPTO-DEBUG]   - Server Public ({} bytes): {}",
+        ED25519_PUBLIC_KEY_SIZE,
         hex::encode(server_public)
     );
 
     // Perform HKDF-SHA256
-    info!("[KDF] 🔄 Performing HKDF-SHA256 expansion...");
+    debug!("[CRYPTO-DEBUG] Performing HKDF-SHA256...");
     let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret);
     
     let mut key_bytes = [0u8; CHACHA20_KEY_SIZE];
-    hk.expand(&info, &mut key_bytes)
-        .map_err(|e| {
-            info!("[KDF] ❌ HKDF expansion failed: {:?}", e);
-            CoreError::KeyDerivation {
+    match hk.expand(&info, &mut key_bytes) {
+        Ok(()) => {
+            debug!("[CRYPTO-DEBUG] HKDF expansion successful");
+        }
+        Err(e) => {
+            info!("[CRYPTO-DEBUG] HKDF expansion FAILED: {:?}", e);
+            info.zeroize();
+            return Err(CoreError::KeyDerivation {
                 reason: "HKDF expansion failed".into(),
-            }
-        })?;
+            });
+        }
+    }
 
-    info!("[KDF] ✅ Session key derived successfully!");
-    info!("[KDF] 📤 Output:");
-    info!("[KDF]   Session Key (hex): {}", hex::encode(&key_bytes));
-    info!("[KDF]   Session Key (base64): {}", base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD, 
-        &key_bytes
-    ));
-    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    info!(
+        "[CRYPTO-DEBUG] Output - Derived Session Key: {}",
+        hex::encode(&key_bytes)
+    );
 
     // Clear sensitive intermediate data
     info.zeroize();
+    debug!("[CRYPTO-DEBUG] Cleared intermediate info buffer");
+
+    info!("[CRYPTO-DEBUG] ========== derive_session_key SUCCESS ==========");
+    
+    // Summary for easy comparison
+    info!("[CRYPTO-DEBUG] ====== KEY DERIVATION SUMMARY ======");
+    info!(
+        "[CRYPTO-DEBUG]   Shared Secret:     {}",
+        hex::encode(shared_secret)
+    );
+    info!(
+        "[CRYPTO-DEBUG]   Client Public:     {}",
+        hex::encode(client_public)
+    );
+    info!(
+        "[CRYPTO-DEBUG]   Server Public:     {}",
+        hex::encode(server_public)
+    );
+    info!(
+        "[CRYPTO-DEBUG]   Derived Key:       {}",
+        hex::encode(&key_bytes)
+    );
+    info!("[CRYPTO-DEBUG] ====================================");
 
     Ok(SessionKey::from_bytes(key_bytes))
 }
@@ -132,15 +208,44 @@ pub fn hkdf_expand(
     info: &[u8],
     output_len: usize,
 ) -> Result<Vec<u8>> {
+    debug!("[CRYPTO-DEBUG] ========== hkdf_expand START ==========");
+    debug!(
+        "[CRYPTO-DEBUG] Input - shared_secret: {} ({} bytes)",
+        hex::encode(shared_secret),
+        shared_secret.len()
+    );
+    debug!(
+        "[CRYPTO-DEBUG] Input - salt: {} ({} bytes)",
+        hex::encode(salt),
+        salt.len()
+    );
+    debug!(
+        "[CRYPTO-DEBUG] Input - info: {} ({} bytes)",
+        hex::encode(info),
+        info.len()
+    );
+    debug!("[CRYPTO-DEBUG] Input - output_len: {} bytes", output_len);
+
     let hk = Hkdf::<Sha256>::new(Some(salt), shared_secret);
     
     let mut output = vec![0u8; output_len];
-    hk.expand(info, &mut output)
-        .map_err(|_| CoreError::KeyDerivation {
-            reason: format!("HKDF expansion failed for {} bytes", output_len),
-        })?;
-
-    Ok(output)
+    match hk.expand(info, &mut output) {
+        Ok(()) => {
+            debug!(
+                "[CRYPTO-DEBUG] Output: {} ({} bytes)",
+                hex::encode(&output),
+                output.len()
+            );
+            debug!("[CRYPTO-DEBUG] ========== hkdf_expand SUCCESS ==========");
+            Ok(output)
+        }
+        Err(_) => {
+            debug!("[CRYPTO-DEBUG] ========== hkdf_expand FAILED ==========");
+            Err(CoreError::KeyDerivation {
+                reason: format!("HKDF expansion failed for {} bytes", output_len),
+            })
+        }
+    }
 }
 
 // ============================================
