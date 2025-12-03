@@ -1,51 +1,20 @@
 // ============================================
 // File: crates/aeronyx-core/src/crypto/handshake.rs
 // ============================================
-//! # Handshake Cryptography
+//! # Handshake Cryptography (Enhanced Debug Version)
 //!
-//! ## Creation Reason
-//! Provides cryptographic operations for the handshake protocol,
-//! including signature creation/verification and key exchange.
+//! ## Modification Reason
+//! Added extensive debugging to diagnose session key derivation issues
 //!
 //! ## Main Functionality
 //! - `HandshakeCrypto`: Trait for handshake cryptographic operations
 //! - `DefaultHandshakeCrypto`: Production implementation
 //! - Signature verification for ClientHello messages
 //! - Signature creation for ServerHello messages
-//!
-//! ## Handshake Flow
-//! ```text
-//! Client                                          Server
-//!   │                                               │
-//!   │  ClientHello                                  │
-//!   │  ├─ client_public_key (Ed25519)              │
-//!   │  ├─ client_ephemeral_key (X25519)            │
-//!   │  ├─ timestamp                                 │
-//!   │  └─ signature ─────────────────────────────►  │
-//!   │                                               │
-//!   │                           Verify signature    │
-//!   │                           Generate ephemeral  │
-//!   │                           Derive session key  │
-//!   │                                               │
-//!   │                                  ServerHello  │
-//!   │  ◄───────────────────────────────── signature │
-//!   │                    server_ephemeral_key (X25519)
-//!   │                    assigned_ip                │
-//!   │                    session_id                 │
-//!   │                                               │
-//!   │  Verify signature                             │
-//!   │  Derive session key                           │
-//!   │                                               │
-//!   │ ═══════════ Encrypted Tunnel ═══════════════ │
-//! ```
-//!
-//! ## ⚠️ Important Note for Next Developer
-//! - Signature data must be constructed in exact order
-//! - Timestamp validation prevents replay attacks
-//! - All signature operations should be constant-time where possible
+//! - **ENHANCED**: Detailed handshake debugging
 //!
 //! ## Last Modified
-//! v0.1.0 - Initial handshake crypto implementation
+//! v0.1.1 - Enhanced handshake debugging for troubleshooting
 
 use crate::crypto::kdf::derive_session_key;
 use crate::crypto::keys::{
@@ -55,53 +24,21 @@ use crate::error::{CoreError, Result};
 use crate::protocol::{ClientHello, ServerHello};
 
 use aeronyx_common::time::Timestamp;
+use tracing::info;
 
 // ============================================
 // HandshakeCrypto Trait
 // ============================================
 
 /// Trait for handshake cryptographic operations.
-///
-/// # Purpose
-/// Abstracts handshake crypto operations to allow:
-/// - Testing with mock implementations
-/// - Alternative crypto backends
-/// - Hardware security module integration
-///
-/// # Example
-/// ```ignore
-/// let crypto = DefaultHandshakeCrypto::new(identity);
-/// 
-/// // Process ClientHello
-/// crypto.verify_client_hello(&client_hello)?;
-/// 
-/// // Create ServerHello
-/// let (server_hello, session_key) = crypto.process_handshake(
-///     &client_hello,
-///     assigned_ip,
-///     session_id,
-/// )?;
-/// ```
 pub trait HandshakeCrypto: Send + Sync {
     /// Returns the server's identity public key.
     fn public_key(&self) -> IdentityPublicKey;
 
     /// Verifies the signature on a ClientHello message.
-    ///
-    /// # Errors
-    /// - `SignatureVerification`: If signature is invalid
-    /// - `InvalidTimestamp`: If timestamp is out of acceptable range
     fn verify_client_hello(&self, msg: &ClientHello) -> Result<()>;
 
     /// Processes a ClientHello and produces a ServerHello with session key.
-    ///
-    /// # Arguments
-    /// * `client_hello` - Validated ClientHello message
-    /// * `assigned_ip` - Virtual IP to assign to client
-    /// * `session_id` - Unique session identifier
-    ///
-    /// # Returns
-    /// Tuple of (signed ServerHello, derived SessionKey)
     fn process_handshake(
         &self,
         client_hello: &ClientHello,
@@ -124,9 +61,6 @@ pub struct DefaultHandshakeCrypto {
 
 impl DefaultHandshakeCrypto {
     /// Creates a new handshake crypto instance.
-    ///
-    /// # Arguments
-    /// * `identity` - Server's Ed25519 identity key pair
     #[must_use]
     pub fn new(identity: IdentityKeyPair) -> Self {
         Self {
@@ -136,9 +70,6 @@ impl DefaultHandshakeCrypto {
     }
 
     /// Sets the maximum allowed timestamp skew.
-    ///
-    /// # Arguments
-    /// * `seconds` - Maximum clock difference in seconds
     #[must_use]
     pub fn with_timestamp_skew(mut self, seconds: u64) -> Self {
         self.max_timestamp_skew = seconds;
@@ -146,15 +77,6 @@ impl DefaultHandshakeCrypto {
     }
 
     /// Constructs the data to be signed for ClientHello.
-    ///
-    /// # Wire Format
-    /// ```text
-    /// message_type (1 byte) ||
-    /// version (1 byte) ||
-    /// client_public_key (32 bytes) ||
-    /// client_ephemeral_key (32 bytes) ||
-    /// timestamp (8 bytes)
-    /// ```
     fn client_hello_sign_data(msg: &ClientHello) -> Vec<u8> {
         let mut data = Vec::with_capacity(74);
         data.push(msg.message_type);
@@ -166,17 +88,6 @@ impl DefaultHandshakeCrypto {
     }
 
     /// Constructs the data to be signed for ServerHello.
-    ///
-    /// # Wire Format
-    /// ```text
-    /// message_type (1 byte) ||
-    /// version (1 byte) ||
-    /// server_public_key (32 bytes) ||
-    /// server_ephemeral_key (32 bytes) ||
-    /// assigned_ip (4 bytes) ||
-    /// session_id (16 bytes) ||
-    /// client_public_key (32 bytes)
-    /// ```
     fn server_hello_sign_data(msg: &ServerHello, client_public: &[u8; 32]) -> Vec<u8> {
         let mut data = Vec::with_capacity(118);
         data.push(msg.message_type);
@@ -196,20 +107,25 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
     }
 
     fn verify_client_hello(&self, msg: &ClientHello) -> Result<()> {
+        info!("[HANDSHAKE-SERVER] 📨 Verifying ClientHello");
+        
         // 1. Validate timestamp
         let timestamp = Timestamp::from_secs(msg.timestamp);
         if !timestamp.is_recent(self.max_timestamp_skew) {
+            info!("[HANDSHAKE-SERVER] ❌ Timestamp validation failed");
             return Err(CoreError::invalid_timestamp(format!(
                 "Timestamp {} is not recent (max skew: {}s)",
                 msg.timestamp, self.max_timestamp_skew
             )));
         }
+        info!("[HANDSHAKE-SERVER] ✅ Timestamp valid");
 
         // 2. Verify signature
         let sign_data = Self::client_hello_sign_data(msg);
         let client_public = IdentityPublicKey::from_bytes(&msg.client_public_key)?;
         client_public.verify(&sign_data, &msg.signature)?;
-
+        
+        info!("[HANDSHAKE-SERVER] ✅ ClientHello signature verified");
         Ok(())
     }
 
@@ -219,21 +135,44 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         assigned_ip: [u8; 4],
         session_id: [u8; 16],
     ) -> Result<(ServerHello, SessionKey)> {
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        info!("[HANDSHAKE-SERVER] 🤝 PROCESSING HANDSHAKE");
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
         // 1. Generate ephemeral key pair for this session
+        info!("[HANDSHAKE-SERVER] 🔑 Generating server ephemeral key pair...");
         let ephemeral = EphemeralKeyPair::generate();
         let server_ephemeral_public = ephemeral.public_key_bytes();
+        info!("[HANDSHAKE-SERVER] ✅ Server ephemeral public: {}", hex::encode(&server_ephemeral_public));
 
         // 2. Perform key exchange
+        info!("[HANDSHAKE-SERVER] 🔄 Performing X25519 key exchange...");
+        info!("[HANDSHAKE-SERVER]   Client ephemeral: {}", hex::encode(&client_hello.client_ephemeral_key));
         let shared_secret = ephemeral.exchange(&client_hello.client_ephemeral_key);
+        info!("[HANDSHAKE-SERVER] ✅ Shared secret derived: {}", hex::encode(&shared_secret));
 
         // 3. Derive session key
+        info!("[HANDSHAKE-SERVER] 🔐 Deriving session key...");
+        info!("[HANDSHAKE-SERVER]   Parameters for KDF:");
+        info!("[HANDSHAKE-SERVER]     - Shared secret: {}", hex::encode(&shared_secret));
+        info!("[HANDSHAKE-SERVER]     - Client public (arg 2): {}", hex::encode(&client_hello.client_public_key));
+        info!("[HANDSHAKE-SERVER]     - Server public (arg 3): {}", hex::encode(&self.identity.public_key_bytes()));
+        
         let session_key = derive_session_key(
             &shared_secret,
             &client_hello.client_public_key,
             &self.identity.public_key_bytes(),
         )?;
+        
+        info!("[HANDSHAKE-SERVER] ✅ Session key derived!");
+        info!("[HANDSHAKE-SERVER]   Session Key (hex): {}", hex::encode(session_key.as_bytes()));
+        info!("[HANDSHAKE-SERVER]   Session Key (base64): {}", base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD, 
+            session_key.as_bytes()
+        ));
 
         // 4. Build ServerHello (unsigned)
+        info!("[HANDSHAKE-SERVER] 📝 Building ServerHello message...");
         let mut server_hello = ServerHello {
             message_type: crate::protocol::MessageType::ServerHello as u8,
             version: client_hello.version,
@@ -245,11 +184,16 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         };
 
         // 5. Sign ServerHello
+        info!("[HANDSHAKE-SERVER] ✍️ Signing ServerHello...");
         let sign_data = Self::server_hello_sign_data(
             &server_hello,
             &client_hello.client_public_key,
         );
         server_hello.signature = self.identity.sign(&sign_data);
+        info!("[HANDSHAKE-SERVER] ✅ ServerHello signed");
+
+        info!("[HANDSHAKE-SERVER] ✅ HANDSHAKE COMPLETE");
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
         Ok((server_hello, session_key))
     }
@@ -260,40 +204,34 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
 // ============================================
 
 /// Verifies a ServerHello signature from the client's perspective.
-///
-/// # Arguments
-/// * `server_hello` - The ServerHello message to verify
-/// * `client_public` - The client's public key (for signature binding)
-///
-/// # Errors
-/// Returns `SignatureVerification` error if signature is invalid.
 pub fn verify_server_hello(
     server_hello: &ServerHello,
     client_public: &[u8; 32],
 ) -> Result<()> {
+    info!("[HANDSHAKE-CLIENT] 📨 Verifying ServerHello signature");
+    
     let sign_data = DefaultHandshakeCrypto::server_hello_sign_data(
         server_hello,
         client_public,
     );
     
     let server_public = IdentityPublicKey::from_bytes(&server_hello.server_public_key)?;
-    server_public.verify(&sign_data, &server_hello.signature)
+    server_public.verify(&sign_data, &server_hello.signature)?;
+    
+    info!("[HANDSHAKE-CLIENT] ✅ ServerHello signature verified");
+    Ok(())
 }
 
 /// Creates a signed ClientHello message.
-///
-/// # Arguments
-/// * `identity` - Client's identity key pair
-/// * `ephemeral_public` - Client's ephemeral X25519 public key
-/// * `version` - Protocol version to use
-///
-/// # Returns
-/// A signed ClientHello ready for transmission.
 pub fn create_client_hello(
     identity: &IdentityKeyPair,
     ephemeral_public: [u8; 32],
     version: u8,
 ) -> ClientHello {
+    info!("[HANDSHAKE-CLIENT] 📝 Creating ClientHello");
+    info!("[HANDSHAKE-CLIENT]   Client public: {}", hex::encode(&identity.public_key_bytes()));
+    info!("[HANDSHAKE-CLIENT]   Client ephemeral: {}", hex::encode(&ephemeral_public));
+    
     let timestamp = Timestamp::now().as_secs();
     
     let mut msg = ClientHello {
@@ -308,8 +246,50 @@ pub fn create_client_hello(
     // Sign the message
     let sign_data = DefaultHandshakeCrypto::client_hello_sign_data(&msg);
     msg.signature = identity.sign(&sign_data);
+    
+    info!("[HANDSHAKE-CLIENT] ✅ ClientHello created and signed");
 
     msg
+}
+
+/// Client-side session key derivation (with debugging).
+pub fn client_derive_session_key(
+    ephemeral: &EphemeralKeyPair,
+    server_hello: &ServerHello,
+    client_identity: &IdentityKeyPair,
+) -> Result<SessionKey> {
+    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    info!("[HANDSHAKE-CLIENT] 🤝 CLIENT SESSION KEY DERIVATION");
+    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    // Perform key exchange
+    info!("[HANDSHAKE-CLIENT] 🔄 Performing X25519 key exchange...");
+    info!("[HANDSHAKE-CLIENT]   Server ephemeral: {}", hex::encode(&server_hello.server_ephemeral_key));
+    let shared_secret = ephemeral.exchange(&server_hello.server_ephemeral_key);
+    info!("[HANDSHAKE-CLIENT] ✅ Shared secret: {}", hex::encode(&shared_secret));
+
+    // Derive session key
+    info!("[HANDSHAKE-CLIENT] 🔐 Deriving session key...");
+    info!("[HANDSHAKE-CLIENT]   Parameters for KDF:");
+    info!("[HANDSHAKE-CLIENT]     - Shared secret: {}", hex::encode(&shared_secret));
+    info!("[HANDSHAKE-CLIENT]     - Client public (arg 2): {}", hex::encode(&client_identity.public_key_bytes()));
+    info!("[HANDSHAKE-CLIENT]     - Server public (arg 3): {}", hex::encode(&server_hello.server_public_key));
+
+    let session_key = derive_session_key(
+        &shared_secret,
+        &client_identity.public_key_bytes(),
+        &server_hello.server_public_key,
+    )?;
+
+    info!("[HANDSHAKE-CLIENT] ✅ Session key derived!");
+    info!("[HANDSHAKE-CLIENT]   Session Key (hex): {}", hex::encode(session_key.as_bytes()));
+    info!("[HANDSHAKE-CLIENT]   Session Key (base64): {}", base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        session_key.as_bytes()
+    ));
+    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    Ok(session_key)
 }
 
 // ============================================
@@ -357,11 +337,10 @@ mod tests {
         ).is_ok());
 
         // Client derives session key
-        let shared_secret = client_ephemeral.exchange(&server_hello.server_ephemeral_key);
-        let client_session_key = derive_session_key(
-            &shared_secret,
-            &client_identity.public_key_bytes(),
-            &server_hello.server_public_key,
+        let client_session_key = client_derive_session_key(
+            &client_ephemeral,
+            &server_hello,
+            &client_identity,
         ).unwrap();
 
         // Both sides should have the same session key
