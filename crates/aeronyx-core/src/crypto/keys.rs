@@ -3,9 +3,9 @@
 // ============================================
 //! # Cryptographic Key Types
 //!
-//! ## Creation Reason
-//! Defines key types used throughout the AeroNyx protocol with proper
-//! security properties (Zeroize on drop, constant-time comparison).
+//! ## Modification Reason
+//! Adapted for ed25519-dalek 1.0 and x25519-dalek 1.1 API to match
+//! client library versions (constrained by solana-sdk).
 //!
 //! ## Main Functionality
 //! - `IdentityKeyPair`: Long-term Ed25519 signing keys
@@ -32,23 +32,40 @@
 //! └────────────────────────────────────────────────────────────┘
 //! ```
 //!
+//! ## API Version Notes
+//! - ed25519-dalek 1.0: Uses `Keypair`, `SecretKey`, `PublicKey`
+//! - ed25519-dalek 2.x: Uses `SigningKey`, `VerifyingKey` (NOT compatible)
+//! - x25519-dalek 1.1: Uses `EphemeralSecret`, `PublicKey`
+//! - x25519-dalek 2.x: Different API (NOT compatible)
+//!
 //! ## ⚠️ Important Note for Next Developer
 //! - ALL key types MUST implement Zeroize
 //! - Private keys should NEVER be logged or serialized carelessly
+//! - DO NOT upgrade to ed25519-dalek 2.x without client upgrade
 //! - Equality comparison uses constant-time for SessionKey
 //!
 //! ## Last Modified
-//! v0.1.0 - Initial key type definitions
-//! v0.1.1 - Removed subtle crate dependency, use simple comparison
+//! v0.1.1 - Adapted for ed25519-dalek 1.0 / x25519-dalek 1.1 API
 
 use std::fmt;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
+// ed25519-dalek 1.0 API (different from 2.x)
+use ed25519_dalek::{
+    Keypair, 
+    PublicKey as Ed25519PublicKey, 
+    SecretKey, 
+    Signature, 
+    Signer, 
+    Verifier
+};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+// x25519-dalek 1.1 API
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, SharedSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+// zeroize 1.3 does NOT have ZeroizeOnDrop derive
+// Must use manual Drop implementation
+use zeroize::Zeroize;
 
 use super::{ED25519_PUBLIC_KEY_SIZE, ED25519_SIGNATURE_SIZE, X25519_PUBLIC_KEY_SIZE, CHACHA20_KEY_SIZE};
 use crate::error::{CoreError, Result};
@@ -68,6 +85,11 @@ use crate::error::{CoreError, Result};
 /// - Never serialize the private key to untrusted storage
 /// - Generate using OS random number generator
 ///
+/// # API Note
+/// This implementation uses ed25519-dalek 1.0 API which differs from 2.x:
+/// - 1.0: `Keypair`, `SecretKey`, `PublicKey`
+/// - 2.x: `SigningKey`, `VerifyingKey`
+///
 /// # Example
 /// ```
 /// use aeronyx_core::crypto::IdentityKeyPair;
@@ -83,8 +105,8 @@ use crate::error::{CoreError, Result};
 /// assert!(identity.verify(message, &signature).is_ok());
 /// ```
 pub struct IdentityKeyPair {
-    /// Ed25519 signing key (private)
-    signing_key: SigningKey,
+    /// Ed25519 keypair (contains both secret and public keys)
+    keypair: Keypair,
 }
 
 impl IdentityKeyPair {
@@ -93,8 +115,9 @@ impl IdentityKeyPair {
     /// Uses the operating system's secure random number generator.
     #[must_use]
     pub fn generate() -> Self {
-        let signing_key = SigningKey::generate(&mut OsRng);
-        Self { signing_key }
+        let mut csprng = OsRng;
+        let keypair = Keypair::generate(&mut csprng);
+        Self { keypair }
     }
 
     /// Creates an identity key pair from raw private key bytes.
@@ -103,30 +126,33 @@ impl IdentityKeyPair {
     /// * `bytes` - 32-byte Ed25519 private key seed
     ///
     /// # Errors
-    /// Returns error if bytes length is incorrect.
+    /// Returns error if bytes length is incorrect or key is invalid.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != 32 {
             return Err(CoreError::key_generation(
                 format!("Invalid Ed25519 key size: expected 32, got {}", bytes.len())
             ));
         }
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(bytes);
-        let signing_key = SigningKey::from_bytes(&key_bytes);
-        key_bytes.zeroize();
-        Ok(Self { signing_key })
+        
+        // ed25519-dalek 1.0 API: SecretKey::from_bytes
+        let secret = SecretKey::from_bytes(bytes)
+            .map_err(|_| CoreError::key_generation("Invalid Ed25519 secret key"))?;
+        let public = Ed25519PublicKey::from(&secret);
+        let keypair = Keypair { secret, public };
+        
+        Ok(Self { keypair })
     }
 
     /// Returns the public key component.
     #[must_use]
     pub fn public_key(&self) -> IdentityPublicKey {
-        IdentityPublicKey(self.signing_key.verifying_key())
+        IdentityPublicKey(self.keypair.public)
     }
 
     /// Returns the raw public key bytes.
     #[must_use]
     pub fn public_key_bytes(&self) -> [u8; ED25519_PUBLIC_KEY_SIZE] {
-        self.signing_key.verifying_key().to_bytes()
+        self.keypair.public.to_bytes()
     }
 
     /// Signs a message using this identity.
@@ -138,7 +164,7 @@ impl IdentityKeyPair {
     /// 64-byte Ed25519 signature
     #[must_use]
     pub fn sign(&self, message: &[u8]) -> [u8; ED25519_SIGNATURE_SIZE] {
-        let signature = self.signing_key.sign(message);
+        let signature = self.keypair.sign(message);
         signature.to_bytes()
     }
 
@@ -161,14 +187,18 @@ impl IdentityKeyPair {
     /// encrypted before storage and zeroed after use.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 32] {
-        self.signing_key.to_bytes()
+        self.keypair.secret.to_bytes()
     }
 }
 
 impl Clone for IdentityKeyPair {
     fn clone(&self) -> Self {
+        // ed25519-dalek 1.0: reconstruct keypair from secret bytes
+        let secret = SecretKey::from_bytes(&self.keypair.secret.to_bytes())
+            .expect("Cloning existing valid key should not fail");
+        let public = Ed25519PublicKey::from(&secret);
         Self {
-            signing_key: SigningKey::from_bytes(&self.signing_key.to_bytes()),
+            keypair: Keypair { secret, public },
         }
     }
 }
@@ -184,7 +214,7 @@ impl fmt::Debug for IdentityKeyPair {
 
 impl Drop for IdentityKeyPair {
     fn drop(&mut self) {
-        // SigningKey from ed25519-dalek implements Zeroize internally
+        // SecretKey from ed25519-dalek 1.0 implements Zeroize internally
     }
 }
 
@@ -197,7 +227,7 @@ impl Drop for IdentityKeyPair {
 /// Safe to share publicly. Used to verify signatures from the
 /// corresponding private key holder.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct IdentityPublicKey(VerifyingKey);
+pub struct IdentityPublicKey(Ed25519PublicKey);
 
 impl IdentityPublicKey {
     /// Creates a public key from raw bytes.
@@ -208,7 +238,8 @@ impl IdentityPublicKey {
     /// # Errors
     /// Returns error if bytes are invalid.
     pub fn from_bytes(bytes: &[u8; ED25519_PUBLIC_KEY_SIZE]) -> Result<Self> {
-        let key = VerifyingKey::from_bytes(bytes)
+        // ed25519-dalek 1.0 API
+        let key = Ed25519PublicKey::from_bytes(bytes)
             .map_err(|_| CoreError::key_generation("Invalid Ed25519 public key"))?;
         Ok(Self(key))
     }
@@ -230,7 +261,9 @@ impl IdentityPublicKey {
     /// # Errors
     /// Returns `SignatureVerification` error if verification fails.
     pub fn verify(&self, message: &[u8], signature: &[u8; ED25519_SIGNATURE_SIZE]) -> Result<()> {
-        let sig = Signature::from_bytes(signature);
+        // ed25519-dalek 1.0: Signature::from_bytes returns Result
+        let sig = Signature::from_bytes(signature)
+            .map_err(|_| CoreError::SignatureVerification)?;
         self.0
             .verify(message, &sig)
             .map_err(|_| CoreError::SignatureVerification)
@@ -309,6 +342,11 @@ impl<'de> Deserialize<'de> for IdentityPublicKey {
 /// - Single-use design (consumed by `exchange`)
 /// - Provides forward secrecy
 ///
+/// # API Note
+/// This implementation uses x25519-dalek 1.1 API:
+/// - `EphemeralSecret::new(rng)` for generation
+/// - `secret.diffie_hellman(&public)` for exchange
+///
 /// # Example
 /// ```
 /// use aeronyx_core::crypto::EphemeralKeyPair;
@@ -326,7 +364,9 @@ impl<'de> Deserialize<'de> for IdentityPublicKey {
 /// // Both parties now have the same shared secret
 /// ```
 pub struct EphemeralKeyPair {
+    /// X25519 ephemeral secret (consumed on exchange)
     secret: Option<EphemeralSecret>,
+    /// X25519 public key
     public: X25519PublicKey,
 }
 
@@ -334,7 +374,8 @@ impl EphemeralKeyPair {
     /// Generates a new random ephemeral key pair.
     #[must_use]
     pub fn generate() -> Self {
-        let secret = EphemeralSecret::random_from_rng(OsRng);
+        // x25519-dalek 1.1 API
+        let secret = EphemeralSecret::new(OsRng);
         let public = X25519PublicKey::from(&secret);
         Self {
             secret: Some(secret),
@@ -359,6 +400,9 @@ impl EphemeralKeyPair {
     ///
     /// # Returns
     /// 32-byte shared secret
+    ///
+    /// # Panics
+    /// Panics if the key has already been consumed.
     #[must_use]
     pub fn exchange(mut self, peer_public: &[u8; X25519_PUBLIC_KEY_SIZE]) -> [u8; 32] {
         let peer_key = X25519PublicKey::from(*peer_public);
@@ -398,7 +442,7 @@ impl fmt::Debug for EphemeralKeyPair {
 /// authenticated encryption of all data packets.
 ///
 /// # Security
-/// - Zeroed on drop
+/// - Zeroed on drop (manual Drop implementation for zeroize 1.3 compat)
 /// - Never logged or serialized
 /// - Equality comparison (not constant-time in this simplified version)
 ///
@@ -408,11 +452,19 @@ impl fmt::Debug for EphemeralKeyPair {
 /// session_key = HKDF-SHA256(
 ///     ikm: shared_secret,
 ///     salt: "aeronyx-v1",
-///     info: client_public || server_public
+///     info: "aeronyx-session-key" || client_public || server_public
 /// )
 /// ```
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize)]
 pub struct SessionKey([u8; CHACHA20_KEY_SIZE]);
+
+// Manual Drop implementation for secure zeroization
+// Required because zeroize 1.3 does not have ZeroizeOnDrop derive
+impl Drop for SessionKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 impl SessionKey {
     /// Creates a session key from raw bytes.
@@ -535,5 +587,20 @@ mod tests {
         let restored: IdentityPublicKey = serde_json::from_str(&json).unwrap();
         
         assert_eq!(public, restored);
+    }
+
+    #[test]
+    fn test_identity_keypair_clone() {
+        let kp1 = IdentityKeyPair::generate();
+        let kp2 = kp1.clone();
+        
+        // Cloned key should have same public key
+        assert_eq!(kp1.public_key_bytes(), kp2.public_key_bytes());
+        
+        // Both should produce same signature
+        let message = b"test";
+        let sig1 = kp1.sign(message);
+        let sig2 = kp2.sign(message);
+        assert_eq!(sig1, sig2);
     }
 }
