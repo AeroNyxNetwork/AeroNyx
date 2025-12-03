@@ -7,6 +7,10 @@
 //! Centralizes fundamental type definitions used throughout the AeroNyx
 //! privacy network, ensuring type safety and consistent representations.
 //!
+//! ## Modification Notes
+//! - Adapted for zeroize 1.3 (no ZeroizeOnDrop derive, manual Drop impl)
+//! - Adapted for base64 0.21 API (DecodeError variants differ from 0.22)
+//!
 //! ## Main Functionality
 //! - `SessionId`: Unique identifier for active sessions (16 bytes)
 //! - `VirtualIp`: Wrapper for virtual IP addresses in the tunnel
@@ -20,12 +24,12 @@
 //!
 //! ## ⚠️ Important Note for Next Developer
 //! - SessionId is security-critical - always use cryptographically secure random
-//! - SessionId implements Zeroize but NOT Copy (has destructor)
+//! - SessionId implements Zeroize and manual Drop (zeroize 1.3 compatibility)
+//! - zeroize 1.3 does NOT have ZeroizeOnDrop derive macro
 //! - Maintain backward-compatible serialization formats
 //!
 //! ## Last Modified
-//! v0.1.0 - Initial type definitions
-//! v0.1.1 - Fixed: Removed Copy from SessionId (incompatible with ZeroizeOnDrop)
+//! v0.1.2 - Fixed: Compatibility with zeroize 1.3 and base64 0.21
 
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -34,7 +38,7 @@ use std::str::FromStr;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 
 // ============================================
 // Constants
@@ -42,6 +46,32 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Size of SessionId in bytes
 pub const SESSION_ID_SIZE: usize = 16;
+
+// ============================================
+// SessionId Error Type
+// ============================================
+
+/// Error type for SessionId parsing failures
+#[derive(Debug, Clone)]
+pub enum SessionIdError {
+    /// Base64 decoding failed
+    InvalidBase64(String),
+    /// Decoded bytes have wrong length
+    InvalidLength { expected: usize, actual: usize },
+}
+
+impl fmt::Display for SessionIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBase64(msg) => write!(f, "Invalid base64: {}", msg),
+            Self::InvalidLength { expected, actual } => {
+                write!(f, "Invalid length: expected {}, got {}", expected, actual)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionIdError {}
 
 // ============================================
 // SessionId
@@ -52,7 +82,8 @@ pub const SESSION_ID_SIZE: usize = 16;
 /// # Security Properties
 /// - Generated using cryptographically secure random number generator
 /// - Fixed 16-byte size (128 bits of entropy)
-/// - Implements `Zeroize` and `ZeroizeOnDrop` for secure memory cleanup
+/// - Implements `Zeroize` for secure memory cleanup
+/// - Manual `Drop` implementation ensures zeroization (zeroize 1.3 compat)
 /// - Does NOT implement `Copy` due to secure drop behavior
 ///
 /// # Wire Format
@@ -76,8 +107,16 @@ pub const SESSION_ID_SIZE: usize = 16;
 ///
 /// assert_eq!(session_id, restored);
 /// ```
-#[derive(Clone, PartialEq, Eq, Hash, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, PartialEq, Eq, Hash, Zeroize)]
 pub struct SessionId([u8; SESSION_ID_SIZE]);
+
+// Manual Drop implementation for secure zeroization
+// Required because zeroize 1.3 does not have ZeroizeOnDrop derive
+impl Drop for SessionId {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 impl SessionId {
     /// Creates a new `SessionId` from raw bytes.
@@ -144,12 +183,15 @@ impl fmt::Display for SessionId {
 }
 
 impl FromStr for SessionId {
-    type Err = base64::DecodeError;
+    type Err = SessionIdError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes = BASE64.decode(s)?;
-        Self::from_bytes(&bytes).ok_or_else(|| {
-            base64::DecodeError::InvalidLength(bytes.len())
+        let bytes = BASE64.decode(s)
+            .map_err(|e| SessionIdError::InvalidBase64(e.to_string()))?;
+        
+        Self::from_bytes(&bytes).ok_or_else(|| SessionIdError::InvalidLength {
+            expected: SESSION_ID_SIZE,
+            actual: bytes.len(),
         })
     }
 }
@@ -447,5 +489,12 @@ mod tests {
         let original = SessionId::generate();
         let cloned = original.clone();
         assert_eq!(original, cloned);
+    }
+
+    #[test]
+    fn test_session_id_error_display() {
+        let err = SessionIdError::InvalidLength { expected: 16, actual: 8 };
+        assert!(err.to_string().contains("16"));
+        assert!(err.to_string().contains("8"));
     }
 }
