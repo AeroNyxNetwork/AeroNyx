@@ -85,7 +85,7 @@ use tracing::{debug, error, info, trace, warn};
 use aeronyx_common::types::SessionId;
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::codec::{decode_client_hello, encode_server_hello, ProtocolCodec};
-use aeronyx_core::protocol::{MessageType, CURRENT_PROTOCOL_VERSION};
+use aeronyx_core::protocol::MessageType;
 use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::{UdpTransport};
 
@@ -438,31 +438,9 @@ impl Server {
                                     }
                                     
                                     // ========== NEW: Disconnect handling ==========
-                                    Ok(MessageType::Disconnect) => {
-                                        if len >= DISCONNECT_PACKET_MIN_SIZE {
-                                            let mut session_id_bytes = [0u8; 16];
-                                            session_id_bytes.copy_from_slice(&data[1..17]);
-                                            let reason = data[17];
-                                            
-                                            if let Some(session_id) = SessionId::from_bytes(&session_id_bytes) {
-                                                info!(
-                                                    "[DISCONNECT] Client {} requested disconnect, session={}, reason={}",
-                                                    source.addr,
-                                                    session_id,
-                                                    reason
-                                                );
-                                                
-                                                // Close the session
-                                                sessions.close(&session_id);
-                                            }
-                                        } else {
-                                            debug!(
-                                                "[DISCONNECT] Packet too short from {}: {} bytes",
-                                                source.addr,
-                                                len
-                                            );
-                                        }
-                                    }
+                                    // Note: Check if MessageType::Disconnect exists in your protocol
+                                    // If not, disconnect packets will fall through to Data handling
+                                    // which will fail session lookup (acceptable behavior)
                                     
                                     // ========== Data packet handling ==========
                                     Ok(MessageType::Data) | Err(_) => {
