@@ -7,11 +7,17 @@
 //! Main server implementation that coordinates all components and
 //! manages the server lifecycle.
 //!
+//! ## Modification Reason
+//! Added Keepalive packet handling to prevent session timeout.
+//! Previously, Keepalive packets (0x04) were ignored, causing
+//! sessions to expire even when clients were actively sending heartbeats.
+//!
 //! ## Main Functionality
 //! - `Server`: Main server struct and lifecycle management
 //! - Component initialization and wiring
 //! - Async task management
 //! - Graceful shutdown handling
+//! - Keepalive packet handling (NEW)
 //!
 //! ## Server Architecture
 //! ```text
@@ -31,9 +37,9 @@
 //! │  │  └─────┬──────┘  └─────┴──────┘  └──────────────┘   │   │
 //! │  │        │               │                            │   │
 //! │  │        ▼               ▼                            │   │
-//! │  │  ┌─────────────────────────────────────────────────┐   │   │
+//! │  │  ┌─────────────────────────────────────────────────┐   │
 //! │  │  │            Packet Handler                    │   │   │
-//! │  │  └─────────────────────────────────────────────────┘   │   │
+//! │  │  └─────────────────────────────────────────────────┘   │
 //! │  │                                                      │   │
 //! │  └─────────────────────────────────────────────────────┘   │
 //! │                                                             │
@@ -48,14 +54,23 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
+//! ## Packet Types Handled
+//! - 0x01 ClientHello: Handshake initiation
+//! - 0x02 ServerHello: Handshake response (sent by server)
+//! - 0x03 Data: Encrypted VPN traffic (no prefix, identified by structure)
+//! - 0x04 Keepalive: Session heartbeat (NEW - now handled!)
+//! - 0x05 Disconnect: Graceful session termination
+//!
 //! ## ⚠️ Important Note for Next Developer
 //! - Server requires root for TUN operations
 //! - Graceful shutdown waits for tasks to complete
 //! - All services are Arc-wrapped for sharing
 //! - Use tokio::select! for concurrent operations
+//! - Keepalive packets MUST update session.last_activity
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial server implementation
+//! v0.1.1 - Added Keepalive packet handling to prevent session timeout
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,8 +80,9 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
+use aeronyx_common::types::SessionId;
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::codec::{decode_client_hello, encode_server_hello, ProtocolCodec};
 use aeronyx_core::protocol::{MessageType, CURRENT_PROTOCOL_VERSION};
@@ -82,6 +98,16 @@ use crate::handlers::PacketHandler;
 use crate::services::{
     HandshakeService, IpPoolService, RoutingService, SessionManager,
 };
+
+// ============================================
+// Constants
+// ============================================
+
+/// Keepalive packet size: 1 byte type + 16 bytes session ID
+const KEEPALIVE_PACKET_SIZE: usize = 17;
+
+/// Disconnect packet minimum size: 1 byte type + 16 bytes session ID + 1 byte reason
+const DISCONNECT_PACKET_MIN_SIZE: usize = 18;
 
 // ============================================
 // Server
@@ -167,6 +193,7 @@ impl Server {
             Arc::clone(&tun),
             Arc::clone(&handshake_service),
             Arc::clone(&packet_handler),
+            Arc::clone(&sessions),  // ← NEW: Pass sessions for keepalive handling
         );
         tasks.push(("udp", udp_task));
 
@@ -284,6 +311,7 @@ impl Server {
         tun: Arc<LinuxTun>,
         handshake: Arc<HandshakeService>,
         packet_handler: Arc<PacketHandler>,
+        sessions: Arc<SessionManager>,  // ← NEW: For keepalive handling
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -317,7 +345,7 @@ impl Server {
                                 // Check message type
                                 match ProtocolCodec::peek_message_type(data) {
                                     Ok(MessageType::ClientHello) => {
-                                        // ========== DEBUG LOG: ClientHello received ==========
+                                        // ========== ClientHello handling ==========
                                         info!(
                                             "[HANDSHAKE] ClientHello received from {}",
                                             source.addr
@@ -328,7 +356,6 @@ impl Server {
                                             Ok(client_hello) => {
                                                 match handshake.process(&client_hello, source.addr) {
                                                     Ok(result) => {
-                                                        // ========== DEBUG LOG: New session created ==========
                                                         info!(
                                                             "[HANDSHAKE] ✅ Session created for {}, SessionID={}",
                                                             source.addr,
@@ -360,8 +387,87 @@ impl Server {
                                             }
                                         }
                                     }
+                                    
+                                    // ========== NEW: Keepalive handling ==========
+                                    Ok(MessageType::Keepalive) => {
+                                        if len >= KEEPALIVE_PACKET_SIZE {
+                                            // Extract session ID (bytes 1-17)
+                                            let mut session_id_bytes = [0u8; 16];
+                                            session_id_bytes.copy_from_slice(&data[1..17]);
+                                            
+                                            if let Some(session_id) = SessionId::from_bytes(&session_id_bytes) {
+                                                if let Some(session) = sessions.get(&session_id) {
+                                                    // ✅ Update session activity time
+                                                    session.touch();
+                                                    trace!(
+                                                        "[KEEPALIVE] ✅ Session {} touched from {}",
+                                                        session_id,
+                                                        source.addr
+                                                    );
+                                                    
+                                                    // Optionally update client endpoint if NAT changed
+                                                    // (uncomment if you want NAT rebinding support)
+                                                    // if session.client_endpoint != source.addr {
+                                                    //     debug!(
+                                                    //         "[KEEPALIVE] NAT rebind: {} -> {}",
+                                                    //         session.client_endpoint,
+                                                    //         source.addr
+                                                    //     );
+                                                    //     // Note: Would need mutable access to update endpoint
+                                                    // }
+                                                } else {
+                                                    debug!(
+                                                        "[KEEPALIVE] Session not found: {} from {}",
+                                                        BASE64.encode(&session_id_bytes),
+                                                        source.addr
+                                                    );
+                                                }
+                                            } else {
+                                                debug!(
+                                                    "[KEEPALIVE] Invalid session ID format from {}",
+                                                    source.addr
+                                                );
+                                            }
+                                        } else {
+                                            debug!(
+                                                "[KEEPALIVE] Packet too short from {}: {} bytes",
+                                                source.addr,
+                                                len
+                                            );
+                                        }
+                                    }
+                                    
+                                    // ========== NEW: Disconnect handling ==========
+                                    Ok(MessageType::Disconnect) => {
+                                        if len >= DISCONNECT_PACKET_MIN_SIZE {
+                                            let mut session_id_bytes = [0u8; 16];
+                                            session_id_bytes.copy_from_slice(&data[1..17]);
+                                            let reason = data[17];
+                                            
+                                            if let Some(session_id) = SessionId::from_bytes(&session_id_bytes) {
+                                                info!(
+                                                    "[DISCONNECT] Client {} requested disconnect, session={}, reason={}",
+                                                    source.addr,
+                                                    session_id,
+                                                    reason
+                                                );
+                                                
+                                                // Close the session
+                                                sessions.close(&session_id);
+                                            }
+                                        } else {
+                                            debug!(
+                                                "[DISCONNECT] Packet too short from {}: {} bytes",
+                                                source.addr,
+                                                len
+                                            );
+                                        }
+                                    }
+                                    
+                                    // ========== Data packet handling ==========
                                     Ok(MessageType::Data) | Err(_) => {
-                                        // ========== DEBUG LOG: Data packet session ID ==========
+                                        // Data packets don't have a message type prefix
+                                        // They start directly with session_id
                                         if data.len() >= 16 {
                                             let received_session_id = &data[0..16];
                                             debug!(
@@ -392,7 +498,6 @@ impl Server {
                                                 }
                                             }
                                             Err(e) => {
-                                                // ========== DEBUG LOG: Session not found ==========
                                                 if data.len() >= 16 {
                                                     warn!(
                                                         "[DATA_RX] ❌ Packet handling FAILED from {}, SessionID={}, error: {}",
@@ -406,8 +511,14 @@ impl Server {
                                             }
                                         }
                                     }
+                                    
+                                    // ========== Unknown message types ==========
                                     _ => {
-                                        debug!("Ignoring message type from {}", source.addr);
+                                        debug!(
+                                            "[UDP_RX] Unknown message type 0x{:02X} from {}",
+                                            data.get(0).copied().unwrap_or(0),
+                                            source.addr
+                                        );
                                     }
                                 }
                             }
