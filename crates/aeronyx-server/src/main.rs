@@ -11,31 +11,32 @@
 //! - CLI argument parsing with clap
 //! - Logging initialization with tracing
 //! - Configuration loading
-//! - Server key management
+//! - Node registration with CMS
 //! - Server execution
 //!
 //! ## Usage
 //! ```bash
-//! # Start with default config
+//! # Step 1: Register node (get code from web dashboard)
+//! aeronyx-server register --code NYX-1234-ABCDE
+//!
+//! # Step 2: Start server
 //! aeronyx-server start
 //!
-//! # Start with custom config
-//! aeronyx-server start --config /path/to/config.toml
-//!
-//! # Generate new server key
-//! aeronyx-server keygen --output /etc/aeronyx/server_key.json
-//!
-//! # Show server public key
-//! aeronyx-server pubkey --key /etc/aeronyx/server_key.json
+//! # Other commands
+//! aeronyx-server status              # Check registration status
+//! aeronyx-server validate            # Validate config file
+//! aeronyx-server pubkey              # Show node public key (for troubleshooting)
 //! ```
 //!
 //! ## ⚠️ Important Note for Next Developer
 //! - Server requires root or CAP_NET_ADMIN for TUN
-//! - Key files should have restricted permissions (600)
+//! - Node MUST be registered before starting
+//! - Key is auto-generated during registration (user doesn't need to know)
 //! - Use systemd for production deployments
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
+//! v0.2.0 - Added register command, simplified user flow
 
 use std::path::PathBuf;
 
@@ -44,13 +45,19 @@ use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use aeronyx_core::crypto::IdentityKeyPair;
-use aeronyx_server::{Server, ServerConfig};
+use aeronyx_server::{Server, ServerConfig, ManagementClient};
+use aeronyx_server::management::models::StoredNodeInfo;
 
 // ============================================
 // CLI Definition
 // ============================================
 
 /// AeroNyx Privacy Network Server
+///
+/// Quick Start:
+///   1. Get registration code from https://dashboard.aeronyx.network
+///   2. Run: aeronyx-server register --code <YOUR_CODE>
+///   3. Run: aeronyx-server start
 #[derive(Parser, Debug)]
 #[command(name = "aeronyx-server")]
 #[command(author, version, about, long_about = None)]
@@ -62,33 +69,39 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Start the server
-    Start {
+    /// Register this node with AeroNyx network
+    ///
+    /// Get your registration code from the AeroNyx dashboard.
+    /// This command will automatically generate a secure key pair
+    /// and bind this node to your account.
+    Register {
+        /// Registration code from dashboard (e.g., NYX-1234-ABCDE)
+        #[arg(short = 'C', long)]
+        code: String,
+
         /// Path to configuration file
         #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
         config: PathBuf,
 
-        /// Path to server key file
-        #[arg(short, long, default_value = "/etc/aeronyx/server_key.json")]
-        key: PathBuf,
+        /// CMS API URL (usually not needed, uses default)
+        #[arg(long, hide = true)]
+        cms_url: Option<String>,
     },
 
-    /// Generate a new server key pair
-    Keygen {
-        /// Output path for the key file
-        #[arg(short, long, default_value = "/etc/aeronyx/server_key.json")]
-        output: PathBuf,
-
-        /// Force overwrite if file exists
-        #[arg(short, long)]
-        force: bool,
+    /// Start the server
+    ///
+    /// Node must be registered first. Run 'register' command if not done yet.
+    Start {
+        /// Path to configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
     },
 
-    /// Display the server's public key
-    Pubkey {
-        /// Path to server key file
-        #[arg(short, long, default_value = "/etc/aeronyx/server_key.json")]
-        key: PathBuf,
+    /// Check node registration status
+    Status {
+        /// Path to configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
     },
 
     /// Validate configuration file
@@ -96,6 +109,18 @@ enum Commands {
         /// Path to configuration file
         #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
         config: PathBuf,
+    },
+
+    /// Show node public key (for troubleshooting)
+    #[command(hide = true)]
+    Pubkey {
+        /// Path to configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Output format: base64 (default), hex
+        #[arg(long, default_value = "hex")]
+        format: String,
     },
 }
 
@@ -108,20 +133,23 @@ async fn main() {
     // Parse CLI arguments
     let cli = Cli::parse();
 
-    // Initialize logging (can be overridden by config in start command)
+    // Initialize logging
     init_logging("info");
 
     // Execute command
     let result = match cli.command {
-        Commands::Start { config, key } => cmd_start(config, key).await,
-        Commands::Keygen { output, force } => cmd_keygen(output, force).await,
-        Commands::Pubkey { key } => cmd_pubkey(key).await,
+        Commands::Register { code, config, cms_url } => {
+            cmd_register(code, config, cms_url).await
+        }
+        Commands::Start { config } => cmd_start(config).await,
+        Commands::Status { config } => cmd_status(config).await,
         Commands::Validate { config } => cmd_validate(config).await,
+        Commands::Pubkey { config, format } => cmd_pubkey(config, format).await,
     };
 
     // Handle errors
     if let Err(e) = result {
-        error!("Error: {}", e);
+        error!("{}", e);
         std::process::exit(1);
     }
 }
@@ -130,9 +158,102 @@ async fn main() {
 // Commands
 // ============================================
 
+/// Registers node with CMS.
+async fn cmd_register(
+    code: String,
+    config_path: PathBuf,
+    cms_url_override: Option<String>,
+) -> anyhow::Result<()> {
+    println!("🚀 AeroNyx Node Registration");
+    println!("════════════════════════════════════════");
+    println!();
+
+    // Load config
+    let config = load_or_default_config(&config_path).await;
+    let key_path = PathBuf::from(&config.server_key.key_file);
+    let node_info_path = &config.management.node_info_path;
+
+    // Check if already registered
+    if std::path::Path::new(node_info_path).exists() {
+        if let Ok(info) = StoredNodeInfo::load(node_info_path) {
+            println!("⚠️  This node is already registered!");
+            println!();
+            println!("   Node ID:  {}", info.node_id);
+            println!("   Name:     {}", info.name);
+            println!("   Owner:    {}", info.owner_wallet);
+            println!();
+            println!("If you want to re-register, delete the file:");
+            println!("   rm {}", node_info_path);
+            return Ok(());
+        }
+    }
+
+    // Generate or load key (user doesn't need to know this detail)
+    let identity = if key_path.exists() {
+        info!("Loading existing node key...");
+        load_key(&key_path).await?
+    } else {
+        info!("Generating secure node key...");
+        let identity = IdentityKeyPair::generate();
+        save_key(&identity, &key_path).await?;
+        identity
+    };
+
+    // Build management config
+    let mut mgmt_config = config.management.clone();
+    if let Some(url) = cms_url_override {
+        mgmt_config.cms_url = url;
+    }
+
+    // Create management client and register
+    let client = ManagementClient::new(mgmt_config.clone(), identity);
+
+    println!("📡 Connecting to AeroNyx network...");
+    println!();
+
+    match client.register_node(&code).await {
+        Ok(node_info) => {
+            // Save node info
+            let stored = StoredNodeInfo {
+                node_id: node_info.id.clone(),
+                owner_wallet: node_info.owner_wallet.clone(),
+                name: node_info.name.clone(),
+                registered_at: node_info.created_at.clone(),
+            };
+            stored.save(&mgmt_config.node_info_path)?;
+
+            println!("✅ Registration successful!");
+            println!();
+            println!("════════════════════════════════════════");
+            println!("   Node ID:  {}", node_info.id);
+            println!("   Name:     {}", node_info.name);
+            println!("   Owner:    {}", node_info.owner_wallet);
+            println!("════════════════════════════════════════");
+            println!();
+            println!("🎉 Your node is ready! Start it with:");
+            println!();
+            println!("   aeronyx-server start");
+            println!();
+        }
+        Err(e) => {
+            println!("❌ Registration failed: {}", e);
+            println!();
+            println!("Please check:");
+            println!("  • Is the registration code correct?");
+            println!("  • Has the code expired? (codes expire in 15 minutes)");
+            println!("  • Is there network connectivity?");
+            println!();
+            println!("Get a new code from: https://dashboard.aeronyx.network");
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
 /// Starts the server.
-async fn cmd_start(config_path: PathBuf, key_path: PathBuf) -> anyhow::Result<()> {
-    info!("Loading configuration from: {}", config_path.display());
+async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
+    info!("Starting AeroNyx server...");
 
     // Load configuration
     let config = if config_path.exists() {
@@ -145,25 +266,57 @@ async fn cmd_start(config_path: PathBuf, key_path: PathBuf) -> anyhow::Result<()
     // Re-initialize logging with config level
     init_logging(&config.logging.level);
 
-    // Load or generate server key
-    let identity = if key_path.exists() {
-        info!("Loading server key from: {}", key_path.display());
-        load_key(&key_path).await?
-    } else if config.server_key.auto_generate {
-        info!("Generating new server key");
-        let identity = IdentityKeyPair::generate();
-        
-        // Try to save it (may fail if directory doesn't exist)
-        if let Err(e) = save_key(&identity, &key_path).await {
-            info!("Could not save generated key: {} (continuing anyway)", e);
+    let key_path = PathBuf::from(&config.server_key.key_file);
+    let node_info_path = &config.management.node_info_path;
+
+    // ========================================
+    // Check registration (MANDATORY)
+    // ========================================
+    if !std::path::Path::new(node_info_path).exists() {
+        println!();
+        println!("❌ Node is not registered!");
+        println!();
+        println!("All nodes must be registered to join the AeroNyx network.");
+        println!();
+        println!("To register your node:");
+        println!("  1. Get a registration code from https://dashboard.aeronyx.network");
+        println!("  2. Run: aeronyx-server register --code <YOUR_CODE>");
+        println!();
+        std::process::exit(1);
+    }
+
+    // Load registration info
+    let node_info = match StoredNodeInfo::load(node_info_path) {
+        Ok(info) => info,
+        Err(e) => {
+            error!("Failed to load registration info: {}", e);
+            println!();
+            println!("❌ Registration data is corrupted.");
+            println!();
+            println!("Please re-register your node:");
+            println!("  rm {}", node_info_path);
+            println!("  aeronyx-server register --code <YOUR_CODE>");
+            std::process::exit(1);
         }
-        
-        identity
-    } else {
-        anyhow::bail!("Server key file not found: {}", key_path.display());
     };
 
-    info!("Server public key: {}", identity.public_key());
+    // Load server key
+    let identity = if key_path.exists() {
+        load_key(&key_path).await?
+    } else {
+        println!();
+        println!("❌ Server key not found!");
+        println!();
+        println!("The key file is missing. Please re-register your node:");
+        println!("  aeronyx-server register --code <YOUR_CODE>");
+        std::process::exit(1);
+    };
+
+    info!("════════════════════════════════════════");
+    info!("Node ID:    {}", node_info.node_id);
+    info!("Node Name:  {}", node_info.name);
+    info!("Owner:      {}", node_info.owner_wallet);
+    info!("════════════════════════════════════════");
 
     // Create and run server
     let server = Server::new(config, identity);
@@ -172,46 +325,110 @@ async fn cmd_start(config_path: PathBuf, key_path: PathBuf) -> anyhow::Result<()
     Ok(())
 }
 
-/// Generates a new server key.
-async fn cmd_keygen(output: PathBuf, force: bool) -> anyhow::Result<()> {
-    // Check if file exists
-    if output.exists() && !force {
-        anyhow::bail!(
-            "Key file already exists: {}. Use --force to overwrite.",
-            output.display()
-        );
+/// Shows node registration status.
+async fn cmd_status(config_path: PathBuf) -> anyhow::Result<()> {
+    let config = load_or_default_config(&config_path).await;
+    let node_info_path = &config.management.node_info_path;
+    let key_path = PathBuf::from(&config.server_key.key_file);
+
+    println!();
+    println!("AeroNyx Node Status");
+    println!("════════════════════════════════════════");
+    println!();
+
+    // Check registration
+    match StoredNodeInfo::load(node_info_path) {
+        Ok(info) => {
+            println!("Registration:  ✅ Registered");
+            println!();
+            println!("   Node ID:       {}", info.node_id);
+            println!("   Name:          {}", info.name);
+            println!("   Owner:         {}", info.owner_wallet);
+            println!("   Registered:    {}", info.registered_at);
+        }
+        Err(_) => {
+            println!("Registration:  ❌ Not registered");
+            println!();
+            println!("Run this command to register:");
+            println!("   aeronyx-server register --code <YOUR_CODE>");
+            return Ok(());
+        }
     }
 
-    // Generate key
-    let identity = IdentityKeyPair::generate();
+    println!();
 
-    // Save key
-    save_key(&identity, &output).await?;
+    // Check key file
+    if key_path.exists() {
+        match load_key(&key_path).await {
+            Ok(identity) => {
+                println!("Server Key:    ✅ Valid");
+                println!("   Public Key:    {}", hex::encode(identity.public_key_bytes()));
+            }
+            Err(_) => {
+                println!("Server Key:    ⚠️  Invalid or corrupted");
+            }
+        }
+    } else {
+        println!("Server Key:    ❌ Missing");
+    }
 
-    println!("Generated new server key:");
-    println!("  File: {}", output.display());
-    println!("  Public key: {}", identity.public_key());
+    println!();
+    println!("════════════════════════════════════════");
+    println!();
 
     Ok(())
 }
 
-/// Displays the server's public key.
-async fn cmd_pubkey(key_path: PathBuf) -> anyhow::Result<()> {
-    let identity = load_key(&key_path).await?;
-    println!("{}", identity.public_key());
-    Ok(())
-}
-
-/// Validates a configuration file.
+/// Validates configuration file.
 async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
+    if !config_path.exists() {
+        println!("⚠️  Config file not found: {}", config_path.display());
+        println!("   Server will use default values.");
+        return Ok(());
+    }
+
     let config = ServerConfig::load(&config_path).await?;
     
-    println!("Configuration is valid:");
-    println!("  Listen address: {}", config.network.listen_addr);
-    println!("  TUN device: {}", config.tunnel.device_name);
-    println!("  IP range: {}", config.tunnel.ip_range);
-    println!("  Max sessions: {}", config.limits.max_sessions);
+    println!("✅ Configuration is valid");
+    println!();
+    println!("Network:");
+    println!("   Listen:     {}", config.network.listen_addr);
+    if let Some(ip) = config.network.public_ip {
+        println!("   Public IP:  {}", ip);
+    }
+    println!();
+    println!("Tunnel:");
+    println!("   Device:     {}", config.tunnel.device_name);
+    println!("   IP Range:   {}", config.tunnel.ip_range);
+    println!("   Gateway:    {}", config.tunnel.gateway_ip);
+    println!("   MTU:        {}", config.tunnel.mtu);
+    println!();
+    println!("Limits:");
+    println!("   Max Sessions:     {}", config.limits.max_sessions);
+    println!("   Session Timeout:  {}s", config.limits.session_timeout_secs);
+    println!();
 
+    Ok(())
+}
+
+/// Shows node public key (hidden command for troubleshooting).
+async fn cmd_pubkey(config_path: PathBuf, format: String) -> anyhow::Result<()> {
+    let config = load_or_default_config(&config_path).await;
+    let key_path = PathBuf::from(&config.server_key.key_file);
+
+    if !key_path.exists() {
+        println!("❌ Node key not found. Register first:");
+        println!("   aeronyx-server register --code <YOUR_CODE>");
+        std::process::exit(1);
+    }
+
+    let identity = load_key(&key_path).await?;
+    
+    match format.as_str() {
+        "base64" => println!("{}", identity.public_key()),
+        "hex" | _ => println!("{}", hex::encode(identity.public_key_bytes())),
+    }
+    
     Ok(())
 }
 
@@ -228,7 +445,16 @@ fn init_logging(level: &str) {
         .with(fmt::layer().with_target(true))
         .with(filter)
         .try_init()
-        .ok(); // Ignore error if already initialized
+        .ok();
+}
+
+/// Loads config or returns default.
+async fn load_or_default_config(path: &PathBuf) -> ServerConfig {
+    if path.exists() {
+        ServerConfig::load(path).await.unwrap_or_default()
+    } else {
+        ServerConfig::default()
+    }
 }
 
 /// Loads a server key from a JSON file.
@@ -277,7 +503,7 @@ async fn save_key(identity: &IdentityKeyPair, path: &PathBuf) -> anyhow::Result<
     Ok(())
 }
 
-/// Returns current timestamp as ISO 8601 string (simple implementation).
+/// Returns current timestamp as ISO 8601 string.
 fn chrono_lite_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     
@@ -285,12 +511,10 @@ fn chrono_lite_timestamp() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     
-    let secs = duration.as_secs();
-    // Simple UTC timestamp (not fully ISO 8601 compliant but good enough)
-    format!("{}Z", secs)
+    format!("{}Z", duration.as_secs())
 }
 
-/// Server key file format.
+/// Server key file format (internal, user doesn't need to know).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct KeyFile {
     version: String,
