@@ -7,6 +7,9 @@
 //! Provides the core server implementation for the AeroNyx privacy network,
 //! orchestrating all components to create a functional privacy tunnel server.
 //!
+//! ## Modification Reason
+//! Added management module for CMS integration.
+//!
 //! ## Main Functionality
 //!
 //! ### Modules
@@ -19,6 +22,9 @@
 //!   - [`services::handshake`]: Handshake processing
 //! - [`handlers`]: Packet and event handlers
 //! - [`error`]: Server-specific error types
+//! - [`management`]: CMS integration (NEW)
+//!   - [`management::client`]: HTTP client with Ed25519 auth
+//!   - [`management::reporter`]: Heartbeat and session reporting
 //!
 //! ## Architecture Overview
 //! ```text
@@ -37,6 +43,14 @@
 //! │  │  Session    │     │   Routing   │     │   IP Pool   │     │
 //! │  │  Manager    │     │   Service   │     │   Service   │     │
 //! │  └─────────────┘     └─────────────┘     └─────────────┘     │
+//! │                                                               │
+//! │  ┌─────────────────────────────────────────────────────────┐ │
+//! │  │                  Management (Optional)                   │ │
+//! │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │ │
+//! │  │  │   Client     │  │  Heartbeat   │  │   Session    │  │ │
+//! │  │  │ (HTTP+Sign)  │  │  Reporter    │  │   Reporter   │  │ │
+//! │  │  └──────────────┘  └──────────────┘  └──────────────┘  │ │
+//! │  └─────────────────────────────────────────────────────────┘ │
 //! │                                                               │
 //! ├───────────────────────────────────────────────────────────────┤
 //! │                     Transport Layer                           │
@@ -58,9 +72,11 @@
 //! - Configuration changes require restart (no hot-reload)
 //! - Graceful shutdown waits for active sessions
 //! - Metrics and logging are built-in
+//! - Management module is optional (disabled by default)
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial server library
+//! v0.2.0 - Added management module for CMS integration
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
@@ -70,6 +86,7 @@
 pub mod config;
 pub mod error;
 pub mod handlers;
+pub mod management;
 pub mod server;
 pub mod services;
 
@@ -77,3 +94,6 @@ pub mod services;
 pub use config::ServerConfig;
 pub use error::{ServerError, Result};
 pub use server::Server;
+
+// Re-export management types
+pub use management::{ManagementClient, ManagementConfig};
