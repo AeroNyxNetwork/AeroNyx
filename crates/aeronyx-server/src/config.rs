@@ -7,6 +7,9 @@
 //! Provides configuration management for the AeroNyx server,
 //! supporting TOML files and environment variables.
 //!
+//! ## Modification Reason
+//! Added ManagementConfig for CMS integration.
+//!
 //! ## Main Functionality
 //! - `ServerConfig`: Main configuration structure
 //! - TOML file loading and parsing
@@ -19,6 +22,7 @@
 //! - `server_key`: Key file paths
 //! - `limits`: Connection and resource limits
 //! - `logging`: Log level and output
+//! - `management`: CMS integration settings (REQUIRED)
 //!
 //! ## Example Configuration
 //! ```toml
@@ -35,15 +39,21 @@
 //! [limits]
 //! max_sessions = 1000
 //! session_timeout_secs = 300
+//!
+//! [management]
+//! cms_url = "https://api.aeronyx.network/api/privacy_network"
+//! heartbeat_interval_secs = 30
 //! ```
 //!
 //! ## ⚠️ Important Note for Next Developer
 //! - All config changes require server restart
 //! - Validate config before server startup
 //! - Sensitive values should use environment variables
+//! - Node registration is MANDATORY for official network
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial configuration implementation
+//! v0.2.0 - Added management configuration for CMS integration
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -52,6 +62,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::error::{Result, ServerError};
+use crate::management::ManagementConfig;
 
 // ============================================
 // ServerConfig
@@ -90,6 +101,11 @@ pub struct ServerConfig {
     /// Logging configuration.
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    /// Management/CMS configuration (REQUIRED for official network).
+    /// All nodes must register with CMS before operating.
+    #[serde(default)]
+    pub management: ManagementConfig,
 }
 
 impl ServerConfig {
@@ -141,6 +157,12 @@ impl ServerConfig {
         self.network.validate()?;
         self.tunnel.validate()?;
         self.limits.validate()?;
+        
+        // Validate management config if enabled
+        self.management.validate().map_err(|e| {
+            ServerError::config_invalid("management", e)
+        })?;
+        
         Ok(())
     }
 
@@ -159,6 +181,7 @@ impl Default for ServerConfig {
             server_key: ServerKeyConfig::default(),
             limits: LimitsConfig::default(),
             logging: LoggingConfig::default(),
+            management: ManagementConfig::default(),
         }
     }
 }
@@ -537,5 +560,21 @@ mod tests {
         assert!(toml.contains("[network]"));
         assert!(toml.contains("[tunnel]"));
         assert!(toml.contains("[limits]"));
+    }
+
+    #[test]
+    fn test_config_with_management() {
+        let toml = r#"
+            [network]
+            listen_addr = "0.0.0.0:12345"
+            
+            [management]
+            cms_url = "https://api.example.com/api/privacy_network"
+            heartbeat_interval_secs = 30
+        "#;
+
+        let config = ServerConfig::from_str(toml).unwrap();
+        assert_eq!(config.management.cms_url, "https://api.example.com/api/privacy_network");
+        assert_eq!(config.management.heartbeat_interval_secs, 30);
     }
 }
