@@ -392,20 +392,22 @@ async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
     println!("✅ Configuration is valid");
     println!();
     println!("Network:");
-    println!("   Listen:     {}", config.network.listen_addr);
-    if let Some(ip) = config.network.public_ip {
-        println!("   Public IP:  {}", ip);
+    println!("   Listen:     {}", config.listen_addr());
+    if let Some(ep) = &config.network.public_endpoint {
+        println!("   Public:     {}", ep);
     }
     println!();
-    println!("Tunnel:");
-    println!("   Device:     {}", config.tunnel.device_name);
-    println!("   IP Range:   {}", config.tunnel.ip_range);
-    println!("   Gateway:    {}", config.tunnel.gateway_ip);
-    println!("   MTU:        {}", config.tunnel.mtu);
+    println!("VPN:");
+    println!("   IP Range:   {}", config.ip_range());
+    println!("   Gateway:    {}", config.gateway_ip());
+    println!();
+    println!("TUN:");
+    println!("   Device:     {}", config.device_name());
+    println!("   MTU:        {}", config.mtu());
     println!();
     println!("Limits:");
-    println!("   Max Sessions:     {}", config.limits.max_sessions);
-    println!("   Session Timeout:  {}s", config.limits.session_timeout_secs);
+    println!("   Max Connections:  {}", config.max_sessions());
+    println!("   Session Timeout:  {}s", config.session_timeout_secs());
     println!();
 
     Ok(())
