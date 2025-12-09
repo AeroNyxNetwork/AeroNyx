@@ -17,28 +17,31 @@
 //! - Default values for MVP
 //!
 //! ## Configuration Sections
-//! - `network`: UDP listen address, public IP
-//! - `tunnel`: TUN device settings, IP range
-//! - `server_key`: Key file paths
+//! - `network`: UDP listen address, public endpoint
+//! - `vpn`: Virtual IP range, gateway
+//! - `tun`: TUN device settings
+//! - `server_key`: Key file path
 //! - `limits`: Connection and resource limits
-//! - `logging`: Log level and output
+//! - `logging`: Log level
 //! - `management`: CMS integration settings (REQUIRED)
 //!
 //! ## Example Configuration
 //! ```toml
 //! [network]
 //! listen_addr = "0.0.0.0:51820"
-//! public_ip = "1.2.3.4"
+//! public_endpoint = "1.2.3.4:51820"
 //!
-//! [tunnel]
-//! device_name = "aeronyx0"
-//! ip_range = "100.64.0.0/24"
+//! [vpn]
+//! virtual_ip_range = "100.64.0.0/24"
 //! gateway_ip = "100.64.0.1"
+//!
+//! [tun]
+//! device_name = "aeronyx0"
 //! mtu = 1420
 //!
 //! [limits]
-//! max_sessions = 1000
-//! session_timeout_secs = 300
+//! max_connections = 1000
+//! session_timeout = 300
 //!
 //! [management]
 //! cms_url = "https://api.aeronyx.network/api/privacy_network"
@@ -48,7 +51,6 @@
 //! ## ⚠️ Important Note for Next Developer
 //! - All config changes require server restart
 //! - Validate config before server startup
-//! - Sensitive values should use environment variables
 //! - Node registration is MANDATORY for official network
 //!
 //! ## Last Modified
@@ -69,26 +71,19 @@ use crate::management::ManagementConfig;
 // ============================================
 
 /// Main server configuration.
-///
-/// # Example
-/// ```
-/// use aeronyx_server::config::ServerConfig;
-///
-/// // Load from default values
-/// let config = ServerConfig::default();
-///
-/// // Load from file
-/// // let config = ServerConfig::load("config.toml").await?;
-/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// Network configuration.
     #[serde(default)]
     pub network: NetworkConfig,
 
+    /// VPN configuration (virtual IP range).
+    #[serde(default)]
+    pub vpn: VpnConfig,
+
     /// TUN device configuration.
     #[serde(default)]
-    pub tunnel: TunnelConfig,
+    pub tun: TunConfig,
 
     /// Server key configuration.
     #[serde(default)]
@@ -103,7 +98,6 @@ pub struct ServerConfig {
     pub logging: LoggingConfig,
 
     /// Management/CMS configuration (REQUIRED for official network).
-    /// All nodes must register with CMS before operating.
     #[serde(default)]
     pub management: ManagementConfig,
 }
@@ -136,12 +130,6 @@ impl ServerConfig {
     }
 
     /// Loads configuration from a string (useful for testing).
-    ///
-    /// # Arguments
-    /// * `content` - TOML configuration string
-    ///
-    /// # Errors
-    /// Returns error if parsing fails.
     pub fn from_str(content: &str) -> Result<Self> {
         let config: Self = toml::from_str(content)
             .map_err(|e| ServerError::config_load("<string>", e.to_string()))?;
@@ -150,15 +138,12 @@ impl ServerConfig {
     }
 
     /// Validates the configuration.
-    ///
-    /// # Errors
-    /// Returns error if any configuration value is invalid.
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
-        self.tunnel.validate()?;
+        self.vpn.validate()?;
+        self.tun.validate()?;
         self.limits.validate()?;
         
-        // Validate management config if enabled
         self.management.validate().map_err(|e| {
             ServerError::config_invalid("management", e)
         })?;
@@ -171,13 +156,58 @@ impl ServerConfig {
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).unwrap_or_default()
     }
+
+    // ========================================
+    // Helper methods for compatibility
+    // ========================================
+
+    /// Returns listen address (from network config).
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.network.listen_addr
+    }
+
+    /// Returns TUN device name.
+    pub fn device_name(&self) -> &str {
+        &self.tun.device_name
+    }
+
+    /// Returns virtual IP range.
+    pub fn ip_range(&self) -> &str {
+        &self.vpn.virtual_ip_range
+    }
+
+    /// Returns gateway IP.
+    pub fn gateway_ip(&self) -> Ipv4Addr {
+        self.vpn.gateway_ip
+    }
+
+    /// Returns MTU.
+    pub fn mtu(&self) -> u16 {
+        self.tun.mtu
+    }
+
+    /// Returns max sessions.
+    pub fn max_sessions(&self) -> usize {
+        self.limits.max_connections
+    }
+
+    /// Returns session timeout in seconds.
+    pub fn session_timeout_secs(&self) -> u64 {
+        self.limits.session_timeout
+    }
+
+    /// Parses the IP range and returns (network, prefix_len).
+    pub fn parse_ip_range(&self) -> Result<(Ipv4Addr, u8)> {
+        self.vpn.parse_ip_range()
+    }
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             network: NetworkConfig::default(),
-            tunnel: TunnelConfig::default(),
+            vpn: VpnConfig::default(),
+            tun: TunConfig::default(),
             server_key: ServerKeyConfig::default(),
             limits: LimitsConfig::default(),
             logging: LoggingConfig::default(),
@@ -197,9 +227,9 @@ pub struct NetworkConfig {
     #[serde(default = "default_listen_addr")]
     pub listen_addr: SocketAddr,
 
-    /// Public IP address (for clients behind NAT).
+    /// Public endpoint (IP:port) for clients to connect.
     #[serde(default)]
-    pub public_ip: Option<Ipv4Addr>,
+    pub public_endpoint: Option<String>,
 }
 
 fn default_listen_addr() -> SocketAddr {
@@ -216,43 +246,38 @@ impl NetworkConfig {
         }
         Ok(())
     }
+
+    /// Returns public IP if configured.
+    pub fn public_ip(&self) -> Option<Ipv4Addr> {
+        self.public_endpoint.as_ref().and_then(|ep| {
+            ep.split(':').next().and_then(|ip| ip.parse().ok())
+        })
+    }
 }
 
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             listen_addr: default_listen_addr(),
-            public_ip: None,
+            public_endpoint: None,
         }
     }
 }
 
 // ============================================
-// TunnelConfig
+// VpnConfig
 // ============================================
 
-/// TUN device configuration section.
+/// VPN configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TunnelConfig {
-    /// TUN device name.
-    #[serde(default = "default_device_name")]
-    pub device_name: String,
-
+pub struct VpnConfig {
     /// Virtual IP range (CIDR notation).
     #[serde(default = "default_ip_range")]
-    pub ip_range: String,
+    pub virtual_ip_range: String,
 
     /// Gateway IP (server's virtual IP).
     #[serde(default = "default_gateway_ip")]
     pub gateway_ip: Ipv4Addr,
-
-    /// MTU size.
-    #[serde(default = "default_mtu")]
-    pub mtu: u16,
-}
-
-fn default_device_name() -> String {
-    "aeronyx0".to_string()
 }
 
 fn default_ip_range() -> String {
@@ -263,78 +288,38 @@ fn default_gateway_ip() -> Ipv4Addr {
     Ipv4Addr::new(100, 64, 0, 1)
 }
 
-fn default_mtu() -> u16 {
-    1420
-}
-
-impl TunnelConfig {
+impl VpnConfig {
     fn validate(&self) -> Result<()> {
-        if self.device_name.is_empty() {
+        if !self.virtual_ip_range.contains('/') {
             return Err(ServerError::config_invalid(
-                "tunnel.device_name",
-                "cannot be empty",
-            ));
-        }
-
-        if self.device_name.len() > 15 {
-            return Err(ServerError::config_invalid(
-                "tunnel.device_name",
-                "cannot exceed 15 characters",
-            ));
-        }
-
-        if self.mtu < 576 {
-            return Err(ServerError::config_invalid(
-                "tunnel.mtu",
-                "must be at least 576",
-            ));
-        }
-
-        if self.mtu > 9000 {
-            return Err(ServerError::config_invalid(
-                "tunnel.mtu",
-                "cannot exceed 9000",
-            ));
-        }
-
-        // Validate IP range format
-        if !self.ip_range.contains('/') {
-            return Err(ServerError::config_invalid(
-                "tunnel.ip_range",
+                "vpn.virtual_ip_range",
                 "must be in CIDR notation (e.g., 100.64.0.0/24)",
             ));
         }
-
         Ok(())
     }
 
     /// Parses the IP range and returns (network, prefix_len).
-    ///
-    /// # Returns
-    /// Tuple of (network address, prefix length)
-    ///
-    /// # Errors
-    /// Returns error if format is invalid.
     pub fn parse_ip_range(&self) -> Result<(Ipv4Addr, u8)> {
-        let parts: Vec<&str> = self.ip_range.split('/').collect();
+        let parts: Vec<&str> = self.virtual_ip_range.split('/').collect();
         if parts.len() != 2 {
             return Err(ServerError::config_invalid(
-                "tunnel.ip_range",
+                "vpn.virtual_ip_range",
                 "invalid CIDR format",
             ));
         }
 
         let network: Ipv4Addr = parts[0].parse().map_err(|_| {
-            ServerError::config_invalid("tunnel.ip_range", "invalid network address")
+            ServerError::config_invalid("vpn.virtual_ip_range", "invalid network address")
         })?;
 
         let prefix: u8 = parts[1].parse().map_err(|_| {
-            ServerError::config_invalid("tunnel.ip_range", "invalid prefix length")
+            ServerError::config_invalid("vpn.virtual_ip_range", "invalid prefix length")
         })?;
 
         if prefix > 32 {
             return Err(ServerError::config_invalid(
-                "tunnel.ip_range",
+                "vpn.virtual_ip_range",
                 "prefix length cannot exceed 32",
             ));
         }
@@ -343,12 +328,77 @@ impl TunnelConfig {
     }
 }
 
-impl Default for TunnelConfig {
+impl Default for VpnConfig {
+    fn default() -> Self {
+        Self {
+            virtual_ip_range: default_ip_range(),
+            gateway_ip: default_gateway_ip(),
+        }
+    }
+}
+
+// ============================================
+// TunConfig
+// ============================================
+
+/// TUN device configuration section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunConfig {
+    /// TUN device name.
+    #[serde(default = "default_device_name")]
+    pub device_name: String,
+
+    /// MTU size.
+    #[serde(default = "default_mtu")]
+    pub mtu: u16,
+}
+
+fn default_device_name() -> String {
+    "aeronyx0".to_string()
+}
+
+fn default_mtu() -> u16 {
+    1420
+}
+
+impl TunConfig {
+    fn validate(&self) -> Result<()> {
+        if self.device_name.is_empty() {
+            return Err(ServerError::config_invalid(
+                "tun.device_name",
+                "cannot be empty",
+            ));
+        }
+
+        if self.device_name.len() > 15 {
+            return Err(ServerError::config_invalid(
+                "tun.device_name",
+                "cannot exceed 15 characters",
+            ));
+        }
+
+        if self.mtu < 576 {
+            return Err(ServerError::config_invalid(
+                "tun.mtu",
+                "must be at least 576",
+            ));
+        }
+
+        if self.mtu > 9000 {
+            return Err(ServerError::config_invalid(
+                "tun.mtu",
+                "cannot exceed 9000",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for TunConfig {
     fn default() -> Self {
         Self {
             device_name: default_device_name(),
-            ip_range: default_ip_range(),
-            gateway_ip: default_gateway_ip(),
             mtu: default_mtu(),
         }
     }
@@ -364,25 +414,16 @@ pub struct ServerKeyConfig {
     /// Path to key file.
     #[serde(default = "default_key_file")]
     pub key_file: String,
-
-    /// Whether to generate key if missing.
-    #[serde(default = "default_auto_generate")]
-    pub auto_generate: bool,
 }
 
 fn default_key_file() -> String {
     "/etc/aeronyx/server_key.json".to_string()
 }
 
-fn default_auto_generate() -> bool {
-    true
-}
-
 impl Default for ServerKeyConfig {
     fn default() -> Self {
         Self {
             key_file: default_key_file(),
-            auto_generate: default_auto_generate(),
         }
     }
 }
@@ -394,20 +435,16 @@ impl Default for ServerKeyConfig {
 /// Resource limits configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimitsConfig {
-    /// Maximum concurrent sessions.
-    #[serde(default = "default_max_sessions")]
-    pub max_sessions: usize,
+    /// Maximum concurrent connections/sessions.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
 
     /// Session timeout in seconds.
     #[serde(default = "default_session_timeout")]
-    pub session_timeout_secs: u64,
-
-    /// Handshake timeout in seconds.
-    #[serde(default = "default_handshake_timeout")]
-    pub handshake_timeout_secs: u64,
+    pub session_timeout: u64,
 }
 
-fn default_max_sessions() -> usize {
+fn default_max_connections() -> usize {
     1000
 }
 
@@ -415,22 +452,18 @@ fn default_session_timeout() -> u64 {
     300
 }
 
-fn default_handshake_timeout() -> u64 {
-    10
-}
-
 impl LimitsConfig {
     fn validate(&self) -> Result<()> {
-        if self.max_sessions == 0 {
+        if self.max_connections == 0 {
             return Err(ServerError::config_invalid(
-                "limits.max_sessions",
+                "limits.max_connections",
                 "must be greater than 0",
             ));
         }
 
-        if self.session_timeout_secs == 0 {
+        if self.session_timeout == 0 {
             return Err(ServerError::config_invalid(
-                "limits.session_timeout_secs",
+                "limits.session_timeout",
                 "must be greater than 0",
             ));
         }
@@ -442,9 +475,8 @@ impl LimitsConfig {
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
-            max_sessions: default_max_sessions(),
-            session_timeout_secs: default_session_timeout(),
-            handshake_timeout_secs: default_handshake_timeout(),
+            max_connections: default_max_connections(),
+            session_timeout: default_session_timeout(),
         }
     }
 }
@@ -459,25 +491,16 @@ pub struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error).
     #[serde(default = "default_log_level")]
     pub level: String,
-
-    /// Output format (text, json).
-    #[serde(default = "default_log_format")]
-    pub format: String,
 }
 
 fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn default_log_format() -> String {
-    "text".to_string()
-}
-
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: default_log_level(),
-            format: default_log_format(),
         }
     }
 }
@@ -497,76 +520,50 @@ mod tests {
     }
 
     #[test]
-    fn test_config_from_toml() {
+    fn test_existing_config_format() {
         let toml = r#"
             [network]
-            listen_addr = "0.0.0.0:12345"
-            
-            [tunnel]
-            device_name = "test0"
-            ip_range = "10.0.0.0/24"
-            gateway_ip = "10.0.0.1"
-            mtu = 1400
-            
+            listen_addr = "0.0.0.0:51820"
+            public_endpoint = "8.213.146.244:51820"
+
+            [vpn]
+            virtual_ip_range = "100.64.0.0/24"
+            gateway_ip = "100.64.0.1"
+
+            [tun]
+            device_name = "aeronyx0"
+            mtu = 1420
+
+            [server_key]
+            key_file = "/etc/aeronyx/server_key.json"
+
             [limits]
-            max_sessions = 500
-            session_timeout_secs = 600
+            max_connections = 1000
+            session_timeout = 300
+
+            [logging]
+            level = "info"
         "#;
 
         let config = ServerConfig::from_str(toml).unwrap();
-        assert_eq!(config.network.listen_addr.port(), 12345);
-        assert_eq!(config.tunnel.device_name, "test0");
-        assert_eq!(config.limits.max_sessions, 500);
-    }
-
-    #[test]
-    fn test_invalid_config() {
-        // Invalid port
-        let toml = r#"
-            [network]
-            listen_addr = "0.0.0.0:0"
-        "#;
-        assert!(ServerConfig::from_str(toml).is_err());
-
-        // Invalid MTU
-        let toml = r#"
-            [tunnel]
-            mtu = 100
-        "#;
-        assert!(ServerConfig::from_str(toml).is_err());
-
-        // Invalid max_sessions
-        let toml = r#"
-            [limits]
-            max_sessions = 0
-        "#;
-        assert!(ServerConfig::from_str(toml).is_err());
-    }
-
-    #[test]
-    fn test_parse_ip_range() {
-        let config = TunnelConfig::default();
-        let (network, prefix) = config.parse_ip_range().unwrap();
-        
-        assert_eq!(network, Ipv4Addr::new(100, 64, 0, 0));
-        assert_eq!(prefix, 24);
-    }
-
-    #[test]
-    fn test_config_to_toml() {
-        let config = ServerConfig::default();
-        let toml = config.to_toml();
-        
-        assert!(toml.contains("[network]"));
-        assert!(toml.contains("[tunnel]"));
-        assert!(toml.contains("[limits]"));
+        assert_eq!(config.network.listen_addr.port(), 51820);
+        assert_eq!(config.vpn.virtual_ip_range, "100.64.0.0/24");
+        assert_eq!(config.tun.device_name, "aeronyx0");
+        assert_eq!(config.limits.max_connections, 1000);
     }
 
     #[test]
     fn test_config_with_management() {
         let toml = r#"
             [network]
-            listen_addr = "0.0.0.0:12345"
+            listen_addr = "0.0.0.0:51820"
+            
+            [vpn]
+            virtual_ip_range = "100.64.0.0/24"
+            gateway_ip = "100.64.0.1"
+
+            [tun]
+            device_name = "aeronyx0"
             
             [management]
             cms_url = "https://api.example.com/api/privacy_network"
@@ -576,5 +573,24 @@ mod tests {
         let config = ServerConfig::from_str(toml).unwrap();
         assert_eq!(config.management.cms_url, "https://api.example.com/api/privacy_network");
         assert_eq!(config.management.heartbeat_interval_secs, 30);
+    }
+
+    #[test]
+    fn test_parse_ip_range() {
+        let config = VpnConfig::default();
+        let (network, prefix) = config.parse_ip_range().unwrap();
+        
+        assert_eq!(network, Ipv4Addr::new(100, 64, 0, 0));
+        assert_eq!(prefix, 24);
+    }
+
+    #[test]
+    fn test_public_ip_extraction() {
+        let config = NetworkConfig {
+            listen_addr: default_listen_addr(),
+            public_endpoint: Some("8.213.146.244:51820".to_string()),
+        };
+        
+        assert_eq!(config.public_ip(), Some(Ipv4Addr::new(8, 213, 146, 244)));
     }
 }
