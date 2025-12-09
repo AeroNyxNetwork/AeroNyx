@@ -8,16 +8,16 @@
 //! manages the server lifecycle.
 //!
 //! ## Modification Reason
-//! Added Keepalive packet handling to prevent session timeout.
-//! Previously, Keepalive packets (0x04) were ignored, causing
-//! sessions to expire even when clients were actively sending heartbeats.
+//! - Added Keepalive packet handling to prevent session timeout.
+//! - Added CMS management integration (heartbeat + session reporting).
 //!
 //! ## Main Functionality
 //! - `Server`: Main server struct and lifecycle management
 //! - Component initialization and wiring
 //! - Async task management
 //! - Graceful shutdown handling
-//! - Keepalive packet handling (NEW)
+//! - Keepalive packet handling
+//! - CMS management reporting
 //!
 //! ## Server Architecture
 //! ```text
@@ -41,6 +41,11 @@
 //! │  │  │            Packet Handler                    │   │   │
 //! │  │  └─────────────────────────────────────────────────┘   │
 //! │  │                                                      │   │
+//! │  │  ┌────────────────┐  ┌────────────────┐             │   │
+//! │  │  │ Heartbeat Task │  │ Session Report │             │   │
+//! │  │  │ (30s interval) │  │ Task (events)  │             │   │
+//! │  │  └────────────────┘  └────────────────┘             │   │
+//! │  │                                                      │   │
 //! │  └─────────────────────────────────────────────────────┘   │
 //! │                                                             │
 //! │  ┌─────────────────────────────────────────────────────┐   │
@@ -58,7 +63,7 @@
 //! - 0x01 ClientHello: Handshake initiation
 //! - 0x02 ServerHello: Handshake response (sent by server)
 //! - 0x03 Data: Encrypted VPN traffic (no prefix, identified by structure)
-//! - 0x04 Keepalive: Session heartbeat (NEW - now handled!)
+//! - 0x04 Keepalive: Session heartbeat
 //! - 0x05 Disconnect: Graceful session termination
 //!
 //! ## ⚠️ Important Note for Next Developer
@@ -67,10 +72,12 @@
 //! - All services are Arc-wrapped for sharing
 //! - Use tokio::select! for concurrent operations
 //! - Keepalive packets MUST update session.last_activity
+//! - Node must be registered before starting (checked in main.rs)
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial server implementation
 //! v0.1.1 - Added Keepalive packet handling to prevent session timeout
+//! v0.2.0 - Added CMS management integration (heartbeat + session reporting)
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -95,6 +102,12 @@ use aeronyx_transport::LinuxTun;
 use crate::config::ServerConfig;
 use crate::error::{Result, ServerError};
 use crate::handlers::PacketHandler;
+use crate::management::{
+    ManagementClient,
+    HeartbeatReporter,
+    SessionReporter,
+    reporter::SessionEventSender,
+};
 use crate::services::{
     HandshakeService, IpPoolService, RoutingService, SessionManager,
 };
@@ -156,6 +169,9 @@ impl Server {
         // Initialize services
         let (ip_pool, sessions, routing) = self.init_services()?;
 
+        // Initialize session event sender (for CMS reporting)
+        let session_event_sender = self.init_management_reporter(&sessions).await;
+
         // Initialize handshake service
         let handshake_service = Arc::new(HandshakeService::new(
             self.identity.clone(),
@@ -172,12 +188,12 @@ impl Server {
 
         // Initialize transport
         let udp = Arc::new(
-            UdpTransport::bind_addr(self.config.network.listen_addr)
+            UdpTransport::bind_addr(self.config.listen_addr())
                 .await
                 .map_err(|e| ServerError::startup_failed(format!("UDP bind failed: {}", e)))?,
         );
 
-        info!("UDP transport listening on {}", self.config.network.listen_addr);
+        info!("UDP transport listening on {}", self.config.listen_addr());
 
         // Initialize TUN device (Linux only for now)
         #[cfg(target_os = "linux")]
@@ -193,7 +209,8 @@ impl Server {
             Arc::clone(&tun),
             Arc::clone(&handshake_service),
             Arc::clone(&packet_handler),
-            Arc::clone(&sessions),  // ← NEW: Pass sessions for keepalive handling
+            Arc::clone(&sessions),
+            session_event_sender.clone(),
         );
         tasks.push(("udp", udp_task));
 
@@ -213,6 +230,7 @@ impl Server {
             Arc::clone(&sessions),
             Arc::clone(&ip_pool),
             Arc::clone(&routing),
+            session_event_sender.clone(),
         );
         tasks.push(("cleanup", cleanup_task));
 
@@ -244,6 +262,62 @@ impl Server {
         Ok(())
     }
 
+    /// Initializes management reporters.
+    ///
+    /// Management reporting is REQUIRED for all nodes on the official network.
+    /// Returns a SessionEventSender for reporting session events to CMS.
+    async fn init_management_reporter(
+        &self,
+        sessions: &Arc<SessionManager>,
+    ) -> SessionEventSender {
+        info!("Initializing management reporting...");
+
+        // Create management client
+        let mgmt_client = Arc::new(ManagementClient::new(
+            self.config.management.clone(),
+            self.identity.clone(),
+        ));
+
+        info!("Node ID: {}", mgmt_client.node_id());
+
+        // Determine public IP
+        let public_ip = self.config.network.public_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| {
+                // Fallback to listen address IP
+                self.config.listen_addr().ip().to_string()
+            });
+
+        // Start heartbeat reporter
+        let heartbeat_reporter = HeartbeatReporter::new(
+            Arc::clone(&mgmt_client),
+            public_ip,
+        );
+        
+        let sessions_for_heartbeat = Arc::clone(sessions);
+        let shutdown_rx = self.shutdown_tx.subscribe();
+        
+        tokio::spawn(async move {
+            heartbeat_reporter.run(
+                move || sessions_for_heartbeat.count() as u32,
+                shutdown_rx,
+            ).await;
+        });
+
+        // Start session reporter
+        let (session_reporter, event_tx) = SessionReporter::new(Arc::clone(&mgmt_client));
+        let shutdown_rx = self.shutdown_tx.subscribe();
+        
+        tokio::spawn(async move {
+            session_reporter.run(shutdown_rx).await;
+        });
+
+        info!("Management reporting started (heartbeat interval: {}s)", 
+              self.config.management.heartbeat_interval_secs);
+        
+        SessionEventSender::new(event_tx)
+    }
+
     /// Initializes core services.
     fn init_services(&self) -> Result<(
         Arc<IpPoolService>,
@@ -251,19 +325,19 @@ impl Server {
         Arc<RoutingService>,
     )> {
         // Parse IP range
-        let (network, prefix) = self.config.tunnel.parse_ip_range()?;
+        let (network, prefix) = self.config.parse_ip_range()?;
 
         // Create IP pool
         let ip_pool = Arc::new(IpPoolService::new(
             network,
             prefix,
-            self.config.tunnel.gateway_ip,
+            self.config.gateway_ip(),
         )?);
 
         // Create session manager
         let sessions = Arc::new(SessionManager::new(
-            self.config.limits.max_sessions,
-            Duration::from_secs(self.config.limits.session_timeout_secs),
+            self.config.max_sessions(),
+            Duration::from_secs(self.config.session_timeout_secs()),
         ));
 
         // Create routing service
@@ -272,7 +346,7 @@ impl Server {
         info!(
             "Services initialized: IP pool capacity={}, max sessions={}",
             ip_pool.capacity(),
-            self.config.limits.max_sessions
+            self.config.max_sessions()
         );
 
         Ok((ip_pool, sessions, routing))
@@ -281,10 +355,10 @@ impl Server {
     /// Initializes the TUN device.
     #[cfg(target_os = "linux")]
     async fn init_tun(&self) -> Result<Arc<LinuxTun>> {
-        let tun_config = TunConfig::new(&self.config.tunnel.device_name)
-            .with_address(self.config.tunnel.gateway_ip)
+        let tun_config = TunConfig::new(self.config.device_name())
+            .with_address(self.config.gateway_ip())
             .with_netmask(Ipv4Addr::new(255, 255, 255, 0))
-            .with_mtu(self.config.tunnel.mtu);
+            .with_mtu(self.config.mtu());
 
         let tun = LinuxTun::create(tun_config)
             .await
@@ -297,7 +371,7 @@ impl Server {
         info!(
             "TUN device '{}' initialized with IP {}",
             tun.name(),
-            self.config.tunnel.gateway_ip
+            self.config.gateway_ip()
         );
 
         Ok(Arc::new(tun))
@@ -311,7 +385,8 @@ impl Server {
         tun: Arc<LinuxTun>,
         handshake: Arc<HandshakeService>,
         packet_handler: Arc<PacketHandler>,
-        sessions: Arc<SessionManager>,  // ← NEW: For keepalive handling
+        sessions: Arc<SessionManager>,
+        session_events: SessionEventSender,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -356,10 +431,17 @@ impl Server {
                                             Ok(client_hello) => {
                                                 match handshake.process(&client_hello, source.addr) {
                                                     Ok(result) => {
+                                                        let session_id_b64 = BASE64.encode(&result.response.session_id);
                                                         info!(
                                                             "[HANDSHAKE] ✅ Session created for {}, SessionID={}",
                                                             source.addr,
-                                                            BASE64.encode(&result.response.session_id)
+                                                            session_id_b64
+                                                        );
+                                                        
+                                                        // Report session created to CMS
+                                                        session_events.session_created(
+                                                            &session_id_b64,
+                                                            None, // TODO: extract wallet from handshake if available
                                                         );
                                                         
                                                         let response = encode_server_hello(&result.response);
@@ -388,7 +470,7 @@ impl Server {
                                         }
                                     }
                                     
-                                    // ========== NEW: Keepalive handling ==========
+                                    // ========== Keepalive handling ==========
                                     Ok(MessageType::Keepalive) => {
                                         if len >= KEEPALIVE_PACKET_SIZE {
                                             // Extract session ID (bytes 1-17)
@@ -436,11 +518,6 @@ impl Server {
                                             );
                                         }
                                     }
-                                    
-                                    // ========== NEW: Disconnect handling ==========
-                                    // Note: Check if MessageType::Disconnect exists in your protocol
-                                    // If not, disconnect packets will fall through to Data handling
-                                    // which will fail session lookup (acceptable behavior)
                                     
                                     // ========== Data packet handling ==========
                                     Ok(MessageType::Data) | Err(_) => {
@@ -575,6 +652,7 @@ impl Server {
         sessions: Arc<SessionManager>,
         ip_pool: Arc<IpPoolService>,
         routing: Arc<RoutingService>,
+        session_events: SessionEventSender,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -601,6 +679,15 @@ impl Server {
                         for (session_id, virtual_ip) in expired {
                             routing.remove_route(virtual_ip);
                             ip_pool.release(virtual_ip);
+                            
+                            // Report session ended to CMS
+                            session_events.session_ended(
+                                &session_id.to_string(),
+                                None,
+                                0,
+                                0,
+                            );
+                            
                             debug!(
                                 session_id = %session_id,
                                 virtual_ip = %virtual_ip,
@@ -641,8 +728,8 @@ impl Server {
 impl std::fmt::Debug for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Server")
-            .field("listen_addr", &self.config.network.listen_addr)
-            .field("tun_device", &self.config.tunnel.device_name)
+            .field("listen_addr", &self.config.listen_addr())
+            .field("tun_device", &self.config.device_name())
             .finish()
     }
 }
