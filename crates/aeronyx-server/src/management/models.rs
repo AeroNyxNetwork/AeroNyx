@@ -241,16 +241,26 @@ pub struct HeartbeatResponse {
     pub error: Option<String>,
 }
 
+/// Session event type enumeration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEventType {
+    SessionCreated,
+    SessionUpdated,
+    SessionEnded,
+}
+
 /// Session event report sent to CMS.
 #[derive(Debug, Serialize)]
 pub struct SessionEventReport {
-    /// Event type: "session_created", "session_updated", or "session_ended"
+    /// Event type: session_created, session_updated, or session_ended
     #[serde(rename = "type")]
-    pub event_type: String,
+    pub event_type: SessionEventType,
     /// Unique session identifier
     pub session_id: String,
-    /// Client's wallet address
-    pub client_wallet: String,
+    /// Client's wallet address (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_wallet: Option<String>,
     /// Client's IP address (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,
