@@ -157,14 +157,16 @@ impl ManagementClient {
 
     /// Sends a heartbeat to the CMS with current node status.
     /// 
-    /// CRITICAL: JSON field order MUST match Python backend expectation:
+    /// CRITICAL: Signature is computed over body WITHOUT the signature field.
+    /// Python backend will reconstruct the same body (without signature) to verify.
+    /// 
+    /// JSON field order for body (without signature):
     /// 1. node_id
     /// 2. timestamp
     /// 3. public_ip
     /// 4. version
     /// 5. binary_hash
     /// 6. system_stats (with cpu_usage, memory_mb, active_sessions)
-    /// 7. signature
     /// 
     /// # Arguments
     /// * `public_ip` - Node's public IP address
@@ -178,12 +180,10 @@ impl ManagementClient {
         let node_id = self.node_id();
         let stats = SystemStats::collect(active_sessions);
     
-        // CRITICAL: Build JSON with exact field order matching Python backend
-        // Using json! macro preserves insertion order when serde_json has "preserve_order" feature
-        // 
-        // Step 1: Create body with empty signature for signing
+        // CRITICAL: Build JSON WITHOUT signature field for signing
+        // This is what Python will reconstruct to verify the signature
         let body_for_signing = json!({
-            "node_id": node_id,
+            "node_id": &node_id,
             "timestamp": timestamp,
             "public_ip": public_ip,
             "version": super::integrity::get_version(),
@@ -192,20 +192,18 @@ impl ManagementClient {
                 "cpu_usage": stats.cpu_usage,
                 "memory_mb": stats.memory_mb,
                 "active_sessions": stats.active_sessions
-            },
-            "signature": ""
+            }
         });
         
-        // Serialize to string for signing
+        // Serialize to string for signing (NO signature field)
         let body_str = serde_json::to_string(&body_for_signing).map_err(|e| e.to_string())?;
         
         // Create signature over the body
         let signature = self.create_signature(timestamp, &body_str);
 
-        // Step 2: Create final body with actual signature
-        // IMPORTANT: Must use json! macro again to preserve field order
+        // Create final body WITH signature field for sending
         let body_json = json!({
-            "node_id": node_id,
+            "node_id": &node_id,
             "timestamp": timestamp,
             "public_ip": public_ip,
             "version": super::integrity::get_version(),
@@ -220,13 +218,12 @@ impl ManagementClient {
 
         debug!("Heartbeat: sessions={}", active_sessions);
 
-        // Send the json! constructed value directly - NOT a HeartbeatRequest struct
-        // This ensures field order is preserved
+        // Send the json! constructed value directly
         let response = self.http.post(&url)
             .header("X-Node-ID", &node_id)
             .header("X-Timestamp", timestamp.to_string())
             .header("X-Signature", &signature)
-            .json(&body_json)  // Use body_json, NOT a struct
+            .json(&body_json)
             .send().await
             .map_err(|e| format!("Request failed: {}", e))?;
 
