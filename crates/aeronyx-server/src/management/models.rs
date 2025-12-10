@@ -1,4 +1,18 @@
-//! # Management API Data Models
+/*
+============================================
+File: crates/aeronyx-server/src/management/models.rs
+Path: aeronyx-server/src/management/models.rs
+============================================
+Purpose: Management API data models
+
+Key Fix v1.1.0:
+  - Force JSON field order to match Python backend
+  - Use #[serde(skip_serializing)] for signature field during signing
+
+Author: Claude
+Last Modified: 2024-12-10
+============================================
+*/
 
 use serde::{Deserialize, Serialize};
 
@@ -99,22 +113,25 @@ pub struct NodeInfo {
     pub created_at: String,
 }
 
+/// CRITICAL: Field order MUST match Python backend expectation
+/// Do NOT reorder these fields!
 #[derive(Debug, Serialize)]
 pub struct HeartbeatRequest {
-    pub node_id: String,
-    pub timestamp: u64,
-    pub public_ip: String,
-    pub version: String,
-    pub binary_hash: String,
-    pub system_stats: SystemStats,
-    pub signature: String,
+    pub node_id: String,           // 1st - MUST be first
+    pub timestamp: u64,             // 2nd
+    pub public_ip: String,          // 3rd
+    pub version: String,            // 4th
+    pub binary_hash: String,        // 5th
+    pub system_stats: SystemStats,  // 6th
+    pub signature: String,          // 7th - MUST be last
 }
 
+/// CRITICAL: Field order MUST match Python backend expectation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemStats {
-    pub cpu_usage: f32,
-    pub memory_mb: u64,
-    pub active_sessions: u32,
+    pub cpu_usage: f32,        // 1st
+    pub memory_mb: u64,         // 2nd
+    pub active_sessions: u32,   // 3rd
 }
 
 impl SystemStats {
@@ -175,20 +192,13 @@ pub struct HeartbeatResponse {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionEventType {
-    SessionCreated,
-    SessionUpdated,
-    SessionEnded,
-}
-
 #[derive(Debug, Serialize)]
 pub struct SessionEventReport {
     #[serde(rename = "type")]
-    pub event_type: SessionEventType,
+    pub event_type: String,      // Changed from enum to String
     pub session_id: String,
-    pub client_wallet: Option<String>,
+    pub client_wallet: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,
     pub bytes_in: u64,
     pub bytes_out: u64,
