@@ -65,7 +65,7 @@ clap = { workspace = true }
 # Configuration
 toml = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { version = "1.0", features = ["preserve_order"] }
 
 # Error handling
 thiserror = { workspace = true }
