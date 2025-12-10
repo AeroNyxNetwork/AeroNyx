@@ -1,34 +1,32 @@
-/*
-============================================
-File: crates/aeronyx-server/src/management/models.rs
-Path: aeronyx-server/src/management/models.rs
-============================================
-Purpose: Management API data models for CMS communication
-
-Key Fix v1.2.0:
-  - HeartbeatRequest struct is kept for documentation but NOT used for sending
-  - Actual heartbeat uses json! macro in client.rs to preserve field order
-  - SessionEventReport uses String for event_type (not enum) for flexibility
-
-Main Data Structures:
-  - BindNodeRequest/Response: Node registration
-  - HeartbeatRequest/Response: Periodic status updates
-  - SessionEventReport/Response: Session event reporting
-  - HardwareInfo: System hardware information
-  - SystemStats: Runtime system statistics
-
-⚠️ Important Note for Next Developer:
-  - HeartbeatRequest struct field order is documented but struct is NOT used for actual HTTP request
-  - The client.rs uses json! macro directly to ensure field order
-  - If you need to modify heartbeat fields, update BOTH models.rs AND client.rs json! calls
-
-Dependencies:
-  - serde for serialization/deserialization
-  - System files (/proc/*) for Linux system information
-
-Last Modified: v1.2.0 - Clarified that HeartbeatRequest is for documentation only
-============================================
-*/
+//! ============================================
+//! File: crates/aeronyx-server/src/management/models.rs
+//! Path: aeronyx-server/src/management/models.rs
+//! ============================================
+//! Purpose: Management API data models for CMS communication
+//!
+//! Key Fix v1.2.0:
+//!   - HeartbeatRequest struct is kept for documentation but NOT used for sending
+//!   - Actual heartbeat uses json! macro in client.rs to preserve field order
+//!   - SessionEventReport uses String for event_type (not enum) for flexibility
+//!
+//! Main Data Structures:
+//!   - BindNodeRequest/Response: Node registration
+//!   - HeartbeatRequest/Response: Periodic status updates
+//!   - SessionEventReport/Response: Session event reporting
+//!   - HardwareInfo: System hardware information
+//!   - SystemStats: Runtime system statistics
+//!
+//! ⚠️ Important Note for Next Developer:
+//!   - HeartbeatRequest struct field order is documented but struct is NOT used for actual HTTP request
+//!   - The client.rs uses json! macro directly to ensure field order
+//!   - If you need to modify heartbeat fields, update BOTH models.rs AND client.rs json! calls
+//!
+//! Dependencies:
+//!   - serde for serialization/deserialization
+//!   - System files (/proc/cpuinfo, /proc/meminfo, etc.) for Linux system information
+//!
+//! Last Modified: v1.2.0 - Clarified that HeartbeatRequest is for documentation only
+//! ============================================
 
 use serde::{Deserialize, Serialize};
 
