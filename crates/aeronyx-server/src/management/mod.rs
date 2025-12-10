@@ -53,6 +53,8 @@
 //! ## Last Modified
 //! v0.1.0 - Initial management module
 
+//! # Node Management Module
+
 pub mod client;
 pub mod config;
 pub mod integrity;
