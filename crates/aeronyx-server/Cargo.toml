@@ -50,6 +50,10 @@ aeronyx-core = { workspace = true }
 aeronyx-transport = { workspace = true }
 aeronyx-common = { workspace = true }
 
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+sha2 = "0.10"
+hex = "0.4"
+
 # Async runtime
 tokio = { workspace = true }
 async-trait = { workspace = true }
