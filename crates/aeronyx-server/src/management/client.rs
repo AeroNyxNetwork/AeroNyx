@@ -35,11 +35,33 @@ impl ManagementClient {
     }
 
     fn create_signature(&self, timestamp: u64, body: &str) -> String {
-        let message = format!("{}{}{}", self.node_id(), timestamp, body);
+        let node_id = self.node_id();
+        
+     
+        let message = format!("{}{}{}", node_id, timestamp, body);
+        
+        eprintln!("============================================================");
+        eprintln!("[Rust Signature] Node ID: {}", node_id);
+        eprintln!("[Rust Signature] Timestamp: {}", timestamp);
+        eprintln!("[Rust Signature] Body (first 200): {}", &body.chars().take(200).collect::<String>());
+        eprintln!("[Rust Signature] Message (first 200): {}", &message.chars().take(200).collect::<String>());
+        
+
         let mut hasher = Sha256::new();
         hasher.update(message.as_bytes());
-        let hash = hasher.finalize();
-        hex::encode(self.identity.sign(&hash))
+        let message_hash = hasher.finalize();
+        let hash_hex = hex::encode(&message_hash);
+        
+        eprintln!("[Rust Signature] Message hash: {}", hash_hex);
+        
+
+        let signature = self.identity.sign(&message_hash);
+        let sig_hex = hex::encode(signature);
+        
+        eprintln!("[Rust Signature] Signature: {}", sig_hex);
+        eprintln!("============================================================");
+        
+        sig_hex
     }
 
     pub async fn register_node(&self, code: &str) -> Result<NodeInfo, String> {
