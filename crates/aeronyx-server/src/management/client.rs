@@ -95,14 +95,20 @@ impl ManagementClient {
         let timestamp = Self::current_timestamp();
         let node_id = self.node_id();
         let stats = SystemStats::collect(active_sessions);
-
-        let body_for_signing = serde_json::json!({
+    
+        use serde_json::json;
+        let body_for_signing = json!({
             "node_id": node_id,
             "timestamp": timestamp,
             "public_ip": public_ip,
             "version": super::integrity::get_version(),
             "binary_hash": self.binary_hash,
-            "system_stats": stats,
+            "system_stats": {
+                "cpu_usage": stats.cpu_usage,
+                "memory_mb": stats.memory_mb,
+                "active_sessions": stats.active_sessions
+            },
+            "signature": ""
         });
         let body_str = serde_json::to_string(&body_for_signing).map_err(|e| e.to_string())?;
         let signature = self.create_signature(timestamp, &body_str);
