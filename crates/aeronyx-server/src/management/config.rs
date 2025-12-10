@@ -3,32 +3,27 @@
 // ============================================
 //! # Management Configuration
 
+//! # Management Configuration
+
 use serde::{Deserialize, Serialize};
 
-/// Management system configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagementConfig {
-    /// CMS API base URL.
     #[serde(default = "default_cms_url")]
     pub cms_url: String,
 
-    /// Heartbeat reporting interval in seconds.
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_secs: u64,
 
-    /// Session report batch interval in seconds.
     #[serde(default = "default_session_report_interval")]
     pub session_report_interval_secs: u64,
 
-    /// HTTP request timeout in seconds.
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
 
-    /// Maximum retry attempts for failed requests.
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
 
-    /// Path to store node binding info.
     #[serde(default = "default_node_info_path")]
     pub node_info_path: String,
 }
@@ -37,21 +32,10 @@ fn default_cms_url() -> String {
     "https://api.aeronyx.network/api/privacy_network".to_string()
 }
 
-fn default_heartbeat_interval() -> u64 {
-    30
-}
-
-fn default_session_report_interval() -> u64 {
-    60
-}
-
-fn default_request_timeout() -> u64 {
-    10
-}
-
-fn default_max_retries() -> u32 {
-    3
-}
+fn default_heartbeat_interval() -> u64 { 30 }
+fn default_session_report_interval() -> u64 { 60 }
+fn default_request_timeout() -> u64 { 10 }
+fn default_max_retries() -> u32 { 3 }
 
 fn default_node_info_path() -> String {
     "/etc/aeronyx/node_info.json".to_string()
@@ -71,7 +55,6 @@ impl Default for ManagementConfig {
 }
 
 impl ManagementConfig {
-    /// Validates the configuration.
     pub fn validate(&self) -> Result<(), String> {
         if self.cms_url.is_empty() {
             return Err("cms_url cannot be empty".to_string());
@@ -85,7 +68,6 @@ impl ManagementConfig {
         Ok(())
     }
 
-    /// Checks if node is registered.
     pub fn is_registered(&self) -> bool {
         std::path::Path::new(&self.node_info_path).exists()
     }
