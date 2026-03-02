@@ -10,6 +10,8 @@
 //! ## Modification Reason
 //! - Added ManagementConfig for CMS integration.
 //! - 🌟 Added MemChainConfig for MemChain mode control and API listen address.
+//! - 🌟 v0.4.0: Added `trusted_agents` whitelist to MemChainConfig for
+//!   Phase 3 P2P trust boundary enforcement.
 //!
 //! ## Main Functionality
 //! - `ServerConfig`: Main configuration structure
@@ -53,6 +55,9 @@
 //! mode = "local"                       # "local", "p2p", or "off"
 //! api_listen_addr = "127.0.0.1:8421"   # Agent API bind address
 //! aof_path = ".memchain"               # Append-only ledger file
+//! trusted_agents = [                   # Ed25519 pubkey hex whitelist
+//!   "fa29c129f789d4f79ed2075c5c2706cdbcf8ae11196b13048174598e1dca4d54",
+//! ]
 //! ```
 //!
 //! ## ⚠️ Important Note for Next Developer
@@ -60,11 +65,14 @@
 //! - Validate config before server startup
 //! - Node registration is MANDATORY for official network
 //! - MemChain API only binds to loopback by default (security)
+//! - `trusted_agents` empty = trust all authenticated sessions (MVP fallback)
+//! - `trusted_agents` hex strings are validated at startup (must be 64 hex chars)
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial configuration implementation
 //! v0.2.0 - Added management configuration for CMS integration
 //! v0.3.0 - 🌟 Added MemChainConfig for mode control and API settings
+//! v0.4.0 - 🌟 Added trusted_agents whitelist for Phase 3 P2P trust
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -110,7 +118,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub management: ManagementConfig,
 
-    /// 🌟 MemChain configuration (mode, API, storage).
+    /// 🌟 MemChain configuration (mode, API, storage, trust).
     #[serde(default)]
     pub memchain: MemChainConfig,
 }
@@ -227,7 +235,7 @@ impl Default for ServerConfig {
 }
 
 // ============================================
-// 🌟 MemChainConfig (NEW)
+// 🌟 MemChainConfig
 // ============================================
 
 /// MemChain operating mode.
@@ -242,7 +250,6 @@ pub enum MemChainMode {
     /// This is the default for MVP.
     Local,
     /// Full P2P mode — local storage + broadcast to connected peers.
-    /// (Phase 2, not yet implemented)
     P2p,
 }
 
@@ -257,10 +264,21 @@ impl Default for MemChainMode {
 /// # Example TOML
 /// ```toml
 /// [memchain]
-/// mode = "local"
+/// mode = "p2p"
 /// api_listen_addr = "127.0.0.1:8421"
 /// aof_path = ".memchain"
+/// trusted_agents = [
+///   "fa29c129f789d4f79ed2075c5c2706cdbcf8ae11196b13048174598e1dca4d54",
+/// ]
 /// ```
+///
+/// # Trust Model
+/// - If `trusted_agents` is **empty** (default), all facts from
+///   authenticated VPN sessions are accepted (MVP behaviour).
+/// - If `trusted_agents` is **non-empty**, only facts whose
+///   `origin` public key appears in the list (or matches the
+///   server's own identity) are accepted. Everything else is
+///   dropped with a warning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemChainConfig {
     /// Operating mode: "off", "local", or "p2p".
@@ -275,6 +293,14 @@ pub struct MemChainConfig {
     /// Path to the append-only ledger file.
     #[serde(default = "default_memchain_aof_path")]
     pub aof_path: String,
+
+    /// 🌟 Trusted agent Ed25519 public keys (hex-encoded).
+    ///
+    /// Empty = trust all authenticated sessions (MVP fallback).
+    /// Non-empty = strict whitelist; only listed keys + server's own key
+    /// are allowed to contribute Facts.
+    #[serde(default)]
+    pub trusted_agents: Vec<String>,
 }
 
 fn default_memchain_api_addr() -> SocketAddr {
@@ -313,6 +339,38 @@ impl MemChainConfig {
                     self.api_listen_addr
                 );
             }
+
+            // 🌟 Validate trusted_agents hex format
+            for (i, hex_key) in self.trusted_agents.iter().enumerate() {
+                if hex_key.len() != 64 {
+                    return Err(ServerError::config_invalid(
+                        &format!("memchain.trusted_agents[{}]", i),
+                        format!(
+                            "expected 64 hex chars (32 bytes), got {} chars: '{}'",
+                            hex_key.len(),
+                            hex_key
+                        ),
+                    ));
+                }
+                if hex::decode(hex_key).is_err() {
+                    return Err(ServerError::config_invalid(
+                        &format!("memchain.trusted_agents[{}]", i),
+                        format!("invalid hex string: '{}'", hex_key),
+                    ));
+                }
+            }
+
+            if !self.trusted_agents.is_empty() {
+                tracing::info!(
+                    "[MEMCHAIN] 🔒 Trust whitelist active: {} trusted agent(s)",
+                    self.trusted_agents.len()
+                );
+            } else {
+                tracing::info!(
+                    "[MEMCHAIN] ⚠️ No trusted_agents configured — \
+                     accepting facts from all authenticated sessions"
+                );
+            }
         }
 
         Ok(())
@@ -329,6 +387,31 @@ impl MemChainConfig {
     pub fn is_p2p(&self) -> bool {
         self.mode == MemChainMode::P2p
     }
+
+    /// Checks whether a given origin public key is trusted.
+    ///
+    /// # Arguments
+    /// * `origin_hex` - Hex-encoded Ed25519 public key (64 chars)
+    /// * `server_pubkey_hex` - This server's own public key (always trusted)
+    ///
+    /// # Returns
+    /// - `true` if trusted (whitelist empty, or key in list, or is server's own key)
+    /// - `false` if the key is explicitly not in a non-empty whitelist
+    #[must_use]
+    pub fn is_origin_trusted(&self, origin_hex: &str, server_pubkey_hex: &str) -> bool {
+        // Server's own key is always trusted
+        if origin_hex == server_pubkey_hex {
+            return true;
+        }
+
+        // Empty whitelist = trust all (MVP fallback)
+        if self.trusted_agents.is_empty() {
+            return true;
+        }
+
+        // Check whitelist
+        self.trusted_agents.iter().any(|trusted| trusted == origin_hex)
+    }
 }
 
 impl Default for MemChainConfig {
@@ -337,6 +420,7 @@ impl Default for MemChainConfig {
             mode: MemChainMode::default(),
             api_listen_addr: default_memchain_api_addr(),
             aof_path: default_memchain_aof_path(),
+            trusted_agents: Vec::new(),
         }
     }
 }
@@ -678,6 +762,8 @@ mod tests {
         // memchain should default to "local" when not specified
         assert_eq!(config.memchain.mode, MemChainMode::Local);
         assert!(config.memchain.is_enabled());
+        // trusted_agents should default to empty
+        assert!(config.memchain.trusted_agents.is_empty());
     }
 
     #[test]
@@ -750,6 +836,112 @@ mod tests {
         let config = ServerConfig::from_str(toml).unwrap();
         assert_eq!(config.memchain.mode, MemChainMode::Off);
         assert!(!config.memchain.is_enabled());
+    }
+
+    #[test]
+    fn test_config_with_trusted_agents() {
+        let toml = r#"
+            [network]
+            listen_addr = "0.0.0.0:51820"
+
+            [vpn]
+            virtual_ip_range = "100.64.0.0/24"
+            gateway_ip = "100.64.0.1"
+
+            [tun]
+            device_name = "aeronyx0"
+
+            [memchain]
+            mode = "p2p"
+            trusted_agents = [
+                "fa29c129f789d4f79ed2075c5c2706cdbcf8ae11196b13048174598e1dca4d54",
+                "ab12cd34ef56789012345678901234567890123456789012345678901234abcd",
+            ]
+        "#;
+
+        let config = ServerConfig::from_str(toml).unwrap();
+        assert_eq!(config.memchain.trusted_agents.len(), 2);
+        assert!(config.memchain.is_p2p());
+    }
+
+    #[test]
+    fn test_trusted_agents_invalid_hex_rejected() {
+        let toml = r#"
+            [network]
+            listen_addr = "0.0.0.0:51820"
+
+            [vpn]
+            virtual_ip_range = "100.64.0.0/24"
+            gateway_ip = "100.64.0.1"
+
+            [tun]
+            device_name = "aeronyx0"
+
+            [memchain]
+            mode = "local"
+            trusted_agents = ["not_valid_hex"]
+        "#;
+
+        let result = ServerConfig::from_str(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_trusted_agents_wrong_length_rejected() {
+        let toml = r#"
+            [network]
+            listen_addr = "0.0.0.0:51820"
+
+            [vpn]
+            virtual_ip_range = "100.64.0.0/24"
+            gateway_ip = "100.64.0.1"
+
+            [tun]
+            device_name = "aeronyx0"
+
+            [memchain]
+            mode = "local"
+            trusted_agents = ["abcd1234"]
+        "#;
+
+        let result = ServerConfig::from_str(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_origin_trusted() {
+        let config = MemChainConfig {
+            trusted_agents: vec![
+                "aaaa0000000000000000000000000000000000000000000000000000000000aa".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let server_key = "bbbb0000000000000000000000000000000000000000000000000000000000bb";
+
+        // Server's own key is always trusted
+        assert!(config.is_origin_trusted(server_key, server_key));
+
+        // Whitelisted key is trusted
+        assert!(config.is_origin_trusted(
+            "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+            server_key,
+        ));
+
+        // Unknown key is NOT trusted
+        assert!(!config.is_origin_trusted(
+            "cccc0000000000000000000000000000000000000000000000000000000000cc",
+            server_key,
+        ));
+    }
+
+    #[test]
+    fn test_is_origin_trusted_empty_whitelist() {
+        let config = MemChainConfig::default();
+        let server_key = "bbbb0000000000000000000000000000000000000000000000000000000000bb";
+
+        // Empty whitelist = trust everyone
+        assert!(config.is_origin_trusted("any_key_at_all", server_key));
     }
 
     #[test]
