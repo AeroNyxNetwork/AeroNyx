@@ -79,6 +79,10 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 # 🌟 Added for MemChain: AOF persistence + message handling
 bincode = "1.3"
 
+# 🌟 Added for MemChain Phase 1: Agent HTTP API
+axum = "0.7"
+tower = "0.5"
+
 # Error handling
 thiserror = { workspace = true }
 anyhow = { workspace = true }
@@ -99,6 +103,7 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.12"
+tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 
 [lints]
