@@ -301,6 +301,12 @@ pub struct MemChainConfig {
     /// are allowed to contribute Facts.
     #[serde(default)]
     pub trusted_agents: Vec<String>,
+
+    /// 🌟 v0.5.0: Miner interval in seconds.
+    /// How often the ReflectionMiner packs pending Facts into a Block.
+    /// Default: 3600 (1 hour). Set to 0 to disable mining.
+    #[serde(default = "default_miner_interval")]
+    pub miner_interval_secs: u64,
 }
 
 fn default_memchain_api_addr() -> SocketAddr {
@@ -309,6 +315,10 @@ fn default_memchain_api_addr() -> SocketAddr {
 
 fn default_memchain_aof_path() -> String {
     ".memchain".to_string()
+}
+
+fn default_miner_interval() -> u64 {
+    3600
 }
 
 impl MemChainConfig {
@@ -421,6 +431,7 @@ impl Default for MemChainConfig {
             api_listen_addr: default_memchain_api_addr(),
             aof_path: default_memchain_aof_path(),
             trusted_agents: Vec::new(),
+            miner_interval_secs: default_miner_interval(),
         }
     }
 }
