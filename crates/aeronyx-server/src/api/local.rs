@@ -504,7 +504,7 @@ async fn trigger_sync(
         peers_contacted,
     };
 
-    (StatusCode::OK, Json(body))
+    (StatusCode::OK, Json(serde_json::json!(body)))
 }
 
 // ============================================
