@@ -64,6 +64,9 @@ use aeronyx_core::protocol::MessageType;
 use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::UdpTransport;
 
+use crate::api::start_api_server;
+use crate::config::MemChainMode;
+
 #[cfg(target_os = "linux")]
 use aeronyx_transport::LinuxTun;
 
@@ -79,7 +82,6 @@ use crate::services::{
     HandshakeService, IpPoolService, RoutingService, SessionManager,
 };
 use crate::services::memchain::{AofWriter, MemPool};
-use crate::services::memchain::aof::DEFAULT_AOF_FILENAME;
 
 // ============================================
 // Constants
@@ -150,9 +152,15 @@ impl Server {
         ));
 
         // ====================================================
-        // 🌟 Initialize MemChain storage engine
+        // 🌟 Initialize MemChain storage engine (if enabled)
         // ====================================================
-        let (mempool, aof_writer) = self.init_memchain().await?;
+        let (mempool, aof_writer) = if self.config.memchain.is_enabled() {
+            let (mp, aw) = self.init_memchain().await?;
+            (Some(mp), Some(aw))
+        } else {
+            info!("[MEMCHAIN] MemChain is disabled (mode=off)");
+            (None, None)
+        };
 
         // Initialize transport
         let udp = Arc::new(
@@ -179,8 +187,8 @@ impl Server {
             Arc::clone(&packet_handler),
             Arc::clone(&sessions),
             session_event_sender.clone(),
-            Arc::clone(&mempool),
-            Arc::clone(&aof_writer),
+            mempool.clone(),
+            aof_writer.clone(),
         );
         tasks.push(("udp", udp_task));
 
@@ -203,6 +211,20 @@ impl Server {
             session_event_sender.clone(),
         );
         tasks.push(("cleanup", cleanup_task));
+
+        // ====================================================
+        // 🌟 Start MemChain Agent API (if enabled)
+        // ====================================================
+        if let (Some(ref mp), Some(ref aw)) = (&mempool, &aof_writer) {
+            let api_task = start_api_server(
+                self.config.memchain.api_listen_addr,
+                Arc::clone(mp),
+                Arc::clone(aw),
+                self.identity.clone(),
+                self.shutdown_tx.subscribe(),
+            );
+            tasks.push(("memchain-api", api_task));
+        }
 
         info!("Server started successfully");
 
@@ -228,11 +250,15 @@ impl Server {
             warn!("UDP shutdown error: {}", e);
         }
 
-        info!(
-            mempool_facts = mempool.count(),
-            aof_writes = aof_writer.lock().await.write_count(),
-            "Server shutdown complete (MemChain stats)"
-        );
+        if let (Some(ref mp), Some(ref aw)) = (&mempool, &aof_writer) {
+            info!(
+                mempool_facts = mp.count(),
+                aof_writes = aw.lock().await.write_count(),
+                "Server shutdown complete (MemChain stats)"
+            );
+        } else {
+            info!("Server shutdown complete");
+        }
         Ok(())
     }
 
@@ -245,7 +271,7 @@ impl Server {
     /// 1. Opens (or creates) the `.memchain` AOF file.
     /// 2. Replays existing facts from disk into MemPool.
     async fn init_memchain(&self) -> Result<(Arc<MemPool>, Arc<TokioMutex<AofWriter>>)> {
-        let aof_path = DEFAULT_AOF_FILENAME;
+        let aof_path = &self.config.memchain.aof_path;
 
         // Replay existing facts from disk
         let existing_facts = AofWriter::replay(aof_path)
@@ -411,8 +437,8 @@ impl Server {
         packet_handler: Arc<PacketHandler>,
         sessions: Arc<SessionManager>,
         session_events: SessionEventSender,
-        mempool: Arc<MemPool>,
-        aof_writer: Arc<TokioMutex<AofWriter>>,
+        mempool: Option<Arc<MemPool>>,
+        aof_writer: Option<Arc<TokioMutex<AofWriter>>>,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
