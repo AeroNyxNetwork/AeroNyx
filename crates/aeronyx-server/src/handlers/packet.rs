@@ -70,8 +70,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use bytes::{Bytes, BytesMut};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use aeronyx_common::types::SessionId;
 use aeronyx_core::crypto::transport::{DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD};
