@@ -1,6 +1,3 @@
-// ============================================
-// File: crates/aeronyx-server/src/server.rs
-// ============================================
 //! # Server Orchestrator
 //!
 //! ## Creation Reason
@@ -12,6 +9,9 @@
 //! - Added CMS management integration (heartbeat + session reporting).
 //! - 🌟 Added MemChain integration: MemPool + AofWriter initialisation,
 //!   1st-byte multiplexing dispatch in UDP task, AOF replay on startup.
+//! - 🐛 Fixed E0308: handle_memchain_message called with Option<Arc<…>>
+//!   instead of &Arc<…>. Now guarded with if-let at the call site and
+//!   logs a warning if MemChain traffic arrives while the engine is disabled.
 //!
 //! ## Main Functionality
 //! - `Server`: Main server struct and lifecycle management
@@ -40,12 +40,14 @@
 //! - 🌟 MemPool is Arc<MemPool> (DashMap is internally sync)
 //! - 🌟 AofWriter is Arc<TokioMutex<AofWriter>> (file needs exclusive access)
 //! - 🌟 AOF replay happens before UDP task starts
+//! - 🌟 mempool / aof_writer are Option — always guard with if-let before use
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial server implementation
 //! v0.1.1 - Added Keepalive packet handling
 //! v0.2.0 - Added CMS management integration
 //! v0.3.0 - 🌟 Added MemChain integration (MemPool, AofWriter, 1st-byte dispatch)
+//! v0.3.1 - 🐛 Fixed Option<Arc<…>> type mismatch in handle_memchain_message
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -464,7 +466,7 @@ impl Server {
                                     "[UDP_RX] Received {} bytes from {}, first_byte=0x{:02X}",
                                     len,
                                     source.addr,
-                                    data.get(0).copied().unwrap_or(0)
+                                    data.first().copied().unwrap_or(0)
                                 );
 
                                 // ========== Dispatch by outer message type ==========
@@ -588,6 +590,12 @@ impl Server {
                                             }
 
                                             // ---- 🌟 MemChain → route to MemPool ----
+                                            //
+                                            // 🐛 FIX (v0.3.1): `mempool` and `aof_writer`
+                                            // are `Option<Arc<…>>` because MemChain may be
+                                            // disabled. We guard with `if let` and log a
+                                            // warning when traffic arrives but the engine
+                                            // is off.
                                             Ok((session, DecryptedPayload::MemChain(msg))) => {
                                                 debug!(
                                                     "[MEMCHAIN_RX] ✅ MemChain msg from session {}, type={:?}",
@@ -595,11 +603,20 @@ impl Server {
                                                     std::mem::discriminant(&msg)
                                                 );
 
-                                                Self::handle_memchain_message(
-                                                    msg,
-                                                    &mempool,
-                                                    &aof_writer,
-                                                ).await;
+                                                if let (Some(ref mp), Some(ref aw)) = (&mempool, &aof_writer) {
+                                                    Self::handle_memchain_message(
+                                                        msg,
+                                                        mp,
+                                                        aw,
+                                                    ).await;
+                                                } else {
+                                                    warn!(
+                                                        "[MEMCHAIN_RX] ⚠️ MemChain message received \
+                                                         from session {} but MemChain engine is \
+                                                         disabled — dropping message",
+                                                        session.id
+                                                    );
+                                                }
                                             }
 
                                             // ---- Error ----
@@ -625,7 +642,7 @@ impl Server {
                                     _ => {
                                         debug!(
                                             "[UDP_RX] Unknown message type 0x{:02X} from {}",
-                                            data.get(0).copied().unwrap_or(0),
+                                            data.first().copied().unwrap_or(0),
                                             source.addr
                                         );
                                     }
