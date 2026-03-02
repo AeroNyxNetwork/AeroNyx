@@ -8,74 +8,58 @@
 //! MemChain ledger. This is the "front door" for OpenClaw and other
 //! tools to write and read memory Facts.
 //!
+//! ## Modification Reason
+//! - 🌟 v0.4.0: Added P2P broadcast on `POST /api/fact` — after storing
+//!   locally, the Fact is encrypted and sent to all connected sessions.
+//! - 🌟 v0.4.0: Added `POST /api/sync` endpoint to trigger P2P catch-up
+//!   (broadcasts a SyncRequest to all connected peers).
+//! - 🌟 v0.4.0: `ApiState` extended with `sessions`, `udp`, `crypto`,
+//!   and `memchain_config` for P2P operations.
+//!
 //! ## Main Functionality
 //! - `start_api_server()` — spawn the axum server as a tokio task
-//! - `POST /api/fact` — create a new Fact (JSON → sign → MemPool → AOF)
+//! - `POST /api/fact` — create a new Fact (JSON → sign → MemPool → AOF → broadcast)
 //! - `GET /api/facts?n=10` — query recent Facts from MemPool
 //! - `GET /api/status` — MemChain health check (pool size, AOF writes)
+//! - `POST /api/sync` — 🌟 trigger P2P SyncRequest broadcast
 //!
 //! ## Request / Response Formats
 //!
 //! ### POST /api/fact
 //! ```json
 //! // Request
-//! {
-//!   "subject": "user.preference",
-//!   "predicate": "favorite_language",
-//!   "object": "Rust"
-//! }
-//!
+//! { "subject": "user.preference", "predicate": "favorite_language", "object": "Rust" }
 //! // Response (201 Created)
-//! {
-//!   "fact_id": "a1b2c3d4...",
-//!   "timestamp": 1700000000,
-//!   "subject": "user.preference",
-//!   "predicate": "favorite_language",
-//!   "object": "Rust",
-//!   "origin": "ab12cd34...",
-//!   "signature": "ef56..."
-//! }
+//! { "fact_id": "a1b2c3d4...", "timestamp": 1700000000, "subject": "...", ... }
 //! ```
 //!
-//! ### GET /api/facts?n=10
+//! ### POST /api/sync
 //! ```json
+//! // Request: empty body
 //! // Response (200 OK)
-//! {
-//!   "count": 2,
-//!   "facts": [
-//!     { "fact_id": "...", "subject": "...", ... },
-//!     { "fact_id": "...", "subject": "...", ... }
-//!   ]
-//! }
-//! ```
-//!
-//! ### GET /api/status
-//! ```json
-//! {
-//!   "memchain_enabled": true,
-//!   "mode": "local",
-//!   "mempool_count": 42,
-//!   "mempool_total_accepted": 100,
-//!   "mempool_total_rejected": 3,
-//!   "aof_writes": 97
-//! }
+//! { "status": "sync_requested", "last_known_hash": "abc123...", "peers_contacted": 5 }
 //! ```
 //!
 //! ## Dependencies
 //! - `axum` for HTTP routing
 //! - `aeronyx_core::crypto::IdentityKeyPair` for Ed25519 signing
+//! - `aeronyx_core::crypto::transport::{TransportCrypto, DefaultTransportCrypto}` for encryption
 //! - `aeronyx_core::ledger::Fact` for data model
+//! - `aeronyx_core::protocol::memchain::encode_memchain` for 0xAE encoding
 //! - `MemPool` and `AofWriter` from services
+//! - `SessionManager` and `UdpTransport` for P2P
 //!
 //! ## ⚠️ Important Note for Next Developer
 //! - All handlers are non-blocking (async, no `block_in_place`).
 //! - AofWriter is behind `TokioMutex` — hold the lock briefly.
 //! - Fact signing uses the server's own IdentityKeyPair.
-//! - Future: add `POST /api/broadcast` to trigger P2P push.
-//! - Future: add authentication (API key / JWT) if binding to non-loopback.
+//! - P2P broadcast failures for individual sessions are logged but
+//!   do NOT fail the API response.
+//! - Broadcast is fire-and-forget via `tokio::spawn`.
 //!
 //! ## Last Modified
 //! v0.3.0 - 🌟 Initial API implementation for MemChain Phase 1
+//! v0.4.0 - 🌟 P2P broadcast on fact creation + POST /api/sync
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -90,12 +74,20 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use aeronyx_core::crypto::IdentityKeyPair;
+use aeronyx_core::crypto::transport::{DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD};
 use aeronyx_core::ledger::Fact;
+use aeronyx_core::protocol::codec::encode_data_packet;
+use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
+use aeronyx_core::protocol::DataPacket;
+use aeronyx_transport::traits::Transport;
+use aeronyx_transport::UdpTransport;
 
+use crate::config::MemChainConfig;
 use crate::services::memchain::{AofWriter, MemPool};
+use crate::services::SessionManager;
 
 // ============================================
 // Shared State
@@ -111,6 +103,14 @@ pub struct ApiState {
     pub aof_writer: Arc<TokioMutex<AofWriter>>,
     /// Server identity for signing new Facts.
     pub identity: IdentityKeyPair,
+    /// 🌟 Session manager for enumerating connected peers.
+    pub sessions: Arc<SessionManager>,
+    /// 🌟 UDP transport for sending P2P messages.
+    pub udp: Arc<UdpTransport>,
+    /// 🌟 Transport crypto for encrypting outbound messages.
+    pub crypto: DefaultTransportCrypto,
+    /// 🌟 MemChain config (for mode check).
+    pub memchain_config: MemChainConfig,
 }
 
 // ============================================
@@ -199,6 +199,110 @@ pub struct StatusResponse {
     pub aof_writes: u64,
 }
 
+/// Response for `POST /api/sync`.
+#[derive(Debug, Serialize)]
+pub struct SyncResponse {
+    /// Status message.
+    pub status: String,
+    /// Last known hash (hex), or null if pool is empty.
+    pub last_known_hash: Option<String>,
+    /// Number of peers the sync request was sent to.
+    pub peers_contacted: usize,
+}
+
+// ============================================
+// P2P Broadcast Helper
+// ============================================
+
+/// Encrypts a MemChain message and sends it to all connected sessions.
+///
+/// This is fire-and-forget: individual session failures are logged but
+/// do not propagate errors. The function is designed to be called from
+/// a `tokio::spawn` context.
+///
+/// # Arguments
+/// * `msg` - The MemChainMessage to broadcast
+/// * `sessions` - Session manager to enumerate peers
+/// * `udp` - UDP transport for sending
+/// * `crypto` - Transport crypto for per-session encryption
+async fn broadcast_to_all_sessions(
+    msg: MemChainMessage,
+    sessions: Arc<SessionManager>,
+    udp: Arc<UdpTransport>,
+    crypto: DefaultTransportCrypto,
+) -> usize {
+    // Encode the MemChain message with 0xAE prefix
+    let plaintext = match encode_memchain(&msg) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("[API_BROADCAST] ❌ Failed to encode MemChain message: {}", e);
+            return 0;
+        }
+    };
+
+    let all_sessions = sessions.all_sessions();
+    let mut sent_count = 0usize;
+
+    for session in &all_sessions {
+        if !session.is_established() {
+            continue;
+        }
+
+        // Get next TX counter for this session
+        let counter = session.next_tx_counter();
+
+        // Encrypt plaintext with session's key
+        let encrypted_len = plaintext.len() + ENCRYPTION_OVERHEAD;
+        let mut encrypted = vec![0u8; encrypted_len];
+        let actual_len = match crypto.encrypt(
+            &session.session_key,
+            counter,
+            session.id.as_bytes(),
+            &plaintext,
+            &mut encrypted,
+        ) {
+            Ok(len) => len,
+            Err(e) => {
+                warn!(
+                    session_id = %session.id,
+                    error = %e,
+                    "[API_BROADCAST] ⚠️ Encryption failed, skipping session"
+                );
+                continue;
+            }
+        };
+        encrypted.truncate(actual_len);
+
+        // Build DataPacket
+        let data_packet = DataPacket::new(
+            *session.id.as_bytes(),
+            counter,
+            encrypted,
+        );
+
+        let packet_bytes = encode_data_packet(&data_packet).to_vec();
+
+        // Send via UDP
+        if let Err(e) = udp.send(&packet_bytes, &session.client_endpoint).await {
+            warn!(
+                session_id = %session.id,
+                endpoint = %session.client_endpoint,
+                error = %e,
+                "[API_BROADCAST] ⚠️ UDP send failed, skipping session"
+            );
+            continue;
+        }
+
+        sent_count += 1;
+        debug!(
+            session_id = %session.id,
+            "[API_BROADCAST] ✅ Sent to session"
+        );
+    }
+
+    sent_count
+}
+
 // ============================================
 // Route Handlers
 // ============================================
@@ -210,7 +314,8 @@ pub struct StatusResponse {
 /// 3. Sign the hash with server's Ed25519 key.
 /// 4. Add to MemPool (hash validation + dedup).
 /// 5. Persist to AOF.
-/// 6. Return the signed Fact as JSON.
+/// 6. 🌟 If P2P mode: broadcast to all connected sessions.
+/// 7. Return the signed Fact as JSON.
 async fn create_fact(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateFactRequest>,
@@ -266,16 +371,28 @@ async fn create_fact(
                 "[API] ❌ AOF write failed"
             );
             // Fact is in MemPool but not persisted — log but don't fail the request
-            // (it will be persisted on next write or recovered from MemPool)
         }
     }
 
-    // TODO (Phase 2): If P2P mode is enabled, broadcast the Fact:
-    // 1. Encode: encode_memchain(&MemChainMessage::BroadcastFact(fact.clone()))
-    // 2. For each connected session: encrypt with session key → send via UDP
+    // 🌟 P2P broadcast (if enabled)
+    if state.memchain_config.is_p2p() {
+        let msg = MemChainMessage::BroadcastFact(fact.clone());
+        let sessions = Arc::clone(&state.sessions);
+        let udp = Arc::clone(&state.udp);
+        let crypto = state.crypto.clone();
+
+        // Fire-and-forget: don't block the HTTP response
+        tokio::spawn(async move {
+            let count = broadcast_to_all_sessions(msg, sessions, udp, crypto).await;
+            info!(
+                fact_id = %fact_id_hex,
+                peers_sent = count,
+                "[API] 📡 BroadcastFact sent to peers"
+            );
+        });
+    }
 
     info!(
-        fact_id = %fact_id_hex,
         pool_size = state.mempool.count(),
         "[API] ✅ Fact created and stored"
     );
@@ -312,13 +429,79 @@ async fn status(
         writer.write_count()
     };
 
+    let mode_str = if state.memchain_config.is_p2p() {
+        "p2p"
+    } else {
+        "local"
+    };
+
     let body = StatusResponse {
         memchain_enabled: true,
-        mode: "local".to_string(),
+        mode: mode_str.to_string(),
         mempool_count: state.mempool.count(),
         mempool_total_accepted: state.mempool.total_accepted(),
         mempool_total_rejected: state.mempool.total_rejected(),
         aof_writes,
+    };
+
+    (StatusCode::OK, Json(body))
+}
+
+/// `POST /api/sync` — 🌟 Trigger P2P catch-up.
+///
+/// Broadcasts a `SyncRequest` to all connected sessions, asking them
+/// to send any Facts this node is missing.
+///
+/// The `last_known_hash` is the `fact_id` of the most recently inserted
+/// Fact in the local MemPool. If the pool is empty, `[0u8; 32]` is sent
+/// (meaning "give me everything").
+async fn trigger_sync(
+    State(state): State<Arc<ApiState>>,
+) -> impl IntoResponse {
+    if !state.memchain_config.is_p2p() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "P2P sync is only available in p2p mode. Current mode: local"
+            })),
+        );
+    }
+
+    // Determine last known hash
+    let last_hash = state.mempool.last_fact_id().unwrap_or([0u8; 32]);
+    let last_hash_hex = if last_hash == [0u8; 32] {
+        None
+    } else {
+        Some(hex::encode(last_hash))
+    };
+
+    // Build SyncRequest
+    let msg = MemChainMessage::SyncRequest {
+        last_known_hash: last_hash,
+    };
+
+    let sessions = Arc::clone(&state.sessions);
+    let udp = Arc::clone(&state.udp);
+    let crypto = state.crypto.clone();
+
+    // Broadcast SyncRequest to all peers
+    let peers_contacted = broadcast_to_all_sessions(
+        msg,
+        sessions,
+        udp,
+        crypto,
+    ).await;
+
+    info!(
+        last_known_hash = ?last_hash_hex,
+        peers_contacted = peers_contacted,
+        "[API] 📡 SyncRequest broadcast complete"
+    );
+
+    let body = SyncResponse {
+        status: "sync_requested".to_string(),
+        last_known_hash: last_hash_hex,
+        peers_contacted,
     };
 
     (StatusCode::OK, Json(body))
@@ -334,6 +517,7 @@ fn build_router(state: Arc<ApiState>) -> Router {
         .route("/api/fact", post(create_fact))
         .route("/api/facts", get(list_facts))
         .route("/api/status", get(status))
+        .route("/api/sync", post(trigger_sync))
         .with_state(state)
 }
 
@@ -348,6 +532,9 @@ fn build_router(state: Arc<ApiState>) -> Router {
 /// * `mempool` - Shared MemPool instance
 /// * `aof_writer` - Shared AofWriter instance
 /// * `identity` - Server's Ed25519 identity for signing Facts
+/// * `sessions` - 🌟 Session manager for P2P broadcast
+/// * `udp` - 🌟 UDP transport for sending P2P messages
+/// * `memchain_config` - 🌟 MemChain configuration (mode, trust)
 /// * `shutdown_rx` - Broadcast receiver for graceful shutdown
 ///
 /// # Returns
@@ -357,12 +544,19 @@ pub fn start_api_server(
     mempool: Arc<MemPool>,
     aof_writer: Arc<TokioMutex<AofWriter>>,
     identity: IdentityKeyPair,
+    sessions: Arc<SessionManager>,
+    udp: Arc<UdpTransport>,
+    memchain_config: MemChainConfig,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     let state = Arc::new(ApiState {
         mempool,
         aof_writer,
         identity,
+        sessions,
+        udp,
+        crypto: DefaultTransportCrypto::new(),
+        memchain_config,
     });
 
     let app = build_router(state);
@@ -410,37 +604,39 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt; // for `oneshot`
 
-    fn make_test_state() -> Arc<ApiState> {
+    /// Helper to build a test state with real AOF (needed for write tests).
+    /// Sessions / UDP / crypto are stubbed out since P2P is not tested here.
+    async fn make_test_state_with_aof(aof_path: &std::path::Path) -> Arc<ApiState> {
+        let aof = AofWriter::open(aof_path).await.unwrap();
+
+        // We need a real UdpTransport for the state struct, but won't
+        // actually send anything in local-mode tests.
+        let udp = Arc::new(
+            UdpTransport::bind_addr("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap()
+        );
+
         Arc::new(ApiState {
             mempool: Arc::new(MemPool::new()),
-            aof_writer: Arc::new(TokioMutex::new(
-                // We can't easily create AofWriter in tests without a file,
-                // so we'll test routes that don't need AOF separately.
-                // For integration tests, use tempfile.
-                unreachable!("AOF not used in unit route tests"),
-            )),
+            aof_writer: Arc::new(TokioMutex::new(aof)),
             identity: IdentityKeyPair::generate(),
+            sessions: Arc::new(SessionManager::new(100, std::time::Duration::from_secs(300))),
+            udp,
+            crypto: DefaultTransportCrypto::new(),
+            memchain_config: MemChainConfig::default(), // local mode
         })
     }
 
     #[tokio::test]
     async fn test_status_endpoint() {
-        // Create a minimal state without AOF (status reads write_count via lock)
-        let mempool = Arc::new(MemPool::new());
-        // Add a test fact
-        let fact = Fact::new(100, "s".into(), "p".into(), "o".into());
-        mempool.add_fact(fact);
-
-        // For status test, we need a real AOF
         let dir = tempfile::tempdir().unwrap();
         let aof_path = dir.path().join(".memchain");
-        let aof = AofWriter::open(&aof_path).await.unwrap();
+        let state = make_test_state_with_aof(&aof_path).await;
 
-        let state = Arc::new(ApiState {
-            mempool,
-            aof_writer: Arc::new(TokioMutex::new(aof)),
-            identity: IdentityKeyPair::generate(),
-        });
+        // Add a test fact
+        let fact = Fact::new(100, "s".into(), "p".into(), "o".into());
+        state.mempool.add_fact(fact);
 
         let app = build_router(state);
 
@@ -457,19 +653,14 @@ mod tests {
 
         assert_eq!(json["memchain_enabled"], true);
         assert_eq!(json["mempool_count"], 1);
+        assert_eq!(json["mode"], "local");
     }
 
     #[tokio::test]
     async fn test_create_and_list_facts() {
         let dir = tempfile::tempdir().unwrap();
         let aof_path = dir.path().join(".memchain");
-        let aof = AofWriter::open(&aof_path).await.unwrap();
-
-        let state = Arc::new(ApiState {
-            mempool: Arc::new(MemPool::new()),
-            aof_writer: Arc::new(TokioMutex::new(aof)),
-            identity: IdentityKeyPair::generate(),
-        });
+        let state = make_test_state_with_aof(&aof_path).await;
 
         let app = build_router(state);
 
@@ -509,13 +700,7 @@ mod tests {
     async fn test_create_fact_empty_fields_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let aof_path = dir.path().join(".memchain");
-        let aof = AofWriter::open(&aof_path).await.unwrap();
-
-        let state = Arc::new(ApiState {
-            mempool: Arc::new(MemPool::new()),
-            aof_writer: Arc::new(TokioMutex::new(aof)),
-            identity: IdentityKeyPair::generate(),
-        });
+        let state = make_test_state_with_aof(&aof_path).await;
 
         let app = build_router(state);
 
@@ -524,6 +709,24 @@ mod tests {
             .uri("/api/fact")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"subject":"","predicate":"likes","object":"Rust"}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_sync_rejected_in_local_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let aof_path = dir.path().join(".memchain");
+        let state = make_test_state_with_aof(&aof_path).await;
+
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/sync")
+            .body(Body::empty())
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
