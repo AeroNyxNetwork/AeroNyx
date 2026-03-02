@@ -3,40 +3,15 @@
 // ============================================
 //! # AeroNyx Server Entry Point
 //!
-//! ## Creation Reason
-//! Main entry point for the AeroNyx privacy network server binary.
-//! Handles CLI parsing, logging setup, and server initialization.
-//!
-//! ## Main Functionality
-//! - CLI argument parsing with clap
-//! - Logging initialization with tracing
-//! - Configuration loading
-//! - Node registration with CMS
-//! - Server execution
-//!
-//! ## Usage
-//! ```bash
-//! # Step 1: Register node (get code from web dashboard)
-//! aeronyx-server register --code NYX-1234-ABCDE
-//!
-//! # Step 2: Start server
-//! aeronyx-server start
-//!
-//! # Other commands
-//! aeronyx-server status              # Check registration status
-//! aeronyx-server validate            # Validate config file
-//! aeronyx-server pubkey              # Show node public key (for troubleshooting)
-//! ```
-//!
-//! ## ⚠️ Important Note for Next Developer
-//! - Server requires root or CAP_NET_ADMIN for TUN
-//! - Node MUST be registered before starting
-//! - Key is auto-generated during registration (user doesn't need to know)
-//! - Use systemd for production deployments
+//! ## Modification Reason
+//! - 🌟 Added MemChain status display in `status` command (AOF file size,
+//!   mode, API address).
+//! - 🌟 Added MemChain config display in `validate` command.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
 //! v0.2.0 - Added register command, simplified user flow
+//! v0.3.0 - 🌟 Added MemChain status and config display
 
 use std::path::PathBuf;
 
@@ -53,16 +28,10 @@ use aeronyx_server::management::models::StoredNodeInfo;
 // ============================================
 
 /// AeroNyx Privacy Network Server
-///
-/// Quick Start:
-///   1. Get registration code from https://dashboard.aeronyx.network
-///   2. Run: aeronyx-server register --code <YOUR_CODE>
-///   3. Run: aeronyx-server start
 #[derive(Parser, Debug)]
 #[command(name = "aeronyx-server")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Subcommand to execute
     #[command(subcommand)]
     command: Commands,
 }
@@ -70,10 +39,6 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Register this node with AeroNyx network
-    ///
-    /// Get your registration code from the AeroNyx dashboard.
-    /// This command will automatically generate a secure key pair
-    /// and bind this node to your account.
     Register {
         /// Registration code from dashboard (e.g., NYX-1234-ABCDE)
         #[arg(short = 'C', long)]
@@ -89,8 +54,6 @@ enum Commands {
     },
 
     /// Start the server
-    ///
-    /// Node must be registered first. Run 'register' command if not done yet.
     Start {
         /// Path to configuration file
         #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
@@ -130,13 +93,9 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
-    // Parse CLI arguments
     let cli = Cli::parse();
-
-    // Initialize logging
     init_logging("info");
 
-    // Execute command
     let result = match cli.command {
         Commands::Register { code, config, cms_url } => {
             cmd_register(code, config, cms_url).await
@@ -147,7 +106,6 @@ async fn main() {
         Commands::Pubkey { config, format } => cmd_pubkey(config, format).await,
     };
 
-    // Handle errors
     if let Err(e) = result {
         error!("{}", e);
         std::process::exit(1);
@@ -168,12 +126,10 @@ async fn cmd_register(
     println!("════════════════════════════════════════");
     println!();
 
-    // Load config
     let config = load_or_default_config(&config_path).await;
     let key_path = PathBuf::from(&config.server_key.key_file);
     let node_info_path = &config.management.node_info_path;
 
-    // Check if already registered
     if std::path::Path::new(node_info_path).exists() {
         if let Ok(info) = StoredNodeInfo::load(node_info_path) {
             println!("⚠️  This node is already registered!");
@@ -188,7 +144,6 @@ async fn cmd_register(
         }
     }
 
-    // Generate or load key (user doesn't need to know this detail)
     let identity = if key_path.exists() {
         info!("Loading existing node key...");
         load_key(&key_path).await?
@@ -199,13 +154,11 @@ async fn cmd_register(
         identity
     };
 
-    // Build management config
     let mut mgmt_config = config.management.clone();
     if let Some(url) = cms_url_override {
         mgmt_config.cms_url = url;
     }
 
-    // Create management client and register
     let client = ManagementClient::new(mgmt_config.clone(), identity);
 
     println!("📡 Connecting to AeroNyx network...");
@@ -213,7 +166,6 @@ async fn cmd_register(
 
     match client.register_node(&code).await {
         Ok(node_info) => {
-            // Save node info
             let stored = StoredNodeInfo {
                 node_id: node_info.id.clone(),
                 owner_wallet: node_info.owner_wallet.clone(),
@@ -255,7 +207,6 @@ async fn cmd_register(
 async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
     info!("Starting AeroNyx server...");
 
-    // Load configuration
     let config = if config_path.exists() {
         ServerConfig::load(&config_path).await?
     } else {
@@ -263,15 +214,11 @@ async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
         ServerConfig::default()
     };
 
-    // Re-initialize logging with config level
     init_logging(&config.logging.level);
 
     let key_path = PathBuf::from(&config.server_key.key_file);
     let node_info_path = &config.management.node_info_path;
 
-    // ========================================
-    // Check registration (MANDATORY)
-    // ========================================
     if !std::path::Path::new(node_info_path).exists() {
         println!();
         println!("❌ Node is not registered!");
@@ -285,7 +232,6 @@ async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    // Load registration info
     let node_info = match StoredNodeInfo::load(node_info_path) {
         Ok(info) => info,
         Err(e) => {
@@ -300,7 +246,6 @@ async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
         }
     };
 
-    // Load server key
     let identity = if key_path.exists() {
         load_key(&key_path).await?
     } else {
@@ -318,14 +263,13 @@ async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
     info!("Owner:      {}", node_info.owner_wallet);
     info!("════════════════════════════════════════");
 
-    // Create and run server
     let server = Server::new(config, identity);
     server.run().await?;
 
     Ok(())
 }
 
-/// Shows node registration status.
+/// Shows node registration status + 🌟 MemChain status.
 async fn cmd_status(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_or_default_config(&config_path).await;
     let node_info_path = &config.management.node_info_path;
@@ -373,13 +317,48 @@ async fn cmd_status(config_path: PathBuf) -> anyhow::Result<()> {
     }
 
     println!();
+
+    // ====================================================
+    // 🌟 MemChain Status
+    // ====================================================
+    println!("MemChain:");
+    println!("   Mode:          {:?}", config.memchain.mode);
+
+    if config.memchain.is_enabled() {
+        println!("   API Address:   {}", config.memchain.api_listen_addr);
+        println!("   AOF Path:      {}", config.memchain.aof_path);
+
+        // Check AOF file size
+        let aof_path = std::path::Path::new(&config.memchain.aof_path);
+        if aof_path.exists() {
+            match std::fs::metadata(aof_path) {
+                Ok(meta) => {
+                    let size_kb = meta.len() as f64 / 1024.0;
+                    if size_kb < 1024.0 {
+                        println!("   AOF Size:      {:.1} KB", size_kb);
+                    } else {
+                        println!("   AOF Size:      {:.2} MB", size_kb / 1024.0);
+                    }
+                }
+                Err(_) => {
+                    println!("   AOF Size:      ⚠️  Could not read");
+                }
+            }
+        } else {
+            println!("   AOF File:      (not yet created — will be created on first write)");
+        }
+    } else {
+        println!("   Status:        Disabled");
+    }
+
+    println!();
     println!("════════════════════════════════════════");
     println!();
 
     Ok(())
 }
 
-/// Validates configuration file.
+/// Validates configuration file + 🌟 shows MemChain config.
 async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
     if !config_path.exists() {
         println!("⚠️  Config file not found: {}", config_path.display());
@@ -388,7 +367,7 @@ async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
     }
 
     let config = ServerConfig::load(&config_path).await?;
-    
+
     println!("✅ Configuration is valid");
     println!();
     println!("Network:");
@@ -410,6 +389,15 @@ async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
     println!("   Session Timeout:  {}s", config.session_timeout_secs());
     println!();
 
+    // 🌟 MemChain config
+    println!("MemChain:");
+    println!("   Mode:             {:?}", config.memchain.mode);
+    if config.memchain.is_enabled() {
+        println!("   API Listen:       {}", config.memchain.api_listen_addr);
+        println!("   AOF Path:         {}", config.memchain.aof_path);
+    }
+    println!();
+
     Ok(())
 }
 
@@ -425,12 +413,12 @@ async fn cmd_pubkey(config_path: PathBuf, format: String) -> anyhow::Result<()> 
     }
 
     let identity = load_key(&key_path).await?;
-    
+
     match format.as_str() {
         "base64" => println!("{}", identity.public_key()),
         "hex" | _ => println!("{}", hex::encode(identity.public_key_bytes())),
     }
-    
+
     Ok(())
 }
 
@@ -438,7 +426,6 @@ async fn cmd_pubkey(config_path: PathBuf, format: String) -> anyhow::Result<()> 
 // Helper Functions
 // ============================================
 
-/// Initializes the tracing subscriber.
 fn init_logging(level: &str) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(level));
@@ -450,7 +437,6 @@ fn init_logging(level: &str) {
         .ok();
 }
 
-/// Loads config or returns default.
 async fn load_or_default_config(path: &PathBuf) -> ServerConfig {
     if path.exists() {
         ServerConfig::load(path).await.unwrap_or_default()
@@ -459,25 +445,22 @@ async fn load_or_default_config(path: &PathBuf) -> ServerConfig {
     }
 }
 
-/// Loads a server key from a JSON file.
 async fn load_key(path: &PathBuf) -> anyhow::Result<IdentityKeyPair> {
     let content = tokio::fs::read_to_string(path).await?;
     let key_data: KeyFile = serde_json::from_str(&content)?;
-    
+
     let private_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &key_data.private_key,
     )?;
-    
+
     let identity = IdentityKeyPair::from_bytes(&private_bytes)?;
     Ok(identity)
 }
 
-/// Saves a server key to a JSON file.
 async fn save_key(identity: &IdentityKeyPair, path: &PathBuf) -> anyhow::Result<()> {
     use base64::Engine;
 
-    // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -493,7 +476,6 @@ async fn save_key(identity: &IdentityKeyPair, path: &PathBuf) -> anyhow::Result<
     let content = serde_json::to_string_pretty(&key_data)?;
     tokio::fs::write(path, content).await?;
 
-    // Set restrictive permissions on Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -505,18 +487,16 @@ async fn save_key(identity: &IdentityKeyPair, path: &PathBuf) -> anyhow::Result<
     Ok(())
 }
 
-/// Returns current timestamp as ISO 8601 string.
 fn chrono_lite_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    
+
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    
+
     format!("{}Z", duration.as_secs())
 }
 
-/// Server key file format (internal, user doesn't need to know).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct KeyFile {
     version: String,
