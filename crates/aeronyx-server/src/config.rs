@@ -8,7 +8,8 @@
 //! supporting TOML files and environment variables.
 //!
 //! ## Modification Reason
-//! Added ManagementConfig for CMS integration.
+//! - Added ManagementConfig for CMS integration.
+//! - 🌟 Added MemChainConfig for MemChain mode control and API listen address.
 //!
 //! ## Main Functionality
 //! - `ServerConfig`: Main configuration structure
@@ -24,6 +25,7 @@
 //! - `limits`: Connection and resource limits
 //! - `logging`: Log level
 //! - `management`: CMS integration settings (REQUIRED)
+//! - `memchain`: 🌟 MemChain mode and API settings (NEW)
 //!
 //! ## Example Configuration
 //! ```toml
@@ -46,16 +48,23 @@
 //! [management]
 //! cms_url = "https://api.aeronyx.network/api/privacy_network"
 //! heartbeat_interval_secs = 30
+//!
+//! [memchain]
+//! mode = "local"                       # "local", "p2p", or "off"
+//! api_listen_addr = "127.0.0.1:8421"   # Agent API bind address
+//! aof_path = ".memchain"               # Append-only ledger file
 //! ```
 //!
 //! ## ⚠️ Important Note for Next Developer
 //! - All config changes require server restart
 //! - Validate config before server startup
 //! - Node registration is MANDATORY for official network
+//! - MemChain API only binds to loopback by default (security)
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial configuration implementation
 //! v0.2.0 - Added management configuration for CMS integration
+//! v0.3.0 - 🌟 Added MemChainConfig for mode control and API settings
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -100,16 +109,14 @@ pub struct ServerConfig {
     /// Management/CMS configuration (REQUIRED for official network).
     #[serde(default)]
     pub management: ManagementConfig,
+
+    /// 🌟 MemChain configuration (mode, API, storage).
+    #[serde(default)]
+    pub memchain: MemChainConfig,
 }
 
 impl ServerConfig {
     /// Loads configuration from a TOML file.
-    ///
-    /// # Arguments
-    /// * `path` - Path to the configuration file
-    ///
-    /// # Errors
-    /// Returns error if file cannot be read or parsed.
     pub async fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let path_str = path.display().to_string();
@@ -143,11 +150,13 @@ impl ServerConfig {
         self.vpn.validate()?;
         self.tun.validate()?;
         self.limits.validate()?;
-        
+
         self.management.validate().map_err(|e| {
             ServerError::config_invalid("management", e)
         })?;
-        
+
+        self.memchain.validate()?;
+
         Ok(())
     }
 
@@ -212,6 +221,122 @@ impl Default for ServerConfig {
             limits: LimitsConfig::default(),
             logging: LoggingConfig::default(),
             management: ManagementConfig::default(),
+            memchain: MemChainConfig::default(),
+        }
+    }
+}
+
+// ============================================
+// 🌟 MemChainConfig (NEW)
+// ============================================
+
+/// MemChain operating mode.
+///
+/// Controls whether the MemChain storage engine and API are active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemChainMode {
+    /// MemChain is disabled — no MemPool, no AOF, no API.
+    Off,
+    /// Local-only mode — MemPool + AOF + local HTTP API, no P2P broadcast.
+    /// This is the default for MVP.
+    Local,
+    /// Full P2P mode — local storage + broadcast to connected peers.
+    /// (Phase 2, not yet implemented)
+    P2p,
+}
+
+impl Default for MemChainMode {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
+/// MemChain configuration section.
+///
+/// # Example TOML
+/// ```toml
+/// [memchain]
+/// mode = "local"
+/// api_listen_addr = "127.0.0.1:8421"
+/// aof_path = ".memchain"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemChainConfig {
+    /// Operating mode: "off", "local", or "p2p".
+    #[serde(default)]
+    pub mode: MemChainMode,
+
+    /// HTTP API listen address for Agent integration.
+    /// Defaults to loopback only for security.
+    #[serde(default = "default_memchain_api_addr")]
+    pub api_listen_addr: SocketAddr,
+
+    /// Path to the append-only ledger file.
+    #[serde(default = "default_memchain_aof_path")]
+    pub aof_path: String,
+}
+
+fn default_memchain_api_addr() -> SocketAddr {
+    "127.0.0.1:8421".parse().unwrap()
+}
+
+fn default_memchain_aof_path() -> String {
+    ".memchain".to_string()
+}
+
+impl MemChainConfig {
+    /// Validates the MemChain configuration.
+    pub fn validate(&self) -> Result<()> {
+        if self.mode != MemChainMode::Off {
+            // API port must not be zero
+            if self.api_listen_addr.port() == 0 {
+                return Err(ServerError::config_invalid(
+                    "memchain.api_listen_addr",
+                    "port cannot be 0",
+                ));
+            }
+
+            // AOF path must not be empty
+            if self.aof_path.is_empty() {
+                return Err(ServerError::config_invalid(
+                    "memchain.aof_path",
+                    "cannot be empty when memchain is enabled",
+                ));
+            }
+
+            // Warn (but allow) non-loopback API addresses
+            if !self.api_listen_addr.ip().is_loopback() {
+                tracing::warn!(
+                    "[MEMCHAIN] ⚠️ API is binding to non-loopback address {}. \
+                     This exposes the MemChain API to the network!",
+                    self.api_listen_addr
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns true if MemChain is enabled (local or p2p).
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.mode != MemChainMode::Off
+    }
+
+    /// Returns true if P2P broadcast is enabled.
+    #[must_use]
+    pub fn is_p2p(&self) -> bool {
+        self.mode == MemChainMode::P2p
+    }
+}
+
+impl Default for MemChainConfig {
+    fn default() -> Self {
+        Self {
+            mode: MemChainMode::default(),
+            api_listen_addr: default_memchain_api_addr(),
+            aof_path: default_memchain_aof_path(),
         }
     }
 }
@@ -550,6 +675,9 @@ mod tests {
         assert_eq!(config.vpn.virtual_ip_range, "100.64.0.0/24");
         assert_eq!(config.tun.device_name, "aeronyx0");
         assert_eq!(config.limits.max_connections, 1000);
+        // memchain should default to "local" when not specified
+        assert_eq!(config.memchain.mode, MemChainMode::Local);
+        assert!(config.memchain.is_enabled());
     }
 
     #[test]
@@ -557,14 +685,14 @@ mod tests {
         let toml = r#"
             [network]
             listen_addr = "0.0.0.0:51820"
-            
+
             [vpn]
             virtual_ip_range = "100.64.0.0/24"
             gateway_ip = "100.64.0.1"
 
             [tun]
             device_name = "aeronyx0"
-            
+
             [management]
             cms_url = "https://api.example.com/api/privacy_network"
             heartbeat_interval_secs = 30
@@ -576,10 +704,59 @@ mod tests {
     }
 
     #[test]
+    fn test_config_with_memchain() {
+        let toml = r#"
+            [network]
+            listen_addr = "0.0.0.0:51820"
+
+            [vpn]
+            virtual_ip_range = "100.64.0.0/24"
+            gateway_ip = "100.64.0.1"
+
+            [tun]
+            device_name = "aeronyx0"
+
+            [memchain]
+            mode = "local"
+            api_listen_addr = "127.0.0.1:9999"
+            aof_path = "/data/my.memchain"
+        "#;
+
+        let config = ServerConfig::from_str(toml).unwrap();
+        assert_eq!(config.memchain.mode, MemChainMode::Local);
+        assert_eq!(config.memchain.api_listen_addr.port(), 9999);
+        assert_eq!(config.memchain.aof_path, "/data/my.memchain");
+        assert!(config.memchain.is_enabled());
+        assert!(!config.memchain.is_p2p());
+    }
+
+    #[test]
+    fn test_config_memchain_off() {
+        let toml = r#"
+            [network]
+            listen_addr = "0.0.0.0:51820"
+
+            [vpn]
+            virtual_ip_range = "100.64.0.0/24"
+            gateway_ip = "100.64.0.1"
+
+            [tun]
+            device_name = "aeronyx0"
+
+            [memchain]
+            mode = "off"
+        "#;
+
+        let config = ServerConfig::from_str(toml).unwrap();
+        assert_eq!(config.memchain.mode, MemChainMode::Off);
+        assert!(!config.memchain.is_enabled());
+    }
+
+    #[test]
     fn test_parse_ip_range() {
         let config = VpnConfig::default();
         let (network, prefix) = config.parse_ip_range().unwrap();
-        
+
         assert_eq!(network, Ipv4Addr::new(100, 64, 0, 0));
         assert_eq!(prefix, 24);
     }
@@ -590,7 +767,7 @@ mod tests {
             listen_addr: default_listen_addr(),
             public_endpoint: Some("8.213.146.244:51820".to_string()),
         };
-        
+
         assert_eq!(config.public_ip(), Some(Ipv4Addr::new(8, 213, 146, 244)));
     }
 }
