@@ -65,7 +65,6 @@ use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::UdpTransport;
 
 use crate::api::start_api_server;
-use crate::config::MemChainMode;
 
 #[cfg(target_os = "linux")]
 use aeronyx_transport::LinuxTun;
