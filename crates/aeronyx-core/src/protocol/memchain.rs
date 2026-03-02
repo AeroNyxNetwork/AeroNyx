@@ -9,6 +9,12 @@
 //! to any network observer — they share the exact same session
 //! encryption, counter, and wire format as normal VPN traffic.
 //!
+//! ## Modification Reason
+//! - 🌟 v0.5.0: Added `BlockAnnounce(BlockHeader)` variant at the END
+//!   of the enum to preserve bincode discriminant compatibility.
+//!   This allows the Miner to broadcast lightweight block headers
+//!   (<100 bytes) over UDP without hitting MTU limits.
+//!
 //! ## Multiplexing Design (The 1st-Byte Hack)
 //! After decryption, the plaintext's first byte determines the payload type:
 //!
@@ -21,12 +27,6 @@
 //! └────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! `0xAE` was chosen because:
-//! - It does NOT collide with any IP version nibble (4 or 6).
-//! - It is the first byte of "AEronyx" — easy to remember.
-//! - It falls outside the valid IP version range, so no legitimate
-//!   VPN packet will ever start with this byte.
-//!
 //! ## Wire Format
 //! ```text
 //! ┌──────┬──────────────────────────────────────────────┐
@@ -34,40 +34,27 @@
 //! └──────┴──────────────────────────────────────────────┘
 //! ```
 //!
-//! ## Main Functionality
-//! - `MEMCHAIN_MAGIC`: The `0xAE` prefix constant.
-//! - `MemChainMessage` enum: All MemChain P2P operations.
-//! - `encode_memchain()` / `decode_memchain()`: Helpers that prepend /
-//!   strip the magic byte and (de)serialise with `bincode`.
-//!
-//! ## Dependencies
-//! - `serde` / `bincode` (workspace)
-//! - `aeronyx_core::ledger::Fact`
-//!
 //! ## ⚠️ Important Note for Next Developer
 //! - NEVER change `MEMCHAIN_MAGIC` — it would break all in-flight
 //!   MemChain traffic and the multiplexing router in `packet.rs`.
-//! - Adding new variants to `MemChainMessage` is safe (bincode handles
-//!   enum discriminants), but NEVER reorder or remove existing variants.
-//! - The `encode_memchain` output is what gets encrypted by the existing
-//!   `TransportCrypto::encrypt` — no additional encryption is needed.
+//! - Adding new variants to `MemChainMessage` is safe ONLY at the end.
+//!   NEVER reorder or remove existing variants (bincode discriminants).
+//! - `BlockAnnounce` carries only the header (~100 bytes), NOT the full
+//!   Block. Full block retrieval uses SyncRequest/SyncResponse.
 //!
 //! ## Last Modified
 //! v0.2.0 - Initial MemChain protocol messages for P2P memory sync
+//! v0.5.0 - 🌟 Added BlockAnnounce variant for Miner block broadcast
 
 use serde::{Deserialize, Serialize};
 
-use crate::ledger::Fact;
+use crate::ledger::{BlockHeader, Fact};
 
 // ============================================
 // Constants
 // ============================================
 
 /// Magic byte prepended to every MemChain plaintext payload.
-///
-/// Chosen to be outside the valid IP version nibble range (4/6)
-/// so that the multiplexer in `packet.rs` can distinguish MemChain
-/// traffic from normal VPN IP packets with a single byte peek.
 ///
 /// `0xAE` = first byte of "**AE**ronyx".
 pub const MEMCHAIN_MAGIC: u8 = 0xAE;
@@ -80,6 +67,21 @@ pub const MEMCHAIN_MAGIC: u8 = 0xAE;
 ///
 /// These are serialised with `bincode`, prefixed with [`MEMCHAIN_MAGIC`],
 /// and then encrypted inside a standard `DataPacket`.
+///
+/// ## Variant Ordering — STABLE CONTRACT
+/// bincode serialises enum discriminants by index. The order below
+/// MUST NOT change. New variants MUST be appended at the end.
+///
+/// | Index | Variant         | Added in |
+/// |-------|-----------------|----------|
+/// | 0     | BroadcastFact   | v0.2.0   |
+/// | 1     | SyncRequest     | v0.2.0   |
+/// | 2     | SyncResponse    | v0.2.0   |
+/// | 3     | QueryRequest    | v0.2.0   |
+/// | 4     | QueryResponse   | v0.2.0   |
+/// | 5     | Ping            | v0.2.0   |
+/// | 6     | Pong            | v0.2.0   |
+/// | 7     | BlockAnnounce   | v0.5.0   |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MemChainMessage {
     /// Broadcast a newly created Fact to peers.
@@ -120,6 +122,12 @@ pub enum MemChainMessage {
         /// Echoed nonce from the `Ping`.
         nonce: u64,
     },
+
+    /// 🌟 Announce a newly mined block (header only, <100 bytes).
+    ///
+    /// The full block is NOT broadcast over UDP (MTU risk).
+    /// Peers that want the full block content can use `SyncRequest`.
+    BlockAnnounce(BlockHeader),
 }
 
 // ============================================
@@ -127,13 +135,6 @@ pub enum MemChainMessage {
 // ============================================
 
 /// Encodes a `MemChainMessage` into a byte vector with the `0xAE` prefix.
-///
-/// The returned `Vec<u8>` is the **plaintext** that should be handed to
-/// `TransportCrypto::encrypt` in place of a normal IP packet.
-///
-/// # Errors
-/// Returns a bincode serialisation error on failure (should never happen
-/// for well-formed messages).
 pub fn encode_memchain(msg: &MemChainMessage) -> std::result::Result<Vec<u8>, bincode::Error> {
     let payload = bincode::serialize(msg)?;
     let mut buf = Vec::with_capacity(1 + payload.len());
@@ -145,12 +146,6 @@ pub fn encode_memchain(msg: &MemChainMessage) -> std::result::Result<Vec<u8>, bi
 /// Decodes a `MemChainMessage` from a plaintext slice whose first byte
 /// (`MEMCHAIN_MAGIC`) has **already been verified and stripped** by the
 /// caller.
-///
-/// # Arguments
-/// * `payload` - The bytes **after** the `0xAE` prefix.
-///
-/// # Errors
-/// Returns a bincode deserialisation error if the payload is malformed.
 pub fn decode_memchain(payload: &[u8]) -> std::result::Result<MemChainMessage, bincode::Error> {
     bincode::deserialize(payload)
 }
@@ -162,11 +157,10 @@ pub fn decode_memchain(payload: &[u8]) -> std::result::Result<MemChainMessage, b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::{BLOCK_TYPE_NORMAL, GENESIS_PREV_HASH};
 
     #[test]
     fn test_magic_does_not_collide_with_ip() {
-        // IPv4 packets start with 0x4X (typically 0x45)
-        // IPv6 packets start with 0x6X (typically 0x60)
         assert_ne!(MEMCHAIN_MAGIC >> 4, 4, "Must not collide with IPv4");
         assert_ne!(MEMCHAIN_MAGIC >> 4, 6, "Must not collide with IPv6");
     }
@@ -209,6 +203,31 @@ mod tests {
         match decoded {
             MemChainMessage::Ping { nonce } => assert_eq!(nonce, 42),
             other => panic!("Expected Ping, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_block_announce_roundtrip() {
+        let header = BlockHeader {
+            height: 42,
+            timestamp: 1_700_000_000,
+            prev_block_hash: GENESIS_PREV_HASH,
+            merkle_root: [0xBB; 32],
+            block_type: BLOCK_TYPE_NORMAL,
+        };
+        let msg = MemChainMessage::BlockAnnounce(header.clone());
+
+        let encoded = encode_memchain(&msg).expect("encode");
+        // Verify it's well within MTU: 1 (magic) + bincode overhead + ~81 bytes
+        assert!(encoded.len() < 200, "BlockAnnounce must be <200 bytes, got {}", encoded.len());
+
+        let decoded = decode_memchain(&encoded[1..]).expect("decode");
+        match decoded {
+            MemChainMessage::BlockAnnounce(h) => {
+                assert_eq!(h.height, 42);
+                assert_eq!(h, header);
+            }
+            other => panic!("Expected BlockAnnounce, got {:?}", other),
         }
     }
 }
