@@ -9,11 +9,17 @@
 //! fact is an append-only, signed, hash-linked record — inspired by
 //! blockchain principles but optimised for single-node + P2P sync.
 //!
+//! ## Modification Reason
+//! - 🌟 v0.5.0: Added `block` and `merkle` submodules for Miner /
+//!   Checkpoint system. Facts are now packed into Blocks with a
+//!   SHA-256 Merkle root for integrity verification.
+//!
 //! ## Main Functionality
 //!
 //! ### Submodules
 //! - [`fact`]: `Fact` struct — the atomic unit of AI memory
-//!   (subject-predicate-object triple with Ed25519 signature)
+//! - [`block`]: 🌟 `Block` / `BlockHeader` — immutable container of Facts
+//! - [`merkle`]: 🌟 SHA-256 Merkle Tree for Fact integrity
 //!
 //! ## Architecture Position
 //! ```text
@@ -21,34 +27,33 @@
 //!  ├── crypto/      ← we reuse Ed25519 & SessionKey from here
 //!  ├── protocol/    ← wire-level message types
 //!  └── ledger/      ← 🌟 YOU ARE HERE (MemChain data model)
-//!       └── fact.rs
+//!       ├── fact.rs
+//!       ├── block.rs   ← 🌟 NEW
+//!       └── merkle.rs  ← 🌟 NEW
 //! ```
 //!
 //! ## Design Principles
-//! - **Append-Only**: Facts are never modified or deleted.
+//! - **Append-Only**: Facts and Blocks are never modified or deleted.
 //! - **Signed**: Every Fact carries an Ed25519 signature from its origin node.
-//! - **Hash-Linked**: `fact_id` is the SHA-256 digest of the canonical content,
-//!   enabling integrity verification and deduplication.
-//! - **Zero new crypto**: We reuse the existing `IdentityKeyPair` and `sha2`
-//!   crate that are already in `aeronyx-core`.
-//!
-//! ## Dependencies
-//! - `serde` / `bincode` for serialisation (already in workspace)
-//! - `sha2` for content hashing (already in workspace)
+//! - **Hash-Linked**: `fact_id` is SHA-256 of content; `BlockHeader::hash()`
+//!   links blocks into a chain via `prev_block_hash`.
+//! - **Zero new crypto**: We reuse the existing `sha2` crate.
 //!
 //! ## ⚠️ Important Note for Next Developer
 //! - Do NOT add CRUD mutation methods — the ledger is append-only.
-//! - `Fact::hash()` output MUST remain stable across versions;
-//!   changing the field order or encoding would break signature
-//!   verification for all existing facts.
-//! - Future `block.rs` and `merkle.rs` submodules will be added here
-//!   when the Miner / Checkpoint system is implemented.
+//! - `Fact::compute_hash()` and `BlockHeader::hash()` canonical forms
+//!   are **stable contracts** — changing them breaks the chain.
+//! - `merkle_root()` duplication-of-odd-leaf matches Bitcoin's design.
 //!
 //! ## Last Modified
 //! v0.2.0 - Initial ledger module for MemChain integration
-// ============================================
+//! v0.5.0 - 🌟 Added block and merkle submodules for Miner
 
+pub mod block;
 pub mod fact;
+pub mod merkle;
 
 // Re-export primary types
+pub use block::{Block, BlockHeader, BLOCK_TYPE_CHECKPOINT, BLOCK_TYPE_NORMAL, GENESIS_PREV_HASH};
 pub use fact::Fact;
+pub use merkle::merkle_root;
