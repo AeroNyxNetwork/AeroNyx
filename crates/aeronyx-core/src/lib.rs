@@ -8,18 +8,28 @@
 //! for the AeroNyx privacy network. This crate is the security backbone of
 //! the entire system.
 //!
+//! ## Modification Reason
+//! Added `ledger` module containing the MemChain data structures (Fact,
+//! future Block/Merkle). These structures are used by both `aeronyx-core`
+//! (protocol serialisation) and `aeronyx-server` (storage and routing).
+//!
 //! ## Main Functionality
 //!
 //! ### Protocol Module ([`protocol`])
 //! - Message type definitions (`ClientHello`, `ServerHello`, data packets)
 //! - Binary codec for wire format serialization
 //! - Protocol version management
+//! - 🌟 MemChain messages (`MemChainMessage`, encode/decode helpers)
 //!
 //! ### Crypto Module ([`crypto`])
 //! - Key types (`IdentityKeyPair`, `EphemeralKeyPair`, `SessionKey`)
 //! - Handshake cryptography (signatures, key exchange)
 //! - Transport encryption (ChaCha20-Poly1305)
 //! - Key derivation (HKDF-SHA256)
+//!
+//! ### Ledger Module ([`ledger`]) — 🌟 NEW
+//! - `Fact`: Atomic AI memory record (subject-predicate-object triple)
+//! - Content-addressed hashing (SHA-256) and Ed25519 signature support
 //!
 //! ## Architecture Position
 //! ```text
@@ -53,6 +63,7 @@
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial implementation
+//! v0.2.0 - Added ledger module for MemChain AI memory structures
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
@@ -61,15 +72,15 @@
 
 pub mod crypto;
 pub mod error;
+pub mod ledger;
 pub mod protocol;
 
 // Re-export commonly used items
 pub use crypto::{
-    EphemeralKeyPair, IdentityKeyPair, SessionKey,
-    HandshakeCrypto, TransportCrypto,
+    EphemeralKeyPair, HandshakeCrypto, IdentityKeyPair, SessionKey, TransportCrypto,
 };
 pub use error::{CoreError, Result};
+pub use ledger::Fact;
 pub use protocol::{
-    ClientHello, ServerHello, MessageType,
-    ProtocolVersion, CURRENT_PROTOCOL_VERSION,
+    ClientHello, MessageType, ProtocolVersion, ServerHello, CURRENT_PROTOCOL_VERSION,
 };
