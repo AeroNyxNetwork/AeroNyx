@@ -180,7 +180,7 @@ impl AofWriter {
             // Read length prefix
             let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
             match reader.read_exact(&mut len_buf).await {
-                Ok(()) => {}
+                Ok(_n) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     // Normal end of file
                     break;
@@ -210,7 +210,7 @@ impl AofWriter {
             // Read payload
             let mut payload = vec![0u8; length];
             match reader.read_exact(&mut payload).await {
-                Ok(()) => {}
+                Ok(_n) => {}
                 Err(e) => {
                     warn!(
                         offset = offset,
