@@ -74,6 +74,8 @@ base64 = { workspace = true }
 bincode = "1.3"
 # 🌟 Added for MemChain: Fact::id_hex() and logging (was dev-only before)
 hex = "0.4"
+# 🌟 Added for MemChain: serde support for [u8; 64] signature fields
+serde_bytes = "0.11"
 
 # Error handling
 thiserror = { workspace = true }
