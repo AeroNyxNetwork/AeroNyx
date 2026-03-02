@@ -1,3 +1,6 @@
+// ============================================
+// File: crates/aeronyx-server/src/server.rs
+// ============================================
 //! # Server Orchestrator
 //!
 //! ## Creation Reason
