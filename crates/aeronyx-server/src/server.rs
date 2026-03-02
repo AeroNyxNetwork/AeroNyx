@@ -95,6 +95,7 @@ use crate::management::{
 use crate::services::{
     HandshakeService, IpPoolService, RoutingService, SessionManager,
 };
+use crate::miner::ReflectionMiner;
 use crate::services::memchain::{AofWriter, MemPool};
 
 // ============================================
@@ -246,6 +247,24 @@ impl Server {
                 self.shutdown_tx.subscribe(),
             );
             tasks.push(("memchain-api", api_task));
+
+            // 🌟 Start ReflectionMiner (if interval > 0)
+            if self.config.memchain.miner_interval_secs > 0 {
+                let miner = ReflectionMiner::new(
+                    self.config.memchain.miner_interval_secs,
+                    Arc::clone(mp),
+                    Arc::clone(aw),
+                    Arc::clone(&sessions),
+                    Arc::clone(&udp),
+                );
+                let miner_shutdown_rx = self.shutdown_tx.subscribe();
+                let miner_task = tokio::spawn(async move {
+                    miner.run(miner_shutdown_rx).await;
+                });
+                tasks.push(("miner", miner_task));
+            } else {
+                info!("[MINER] Mining disabled (miner_interval_secs=0)");
+            }
         }
 
         info!("Server started successfully");
@@ -291,12 +310,13 @@ impl Server {
     /// Initializes the MemChain storage engine.
     ///
     /// 1. Opens (or creates) the `.memchain` AOF file.
-    /// 2. Replays existing facts from disk into MemPool.
+    /// 2. Replays existing facts and blocks from disk into MemPool.
+    /// 3. Restores chain state (last block hash/height) for the Miner.
     async fn init_memchain(&self) -> Result<(Arc<MemPool>, Arc<TokioMutex<AofWriter>>)> {
         let aof_path = &self.config.memchain.aof_path;
 
-        // Replay existing facts from disk
-        let existing_facts = AofWriter::replay(aof_path)
+        // Replay existing records from disk (facts + blocks)
+        let (existing_facts, last_block) = AofWriter::replay(aof_path)
             .await
             .map_err(|e| ServerError::startup_failed(format!("AOF replay failed: {}", e)))?;
 
@@ -315,11 +335,15 @@ impl Server {
             .await
             .map_err(|e| ServerError::startup_failed(format!("AOF open failed: {}", e)))?;
 
+        // 🌟 Restore chain state from replay
+        aof_writer.set_chain_state(last_block.as_ref());
+
         let aof_writer = Arc::new(TokioMutex::new(aof_writer));
 
         info!(
             facts_loaded = loaded,
             mempool_size = mempool.count(),
+            last_block_height = last_block.as_ref().map_or(0, |b| b.height),
             "[MEMCHAIN] ✅ Storage engine initialized"
         );
 
@@ -889,6 +913,32 @@ impl Server {
                     "[MEMCHAIN] Ping received (stub — not yet implemented)"
                 );
                 // TODO: Send back Pong with same nonce via encrypted tunnel
+            }
+
+            // ===== 🌟 BlockAnnounce: peer mined a new block =====
+            MemChainMessage::BlockAnnounce(header) => {
+                let block_hash = hex::encode(header.hash());
+                info!(
+                    height = header.height,
+                    block_hash = %block_hash,
+                    prev_hash = hex::encode(header.prev_block_hash),
+                    merkle_root = hex::encode(header.merkle_root),
+                    block_type = header.block_type,
+                    session_id = %session.id,
+                    "[MEMCHAIN] 📦 BlockAnnounce received"
+                );
+
+                // Validate chain continuity: check prev_block_hash links
+                // to our known chain. For now, just log — full validation
+                // requires tracking local chain state in the UDP task context.
+                // The AOF writer tracks this, but it's behind a Mutex.
+                // Phase 6+ can add strict validation here.
+
+                info!(
+                    height = header.height,
+                    block_hash = %block_hash,
+                    "[MEMCHAIN] ✅ Block header recorded (light node mode)"
+                );
             }
 
             other => {
