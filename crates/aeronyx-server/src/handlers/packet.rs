@@ -7,81 +7,78 @@
 //! Handles data packet processing including encryption, decryption,
 //! and forwarding between UDP and TUN interfaces.
 //!
+//! ## Modification Reason
+//! Added **MemChain 1st-byte multiplexing** support. After decryption,
+//! the plaintext's first byte is inspected:
+//!   - `0x4X` (IPv4) → normal VPN path (validate source IP, forward to TUN)
+//!   - `0xAE` (MemChain magic) → strip prefix, deserialise to
+//!     `MemChainMessage`, return via `DecryptedPayload::MemChain` —
+//!     caller routes to MemPool instead of TUN.
+//!
+//! This achieves **zero modification** to the outer wire protocol,
+//! crypto layer, or session management.
+//!
 //! ## Main Functionality
 //! - `PacketHandler`: Main packet processing logic
+//! - `DecryptedPayload`: 🌟 NEW enum distinguishing VPN vs MemChain payloads
 //! - UDP packet decryption and TUN forwarding
 //! - TUN packet encryption and UDP forwarding
 //! - Session and routing lookups
 //!
 //! ## Packet Processing
 //!
-//! ### Client → Internet (UDP → TUN)
+//! ### Client → Internet (UDP → TUN)  [original path]
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │  1. Receive UDP packet                                      │
-//! │     ┌────────────┬─────────┬──────────────────────────┐    │
-//! │     │ Session ID │ Counter │ Encrypted Payload        │    │
-//! │     └────────────┴─────────┴──────────────────────────┘    │
-//! │                                                             │
 //! │  2. Lookup session by ID                                    │
-//! │                                                             │
 //! │  3. Validate counter (replay protection)                    │
-//! │                                                             │
 //! │  4. Decrypt payload with session key                        │
-//! │     ┌──────────────────────────────────────────────────┐   │
-//! │     │              IP Packet                            │   │
-//! │     └──────────────────────────────────────────────────┘   │
-//! │                                                             │
-//! │  5. Validate source IP matches session                      │
-//! │                                                             │
-//! │  6. Write to TUN device                                     │
+//! │  5. Peek plaintext[0]:                                      │
+//! │     ├─ 0x4X → Validate source IP → DecryptedPayload::Vpn   │
+//! │     └─ 0xAE → bincode decode → DecryptedPayload::MemChain  │
+//! │  6. Caller writes VPN to TUN, MemChain to MemPool           │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! ### Internet → Client (TUN → UDP)
+//! ### Internet → Client (TUN → UDP)  [unchanged]
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │  1. Read IP packet from TUN                                 │
-//! │     ┌──────────────────────────────────────────────────┐   │
-//! │     │              IP Packet (dest: 100.64.0.x)        │   │
-//! │     └──────────────────────────────────────────────────┘   │
-//! │                                                             │
 //! │  2. Extract destination IP                                  │
-//! │                                                             │
 //! │  3. Lookup route → session                                  │
-//! │                                                             │
-//! │  4. Encrypt with session key                                │
-//! │                                                             │
+//! │  4. Encrypt packet                                          │
 //! │  5. Build packet with session ID and counter                │
-//! │     ┌────────────┬─────────┬──────────────────────────┐    │
-//! │     │ Session ID │ Counter │ Encrypted Payload        │    │
-//! │     └────────────┴─────────┴──────────────────────────┘    │
-//! │                                                             │
-//! │  6. Send via UDP to client endpoint                         │
+//! │  6. Send via UDP to client                                  │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! ## ⚠️ Important Note for Next Developer
 //! - Performance critical - minimize allocations
 //! - Counter validation prevents replay attacks
-//! - Source IP validation prevents IP spoofing
+//! - Source IP validation prevents IP spoofing (VPN path only)
+//! - MemChain path deliberately skips IP validation (no IP header)
 //! - Log security events but avoid log flooding
+//! - The `MEMCHAIN_MAGIC` constant (0xAE) must stay in sync with
+//!   `aeronyx_core::protocol::memchain::MEMCHAIN_MAGIC`
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial packet handler
+//! v0.2.0 - Added MemChain 1st-byte multiplexing (DecryptedPayload enum)
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::{Bytes, BytesMut};
-use tracing::{debug, trace, warn, info};
+use tracing::{debug, info, trace, warn};
 
 use aeronyx_common::types::SessionId;
 use aeronyx_core::crypto::transport::{DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD};
 use aeronyx_core::protocol::codec::{decode_data_packet, encode_data_packet};
+use aeronyx_core::protocol::memchain::{decode_memchain, MEMCHAIN_MAGIC};
 use aeronyx_core::protocol::messages::DATA_PACKET_HEADER_SIZE;
-use aeronyx_core::protocol::DataPacket;
+use aeronyx_core::protocol::{DataPacket, MemChainMessage};
 
 use crate::error::{Result, ServerError};
 use crate::services::{RoutingService, Session, SessionManager};
@@ -98,6 +95,27 @@ const IPV4_DST_OFFSET: usize = 16;
 
 /// Offset of source IP in IPv4 header.
 const IPV4_SRC_OFFSET: usize = 12;
+
+// ============================================
+// DecryptedPayload — 🌟 NEW
+// ============================================
+
+/// Result of decrypting an incoming DataPacket.
+///
+/// The multiplexer inspects `plaintext[0]` to decide the variant:
+/// - `0x4X` (IPv4) → [`DecryptedPayload::Vpn`]
+/// - `0xAE` → [`DecryptedPayload::MemChain`]
+///
+/// The caller (`server.rs` UDP task) uses this to route the payload
+/// to either the TUN device or the MemChain MemPool.
+#[derive(Debug)]
+pub enum DecryptedPayload {
+    /// Standard VPN IP packet — should be written to TUN.
+    Vpn(Vec<u8>),
+
+    /// MemChain application message — should be routed to MemPool.
+    MemChain(MemChainMessage),
+}
 
 // ============================================
 // PacketHandler
@@ -128,19 +146,31 @@ impl PacketHandler {
 
     /// Processes an incoming UDP data packet.
     ///
+    /// After decryption, the plaintext's **first byte** is peeked to
+    /// determine whether this is a VPN IP packet or a MemChain message:
+    ///
+    /// | Byte      | Action                                          |
+    /// |-----------|-------------------------------------------------|
+    /// | `0x4X`    | IPv4 — validate source IP, return `Vpn`         |
+    /// | `0xAE`    | MemChain — bincode decode, return `MemChain`    |
+    /// | other     | Error (unknown payload type)                    |
+    ///
     /// # Arguments
-    /// * `data` - Raw UDP packet data
+    /// * `data` - Raw UDP packet data (session_id + counter + ciphertext)
     ///
     /// # Returns
-    /// Decrypted IP packet ready for TUN device.
+    /// - `Ok((session, DecryptedPayload::Vpn(ip_packet)))` for VPN traffic
+    /// - `Ok((session, DecryptedPayload::MemChain(msg)))` for MemChain traffic
     ///
     /// # Errors
     /// - Session not found
     /// - Decryption failure
     /// - Replay attack detected
-    /// - IP spoofing detected
-    pub fn handle_udp_packet(&self, data: &[u8]) -> Result<(Arc<Session>, Vec<u8>)> {
-        // Validate minimum size
+    /// - IP spoofing detected (VPN path only)
+    /// - Unknown plaintext type
+    /// - MemChain deserialisation failure
+    pub fn handle_udp_packet(&self, data: &[u8]) -> Result<(Arc<Session>, DecryptedPayload)> {
+        // ---- Validate minimum size ----
         if data.len() < DATA_PACKET_HEADER_SIZE + ENCRYPTION_OVERHEAD {
             return Err(ServerError::invalid_packet(
                 "0.0.0.0:0".parse().unwrap(),
@@ -148,7 +178,7 @@ impl PacketHandler {
             ));
         }
 
-        // ========== DEBUG LOG: Raw session ID bytes ==========
+        // ---- DEBUG LOG: Raw session ID bytes ----
         let raw_session_id = &data[0..16];
         debug!(
             "[PACKET_HANDLER] Processing packet, raw SessionID bytes: {:02X?}",
@@ -159,16 +189,15 @@ impl PacketHandler {
             BASE64.encode(raw_session_id)
         );
 
-        // Decode packet header
+        // ---- Decode packet header ----
         let packet = decode_data_packet(data)?;
 
-        // ========== DEBUG LOG: Decoded session ID ==========
         debug!(
             "[PACKET_HANDLER] Decoded packet.session_id (base64): {}",
             BASE64.encode(&packet.session_id)
         );
 
-        // Lookup session
+        // ---- Lookup session ----
         let session_id = SessionId::from_bytes(&packet.session_id)
             .ok_or_else(|| {
                 warn!(
@@ -181,13 +210,10 @@ impl PacketHandler {
                 )
             })?;
 
-        // ========== DEBUG LOG: Looking up session ==========
         debug!(
             "[PACKET_HANDLER] Looking up SessionID: {}",
             session_id
         );
-
-        // ========== DEBUG LOG: Session count ==========
         debug!(
             "[PACKET_HANDLER] Active sessions count: {}",
             self.sessions.count()
@@ -213,7 +239,7 @@ impl PacketHandler {
             }
         };
 
-        // Validate counter (replay protection)
+        // ---- Validate counter (replay protection) ----
         if !session.validate_rx_counter(packet.counter) {
             warn!(
                 session_id = %session_id,
@@ -226,7 +252,7 @@ impl PacketHandler {
             )));
         }
 
-        // Decrypt packet
+        // ---- Decrypt packet ----
         let mut plaintext = vec![0u8; packet.encrypted_payload.len()];
         let plaintext_len = self.crypto.decrypt(
             &session.session_key,
@@ -237,40 +263,111 @@ impl PacketHandler {
         )?;
         plaintext.truncate(plaintext_len);
 
-        // Validate IP packet
-        if plaintext_len < IPV4_HEADER_MIN_SIZE {
-            return Err(ServerError::invalid_packet(
-                session.client_endpoint,
-                "IP packet too short",
-            ));
-        }
+        // ====================================================
+        // 🌟 1st-Byte Multiplexing — The Core Routing Hack
+        // ====================================================
+        // Zero-copy peek of the first byte to determine payload type.
+        // This is O(1) and adds no measurable latency.
+        let payload = match plaintext.first().copied() {
+            // ---- IPv4 VPN packet (most common path) ----
+            Some(b) if b >> 4 == 4 => {
+                // Validate minimum IP header size
+                if plaintext_len < IPV4_HEADER_MIN_SIZE {
+                    return Err(ServerError::invalid_packet(
+                        session.client_endpoint,
+                        "IP packet too short",
+                    ));
+                }
 
-        // Validate source IP matches session's virtual IP
-        let src_ip = extract_ipv4_src(&plaintext)?;
-        if src_ip != session.virtual_ip {
-            warn!(
-                session_id = %session_id,
-                expected = %session.virtual_ip,
-                actual = %src_ip,
-                "IP spoofing detected"
-            );
-            return Err(ServerError::invalid_packet(
-                session.client_endpoint,
-                "Source IP mismatch",
-            ));
-        }
+                // Validate source IP matches session's virtual IP
+                let src_ip = extract_ipv4_src(&plaintext)?;
+                if src_ip != session.virtual_ip {
+                    warn!(
+                        session_id = %session_id,
+                        expected = %session.virtual_ip,
+                        actual = %src_ip,
+                        "IP spoofing detected"
+                    );
+                    return Err(ServerError::invalid_packet(
+                        session.client_endpoint,
+                        "Source IP mismatch",
+                    ));
+                }
 
-        // Update session activity and stats
+                trace!(
+                    session_id = %session_id,
+                    len = plaintext_len,
+                    "VPN packet decrypted"
+                );
+
+                DecryptedPayload::Vpn(plaintext)
+            }
+
+            // ---- MemChain message ----
+            Some(MEMCHAIN_MAGIC) => {
+                // Strip the magic byte; remaining bytes are bincode payload
+                let memchain_payload = &plaintext[1..];
+
+                match decode_memchain(memchain_payload) {
+                    Ok(msg) => {
+                        debug!(
+                            session_id = %session_id,
+                            msg_type = ?std::mem::discriminant(&msg),
+                            "[MEMCHAIN] ✅ MemChain message decoded"
+                        );
+                        DecryptedPayload::MemChain(msg)
+                    }
+                    Err(e) => {
+                        warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "[MEMCHAIN] ❌ Failed to decode MemChain payload"
+                        );
+                        return Err(ServerError::invalid_packet(
+                            session.client_endpoint,
+                            format!("MemChain decode error: {}", e),
+                        ));
+                    }
+                }
+            }
+
+            // ---- IPv6 — pass through as VPN (future support) ----
+            Some(b) if b >> 4 == 6 => {
+                trace!(
+                    session_id = %session_id,
+                    len = plaintext_len,
+                    "IPv6 packet decrypted (pass-through)"
+                );
+                DecryptedPayload::Vpn(plaintext)
+            }
+
+            // ---- Unknown payload type ----
+            Some(b) => {
+                warn!(
+                    session_id = %session_id,
+                    first_byte = format_args!("0x{:02X}", b),
+                    "Unknown plaintext type"
+                );
+                return Err(ServerError::invalid_packet(
+                    session.client_endpoint,
+                    format!("Unknown plaintext first byte: 0x{:02X}", b),
+                ));
+            }
+
+            // ---- Empty plaintext (should not happen after decrypt) ----
+            None => {
+                return Err(ServerError::invalid_packet(
+                    session.client_endpoint,
+                    "Empty plaintext after decryption",
+                ));
+            }
+        };
+
+        // ---- Update session activity and stats ----
         session.touch();
         session.stats.record_rx(plaintext_len as u64);
 
-        trace!(
-            session_id = %session_id,
-            len = plaintext_len,
-            "UDP packet decrypted"
-        );
-
-        Ok((session, plaintext))
+        Ok((session, payload))
     }
 
     /// Processes an IP packet from the TUN device.
@@ -415,7 +512,6 @@ mod tests {
         packet[1] = 0x00; // DSCP, ECN
         packet[2] = 0x00; // Total length (high)
         packet[3] = 0x14; // Total length (low) = 20
-        // ... other fields ...
         packet[IPV4_SRC_OFFSET..IPV4_SRC_OFFSET + 4].copy_from_slice(&src.octets());
         packet[IPV4_DST_OFFSET..IPV4_DST_OFFSET + 4].copy_from_slice(&dst.octets());
         packet
@@ -444,7 +540,6 @@ mod tests {
     #[test]
     fn test_extract_from_short_packet() {
         let short_packet = vec![0x45, 0x00]; // Too short
-        
         assert!(extract_ipv4_src(&short_packet).is_err());
         assert!(extract_ipv4_dst(&short_packet).is_err());
     }
@@ -453,7 +548,13 @@ mod tests {
     fn test_extract_wrong_version() {
         let mut packet = vec![0u8; 20];
         packet[0] = 0x60; // IPv6 version
-
         assert!(extract_ipv4_src(&packet).is_err());
+    }
+
+    #[test]
+    fn test_memchain_magic_no_ip_collision() {
+        // Verify MEMCHAIN_MAGIC cannot be confused with IP version nibble
+        assert_ne!(MEMCHAIN_MAGIC >> 4, 4, "Must not collide with IPv4");
+        assert_ne!(MEMCHAIN_MAGIC >> 4, 6, "Must not collide with IPv6");
     }
 }
