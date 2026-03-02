@@ -6,11 +6,18 @@
 # Creation Reason: Contains the core protocol definitions, message types,
 #                  and cryptographic operations for the AeroNyx privacy network.
 #
+# Modification Reason: Added `bincode` and `hex` as runtime dependencies
+# for the new MemChain ledger module. `bincode` is used for MemChainMessage
+# serialisation inside encrypted DataPackets. `hex` is used for Fact ID
+# display/logging.
+#
 # Main Functionality:
 # - Protocol message definitions (ClientHello, ServerHello, etc.)
 # - Cryptographic primitives (Ed25519, X25519, ChaCha20-Poly1305)
 # - Message codec (serialization/deserialization)
 # - Key management and derivation
+# - 🌟 Ledger data structures (Fact, MemChainMessage)
+# - 🌟 MemChain protocol encode/decode (bincode + 0xAE prefix)
 #
 # Dependencies:
 # - Used by: aeronyx-server, aeronyx-transport
@@ -24,8 +31,12 @@
 # - Do NOT implement custom cryptographic primitives
 # - All keys must implement Zeroize
 # - Protocol changes must maintain backward compatibility
+# - `bincode` serialisation format for MemChainMessage is a stable contract;
+#   do NOT change field order in Fact or MemChainMessage enums
 #
-# Last Modified: v0.1.0 - Initial protocol and crypto implementation
+# Last Modified:
+# v0.1.0 - Initial protocol and crypto implementation
+# v0.2.0 - Added bincode + hex for MemChain ledger module
 # ============================================
 
 [package]
@@ -59,6 +70,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
 base64 = { workspace = true }
+# 🌟 Added for MemChain: bincode serialisation of MemChainMessage / Fact
+bincode = "1.3"
+# 🌟 Added for MemChain: Fact::id_hex() and logging (was dev-only before)
+hex = "0.4"
 
 # Error handling
 thiserror = { workspace = true }
@@ -73,7 +88,6 @@ parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 proptest = { workspace = true }
 test-case = { workspace = true }
-hex = "0.4"
 
 [lints]
 workspace = true
