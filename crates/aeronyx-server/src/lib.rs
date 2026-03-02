@@ -3,86 +3,21 @@
 // ============================================
 //! # AeroNyx Server Library
 //!
-//! ## Creation Reason
-//! Provides the core server implementation for the AeroNyx privacy network,
-//! orchestrating all components to create a functional privacy tunnel server.
-//!
 //! ## Modification Reason
-//! Added management module for CMS integration.
-//!
-//! ## Main Functionality
-//!
-//! ### Modules
-//! - [`config`]: Server configuration management
-//! - [`server`]: Main server orchestration
-//! - [`services`]: Business logic services
-//!   - [`services::session`]: Session management
-//!   - [`services::routing`]: Packet routing
-//!   - [`services::ip_pool`]: Virtual IP allocation
-//!   - [`services::handshake`]: Handshake processing
-//! - [`handlers`]: Packet and event handlers
-//! - [`error`]: Server-specific error types
-//! - [`management`]: CMS integration (NEW)
-//!   - [`management::client`]: HTTP client with Ed25519 auth
-//!   - [`management::reporter`]: Heartbeat and session reporting
-//!
-//! ## Architecture Overview
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                        AeroNyx Server                           │
-//! ├─────────────────────────────────────────────────────────────────┤
-//! │                                                                 │
-//! │  ┌─────────────┐     ┌─────────────┐     ┌─────────────────┐  │
-//! │  │   Config    │────►│   Server    │────►│    Handlers     │  │
-//! │  │  Manager    │     │ Orchestrator│     │                 │  │
-//! │  └─────────────┘     └──────┬──────┘     └────────┬────────┘  │
-//! │                             │                     │           │
-//! │         ┌───────────────────┼───────────────────┬─┘           │
-//! │         ▼                   ▼                   ▼             │
-//! │  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐     │
-//! │  │  Session    │     │   Routing   │     │   IP Pool   │     │
-//! │  │  Manager    │     │   Service   │     │   Service   │     │
-//! │  └─────────────┘     └─────────────┘     └─────────────┘     │
-//! │                                                               │
-//! │  ┌─────────────────────────────────────────────────────────┐ │
-//! │  │                  Management (Optional)                   │ │
-//! │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │ │
-//! │  │  │   Client     │  │  Heartbeat   │  │   Session    │  │ │
-//! │  │  │ (HTTP+Sign)  │  │  Reporter    │  │   Reporter   │  │ │
-//! │  │  └──────────────┘  └──────────────┘  └──────────────┘  │ │
-//! │  └─────────────────────────────────────────────────────────┘ │
-//! │                                                               │
-//! ├───────────────────────────────────────────────────────────────┤
-//! │                     Transport Layer                           │
-//! │  ┌─────────────────────┐     ┌─────────────────────────────┐ │
-//! │  │    UDP Transport    │     │       TUN Device            │ │
-//! │  │  (client packets)   │     │     (IP packets)            │ │
-//! │  └─────────────────────┘     └─────────────────────────────┘ │
-//! └─────────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! ## Data Flow
-//! ```text
-//! Client → UDP → Decrypt → Route → TUN → Internet
-//! Client ← UDP ← Encrypt ← Route ← TUN ← Internet
-//! ```
-//!
-//! ## ⚠️ Important Note for Next Developer
-//! - Server requires root or CAP_NET_ADMIN for TUN
-//! - Configuration changes require restart (no hot-reload)
-//! - Graceful shutdown waits for active sessions
-//! - Metrics and logging are built-in
-//! - Management module is optional (disabled by default)
+//! - Added management module for CMS integration.
+//! - 🌟 Added api module for MemChain Agent HTTP API.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial server library
 //! v0.2.0 - Added management module for CMS integration
+//! v0.3.0 - 🌟 Added api module for MemChain Agent HTTP API
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod api;
 pub mod config;
 pub mod error;
 pub mod handlers;
@@ -92,7 +27,7 @@ pub mod services;
 
 // Re-export primary types
 pub use config::ServerConfig;
-pub use error::{ServerError, Result};
+pub use error::{Result, ServerError};
 pub use server::Server;
 
 // Re-export management types
