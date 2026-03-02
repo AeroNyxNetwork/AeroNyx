@@ -12,9 +12,10 @@
 //! - Added CMS management integration (heartbeat + session reporting).
 //! - 🌟 Added MemChain integration: MemPool + AofWriter initialisation,
 //!   1st-byte multiplexing dispatch in UDP task, AOF replay on startup.
-//! - 🐛 Fixed E0308: handle_memchain_message called with Option<Arc<…>>
-//!   instead of &Arc<…>. Now guarded with if-let at the call site and
-//!   logs a warning if MemChain traffic arrives while the engine is disabled.
+//! - 🐛 v0.3.1: Fixed E0308 Option<Arc<…>> type mismatch in handle_memchain_message.
+//! - 🌟 v0.4.0: Phase 3 — Ed25519 signature verification on received Facts,
+//!   trusted_agents whitelist enforcement, SyncRequest/SyncResponse handling,
+//!   start_api_server extended with sessions + udp for P2P broadcast.
 //!
 //! ## Main Functionality
 //! - `Server`: Main server struct and lifecycle management
@@ -24,6 +25,8 @@
 //! - Keepalive packet handling
 //! - CMS management reporting
 //! - 🌟 MemChain MemPool + AofWriter lifecycle
+//! - 🌟 Ed25519 signature verification + trust whitelist
+//! - 🌟 SyncRequest → SyncResponse reply via encrypted UDP
 //!
 //! ## Packet Types Handled
 //! - 0x01 ClientHello: Handshake initiation
@@ -44,6 +47,8 @@
 //! - 🌟 AofWriter is Arc<TokioMutex<AofWriter>> (file needs exclusive access)
 //! - 🌟 AOF replay happens before UDP task starts
 //! - 🌟 mempool / aof_writer are Option — always guard with if-let before use
+//! - 🌟 handle_memchain_message now requires config + session + udp + crypto
+//!   for signature verification and SyncResponse reply
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial server implementation
@@ -51,6 +56,7 @@
 //! v0.2.0 - Added CMS management integration
 //! v0.3.0 - 🌟 Added MemChain integration (MemPool, AofWriter, 1st-byte dispatch)
 //! v0.3.1 - 🐛 Fixed Option<Arc<…>> type mismatch in handle_memchain_message
+//! v0.4.0 - 🌟 Phase 3: Ed25519 verify, trust whitelist, SyncReq/SyncRes
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,12 +70,16 @@ use tracing::{debug, error, info, trace, warn};
 
 use aeronyx_common::types::SessionId;
 use aeronyx_core::crypto::IdentityKeyPair;
-use aeronyx_core::protocol::codec::{decode_client_hello, encode_server_hello, ProtocolCodec};
-use aeronyx_core::protocol::MessageType;
+use aeronyx_core::crypto::keys::IdentityPublicKey;
+use aeronyx_core::crypto::transport::{DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD};
+use aeronyx_core::protocol::codec::{decode_client_hello, encode_server_hello, encode_data_packet, ProtocolCodec};
+use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
+use aeronyx_core::protocol::{DataPacket, MessageType};
 use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::UdpTransport;
 
 use crate::api::start_api_server;
+use crate::config::MemChainConfig;
 
 #[cfg(target_os = "linux")]
 use aeronyx_transport::LinuxTun;
@@ -179,6 +189,9 @@ impl Server {
         #[cfg(target_os = "linux")]
         let tun = self.init_tun().await?;
 
+        // 🌟 Pre-compute server pubkey hex for trust checks
+        let server_pubkey_hex = hex::encode(self.identity.public_key_bytes());
+
         // Spawn worker tasks
         let mut tasks = Vec::new();
 
@@ -193,6 +206,8 @@ impl Server {
             session_event_sender.clone(),
             mempool.clone(),
             aof_writer.clone(),
+            self.config.memchain.clone(),
+            server_pubkey_hex.clone(),
         );
         tasks.push(("udp", udp_task));
 
@@ -225,6 +240,9 @@ impl Server {
                 Arc::clone(mp),
                 Arc::clone(aw),
                 self.identity.clone(),
+                Arc::clone(&sessions),
+                Arc::clone(&udp),
+                self.config.memchain.clone(),
                 self.shutdown_tx.subscribe(),
             );
             tasks.push(("memchain-api", api_task));
@@ -429,8 +447,8 @@ impl Server {
 
     /// Spawns the UDP receive task.
     ///
-    /// 🌟 Now accepts `mempool` and `aof_writer` to route MemChain
-    /// messages to the storage engine.
+    /// 🌟 v0.4.0: Now accepts `memchain_config` and `server_pubkey_hex`
+    /// for trust verification and SyncResponse reply.
     #[allow(clippy::too_many_arguments)]
     fn spawn_udp_task(
         &self,
@@ -443,12 +461,16 @@ impl Server {
         session_events: SessionEventSender,
         mempool: Option<Arc<MemPool>>,
         aof_writer: Option<Arc<TokioMutex<AofWriter>>>,
+        memchain_config: MemChainConfig,
+        server_pubkey_hex: String,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let udp_for_reply = Arc::clone(&udp);
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
+            let crypto = DefaultTransportCrypto::new();
 
             loop {
                 tokio::select! {
@@ -593,12 +615,6 @@ impl Server {
                                             }
 
                                             // ---- 🌟 MemChain → route to MemPool ----
-                                            //
-                                            // 🐛 FIX (v0.3.1): `mempool` and `aof_writer`
-                                            // are `Option<Arc<…>>` because MemChain may be
-                                            // disabled. We guard with `if let` and log a
-                                            // warning when traffic arrives but the engine
-                                            // is off.
                                             Ok((session, DecryptedPayload::MemChain(msg))) => {
                                                 debug!(
                                                     "[MEMCHAIN_RX] ✅ MemChain msg from session {}, type={:?}",
@@ -611,6 +627,11 @@ impl Server {
                                                         msg,
                                                         mp,
                                                         aw,
+                                                        &memchain_config,
+                                                        &server_pubkey_hex,
+                                                        &session,
+                                                        &udp_for_reply,
+                                                        &crypto,
                                                     ).await;
                                                 } else {
                                                     warn!(
@@ -671,34 +692,77 @@ impl Server {
 
     /// Handles a decoded MemChain message from the encrypted tunnel.
     ///
-    /// Currently supports:
-    /// - `BroadcastFact`: Validate, store in MemPool, persist to AOF.
-    /// - Other variants: Logged as unimplemented stubs.
+    /// ## v0.4.0 Changes
+    /// - **BroadcastFact**: Now verifies Ed25519 signature and checks
+    ///   origin against trusted_agents whitelist before storing.
+    /// - **SyncRequest**: Queries MemPool for missing facts and sends
+    ///   back a SyncResponse via encrypted UDP unicast.
+    /// - **SyncResponse**: Validates, verifies, and stores each fact.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_memchain_message(
         msg: aeronyx_core::protocol::MemChainMessage,
         mempool: &Arc<MemPool>,
         aof_writer: &Arc<TokioMutex<AofWriter>>,
+        memchain_config: &MemChainConfig,
+        server_pubkey_hex: &str,
+        session: &Arc<crate::services::Session>,
+        udp: &Arc<UdpTransport>,
+        crypto: &DefaultTransportCrypto,
     ) {
         use aeronyx_core::protocol::MemChainMessage;
 
         match msg {
             MemChainMessage::BroadcastFact(fact) => {
                 let fact_id_hex = fact.id_hex();
+                let origin_hex = hex::encode(fact.origin);
+
                 info!(
                     fact_id = %fact_id_hex,
+                    origin = %origin_hex,
                     subject = %fact.subject,
                     predicate = %fact.predicate,
                     object = %fact.object,
                     "[MEMCHAIN] 📥 Received BroadcastFact"
                 );
 
-                // TODO: Verify Ed25519 signature using fact.origin public key.
-                // For MVP, we trust facts from authenticated sessions
-                // (the session itself was authenticated via Ed25519 handshake).
+                // ===== 🌟 Step 1: Ed25519 signature verification =====
+                match IdentityPublicKey::from_bytes(&fact.origin) {
+                    Ok(pubkey) => {
+                        if pubkey.verify(&fact.fact_id, &fact.signature).is_err() {
+                            warn!(
+                                fact_id = %fact_id_hex,
+                                origin = %origin_hex,
+                                "[MEMCHAIN] ❌ Signature verification FAILED — dropping fact"
+                            );
+                            return;
+                        }
+                        debug!(
+                            fact_id = %fact_id_hex,
+                            "[MEMCHAIN] ✅ Signature verified"
+                        );
+                    }
+                    Err(_) => {
+                        warn!(
+                            fact_id = %fact_id_hex,
+                            origin = %origin_hex,
+                            "[MEMCHAIN] ❌ Invalid origin public key — dropping fact"
+                        );
+                        return;
+                    }
+                }
 
-                // Add to MemPool (validates hash integrity + dedup)
+                // ===== 🌟 Step 2: Trust whitelist check =====
+                if !memchain_config.is_origin_trusted(&origin_hex, server_pubkey_hex) {
+                    warn!(
+                        fact_id = %fact_id_hex,
+                        origin = %origin_hex,
+                        "[MEMCHAIN] 🚫 Origin NOT in trusted_agents whitelist — dropping fact"
+                    );
+                    return;
+                }
+
+                // ===== Step 3: Store in MemPool + persist to AOF =====
                 if mempool.add_fact(fact.clone()) {
-                    // Persist to AOF
                     let mut writer = aof_writer.lock().await;
                     if let Err(e) = writer.append_fact(&fact).await {
                         error!(
@@ -716,12 +780,99 @@ impl Server {
                 }
             }
 
+            // ===== 🌟 SyncRequest: peer wants to catch up =====
             MemChainMessage::SyncRequest { last_known_hash } => {
-                debug!(
+                info!(
                     last_known = hex::encode(last_known_hash),
-                    "[MEMCHAIN] SyncRequest received (stub — not yet implemented)"
+                    session_id = %session.id,
+                    "[MEMCHAIN] 📥 SyncRequest received"
                 );
-                // TODO: Respond with SyncResponse containing missing facts
+
+                // Query MemPool for facts after the given hash
+                let missing_facts = mempool.get_facts_after(last_known_hash);
+
+                info!(
+                    facts_to_send = missing_facts.len(),
+                    session_id = %session.id,
+                    "[MEMCHAIN] 📤 Preparing SyncResponse"
+                );
+
+                // Build SyncResponse
+                let response_msg = MemChainMessage::SyncResponse {
+                    facts: missing_facts,
+                };
+
+                // Encode, encrypt, send
+                Self::send_memchain_to_session(
+                    &response_msg,
+                    session,
+                    udp,
+                    crypto,
+                ).await;
+            }
+
+            // ===== 🌟 SyncResponse: peer sent us missing facts =====
+            MemChainMessage::SyncResponse { facts } => {
+                info!(
+                    facts_received = facts.len(),
+                    session_id = %session.id,
+                    "[MEMCHAIN] 📥 SyncResponse received"
+                );
+
+                let mut accepted = 0u64;
+                let mut rejected = 0u64;
+
+                for fact in facts {
+                    let fact_id_hex = fact.id_hex();
+                    let origin_hex = hex::encode(fact.origin);
+
+                    // Verify signature
+                    let sig_ok = match IdentityPublicKey::from_bytes(&fact.origin) {
+                        Ok(pubkey) => pubkey.verify(&fact.fact_id, &fact.signature).is_ok(),
+                        Err(_) => false,
+                    };
+
+                    if !sig_ok {
+                        warn!(
+                            fact_id = %fact_id_hex,
+                            "[MEMCHAIN_SYNC] ❌ Signature invalid — skipping"
+                        );
+                        rejected += 1;
+                        continue;
+                    }
+
+                    // Trust check
+                    if !memchain_config.is_origin_trusted(&origin_hex, server_pubkey_hex) {
+                        warn!(
+                            fact_id = %fact_id_hex,
+                            origin = %origin_hex,
+                            "[MEMCHAIN_SYNC] 🚫 Untrusted origin — skipping"
+                        );
+                        rejected += 1;
+                        continue;
+                    }
+
+                    // Store
+                    if mempool.add_fact(fact.clone()) {
+                        let mut writer = aof_writer.lock().await;
+                        if let Err(e) = writer.append_fact(&fact).await {
+                            error!(
+                                fact_id = %fact_id_hex,
+                                error = %e,
+                                "[MEMCHAIN_SYNC] ❌ AOF write failed"
+                            );
+                        }
+                        accepted += 1;
+                    }
+                    // Duplicate (already had it) — not counted as rejected
+                }
+
+                info!(
+                    accepted = accepted,
+                    rejected = rejected,
+                    pool_size = mempool.count(),
+                    "[MEMCHAIN_SYNC] ✅ SyncResponse processed"
+                );
             }
 
             MemChainMessage::QueryRequest { fact_id } => {
@@ -746,6 +897,84 @@ impl Server {
                     "[MEMCHAIN] Unhandled message variant"
                 );
             }
+        }
+    }
+
+    // ============================================
+    // 🌟 MemChain UDP Reply Helper
+    // ============================================
+
+    /// Encodes a MemChainMessage, encrypts it with the session's key,
+    /// and sends it as a DataPacket via UDP to the session's endpoint.
+    ///
+    /// Used by `handle_memchain_message` to send SyncResponse back to
+    /// the requesting peer.
+    async fn send_memchain_to_session(
+        msg: &MemChainMessage,
+        session: &Arc<crate::services::Session>,
+        udp: &Arc<UdpTransport>,
+        crypto: &DefaultTransportCrypto,
+    ) {
+        // Encode with 0xAE prefix
+        let plaintext = match encode_memchain(msg) {
+            Ok(p) => p,
+            Err(e) => {
+                error!(
+                    session_id = %session.id,
+                    error = %e,
+                    "[MEMCHAIN_TX] ❌ Failed to encode MemChain message"
+                );
+                return;
+            }
+        };
+
+        // Encrypt
+        let counter = session.next_tx_counter();
+        let encrypted_len = plaintext.len() + ENCRYPTION_OVERHEAD;
+        let mut encrypted = vec![0u8; encrypted_len];
+
+        let actual_len = match crypto.encrypt(
+            &session.session_key,
+            counter,
+            session.id.as_bytes(),
+            &plaintext,
+            &mut encrypted,
+        ) {
+            Ok(len) => len,
+            Err(e) => {
+                error!(
+                    session_id = %session.id,
+                    error = %e,
+                    "[MEMCHAIN_TX] ❌ Encryption failed"
+                );
+                return;
+            }
+        };
+        encrypted.truncate(actual_len);
+
+        // Build DataPacket
+        let data_packet = DataPacket::new(
+            *session.id.as_bytes(),
+            counter,
+            encrypted,
+        );
+
+        let packet_bytes = encode_data_packet(&data_packet).to_vec();
+
+        // Send
+        if let Err(e) = udp.send(&packet_bytes, &session.client_endpoint).await {
+            warn!(
+                session_id = %session.id,
+                endpoint = %session.client_endpoint,
+                error = %e,
+                "[MEMCHAIN_TX] ⚠️ UDP send failed"
+            );
+        } else {
+            debug!(
+                session_id = %session.id,
+                packet_len = packet_bytes.len(),
+                "[MEMCHAIN_TX] ✅ MemChain message sent"
+            );
         }
     }
 
