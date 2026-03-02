@@ -50,8 +50,29 @@
 //! ## Last Modified
 //! v0.2.0 - Initial Fact definition for MemChain integration
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
+
+// ============================================
+// Serde helpers for [u8; 64]
+// ============================================
+// serde only implements Serialize/Deserialize for arrays up to [T; 32].
+// We provide a custom module for the 64-byte signature field.
+
+mod serde_bytes_64 {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(bytes: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+        serde_bytes::serialize(bytes.as_slice(), s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+        let slice: Vec<u8> = serde_bytes::deserialize(d)?;
+        slice.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::invalid_length(v.len(), &"64 bytes")
+        })
+    }
+}
 
 // ============================================
 // Fact
@@ -86,6 +107,7 @@ pub struct Fact {
     pub origin: [u8; 32],
 
     /// Ed25519 signature over `fact_id`, produced by the origin node.
+    #[serde(with = "serde_bytes_64")]
     pub signature: [u8; 64],
 }
 
