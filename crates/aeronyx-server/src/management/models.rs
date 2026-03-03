@@ -396,6 +396,7 @@ fn default_priority() -> u8 {
 /// ```json
 /// {
 ///     "command_id": "cmd-550e8400-e29b-41d4-a716-446655440000",
+///     "agent_type": "openclaw",
 ///     "status": "in_progress",
 ///     "progress": 45,
 ///     "message": "Downloading OpenClaw binary...",
@@ -406,6 +407,11 @@ fn default_priority() -> u8 {
 pub struct CommandStatusReport {
     /// The command ID this report refers to (from `Command.id`).
     pub command_id: String,
+
+    /// Agent type identifier. CMS uses this to route the status
+    /// to the correct agent handler. Default: "openclaw".
+    #[serde(default = "default_agent_type")]
+    pub agent_type: String,
 
     /// Execution status.
     pub status: CommandExecutionStatus,
@@ -420,6 +426,10 @@ pub struct CommandStatusReport {
 
     /// Unix timestamp of this status update.
     pub timestamp: u64,
+}
+
+fn default_agent_type() -> String {
+    "openclaw".to_string()
 }
 
 /// Execution status for a CMS command.
