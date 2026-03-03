@@ -60,6 +60,17 @@ const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 10;
 /// Prevents CMS from making the node appear offline for too long.
 const MAX_HEARTBEAT_INTERVAL_SECS: u64 = 300;
 
+/// Number of initial heartbeats that get extra tolerance.
+/// During server cold-start, CMS (Gunicorn) may still be loading
+/// Django, DB connections, etc. We suppress error-level logging
+/// and use a longer timeout for these first few beats.
+const COLD_START_GRACE_BEATS: u32 = 5;
+
+/// Extended timeout for cold-start heartbeats (seconds).
+/// Normal timeout is from config (default 10s), but during
+/// the grace period we allow up to 30s for CMS to warm up.
+const COLD_START_TIMEOUT_SECS: u64 = 30;
+
 // ============================================
 // Session Events
 // ============================================
@@ -179,6 +190,7 @@ impl HeartbeatReporter {
 
         let mut interval = tokio::time::interval(self.interval);
         let mut failures = 0u32;
+        let mut total_beats = 0u32;
 
         loop {
             tokio::select! {
@@ -187,8 +199,55 @@ impl HeartbeatReporter {
                     break;
                 }
                 _ = interval.tick() => {
-                    match self.client.send_heartbeat(&self.public_ip, session_count_fn()).await {
-                        Ok(response) => {
+                    total_beats += 1;
+                    let in_cold_start = total_beats <= COLD_START_GRACE_BEATS;
+
+                    // Use extended timeout during cold-start grace period
+                    let result = if in_cold_start {
+                        debug!(
+                            beat = total_beats,
+                            grace_remaining = COLD_START_GRACE_BEATS - total_beats,
+                            "[HEARTBEAT] Cold-start grace period (extended timeout {}s)",
+                            COLD_START_TIMEOUT_SECS
+                        );
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(COLD_START_TIMEOUT_SECS),
+                            self.client.send_heartbeat(&self.public_ip, session_count_fn()),
+                        ).await
+                    } else {
+                        // Normal operation: use config timeout (already in reqwest client)
+                        // Wrap in a generous outer timeout as safety net
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(60),
+                            self.client.send_heartbeat(&self.public_ip, session_count_fn()),
+                        ).await
+                    };
+
+                    match result {
+                        // Outer timeout expired
+                        Err(_elapsed) => {
+                            failures += 1;
+                            if in_cold_start {
+                                info!(
+                                    beat = total_beats,
+                                    "[HEARTBEAT] ⏳ Timeout during cold-start (CMS may still be loading)"
+                                );
+                            } else {
+                                warn!(
+                                    failures = failures,
+                                    "[HEARTBEAT] ⚠️ Heartbeat outer timeout"
+                                );
+                            }
+                        }
+                        // Inner result
+                        Ok(Ok(response)) => {
+                            if failures > 0 {
+                                info!(
+                                    previous_failures = failures,
+                                    "[HEARTBEAT] ✅ Recovered after {} failure(s)",
+                                    failures
+                                );
+                            }
                             failures = 0;
 
                             // 🌟 Process commands from CMS
@@ -217,26 +276,36 @@ impl HeartbeatReporter {
                                         applied = clamped,
                                         "[HEARTBEAT] 🔄 CMS requested interval change"
                                     );
-                                    // Note: tokio::time::interval does not support
-                                    // runtime period change. The clamped value is
-                                    // logged for observability. Full dynamic interval
-                                    // requires restructuring to use tokio::time::sleep
-                                    // in a loop instead. Deferred to future iteration.
                                 }
                             }
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             failures += 1;
-                            if failures >= 3 {
-                                error!(
+
+                            // During cold-start: only info level, not warn/error
+                            if in_cold_start {
+                                info!(
+                                    beat = total_beats,
                                     failures = failures,
-                                    "[HEARTBEAT] ❌ Failed: {}",
+                                    "[HEARTBEAT] ⏳ Failed during cold-start (expected): {}",
                                     e
                                 );
-                            } else {
+                            } else if failures >= 5 {
+                                error!(
+                                    failures = failures,
+                                    "[HEARTBEAT] ❌ Persistent failure: {}",
+                                    e
+                                );
+                            } else if failures >= 3 {
                                 warn!(
                                     failures = failures,
                                     "[HEARTBEAT] ⚠️ Failed: {}",
+                                    e
+                                );
+                            } else {
+                                debug!(
+                                    failures = failures,
+                                    "[HEARTBEAT] Failed (transient): {}",
                                     e
                                 );
                             }
