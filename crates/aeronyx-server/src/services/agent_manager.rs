@@ -208,16 +208,22 @@ impl AgentManager {
     pub async fn detect_existing(&self) {
         info!("[AGENT] Detecting existing OpenClaw installation...");
 
-        // Check if openclaw CLI is available
-        let cli_exists = Self::run_command("which", &["openclaw"]).await.is_ok();
+        // Check both system-wide and user-local npm-global paths
+        let user_bin = format!("{}/.npm-global/bin/openclaw", OPENCLAW_HOME);
+        let cli_exists = std::path::Path::new(&user_bin).exists()
+            || Self::run_command("which", &["openclaw"]).await.is_ok();
 
         if !cli_exists {
             info!("[AGENT] OpenClaw not found — status: NotInstalled");
             return;
         }
 
-        // Get version
-        let version = Self::run_command_output("openclaw", &["--version"]).await.ok();
+        // Get version (try user-local first)
+        let version = Self::run_command_output_as_user("openclaw", &["--version"]).await.ok()
+            .or_else(|| {
+                // Sync fallback — check the binary directly
+                None
+            });
 
         // Check if gateway is running
         let gateway_running = self.check_gateway_health().await;
@@ -700,6 +706,10 @@ impl AgentManager {
     // ============================================
 
     /// Installs OpenClaw npm package as the openclaw user.
+    ///
+    /// Uses `NPM_CONFIG_PREFIX` to install into the user's home directory
+    /// instead of the system `/usr/lib/node_modules/` which requires root.
+    /// The binary ends up at `/home/openclaw/.npm-global/bin/openclaw`.
     async fn install_openclaw_package(&self, version: &str) -> Result<(), String> {
         let package = if version == "latest" {
             "openclaw@latest".to_string()
@@ -709,16 +719,31 @@ impl AgentManager {
 
         info!("[AGENT] Installing {} via npm...", package);
 
-        Self::run_command_as_user(
+        // Ensure npm global prefix directory exists
+        let npm_prefix = format!("{}/.npm-global", OPENCLAW_HOME);
+        Self::run_command_as_user("mkdir", &["-p", &npm_prefix]).await
+            .map_err(|e| format!("Failed to create npm prefix dir: {}", e))?;
+
+        // Configure npm to use user-local prefix
+        // This avoids EACCES errors when installing globally without root
+        Self::run_command_as_user_with_env(
             "npm",
             &["install", "-g", &package],
+            &[
+                ("NPM_CONFIG_PREFIX", &npm_prefix),
+            ],
         ).await.map_err(|e| format!("npm install failed: {}", e))?;
 
-        // Verify installation
-        Self::run_command_as_user("openclaw", &["--version"]).await
-            .map_err(|e| format!("openclaw binary not found after install: {}", e))?;
+        // Verify installation — binary is at ~/.npm-global/bin/openclaw
+        let openclaw_bin = format!("{}/.npm-global/bin/openclaw", OPENCLAW_HOME);
+        if !std::path::Path::new(&openclaw_bin).exists() {
+            return Err(format!(
+                "openclaw binary not found at {} after install",
+                openclaw_bin
+            ));
+        }
 
-        info!("[AGENT] ✅ {} installed", package);
+        info!("[AGENT] ✅ {} installed at {}", package, openclaw_bin);
         Ok(())
     }
 
@@ -729,10 +754,14 @@ impl AgentManager {
     ) -> Result<(), String> {
         info!("[AGENT] Running onboarding (non-interactive)...");
 
-        let args = vec!["onboard", "--install-daemon"];
+        let npm_bin = format!("{}/.npm-global/bin", OPENCLAW_HOME);
+        let openclaw_bin = format!("{}/openclaw", npm_bin);
+        let path_value = format!(
+            "{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            npm_bin
+        );
 
         // If CMS provides an API key, pass it via environment
-        // The onboarding wizard can be pre-configured via env vars
         let api_key = params.get("api_key")
             .and_then(|v| v.as_str());
 
@@ -740,12 +769,19 @@ impl AgentManager {
             .and_then(|v| v.as_str())
             .unwrap_or("anthropic/claude-sonnet-4-5-20250929");
 
-        // Build command with env vars for non-interactive setup
+        // Build command — run openclaw binary directly with sudo
         let mut cmd = TokioCommand::new("sudo");
-        cmd.args(&["-u", OPENCLAW_USER, "-i", "openclaw"]);
-        cmd.args(&args);
+        cmd.args(&[
+            "-u", OPENCLAW_USER,
+            "--preserve-env=PATH,HOME,OPENCLAW_HOME,NPM_CONFIG_PREFIX",
+            &openclaw_bin,
+            "onboard",
+            "--install-daemon",
+        ]);
         cmd.env("HOME", OPENCLAW_HOME);
         cmd.env("OPENCLAW_HOME", OPENCLAW_HOME);
+        cmd.env("PATH", &path_value);
+        cmd.env("NPM_CONFIG_PREFIX", format!("{}/.npm-global", OPENCLAW_HOME));
 
         if let Some(key) = api_key {
             cmd.env("ANTHROPIC_API_KEY", key);
@@ -782,13 +818,28 @@ impl AgentManager {
             return Ok(());
         }
 
-        // Fallback: direct process launch
+        // Fallback: direct process launch using the npm-global binary
         warn!("[AGENT] systemd start failed, falling back to direct launch...");
 
+        let npm_bin = format!("{}/.npm-global/bin", OPENCLAW_HOME);
+        let openclaw_bin = format!("{}/openclaw", npm_bin);
+        let path_value = format!(
+            "{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            npm_bin
+        );
+
         let mut cmd = TokioCommand::new("sudo");
-        cmd.args(&["-u", OPENCLAW_USER, "-i", "openclaw", "gateway", "--verbose"]);
+        cmd.args(&[
+            "-u", OPENCLAW_USER,
+            "--preserve-env=PATH,HOME,OPENCLAW_HOME,NPM_CONFIG_PREFIX",
+            &openclaw_bin,
+            "gateway",
+            "--verbose",
+        ]);
         cmd.env("HOME", OPENCLAW_HOME);
         cmd.env("OPENCLAW_HOME", OPENCLAW_HOME);
+        cmd.env("PATH", &path_value);
+        cmd.env("NPM_CONFIG_PREFIX", format!("{}/.npm-global", OPENCLAW_HOME));
         // Detach from parent
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
@@ -889,13 +940,41 @@ impl AgentManager {
 
     /// Runs a command as the `openclaw` user via `sudo -u`.
     async fn run_command_as_user(program: &str, args: &[&str]) -> Result<(), String> {
-        debug!("[AGENT_CMD] sudo -u {} -i {} {}", OPENCLAW_USER, program, args.join(" "));
+        Self::run_command_as_user_with_env(program, args, &[]).await
+    }
 
-        let output = TokioCommand::new("sudo")
-            .args(&["-u", OPENCLAW_USER, "-i", program])
-            .args(args)
-            .env("HOME", OPENCLAW_HOME)
-            .output()
+    /// Runs a command as the `openclaw` user with extra environment variables.
+    ///
+    /// Always sets HOME, PATH (including npm-global/bin), and OPENCLAW_HOME.
+    async fn run_command_as_user_with_env(
+        program: &str,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), String> {
+        let npm_bin = format!("{}/.npm-global/bin", OPENCLAW_HOME);
+        let path_value = format!(
+            "{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            npm_bin
+        );
+
+        debug!(
+            "[AGENT_CMD] sudo -u {} {} {}",
+            OPENCLAW_USER, program, args.join(" ")
+        );
+
+        let mut cmd = TokioCommand::new("sudo");
+        cmd.args(&["-u", OPENCLAW_USER, "--preserve-env=PATH,HOME,NPM_CONFIG_PREFIX,OPENCLAW_HOME", program]);
+        cmd.args(args);
+        cmd.env("HOME", OPENCLAW_HOME);
+        cmd.env("OPENCLAW_HOME", OPENCLAW_HOME);
+        cmd.env("PATH", &path_value);
+        cmd.env("NPM_CONFIG_PREFIX", format!("{}/.npm-global", OPENCLAW_HOME));
+
+        for (key, val) in extra_env {
+            cmd.env(key, val);
+        }
+
+        let output = cmd.output()
             .await
             .map_err(|e| format!("Failed to execute {} as {}: {}", program, OPENCLAW_USER, e))?;
 
@@ -909,10 +988,19 @@ impl AgentManager {
 
     /// Runs a command as the `openclaw` user and returns stdout.
     async fn run_command_output_as_user(program: &str, args: &[&str]) -> Result<String, String> {
+        let npm_bin = format!("{}/.npm-global/bin", OPENCLAW_HOME);
+        let path_value = format!(
+            "{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            npm_bin
+        );
+
         let output = TokioCommand::new("sudo")
-            .args(&["-u", OPENCLAW_USER, "-i", program])
+            .args(&["-u", OPENCLAW_USER, "--preserve-env=PATH,HOME,NPM_CONFIG_PREFIX,OPENCLAW_HOME", program])
             .args(args)
             .env("HOME", OPENCLAW_HOME)
+            .env("OPENCLAW_HOME", OPENCLAW_HOME)
+            .env("PATH", &path_value)
+            .env("NPM_CONFIG_PREFIX", format!("{}/.npm-global", OPENCLAW_HOME))
             .output()
             .await
             .map_err(|e| format!("Failed to execute {} as {}: {}", program, OPENCLAW_USER, e))?;
