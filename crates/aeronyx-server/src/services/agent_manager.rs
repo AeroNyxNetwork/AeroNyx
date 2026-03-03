@@ -729,14 +729,14 @@ impl AgentManager {
     ) -> Result<(), String> {
         info!("[AGENT] Running onboarding (non-interactive)...");
 
-        let mut args = vec!["onboard", "--install-daemon"];
+        let args = vec!["onboard", "--install-daemon"];
 
         // If CMS provides an API key, pass it via environment
         // The onboarding wizard can be pre-configured via env vars
         let api_key = params.get("api_key")
             .and_then(|v| v.as_str());
 
-        let model = params.get("model")
+        let _model = params.get("model")
             .and_then(|v| v.as_str())
             .unwrap_or("anthropic/claude-sonnet-4-5-20250929");
 
