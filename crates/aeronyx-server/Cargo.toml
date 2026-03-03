@@ -11,6 +11,12 @@
 # (via aeronyx-core) and for AOF persistence. Also moved `tempfile`
 # note to dev-deps (already present, just documenting).
 #
+# Modification Reason (v1.3.0):
+# - 🌟 Added `tokio-tungstenite` with `rustls-tls-native-roots` for
+#   WebSocket tunnel to CMS (Phase 3: wss:// to CMS + ws:// to local OpenClaw)
+# - `futures` was already present (workspace), confirmed needed for
+#   Stream/Sink traits used by tokio-tungstenite split()
+#
 # Main Functionality:
 # - Server binary with CLI interface
 # - Configuration management
@@ -18,10 +24,13 @@
 # - Handshake processing
 # - Packet forwarding
 # - 🌟 MemChain storage engine (MemPool + AofWriter)
+# - 🌟 CMS command pipeline + AgentManager (v1.3.0)
+# - 🌟 WebSocket tunnel for real-time AI interaction (v1.3.0)
 #
 # Dependencies:
 # - Depends on: aeronyx-core, aeronyx-transport, aeronyx-common
 # - External: tokio, clap, tracing
+# - 🌟 v1.3.0: tokio-tungstenite (WebSocket client)
 #
 # Binary:
 # - aeronyx-server: Main server executable
@@ -31,10 +40,15 @@
 # - Configuration is loaded from TOML files
 # - Requires root/CAP_NET_ADMIN for TUN operations
 # - MemChain AOF file is created in the working directory
+# - 🌟 tokio-tungstenite uses rustls (not native-tls) to match
+#   the rest of the project's TLS strategy (reqwest also uses rustls-tls)
+# - 🌟 futures crate is needed for SinkExt/StreamExt traits
+#   used by tokio-tungstenite's split() WS streams
 #
 # Last Modified:
 # v0.1.0 - Initial server implementation
 # v0.2.0 - Added bincode for MemChain integration
+# v1.3.0 - 🌟 Added tokio-tungstenite for WebSocket tunnel
 # ============================================
 
 [package]
@@ -82,6 +96,11 @@ bincode = "1.3"
 # 🌟 Added for MemChain Phase 1: Agent HTTP API
 axum = "0.7"
 tower = "0.5"
+
+# 🌟 v1.3.0: WebSocket client for CMS tunnel + local OpenClaw Gateway
+# Uses rustls-tls-native-roots to match the project's TLS strategy
+# (reqwest also uses rustls). Provides async WS client via tokio.
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 
 # Error handling
 thiserror = { workspace = true }
