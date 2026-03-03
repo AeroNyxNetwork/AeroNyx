@@ -1,6 +1,6 @@
-// ============================================
-// File: crates/aeronyx-server/src/server.rs
-// ============================================
+//! ============================================
+//! File: crates/aeronyx-server/src/server.rs
+//! ============================================
 //! # Server Orchestrator
 //!
 //! ## Creation Reason
@@ -16,6 +16,11 @@
 //! - 🌟 v0.4.0: Phase 3 — Ed25519 signature verification on received Facts,
 //!   trusted_agents whitelist enforcement, SyncRequest/SyncResponse handling,
 //!   start_api_server extended with sessions + udp for P2P broadcast.
+//! - 🌟 v1.3.0: Phase 1 Command Pipeline — `init_management_reporter` now
+//!   creates a command `mpsc` channel, wires `HeartbeatReporter` to forward
+//!   CMS commands, and spawns `CommandHandler` as a supervised task.
+//!   `ManagementClient` is promoted to `Arc` and shared across reporter
+//!   and command handler for signed CMS communication.
 //!
 //! ## Main Functionality
 //! - `Server`: Main server struct and lifecycle management
@@ -27,6 +32,7 @@
 //! - 🌟 MemChain MemPool + AofWriter lifecycle
 //! - 🌟 Ed25519 signature verification + trust whitelist
 //! - 🌟 SyncRequest → SyncResponse reply via encrypted UDP
+//! - 🌟 CMS command dispatch pipeline (v1.3.0)
 //!
 //! ## Packet Types Handled
 //! - 0x01 ClientHello: Handshake initiation
@@ -49,6 +55,8 @@
 //! - 🌟 mempool / aof_writer are Option — always guard with if-let before use
 //! - 🌟 handle_memchain_message now requires config + session + udp + crypto
 //!   for signature verification and SyncResponse reply
+//! - 🌟 v1.3.0: `mgmt_client` is shared between HeartbeatReporter,
+//!   SessionReporter, and CommandHandler — do NOT create separate instances
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial server implementation
@@ -57,6 +65,7 @@
 //! v0.3.0 - 🌟 Added MemChain integration (MemPool, AofWriter, 1st-byte dispatch)
 //! v0.3.1 - 🐛 Fixed Option<Arc<…>> type mismatch in handle_memchain_message
 //! v0.4.0 - 🌟 Phase 3: Ed25519 verify, trust whitelist, SyncReq/SyncRes
+//! v1.3.0 - 🌟 Phase 1 Command Pipeline: CommandHandler + channel wiring
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,7 +73,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use tokio::sync::{broadcast, Mutex as TokioMutex};
+use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
@@ -89,7 +98,7 @@ use crate::error::{Result, ServerError};
 use crate::handlers::packet::DecryptedPayload;
 use crate::handlers::PacketHandler;
 use crate::management::{
-    HeartbeatReporter, ManagementClient, SessionReporter,
+    CommandHandler, HeartbeatReporter, ManagementClient, SessionReporter,
     reporter::SessionEventSender,
 };
 use crate::services::{
@@ -108,6 +117,11 @@ const KEEPALIVE_PACKET_SIZE: usize = 17;
 /// Disconnect packet minimum size: 1 byte type + 16 bytes session ID + 1 byte reason
 #[allow(dead_code)]
 const DISCONNECT_PACKET_MIN_SIZE: usize = 18;
+
+/// 🌟 v1.3.0: Command channel buffer size.
+/// Should be large enough to handle burst of commands from CMS
+/// without blocking the heartbeat loop.
+const COMMAND_CHANNEL_BUFFER: usize = 100;
 
 // ============================================
 // Server
@@ -150,6 +164,7 @@ impl Server {
         let (ip_pool, sessions, routing) = self.init_services()?;
 
         // Initialize session event sender (for CMS reporting)
+        // 🌟 v1.3.0: Also spawns CommandHandler task
         let session_event_sender = self.init_management_reporter(&sessions).await;
 
         // Initialize handshake service
@@ -354,7 +369,25 @@ impl Server {
     // Management Reporter
     // ============================================
 
-    /// Initializes management reporters.
+    /// Initializes management reporters, command handler, and agent manager.
+    ///
+    /// 🌟 v1.3.0 Phase 2: Now also creates the `AgentManager`, detects
+    /// existing OpenClaw installations, and wires it into both the
+    /// `CommandHandler` (for mutations) and the heartbeat loop (for
+    /// status reporting). A periodic health check task is also spawned.
+    ///
+    /// ## Architecture
+    /// ```text
+    /// ManagementClient (Arc)
+    ///       │
+    ///       ├── HeartbeatReporter ──(commands)──→ mpsc ──→ CommandHandler
+    ///       │                                                    │
+    ///       ├── SessionReporter                          AgentManager (Arc)
+    ///       │                                              │
+    ///       └── AgentManager ◄─────────────────────────────┘
+    ///             │
+    ///             └── Health Check Task (periodic)
+    /// ```
     async fn init_management_reporter(
         &self,
         sessions: &Arc<SessionManager>,
@@ -374,11 +407,65 @@ impl Server {
                 self.config.listen_addr().ip().to_string()
             });
 
-        // Start heartbeat reporter
+        // ====================================================
+        // 🌟 v1.3.0 Phase 2: Initialize AgentManager
+        // ====================================================
+        let agent_manager = Arc::new(crate::services::AgentManager::new(
+            Arc::clone(&mgmt_client),
+        ));
+
+        // Detect existing OpenClaw installation on startup
+        agent_manager.detect_existing().await;
+
+        // Spawn periodic health check for the agent (every 30s)
+        {
+            let am = Arc::clone(&agent_manager);
+            let mut health_shutdown_rx = self.shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(
+                    std::time::Duration::from_secs(30),
+                );
+                loop {
+                    tokio::select! {
+                        _ = health_shutdown_rx.recv() => {
+                            debug!("[AGENT_HEALTH] Stopping health check");
+                            break;
+                        }
+                        _ = interval.tick() => {
+                            am.periodic_health_check().await;
+                        }
+                    }
+                }
+            });
+        }
+
+        info!("[AGENT] Agent manager initialized with health monitoring");
+
+        // ====================================================
+        // 🌟 v1.3.0: Create command channel and handler
+        // ====================================================
+        let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_BUFFER);
+
+        // Spawn CommandHandler task (with AgentManager)
+        let cmd_handler = CommandHandler::new(
+            command_rx,
+            Arc::clone(&mgmt_client),
+            Arc::clone(&agent_manager),
+        );
+        let cmd_shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            cmd_handler.run(cmd_shutdown_rx).await;
+        });
+
+        info!("[CMD_HANDLER] Command handler spawned");
+
+        // ====================================================
+        // Start heartbeat reporter (with command forwarding)
+        // ====================================================
         let heartbeat_reporter = HeartbeatReporter::new(
             Arc::clone(&mgmt_client),
             public_ip,
-        );
+        ).with_command_sender(command_tx);
 
         let sessions_for_heartbeat = Arc::clone(sessions);
         let shutdown_rx = self.shutdown_tx.subscribe();
@@ -398,9 +485,37 @@ impl Server {
             session_reporter.run(shutdown_rx).await;
         });
 
+        // ====================================================
+        // 🌟 v1.3.0 Phase 3: Start WebSocket Tunnel to CMS
+        // ====================================================
+        // Only start if the node is registered (we need the CMS node UUID)
+        let node_info_path = &self.config.management.node_info_path;
+        if let Ok(node_info) = crate::management::models::StoredNodeInfo::load(node_info_path) {
+            let ws_tunnel = crate::management::WsTunnel::new(
+                self.identity.clone(),
+                node_info.node_id.clone(),
+                Arc::clone(&agent_manager),
+            );
+            let ws_shutdown_rx = self.shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                ws_tunnel.run(ws_shutdown_rx).await;
+            });
+
+            info!(
+                cms_node_id = %node_info.node_id,
+                "[WS_TUNNEL] WebSocket tunnel task spawned"
+            );
+        } else {
+            warn!(
+                "[WS_TUNNEL] Node not registered — WebSocket tunnel disabled. \
+                 Register the node first with: aeronyx-server register --code <CODE>"
+            );
+        }
+
         info!(
-            "Management reporting started (heartbeat interval: {}s)",
-            self.config.management.heartbeat_interval_secs
+            heartbeat_interval = self.config.management.heartbeat_interval_secs,
+            command_channel_buffer = COMMAND_CHANNEL_BUFFER,
+            "[MANAGEMENT] ✅ Reporting started (heartbeat + session + command + agent + ws_tunnel)"
         );
 
         SessionEventSender::new(event_tx)
