@@ -631,7 +631,7 @@ impl WsTunnel {
             .map_err(|e| format!("OpenClaw connect send failed: {}", e))?;
 
         // Wait for hello-ok (with timeout)
-        let hello_ok = tokio::time::timeout(
+        let _hello_ok = tokio::time::timeout(
             Duration::from_secs(10),
             Self::wait_for_openclaw_hello(&mut oc_source),
         ).await
@@ -873,6 +873,9 @@ impl WsTunnel {
                     });
                     let _ = cms_sink.send(ws_text(&done_msg)).await;
                     return Ok(());
+                }
+                _ => {
+                    // Binary/Ping/Pong/Frame — skip
                 }
             }
         }
