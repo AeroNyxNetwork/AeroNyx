@@ -1034,6 +1034,7 @@ impl AgentManager {
     ) {
         let report = CommandStatusReport {
             command_id: command_id.to_string(),
+            agent_type: "openclaw".to_string(),
             status,
             progress,
             message: message.to_string(),
