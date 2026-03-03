@@ -448,14 +448,38 @@ impl AgentManager {
 
     /// Starts the OpenClaw gateway process.
     ///
+    /// **Idempotent**: if already running, reports success without error.
     /// Uses systemd user service if available, falls back to direct process.
     pub async fn start_agent(&self, command_id: &str) -> Result<(), String> {
         let current_status = self.state.read().await.status;
-        if current_status == AgentStatus::Running {
-            return Err("OpenClaw is already running".to_string());
-        }
-        if current_status == AgentStatus::NotInstalled {
-            return Err("OpenClaw is not installed".to_string());
+
+        match current_status {
+            // Already running — idempotent success
+            AgentStatus::Running => {
+                info!(
+                    command_id = %command_id,
+                    "[AGENT] OpenClaw already running — nothing to do"
+                );
+                self.report_progress(
+                    command_id,
+                    CommandExecutionStatus::Completed,
+                    100,
+                    "OpenClaw is already running",
+                ).await;
+                return Ok(());
+            }
+            // Not installed — can't start what doesn't exist
+            AgentStatus::NotInstalled => {
+                self.report_progress(
+                    command_id,
+                    CommandExecutionStatus::Failed,
+                    0,
+                    "OpenClaw is not installed. Send install_openclaw first.",
+                ).await;
+                return Err("OpenClaw is not installed".to_string());
+            }
+            // Stopped, Error, Updating — try to start
+            _ => {}
         }
 
         self.report_progress(command_id, CommandExecutionStatus::InProgress, 30, "Starting gateway...").await;
@@ -478,10 +502,29 @@ impl AgentManager {
     }
 
     /// Stops the OpenClaw gateway process.
+    ///
+    /// **Idempotent**: if already stopped or not installed, reports success.
     pub async fn stop_agent(&self, command_id: &str) -> Result<(), String> {
         let current_status = self.state.read().await.status;
-        if current_status != AgentStatus::Running {
-            return Err("OpenClaw is not running".to_string());
+
+        match current_status {
+            // Already stopped or not installed — idempotent success
+            AgentStatus::Stopped | AgentStatus::NotInstalled => {
+                info!(
+                    command_id = %command_id,
+                    status = ?current_status,
+                    "[AGENT] OpenClaw not running — nothing to stop"
+                );
+                self.report_progress(
+                    command_id,
+                    CommandExecutionStatus::Completed,
+                    100,
+                    "OpenClaw is not running",
+                ).await;
+                return Ok(());
+            }
+            // Running, Error, Installing, Updating — try to stop
+            _ => {}
         }
 
         self.report_progress(command_id, CommandExecutionStatus::InProgress, 30, "Stopping gateway...").await;
@@ -518,9 +561,28 @@ impl AgentManager {
     // ============================================
 
     /// Uninstalls OpenClaw from this node.
+    ///
+    /// **Idempotent**: if not installed, reports success.
+    /// If running, stops first then uninstalls.
     pub async fn uninstall_agent(&self, command_id: &str) -> Result<(), String> {
-        // Stop first if running
         let current_status = self.state.read().await.status;
+
+        // Already not installed — idempotent success
+        if current_status == AgentStatus::NotInstalled {
+            info!(
+                command_id = %command_id,
+                "[AGENT] OpenClaw not installed — nothing to uninstall"
+            );
+            self.report_progress(
+                command_id,
+                CommandExecutionStatus::Completed,
+                100,
+                "OpenClaw is not installed",
+            ).await;
+            return Ok(());
+        }
+
+        // Stop first if running
         if current_status == AgentStatus::Running {
             self.report_progress(command_id, CommandExecutionStatus::InProgress, 10, "Stopping gateway before uninstall...").await;
             let _ = self.stop_agent(command_id).await;
@@ -560,13 +622,26 @@ impl AgentManager {
     // ============================================
 
     /// Updates OpenClaw to the latest (or specified) version.
+    ///
+    /// **Smart handling**:
+    /// - NotInstalled → reports error (send install_openclaw instead)
+    /// - Running → stop, update, restart
+    /// - Stopped → update only (don't start)
+    /// - Error → try update anyway (might fix the error)
     pub async fn update_agent(
         &self,
         command_id: &str,
         params: &serde_json::Value,
     ) -> Result<(), String> {
         let current_status = self.state.read().await.status;
+
         if current_status == AgentStatus::NotInstalled {
+            self.report_progress(
+                command_id,
+                CommandExecutionStatus::Failed,
+                0,
+                "OpenClaw is not installed. Send install_openclaw first.",
+            ).await;
             return Err("OpenClaw is not installed".to_string());
         }
 
