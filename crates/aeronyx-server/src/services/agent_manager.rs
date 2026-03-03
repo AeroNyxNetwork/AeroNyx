@@ -292,8 +292,61 @@ impl AgentManager {
             if state.status == AgentStatus::Installing {
                 return Err("Installation already in progress".to_string());
             }
+            // 🐛 v1.3.1: If already installed, be smart about it
             if state.status == AgentStatus::Running {
-                return Err("OpenClaw is already installed and running".to_string());
+                info!(
+                    command_id = %command_id,
+                    "[AGENT] OpenClaw already installed and running — nothing to do"
+                );
+                self.report_progress(
+                    command_id,
+                    CommandExecutionStatus::Completed,
+                    100,
+                    "OpenClaw is already installed and running",
+                ).await;
+                return Ok(());
+            }
+            if state.status == AgentStatus::Stopped {
+                info!(
+                    command_id = %command_id,
+                    "[AGENT] OpenClaw installed but stopped — starting gateway"
+                );
+                // Drop the read lock before calling start_gateway
+            }
+        }
+
+        // If installed but stopped, just start it
+        {
+            let state = self.state.read().await;
+            if state.status == AgentStatus::Stopped {
+                drop(state);
+                self.report_progress(
+                    command_id,
+                    CommandExecutionStatus::InProgress,
+                    80,
+                    "Starting existing OpenClaw installation...",
+                ).await;
+
+                if let Err(e) = self.start_gateway().await {
+                    let msg = format!("Failed to start gateway: {}", e);
+                    self.set_state(AgentStatus::Error, &msg).await;
+                    self.report_progress(command_id, CommandExecutionStatus::Failed, 80, &msg).await;
+                    return Err(msg);
+                }
+
+                if self.wait_for_gateway_healthy().await {
+                    let version = Self::run_command_output_as_user("openclaw", &["--version"]).await.ok();
+                    let mut st = self.state.write().await;
+                    st.status = AgentStatus::Running;
+                    st.version = version;
+                    st.message = "Running".to_string();
+                    self.report_progress(command_id, CommandExecutionStatus::Completed, 100, "OpenClaw started").await;
+                    return Ok(());
+                } else {
+                    self.set_state(AgentStatus::Error, "Gateway health check failed").await;
+                    self.report_progress(command_id, CommandExecutionStatus::Failed, 90, "Health check failed").await;
+                    return Err("Gateway failed to start".to_string());
+                }
             }
         }
 
