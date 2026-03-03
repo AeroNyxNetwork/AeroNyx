@@ -98,9 +98,10 @@ axum = "0.7"
 tower = "0.5"
 
 # 🌟 v1.3.0: WebSocket client for CMS tunnel + local OpenClaw Gateway
-# Uses rustls-tls-native-roots to match the project's TLS strategy
-# (reqwest also uses rustls). Provides async WS client via tokio.
+# Uses rustls with ring crypto backend for TLS.
+# native-roots loads the system CA store for wss:// certificate validation.
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+rustls = { version = "0.23", features = ["ring"], default-features = false }
 
 # Error handling
 thiserror = { workspace = true }
