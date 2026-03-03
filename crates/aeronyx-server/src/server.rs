@@ -324,11 +324,29 @@ impl Server {
 
     /// Initializes the MemChain storage engine.
     ///
-    /// 1. Opens (or creates) the `.memchain` AOF file.
-    /// 2. Replays existing facts and blocks from disk into MemPool.
-    /// 3. Restores chain state (last block hash/height) for the Miner.
+    /// 1. Ensures the AOF parent directory exists (auto-create).
+    /// 2. Opens (or creates) the `.memchain` AOF file.
+    /// 3. Replays existing facts and blocks from disk into MemPool.
+    /// 4. Restores chain state (last block hash/height) for the Miner.
     async fn init_memchain(&self) -> Result<(Arc<MemPool>, Arc<TokioMutex<AofWriter>>)> {
         let aof_path = &self.config.memchain.aof_path;
+
+        // 🐛 v1.3.1: Auto-create parent directory for AOF file.
+        // Previously the server would crash with "No such file or directory"
+        // if the parent directory didn't exist (e.g., /var/lib/aeronyx/).
+        if let Some(parent) = std::path::Path::new(aof_path).parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| ServerError::startup_failed(
+                        format!("Failed to create AOF directory '{}': {}", parent.display(), e)
+                    ))?;
+                info!(
+                    path = %parent.display(),
+                    "[MEMCHAIN] Created AOF directory"
+                );
+            }
+        }
 
         // Replay existing records from disk (facts + blocks)
         let (existing_facts, last_block) = AofWriter::replay(aof_path)
@@ -401,11 +419,7 @@ impl Server {
 
         info!("Node ID: {}", mgmt_client.node_id());
 
-        let public_ip = self.config.network.public_ip()
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| {
-                self.config.listen_addr().ip().to_string()
-            });
+        let public_ip = self.resolve_public_ip().await;
 
         // ====================================================
         // 🌟 v1.3.0 Phase 2: Initialize AgentManager
@@ -519,6 +533,91 @@ impl Server {
         );
 
         SessionEventSender::new(event_tx)
+    }
+
+    // ============================================
+    // Public IP Resolution
+    // ============================================
+
+    /// Resolves the node's public IP address.
+    ///
+    /// Priority order:
+    /// 1. `network.public_endpoint` from config (explicit override)
+    /// 2. Auto-detect via external HTTP services (for cloud VMs behind NAT)
+    /// 3. Fallback to listen address (last resort)
+    ///
+    /// 🐛 v1.3.1: Cloud VMs (GCP, AWS, Azure) sit behind NAT.
+    /// `listen_addr` is typically `0.0.0.0` which is useless for CMS.
+    /// We now query external services to discover the real public IP.
+    async fn resolve_public_ip(&self) -> String {
+        // Priority 1: Explicit config
+        if let Some(ip) = self.config.network.public_ip() {
+            info!(ip = %ip, "[NET] Using public IP from config");
+            return ip.to_string();
+        }
+
+        // Priority 2: Auto-detect from external services
+        info!("[NET] No public_endpoint configured, auto-detecting public IP...");
+
+        let detect_services = [
+            "https://api.ipify.org",
+            "https://ifconfig.me/ip",
+            "https://ipinfo.io/ip",
+            "http://169.254.169.254/latest/meta-data/public-ipv4", // AWS
+            "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip", // GCP
+        ];
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .ok();
+
+        if let Some(client) = client {
+            for service_url in &detect_services {
+                let mut request = client.get(*service_url);
+
+                // GCP metadata requires a special header
+                if service_url.contains("metadata.google.internal") {
+                    request = request.header("Metadata-Flavor", "Google");
+                }
+
+                match request.send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(body) = resp.text().await {
+                            let ip = body.trim().to_string();
+                            // Basic validation: should look like an IP
+                            if !ip.is_empty()
+                                && !ip.starts_with('<')
+                                && ip.len() <= 45
+                                && ip.parse::<std::net::IpAddr>().is_ok()
+                            {
+                                info!(
+                                    ip = %ip,
+                                    source = %service_url,
+                                    "[NET] ✅ Public IP detected"
+                                );
+                                return ip;
+                            }
+                        }
+                    }
+                    _ => {
+                        debug!(
+                            service = %service_url,
+                            "[NET] IP detection service unavailable"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Priority 3: Fallback to listen address
+        let fallback = self.config.listen_addr().ip().to_string();
+        warn!(
+            fallback_ip = %fallback,
+            "[NET] ⚠️ Could not detect public IP, using listen address. \
+             Set network.public_endpoint in server.toml to fix this."
+        );
+        fallback
     }
 
     // ============================================
