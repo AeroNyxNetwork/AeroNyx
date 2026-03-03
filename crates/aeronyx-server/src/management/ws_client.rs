@@ -91,7 +91,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
-use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
@@ -129,6 +128,16 @@ const AUTH_TIMEOUT_SECS: u64 = 25; // Slightly under CMS's 30s limit
 type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type WsSink = SplitSink<WsStream, WsMessage>;
 type WsSource = SplitStream<WsStream>;
+
+/// Helper: creates a WsMessage::Text from a serializable value.
+/// tungstenite 0.26+ requires `Utf8Bytes`, not `String`.
+fn ws_text(value: &serde_json::Value) -> WsMessage {
+    WsMessage::Text(value.to_string().into())
+}
+
+fn ws_text_str(s: &str) -> WsMessage {
+    WsMessage::Text(s.to_string().into())
+}
 
 // ============================================
 // WsTunnel
@@ -312,7 +321,7 @@ impl WsTunnel {
 
         debug!("[WS_TUNNEL] Sending auth message...");
 
-        sink.send(WsMessage::Text(auth_msg.to_string()))
+        sink.send(ws_text(&auth_msg))
             .await
             .map_err(|e| format!("Failed to send auth: {}", e))?;
 
@@ -409,7 +418,7 @@ impl WsTunnel {
                 // --- Periodic ping ---
                 _ = ping_interval.tick() => {
                     let ping_msg = serde_json::json!({"type": "ping"});
-                    if let Err(e) = sink.send(WsMessage::Text(ping_msg.to_string())).await {
+                    if let Err(e) = sink.send(ws_text(&ping_msg)).await {
                         return Ok(ShutdownReason::Disconnected(
                             format!("Ping send failed: {}", e)
                         ));
@@ -475,7 +484,7 @@ impl WsTunnel {
             }
             "ping" => {
                 let pong = serde_json::json!({"type": "pong"});
-                sink.send(WsMessage::Text(pong.to_string()))
+                sink.send(ws_text(&pong))
                     .await
                     .map_err(|e| format!("Pong send failed: {}", e))?;
             }
@@ -538,7 +547,7 @@ impl WsTunnel {
                         "error": "OpenClaw gateway token not available. Is OpenClaw installed?"
                     }
                 });
-                let _ = cms_sink.send(WsMessage::Text(error_response.to_string())).await;
+                let _ = cms_sink.send(ws_text(&error_response)).await;
                 return Ok(());
             }
         };
@@ -565,7 +574,7 @@ impl WsTunnel {
                         "error": format!("Failed to communicate with OpenClaw: {}", e)
                     }
                 });
-                let _ = cms_sink.send(WsMessage::Text(error_response.to_string())).await;
+                let _ = cms_sink.send(ws_text(&error_response)).await;
             }
         }
 
@@ -617,7 +626,7 @@ impl WsTunnel {
             }
         });
 
-        oc_sink.send(WsMessage::Text(connect_msg.to_string()))
+        oc_sink.send(ws_text(&connect_msg))
             .await
             .map_err(|e| format!("OpenClaw connect send failed: {}", e))?;
 
@@ -648,7 +657,7 @@ impl WsTunnel {
                     }
                 });
 
-                oc_sink.send(WsMessage::Text(chat_msg.to_string()))
+                oc_sink.send(ws_text(&chat_msg))
                     .await
                     .map_err(|e| format!("Chat send failed: {}", e))?;
 
@@ -668,7 +677,7 @@ impl WsTunnel {
                     "status": "success",
                     "payload": status
                 });
-                cms_sink.send(WsMessage::Text(response.to_string()))
+                cms_sink.send(ws_text(&response))
                     .await
                     .map_err(|e| format!("Status response send failed: {}", e))?;
             }
@@ -681,7 +690,7 @@ impl WsTunnel {
                         "error": format!("Unknown action: {}", other)
                     }
                 });
-                cms_sink.send(WsMessage::Text(response.to_string()))
+                cms_sink.send(ws_text(&response))
                     .await
                     .map_err(|e| format!("Error response send failed: {}", e))?;
             }
@@ -796,7 +805,7 @@ impl WsTunnel {
                                                 "response": text_content
                                             }
                                         });
-                                        cms_sink.send(WsMessage::Text(response.to_string()))
+                                        cms_sink.send(ws_text(&response))
                                             .await
                                             .map_err(|e| format!("Send failed: {}", e))?;
                                         return Ok(());
@@ -808,7 +817,7 @@ impl WsTunnel {
                                             "chunk": text_content,
                                             "done": false
                                         });
-                                        cms_sink.send(WsMessage::Text(stream_msg.to_string()))
+                                        cms_sink.send(ws_text(&stream_msg))
                                             .await
                                             .map_err(|e| format!("Stream send failed: {}", e))?;
                                     }
@@ -827,7 +836,7 @@ impl WsTunnel {
                                 "status": "success",
                                 "payload": result
                             });
-                            cms_sink.send(WsMessage::Text(response.to_string()))
+                            cms_sink.send(ws_text(&response))
                                 .await
                                 .map_err(|e| format!("Response send failed: {}", e))?;
                             return Ok(());
@@ -845,7 +854,7 @@ impl WsTunnel {
                         "chunk": "",
                         "done": true
                     });
-                    let _ = cms_sink.send(WsMessage::Text(done_msg.to_string())).await;
+                    let _ = cms_sink.send(ws_text(&done_msg)).await;
                     return Ok(());
                 }
                 Ok(Some(Err(e))) => {
@@ -862,7 +871,7 @@ impl WsTunnel {
                         "chunk": "",
                         "done": true
                     });
-                    let _ = cms_sink.send(WsMessage::Text(done_msg.to_string())).await;
+                    let _ = cms_sink.send(ws_text(&done_msg)).await;
                     return Ok(());
                 }
             }
@@ -875,7 +884,7 @@ impl WsTunnel {
             "status": "error",
             "payload": {"error": "Request timed out (120s)"}
         });
-        let _ = cms_sink.send(WsMessage::Text(timeout_msg.to_string())).await;
+        let _ = cms_sink.send(ws_text(&timeout_msg)).await;
 
         Ok(())
     }
