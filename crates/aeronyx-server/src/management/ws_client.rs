@@ -533,11 +533,11 @@ impl WsTunnel {
 
         let url = format!("{}{}", OPENCLAW_HTTP_BASE, OPENCLAW_CHAT_PATH);
 
-        debug!(
+        info!(
             request_id = %request_id,
             url = %url,
             session = %session_user,
-            "[WS_TUNNEL] 📤 Sending chat request to OpenClaw HTTP API"
+            "[WS_TUNNEL] 📤 Sending chat to OpenClaw"
         );
 
         let response = tokio::time::timeout(
@@ -566,6 +566,12 @@ impl WsTunnel {
             ));
         }
 
+        info!(
+            request_id = %request_id,
+            http_status = %status.as_u16(),
+            "[WS_TUNNEL] ✅ OpenClaw responded, starting SSE stream"
+        );
+
         self.stream_sse_response(request_id, response, cms_sink).await
     }
 
@@ -587,14 +593,19 @@ impl WsTunnel {
         let mut full_response = String::new();
         let mut line_buffer = String::new();
 
-        // Phase 1: Read body incrementally
+        // Phase 1: Read body incrementally.
+        // Each chunk() call has a 30-second timeout — if no data arrives
+        // in 30 seconds, we consider the stream stalled and break out.
+        // This prevents permanent hangs when OpenClaw's agent enters an
+        // interactive/tool loop that keeps the SSE connection open.
         loop {
-            let chunk_opt = response.chunk()
-                .await
-                .map_err(|e| format!("SSE read error: {}", e))?;
+            let chunk_result = tokio::time::timeout(
+                Duration::from_secs(30),
+                response.chunk(),
+            ).await;
 
-            match chunk_opt {
-                Some(bytes) => {
+            match chunk_result {
+                Ok(Ok(Some(bytes))) => {
                     line_buffer.push_str(&String::from_utf8_lossy(&bytes));
 
                     if self.process_sse_lines(
@@ -603,12 +614,30 @@ impl WsTunnel {
                         return Ok(()); // [DONE] found and handled
                     }
                 }
-                None => {
+                Ok(Ok(None)) => {
+                    // Body exhausted
                     debug!(
                         request_id = %request_id,
                         residual_len = line_buffer.len(),
                         "[WS_TUNNEL] SSE body exhausted, residual buffer: {} bytes",
                         line_buffer.len()
+                    );
+                    break;
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        request_id = %request_id,
+                        error = %e,
+                        "[WS_TUNNEL] SSE read error"
+                    );
+                    break;
+                }
+                Err(_) => {
+                    // 30-second timeout — no data received
+                    warn!(
+                        request_id = %request_id,
+                        response_so_far_len = full_response.len(),
+                        "[WS_TUNNEL] ⚠️ SSE chunk timeout (30s no data) — ending stream"
                     );
                     break;
                 }
@@ -631,7 +660,7 @@ impl WsTunnel {
         warn!(
             request_id = %request_id,
             response_len = full_response.len(),
-            "[WS_TUNNEL] ⚠️ SSE ended without [DONE] — sending fallback"
+            "[WS_TUNNEL] ⚠️ SSE ended without [DONE] — sending fallback done"
         );
         self.send_done_and_response(request_id, &full_response, cms_sink).await
     }
@@ -666,7 +695,7 @@ impl WsTunnel {
 
             // Stream termination
             if data == "[DONE]" {
-                debug!(request_id = %request_id, "[WS_TUNNEL] ✅ SSE [DONE] received");
+                info!(request_id = %request_id, "[WS_TUNNEL] ✅ SSE [DONE] received");
                 self.send_done_and_response(request_id, full_response, cms_sink).await?;
                 return Ok(true);
             }
