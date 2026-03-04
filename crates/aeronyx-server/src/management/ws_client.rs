@@ -148,7 +148,10 @@ const AUTH_TIMEOUT_SECS: u64 = 25; // Slightly under CMS's 30s limit
 
 /// Timeout for a single OpenClaw HTTP request (seconds).
 /// This covers the entire SSE stream duration, not just the first byte.
-const OPENCLAW_REQUEST_TIMEOUT_SECS: u64 = 120;
+/// Set to 180s to accommodate tool execution (browser, code, file ops).
+/// The 30-second per-chunk timeout in stream_sse_response provides
+/// faster detection of truly stuck streams.
+const OPENCLAW_REQUEST_TIMEOUT_SECS: u64 = 180;
 
 /// Default OpenClaw agent ID.
 const OPENCLAW_AGENT_ID: &str = "main";
@@ -615,6 +618,16 @@ impl WsTunnel {
                         error = %e,
                         "[WS_TUNNEL] ❌ Chat request failed"
                     );
+                    // Always send done + error so the frontend stops waiting.
+                    // Without this, the frontend hangs forever on timeout/error.
+                    let done_msg = serde_json::json!({
+                        "type": "agent_stream",
+                        "request_id": request_id,
+                        "chunk": "",
+                        "done": true
+                    });
+                    let _ = cms_sink.send(ws_text(&done_msg)).await;
+
                     let error_response = serde_json::json!({
                         "type": "agent_response",
                         "request_id": request_id,
@@ -710,7 +723,15 @@ impl WsTunnel {
             format!("aeronyx:req:{}", request_id)
         };
 
-        // Build OpenAI-compatible request body
+        // Build OpenAI-compatible request body.
+        //
+        // We rely on OpenClaw's session management (via `user` field) to
+        // maintain conversation history. Tools and skills remain fully
+        // enabled — the agent can execute commands, read files, etc.
+        //
+        // The `user` field creates a stable session in OpenClaw, so
+        // multi-turn conversations work naturally: the AI remembers
+        // previous messages and tool results.
         let request_body = serde_json::json!({
             "model": "openclaw",
             "stream": true,
@@ -742,7 +763,12 @@ impl WsTunnel {
                 .json(&request_body)
                 .send()
         ).await
-            .map_err(|_| format!("OpenClaw request timed out ({}s)", OPENCLAW_REQUEST_TIMEOUT_SECS))?
+            .map_err(|_| {
+                format!(
+                    "OpenClaw request timed out ({}s). The AI may be stuck in an interactive loop.",
+                    OPENCLAW_REQUEST_TIMEOUT_SECS
+                )
+            })?
             .map_err(|e| format!("OpenClaw HTTP request failed: {}", e))?;
 
         // Check HTTP status
@@ -807,12 +833,27 @@ impl WsTunnel {
                 .map_err(|e| format!("SSE read error: {}", e))?;
 
             let chunk_bytes = match chunk_opt {
-                Some(bytes) => bytes,
+                Some(bytes) => {
+                    debug!(
+                        request_id = %request_id,
+                        bytes_len = bytes.len(),
+                        "[WS_TUNNEL] SSE chunk received ({} bytes)",
+                        bytes.len()
+                    );
+                    bytes
+                }
                 None => {
                     // Body exhausted — but line_buffer may still contain
                     // unprocessed lines (e.g., "data: [DONE]\n" arrived in
                     // the last TCP frame). Process remaining buffer below
                     // before exiting.
+                    debug!(
+                        request_id = %request_id,
+                        line_buffer_len = line_buffer.len(),
+                        line_buffer_preview = %line_buffer.chars().take(200).collect::<String>(),
+                        "[WS_TUNNEL] SSE body exhausted, residual buffer: {} bytes",
+                        line_buffer.len()
+                    );
                     break;
                 }
             };
@@ -1014,8 +1055,17 @@ impl WsTunnel {
         }
 
         // If we STILL didn't find [DONE] after processing residual buffer,
-        // send done + response as fallback
+        // send done + response as fallback.
+        // This is the safety net — if we reach here, it means either:
+        // 1. OpenClaw didn't send [DONE] (bug in OpenClaw or network cutoff)
+        // 2. [DONE] was split across TCP frames in an unexpected way
+        // 3. The overall timeout fired and we exited early
         warn!(
+            request_id = %request_id,
+            full_response_len = full_response.len(),
+            line_buffer_residual = %line_buffer.chars().take(100).collect::<String>(),
+            "[WS_TUNNEL] ⚠️ SSE stream ended without [DONE] — sending fallback done signal"
+        );
             request_id = %request_id,
             "[WS_TUNNEL] ⚠️ SSE stream ended without [DONE] marker"
         );
