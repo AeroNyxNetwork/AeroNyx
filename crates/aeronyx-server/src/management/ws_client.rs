@@ -784,7 +784,7 @@ impl WsTunnel {
     async fn stream_sse_response(
         &self,
         request_id: &str,
-        response: reqwest::Response,
+        mut response: reqwest::Response,
         cms_sink: &mut WsSink,
     ) -> Result<(), String> {
         // Read the full SSE response body as a single chunk.
