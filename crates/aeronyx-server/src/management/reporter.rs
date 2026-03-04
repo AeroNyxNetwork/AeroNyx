@@ -47,6 +47,7 @@ use tracing::{debug, error, info, warn};
 
 use super::client::ManagementClient;
 use super::models::{Command, SessionEventReport, SessionEventType};
+use crate::services::AgentManager;
 
 // ============================================
 // Constants
@@ -144,6 +145,9 @@ pub struct HeartbeatReporter {
     /// 🌟 Optional channel to forward commands to CommandHandler.
     /// If `None`, commands from CMS are logged but not dispatched.
     command_tx: Option<mpsc::Sender<Command>>,
+    /// 🌟 v1.3.1: Optional reference to AgentManager for status reporting.
+    /// If `Some`, heartbeat includes `agent_status` in `system_stats`.
+    agent_manager: Option<Arc<AgentManager>>,
 }
 
 impl HeartbeatReporter {
@@ -159,18 +163,19 @@ impl HeartbeatReporter {
             interval,
             public_ip,
             command_tx: None,
+            agent_manager: None,
         }
     }
 
     /// 🌟 Attaches a command sender channel for forwarding CMS commands.
-    ///
-    /// Must be called before `.run()` to enable command dispatch.
-    /// If not called, commands from CMS are logged but discarded.
-    ///
-    /// # Arguments
-    /// * `tx` - Sender end of the command channel (receiver held by CommandHandler)
     pub fn with_command_sender(mut self, tx: mpsc::Sender<Command>) -> Self {
         self.command_tx = Some(tx);
+        self
+    }
+
+    /// 🌟 v1.3.1: Attaches an AgentManager for status reporting in heartbeat.
+    pub fn with_agent_manager(mut self, am: Arc<AgentManager>) -> Self {
+        self.agent_manager = Some(am);
         self
     }
 
@@ -202,6 +207,13 @@ impl HeartbeatReporter {
                     total_beats += 1;
                     let in_cold_start = total_beats <= COLD_START_GRACE_BEATS;
 
+                    // 🌟 v1.3.1: Fetch agent status if AgentManager is available
+                    let agent_status = if let Some(ref am) = self.agent_manager {
+                        Some(am.status().await)
+                    } else {
+                        None
+                    };
+
                     // Use extended timeout during cold-start grace period
                     let result = if in_cold_start {
                         debug!(
@@ -212,14 +224,20 @@ impl HeartbeatReporter {
                         );
                         tokio::time::timeout(
                             std::time::Duration::from_secs(COLD_START_TIMEOUT_SECS),
-                            self.client.send_heartbeat(&self.public_ip, session_count_fn()),
+                            self.client.send_heartbeat(
+                                &self.public_ip,
+                                session_count_fn(),
+                                agent_status,
+                            ),
                         ).await
                     } else {
-                        // Normal operation: use config timeout (already in reqwest client)
-                        // Wrap in a generous outer timeout as safety net
                         tokio::time::timeout(
                             std::time::Duration::from_secs(60),
-                            self.client.send_heartbeat(&self.public_ip, session_count_fn()),
+                            self.client.send_heartbeat(
+                                &self.public_ip,
+                                session_count_fn(),
+                                agent_status,
+                            ),
                         ).await
                     };
 
