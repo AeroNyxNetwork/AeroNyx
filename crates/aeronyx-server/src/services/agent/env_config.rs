@@ -42,7 +42,7 @@
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
-use super::{CommandRunner, OPENCLAW_ENV_PATH, OPENCLAW_HOME, OPENCLAW_USER};
+use super::{CommandRunner, OPENCLAW_ENV_PATH, OPENCLAW_HOME, OPENCLAW_USER, OPENCLAW_BIN};
 
 // ============================================
 // EnvConfig
@@ -150,16 +150,18 @@ impl EnvConfig {
 
         let content = lines.join("\n") + "\n";
 
-        // Write via sudo to ensure correct ownership
+        // Write via bash as the openclaw user to ensure correct ownership.
+        // We use run_as_user (which already wraps sudo -u openclaw).
         let write_cmd = format!(
-            "cat > {} << 'ENVEOF'\n{}ENVEOF\nchmod 600 {}",
-            OPENCLAW_ENV_PATH, content, OPENCLAW_ENV_PATH
+            "printf '%s' '{}' > {} && chmod 600 {}",
+            content.replace('\'', "'\\''"),  // escape single quotes in content
+            OPENCLAW_ENV_PATH,
+            OPENCLAW_ENV_PATH
         );
 
-        CommandRunner::run_as_root(
-            "sudo",
-            &["-u", OPENCLAW_USER, "bash", "-c", &write_cmd],
-        ).await.map_err(|e| format!("Failed to write .env file: {}", e))?;
+        CommandRunner::run_as_user("bash", &["-c", &write_cmd])
+            .await
+            .map_err(|e| format!("Failed to write .env file: {}", e))?;
 
         debug!(key = %key, "[ENV] Written env var to .env");
         Ok(())
