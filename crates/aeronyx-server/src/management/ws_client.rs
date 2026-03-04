@@ -650,31 +650,37 @@ impl WsTunnel {
             }
         }
 
-        // Phase 2: Process residual buffer
+        // Phase 2: Process residual buffer (may contain final text chunks)
         if !line_buffer.is_empty() {
             if !line_buffer.ends_with('\n') {
                 line_buffer.push('\n');
             }
-            if self.process_sse_lines(
+            let _ = self.process_sse_lines(
                 request_id, &mut line_buffer, &mut full_response, cms_sink
-            ).await? {
-                return Ok(());
-            }
+            ).await?;
         }
 
-        // Phase 3: Fallback — [DONE] was never received
-        warn!(
+        // Phase 3: Stream ended (body exhausted or idle timeout).
+        // Send done + full response. This is always the termination path now.
+        info!(
             request_id = %request_id,
             response_len = full_response.len(),
-            "[WS_TUNNEL] ⚠️ SSE ended without [DONE] — sending fallback done"
+            "[WS_TUNNEL] ✅ Stream ended, sending done + response"
         );
         self.send_done_and_response(request_id, &full_response, cms_sink).await
     }
 
     /// Extracts complete SSE lines from the buffer and processes them.
     ///
-    /// Returns `Ok(true)` if `[DONE]` was found and final messages were sent.
+    /// Returns `Ok(true)` if the stream should end (body exhausted naturally).
     /// Returns `Ok(false)` if more data is needed.
+    ///
+    /// NOTE: We do NOT treat `[DONE]` as a termination signal because OpenClaw
+    /// may send multiple `[DONE]` markers in a single agent turn (e.g., text
+    /// output → [DONE] → tool execution → more text → [DONE]). Instead, we
+    /// send `done: true` when the stream actually ends (body exhaustion or
+    /// idle timeout). `[DONE]` markers are used to flush the current
+    /// accumulated text as an `agent_response`.
     async fn process_sse_lines(
         &self,
         request_id: &str,
@@ -699,11 +705,16 @@ impl WsTunnel {
                 continue;
             };
 
-            // Stream termination
+            // [DONE] marker — log it but do NOT terminate the stream.
+            // OpenClaw sends [DONE] after each text segment, but may
+            // continue with tool execution and more text afterwards.
             if data == "[DONE]" {
-                info!(request_id = %request_id, "[WS_TUNNEL] ✅ SSE [DONE] received");
-                self.send_done_and_response(request_id, full_response, cms_sink).await?;
-                return Ok(true);
+                info!(
+                    request_id = %request_id,
+                    segments_so_far = full_response.len(),
+                    "[WS_TUNNEL] SSE [DONE] marker (segment boundary, stream continues)"
+                );
+                continue;
             }
 
             // Parse OpenAI-compatible JSON chunk
