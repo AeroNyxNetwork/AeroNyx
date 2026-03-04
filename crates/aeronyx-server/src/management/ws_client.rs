@@ -594,33 +594,44 @@ impl WsTunnel {
         let mut line_buffer = String::new();
 
         // Phase 1: Read body incrementally.
-        // Each chunk() call has a 10-second timeout — if no data arrives
-        // in 10 seconds, we consider this turn's output complete.
         //
-        // Why 10 seconds instead of longer:
-        // OpenClaw keeps the SSE connection open for multi-turn interaction
-        // (e.g., "choose 1/2/3" then waits for user reply in the same stream).
-        // But our architecture uses one HTTP request per user message, so
-        // when the AI stops outputting text, this turn is done.
-        // Normal streaming has sub-second gaps between chunks, so 10s of
-        // silence reliably indicates the AI finished its current response.
-        // Tool execution (browser, code) may cause pauses, but OpenClaw
-        // sends status events during tool execution, keeping the stream alive.
-        let chunk_timeout = Duration::from_secs(10);
+        // Timeout strategy:
+        // - Normal streaming: 10s idle timeout (text chunks arrive sub-second)
+        // - After [DONE] marker: 45s timeout (tool execution may take time)
+        //
+        // When [DONE] is received, OpenClaw may be executing a tool (shell
+        // command, browser action, file read, etc.) before sending more text.
+        // Tool execution can take 5-30 seconds. We extend the timeout after
+        // each [DONE] to accommodate this.
+        let idle_timeout = Duration::from_secs(10);
+        let tool_timeout = Duration::from_secs(45);
+        let mut current_timeout = idle_timeout;
+
         loop {
             let chunk_result = tokio::time::timeout(
-                chunk_timeout,
+                current_timeout,
                 response.chunk(),
             ).await;
 
             match chunk_result {
                 Ok(Ok(Some(bytes))) => {
+                    // Reset to normal idle timeout on any data received
+                    current_timeout = idle_timeout;
+
                     line_buffer.push_str(&String::from_utf8_lossy(&bytes));
 
-                    if self.process_sse_lines(
+                    let got_done = self.process_sse_lines(
                         request_id, &mut line_buffer, &mut full_response, cms_sink
-                    ).await? {
-                        return Ok(()); // [DONE] found and handled
+                    ).await?;
+
+                    if got_done {
+                        // [DONE] received — extend timeout for tool execution
+                        current_timeout = tool_timeout;
+                        info!(
+                            request_id = %request_id,
+                            "[WS_TUNNEL] Extended timeout to {}s for tool execution",
+                            tool_timeout.as_secs()
+                        );
                     }
                 }
                 Ok(Ok(None)) => {
@@ -642,8 +653,9 @@ impl WsTunnel {
                 Err(_) => {
                     info!(
                         request_id = %request_id,
+                        timeout_secs = current_timeout.as_secs(),
                         response_len = full_response.len(),
-                        "[WS_TUNNEL] SSE idle timeout (10s no data) — ending stream"
+                        "[WS_TUNNEL] SSE idle timeout — ending stream"
                     );
                     break;
                 }
@@ -672,15 +684,14 @@ impl WsTunnel {
 
     /// Extracts complete SSE lines from the buffer and processes them.
     ///
-    /// Returns `Ok(true)` if the stream should end (body exhausted naturally).
-    /// Returns `Ok(false)` if more data is needed.
+    /// Returns `Ok(true)` if more time should be allowed (received [DONE]
+    /// which means a tool may be executing — reset the idle timer).
+    /// Returns `Ok(false)` for normal data flow.
     ///
-    /// NOTE: We do NOT treat `[DONE]` as a termination signal because OpenClaw
+    /// NOTE: We do NOT treat `[DONE]` as stream termination because OpenClaw
     /// may send multiple `[DONE]` markers in a single agent turn (e.g., text
-    /// output → [DONE] → tool execution → more text → [DONE]). Instead, we
-    /// send `done: true` when the stream actually ends (body exhaustion or
-    /// idle timeout). `[DONE]` markers are used to flush the current
-    /// accumulated text as an `agent_response`.
+    /// output → [DONE] → tool execution → more text → [DONE]).
+    /// Instead, [DONE] signals "a segment finished, tool may run next".
     async fn process_sse_lines(
         &self,
         request_id: &str,
@@ -688,6 +699,8 @@ impl WsTunnel {
         full_response: &mut String,
         cms_sink: &mut WsSink,
     ) -> Result<bool, String> {
+        let mut got_done_marker = false;
+
         while let Some(newline_pos) = line_buffer.find('\n') {
             let line = line_buffer[..newline_pos].trim_end_matches('\r').to_string();
             *line_buffer = line_buffer[newline_pos + 1..].to_string();
@@ -696,7 +709,6 @@ impl WsTunnel {
                 continue;
             }
 
-            // Extract "data: ..." payload
             let data = if let Some(s) = line.strip_prefix("data: ") {
                 s.trim()
             } else if let Some(s) = line.strip_prefix("data:") {
@@ -705,25 +717,21 @@ impl WsTunnel {
                 continue;
             };
 
-            // [DONE] marker — log it but do NOT terminate the stream.
-            // OpenClaw sends [DONE] after each text segment, but may
-            // continue with tool execution and more text afterwards.
             if data == "[DONE]" {
                 info!(
                     request_id = %request_id,
-                    segments_so_far = full_response.len(),
-                    "[WS_TUNNEL] SSE [DONE] marker (segment boundary, stream continues)"
+                    response_len = full_response.len(),
+                    "[WS_TUNNEL] SSE [DONE] marker — tool may execute next"
                 );
+                got_done_marker = true;
                 continue;
             }
 
-            // Parse OpenAI-compatible JSON chunk
             let parsed: serde_json::Value = match serde_json::from_str(data) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
 
-            // Extract delta content: choices[0].delta.content
             let content = parsed
                 .get("choices")
                 .and_then(|c| c.as_array())
@@ -748,7 +756,7 @@ impl WsTunnel {
             }
         }
 
-        Ok(false)
+        Ok(got_done_marker)
     }
 
     /// Sends `agent_stream(done=true)` + `agent_response(success)` to CMS.
@@ -758,14 +766,23 @@ impl WsTunnel {
         full_response: &str,
         cms_sink: &mut WsSink,
     ) -> Result<(), String> {
+        // 1. Stream end signal
         let done_msg = serde_json::json!({
             "type": "agent_stream",
             "request_id": request_id,
             "chunk": "",
             "done": true
         });
-        let _ = cms_sink.send(ws_text(&done_msg)).await;
+        info!(request_id = %request_id, "[WS_TUNNEL] Sending done=true to CMS...");
+        match cms_sink.send(ws_text(&done_msg)).await {
+            Ok(_) => info!(request_id = %request_id, "[WS_TUNNEL] ✅ done=true SENT"),
+            Err(e) => {
+                error!(request_id = %request_id, error = %e, "[WS_TUNNEL] ❌ Failed to send done=true");
+                return Err(format!("Failed to send done: {}", e));
+            }
+        }
 
+        // 2. Complete response
         if !full_response.is_empty() {
             let final_msg = serde_json::json!({
                 "type": "agent_response",
@@ -775,7 +792,18 @@ impl WsTunnel {
                     "response": full_response
                 }
             });
-            let _ = cms_sink.send(ws_text(&final_msg)).await;
+            info!(
+                request_id = %request_id,
+                response_len = full_response.len(),
+                "[WS_TUNNEL] Sending agent_response to CMS..."
+            );
+            match cms_sink.send(ws_text(&final_msg)).await {
+                Ok(_) => info!(request_id = %request_id, "[WS_TUNNEL] ✅ agent_response SENT"),
+                Err(e) => {
+                    error!(request_id = %request_id, error = %e, "[WS_TUNNEL] ❌ Failed to send agent_response");
+                    return Err(format!("Failed to send response: {}", e));
+                }
+            }
         }
 
         Ok(())
