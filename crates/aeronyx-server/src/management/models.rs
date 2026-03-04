@@ -208,25 +208,44 @@ pub struct HeartbeatRequest {
 
 /// System statistics for heartbeat reporting.
 ///
-/// CRITICAL: Field order MUST match Python backend expectation:
-/// 1. cpu_usage
-/// 2. memory_mb
-/// 3. active_sessions
-/// 4. agent_status (🌟 v1.3.0 — optional, omitted if None for backward compat)
+/// 🌟 v1.3.1: Enhanced for cloud/container compatibility.
+/// All fields use best-effort collection — missing data defaults to 0/None.
+///
+/// Field order matters for heartbeat signature verification.
+/// New optional fields use `skip_serializing_if` so they don't
+/// break CMS versions that don't expect them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemStats {
-    /// CPU usage percentage (0.0 - 100.0)
-    pub cpu_usage: f32,        // 1st
-    /// Memory usage in megabytes
-    pub memory_mb: u64,        // 2nd
-    /// Number of active VPN sessions
-    pub active_sessions: u32,  // 3rd
+    /// CPU usage percentage (0.0 - 100.0).
+    /// Collected from /proc/loadavg (normalized by CPU count).
+    pub cpu_usage: f32,
+    /// Memory usage in megabytes.
+    /// Prefers cgroup limits (container-aware), falls back to /proc/meminfo.
+    pub memory_mb: u64,
+    /// Number of active VPN sessions.
+    pub active_sessions: u32,
 
     /// 🌟 v1.3.0: OpenClaw agent status for CMS dashboard display.
     /// `None` = field omitted from JSON (backward compatible with old CMS).
-    /// `Some(info)` = agent lifecycle state + optional detail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_status: Option<AgentStatusInfo>,
+
+    /// 🌟 v1.3.1: Total network bytes received since boot (all non-loopback interfaces).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_rx_bytes: Option<u64>,
+
+    /// 🌟 v1.3.1: Total network bytes transmitted since boot (all non-loopback interfaces).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_tx_bytes: Option<u64>,
+
+    /// 🌟 v1.3.1: Total memory available on the system/container in MB.
+    /// Useful for CMS to calculate usage percentage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_total_mb: Option<u64>,
+
+    /// 🌟 v1.3.1: Number of CPU cores (vCPU count).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_count: Option<u32>,
 }
 
 impl SystemStats {
@@ -235,11 +254,20 @@ impl SystemStats {
     /// # Arguments
     /// * `active_sessions` - Number of active client sessions
     pub fn collect(active_sessions: u32) -> Self {
+        let (memory_mb, memory_total_mb) = Self::get_memory_info();
+        let (net_rx, net_tx) = Self::get_network_stats();
+
         Self {
             cpu_usage: Self::get_cpu_usage(),
-            memory_mb: Self::get_memory_usage_mb(),
+            memory_mb,
             active_sessions,
-            agent_status: None, // Will be populated by server if AgentManager is active
+            agent_status: None,
+            net_rx_bytes: net_rx,
+            net_tx_bytes: net_tx,
+            memory_total_mb,
+            cpu_count: std::thread::available_parallelism()
+                .map(|p| Some(p.get() as u32))
+                .unwrap_or(None),
         }
     }
 
@@ -249,14 +277,22 @@ impl SystemStats {
     /// * `active_sessions` - Number of active client sessions
     /// * `agent_status` - Current OpenClaw agent status
     pub fn collect_with_agent(active_sessions: u32, agent_status: AgentStatusInfo) -> Self {
-        Self {
-            cpu_usage: Self::get_cpu_usage(),
-            memory_mb: Self::get_memory_usage_mb(),
-            active_sessions,
-            agent_status: Some(agent_status),
-        }
+        let mut stats = Self::collect(active_sessions);
+        stats.agent_status = Some(agent_status);
+        stats
     }
 
+    /// Gets CPU usage percentage.
+    ///
+    /// Strategy:
+    /// 1. Read /proc/loadavg (1-min average)
+    /// 2. Normalize by available CPU count
+    /// 3. Cap at 100%
+    ///
+    /// Works in: bare metal, VPS, GCP, AWS, Azure VMs.
+    /// In containers: reflects host load (not container-specific).
+    /// This is acceptable for our use case since the container
+    /// IS the entire node.
     fn get_cpu_usage() -> f32 {
         #[cfg(target_os = "linux")]
         {
@@ -274,27 +310,155 @@ impl SystemStats {
         { 0.0 }
     }
 
-    fn get_memory_usage_mb() -> u64 {
+    /// Gets memory usage and total memory.
+    ///
+    /// Strategy (in priority order):
+    /// 1. cgroup v2: /sys/fs/cgroup/memory.current + memory.max (Docker/K8s)
+    /// 2. cgroup v1: /sys/fs/cgroup/memory/memory.usage_in_bytes (older Docker)
+    /// 3. /proc/meminfo MemTotal - MemAvailable (VM/bare metal)
+    ///
+    /// Returns (used_mb, Some(total_mb)).
+    fn get_memory_info() -> (u64, Option<u64>) {
         #[cfg(target_os = "linux")]
         {
-            std::fs::read_to_string("/proc/meminfo")
-                .ok()
-                .and_then(|content| {
-                    let mut total = 0u64;
-                    let mut avail = 0u64;
-                    for line in content.lines() {
-                        if line.starts_with("MemTotal:") {
-                            total = line.split_whitespace().nth(1)?.parse().ok()?;
-                        } else if line.starts_with("MemAvailable:") {
-                            avail = line.split_whitespace().nth(1)?.parse().ok()?;
-                        }
-                    }
-                    Some((total - avail) / 1024)
-                })
-                .unwrap_or(0)
+            // Try cgroup v2 first (modern Docker, K8s, systemd)
+            if let Some(result) = Self::get_memory_cgroup_v2() {
+                return result;
+            }
+
+            // Try cgroup v1
+            if let Some(result) = Self::get_memory_cgroup_v1() {
+                return result;
+            }
+
+            // Fallback to /proc/meminfo
+            Self::get_memory_procinfo()
         }
         #[cfg(not(target_os = "linux"))]
-        { 0 }
+        { (0, None) }
+    }
+
+    /// Reads memory from cgroup v2 (Docker with cgroup2, systemd).
+    #[cfg(target_os = "linux")]
+    fn get_memory_cgroup_v2() -> Option<(u64, Option<u64>)> {
+        let current = std::fs::read_to_string("/sys/fs/cgroup/memory.current").ok()?;
+        let current_bytes: u64 = current.trim().parse().ok()?;
+
+        let max = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()
+            .and_then(|s| {
+                let trimmed = s.trim();
+                if trimmed == "max" { None } // no limit set
+                else { trimmed.parse::<u64>().ok() }
+            });
+
+        let used_mb = current_bytes / 1024 / 1024;
+        let total_mb = max.map(|m| m / 1024 / 1024);
+
+        Some((used_mb, total_mb))
+    }
+
+    /// Reads memory from cgroup v1 (older Docker).
+    #[cfg(target_os = "linux")]
+    fn get_memory_cgroup_v1() -> Option<(u64, Option<u64>)> {
+        let usage = std::fs::read_to_string(
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes"
+        ).ok()?;
+        let usage_bytes: u64 = usage.trim().parse().ok()?;
+
+        let limit = std::fs::read_to_string(
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+        ).ok()
+            .and_then(|s| {
+                let val: u64 = s.trim().parse().ok()?;
+                // Very large value means "no limit" (usually 2^63 or similar)
+                if val > 1_000_000_000_000 { None } else { Some(val) }
+            });
+
+        let used_mb = usage_bytes / 1024 / 1024;
+        let total_mb = limit.map(|l| l / 1024 / 1024);
+
+        Some((used_mb, total_mb))
+    }
+
+    /// Reads memory from /proc/meminfo (standard Linux).
+    #[cfg(target_os = "linux")]
+    fn get_memory_procinfo() -> (u64, Option<u64>) {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|content| {
+                let mut total_kb = 0u64;
+                let mut avail_kb = 0u64;
+                for line in content.lines() {
+                    if line.starts_with("MemTotal:") {
+                        total_kb = line.split_whitespace().nth(1)?.parse().ok()?;
+                    } else if line.starts_with("MemAvailable:") {
+                        avail_kb = line.split_whitespace().nth(1)?.parse().ok()?;
+                    }
+                }
+                let used_mb = (total_kb.saturating_sub(avail_kb)) / 1024;
+                let total_mb = total_kb / 1024;
+                Some((used_mb, Some(total_mb)))
+            })
+            .unwrap_or((0, None))
+    }
+
+    /// Gets network I/O stats from /proc/net/dev.
+    ///
+    /// Sums rx_bytes and tx_bytes across all non-loopback interfaces.
+    /// Works across all Linux environments (VM, container, bare metal).
+    /// Interface names vary (eth0, ens4, enp0s3, veth*, etc.) —
+    /// we include all except `lo`.
+    ///
+    /// Returns (Some(rx_bytes), Some(tx_bytes)) or (None, None) on failure.
+    fn get_network_stats() -> (Option<u64>, Option<u64>) {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string("/proc/net/dev")
+                .ok()
+                .map(|content| {
+                    let mut total_rx = 0u64;
+                    let mut total_tx = 0u64;
+
+                    for line in content.lines().skip(2) { // skip header lines
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+
+                        // Format: "iface: rx_bytes rx_packets ... tx_bytes tx_packets ..."
+                        let parts: Vec<&str> = line.splitn(2, ':').collect();
+                        if parts.len() != 2 {
+                            continue;
+                        }
+
+                        let iface = parts[0].trim();
+
+                        // Skip loopback and virtual bridge interfaces
+                        if iface == "lo" {
+                            continue;
+                        }
+
+                        let fields: Vec<&str> = parts[1].split_whitespace().collect();
+                        if fields.len() < 10 {
+                            continue;
+                        }
+
+                        // rx_bytes is field 0, tx_bytes is field 8
+                        if let (Ok(rx), Ok(tx)) = (
+                            fields[0].parse::<u64>(),
+                            fields[8].parse::<u64>(),
+                        ) {
+                            total_rx += rx;
+                            total_tx += tx;
+                        }
+                    }
+
+                    (Some(total_rx), Some(total_tx))
+                })
+                .unwrap_or((None, None))
+        }
+        #[cfg(not(target_os = "linux"))]
+        { (None, None) }
     }
 }
 
@@ -503,6 +667,18 @@ pub struct AgentStatusInfo {
     /// PID of the running agent process, if applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+
+    /// 🌟 v1.3.1: Local port the agent gateway is listening on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_port: Option<u16>,
+
+    /// 🌟 v1.3.1: Agent process CPU usage percentage (0.0 - 100.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_usage: Option<f32>,
+
+    /// 🌟 v1.3.1: Agent process memory usage in MB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u64>,
 }
 
 impl AgentStatusInfo {
@@ -513,6 +689,9 @@ impl AgentStatusInfo {
             version: None,
             message: None,
             pid: None,
+            local_port: None,
+            cpu_usage: None,
+            memory_mb: None,
         }
     }
 
@@ -523,6 +702,9 @@ impl AgentStatusInfo {
             version: Some(version),
             message: Some("Healthy".to_string()),
             pid: Some(pid),
+            local_port: Some(18789),
+            cpu_usage: None,
+            memory_mb: None,
         }
     }
 
@@ -533,6 +715,9 @@ impl AgentStatusInfo {
             version: None,
             message: Some(message),
             pid: None,
+            local_port: None,
+            cpu_usage: None,
+            memory_mb: None,
         }
     }
 
@@ -543,6 +728,9 @@ impl AgentStatusInfo {
             version: None,
             message: Some(message),
             pid: None,
+            local_port: None,
+            cpu_usage: None,
+            memory_mb: None,
         }
     }
 }
