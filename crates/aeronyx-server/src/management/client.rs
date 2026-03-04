@@ -50,9 +50,7 @@ use serde_json::json;
 
 use aeronyx_core::crypto::IdentityKeyPair;
 use super::config::ManagementConfig;
-use super::models::*;
-
-/// Management API client for communicating with the CMS backend.
+use super::models::*;/// Management API client for communicating with the CMS backend.
 ///
 /// Handles:
 /// - Node registration with binding codes
@@ -206,25 +204,56 @@ impl ManagementClient {
     ///
     /// # Returns
     /// HeartbeatResponse on success, error message on failure
-    pub async fn send_heartbeat(&self, public_ip: &str, active_sessions: u32) -> Result<HeartbeatResponse, String> {
+    pub async fn send_heartbeat(
+        &self,
+        public_ip: &str,
+        active_sessions: u32,
+        agent_status: Option<AgentStatusInfo>,
+    ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/node/heartbeat/", self.config.cms_url);
         let timestamp = Self::current_timestamp();
         let node_id = self.node_id();
         let stats = SystemStats::collect(active_sessions);
 
-        // CRITICAL: Build JSON WITHOUT signature field for signing
-        // This is what Python will reconstruct to verify the signature
+        // CRITICAL: Build JSON WITHOUT signature field for signing.
+        // This is what Python will reconstruct to verify the signature.
+        //
+        // 🌟 v1.3.1: Optional fields (agent_status, net_rx_bytes, etc.)
+        // are conditionally injected so they don't break older CMS versions.
+        let mut system_stats_json = serde_json::json!({
+            "cpu_usage": stats.cpu_usage,
+            "memory_mb": stats.memory_mb,
+            "active_sessions": stats.active_sessions
+        });
+
+        if let Some(obj) = system_stats_json.as_object_mut() {
+            if let Some(ref status) = agent_status {
+                obj.insert(
+                    "agent_status".to_string(),
+                    serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            if let Some(rx) = stats.net_rx_bytes {
+                obj.insert("net_rx_bytes".to_string(), serde_json::json!(rx));
+            }
+            if let Some(tx) = stats.net_tx_bytes {
+                obj.insert("net_tx_bytes".to_string(), serde_json::json!(tx));
+            }
+            if let Some(total) = stats.memory_total_mb {
+                obj.insert("memory_total_mb".to_string(), serde_json::json!(total));
+            }
+            if let Some(count) = stats.cpu_count {
+                obj.insert("cpu_count".to_string(), serde_json::json!(count));
+            }
+        }
+
         let body_for_signing = json!({
             "node_id": &node_id,
             "timestamp": timestamp,
             "public_ip": public_ip,
             "version": super::integrity::get_version(),
             "binary_hash": &self.binary_hash,
-            "system_stats": {
-                "cpu_usage": stats.cpu_usage,
-                "memory_mb": stats.memory_mb,
-                "active_sessions": stats.active_sessions
-            }
+            "system_stats": system_stats_json
         });
 
         // Serialize to string for signing (NO signature field)
@@ -233,8 +262,7 @@ impl ManagementClient {
         // Create signature over the body
         let signature = self.create_signature(timestamp, &body_str);
 
-        // 🌟 v1.3.0: Build final body by inserting signature into existing object
-        // This avoids duplicating the json! macro and reduces mismatch risk.
+        // Build final body by inserting signature into existing object
         let body_json = {
             let mut obj = body_for_signing;
             if let Some(map) = obj.as_object_mut() {
@@ -245,7 +273,6 @@ impl ManagementClient {
 
         debug!("Heartbeat: sessions={}", active_sessions);
 
-        // Send the json! constructed value directly
         let mut request = self.http.post(&url);
         for (header, value) in Self::signed_headers(&node_id, timestamp, &signature) {
             request = request.header(header, value);
