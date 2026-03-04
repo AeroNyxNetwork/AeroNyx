@@ -787,24 +787,31 @@ impl WsTunnel {
         response: reqwest::Response,
         cms_sink: &mut WsSink,
     ) -> Result<(), String> {
-        // Collect the full response text to accumulate for final agent_response.
-        // We also stream chunks as they arrive for real-time UX.
+        // Read the full SSE response body as a single chunk.
+        //
+        // Ideally we'd use `response.bytes_stream()` for true streaming,
+        // but that requires reqwest's `stream` feature (+ futures::StreamExt).
+        // Instead, we use `response.chunk()` in a loop which gives us
+        // incremental reads without needing the stream feature.
+        //
+        // Each chunk may contain partial SSE lines, so we buffer and
+        // split by newlines.
         let mut full_response = String::new();
-
-        // Read the response body as a byte stream and process SSE lines.
-        // reqwest gives us the body as a stream of Bytes chunks.
-        let mut stream = response.bytes_stream();
-
-        // SSE line buffer — SSE events can span multiple TCP frames,
-        // so we need to buffer and split by newlines.
         let mut line_buffer = String::new();
 
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result
-                .map_err(|e| format!("SSE stream read error: {}", e))?;
+        loop {
+            // `chunk()` returns `Option<Bytes>` — None when body is exhausted.
+            // This does NOT require the `stream` feature.
+            let chunk_opt = response.chunk()
+                .await
+                .map_err(|e| format!("SSE read error: {}", e))?;
 
-            // Append raw bytes to line buffer
-            let chunk_str = String::from_utf8_lossy(&chunk);
+            let chunk_bytes = match chunk_opt {
+                Some(bytes) => bytes,
+                None => break, // Body exhausted
+            };
+
+            let chunk_str = String::from_utf8_lossy(&chunk_bytes);
             line_buffer.push_str(&chunk_str);
 
             // Process complete lines (SSE uses \n or \r\n as delimiters)
@@ -817,7 +824,7 @@ impl WsTunnel {
                     continue;
                 }
 
-                // SSE data lines start with "data: "
+                // SSE data lines start with "data: " or "data:"
                 let data = if let Some(stripped) = line.strip_prefix("data: ") {
                     stripped
                 } else if let Some(stripped) = line.strip_prefix("data:") {
@@ -839,6 +846,7 @@ impl WsTunnel {
                         request_id = %request_id,
                         "[WS_TUNNEL] ✅ SSE stream complete"
                     );
+
                     // Send final done message to CMS
                     let done_msg = serde_json::json!({
                         "type": "agent_stream",
@@ -910,7 +918,7 @@ impl WsTunnel {
             }
         }
 
-        // If we get here, the stream ended without [DONE] — still send done
+        // Body exhausted without [DONE] — still send done
         warn!(
             request_id = %request_id,
             "[WS_TUNNEL] ⚠️ SSE stream ended without [DONE] marker"
