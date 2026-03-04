@@ -42,7 +42,7 @@
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
-use super::{CommandRunner, OPENCLAW_ENV_PATH, OPENCLAW_HOME, OPENCLAW_USER, OPENCLAW_BIN};
+use super::{CommandRunner, OPENCLAW_ENV_PATH, OPENCLAW_USER};
 
 // ============================================
 // EnvConfig
