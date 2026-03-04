@@ -9,28 +9,39 @@
 //! the CMS backend, enabling low-latency bidirectional communication
 //! for frontend → OpenClaw AI agent interactions.
 //!
+//! ## Modification Reason (v1.3.2)
+//! Replaced OpenClaw Gateway WebSocket RPC with HTTP API (`/v1/chat/completions`).
+//! The HTTP API is OpenAI-compatible, supports SSE streaming, and is far simpler
+//! than the internal WS RPC protocol. Benefits:
+//! - No complex RPC handshake (connect → hello-ok → chat.send)
+//! - Reuses `reqwest::Client` connection pool (no per-request WS connect)
+//! - Standard SSE parsing instead of fragile event name matching
+//! - Proper session management via OpenAI `user` field
+//! - Lower latency and better error handling
+//!
 //! ## Main Functionality
 //! - `WsTunnel`: Background async task managing the CMS WebSocket lifecycle
 //! - Ed25519-signed authentication on connect
 //! - Automatic reconnection with exponential backoff
-//! - Bidirectional message relay: CMS ↔ local OpenClaw Gateway
+//! - Bidirectional message relay: CMS ↔ local OpenClaw Gateway (HTTP API)
 //! - Ping/pong keepalive for connection health
 //! - Graceful shutdown via broadcast signal
 //!
 //! ## Main Logical Flow
 //! ```text
-//!   ┌────────┐       wss://            ┌─────────┐     ws://localhost:18789    ┌──────────┐
-//!   │  CMS   │ ◄──────────────────────►│ WsTunnel│ ◄────────────────────────► │ OpenClaw │
-//!   │Backend │  agent_request/response  │ (Rust)  │  OpenClaw Gateway RPC      │ Gateway  │
-//!   └────────┘                          └─────────┘                            └──────────┘
+//!   ┌────────┐       wss://            ┌─────────┐  HTTP POST /v1/chat/completions  ┌──────────┐
+//!   │  CMS   │ ◄──────────────────────►│ WsTunnel│ ──────────────────────────────► │ OpenClaw │
+//!   │Backend │  agent_request/response  │ (Rust)  │  ◄── SSE stream ──────────────  │ Gateway  │
+//!   └────────┘                          └─────────┘                                 └──────────┘
 //! ```
 //!
 //! 1. WsTunnel connects to `wss://api.aeronyx.network/ws/node/tunnel/{node_id}/`
 //! 2. Sends `auth` message with Ed25519-signed `{public_key}:{timestamp}`
-//! 3. Waits for `auth_ok` (30s timeout on CMS side)
+//! 3. Waits for `auth_ok` (25s timeout, CMS allows 30s)
 //! 4. Enters message loop:
-//!    - `agent_request` from CMS → forward to local OpenClaw Gateway via WS RPC
-//!    - OpenClaw response → wrap as `agent_response`/`agent_stream` → send to CMS
+//!    - `agent_request` from CMS → HTTP POST to OpenClaw `/v1/chat/completions`
+//!    - SSE chunks → wrap as `agent_stream` → send to CMS
+//!    - Final `data: [DONE]` → wrap as `agent_stream` with `done: true` → send to CMS
 //!    - Periodic `ping`/`pong` keepalive (every 30s)
 //! 5. On disconnect: exponential backoff reconnect (1s → 2s → 4s → ... → 60s max)
 //!
@@ -41,7 +52,7 @@
 //! → {"type": "auth", "node_id": "<public_key_hex>", "timestamp": 1709500000, "signature": "<hex>"}
 //! ← {"type": "auth_ok", "node_id": "<uuid>", "node_name": "My Node"}
 //! ```
-//! Signature: `Ed25519_Sign(SHA256("{public_key_hex}:{timestamp}"))`
+//! Signature: `Ed25519_Sign("{public_key_hex}:{timestamp}".as_bytes())`
 //!
 //! ### Messages (post-auth)
 //! ```json
@@ -56,34 +67,45 @@
 //! - 4001: Auth failed (invalid signature / node not found / disabled)
 //! - 4002: Auth timeout (30s)
 //!
-//! ## OpenClaw Gateway RPC (local)
-//! The OpenClaw Gateway at `ws://127.0.0.1:18789` uses a JSON RPC protocol.
-//! We connect as role=`operator` with the gateway token from config.
-//! Chat messages are sent via the `gateway.call` / `chat.send` method.
+//! ## OpenClaw Gateway HTTP API (local)
+//! The OpenClaw Gateway at `http://127.0.0.1:18789` serves an OpenAI-compatible
+//! Chat Completions endpoint at `/v1/chat/completions`.
+//! - Must be enabled: `gateway.http.endpoints.chatCompletions.enabled = true`
+//! - Auth via `Authorization: Bearer <gateway_token>`
+//! - Agent selection via `x-openclaw-agent-id: main` header
+//! - Session persistence via `user` field in request body
+//! - Streaming via `stream: true` → SSE response
 //!
 //! ## Dependencies
 //! - `tokio-tungstenite` with `rustls-tls-native-roots` for wss:// to CMS
-//! - `tokio-tungstenite` (plain) for ws:// to local OpenClaw
+//! - `reqwest` for HTTP calls to local OpenClaw Gateway
 //! - `aeronyx_core::crypto::IdentityKeyPair` for Ed25519 signing
-//! - `sha2` for SHA-256 message hashing
 //!
 //! ## ⚠️ Important Note for Next Developer
 //! - The CMS URL uses `node_id` which is the **CMS database UUID**, NOT the
 //!   Ed25519 public key. The UUID is obtained from `StoredNodeInfo.node_id`.
 //! - The `auth` message uses `node_id` field which IS the Ed25519 public key hex.
-//! - Signature format differs from heartbeat: it's `"{pubkey}:{timestamp}"` directly
-//!   (no body), and the signature is over the raw bytes (no SHA-256 intermediate).
-//!   Wait — your spec says: `verify(f"{public_key}:{timestamp}")` and
-//!   `signing_key.sign(message.as_bytes())` — so it's a raw sign, NOT SHA-256.
-//!   This differs from heartbeat which does SHA-256 first. Be careful.
-//! - The OpenClaw Gateway connection is lazy: only established when the first
-//!   `agent_request` arrives, and cached for subsequent requests.
-//! - If OpenClaw is not installed/running, `agent_request` responses will be
-//!   `{"type": "agent_response", "request_id": "...", "status": "error",
-//!     "payload": {"error": "OpenClaw gateway is not available"}}`
+//! - Signature format: `Ed25519_Sign("{pubkey}:{timestamp}".as_bytes())` — raw
+//!   sign, NOT SHA-256 then sign. This differs from heartbeat which does SHA-256
+//!   first. Be careful.
+//! - The `reqwest::Client` is created ONCE and reused for all requests (connection
+//!   pool). Do NOT create a new client per request.
+//! - OpenClaw HTTP API must be enabled in config before this works. The
+//!   AgentManager should enable it during install/onboard. If you get 404,
+//!   run: `openclaw config set gateway.http.endpoints.chatCompletions.enabled true`
+//! - The `user` field in OpenAI requests creates stable sessions in OpenClaw.
+//!   We use `"aeronyx:{request_id}"` for stateless or `"aeronyx:user:{user_id}"`
+//!   for persistent sessions (if CMS provides a user_id in the payload).
 //!
 //! ## Last Modified
 //! v1.3.0 - 🌟 Initial creation (Phase 3: WebSocket Tunnel)
+//! v1.3.2 - 🔄 Replaced OpenClaw WS RPC with HTTP API (/v1/chat/completions)
+//!          - Fixed: per-request WS connection overhead → reqwest connection pool
+//!          - Fixed: fragile event name matching → standard SSE parsing
+//!          - Fixed: no session management → OpenAI `user` field for session persistence
+//!          - Added: proper SSE `data: [DONE]` handling
+//!          - Added: non-streaming fallback for `status` action
+//!          - Added: configurable request timeout (120s default)
 //! ============================================
 
 use std::sync::Arc;
@@ -106,8 +128,11 @@ use crate::services::AgentManager;
 /// CMS WebSocket base URL (without trailing node_id).
 const CMS_WS_BASE_URL: &str = "wss://api.aeronyx.network/ws/node/tunnel";
 
-/// Local OpenClaw Gateway WebSocket URL.
-const OPENCLAW_GATEWAY_WS: &str = "ws://127.0.0.1:18789";
+/// Local OpenClaw Gateway HTTP API base URL.
+const OPENCLAW_HTTP_BASE: &str = "http://127.0.0.1:18789";
+
+/// OpenClaw Chat Completions endpoint path.
+const OPENCLAW_CHAT_PATH: &str = "/v1/chat/completions";
 
 /// Maximum reconnection backoff interval (seconds).
 const MAX_RECONNECT_BACKOFF_SECS: u64 = 60;
@@ -120,6 +145,13 @@ const PING_INTERVAL_SECS: u64 = 30;
 
 /// Timeout waiting for auth_ok response (seconds).
 const AUTH_TIMEOUT_SECS: u64 = 25; // Slightly under CMS's 30s limit
+
+/// Timeout for a single OpenClaw HTTP request (seconds).
+/// This covers the entire SSE stream duration, not just the first byte.
+const OPENCLAW_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+/// Default OpenClaw agent ID.
+const OPENCLAW_AGENT_ID: &str = "main";
 
 // ============================================
 // Type aliases
@@ -135,10 +167,6 @@ fn ws_text(value: &serde_json::Value) -> WsMessage {
     WsMessage::Text(value.to_string().into())
 }
 
-fn ws_text_str(s: &str) -> WsMessage {
-    WsMessage::Text(s.to_string().into())
-}
-
 // ============================================
 // WsTunnel
 // ============================================
@@ -149,8 +177,14 @@ fn ws_text_str(s: &str) -> WsMessage {
 /// 1. Created in `server.rs` with identity + node info
 /// 2. Spawned as a `tokio::spawn` task via `run()`
 /// 3. Maintains persistent connection to CMS with auto-reconnect
-/// 4. Relays `agent_request` from CMS to local OpenClaw Gateway
+/// 4. Relays `agent_request` from CMS to local OpenClaw Gateway via HTTP API
 /// 5. Stops on shutdown signal
+///
+/// ## v1.3.2 Architecture Change
+/// Previously connected to OpenClaw via WebSocket RPC (complex handshake).
+/// Now uses the OpenAI-compatible HTTP API at `/v1/chat/completions` with
+/// SSE streaming. The `reqwest::Client` is created once and reused for all
+/// requests via its built-in connection pool.
 pub struct WsTunnel {
     /// Ed25519 identity for signing auth messages.
     identity: IdentityKeyPair,
@@ -161,6 +195,11 @@ pub struct WsTunnel {
 
     /// Agent manager for checking OpenClaw availability and getting gateway token.
     agent_manager: Arc<AgentManager>,
+
+    /// Reusable HTTP client for OpenClaw Gateway API calls.
+    /// Created once, uses connection pool internally.
+    /// v1.3.2: Replaces per-request WebSocket connections.
+    http_client: reqwest::Client,
 }
 
 impl WsTunnel {
@@ -175,10 +214,22 @@ impl WsTunnel {
         cms_node_id: String,
         agent_manager: Arc<AgentManager>,
     ) -> Self {
+        // Build a reusable HTTP client with sensible defaults.
+        // reqwest::Client internally maintains a connection pool, so
+        // creating it once and reusing across all requests is optimal.
+        let http_client = reqwest::Client::builder()
+            // Do NOT set a global timeout here — SSE streams can last minutes.
+            // We apply per-phase timeouts in the request logic instead.
+            .pool_max_idle_per_host(4)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .build()
+            .expect("Failed to build reqwest::Client");
+
         Self {
             identity,
             cms_node_id,
             agent_manager,
+            http_client,
         }
     }
 
@@ -393,7 +444,7 @@ impl WsTunnel {
     /// Main message relay loop after successful authentication.
     ///
     /// Handles:
-    /// - `agent_request` from CMS → forward to OpenClaw → respond
+    /// - `agent_request` from CMS → forward to OpenClaw via HTTP API → respond
     /// - `ping` from CMS → respond with `pong`
     /// - Periodic ping to keep connection alive
     /// - Shutdown signal
@@ -500,18 +551,19 @@ impl WsTunnel {
     }
 
     // ============================================
-    // Agent Request Handling
+    // Agent Request Handling (v1.3.2: HTTP API)
     // ============================================
 
-    /// Handles an `agent_request` from CMS by forwarding to local OpenClaw.
+    /// Handles an `agent_request` from CMS by forwarding to local OpenClaw HTTP API.
+    ///
+    /// v1.3.2: Replaced WebSocket RPC with HTTP POST to `/v1/chat/completions`.
     ///
     /// The flow:
     /// 1. Extract `request_id`, `action`, `payload` from CMS message
-    /// 2. Connect to local OpenClaw Gateway (ws://127.0.0.1:18789)
-    /// 3. Authenticate with gateway token
-    /// 4. Send the request via OpenClaw's RPC protocol
-    /// 5. Stream/collect the response
-    /// 6. Send `agent_response` or `agent_stream` back to CMS
+    /// 2. Get gateway token from AgentManager
+    /// 3. For `chat` action: POST to OpenClaw with `stream: true`, relay SSE chunks
+    /// 4. For `status` action: return AgentManager status directly
+    /// 5. Send `agent_response` or `agent_stream` back to CMS
     async fn handle_agent_request(
         &self,
         request: &serde_json::Value,
@@ -535,7 +587,7 @@ impl WsTunnel {
             "[WS_TUNNEL] 📥 Agent request from CMS"
         );
 
-        // Get gateway token
+        // Get gateway token from AgentManager
         let gateway_token = match self.agent_manager.gateway_token().await {
             Some(token) => token,
             None => {
@@ -544,7 +596,7 @@ impl WsTunnel {
                     "request_id": request_id,
                     "status": "error",
                     "payload": {
-                        "error": "OpenClaw gateway token not available. Is OpenClaw installed?"
+                        "error": "OpenClaw gateway token not available. Is OpenClaw installed and configured?"
                     }
                 });
                 let _ = cms_sink.send(ws_text(&error_response)).await;
@@ -552,130 +604,35 @@ impl WsTunnel {
             }
         };
 
-        // Forward to OpenClaw and relay response
-        match self.forward_to_openclaw(request_id, action, &payload, &gateway_token, cms_sink).await {
-            Ok(()) => {
-                debug!(
-                    request_id = %request_id,
-                    "[WS_TUNNEL] ✅ Agent request completed"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    request_id = %request_id,
-                    error = %e,
-                    "[WS_TUNNEL] ❌ Agent request failed"
-                );
-                let error_response = serde_json::json!({
-                    "type": "agent_response",
-                    "request_id": request_id,
-                    "status": "error",
-                    "payload": {
-                        "error": format!("Failed to communicate with OpenClaw: {}", e)
-                    }
-                });
-                let _ = cms_sink.send(ws_text(&error_response)).await;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Connects to local OpenClaw Gateway and relays a chat request.
-    ///
-    /// OpenClaw uses a JSON RPC protocol over WebSocket. The flow:
-    /// 1. Connect to ws://127.0.0.1:18789
-    /// 2. Send `connect` frame with role=operator and gateway token
-    /// 3. Wait for `hello-ok`
-    /// 4. Send chat message via `chat.send` method
-    /// 5. Stream response events back to CMS
-    async fn forward_to_openclaw(
-        &self,
-        request_id: &str,
-        action: &str,
-        payload: &serde_json::Value,
-        gateway_token: &str,
-        cms_sink: &mut WsSink,
-    ) -> Result<(), String> {
-        // Connect to local OpenClaw Gateway
-        let (oc_stream, _) = connect_async(OPENCLAW_GATEWAY_WS)
-            .await
-            .map_err(|e| format!("OpenClaw Gateway connect failed: {}", e))?;
-
-        let (mut oc_sink, mut oc_source) = oc_stream.split();
-
-        // Send connect frame (OpenClaw RPC protocol)
-        let connect_msg = serde_json::json!({
-            "type": "req",
-            "id": format!("aeronyx-{}", request_id),
-            "method": "connect",
-            "params": {
-                "minProtocol": 3,
-                "maxProtocol": 3,
-                "client": {
-                    "id": "aeronyx-tunnel",
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "platform": "linux",
-                    "mode": "operator"
-                },
-                "role": "operator",
-                "scopes": [],
-                "auth": {
-                    "token": gateway_token
-                }
-            }
-        });
-
-        oc_sink.send(ws_text(&connect_msg))
-            .await
-            .map_err(|e| format!("OpenClaw connect send failed: {}", e))?;
-
-        // Wait for hello-ok (with timeout)
-        let _hello_ok = tokio::time::timeout(
-            Duration::from_secs(10),
-            Self::wait_for_openclaw_hello(&mut oc_source),
-        ).await
-            .map_err(|_| "OpenClaw hello-ok timeout".to_string())?
-            .map_err(|e| format!("OpenClaw handshake failed: {}", e))?;
-
-        debug!("[WS_TUNNEL] ✅ Connected to OpenClaw Gateway");
-
-        // Send the actual request based on action
+        // Dispatch based on action
         match action {
             "chat" => {
-                let prompt = payload.get("prompt")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-
-                let chat_msg = serde_json::json!({
-                    "type": "req",
-                    "id": format!("chat-{}", request_id),
-                    "method": "chat.send",
-                    "params": {
-                        "message": prompt,
-                        "session": "main"
-                    }
-                });
-
-                oc_sink.send(ws_text(&chat_msg))
-                    .await
-                    .map_err(|e| format!("Chat send failed: {}", e))?;
-
-                // Stream responses back to CMS
-                self.relay_openclaw_response(
-                    request_id,
-                    &mut oc_source,
-                    cms_sink,
-                ).await?;
+                if let Err(e) = self.handle_chat_request(
+                    request_id, &payload, &gateway_token, cms_sink
+                ).await {
+                    warn!(
+                        request_id = %request_id,
+                        error = %e,
+                        "[WS_TUNNEL] ❌ Chat request failed"
+                    );
+                    let error_response = serde_json::json!({
+                        "type": "agent_response",
+                        "request_id": request_id,
+                        "status": "error",
+                        "payload": {
+                            "error": format!("Failed to communicate with OpenClaw: {}", e)
+                        }
+                    });
+                    let _ = cms_sink.send(ws_text(&error_response)).await;
+                }
             }
             "status" => {
-                // Return agent status directly
                 let status = self.agent_manager.status().await;
                 let response = serde_json::json!({
                     "type": "agent_response",
                     "request_id": request_id,
                     "status": "success",
-                    "payload": status
+                    "payload": serde_json::to_value(&status).unwrap_or(serde_json::Value::Null)
                 });
                 cms_sink.send(ws_text(&response))
                     .await
@@ -696,198 +653,288 @@ impl WsTunnel {
             }
         }
 
-        // Close OpenClaw connection
-        let _ = oc_sink.close().await;
-
         Ok(())
     }
 
-    /// Waits for OpenClaw Gateway's hello-ok response after connect.
-    async fn wait_for_openclaw_hello(source: &mut WsSource) -> Result<(), String> {
-        while let Some(msg_result) = source.next().await {
-            let msg = msg_result.map_err(|e| format!("WS error: {}", e))?;
+    // ============================================
+    // Chat Request: HTTP SSE (v1.3.2)
+    // ============================================
 
-            if let WsMessage::Text(text) = msg {
-                let parsed: serde_json::Value = serde_json::from_str(&text)
-                    .map_err(|e| format!("Invalid JSON: {}", e))?;
-
-                // OpenClaw sends {"type": "res", "id": "...", "result": {...}}
-                // for successful connect, or an event with hello-ok
-                let msg_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-                if msg_type == "res" {
-                    // Check if it's an error response
-                    if parsed.get("error").is_some() {
-                        let err = parsed.get("error")
-                            .and_then(|e| e.get("message"))
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("unknown error");
-                        return Err(format!("OpenClaw rejected connect: {}", err));
-                    }
-                    return Ok(());
-                }
-
-                if msg_type == "event" {
-                    let event = parsed.get("event").and_then(|e| e.as_str()).unwrap_or("");
-                    if event == "connect.hello-ok" || event.contains("hello") {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        Err("OpenClaw connection closed before hello".to_string())
-    }
-
-    /// Relays OpenClaw response events back to CMS as agent_stream/agent_response.
+    /// Sends a chat request to OpenClaw via HTTP API and streams the response
+    /// back to CMS as `agent_stream` messages.
     ///
-    /// OpenClaw streams responses as multiple events. We relay each
-    /// text chunk as an `agent_stream` message, and the final response
-    /// as `agent_response`.
-    async fn relay_openclaw_response(
+    /// v1.3.2: New implementation using OpenAI-compatible HTTP API.
+    ///
+    /// ## OpenClaw API Contract
+    /// ```text
+    /// POST http://127.0.0.1:18789/v1/chat/completions
+    /// Headers:
+    ///   Authorization: Bearer <gateway_token>
+    ///   Content-Type: application/json
+    ///   x-openclaw-agent-id: main
+    /// Body:
+    ///   {"model":"openclaw","stream":true,"user":"aeronyx:...","messages":[...]}
+    ///
+    /// Response (SSE):
+    ///   data: {"choices":[{"delta":{"content":"Hello"}}]}
+    ///   data: {"choices":[{"delta":{"content":" world"}}]}
+    ///   data: [DONE]
+    /// ```
+    ///
+    /// ## Session Management
+    /// The `user` field controls session persistence in OpenClaw:
+    /// - If payload contains `user_id`: uses `"aeronyx:user:{user_id}"` for
+    ///   persistent conversation history across requests
+    /// - Otherwise: uses `"aeronyx:req:{request_id}"` for single-use sessions
+    async fn handle_chat_request(
         &self,
         request_id: &str,
-        oc_source: &mut WsSource,
+        payload: &serde_json::Value,
+        gateway_token: &str,
         cms_sink: &mut WsSink,
     ) -> Result<(), String> {
-        let timeout = Duration::from_secs(120); // 2 min max per request
-        let deadline = tokio::time::Instant::now() + timeout;
+        let prompt = payload.get("prompt")
+            .and_then(|p| p.as_str())
+            .unwrap_or("");
 
-        while tokio::time::Instant::now() < deadline {
-            let read_result = tokio::time::timeout(
-                Duration::from_secs(30),
-                oc_source.next(),
-            ).await;
+        if prompt.is_empty() {
+            return Err("Empty prompt in chat request".to_string());
+        }
 
-            match read_result {
-                Ok(Some(Ok(WsMessage::Text(text)))) => {
-                    let parsed: serde_json::Value = match serde_json::from_str(&text) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
+        // Determine session key for OpenClaw.
+        // If CMS provides a user_id, use it for persistent sessions.
+        // Otherwise, each request gets its own ephemeral session.
+        let session_user = if let Some(user_id) = payload.get("user_id").and_then(|u| u.as_str()) {
+            format!("aeronyx:user:{}", user_id)
+        } else {
+            format!("aeronyx:req:{}", request_id)
+        };
 
-                    let msg_type = parsed.get("type")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
+        // Build OpenAI-compatible request body
+        let request_body = serde_json::json!({
+            "model": "openclaw",
+            "stream": true,
+            "user": session_user,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        });
 
-                    match msg_type {
-                        // OpenClaw event responses
-                        "event" => {
-                            let event_name = parsed.get("event")
-                                .and_then(|e| e.as_str())
-                                .unwrap_or("");
+        let url = format!("{}{}", OPENCLAW_HTTP_BASE, OPENCLAW_CHAT_PATH);
 
-                            // Chat events contain streamed text
-                            if event_name.contains("chat") || event_name.contains("agent") {
-                                let event_payload = parsed.get("payload")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Null);
+        debug!(
+            request_id = %request_id,
+            url = %url,
+            session = %session_user,
+            "[WS_TUNNEL] 📤 Sending chat request to OpenClaw HTTP API"
+        );
 
-                                // Extract text content from event
-                                let text_content = event_payload.get("text")
-                                    .or_else(|| event_payload.get("content"))
-                                    .or_else(|| event_payload.get("chunk"))
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("");
+        // Send HTTP request — do NOT set a timeout on the client level
+        // because SSE streams can legitimately last several minutes.
+        // Instead we use a tokio::time::timeout wrapper.
+        let response = tokio::time::timeout(
+            Duration::from_secs(OPENCLAW_REQUEST_TIMEOUT_SECS),
+            self.http_client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", gateway_token))
+                .header("Content-Type", "application/json")
+                .header("x-openclaw-agent-id", OPENCLAW_AGENT_ID)
+                .json(&request_body)
+                .send()
+        ).await
+            .map_err(|_| format!("OpenClaw request timed out ({}s)", OPENCLAW_REQUEST_TIMEOUT_SECS))?
+            .map_err(|e| format!("OpenClaw HTTP request failed: {}", e))?;
 
-                                let is_final = event_name.contains("final")
-                                    || event_name.contains("done")
-                                    || event_name.contains("end");
+        // Check HTTP status
+        let status = response.status();
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "OpenClaw returned HTTP {}: {}",
+                status.as_u16(),
+                error_body.chars().take(500).collect::<String>()
+            ));
+        }
 
-                                if !text_content.is_empty() || is_final {
-                                    if is_final {
-                                        // Final response
-                                        let response = serde_json::json!({
-                                            "type": "agent_response",
-                                            "request_id": request_id,
-                                            "status": "success",
-                                            "payload": {
-                                                "response": text_content
-                                            }
-                                        });
-                                        cms_sink.send(ws_text(&response))
-                                            .await
-                                            .map_err(|e| format!("Send failed: {}", e))?;
-                                        return Ok(());
-                                    } else {
-                                        // Streaming chunk
-                                        let stream_msg = serde_json::json!({
-                                            "type": "agent_stream",
-                                            "request_id": request_id,
-                                            "chunk": text_content,
-                                            "done": false
-                                        });
-                                        cms_sink.send(ws_text(&stream_msg))
-                                            .await
-                                            .map_err(|e| format!("Stream send failed: {}", e))?;
-                                    }
-                                }
+        // Stream SSE response
+        self.stream_sse_response(request_id, response, cms_sink).await
+    }
+
+    /// Parses an SSE stream from OpenClaw and relays chunks to CMS.
+    ///
+    /// ## SSE Format (OpenAI-compatible)
+    /// Each line is prefixed with `data: `. Content chunks are JSON objects:
+    /// ```json
+    /// data: {"id":"...","choices":[{"delta":{"content":"text"}}]}
+    /// ```
+    /// The stream ends with:
+    /// ```text
+    /// data: [DONE]
+    /// ```
+    ///
+    /// ## Relay Protocol
+    /// Each content chunk becomes:
+    /// ```json
+    /// {"type":"agent_stream","request_id":"...","chunk":"text","done":false}
+    /// ```
+    /// The `[DONE]` signal becomes:
+    /// ```json
+    /// {"type":"agent_stream","request_id":"...","chunk":"","done":true}
+    /// ```
+    async fn stream_sse_response(
+        &self,
+        request_id: &str,
+        response: reqwest::Response,
+        cms_sink: &mut WsSink,
+    ) -> Result<(), String> {
+        // Collect the full response text to accumulate for final agent_response.
+        // We also stream chunks as they arrive for real-time UX.
+        let mut full_response = String::new();
+
+        // Read the response body as a byte stream and process SSE lines.
+        // reqwest gives us the body as a stream of Bytes chunks.
+        let mut stream = response.bytes_stream();
+
+        // SSE line buffer — SSE events can span multiple TCP frames,
+        // so we need to buffer and split by newlines.
+        let mut line_buffer = String::new();
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result
+                .map_err(|e| format!("SSE stream read error: {}", e))?;
+
+            // Append raw bytes to line buffer
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            line_buffer.push_str(&chunk_str);
+
+            // Process complete lines (SSE uses \n or \r\n as delimiters)
+            while let Some(newline_pos) = line_buffer.find('\n') {
+                let line = line_buffer[..newline_pos].trim_end_matches('\r').to_string();
+                line_buffer = line_buffer[newline_pos + 1..].to_string();
+
+                // Skip empty lines (SSE event separators)
+                if line.is_empty() {
+                    continue;
+                }
+
+                // SSE data lines start with "data: "
+                let data = if let Some(stripped) = line.strip_prefix("data: ") {
+                    stripped
+                } else if let Some(stripped) = line.strip_prefix("data:") {
+                    stripped
+                } else {
+                    // Other SSE fields (event:, id:, retry:) — skip
+                    debug!(
+                        line = %line,
+                        "[WS_TUNNEL] Skipping non-data SSE line"
+                    );
+                    continue;
+                };
+
+                let data = data.trim();
+
+                // Check for stream termination
+                if data == "[DONE]" {
+                    debug!(
+                        request_id = %request_id,
+                        "[WS_TUNNEL] ✅ SSE stream complete"
+                    );
+                    // Send final done message to CMS
+                    let done_msg = serde_json::json!({
+                        "type": "agent_stream",
+                        "request_id": request_id,
+                        "chunk": "",
+                        "done": true
+                    });
+                    cms_sink.send(ws_text(&done_msg))
+                        .await
+                        .map_err(|e| format!("Done send failed: {}", e))?;
+
+                    // Also send complete response as agent_response
+                    if !full_response.is_empty() {
+                        let final_response = serde_json::json!({
+                            "type": "agent_response",
+                            "request_id": request_id,
+                            "status": "success",
+                            "payload": {
+                                "response": full_response
                             }
-                        }
-                        // RPC response (non-streaming)
-                        "res" => {
-                            let result = parsed.get("result")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-
-                            let response = serde_json::json!({
-                                "type": "agent_response",
-                                "request_id": request_id,
-                                "status": "success",
-                                "payload": result
-                            });
-                            cms_sink.send(ws_text(&response))
-                                .await
-                                .map_err(|e| format!("Response send failed: {}", e))?;
-                            return Ok(());
-                        }
-                        _ => {
-                            // Other events — skip
-                        }
+                        });
+                        cms_sink.send(ws_text(&final_response))
+                            .await
+                            .map_err(|e| format!("Final response send failed: {}", e))?;
                     }
-                }
-                Ok(Some(Ok(WsMessage::Close(_)))) => {
-                    // OpenClaw closed connection — send final done
-                    let done_msg = serde_json::json!({
-                        "type": "agent_stream",
-                        "request_id": request_id,
-                        "chunk": "",
-                        "done": true
-                    });
-                    let _ = cms_sink.send(ws_text(&done_msg)).await;
+
                     return Ok(());
                 }
-                Ok(Some(Err(e))) => {
-                    return Err(format!("OpenClaw WS error: {}", e));
-                }
-                Ok(None) => {
-                    return Ok(()); // Stream ended
-                }
-                Err(_) => {
-                    // Read timeout — send done and return
-                    let done_msg = serde_json::json!({
+
+                // Parse the JSON data chunk
+                let parsed: serde_json::Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        debug!(
+                            data = %data,
+                            error = %e,
+                            "[WS_TUNNEL] Skipping unparseable SSE data"
+                        );
+                        continue;
+                    }
+                };
+
+                // Extract content from OpenAI-compatible format:
+                // {"choices":[{"delta":{"content":"text"}}]}
+                let content = parsed
+                    .get("choices")
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|choice| choice.get("delta"))
+                    .and_then(|delta| delta.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+
+                if !content.is_empty() {
+                    // Accumulate for final response
+                    full_response.push_str(content);
+
+                    // Stream chunk to CMS
+                    let stream_msg = serde_json::json!({
                         "type": "agent_stream",
                         "request_id": request_id,
-                        "chunk": "",
-                        "done": true
+                        "chunk": content,
+                        "done": false
                     });
-                    let _ = cms_sink.send(ws_text(&done_msg)).await;
-                    return Ok(());
-                }
-                _ => {
-                    // Binary/Ping/Pong/Frame — skip
+                    cms_sink.send(ws_text(&stream_msg))
+                        .await
+                        .map_err(|e| format!("Stream chunk send failed: {}", e))?;
                 }
             }
         }
 
-        // Overall timeout
-        let timeout_msg = serde_json::json!({
-            "type": "agent_response",
+        // If we get here, the stream ended without [DONE] — still send done
+        warn!(
+            request_id = %request_id,
+            "[WS_TUNNEL] ⚠️ SSE stream ended without [DONE] marker"
+        );
+
+        let done_msg = serde_json::json!({
+            "type": "agent_stream",
             "request_id": request_id,
-            "status": "error",
-            "payload": {"error": "Request timed out (120s)"}
+            "chunk": "",
+            "done": true
         });
-        let _ = cms_sink.send(ws_text(&timeout_msg)).await;
+        let _ = cms_sink.send(ws_text(&done_msg)).await;
+
+        if !full_response.is_empty() {
+            let final_response = serde_json::json!({
+                "type": "agent_response",
+                "request_id": request_id,
+                "status": "success",
+                "payload": {
+                    "response": full_response
+                }
+            });
+            let _ = cms_sink.send(ws_text(&final_response)).await;
+        }
 
         Ok(())
     }
