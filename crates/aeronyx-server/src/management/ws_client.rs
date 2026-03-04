@@ -11,13 +11,8 @@
 //!
 //! ## Modification Reason (v1.3.2)
 //! Replaced OpenClaw Gateway WebSocket RPC with HTTP API (`/v1/chat/completions`).
-//! The HTTP API is OpenAI-compatible, supports SSE streaming, and is far simpler
-//! than the internal WS RPC protocol. Benefits:
-//! - No complex RPC handshake (connect → hello-ok → chat.send)
-//! - Reuses `reqwest::Client` connection pool (no per-request WS connect)
-//! - Standard SSE parsing instead of fragile event name matching
-//! - Proper session management via OpenAI `user` field
-//! - Lower latency and better error handling
+//! The HTTP API is OpenAI-compatible, supports SSE streaming, and is simpler
+//! than the internal WS RPC protocol.
 //!
 //! ## Main Functionality
 //! - `WsTunnel`: Background async task managing the CMS WebSocket lifecycle
@@ -35,16 +30,6 @@
 //!   └────────┘                          └─────────┘                                 └──────────┘
 //! ```
 //!
-//! 1. WsTunnel connects to `wss://api.aeronyx.network/ws/node/tunnel/{node_id}/`
-//! 2. Sends `auth` message with Ed25519-signed `{public_key}:{timestamp}`
-//! 3. Waits for `auth_ok` (25s timeout, CMS allows 30s)
-//! 4. Enters message loop:
-//!    - `agent_request` from CMS → HTTP POST to OpenClaw `/v1/chat/completions`
-//!    - SSE chunks → wrap as `agent_stream` → send to CMS
-//!    - Final `data: [DONE]` → wrap as `agent_stream` with `done: true` → send to CMS
-//!    - Periodic `ping`/`pong` keepalive (every 30s)
-//! 5. On disconnect: exponential backoff reconnect (1s → 2s → 4s → ... → 60s max)
-//!
 //! ## CMS WebSocket Protocol
 //!
 //! ### Authentication (must complete within 30s)
@@ -52,7 +37,6 @@
 //! → {"type": "auth", "node_id": "<public_key_hex>", "timestamp": 1709500000, "signature": "<hex>"}
 //! ← {"type": "auth_ok", "node_id": "<uuid>", "node_name": "My Node"}
 //! ```
-//! Signature: `Ed25519_Sign("{public_key_hex}:{timestamp}".as_bytes())`
 //!
 //! ### Messages (post-auth)
 //! ```json
@@ -62,50 +46,22 @@
 //! ↔ {"type": "ping"} / {"type": "pong"}
 //! ```
 //!
-//! ### Close Codes
-//! - 4000: Missing node_id in URL
-//! - 4001: Auth failed (invalid signature / node not found / disabled)
-//! - 4002: Auth timeout (30s)
-//!
-//! ## OpenClaw Gateway HTTP API (local)
-//! The OpenClaw Gateway at `http://127.0.0.1:18789` serves an OpenAI-compatible
-//! Chat Completions endpoint at `/v1/chat/completions`.
-//! - Must be enabled: `gateway.http.endpoints.chatCompletions.enabled = true`
-//! - Auth via `Authorization: Bearer <gateway_token>`
-//! - Agent selection via `x-openclaw-agent-id: main` header
-//! - Session persistence via `user` field in request body
-//! - Streaming via `stream: true` → SSE response
-//!
-//! ## Dependencies
-//! - `tokio-tungstenite` with `rustls-tls-native-roots` for wss:// to CMS
-//! - `reqwest` for HTTP calls to local OpenClaw Gateway
-//! - `aeronyx_core::crypto::IdentityKeyPair` for Ed25519 signing
-//!
 //! ## ⚠️ Important Note for Next Developer
 //! - The CMS URL uses `node_id` which is the **CMS database UUID**, NOT the
-//!   Ed25519 public key. The UUID is obtained from `StoredNodeInfo.node_id`.
-//! - The `auth` message uses `node_id` field which IS the Ed25519 public key hex.
-//! - Signature format: `Ed25519_Sign("{pubkey}:{timestamp}".as_bytes())` — raw
-//!   sign, NOT SHA-256 then sign. This differs from heartbeat which does SHA-256
-//!   first. Be careful.
-//! - The `reqwest::Client` is created ONCE and reused for all requests (connection
-//!   pool). Do NOT create a new client per request.
-//! - OpenClaw HTTP API must be enabled in config before this works. The
-//!   AgentManager should enable it during install/onboard. If you get 404,
-//!   run: `openclaw config set gateway.http.endpoints.chatCompletions.enabled true`
-//! - The `user` field in OpenAI requests creates stable sessions in OpenClaw.
-//!   We use `"aeronyx:{request_id}"` for stateless or `"aeronyx:user:{user_id}"`
-//!   for persistent sessions (if CMS provides a user_id in the payload).
+//!   Ed25519 public key.
+//! - The `auth` message `node_id` field IS the Ed25519 public key hex.
+//! - Signature: `Ed25519_Sign("{pubkey}:{timestamp}".as_bytes())` — raw sign,
+//!   NOT SHA-256 then sign. Differs from heartbeat.
+//! - The `reqwest::Client` is created ONCE and reused (connection pool).
+//! - OpenClaw HTTP API must be enabled in config for this to work.
+//! - The `user` field in requests creates stable sessions in OpenClaw.
 //!
 //! ## Last Modified
 //! v1.3.0 - 🌟 Initial creation (Phase 3: WebSocket Tunnel)
-//! v1.3.2 - 🔄 Replaced OpenClaw WS RPC with HTTP API (/v1/chat/completions)
-//!          - Fixed: per-request WS connection overhead → reqwest connection pool
-//!          - Fixed: fragile event name matching → standard SSE parsing
-//!          - Fixed: no session management → OpenAI `user` field for session persistence
-//!          - Added: proper SSE `data: [DONE]` handling
-//!          - Added: non-streaming fallback for `status` action
-//!          - Added: configurable request timeout (120s default)
+//! v1.3.2 - 🔄 Replaced OpenClaw WS RPC with HTTP API
+//! v1.4.0 - 🐛 Fixed SSE [DONE] signal lost in residual buffer
+//!          - 🔄 Refactored stream_sse_response into 3 focused methods
+//!          - 🔄 Error path now sends done: true before error response
 //! ============================================
 
 use std::sync::Arc;
@@ -125,35 +81,14 @@ use crate::services::AgentManager;
 // Constants
 // ============================================
 
-/// CMS WebSocket base URL (without trailing node_id).
 const CMS_WS_BASE_URL: &str = "wss://api.aeronyx.network/ws/node/tunnel";
-
-/// Local OpenClaw Gateway HTTP API base URL.
 const OPENCLAW_HTTP_BASE: &str = "http://127.0.0.1:18789";
-
-/// OpenClaw Chat Completions endpoint path.
 const OPENCLAW_CHAT_PATH: &str = "/v1/chat/completions";
-
-/// Maximum reconnection backoff interval (seconds).
 const MAX_RECONNECT_BACKOFF_SECS: u64 = 60;
-
-/// Initial reconnection delay (seconds).
 const INITIAL_RECONNECT_DELAY_SECS: u64 = 1;
-
-/// Ping interval to keep the CMS connection alive (seconds).
 const PING_INTERVAL_SECS: u64 = 30;
-
-/// Timeout waiting for auth_ok response (seconds).
-const AUTH_TIMEOUT_SECS: u64 = 25; // Slightly under CMS's 30s limit
-
-/// Timeout for a single OpenClaw HTTP request (seconds).
-/// This covers the entire SSE stream duration, not just the first byte.
-/// Set to 180s to accommodate tool execution (browser, code, file ops).
-/// The 30-second per-chunk timeout in stream_sse_response provides
-/// faster detection of truly stuck streams.
+const AUTH_TIMEOUT_SECS: u64 = 25;
 const OPENCLAW_REQUEST_TIMEOUT_SECS: u64 = 180;
-
-/// Default OpenClaw agent ID.
 const OPENCLAW_AGENT_ID: &str = "main";
 
 // ============================================
@@ -164,8 +99,6 @@ type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::Tc
 type WsSink = SplitSink<WsStream, WsMessage>;
 type WsSource = SplitStream<WsStream>;
 
-/// Helper: creates a WsMessage::Text from a serializable value.
-/// tungstenite 0.26+ requires `Utf8Bytes`, not `String`.
 fn ws_text(value: &serde_json::Value) -> WsMessage {
     WsMessage::Text(value.to_string().into())
 }
@@ -174,55 +107,20 @@ fn ws_text(value: &serde_json::Value) -> WsMessage {
 // WsTunnel
 // ============================================
 
-/// WebSocket tunnel client for CMS ↔ OpenClaw real-time communication.
-///
-/// ## Lifecycle
-/// 1. Created in `server.rs` with identity + node info
-/// 2. Spawned as a `tokio::spawn` task via `run()`
-/// 3. Maintains persistent connection to CMS with auto-reconnect
-/// 4. Relays `agent_request` from CMS to local OpenClaw Gateway via HTTP API
-/// 5. Stops on shutdown signal
-///
-/// ## v1.3.2 Architecture Change
-/// Previously connected to OpenClaw via WebSocket RPC (complex handshake).
-/// Now uses the OpenAI-compatible HTTP API at `/v1/chat/completions` with
-/// SSE streaming. The `reqwest::Client` is created once and reused for all
-/// requests via its built-in connection pool.
 pub struct WsTunnel {
-    /// Ed25519 identity for signing auth messages.
     identity: IdentityKeyPair,
-
-    /// CMS database UUID for the node (used in WS URL path).
-    /// Loaded from `StoredNodeInfo.node_id`.
     cms_node_id: String,
-
-    /// Agent manager for checking OpenClaw availability and getting gateway token.
     agent_manager: Arc<AgentManager>,
-
-    /// Reusable HTTP client for OpenClaw Gateway API calls.
-    /// Created once, uses connection pool internally.
-    /// v1.3.2: Replaces per-request WebSocket connections.
     http_client: reqwest::Client,
 }
 
 impl WsTunnel {
-    /// Creates a new WsTunnel.
-    ///
-    /// # Arguments
-    /// * `identity` - Ed25519 keypair for signing auth messages
-    /// * `cms_node_id` - CMS database UUID (NOT the public key)
-    /// * `agent_manager` - Shared AgentManager for OpenClaw status and token
     pub fn new(
         identity: IdentityKeyPair,
         cms_node_id: String,
         agent_manager: Arc<AgentManager>,
     ) -> Self {
-        // Build a reusable HTTP client with sensible defaults.
-        // reqwest::Client internally maintains a connection pool, so
-        // creating it once and reusing across all requests is optimal.
         let http_client = reqwest::Client::builder()
-            // Do NOT set a global timeout here — SSE streams can last minutes.
-            // We apply per-phase timeouts in the request logic instead.
             .pool_max_idle_per_host(4)
             .pool_idle_timeout(Duration::from_secs(60))
             .build()
@@ -236,14 +134,6 @@ impl WsTunnel {
         }
     }
 
-    /// Runs the WebSocket tunnel loop with automatic reconnection.
-    ///
-    /// This is the main entry point. It will:
-    /// 1. Connect to CMS WebSocket
-    /// 2. Authenticate
-    /// 3. Enter message relay loop
-    /// 4. On disconnect: wait with exponential backoff, then reconnect
-    /// 5. Stop on shutdown signal
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) {
         info!(
             cms_node_id = %self.cms_node_id,
@@ -253,14 +143,12 @@ impl WsTunnel {
         let mut backoff_secs = INITIAL_RECONNECT_DELAY_SECS;
 
         loop {
-            // Check shutdown before attempting connection
             if shutdown.try_recv().is_ok() {
                 info!("[WS_TUNNEL] Shutdown signal received before connect");
                 break;
             }
 
             let url = format!("{}/{}/", CMS_WS_BASE_URL, self.cms_node_id);
-
             info!(url = %url, "[WS_TUNNEL] Connecting to CMS...");
 
             match self.connect_and_run(&url, &mut shutdown).await {
@@ -269,33 +157,25 @@ impl WsTunnel {
                     break;
                 }
                 Ok(ShutdownReason::AuthFailed(reason)) => {
-                    error!(
-                        reason = %reason,
-                        "[WS_TUNNEL] ❌ Authentication failed — will retry"
-                    );
-                    // Auth failures might be transient (clock skew, CMS restart)
-                    // so still retry, but with longer backoff
+                    error!(reason = %reason, "[WS_TUNNEL] ❌ Auth failed — will retry");
                     backoff_secs = (backoff_secs * 2).min(MAX_RECONNECT_BACKOFF_SECS);
                 }
                 Ok(ShutdownReason::Disconnected(reason)) => {
                     warn!(
                         reason = %reason,
                         backoff_secs = backoff_secs,
-                        "[WS_TUNNEL] ⚠️ Disconnected — reconnecting in {}s",
-                        backoff_secs
+                        "[WS_TUNNEL] ⚠️ Disconnected — reconnecting in {}s", backoff_secs
                     );
                 }
                 Err(e) => {
                     warn!(
                         error = %e,
                         backoff_secs = backoff_secs,
-                        "[WS_TUNNEL] ❌ Connection error — reconnecting in {}s",
-                        backoff_secs
+                        "[WS_TUNNEL] ❌ Connection error — reconnecting in {}s", backoff_secs
                     );
                 }
             }
 
-            // Wait with backoff (but also listen for shutdown)
             tokio::select! {
                 _ = shutdown.recv() => {
                     info!("[WS_TUNNEL] Shutdown during backoff");
@@ -304,22 +184,17 @@ impl WsTunnel {
                 _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
             }
 
-            // Exponential backoff
             backoff_secs = (backoff_secs * 2).min(MAX_RECONNECT_BACKOFF_SECS);
         }
 
         info!("[WS_TUNNEL] WebSocket tunnel stopped");
     }
 
-    /// Connects to CMS, authenticates, and runs the message loop.
-    ///
-    /// Returns the reason the connection ended.
     async fn connect_and_run(
         &self,
         url: &str,
         shutdown: &mut broadcast::Receiver<()>,
     ) -> Result<ShutdownReason, String> {
-        // --- Step 1: WebSocket connect ---
         let (ws_stream, _response) = connect_async(url)
             .await
             .map_err(|e| format!("WebSocket connect failed: {}", e))?;
@@ -328,18 +203,12 @@ impl WsTunnel {
 
         let (mut sink, mut source) = ws_stream.split();
 
-        // --- Step 2: Authenticate ---
         if let Err(reason) = self.authenticate(&mut sink, &mut source).await {
             let _ = sink.close().await;
             return Ok(ShutdownReason::AuthFailed(reason));
         }
 
         info!("[WS_TUNNEL] ✅ Authenticated with CMS");
-
-        // Reset backoff on successful auth
-        // (caller tracks backoff, we signal success via return type)
-
-        // --- Step 3: Message relay loop ---
         self.message_loop(&mut sink, &mut source, shutdown).await
     }
 
@@ -347,7 +216,6 @@ impl WsTunnel {
     // Authentication
     // ============================================
 
-    /// Sends auth message and waits for auth_ok.
     async fn authenticate(
         &self,
         sink: &mut WsSink,
@@ -359,9 +227,6 @@ impl WsTunnel {
             .as_secs();
 
         let public_key_hex = hex::encode(self.identity.public_key_bytes());
-
-        // Signature: sign raw bytes of "{public_key_hex}:{timestamp}"
-        // Per CMS spec: this is direct Ed25519 sign, NOT SHA-256 then sign
         let message = format!("{}:{}", public_key_hex, timestamp);
         let signature_bytes = self.identity.sign(message.as_bytes());
         let signature_hex = hex::encode(signature_bytes);
@@ -374,12 +239,10 @@ impl WsTunnel {
         });
 
         debug!("[WS_TUNNEL] Sending auth message...");
-
         sink.send(ws_text(&auth_msg))
             .await
             .map_err(|e| format!("Failed to send auth: {}", e))?;
 
-        // Wait for auth_ok with timeout
         let auth_result = tokio::time::timeout(
             Duration::from_secs(AUTH_TIMEOUT_SECS),
             Self::wait_for_auth_ok(source),
@@ -392,7 +255,6 @@ impl WsTunnel {
         }
     }
 
-    /// Reads messages from the WebSocket until auth_ok is received.
     async fn wait_for_auth_ok(source: &mut WsSource) -> Result<(), String> {
         while let Some(msg_result) = source.next().await {
             let msg = msg_result.map_err(|e| format!("WS read error during auth: {}", e))?;
@@ -407,10 +269,7 @@ impl WsTunnel {
                             let node_name = parsed.get("node_name")
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("unknown");
-                            info!(
-                                node_name = %node_name,
-                                "[WS_TUNNEL] ✅ Auth OK"
-                            );
+                            info!(node_name = %node_name, "[WS_TUNNEL] ✅ Auth OK");
                             return Ok(());
                         }
                         Some("error") => {
@@ -420,10 +279,7 @@ impl WsTunnel {
                             return Err(format!("Auth rejected: {}", error_msg));
                         }
                         other => {
-                            debug!(
-                                msg_type = ?other,
-                                "[WS_TUNNEL] Unexpected message during auth"
-                            );
+                            debug!(msg_type = ?other, "[WS_TUNNEL] Unexpected message during auth");
                         }
                     }
                 }
@@ -433,7 +289,7 @@ impl WsTunnel {
                         .unwrap_or_else(|| "no frame".to_string());
                     return Err(format!("Connection closed during auth: {}", reason));
                 }
-                _ => {} // Ignore ping/pong/binary during auth
+                _ => {}
             }
         }
 
@@ -444,13 +300,6 @@ impl WsTunnel {
     // Message Loop
     // ============================================
 
-    /// Main message relay loop after successful authentication.
-    ///
-    /// Handles:
-    /// - `agent_request` from CMS → forward to OpenClaw via HTTP API → respond
-    /// - `ping` from CMS → respond with `pong`
-    /// - Periodic ping to keep connection alive
-    /// - Shutdown signal
     async fn message_loop(
         &self,
         sink: &mut WsSink,
@@ -458,18 +307,15 @@ impl WsTunnel {
         shutdown: &mut broadcast::Receiver<()>,
     ) -> Result<ShutdownReason, String> {
         let mut ping_interval = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
-        // Skip the first immediate tick
         ping_interval.tick().await;
 
         loop {
             tokio::select! {
-                // --- Shutdown ---
                 _ = shutdown.recv() => {
                     let _ = sink.close().await;
                     return Ok(ShutdownReason::GracefulShutdown);
                 }
 
-                // --- Periodic ping ---
                 _ = ping_interval.tick() => {
                     let ping_msg = serde_json::json!({"type": "ping"});
                     if let Err(e) = sink.send(ws_text(&ping_msg)).await {
@@ -479,15 +325,11 @@ impl WsTunnel {
                     }
                 }
 
-                // --- Incoming message from CMS ---
                 msg = source.next() => {
                     match msg {
                         Some(Ok(WsMessage::Text(text))) => {
                             if let Err(e) = self.handle_cms_message(&text, sink).await {
-                                warn!(
-                                    error = %e,
-                                    "[WS_TUNNEL] ⚠️ Error handling CMS message"
-                                );
+                                warn!(error = %e, "[WS_TUNNEL] ⚠️ Error handling CMS message");
                             }
                         }
                         Some(Ok(WsMessage::Ping(data))) => {
@@ -500,23 +342,18 @@ impl WsTunnel {
                             return Ok(ShutdownReason::Disconnected(reason));
                         }
                         Some(Err(e)) => {
-                            return Ok(ShutdownReason::Disconnected(
-                                format!("WS read error: {}", e)
-                            ));
+                            return Ok(ShutdownReason::Disconnected(format!("WS read error: {}", e)));
                         }
                         None => {
-                            return Ok(ShutdownReason::Disconnected(
-                                "Stream ended".to_string()
-                            ));
+                            return Ok(ShutdownReason::Disconnected("Stream ended".to_string()));
                         }
-                        _ => {} // Ignore binary/pong
+                        _ => {}
                     }
                 }
             }
         }
     }
 
-    /// Handles a single text message from CMS.
     async fn handle_cms_message(
         &self,
         text: &str,
@@ -543,10 +380,7 @@ impl WsTunnel {
                     .map_err(|e| format!("Pong send failed: {}", e))?;
             }
             other => {
-                debug!(
-                    msg_type = %other,
-                    "[WS_TUNNEL] Unhandled message type from CMS"
-                );
+                debug!(msg_type = %other, "[WS_TUNNEL] Unhandled message type from CMS");
             }
         }
 
@@ -554,19 +388,9 @@ impl WsTunnel {
     }
 
     // ============================================
-    // Agent Request Handling (v1.3.2: HTTP API)
+    // Agent Request Handling
     // ============================================
 
-    /// Handles an `agent_request` from CMS by forwarding to local OpenClaw HTTP API.
-    ///
-    /// v1.3.2: Replaced WebSocket RPC with HTTP POST to `/v1/chat/completions`.
-    ///
-    /// The flow:
-    /// 1. Extract `request_id`, `action`, `payload` from CMS message
-    /// 2. Get gateway token from AgentManager
-    /// 3. For `chat` action: POST to OpenClaw with `stream: true`, relay SSE chunks
-    /// 4. For `status` action: return AgentManager status directly
-    /// 5. Send `agent_response` or `agent_stream` back to CMS
     async fn handle_agent_request(
         &self,
         request: &serde_json::Value,
@@ -590,24 +414,18 @@ impl WsTunnel {
             "[WS_TUNNEL] 📥 Agent request from CMS"
         );
 
-        // Get gateway token from AgentManager
         let gateway_token = match self.agent_manager.gateway_token().await {
             Some(token) => token,
             None => {
-                let error_response = serde_json::json!({
-                    "type": "agent_response",
-                    "request_id": request_id,
-                    "status": "error",
-                    "payload": {
-                        "error": "OpenClaw gateway token not available. Is OpenClaw installed and configured?"
-                    }
-                });
-                let _ = cms_sink.send(ws_text(&error_response)).await;
+                self.send_done_and_error(
+                    request_id,
+                    "OpenClaw gateway token not available. Is OpenClaw installed and configured?",
+                    cms_sink,
+                ).await;
                 return Ok(());
             }
         };
 
-        // Dispatch based on action
         match action {
             "chat" => {
                 if let Err(e) = self.handle_chat_request(
@@ -618,25 +436,11 @@ impl WsTunnel {
                         error = %e,
                         "[WS_TUNNEL] ❌ Chat request failed"
                     );
-                    // Always send done + error so the frontend stops waiting.
-                    // Without this, the frontend hangs forever on timeout/error.
-                    let done_msg = serde_json::json!({
-                        "type": "agent_stream",
-                        "request_id": request_id,
-                        "chunk": "",
-                        "done": true
-                    });
-                    let _ = cms_sink.send(ws_text(&done_msg)).await;
-
-                    let error_response = serde_json::json!({
-                        "type": "agent_response",
-                        "request_id": request_id,
-                        "status": "error",
-                        "payload": {
-                            "error": format!("Failed to communicate with OpenClaw: {}", e)
-                        }
-                    });
-                    let _ = cms_sink.send(ws_text(&error_response)).await;
+                    self.send_done_and_error(
+                        request_id,
+                        &format!("Failed to communicate with OpenClaw: {}", e),
+                        cms_sink,
+                    ).await;
                 }
             }
             "status" => {
@@ -656,9 +460,7 @@ impl WsTunnel {
                     "type": "agent_response",
                     "request_id": request_id,
                     "status": "error",
-                    "payload": {
-                        "error": format!("Unknown action: {}", other)
-                    }
+                    "payload": { "error": format!("Unknown action: {}", other) }
                 });
                 cms_sink.send(ws_text(&response))
                     .await
@@ -669,36 +471,36 @@ impl WsTunnel {
         Ok(())
     }
 
+    /// Sends `agent_stream(done=true)` + `agent_response(error)` to CMS.
+    /// Ensures the frontend always receives a termination signal,
+    /// even on errors or timeouts.
+    async fn send_done_and_error(
+        &self,
+        request_id: &str,
+        error_message: &str,
+        cms_sink: &mut WsSink,
+    ) {
+        let done_msg = serde_json::json!({
+            "type": "agent_stream",
+            "request_id": request_id,
+            "chunk": "",
+            "done": true
+        });
+        let _ = cms_sink.send(ws_text(&done_msg)).await;
+
+        let error_response = serde_json::json!({
+            "type": "agent_response",
+            "request_id": request_id,
+            "status": "error",
+            "payload": { "error": error_message }
+        });
+        let _ = cms_sink.send(ws_text(&error_response)).await;
+    }
+
     // ============================================
-    // Chat Request: HTTP SSE (v1.3.2)
+    // Chat Request: HTTP SSE
     // ============================================
 
-    /// Sends a chat request to OpenClaw via HTTP API and streams the response
-    /// back to CMS as `agent_stream` messages.
-    ///
-    /// v1.3.2: New implementation using OpenAI-compatible HTTP API.
-    ///
-    /// ## OpenClaw API Contract
-    /// ```text
-    /// POST http://127.0.0.1:18789/v1/chat/completions
-    /// Headers:
-    ///   Authorization: Bearer <gateway_token>
-    ///   Content-Type: application/json
-    ///   x-openclaw-agent-id: main
-    /// Body:
-    ///   {"model":"openclaw","stream":true,"user":"aeronyx:...","messages":[...]}
-    ///
-    /// Response (SSE):
-    ///   data: {"choices":[{"delta":{"content":"Hello"}}]}
-    ///   data: {"choices":[{"delta":{"content":" world"}}]}
-    ///   data: [DONE]
-    /// ```
-    ///
-    /// ## Session Management
-    /// The `user` field controls session persistence in OpenClaw:
-    /// - If payload contains `user_id`: uses `"aeronyx:user:{user_id}"` for
-    ///   persistent conversation history across requests
-    /// - Otherwise: uses `"aeronyx:req:{request_id}"` for single-use sessions
     async fn handle_chat_request(
         &self,
         request_id: &str,
@@ -714,24 +516,12 @@ impl WsTunnel {
             return Err("Empty prompt in chat request".to_string());
         }
 
-        // Determine session key for OpenClaw.
-        // If CMS provides a user_id, use it for persistent sessions.
-        // Otherwise, each request gets its own ephemeral session.
         let session_user = if let Some(user_id) = payload.get("user_id").and_then(|u| u.as_str()) {
             format!("aeronyx:user:{}", user_id)
         } else {
             format!("aeronyx:req:{}", request_id)
         };
 
-        // Build OpenAI-compatible request body.
-        //
-        // We rely on OpenClaw's session management (via `user` field) to
-        // maintain conversation history. Tools and skills remain fully
-        // enabled — the agent can execute commands, read files, etc.
-        //
-        // The `user` field creates a stable session in OpenClaw, so
-        // multi-turn conversations work naturally: the AI remembers
-        // previous messages and tool results.
         let request_body = serde_json::json!({
             "model": "openclaw",
             "stream": true,
@@ -750,9 +540,6 @@ impl WsTunnel {
             "[WS_TUNNEL] 📤 Sending chat request to OpenClaw HTTP API"
         );
 
-        // Send HTTP request — do NOT set a timeout on the client level
-        // because SSE streams can legitimately last several minutes.
-        // Instead we use a tokio::time::timeout wrapper.
         let response = tokio::time::timeout(
             Duration::from_secs(OPENCLAW_REQUEST_TIMEOUT_SECS),
             self.http_client
@@ -763,15 +550,12 @@ impl WsTunnel {
                 .json(&request_body)
                 .send()
         ).await
-            .map_err(|_| {
-                format!(
-                    "OpenClaw request timed out ({}s). The AI may be stuck in an interactive loop.",
-                    OPENCLAW_REQUEST_TIMEOUT_SECS
-                )
-            })?
+            .map_err(|_| format!(
+                "OpenClaw request timed out ({}s). The AI may be stuck in an interactive loop.",
+                OPENCLAW_REQUEST_TIMEOUT_SECS
+            ))?
             .map_err(|e| format!("OpenClaw HTTP request failed: {}", e))?;
 
-        // Check HTTP status
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
@@ -782,294 +566,152 @@ impl WsTunnel {
             ));
         }
 
-        // Stream SSE response
         self.stream_sse_response(request_id, response, cms_sink).await
     }
 
-    /// Parses an SSE stream from OpenClaw and relays chunks to CMS.
+    // ============================================
+    // SSE Stream Processing (3 methods)
+    // ============================================
+
+    /// Main SSE processing entry point.
     ///
-    /// ## SSE Format (OpenAI-compatible)
-    /// Each line is prefixed with `data: `. Content chunks are JSON objects:
-    /// ```json
-    /// data: {"id":"...","choices":[{"delta":{"content":"text"}}]}
-    /// ```
-    /// The stream ends with:
-    /// ```text
-    /// data: [DONE]
-    /// ```
-    ///
-    /// ## Relay Protocol
-    /// Each content chunk becomes:
-    /// ```json
-    /// {"type":"agent_stream","request_id":"...","chunk":"text","done":false}
-    /// ```
-    /// The `[DONE]` signal becomes:
-    /// ```json
-    /// {"type":"agent_stream","request_id":"...","chunk":"","done":true}
-    /// ```
+    /// Phase 1: Read body chunks via `response.chunk()` and process lines.
+    /// Phase 2: Process residual data left in the buffer after body exhaustion.
+    /// Phase 3: Fallback — send done signal if [DONE] was never received.
     async fn stream_sse_response(
         &self,
         request_id: &str,
         mut response: reqwest::Response,
         cms_sink: &mut WsSink,
     ) -> Result<(), String> {
-        // Read the full SSE response body as a single chunk.
-        //
-        // Ideally we'd use `response.bytes_stream()` for true streaming,
-        // but that requires reqwest's `stream` feature (+ futures::StreamExt).
-        // Instead, we use `response.chunk()` in a loop which gives us
-        // incremental reads without needing the stream feature.
-        //
-        // Each chunk may contain partial SSE lines, so we buffer and
-        // split by newlines.
         let mut full_response = String::new();
         let mut line_buffer = String::new();
 
+        // Phase 1: Read body incrementally
         loop {
-            // `chunk()` returns `Option<Bytes>` — None when body is exhausted.
-            // This does NOT require the `stream` feature.
             let chunk_opt = response.chunk()
                 .await
                 .map_err(|e| format!("SSE read error: {}", e))?;
 
-            let chunk_bytes = match chunk_opt {
+            match chunk_opt {
                 Some(bytes) => {
-                    debug!(
-                        request_id = %request_id,
-                        bytes_len = bytes.len(),
-                        "[WS_TUNNEL] SSE chunk received ({} bytes)",
-                        bytes.len()
-                    );
-                    bytes
+                    line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                    if self.process_sse_lines(
+                        request_id, &mut line_buffer, &mut full_response, cms_sink
+                    ).await? {
+                        return Ok(()); // [DONE] found and handled
+                    }
                 }
                 None => {
-                    // Body exhausted — but line_buffer may still contain
-                    // unprocessed lines (e.g., "data: [DONE]\n" arrived in
-                    // the last TCP frame). Process remaining buffer below
-                    // before exiting.
                     debug!(
                         request_id = %request_id,
-                        line_buffer_len = line_buffer.len(),
-                        line_buffer_preview = %line_buffer.chars().take(200).collect::<String>(),
+                        residual_len = line_buffer.len(),
                         "[WS_TUNNEL] SSE body exhausted, residual buffer: {} bytes",
                         line_buffer.len()
                     );
                     break;
                 }
-            };
-
-            let chunk_str = String::from_utf8_lossy(&chunk_bytes);
-            line_buffer.push_str(&chunk_str);
-
-            // Process complete lines (SSE uses \n or \r\n as delimiters)
-            while let Some(newline_pos) = line_buffer.find('\n') {
-                let line = line_buffer[..newline_pos].trim_end_matches('\r').to_string();
-                line_buffer = line_buffer[newline_pos + 1..].to_string();
-
-                // Skip empty lines (SSE event separators)
-                if line.is_empty() {
-                    continue;
-                }
-
-                // SSE data lines start with "data: " or "data:"
-                let data = if let Some(stripped) = line.strip_prefix("data: ") {
-                    stripped
-                } else if let Some(stripped) = line.strip_prefix("data:") {
-                    stripped
-                } else {
-                    // Other SSE fields (event:, id:, retry:) — skip
-                    debug!(
-                        line = %line,
-                        "[WS_TUNNEL] Skipping non-data SSE line"
-                    );
-                    continue;
-                };
-
-                let data = data.trim();
-
-                // Check for stream termination
-                if data == "[DONE]" {
-                    debug!(
-                        request_id = %request_id,
-                        "[WS_TUNNEL] ✅ SSE stream complete"
-                    );
-
-                    // Send final done message to CMS
-                    let done_msg = serde_json::json!({
-                        "type": "agent_stream",
-                        "request_id": request_id,
-                        "chunk": "",
-                        "done": true
-                    });
-                    cms_sink.send(ws_text(&done_msg))
-                        .await
-                        .map_err(|e| format!("Done send failed: {}", e))?;
-
-                    // Also send complete response as agent_response
-                    if !full_response.is_empty() {
-                        let final_response = serde_json::json!({
-                            "type": "agent_response",
-                            "request_id": request_id,
-                            "status": "success",
-                            "payload": {
-                                "response": full_response
-                            }
-                        });
-                        cms_sink.send(ws_text(&final_response))
-                            .await
-                            .map_err(|e| format!("Final response send failed: {}", e))?;
-                    }
-
-                    return Ok(());
-                }
-
-                // Parse the JSON data chunk
-                let parsed: serde_json::Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        debug!(
-                            data = %data,
-                            error = %e,
-                            "[WS_TUNNEL] Skipping unparseable SSE data"
-                        );
-                        continue;
-                    }
-                };
-
-                // Extract content from OpenAI-compatible format:
-                // {"choices":[{"delta":{"content":"text"}}]}
-                let content = parsed
-                    .get("choices")
-                    .and_then(|c| c.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|choice| choice.get("delta"))
-                    .and_then(|delta| delta.get("content"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-
-                if !content.is_empty() {
-                    // Accumulate for final response
-                    full_response.push_str(content);
-
-                    // Stream chunk to CMS
-                    let stream_msg = serde_json::json!({
-                        "type": "agent_stream",
-                        "request_id": request_id,
-                        "chunk": content,
-                        "done": false
-                    });
-                    cms_sink.send(ws_text(&stream_msg))
-                        .await
-                        .map_err(|e| format!("Stream chunk send failed: {}", e))?;
-                }
             }
         }
 
-        // ============================================================
-        // Process any remaining data left in line_buffer after the
-        // body stream is exhausted. This is the critical fix for the
-        // missing [DONE] signal: the last TCP frame often contains
-        // "data: [DONE]\n\n" which gets buffered but never processed
-        // if we exit the loop immediately on chunk_opt == None.
-        // ============================================================
-        // Append a trailing newline so the line-splitting logic below
-        // can extract the final line even if it lacked a terminator.
-        if !line_buffer.is_empty() && !line_buffer.ends_with('\n') {
-            line_buffer.push('\n');
+        // Phase 2: Process residual buffer
+        if !line_buffer.is_empty() {
+            if !line_buffer.ends_with('\n') {
+                line_buffer.push('\n');
+            }
+            if self.process_sse_lines(
+                request_id, &mut line_buffer, &mut full_response, cms_sink
+            ).await? {
+                return Ok(());
+            }
         }
 
+        // Phase 3: Fallback — [DONE] was never received
+        warn!(
+            request_id = %request_id,
+            response_len = full_response.len(),
+            "[WS_TUNNEL] ⚠️ SSE ended without [DONE] — sending fallback"
+        );
+        self.send_done_and_response(request_id, &full_response, cms_sink).await
+    }
+
+    /// Extracts complete SSE lines from the buffer and processes them.
+    ///
+    /// Returns `Ok(true)` if `[DONE]` was found and final messages were sent.
+    /// Returns `Ok(false)` if more data is needed.
+    async fn process_sse_lines(
+        &self,
+        request_id: &str,
+        line_buffer: &mut String,
+        full_response: &mut String,
+        cms_sink: &mut WsSink,
+    ) -> Result<bool, String> {
         while let Some(newline_pos) = line_buffer.find('\n') {
             let line = line_buffer[..newline_pos].trim_end_matches('\r').to_string();
-            line_buffer = line_buffer[newline_pos + 1..].to_string();
+            *line_buffer = line_buffer[newline_pos + 1..].to_string();
 
             if line.is_empty() {
                 continue;
             }
 
-            let data = if let Some(stripped) = line.strip_prefix("data: ") {
-                stripped
-            } else if let Some(stripped) = line.strip_prefix("data:") {
-                stripped
+            // Extract "data: ..." payload
+            let data = if let Some(s) = line.strip_prefix("data: ") {
+                s.trim()
+            } else if let Some(s) = line.strip_prefix("data:") {
+                s.trim()
             } else {
                 continue;
             };
 
-            let data = data.trim();
-
+            // Stream termination
             if data == "[DONE]" {
-                debug!(
-                    request_id = %request_id,
-                    "[WS_TUNNEL] ✅ SSE [DONE] found in residual buffer"
-                );
-
-                let done_msg = serde_json::json!({
-                    "type": "agent_stream",
-                    "request_id": request_id,
-                    "chunk": "",
-                    "done": true
-                });
-                cms_sink.send(ws_text(&done_msg))
-                    .await
-                    .map_err(|e| format!("Done send failed: {}", e))?;
-
-                if !full_response.is_empty() {
-                    let final_response = serde_json::json!({
-                        "type": "agent_response",
-                        "request_id": request_id,
-                        "status": "success",
-                        "payload": {
-                            "response": full_response
-                        }
-                    });
-                    cms_sink.send(ws_text(&final_response))
-                        .await
-                        .map_err(|e| format!("Final response send failed: {}", e))?;
-                }
-
-                return Ok(());
+                debug!(request_id = %request_id, "[WS_TUNNEL] ✅ SSE [DONE] received");
+                self.send_done_and_response(request_id, full_response, cms_sink).await?;
+                return Ok(true);
             }
 
-            // Parse remaining content chunks (unlikely but handle gracefully)
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                let content = parsed
-                    .get("choices")
-                    .and_then(|c| c.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|choice| choice.get("delta"))
-                    .and_then(|delta| delta.get("content"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
+            // Parse OpenAI-compatible JSON chunk
+            let parsed: serde_json::Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
 
-                if !content.is_empty() {
-                    full_response.push_str(content);
+            // Extract delta content: choices[0].delta.content
+            let content = parsed
+                .get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|choice| choice.get("delta"))
+                .and_then(|delta| delta.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
 
-                    let stream_msg = serde_json::json!({
-                        "type": "agent_stream",
-                        "request_id": request_id,
-                        "chunk": content,
-                        "done": false
-                    });
-                    let _ = cms_sink.send(ws_text(&stream_msg)).await;
-                }
+            if !content.is_empty() {
+                full_response.push_str(content);
+
+                let stream_msg = serde_json::json!({
+                    "type": "agent_stream",
+                    "request_id": request_id,
+                    "chunk": content,
+                    "done": false
+                });
+                cms_sink.send(ws_text(&stream_msg))
+                    .await
+                    .map_err(|e| format!("Stream send failed: {}", e))?;
             }
         }
 
-        // If we STILL didn't find [DONE] after processing residual buffer,
-        // send done + response as fallback.
-        // This is the safety net — if we reach here, it means either:
-        // 1. OpenClaw didn't send [DONE] (bug in OpenClaw or network cutoff)
-        // 2. [DONE] was split across TCP frames in an unexpected way
-        // 3. The overall timeout fired and we exited early
-        warn!(
-            request_id = %request_id,
-            full_response_len = full_response.len(),
-            line_buffer_residual = %line_buffer.chars().take(100).collect::<String>(),
-            "[WS_TUNNEL] ⚠️ SSE stream ended without [DONE] — sending fallback done signal"
-        );
-            request_id = %request_id,
-            "[WS_TUNNEL] ⚠️ SSE stream ended without [DONE] marker"
-        );
+        Ok(false)
+    }
 
+    /// Sends `agent_stream(done=true)` + `agent_response(success)` to CMS.
+    async fn send_done_and_response(
+        &self,
+        request_id: &str,
+        full_response: &str,
+        cms_sink: &mut WsSink,
+    ) -> Result<(), String> {
         let done_msg = serde_json::json!({
             "type": "agent_stream",
             "request_id": request_id,
@@ -1079,7 +721,7 @@ impl WsTunnel {
         let _ = cms_sink.send(ws_text(&done_msg)).await;
 
         if !full_response.is_empty() {
-            let final_response = serde_json::json!({
+            let final_msg = serde_json::json!({
                 "type": "agent_response",
                 "request_id": request_id,
                 "status": "success",
@@ -1087,7 +729,7 @@ impl WsTunnel {
                     "response": full_response
                 }
             });
-            let _ = cms_sink.send(ws_text(&final_response)).await;
+            let _ = cms_sink.send(ws_text(&final_msg)).await;
         }
 
         Ok(())
@@ -1098,12 +740,8 @@ impl WsTunnel {
 // Shutdown Reason
 // ============================================
 
-/// Reason the WebSocket connection ended.
 enum ShutdownReason {
-    /// Server received shutdown signal.
     GracefulShutdown,
-    /// Authentication failed.
     AuthFailed(String),
-    /// Connection lost (will reconnect).
     Disconnected(String),
 }
