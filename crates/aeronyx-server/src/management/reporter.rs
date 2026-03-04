@@ -44,7 +44,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
-
 use super::client::ManagementClient;
 use super::models::{Command, SessionEventReport, SessionEventType};
 use crate::services::AgentManager;
