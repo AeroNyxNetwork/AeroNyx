@@ -479,7 +479,9 @@ impl Server {
         let heartbeat_reporter = HeartbeatReporter::new(
             Arc::clone(&mgmt_client),
             public_ip,
-        ).with_command_sender(command_tx);
+        )
+        .with_command_sender(command_tx)
+        .with_agent_manager(Arc::clone(&agent_manager));
 
         let sessions_for_heartbeat = Arc::clone(sessions);
         let shutdown_rx = self.shutdown_tx.subscribe();
