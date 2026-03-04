@@ -14,6 +14,26 @@
 //! The HTTP API is OpenAI-compatible, supports SSE streaming, and is simpler
 //! than the internal WS RPC protocol.
 //!
+//! ## Modification Reason (v1.4.1)
+//! **BUG FIX**: `done=true` and `agent_response` messages were silently lost.
+//!
+//! Root cause: `tungstenite::SplitSink::send()` writes data into an internal
+//! userspace buffer and returns `Ok(())` without flushing to the kernel TCP
+//! send buffer. During high-frequency streaming (150+ chunks), intermediate
+//! chunks are flushed automatically when the buffer fills up. However, the
+//! final `done=true` and `agent_response` messages — written after all chunks
+//! are sent — remain in the userspace buffer with no subsequent write to
+//! trigger a flush. The data stays in memory until the next ping (30s later),
+//! by which time the frontend has already timed out.
+//!
+//! Evidence: TCP Send-Q monitoring on the Rust node showed that `done=true`
+//! (sent at 21:53:59.809) never appeared in the kernel TCP buffer, while
+//! streaming chunks consistently showed Send-Q values of 131-263 bytes.
+//!
+//! Fix: Added explicit `SinkExt::flush()` calls after every `send()` in
+//! critical paths: `send_done_and_response`, `send_done_and_error`,
+//! `process_sse_lines`, and `message_loop` ping.
+//!
 //! ## Main Functionality
 //! - `WsTunnel`: Background async task managing the CMS WebSocket lifecycle
 //! - Ed25519-signed authentication on connect
@@ -55,6 +75,10 @@
 //! - The `reqwest::Client` is created ONCE and reused (connection pool).
 //! - OpenClaw HTTP API must be enabled in config for this to work.
 //! - The `user` field in requests creates stable sessions in OpenClaw.
+//! - **CRITICAL**: Always call `flush()` after `send()` on the WebSocket sink.
+//!   `tungstenite::SplitSink::send()` only writes to a userspace buffer —
+//!   without `flush()`, data may never reach the TCP layer. This caused a
+//!   production bug where `done=true` messages were silently lost (v1.4.1).
 //!
 //! ## Last Modified
 //! v1.3.0 - 🌟 Initial creation (Phase 3: WebSocket Tunnel)
@@ -62,6 +86,10 @@
 //! v1.4.0 - 🐛 Fixed SSE [DONE] signal lost in residual buffer
 //!          - 🔄 Refactored stream_sse_response into 3 focused methods
 //!          - 🔄 Error path now sends done: true before error response
+//! v1.4.1 - 🐛 Fixed done=true and agent_response silently lost in
+//!            tungstenite userspace buffer (missing flush() after send())
+//!          - 🔄 Added flush() after every send() in critical paths
+//!          - 🔄 Added flush() to ping and stream chunk sends for consistency
 //! ============================================
 
 use std::sync::Arc;
@@ -101,6 +129,25 @@ type WsSource = SplitStream<WsStream>;
 
 fn ws_text(value: &serde_json::Value) -> WsMessage {
     WsMessage::Text(value.to_string().into())
+}
+
+/// Helper: send a WebSocket text frame AND flush to TCP.
+///
+/// **Why this exists (v1.4.1)**:
+/// `SplitSink::send()` writes into a userspace buffer only.
+/// Without an explicit `flush()`, data may sit in memory indefinitely
+/// until the next write triggers an automatic flush. This caused
+/// `done=true` and `agent_response` messages to be silently lost
+/// in production — they were the last messages in a burst, so no
+/// subsequent write ever flushed them out.
+async fn ws_send_flush(sink: &mut WsSink, msg: WsMessage) -> Result<(), String> {
+    sink.send(msg)
+        .await
+        .map_err(|e| format!("WebSocket send failed: {}", e))?;
+    sink.flush()
+        .await
+        .map_err(|e| format!("WebSocket flush failed: {}", e))?;
+    Ok(())
 }
 
 // ============================================
@@ -239,8 +286,8 @@ impl WsTunnel {
         });
 
         debug!("[WS_TUNNEL] Sending auth message...");
-        sink.send(ws_text(&auth_msg))
-            .await
+        // v1.4.1: use ws_send_flush to ensure auth message reaches TCP
+        ws_send_flush(sink, ws_text(&auth_msg)).await
             .map_err(|e| format!("Failed to send auth: {}", e))?;
 
         let auth_result = tokio::time::timeout(
@@ -318,7 +365,8 @@ impl WsTunnel {
 
                 _ = ping_interval.tick() => {
                     let ping_msg = serde_json::json!({"type": "ping"});
-                    if let Err(e) = sink.send(ws_text(&ping_msg)).await {
+                    // v1.4.1: flush ping to ensure keepalive reaches CMS
+                    if let Err(e) = ws_send_flush(sink, ws_text(&ping_msg)).await {
                         return Ok(ShutdownReason::Disconnected(
                             format!("Ping send failed: {}", e)
                         ));
@@ -375,8 +423,8 @@ impl WsTunnel {
             }
             "ping" => {
                 let pong = serde_json::json!({"type": "pong"});
-                sink.send(ws_text(&pong))
-                    .await
+                // v1.4.1: flush pong response
+                ws_send_flush(sink, ws_text(&pong)).await
                     .map_err(|e| format!("Pong send failed: {}", e))?;
             }
             other => {
@@ -451,8 +499,8 @@ impl WsTunnel {
                     "status": "success",
                     "payload": serde_json::to_value(&status).unwrap_or(serde_json::Value::Null)
                 });
-                cms_sink.send(ws_text(&response))
-                    .await
+                // v1.4.1: flush status response
+                ws_send_flush(cms_sink, ws_text(&response)).await
                     .map_err(|e| format!("Status response send failed: {}", e))?;
             }
             other => {
@@ -462,8 +510,8 @@ impl WsTunnel {
                     "status": "error",
                     "payload": { "error": format!("Unknown action: {}", other) }
                 });
-                cms_sink.send(ws_text(&response))
-                    .await
+                // v1.4.1: flush error response
+                ws_send_flush(cms_sink, ws_text(&response)).await
                     .map_err(|e| format!("Error response send failed: {}", e))?;
             }
         }
@@ -474,6 +522,8 @@ impl WsTunnel {
     /// Sends `agent_stream(done=true)` + `agent_response(error)` to CMS.
     /// Ensures the frontend always receives a termination signal,
     /// even on errors or timeouts.
+    ///
+    /// v1.4.1: Added flush() after each send() to guarantee data reaches TCP.
     async fn send_done_and_error(
         &self,
         request_id: &str,
@@ -486,7 +536,8 @@ impl WsTunnel {
             "chunk": "",
             "done": true
         });
-        let _ = cms_sink.send(ws_text(&done_msg)).await;
+        // v1.4.1: flush done=true to TCP
+        let _ = ws_send_flush(cms_sink, ws_text(&done_msg)).await;
 
         let error_response = serde_json::json!({
             "type": "agent_response",
@@ -494,7 +545,8 @@ impl WsTunnel {
             "status": "error",
             "payload": { "error": error_message }
         });
-        let _ = cms_sink.send(ws_text(&error_response)).await;
+        // v1.4.1: flush error response to TCP
+        let _ = ws_send_flush(cms_sink, ws_text(&error_response)).await;
     }
 
     // ============================================
@@ -692,6 +744,9 @@ impl WsTunnel {
     /// may send multiple `[DONE]` markers in a single agent turn (e.g., text
     /// output → [DONE] → tool execution → more text → [DONE]).
     /// Instead, [DONE] signals "a segment finished, tool may run next".
+    ///
+    /// v1.4.1: Added flush() after each chunk send() to ensure data reaches
+    /// TCP layer promptly, especially for the last chunk before done=true.
     async fn process_sse_lines(
         &self,
         request_id: &str,
@@ -750,8 +805,11 @@ impl WsTunnel {
                     "chunk": content,
                     "done": false
                 });
-                cms_sink.send(ws_text(&stream_msg))
-                    .await
+                // v1.4.1: flush each chunk to TCP to ensure timely delivery.
+                // During high-frequency streaming, tungstenite's internal
+                // buffer would auto-flush when full, but the last few chunks
+                // before [DONE] could be stranded. Explicit flush prevents this.
+                ws_send_flush(cms_sink, ws_text(&stream_msg)).await
                     .map_err(|e| format!("Stream send failed: {}", e))?;
             }
         }
@@ -760,6 +818,10 @@ impl WsTunnel {
     }
 
     /// Sends `agent_stream(done=true)` + `agent_response(success)` to CMS.
+    ///
+    /// v1.4.1: Added flush() after each send() — this was the primary fix
+    /// for the production bug where done=true never reached CMS. Without
+    /// flush(), the data sat in tungstenite's userspace buffer indefinitely.
     async fn send_done_and_response(
         &self,
         request_id: &str,
@@ -774,8 +836,9 @@ impl WsTunnel {
             "done": true
         });
         info!(request_id = %request_id, "[WS_TUNNEL] Sending done=true to CMS...");
-        match cms_sink.send(ws_text(&done_msg)).await {
-            Ok(_) => info!(request_id = %request_id, "[WS_TUNNEL] ✅ done=true SENT"),
+        // v1.4.1: flush to ensure done=true reaches TCP immediately
+        match ws_send_flush(cms_sink, ws_text(&done_msg)).await {
+            Ok(_) => info!(request_id = %request_id, "[WS_TUNNEL] ✅ done=true SENT+FLUSHED"),
             Err(e) => {
                 error!(request_id = %request_id, error = %e, "[WS_TUNNEL] ❌ Failed to send done=true");
                 return Err(format!("Failed to send done: {}", e));
@@ -797,8 +860,9 @@ impl WsTunnel {
                 response_len = full_response.len(),
                 "[WS_TUNNEL] Sending agent_response to CMS..."
             );
-            match cms_sink.send(ws_text(&final_msg)).await {
-                Ok(_) => info!(request_id = %request_id, "[WS_TUNNEL] ✅ agent_response SENT"),
+            // v1.4.1: flush to ensure agent_response reaches TCP immediately
+            match ws_send_flush(cms_sink, ws_text(&final_msg)).await {
+                Ok(_) => info!(request_id = %request_id, "[WS_TUNNEL] ✅ agent_response SENT+FLUSHED"),
                 Err(e) => {
                     error!(request_id = %request_id, error = %e, "[WS_TUNNEL] ❌ Failed to send agent_response");
                     return Err(format!("Failed to send response: {}", e));
