@@ -808,7 +808,13 @@ impl WsTunnel {
 
             let chunk_bytes = match chunk_opt {
                 Some(bytes) => bytes,
-                None => break, // Body exhausted
+                None => {
+                    // Body exhausted — but line_buffer may still contain
+                    // unprocessed lines (e.g., "data: [DONE]\n" arrived in
+                    // the last TCP frame). Process remaining buffer below
+                    // before exiting.
+                    break;
+                }
             };
 
             let chunk_str = String::from_utf8_lossy(&chunk_bytes);
@@ -918,7 +924,97 @@ impl WsTunnel {
             }
         }
 
-        // Body exhausted without [DONE] — still send done
+        // ============================================================
+        // Process any remaining data left in line_buffer after the
+        // body stream is exhausted. This is the critical fix for the
+        // missing [DONE] signal: the last TCP frame often contains
+        // "data: [DONE]\n\n" which gets buffered but never processed
+        // if we exit the loop immediately on chunk_opt == None.
+        // ============================================================
+        // Append a trailing newline so the line-splitting logic below
+        // can extract the final line even if it lacked a terminator.
+        if !line_buffer.is_empty() && !line_buffer.ends_with('\n') {
+            line_buffer.push('\n');
+        }
+
+        while let Some(newline_pos) = line_buffer.find('\n') {
+            let line = line_buffer[..newline_pos].trim_end_matches('\r').to_string();
+            line_buffer = line_buffer[newline_pos + 1..].to_string();
+
+            if line.is_empty() {
+                continue;
+            }
+
+            let data = if let Some(stripped) = line.strip_prefix("data: ") {
+                stripped
+            } else if let Some(stripped) = line.strip_prefix("data:") {
+                stripped
+            } else {
+                continue;
+            };
+
+            let data = data.trim();
+
+            if data == "[DONE]" {
+                debug!(
+                    request_id = %request_id,
+                    "[WS_TUNNEL] ✅ SSE [DONE] found in residual buffer"
+                );
+
+                let done_msg = serde_json::json!({
+                    "type": "agent_stream",
+                    "request_id": request_id,
+                    "chunk": "",
+                    "done": true
+                });
+                cms_sink.send(ws_text(&done_msg))
+                    .await
+                    .map_err(|e| format!("Done send failed: {}", e))?;
+
+                if !full_response.is_empty() {
+                    let final_response = serde_json::json!({
+                        "type": "agent_response",
+                        "request_id": request_id,
+                        "status": "success",
+                        "payload": {
+                            "response": full_response
+                        }
+                    });
+                    cms_sink.send(ws_text(&final_response))
+                        .await
+                        .map_err(|e| format!("Final response send failed: {}", e))?;
+                }
+
+                return Ok(());
+            }
+
+            // Parse remaining content chunks (unlikely but handle gracefully)
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                let content = parsed
+                    .get("choices")
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|choice| choice.get("delta"))
+                    .and_then(|delta| delta.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+
+                if !content.is_empty() {
+                    full_response.push_str(content);
+
+                    let stream_msg = serde_json::json!({
+                        "type": "agent_stream",
+                        "request_id": request_id,
+                        "chunk": content,
+                        "done": false
+                    });
+                    let _ = cms_sink.send(ws_text(&stream_msg)).await;
+                }
+            }
+        }
+
+        // If we STILL didn't find [DONE] after processing residual buffer,
+        // send done + response as fallback
         warn!(
             request_id = %request_id,
             "[WS_TUNNEL] ⚠️ SSE stream ended without [DONE] marker"
