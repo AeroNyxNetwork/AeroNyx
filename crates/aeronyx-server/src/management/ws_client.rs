@@ -594,13 +594,22 @@ impl WsTunnel {
         let mut line_buffer = String::new();
 
         // Phase 1: Read body incrementally.
-        // Each chunk() call has a 30-second timeout — if no data arrives
-        // in 30 seconds, we consider the stream stalled and break out.
-        // This prevents permanent hangs when OpenClaw's agent enters an
-        // interactive/tool loop that keeps the SSE connection open.
+        // Each chunk() call has a 10-second timeout — if no data arrives
+        // in 10 seconds, we consider this turn's output complete.
+        //
+        // Why 10 seconds instead of longer:
+        // OpenClaw keeps the SSE connection open for multi-turn interaction
+        // (e.g., "choose 1/2/3" then waits for user reply in the same stream).
+        // But our architecture uses one HTTP request per user message, so
+        // when the AI stops outputting text, this turn is done.
+        // Normal streaming has sub-second gaps between chunks, so 10s of
+        // silence reliably indicates the AI finished its current response.
+        // Tool execution (browser, code) may cause pauses, but OpenClaw
+        // sends status events during tool execution, keeping the stream alive.
+        let chunk_timeout = Duration::from_secs(10);
         loop {
             let chunk_result = tokio::time::timeout(
-                Duration::from_secs(30),
+                chunk_timeout,
                 response.chunk(),
             ).await;
 
@@ -615,12 +624,10 @@ impl WsTunnel {
                     }
                 }
                 Ok(Ok(None)) => {
-                    // Body exhausted
-                    debug!(
+                    info!(
                         request_id = %request_id,
                         residual_len = line_buffer.len(),
-                        "[WS_TUNNEL] SSE body exhausted, residual buffer: {} bytes",
-                        line_buffer.len()
+                        "[WS_TUNNEL] SSE body exhausted"
                     );
                     break;
                 }
@@ -633,11 +640,10 @@ impl WsTunnel {
                     break;
                 }
                 Err(_) => {
-                    // 30-second timeout — no data received
-                    warn!(
+                    info!(
                         request_id = %request_id,
-                        response_so_far_len = full_response.len(),
-                        "[WS_TUNNEL] ⚠️ SSE chunk timeout (30s no data) — ending stream"
+                        response_len = full_response.len(),
+                        "[WS_TUNNEL] SSE idle timeout (10s no data) — ending stream"
                     );
                     break;
                 }
