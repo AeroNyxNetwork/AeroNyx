@@ -181,13 +181,37 @@ impl AgentManager {
     ///
     /// This is called every heartbeat cycle (30s) from the
     /// HeartbeatReporter to populate `SystemStats.agent_status`.
+    ///
+    /// 🌟 v1.3.1: Now includes process-level CPU and memory usage
+    /// when the gateway is running and PID is known.
     pub async fn status(&self) -> AgentStatusInfo {
         let state = self.state.read().await;
+
+        // Collect process stats if we have a PID and agent is running
+        let (cpu_usage, memory_mb) = if state.status == AgentStatus::Running {
+            if let Some(pid) = state.pid {
+                Self::collect_process_stats(pid).await
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        let local_port = if state.status == AgentStatus::Running {
+            Some(self.gateway_port)
+        } else {
+            None
+        };
+
         AgentStatusInfo {
             status: state.status,
             version: state.version.clone(),
             message: Some(state.message.clone()),
             pid: state.pid,
+            local_port,
+            cpu_usage,
+            memory_mb,
         }
     }
 
@@ -745,6 +769,163 @@ impl AgentManager {
             state.status = AgentStatus::Error;
             state.pid = None;
             state.message = "Gateway is unresponsive".to_string();
+        }
+    }
+
+    // ============================================
+    // Process Stats (Linux /proc)
+    // ============================================
+
+    /// Collects CPU and memory usage for the OpenClaw process tree.
+    ///
+    /// 🌟 v1.3.1: Aggregates across ALL openclaw-related processes,
+    /// not just the main PID. Node.js may fork worker processes,
+    /// and we want total resource usage.
+    ///
+    /// Strategy:
+    /// 1. Use `pgrep -f "openclaw"` to find all related PIDs
+    /// 2. Sum VmRSS from /proc/{pid}/status for each
+    /// 3. Sum utime+stime from /proc/{pid}/stat for each
+    /// 4. If pgrep fails, fall back to just the known PID
+    #[cfg(target_os = "linux")]
+    async fn collect_process_stats(primary_pid: u32) -> (Option<f32>, Option<u64>) {
+        // Find all openclaw-related PIDs
+        let pids = Self::find_all_openclaw_pids(primary_pid).await;
+
+        if pids.is_empty() {
+            return (None, None);
+        }
+
+        let mut total_memory_kb = 0u64;
+        let mut total_cpu_ticks = 0u64;
+        let mut min_starttime = u64::MAX;
+        let mut found_any = false;
+
+        for pid in &pids {
+            // Memory: read VmRSS from /proc/{pid}/status
+            if let Some(rss_kb) = Self::read_pid_rss(*pid).await {
+                total_memory_kb += rss_kb;
+                found_any = true;
+            }
+
+            // CPU: read utime+stime from /proc/{pid}/stat
+            if let Some((ticks, starttime)) = Self::read_pid_cpu_ticks(*pid).await {
+                total_cpu_ticks += ticks;
+                if starttime < min_starttime {
+                    min_starttime = starttime;
+                }
+            }
+        }
+
+        if !found_any {
+            return (None, None);
+        }
+
+        let memory_mb = Some(total_memory_kb / 1024);
+
+        // Calculate CPU percentage using the earliest start time
+        let cpu_pct = if min_starttime < u64::MAX {
+            Self::calculate_cpu_percent(total_cpu_ticks, min_starttime).await
+        } else {
+            None
+        };
+
+        (cpu_pct, memory_mb)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn collect_process_stats(_pid: u32) -> (Option<f32>, Option<u64>) {
+        (None, None)
+    }
+
+    /// Finds all PIDs related to OpenClaw (main + child processes).
+    #[cfg(target_os = "linux")]
+    async fn find_all_openclaw_pids(primary_pid: u32) -> Vec<u32> {
+        // First try pgrep for all openclaw processes
+        let output = TokioCommand::new("pgrep")
+            .args(&["-f", "openclaw"])
+            .output()
+            .await;
+
+        let mut pids: Vec<u32> = match output {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|l| l.trim().parse::<u32>().ok())
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
+        // Ensure primary PID is included
+        if !pids.contains(&primary_pid) {
+            // Check if the primary PID still exists
+            if std::path::Path::new(&format!("/proc/{}", primary_pid)).exists() {
+                pids.push(primary_pid);
+            }
+        }
+
+        pids
+    }
+
+    /// Reads VmRSS (resident memory) for a PID from /proc/{pid}/status.
+    #[cfg(target_os = "linux")]
+    async fn read_pid_rss(pid: u32) -> Option<u64> {
+        let path = format!("/proc/{}/status", pid);
+        let content = tokio::fs::read_to_string(&path).await.ok()?;
+
+        for line in content.lines() {
+            // Prefer RssAnon if available (actual private memory)
+            // Fall back to VmRSS (includes shared libraries)
+            if line.starts_with("VmRSS:") {
+                return line.split_whitespace().nth(1)?.parse::<u64>().ok();
+            }
+        }
+        None
+    }
+
+    /// Reads utime + stime (CPU ticks) and starttime for a PID.
+    /// Returns (total_ticks, starttime).
+    #[cfg(target_os = "linux")]
+    async fn read_pid_cpu_ticks(pid: u32) -> Option<(u64, u64)> {
+        let path = format!("/proc/{}/stat", pid);
+        let content = tokio::fs::read_to_string(&path).await.ok()?;
+
+        // Parse: skip past "(comm)" which may contain spaces
+        let after_comm = content.rfind(')')? + 2;
+        let fields: Vec<&str> = content[after_comm..].split_whitespace().collect();
+
+        if fields.len() < 20 {
+            return None;
+        }
+
+        // utime=field[11], stime=field[12], starttime=field[19]
+        // (0-indexed relative to fields after comm)
+        let utime: u64 = fields[11].parse().ok()?;
+        let stime: u64 = fields[12].parse().ok()?;
+        let starttime: u64 = fields[19].parse().ok()?;
+
+        Some((utime + stime, starttime))
+    }
+
+    /// Calculates CPU percentage from total ticks and earliest start time.
+    #[cfg(target_os = "linux")]
+    async fn calculate_cpu_percent(total_ticks: u64, starttime: u64) -> Option<f32> {
+        let uptime_content = tokio::fs::read_to_string("/proc/uptime").await.ok()?;
+        let uptime_secs: f64 = uptime_content
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+
+        let clk_tck: f64 = 100.0; // sysconf(_SC_CLK_TCK)
+        let total_time = total_ticks as f64 / clk_tck;
+        let process_uptime = uptime_secs - (starttime as f64 / clk_tck);
+
+        if process_uptime > 0.0 {
+            Some((total_time / process_uptime * 100.0) as f32)
+        } else {
+            None
         }
     }
 
