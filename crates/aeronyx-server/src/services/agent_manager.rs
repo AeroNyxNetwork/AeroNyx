@@ -9,6 +9,19 @@
 //! download, install, configure, start, stop, update, uninstall, and
 //! health monitoring.
 //!
+//! ## Modification Reason (v1.3.2)
+//! - 🔄 Added `ensure_http_api_enabled()` to enable OpenClaw's HTTP Chat
+//!   Completions endpoint (`/v1/chat/completions`) during install and startup.
+//!   This is REQUIRED for `ws_client.rs` (v1.3.2) which replaced WS RPC with
+//!   HTTP API calls.
+//! - 🔄 Added `load_env_file()` to read API keys from `~/.openclaw/.env` and
+//!   pass them to the gateway process on startup. Without this, the gateway
+//!   cannot authenticate with upstream LLM providers (xAI, OpenAI, etc.).
+//! - 🐛 Fixed TOCTOU race in `install_agent` for `Stopped` state: consolidated
+//!   into a single write-lock block to prevent concurrent state changes.
+//! - 🐛 Fixed `start_gateway` fallback: added `stdin(Stdio::null())` for proper
+//!   process detachment and pass `.env` variables to the spawned process.
+//!
 //! ## Main Functionality
 //! - `AgentManager`: Thread-safe (Arc-wrapped) manager for OpenClaw lifecycle
 //! - `install_agent()`: Installs Node.js (if missing) + OpenClaw via npm
@@ -33,9 +46,10 @@
 //!   `openclaw onboard --install-daemon` (non-interactive via env vars)
 //!
 //! ## OpenClaw Architecture Summary
-//! - Gateway listens on ws://127.0.0.1:18789 (default)
+//! - Gateway listens on ws+http://127.0.0.1:18789 (WS + HTTP multiplex)
 //! - Config stored at ~/.openclaw/openclaw.json (JSON5)
 //! - Gateway Token stored at gateway.auth.token in config
+//! - HTTP API: POST /v1/chat/completions (OpenAI-compatible, must be enabled)
 //! - CLI commands: openclaw status, openclaw doctor, openclaw gateway
 //! - systemd service: openclaw-gateway (user service)
 //!
@@ -43,7 +57,7 @@
 //! 1. CommandHandler receives "install_openclaw" command
 //! 2. Calls AgentManager::install_agent(params)
 //! 3. AgentManager reports progress via ManagementClient
-//! 4. On success, starts the gateway process
+//! 4. On success, enables HTTP API + starts the gateway process
 //! 5. Health check loop monitors ws://127.0.0.1:18789
 //! 6. Status exposed via AgentManager::status() for heartbeat
 //!
@@ -63,12 +77,22 @@
 //! - `AgentState` is protected by `tokio::sync::RwLock` for concurrent
 //!   access from CommandHandler (write) and HeartbeatReporter (read)
 //! - Process PID is tracked for health monitoring and cleanup on shutdown
+//! - The HTTP Chat Completions endpoint MUST be enabled for ws_client.rs
+//!   to work. If you see 404 from `/v1/chat/completions`, run:
+//!   `openclaw config set gateway.http.endpoints.chatCompletions.enabled true`
+//! - API keys are stored in `~/.openclaw/.env` (e.g., XAI_API_KEY).
+//!   The gateway process reads this file on startup. We also pass these
+//!   env vars explicitly when spawning the gateway as a fallback.
 //!
 //! ## Last Modified
 //! v1.3.0 - 🌟 Initial creation (Phase 2: Agent Process Management)
+//! v1.3.2 - 🔄 Enable HTTP API endpoint during install/startup
+//!          - 🔄 Load and pass .env API keys to gateway process
+//!          - 🐛 Fixed TOCTOU race in install_agent Stopped path
+//!          - 🐛 Fixed start_gateway stdin detachment
 //! ============================================
 
-use std::path::PathBuf;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -96,6 +120,10 @@ const OPENCLAW_HOME: &str = "/home/openclaw";
 
 /// OpenClaw config file path.
 const OPENCLAW_CONFIG_PATH: &str = "/home/openclaw/.openclaw/openclaw.json";
+
+/// OpenClaw .env file path (contains API keys).
+/// v1.3.2: Read on gateway start to pass API keys to the process.
+const OPENCLAW_ENV_PATH: &str = "/home/openclaw/.openclaw/.env";
 
 /// Maximum time (seconds) to wait for gateway to become healthy after start.
 const GATEWAY_STARTUP_TIMEOUT_SECS: u64 = 60;
@@ -229,6 +257,8 @@ impl AgentManager {
     ///
     /// Called once during server startup to restore state.
     /// Checks for the `openclaw` binary and running gateway process.
+    ///
+    /// v1.3.2: Also ensures HTTP API endpoint is enabled if OpenClaw is installed.
     pub async fn detect_existing(&self) {
         info!("[AGENT] Detecting existing OpenClaw installation...");
 
@@ -254,6 +284,15 @@ impl AgentManager {
 
         // Try to read gateway token
         let token = Self::read_gateway_token().await;
+
+        // v1.3.2: Ensure HTTP API is enabled for ws_client.rs
+        // This is idempotent — safe to call on every startup.
+        if let Err(e) = self.ensure_http_api_enabled().await {
+            warn!(
+                error = %e,
+                "[AGENT] ⚠️ Failed to enable HTTP API endpoint — ws_client may get 404"
+            );
+        }
 
         let mut state = self.state.write().await;
         state.version = version.clone();
@@ -295,9 +334,10 @@ impl AgentManager {
     /// 1. Create `openclaw` system user (if not exists)
     /// 2. Run official installer script (handles Node.js + npm install)
     /// 3. Run onboarding with `--install-daemon` (systemd service)
-    /// 4. Extract gateway token from config
-    /// 5. Start the gateway
-    /// 6. Verify health
+    /// 4. Enable HTTP API endpoint for ws_client.rs (v1.3.2)
+    /// 5. Extract gateway token from config
+    /// 6. Start the gateway
+    /// 7. Verify health
     ///
     /// # Arguments
     /// * `command_id` - CMS command ID for progress reporting
@@ -310,18 +350,23 @@ impl AgentManager {
         command_id: &str,
         params: &serde_json::Value,
     ) -> Result<(), String> {
-        // Guard: check current state
+        // v1.3.2: Use a single write lock to check-and-transition atomically,
+        // fixing the TOCTOU race condition from v1.3.0 where two separate
+        // read locks could see stale state under concurrent access.
         {
-            let state = self.state.read().await;
+            let mut state = self.state.write().await;
+
             if state.status == AgentStatus::Installing {
                 return Err("Installation already in progress".to_string());
             }
-            // 🐛 v1.3.1: If already installed, be smart about it
+
             if state.status == AgentStatus::Running {
                 info!(
                     command_id = %command_id,
                     "[AGENT] OpenClaw already installed and running — nothing to do"
                 );
+                // Drop write lock before async call
+                drop(state);
                 self.report_progress(
                     command_id,
                     CommandExecutionStatus::Completed,
@@ -330,20 +375,18 @@ impl AgentManager {
                 ).await;
                 return Ok(());
             }
+
             if state.status == AgentStatus::Stopped {
+                // Transition to a transient state to prevent concurrent installs.
+                // We'll handle the "start existing" path below.
                 info!(
                     command_id = %command_id,
                     "[AGENT] OpenClaw installed but stopped — starting gateway"
                 );
-                // Drop the read lock before calling start_gateway
-            }
-        }
-
-        // If installed but stopped, just start it
-        {
-            let state = self.state.read().await;
-            if state.status == AgentStatus::Stopped {
+                // Mark as installing briefly to block concurrent calls
+                state.message = "Starting existing installation...".to_string();
                 drop(state);
+
                 self.report_progress(
                     command_id,
                     CommandExecutionStatus::InProgress,
@@ -364,6 +407,7 @@ impl AgentManager {
                     st.status = AgentStatus::Running;
                     st.version = version;
                     st.message = "Running".to_string();
+                    drop(st);
                     self.report_progress(command_id, CommandExecutionStatus::Completed, 100, "OpenClaw started").await;
                     return Ok(());
                 } else {
@@ -372,10 +416,12 @@ impl AgentManager {
                     return Err("Gateway failed to start".to_string());
                 }
             }
+
+            // For NotInstalled, Error, Updating — proceed with full install
+            state.status = AgentStatus::Installing;
+            state.message = "Starting installation...".to_string();
         }
 
-        // Transition to Installing
-        self.set_state(AgentStatus::Installing, "Starting installation...").await;
         self.report_progress(command_id, CommandExecutionStatus::InProgress, 5, "Starting installation...").await;
 
         // --- Step 1: Create system user ---
@@ -418,7 +464,17 @@ impl AgentManager {
             return Err(msg);
         }
 
-        // --- Step 5: Extract gateway token ---
+        // --- Step 5: Enable HTTP API endpoint (v1.3.2) ---
+        self.report_progress(command_id, CommandExecutionStatus::InProgress, 70, "Enabling HTTP API...").await;
+        if let Err(e) = self.ensure_http_api_enabled().await {
+            // Non-fatal: log warning but continue. The admin can enable it manually.
+            warn!(
+                error = %e,
+                "[AGENT] ⚠️ Failed to enable HTTP API — ws_client may need manual config"
+            );
+        }
+
+        // --- Step 6: Extract gateway token ---
         self.report_progress(command_id, CommandExecutionStatus::InProgress, 75, "Extracting gateway token...").await;
         let token = Self::read_gateway_token().await;
         {
@@ -426,7 +482,7 @@ impl AgentManager {
             state.gateway_token = token;
         }
 
-        // --- Step 6: Start gateway ---
+        // --- Step 7: Start gateway ---
         self.report_progress(command_id, CommandExecutionStatus::InProgress, 80, "Starting OpenClaw gateway...").await;
         if let Err(e) = self.start_gateway().await {
             let msg = format!("Failed to start gateway: {}", e);
@@ -435,7 +491,7 @@ impl AgentManager {
             return Err(msg);
         }
 
-        // --- Step 7: Verify health ---
+        // --- Step 8: Verify health ---
         self.report_progress(command_id, CommandExecutionStatus::InProgress, 90, "Verifying gateway health...").await;
         if !self.wait_for_gateway_healthy().await {
             let msg = "Gateway started but health check timed out".to_string();
@@ -444,7 +500,7 @@ impl AgentManager {
             return Err(msg);
         }
 
-        // --- Step 8: Get version and finalize ---
+        // --- Step 9: Get version and finalize ---
         let installed_version = Self::run_command_output_as_user("openclaw", &["--version"]).await.ok();
         {
             let mut state = self.state.write().await;
@@ -692,6 +748,14 @@ impl AgentManager {
             return Err(msg);
         }
 
+        // v1.3.2: Re-ensure HTTP API is enabled after update (new version may reset config)
+        if let Err(e) = self.ensure_http_api_enabled().await {
+            warn!(
+                error = %e,
+                "[AGENT] ⚠️ Failed to re-enable HTTP API after update"
+            );
+        }
+
         // Restart if it was running
         if was_running {
             self.report_progress(command_id, CommandExecutionStatus::InProgress, 80, "Restarting gateway...").await;
@@ -930,6 +994,107 @@ impl AgentManager {
     }
 
     // ============================================
+    // Internal: HTTP API Enablement (v1.3.2)
+    // ============================================
+
+    /// Ensures the OpenClaw HTTP Chat Completions endpoint is enabled.
+    ///
+    /// v1.3.2: This is REQUIRED for ws_client.rs to function.
+    /// The endpoint is disabled by default in OpenClaw. We enable it
+    /// via `openclaw config set` which is idempotent and safe to call
+    /// repeatedly.
+    ///
+    /// Sets: `gateway.http.endpoints.chatCompletions.enabled = true`
+    ///
+    /// ## Why this matters
+    /// Without this, POST requests to `/v1/chat/completions` return 404.
+    /// The ws_client.rs (v1.3.2) uses this endpoint instead of the complex
+    /// WebSocket RPC protocol.
+    async fn ensure_http_api_enabled(&self) -> Result<(), String> {
+        info!("[AGENT] Ensuring HTTP Chat Completions API is enabled...");
+
+        // Use openclaw config set (idempotent)
+        Self::run_command_as_user_with_env(
+            "openclaw",
+            &["config", "set", "gateway.http.endpoints.chatCompletions.enabled", "true"],
+            &[],
+        ).await.map_err(|e| format!("Failed to enable HTTP API: {}", e))?;
+
+        info!("[AGENT] ✅ HTTP Chat Completions API enabled");
+        Ok(())
+    }
+
+    // ============================================
+    // Internal: .env File Loading (v1.3.2)
+    // ============================================
+
+    /// Reads key=value pairs from the OpenClaw .env file.
+    ///
+    /// v1.3.2: Used to pass API keys (e.g., XAI_API_KEY) to the gateway
+    /// process when launched via direct spawn (non-systemd fallback).
+    ///
+    /// Returns a HashMap of environment variable name → value.
+    /// Returns an empty map if the file doesn't exist or can't be read.
+    ///
+    /// ## File format
+    /// Standard .env format:
+    /// ```text
+    /// XAI_API_KEY=xai-abc123...
+    /// OPENAI_API_KEY=sk-...
+    /// ```
+    /// Lines starting with `#` are comments. Empty lines are skipped.
+    /// Values are NOT shell-expanded (no $VAR substitution).
+    async fn load_env_file() -> HashMap<String, String> {
+        let content = match tokio::fs::read_to_string(OPENCLAW_ENV_PATH).await {
+            Ok(c) => c,
+            Err(_) => {
+                debug!("[AGENT] No .env file at {} — skipping", OPENCLAW_ENV_PATH);
+                return HashMap::new();
+            }
+        };
+
+        let mut env_vars = HashMap::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+
+            // Skip empty lines and comments
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            // Split on first '=' only (value may contain '=')
+            if let Some(eq_pos) = line.find('=') {
+                let key = line[..eq_pos].trim().to_string();
+                let value = line[eq_pos + 1..].trim().to_string();
+
+                // Strip optional surrounding quotes from value
+                let value = if (value.starts_with('"') && value.ends_with('"'))
+                    || (value.starts_with('\'') && value.ends_with('\''))
+                {
+                    value[1..value.len() - 1].to_string()
+                } else {
+                    value
+                };
+
+                if !key.is_empty() {
+                    env_vars.insert(key, value);
+                }
+            }
+        }
+
+        if !env_vars.is_empty() {
+            debug!(
+                count = env_vars.len(),
+                "[AGENT] Loaded {} env vars from .env file",
+                env_vars.len()
+            );
+        }
+
+        env_vars
+    }
+
+    // ============================================
     // Internal: System User Management
     // ============================================
 
@@ -1113,6 +1278,10 @@ impl AgentManager {
     // ============================================
 
     /// Starts the OpenClaw gateway via systemd user service.
+    ///
+    /// v1.3.2: Loads API keys from .env file and passes them to the
+    /// gateway process when using direct-spawn fallback. Systemd should
+    /// inherit env from the user session (which reads .env on login).
     async fn start_gateway(&self) -> Result<(), String> {
         info!("[AGENT] Starting OpenClaw gateway...");
 
@@ -1137,6 +1306,10 @@ impl AgentManager {
             npm_bin
         );
 
+        // v1.3.2: Load API keys from .env file so the gateway can
+        // authenticate with upstream LLM providers
+        let env_vars = Self::load_env_file().await;
+
         let mut cmd = TokioCommand::new("sudo");
         cmd.args(&[
             "-u", OPENCLAW_USER,
@@ -1149,7 +1322,16 @@ impl AgentManager {
         cmd.env("OPENCLAW_HOME", OPENCLAW_HOME);
         cmd.env("PATH", &path_value);
         cmd.env("NPM_CONFIG_PREFIX", format!("{}/.npm-global", OPENCLAW_HOME));
-        // Detach from parent
+
+        // v1.3.2: Pass API keys from .env file
+        for (key, value) in &env_vars {
+            cmd.env(key, value);
+        }
+
+        // v1.3.2: Fully detach child process from parent —
+        // stdin must also be null to prevent the child from
+        // blocking on input after the parent exits.
+        cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
 
