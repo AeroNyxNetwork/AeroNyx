@@ -59,7 +59,11 @@ use crate::management::models::{
     AgentStatus, AgentStatusInfo, CommandExecutionStatus, CommandStatusReport,
 };
 
-// Sub-modules (implementation details)
+// Sub-modules — the `agent` directory lives at services/agent/.
+// We use #[path] because this file is services/agent_manager.rs (not a directory mod.rs),
+// so Rust won't automatically look for services/agent_manager/agent/.
+// This tells the compiler: "agent_manager::agent" maps to "services/agent/".
+#[path = "agent/mod.rs"]
 pub(crate) mod agent;
 
 use agent::preflight::PreflightChecker;
