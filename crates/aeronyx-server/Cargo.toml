@@ -17,13 +17,20 @@
 # - `futures` was already present (workspace), confirmed needed for
 #   Stream/Sink traits used by tokio-tungstenite split()
 #
+# Modification Reason (v2.0.0 — MemChain Protocol Refactor):
+# - 🌟 Added `rusqlite` with `bundled` feature for SQLite-backed
+#   MemoryRecord persistence (replaces AOF as primary storage)
+# - bundled mode compiles SQLite from source, avoiding system
+#   library version issues on GCP Ubuntu 22.04
+#
 # Main Functionality:
 # - Server binary with CLI interface
 # - Configuration management
 # - Session management and routing
 # - Handshake processing
 # - Packet forwarding
-# - 🌟 MemChain storage engine (MemPool + AofWriter)
+# - 🌟 MemChain storage engine (MemPool + AofWriter) — legacy
+# - 🌟 MemChain storage engine (SQLite + VectorIndex) — new primary
 # - 🌟 CMS command pipeline + AgentManager (v1.3.0)
 # - 🌟 WebSocket tunnel for real-time AI interaction (v1.3.0)
 #
@@ -31,6 +38,7 @@
 # - Depends on: aeronyx-core, aeronyx-transport, aeronyx-common
 # - External: tokio, clap, tracing
 # - 🌟 v1.3.0: tokio-tungstenite (WebSocket client)
+# - 🌟 v2.0.0: rusqlite (SQLite persistence)
 #
 # Binary:
 # - aeronyx-server: Main server executable
@@ -39,16 +47,20 @@
 # - This is the main entry point for the server
 # - Configuration is loaded from TOML files
 # - Requires root/CAP_NET_ADMIN for TUN operations
-# - MemChain AOF file is created in the working directory
+# - MemChain AOF file is created in the working directory (legacy)
+# - MemChain SQLite database replaces AOF as primary storage (new)
 # - 🌟 tokio-tungstenite uses rustls (not native-tls) to match
 #   the rest of the project's TLS strategy (reqwest also uses rustls-tls)
 # - 🌟 futures crate is needed for SinkExt/StreamExt traits
 #   used by tokio-tungstenite's split() WS streams
+# - 🌟 rusqlite bundled mode requires a C compiler (cc) at build time
+#   This is already available on the GCP Ubuntu 22.04 build server.
 #
 # Last Modified:
 # v0.1.0 - Initial server implementation
 # v0.2.0 - Added bincode for MemChain integration
 # v1.3.0 - 🌟 Added tokio-tungstenite for WebSocket tunnel
+# v2.0.0 - 🌟 Added rusqlite for SQLite MemoryRecord storage
 # ============================================
 
 [package]
@@ -102,6 +114,14 @@ tower = "0.5"
 # native-roots loads the system CA store for wss:// certificate validation.
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", features = ["ring"], default-features = false }
+
+# 🌟 v2.0.0: SQLite persistence for MemoryRecord (MRS-1)
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# 🌟 v2.1.0: MVF + Rule Engine + RawLog encryption
+regex = "1.10"
+hkdf = "0.12"
+chacha20poly1305 = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
