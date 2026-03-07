@@ -14,6 +14,7 @@
 //! v2.1.0 - 🌟 Dual-engine init (SQLite+Vector + legacy MemPool+AOF),
 //!           MPI router merged, BroadcastRecord/SyncRecordRequest handling,
 //!           vector index rebuild on startup, new Miner 8-arg signature.
+//! v2.1.1 - Fixed duplicate LinuxTun import, removed unused `trace` import
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use aeronyx_common::types::SessionId;
 use aeronyx_core::crypto::IdentityKeyPair;
@@ -37,6 +38,7 @@ use aeronyx_core::protocol::{DataPacket, MessageType};
 use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::UdpTransport;
 
+// Single cfg-gated import — removed the duplicate that was at line 50
 #[cfg(target_os = "linux")]
 use aeronyx_transport::LinuxTun;
 
@@ -45,9 +47,6 @@ use rusqlite::OptionalExtension;
 use crate::api::mpi::{build_mpi_router, MpiState, BaselineSnapshot};
 use crate::config::{MemChainConfig, ServerConfig};
 use crate::error::{Result, ServerError};
-
-#[cfg(target_os = "linux")]
-use aeronyx_transport::LinuxTun;
 use crate::handlers::packet::DecryptedPayload;
 use crate::handlers::PacketHandler;
 use crate::management::{
@@ -865,10 +864,9 @@ impl Server {
             MemChainMessage::SyncRecordResponse { records } => {
                 if let Some(ref st) = storage {
                     for record in records {
-                        let rec: &aeronyx_core::ledger::MemoryRecord = &record;
-                        let owner_hex = rec.owner_hex();
-                        let sig_ok = match IdentityPublicKey::from_bytes(&rec.owner) {
-                            Ok(pk) => pk.verify(&rec.record_id, &rec.signature).is_ok(),
+                        let owner_hex = record.owner_hex();
+                        let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
+                            Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                             Err(_) => false,
                         };
                         if !sig_ok || !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
