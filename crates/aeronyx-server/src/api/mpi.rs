@@ -303,7 +303,7 @@ pub async fn mpi_recall(
             if !record.is_active() { continue; }
 
             let v_old = compute_recall_score(
-                sr.similarity, record.timestamp, now, record.access_count, record.layer, None,
+                sr.similarity, record.timestamp, now, record.access_count, record.layer,
             );
             let time_bonus: f64 = match &req.time_hint {
                 Some(th) if (record.timestamp as i64) >= th.start && (record.timestamp as i64) <= th.end => 0.15,
@@ -338,7 +338,7 @@ pub async fn mpi_recall(
         let recent = state.storage.get_active_records(&owner, layer_filter, top_k).await;
         for r in recent {
             if seen_ids.contains(&r.record_id) { continue; }
-            let s = compute_recall_score(1.0, r.timestamp, now, r.access_count, r.layer, None);
+            let s = compute_recall_score(1.0, r.timestamp, now, r.access_count, r.layer);
             scored.push((r, s));
         }
     }
