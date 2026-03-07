@@ -493,7 +493,15 @@ pub async fn mpi_log(
 
             // --- Rule engine (only if extractable) ---
             if extractable == 1 {
-                let extractions = run_rule_engine(&turn.content);
+                let mut extractions = run_rule_engine(&turn.content);
+
+                // Sort by confidence descending so the highest-confidence
+                // extraction wins the content dedup race.
+                // e.g. allergy (0.90) beats identity (0.85) for "I am allergic to X"
+                extractions.sort_unstable_by(|a, b| {
+                    b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
                 for ext in extractions {
                     let encrypted_content = ext.content.as_bytes().to_vec();
 
