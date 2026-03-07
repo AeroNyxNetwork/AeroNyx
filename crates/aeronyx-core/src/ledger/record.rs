@@ -9,18 +9,9 @@
 //! Protocol's vision: **"DNS gave websites an address; MemChain gives
 //! human AI memory a wallet."**
 //!
-//! ## Modification Reason (v2.1.0)
-//! - Added `MemoryLayer::Archive` variant (value=3) to support the 4-layer
-//!   cognitive model required by the smart Miner compaction pipeline.
-//!   Archive represents compacted episodes — the "subconscious" layer with
-//!   very low recall weight (0.05) but never deleted.
-//! - Added `stability_hours()` and `recall_weight()` for Archive layer.
-//! - Fixed `MemoryLayer::from_u8(3)` to return `Some(Archive)` instead of `None`.
-//! - Added `MemoryLayer::as_str()` for JSON API serialization.
-//!
 //! ## Main Functionality
 //! - `MemoryRecord` struct — the atomic unit of AI memory (MRS-1 standard)
-//! - `MemoryLayer` enum — Identity / Knowledge / Episode / Archive classification
+//! - `MemoryLayer` enum — Identity / Knowledge / Episode classification
 //! - `RecordStatus` enum — Active / Superseded / Revoked / Archived lifecycle
 //! - `MemoryRecord::compute_record_id()` — deterministic SHA-256 content hash
 //! - `MemoryRecord::verify_id()` — integrity check
@@ -33,7 +24,7 @@
 //! │ owner              [u8; 32]   Ed25519 wallet public key     │
 //! │ timestamp          u64        Unix epoch seconds (UTC)      │
 //! │ layer              u8         0=Identity, 1=Knowledge,      │
-//! │                               2=Episode, 3=Archive          │
+//! │                               2=Episode                     │
 //! │ topic_tags         Vec<Str>   Categorisation tags            │
 //! │ source_ai          String     e.g. "openclaw-v1"            │
 //! │ status             u8         0=Active, 1=Superseded,       │
@@ -77,15 +68,10 @@
 //!   only the owner's private key can decrypt them.
 //! - `status` and `supersedes` enable record lifecycle management
 //!   without deleting data from the append-only ledger.
-//! - `MemoryLayer` discriminant values (0-3) are stored in SQLite `layer`
-//!   column and in bincode P2P messages — do NOT reorder or renumber.
-//! - `RecordStatus` discriminant values (0-3) are stored in SQLite `status`
-//!   column — do NOT reorder or renumber.
 //! - Keep `MemoryRecord` clonable and serialisable for P2P broadcast.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial MemoryRecord definition (MRS-1 standard)
-//! v2.1.0 - 🌟 Added Archive layer, stability_hours(), recall_weight(), as_str()
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -112,23 +98,22 @@ mod serde_bytes_64 {
 }
 
 // ============================================
-// MemoryLayer — 4-Layer Cognitive Model
+// MemoryLayer
 // ============================================
 
 /// Classification layer for a memory record.
 ///
-/// The 4-layer cognitive model, inspired by human memory architecture:
+/// Determines how the record is weighted during recall and when
+/// it becomes eligible for compaction by the smart Miner.
 ///
-/// | Variant   | Value | Weight | Stability  | Description                    |
-/// |-----------|-------|--------|------------|--------------------------------|
-/// | Identity  | 0     | 0.30   | 8760h (1y) | Core user facts, near-permanent|
-/// | Knowledge | 1     | 0.20   | 2160h (90d)| Distilled compacted knowledge  |
-/// | Episode   | 2     | 0.10   | 168h  (7d) | Conversational events          |
-/// | Archive   | 3     | 0.05   | 720h  (30d)| Compacted episodes, subconscious|
-///
-/// ## Discriminant Values (Stable Contract)
-/// These integer values are stored in SQLite and serialized over P2P.
-/// Do NOT reorder or renumber.
+/// ## Layer Semantics
+/// - **Identity**: Core user attributes (name, preferences, personality).
+///   Rarely changes, highest recall priority. Never auto-archived.
+/// - **Knowledge**: Accumulated factual knowledge and learned patterns.
+///   Medium recall priority. Created by Miner compaction of Episodes.
+/// - **Episode**: Individual interaction events and conversations.
+///   Lowest recall priority, subject to time decay. Compacted into
+///   Knowledge records when count exceeds threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum MemoryLayer {
@@ -136,32 +121,21 @@ pub enum MemoryLayer {
     Identity = 0,
     /// Accumulated knowledge — medium priority, created by compaction.
     Knowledge = 1,
-    /// Individual episodes — subject to compaction by the Miner.
+    /// Individual episodes — lowest priority, subject to compaction.
     Episode = 2,
-    /// Compacted episodes — the "subconscious". Very low recall weight
-    /// but never deleted. Created when Miner compacts Episodes.
-    ///
-    /// ## Design Note
-    /// Archive records participate in recall with weight 0.05 (vs Episode 0.10).
-    /// They "sink into the subconscious" but don't die — the user can still
-    /// recall them if the semantic match is strong enough.
-    Archive = 3,
 }
 
 impl MemoryLayer {
-    /// Returns the recall weight (bias) added to the cognitive recall score.
+    /// Returns the recall weight for this layer.
     ///
     /// Used in the scoring formula:
     /// `score = semantic_similarity * time_decay * freq_boost + layer_weight`
-    ///
-    /// Identity has the highest weight to ensure it always surfaces in recall.
     #[must_use]
     pub fn recall_weight(self) -> f64 {
         match self {
-            Self::Identity  => 0.30,
-            Self::Knowledge => 0.20,
-            Self::Episode   => 0.10,
-            Self::Archive   => 0.05,
+            Self::Identity => 0.3,
+            Self::Knowledge => 0.2,
+            Self::Episode => 0.1,
         }
     }
 
@@ -172,54 +146,21 @@ impl MemoryLayer {
     #[must_use]
     pub fn stability_hours(self) -> f64 {
         match self {
-            Self::Identity  => 8760.0,  // 1 year — near-permanent
+            Self::Identity => 8760.0,   // 1 year — near-permanent
             Self::Knowledge => 2160.0,  // 90 days
-            Self::Episode   => 168.0,   // 7 days
-            Self::Archive   => 720.0,   // 30 days
+            Self::Episode => 168.0,     // 7 days
         }
     }
 
     /// Converts a u8 value to a MemoryLayer.
     ///
-    /// Returns `None` for unrecognised values (forward-compatibility).
+    /// Returns `None` for unrecognised values.
     #[must_use]
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Identity),
             1 => Some(Self::Knowledge),
             2 => Some(Self::Episode),
-            3 => Some(Self::Archive),
-            _ => None,
-        }
-    }
-
-    /// Convert to integer for SQLite storage.
-    #[must_use]
-    pub fn as_u8(self) -> u8 {
-        self as u8
-    }
-
-    /// Returns a human-readable name (for JSON API responses and logging).
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Identity  => "identity",
-            Self::Knowledge => "knowledge",
-            Self::Episode   => "episode",
-            Self::Archive   => "archive",
-        }
-    }
-
-    /// Parse from a string (case-insensitive). Used by MPI JSON deserialization.
-    ///
-    /// Returns `None` for unrecognized strings.
-    #[must_use]
-    pub fn from_str_loose(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "identity"  => Some(Self::Identity),
-            "knowledge" => Some(Self::Knowledge),
-            "episode"   => Some(Self::Episode),
-            "archive"   => Some(Self::Archive),
             _ => None,
         }
     }
@@ -227,7 +168,11 @@ impl MemoryLayer {
 
 impl std::fmt::Display for MemoryLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        match self {
+            Self::Identity => write!(f, "identity"),
+            Self::Knowledge => write!(f, "knowledge"),
+            Self::Episode => write!(f, "episode"),
+        }
     }
 }
 
@@ -240,10 +185,6 @@ impl std::fmt::Display for MemoryLayer {
 /// Records progress through states but never truly disappear from
 /// the append-only ledger. "Deletion" is achieved by marking a
 /// record as `Revoked` and clearing its encrypted content locally.
-///
-/// ## Discriminant Values (Stable Contract)
-/// These integer values are stored in SQLite `status` column.
-/// Do NOT reorder or renumber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum RecordStatus {
@@ -280,22 +221,16 @@ impl RecordStatus {
             _ => None,
         }
     }
-
-    /// Returns a human-readable name for JSON/logging.
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Active     => "active",
-            Self::Superseded => "superseded",
-            Self::Revoked    => "revoked",
-            Self::Archived   => "archived",
-        }
-    }
 }
 
 impl std::fmt::Display for RecordStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        match self {
+            Self::Active => write!(f, "active"),
+            Self::Superseded => write!(f, "superseded"),
+            Self::Revoked => write!(f, "revoked"),
+            Self::Archived => write!(f, "archived"),
+        }
     }
 }
 
@@ -454,8 +389,9 @@ impl MemoryRecord {
 
     /// Creates a new `MemoryRecord` with `record_id` automatically computed.
     ///
-    /// `signature` is left zeroed — the caller is responsible for signing
-    /// after construction.
+    /// `owner`, `signature`, and `access_count` are left zeroed — the
+    /// caller is responsible for setting the owner and signing after
+    /// construction.
     #[must_use]
     pub fn new(
         owner: [u8; 32],
@@ -644,16 +580,12 @@ mod tests {
     fn test_memory_layer_recall_weight() {
         assert!(MemoryLayer::Identity.recall_weight() > MemoryLayer::Knowledge.recall_weight());
         assert!(MemoryLayer::Knowledge.recall_weight() > MemoryLayer::Episode.recall_weight());
-        assert!(MemoryLayer::Episode.recall_weight() > MemoryLayer::Archive.recall_weight());
-        assert!(MemoryLayer::Archive.recall_weight() > 0.0);
     }
 
     #[test]
     fn test_memory_layer_stability() {
         assert!(MemoryLayer::Identity.stability_hours() > MemoryLayer::Knowledge.stability_hours());
         assert!(MemoryLayer::Knowledge.stability_hours() > MemoryLayer::Episode.stability_hours());
-        // Archive (720h) > Episode (168h) because archived memories decay slower
-        assert!(MemoryLayer::Archive.stability_hours() > MemoryLayer::Episode.stability_hours());
     }
 
     #[test]
@@ -661,32 +593,7 @@ mod tests {
         assert_eq!(MemoryLayer::from_u8(0), Some(MemoryLayer::Identity));
         assert_eq!(MemoryLayer::from_u8(1), Some(MemoryLayer::Knowledge));
         assert_eq!(MemoryLayer::from_u8(2), Some(MemoryLayer::Episode));
-        assert_eq!(MemoryLayer::from_u8(3), Some(MemoryLayer::Archive));
-        assert_eq!(MemoryLayer::from_u8(4), None);
-    }
-
-    #[test]
-    fn test_memory_layer_as_str() {
-        assert_eq!(MemoryLayer::Identity.as_str(), "identity");
-        assert_eq!(MemoryLayer::Knowledge.as_str(), "knowledge");
-        assert_eq!(MemoryLayer::Episode.as_str(), "episode");
-        assert_eq!(MemoryLayer::Archive.as_str(), "archive");
-    }
-
-    #[test]
-    fn test_memory_layer_from_str_loose() {
-        assert_eq!(MemoryLayer::from_str_loose("Identity"), Some(MemoryLayer::Identity));
-        assert_eq!(MemoryLayer::from_str_loose("ARCHIVE"), Some(MemoryLayer::Archive));
-        assert_eq!(MemoryLayer::from_str_loose("episode"), Some(MemoryLayer::Episode));
-        assert_eq!(MemoryLayer::from_str_loose("unknown"), None);
-    }
-
-    #[test]
-    fn test_memory_layer_roundtrip_u8() {
-        for v in 0..=3u8 {
-            let layer = MemoryLayer::from_u8(v).unwrap();
-            assert_eq!(layer.as_u8(), v);
-        }
+        assert_eq!(MemoryLayer::from_u8(3), None);
     }
 
     #[test]
@@ -707,9 +614,6 @@ mod tests {
         assert!(!record.is_active());
 
         record.status = RecordStatus::Archived;
-        assert!(!record.is_active());
-
-        record.status = RecordStatus::Superseded;
         assert!(!record.is_active());
     }
 
@@ -735,15 +639,5 @@ mod tests {
             "test".into(), b"content".to_vec(), vec![],
         );
         assert_ne!(r1.record_id, r2.record_id, "Tag order must affect hash");
-    }
-
-    #[test]
-    fn test_archive_layer_record() {
-        let record = make_record(100, MemoryLayer::Archive, "miner-v1");
-        assert!(record.verify_id());
-        assert_eq!(record.layer, MemoryLayer::Archive);
-        assert_eq!(record.layer.as_u8(), 3);
-        let s = format!("{}", record);
-        assert!(s.contains("archive"));
     }
 }
