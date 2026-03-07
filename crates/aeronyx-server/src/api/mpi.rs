@@ -5,6 +5,19 @@
 //!
 //! Endpoints: remember, recall, forget, status, log
 //! recall hot path target: < 50ms
+//!
+//! ## v2.1.0+MVF Changes
+//! - recall: compute_features() now reads record.positive_feedback,
+//!   record.negative_feedback, and record.has_conflict() from the
+//!   MemoryRecord struct instead of using hardcoded zeros.
+//!   This enables MVF φ₄ (feedback score) and φ₈ (conflict penalty)
+//!   to use real data from Schema v4 columns.
+//!
+//! ## Last Modified
+//! v2.1.0 - MPI endpoints with MVF fusion scoring
+//! v2.1.0+MVF - 🌟 Fixed hardcoded feedback/conflict in compute_features();
+//!   recall scoring now uses actual positive_feedback, negative_feedback,
+//!   and conflict_with data from records table (Schema v4).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -317,10 +330,22 @@ pub async fn mpi_recall(
                     .filter(|c| record.has_embedding() && c.len() == record.embedding.len())
                     .map(|c| crate::services::memchain::cosine_similarity(c, &record.embedding))
                     .unwrap_or(0.0);
-                let has_conflict = record.topic_tags.iter().any(|t| t == "_conflict");
+
+                // v2.1.0+MVF: Read actual feedback and conflict data from record
+                // (previously hardcoded as 0, 0, false — rendering φ₄ and φ₈ useless)
                 let phi = mvf::compute_features(
-                    sr.similarity, record.layer as u8, record.timestamp, now,
-                    record.access_count, 0, 0, has_conflict, time_hint_tuple, cs, gd, max_degree,
+                    sr.similarity,
+                    record.layer as u8,
+                    record.timestamp,
+                    now,
+                    record.access_count,
+                    record.positive_feedback,   // was: 0 (hardcoded)
+                    record.negative_feedback,   // was: 0 (hardcoded)
+                    record.has_conflict(),      // was: record.topic_tags.iter().any(|t| t == "_conflict")
+                    time_hint_tuple,
+                    cs,
+                    gd,
+                    max_degree,
                 );
                 let mut uw = { state.user_weights.read().get(&owner_hex).cloned().unwrap_or_else(mvf::default_weights) };
                 let pn = mvf::normalize(&phi, &mut uw);
