@@ -124,6 +124,11 @@ fn decrypt_rawlog_content(key: &[u8; 32], stored: &[u8]) -> Result<Vec<u8>, Stri
         .map_err(|e| format!("ChaCha20 decrypt: {}", e))
 }
 
+/// Public wrapper for rawlog content decryption (used by Miner).
+pub fn decrypt_rawlog_content_pub(key: &[u8; 32], stored: &[u8]) -> Result<Vec<u8>, String> {
+    decrypt_rawlog_content(key, stored)
+}
+
 // ============================================
 // RawLogRow — query result struct
 // ============================================
@@ -876,6 +881,14 @@ impl MemoryStorage {
 
     pub fn total_inserted(&self) -> u64 { self.total_inserted.load(Ordering::Relaxed) }
     pub fn total_rejected(&self) -> u64 { self.total_rejected.load(Ordering::Relaxed) }
+
+    /// Acquire the inner SQLite connection lock directly.
+    ///
+    /// Used by Miner for bulk operations that need raw SQL access.
+    /// Hold the lock briefly — other operations will block.
+    pub async fn conn_lock(&self) -> tokio::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().await
+    }
 
     // ========================================
     // RawLog Operations
