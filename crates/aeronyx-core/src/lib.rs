@@ -9,9 +9,12 @@
 //! the entire system.
 //!
 //! ## Modification Reason
-//! Added `ledger` module containing the MemChain data structures (Fact,
-//! future Block/Merkle). These structures are used by both `aeronyx-core`
-//! (protocol serialisation) and `aeronyx-server` (storage and routing).
+//! - Added `ledger` module containing the MemChain data structures (Fact,
+//!   future Block/Merkle). These structures are used by both `aeronyx-core`
+//!   (protocol serialisation) and `aeronyx-server` (storage and routing).
+//! - 🌟 v1.0.0: Added `MemoryRecord`, `MemoryLayer`, and `RecordStatus`
+//!   re-exports from the new `ledger::record` submodule. These form the
+//!   MRS-1 standard for the intelligent AI memory engine.
 //!
 //! ## Main Functionality
 //!
@@ -27,8 +30,13 @@
 //! - Transport encryption (ChaCha20-Poly1305)
 //! - Key derivation (HKDF-SHA256)
 //!
-//! ### Ledger Module ([`ledger`]) — 🌟 NEW
-//! - `Fact`: Atomic AI memory record (subject-predicate-object triple)
+//! ### Ledger Module ([`ledger`])
+//! - `Fact`: Legacy atomic AI memory record (subject-predicate-object triple)
+//! - 🌟 `MemoryRecord`: MRS-1 standard AI memory unit (layered, encrypted)
+//! - 🌟 `MemoryLayer`: Identity / Knowledge / Episode classification
+//! - 🌟 `RecordStatus`: Active / Superseded / Revoked / Archived lifecycle
+//! - `Block` / `RecordBlock`: Immutable containers for chain packing
+//! - `BlockHeader`: Lightweight block summary for P2P broadcast
 //! - Content-addressed hashing (SHA-256) and Ed25519 signature support
 //!
 //! ## Architecture Position
@@ -60,10 +68,13 @@
 //! - ALL keys MUST implement Zeroize for secure cleanup
 //! - Protocol changes MUST maintain backward compatibility
 //! - Test vectors should match reference implementations
+//! - `Fact` re-export is preserved for backward compatibility;
+//!   new code should prefer `MemoryRecord`.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial implementation
 //! v0.2.0 - Added ledger module for MemChain AI memory structures
+//! v1.0.0 - 🌟 Added MemoryRecord, MemoryLayer, RecordStatus (MRS-1)
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
@@ -75,12 +86,18 @@ pub mod error;
 pub mod ledger;
 pub mod protocol;
 
-// Re-export commonly used items
+// Re-export commonly used items — crypto & protocol
 pub use crypto::{
     EphemeralKeyPair, HandshakeCrypto, IdentityKeyPair, SessionKey, TransportCrypto,
 };
 pub use error::{CoreError, Result};
-pub use ledger::Fact;
 pub use protocol::{
     ClientHello, MessageType, ProtocolVersion, ServerHello, CURRENT_PROTOCOL_VERSION,
 };
+
+// Re-export commonly used items — ledger (legacy, deprecated)
+#[allow(deprecated)]
+pub use ledger::Fact;
+
+// Re-export commonly used items — ledger (MRS-1)
+pub use ledger::{MemoryLayer, MemoryRecord, RecordStatus};
