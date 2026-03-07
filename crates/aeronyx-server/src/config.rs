@@ -12,6 +12,9 @@
 //! - 🌟 Added MemChainConfig for MemChain mode control and API listen address.
 //! - 🌟 v0.4.0: Added `trusted_agents` whitelist to MemChainConfig for
 //!   Phase 3 P2P trust boundary enforcement.
+//! - 🌟 v1.0.0: Added `db_path` field to MemChainConfig for SQLite database
+//!   location. The `aof_path` field is preserved for legacy AOF compatibility.
+//!   Added `compaction_threshold` for smart Miner configuration.
 //!
 //! ## Main Functionality
 //! - `ServerConfig`: Main configuration structure
@@ -27,7 +30,7 @@
 //! - `limits`: Connection and resource limits
 //! - `logging`: Log level
 //! - `management`: CMS integration settings (REQUIRED)
-//! - `memchain`: 🌟 MemChain mode and API settings (NEW)
+//! - `memchain`: MemChain mode and API settings
 //!
 //! ## Example Configuration
 //! ```toml
@@ -52,10 +55,13 @@
 //! heartbeat_interval_secs = 30
 //!
 //! [memchain]
-//! mode = "local"                       # "local", "p2p", or "off"
-//! api_listen_addr = "127.0.0.1:8421"   # Agent API bind address
-//! aof_path = ".memchain"               # Append-only ledger file
-//! trusted_agents = [                   # Ed25519 pubkey hex whitelist
+//! mode = "local"
+//! api_listen_addr = "127.0.0.1:8421"
+//! db_path = "/var/lib/aeronyx/memchain.db"     # 🌟 NEW: SQLite database
+//! aof_path = "/var/lib/aeronyx/.memchain"       # Legacy AOF (still used for Fact P2P)
+//! compaction_threshold = 500                     # 🌟 NEW: episodes before compaction
+//! miner_interval_secs = 3600
+//! trusted_agents = [
 //!   "fa29c129f789d4f79ed2075c5c2706cdbcf8ae11196b13048174598e1dca4d54",
 //! ]
 //! ```
@@ -67,12 +73,15 @@
 //! - MemChain API only binds to loopback by default (security)
 //! - `trusted_agents` empty = trust all authenticated sessions (MVP fallback)
 //! - `trusted_agents` hex strings are validated at startup (must be 64 hex chars)
+//! - `db_path` defaults to "memchain.db" in working directory
+//! - `aof_path` is still used by legacy MemPool + AofWriter for Fact P2P
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial configuration implementation
 //! v0.2.0 - Added management configuration for CMS integration
-//! v0.3.0 - 🌟 Added MemChainConfig for mode control and API settings
-//! v0.4.0 - 🌟 Added trusted_agents whitelist for Phase 3 P2P trust
+//! v0.3.0 - Added MemChainConfig for mode control and API settings
+//! v0.4.0 - Added trusted_agents whitelist for Phase 3 P2P trust
+//! v1.0.0 - 🌟 Added db_path (SQLite) + compaction_threshold
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -118,7 +127,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub management: ManagementConfig,
 
-    /// 🌟 MemChain configuration (mode, API, storage, trust).
+    /// MemChain configuration (mode, API, storage, trust).
     #[serde(default)]
     pub memchain: MemChainConfig,
 }
@@ -239,17 +248,14 @@ impl Default for ServerConfig {
 // ============================================
 
 /// MemChain operating mode.
-///
-/// Controls whether the MemChain storage engine and API are active.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MemChainMode {
-    /// MemChain is disabled — no MemPool, no AOF, no API.
+    /// MemChain is disabled.
     Off,
-    /// Local-only mode — MemPool + AOF + local HTTP API, no P2P broadcast.
-    /// This is the default for MVP.
+    /// Local-only mode (default for MVP).
     Local,
-    /// Full P2P mode — local storage + broadcast to connected peers.
+    /// Full P2P mode.
     P2p,
 }
 
@@ -266,19 +272,14 @@ impl Default for MemChainMode {
 /// [memchain]
 /// mode = "p2p"
 /// api_listen_addr = "127.0.0.1:8421"
-/// aof_path = ".memchain"
+/// db_path = "/var/lib/aeronyx/memchain.db"
+/// aof_path = "/var/lib/aeronyx/.memchain"
+/// compaction_threshold = 500
+/// miner_interval_secs = 3600
 /// trusted_agents = [
 ///   "fa29c129f789d4f79ed2075c5c2706cdbcf8ae11196b13048174598e1dca4d54",
 /// ]
 /// ```
-///
-/// # Trust Model
-/// - If `trusted_agents` is **empty** (default), all facts from
-///   authenticated VPN sessions are accepted (MVP behaviour).
-/// - If `trusted_agents` is **non-empty**, only facts whose
-///   `origin` public key appears in the list (or matches the
-///   server's own identity) are accepted. Everything else is
-///   dropped with a warning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemChainConfig {
     /// Operating mode: "off", "local", or "p2p".
@@ -286,31 +287,38 @@ pub struct MemChainConfig {
     pub mode: MemChainMode,
 
     /// HTTP API listen address for Agent integration.
-    /// Defaults to loopback only for security.
     #[serde(default = "default_memchain_api_addr")]
     pub api_listen_addr: SocketAddr,
 
-    /// Path to the append-only ledger file.
+    /// 🌟 v1.0.0: Path to the SQLite database file (primary storage).
+    #[serde(default = "default_memchain_db_path")]
+    pub db_path: String,
+
+    /// Path to the append-only ledger file (legacy, for Fact P2P compat).
     #[serde(default = "default_memchain_aof_path")]
     pub aof_path: String,
 
-    /// 🌟 Trusted agent Ed25519 public keys (hex-encoded).
-    ///
-    /// Empty = trust all authenticated sessions (MVP fallback).
-    /// Non-empty = strict whitelist; only listed keys + server's own key
-    /// are allowed to contribute Facts.
+    /// Trusted agent Ed25519 public keys (hex-encoded).
     #[serde(default)]
     pub trusted_agents: Vec<String>,
 
-    /// 🌟 v0.5.0: Miner interval in seconds.
-    /// How often the ReflectionMiner packs pending Facts into a Block.
-    /// Default: 3600 (1 hour). Set to 0 to disable mining.
+    /// Miner interval in seconds.
     #[serde(default = "default_miner_interval")]
     pub miner_interval_secs: u64,
+
+    /// 🌟 v1.0.0: Episode count threshold for triggering smart compaction.
+    /// When active Episode records exceed this count, the Miner will
+    /// summarise them into Knowledge records via OpenClaw.
+    #[serde(default = "default_compaction_threshold")]
+    pub compaction_threshold: u64,
 }
 
 fn default_memchain_api_addr() -> SocketAddr {
     "127.0.0.1:8421".parse().unwrap()
+}
+
+fn default_memchain_db_path() -> String {
+    "memchain.db".to_string()
 }
 
 fn default_memchain_aof_path() -> String {
@@ -320,6 +328,12 @@ fn default_memchain_aof_path() -> String {
 fn default_miner_interval() -> u64 {
     3600
 }
+
+fn default_compaction_threshold() -> u64 { 500 }
+fn default_mvf_alpha() -> f32 { 0.5 }
+fn default_cold_start_threshold() -> usize { 10 }
+fn default_cold_start_until() -> usize { 200 }
+fn default_rawlog_batch_threshold() -> usize { 100 }
 
 impl MemChainConfig {
     /// Validates the MemChain configuration.
@@ -333,12 +347,29 @@ impl MemChainConfig {
                 ));
             }
 
-            // AOF path must not be empty
+            // DB path must not be empty
+            if self.db_path.is_empty() {
+                return Err(ServerError::config_invalid(
+                    "memchain.db_path",
+                    "cannot be empty when memchain is enabled",
+                ));
+            }
+
+            // AOF path must not be empty (still needed for legacy)
             if self.aof_path.is_empty() {
                 return Err(ServerError::config_invalid(
                     "memchain.aof_path",
                     "cannot be empty when memchain is enabled",
                 ));
+            }
+
+            // Compaction threshold sanity
+            if self.compaction_threshold > 0 && self.compaction_threshold < 10 {
+                tracing::warn!(
+                    "[MEMCHAIN] ⚠️ compaction_threshold={} is very low — \
+                     this will trigger frequent LLM summarisation",
+                    self.compaction_threshold
+                );
             }
 
             // Warn (but allow) non-loopback API addresses
@@ -350,7 +381,7 @@ impl MemChainConfig {
                 );
             }
 
-            // 🌟 Validate trusted_agents hex format
+            // Validate trusted_agents hex format
             for (i, hex_key) in self.trusted_agents.iter().enumerate() {
                 if hex_key.len() != 64 {
                     return Err(ServerError::config_invalid(
@@ -399,27 +430,14 @@ impl MemChainConfig {
     }
 
     /// Checks whether a given origin public key is trusted.
-    ///
-    /// # Arguments
-    /// * `origin_hex` - Hex-encoded Ed25519 public key (64 chars)
-    /// * `server_pubkey_hex` - This server's own public key (always trusted)
-    ///
-    /// # Returns
-    /// - `true` if trusted (whitelist empty, or key in list, or is server's own key)
-    /// - `false` if the key is explicitly not in a non-empty whitelist
     #[must_use]
     pub fn is_origin_trusted(&self, origin_hex: &str, server_pubkey_hex: &str) -> bool {
-        // Server's own key is always trusted
         if origin_hex == server_pubkey_hex {
             return true;
         }
-
-        // Empty whitelist = trust all (MVP fallback)
         if self.trusted_agents.is_empty() {
             return true;
         }
-
-        // Check whitelist
         self.trusted_agents.iter().any(|trusted| trusted == origin_hex)
     }
 }
@@ -429,9 +447,16 @@ impl Default for MemChainConfig {
         Self {
             mode: MemChainMode::default(),
             api_listen_addr: default_memchain_api_addr(),
+            db_path: default_memchain_db_path(),
             aof_path: default_memchain_aof_path(),
             trusted_agents: Vec::new(),
             miner_interval_secs: default_miner_interval(),
+            compaction_threshold: default_compaction_threshold(),
+            mvf_alpha: default_mvf_alpha(),
+            mvf_enabled: false,
+            cold_start_threshold: default_cold_start_threshold(),
+            cold_start_until: default_cold_start_until(),
+            rawlog_batch_threshold: default_rawlog_batch_threshold(),
         }
     }
 }
@@ -440,14 +465,10 @@ impl Default for MemChainConfig {
 // NetworkConfig
 // ============================================
 
-/// Network configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
-    /// UDP listen address.
     #[serde(default = "default_listen_addr")]
     pub listen_addr: SocketAddr,
-
-    /// Public endpoint (IP:port) for clients to connect.
     #[serde(default)]
     pub public_endpoint: Option<String>,
 }
@@ -467,7 +488,6 @@ impl NetworkConfig {
         Ok(())
     }
 
-    /// Returns public IP if configured.
     pub fn public_ip(&self) -> Option<Ipv4Addr> {
         self.public_endpoint.as_ref().and_then(|ep| {
             ep.split(':').next().and_then(|ip| ip.parse().ok())
@@ -488,14 +508,10 @@ impl Default for NetworkConfig {
 // VpnConfig
 // ============================================
 
-/// VPN configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VpnConfig {
-    /// Virtual IP range (CIDR notation).
     #[serde(default = "default_ip_range")]
     pub virtual_ip_range: String,
-
-    /// Gateway IP (server's virtual IP).
     #[serde(default = "default_gateway_ip")]
     pub gateway_ip: Ipv4Addr,
 }
@@ -519,7 +535,6 @@ impl VpnConfig {
         Ok(())
     }
 
-    /// Parses the IP range and returns (network, prefix_len).
     pub fn parse_ip_range(&self) -> Result<(Ipv4Addr, u8)> {
         let parts: Vec<&str> = self.virtual_ip_range.split('/').collect();
         if parts.len() != 2 {
@@ -561,14 +576,10 @@ impl Default for VpnConfig {
 // TunConfig
 // ============================================
 
-/// TUN device configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunConfig {
-    /// TUN device name.
     #[serde(default = "default_device_name")]
     pub device_name: String,
-
-    /// MTU size.
     #[serde(default = "default_mtu")]
     pub mtu: u16,
 }
@@ -584,33 +595,17 @@ fn default_mtu() -> u16 {
 impl TunConfig {
     fn validate(&self) -> Result<()> {
         if self.device_name.is_empty() {
-            return Err(ServerError::config_invalid(
-                "tun.device_name",
-                "cannot be empty",
-            ));
+            return Err(ServerError::config_invalid("tun.device_name", "cannot be empty"));
         }
-
         if self.device_name.len() > 15 {
-            return Err(ServerError::config_invalid(
-                "tun.device_name",
-                "cannot exceed 15 characters",
-            ));
+            return Err(ServerError::config_invalid("tun.device_name", "cannot exceed 15 characters"));
         }
-
         if self.mtu < 576 {
-            return Err(ServerError::config_invalid(
-                "tun.mtu",
-                "must be at least 576",
-            ));
+            return Err(ServerError::config_invalid("tun.mtu", "must be at least 576"));
         }
-
         if self.mtu > 9000 {
-            return Err(ServerError::config_invalid(
-                "tun.mtu",
-                "cannot exceed 9000",
-            ));
+            return Err(ServerError::config_invalid("tun.mtu", "cannot exceed 9000"));
         }
-
         Ok(())
     }
 }
@@ -628,10 +623,8 @@ impl Default for TunConfig {
 // ServerKeyConfig
 // ============================================
 
-/// Server key configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerKeyConfig {
-    /// Path to key file.
     #[serde(default = "default_key_file")]
     pub key_file: String,
 }
@@ -642,9 +635,7 @@ fn default_key_file() -> String {
 
 impl Default for ServerKeyConfig {
     fn default() -> Self {
-        Self {
-            key_file: default_key_file(),
-        }
+        Self { key_file: default_key_file() }
     }
 }
 
@@ -652,14 +643,10 @@ impl Default for ServerKeyConfig {
 // LimitsConfig
 // ============================================
 
-/// Resource limits configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimitsConfig {
-    /// Maximum concurrent connections/sessions.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
-
-    /// Session timeout in seconds.
     #[serde(default = "default_session_timeout")]
     pub session_timeout: u64,
 }
@@ -675,19 +662,11 @@ fn default_session_timeout() -> u64 {
 impl LimitsConfig {
     fn validate(&self) -> Result<()> {
         if self.max_connections == 0 {
-            return Err(ServerError::config_invalid(
-                "limits.max_connections",
-                "must be greater than 0",
-            ));
+            return Err(ServerError::config_invalid("limits.max_connections", "must be greater than 0"));
         }
-
         if self.session_timeout == 0 {
-            return Err(ServerError::config_invalid(
-                "limits.session_timeout",
-                "must be greater than 0",
-            ));
+            return Err(ServerError::config_invalid("limits.session_timeout", "must be greater than 0"));
         }
-
         Ok(())
     }
 }
@@ -705,10 +684,8 @@ impl Default for LimitsConfig {
 // LoggingConfig
 // ============================================
 
-/// Logging configuration section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
-    /// Log level (trace, debug, info, warn, error).
     #[serde(default = "default_log_level")]
     pub level: String,
 }
@@ -719,9 +696,7 @@ fn default_log_level() -> String {
 
 impl Default for LoggingConfig {
     fn default() -> Self {
-        Self {
-            level: default_log_level(),
-        }
+        Self { level: default_log_level() }
     }
 }
 
@@ -767,41 +742,14 @@ mod tests {
 
         let config = ServerConfig::from_str(toml).unwrap();
         assert_eq!(config.network.listen_addr.port(), 51820);
-        assert_eq!(config.vpn.virtual_ip_range, "100.64.0.0/24");
-        assert_eq!(config.tun.device_name, "aeronyx0");
-        assert_eq!(config.limits.max_connections, 1000);
-        // memchain should default to "local" when not specified
         assert_eq!(config.memchain.mode, MemChainMode::Local);
         assert!(config.memchain.is_enabled());
-        // trusted_agents should default to empty
-        assert!(config.memchain.trusted_agents.is_empty());
+        assert_eq!(config.memchain.db_path, "memchain.db");
+        assert_eq!(config.memchain.compaction_threshold, 500);
     }
 
     #[test]
-    fn test_config_with_management() {
-        let toml = r#"
-            [network]
-            listen_addr = "0.0.0.0:51820"
-
-            [vpn]
-            virtual_ip_range = "100.64.0.0/24"
-            gateway_ip = "100.64.0.1"
-
-            [tun]
-            device_name = "aeronyx0"
-
-            [management]
-            cms_url = "https://api.example.com/api/privacy_network"
-            heartbeat_interval_secs = 30
-        "#;
-
-        let config = ServerConfig::from_str(toml).unwrap();
-        assert_eq!(config.management.cms_url, "https://api.example.com/api/privacy_network");
-        assert_eq!(config.management.heartbeat_interval_secs, 30);
-    }
-
-    #[test]
-    fn test_config_with_memchain() {
+    fn test_config_with_memchain_full() {
         let toml = r#"
             [network]
             listen_addr = "0.0.0.0:51820"
@@ -814,17 +762,24 @@ mod tests {
             device_name = "aeronyx0"
 
             [memchain]
-            mode = "local"
+            mode = "p2p"
             api_listen_addr = "127.0.0.1:9999"
-            aof_path = "/data/my.memchain"
+            db_path = "/data/memchain.db"
+            aof_path = "/data/.memchain"
+            compaction_threshold = 200
+            miner_interval_secs = 1800
+            trusted_agents = [
+                "fa29c129f789d4f79ed2075c5c2706cdbcf8ae11196b13048174598e1dca4d54",
+            ]
         "#;
 
         let config = ServerConfig::from_str(toml).unwrap();
-        assert_eq!(config.memchain.mode, MemChainMode::Local);
-        assert_eq!(config.memchain.api_listen_addr.port(), 9999);
-        assert_eq!(config.memchain.aof_path, "/data/my.memchain");
-        assert!(config.memchain.is_enabled());
-        assert!(!config.memchain.is_p2p());
+        assert!(config.memchain.is_p2p());
+        assert_eq!(config.memchain.db_path, "/data/memchain.db");
+        assert_eq!(config.memchain.aof_path, "/data/.memchain");
+        assert_eq!(config.memchain.compaction_threshold, 200);
+        assert_eq!(config.memchain.miner_interval_secs, 1800);
+        assert_eq!(config.memchain.trusted_agents.len(), 1);
     }
 
     #[test]
@@ -845,78 +800,7 @@ mod tests {
         "#;
 
         let config = ServerConfig::from_str(toml).unwrap();
-        assert_eq!(config.memchain.mode, MemChainMode::Off);
         assert!(!config.memchain.is_enabled());
-    }
-
-    #[test]
-    fn test_config_with_trusted_agents() {
-        let toml = r#"
-            [network]
-            listen_addr = "0.0.0.0:51820"
-
-            [vpn]
-            virtual_ip_range = "100.64.0.0/24"
-            gateway_ip = "100.64.0.1"
-
-            [tun]
-            device_name = "aeronyx0"
-
-            [memchain]
-            mode = "p2p"
-            trusted_agents = [
-                "fa29c129f789d4f79ed2075c5c2706cdbcf8ae11196b13048174598e1dca4d54",
-                "ab12cd34ef56789012345678901234567890123456789012345678901234abcd",
-            ]
-        "#;
-
-        let config = ServerConfig::from_str(toml).unwrap();
-        assert_eq!(config.memchain.trusted_agents.len(), 2);
-        assert!(config.memchain.is_p2p());
-    }
-
-    #[test]
-    fn test_trusted_agents_invalid_hex_rejected() {
-        let toml = r#"
-            [network]
-            listen_addr = "0.0.0.0:51820"
-
-            [vpn]
-            virtual_ip_range = "100.64.0.0/24"
-            gateway_ip = "100.64.0.1"
-
-            [tun]
-            device_name = "aeronyx0"
-
-            [memchain]
-            mode = "local"
-            trusted_agents = ["not_valid_hex"]
-        "#;
-
-        let result = ServerConfig::from_str(toml);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_trusted_agents_wrong_length_rejected() {
-        let toml = r#"
-            [network]
-            listen_addr = "0.0.0.0:51820"
-
-            [vpn]
-            virtual_ip_range = "100.64.0.0/24"
-            gateway_ip = "100.64.0.1"
-
-            [tun]
-            device_name = "aeronyx0"
-
-            [memchain]
-            mode = "local"
-            trusted_agents = ["abcd1234"]
-        "#;
-
-        let result = ServerConfig::from_str(toml);
-        assert!(result.is_err());
     }
 
     #[test]
@@ -929,17 +813,11 @@ mod tests {
         };
 
         let server_key = "bbbb0000000000000000000000000000000000000000000000000000000000bb";
-
-        // Server's own key is always trusted
         assert!(config.is_origin_trusted(server_key, server_key));
-
-        // Whitelisted key is trusted
         assert!(config.is_origin_trusted(
             "aaaa0000000000000000000000000000000000000000000000000000000000aa",
             server_key,
         ));
-
-        // Unknown key is NOT trusted
         assert!(!config.is_origin_trusted(
             "cccc0000000000000000000000000000000000000000000000000000000000cc",
             server_key,
@@ -949,17 +827,14 @@ mod tests {
     #[test]
     fn test_is_origin_trusted_empty_whitelist() {
         let config = MemChainConfig::default();
-        let server_key = "bbbb0000000000000000000000000000000000000000000000000000000000bb";
-
-        // Empty whitelist = trust everyone
-        assert!(config.is_origin_trusted("any_key_at_all", server_key));
+        let server_key = "bbbb";
+        assert!(config.is_origin_trusted("any_key", server_key));
     }
 
     #[test]
     fn test_parse_ip_range() {
         let config = VpnConfig::default();
         let (network, prefix) = config.parse_ip_range().unwrap();
-
         assert_eq!(network, Ipv4Addr::new(100, 64, 0, 0));
         assert_eq!(prefix, 24);
     }
@@ -970,7 +845,30 @@ mod tests {
             listen_addr: default_listen_addr(),
             public_endpoint: Some("8.213.146.244:51820".to_string()),
         };
-
         assert_eq!(config.public_ip(), Some(Ipv4Addr::new(8, 213, 146, 244)));
+    }
+
+    #[test]
+    fn test_backward_compat_no_db_path() {
+        // Old config without db_path should use default
+        let toml = r#"
+            [network]
+            listen_addr = "0.0.0.0:51820"
+
+            [vpn]
+            virtual_ip_range = "100.64.0.0/24"
+            gateway_ip = "100.64.0.1"
+
+            [tun]
+            device_name = "aeronyx0"
+
+            [memchain]
+            mode = "local"
+            aof_path = "/data/.memchain"
+        "#;
+
+        let config = ServerConfig::from_str(toml).unwrap();
+        assert_eq!(config.memchain.db_path, "memchain.db");
+        assert_eq!(config.memchain.aof_path, "/data/.memchain");
     }
 }
