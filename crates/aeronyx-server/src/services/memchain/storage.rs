@@ -11,7 +11,18 @@
 //! The sole primary storage engine for MemChain v2.0. Uses rusqlite (bundled)
 //! with WAL mode for indexed queries, crash-safe transactions, and lifecycle mgmt.
 //!
-//! ## v2.1 Changes (vs v1.0.0)
+//! ## v2.1+MVF Changes (Schema v4, vs Schema v2)
+//! - `records` table gains 3 new columns:
+//!   - `positive_feedback INTEGER NOT NULL DEFAULT 0`
+//!   - `negative_feedback INTEGER NOT NULL DEFAULT 0`
+//!   - `conflict_with BLOB` (nullable, stores conflicting record_id)
+//! - `maybe_migrate()` handles v2→v4 migration via ALTER TABLE ADD COLUMN
+//! - `row_to_record()` reads all 18 columns (was 12) including feedback fields
+//! - `increment_positive_feedback()` / `increment_negative_feedback()` now log errors
+//!   instead of silently swallowing them
+//! - INSERT statement includes new columns
+//!
+//! ## Previous Changes (v2.1.0 vs v1.0.0)
 //! - `embedding` 列改为 BLOB（f32 LE 序列化），去掉 `encrypted_embedding`
 //! - `access_count` 改为 INTEGER (u32)
 //! - `layer = 3` 表示 Archive（独立层级，不是 status）
@@ -19,22 +30,28 @@
 //!   （而非标记 status=Archived），使归档记忆仍可以极低权重被召回
 //! - 新增 `get_records_needing_embedding()` 用于启动时重建向量索引
 //!
-//! ## Schema (v2)
+//! ## Schema (v4)
 //! ```sql
 //! CREATE TABLE records (
-//!     record_id         BLOB(32) PRIMARY KEY,
-//!     owner             BLOB(32) NOT NULL,
-//!     timestamp         INTEGER NOT NULL,
-//!     layer             INTEGER NOT NULL,  -- 0=Identity,1=Knowledge,2=Episode,3=Archive
-//!     topic_tags        TEXT NOT NULL,      -- JSON array
-//!     source_ai         TEXT NOT NULL,
-//!     status            INTEGER NOT NULL DEFAULT 0,  -- 0=Active,1=Superseded,2=Revoked
-//!     supersedes        BLOB(32),
-//!     encrypted_content BLOB NOT NULL,
-//!     embedding         BLOB,              -- f32 LE bytes, NULL if no embedding
-//!     signature         BLOB(64) NOT NULL,
-//!     access_count      INTEGER NOT NULL DEFAULT 0,
-//!     created_at        INTEGER NOT NULL
+//!     record_id           BLOB(32) PRIMARY KEY,
+//!     owner               BLOB(32) NOT NULL,
+//!     timestamp           INTEGER NOT NULL,
+//!     layer               INTEGER NOT NULL,  -- 0=Identity,1=Knowledge,2=Episode,3=Archive
+//!     topic_tags          TEXT NOT NULL,      -- JSON array
+//!     source_ai           TEXT NOT NULL,
+//!     status              INTEGER NOT NULL DEFAULT 0,  -- 0=Active,1=Superseded,2=Revoked
+//!     supersedes          BLOB(32),
+//!     encrypted_content   BLOB NOT NULL,
+//!     embedding           BLOB,              -- f32 LE bytes, NULL if no embedding
+//!     embedding_model     TEXT NOT NULL DEFAULT '',
+//!     embedding_dim       INTEGER NOT NULL DEFAULT 0,
+//!     signature           BLOB(64) NOT NULL,
+//!     access_count        INTEGER NOT NULL DEFAULT 0,
+//!     created_at          INTEGER NOT NULL,
+//!     archived_at         INTEGER,
+//!     positive_feedback   INTEGER NOT NULL DEFAULT 0,  -- v4: MVF φ₄ positive count
+//!     negative_feedback   INTEGER NOT NULL DEFAULT 0,  -- v4: MVF φ₄ negative count
+//!     conflict_with       BLOB                         -- v4: MVF φ₈ conflicting record_id
 //! );
 //! ```
 //!
@@ -42,15 +59,18 @@
 //! `rusqlite::Connection` behind `tokio::sync::Mutex`. Phase 2+ can use r2d2 pooling.
 //!
 //! ## ⚠️ Important Note for Next Developer
-//! - Schema migrations: use `ALTER TABLE` in `migrate()`, NEVER drop tables.
+//! - Schema migrations: use `ALTER TABLE` in `maybe_migrate()`, NEVER drop tables.
 //! - `record_id` is PRIMARY KEY. Duplicate inserts use `INSERT OR IGNORE`.
 //! - `embedding` is stored as raw f32 little-endian bytes. 384-dim = 1536 bytes.
 //! - Miner 压实: 改 `layer` 从 Episode→Archive（不是改 status），保持 status=Active。
 //! - `created_at` is local insertion time, not the record's `timestamp`.
+//! - v4 migration is additive-only (ALTER TABLE ADD COLUMN). Safe for existing data.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
 //! v2.1.0 - 🌟 4-layer support, plaintext embedding BLOB, compaction via layer change
+//! v2.1.0+MVF - 🌟 Schema v4: positive_feedback, negative_feedback, conflict_with columns;
+//!   migration from v2; error logging for feedback operations; row_to_record reads 18 cols
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -156,7 +176,8 @@ const LRU_CACHE_CAPACITY: usize = 1000;
 // ============================================
 
 /// Schema 版本号，增加时需要添加迁移逻辑
-const SCHEMA_VERSION: u32 = 2;
+/// Schema version — bump this AND add migration logic in maybe_migrate()
+const SCHEMA_VERSION: u32 = 4;
 
 /// 分页查询默认页大小
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -324,22 +345,25 @@ impl MemoryStorage {
     fn create_schema(conn: &Connection) -> Result<(), String> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS records (
-                record_id         BLOB PRIMARY KEY,
-                owner             BLOB NOT NULL,
-                timestamp         INTEGER NOT NULL,
-                layer             INTEGER NOT NULL,
-                topic_tags        TEXT NOT NULL DEFAULT '[]',
-                source_ai         TEXT NOT NULL DEFAULT '',
-                status            INTEGER NOT NULL DEFAULT 0,
-                supersedes        BLOB,
-                encrypted_content BLOB NOT NULL DEFAULT x'',
-                embedding         BLOB,
-                embedding_model   TEXT NOT NULL DEFAULT '',
-                embedding_dim     INTEGER NOT NULL DEFAULT 0,
-                signature         BLOB NOT NULL,
-                access_count      INTEGER NOT NULL DEFAULT 0,
-                created_at        INTEGER NOT NULL,
-                archived_at       INTEGER
+                record_id           BLOB PRIMARY KEY,
+                owner               BLOB NOT NULL,
+                timestamp           INTEGER NOT NULL,
+                layer               INTEGER NOT NULL,
+                topic_tags          TEXT NOT NULL DEFAULT '[]',
+                source_ai           TEXT NOT NULL DEFAULT '',
+                status              INTEGER NOT NULL DEFAULT 0,
+                supersedes          BLOB,
+                encrypted_content   BLOB NOT NULL DEFAULT x'',
+                embedding           BLOB,
+                embedding_model     TEXT NOT NULL DEFAULT '',
+                embedding_dim       INTEGER NOT NULL DEFAULT 0,
+                signature           BLOB NOT NULL,
+                access_count        INTEGER NOT NULL DEFAULT 0,
+                created_at          INTEGER NOT NULL,
+                archived_at         INTEGER,
+                positive_feedback   INTEGER NOT NULL DEFAULT 0,
+                negative_feedback   INTEGER NOT NULL DEFAULT 0,
+                conflict_with       BLOB
             );
 
             CREATE INDEX IF NOT EXISTS idx_owner
@@ -430,13 +454,27 @@ impl MemoryStorage {
         Ok(())
     }
 
-    /// Schema 迁移 — v1 → v2 的差量
-    /// Schema migration — delta from v1 to v2
+    /// Schema 迁移 — 支持 v1→v2→v4 的增量迁移
+    /// Schema migration — incremental migration through v1→v2→v4
+    ///
+    /// ## Migration History
+    /// - v1→v2: Added `embedding` column (replaced `encrypted_embedding`)
+    /// - v2→v4: Added `positive_feedback`, `negative_feedback`, `conflict_with` columns
+    ///          (skipped v3 to align with architecture doc "Schema v4" naming)
+    ///
+    /// ## Safety
+    /// All migrations use ALTER TABLE ADD COLUMN which is:
+    /// - Non-destructive (existing data untouched)
+    /// - Idempotent-safe (we check column existence before ALTER)
+    /// - WAL-compatible (no table rebuild needed)
     fn maybe_migrate(conn: &Connection) -> Result<(), String> {
         let current: u32 = conn
             .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
             .unwrap_or(1);
 
+        // ========================================
+        // v1 → v2: embedding column
+        // ========================================
         if current < 2 {
             info!("[STORAGE] Migrating schema v{} → v2", current);
 
@@ -448,7 +486,6 @@ impl MemoryStorage {
                 .is_ok();
 
             if !has_embedding {
-                // Old schema — add `embedding` column
                 let _ = conn.execute_batch(
                     "ALTER TABLE records ADD COLUMN embedding BLOB;"
                 );
@@ -456,11 +493,64 @@ impl MemoryStorage {
             }
 
             conn.execute(
-                "UPDATE schema_version SET version = ?1",
-                params![SCHEMA_VERSION],
-            ).map_err(|e| format!("Update schema version: {}", e))?;
+                "UPDATE schema_version SET version = 2",
+                [],
+            ).map_err(|e| format!("Update schema version to v2: {}", e))?;
 
             info!("[STORAGE] ✅ Migration to v2 complete");
+        }
+
+        // ========================================
+        // v2 → v4: MVF feedback + conflict columns
+        // (skipped v3 to align with architecture doc naming)
+        // ========================================
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
+            .unwrap_or(2);
+
+        if current < 4 {
+            info!("[STORAGE] Migrating schema v{} → v4 (MVF feedback + conflict)", current);
+
+            // Add positive_feedback column if missing
+            let has_positive: bool = conn
+                .prepare("SELECT positive_feedback FROM records LIMIT 0")
+                .is_ok();
+            if !has_positive {
+                conn.execute_batch(
+                    "ALTER TABLE records ADD COLUMN positive_feedback INTEGER NOT NULL DEFAULT 0;"
+                ).map_err(|e| format!("Add positive_feedback column: {}", e))?;
+                info!("[STORAGE] Added `positive_feedback` column");
+            }
+
+            // Add negative_feedback column if missing
+            let has_negative: bool = conn
+                .prepare("SELECT negative_feedback FROM records LIMIT 0")
+                .is_ok();
+            if !has_negative {
+                conn.execute_batch(
+                    "ALTER TABLE records ADD COLUMN negative_feedback INTEGER NOT NULL DEFAULT 0;"
+                ).map_err(|e| format!("Add negative_feedback column: {}", e))?;
+                info!("[STORAGE] Added `negative_feedback` column");
+            }
+
+            // Add conflict_with column if missing
+            let has_conflict: bool = conn
+                .prepare("SELECT conflict_with FROM records LIMIT 0")
+                .is_ok();
+            if !has_conflict {
+                conn.execute_batch(
+                    "ALTER TABLE records ADD COLUMN conflict_with BLOB;"
+                ).map_err(|e| format!("Add conflict_with column: {}", e))?;
+                info!("[STORAGE] Added `conflict_with` column");
+            }
+
+            // Update schema version to 4
+            conn.execute(
+                "UPDATE schema_version SET version = ?1",
+                params![SCHEMA_VERSION],
+            ).map_err(|e| format!("Update schema version to v4: {}", e))?;
+
+            info!("[STORAGE] ✅ Migration to v4 complete (positive_feedback, negative_feedback, conflict_with)");
         }
 
         Ok(())
@@ -502,6 +592,8 @@ impl MemoryStorage {
 
         let embedding_dim = record.embedding_dim() as i64;
 
+        let conflict_with_blob: Option<Vec<u8>> = record.conflict_with.map(|c| c.to_vec());
+
         let conn = self.conn.lock().await;
 
         let result = conn.execute(
@@ -509,8 +601,9 @@ impl MemoryStorage {
                 record_id, owner, timestamp, layer, topic_tags, source_ai,
                 status, supersedes, encrypted_content, embedding,
                 embedding_model, embedding_dim,
-                signature, access_count, created_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                signature, access_count, created_at,
+                positive_feedback, negative_feedback, conflict_with
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 record.record_id.as_slice(),
                 record.owner.as_slice(),
@@ -527,6 +620,9 @@ impl MemoryStorage {
                 record.signature.as_slice(),
                 record.access_count as i64,
                 now,
+                record.positive_feedback as i64,
+                record.negative_feedback as i64,
+                conflict_with_blob.as_deref(),
             ],
         );
 
@@ -572,10 +668,7 @@ impl MemoryStorage {
         // 缓存未命中 → 查 SQLite
         let conn = self.conn.lock().await;
         let result = conn.query_row(
-            "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
-                    status,supersedes,encrypted_content,embedding,
-                    signature,access_count
-             FROM records WHERE record_id = ?1",
+            Self::SELECT_RECORD_COLS,
             params![record_id.as_slice()],
             |row| Self::row_to_record(row),
         )
@@ -605,7 +698,8 @@ impl MemoryStorage {
             Self::query_rows(&conn,
                 "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                         status,supersedes,encrypted_content,embedding,
-                        signature,access_count
+                        signature,access_count,
+                        positive_feedback,negative_feedback,conflict_with
                  FROM records
                  WHERE owner=?1 AND status=0 AND layer=?2
                  ORDER BY timestamp DESC LIMIT ?3",
@@ -615,7 +709,8 @@ impl MemoryStorage {
             Self::query_rows(&conn,
                 "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                         status,supersedes,encrypted_content,embedding,
-                        signature,access_count
+                        signature,access_count,
+                        positive_feedback,negative_feedback,conflict_with
                  FROM records
                  WHERE owner=?1 AND status=0
                  ORDER BY timestamp DESC LIMIT ?2",
@@ -634,7 +729,8 @@ impl MemoryStorage {
         Self::query_rows(&conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,
-                    signature,access_count
+                    signature,access_count,
+                    positive_feedback,negative_feedback,conflict_with
              FROM records
              WHERE owner=?1 AND timestamp>?2
              ORDER BY timestamp ASC LIMIT ?3",
@@ -653,7 +749,9 @@ impl MemoryStorage {
         let mut stmt = match conn.prepare(
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,
-                    signature,access_count, embedding_model
+                    signature,access_count,
+                    positive_feedback,negative_feedback,conflict_with,
+                    embedding_model
              FROM records
              WHERE owner=?1 AND status=0 AND embedding IS NOT NULL
              ORDER BY timestamp DESC"
@@ -664,7 +762,7 @@ impl MemoryStorage {
 
         stmt.query_map(params![owner.as_slice()], |row| {
             let record = Self::row_to_record(row)?;
-            let model: String = row.get(12)?;
+            let model: String = row.get(15)?; // embedding_model is at index 15
             Ok((record, model))
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -752,7 +850,8 @@ impl MemoryStorage {
         let records = Self::query_rows(&conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,
-                    signature,access_count
+                    signature,access_count,
+                    positive_feedback,negative_feedback,conflict_with
              FROM records
              WHERE owner=?1 AND status=0 AND layer=?2
              ORDER BY timestamp ASC LIMIT ?3",
@@ -980,21 +1079,88 @@ impl MemoryStorage {
     }
 
     /// Increment positive_feedback on a record.
+    ///
+    /// Used by Miner Step 0 when detecting positive user signals.
+    /// Updates both the SQLite column and the LRU cache entry.
     pub async fn increment_positive_feedback(&self, record_id: &[u8; 32]) {
         let conn = self.conn.lock().await;
-        let _ = conn.execute(
+        match conn.execute(
             "UPDATE records SET positive_feedback = positive_feedback + 1 WHERE record_id = ?1",
             params![record_id.as_slice()],
-        );
+        ) {
+            Ok(n) if n > 0 => {
+                debug!(record_id = hex::encode(record_id), "[STORAGE] positive_feedback incremented");
+                // Invalidate cache so next read gets fresh data
+                self.cache.write().invalidate(record_id);
+            }
+            Ok(_) => {
+                warn!(record_id = hex::encode(record_id), "[STORAGE] positive_feedback: record not found");
+            }
+            Err(e) => {
+                error!(
+                    record_id = hex::encode(record_id),
+                    error = %e,
+                    "[STORAGE] ❌ positive_feedback increment failed (schema migration needed?)"
+                );
+            }
+        }
     }
 
     /// Increment negative_feedback on a record.
+    ///
+    /// Used by /log negative feedback detection when user corrects the AI.
+    /// Updates both the SQLite column and the LRU cache entry.
     pub async fn increment_negative_feedback(&self, record_id: &[u8; 32]) {
         let conn = self.conn.lock().await;
-        let _ = conn.execute(
+        match conn.execute(
             "UPDATE records SET negative_feedback = negative_feedback + 1 WHERE record_id = ?1",
             params![record_id.as_slice()],
-        );
+        ) {
+            Ok(n) if n > 0 => {
+                debug!(record_id = hex::encode(record_id), "[STORAGE] negative_feedback incremented");
+                // Invalidate cache so next read gets fresh data
+                self.cache.write().invalidate(record_id);
+            }
+            Ok(_) => {
+                warn!(record_id = hex::encode(record_id), "[STORAGE] negative_feedback: record not found");
+            }
+            Err(e) => {
+                error!(
+                    record_id = hex::encode(record_id),
+                    error = %e,
+                    "[STORAGE] ❌ negative_feedback increment failed (schema migration needed?)"
+                );
+            }
+        }
+    }
+
+    /// Set the conflict_with field on a record (for MVF φ₈ feature).
+    ///
+    /// Used by Miner Step 0.6 correction chaining to link conflicting memories.
+    pub async fn set_conflict_with(&self, record_id: &[u8; 32], conflict_id: &[u8; 32]) -> bool {
+        let conn = self.conn.lock().await;
+        match conn.execute(
+            "UPDATE records SET conflict_with = ?1 WHERE record_id = ?2",
+            params![conflict_id.as_slice(), record_id.as_slice()],
+        ) {
+            Ok(n) if n > 0 => {
+                debug!(
+                    record_id = hex::encode(record_id),
+                    conflict = hex::encode(conflict_id),
+                    "[STORAGE] conflict_with set"
+                );
+                self.cache.write().invalidate(record_id);
+                true
+            }
+            Ok(_) => {
+                warn!(record_id = hex::encode(record_id), "[STORAGE] conflict_with: record not found");
+                false
+            }
+            Err(e) => {
+                error!(error = %e, "[STORAGE] ❌ set_conflict_with failed");
+                false
+            }
+        }
     }
 
     /// Insert a feedback event for SGD training.
@@ -1071,7 +1237,8 @@ impl MemoryStorage {
         Self::query_rows(&conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,
-                    signature,access_count
+                    signature,access_count,
+                    positive_feedback,negative_feedback,conflict_with
              FROM records
              WHERE embedding IS NULL AND status = 0
              LIMIT ?1",
@@ -1125,7 +1292,8 @@ impl MemoryStorage {
         Self::query_rows(&conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,
-                    signature,access_count
+                    signature,access_count,
+                    positive_feedback,negative_feedback,conflict_with
              FROM records
              WHERE topic_tags LIKE '%_correction%' AND status = 0",
             [],
@@ -1164,6 +1332,17 @@ impl MemoryStorage {
     // Private helpers
     // ========================================
 
+    /// Standard SELECT column list for MemoryRecord queries.
+    /// 15 columns: indices 0-14 map to row_to_record() expectations.
+    ///
+    /// When modifying this, also update row_to_record() and all query methods.
+    const SELECT_RECORD_COLS: &'static str =
+        "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
+                status,supersedes,encrypted_content,embedding,
+                signature,access_count,
+                positive_feedback,negative_feedback,conflict_with
+         FROM records WHERE record_id = ?1";
+
     /// 通用查询辅助：执行 SQL 返回 Vec<MemoryRecord>
     fn query_rows(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Vec<MemoryRecord> {
         let mut stmt = match conn.prepare(sql) {
@@ -1176,6 +1355,12 @@ impl MemoryStorage {
     }
 
     /// SQLite row → MemoryRecord
+    ///
+    /// Expected column order (15 columns):
+    ///   0: record_id, 1: owner, 2: timestamp, 3: layer, 4: topic_tags,
+    ///   5: source_ai, 6: status, 7: supersedes, 8: encrypted_content,
+    ///   9: embedding, 10: signature, 11: access_count,
+    ///   12: positive_feedback, 13: negative_feedback, 14: conflict_with
     fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
         let record_id_blob: Vec<u8> = row.get(0)?;
         let owner_blob: Vec<u8> = row.get(1)?;
@@ -1190,6 +1375,11 @@ impl MemoryStorage {
         let signature_blob: Vec<u8> = row.get(10)?;
         let access_count: i64 = row.get(11)?;
 
+        // v4 columns (with safe defaults for migration compatibility)
+        let positive_feedback: i64 = row.get(12).unwrap_or(0);
+        let negative_feedback: i64 = row.get(13).unwrap_or(0);
+        let conflict_with_blob: Option<Vec<u8>> = row.get(14).unwrap_or(None);
+
         let mut record_id = [0u8; 32];
         if record_id_blob.len() == 32 { record_id.copy_from_slice(&record_id_blob); }
 
@@ -1200,6 +1390,11 @@ impl MemoryStorage {
         if signature_blob.len() == 64 { signature.copy_from_slice(&signature_blob); }
 
         let supersedes = supersedes_blob.and_then(|b| {
+            if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) }
+            else { None }
+        });
+
+        let conflict_with = conflict_with_blob.and_then(|b| {
             if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) }
             else { None }
         });
@@ -1221,6 +1416,9 @@ impl MemoryStorage {
             embedding,
             signature,
             access_count: access_count as u32,
+            positive_feedback: positive_feedback as u32,
+            negative_feedback: negative_feedback as u32,
+            conflict_with,
         })
     }
 }
@@ -1279,6 +1477,9 @@ mod tests {
         assert_eq!(got.source_ai, "test");
         assert_eq!(got.layer, MemoryLayer::Episode);
         assert_eq!(got.embedding, vec![0.1, 0.2, 0.3]);
+        assert_eq!(got.positive_feedback, 0);
+        assert_eq!(got.negative_feedback, 0);
+        assert_eq!(got.conflict_with, None);
         assert_eq!(s.count().await, 1);
     }
 
@@ -1398,7 +1599,7 @@ mod tests {
             vec![], "t".into(), b"c".to_vec(),
             vec![], // 空 embedding
         );
-        s.insert(&r).await;
+        s.insert(&r, "").await;
         let got = s.get(&r.record_id).await.unwrap();
         assert!(got.embedding.is_empty());
         assert!(!got.has_embedding());
@@ -1410,15 +1611,106 @@ mod tests {
         let o = [0xAA; 32];
 
         // 有 embedding
-        s.insert(&make_rec_owner(100, o, MemoryLayer::Episode)).await;
+        s.insert(&make_rec_owner(100, o, MemoryLayer::Episode), "m").await;
         // 无 embedding
         let mut no_emb = make_rec_owner(200, o, MemoryLayer::Knowledge);
         no_emb.embedding = vec![];
-        // 需要重新计算 record_id 因为改了字段…但 embedding 不在哈希里，所以不需要
-        s.insert(&no_emb).await;
+        s.insert(&no_emb, "m").await;
 
         let with = s.get_records_with_embedding(&o).await;
         assert_eq!(with.len(), 1);
-        assert_eq!(with[0].timestamp, 100);
+        assert_eq!(with[0].0.timestamp, 100);
+    }
+
+    // ========================================
+    // v4 Migration & Feedback Tests
+    // ========================================
+
+    #[tokio::test]
+    async fn test_positive_feedback_increment() {
+        let s = MemoryStorage::open(":memory:").unwrap();
+        let r = make_rec(100, MemoryLayer::Episode, "t");
+        let id = r.record_id;
+        s.insert(&r, "m").await;
+
+        s.increment_positive_feedback(&id).await;
+        s.increment_positive_feedback(&id).await;
+        s.increment_positive_feedback(&id).await;
+
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.positive_feedback, 3);
+    }
+
+    #[tokio::test]
+    async fn test_negative_feedback_increment() {
+        let s = MemoryStorage::open(":memory:").unwrap();
+        let r = make_rec(100, MemoryLayer::Episode, "t");
+        let id = r.record_id;
+        s.insert(&r, "m").await;
+
+        s.increment_negative_feedback(&id).await;
+
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.negative_feedback, 1);
+    }
+
+    #[tokio::test]
+    async fn test_set_conflict_with() {
+        let s = MemoryStorage::open(":memory:").unwrap();
+        let r = make_rec(100, MemoryLayer::Episode, "t");
+        let id = r.record_id;
+        s.insert(&r, "m").await;
+
+        let conflict_id = [0xCC; 32];
+        assert!(s.set_conflict_with(&id, &conflict_id).await);
+
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.conflict_with, Some(conflict_id));
+        assert!(got.has_conflict());
+    }
+
+    #[tokio::test]
+    async fn test_feedback_score_via_storage() {
+        let s = MemoryStorage::open(":memory:").unwrap();
+        let r = make_rec(100, MemoryLayer::Episode, "t");
+        let id = r.record_id;
+        s.insert(&r, "m").await;
+
+        // 3 positive, 1 negative → φ₄ = (3-1)/(3+1+1) = 0.4
+        s.increment_positive_feedback(&id).await;
+        s.increment_positive_feedback(&id).await;
+        s.increment_positive_feedback(&id).await;
+        s.increment_negative_feedback(&id).await;
+
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.positive_feedback, 3);
+        assert_eq!(got.negative_feedback, 1);
+        assert!((got.feedback_score() - 0.4).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_insert_with_feedback_fields() {
+        let s = MemoryStorage::open(":memory:").unwrap();
+        let mut r = make_rec(100, MemoryLayer::Episode, "t");
+        r.positive_feedback = 5;
+        r.negative_feedback = 2;
+        r.conflict_with = Some([0xDD; 32]);
+
+        s.insert(&r, "m").await;
+
+        let got = s.get(&r.record_id).await.unwrap();
+        assert_eq!(got.positive_feedback, 5);
+        assert_eq!(got.negative_feedback, 2);
+        assert_eq!(got.conflict_with, Some([0xDD; 32]));
+    }
+
+    #[tokio::test]
+    async fn test_schema_version_is_4() {
+        let s = MemoryStorage::open(":memory:").unwrap();
+        let conn = s.conn.lock().await;
+        let version: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
     }
 }
