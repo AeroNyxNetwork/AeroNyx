@@ -50,5 +50,11 @@
 //! v0.3.0 - 🌟 Initial Agent API for MemChain Phase 1
 //! v0.4.0 - 🌟 Extended for Phase 3: P2P broadcast + POST /api/sync
 
+pub mod mpi;
+pub mod log_handler;
 pub mod local;
-pub use local::start_api_server;
+
+pub use mpi::{build_mpi_router, MpiState, BaselineSnapshot};
+
+#[allow(deprecated)]
+pub use local::start_legacy_api_server;
