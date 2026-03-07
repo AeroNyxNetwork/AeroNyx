@@ -1231,6 +1231,28 @@ impl MemoryStorage {
         .unwrap_or_default()
     }
 
+    /// Check if an active record with the same content already exists for this owner.
+    ///
+    /// Used by /log rule engine to prevent duplicate extractions when:
+    /// - The same /log is called multiple times with identical content
+    /// - Multiple rules (e.g. P2 + P5) extract from the same message
+    ///
+    /// Compares raw `encrypted_content` bytes + `owner` + `status=Active`.
+    /// Returns true if a duplicate exists.
+    ///
+    /// Performance: Single indexed query, < 0.5ms.
+    pub async fn has_active_content(&self, owner: &[u8; 32], content: &[u8]) -> bool {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM records
+             WHERE owner = ?1 AND encrypted_content = ?2 AND status = 0
+             LIMIT 1",
+            params![owner.as_slice(), content],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        count > 0
+    }
+
     /// Query records that need embedding backfill.
     pub async fn get_records_needing_embedding(&self, limit: usize) -> Vec<MemoryRecord> {
         let conn = self.conn.lock().await;
