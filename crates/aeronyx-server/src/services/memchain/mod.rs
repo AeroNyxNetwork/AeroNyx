@@ -71,7 +71,6 @@ pub use vector::{
     VectorIndex, SearchResult, DedupResult,
     cosine_similarity, compute_recall_score,
     dedup_threshold_for_layer, EPISODE_DEDUP_WINDOW_SECS,
-    ARCHIVE_OBSERVATION_SECS,
 };
 
 // Re-exports: Legacy
