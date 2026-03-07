@@ -43,6 +43,9 @@ use aeronyx_transport::LinuxTun;
 use crate::api::mpi::{build_mpi_router, MpiState};
 use crate::config::{MemChainConfig, ServerConfig};
 use crate::error::{Result, ServerError};
+
+#[cfg(target_os = "linux")]
+use aeronyx_transport::LinuxTun;
 use crate::handlers::packet::DecryptedPayload;
 use crate::handlers::PacketHandler;
 use crate::management::{
@@ -197,20 +200,24 @@ impl Server {
             }
 
             // Load or create MVF baseline from chain_state
-            let mvf_baseline = {
-                let conn = st.conn_lock().await;
-                let baseline_json: Option<String> = conn.query_row(
+            let mvf_baseline: Option<crate::api::BaselineSnapshot> = {
+                let baseline_str: Option<String> = st.load_user_weights(&[0u8; 0]).await
+                    .and_then(|_| None); // placeholder — load from chain_state below
+
+                // Direct SQLite query for mvf_baseline
+                let conn: tokio::sync::MutexGuard<'_, rusqlite::Connection> = st.conn_lock().await;
+                let result: Option<String> = conn.query_row(
                     "SELECT value FROM chain_state WHERE key = 'mvf_baseline'",
                     [],
-                    |row| {
+                    |row: &rusqlite::Row<'_>| {
                         let blob: Vec<u8> = row.get(0)?;
                         Ok(String::from_utf8_lossy(&blob).to_string())
                     },
                 ).optional().ok().flatten();
                 drop(conn);
 
-                baseline_json.and_then(|json| {
-                    serde_json::from_str::<crate::api::BaselineSnapshot>(&json).ok()
+                result.and_then(|json_str| {
+                    serde_json::from_str::<crate::api::BaselineSnapshot>(&json_str).ok()
                 })
             };
 
@@ -260,9 +267,8 @@ impl Server {
                         frozen_at: now_ts,
                     };
 
-                    // Persist to chain_state
                     if let Ok(json) = serde_json::to_string(&baseline) {
-                        let conn = st.conn_lock().await;
+                        let conn: tokio::sync::MutexGuard<'_, rusqlite::Connection> = st.conn_lock().await;
                         let _ = conn.execute(
                             "INSERT OR REPLACE INTO chain_state (key, value) VALUES ('mvf_baseline', ?1)",
                             rusqlite::params![json.as_bytes()],
@@ -384,7 +390,7 @@ impl Server {
             if r.has_embedding() {
                 vector_index.upsert(
                     r.record_id,
-                    r.embedding,
+                    r.embedding.clone(),
                     r.layer,
                     r.timestamp,
                     &r.owner,
@@ -445,10 +451,10 @@ impl Server {
         &self,
         listen_addr: std::net::SocketAddr,
         mpi_state: Arc<MpiState>,
-        mempool: Arc<MemPool>,
-        aof_writer: Arc<TokioMutex<AofWriter>>,
-        sessions: Arc<SessionManager>,
-        udp: Arc<UdpTransport>,
+        _mempool: Arc<MemPool>,
+        _aof_writer: Arc<TokioMutex<AofWriter>>,
+        _sessions: Arc<SessionManager>,
+        _udp: Arc<UdpTransport>,
     ) -> JoinHandle<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
@@ -792,7 +798,6 @@ impl Server {
             MemChainMessage::BroadcastRecord(record) => {
                 let owner_hex = record.owner_hex();
 
-                // Signature verification
                 let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
                     Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                     Err(_) => false,
@@ -806,15 +811,10 @@ impl Server {
                     return;
                 }
 
-                // Store in SQLite
                 if let Some(ref st) = storage {
                     if st.insert(&record, "p2p-remote").await {
-                        info!(
-                            id = hex::encode(record.record_id),
-                            "[MEMCHAIN] BroadcastRecord stored"
-                        );
+                        info!(id = hex::encode(record.record_id), "[MEMCHAIN] BroadcastRecord stored");
 
-                        // Index embedding if present
                         if record.has_embedding() {
                             if let Some(ref vi) = vector_index {
                                 vi.upsert(
@@ -869,9 +869,10 @@ impl Server {
             MemChainMessage::SyncRecordResponse { records } => {
                 if let Some(ref st) = storage {
                     for record in records {
-                        let owner_hex = record.owner_hex();
-                        let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
-                            Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
+                        let rec: &aeronyx_core::ledger::MemoryRecord = &record;
+                        let owner_hex = rec.owner_hex();
+                        let sig_ok = match IdentityPublicKey::from_bytes(&rec.owner) {
+                            Ok(pk) => pk.verify(&rec.record_id, &rec.signature).is_ok(),
                             Err(_) => false,
                         };
                         if !sig_ok || !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
