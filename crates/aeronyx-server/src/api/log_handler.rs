@@ -15,16 +15,29 @@
 //!   ├─ Step 1: For each role="user" turn:
 //!   │   ├─ SKIP classification (has_persistent_info) < 0.1ms
 //!   │   ├─ if extractable=1: Rule engine P0-P6 < 0.5ms
+//!   │   │   → Content dedup check (< 0.5ms)
 //!   │   │   → hits call internal remember (storage.insert + vector.upsert)
 //!   │   └─ Negative feedback detection < 0.5ms
 //!   │       → hits: update records.negative_feedback + write memory_feedback
 //!   └─ Return 202 Accepted { logged: N, session_id: "..." }
 //! ```
 //!
+//! ## Content Dedup (v2.1.0+MVF)
+//! Rule engine extractions lack embeddings (filled by Miner Step 0.5),
+//! so vector dedup cannot apply. Instead, before inserting each extraction,
+//! we check `storage.has_active_content(owner, content_bytes)` — if an
+//! Active record with identical encrypted_content already exists for this
+//! owner, the extraction is skipped. This prevents:
+//!   1. Cross-request duplicates (same /log called twice)
+//!   2. Intra-request duplicates (P2 + P5 both match "I am allergic to X")
+//!
 //! ## Immutable: 202 response format { logged, session_id } unchanged
 //!
 //! ## Last Modified
 //! v2.1.0 - New file: /log endpoint with SKIP + rule engine + neg feedback
+//! v2.1.0+MVF - 🌟 Content fingerprint dedup for rule engine extractions;
+//!   prevents duplicate memories when same content triggers multiple rules
+//!   or when /log is called multiple times with identical input.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -433,7 +446,7 @@ fn parse_recall_context(ctx: &str) -> Vec<RecallContextEntry> {
 ///
 /// Processing pipeline:
 /// 1. Write each turn to raw_logs (encrypted if key available)
-/// 2. For each user turn: SKIP classification → rule engine → neg feedback
+/// 2. For each user turn: SKIP classification → rule engine → content dedup → neg feedback
 /// 3. Return 202 { logged, session_id }
 pub async fn mpi_log(
     State(state): State<Arc<MpiState>>,
@@ -454,6 +467,10 @@ pub async fn mpi_log(
 
     // Track the most recent assistant turn's recall_context for neg feedback
     let mut last_assistant_recall_ctx: Option<String> = request_recall_ctx.map(|s| s.to_string());
+
+    // Track content already extracted in THIS request to prevent intra-request
+    // duplicates (e.g. P2 + P5 both extracting from the same message).
+    let mut extracted_this_request: Vec<Vec<u8>> = Vec::new();
 
     for (idx, turn) in req.turns.iter().enumerate() {
         let turn_index = idx as i64;
@@ -478,21 +495,60 @@ pub async fn mpi_log(
             if extractable == 1 {
                 let extractions = run_rule_engine(&turn.content);
                 for ext in extractions {
-                    // Build a MemoryRecord from extraction
                     let encrypted_content = ext.content.as_bytes().to_vec();
+
+                    // ========================================
+                    // Content dedup (v2.1.0+MVF)
+                    // ========================================
+                    // Two-level dedup:
+                    // 1. Intra-request: check in-memory set (zero cost)
+                    // 2. Cross-request: check SQLite for existing Active record (< 0.5ms)
+                    //
+                    // This prevents:
+                    // - P2 + P5 both creating a record for "I am allergic to shellfish"
+                    // - Repeated /log calls with the same conversation producing duplicates
+
+                    // Level 1: Intra-request dedup (same content already extracted in this request)
+                    if extracted_this_request.contains(&encrypted_content) {
+                        debug!(
+                            session = %req.session_id,
+                            turn = turn_index,
+                            tags = ?ext.tags,
+                            "[LOG_RULE] ⏭️ Skipped (intra-request duplicate)"
+                        );
+                        continue;
+                    }
+
+                    // Level 2: Cross-request dedup (same content already in SQLite)
+                    if state.storage.has_active_content(&owner, &encrypted_content).await {
+                        debug!(
+                            session = %req.session_id,
+                            turn = turn_index,
+                            tags = ?ext.tags,
+                            "[LOG_RULE] ⏭️ Skipped (content already exists in DB)"
+                        );
+                        // Still track it for intra-request dedup
+                        extracted_this_request.push(encrypted_content);
+                        continue;
+                    }
+
+                    // Build a MemoryRecord from extraction
                     let mut record = MemoryRecord::new(
                         owner,
                         now_ts,
                         ext.layer,
                         ext.tags,
                         req.source_ai.clone(),
-                        encrypted_content,
+                        encrypted_content.clone(),
                         vec![], // embedding = NULL, Miner Step 0.5 will backfill
                     );
                     record.signature = state.identity.sign(&record.record_id);
 
                     // Persist to SQLite (embedding_model="" since no embedding)
                     state.storage.insert(&record, "").await;
+
+                    // Track this content for intra-request dedup
+                    extracted_this_request.push(encrypted_content);
 
                     // Update Identity cache if tags indicate identity info
                     if record.topic_tags.iter().any(|t| t == "identity" || t == "allergy") {
@@ -710,5 +766,16 @@ mod tests {
     fn test_parse_recall_context_invalid() {
         let entries = parse_recall_context("not json");
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_rule_engine_allergy_en_triggers_p2_and_p5() {
+        // "I am allergic to shellfish" matches both P2 (I am...) and P5 (allergic to...)
+        // Both should produce extractions with the SAME content
+        let results = run_rule_engine("I am allergic to shellfish");
+        // P2 produces identity tag, P5 produces allergy tag
+        assert!(results.len() >= 2, "Should match both P2 and P5");
+        // Both extractions have the same content — content dedup will catch this
+        assert_eq!(results[0].content, results[1].content);
     }
 }
