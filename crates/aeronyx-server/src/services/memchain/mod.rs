@@ -55,9 +55,25 @@
 //! ## Last Modified
 //! v0.2.0 - Initial MemChain storage engine
 
+// New primary engine
+pub mod storage;
+pub mod vector;
+pub mod mvf;
+pub mod graph;
+
+// Legacy engine (deprecated)
 pub mod aof;
 pub mod mempool;
 
-// Re-export primary types
+// Re-exports: New
+pub use storage::{MemoryStorage, StorageStats, LayerCounts, RawLogRow, derive_rawlog_key};
+pub use vector::{
+    VectorIndex, SearchResult, DedupResult,
+    cosine_similarity, compute_recall_score,
+    dedup_threshold_for_layer, EPISODE_DEDUP_WINDOW_SECS,
+    ARCHIVE_OBSERVATION_SECS,
+};
+
+// Re-exports: Legacy
 pub use aof::AofWriter;
 pub use mempool::MemPool;
