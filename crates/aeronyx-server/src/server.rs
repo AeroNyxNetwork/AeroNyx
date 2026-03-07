@@ -40,7 +40,9 @@ use aeronyx_transport::UdpTransport;
 #[cfg(target_os = "linux")]
 use aeronyx_transport::LinuxTun;
 
-use crate::api::mpi::{build_mpi_router, MpiState};
+use rusqlite::OptionalExtension;
+
+use crate::api::mpi::{build_mpi_router, MpiState, BaselineSnapshot};
 use crate::config::{MemChainConfig, ServerConfig};
 use crate::error::{Result, ServerError};
 
@@ -200,24 +202,18 @@ impl Server {
             }
 
             // Load or create MVF baseline from chain_state
-            let mvf_baseline: Option<crate::api::BaselineSnapshot> = {
-                let baseline_str: Option<String> = st.load_user_weights(&[0u8; 0]).await
-                    .and_then(|_| None); // placeholder — load from chain_state below
-
-                // Direct SQLite query for mvf_baseline
-                let conn: tokio::sync::MutexGuard<'_, rusqlite::Connection> = st.conn_lock().await;
-                let result: Option<String> = conn.query_row(
+            let mvf_baseline: Option<BaselineSnapshot> = {
+                let conn = st.conn_lock().await;
+                let raw: Option<Vec<u8>> = conn.query_row(
                     "SELECT value FROM chain_state WHERE key = 'mvf_baseline'",
                     [],
-                    |row: &rusqlite::Row<'_>| {
-                        let blob: Vec<u8> = row.get(0)?;
-                        Ok(String::from_utf8_lossy(&blob).to_string())
-                    },
-                ).optional().ok().flatten();
+                    |row: &rusqlite::Row<'_>| row.get::<_, Vec<u8>>(0),
+                ).optional().unwrap_or(None);
                 drop(conn);
 
-                result.and_then(|json_str| {
-                    serde_json::from_str::<crate::api::BaselineSnapshot>(&json_str).ok()
+                raw.and_then(|bytes| {
+                    let s = String::from_utf8_lossy(&bytes);
+                    serde_json::from_str::<BaselineSnapshot>(&s).ok()
                 })
             };
 
@@ -261,14 +257,14 @@ impl Server {
                     let now_ts = SystemTime::now().duration_since(UNIX_EPOCH)
                         .unwrap_or_default().as_secs() as i64;
 
-                    let baseline = crate::api::BaselineSnapshot {
+                    let baseline = BaselineSnapshot {
                         positive_rate: rate,
                         sample_size: feedback.len(),
                         frozen_at: now_ts,
                     };
 
                     if let Ok(json) = serde_json::to_string(&baseline) {
-                        let conn: tokio::sync::MutexGuard<'_, rusqlite::Connection> = st.conn_lock().await;
+                        let conn = st.conn_lock().await;
                         let _ = conn.execute(
                             "INSERT OR REPLACE INTO chain_state (key, value) VALUES ('mvf_baseline', ?1)",
                             rusqlite::params![json.as_bytes()],
