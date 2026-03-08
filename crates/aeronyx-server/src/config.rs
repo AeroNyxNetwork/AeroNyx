@@ -3,8 +3,37 @@
 // ============================================
 //! # Server Configuration
 //!
-//! v2.1+MVF — Added db_path, compaction_threshold, mvf_alpha, mvf_enabled,
-//! cold_start_threshold, cold_start_until, rawlog_batch_threshold.
+//! ## Creation Reason
+//! Central configuration for all AeroNyx server subsystems, loaded from TOML.
+//!
+//! ## Modification Reason
+//! v2.1+MVF+Auth — Added `api_secret` field to MemChainConfig for MPI Bearer token auth.
+//!
+//! ## Main Functionality
+//! - ServerConfig: top-level config with network, vpn, tun, limits, logging, management, memchain
+//! - MemChainConfig: memory system config with MVF parameters, DB paths, and API auth
+//! - Validation for all config sections
+//!
+//! ## Dependencies
+//! - Used by server.rs to initialize all subsystems
+//! - MemChainConfig consumed by MPI router (api/mpi.rs) for auth middleware
+//! - MemChainConfig consumed by storage.rs for DB path
+//!
+//! ## Main Logical Flow
+//! 1. Load TOML file → deserialize into ServerConfig
+//! 2. Validate all sections (network, vpn, tun, limits, management, memchain)
+//! 3. Return validated config for server initialization
+//!
+//! ⚠️ Important Note for Next Developer:
+//! - api_secret validation: must be >= 16 chars when set (prevents weak secrets)
+//! - Empty/None api_secret = open access (backward compatible)
+//! - All MemChain config fields have serde defaults for backward compatibility
+//!
+//! ## Last Modified
+//! v2.1.0 - Added db_path, compaction_threshold, mvf_alpha, mvf_enabled,
+//!           cold_start_threshold, cold_start_until, rawlog_batch_threshold
+//! v2.1.0+MVF - MVF fields added
+//! v2.1.0+MVF+Auth - 🌟 Added api_secret for MPI Bearer token authentication
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -142,6 +171,46 @@ pub struct MemChainConfig {
     pub cold_start_until: usize,
     #[serde(default = "default_rawlog_batch_threshold")]
     pub rawlog_batch_threshold: usize,
+    /// Path to the local embedding model directory.
+    ///
+    /// The directory must contain `model.onnx` and `tokenizer.json` for
+    /// MiniLM-L6-v2 (or compatible BERT-family model).
+    /// If the path does not exist or files are missing, embedding is disabled
+    /// and the system falls back to OpenClaw Gateway `/v1/embeddings`.
+    ///
+    /// ## Configuration Example
+    /// ```toml
+    /// [memchain]
+    /// embed_model_path = "models/minilm-l6-v2"
+    /// ```
+    #[serde(default = "default_embed_model_path")]
+    pub embed_model_path: String,
+
+    /// Expected embedding dimension from the local model.
+    /// MiniLM-L6-v2 produces 384-dim vectors. Used for validation only.
+    #[serde(default = "default_embed_dim")]
+    pub embed_dim: usize,
+
+    /// Maximum token sequence length for embedding inference.
+    /// Inputs longer than this are truncated. MiniLM supports up to 512
+    /// but 128 is optimal for MemChain's short content (preferences, facts).
+    /// 512 would quadruple inference time with no quality benefit.
+    #[serde(default = "default_embed_max_tokens")]
+    pub embed_max_tokens: usize,
+
+    /// MPI Bearer token secret for API authentication.
+    ///
+    /// When set (non-empty, >= 16 chars), all MPI endpoints require:
+    ///   `Authorization: Bearer <api_secret>`
+    /// When None or empty, MPI is open (backward compatible, loopback-only mitigates).
+    ///
+    /// ## Configuration Example
+    /// ```toml
+    /// [memchain]
+    /// api_secret = "your-secret-at-least-16-chars"
+    /// ```
+    #[serde(default)]
+    pub api_secret: Option<String>,
 }
 
 fn default_memchain_api_addr() -> SocketAddr { "127.0.0.1:8421".parse().unwrap() }
@@ -153,6 +222,9 @@ fn default_mvf_alpha() -> f32 { 0.5 }
 fn default_cold_start_threshold() -> usize { 10 }
 fn default_cold_start_until() -> usize { 200 }
 fn default_rawlog_batch_threshold() -> usize { 100 }
+fn default_embed_model_path() -> String { "models/minilm-l6-v2".into() }
+fn default_embed_dim() -> usize { 384 }
+fn default_embed_max_tokens() -> usize { 128 }
 
 impl MemChainConfig {
     pub fn validate(&self) -> Result<()> {
@@ -183,12 +255,32 @@ impl MemChainConfig {
                     ));
                 }
             }
+
+            // Validate api_secret: if set, must be >= 16 characters
+            // This prevents weak secrets that could be easily brute-forced.
+            // None or empty string = open access (backward compatible).
+            if let Some(ref secret) = self.api_secret {
+                if !secret.is_empty() && secret.len() < 16 {
+                    return Err(ServerError::config_invalid(
+                        "memchain.api_secret",
+                        format!("must be at least 16 characters, got {}", secret.len()),
+                    ));
+                }
+            }
         }
         Ok(())
     }
 
     #[must_use] pub fn is_enabled(&self) -> bool { self.mode != MemChainMode::Off }
     #[must_use] pub fn is_p2p(&self) -> bool { self.mode == MemChainMode::P2p }
+
+    /// Returns the effective API secret, or None if auth is disabled.
+    ///
+    /// Empty string is treated as None (no auth) for backward compatibility.
+    #[must_use]
+    pub fn effective_api_secret(&self) -> Option<&str> {
+        self.api_secret.as_deref().filter(|s| !s.is_empty())
+    }
 
     #[must_use]
     pub fn is_origin_trusted(&self, origin_hex: &str, server_pubkey_hex: &str) -> bool {
@@ -213,6 +305,10 @@ impl Default for MemChainConfig {
             cold_start_threshold: default_cold_start_threshold(),
             cold_start_until: default_cold_start_until(),
             rawlog_batch_threshold: default_rawlog_batch_threshold(),
+            embed_model_path: default_embed_model_path(),
+            embed_dim: default_embed_dim(),
+            embed_max_tokens: default_embed_max_tokens(),
+            api_secret: None,
         }
     }
 }
@@ -414,6 +510,7 @@ mod tests {
         assert_eq!(config.memchain.mvf_alpha, 0.5);
         assert!(!config.memchain.mvf_enabled);
         assert_eq!(config.memchain.cold_start_threshold, 10);
+        assert!(config.memchain.api_secret.is_none());
     }
 
     #[test]
@@ -426,6 +523,60 @@ mod tests {
         assert_eq!(mc.cold_start_threshold, 10);
         assert_eq!(mc.cold_start_until, 200);
         assert_eq!(mc.rawlog_batch_threshold, 100);
+        assert_eq!(mc.embed_model_path, "models/minilm-l6-v2");
+        assert_eq!(mc.embed_dim, 384);
+        assert_eq!(mc.embed_max_tokens, 128);
+        assert!(mc.api_secret.is_none());
+        assert!(mc.effective_api_secret().is_none());
+    }
+
+    #[test]
+    fn test_api_secret_validation_too_short() {
+        let mc = MemChainConfig {
+            api_secret: Some("short".into()),
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_api_secret_validation_valid() {
+        let mc = MemChainConfig {
+            api_secret: Some("this-is-a-long-secret-key-1234".into()),
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_api_secret_empty_is_none() {
+        let mc = MemChainConfig {
+            api_secret: Some(String::new()),
+            ..Default::default()
+        };
+        // Empty string passes validation (treated as disabled)
+        assert!(mc.validate().is_ok());
+        // effective_api_secret returns None for empty string
+        assert!(mc.effective_api_secret().is_none());
+    }
+
+    #[test]
+    fn test_api_secret_none_is_open() {
+        let mc = MemChainConfig {
+            api_secret: None,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+        assert!(mc.effective_api_secret().is_none());
+    }
+
+    #[test]
+    fn test_effective_api_secret() {
+        let mc = MemChainConfig {
+            api_secret: Some("my-secure-secret-token-here".into()),
+            ..Default::default()
+        };
+        assert_eq!(mc.effective_api_secret(), Some("my-secure-secret-token-here"));
     }
 
     #[test]
