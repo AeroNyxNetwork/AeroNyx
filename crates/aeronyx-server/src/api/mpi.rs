@@ -74,7 +74,7 @@ use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 
 use crate::services::memchain::{MemoryStorage, VectorIndex, compute_recall_score};
-use crate::services::memchain::mvf::{self, WeightVector, MVF_DIM};
+use crate::services::memchain::mvf::{self, WeightVector};
 use crate::services::memchain::graph;
 use crate::services::memchain::EmbedEngine;
 
