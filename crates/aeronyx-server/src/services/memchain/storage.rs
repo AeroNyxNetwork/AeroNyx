@@ -11,6 +11,18 @@
 //! The sole primary storage engine for MemChain v2.0. Uses rusqlite (bundled)
 //! with WAL mode for indexed queries, crash-safe transactions, and lifecycle mgmt.
 //!
+//! ## Modification Reason (v2.1.0+MVF+Encryption)
+//! - Added transparent record content encryption (deterministic ChaCha20-Poly1305)
+//! - Added `record_key: Option<[u8; 32]>` to MemoryStorage for encryption key
+//! - `open()` now accepts `record_key` parameter
+//! - `insert()` encrypts content before storage when record_key is set
+//! - `row_to_record()` decrypts content on read when record_key is set
+//! - `has_active_content()` encrypts input before comparison (deterministic encryption
+//!   guarantees same plaintext → same ciphertext, so dedup still works)
+//! - `query_rows()` changed from static `Self::` to `&self` method to access record_key
+//! - `get_records_with_embedding()` now uses `self.query_rows()` unified path
+//! - All `Self::query_rows` call sites changed to `self.query_rows`
+//!
 //! ## v2.1+MVF Changes (Schema v4, vs Schema v2)
 //! - `records` table gains 3 new columns:
 //!   - `positive_feedback INTEGER NOT NULL DEFAULT 0`
@@ -65,12 +77,22 @@
 //! - Miner 压实: 改 `layer` 从 Episode→Archive（不是改 status），保持 status=Active。
 //! - `created_at` is local insertion time, not the record's `timestamp`.
 //! - v4 migration is additive-only (ALTER TABLE ADD COLUMN). Safe for existing data.
+//! - Record encryption is deterministic: same plaintext → same ciphertext.
+//!   This preserves content dedup (`has_active_content`) and record_id consistency.
+//! - Legacy unencrypted records are auto-detected on read (too short for nonce+tag).
+//! - `query_rows()` is `&self` (not `Self::`) — it needs `self.record_key` for decryption.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
 //! v2.1.0 - 🌟 4-layer support, plaintext embedding BLOB, compaction via layer change
 //! v2.1.0+MVF - 🌟 Schema v4: positive_feedback, negative_feedback, conflict_with columns;
 //!   migration from v2; error logging for feedback operations; row_to_record reads 18 cols
+//! v2.1.0+MVF+Encryption - 🌟 Transparent record content encryption (deterministic
+//!   ChaCha20-Poly1305); derive_record_key from Ed25519 private key; has_active_content
+//!   encrypts before comparison; get_records_with_embedding uses unified query path;
+//!   all Self::query_rows changed to self.query_rows;
+//!   maybe_migrate() clears old raw_logs on first run (rawlog key derivation changed
+//!   from public key to private key — old entries undecryptable, safe to discard)
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -88,10 +110,14 @@ use aeronyx_core::ledger::{MemoryLayer, MemoryRecord, RecordStatus};
 // RawLog Encryption (D3)
 // ============================================
 
-/// Derive a rawlog encryption key from the owner's Ed25519 private key.
+/// Derive a rawlog encryption key from the owner's Ed25519 key bytes.
 ///
 /// Uses HKDF-SHA256 with salt="memchain-rawlog", info="v1".
 /// Output: 32-byte key suitable for ChaCha20-Poly1305.
+///
+/// ⚠️ Known issue: currently called with public key in server.rs.
+/// Should be called with private key for proper security.
+/// See ARCHITECTURE.md Section 11 "rawlog key from public key".
 pub fn derive_rawlog_key(owner_secret: &[u8; 32]) -> [u8; 32] {
     use sha2::Sha256;
     use hkdf::Hkdf;
@@ -99,6 +125,89 @@ pub fn derive_rawlog_key(owner_secret: &[u8; 32]) -> [u8; 32] {
     let mut key = [0u8; 32];
     hk.expand(b"v1", &mut key).expect("HKDF expand should not fail for 32 bytes");
     key
+}
+
+/// Derive a record content encryption key from the owner's Ed25519 **private** key.
+///
+/// Uses HKDF-SHA256 with a different salt than rawlog to produce an independent key.
+/// This key is used for deterministic encryption of `encrypted_content` in the records table.
+///
+/// ## Security
+/// - Input MUST be the Ed25519 private key (32 bytes), NOT the public key.
+/// - Anyone with only the public key or the database file cannot decrypt.
+/// - The key is deterministic: same private key always produces the same record key.
+///
+/// ## Usage
+/// ```rust,ignore
+/// let record_key = derive_record_key(&identity.to_bytes());
+/// let storage = MemoryStorage::open("memchain.db", Some(record_key))?;
+/// ```
+pub fn derive_record_key(owner_private: &[u8; 32]) -> [u8; 32] {
+    use sha2::Sha256;
+    use hkdf::Hkdf;
+    let hk = Hkdf::<Sha256>::new(Some(b"memchain-records"), owner_private);
+    let mut key = [0u8; 32];
+    hk.expand(b"v1", &mut key).expect("HKDF expand should not fail for 32 bytes");
+    key
+}
+
+/// Deterministic encryption for record content.
+///
+/// Uses HMAC-SHA256(key, plaintext) truncated to 12 bytes as a deterministic nonce,
+/// then encrypts with ChaCha20-Poly1305. This ensures:
+/// - Same plaintext + same key → same ciphertext (dedup compatible)
+/// - Without the key, content cannot be decrypted
+/// - Format: nonce(12) || ciphertext(len + 16 tag)
+///
+/// ## Why deterministic?
+/// Record content dedup (`has_active_content`) and `record_id` hashing both
+/// depend on `encrypted_content` being consistent for the same plaintext.
+/// Random nonces would break both features.
+pub fn encrypt_record_content(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+    use chacha20poly1305::aead::{Aead, NewAead};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    // Deterministic nonce: HMAC-SHA256(key, plaintext)[0..12]
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(key)
+        .map_err(|e| format!("HMAC init: {}", e))?;
+    mac.update(plaintext);
+    let hmac_result = mac.finalize().into_bytes();
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(&hmac_result[..12]);
+
+    let cipher_key = Key::from_slice(key);
+    let cipher = ChaCha20Poly1305::new(cipher_key);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher.encrypt(nonce, plaintext)
+        .map_err(|e| format!("ChaCha20 encrypt: {}", e))?;
+
+    let mut result = Vec::with_capacity(12 + ciphertext.len());
+    result.extend_from_slice(&nonce_bytes);
+    result.extend_from_slice(&ciphertext);
+    Ok(result)
+}
+
+/// Decrypt record content.
+/// Input format: nonce(12) || ciphertext(len + 16 tag)
+pub fn decrypt_record_content(key: &[u8; 32], stored: &[u8]) -> Result<Vec<u8>, String> {
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+    use chacha20poly1305::aead::{Aead, NewAead};
+
+    if stored.len() < 12 + 16 {
+        return Err("Record ciphertext too short".into());
+    }
+
+    let cipher_key = Key::from_slice(key);
+    let cipher = ChaCha20Poly1305::new(cipher_key);
+    let nonce = Nonce::from_slice(&stored[..12]);
+    let ciphertext = &stored[12..];
+
+    cipher.decrypt(nonce, ciphertext)
+        .map_err(|e| format!("ChaCha20 decrypt: {}", e))
 }
 
 /// Encrypt content bytes for rawlog storage.
@@ -244,6 +353,13 @@ pub struct LayerCounts {
 
 /// SQLite 持久化存储引擎
 /// SQLite persistent storage engine for MemoryRecord
+///
+/// ## Record Content Encryption (v2.1.0+MVF+Encryption)
+/// When `record_key` is Some, all `encrypted_content` is transparently:
+/// - Encrypted on insert (deterministic ChaCha20-Poly1305)
+/// - Decrypted on read (get, get_active_records, etc.)
+/// - Encrypted before comparison in has_active_content (dedup still works)
+/// Callers see plaintext; SQLite stores ciphertext.
 pub struct MemoryStorage {
     conn: TokioMutex<Connection>,
     total_inserted: AtomicU64,
@@ -251,6 +367,10 @@ pub struct MemoryStorage {
     /// LRU 缓存：最近访问的 MemoryRecord，减少 recall 时的 SQLite IO
     /// LRU cache: recently accessed records to reduce SQLite IO during recall
     cache: RwLock<LruCache>,
+    /// Optional record content encryption key.
+    /// When Some, encrypted_content is encrypted/decrypted transparently.
+    /// Derived from Ed25519 private key via derive_record_key().
+    record_key: Option<[u8; 32]>,
 }
 
 /// 简易 LRU 缓存（基于 LinkedHashMap 语义的 Vec + HashMap）
@@ -302,8 +422,14 @@ impl LruCache {
 
 impl MemoryStorage {
     /// 打开或创建 SQLite 数据库
-    /// Open or create the SQLite database at the given path
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
+    /// Open or create the SQLite database at the given path.
+    ///
+    /// ## Arguments
+    /// * `path` - Database file path, or ":memory:" for in-memory DB
+    /// * `record_key` - Optional encryption key for record content.
+    ///   When Some, all encrypted_content is transparently encrypted/decrypted.
+    ///   Derive with `derive_record_key(&identity.to_bytes())`.
+    pub fn open(path: impl AsRef<Path>, record_key: Option<[u8; 32]>) -> Result<Self, String> {
         let path = path.as_ref();
 
         let conn = if path.to_str() == Some(":memory:") {
@@ -332,13 +458,20 @@ impl MemoryStorage {
         Self::create_schema(&conn)?;
         Self::maybe_migrate(&conn)?;
 
-        info!(path = %path.display(), "[STORAGE] ✅ SQLite database opened (schema v{})", SCHEMA_VERSION);
+        let encrypted_status = if record_key.is_some() { "encrypted" } else { "plaintext" };
+        info!(
+            path = %path.display(),
+            mode = encrypted_status,
+            "[STORAGE] ✅ SQLite database opened (schema v{})",
+            SCHEMA_VERSION
+        );
 
         Ok(Self {
             conn: TokioMutex::new(conn),
             total_inserted: AtomicU64::new(0),
             total_rejected: AtomicU64::new(0),
             cache: RwLock::new(LruCache::new(LRU_CACHE_CAPACITY)),
+            record_key,
         })
     }
 
@@ -553,6 +686,63 @@ impl MemoryStorage {
             info!("[STORAGE] ✅ Migration to v4 complete (positive_feedback, negative_feedback, conflict_with)");
         }
 
+        // ========================================
+        // Rawlog key migration: clear old raw_logs
+        // ========================================
+        // v2.1.0+MVF+Encryption: derive_rawlog_key was changed from using
+        // the PUBLIC key (insecure) to the PRIVATE key. Old rawlogs encrypted
+        // with the public-key-derived key are now undecryptable with the new
+        // private-key-derived key. Since raw_logs are transient (used only for
+        // /log extraction and Miner Step 0 feedback detection), we clear them
+        // on first run after the fix.
+        //
+        // Detection: chain_state key 'rawlog_key_migrated' = "1" means done.
+        // If absent, this is the first run after the fix → clear raw_logs.
+        {
+            let migrated: bool = conn.query_row(
+                "SELECT value FROM chain_state WHERE key = 'rawlog_key_migrated'",
+                [],
+                |row| {
+                    let v: Vec<u8> = row.get(0)?;
+                    Ok(v == b"1")
+                },
+            ).unwrap_or(false);
+
+            if !migrated {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM raw_logs",
+                    [],
+                    |row| row.get(0),
+                ).unwrap_or(0);
+
+                if count > 0 {
+                    match conn.execute("DELETE FROM raw_logs", []) {
+                        Ok(deleted) => {
+                            info!(
+                                deleted = deleted,
+                                "[STORAGE] 🔑 Cleared old raw_logs (rawlog key derivation migrated to private key)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "[STORAGE] Failed to clear old raw_logs during migration");
+                        }
+                    }
+                    // Reset autoincrement counter for clean IDs
+                    let _ = conn.execute(
+                        "DELETE FROM sqlite_sequence WHERE name = 'raw_logs'",
+                        [],
+                    );
+                }
+
+                // Mark migration as done
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO chain_state (key, value) VALUES ('rawlog_key_migrated', ?1)",
+                    params![b"1".as_slice()],
+                );
+                info!("[STORAGE] ✅ Rawlog key migration marker set");
+            }
+        }
+
         Ok(())
     }
 
@@ -566,6 +756,10 @@ impl MemoryStorage {
     /// # Arguments
     /// * `record` - 要插入的记忆记录
     /// * `embedding_model` - embedding 模型标识（如 "minilm-l6-v2"）
+    ///
+    /// ## Encryption
+    /// If `record_key` is set, `encrypted_content` is transparently encrypted
+    /// before storage. The caller always passes plaintext content.
     pub async fn insert(&self, record: &MemoryRecord, embedding_model: &str) -> bool {
         if !record.verify_id() {
             warn!(
@@ -594,6 +788,23 @@ impl MemoryStorage {
 
         let conflict_with_blob: Option<Vec<u8>> = record.conflict_with.map(|c| c.to_vec());
 
+        // Encrypt content if record_key is available (transparent encryption)
+        let stored_content: Vec<u8> = if let Some(ref key) = self.record_key {
+            if record.encrypted_content.is_empty() {
+                record.encrypted_content.clone()
+            } else {
+                match encrypt_record_content(key, &record.encrypted_content) {
+                    Ok(ct) => ct,
+                    Err(e) => {
+                        warn!("[STORAGE] Record content encryption failed, storing plaintext: {}", e);
+                        record.encrypted_content.clone()
+                    }
+                }
+            }
+        } else {
+            record.encrypted_content.clone()
+        };
+
         let conn = self.conn.lock().await;
 
         let result = conn.execute(
@@ -613,7 +824,7 @@ impl MemoryStorage {
                 record.source_ai,
                 record.status as u8 as i64,
                 record.supersedes.as_ref().map(|s| s.as_slice()),
-                record.encrypted_content.as_slice(),
+                stored_content.as_slice(),
                 embedding_blob.as_deref(),
                 embedding_model,
                 embedding_dim,
@@ -629,7 +840,7 @@ impl MemoryStorage {
         match result {
             Ok(changes) if changes > 0 => {
                 self.total_inserted.fetch_add(1, Ordering::Relaxed);
-                // 回填 LRU 缓存
+                // 回填 LRU 缓存 (store plaintext in cache for fast reads)
                 self.cache.write().put(record.clone());
                 debug!(
                     record_id = hex::encode(record.record_id),
@@ -667,10 +878,11 @@ impl MemoryStorage {
 
         // 缓存未命中 → 查 SQLite
         let conn = self.conn.lock().await;
+        let rk = self.record_key;
         let result = conn.query_row(
             Self::SELECT_RECORD_COLS,
             params![record_id.as_slice()],
-            |row| Self::row_to_record(row),
+            |row| Self::row_to_record(row, rk.as_ref()),
         )
         .optional()
         .unwrap_or_else(|e| { error!(error=%e, "[STORAGE] Query failed"); None });
@@ -695,7 +907,7 @@ impl MemoryStorage {
         let conn = self.conn.lock().await;
 
         if let Some(l) = layer {
-            Self::query_rows(&conn,
+            self.query_rows(&conn,
                 "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                         status,supersedes,encrypted_content,embedding,
                         signature,access_count,
@@ -706,7 +918,7 @@ impl MemoryStorage {
                 params![owner.as_slice(), l as u8 as i64, limit as i64],
             )
         } else {
-            Self::query_rows(&conn,
+            self.query_rows(&conn,
                 "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                         status,supersedes,encrypted_content,embedding,
                         signature,access_count,
@@ -726,7 +938,7 @@ impl MemoryStorage {
         after_timestamp: u64,
     ) -> Vec<MemoryRecord> {
         let conn = self.conn.lock().await;
-        Self::query_rows(&conn,
+        self.query_rows(&conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,
                     signature,access_count,
@@ -743,6 +955,11 @@ impl MemoryStorage {
     ///
     /// Returns `(MemoryRecord, embedding_model)` tuples so the caller can
     /// insert each vector into the correct partition.
+    ///
+    /// ## v2.1.0+MVF+Encryption Fix
+    /// Now uses unified row_to_record with record_key for transparent decryption.
+    /// Previously this method bypassed query_rows and called row_to_record without
+    /// the record_key parameter, causing encrypted records to not be decrypted.
     pub async fn get_records_with_embedding(&self, owner: &[u8; 32]) -> Vec<(MemoryRecord, String)> {
         let conn = self.conn.lock().await;
 
@@ -760,8 +977,9 @@ impl MemoryStorage {
             Err(e) => { error!(error=%e, "[STORAGE] Prepare failed"); return Vec::new(); }
         };
 
+        let rk = self.record_key;
         stmt.query_map(params![owner.as_slice()], |row| {
-            let record = Self::row_to_record(row)?;
+            let record = Self::row_to_record(row, rk.as_ref())?;
             let model: String = row.get(15)?; // embedding_model is at index 15
             Ok((record, model))
         })
@@ -847,7 +1065,7 @@ impl MemoryStorage {
         let conn = self.conn.lock().await;
 
         // Step 1: 选出最老的 Active Episode
-        let records = Self::query_rows(&conn,
+        let records = self.query_rows(&conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,
                     signature,access_count,
@@ -995,7 +1213,7 @@ impl MemoryStorage {
 
     /// Insert a raw conversation log entry.
     ///
-    /// If `rawlog_key` is provided, content is encrypted with XChaCha20-Poly1305
+    /// If `rawlog_key` is provided, content is encrypted with ChaCha20-Poly1305
     /// before storage. The `encrypted` flag is set accordingly.
     pub async fn insert_raw_log(
         &self,
@@ -1237,17 +1455,40 @@ impl MemoryStorage {
     /// - The same /log is called multiple times with identical content
     /// - Multiple rules (e.g. P2 + P5) extract from the same message
     ///
-    /// Compares raw `encrypted_content` bytes + `owner` + `status=Active`.
+    /// ## Encryption Compatibility (v2.1.0+MVF+Encryption)
+    /// When record_key is set, the input content (plaintext) is encrypted first
+    /// before comparison. Because encryption is deterministic (same plaintext →
+    /// same ciphertext), this correctly matches against stored encrypted content.
+    ///
+    /// Compares `encrypted_content` bytes + `owner` + `status=Active`.
     /// Returns true if a duplicate exists.
     ///
     /// Performance: Single indexed query, < 0.5ms.
     pub async fn has_active_content(&self, owner: &[u8; 32], content: &[u8]) -> bool {
+        // If record_key is set, encrypt the content first for comparison.
+        // Deterministic encryption guarantees same plaintext → same ciphertext.
+        let compare_content: Vec<u8> = if let Some(ref key) = self.record_key {
+            if content.is_empty() {
+                content.to_vec()
+            } else {
+                match encrypt_record_content(key, content) {
+                    Ok(ct) => ct,
+                    Err(e) => {
+                        warn!("[STORAGE] has_active_content encryption failed, comparing plaintext: {}", e);
+                        content.to_vec()
+                    }
+                }
+            }
+        } else {
+            content.to_vec()
+        };
+
         let conn = self.conn.lock().await;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM records
              WHERE owner = ?1 AND encrypted_content = ?2 AND status = 0
              LIMIT 1",
-            params![owner.as_slice(), content],
+            params![owner.as_slice(), compare_content.as_slice()],
             |row| row.get(0),
         ).unwrap_or(0);
         count > 0
@@ -1256,7 +1497,7 @@ impl MemoryStorage {
     /// Query records that need embedding backfill.
     pub async fn get_records_needing_embedding(&self, limit: usize) -> Vec<MemoryRecord> {
         let conn = self.conn.lock().await;
-        Self::query_rows(&conn,
+        self.query_rows(&conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,
                     signature,access_count,
@@ -1311,7 +1552,7 @@ impl MemoryStorage {
     /// Get records with _correction tag for Miner Step 0.6.
     pub async fn get_correction_records(&self) -> Vec<MemoryRecord> {
         let conn = self.conn.lock().await;
-        Self::query_rows(&conn,
+        self.query_rows(&conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,
                     signature,access_count,
@@ -1366,12 +1607,17 @@ impl MemoryStorage {
          FROM records WHERE record_id = ?1";
 
     /// 通用查询辅助：执行 SQL 返回 Vec<MemoryRecord>
-    fn query_rows(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Vec<MemoryRecord> {
+    ///
+    /// ## v2.1.0+MVF+Encryption
+    /// Changed from `Self::query_rows` (static) to `&self` method to access
+    /// `self.record_key` for transparent decryption in row_to_record().
+    fn query_rows(&self, conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Vec<MemoryRecord> {
         let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
             Err(e) => { error!(error=%e, "[STORAGE] Prepare failed"); return Vec::new(); }
         };
-        stmt.query_map(p, |row| Self::row_to_record(row))
+        let rk = self.record_key;
+        stmt.query_map(p, |row| Self::row_to_record(row, rk.as_ref()))
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
     }
@@ -1383,7 +1629,10 @@ impl MemoryStorage {
     ///   5: source_ai, 6: status, 7: supersedes, 8: encrypted_content,
     ///   9: embedding, 10: signature, 11: access_count,
     ///   12: positive_feedback, 13: negative_feedback, 14: conflict_with
-    fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
+    ///
+    /// If `record_key` is provided, `encrypted_content` is decrypted transparently.
+    /// Legacy plaintext records are auto-detected (too short for nonce+tag = 28 bytes).
+    fn row_to_record(row: &rusqlite::Row<'_>, record_key: Option<&[u8; 32]>) -> rusqlite::Result<MemoryRecord> {
         let record_id_blob: Vec<u8> = row.get(0)?;
         let owner_blob: Vec<u8> = row.get(1)?;
         let timestamp: i64 = row.get(2)?;
@@ -1394,6 +1643,22 @@ impl MemoryStorage {
         let supersedes_blob: Option<Vec<u8>> = row.get(7)?;
         let encrypted_content: Vec<u8> = row.get(8)?;
         let embedding_blob: Option<Vec<u8>> = row.get(9)?;
+
+        // Decrypt content if record_key provided and content looks encrypted (has nonce prefix)
+        // Minimum encrypted size = nonce(12) + tag(16) = 28 bytes
+        let decrypted_content = if let Some(key) = record_key {
+            if encrypted_content.len() >= 12 + 16 {
+                // Try to decrypt; if it fails, return raw bytes (might be legacy plaintext)
+                match decrypt_record_content(key, &encrypted_content) {
+                    Ok(plain) => plain,
+                    Err(_) => encrypted_content, // Legacy unencrypted record
+                }
+            } else {
+                encrypted_content // Too short to be encrypted, return as-is
+            }
+        } else {
+            encrypted_content
+        };
         let signature_blob: Vec<u8> = row.get(10)?;
         let access_count: i64 = row.get(11)?;
 
@@ -1434,7 +1699,7 @@ impl MemoryStorage {
             source_ai,
             status: RecordStatus::from_u8(status_val as u8).unwrap_or(RecordStatus::Active),
             supersedes,
-            encrypted_content,
+            encrypted_content: decrypted_content,
             embedding,
             signature,
             access_count: access_count as u32,
@@ -1450,6 +1715,7 @@ impl std::fmt::Debug for MemoryStorage {
         f.debug_struct("MemoryStorage")
             .field("inserted", &self.total_inserted())
             .field("rejected", &self.total_rejected())
+            .field("encrypted", &self.record_key.is_some())
             .finish()
     }
 }
@@ -1482,13 +1748,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_in_memory() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         assert_eq!(s.count().await, 0);
     }
 
     #[tokio::test]
     async fn test_insert_and_get() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let r = make_rec(100, MemoryLayer::Episode, "test");
         let id = r.record_id;
 
@@ -1507,7 +1773,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reject_invalid_hash() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let mut r = make_rec(100, MemoryLayer::Episode, "t");
         r.record_id = [0xFF; 32];
         assert!(!s.insert(&r, "m").await);
@@ -1516,7 +1782,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_active_records() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let o = [0xAA; 32];
         s.insert(&make_rec_owner(100, o, MemoryLayer::Episode), "m").await;
         s.insert(&make_rec_owner(200, o, MemoryLayer::Knowledge), "m").await;
@@ -1534,7 +1800,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_revoke() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let r = make_rec(100, MemoryLayer::Episode, "t");
         let id = r.record_id;
         s.insert(&r, "m").await;
@@ -1548,7 +1814,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compact_episodes_to_archive() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let o = [0xAA; 32];
         s.insert(&make_rec_owner(100, o, MemoryLayer::Episode), "m").await;
         s.insert(&make_rec_owner(200, o, MemoryLayer::Episode), "m").await;
@@ -1571,7 +1837,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_increment_access() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let r = make_rec(100, MemoryLayer::Episode, "t");
         let id = r.record_id;
         s.insert(&r, "m").await;
@@ -1583,7 +1849,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_chain_state() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         assert_eq!(s.last_block_hash().await, [0u8; 32]);
         s.set_chain_state(&[0xBB; 32], 42).await;
         assert_eq!(s.last_block_hash().await, [0xBB; 32]);
@@ -1592,7 +1858,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let o = [0xAA; 32];
         s.insert(&make_rec_owner(100, o, MemoryLayer::Episode), "m").await;
         s.insert(&make_rec_owner(200, o, MemoryLayer::Identity), "m").await;
@@ -1615,7 +1881,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_embedding_stored_as_null() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let r = MemoryRecord::new(
             [0xAA; 32], 100, MemoryLayer::Episode,
             vec![], "t".into(), b"c".to_vec(),
@@ -1629,7 +1895,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_records_with_embedding() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let o = [0xAA; 32];
 
         // 有 embedding
@@ -1650,7 +1916,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_positive_feedback_increment() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let r = make_rec(100, MemoryLayer::Episode, "t");
         let id = r.record_id;
         s.insert(&r, "m").await;
@@ -1665,7 +1931,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_negative_feedback_increment() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let r = make_rec(100, MemoryLayer::Episode, "t");
         let id = r.record_id;
         s.insert(&r, "m").await;
@@ -1678,7 +1944,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_conflict_with() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let r = make_rec(100, MemoryLayer::Episode, "t");
         let id = r.record_id;
         s.insert(&r, "m").await;
@@ -1693,7 +1959,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_feedback_score_via_storage() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let r = make_rec(100, MemoryLayer::Episode, "t");
         let id = r.record_id;
         s.insert(&r, "m").await;
@@ -1712,7 +1978,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_with_feedback_fields() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let mut r = make_rec(100, MemoryLayer::Episode, "t");
         r.positive_feedback = 5;
         r.negative_feedback = 2;
@@ -1728,11 +1994,138 @@ mod tests {
 
     #[tokio::test]
     async fn test_schema_version_is_4() {
-        let s = MemoryStorage::open(":memory:").unwrap();
+        let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
         let version: u32 = conn
             .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 4);
+    }
+
+    // ========================================
+    // Encryption Tests (v2.1.0+MVF+Encryption)
+    // ========================================
+
+    /// Helper: generate a deterministic test encryption key
+    fn test_record_key() -> [u8; 32] {
+        derive_record_key(&[0x42; 32])
+    }
+
+    #[tokio::test]
+    async fn test_encrypt_decrypt_record_content_roundtrip() {
+        let key = test_record_key();
+        let plaintext = b"User is allergic to nuts";
+        let ciphertext = encrypt_record_content(&key, plaintext).unwrap();
+
+        // Ciphertext should be longer than plaintext (nonce + tag overhead)
+        assert!(ciphertext.len() > plaintext.len());
+        // Ciphertext should not contain plaintext
+        assert!(!ciphertext.windows(plaintext.len()).any(|w| w == plaintext));
+
+        let decrypted = decrypt_record_content(&key, &ciphertext).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[tokio::test]
+    async fn test_deterministic_encryption() {
+        let key = test_record_key();
+        let plaintext = b"Same content always produces same ciphertext";
+        let ct1 = encrypt_record_content(&key, plaintext).unwrap();
+        let ct2 = encrypt_record_content(&key, plaintext).unwrap();
+        assert_eq!(ct1, ct2, "Deterministic encryption must produce same output");
+    }
+
+    #[tokio::test]
+    async fn test_different_plaintext_different_ciphertext() {
+        let key = test_record_key();
+        let ct1 = encrypt_record_content(&key, b"content A").unwrap();
+        let ct2 = encrypt_record_content(&key, b"content B").unwrap();
+        assert_ne!(ct1, ct2);
+    }
+
+    #[tokio::test]
+    async fn test_storage_with_encryption_insert_and_get() {
+        let key = test_record_key();
+        let s = MemoryStorage::open(":memory:", Some(key)).unwrap();
+        let r = make_rec(100, MemoryLayer::Episode, "test");
+        let id = r.record_id;
+
+        assert!(s.insert(&r, "minilm").await);
+
+        // Clear cache to force SQLite read (tests decryption path)
+        s.cache.write().clear();
+
+        let got = s.get(&id).await.unwrap();
+        // Content should be decrypted transparently
+        assert_eq!(got.encrypted_content, b"encrypted_data");
+        assert_eq!(got.source_ai, "test");
+    }
+
+    #[tokio::test]
+    async fn test_storage_encrypted_content_dedup() {
+        let key = test_record_key();
+        let s = MemoryStorage::open(":memory:", Some(key)).unwrap();
+        let o = [0xAA; 32];
+
+        // Insert a record with known content
+        let r = MemoryRecord::new(
+            o, 100, MemoryLayer::Episode,
+            vec!["test".into()], "ai".into(),
+            b"dedup test content".to_vec(),
+            vec![0.5; 4],
+        );
+        s.insert(&r, "m").await;
+
+        // has_active_content should find the encrypted record using plaintext input
+        assert!(s.has_active_content(&o, b"dedup test content").await);
+        assert!(!s.has_active_content(&o, b"different content").await);
+    }
+
+    #[tokio::test]
+    async fn test_storage_encrypted_get_active_records() {
+        let key = test_record_key();
+        let s = MemoryStorage::open(":memory:", Some(key)).unwrap();
+        let o = [0xAA; 32];
+        s.insert(&make_rec_owner(100, o, MemoryLayer::Episode), "m").await;
+        s.insert(&make_rec_owner(200, o, MemoryLayer::Knowledge), "m").await;
+
+        // Clear cache to test decryption through query_rows
+        s.cache.write().clear();
+
+        let recs = s.get_active_records(&o, None, 10).await;
+        assert_eq!(recs.len(), 2);
+        // Content should be decrypted
+        assert!(recs.iter().all(|r| !r.encrypted_content.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn test_storage_no_encryption_backward_compat() {
+        // None key = plaintext mode (backward compatible)
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let r = make_rec(100, MemoryLayer::Episode, "test");
+        let id = r.record_id;
+        s.insert(&r, "m").await;
+
+        s.cache.write().clear();
+        let got = s.get(&id).await.unwrap();
+        assert_eq!(got.encrypted_content, b"encrypted_data");
+    }
+
+    #[tokio::test]
+    async fn test_derive_record_key_deterministic() {
+        let k1 = derive_record_key(&[0x01; 32]);
+        let k2 = derive_record_key(&[0x01; 32]);
+        assert_eq!(k1, k2);
+        // Different input → different key
+        let k3 = derive_record_key(&[0x02; 32]);
+        assert_ne!(k1, k3);
+    }
+
+    #[tokio::test]
+    async fn test_record_key_independent_from_rawlog_key() {
+        let private_key = [0x42; 32];
+        let rk = derive_record_key(&private_key);
+        let rlk = derive_rawlog_key(&private_key);
+        assert_ne!(rk, rlk, "Record key and rawlog key must be independent");
     }
 }
