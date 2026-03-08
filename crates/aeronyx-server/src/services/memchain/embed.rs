@@ -54,9 +54,21 @@
 //! - Plugin falls back to OpenClaw Gateway `/v1/embeddings`
 //!
 //! ## Dependencies
-//! - `ort` 2.0 — ONNX Runtime Rust bindings
+//! - `ort` 2.0.0-rc.12 — ONNX Runtime Rust bindings
 //! - `tokenizers` 0.21 — HuggingFace tokenizer (pure Rust, no Python)
-//! - `ndarray` 0.16 — Tensor construction for ort input/output
+//! - `ndarray` 0.17 — Tensor construction for ort input/output
+//!   ⚠️ MUST be 0.17 to match ort rc.12's internal ndarray dependency.
+//!   Using 0.16 causes type incompatibility at compile time.
+//!
+//! ## Modification Reason (v2.1.0+Embed fix):
+//! Fixed 4 compilation errors caused by ort 2.0.0-rc.12 API changes:
+//! 1. ndarray 0.16 → 0.17 (type compatibility with ort's internal ndarray)
+//! 2. ort::inputs! macro no longer returns Result — removed .map_err()
+//! 3. try_extract_tensor() → try_extract_array() for ndarray ArrayViewD output
+//! 4. Output indexing adapted to use ndarray ArrayViewD instead of raw tuple
+//!
+//! Additionally, input tensors now use Tensor::from_array() with raw
+//! (shape, boxed_slice) form, which ort rc.12 accepts without copying.
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - Tokenizer MUST match model training — do NOT substitute with generic WordPiece.
@@ -69,19 +81,28 @@
 //! - Output vectors are L2-normalized (unit length): cosine_sim = dot product.
 //! - EmbedEngine is Send + Sync (ort::Session is thread-safe).
 //! - Run `scripts/download_models.sh` before first build/run to fetch model files.
+//! - ort::inputs! macro in rc.12 returns Vec<(Cow<str>, SessionInputValue)>
+//!   directly (NOT a Result). Do NOT add .map_err() — it won't compile.
+//! - Tensor::from_array() accepts (shape_tuple, Box<[T]>) or ndarray Array/View.
+//!   For i64 inputs, use raw (shape, boxed_slice) form for zero-copy.
+//! - Output extraction: use try_extract_array::<f32>() which returns
+//!   ArrayViewD<f32> (dynamic-dim ndarray view). Do NOT use try_extract_tensor
+//!   which returns a raw (&Shape, &[f32]) tuple in rc.12.
 //!
 //! ## Last Modified
 //! v2.1.0+Embed - 🌟 Initial implementation: disk-based model loading,
 //!   ort 2.0, tokenizers 0.21, attention-mask-weighted mean pooling,
 //!   L2 normalize, batch support, configurable max_seq_length
+//! v2.1.0+Embed-fix - 🔧 Fixed ort rc.12 API compatibility:
+//!   ndarray 0.17, Tensor::from_array, try_extract_array, inputs! macro
 
 use std::path::Path;
 
-use ndarray::Array2;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
+use ort::value::Tensor;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // ============================================
 // Constants
@@ -224,7 +245,8 @@ impl EmbedEngine {
     ///
     /// ## Pipeline
     /// 1. Tokenize all texts (pad to longest in batch, truncate to max_seq_length)
-    /// 2. Build input_ids + attention_mask + token_type_ids as ndarray::Array2<i64>
+    /// 2. Build input_ids + attention_mask + token_type_ids as Tensor via
+    ///    Tensor::from_array with (shape, Box<[i64]>) — zero-copy into ort
     /// 3. Run ONNX session → last_hidden_state [batch, seq_len, 384]
     /// 4. Mean-pool token embeddings (attention-mask-weighted, excluding padding)
     /// 5. L2-normalize each vector to unit length
@@ -265,9 +287,15 @@ impl EmbedEngine {
         // ── Step 2: Build tensors ─────────────────────────────────────
         // ONNX model expects: input_ids, attention_mask, token_type_ids
         // All shape [batch_size, seq_len], dtype i64
-        let mut input_ids = Vec::with_capacity(batch_size * seq_len);
-        let mut attention_mask = Vec::with_capacity(batch_size * seq_len);
-        let mut token_type_ids = Vec::with_capacity(batch_size * seq_len);
+        //
+        // ort 2.0.0-rc.12 API: Tensor::from_array accepts
+        //   (shape_as_slice_or_tuple, Box<[T]>) for zero-copy ownership,
+        //   or ndarray Array/ArrayView for borrowed data.
+        // We use the raw (shape, boxed_slice) form for efficiency.
+        let total_elements = batch_size * seq_len;
+        let mut input_ids = Vec::with_capacity(total_elements);
+        let mut attention_mask_raw = Vec::with_capacity(total_elements);
+        let mut token_type_ids = Vec::with_capacity(total_elements);
 
         for enc in &encodings {
             let ids: &[u32] = enc.get_ids();
@@ -276,39 +304,46 @@ impl EmbedEngine {
 
             for i in 0..seq_len {
                 input_ids.push(ids.get(i).copied().unwrap_or(0) as i64);
-                attention_mask.push(mask.get(i).copied().unwrap_or(0) as i64);
+                attention_mask_raw.push(mask.get(i).copied().unwrap_or(0) as i64);
                 token_type_ids.push(types.get(i).copied().unwrap_or(0) as i64);
             }
         }
 
-        let ids_array = Array2::from_shape_vec((batch_size, seq_len), input_ids)
-            .map_err(|e| format!("input_ids shape: {}", e))?;
-        let mask_array = Array2::from_shape_vec((batch_size, seq_len), attention_mask.clone())
-            .map_err(|e| format!("attention_mask shape: {}", e))?;
-        let types_array = Array2::from_shape_vec((batch_size, seq_len), token_type_ids)
-            .map_err(|e| format!("token_type_ids shape: {}", e))?;
+        // Build ort Tensor values using (shape, Box<[i64]>) form.
+        // This is the recommended zero-copy path in ort 2.0.0-rc.12.
+        let shape = [batch_size, seq_len];
+
+        let ids_tensor = Tensor::from_array((shape, input_ids.into_boxed_slice()))
+            .map_err(|e| format!("input_ids tensor: {}", e))?;
+        let mask_tensor = Tensor::from_array((shape, attention_mask_raw.clone().into_boxed_slice()))
+            .map_err(|e| format!("attention_mask tensor: {}", e))?;
+        let types_tensor = Tensor::from_array((shape, token_type_ids.into_boxed_slice()))
+            .map_err(|e| format!("token_type_ids tensor: {}", e))?;
 
         // ── Step 3: ONNX inference ────────────────────────────────────
+        // ort::inputs! macro in rc.12 returns Vec<(Cow<str>, SessionInputValue)>
+        // directly — it does NOT return a Result, so no .map_err() needed.
         let outputs = self.session.run(
             ort::inputs![
-                "input_ids" => ids_array,
-                "attention_mask" => mask_array,
-                "token_type_ids" => types_array,
+                "input_ids" => ids_tensor,
+                "attention_mask" => mask_tensor,
+                "token_type_ids" => types_tensor,
             ]
-            .map_err(|e| format!("Input creation: {}", e))?,
         )
         .map_err(|e| format!("ONNX inference: {}", e))?;
 
         // Output[0] = last_hidden_state: [batch_size, seq_len, hidden_dim]
+        // ort rc.12: try_extract_array() returns ArrayViewD<f32> (dynamic ndarray view)
+        // This supports .shape() and multi-dimensional indexing via [[b, s, d]].
         let hidden = outputs[0]
-            .try_extract_tensor::<f32>()
+            .try_extract_array::<f32>()
             .map_err(|e| format!("Output extraction: {}", e))?;
 
-        let shape = hidden.shape();
-        if shape.len() != 3 {
-            return Err(format!("Expected 3D output [batch, seq, dim], got {}D", shape.len()));
+        let hidden_shape = hidden.shape();
+        if hidden_shape.len() != 3 {
+            return Err(format!("Expected 3D output [batch, seq, dim], got {}D", hidden_shape.len()));
         }
-        let hidden_dim = shape[2];
+        let hidden_dim = hidden_shape[2];
 
         // ── Step 4: Mean pooling with attention mask ──────────────────
         // CRITICAL: padding tokens have non-zero hidden states in transformer models.
@@ -327,10 +362,11 @@ impl EmbedEngine {
             let mut mask_sum = 0.0f32;
 
             for s in 0..seq_len {
-                let m = attention_mask[b * seq_len + s] as f32;
+                let m = attention_mask_raw[b * seq_len + s] as f32;
                 if m > 0.0 {
                     mask_sum += m;
                     for d in 0..hidden_dim {
+                        // ndarray ArrayViewD supports IxDyn indexing via &[usize] slice
                         pooled[d] += hidden[[b, s, d]] * m;
                     }
                 }
