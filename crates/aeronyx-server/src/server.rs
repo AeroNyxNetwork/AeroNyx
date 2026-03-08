@@ -15,6 +15,37 @@
 //!           MPI router merged, BroadcastRecord/SyncRecordRequest handling,
 //!           vector index rebuild on startup, new Miner 8-arg signature.
 //! v2.1.1 - Fixed duplicate LinuxTun import, removed unused `trace` import
+//! v2.1.0+MVF+Encryption - 🌟 MemoryStorage.open() now receives record_key
+//!   derived from Ed25519 private key for transparent record content encryption.
+//!   MpiState now receives api_secret from config for Bearer token auth.
+//!
+//! ## Modification Reason (v2.1.0+MVF+Encryption)
+//! - init_memchain() derives record_key from identity private key via
+//!   derive_record_key() and passes it to MemoryStorage::open()
+//! - MpiState construction now includes api_secret from config
+//! - Both changes enable the two pending security features:
+//!   1. Record content encryption at rest
+//!   2. MPI Bearer token authentication
+//!
+//! ## Main Functionality
+//! - Server lifecycle: init → run → shutdown
+//! - Dual-engine MemChain initialization (SQLite+Vector + legacy MemPool+AOF)
+//! - MPI API server with auth middleware
+//! - Smart Miner with MVF integration
+//! - UDP/TUN packet handling
+//! - Management reporting (heartbeat, sessions, commands, WebSocket)
+//!
+//! ## Dependencies
+//! - config.rs for ServerConfig (including MemChainConfig.api_secret)
+//! - storage.rs for MemoryStorage (with record_key encryption)
+//! - mpi.rs for MPI router (with auth middleware)
+//! - All other server subsystems
+//!
+//! ⚠️ Important Note for Next Developer:
+//! - record_key is derived from identity.to_bytes() (Ed25519 PRIVATE key)
+//! - Do NOT use public_key_bytes() for record_key derivation (security critical)
+//! - api_secret flows: config.rs → server.rs → MpiState → auth middleware
+//! - The rawlog key derivation still uses public key (known issue, separate fix)
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,6 +87,8 @@ use crate::management::{
 use crate::miner::ReflectionMiner;
 #[allow(deprecated)]
 use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
+use crate::services::memchain::storage::derive_record_key;
+use crate::services::memchain::EmbedEngine;
 use crate::services::{HandshakeService, IpPoolService, RoutingService, SessionManager};
 
 // ============================================
@@ -218,6 +251,35 @@ impl Server {
 
             let owner_key = self.identity.public_key_bytes();
 
+            // Get api_secret from config for MPI auth middleware
+            let api_secret = self.config.memchain.effective_api_secret()
+                .map(|s| s.to_string());
+
+            // Initialize local embedding engine (optional — graceful if missing)
+            let embed_engine: Option<Arc<EmbedEngine>> = {
+                let model_path = &self.config.memchain.embed_model_path;
+                let max_tokens = self.config.memchain.embed_max_tokens;
+                match EmbedEngine::load(model_path, max_tokens) {
+                    Ok(engine) => {
+                        info!(
+                            model = %model_path,
+                            dim = engine.dim(),
+                            "[EMBED] ✅ Local embedding engine loaded"
+                        );
+                        Some(Arc::new(engine))
+                    }
+                    Err(e) => {
+                        warn!(
+                            model = %model_path,
+                            error = %e,
+                            "[EMBED] ⚠️ Local embedding unavailable — /embed returns 503, \
+                             Miner falls back to OpenClaw Gateway"
+                        );
+                        None
+                    }
+                }
+            };
+
             let mpi_state = Arc::new(MpiState {
                 storage: Arc::clone(st),
                 vector_index: Arc::clone(vi),
@@ -230,6 +292,8 @@ impl Server {
                 session_embeddings: parking_lot::RwLock::new(std::collections::HashMap::new()),
                 mvf_baseline: parking_lot::RwLock::new(mvf_baseline),
                 owner_key,
+                api_secret,
+                embed_engine: embed_engine.clone(),
             });
 
             // Pre-populate Identity cache
@@ -300,6 +364,13 @@ impl Server {
                 .with_compaction_threshold(self.config.memchain.compaction_threshold)
                 .with_mvf(self.config.memchain.mvf_enabled, Arc::clone(&user_weights));
 
+                // Attach local embed engine if available
+                let miner = if let Some(ref ee) = embed_engine {
+                    miner.with_embed_engine(Arc::clone(ee))
+                } else {
+                    miner
+                };
+
                 let miner_shutdown = self.shutdown_tx.subscribe();
                 tasks.push(("miner", tokio::spawn(async move {
                     miner.run(miner_shutdown).await;
@@ -352,6 +423,10 @@ impl Server {
     /// and the legacy engine (MemPool + AofWriter) for P2P compat.
     ///
     /// Also rebuilds the vector index from SQLite on startup.
+    ///
+    /// ## v2.1.0+MVF+Encryption
+    /// Now derives record_key from Ed25519 private key and passes it to
+    /// MemoryStorage::open() for transparent record content encryption.
     async fn init_memchain(&self) -> Result<(
         Arc<MemoryStorage>,
         Arc<VectorIndex>,
@@ -368,8 +443,15 @@ impl Server {
             }
         }
 
+        // Derive record encryption key from Ed25519 PRIVATE key.
+        // This ensures only the holder of the private key can decrypt record content.
+        // ⚠️ SECURITY: identity.to_bytes() returns the PRIVATE key (32 bytes).
+        //    Do NOT use public_key_bytes() here — that would defeat the purpose.
+        let record_key = derive_record_key(&self.identity.to_bytes());
+        info!("[MEMCHAIN] Record content encryption enabled (key derived from identity)");
+
         let storage = Arc::new(
-            MemoryStorage::open(db_path)
+            MemoryStorage::open(db_path, Some(record_key))
                 .map_err(|e| ServerError::startup_failed(format!("SQLite: {}", e)))?,
         );
 
