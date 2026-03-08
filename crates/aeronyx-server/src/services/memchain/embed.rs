@@ -200,8 +200,12 @@ fn init_ort_runtime(model_dir: &Path) -> Result<(), String> {
         match dylib_path {
             Some(path) => {
                 info!(path = %path.display(), "[EMBED] Found ONNX Runtime library");
-                match ort::init_from(path).commit() {
-                    Ok(_) => {
+                // ort rc.11 API:
+                //   init_from(path) -> Result<EnvironmentBuilder, ort::Error>
+                //   EnvironmentBuilder::commit() -> bool
+                match ort::init_from(path) {
+                    Ok(builder) => {
+                        builder.commit();
                         info!(path = %path.display(), "[EMBED] ✅ ONNX Runtime initialized (load-dynamic)");
                     }
                     Err(e) => {
