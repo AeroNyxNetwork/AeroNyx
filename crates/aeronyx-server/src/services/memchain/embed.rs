@@ -79,7 +79,7 @@ use std::path::Path;
 
 use ndarray::Array2;
 use ort::{GraphOptimizationLevel, Session};
-use tokenizers::Tokenizer;
+use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use tracing::{debug, info, warn};
 
 // ============================================
@@ -244,18 +244,18 @@ impl EmbedEngine {
         let mut tokenizer = self.tokenizer.clone();
 
         tokenizer
-            .with_truncation(Some(tokenizers::TruncationParams {
+            .with_truncation(Some(TruncationParams {
                 max_length: self.max_seq_length,
                 ..Default::default()
             }))
             .map_err(|e| format!("Truncation config: {}", e))?;
 
-        tokenizer.with_padding(Some(tokenizers::PaddingParams {
-            strategy: tokenizers::PaddingStrategy::BatchLongest,
+        tokenizer.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::BatchLongest,
             ..Default::default()
         }));
 
-        let encodings = tokenizer
+        let encodings: Vec<tokenizers::Encoding> = tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| format!("Tokenization failed: {}", e))?;
 
@@ -269,9 +269,9 @@ impl EmbedEngine {
         let mut token_type_ids = Vec::with_capacity(batch_size * seq_len);
 
         for enc in &encodings {
-            let ids = enc.get_ids();
-            let mask = enc.get_attention_mask();
-            let types = enc.get_type_ids();
+            let ids: &[u32] = enc.get_ids();
+            let mask: &[u32] = enc.get_attention_mask();
+            let types: &[u32] = enc.get_type_ids();
 
             for i in 0..seq_len {
                 input_ids.push(ids.get(i).copied().unwrap_or(0) as i64);
