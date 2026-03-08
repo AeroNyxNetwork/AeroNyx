@@ -80,7 +80,6 @@ use std::path::Path;
 use ndarray::Array2;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
-use ort::value::Value;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use tracing::{debug, info, warn};
 
