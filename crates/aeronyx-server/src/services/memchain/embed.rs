@@ -61,11 +61,16 @@
 //!   Using 0.16 causes type incompatibility at compile time.
 //!
 //! ## Modification Reason (v2.1.0+Embed fix):
-//! Fixed 4 compilation errors caused by ort 2.0.0-rc.12 API changes:
+//! Fixed 5 compilation errors caused by ort 2.0.0-rc.12 API changes:
 //! 1. ndarray 0.16 → 0.17 (type compatibility with ort's internal ndarray)
 //! 2. ort::inputs! macro no longer returns Result — removed .map_err()
 //! 3. try_extract_tensor() → try_extract_array() for ndarray ArrayViewD output
 //! 4. Output indexing adapted to use ndarray ArrayViewD instead of raw tuple
+//! 5. Session::run() requires &mut self in rc.12 — wrapped Session in
+//!    std::sync::Mutex to maintain &self signature and thread safety.
+//!    Mutex chosen over RwLock because run() is always a write operation.
+//!    Lock contention is minimal: inference takes 2-100ms, and concurrent
+//!    embed requests are rare in MemChain's access pattern.
 //!
 //! Additionally, input tensors now use Tensor::from_array() with raw
 //! (shape, boxed_slice) form, which ort rc.12 accepts without copying.
@@ -79,7 +84,7 @@
 //! - max_seq_length is configurable (default 128); MiniLM supports up to 512 but
 //!   128 is optimal for MemChain's short content. 512 quadruples inference time.
 //! - Output vectors are L2-normalized (unit length): cosine_sim = dot product.
-//! - EmbedEngine is Send + Sync (ort::Session is thread-safe).
+//! - EmbedEngine is Send + Sync (Session wrapped in Mutex for interior mutability).
 //! - Run `scripts/download_models.sh` before first build/run to fetch model files.
 //! - ort::inputs! macro in rc.12 returns Vec<(Cow<str>, SessionInputValue)>
 //!   directly (NOT a Result). Do NOT add .map_err() — it won't compile.
@@ -88,15 +93,20 @@
 //! - Output extraction: use try_extract_array::<f32>() which returns
 //!   ArrayViewD<f32> (dynamic-dim ndarray view). Do NOT use try_extract_tensor
 //!   which returns a raw (&Shape, &[f32]) tuple in rc.12.
+//! - Session::run() takes &mut self in ort rc.12. The Mutex wrapper handles
+//!   this transparently. Do NOT remove the Mutex or change &self to &mut self
+//!   on public methods — that would break concurrent access from HTTP handlers.
 //!
 //! ## Last Modified
 //! v2.1.0+Embed - 🌟 Initial implementation: disk-based model loading,
 //!   ort 2.0, tokenizers 0.21, attention-mask-weighted mean pooling,
 //!   L2 normalize, batch support, configurable max_seq_length
 //! v2.1.0+Embed-fix - 🔧 Fixed ort rc.12 API compatibility:
-//!   ndarray 0.17, Tensor::from_array, try_extract_array, inputs! macro
+//!   ndarray 0.17, Tensor::from_array, try_extract_array, inputs! macro,
+//!   Mutex<Session> for &mut self requirement on Session::run()
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
@@ -134,7 +144,11 @@ pub const MAX_BATCH_SIZE: usize = 100;
 
 /// Local embedding engine using ONNX Runtime + HuggingFace tokenizer.
 ///
-/// Thread-safe: `ort::Session` supports concurrent inference internally.
+/// Thread-safe: `ort::Session` is wrapped in `Mutex` because `Session::run()`
+/// requires `&mut self` in ort 2.0.0-rc.12. The Mutex provides interior
+/// mutability while keeping the public API as `&self` for ergonomic use
+/// from concurrent HTTP handlers.
+///
 /// The tokenizer is cloned per-call (cheap — only clones Arc references
 /// to vocabulary, not the vocabulary data itself).
 ///
@@ -145,7 +159,10 @@ pub const MAX_BATCH_SIZE: usize = 100;
 /// assert_eq!(vecs[0].len(), 384);
 /// ```
 pub struct EmbedEngine {
-    session: Session,
+    /// Wrapped in Mutex because ort rc.12 Session::run() requires &mut self.
+    /// Lock contention is minimal: inference is 2-100ms, concurrent embed
+    /// requests are rare in MemChain's single-agent access pattern.
+    session: Mutex<Session>,
     tokenizer: Tokenizer,
     max_seq_length: usize,
 }
@@ -212,7 +229,7 @@ impl EmbedEngine {
         );
 
         Ok(Self {
-            session,
+            session: Mutex::new(session),
             tokenizer,
             max_seq_length,
         })
@@ -250,6 +267,11 @@ impl EmbedEngine {
     /// 3. Run ONNX session → last_hidden_state [batch, seq_len, 384]
     /// 4. Mean-pool token embeddings (attention-mask-weighted, excluding padding)
     /// 5. L2-normalize each vector to unit length
+    ///
+    /// ## Thread Safety
+    /// Uses Mutex internally — safe to call from multiple threads concurrently.
+    /// Concurrent callers will serialize on the Mutex; this is acceptable because
+    /// inference dominates wall-clock time and concurrent embed calls are rare.
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -323,14 +345,22 @@ impl EmbedEngine {
         // ── Step 3: ONNX inference ────────────────────────────────────
         // ort::inputs! macro in rc.12 returns Vec<(Cow<str>, SessionInputValue)>
         // directly — it does NOT return a Result, so no .map_err() needed.
-        let outputs = self.session.run(
-            ort::inputs![
-                "input_ids" => ids_tensor,
-                "attention_mask" => mask_tensor,
-                "token_type_ids" => types_tensor,
-            ]
-        )
-        .map_err(|e| format!("ONNX inference: {}", e))?;
+        //
+        // Session::run() requires &mut self in ort rc.12, so we acquire
+        // the Mutex lock here. The lock is held only during inference.
+        let outputs = {
+            let mut session = self.session.lock()
+                .map_err(|e| format!("Session lock poisoned: {}", e))?;
+            session.run(
+                ort::inputs![
+                    "input_ids" => ids_tensor,
+                    "attention_mask" => mask_tensor,
+                    "token_type_ids" => types_tensor,
+                ]
+            )
+            .map_err(|e| format!("ONNX inference: {}", e))?
+        };
+        // Mutex released here — post-processing does not need the session
 
         // Output[0] = last_hidden_state: [batch_size, seq_len, hidden_dim]
         // ort rc.12: try_extract_array() returns ArrayViewD<f32> (dynamic ndarray view)
