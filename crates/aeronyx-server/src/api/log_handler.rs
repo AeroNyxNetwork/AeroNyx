@@ -31,6 +31,24 @@
 //!   1. Cross-request duplicates (same /log called twice)
 //!   2. Intra-request duplicates (P2 + P5 both match "I am allergic to X")
 //!
+//! ## Modification Reason (v2.1.0+MVF+Encryption)
+//! Fixed rawlog key derivation: changed from public key to PRIVATE key.
+//! Previously: `derive_rawlog_key(&identity.public_key_bytes())` — insecure,
+//! anyone with the public key could derive the rawlog encryption key.
+//! Now: `derive_rawlog_key(&identity.to_bytes())` — only private key holder
+//! can derive the key and decrypt rawlogs.
+//!
+//! ## Dependencies
+//! - MpiState (from mpi.rs) — shared state including identity, storage
+//! - storage.rs — derive_rawlog_key, insert_raw_log, has_active_content
+//! - MpiState.identity.to_bytes() — Ed25519 PRIVATE key for rawlog key derivation
+//!
+//! ⚠️ Important Note for Next Developer:
+//! - derive_rawlog_key MUST use identity.to_bytes() (PRIVATE key), NOT public_key_bytes()
+//! - Using public key defeats encryption (public key is broadcast on P2P network)
+//! - After this fix, old rawlogs encrypted with public-key-derived key are unreadable
+//! - Migration in storage.rs clears old raw_logs table on first run
+//!
 //! ## Immutable: 202 response format { logged, session_id } unchanged
 //!
 //! ## Last Modified
@@ -38,6 +56,8 @@
 //! v2.1.0+MVF - 🌟 Content fingerprint dedup for rule engine extractions;
 //!   prevents duplicate memories when same content triggers multiple rules
 //!   or when /log is called multiple times with identical input.
+//! v2.1.0+MVF+Encryption - 🌟 Fixed rawlog key derivation: now uses
+//!   identity.to_bytes() (PRIVATE key) instead of public_key_bytes().
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -448,12 +468,23 @@ fn parse_recall_context(ctx: &str) -> Vec<RecallContextEntry> {
 /// 1. Write each turn to raw_logs (encrypted if key available)
 /// 2. For each user turn: SKIP classification → rule engine → content dedup → neg feedback
 /// 3. Return 202 { logged, session_id }
+///
+/// ## RawLog Key Derivation (v2.1.0+MVF+Encryption)
+/// Uses `identity.to_bytes()` (Ed25519 PRIVATE key) for HKDF key derivation.
+/// Previously used `identity.public_key_bytes()` which was insecure — the public
+/// key is broadcast on the P2P network, so anyone could derive the rawlog key.
 pub async fn mpi_log(
     State(state): State<Arc<MpiState>>,
     Json(req): Json<LogRequest>,
 ) -> impl IntoResponse {
     let owner = state.identity.public_key_bytes();
-    let rawlog_key = derive_rawlog_key(&owner);
+
+    // ⚠️ SECURITY FIX (v2.1.0+MVF+Encryption):
+    // derive_rawlog_key now uses PRIVATE key (identity.to_bytes())
+    // Previously: derive_rawlog_key(&owner) — used PUBLIC key, insecure!
+    // identity.to_bytes() returns Keypair.secret.to_bytes() (confirmed in keys.rs)
+    let rawlog_key = derive_rawlog_key(&state.identity.to_bytes());
+
     let now_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
