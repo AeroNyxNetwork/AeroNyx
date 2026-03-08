@@ -23,6 +23,14 @@
 # - bundled mode compiles SQLite from source, avoiding system
 #   library version issues on GCP Ubuntu 22.04
 #
+# Modification Reason (v2.1.0+Embed — ndarray version bump):
+# - 🔧 Upgraded `ndarray` from 0.16 to 0.17 to match ort 2.0.0-rc.12's
+#   dependency requirement. ort rc.12 internally depends on ndarray ^0.17;
+#   using ndarray 0.16 causes type incompatibility (Array2<i64> from 0.16
+#   is a different type than Array2<i64> from 0.17 in Rust's type system),
+#   leading to `From<ArrayBase<OwnedRepr<i64>, Dim<[usize; 2]>>>` not
+#   being implemented for `SessionInputValue`.
+#
 # Main Functionality:
 # - Server binary with CLI interface
 # - Configuration management
@@ -55,12 +63,16 @@
 #   used by tokio-tungstenite's split() WS streams
 # - 🌟 rusqlite bundled mode requires a C compiler (cc) at build time
 #   This is already available on the GCP Ubuntu 22.04 build server.
+# - ⚠️ ndarray version MUST match ort's dependency. ort 2.0.0-rc.12
+#   requires ndarray ^0.17. Do NOT downgrade to 0.16 or Tensor
+#   conversions will fail at compile time.
 #
 # Last Modified:
 # v0.1.0 - Initial server implementation
 # v0.2.0 - Added bincode for MemChain integration
 # v1.3.0 - 🌟 Added tokio-tungstenite for WebSocket tunnel
 # v2.0.0 - 🌟 Added rusqlite for SQLite MemoryRecord storage
+# v2.1.0+Embed - 🔧 ndarray 0.16 → 0.17 for ort rc.12 compatibility
 # ============================================
 
 [package]
@@ -123,10 +135,12 @@ regex = "1.10"
 hkdf = "0.12"
 chacha20poly1305 = { workspace = true }
 
-# 🌟 v2.1.0+Embed: Local MiniLM embedding inference 
+# 🌟 v2.1.0+Embed: Local MiniLM embedding inference
+# ⚠️ ort 2.0.0-rc.12 requires ndarray ^0.17 — do NOT use ndarray 0.16
 ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
-ndarray = "0.16"
+# 🔧 v2.1.0+Embed: upgraded from 0.16 → 0.17 to match ort rc.12 dependency
+ndarray = "0.17"
 hmac = "0.12"
 
 # Error handling
