@@ -348,23 +348,31 @@ impl EmbedEngine {
         //
         // Session::run() requires &mut self in ort rc.12, so we acquire
         // the Mutex lock here. The lock is held only during inference.
-        let outputs = {
-            let mut session = self.session.lock()
-                .map_err(|e| format!("Session lock poisoned: {}", e))?;
-            session.run(
-                ort::inputs![
-                    "input_ids" => ids_tensor,
-                    "attention_mask" => mask_tensor,
-                    "token_type_ids" => types_tensor,
-                ]
-            )
-            .map_err(|e| format!("ONNX inference: {}", e))?
-        };
-        // Mutex released here — post-processing does not need the session
+        //
+        // ⚠️ Lifetime note: SessionOutputs borrows from Session, so we must
+        // ensure the MutexGuard outlives the outputs. We bind outputs first,
+        // then drop the guard explicitly after extracting the data we need.
+        // If we put session.run() at the end of a block, the MutexGuard drops
+        // before the temporary SessionOutputs, causing E0597.
+        let mut session = self.session.lock()
+            .map_err(|e| format!("Session lock poisoned: {}", e))?;
+        let outputs = session.run(
+            ort::inputs![
+                "input_ids" => ids_tensor,
+                "attention_mask" => mask_tensor,
+                "token_type_ids" => types_tensor,
+            ]
+        )
+        .map_err(|e| format!("ONNX inference: {}", e))?;
 
         // Output[0] = last_hidden_state: [batch_size, seq_len, hidden_dim]
         // ort rc.12: try_extract_array() returns ArrayViewD<f32> (dynamic ndarray view)
         // This supports .shape() and multi-dimensional indexing via [[b, s, d]].
+        //
+        // Note: `session` (MutexGuard) is still held here because `outputs`
+        // (SessionOutputs) borrows from it. The guard will be dropped at the
+        // end of embed_batch(). This is fine — the post-processing below is
+        // fast (microseconds) and does not cause meaningful lock contention.
         let hidden = outputs[0]
             .try_extract_array::<f32>()
             .map_err(|e| format!("Output extraction: {}", e))?;
