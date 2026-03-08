@@ -20,6 +20,24 @@
 //! Step 0.5 calls OpenClaw HTTP `POST /v1/embeddings` for MiniLM inference.
 //! No ort/ONNX dependency — all embedding computation delegated to OpenClaw.
 //!
+//! ## Modification Reason (v2.1.0+MVF+Encryption)
+//! Fixed rawlog key derivation in Step 0: changed from public key to PRIVATE key.
+//! Previously: `derive_rawlog_key(&owner)` where owner = public_key_bytes() — insecure.
+//! Now: `derive_rawlog_key(&self.identity.to_bytes())` — only private key holder
+//! can derive the key and decrypt rawlogs.
+//!
+//! ## Dependencies
+//! - storage.rs — MemoryStorage, derive_rawlog_key, decrypt_rawlog_content_pub
+//! - identity.to_bytes() — Ed25519 PRIVATE key for rawlog key derivation
+//! - vector.rs — VectorIndex, cosine_similarity
+//! - mvf.rs — WeightVector, SGD
+//!
+//! ⚠️ Important Note for Next Developer:
+//! - derive_rawlog_key MUST use identity.to_bytes() (PRIVATE key), NOT public_key_bytes()
+//! - Step 0 decrypts rawlogs — if the key is wrong, content will be garbage/empty
+//! - After the key derivation fix, old rawlogs encrypted with public-key-derived key
+//!   are cleared by the migration in storage.rs
+//!
 //! ## Error Isolation
 //! Each step has independent error handling. Step 0 failure does NOT block
 //! Step 1-5. All steps log errors and continue.
@@ -28,6 +46,8 @@
 //! v0.5.0 - Initial timer-based block packer
 //! v1.0.0 - Smart compaction via OpenClaw
 //! v2.1.0 - MVF feedback pipeline (Step 0, 0.5, 0.6) + SGD integration
+//! v2.1.0+MVF+Encryption - 🌟 Fixed rawlog key derivation in Step 0:
+//!   now uses identity.to_bytes() (PRIVATE key) instead of public_key_bytes().
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -52,6 +72,7 @@ use aeronyx_transport::UdpTransport;
 use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
 use crate::services::memchain::mvf;
 use crate::services::memchain::vector::cosine_similarity;
+use crate::services::memchain::EmbedEngine;
 use crate::services::SessionManager;
 
 // ============================================
@@ -102,6 +123,9 @@ pub struct ReflectionMiner {
     mvf_enabled: bool,
     /// Shared user_weights map (same Arc as MpiState)
     user_weights: Option<Arc<parking_lot::RwLock<std::collections::HashMap<String, mvf::WeightVector>>>>,
+    /// Local embedding engine (shared with MpiState). When Some, used for
+    /// embedding generation instead of calling OpenClaw Gateway HTTP.
+    embed_engine: Option<Arc<EmbedEngine>>,
 }
 
 impl ReflectionMiner {
@@ -128,6 +152,7 @@ impl ReflectionMiner {
             udp,
             mvf_enabled: false,
             user_weights: None,
+            embed_engine: None,
         }
     }
 
@@ -145,6 +170,15 @@ impl ReflectionMiner {
     ) -> Self {
         self.mvf_enabled = enabled;
         self.user_weights = Some(weights);
+        self
+    }
+
+    /// Set the local embedding engine for Miner steps.
+    /// When set, Miner uses local inference instead of OpenClaw Gateway HTTP.
+    /// Falls back to OpenClaw if local inference fails.
+    #[must_use]
+    pub fn with_embed_engine(mut self, engine: Arc<EmbedEngine>) -> Self {
+        self.embed_engine = Some(engine);
         self
     }
 
@@ -214,8 +248,13 @@ impl ReflectionMiner {
                 }
 
                 // Decrypt content for analysis
+                // ⚠️ SECURITY FIX (v2.1.0+MVF+Encryption):
+                // derive_rawlog_key now uses PRIVATE key (identity.to_bytes())
+                // Previously: derive_rawlog_key(&owner) — used PUBLIC key, insecure!
                 let content = if row.encrypted == 1 {
-                    let key = crate::services::memchain::storage::derive_rawlog_key(&owner);
+                    let key = crate::services::memchain::storage::derive_rawlog_key(
+                        &self.identity.to_bytes()
+                    );
                     String::from_utf8(
                         crate::services::memchain::storage::decrypt_rawlog_content_pub(&key, &row.content)
                             .unwrap_or_default()
@@ -644,7 +683,32 @@ impl ReflectionMiner {
             .as_str().map(|s| s.to_string())
     }
 
+    /// Generate embedding for a text.
+    ///
+    /// ## Strategy (v2.1.0+Embed)
+    /// 1. If local EmbedEngine is available → use it (< 5ms, no network)
+    /// 2. If local fails or unavailable → fall back to OpenClaw Gateway HTTP
+    /// 3. If both fail → return None (caller skips embedding-dependent logic)
     async fn call_openclaw_embed(&self, text: &str) -> Option<Vec<f32>> {
+        // Try local embed engine first
+        if let Some(ref engine) = self.embed_engine {
+            match engine.embed_single(text) {
+                Ok(embedding) => {
+                    debug!(dim = embedding.len(), "[MINER] Local embed succeeded");
+                    return Some(embedding);
+                }
+                Err(e) => {
+                    warn!(error = %e, "[MINER] Local embed failed, falling back to OpenClaw");
+                }
+            }
+        }
+
+        // Fallback: OpenClaw Gateway HTTP
+        self.call_openclaw_embed_remote(text).await
+    }
+
+    /// Remote embedding via OpenClaw Gateway HTTP (fallback path).
+    async fn call_openclaw_embed_remote(&self, text: &str) -> Option<Vec<f32>> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build().ok()?;
