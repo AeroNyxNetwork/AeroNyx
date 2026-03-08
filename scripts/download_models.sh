@@ -54,7 +54,8 @@ BASE_URL="https://huggingface.co/${REPO}/resolve/main"
 
 # ONNX Runtime version — must be ABI-compatible with ort crate
 # ort 2.0.0-rc.11 ↔ ORT 1.20-1.22 (C API is stable across minors)
-ORT_VERSION="1.22.0"
+# ort 2.0.0-rc.11 requires ORT >= 1.23.x
+ORT_VERSION="1.23.2"
 
 # Resolve project root (works from any directory)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
