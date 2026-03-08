@@ -123,6 +123,12 @@ regex = "1.10"
 hkdf = "0.12"
 chacha20poly1305 = { workspace = true }
 
+# 🌟 v2.1.0+Embed: Local MiniLM embedding inference    ← 加在这里
+ort = { version = "2.0", features = ["download-binaries"] }
+tokenizers = { version = "0.21", default-features = false }
+ndarray = "0.16"
+hmac = "0.12"
+
 # Error handling
 thiserror = { workspace = true }
 anyhow = { workspace = true }
