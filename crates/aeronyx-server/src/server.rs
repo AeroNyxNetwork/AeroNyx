@@ -87,7 +87,7 @@ use crate::management::{
 use crate::miner::ReflectionMiner;
 #[allow(deprecated)]
 use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
-use crate::services::memchain::storage::derive_record_key;
+use crate::services::memchain::derive_record_key;
 use crate::services::memchain::EmbedEngine;
 use crate::services::{HandshakeService, IpPoolService, RoutingService, SessionManager};
 
