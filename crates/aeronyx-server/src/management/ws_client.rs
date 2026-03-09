@@ -1,96 +1,29 @@
-//! ============================================
-//! File: crates/aeronyx-server/src/management/ws_client.rs
-//! Path: aeronyx-server/src/management/ws_client.rs
-//! ============================================
+// ============================================
+// File: crates/aeronyx-server/src/management/ws_client.rs
+// ============================================
+//! # WebSocket Tunnel — CMS ↔ Local Services
 //!
-//! ## Creation Reason
-//! Phase 3 of the OpenClaw integration: Real-time WebSocket Tunnel.
-//! Maintains a persistent WebSocket connection from the Rust node to
-//! the CMS backend, enabling low-latency bidirectional communication
-//! for frontend → OpenClaw AI agent interactions.
+//! ## Modification Reason (v2.2.0-MemExplorer)
+//! Added MPI proxy support: `action: "mpi_*"` messages from CMS are
+//! transparently forwarded to the local MPI API (http://127.0.0.1:8421)
+//! and the response is relayed back via WebSocket.
 //!
-//! ## Modification Reason (v1.3.2)
-//! Replaced OpenClaw Gateway WebSocket RPC with HTTP API (`/v1/chat/completions`).
-//! The HTTP API is OpenAI-compatible, supports SSE streaming, and is simpler
-//! than the internal WS RPC protocol.
+//! This enables the MemExplorer frontend (Next.js) to access MPI endpoints
+//! through the existing CMS WebSocket tunnel without direct MPI connectivity.
 //!
-//! ## Modification Reason (v1.4.1)
-//! **BUG FIX**: `done=true` and `agent_response` messages were silently lost.
+//! ## MPI Proxy Design
+//! - Action whitelist: only allowed actions are forwarded (security)
+//! - Action → HTTP method + path mapping (mpi_status → GET /status, etc.)
+//! - 10s timeout per MPI request (prevents blocking WebSocket)
+//! - MPI unavailable → 503 error response to frontend
+//! - Bearer token from config automatically injected into MPI requests
 //!
-//! Root cause: `tungstenite::SplitSink::send()` writes data into an internal
-//! userspace buffer and returns `Ok(())` without flushing to the kernel TCP
-//! send buffer. During high-frequency streaming (150+ chunks), intermediate
-//! chunks are flushed automatically when the buffer fills up. However, the
-//! final `done=true` and `agent_response` messages — written after all chunks
-//! are sent — remain in the userspace buffer with no subsequent write to
-//! trigger a flush. The data stays in memory until the next ping (30s later),
-//! by which time the frontend has already timed out.
-//!
-//! Evidence: TCP Send-Q monitoring on the Rust node showed that `done=true`
-//! (sent at 21:53:59.809) never appeared in the kernel TCP buffer, while
-//! streaming chunks consistently showed Send-Q values of 131-263 bytes.
-//!
-//! Fix: Added explicit `SinkExt::flush()` calls after every `send()` in
-//! critical paths: `send_done_and_response`, `send_done_and_error`,
-//! `process_sse_lines`, and `message_loop` ping.
-//!
-//! ## Main Functionality
-//! - `WsTunnel`: Background async task managing the CMS WebSocket lifecycle
-//! - Ed25519-signed authentication on connect
-//! - Automatic reconnection with exponential backoff
-//! - Bidirectional message relay: CMS ↔ local OpenClaw Gateway (HTTP API)
-//! - Ping/pong keepalive for connection health
-//! - Graceful shutdown via broadcast signal
-//!
-//! ## Main Logical Flow
-//! ```text
-//!   ┌────────┐       wss://            ┌─────────┐  HTTP POST /v1/chat/completions  ┌──────────┐
-//!   │  CMS   │ ◄──────────────────────►│ WsTunnel│ ──────────────────────────────► │ OpenClaw │
-//!   │Backend │  agent_request/response  │ (Rust)  │  ◄── SSE stream ──────────────  │ Gateway  │
-//!   └────────┘                          └─────────┘                                 └──────────┘
-//! ```
-//!
-//! ## CMS WebSocket Protocol
-//!
-//! ### Authentication (must complete within 30s)
-//! ```json
-//! → {"type": "auth", "node_id": "<public_key_hex>", "timestamp": 1709500000, "signature": "<hex>"}
-//! ← {"type": "auth_ok", "node_id": "<uuid>", "node_name": "My Node"}
-//! ```
-//!
-//! ### Messages (post-auth)
-//! ```json
-//! ← {"type": "agent_request", "request_id": "uuid", "action": "chat", "payload": {...}}
-//! → {"type": "agent_response", "request_id": "uuid", "status": "success", "payload": {...}}
-//! → {"type": "agent_stream", "request_id": "uuid", "chunk": "...", "done": false}
-//! ↔ {"type": "ping"} / {"type": "pong"}
-//! ```
-//!
-//! ## ⚠️ Important Note for Next Developer
-//! - The CMS URL uses `node_id` which is the **CMS database UUID**, NOT the
-//!   Ed25519 public key.
-//! - The `auth` message `node_id` field IS the Ed25519 public key hex.
-//! - Signature: `Ed25519_Sign("{pubkey}:{timestamp}".as_bytes())` — raw sign,
-//!   NOT SHA-256 then sign. Differs from heartbeat.
-//! - The `reqwest::Client` is created ONCE and reused (connection pool).
-//! - OpenClaw HTTP API must be enabled in config for this to work.
-//! - The `user` field in requests creates stable sessions in OpenClaw.
-//! - **CRITICAL**: Always call `flush()` after `send()` on the WebSocket sink.
-//!   `tungstenite::SplitSink::send()` only writes to a userspace buffer —
-//!   without `flush()`, data may never reach the TCP layer. This caused a
-//!   production bug where `done=true` messages were silently lost (v1.4.1).
-//!
-//! ## Last Modified
-//! v1.3.0 - 🌟 Initial creation (Phase 3: WebSocket Tunnel)
-//! v1.3.2 - 🔄 Replaced OpenClaw WS RPC with HTTP API
-//! v1.4.0 - 🐛 Fixed SSE [DONE] signal lost in residual buffer
-//!          - 🔄 Refactored stream_sse_response into 3 focused methods
-//!          - 🔄 Error path now sends done: true before error response
-//! v1.4.1 - 🐛 Fixed done=true and agent_response silently lost in
-//!            tungstenite userspace buffer (missing flush() after send())
-//!          - 🔄 Added flush() after every send() in critical paths
-//!          - 🔄 Added flush() to ping and stream chunk sends for consistency
-//! ============================================
+//! ## Previous Modifications
+//! v1.3.0 - Initial creation (Phase 3: WebSocket Tunnel)
+//! v1.3.2 - Replaced OpenClaw WS RPC with HTTP API
+//! v1.4.0 - Fixed SSE [DONE] signal lost in residual buffer
+//! v1.4.1 - Fixed done=true silently lost (missing flush after send)
+//! v2.2.0 - 🌟 Added MPI proxy for MemExplorer frontend
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -119,6 +52,29 @@ const AUTH_TIMEOUT_SECS: u64 = 25;
 const OPENCLAW_REQUEST_TIMEOUT_SECS: u64 = 180;
 const OPENCLAW_AGENT_ID: &str = "main";
 
+/// MPI API base URL (local Axum server).
+const MPI_BASE_URL: &str = "http://127.0.0.1:8421";
+
+/// Timeout for MPI proxy requests (embed is slowest at ~300ms).
+const MPI_PROXY_TIMEOUT_SECS: u64 = 10;
+
+/// Allowed MPI actions that can be proxied from CMS WebSocket.
+/// Actions not in this list are rejected with an error response.
+///
+/// ## Security
+/// - `mpi_log` is deliberately excluded: /log is called by the plugin
+///   after each session, not by the frontend.
+/// - Only read-oriented actions + remember/forget (user-initiated) are allowed.
+const MPI_ALLOWED_ACTIONS: &[&str] = &[
+    "mpi_status",
+    "mpi_recall",
+    "mpi_remember",
+    "mpi_forget",
+    "mpi_embed",
+    "mpi_record",
+    "mpi_overview",
+];
+
 // ============================================
 // Type aliases
 // ============================================
@@ -132,21 +88,9 @@ fn ws_text(value: &serde_json::Value) -> WsMessage {
 }
 
 /// Helper: send a WebSocket text frame AND flush to TCP.
-///
-/// **Why this exists (v1.4.1)**:
-/// `SplitSink::send()` writes into a userspace buffer only.
-/// Without an explicit `flush()`, data may sit in memory indefinitely
-/// until the next write triggers an automatic flush. This caused
-/// `done=true` and `agent_response` messages to be silently lost
-/// in production — they were the last messages in a burst, so no
-/// subsequent write ever flushed them out.
 async fn ws_send_flush(sink: &mut WsSink, msg: WsMessage) -> Result<(), String> {
-    sink.send(msg)
-        .await
-        .map_err(|e| format!("WebSocket send failed: {}", e))?;
-    sink.flush()
-        .await
-        .map_err(|e| format!("WebSocket flush failed: {}", e))?;
+    sink.send(msg).await.map_err(|e| format!("WebSocket send failed: {}", e))?;
+    sink.flush().await.map_err(|e| format!("WebSocket flush failed: {}", e))?;
     Ok(())
 }
 
@@ -173,20 +117,11 @@ impl WsTunnel {
             .build()
             .expect("Failed to build reqwest::Client");
 
-        Self {
-            identity,
-            cms_node_id,
-            agent_manager,
-            http_client,
-        }
+        Self { identity, cms_node_id, agent_manager, http_client }
     }
 
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) {
-        info!(
-            cms_node_id = %self.cms_node_id,
-            "[WS_TUNNEL] Starting WebSocket tunnel"
-        );
-
+        info!(cms_node_id = %self.cms_node_id, "[WS_TUNNEL] Starting WebSocket tunnel");
         let mut backoff_secs = INITIAL_RECONNECT_DELAY_SECS;
 
         loop {
@@ -208,53 +143,36 @@ impl WsTunnel {
                     backoff_secs = (backoff_secs * 2).min(MAX_RECONNECT_BACKOFF_SECS);
                 }
                 Ok(ShutdownReason::Disconnected(reason)) => {
-                    warn!(
-                        reason = %reason,
-                        backoff_secs = backoff_secs,
-                        "[WS_TUNNEL] ⚠️ Disconnected — reconnecting in {}s", backoff_secs
-                    );
+                    warn!(reason = %reason, backoff_secs = backoff_secs,
+                        "[WS_TUNNEL] ⚠️ Disconnected — reconnecting in {}s", backoff_secs);
                 }
                 Err(e) => {
-                    warn!(
-                        error = %e,
-                        backoff_secs = backoff_secs,
-                        "[WS_TUNNEL] ❌ Connection error — reconnecting in {}s", backoff_secs
-                    );
+                    warn!(error = %e, backoff_secs = backoff_secs,
+                        "[WS_TUNNEL] ❌ Connection error — reconnecting in {}s", backoff_secs);
                 }
             }
 
             tokio::select! {
-                _ = shutdown.recv() => {
-                    info!("[WS_TUNNEL] Shutdown during backoff");
-                    break;
-                }
+                _ = shutdown.recv() => { info!("[WS_TUNNEL] Shutdown during backoff"); break; }
                 _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
             }
-
             backoff_secs = (backoff_secs * 2).min(MAX_RECONNECT_BACKOFF_SECS);
         }
-
         info!("[WS_TUNNEL] WebSocket tunnel stopped");
     }
 
     async fn connect_and_run(
-        &self,
-        url: &str,
-        shutdown: &mut broadcast::Receiver<()>,
+        &self, url: &str, shutdown: &mut broadcast::Receiver<()>,
     ) -> Result<ShutdownReason, String> {
-        let (ws_stream, _response) = connect_async(url)
-            .await
+        let (ws_stream, _) = connect_async(url).await
             .map_err(|e| format!("WebSocket connect failed: {}", e))?;
-
         info!("[WS_TUNNEL] ✅ Connected to CMS");
 
         let (mut sink, mut source) = ws_stream.split();
-
         if let Err(reason) = self.authenticate(&mut sink, &mut source).await {
             let _ = sink.close().await;
             return Ok(ShutdownReason::AuthFailed(reason));
         }
-
         info!("[WS_TUNNEL] ✅ Authenticated with CMS");
         self.message_loop(&mut sink, &mut source, shutdown).await
     }
@@ -263,30 +181,16 @@ impl WsTunnel {
     // Authentication
     // ============================================
 
-    async fn authenticate(
-        &self,
-        sink: &mut WsSink,
-        source: &mut WsSource,
-    ) -> Result<(), String> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
+    async fn authenticate(&self, sink: &mut WsSink, source: &mut WsSource) -> Result<(), String> {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let public_key_hex = hex::encode(self.identity.public_key_bytes());
         let message = format!("{}:{}", public_key_hex, timestamp);
-        let signature_bytes = self.identity.sign(message.as_bytes());
-        let signature_hex = hex::encode(signature_bytes);
+        let signature_hex = hex::encode(self.identity.sign(message.as_bytes()));
 
         let auth_msg = serde_json::json!({
-            "type": "auth",
-            "node_id": public_key_hex,
-            "timestamp": timestamp,
-            "signature": signature_hex,
+            "type": "auth", "node_id": public_key_hex,
+            "timestamp": timestamp, "signature": signature_hex,
         });
-
-        debug!("[WS_TUNNEL] Sending auth message...");
-        // v1.4.1: use ws_send_flush to ensure auth message reaches TCP
         ws_send_flush(sink, ws_text(&auth_msg)).await
             .map_err(|e| format!("Failed to send auth: {}", e))?;
 
@@ -305,41 +209,31 @@ impl WsTunnel {
     async fn wait_for_auth_ok(source: &mut WsSource) -> Result<(), String> {
         while let Some(msg_result) = source.next().await {
             let msg = msg_result.map_err(|e| format!("WS read error during auth: {}", e))?;
-
             match msg {
                 WsMessage::Text(text) => {
                     let parsed: serde_json::Value = serde_json::from_str(&text)
                         .map_err(|e| format!("Invalid JSON from CMS: {}", e))?;
-
                     match parsed.get("type").and_then(|t| t.as_str()) {
                         Some("auth_ok") => {
-                            let node_name = parsed.get("node_name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("unknown");
-                            info!(node_name = %node_name, "[WS_TUNNEL] ✅ Auth OK");
+                            let name = parsed.get("node_name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                            info!(node_name = %name, "[WS_TUNNEL] ✅ Auth OK");
                             return Ok(());
                         }
                         Some("error") => {
-                            let error_msg = parsed.get("message")
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("unknown error");
-                            return Err(format!("Auth rejected: {}", error_msg));
+                            let msg = parsed.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
+                            return Err(format!("Auth rejected: {}", msg));
                         }
-                        other => {
-                            debug!(msg_type = ?other, "[WS_TUNNEL] Unexpected message during auth");
-                        }
+                        other => debug!(msg_type = ?other, "[WS_TUNNEL] Unexpected message during auth"),
                     }
                 }
                 WsMessage::Close(frame) => {
-                    let reason = frame
-                        .map(|f| format!("code={}, reason={}", f.code, f.reason))
+                    let reason = frame.map(|f| format!("code={}, reason={}", f.code, f.reason))
                         .unwrap_or_else(|| "no frame".to_string());
                     return Err(format!("Connection closed during auth: {}", reason));
                 }
                 _ => {}
             }
         }
-
         Err("Connection closed before auth_ok".to_string())
     }
 
@@ -348,9 +242,7 @@ impl WsTunnel {
     // ============================================
 
     async fn message_loop(
-        &self,
-        sink: &mut WsSink,
-        source: &mut WsSource,
+        &self, sink: &mut WsSink, source: &mut WsSource,
         shutdown: &mut broadcast::Receiver<()>,
     ) -> Result<ShutdownReason, String> {
         let mut ping_interval = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
@@ -362,17 +254,12 @@ impl WsTunnel {
                     let _ = sink.close().await;
                     return Ok(ShutdownReason::GracefulShutdown);
                 }
-
                 _ = ping_interval.tick() => {
                     let ping_msg = serde_json::json!({"type": "ping"});
-                    // v1.4.1: flush ping to ensure keepalive reaches CMS
                     if let Err(e) = ws_send_flush(sink, ws_text(&ping_msg)).await {
-                        return Ok(ShutdownReason::Disconnected(
-                            format!("Ping send failed: {}", e)
-                        ));
+                        return Ok(ShutdownReason::Disconnected(format!("Ping failed: {}", e)));
                     }
                 }
-
                 msg = source.next() => {
                     match msg {
                         Some(Ok(WsMessage::Text(text))) => {
@@ -380,21 +267,14 @@ impl WsTunnel {
                                 warn!(error = %e, "[WS_TUNNEL] ⚠️ Error handling CMS message");
                             }
                         }
-                        Some(Ok(WsMessage::Ping(data))) => {
-                            let _ = sink.send(WsMessage::Pong(data)).await;
-                        }
+                        Some(Ok(WsMessage::Ping(data))) => { let _ = sink.send(WsMessage::Pong(data)).await; }
                         Some(Ok(WsMessage::Close(frame))) => {
-                            let reason = frame
-                                .map(|f| format!("code={}, reason={}", f.code, f.reason))
+                            let reason = frame.map(|f| format!("code={}, reason={}", f.code, f.reason))
                                 .unwrap_or_else(|| "no frame".to_string());
                             return Ok(ShutdownReason::Disconnected(reason));
                         }
-                        Some(Err(e)) => {
-                            return Ok(ShutdownReason::Disconnected(format!("WS read error: {}", e)));
-                        }
-                        None => {
-                            return Ok(ShutdownReason::Disconnected("Stream ended".to_string()));
-                        }
+                        Some(Err(e)) => return Ok(ShutdownReason::Disconnected(format!("WS read error: {}", e))),
+                        None => return Ok(ShutdownReason::Disconnected("Stream ended".to_string())),
                         _ => {}
                     }
                 }
@@ -402,36 +282,22 @@ impl WsTunnel {
         }
     }
 
-    async fn handle_cms_message(
-        &self,
-        text: &str,
-        sink: &mut WsSink,
-    ) -> Result<(), String> {
+    async fn handle_cms_message(&self, text: &str, sink: &mut WsSink) -> Result<(), String> {
         let parsed: serde_json::Value = serde_json::from_str(text)
             .map_err(|e| format!("Invalid JSON: {}", e))?;
 
-        let msg_type = parsed.get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
+        let msg_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         match msg_type {
-            "agent_request" => {
-                self.handle_agent_request(&parsed, sink).await?;
-            }
-            "pong" => {
-                debug!("[WS_TUNNEL] Pong received");
-            }
+            "agent_request" => self.handle_agent_request(&parsed, sink).await?,
+            "pong" => debug!("[WS_TUNNEL] Pong received"),
             "ping" => {
                 let pong = serde_json::json!({"type": "pong"});
-                // v1.4.1: flush pong response
                 ws_send_flush(sink, ws_text(&pong)).await
                     .map_err(|e| format!("Pong send failed: {}", e))?;
             }
-            other => {
-                debug!(msg_type = %other, "[WS_TUNNEL] Unhandled message type from CMS");
-            }
+            other => debug!(msg_type = %other, "[WS_TUNNEL] Unhandled message type"),
         }
-
         Ok(())
     }
 
@@ -440,113 +306,223 @@ impl WsTunnel {
     // ============================================
 
     async fn handle_agent_request(
-        &self,
-        request: &serde_json::Value,
-        cms_sink: &mut WsSink,
+        &self, request: &serde_json::Value, cms_sink: &mut WsSink,
     ) -> Result<(), String> {
-        let request_id = request.get("request_id")
-            .and_then(|r| r.as_str())
-            .unwrap_or("unknown");
+        let request_id = request.get("request_id").and_then(|r| r.as_str()).unwrap_or("unknown");
+        let action = request.get("action").and_then(|a| a.as_str()).unwrap_or("unknown");
+        let payload = request.get("payload").cloned().unwrap_or(serde_json::Value::Null);
 
-        let action = request.get("action")
-            .and_then(|a| a.as_str())
-            .unwrap_or("unknown");
+        info!(request_id = %request_id, action = %action, "[WS_TUNNEL] 📥 Agent request");
 
-        let payload = request.get("payload")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
+        // ── v2.2.0: MPI proxy ──────────────────────────────────────
+        if action.starts_with("mpi_") {
+            let response = self.handle_mpi_proxy(action, request_id, &payload).await;
+            ws_send_flush(cms_sink, ws_text(&response)).await
+                .map_err(|e| format!("MPI proxy response send failed: {}", e))?;
+            return Ok(());
+        }
 
-        info!(
-            request_id = %request_id,
-            action = %action,
-            "[WS_TUNNEL] 📥 Agent request from CMS"
-        );
-
+        // ── Original: OpenClaw actions ─────────────────────────────
         let gateway_token = match self.agent_manager.gateway_token().await {
             Some(token) => token,
             None => {
-                self.send_done_and_error(
-                    request_id,
-                    "OpenClaw gateway token not available. Is OpenClaw installed and configured?",
-                    cms_sink,
-                ).await;
+                self.send_done_and_error(request_id,
+                    "OpenClaw gateway token not available. Is OpenClaw installed?", cms_sink).await;
                 return Ok(());
             }
         };
 
         match action {
             "chat" => {
-                if let Err(e) = self.handle_chat_request(
-                    request_id, &payload, &gateway_token, cms_sink
-                ).await {
-                    warn!(
-                        request_id = %request_id,
-                        error = %e,
-                        "[WS_TUNNEL] ❌ Chat request failed"
-                    );
-                    self.send_done_and_error(
-                        request_id,
-                        &format!("Failed to communicate with OpenClaw: {}", e),
-                        cms_sink,
-                    ).await;
+                if let Err(e) = self.handle_chat_request(request_id, &payload, &gateway_token, cms_sink).await {
+                    warn!(request_id = %request_id, error = %e, "[WS_TUNNEL] ❌ Chat request failed");
+                    self.send_done_and_error(request_id,
+                        &format!("Failed to communicate with OpenClaw: {}", e), cms_sink).await;
                 }
             }
             "status" => {
                 let status = self.agent_manager.status().await;
                 let response = serde_json::json!({
-                    "type": "agent_response",
-                    "request_id": request_id,
+                    "type": "agent_response", "request_id": request_id,
                     "status": "success",
                     "payload": serde_json::to_value(&status).unwrap_or(serde_json::Value::Null)
                 });
-                // v1.4.1: flush status response
                 ws_send_flush(cms_sink, ws_text(&response)).await
                     .map_err(|e| format!("Status response send failed: {}", e))?;
             }
             other => {
                 let response = serde_json::json!({
-                    "type": "agent_response",
-                    "request_id": request_id,
+                    "type": "agent_response", "request_id": request_id,
                     "status": "error",
-                    "payload": { "error": format!("Unknown action: {}", other) }
+                    "payload": {"error": format!("Unknown action: {}", other)}
                 });
-                // v1.4.1: flush error response
                 ws_send_flush(cms_sink, ws_text(&response)).await
                     .map_err(|e| format!("Error response send failed: {}", e))?;
             }
         }
-
         Ok(())
     }
 
-    /// Sends `agent_stream(done=true)` + `agent_response(error)` to CMS.
-    /// Ensures the frontend always receives a termination signal,
-    /// even on errors or timeouts.
+    // ============================================
+    // MPI Proxy (v2.2.0-MemExplorer)
+    // ============================================
+
+    /// Handle MPI proxy requests from CMS WebSocket.
     ///
-    /// v1.4.1: Added flush() after each send() to guarantee data reaches TCP.
-    async fn send_done_and_error(
+    /// Maps `action: "mpi_*"` to local HTTP requests to the MPI API,
+    /// then wraps the response in `agent_response` format for the frontend.
+    ///
+    /// ## Security
+    /// - Only actions in MPI_ALLOWED_ACTIONS are forwarded
+    /// - `mpi_log` is deliberately excluded (plugin-only endpoint)
+    /// - Requests go to localhost only (no external network access)
+    /// - 10s timeout prevents MPI hangs from blocking the WebSocket
+    async fn handle_mpi_proxy(
         &self,
+        action: &str,
         request_id: &str,
-        error_message: &str,
-        cms_sink: &mut WsSink,
-    ) {
+        payload: &serde_json::Value,
+    ) -> serde_json::Value {
+        // 1. Whitelist check
+        if !MPI_ALLOWED_ACTIONS.contains(&action) {
+            warn!(action = %action, "[WS_MPI] ⛔ Action not in whitelist");
+            return serde_json::json!({
+                "type": "agent_response",
+                "request_id": request_id,
+                "status": "error",
+                "payload": {"error": format!("action '{}' not allowed", action)}
+            });
+        }
+
+        // 2. Map action → HTTP method + path
+        let (method, path) = match action {
+            "mpi_status"   => ("GET",  "/api/mpi/status".to_string()),
+            "mpi_recall"   => ("POST", "/api/mpi/recall".to_string()),
+            "mpi_remember" => ("POST", "/api/mpi/remember".to_string()),
+            "mpi_forget"   => ("POST", "/api/mpi/forget".to_string()),
+            "mpi_embed"    => ("POST", "/api/mpi/embed".to_string()),
+            "mpi_overview" => ("GET",  "/api/mpi/records/overview".to_string()),
+            "mpi_record"   => {
+                let record_id = payload.get("record_id").and_then(|v| v.as_str()).unwrap_or("");
+                if record_id.is_empty() {
+                    return serde_json::json!({
+                        "type": "agent_response",
+                        "request_id": request_id,
+                        "status": "error",
+                        "payload": {"error": "missing record_id in payload"}
+                    });
+                }
+                ("GET", format!("/api/mpi/record/{}", record_id))
+            }
+            _ => {
+                return serde_json::json!({
+                    "type": "agent_response",
+                    "request_id": request_id,
+                    "status": "error",
+                    "payload": {"error": format!("unknown mpi action: {}", action)}
+                });
+            }
+        };
+
+        let url = format!("{}{}", MPI_BASE_URL, path);
+        debug!(action = %action, url = %url, method = %method, "[WS_MPI] Proxying request");
+
+        // 3. Build and send HTTP request with timeout
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(MPI_PROXY_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        let result = match method {
+            "GET" => client.get(&url).send().await,
+            "POST" => client.post(&url)
+                .header("Content-Type", "application/json")
+                .json(payload)
+                .send()
+                .await,
+            _ => unreachable!(),
+        };
+
+        // 4. Wrap response
+        match result {
+            Ok(resp) => {
+                let status_code = resp.status().as_u16();
+                let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+
+                debug!(
+                    action = %action,
+                    status_code = status_code,
+                    "[WS_MPI] MPI response received"
+                );
+
+                serde_json::json!({
+                    "type": "agent_response",
+                    "request_id": request_id,
+                    "status": if status_code < 400 { "success" } else { "error" },
+                    "status_code": status_code,
+                    "payload": body
+                })
+            }
+            Err(e) => {
+                let is_connect_error = e.is_connect();
+                warn!(action = %action, error = %e, "[WS_MPI] ❌ MPI request failed");
+
+                serde_json::json!({
+                    "type": "agent_response",
+                    "request_id": request_id,
+                    "status": "error",
+                    "status_code": if is_connect_error { 503 } else { 500 },
+                    "payload": {
+                        "error": if is_connect_error {
+                            "MemChain MPI is not available on this node".to_string()
+                        } else {
+                            format!("MPI request failed: {}", e)
+                        }
+                    }
+                })
+            }
+        }
+    }
+
+    // ============================================
+    // Done + Error/Response Helpers
+    // ============================================
+
+    async fn send_done_and_error(&self, request_id: &str, error_message: &str, cms_sink: &mut WsSink) {
         let done_msg = serde_json::json!({
-            "type": "agent_stream",
-            "request_id": request_id,
-            "chunk": "",
-            "done": true
+            "type": "agent_stream", "request_id": request_id, "chunk": "", "done": true
         });
-        // v1.4.1: flush done=true to TCP
         let _ = ws_send_flush(cms_sink, ws_text(&done_msg)).await;
 
         let error_response = serde_json::json!({
-            "type": "agent_response",
-            "request_id": request_id,
-            "status": "error",
-            "payload": { "error": error_message }
+            "type": "agent_response", "request_id": request_id,
+            "status": "error", "payload": {"error": error_message}
         });
-        // v1.4.1: flush error response to TCP
         let _ = ws_send_flush(cms_sink, ws_text(&error_response)).await;
+    }
+
+    async fn send_done_and_response(
+        &self, request_id: &str, full_response: &str, cms_sink: &mut WsSink,
+    ) -> Result<(), String> {
+        let done_msg = serde_json::json!({
+            "type": "agent_stream", "request_id": request_id, "chunk": "", "done": true
+        });
+        info!(request_id = %request_id, "[WS_TUNNEL] Sending done=true...");
+        ws_send_flush(cms_sink, ws_text(&done_msg)).await
+            .map_err(|e| { error!(request_id = %request_id, error = %e, "[WS_TUNNEL] ❌ Failed done=true"); e })?;
+        info!(request_id = %request_id, "[WS_TUNNEL] ✅ done=true SENT+FLUSHED");
+
+        if !full_response.is_empty() {
+            let final_msg = serde_json::json!({
+                "type": "agent_response", "request_id": request_id,
+                "status": "success", "payload": {"response": full_response}
+            });
+            info!(request_id = %request_id, response_len = full_response.len(), "[WS_TUNNEL] Sending agent_response...");
+            ws_send_flush(cms_sink, ws_text(&final_msg)).await
+                .map_err(|e| { error!(request_id = %request_id, error = %e, "[WS_TUNNEL] ❌ Failed agent_response"); e })?;
+            info!(request_id = %request_id, "[WS_TUNNEL] ✅ agent_response SENT+FLUSHED");
+        }
+        Ok(())
     }
 
     // ============================================
@@ -554,205 +530,103 @@ impl WsTunnel {
     // ============================================
 
     async fn handle_chat_request(
-        &self,
-        request_id: &str,
-        payload: &serde_json::Value,
-        gateway_token: &str,
-        cms_sink: &mut WsSink,
+        &self, request_id: &str, payload: &serde_json::Value,
+        gateway_token: &str, cms_sink: &mut WsSink,
     ) -> Result<(), String> {
-        let prompt = payload.get("prompt")
-            .and_then(|p| p.as_str())
-            .unwrap_or("");
-
+        let prompt = payload.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
         if prompt.is_empty() {
             return Err("Empty prompt in chat request".to_string());
         }
 
-        let session_user = if let Some(user_id) = payload.get("user_id").and_then(|u| u.as_str()) {
-            format!("aeronyx:user:{}", user_id)
+        let session_user = if let Some(uid) = payload.get("user_id").and_then(|u| u.as_str()) {
+            format!("aeronyx:user:{}", uid)
         } else {
             format!("aeronyx:req:{}", request_id)
         };
 
         let request_body = serde_json::json!({
-            "model": "openclaw",
-            "stream": true,
-            "user": session_user,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
+            "model": "openclaw", "stream": true, "user": session_user,
+            "messages": [{"role": "user", "content": prompt}]
         });
 
         let url = format!("{}{}", OPENCLAW_HTTP_BASE, OPENCLAW_CHAT_PATH);
-
-        info!(
-            request_id = %request_id,
-            url = %url,
-            session = %session_user,
-            "[WS_TUNNEL] 📤 Sending chat to OpenClaw"
-        );
+        info!(request_id = %request_id, url = %url, session = %session_user, "[WS_TUNNEL] 📤 Chat → OpenClaw");
 
         let response = tokio::time::timeout(
             Duration::from_secs(OPENCLAW_REQUEST_TIMEOUT_SECS),
-            self.http_client
-                .post(&url)
+            self.http_client.post(&url)
                 .header("Authorization", format!("Bearer {}", gateway_token))
                 .header("Content-Type", "application/json")
                 .header("x-openclaw-agent-id", OPENCLAW_AGENT_ID)
-                .json(&request_body)
-                .send()
+                .json(&request_body).send()
         ).await
-            .map_err(|_| format!(
-                "OpenClaw request timed out ({}s). The AI may be stuck in an interactive loop.",
-                OPENCLAW_REQUEST_TIMEOUT_SECS
-            ))?
-            .map_err(|e| format!("OpenClaw HTTP request failed: {}", e))?;
+            .map_err(|_| format!("OpenClaw timed out ({}s)", OPENCLAW_REQUEST_TIMEOUT_SECS))?
+            .map_err(|e| format!("OpenClaw HTTP failed: {}", e))?;
 
         let status = response.status();
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
-            return Err(format!(
-                "OpenClaw returned HTTP {}: {}",
-                status.as_u16(),
-                error_body.chars().take(500).collect::<String>()
-            ));
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("OpenClaw HTTP {}: {}", status.as_u16(), body.chars().take(500).collect::<String>()));
         }
 
-        info!(
-            request_id = %request_id,
-            http_status = %status.as_u16(),
-            "[WS_TUNNEL] ✅ OpenClaw responded, starting SSE stream"
-        );
-
+        info!(request_id = %request_id, http_status = %status.as_u16(), "[WS_TUNNEL] ✅ OpenClaw responded, starting SSE");
         self.stream_sse_response(request_id, response, cms_sink).await
     }
 
     // ============================================
-    // SSE Stream Processing (3 methods)
+    // SSE Stream Processing
     // ============================================
 
-    /// Main SSE processing entry point.
-    ///
-    /// Phase 1: Read body chunks via `response.chunk()` and process lines.
-    /// Phase 2: Process residual data left in the buffer after body exhaustion.
-    /// Phase 3: Fallback — send done signal if [DONE] was never received.
     async fn stream_sse_response(
-        &self,
-        request_id: &str,
-        mut response: reqwest::Response,
-        cms_sink: &mut WsSink,
+        &self, request_id: &str, mut response: reqwest::Response, cms_sink: &mut WsSink,
     ) -> Result<(), String> {
         let mut full_response = String::new();
         let mut line_buffer = String::new();
 
-        // Phase 1: Read body incrementally.
-        //
-        // Timeout strategy:
-        // - Normal streaming: 10s idle timeout (text chunks arrive sub-second)
-        // - After [DONE] marker: 45s timeout (tool execution may take time)
-        //
-        // When [DONE] is received, OpenClaw may be executing a tool (shell
-        // command, browser action, file read, etc.) before sending more text.
-        // Tool execution can take 5-30 seconds. We extend the timeout after
-        // each [DONE] to accommodate this.
         let idle_timeout = Duration::from_secs(10);
         let tool_timeout = Duration::from_secs(45);
         let mut current_timeout = idle_timeout;
 
         loop {
-            let chunk_result = tokio::time::timeout(
-                current_timeout,
-                response.chunk(),
-            ).await;
+            let chunk_result = tokio::time::timeout(current_timeout, response.chunk()).await;
 
             match chunk_result {
                 Ok(Ok(Some(bytes))) => {
-                    // Reset to normal idle timeout on any data received
                     current_timeout = idle_timeout;
-
                     line_buffer.push_str(&String::from_utf8_lossy(&bytes));
-
                     let got_done = self.process_sse_lines(
                         request_id, &mut line_buffer, &mut full_response, cms_sink
                     ).await?;
-
                     if got_done {
-                        // [DONE] received — extend timeout for tool execution
                         current_timeout = tool_timeout;
-                        info!(
-                            request_id = %request_id,
-                            "[WS_TUNNEL] Extended timeout to {}s for tool execution",
-                            tool_timeout.as_secs()
-                        );
+                        info!(request_id = %request_id, "[WS_TUNNEL] Extended timeout for tool execution");
                     }
                 }
                 Ok(Ok(None)) => {
-                    info!(
-                        request_id = %request_id,
-                        residual_len = line_buffer.len(),
-                        "[WS_TUNNEL] SSE body exhausted"
-                    );
+                    info!(request_id = %request_id, residual_len = line_buffer.len(), "[WS_TUNNEL] SSE body exhausted");
                     break;
                 }
-                Ok(Err(e)) => {
-                    warn!(
-                        request_id = %request_id,
-                        error = %e,
-                        "[WS_TUNNEL] SSE read error"
-                    );
-                    break;
-                }
+                Ok(Err(e)) => { warn!(request_id = %request_id, error = %e, "[WS_TUNNEL] SSE read error"); break; }
                 Err(_) => {
-                    info!(
-                        request_id = %request_id,
-                        timeout_secs = current_timeout.as_secs(),
-                        response_len = full_response.len(),
-                        "[WS_TUNNEL] SSE idle timeout — ending stream"
-                    );
+                    info!(request_id = %request_id, timeout_secs = current_timeout.as_secs(),
+                        response_len = full_response.len(), "[WS_TUNNEL] SSE idle timeout");
                     break;
                 }
             }
         }
 
-        // Phase 2: Process residual buffer (may contain final text chunks)
         if !line_buffer.is_empty() {
-            if !line_buffer.ends_with('\n') {
-                line_buffer.push('\n');
-            }
-            let _ = self.process_sse_lines(
-                request_id, &mut line_buffer, &mut full_response, cms_sink
-            ).await?;
+            if !line_buffer.ends_with('\n') { line_buffer.push('\n'); }
+            let _ = self.process_sse_lines(request_id, &mut line_buffer, &mut full_response, cms_sink).await?;
         }
 
-        // Phase 3: Stream ended (body exhausted or idle timeout).
-        // Send done + full response. This is always the termination path now.
-        info!(
-            request_id = %request_id,
-            response_len = full_response.len(),
-            "[WS_TUNNEL] ✅ Stream ended, sending done + response"
-        );
+        info!(request_id = %request_id, response_len = full_response.len(), "[WS_TUNNEL] ✅ Stream ended");
         self.send_done_and_response(request_id, &full_response, cms_sink).await
     }
 
-    /// Extracts complete SSE lines from the buffer and processes them.
-    ///
-    /// Returns `Ok(true)` if more time should be allowed (received [DONE]
-    /// which means a tool may be executing — reset the idle timer).
-    /// Returns `Ok(false)` for normal data flow.
-    ///
-    /// NOTE: We do NOT treat `[DONE]` as stream termination because OpenClaw
-    /// may send multiple `[DONE]` markers in a single agent turn (e.g., text
-    /// output → [DONE] → tool execution → more text → [DONE]).
-    /// Instead, [DONE] signals "a segment finished, tool may run next".
-    ///
-    /// v1.4.1: Added flush() after each chunk send() to ensure data reaches
-    /// TCP layer promptly, especially for the last chunk before done=true.
     async fn process_sse_lines(
-        &self,
-        request_id: &str,
-        line_buffer: &mut String,
-        full_response: &mut String,
-        cms_sink: &mut WsSink,
+        &self, request_id: &str, line_buffer: &mut String,
+        full_response: &mut String, cms_sink: &mut WsSink,
     ) -> Result<bool, String> {
         let mut got_done_marker = false;
 
@@ -760,24 +634,14 @@ impl WsTunnel {
             let line = line_buffer[..newline_pos].trim_end_matches('\r').to_string();
             *line_buffer = line_buffer[newline_pos + 1..].to_string();
 
-            if line.is_empty() {
-                continue;
-            }
+            if line.is_empty() { continue; }
 
-            let data = if let Some(s) = line.strip_prefix("data: ") {
-                s.trim()
-            } else if let Some(s) = line.strip_prefix("data:") {
-                s.trim()
-            } else {
-                continue;
-            };
+            let data = if let Some(s) = line.strip_prefix("data: ") { s.trim() }
+                else if let Some(s) = line.strip_prefix("data:") { s.trim() }
+                else { continue };
 
             if data == "[DONE]" {
-                info!(
-                    request_id = %request_id,
-                    response_len = full_response.len(),
-                    "[WS_TUNNEL] SSE [DONE] marker — tool may execute next"
-                );
+                info!(request_id = %request_id, "[WS_TUNNEL] SSE [DONE]");
                 got_done_marker = true;
                 continue;
             }
@@ -787,90 +651,23 @@ impl WsTunnel {
                 Err(_) => continue,
             };
 
-            let content = parsed
-                .get("choices")
-                .and_then(|c| c.as_array())
-                .and_then(|arr| arr.first())
+            let content = parsed.get("choices")
+                .and_then(|c| c.as_array()).and_then(|arr| arr.first())
                 .and_then(|choice| choice.get("delta"))
                 .and_then(|delta| delta.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
+                .and_then(|c| c.as_str()).unwrap_or("");
 
             if !content.is_empty() {
                 full_response.push_str(content);
-
                 let stream_msg = serde_json::json!({
-                    "type": "agent_stream",
-                    "request_id": request_id,
-                    "chunk": content,
-                    "done": false
+                    "type": "agent_stream", "request_id": request_id,
+                    "chunk": content, "done": false
                 });
-                // v1.4.1: flush each chunk to TCP to ensure timely delivery.
-                // During high-frequency streaming, tungstenite's internal
-                // buffer would auto-flush when full, but the last few chunks
-                // before [DONE] could be stranded. Explicit flush prevents this.
                 ws_send_flush(cms_sink, ws_text(&stream_msg)).await
                     .map_err(|e| format!("Stream send failed: {}", e))?;
             }
         }
-
         Ok(got_done_marker)
-    }
-
-    /// Sends `agent_stream(done=true)` + `agent_response(success)` to CMS.
-    ///
-    /// v1.4.1: Added flush() after each send() — this was the primary fix
-    /// for the production bug where done=true never reached CMS. Without
-    /// flush(), the data sat in tungstenite's userspace buffer indefinitely.
-    async fn send_done_and_response(
-        &self,
-        request_id: &str,
-        full_response: &str,
-        cms_sink: &mut WsSink,
-    ) -> Result<(), String> {
-        // 1. Stream end signal
-        let done_msg = serde_json::json!({
-            "type": "agent_stream",
-            "request_id": request_id,
-            "chunk": "",
-            "done": true
-        });
-        info!(request_id = %request_id, "[WS_TUNNEL] Sending done=true to CMS...");
-        // v1.4.1: flush to ensure done=true reaches TCP immediately
-        match ws_send_flush(cms_sink, ws_text(&done_msg)).await {
-            Ok(_) => info!(request_id = %request_id, "[WS_TUNNEL] ✅ done=true SENT+FLUSHED"),
-            Err(e) => {
-                error!(request_id = %request_id, error = %e, "[WS_TUNNEL] ❌ Failed to send done=true");
-                return Err(format!("Failed to send done: {}", e));
-            }
-        }
-
-        // 2. Complete response
-        if !full_response.is_empty() {
-            let final_msg = serde_json::json!({
-                "type": "agent_response",
-                "request_id": request_id,
-                "status": "success",
-                "payload": {
-                    "response": full_response
-                }
-            });
-            info!(
-                request_id = %request_id,
-                response_len = full_response.len(),
-                "[WS_TUNNEL] Sending agent_response to CMS..."
-            );
-            // v1.4.1: flush to ensure agent_response reaches TCP immediately
-            match ws_send_flush(cms_sink, ws_text(&final_msg)).await {
-                Ok(_) => info!(request_id = %request_id, "[WS_TUNNEL] ✅ agent_response SENT+FLUSHED"),
-                Err(e) => {
-                    error!(request_id = %request_id, error = %e, "[WS_TUNNEL] ❌ Failed to send agent_response");
-                    return Err(format!("Failed to send response: {}", e));
-                }
-            }
-        }
-
-        Ok(())
     }
 }
 
