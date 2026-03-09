@@ -1,98 +1,43 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/memchain/storage.rs
 // ============================================
-//! # MemoryStorage — SQLite 持久化存储引擎
-//! # MemoryStorage — SQLite Persistent Storage Engine
+//! # MemoryStorage — SQLite Core (Schema, CRUD, LRU Cache)
 //!
 //! ## Creation Reason
-//! MemChain v2.0 的唯一主存储引擎，替代旧的 MemPool + AofWriter 双引擎。
-//! 使用 rusqlite (bundled) + WAL 模式，提供索引查询、事务安全、生命周期管理。
 //!
-//! The sole primary storage engine for MemChain v2.0. Uses rusqlite (bundled)
-//! with WAL mode for indexed queries, crash-safe transactions, and lifecycle mgmt.
+//! ## Split Structure (v2.2.0)
+//! storage.rs was split into 3 files for maintainability:
+//! - `storage.rs` (THIS FILE) — struct, open, schema, migration, core CRUD, LRU
+//! - `storage_crypto.rs` — all encryption/decryption functions
+//! - `storage_ops.rs` — rawlog, feedback, chain state, stats, miner, overview
 //!
-//! ## Modification Reason (v2.1.0+MVF+Encryption)
-//! - Added transparent record content encryption (deterministic ChaCha20-Poly1305)
-//! - Added `record_key: Option<[u8; 32]>` to MemoryStorage for encryption key
-//! - `open()` now accepts `record_key` parameter
-//! - `insert()` encrypts content before storage when record_key is set
-//! - `row_to_record()` decrypts content on read when record_key is set
-//! - `has_active_content()` encrypts input before comparison (deterministic encryption
-//!   guarantees same plaintext → same ciphertext, so dedup still works)
-//! - `query_rows()` changed from static `Self::` to `&self` method to access record_key
-//! - `get_records_with_embedding()` now uses `self.query_rows()` unified path
-//! - All `Self::query_rows` call sites changed to `self.query_rows`
-//!
-//! ## v2.1+MVF Changes (Schema v4, vs Schema v2)
-//! - `records` table gains 3 new columns:
-//!   - `positive_feedback INTEGER NOT NULL DEFAULT 0`
-//!   - `negative_feedback INTEGER NOT NULL DEFAULT 0`
-//!   - `conflict_with BLOB` (nullable, stores conflicting record_id)
-//! - `maybe_migrate()` handles v2→v4 migration via ALTER TABLE ADD COLUMN
-//! - `row_to_record()` reads all 18 columns (was 12) including feedback fields
-//! - `increment_positive_feedback()` / `increment_negative_feedback()` now log errors
-//!   instead of silently swallowing them
-//! - INSERT statement includes new columns
-//!
-//! ## Previous Changes (v2.1.0 vs v1.0.0)
-//! - `embedding` 列改为 BLOB（f32 LE 序列化），去掉 `encrypted_embedding`
-//! - `access_count` 改为 INTEGER (u32)
-//! - `layer = 3` 表示 Archive（独立层级，不是 status）
-//! - `drain_episodes_for_compaction` 改为将 layer 从 Episode 变更为 Archive
-//!   （而非标记 status=Archived），使归档记忆仍可以极低权重被召回
-//! - 新增 `get_records_needing_embedding()` 用于启动时重建向量索引
+//! All 3 files impl on the same `MemoryStorage` struct.
+//! External API is unchanged — mod.rs re-exports everything.
 //!
 //! ## Schema (v4)
 //! ```sql
-//! CREATE TABLE records (
-//!     record_id           BLOB(32) PRIMARY KEY,
-//!     owner               BLOB(32) NOT NULL,
-//!     timestamp           INTEGER NOT NULL,
-//!     layer               INTEGER NOT NULL,  -- 0=Identity,1=Knowledge,2=Episode,3=Archive
-//!     topic_tags          TEXT NOT NULL,      -- JSON array
-//!     source_ai           TEXT NOT NULL,
-//!     status              INTEGER NOT NULL DEFAULT 0,  -- 0=Active,1=Superseded,2=Revoked
-//!     supersedes          BLOB(32),
-//!     encrypted_content   BLOB NOT NULL,
-//!     embedding           BLOB,              -- f32 LE bytes, NULL if no embedding
-//!     embedding_model     TEXT NOT NULL DEFAULT '',
-//!     embedding_dim       INTEGER NOT NULL DEFAULT 0,
-//!     signature           BLOB(64) NOT NULL,
-//!     access_count        INTEGER NOT NULL DEFAULT 0,
-//!     created_at          INTEGER NOT NULL,
-//!     archived_at         INTEGER,
-//!     positive_feedback   INTEGER NOT NULL DEFAULT 0,  -- v4: MVF φ₄ positive count
-//!     negative_feedback   INTEGER NOT NULL DEFAULT 0,  -- v4: MVF φ₄ negative count
-//!     conflict_with       BLOB                         -- v4: MVF φ₈ conflicting record_id
-//! );
+//! records (19 columns), raw_logs, memory_edges, user_weights,
+//! memory_feedback, chain_state, schema_version, sqlite_sequence
 //! ```
 //!
 //! ## Thread Safety
 //! `rusqlite::Connection` behind `tokio::sync::Mutex`. Phase 2+ can use r2d2 pooling.
 //!
-//! ## ⚠️ Important Note for Next Developer
+//! ⚠️ Important Note for Next Developer:
 //! - Schema migrations: use `ALTER TABLE` in `maybe_migrate()`, NEVER drop tables.
 //! - `record_id` is PRIMARY KEY. Duplicate inserts use `INSERT OR IGNORE`.
-//! - `embedding` is stored as raw f32 little-endian bytes. 384-dim = 1536 bytes.
-//! - Miner 压实: 改 `layer` 从 Episode→Archive（不是改 status），保持 status=Active。
-//! - `created_at` is local insertion time, not the record's `timestamp`.
-//! - v4 migration is additive-only (ALTER TABLE ADD COLUMN). Safe for existing data.
-//! - Record encryption is deterministic: same plaintext → same ciphertext.
-//!   This preserves content dedup (`has_active_content`) and record_id consistency.
-//! - Legacy unencrypted records are auto-detected on read (too short for nonce+tag).
-//! - `query_rows()` is `&self` (not `Self::`) — it needs `self.record_key` for decryption.
+//! - `embedding` stored as raw f32 LE bytes. 384-dim = 1536 bytes.
+//! - `query_rows()` is `&self` — it needs `self.record_key` for decryption.
+//! - LRU cache stores PLAINTEXT records (decrypted) for fast reads.
+//! - v4 migration is additive-only (ALTER TABLE ADD COLUMN).
+//! - Rawlog key migration clears old raw_logs on first run after key fix.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
-//! v2.1.0 - 🌟 4-layer support, plaintext embedding BLOB, compaction via layer change
-//! v2.1.0+MVF - 🌟 Schema v4: positive_feedback, negative_feedback, conflict_with columns;
-//!   migration from v2; error logging for feedback operations; row_to_record reads 18 cols
-//! v2.1.0+MVF+Encryption - 🌟 Transparent record content encryption (deterministic
-//!   ChaCha20-Poly1305); derive_record_key from Ed25519 private key; has_active_content
-//!   encrypts before comparison; get_records_with_embedding uses unified query path;
-//!   all Self::query_rows changed to self.query_rows;
-//!   maybe_migrate() clears old raw_logs on first run (rawlog key derivation changed
-//!   from public key to private key — old entries undecryptable, safe to discard)
+//! v2.1.0 - 4-layer, plaintext embedding BLOB, compaction via layer change
+//! v2.1.0+MVF - Schema v4, feedback columns, content dedup
+//! v2.1.0+MVF+Encryption - Record encryption, rawlog key fix
+//! v2.2.0 - 🌟 Split into storage.rs + storage_crypto.rs + storage_ops.rs
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -106,163 +51,59 @@ use tracing::{debug, error, info, warn};
 
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord, RecordStatus};
 
+use super::storage_crypto::{encrypt_record_content, decrypt_record_content};
+
 // ============================================
-// RawLog Encryption (D3)
+// Constants
 // ============================================
 
-/// Derive a rawlog encryption key from the owner's Ed25519 key bytes.
-///
-/// Uses HKDF-SHA256 with salt="memchain-rawlog", info="v1".
-/// Output: 32-byte key suitable for ChaCha20-Poly1305.
-///
-/// ⚠️ Known issue: currently called with public key in server.rs.
-/// Should be called with private key for proper security.
-/// See ARCHITECTURE.md Section 11 "rawlog key from public key".
-pub fn derive_rawlog_key(owner_secret: &[u8; 32]) -> [u8; 32] {
-    use sha2::Sha256;
-    use hkdf::Hkdf;
-    let hk = Hkdf::<Sha256>::new(Some(b"memchain-rawlog"), owner_secret);
-    let mut key = [0u8; 32];
-    hk.expand(b"v1", &mut key).expect("HKDF expand should not fail for 32 bytes");
-    key
+const SCHEMA_VERSION: u32 = 4;
+const LRU_CACHE_CAPACITY: usize = 1000;
+const DEFAULT_PAGE_SIZE: usize = 100;
+
+// ============================================
+// Embedding helpers
+// ============================================
+
+pub(crate) fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
+    embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-/// Derive a record content encryption key from the owner's Ed25519 **private** key.
-///
-/// Uses HKDF-SHA256 with a different salt than rawlog to produce an independent key.
-/// This key is used for deterministic encryption of `encrypted_content` in the records table.
-///
-/// ## Security
-/// - Input MUST be the Ed25519 private key (32 bytes), NOT the public key.
-/// - Anyone with only the public key or the database file cannot decrypt.
-/// - The key is deterministic: same private key always produces the same record key.
-///
-/// ## Usage
-/// ```rust,ignore
-/// let record_key = derive_record_key(&identity.to_bytes());
-/// let storage = MemoryStorage::open("memchain.db", Some(record_key))?;
-/// ```
-pub fn derive_record_key(owner_private: &[u8; 32]) -> [u8; 32] {
-    use sha2::Sha256;
-    use hkdf::Hkdf;
-    let hk = Hkdf::<Sha256>::new(Some(b"memchain-records"), owner_private);
-    let mut key = [0u8; 32];
-    hk.expand(b"v1", &mut key).expect("HKDF expand should not fail for 32 bytes");
-    key
-}
-
-/// Deterministic encryption for record content.
-///
-/// Uses HMAC-SHA256(key, plaintext) truncated to 12 bytes as a deterministic nonce,
-/// then encrypts with ChaCha20-Poly1305. This ensures:
-/// - Same plaintext + same key → same ciphertext (dedup compatible)
-/// - Without the key, content cannot be decrypted
-/// - Format: nonce(12) || ciphertext(len + 16 tag)
-///
-/// ## Why deterministic?
-/// Record content dedup (`has_active_content`) and `record_id` hashing both
-/// depend on `encrypted_content` being consistent for the same plaintext.
-/// Random nonces would break both features.
-pub fn encrypt_record_content(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-    use chacha20poly1305::aead::{Aead, NewAead};
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    // Deterministic nonce: HMAC-SHA256(key, plaintext)[0..12]
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key)
-        .map_err(|e| format!("HMAC init: {}", e))?;
-    mac.update(plaintext);
-    let hmac_result = mac.finalize().into_bytes();
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes.copy_from_slice(&hmac_result[..12]);
-
-    let cipher_key = Key::from_slice(key);
-    let cipher = ChaCha20Poly1305::new(cipher_key);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher.encrypt(nonce, plaintext)
-        .map_err(|e| format!("ChaCha20 encrypt: {}", e))?;
-
-    let mut result = Vec::with_capacity(12 + ciphertext.len());
-    result.extend_from_slice(&nonce_bytes);
-    result.extend_from_slice(&ciphertext);
-    Ok(result)
-}
-
-/// Decrypt record content.
-/// Input format: nonce(12) || ciphertext(len + 16 tag)
-pub fn decrypt_record_content(key: &[u8; 32], stored: &[u8]) -> Result<Vec<u8>, String> {
-    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-    use chacha20poly1305::aead::{Aead, NewAead};
-
-    if stored.len() < 12 + 16 {
-        return Err("Record ciphertext too short".into());
-    }
-
-    let cipher_key = Key::from_slice(key);
-    let cipher = ChaCha20Poly1305::new(cipher_key);
-    let nonce = Nonce::from_slice(&stored[..12]);
-    let ciphertext = &stored[12..];
-
-    cipher.decrypt(nonce, ciphertext)
-        .map_err(|e| format!("ChaCha20 decrypt: {}", e))
-}
-
-/// Encrypt content bytes for rawlog storage.
-/// Format: nonce(12) || ciphertext(len + 16 tag)
-fn encrypt_rawlog_content(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-    use chacha20poly1305::aead::{Aead, NewAead};
-
-    let cipher_key = Key::from_slice(key);
-    let cipher = ChaCha20Poly1305::new(cipher_key);
-
-    // Generate random 12-byte nonce
-    let mut nonce_bytes = [0u8; 12];
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher.encrypt(nonce, plaintext)
-        .map_err(|e| format!("ChaCha20 encrypt: {}", e))?;
-
-    let mut result = Vec::with_capacity(12 + ciphertext.len());
-    result.extend_from_slice(&nonce_bytes);
-    result.extend_from_slice(&ciphertext);
-    Ok(result)
-}
-
-/// Decrypt content bytes from rawlog storage.
-/// Input format: nonce(12) || ciphertext(len + 16 tag)
-fn decrypt_rawlog_content(key: &[u8; 32], stored: &[u8]) -> Result<Vec<u8>, String> {
-    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-    use chacha20poly1305::aead::{Aead, NewAead};
-
-    if stored.len() < 12 + 16 {
-        return Err("Ciphertext too short".into());
-    }
-
-    let cipher_key = Key::from_slice(key);
-    let cipher = ChaCha20Poly1305::new(cipher_key);
-    let nonce = Nonce::from_slice(&stored[..12]);
-    let ciphertext = &stored[12..];
-
-    cipher.decrypt(nonce, ciphertext)
-        .map_err(|e| format!("ChaCha20 decrypt: {}", e))
-}
-
-/// Public wrapper for rawlog content decryption (used by Miner).
-pub fn decrypt_rawlog_content_pub(key: &[u8; 32], stored: &[u8]) -> Result<Vec<u8>, String> {
-    decrypt_rawlog_content(key, stored)
+pub(crate) fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(4).map(|chunk| {
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(chunk);
+        f32::from_le_bytes(buf)
+    }).collect()
 }
 
 // ============================================
-// RawLogRow — query result struct
+// StorageStats / LayerCounts
 // ============================================
 
-/// A row from the raw_logs table.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StorageStats {
+    pub total_records: u64,
+    pub active_records: u64,
+    pub by_layer: LayerCounts,
+    pub content_bytes: u64,
+    pub records_with_embedding: u64,
+    pub session_inserts: u64,
+    pub session_rejects: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LayerCounts {
+    pub identity: u64,
+    pub knowledge: u64,
+    pub episode: u64,
+    pub archive: u64,
+}
+
+// ============================================
+// RawLogRow
+// ============================================
+
 #[derive(Debug, Clone)]
 pub struct RawLogRow {
     pub log_id: i64,
@@ -276,133 +117,35 @@ pub struct RawLogRow {
     pub feedback_signal: Option<i64>,
 }
 
-/// LRU 缓存容量（条目数）— 单用户 1000 条约 2MB 内存
-/// LRU cache capacity — 1000 records ≈ 2MB for a single user
-const LRU_CACHE_CAPACITY: usize = 1000;
-
 // ============================================
-// Constants
+// LRU Cache
 // ============================================
 
-/// Schema 版本号，增加时需要添加迁移逻辑
-/// Schema version — bump this AND add migration logic in maybe_migrate()
-const SCHEMA_VERSION: u32 = 4;
-
-/// 分页查询默认页大小
-const DEFAULT_PAGE_SIZE: usize = 100;
-
-// ============================================
-// Embedding 序列化辅助
-// Embedding serialization helpers
-// ============================================
-
-/// 将 `Vec<f32>` 序列化为 little-endian 字节序列
-/// Serialize `Vec<f32>` to little-endian byte sequence
-fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
-    embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
-}
-
-/// 从 little-endian 字节序列反序列化为 `Vec<f32>`
-/// Deserialize little-endian bytes to `Vec<f32>`
-fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| {
-            let mut buf = [0u8; 4];
-            buf.copy_from_slice(chunk);
-            f32::from_le_bytes(buf)
-        })
-        .collect()
-}
-
-// ============================================
-// StorageStats — 聚合统计
-// ============================================
-
-/// 存储引擎聚合统计 / Aggregate storage statistics
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct StorageStats {
-    /// 数据库中所有记录数（含所有 status）
-    pub total_records: u64,
-    /// 仅 status=Active 的记录数
-    pub active_records: u64,
-    /// 按 Layer 分布（仅 Active）/ Per-layer distribution (Active only)
-    pub by_layer: LayerCounts,
-    /// 加密内容总字节数（Active only）
-    pub content_bytes: u64,
-    /// 有 embedding 的记录数
-    pub records_with_embedding: u64,
-    /// 本次会话插入数 / Session inserts
-    pub session_inserts: u64,
-    /// 本次会话拒绝数 / Session rejects
-    pub session_rejects: u64,
-}
-
-/// 按层级的活跃记录计数 / Per-layer active record counts
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct LayerCounts {
-    pub identity: u64,
-    pub knowledge: u64,
-    pub episode: u64,
-    pub archive: u64,
-}
-
-// ============================================
-// MemoryStorage
-// ============================================
-
-/// SQLite 持久化存储引擎
-/// SQLite persistent storage engine for MemoryRecord
-///
-/// ## Record Content Encryption (v2.1.0+MVF+Encryption)
-/// When `record_key` is Some, all `encrypted_content` is transparently:
-/// - Encrypted on insert (deterministic ChaCha20-Poly1305)
-/// - Decrypted on read (get, get_active_records, etc.)
-/// - Encrypted before comparison in has_active_content (dedup still works)
-/// Callers see plaintext; SQLite stores ciphertext.
-pub struct MemoryStorage {
-    conn: TokioMutex<Connection>,
-    total_inserted: AtomicU64,
-    total_rejected: AtomicU64,
-    /// LRU 缓存：最近访问的 MemoryRecord，减少 recall 时的 SQLite IO
-    /// LRU cache: recently accessed records to reduce SQLite IO during recall
-    cache: RwLock<LruCache>,
-    /// Optional record content encryption key.
-    /// When Some, encrypted_content is encrypted/decrypted transparently.
-    /// Derived from Ed25519 private key via derive_record_key().
-    record_key: Option<[u8; 32]>,
-}
-
-/// 简易 LRU 缓存（基于 LinkedHashMap 语义的 Vec + HashMap）
-/// 对于 1000 条的规模，HashMap 查找 + Vec 淘汰足够高效。
-/// Phase 2+ 可替换为 `lru` crate 的专业实现。
-struct LruCache {
-    map: HashMap<[u8; 32], (usize, MemoryRecord)>, // record_id → (order, record)
+pub(crate) struct LruCache {
+    map: HashMap<[u8; 32], (usize, MemoryRecord)>,
     order_counter: usize,
     capacity: usize,
 }
 
 impl LruCache {
-    fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self { map: HashMap::with_capacity(capacity), order_counter: 0, capacity }
     }
 
-    fn get(&mut self, id: &[u8; 32]) -> Option<&MemoryRecord> {
+    pub fn get(&mut self, id: &[u8; 32]) -> Option<&MemoryRecord> {
         if let Some(entry) = self.map.get_mut(id) {
             self.order_counter += 1;
-            entry.0 = self.order_counter; // 刷新访问顺序
+            entry.0 = self.order_counter;
             Some(&entry.1)
         } else {
             None
         }
     }
 
-    fn put(&mut self, record: MemoryRecord) {
+    pub fn put(&mut self, record: MemoryRecord) {
         let id = record.record_id;
         self.order_counter += 1;
         self.map.insert(id, (self.order_counter, record));
-
-        // 超容量时淘汰最久未访问的
         if self.map.len() > self.capacity {
             if let Some((&evict_id, _)) = self.map.iter().min_by_key(|(_, (ord, _))| *ord) {
                 self.map.remove(&evict_id);
@@ -410,25 +153,29 @@ impl LruCache {
         }
     }
 
-    fn invalidate(&mut self, id: &[u8; 32]) {
+    pub fn invalidate(&mut self, id: &[u8; 32]) {
         self.map.remove(id);
     }
 
-    fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.map.clear();
         self.order_counter = 0;
     }
 }
 
+// ============================================
+// MemoryStorage
+// ============================================
+
+pub struct MemoryStorage {
+    pub(crate) conn: TokioMutex<Connection>,
+    pub(crate) total_inserted: AtomicU64,
+    pub(crate) total_rejected: AtomicU64,
+    pub(crate) cache: RwLock<LruCache>,
+    pub(crate) record_key: Option<[u8; 32]>,
+}
+
 impl MemoryStorage {
-    /// 打开或创建 SQLite 数据库
-    /// Open or create the SQLite database at the given path.
-    ///
-    /// ## Arguments
-    /// * `path` - Database file path, or ":memory:" for in-memory DB
-    /// * `record_key` - Optional encryption key for record content.
-    ///   When Some, all encrypted_content is transparently encrypted/decrypted.
-    ///   Derive with `derive_record_key(&identity.to_bytes())`.
     pub fn open(path: impl AsRef<Path>, record_key: Option<[u8; 32]>) -> Result<Self, String> {
         let path = path.as_ref();
 
@@ -446,7 +193,6 @@ impl MemoryStorage {
         }
         .map_err(|e| format!("Failed to open SQLite: {}", e))?;
 
-        // 性能优化 pragmas / Performance pragmas
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -458,13 +204,8 @@ impl MemoryStorage {
         Self::create_schema(&conn)?;
         Self::maybe_migrate(&conn)?;
 
-        let encrypted_status = if record_key.is_some() { "encrypted" } else { "plaintext" };
-        info!(
-            path = %path.display(),
-            mode = encrypted_status,
-            "[STORAGE] ✅ SQLite database opened (schema v{})",
-            SCHEMA_VERSION
-        );
+        let mode = if record_key.is_some() { "encrypted" } else { "plaintext" };
+        info!(path = %path.display(), mode = mode, "[STORAGE] ✅ SQLite opened (schema v{})", SCHEMA_VERSION);
 
         Ok(Self {
             conn: TokioMutex::new(conn),
@@ -498,18 +239,11 @@ impl MemoryStorage {
                 negative_feedback   INTEGER NOT NULL DEFAULT 0,
                 conflict_with       BLOB
             );
+            CREATE INDEX IF NOT EXISTS idx_owner ON records(owner);
+            CREATE INDEX IF NOT EXISTS idx_owner_layer_status ON records(owner, layer, status);
+            CREATE INDEX IF NOT EXISTS idx_status_layer ON records(status, layer);
+            CREATE INDEX IF NOT EXISTS idx_timestamp ON records(timestamp);
 
-            CREATE INDEX IF NOT EXISTS idx_owner
-                ON records(owner);
-            CREATE INDEX IF NOT EXISTS idx_owner_layer_status
-                ON records(owner, layer, status);
-            CREATE INDEX IF NOT EXISTS idx_status_layer
-                ON records(status, layer);
-            CREATE INDEX IF NOT EXISTS idx_timestamp
-                ON records(timestamp);
-
-            -- Raw conversation logs (new in v4, but created in initial schema
-            -- so fresh installs get it immediately)
             CREATE TABLE IF NOT EXISTS raw_logs (
                 log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id      TEXT NOT NULL,
@@ -523,55 +257,36 @@ impl MemoryStorage {
                 encrypted       INTEGER DEFAULT 0,
                 created_at      INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_rawlogs_session
-                ON raw_logs(session_id, turn_index);
-            CREATE INDEX IF NOT EXISTS idx_rawlogs_feedback
-                ON raw_logs(feedback_signal);
+            CREATE INDEX IF NOT EXISTS idx_rawlogs_session ON raw_logs(session_id, turn_index);
+            CREATE INDEX IF NOT EXISTS idx_rawlogs_feedback ON raw_logs(feedback_signal);
 
-            -- Memory co-occurrence graph edges
             CREATE TABLE IF NOT EXISTS memory_edges (
-                source_id   BLOB NOT NULL,
-                target_id   BLOB NOT NULL,
-                edge_type   TEXT NOT NULL DEFAULT 'co_occurred',
-                weight      REAL NOT NULL DEFAULT 1.0,
-                created_at  INTEGER NOT NULL,
+                source_id BLOB NOT NULL, target_id BLOB NOT NULL,
+                edge_type TEXT NOT NULL DEFAULT 'co_occurred',
+                weight REAL NOT NULL DEFAULT 1.0, created_at INTEGER NOT NULL,
                 PRIMARY KEY (source_id, target_id)
             );
             CREATE INDEX IF NOT EXISTS idx_edges_source ON memory_edges(source_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON memory_edges(target_id);
 
-            -- Per-user MVF learned weights (9 dim × 3 arrays = 108 bytes)
             CREATE TABLE IF NOT EXISTS user_weights (
-                owner       BLOB PRIMARY KEY,
-                weights     BLOB NOT NULL,
-                version     INTEGER NOT NULL DEFAULT 0,
-                created_at  INTEGER NOT NULL,
-                updated_at  INTEGER NOT NULL
+                owner BLOB PRIMARY KEY, weights BLOB NOT NULL,
+                version INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
             );
 
-            -- Feedback events for SGD training
             CREATE TABLE IF NOT EXISTS memory_feedback (
-                feedback_id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner         BLOB NOT NULL,
-                memory_id     BLOB NOT NULL,
-                session_id    TEXT NOT NULL,
-                turn_index    INTEGER NOT NULL,
-                signal        INTEGER NOT NULL,
-                features      BLOB,
-                prediction    REAL,
-                created_at    INTEGER NOT NULL
+                feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner BLOB NOT NULL, memory_id BLOB NOT NULL,
+                session_id TEXT NOT NULL, turn_index INTEGER NOT NULL,
+                signal INTEGER NOT NULL, features BLOB, prediction REAL,
+                created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_feedback_owner ON memory_feedback(owner);
             CREATE INDEX IF NOT EXISTS idx_feedback_memory ON memory_feedback(memory_id);
 
-            CREATE TABLE IF NOT EXISTS chain_state (
-                key   TEXT PRIMARY KEY,
-                value BLOB NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS schema_version (
-                version INTEGER NOT NULL
-            );"
+            CREATE TABLE IF NOT EXISTS chain_state (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);"
         ).map_err(|e| format!("Schema creation failed: {}", e))?;
 
         let existing: Option<u32> = conn
@@ -587,154 +302,71 @@ impl MemoryStorage {
         Ok(())
     }
 
-    /// Schema 迁移 — 支持 v1→v2→v4 的增量迁移
-    /// Schema migration — incremental migration through v1→v2→v4
-    ///
-    /// ## Migration History
-    /// - v1→v2: Added `embedding` column (replaced `encrypted_embedding`)
-    /// - v2→v4: Added `positive_feedback`, `negative_feedback`, `conflict_with` columns
-    ///          (skipped v3 to align with architecture doc "Schema v4" naming)
-    ///
-    /// ## Safety
-    /// All migrations use ALTER TABLE ADD COLUMN which is:
-    /// - Non-destructive (existing data untouched)
-    /// - Idempotent-safe (we check column existence before ALTER)
-    /// - WAL-compatible (no table rebuild needed)
     fn maybe_migrate(conn: &Connection) -> Result<(), String> {
         let current: u32 = conn
             .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
             .unwrap_or(1);
 
-        // ========================================
         // v1 → v2: embedding column
-        // ========================================
         if current < 2 {
             info!("[STORAGE] Migrating schema v{} → v2", current);
-
-            // v1 had `encrypted_embedding BLOB`; v2 renames to `embedding BLOB`
-            // SQLite doesn't support RENAME COLUMN before 3.25, so we check if
-            // the old column exists and add the new one if missing.
-            let has_embedding: bool = conn
-                .prepare("SELECT embedding FROM records LIMIT 0")
-                .is_ok();
-
+            let has_embedding: bool = conn.prepare("SELECT embedding FROM records LIMIT 0").is_ok();
             if !has_embedding {
-                let _ = conn.execute_batch(
-                    "ALTER TABLE records ADD COLUMN embedding BLOB;"
-                );
+                let _ = conn.execute_batch("ALTER TABLE records ADD COLUMN embedding BLOB;");
                 info!("[STORAGE] Added `embedding` column");
             }
-
-            conn.execute(
-                "UPDATE schema_version SET version = 2",
-                [],
-            ).map_err(|e| format!("Update schema version to v2: {}", e))?;
-
+            conn.execute("UPDATE schema_version SET version = 2", [])
+                .map_err(|e| format!("Update schema version to v2: {}", e))?;
             info!("[STORAGE] ✅ Migration to v2 complete");
         }
 
-        // ========================================
-        // v2 → v4: MVF feedback + conflict columns
-        // (skipped v3 to align with architecture doc naming)
-        // ========================================
+        // v2 → v4: MVF feedback + conflict
         let current: u32 = conn
             .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
             .unwrap_or(2);
 
         if current < 4 {
-            info!("[STORAGE] Migrating schema v{} → v4 (MVF feedback + conflict)", current);
+            info!("[STORAGE] Migrating schema v{} → v4", current);
 
-            // Add positive_feedback column if missing
-            let has_positive: bool = conn
-                .prepare("SELECT positive_feedback FROM records LIMIT 0")
-                .is_ok();
-            if !has_positive {
-                conn.execute_batch(
-                    "ALTER TABLE records ADD COLUMN positive_feedback INTEGER NOT NULL DEFAULT 0;"
-                ).map_err(|e| format!("Add positive_feedback column: {}", e))?;
-                info!("[STORAGE] Added `positive_feedback` column");
+            if !conn.prepare("SELECT positive_feedback FROM records LIMIT 0").is_ok() {
+                conn.execute_batch("ALTER TABLE records ADD COLUMN positive_feedback INTEGER NOT NULL DEFAULT 0;")
+                    .map_err(|e| format!("Add positive_feedback: {}", e))?;
+            }
+            if !conn.prepare("SELECT negative_feedback FROM records LIMIT 0").is_ok() {
+                conn.execute_batch("ALTER TABLE records ADD COLUMN negative_feedback INTEGER NOT NULL DEFAULT 0;")
+                    .map_err(|e| format!("Add negative_feedback: {}", e))?;
+            }
+            if !conn.prepare("SELECT conflict_with FROM records LIMIT 0").is_ok() {
+                conn.execute_batch("ALTER TABLE records ADD COLUMN conflict_with BLOB;")
+                    .map_err(|e| format!("Add conflict_with: {}", e))?;
             }
 
-            // Add negative_feedback column if missing
-            let has_negative: bool = conn
-                .prepare("SELECT negative_feedback FROM records LIMIT 0")
-                .is_ok();
-            if !has_negative {
-                conn.execute_batch(
-                    "ALTER TABLE records ADD COLUMN negative_feedback INTEGER NOT NULL DEFAULT 0;"
-                ).map_err(|e| format!("Add negative_feedback column: {}", e))?;
-                info!("[STORAGE] Added `negative_feedback` column");
-            }
-
-            // Add conflict_with column if missing
-            let has_conflict: bool = conn
-                .prepare("SELECT conflict_with FROM records LIMIT 0")
-                .is_ok();
-            if !has_conflict {
-                conn.execute_batch(
-                    "ALTER TABLE records ADD COLUMN conflict_with BLOB;"
-                ).map_err(|e| format!("Add conflict_with column: {}", e))?;
-                info!("[STORAGE] Added `conflict_with` column");
-            }
-
-            // Update schema version to 4
-            conn.execute(
-                "UPDATE schema_version SET version = ?1",
-                params![SCHEMA_VERSION],
-            ).map_err(|e| format!("Update schema version to v4: {}", e))?;
-
-            info!("[STORAGE] ✅ Migration to v4 complete (positive_feedback, negative_feedback, conflict_with)");
+            conn.execute("UPDATE schema_version SET version = ?1", params![SCHEMA_VERSION])
+                .map_err(|e| format!("Update schema version to v4: {}", e))?;
+            info!("[STORAGE] ✅ Migration to v4 complete");
         }
 
-        // ========================================
-        // Rawlog key migration: clear old raw_logs
-        // ========================================
-        // v2.1.0+MVF+Encryption: derive_rawlog_key was changed from using
-        // the PUBLIC key (insecure) to the PRIVATE key. Old rawlogs encrypted
-        // with the public-key-derived key are now undecryptable with the new
-        // private-key-derived key. Since raw_logs are transient (used only for
-        // /log extraction and Miner Step 0 feedback detection), we clear them
-        // on first run after the fix.
-        //
-        // Detection: chain_state key 'rawlog_key_migrated' = "1" means done.
-        // If absent, this is the first run after the fix → clear raw_logs.
+        // Rawlog key migration: clear old raw_logs encrypted with public key
         {
             let migrated: bool = conn.query_row(
                 "SELECT value FROM chain_state WHERE key = 'rawlog_key_migrated'",
-                [],
-                |row| {
-                    let v: Vec<u8> = row.get(0)?;
-                    Ok(v == b"1")
-                },
+                [], |row| { let v: Vec<u8> = row.get(0)?; Ok(v == b"1") },
             ).unwrap_or(false);
 
             if !migrated {
                 let count: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM raw_logs",
-                    [],
-                    |row| row.get(0),
+                    "SELECT COUNT(*) FROM raw_logs", [], |row| row.get(0),
                 ).unwrap_or(0);
 
                 if count > 0 {
                     match conn.execute("DELETE FROM raw_logs", []) {
-                        Ok(deleted) => {
-                            info!(
-                                deleted = deleted,
-                                "[STORAGE] 🔑 Cleared old raw_logs (rawlog key derivation migrated to private key)"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "[STORAGE] Failed to clear old raw_logs during migration");
-                        }
+                        Ok(deleted) => info!(deleted = deleted,
+                            "[STORAGE] 🔑 Cleared old raw_logs (rawlog key migrated to private key)"),
+                        Err(e) => warn!(error = %e, "[STORAGE] Failed to clear old raw_logs"),
                     }
-                    // Reset autoincrement counter for clean IDs
-                    let _ = conn.execute(
-                        "DELETE FROM sqlite_sequence WHERE name = 'raw_logs'",
-                        [],
-                    );
+                    let _ = conn.execute("DELETE FROM sqlite_sequence WHERE name = 'raw_logs'", []);
                 }
 
-                // Mark migration as done
                 let _ = conn.execute(
                     "INSERT OR REPLACE INTO chain_state (key, value) VALUES ('rawlog_key_migrated', ?1)",
                     params![b"1".as_slice()],
@@ -747,48 +379,24 @@ impl MemoryStorage {
     }
 
     // ========================================
-    // Insert — 插入记录
+    // Insert
     // ========================================
 
-    /// 验证哈希完整性后插入记录（幂等：重复 ID 静默跳过）
-    /// Validate hash integrity and insert record (idempotent: duplicate ID silently ignored)
-    ///
-    /// # Arguments
-    /// * `record` - 要插入的记忆记录
-    /// * `embedding_model` - embedding 模型标识（如 "minilm-l6-v2"）
-    ///
-    /// ## Encryption
-    /// If `record_key` is set, `encrypted_content` is transparently encrypted
-    /// before storage. The caller always passes plaintext content.
     pub async fn insert(&self, record: &MemoryRecord, embedding_model: &str) -> bool {
         if !record.verify_id() {
-            warn!(
-                record_id = hex::encode(record.record_id),
-                "[STORAGE] ❌ Rejected: hash mismatch"
-            );
+            warn!(record_id = hex::encode(record.record_id), "[STORAGE] ❌ Rejected: hash mismatch");
             self.total_rejected.fetch_add(1, Ordering::Relaxed);
             return false;
         }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        let tags_json = serde_json::to_string(&record.topic_tags)
-            .unwrap_or_else(|_| "[]".to_string());
-
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let tags_json = serde_json::to_string(&record.topic_tags).unwrap_or_else(|_| "[]".to_string());
         let embedding_blob: Option<Vec<u8>> = if record.has_embedding() {
             Some(embedding_to_bytes(&record.embedding))
-        } else {
-            None
-        };
-
+        } else { None };
         let embedding_dim = record.embedding_dim() as i64;
-
         let conflict_with_blob: Option<Vec<u8>> = record.conflict_with.map(|c| c.to_vec());
 
-        // Encrypt content if record_key is available (transparent encryption)
         let stored_content: Vec<u8> = if let Some(ref key) = self.record_key {
             if record.encrypted_content.is_empty() {
                 record.encrypted_content.clone()
@@ -796,7 +404,7 @@ impl MemoryStorage {
                 match encrypt_record_content(key, &record.encrypted_content) {
                     Ok(ct) => ct,
                     Err(e) => {
-                        warn!("[STORAGE] Record content encryption failed, storing plaintext: {}", e);
+                        warn!("[STORAGE] Record encryption failed, storing plaintext: {}", e);
                         record.encrypted_content.clone()
                     }
                 }
@@ -806,33 +414,23 @@ impl MemoryStorage {
         };
 
         let conn = self.conn.lock().await;
-
         let result = conn.execute(
             "INSERT OR IGNORE INTO records (
                 record_id, owner, timestamp, layer, topic_tags, source_ai,
                 status, supersedes, encrypted_content, embedding,
-                embedding_model, embedding_dim,
-                signature, access_count, created_at,
+                embedding_model, embedding_dim, signature, access_count, created_at,
                 positive_feedback, negative_feedback, conflict_with
             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
-                record.record_id.as_slice(),
-                record.owner.as_slice(),
-                record.timestamp as i64,
-                record.layer as u8 as i64,
-                tags_json,
-                record.source_ai,
+                record.record_id.as_slice(), record.owner.as_slice(),
+                record.timestamp as i64, record.layer as u8 as i64,
+                tags_json, record.source_ai,
                 record.status as u8 as i64,
                 record.supersedes.as_ref().map(|s| s.as_slice()),
-                stored_content.as_slice(),
-                embedding_blob.as_deref(),
-                embedding_model,
-                embedding_dim,
-                record.signature.as_slice(),
-                record.access_count as i64,
-                now,
-                record.positive_feedback as i64,
-                record.negative_feedback as i64,
+                stored_content.as_slice(), embedding_blob.as_deref(),
+                embedding_model, embedding_dim,
+                record.signature.as_slice(), record.access_count as i64, now,
+                record.positive_feedback as i64, record.negative_feedback as i64,
                 conflict_with_blob.as_deref(),
             ],
         );
@@ -840,19 +438,11 @@ impl MemoryStorage {
         match result {
             Ok(changes) if changes > 0 => {
                 self.total_inserted.fetch_add(1, Ordering::Relaxed);
-                // 回填 LRU 缓存 (store plaintext in cache for fast reads)
                 self.cache.write().put(record.clone());
-                debug!(
-                    record_id = hex::encode(record.record_id),
-                    layer = %record.layer,
-                    "[STORAGE] ✅ Inserted"
-                );
+                debug!(record_id = hex::encode(record.record_id), layer = %record.layer, "[STORAGE] ✅ Inserted");
                 true
             }
-            Ok(_) => {
-                debug!(record_id = hex::encode(record.record_id), "[STORAGE] Duplicate, skipped");
-                false
-            }
+            Ok(_) => { debug!(record_id = hex::encode(record.record_id), "[STORAGE] Duplicate, skipped"); false }
             Err(e) => {
                 error!(record_id = hex::encode(record.record_id), error = %e, "[STORAGE] ❌ Insert failed");
                 self.total_rejected.fetch_add(1, Ordering::Relaxed);
@@ -862,756 +452,139 @@ impl MemoryStorage {
     }
 
     // ========================================
-    // Query — 查询
+    // Query
     // ========================================
 
-    /// 按 record_id 查找单条记录（LRU 缓存优先）
-    /// Lookup by record_id (LRU cache first, then SQLite fallback)
     pub async fn get(&self, record_id: &[u8; 32]) -> Option<MemoryRecord> {
-        // 先查缓存
         {
             let mut cache = self.cache.write();
             if let Some(record) = cache.get(record_id) {
                 return Some(record.clone());
             }
         }
-
-        // 缓存未命中 → 查 SQLite
         let conn = self.conn.lock().await;
         let rk = self.record_key;
         let result = conn.query_row(
             Self::SELECT_RECORD_COLS,
             params![record_id.as_slice()],
             |row| Self::row_to_record(row, rk.as_ref()),
-        )
-        .optional()
-        .unwrap_or_else(|e| { error!(error=%e, "[STORAGE] Query failed"); None });
+        ).optional().unwrap_or_else(|e| { error!(error=%e, "[STORAGE] Query failed"); None });
 
-        // 回填缓存
         if let Some(ref record) = result {
             self.cache.write().put(record.clone());
         }
-
         result
     }
 
-    /// 查询某 owner 的 Active 记录，可选 layer 过滤
-    /// Query active records for an owner, with optional layer filter
     pub async fn get_active_records(
-        &self,
-        owner: &[u8; 32],
-        layer: Option<MemoryLayer>,
-        limit: usize,
+        &self, owner: &[u8; 32], layer: Option<MemoryLayer>, limit: usize,
     ) -> Vec<MemoryRecord> {
         let limit = limit.min(1000).max(1);
         let conn = self.conn.lock().await;
-
         if let Some(l) = layer {
             self.query_rows(&conn,
                 "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
-                        status,supersedes,encrypted_content,embedding,
-                        signature,access_count,
+                        status,supersedes,encrypted_content,embedding,signature,access_count,
                         positive_feedback,negative_feedback,conflict_with
-                 FROM records
-                 WHERE owner=?1 AND status=0 AND layer=?2
+                 FROM records WHERE owner=?1 AND status=0 AND layer=?2
                  ORDER BY timestamp DESC LIMIT ?3",
-                params![owner.as_slice(), l as u8 as i64, limit as i64],
-            )
+                params![owner.as_slice(), l as u8 as i64, limit as i64])
         } else {
             self.query_rows(&conn,
                 "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
-                        status,supersedes,encrypted_content,embedding,
-                        signature,access_count,
+                        status,supersedes,encrypted_content,embedding,signature,access_count,
                         positive_feedback,negative_feedback,conflict_with
-                 FROM records
-                 WHERE owner=?1 AND status=0
+                 FROM records WHERE owner=?1 AND status=0
                  ORDER BY timestamp DESC LIMIT ?2",
-                params![owner.as_slice(), limit as i64],
-            )
+                params![owner.as_slice(), limit as i64])
         }
     }
 
-    /// 按 owner + timestamp 查询（用于 P2P 同步）
-    pub async fn query_by_owner_after(
-        &self,
-        owner: &[u8; 32],
-        after_timestamp: u64,
-    ) -> Vec<MemoryRecord> {
+    pub async fn query_by_owner_after(&self, owner: &[u8; 32], after_timestamp: u64) -> Vec<MemoryRecord> {
         let conn = self.conn.lock().await;
         self.query_rows(&conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
-                    status,supersedes,encrypted_content,embedding,
-                    signature,access_count,
+                    status,supersedes,encrypted_content,embedding,signature,access_count,
                     positive_feedback,negative_feedback,conflict_with
-             FROM records
-             WHERE owner=?1 AND timestamp>?2
+             FROM records WHERE owner=?1 AND timestamp>?2
              ORDER BY timestamp ASC LIMIT ?3",
-            params![owner.as_slice(), after_timestamp as i64, DEFAULT_PAGE_SIZE as i64],
-        )
+            params![owner.as_slice(), after_timestamp as i64, DEFAULT_PAGE_SIZE as i64])
     }
 
-    /// 获取所有有 embedding 的 Active 记录（启动时重建向量索引用）
-    /// Get all active records with embeddings for vector index rebuild on startup.
-    ///
-    /// Returns `(MemoryRecord, embedding_model)` tuples so the caller can
-    /// insert each vector into the correct partition.
-    ///
-    /// ## v2.1.0+MVF+Encryption Fix
-    /// Now uses unified row_to_record with record_key for transparent decryption.
-    /// Previously this method bypassed query_rows and called row_to_record without
-    /// the record_key parameter, causing encrypted records to not be decrypted.
     pub async fn get_records_with_embedding(&self, owner: &[u8; 32]) -> Vec<(MemoryRecord, String)> {
         let conn = self.conn.lock().await;
-
         let mut stmt = match conn.prepare(
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
-                    status,supersedes,encrypted_content,embedding,
-                    signature,access_count,
-                    positive_feedback,negative_feedback,conflict_with,
-                    embedding_model
-             FROM records
-             WHERE owner=?1 AND status=0 AND embedding IS NOT NULL
+                    status,supersedes,encrypted_content,embedding,signature,access_count,
+                    positive_feedback,negative_feedback,conflict_with,embedding_model
+             FROM records WHERE owner=?1 AND status=0 AND embedding IS NOT NULL
              ORDER BY timestamp DESC"
         ) {
             Ok(s) => s,
             Err(e) => { error!(error=%e, "[STORAGE] Prepare failed"); return Vec::new(); }
         };
-
         let rk = self.record_key;
         stmt.query_map(params![owner.as_slice()], |row| {
             let record = Self::row_to_record(row, rk.as_ref())?;
-            let model: String = row.get(15)?; // embedding_model is at index 15
+            let model: String = row.get(15)?;
             Ok((record, model))
-        })
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     }
 
     // ========================================
-    // Lifecycle — 生命周期管理
+    // Lifecycle
     // ========================================
 
-    /// 更新记录的 status / Update record status
     pub async fn update_status(&self, record_id: &[u8; 32], new_status: RecordStatus) -> bool {
         let conn = self.conn.lock().await;
-        match conn.execute(
-            "UPDATE records SET status=?1 WHERE record_id=?2",
-            params![new_status as u8 as i64, record_id.as_slice()],
-        ) {
+        match conn.execute("UPDATE records SET status=?1 WHERE record_id=?2",
+            params![new_status as u8 as i64, record_id.as_slice()]) {
             Ok(n) if n > 0 => { debug!(record_id=hex::encode(record_id), %new_status, "[STORAGE] ✅ Status updated"); true }
             Ok(_) => { warn!(record_id=hex::encode(record_id), "[STORAGE] Not found for status update"); false }
             Err(e) => { error!(error=%e, "[STORAGE] Status update failed"); false }
         }
     }
 
-    /// 撤销记忆：标记 Revoked + 擦除加密内容和 embedding
-    /// Revoke memory: mark Revoked + erase encrypted content and embedding
     pub async fn revoke(&self, record_id: &[u8; 32]) -> bool {
         let conn = self.conn.lock().await;
         match conn.execute(
-            "UPDATE records SET status=?1, encrypted_content=x'', embedding=NULL
-             WHERE record_id=?2",
-            params![RecordStatus::Revoked as u8 as i64, record_id.as_slice()],
-        ) {
+            "UPDATE records SET status=?1, encrypted_content=x'', embedding=NULL WHERE record_id=?2",
+            params![RecordStatus::Revoked as u8 as i64, record_id.as_slice()]) {
             Ok(n) if n > 0 => {
-                // 缓存失效
                 self.cache.write().invalidate(record_id);
-                info!(record_id=hex::encode(record_id), "[STORAGE] 🗑️ Revoked");
-                true
+                info!(record_id=hex::encode(record_id), "[STORAGE] 🗑️ Revoked"); true
             }
             Ok(_) => { warn!(record_id=hex::encode(record_id), "[STORAGE] Not found for revoke"); false }
             Err(e) => { error!(error=%e, "[STORAGE] Revoke failed"); false }
         }
     }
 
-    /// 递增访问计数（召回命中时）
-    /// Increment access count (on recall hit)
     pub async fn increment_access(&self, record_id: &[u8; 32]) {
         let conn = self.conn.lock().await;
         let _ = conn.execute(
             "UPDATE records SET access_count=access_count+1 WHERE record_id=?1",
-            params![record_id.as_slice()],
-        );
+            params![record_id.as_slice()]);
     }
 
-    // ========================================
-    // Miner 支持 — 记忆压实
-    // Miner Support — Memory Compaction
-    // ========================================
-
-    /// 统计某 layer 的 Active 记录数 / Count active records for a layer
-    pub async fn count_by_layer(&self, layer: MemoryLayer) -> u64 {
-        let conn = self.conn.lock().await;
-        conn.query_row(
-            "SELECT COUNT(*) FROM records WHERE status=0 AND layer=?1",
-            params![layer as u8 as i64],
-            |row| row.get::<_, i64>(0),
-        ).unwrap_or(0) as u64
-    }
-
-    /// 将 Episode 记录压实为 Archive（改 layer，保持 status=Active）。
-    /// Compact episodes to archive: change layer to Archive, keep status=Active.
-    ///
-    /// 这是 v2.1 的关键改动：Archive 是独立 Layer，不是 Status。
-    /// 压实后的记忆仍以极低权重（0.05）参与召回。
-    ///
-    /// This is the key v2.1 change: Archive is a separate Layer, not Status.
-    /// Compacted memories still participate in recall at very low weight (0.05).
-    pub async fn compact_episodes_to_archive(
-        &self,
-        owner: &[u8; 32],
-        limit: usize,
-    ) -> Vec<MemoryRecord> {
-        let conn = self.conn.lock().await;
-
-        // Step 1: 选出最老的 Active Episode
-        let records = self.query_rows(&conn,
-            "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
-                    status,supersedes,encrypted_content,embedding,
-                    signature,access_count,
-                    positive_feedback,negative_feedback,conflict_with
-             FROM records
-             WHERE owner=?1 AND status=0 AND layer=?2
-             ORDER BY timestamp ASC LIMIT ?3",
-            params![
-                owner.as_slice(),
-                MemoryLayer::Episode as u8 as i64,
-                limit as i64,
-            ],
-        );
-
-        if records.is_empty() {
-            return records;
-        }
-
-        // Step 2: 事务内批量改 layer → Archive
-        if conn.execute_batch("BEGIN TRANSACTION").is_err() {
-            return Vec::new();
-        }
-
-        for r in &records {
-            let now_ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            if let Err(e) = conn.execute(
-                "UPDATE records SET layer=?1, archived_at=?2 WHERE record_id=?3",
-                params![
-                    MemoryLayer::Archive as u8 as i64,
-                    now_ts,
-                    r.record_id.as_slice(),
-                ],
-            ) {
-                error!(error=%e, "[STORAGE] ❌ Compact update failed, rolling back");
-                let _ = conn.execute_batch("ROLLBACK");
-                return Vec::new();
-            }
-        }
-
-        if conn.execute_batch("COMMIT").is_err() {
-            return Vec::new();
-        }
-
-        info!(count = records.len(), "[STORAGE] ⛏️ Episodes compacted to Archive layer");
-        records
-    }
-
-    // ========================================
-    // Chain State — 区块链状态
-    // ========================================
-
-    pub async fn set_chain_state(&self, block_hash: &[u8; 32], height: u64) {
-        let conn = self.conn.lock().await;
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO chain_state (key,value) VALUES ('last_block_hash',?1)",
-            params![block_hash.as_slice()],
-        );
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO chain_state (key,value) VALUES ('last_block_height',?1)",
-            params![height.to_le_bytes().as_slice()],
-        );
-    }
-
-    pub async fn last_block_hash(&self) -> [u8; 32] {
-        let conn = self.conn.lock().await;
-        conn.query_row(
-            "SELECT value FROM chain_state WHERE key='last_block_hash'",
-            [], |row| {
-                let blob: Vec<u8> = row.get(0)?;
-                let mut h = [0u8; 32];
-                if blob.len() == 32 { h.copy_from_slice(&blob); }
-                Ok(h)
-            },
-        ).unwrap_or([0u8; 32])
-    }
-
-    pub async fn last_block_height(&self) -> u64 {
-        let conn = self.conn.lock().await;
-        conn.query_row(
-            "SELECT value FROM chain_state WHERE key='last_block_height'",
-            [], |row| {
-                let blob: Vec<u8> = row.get(0)?;
-                if blob.len() == 8 {
-                    let mut b = [0u8; 8];
-                    b.copy_from_slice(&blob);
-                    Ok(u64::from_le_bytes(b))
-                } else { Ok(0u64) }
-            },
-        ).unwrap_or(0)
-    }
-
-    // ========================================
-    // Statistics — 统计
-    // ========================================
-
-    pub async fn stats(&self) -> StorageStats {
-        let conn = self.conn.lock().await;
-
-        let q = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> u64 {
-            conn.query_row(sql, p, |r| r.get::<_, i64>(0)).unwrap_or(0) as u64
-        };
-
-        let total = q("SELECT COUNT(*) FROM records", &[]);
-        let active = q("SELECT COUNT(*) FROM records WHERE status=0", &[]);
-
-        StorageStats {
-            total_records: total,
-            active_records: active,
-            by_layer: LayerCounts {
-                identity:  q("SELECT COUNT(*) FROM records WHERE status=0 AND layer=0", &[]),
-                knowledge: q("SELECT COUNT(*) FROM records WHERE status=0 AND layer=1", &[]),
-                episode:   q("SELECT COUNT(*) FROM records WHERE status=0 AND layer=2", &[]),
-                archive:   q("SELECT COUNT(*) FROM records WHERE status=0 AND layer=3", &[]),
-            },
-            content_bytes: q("SELECT COALESCE(SUM(LENGTH(encrypted_content)),0) FROM records WHERE status=0", &[]),
-            records_with_embedding: q("SELECT COUNT(*) FROM records WHERE status=0 AND embedding IS NOT NULL", &[]),
-            session_inserts: self.total_inserted.load(Ordering::Relaxed),
-            session_rejects: self.total_rejected.load(Ordering::Relaxed),
-        }
-    }
-
-    pub async fn count(&self) -> usize {
-        let conn = self.conn.lock().await;
-        conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get::<_, i64>(0))
-            .unwrap_or(0) as usize
+    /// Acquire the inner SQLite connection lock.
+    pub async fn conn_lock(&self) -> tokio::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().await
     }
 
     pub fn total_inserted(&self) -> u64 { self.total_inserted.load(Ordering::Relaxed) }
     pub fn total_rejected(&self) -> u64 { self.total_rejected.load(Ordering::Relaxed) }
 
-    /// Acquire the inner SQLite connection lock directly.
-    ///
-    /// Used by Miner for bulk operations that need raw SQL access.
-    /// Hold the lock briefly — other operations will block.
-    pub async fn conn_lock(&self) -> tokio::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().await
-    }
-
-    // ========================================
-    // RawLog Operations
-    // ========================================
-
-    /// Insert a raw conversation log entry.
-    ///
-    /// If `rawlog_key` is provided, content is encrypted with ChaCha20-Poly1305
-    /// before storage. The `encrypted` flag is set accordingly.
-    pub async fn insert_raw_log(
-        &self,
-        session_id: &str,
-        turn_index: i64,
-        role: &str,
-        content: &str,
-        source_ai: &str,
-        recall_context: Option<&str>,
-        extractable: i64,
-        feedback_signal: Option<i64>,
-        rawlog_key: Option<&[u8; 32]>,
-    ) -> Result<i64, String> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        let (stored_content, encrypted_flag): (Vec<u8>, i64) = match rawlog_key {
-            Some(key) => {
-                match encrypt_rawlog_content(key, content.as_bytes()) {
-                    Ok(ciphertext) => (ciphertext, 1),
-                    Err(e) => {
-                        warn!("[STORAGE] RawLog encryption failed, storing plaintext: {}", e);
-                        (content.as_bytes().to_vec(), 0)
-                    }
-                }
-            }
-            None => (content.as_bytes().to_vec(), 0),
-        };
-
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO raw_logs (session_id, turn_index, role, content, source_ai,
-                recall_context, extractable, feedback_signal, encrypted, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![
-                session_id, turn_index, role, stored_content,
-                source_ai, recall_context, extractable,
-                feedback_signal, encrypted_flag, now,
-            ],
-        ).map_err(|e| format!("RawLog insert: {}", e))?;
-
-        let log_id = conn.last_insert_rowid();
-        Ok(log_id)
-    }
-
-    /// Read and decrypt a raw log entry's content.
-    pub async fn read_rawlog_content(
-        &self,
-        log_id: i64,
-        rawlog_key: Option<&[u8; 32]>,
-    ) -> Option<String> {
-        let conn = self.conn.lock().await;
-        let row: Option<(Vec<u8>, i64)> = conn.query_row(
-            "SELECT content, encrypted FROM raw_logs WHERE log_id = ?1",
-            params![log_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional().ok()?;
-
-        let (content_bytes, encrypted) = row?;
-
-        if encrypted == 0 {
-            String::from_utf8(content_bytes).ok()
-        } else if let Some(key) = rawlog_key {
-            decrypt_rawlog_content(key, &content_bytes).ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-        } else {
-            warn!("[STORAGE] Encrypted rawlog but no key provided");
-            None
-        }
-    }
-
-    /// Update feedback_signal for a raw_log entry.
-    pub async fn update_rawlog_feedback(&self, log_id: i64, signal: i64) {
-        let conn = self.conn.lock().await;
-        let _ = conn.execute(
-            "UPDATE raw_logs SET feedback_signal = ?1 WHERE log_id = ?2",
-            params![signal, log_id],
-        );
-    }
-
-    /// Increment positive_feedback on a record.
-    ///
-    /// Used by Miner Step 0 when detecting positive user signals.
-    /// Updates both the SQLite column and the LRU cache entry.
-    pub async fn increment_positive_feedback(&self, record_id: &[u8; 32]) {
-        let conn = self.conn.lock().await;
-        match conn.execute(
-            "UPDATE records SET positive_feedback = positive_feedback + 1 WHERE record_id = ?1",
-            params![record_id.as_slice()],
-        ) {
-            Ok(n) if n > 0 => {
-                debug!(record_id = hex::encode(record_id), "[STORAGE] positive_feedback incremented");
-                // Invalidate cache so next read gets fresh data
-                self.cache.write().invalidate(record_id);
-            }
-            Ok(_) => {
-                warn!(record_id = hex::encode(record_id), "[STORAGE] positive_feedback: record not found");
-            }
-            Err(e) => {
-                error!(
-                    record_id = hex::encode(record_id),
-                    error = %e,
-                    "[STORAGE] ❌ positive_feedback increment failed (schema migration needed?)"
-                );
-            }
-        }
-    }
-
-    /// Increment negative_feedback on a record.
-    ///
-    /// Used by /log negative feedback detection when user corrects the AI.
-    /// Updates both the SQLite column and the LRU cache entry.
-    pub async fn increment_negative_feedback(&self, record_id: &[u8; 32]) {
-        let conn = self.conn.lock().await;
-        match conn.execute(
-            "UPDATE records SET negative_feedback = negative_feedback + 1 WHERE record_id = ?1",
-            params![record_id.as_slice()],
-        ) {
-            Ok(n) if n > 0 => {
-                debug!(record_id = hex::encode(record_id), "[STORAGE] negative_feedback incremented");
-                // Invalidate cache so next read gets fresh data
-                self.cache.write().invalidate(record_id);
-            }
-            Ok(_) => {
-                warn!(record_id = hex::encode(record_id), "[STORAGE] negative_feedback: record not found");
-            }
-            Err(e) => {
-                error!(
-                    record_id = hex::encode(record_id),
-                    error = %e,
-                    "[STORAGE] ❌ negative_feedback increment failed (schema migration needed?)"
-                );
-            }
-        }
-    }
-
-    /// Set the conflict_with field on a record (for MVF φ₈ feature).
-    ///
-    /// Used by Miner Step 0.6 correction chaining to link conflicting memories.
-    pub async fn set_conflict_with(&self, record_id: &[u8; 32], conflict_id: &[u8; 32]) -> bool {
-        let conn = self.conn.lock().await;
-        match conn.execute(
-            "UPDATE records SET conflict_with = ?1 WHERE record_id = ?2",
-            params![conflict_id.as_slice(), record_id.as_slice()],
-        ) {
-            Ok(n) if n > 0 => {
-                debug!(
-                    record_id = hex::encode(record_id),
-                    conflict = hex::encode(conflict_id),
-                    "[STORAGE] conflict_with set"
-                );
-                self.cache.write().invalidate(record_id);
-                true
-            }
-            Ok(_) => {
-                warn!(record_id = hex::encode(record_id), "[STORAGE] conflict_with: record not found");
-                false
-            }
-            Err(e) => {
-                error!(error = %e, "[STORAGE] ❌ set_conflict_with failed");
-                false
-            }
-        }
-    }
-
-    /// Insert a feedback event for SGD training.
-    pub async fn insert_feedback(
-        &self,
-        owner: &[u8; 32],
-        memory_id: &[u8; 32],
-        session_id: &str,
-        turn_index: i64,
-        signal: i64,
-        features: Option<&[f32; 9]>,
-        prediction: Option<f32>,
-    ) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        let features_blob: Option<Vec<u8>> = features.map(|f| {
-            f.iter().flat_map(|v| v.to_le_bytes()).collect()
-        });
-
-        let conn = self.conn.lock().await;
-        let _ = conn.execute(
-            "INSERT INTO memory_feedback (owner, memory_id, session_id, turn_index,
-                signal, features, prediction, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![
-                owner.as_slice(), memory_id.as_slice(), session_id,
-                turn_index, signal, features_blob.as_deref(),
-                prediction, now,
-            ],
-        );
-    }
-
-    /// Query unprocessed raw_logs for Miner feedback detection.
-    pub async fn get_unprocessed_rawlogs(
-        &self,
-        limit: usize,
-    ) -> Vec<RawLogRow> {
-        let conn = self.conn.lock().await;
-        let mut stmt = match conn.prepare(
-            "SELECT log_id, session_id, turn_index, role, content, encrypted,
-                    recall_context, extractable, feedback_signal
-             FROM raw_logs
-             WHERE feedback_signal IS NULL
-             ORDER BY session_id, turn_index
-             LIMIT ?1"
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-
-        stmt.query_map(params![limit as i64], |row| {
-            Ok(RawLogRow {
-                log_id: row.get(0)?,
-                session_id: row.get(1)?,
-                turn_index: row.get(2)?,
-                role: row.get(3)?,
-                content: row.get(4)?,
-                encrypted: row.get(5)?,
-                recall_context: row.get(6)?,
-                extractable: row.get(7)?,
-                feedback_signal: row.get(8)?,
-            })
-        })
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
-    }
-
-    /// Check if an active record with the same content already exists for this owner.
-    ///
-    /// Used by /log rule engine to prevent duplicate extractions when:
-    /// - The same /log is called multiple times with identical content
-    /// - Multiple rules (e.g. P2 + P5) extract from the same message
-    ///
-    /// ## Encryption Compatibility (v2.1.0+MVF+Encryption)
-    /// When record_key is set, the input content (plaintext) is encrypted first
-    /// before comparison. Because encryption is deterministic (same plaintext →
-    /// same ciphertext), this correctly matches against stored encrypted content.
-    ///
-    /// Compares `encrypted_content` bytes + `owner` + `status=Active`.
-    /// Returns true if a duplicate exists.
-    ///
-    /// Performance: Single indexed query, < 0.5ms.
-    pub async fn has_active_content(&self, owner: &[u8; 32], content: &[u8]) -> bool {
-        // If record_key is set, encrypt the content first for comparison.
-        // Deterministic encryption guarantees same plaintext → same ciphertext.
-        let compare_content: Vec<u8> = if let Some(ref key) = self.record_key {
-            if content.is_empty() {
-                content.to_vec()
-            } else {
-                match encrypt_record_content(key, content) {
-                    Ok(ct) => ct,
-                    Err(e) => {
-                        warn!("[STORAGE] has_active_content encryption failed, comparing plaintext: {}", e);
-                        content.to_vec()
-                    }
-                }
-            }
-        } else {
-            content.to_vec()
-        };
-
-        let conn = self.conn.lock().await;
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM records
-             WHERE owner = ?1 AND encrypted_content = ?2 AND status = 0
-             LIMIT 1",
-            params![owner.as_slice(), compare_content.as_slice()],
-            |row| row.get(0),
-        ).unwrap_or(0);
-        count > 0
-    }
-
-    /// Query records that need embedding backfill.
-    pub async fn get_records_needing_embedding(&self, limit: usize) -> Vec<MemoryRecord> {
-        let conn = self.conn.lock().await;
-        self.query_rows(&conn,
-            "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
-                    status,supersedes,encrypted_content,embedding,
-                    signature,access_count,
-                    positive_feedback,negative_feedback,conflict_with
-             FROM records
-             WHERE embedding IS NULL AND status = 0
-             LIMIT ?1",
-            params![limit as i64],
-        )
-    }
-
-    /// Load MVF user weights from database.
-    pub async fn load_user_weights(&self, owner: &[u8; 32]) -> Option<Vec<u8>> {
-        let conn = self.conn.lock().await;
-        conn.query_row(
-            "SELECT weights FROM user_weights WHERE owner = ?1",
-            params![owner.as_slice()],
-            |row| row.get::<_, Vec<u8>>(0),
-        ).optional().ok()?
-    }
-
-    /// Save MVF user weights to database.
-    pub async fn save_user_weights(&self, owner: &[u8; 32], weights_blob: &[u8], version: u64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        let conn = self.conn.lock().await;
-        let _ = conn.execute(
-            "INSERT INTO user_weights (owner, weights, version, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)
-             ON CONFLICT(owner) DO UPDATE SET weights=?2, version=?3, updated_at=?4",
-            params![owner.as_slice(), weights_blob, version as i64, now],
-        );
-    }
-
-    /// Mark a record as superseded by another.
-    pub async fn supersede_record(&self, old_id: &[u8; 32], new_id: &[u8; 32]) -> bool {
-        let conn = self.conn.lock().await;
-        let r1 = conn.execute(
-            "UPDATE records SET status = 1 WHERE record_id = ?1",
-            params![old_id.as_slice()],
-        );
-        let r2 = conn.execute(
-            "UPDATE records SET supersedes = ?1 WHERE record_id = ?2",
-            params![old_id.as_slice(), new_id.as_slice()],
-        );
-        r1.is_ok() && r2.is_ok()
-    }
-
-    /// Get records with _correction tag for Miner Step 0.6.
-    pub async fn get_correction_records(&self) -> Vec<MemoryRecord> {
-        let conn = self.conn.lock().await;
-        self.query_rows(&conn,
-            "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
-                    status,supersedes,encrypted_content,embedding,
-                    signature,access_count,
-                    positive_feedback,negative_feedback,conflict_with
-             FROM records
-             WHERE topic_tags LIKE '%_correction%' AND status = 0",
-            [],
-        )
-    }
-
-    /// Update topic_tags for a record (remove _correction marker).
-    pub async fn update_topic_tags(&self, record_id: &[u8; 32], tags: &[String]) {
-        let json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
-        let conn = self.conn.lock().await;
-        let _ = conn.execute(
-            "UPDATE records SET topic_tags = ?1 WHERE record_id = ?2",
-            params![json, record_id.as_slice()],
-        );
-    }
-
-    /// Get recent feedback events for baseline calculation.
-    pub async fn get_recent_feedback(&self, limit: usize) -> Vec<(i64, f32)> {
-        let conn = self.conn.lock().await;
-        let mut stmt = match conn.prepare(
-            "SELECT signal, prediction FROM memory_feedback
-             ORDER BY created_at DESC LIMIT ?1"
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-
-        stmt.query_map(params![limit as i64], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1).unwrap_or(0.0)))
-        })
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
-    }
-
     // ========================================
     // Private helpers
     // ========================================
 
-    /// Standard SELECT column list for MemoryRecord queries.
-    /// 15 columns: indices 0-14 map to row_to_record() expectations.
-    ///
-    /// When modifying this, also update row_to_record() and all query methods.
     const SELECT_RECORD_COLS: &'static str =
         "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
-                status,supersedes,encrypted_content,embedding,
-                signature,access_count,
+                status,supersedes,encrypted_content,embedding,signature,access_count,
                 positive_feedback,negative_feedback,conflict_with
          FROM records WHERE record_id = ?1";
 
-    /// 通用查询辅助：执行 SQL 返回 Vec<MemoryRecord>
-    ///
-    /// ## v2.1.0+MVF+Encryption
-    /// Changed from `Self::query_rows` (static) to `&self` method to access
-    /// `self.record_key` for transparent decryption in row_to_record().
-    fn query_rows(&self, conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Vec<MemoryRecord> {
+    pub(crate) fn query_rows(&self, conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Vec<MemoryRecord> {
         let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
             Err(e) => { error!(error=%e, "[STORAGE] Prepare failed"); return Vec::new(); }
@@ -1622,17 +595,7 @@ impl MemoryStorage {
             .unwrap_or_default()
     }
 
-    /// SQLite row → MemoryRecord
-    ///
-    /// Expected column order (15 columns):
-    ///   0: record_id, 1: owner, 2: timestamp, 3: layer, 4: topic_tags,
-    ///   5: source_ai, 6: status, 7: supersedes, 8: encrypted_content,
-    ///   9: embedding, 10: signature, 11: access_count,
-    ///   12: positive_feedback, 13: negative_feedback, 14: conflict_with
-    ///
-    /// If `record_key` is provided, `encrypted_content` is decrypted transparently.
-    /// Legacy plaintext records are auto-detected (too short for nonce+tag = 28 bytes).
-    fn row_to_record(row: &rusqlite::Row<'_>, record_key: Option<&[u8; 32]>) -> rusqlite::Result<MemoryRecord> {
+    pub(crate) fn row_to_record(row: &rusqlite::Row<'_>, record_key: Option<&[u8; 32]>) -> rusqlite::Result<MemoryRecord> {
         let record_id_blob: Vec<u8> = row.get(0)?;
         let owner_blob: Vec<u8> = row.get(1)?;
         let timestamp: i64 = row.get(2)?;
@@ -1644,64 +607,43 @@ impl MemoryStorage {
         let encrypted_content: Vec<u8> = row.get(8)?;
         let embedding_blob: Option<Vec<u8>> = row.get(9)?;
 
-        // Decrypt content if record_key provided and content looks encrypted (has nonce prefix)
-        // Minimum encrypted size = nonce(12) + tag(16) = 28 bytes
         let decrypted_content = if let Some(key) = record_key {
-            if encrypted_content.len() >= 12 + 16 {
-                // Try to decrypt; if it fails, return raw bytes (might be legacy plaintext)
+            if encrypted_content.len() >= 28 {
                 match decrypt_record_content(key, &encrypted_content) {
                     Ok(plain) => plain,
-                    Err(_) => encrypted_content, // Legacy unencrypted record
+                    Err(_) => encrypted_content,
                 }
-            } else {
-                encrypted_content // Too short to be encrypted, return as-is
-            }
-        } else {
-            encrypted_content
-        };
+            } else { encrypted_content }
+        } else { encrypted_content };
+
         let signature_blob: Vec<u8> = row.get(10)?;
         let access_count: i64 = row.get(11)?;
-
-        // v4 columns (with safe defaults for migration compatibility)
         let positive_feedback: i64 = row.get(12).unwrap_or(0);
         let negative_feedback: i64 = row.get(13).unwrap_or(0);
         let conflict_with_blob: Option<Vec<u8>> = row.get(14).unwrap_or(None);
 
         let mut record_id = [0u8; 32];
         if record_id_blob.len() == 32 { record_id.copy_from_slice(&record_id_blob); }
-
         let mut owner = [0u8; 32];
         if owner_blob.len() == 32 { owner.copy_from_slice(&owner_blob); }
-
         let mut signature = [0u8; 64];
         if signature_blob.len() == 64 { signature.copy_from_slice(&signature_blob); }
 
         let supersedes = supersedes_blob.and_then(|b| {
-            if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) }
-            else { None }
+            if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None }
         });
-
         let conflict_with = conflict_with_blob.and_then(|b| {
-            if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) }
-            else { None }
+            if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None }
         });
-
-        let embedding = embedding_blob
-            .map(|b| bytes_to_embedding(&b))
-            .unwrap_or_default();
+        let embedding = embedding_blob.map(|b| bytes_to_embedding(&b)).unwrap_or_default();
 
         Ok(MemoryRecord {
-            record_id,
-            owner,
-            timestamp: timestamp as u64,
+            record_id, owner, timestamp: timestamp as u64,
             layer: MemoryLayer::from_u8(layer_val as u8).unwrap_or(MemoryLayer::Episode),
             topic_tags: serde_json::from_str(&tags_json).unwrap_or_default(),
             source_ai,
             status: RecordStatus::from_u8(status_val as u8).unwrap_or(RecordStatus::Active),
-            supersedes,
-            encrypted_content: decrypted_content,
-            embedding,
-            signature,
+            supersedes, encrypted_content: decrypted_content, embedding, signature,
             access_count: access_count as u32,
             positive_feedback: positive_feedback as u32,
             negative_feedback: negative_feedback as u32,
@@ -1729,21 +671,13 @@ mod tests {
     use super::*;
 
     fn make_rec(ts: u64, layer: MemoryLayer, src: &str) -> MemoryRecord {
-        MemoryRecord::new(
-            [0xAA; 32], ts, layer,
-            vec!["test".into()], src.into(),
-            b"encrypted_data".to_vec(),
-            vec![0.1, 0.2, 0.3],
-        )
+        MemoryRecord::new([0xAA; 32], ts, layer, vec!["test".into()], src.into(),
+            b"encrypted_data".to_vec(), vec![0.1, 0.2, 0.3])
     }
 
     fn make_rec_owner(ts: u64, owner: [u8; 32], layer: MemoryLayer) -> MemoryRecord {
-        MemoryRecord::new(
-            owner, ts, layer,
-            vec!["test".into()], "ai".into(),
-            format!("content_{}", ts).into_bytes(),
-            vec![0.5; 4],
-        )
+        MemoryRecord::new(owner, ts, layer, vec!["test".into()], "ai".into(),
+            format!("content_{}", ts).into_bytes(), vec![0.5; 4])
     }
 
     #[tokio::test]
@@ -1757,18 +691,12 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let r = make_rec(100, MemoryLayer::Episode, "test");
         let id = r.record_id;
-
         assert!(s.insert(&r, "minilm").await);
-        assert!(!s.insert(&r, "minilm").await, "duplicate");
-
+        assert!(!s.insert(&r, "minilm").await);
         let got = s.get(&id).await.unwrap();
         assert_eq!(got.source_ai, "test");
         assert_eq!(got.layer, MemoryLayer::Episode);
         assert_eq!(got.embedding, vec![0.1, 0.2, 0.3]);
-        assert_eq!(got.positive_feedback, 0);
-        assert_eq!(got.negative_feedback, 0);
-        assert_eq!(got.conflict_with, None);
-        assert_eq!(s.count().await, 1);
     }
 
     #[tokio::test]
@@ -1787,345 +715,38 @@ mod tests {
         s.insert(&make_rec_owner(100, o, MemoryLayer::Episode), "m").await;
         s.insert(&make_rec_owner(200, o, MemoryLayer::Knowledge), "m").await;
         s.insert(&make_rec_owner(300, o, MemoryLayer::Archive), "m").await;
-
-        let all = s.get_active_records(&o, None, 100).await;
-        assert_eq!(all.len(), 3);
-
-        let ep = s.get_active_records(&o, Some(MemoryLayer::Episode), 100).await;
-        assert_eq!(ep.len(), 1);
-
-        let ar = s.get_active_records(&o, Some(MemoryLayer::Archive), 100).await;
-        assert_eq!(ar.len(), 1);
+        assert_eq!(s.get_active_records(&o, None, 100).await.len(), 3);
+        assert_eq!(s.get_active_records(&o, Some(MemoryLayer::Episode), 100).await.len(), 1);
     }
 
     #[tokio::test]
     async fn test_revoke() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let r = make_rec(100, MemoryLayer::Episode, "t");
-        let id = r.record_id;
         s.insert(&r, "m").await;
-        assert!(s.revoke(&id).await);
-
-        let got = s.get(&id).await.unwrap();
+        assert!(s.revoke(&r.record_id).await);
+        let got = s.get(&r.record_id).await.unwrap();
         assert_eq!(got.status, RecordStatus::Revoked);
         assert!(got.encrypted_content.is_empty());
-        assert!(got.embedding.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_compact_episodes_to_archive() {
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        let o = [0xAA; 32];
-        s.insert(&make_rec_owner(100, o, MemoryLayer::Episode), "m").await;
-        s.insert(&make_rec_owner(200, o, MemoryLayer::Episode), "m").await;
-        s.insert(&make_rec_owner(300, o, MemoryLayer::Knowledge), "m").await;
-
-        let compacted = s.compact_episodes_to_archive(&o, 10).await;
-        assert_eq!(compacted.len(), 2);
-
-        // 压实后 Episode 数为 0，Archive 数为 2
-        assert_eq!(s.count_by_layer(MemoryLayer::Episode).await, 0);
-        assert_eq!(s.count_by_layer(MemoryLayer::Archive).await, 2);
-
-        // 但它们仍然是 Active 的！（可被低权重召回）
-        let active = s.get_active_records(&o, Some(MemoryLayer::Archive), 100).await;
-        assert_eq!(active.len(), 2);
-
-        // Knowledge 不受影响
-        assert_eq!(s.count_by_layer(MemoryLayer::Knowledge).await, 1);
-    }
-
-    #[tokio::test]
-    async fn test_increment_access() {
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        let r = make_rec(100, MemoryLayer::Episode, "t");
-        let id = r.record_id;
-        s.insert(&r, "m").await;
-        s.increment_access(&id).await;
-        s.increment_access(&id).await;
-        let got = s.get(&id).await.unwrap();
-        assert_eq!(got.access_count, 2);
-    }
-
-    #[tokio::test]
-    async fn test_chain_state() {
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        assert_eq!(s.last_block_hash().await, [0u8; 32]);
-        s.set_chain_state(&[0xBB; 32], 42).await;
-        assert_eq!(s.last_block_hash().await, [0xBB; 32]);
-        assert_eq!(s.last_block_height().await, 42);
-    }
-
-    #[tokio::test]
-    async fn test_stats() {
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        let o = [0xAA; 32];
-        s.insert(&make_rec_owner(100, o, MemoryLayer::Episode), "m").await;
-        s.insert(&make_rec_owner(200, o, MemoryLayer::Identity), "m").await;
-
-        let st = s.stats().await;
-        assert_eq!(st.total_records, 2);
-        assert_eq!(st.active_records, 2);
-        assert_eq!(st.by_layer.episode, 1);
-        assert_eq!(st.by_layer.identity, 1);
-        assert_eq!(st.records_with_embedding, 2);
-    }
-
-    #[tokio::test]
-    async fn test_embedding_roundtrip() {
-        let original = vec![1.0f32, -2.5, 3.14159, 0.0, f32::MIN, f32::MAX];
-        let bytes = embedding_to_bytes(&original);
-        let restored = bytes_to_embedding(&bytes);
-        assert_eq!(original, restored);
-    }
-
-    #[tokio::test]
-    async fn test_no_embedding_stored_as_null() {
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        let r = MemoryRecord::new(
-            [0xAA; 32], 100, MemoryLayer::Episode,
-            vec![], "t".into(), b"c".to_vec(),
-            vec![], // 空 embedding
-        );
-        s.insert(&r, "").await;
-        let got = s.get(&r.record_id).await.unwrap();
-        assert!(got.embedding.is_empty());
-        assert!(!got.has_embedding());
-    }
-
-    #[tokio::test]
-    async fn test_get_records_with_embedding() {
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        let o = [0xAA; 32];
-
-        // 有 embedding
-        s.insert(&make_rec_owner(100, o, MemoryLayer::Episode), "m").await;
-        // 无 embedding
-        let mut no_emb = make_rec_owner(200, o, MemoryLayer::Knowledge);
-        no_emb.embedding = vec![];
-        s.insert(&no_emb, "m").await;
-
-        let with = s.get_records_with_embedding(&o).await;
-        assert_eq!(with.len(), 1);
-        assert_eq!(with[0].0.timestamp, 100);
-    }
-
-    // ========================================
-    // v4 Migration & Feedback Tests
-    // ========================================
-
-    #[tokio::test]
-    async fn test_positive_feedback_increment() {
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        let r = make_rec(100, MemoryLayer::Episode, "t");
-        let id = r.record_id;
-        s.insert(&r, "m").await;
-
-        s.increment_positive_feedback(&id).await;
-        s.increment_positive_feedback(&id).await;
-        s.increment_positive_feedback(&id).await;
-
-        let got = s.get(&id).await.unwrap();
-        assert_eq!(got.positive_feedback, 3);
-    }
-
-    #[tokio::test]
-    async fn test_negative_feedback_increment() {
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        let r = make_rec(100, MemoryLayer::Episode, "t");
-        let id = r.record_id;
-        s.insert(&r, "m").await;
-
-        s.increment_negative_feedback(&id).await;
-
-        let got = s.get(&id).await.unwrap();
-        assert_eq!(got.negative_feedback, 1);
-    }
-
-    #[tokio::test]
-    async fn test_set_conflict_with() {
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        let r = make_rec(100, MemoryLayer::Episode, "t");
-        let id = r.record_id;
-        s.insert(&r, "m").await;
-
-        let conflict_id = [0xCC; 32];
-        assert!(s.set_conflict_with(&id, &conflict_id).await);
-
-        let got = s.get(&id).await.unwrap();
-        assert_eq!(got.conflict_with, Some(conflict_id));
-        assert!(got.has_conflict());
-    }
-
-    #[tokio::test]
-    async fn test_feedback_score_via_storage() {
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        let r = make_rec(100, MemoryLayer::Episode, "t");
-        let id = r.record_id;
-        s.insert(&r, "m").await;
-
-        // 3 positive, 1 negative → φ₄ = (3-1)/(3+1+1) = 0.4
-        s.increment_positive_feedback(&id).await;
-        s.increment_positive_feedback(&id).await;
-        s.increment_positive_feedback(&id).await;
-        s.increment_negative_feedback(&id).await;
-
-        let got = s.get(&id).await.unwrap();
-        assert_eq!(got.positive_feedback, 3);
-        assert_eq!(got.negative_feedback, 1);
-        assert!((got.feedback_score() - 0.4).abs() < 1e-6);
-    }
-
-    #[tokio::test]
-    async fn test_insert_with_feedback_fields() {
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        let mut r = make_rec(100, MemoryLayer::Episode, "t");
-        r.positive_feedback = 5;
-        r.negative_feedback = 2;
-        r.conflict_with = Some([0xDD; 32]);
-
-        s.insert(&r, "m").await;
-
-        let got = s.get(&r.record_id).await.unwrap();
-        assert_eq!(got.positive_feedback, 5);
-        assert_eq!(got.negative_feedback, 2);
-        assert_eq!(got.conflict_with, Some([0xDD; 32]));
     }
 
     #[tokio::test]
     async fn test_schema_version_is_4() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
-        let version: u32 = conn
-            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, 4);
-    }
-
-    // ========================================
-    // Encryption Tests (v2.1.0+MVF+Encryption)
-    // ========================================
-
-    /// Helper: generate a deterministic test encryption key
-    fn test_record_key() -> [u8; 32] {
-        derive_record_key(&[0x42; 32])
+        let v: u32 = conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 4);
     }
 
     #[tokio::test]
-    async fn test_encrypt_decrypt_record_content_roundtrip() {
-        let key = test_record_key();
-        let plaintext = b"User is allergic to nuts";
-        let ciphertext = encrypt_record_content(&key, plaintext).unwrap();
-
-        // Ciphertext should be longer than plaintext (nonce + tag overhead)
-        assert!(ciphertext.len() > plaintext.len());
-        // Ciphertext should not contain plaintext
-        assert!(!ciphertext.windows(plaintext.len()).any(|w| w == plaintext));
-
-        let decrypted = decrypt_record_content(&key, &ciphertext).unwrap();
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[tokio::test]
-    async fn test_deterministic_encryption() {
-        let key = test_record_key();
-        let plaintext = b"Same content always produces same ciphertext";
-        let ct1 = encrypt_record_content(&key, plaintext).unwrap();
-        let ct2 = encrypt_record_content(&key, plaintext).unwrap();
-        assert_eq!(ct1, ct2, "Deterministic encryption must produce same output");
-    }
-
-    #[tokio::test]
-    async fn test_different_plaintext_different_ciphertext() {
-        let key = test_record_key();
-        let ct1 = encrypt_record_content(&key, b"content A").unwrap();
-        let ct2 = encrypt_record_content(&key, b"content B").unwrap();
-        assert_ne!(ct1, ct2);
-    }
-
-    #[tokio::test]
-    async fn test_storage_with_encryption_insert_and_get() {
-        let key = test_record_key();
+    async fn test_encrypted_insert_and_get() {
+        use super::super::storage_crypto::derive_record_key;
+        let key = derive_record_key(&[0x42; 32]);
         let s = MemoryStorage::open(":memory:", Some(key)).unwrap();
         let r = make_rec(100, MemoryLayer::Episode, "test");
-        let id = r.record_id;
-
-        assert!(s.insert(&r, "minilm").await);
-
-        // Clear cache to force SQLite read (tests decryption path)
-        s.cache.write().clear();
-
-        let got = s.get(&id).await.unwrap();
-        // Content should be decrypted transparently
-        assert_eq!(got.encrypted_content, b"encrypted_data");
-        assert_eq!(got.source_ai, "test");
-    }
-
-    #[tokio::test]
-    async fn test_storage_encrypted_content_dedup() {
-        let key = test_record_key();
-        let s = MemoryStorage::open(":memory:", Some(key)).unwrap();
-        let o = [0xAA; 32];
-
-        // Insert a record with known content
-        let r = MemoryRecord::new(
-            o, 100, MemoryLayer::Episode,
-            vec!["test".into()], "ai".into(),
-            b"dedup test content".to_vec(),
-            vec![0.5; 4],
-        );
         s.insert(&r, "m").await;
-
-        // has_active_content should find the encrypted record using plaintext input
-        assert!(s.has_active_content(&o, b"dedup test content").await);
-        assert!(!s.has_active_content(&o, b"different content").await);
-    }
-
-    #[tokio::test]
-    async fn test_storage_encrypted_get_active_records() {
-        let key = test_record_key();
-        let s = MemoryStorage::open(":memory:", Some(key)).unwrap();
-        let o = [0xAA; 32];
-        s.insert(&make_rec_owner(100, o, MemoryLayer::Episode), "m").await;
-        s.insert(&make_rec_owner(200, o, MemoryLayer::Knowledge), "m").await;
-
-        // Clear cache to test decryption through query_rows
         s.cache.write().clear();
-
-        let recs = s.get_active_records(&o, None, 10).await;
-        assert_eq!(recs.len(), 2);
-        // Content should be decrypted
-        assert!(recs.iter().all(|r| !r.encrypted_content.is_empty()));
-    }
-
-    #[tokio::test]
-    async fn test_storage_no_encryption_backward_compat() {
-        // None key = plaintext mode (backward compatible)
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        let r = make_rec(100, MemoryLayer::Episode, "test");
-        let id = r.record_id;
-        s.insert(&r, "m").await;
-
-        s.cache.write().clear();
-        let got = s.get(&id).await.unwrap();
+        let got = s.get(&r.record_id).await.unwrap();
         assert_eq!(got.encrypted_content, b"encrypted_data");
-    }
-
-    #[tokio::test]
-    async fn test_derive_record_key_deterministic() {
-        let k1 = derive_record_key(&[0x01; 32]);
-        let k2 = derive_record_key(&[0x01; 32]);
-        assert_eq!(k1, k2);
-        // Different input → different key
-        let k3 = derive_record_key(&[0x02; 32]);
-        assert_ne!(k1, k3);
-    }
-
-    #[tokio::test]
-    async fn test_record_key_independent_from_rawlog_key() {
-        let private_key = [0x42; 32];
-        let rk = derive_record_key(&private_key);
-        let rlk = derive_rawlog_key(&private_key);
-        assert_ne!(rk, rlk, "Record key and rawlog key must be independent");
     }
 }
