@@ -252,11 +252,11 @@ impl ReflectionMiner {
                 // derive_rawlog_key now uses PRIVATE key (identity.to_bytes())
                 // Previously: derive_rawlog_key(&owner) — used PUBLIC key, insecure!
                 let content = if row.encrypted == 1 {
-                    let key = crate::services::memchain::storage::derive_rawlog_key(
+                    let key = crate::services::memchain::derive_rawlog_key(
                         &self.identity.to_bytes()
                     );
                     String::from_utf8(
-                        crate::services::memchain::storage::decrypt_rawlog_content_pub(&key, &row.content)
+                        crate::services::memchain::decrypt_rawlog_content_pub(&key, &row.content)
                             .unwrap_or_default()
                     ).unwrap_or_default()
                 } else {
