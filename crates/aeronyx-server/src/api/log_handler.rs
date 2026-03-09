@@ -70,7 +70,7 @@ use tracing::{debug, info, warn};
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 
 use crate::api::mpi::MpiState;
-use crate::services::memchain::storage::derive_rawlog_key;
+use crate::services::memchain::derive_rawlog_key;
 
 // ============================================
 // Request / Response Types
