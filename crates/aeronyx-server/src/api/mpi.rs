@@ -62,6 +62,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::extract::Path;
 use axum::http::Request;
 use axum::middleware::{self, Next};
 use axum::routing::{get, post};
@@ -626,6 +627,105 @@ pub async fn mpi_status(
 }
 
 // ============================================
+// GET /api/mpi/record/:record_id (v2.2.0)
+// ============================================
+
+#[derive(Debug, Serialize)]
+pub struct RecordDetailResponse {
+    pub record_id: String,
+    pub layer: String,
+    pub content: String,
+    pub topic_tags: Vec<String>,
+    pub source_ai: String,
+    pub timestamp: u64,
+    pub access_count: u32,
+    pub positive_feedback: u32,
+    pub negative_feedback: u32,
+    pub has_conflict: bool,
+    pub embedding_model: String,
+    pub has_embedding: bool,
+    pub status: String,
+}
+
+/// `GET /api/mpi/record/:record_id` — Get single record details.
+///
+/// Used by the MemExplorer frontend for record detail/edit views.
+/// Content is returned decrypted (transparent via storage layer).
+pub async fn mpi_get_record(
+    State(state): State<Arc<MpiState>>,
+    Path(record_id_hex): Path<String>,
+) -> impl IntoResponse {
+    let rid = match hex::decode(&record_id_hex) {
+        Ok(b) if b.len() == 32 => { let mut a = [0u8; 32]; a.copy_from_slice(&b); a }
+        _ => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid record_id format"}))).into_response(),
+    };
+
+    let record = match state.storage.get(&rid).await {
+        Some(r) => r,
+        None => return (StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "record not found"}))).into_response(),
+    };
+
+    let embedding_model = state.storage.get_embedding_model(&rid).await
+        .unwrap_or_else(|| String::new());
+
+    let content = String::from_utf8_lossy(&record.encrypted_content).to_string();
+
+    (StatusCode::OK, Json(serde_json::json!(RecordDetailResponse {
+        record_id: record_id_hex,
+        layer: record.layer.to_string(),
+        content,
+        topic_tags: record.topic_tags.clone(),
+        source_ai: record.source_ai.clone(),
+        timestamp: record.timestamp,
+        access_count: record.access_count,
+        positive_feedback: record.positive_feedback,
+        negative_feedback: record.negative_feedback,
+        has_conflict: record.has_conflict(),
+        embedding_model,
+        has_embedding: record.has_embedding(),
+        status: if record.is_active() { "active" } else { "revoked" }.to_string(),
+    }))).into_response()
+}
+
+// ============================================
+// GET /api/mpi/records/overview (v2.2.0)
+// ============================================
+
+#[derive(Debug, Serialize)]
+pub struct OverviewResponse {
+    pub total: u64,
+    pub by_layer: std::collections::HashMap<String, u64>,
+    pub recent_by_layer: std::collections::HashMap<String, Vec<crate::services::memchain::OverviewRecord>>,
+    pub last_memory_at: u64,
+    pub embed_ready: bool,
+    pub embed_dim: Option<usize>,
+}
+
+/// `GET /api/mpi/records/overview` — Memory overview for MemExplorer frontend.
+///
+/// Returns per-layer counts + up to 20 recent records per layer (80 max total).
+/// Single request replaces multiple frontend API calls.
+pub async fn mpi_records_overview(
+    State(state): State<Arc<MpiState>>,
+) -> impl IntoResponse {
+    let owner = state.owner_key;
+    let overview = state.storage.get_overview(&owner, 20).await;
+
+    let total: u64 = overview.by_layer.values().sum();
+
+    (StatusCode::OK, Json(serde_json::json!(OverviewResponse {
+        total,
+        by_layer: overview.by_layer,
+        recent_by_layer: overview.recent_by_layer,
+        last_memory_at: overview.last_memory_at,
+        embed_ready: state.embed_engine.is_some(),
+        embed_dim: state.embed_engine.as_ref().map(|e| e.dim()),
+    })))
+}
+
+// ============================================
 // POST /api/mpi/embed
 // ============================================
 
@@ -751,7 +851,10 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
         .route("/api/mpi/forget", post(mpi_forget))
         .route("/api/mpi/status", get(mpi_status))
         .route("/api/mpi/embed", post(mpi_embed))
-        .route("/api/mpi/log", post(crate::api::log_handler::mpi_log));
+        .route("/api/mpi/log", post(crate::api::log_handler::mpi_log))
+        // v2.2.0 MemExplorer
+        .route("/api/mpi/record/:record_id", get(mpi_get_record))
+        .route("/api/mpi/records/overview", get(mpi_records_overview));
 
     if has_auth {
         info!("[MPI] Bearer token auth enabled for all endpoints");
