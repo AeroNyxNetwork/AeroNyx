@@ -545,8 +545,9 @@ impl WsTunnel {
             .map_err(|e| format!("OpenClaw HTTP failed: {}", e))?;
 
         if !response.status().is_success() {
+            let status_code = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
-            let error = format!("OpenClaw HTTP {}: {}", response.status().as_u16(), &body[..body.len().min(500)]);
+            let error = format!("OpenClaw HTTP {}: {}", status_code, &body[..body.len().min(500)]);
             return self.send_e2e_response(request_id, &serde_json::json!({"error": error}).to_string(), sink).await;
         }
 
