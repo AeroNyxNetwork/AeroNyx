@@ -36,6 +36,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream};
 use tracing::{debug, error, info, warn};
 
 use aeronyx_core::crypto::IdentityKeyPair;
+use aeronyx_core::crypto::E2eSession;
 use crate::services::AgentManager;
 
 // ============================================
@@ -103,6 +104,10 @@ pub struct WsTunnel {
     cms_node_id: String,
     agent_manager: Arc<AgentManager>,
     http_client: reqwest::Client,
+    /// E2E encryption session, established via e2e_init handshake.
+    /// None until a frontend sends e2e_init with its ephemeral public key.
+    /// Reset to None on disconnect (ephemeral — one per WS connection).
+    e2e_session: std::sync::Mutex<Option<E2eSession>>,
 }
 
 impl WsTunnel {
@@ -117,7 +122,8 @@ impl WsTunnel {
             .build()
             .expect("Failed to build reqwest::Client");
 
-        Self { identity, cms_node_id, agent_manager, http_client }
+        Self { identity, cms_node_id, agent_manager, http_client,
+            e2e_session: std::sync::Mutex::new(None) }
     }
 
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) {
@@ -290,6 +296,13 @@ impl WsTunnel {
 
         match msg_type {
             "agent_request" => self.handle_agent_request(&parsed, sink).await?,
+
+            // ── E2E handshake (v2.2.0) ─────────────────────────────
+            "e2e_init" => self.handle_e2e_init(&parsed, sink).await?,
+
+            // ── E2E encrypted message (v2.2.0) ─────────────────────
+            "e2e_message" => self.handle_e2e_message(&parsed, sink).await?,
+
             "pong" => debug!("[WS_TUNNEL] Pong received"),
             "ping" => {
                 let pong = serde_json::json!({"type": "pong"});
@@ -360,6 +373,351 @@ impl WsTunnel {
                     .map_err(|e| format!("Error response send failed: {}", e))?;
             }
         }
+        Ok(())
+    }
+
+    // ============================================
+    // E2E Handshake + Encrypted Chat (v2.2.0)
+    // ============================================
+
+    /// Handle `e2e_init` — frontend sends its ephemeral X25519 public key.
+    ///
+    /// Flow:
+    /// 1. Parse frontend's ephemeral_pk (32 bytes hex)
+    /// 2. Convert node's Ed25519 identity → X25519 key pair
+    /// 3. Compute shared_secret = X25519(node_sk, frontend_pk)
+    /// 4. Store E2eSession for this WebSocket connection
+    /// 5. Send `e2e_ready` with node's X25519 public key
+    ///
+    /// Frontend then computes the same shared_secret on its side.
+    async fn handle_e2e_init(
+        &self, msg: &serde_json::Value, sink: &mut WsSink,
+    ) -> Result<(), String> {
+        let ephemeral_pk_hex = msg.get("ephemeral_pk")
+            .and_then(|v| v.as_str())
+            .ok_or("e2e_init: missing ephemeral_pk")?;
+
+        let pk_bytes = hex::decode(ephemeral_pk_hex)
+            .map_err(|e| format!("e2e_init: invalid ephemeral_pk hex: {}", e))?;
+
+        if pk_bytes.len() != 32 {
+            return Err(format!("e2e_init: ephemeral_pk must be 32 bytes, got {}", pk_bytes.len()));
+        }
+
+        let mut frontend_pk_arr = [0u8; 32];
+        frontend_pk_arr.copy_from_slice(&pk_bytes);
+
+        // Single call does: Ed25519→X25519 conversion + DH + E2eSession creation
+        let (session, node_x25519_pk_bytes) = self.identity.e2e_handshake(&frontend_pk_arr);
+
+        // Store E2E session
+        {
+            let mut guard = self.e2e_session.lock()
+                .map_err(|e| format!("E2E session lock: {}", e))?;
+            *guard = Some(session);
+        }
+
+        // Send e2e_ready with node's X25519 public key
+        let ready_msg = serde_json::json!({
+            "type": "e2e_ready",
+            "x25519_pk": hex::encode(node_x25519_pk_bytes),
+        });
+
+        ws_send_flush(sink, ws_text(&ready_msg)).await
+            .map_err(|e| format!("e2e_ready send failed: {}", e))?;
+
+        info!(
+            frontend_pk = %&ephemeral_pk_hex[..ephemeral_pk_hex.len().min(8)],
+            "[WS_E2E] ✅ E2E session established"
+        );
+        Ok(())
+    }
+
+    /// Handle `e2e_message` — decrypt, process, encrypt response.
+    ///
+    /// Flow:
+    /// 1. Decrypt the incoming message using E2eSession
+    /// 2. Parse the plaintext JSON to get action + payload
+    /// 3. Dispatch to the appropriate handler (chat, MPI, etc.)
+    /// 4. Encrypt the response and send as `e2e_response` or `e2e_stream`
+    async fn handle_e2e_message(
+        &self, msg: &serde_json::Value, sink: &mut WsSink,
+    ) -> Result<(), String> {
+        let request_id = msg.get("request_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let nonce = msg.get("nonce").and_then(|v| v.as_str())
+            .ok_or("e2e_message: missing nonce")?;
+        let ciphertext = msg.get("ciphertext").and_then(|v| v.as_str())
+            .ok_or("e2e_message: missing ciphertext")?;
+        let action = msg.get("action").and_then(|v| v.as_str()).unwrap_or("chat");
+
+        // Decrypt
+        let plaintext_bytes = {
+            let guard = self.e2e_session.lock()
+                .map_err(|e| format!("E2E session lock: {}", e))?;
+            let session = guard.as_ref()
+                .ok_or("e2e_message received but no E2E session (send e2e_init first)")?;
+            session.decrypt(nonce, ciphertext)
+                .map_err(|e| format!("E2E decryption failed: {}", e))?
+        };
+
+        let plaintext = String::from_utf8(plaintext_bytes)
+            .map_err(|e| format!("E2E decrypted content is not valid UTF-8: {}", e))?;
+
+        info!(
+            request_id = %request_id,
+            action = %action,
+            len = plaintext.len(),
+            "[WS_E2E] 📥 Decrypted message"
+        );
+
+        // Parse the decrypted plaintext as JSON payload
+        let payload: serde_json::Value = serde_json::from_str(&plaintext)
+            .unwrap_or_else(|_| {
+                // If not JSON, treat as a chat prompt string
+                serde_json::json!({"prompt": plaintext})
+            });
+
+        // Dispatch based on action
+        if action.starts_with("mpi_") {
+            // MPI proxy — same logic as non-E2E, but encrypt the response
+            let mpi_response = self.handle_mpi_proxy(action, request_id, &payload).await;
+            let response_str = serde_json::to_string(&mpi_response.get("payload")
+                .unwrap_or(&serde_json::Value::Null))
+                .unwrap_or_default();
+            self.send_e2e_response(request_id, &response_str, sink).await?;
+        } else if action == "chat" {
+            // Chat — decrypt prompt, send to OpenClaw, encrypt streaming response
+            self.handle_e2e_chat(request_id, &payload, sink).await?;
+        } else {
+            let error_msg = format!("Unknown E2E action: {}", action);
+            self.send_e2e_response(request_id, &serde_json::json!({"error": error_msg}).to_string(), sink).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Handle E2E chat: decrypt prompt → OpenClaw → encrypt streaming response.
+    async fn handle_e2e_chat(
+        &self, request_id: &str, payload: &serde_json::Value, sink: &mut WsSink,
+    ) -> Result<(), String> {
+        let prompt = payload.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+        if prompt.is_empty() {
+            return self.send_e2e_response(
+                request_id,
+                &serde_json::json!({"error": "empty prompt"}).to_string(),
+                sink,
+            ).await;
+        }
+
+        let gateway_token = match self.agent_manager.gateway_token().await {
+            Some(t) => t,
+            None => {
+                return self.send_e2e_response(
+                    request_id,
+                    &serde_json::json!({"error": "OpenClaw gateway not available"}).to_string(),
+                    sink,
+                ).await;
+            }
+        };
+
+        let session_user = if let Some(uid) = payload.get("user_id").and_then(|u| u.as_str()) {
+            format!("aeronyx:user:{}", uid)
+        } else {
+            format!("aeronyx:req:{}", request_id)
+        };
+
+        let request_body = serde_json::json!({
+            "model": "openclaw", "stream": true, "user": session_user,
+            "messages": [{"role": "user", "content": prompt}]
+        });
+
+        let url = format!("{}{}", OPENCLAW_HTTP_BASE, OPENCLAW_CHAT_PATH);
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(OPENCLAW_REQUEST_TIMEOUT_SECS),
+            self.http_client.post(&url)
+                .header("Authorization", format!("Bearer {}", gateway_token))
+                .header("Content-Type", "application/json")
+                .header("x-openclaw-agent-id", OPENCLAW_AGENT_ID)
+                .json(&request_body).send()
+        ).await
+            .map_err(|_| format!("OpenClaw timed out ({}s)", OPENCLAW_REQUEST_TIMEOUT_SECS))?
+            .map_err(|e| format!("OpenClaw HTTP failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let error = format!("OpenClaw HTTP {}: {}", response.status().as_u16(), &body[..body.len().min(500)]);
+            return self.send_e2e_response(request_id, &serde_json::json!({"error": error}).to_string(), sink).await;
+        }
+
+        // Stream SSE response with E2E encryption per chunk
+        self.stream_e2e_sse_response(request_id, response, sink).await
+    }
+
+    /// Stream SSE from OpenClaw, encrypting each chunk for E2E delivery.
+    async fn stream_e2e_sse_response(
+        &self, request_id: &str, mut response: reqwest::Response, sink: &mut WsSink,
+    ) -> Result<(), String> {
+        let mut full_response = String::new();
+        let mut line_buffer = String::new();
+        let idle_timeout = Duration::from_secs(10);
+        let tool_timeout = Duration::from_secs(45);
+        let mut current_timeout = idle_timeout;
+
+        loop {
+            let chunk_result = tokio::time::timeout(current_timeout, response.chunk()).await;
+            match chunk_result {
+                Ok(Ok(Some(bytes))) => {
+                    current_timeout = idle_timeout;
+                    line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                    // Process SSE lines, encrypt each content chunk
+                    let got_done = self.process_e2e_sse_lines(
+                        request_id, &mut line_buffer, &mut full_response, sink
+                    ).await?;
+
+                    if got_done { current_timeout = tool_timeout; }
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => { warn!(error = %e, "[WS_E2E] SSE read error"); break; }
+                Err(_) => break,
+            }
+        }
+
+        if !line_buffer.is_empty() {
+            if !line_buffer.ends_with('\n') { line_buffer.push('\n'); }
+            let _ = self.process_e2e_sse_lines(
+                request_id, &mut line_buffer, &mut full_response, sink
+            ).await?;
+        }
+
+        // Send encrypted done + full response
+        self.send_e2e_stream_done(request_id, sink).await?;
+
+        if !full_response.is_empty() {
+            // Store chat to MPI /log (plaintext, locally)
+            let _ = self.store_chat_to_mpi(request_id, &full_response).await;
+        }
+
+        self.send_e2e_response(
+            request_id,
+            &serde_json::json!({"response": full_response}).to_string(),
+            sink,
+        ).await
+    }
+
+    /// Process SSE lines and send each chunk encrypted via E2E.
+    async fn process_e2e_sse_lines(
+        &self, request_id: &str, line_buffer: &mut String,
+        full_response: &mut String, sink: &mut WsSink,
+    ) -> Result<bool, String> {
+        let mut got_done = false;
+
+        while let Some(pos) = line_buffer.find('\n') {
+            let line = line_buffer[..pos].trim_end_matches('\r').to_string();
+            *line_buffer = line_buffer[pos + 1..].to_string();
+            if line.is_empty() { continue; }
+
+            let data = if let Some(s) = line.strip_prefix("data: ") { s.trim() }
+                else if let Some(s) = line.strip_prefix("data:") { s.trim() }
+                else { continue };
+
+            if data == "[DONE]" { got_done = true; continue; }
+
+            let parsed: serde_json::Value = match serde_json::from_str(data) {
+                Ok(v) => v, Err(_) => continue,
+            };
+
+            let content = parsed.get("choices")
+                .and_then(|c| c.as_array()).and_then(|a| a.first())
+                .and_then(|ch| ch.get("delta"))
+                .and_then(|d| d.get("content"))
+                .and_then(|c| c.as_str()).unwrap_or("");
+
+            if !content.is_empty() {
+                full_response.push_str(content);
+
+                // Encrypt the chunk
+                let (nonce_hex, ct_hex) = {
+                    let guard = self.e2e_session.lock()
+                        .map_err(|e| format!("E2E lock: {}", e))?;
+                    let session = guard.as_ref()
+                        .ok_or("E2E session lost during streaming")?;
+                    session.encrypt(content.as_bytes())
+                        .map_err(|e| format!("E2E encrypt chunk: {}", e))?
+                };
+
+                let stream_msg = serde_json::json!({
+                    "type": "e2e_stream",
+                    "request_id": request_id,
+                    "nonce": nonce_hex,
+                    "ciphertext": ct_hex,
+                    "done": false,
+                });
+                ws_send_flush(sink, ws_text(&stream_msg)).await
+                    .map_err(|e| format!("E2E stream send: {}", e))?;
+            }
+        }
+        Ok(got_done)
+    }
+
+    /// Send encrypted stream-done signal.
+    async fn send_e2e_stream_done(
+        &self, request_id: &str, sink: &mut WsSink,
+    ) -> Result<(), String> {
+        let (nonce_hex, ct_hex) = {
+            let guard = self.e2e_session.lock()
+                .map_err(|e| format!("E2E lock: {}", e))?;
+            let session = guard.as_ref().ok_or("E2E session lost")?;
+            session.encrypt(b"").map_err(|e| format!("E2E encrypt done: {}", e))?
+        };
+        let msg = serde_json::json!({
+            "type": "e2e_stream",
+            "request_id": request_id,
+            "nonce": nonce_hex,
+            "ciphertext": ct_hex,
+            "done": true,
+        });
+        ws_send_flush(sink, ws_text(&msg)).await
+    }
+
+    /// Send an encrypted response (non-streaming).
+    async fn send_e2e_response(
+        &self, request_id: &str, plaintext: &str, sink: &mut WsSink,
+    ) -> Result<(), String> {
+        let (nonce_hex, ct_hex) = {
+            let guard = self.e2e_session.lock()
+                .map_err(|e| format!("E2E lock: {}", e))?;
+            let session = guard.as_ref()
+                .ok_or("E2E session not established")?;
+            session.encrypt(plaintext.as_bytes())
+                .map_err(|e| format!("E2E encrypt response: {}", e))?
+        };
+        let msg = serde_json::json!({
+            "type": "e2e_response",
+            "request_id": request_id,
+            "status": "success",
+            "nonce": nonce_hex,
+            "ciphertext": ct_hex,
+        });
+        ws_send_flush(sink, ws_text(&msg)).await
+    }
+
+    /// Store chat turn to local MPI /log (plaintext, for memory extraction).
+    async fn store_chat_to_mpi(&self, request_id: &str, response: &str) -> Result<(), String> {
+        let url = format!("{}/api/mpi/log", MPI_BASE_URL);
+        let body = serde_json::json!({
+            "session_id": format!("e2e-{}", request_id),
+            "turns": [
+                {"role": "assistant", "content": response}
+            ],
+            "source_ai": "openclaw-e2e"
+        });
+        let _ = self.http_client.post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(Duration::from_secs(5))
+            .send().await;
         Ok(())
     }
 
