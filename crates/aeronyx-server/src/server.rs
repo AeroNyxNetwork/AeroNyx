@@ -18,14 +18,13 @@
 //! v2.1.0+MVF+Encryption - 🌟 MemoryStorage.open() now receives record_key
 //!   derived from Ed25519 private key for transparent record content encryption.
 //!   MpiState now receives api_secret from config for Bearer token auth.
+//! v2.3.0+RemoteStorage - 🌟 MpiState now receives allow_remote_storage and
+//!   max_remote_owners from config for Phase 1 remote MPI Gateway support.
 //!
-//! ## Modification Reason (v2.1.0+MVF+Encryption)
-//! - init_memchain() derives record_key from identity private key via
-//!   derive_record_key() and passes it to MemoryStorage::open()
-//! - MpiState construction now includes api_secret from config
-//! - Both changes enable the two pending security features:
-//!   1. Record content encryption at rest
-//!   2. MPI Bearer token authentication
+//! ## Modification Reason (v2.3.0+RemoteStorage)
+//! - MpiState construction now includes allow_remote_storage and max_remote_owners
+//!   from config.memchain, enabling the unified auth middleware to accept or reject
+//!   Ed25519-signed remote storage requests.
 //!
 //! ## Main Functionality
 //! - Server lifecycle: init → run → shutdown
@@ -36,15 +35,18 @@
 //! - Management reporting (heartbeat, sessions, commands, WebSocket)
 //!
 //! ## Dependencies
-//! - config.rs for ServerConfig (including MemChainConfig.api_secret)
+//! - config.rs for ServerConfig (including MemChainConfig.api_secret,
+//!   allow_remote_storage, max_remote_owners)
 //! - storage.rs for MemoryStorage (with record_key encryption)
-//! - mpi.rs for MPI router (with auth middleware)
+//! - mpi.rs for MPI router (with unified auth middleware)
 //! - All other server subsystems
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - record_key is derived from identity.to_bytes() (Ed25519 PRIVATE key)
 //! - Do NOT use public_key_bytes() for record_key derivation (security critical)
 //! - api_secret flows: config.rs → server.rs → MpiState → auth middleware
+//! - allow_remote_storage + max_remote_owners flow: config.rs → server.rs → MpiState
+//!   → unified_auth_middleware (Ed25519 signature verification + capacity check)
 //! - The rawlog key derivation still uses public key (known issue, separate fix)
 
 use std::net::Ipv4Addr;
@@ -294,6 +296,9 @@ impl Server {
                 owner_key,
                 api_secret,
                 embed_engine: embed_engine.clone(),
+                // v2.3.0: Phase 1 Remote Storage configuration
+                allow_remote_storage: self.config.memchain.allow_remote_storage,
+                max_remote_owners: self.config.memchain.max_remote_owners,
             });
 
             // Pre-populate Identity cache
