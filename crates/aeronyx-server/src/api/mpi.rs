@@ -340,7 +340,7 @@ async fn handle_remote_auth(
         }
     };
 
-    let identity_pubkey = match IdentityPublicKey::from_bytes(&pubkey_bytes) {
+    let identity_pubkey: IdentityPublicKey = match IdentityPublicKey::from_bytes(&pubkey_bytes) {
         Ok(pk) => pk,
         Err(_) => {
             debug!("[MPI_AUTH] Invalid Ed25519 public key");
