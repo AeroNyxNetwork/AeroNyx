@@ -8,15 +8,19 @@
 //!
 //! ## Modification Reason
 //! v2.1+MVF+Auth — Added `api_secret` field to MemChainConfig for MPI Bearer token auth.
+//! v2.3.0+RemoteStorage — 🌟 Added `allow_remote_storage` and `max_remote_owners` fields
+//!   to MemChainConfig for Phase 1 remote MPI Gateway support.
+//!   Also added validation for `mvf_alpha`, `miner_interval_secs`, `embed_dim`,
+//!   and `embed_max_tokens` (bug fixes from code review).
 //!
 //! ## Main Functionality
 //! - ServerConfig: top-level config with network, vpn, tun, limits, logging, management, memchain
-//! - MemChainConfig: memory system config with MVF parameters, DB paths, and API auth
+//! - MemChainConfig: memory system config with MVF parameters, DB paths, API auth, and remote storage
 //! - Validation for all config sections
 //!
 //! ## Dependencies
 //! - Used by server.rs to initialize all subsystems
-//! - MemChainConfig consumed by MPI router (api/mpi.rs) for auth middleware
+//! - MemChainConfig consumed by MPI router (api/mpi.rs) for auth middleware + remote storage checks
 //! - MemChainConfig consumed by storage.rs for DB path
 //!
 //! ## Main Logical Flow
@@ -28,12 +32,22 @@
 //! - api_secret validation: must be >= 16 chars when set (prevents weak secrets)
 //! - Empty/None api_secret = open access (backward compatible)
 //! - All MemChain config fields have serde defaults for backward compatibility
+//! - allow_remote_storage defaults to false — existing nodes are NOT affected
+//! - When allow_remote_storage is true, Ed25519 signature auth is used for remote requests
+//!   (parallel to Bearer token auth for local requests)
+//! - max_remote_owners caps how many distinct remote users this node will serve
+//! - mvf_alpha must be in [0.0, 1.0] — validated since v2.3.0
+//! - miner_interval_secs must be > 0 — validated since v2.3.0
+//! - embed_dim and embed_max_tokens must be > 0 when memchain is enabled — validated since v2.3.0
 //!
 //! ## Last Modified
 //! v2.1.0 - Added db_path, compaction_threshold, mvf_alpha, mvf_enabled,
 //!           cold_start_threshold, cold_start_until, rawlog_batch_threshold
 //! v2.1.0+MVF - MVF fields added
 //! v2.1.0+MVF+Auth - 🌟 Added api_secret for MPI Bearer token authentication
+//! v2.3.0+RemoteStorage - 🌟 Added allow_remote_storage, max_remote_owners for Phase 1
+//!   🐛 Added validation for mvf_alpha range, miner_interval_secs > 0,
+//!      embed_dim > 0, embed_max_tokens > 0
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -211,6 +225,50 @@ pub struct MemChainConfig {
     /// ```
     #[serde(default)]
     pub api_secret: Option<String>,
+
+    /// ## Phase 1: Remote Storage Configuration (v2.3.0)
+    ///
+    /// When `true`, this node accepts MPI requests from remote users
+    /// authenticated via Ed25519 signature (not just local Bearer token).
+    ///
+    /// Remote requests use the signer's public key as the `owner` field,
+    /// isolating their data from the node operator's own data.
+    ///
+    /// When `false` (default), only local requests (Bearer token auth) are
+    /// accepted — existing behavior is completely unchanged.
+    ///
+    /// ## Security Model
+    /// - Remote users cannot read/modify each other's data (owner isolation)
+    /// - Remote users cannot access the node operator's data
+    /// - Node operator can see encrypted content but cannot decrypt it
+    ///   (record_key derived from user's private key via HKDF)
+    /// - Embeddings are stored in plaintext (required for vector search)
+    ///
+    /// ## Configuration Example
+    /// ```toml
+    /// [memchain]
+    /// allow_remote_storage = true
+    /// max_remote_owners = 100
+    /// ```
+    #[serde(default)]
+    pub allow_remote_storage: bool,
+
+    /// Maximum number of distinct remote owners this node will serve.
+    ///
+    /// Prevents a single node from being overwhelmed by too many remote users.
+    /// Once the limit is reached, new remote users receive 503 Service Unavailable
+    /// and should be reassigned to another node by CMS.
+    ///
+    /// Only effective when `allow_remote_storage = true`.
+    /// Set to 0 for unlimited (not recommended for resource-constrained nodes).
+    ///
+    /// ## Configuration Example
+    /// ```toml
+    /// [memchain]
+    /// max_remote_owners = 100
+    /// ```
+    #[serde(default = "default_max_remote_owners")]
+    pub max_remote_owners: usize,
 }
 
 fn default_memchain_api_addr() -> SocketAddr { "127.0.0.1:8421".parse().unwrap() }
@@ -225,6 +283,7 @@ fn default_rawlog_batch_threshold() -> usize { 100 }
 fn default_embed_model_path() -> String { "models/minilm-l6-v2".into() }
 fn default_embed_dim() -> usize { 384 }
 fn default_embed_max_tokens() -> usize { 128 }
+fn default_max_remote_owners() -> usize { 100 }
 
 impl MemChainConfig {
     pub fn validate(&self) -> Result<()> {
@@ -267,6 +326,67 @@ impl MemChainConfig {
                     ));
                 }
             }
+
+            // 🐛 v2.3.0: Validate mvf_alpha range [0.0, 1.0]
+            // mvf_alpha is used in mvf::fuse_scores(vm, v_old, alpha) as a blend factor.
+            // Values outside [0.0, 1.0] produce nonsensical recall scores.
+            if self.mvf_alpha < 0.0 || self.mvf_alpha > 1.0 {
+                return Err(ServerError::config_invalid(
+                    "memchain.mvf_alpha",
+                    format!("must be in [0.0, 1.0], got {}", self.mvf_alpha),
+                ));
+            }
+
+            // 🐛 v2.3.0: Validate miner_interval_secs > 0
+            // A zero interval would cause the Smart Miner timer to fire continuously,
+            // consuming CPU with no benefit (no time for new data to accumulate).
+            if self.miner_interval_secs == 0 {
+                return Err(ServerError::config_invalid(
+                    "memchain.miner_interval_secs",
+                    "must be > 0 (seconds between miner runs)",
+                ));
+            }
+
+            // 🐛 v2.3.0: Validate embed_dim > 0
+            // A zero-dimension embedding is meaningless and would cause
+            // vector index operations to fail or produce empty results.
+            if self.embed_dim == 0 {
+                return Err(ServerError::config_invalid(
+                    "memchain.embed_dim",
+                    "must be > 0",
+                ));
+            }
+
+            // 🐛 v2.3.0: Validate embed_max_tokens > 0
+            // Zero max tokens would truncate all input to nothing,
+            // producing empty embeddings.
+            if self.embed_max_tokens == 0 {
+                return Err(ServerError::config_invalid(
+                    "memchain.embed_max_tokens",
+                    "must be > 0",
+                ));
+            }
+
+            // v2.3.0: Validate remote storage configuration
+            if self.allow_remote_storage {
+                info!(
+                    "[MEMCHAIN] Remote storage enabled (max_remote_owners: {})",
+                    if self.max_remote_owners == 0 { "unlimited".to_string() }
+                    else { self.max_remote_owners.to_string() }
+                );
+
+                // Warn if remote storage is enabled but no api_secret is set.
+                // Remote auth uses Ed25519 signatures (not Bearer token), but having
+                // api_secret protects local MPI from unauthorized access via loopback.
+                // Without it, anyone on the same machine can call MPI without auth.
+                if self.effective_api_secret().is_none() {
+                    tracing::warn!(
+                        "[MEMCHAIN] allow_remote_storage=true but api_secret is not set. \
+                         Local MPI endpoints are unprotected. Consider setting api_secret \
+                         to prevent unauthorized local access."
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -282,9 +402,26 @@ impl MemChainConfig {
         self.api_secret.as_deref().filter(|s| !s.is_empty())
     }
 
+    /// Check whether remote storage is enabled and accepting new owners.
+    ///
+    /// This is a config-level check only. The actual owner count check
+    /// happens in mpi.rs middleware where the storage layer can be queried.
+    ///
+    /// ## Returns
+    /// - `true` if `allow_remote_storage` is enabled
+    /// - `false` otherwise
+    #[must_use]
+    pub fn is_remote_storage_enabled(&self) -> bool {
+        self.allow_remote_storage
+    }
+
     #[must_use]
     pub fn is_origin_trusted(&self, origin_hex: &str, server_pubkey_hex: &str) -> bool {
+        // If origin is the server itself, always trusted
         if origin_hex == server_pubkey_hex { return true; }
+        // If trusted_agents list is empty, all origins are trusted (backward compatible).
+        // ⚠️ Note for Phase 1: this applies to local/P2P trust only.
+        // Remote storage auth uses Ed25519 signatures, not this trust check.
         if self.trusted_agents.is_empty() { return true; }
         self.trusted_agents.iter().any(|t| t == origin_hex)
     }
@@ -309,6 +446,8 @@ impl Default for MemChainConfig {
             embed_dim: default_embed_dim(),
             embed_max_tokens: default_embed_max_tokens(),
             api_secret: None,
+            allow_remote_storage: false,
+            max_remote_owners: default_max_remote_owners(),
         }
     }
 }
@@ -511,6 +650,9 @@ mod tests {
         assert!(!config.memchain.mvf_enabled);
         assert_eq!(config.memchain.cold_start_threshold, 10);
         assert!(config.memchain.api_secret.is_none());
+        // v2.3.0: remote storage defaults
+        assert!(!config.memchain.allow_remote_storage);
+        assert_eq!(config.memchain.max_remote_owners, 100);
     }
 
     #[test]
@@ -528,6 +670,10 @@ mod tests {
         assert_eq!(mc.embed_max_tokens, 128);
         assert!(mc.api_secret.is_none());
         assert!(mc.effective_api_secret().is_none());
+        // v2.3.0
+        assert!(!mc.allow_remote_storage);
+        assert!(!mc.is_remote_storage_enabled());
+        assert_eq!(mc.max_remote_owners, 100);
     }
 
     #[test]
@@ -593,5 +739,150 @@ mod tests {
             "aaaa0000000000000000000000000000000000000000000000000000000000aa", server));
         assert!(!config.is_origin_trusted(
             "cccc0000000000000000000000000000000000000000000000000000000000cc", server));
+    }
+
+    // ========================================
+    // v2.3.0: Remote Storage Tests
+    // ========================================
+
+    #[test]
+    fn test_remote_storage_disabled_by_default() {
+        let mc = MemChainConfig::default();
+        assert!(!mc.allow_remote_storage);
+        assert!(!mc.is_remote_storage_enabled());
+    }
+
+    #[test]
+    fn test_remote_storage_enabled() {
+        let mc = MemChainConfig {
+            allow_remote_storage: true,
+            max_remote_owners: 50,
+            ..Default::default()
+        };
+        assert!(mc.is_remote_storage_enabled());
+        assert_eq!(mc.max_remote_owners, 50);
+        // Validation passes (warn about missing api_secret is just a log warning)
+        assert!(mc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_remote_storage_with_api_secret() {
+        let mc = MemChainConfig {
+            allow_remote_storage: true,
+            max_remote_owners: 200,
+            api_secret: Some("my-secure-remote-secret".into()),
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+        assert!(mc.is_remote_storage_enabled());
+    }
+
+    #[test]
+    fn test_remote_storage_unlimited_owners() {
+        let mc = MemChainConfig {
+            allow_remote_storage: true,
+            max_remote_owners: 0, // unlimited
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_remote_storage_toml_parsing() {
+        let toml_str = r#"
+[memchain]
+mode = "local"
+allow_remote_storage = true
+max_remote_owners = 75
+api_secret = "a-very-secure-secret-key"
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.memchain.allow_remote_storage);
+        assert_eq!(config.memchain.max_remote_owners, 75);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_remote_storage_toml_backward_compat() {
+        // Old TOML without remote storage fields → defaults to false
+        let toml_str = r#"
+[memchain]
+mode = "local"
+db_path = "memchain.db"
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.memchain.allow_remote_storage);
+        assert_eq!(config.memchain.max_remote_owners, 100);
+        assert!(config.validate().is_ok());
+    }
+
+    // ========================================
+    // v2.3.0: Bug Fix Validation Tests
+    // ========================================
+
+    #[test]
+    fn test_mvf_alpha_out_of_range_rejected() {
+        let mc = MemChainConfig {
+            mvf_alpha: 1.5,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+
+        let mc2 = MemChainConfig {
+            mvf_alpha: -0.1,
+            ..Default::default()
+        };
+        assert!(mc2.validate().is_err());
+    }
+
+    #[test]
+    fn test_mvf_alpha_boundary_values() {
+        let mc_zero = MemChainConfig { mvf_alpha: 0.0, ..Default::default() };
+        assert!(mc_zero.validate().is_ok());
+
+        let mc_one = MemChainConfig { mvf_alpha: 1.0, ..Default::default() };
+        assert!(mc_one.validate().is_ok());
+    }
+
+    #[test]
+    fn test_miner_interval_zero_rejected() {
+        let mc = MemChainConfig {
+            miner_interval_secs: 0,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_embed_dim_zero_rejected() {
+        let mc = MemChainConfig {
+            embed_dim: 0,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_embed_max_tokens_zero_rejected() {
+        let mc = MemChainConfig {
+            embed_max_tokens: 0,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_memchain_off_skips_all_validation() {
+        // When mode = Off, no validation is performed (even invalid values pass)
+        let mc = MemChainConfig {
+            mode: MemChainMode::Off,
+            mvf_alpha: 999.0,
+            miner_interval_secs: 0,
+            embed_dim: 0,
+            embed_max_tokens: 0,
+            db_path: String::new(),
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
     }
 }
