@@ -17,6 +17,7 @@
 //!
 //! ### Key Types
 //! - `IdentityKeyPair`: Long-term Ed25519 keys for signing
+//! - `IdentityPublicKey`: Ed25519 public key for signature verification
 //! - `EphemeralKeyPair`: Per-session X25519 keys for key exchange
 //! - `SessionKey`: Derived symmetric key for transport encryption
 //! - `E2eSession`: Per-WebSocket E2E encryption session (v2.2.0)
@@ -79,6 +80,8 @@
 //! ## Last Modified
 //! v0.1.0 - Initial crypto implementation
 //! v2.2.0 - 🌟 Added E2eSession for E2E encrypted chat
+//! v2.3.0 - 🌟 Added IdentityPublicKey re-export (needed by MPI auth middleware
+//!   for Ed25519 signature verification of remote storage requests)
 
 pub mod handshake;
 pub mod kdf;
@@ -87,7 +90,7 @@ pub mod transport;
 
 // Re-export primary types at module level
 pub use handshake::HandshakeCrypto;
-pub use keys::{EphemeralKeyPair, IdentityKeyPair, SessionKey};
+pub use keys::{EphemeralKeyPair, IdentityKeyPair, IdentityPublicKey, SessionKey};
 pub use keys::E2eSession;
 pub use transport::TransportCrypto;
 
