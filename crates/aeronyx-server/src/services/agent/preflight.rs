@@ -1,7 +1,7 @@
-//! ============================================
-//! File: crates/aeronyx-server/src/services/agent/preflight.rs
-//! Path: aeronyx-server/src/services/agent/preflight.rs
-//! ============================================
+// ============================================
+// File: crates/aeronyx-server/src/services/agent/preflight.rs
+// Path: aeronyx-server/src/services/agent/preflight.rs
+// ============================================
 //!
 //! ## Creation Reason
 //! Extracted from `agent_manager.rs` to provide thorough pre-installation
@@ -52,10 +52,17 @@
 //! - Network check uses `tokio::time::timeout` to avoid hanging
 //! - If you add a new check, add it to `run_all()` AND update the
 //!   check count in the module doc above
+//! - NEVER use `block_on()` inside async functions — it panics in tokio.
+//!   Use sequential `.await` calls instead (see check_disk fix).
 //!
 //! ## Last Modified
 //! v1.4.0 - 🌟 Initial creation (extracted from agent_manager.rs)
-//! ============================================
+//! v2.3.0 - 🐛 Fixed check_disk panic: replaced `block_on()` inside
+//!   `or_else()` closure with sequential `.await` calls. The old code
+//!   called `tokio::runtime::Handle::current().block_on()` from within
+//!   an async task, which panics because tokio forbids blocking a thread
+//!   that is driving async tasks.
+// ============================================
 
 use std::path::Path;
 use tokio::net::TcpStream;
@@ -350,15 +357,22 @@ impl PreflightChecker {
     ///
     /// OpenClaw install is ~500MB, but logs, workspace, and node_modules
     /// grow over time. 5GB is the recommended minimum.
+    ///
+    /// ## v2.3.0 Bug Fix
+    /// Previously used `tokio::runtime::Handle::current().block_on()` inside
+    /// a synchronous `or_else()` closure to check the fallback "/" path.
+    /// This panics because `block_on()` blocks the current thread, which tokio
+    /// forbids when that thread is already driving async tasks.
+    /// Fixed by using sequential `.await` calls instead.
     async fn check_disk() -> PreflightCheck {
-        let free_mb = Self::read_free_disk_mb(OPENCLAW_HOME).await
-            .or_else(|| {
-                // If OPENCLAW_HOME doesn't exist yet, check root partition
-                // (the user will be created there)
-                tokio::runtime::Handle::current().block_on(
-                    Self::read_free_disk_mb("/")
-                )
-            });
+        // Try OPENCLAW_HOME first; if it doesn't exist yet, fall back to root partition.
+        // 🐛 v2.3.0 fix: Previously used `block_on()` inside `or_else()` closure,
+        // which panics when called from within a tokio async context.
+        // Now uses sequential `.await` calls instead.
+        let free_mb = match Self::read_free_disk_mb(OPENCLAW_HOME).await {
+            Some(mb) => Some(mb),
+            None => Self::read_free_disk_mb("/").await,
+        };
 
         match free_mb {
             Some(mb) if mb >= 5120 => {
