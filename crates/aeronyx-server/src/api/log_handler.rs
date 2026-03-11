@@ -11,8 +11,9 @@
 //! ## Processing Pipeline (target < 2ms total per request)
 //! ```text
 //! POST /api/mpi/log
-//!   ├─ Step 0: Write each turn to raw_logs (encrypted)
-//!   ├─ Step 1: For each role="user" turn:
+//!   ├─ Step 0: Verify local-only access (v2.3.0)
+//!   ├─ Step 1: Write each turn to raw_logs (encrypted)
+//!   ├─ Step 2: For each role="user" turn:
 //!   │   ├─ SKIP classification (has_persistent_info) < 0.1ms
 //!   │   ├─ if extractable=1: Rule engine P0-P6 < 0.5ms
 //!   │   │   → Content dedup check (< 0.5ms)
@@ -31,45 +32,56 @@
 //!   1. Cross-request duplicates (same /log called twice)
 //!   2. Intra-request duplicates (P2 + P5 both match "I am allergic to X")
 //!
-//! ## Modification Reason (v2.1.0+MVF+Encryption)
-//! Fixed rawlog key derivation: changed from public key to PRIVATE key.
-//! Previously: `derive_rawlog_key(&identity.public_key_bytes())` — insecure,
-//! anyone with the public key could derive the rawlog encryption key.
-//! Now: `derive_rawlog_key(&identity.to_bytes())` — only private key holder
-//! can derive the key and decrypt rawlogs.
+//! ## Modification Reason (v2.3.0+RemoteStorage)
+//! - Handler now extracts owner from AuthenticatedOwner request extension
+//!   instead of directly using state.identity.public_key_bytes()
+//! - Added local-only access restriction: remote (Ed25519 signature) users
+//!   receive 403 Forbidden. Rule engine must run on the local node only.
+//!   In remote mode, the plugin runs its own rule engine locally.
+//! - Handler signature changed from `Json<LogRequest>` to `Request<Body>`
+//!   to access request extensions set by unified_auth_middleware.
+//!
+//! ## Previous Modifications
+//! v2.1.0+MVF+Encryption — Fixed rawlog key derivation: changed from
+//!   public key to PRIVATE key for HKDF derivation.
 //!
 //! ## Dependencies
 //! - MpiState (from mpi.rs) — shared state including identity, storage
+//! - AuthenticatedOwner (from mpi.rs) — request extension for owner identification
 //! - storage.rs — derive_rawlog_key, insert_raw_log, has_active_content
 //! - MpiState.identity.to_bytes() — Ed25519 PRIVATE key for rawlog key derivation
 //!
 //! ⚠️ Important Note for Next Developer:
+//! - /log is LOCAL-ONLY: remote users (AuthenticatedOwner::Remote) get 403
+//! - In Phase 1 remote mode, the OpenClaw plugin runs its own rule engine
+//!   and calls /remember directly for extractions (not /log)
 //! - derive_rawlog_key MUST use identity.to_bytes() (PRIVATE key), NOT public_key_bytes()
 //! - Using public key defeats encryption (public key is broadcast on P2P network)
-//! - After this fix, old rawlogs encrypted with public-key-derived key are unreadable
+//! - After the v2.1.0 fix, old rawlogs encrypted with public-key-derived key are unreadable
 //! - Migration in storage.rs clears old raw_logs table on first run
 //!
 //! ## Immutable: 202 response format { logged, session_id } unchanged
 //!
 //! ## Last Modified
 //! v2.1.0 - New file: /log endpoint with SKIP + rule engine + neg feedback
-//! v2.1.0+MVF - 🌟 Content fingerprint dedup for rule engine extractions;
-//!   prevents duplicate memories when same content triggers multiple rules
-//!   or when /log is called multiple times with identical input.
-//! v2.1.0+MVF+Encryption - 🌟 Fixed rawlog key derivation: now uses
-//!   identity.to_bytes() (PRIVATE key) instead of public_key_bytes().
+//! v2.1.0+MVF - Content fingerprint dedup for rule engine extractions
+//! v2.1.0+MVF+Encryption - Fixed rawlog key derivation to use PRIVATE key
+//! v2.3.0+RemoteStorage - 🌟 Local-only access restriction (remote → 403);
+//!   owner extracted from AuthenticatedOwner extension;
+//!   handler signature changed to Request<Body> for extension access
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::http::Request;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 
-use crate::api::mpi::MpiState;
+use crate::api::mpi::{AuthenticatedOwner, MpiState};
 use crate::services::memchain::derive_rawlog_key;
 
 // ============================================
@@ -465,9 +477,18 @@ fn parse_recall_context(ctx: &str) -> Vec<RecallContextEntry> {
 /// `POST /api/mpi/log` — Ingest conversation turns.
 ///
 /// Processing pipeline:
+/// 0. Verify local-only access (remote users get 403) — v2.3.0
 /// 1. Write each turn to raw_logs (encrypted if key available)
 /// 2. For each user turn: SKIP classification → rule engine → content dedup → neg feedback
 /// 3. Return 202 { logged, session_id }
+///
+/// ## v2.3.0 Changes
+/// - LOCAL-ONLY restriction: remote (Ed25519 signature) users receive 403 Forbidden.
+///   In remote mode, the OpenClaw plugin runs its own rule engine and calls /remember
+///   directly for extractions. The /log endpoint's rule engine, rawlog encryption,
+///   and negative feedback detection all require local access to the node's private key.
+/// - Owner extracted from AuthenticatedOwner extension (consistent with other handlers).
+/// - Handler signature changed from `Json<LogRequest>` to `Request<Body>`.
 ///
 /// ## RawLog Key Derivation (v2.1.0+MVF+Encryption)
 /// Uses `identity.to_bytes()` (Ed25519 PRIVATE key) for HKDF key derivation.
@@ -475,9 +496,51 @@ fn parse_recall_context(ctx: &str) -> Vec<RecallContextEntry> {
 /// key is broadcast on the P2P network, so anyone could derive the rawlog key.
 pub async fn mpi_log(
     State(state): State<Arc<MpiState>>,
-    Json(req): Json<LogRequest>,
+    req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    let owner = state.identity.public_key_bytes();
+    // ========================================
+    // v2.3.0: Local-only access restriction
+    // ========================================
+    // /log requires local access because:
+    // 1. Rule engine runs on the node (extractions stored with node's identity)
+    // 2. RawLog encryption uses node's PRIVATE key (remote users don't have it)
+    // 3. Negative feedback updates records owned by the local node operator
+    // 4. In remote mode, the plugin handles rule engine locally and uses /remember
+    let auth = req.extensions()
+        .get::<AuthenticatedOwner>()
+        .expect("[BUG] AuthenticatedOwner not set — unified_auth_middleware must be applied")
+        .clone();
+
+    if auth.is_remote() {
+        warn!(
+            "[MPI_LOG] Rejected remote /log request from {}",
+            &auth.owner_hex()[..8]
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "/log endpoint is local-only. Remote users should use the plugin's rule engine and call /remember directly.",
+            })),
+        ).into_response();
+    }
+
+    let owner = auth.owner_bytes();
+
+    // Parse body
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "failed to read body"})),
+        ).into_response(),
+    };
+    let log_req: LogRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("invalid JSON: {}", e)})),
+        ).into_response(),
+    };
 
     // ⚠️ SECURITY FIX (v2.1.0+MVF+Encryption):
     // derive_rawlog_key now uses PRIVATE key (identity.to_bytes())
@@ -494,7 +557,7 @@ pub async fn mpi_log(
 
     // The recall_context for the current request (may come from request-level
     // or from the most recent assistant turn's context).
-    let request_recall_ctx = req.recall_context.as_deref();
+    let request_recall_ctx = log_req.recall_context.as_deref();
 
     // Track the most recent assistant turn's recall_context for neg feedback
     let mut last_assistant_recall_ctx: Option<String> = request_recall_ctx.map(|s| s.to_string());
@@ -503,7 +566,7 @@ pub async fn mpi_log(
     // duplicates (e.g. P2 + P5 both extracting from the same message).
     let mut extracted_this_request: Vec<Vec<u8>> = Vec::new();
 
-    for (idx, turn) in req.turns.iter().enumerate() {
+    for (idx, turn) in log_req.turns.iter().enumerate() {
         let turn_index = idx as i64;
 
         // Determine extractable and feedback for this turn
@@ -550,7 +613,7 @@ pub async fn mpi_log(
                     // Level 1: Intra-request dedup (same content already extracted in this request)
                     if extracted_this_request.contains(&encrypted_content) {
                         debug!(
-                            session = %req.session_id,
+                            session = %log_req.session_id,
                             turn = turn_index,
                             tags = ?ext.tags,
                             "[LOG_RULE] ⏭️ Skipped (intra-request duplicate)"
@@ -561,7 +624,7 @@ pub async fn mpi_log(
                     // Level 2: Cross-request dedup (same content already in SQLite)
                     if state.storage.has_active_content(&owner, &encrypted_content).await {
                         debug!(
-                            session = %req.session_id,
+                            session = %log_req.session_id,
                             turn = turn_index,
                             tags = ?ext.tags,
                             "[LOG_RULE] ⏭️ Skipped (content already exists in DB)"
@@ -577,7 +640,7 @@ pub async fn mpi_log(
                         now_ts,
                         ext.layer,
                         ext.tags,
-                        req.source_ai.clone(),
+                        log_req.source_ai.clone(),
                         encrypted_content.clone(),
                         vec![], // embedding = NULL, Miner Step 0.5 will backfill
                     );
@@ -597,7 +660,7 @@ pub async fn mpi_log(
                     }
 
                     debug!(
-                        session = %req.session_id,
+                        session = %log_req.session_id,
                         turn = turn_index,
                         "[LOG_RULE] Extracted memory"
                     );
@@ -634,7 +697,7 @@ pub async fn mpi_log(
                                 state.storage.insert_feedback(
                                     &owner,
                                     &record_id,
-                                    &req.session_id,
+                                    &log_req.session_id,
                                     turn_index,
                                     -1,
                                     features_arr.as_ref(),
@@ -645,7 +708,7 @@ pub async fn mpi_log(
 
                                 info!(
                                     memory = top.id,
-                                    session = %req.session_id,
+                                    session = %log_req.session_id,
                                     "[LOG_NEG] Negative feedback recorded"
                                 );
                             }
@@ -663,11 +726,11 @@ pub async fn mpi_log(
         };
 
         let result = state.storage.insert_raw_log(
-            &req.session_id,
+            &log_req.session_id,
             turn_index,
             &turn.role,
             &turn.content,
-            &req.source_ai,
+            &log_req.source_ai,
             recall_ctx_for_row,
             extractable,
             feedback_signal,
@@ -681,7 +744,7 @@ pub async fn mpi_log(
 
     debug!(
         logged = logged,
-        session = %req.session_id,
+        session = %log_req.session_id,
         "[LOG] Processed"
     );
 
@@ -689,9 +752,9 @@ pub async fn mpi_log(
         StatusCode::ACCEPTED,
         Json(serde_json::json!(LogResponse {
             logged,
-            session_id: req.session_id,
+            session_id: log_req.session_id,
         })),
-    )
+    ).into_response()
 }
 
 // ============================================
