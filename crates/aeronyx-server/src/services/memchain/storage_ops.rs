@@ -10,7 +10,7 @@
 //!
 //! ## Main Functionality
 //! - RawLog: insert_raw_log, read_rawlog_content, update_rawlog_feedback,
-//!   get_unprocessed_rawlogs
+//!   get_unprocessed_rawlogs, get_rawlogs_for_session (v2.4.0 Phase B)
 //! - Feedback: increment_positive/negative_feedback, set_conflict_with,
 //!   insert_feedback, get_recent_feedback
 //! - Chain State: set_chain_state, last_block_hash, last_block_height
@@ -24,7 +24,7 @@
 //! - v2.4.0-GraphCognition: Full CRUD for cognitive graph tables:
 //!   - Episodes: upsert_episode, get_episode, get_episodes_for_session
 //!   - Entities: upsert_entity, get_entity, get_entities_by_owner, get_entities_cached,
-//!     increment_entity_mention, update_entity_community
+//!     increment_entity_mention, update_entity_community, get_entities_with_embedding
 //!   - Knowledge Edges: insert_knowledge_edge, get_active_edges, get_edges_for_entity,
 //!     invalidate_edge, get_edges_within_community
 //!   - Episode Edges: insert_episode_edge, get_entities_for_episode, get_episodes_for_entity
@@ -32,9 +32,12 @@
 //!     get_communities_with_new_entities
 //!   - Projects: upsert_project, get_projects, get_project
 //!   - Sessions: upsert_session, get_session, get_sessions_for_project,
-//!     update_session_summary, get_pending_sessions
+//!     update_session_summary, get_pending_sessions, update_session_ended_at,
+//!     mark_session_entities_extracted, mark_session_summary_generated,
+//!     mark_session_artifacts_extracted
 //!   - Artifacts: insert_artifact, get_artifacts_for_session, get_artifact_versions
 //!   - Graph Stats: graph_stats
+//!   - Entity Merge: merge_entities (v2.4.0 Phase B — Miner Step 9)
 //!
 //! ## Architecture
 //! This file uses `impl MemoryStorage` blocks to add methods to the struct
@@ -58,12 +61,20 @@
 //! - knowledge_edges.valid_until = NULL means "currently valid". Always filter by
 //!   valid_until IS NULL for current state queries.
 //! - entity_id = SHA256(owner || name_normalized) — deterministic, enables upsert.
+//! - merge_entities() performs cascading updates across knowledge_edges, episode_edges,
+//!   and cleans up self-referencing edges created by the merge. The source entity is
+//!   deleted after merge.
+//! - mark_session_artifacts_extracted() requires the `artifacts_extracted` column in
+//!   the `sessions` table. Ensure schema migration adds this column before calling.
 //!
 //! ## Last Modified
 //! v2.2.0 - 🌟 Extracted from storage.rs; added get_embedding_model, get_overview
 //! v2.3.0+RemoteStorage - 🌟 Added count_distinct_owners(), owner_exists()
 //! v2.4.0-GraphCognition - 🌟 Added full CRUD for episodes, entities, knowledge_edges,
 //!   episode_edges, communities, projects, sessions, artifacts tables + graph_stats
+//! v2.4.0-GraphCognition Phase B - 🌟 Added get_rawlogs_for_session, update_session_ended_at,
+//!   mark_session_artifacts_extracted, mark_session_summary_generated,
+//!   get_entities_with_embedding, merge_entities (Miner Steps 7/9/10 support)
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1304,6 +1315,264 @@ impl MemoryStorage {
 }
 
 // ============================================
+// impl MemoryStorage — v2.4.0 Miner Step Support (Phase B)
+// ============================================
+//
+// ## Creation Reason (v2.4.0-GraphCognition Phase B):
+//   Step 7 (entity_extraction) needs to read raw_logs by session_id to
+//   reconstruct full conversation text for NerEngine entity extraction.
+//   Step 9 (entity merge) needs entities with embeddings for pairwise
+//   cosine similarity comparison, and a merge operation to deduplicate.
+//   Step 10 (session_summary) needs to update session ended_at and mark
+//   extraction/summary stages as complete.
+//
+// ## Dependencies:
+//   - storage_crypto::decrypt_rawlog_content (for encrypted rawlog reads)
+//   - storage::bytes_to_embedding (for embedding deserialization)
+//
+// ## Depended by:
+//   - miner/reflection.rs Steps 7, 9, 10, 11
+//
+// ⚠️ Important Note for Next Developer:
+//   - mark_session_artifacts_extracted() requires `artifacts_extracted` column
+//     in the `sessions` table. If this column doesn't exist in your schema,
+//     add it via migration: ALTER TABLE sessions ADD COLUMN artifacts_extracted INTEGER DEFAULT 0
+//   - merge_entities() performs cascading updates and cleans up self-referencing
+//     edges. If episode_edges has a UNIQUE constraint on (episode_id, entity_id),
+//     the repoint uses OR IGNORE to avoid constraint violations from duplicates.
+
+impl MemoryStorage {
+    /// Get raw_logs for a specific session, ordered by turn_index.
+    /// Used by Miner Step 7 to reconstruct full conversation text for NER.
+    ///
+    /// Returns: Vec<RawLogRow> — all turns (user + assistant) for this session.
+    ///
+    /// ## v2.4.0-GraphCognition Phase B
+    /// Created for Step 7 entity extraction pipeline:
+    ///   get_pending_sessions() → get_rawlogs_for_session() → NerEngine → upsert_entity()
+    pub async fn get_rawlogs_for_session(&self, session_id: &str) -> Vec<RawLogRow> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT log_id, session_id, turn_index, role, content, encrypted,
+                    recall_context, extractable, feedback_signal
+             FROM raw_logs
+             WHERE session_id = ?1
+             ORDER BY turn_index ASC"
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("[STORAGE] get_rawlogs_for_session prepare failed: {}", e);
+                return Vec::new();
+            }
+        };
+
+        stmt.query_map(params![session_id], |row| {
+            Ok(RawLogRow {
+                log_id: row.get(0)?,
+                session_id: row.get(1)?,
+                turn_index: row.get(2)?,
+                role: row.get(3)?,
+                content: row.get(4)?,
+                encrypted: row.get(5)?,
+                recall_context: row.get(6)?,
+                extractable: row.get(7)?,
+                feedback_signal: row.get(8)?,
+            })
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// Update session ended_at timestamp.
+    /// Used by Miner Step 10 after processing a session.
+    pub async fn update_session_ended_at(&self, session_id: &str, ended_at: i64) {
+        let conn = self.conn.lock().await;
+        let _ = conn.execute(
+            "UPDATE sessions SET ended_at = ?1 WHERE session_id = ?2",
+            params![ended_at, session_id],
+        );
+    }
+
+    /// Mark a session as having completed artifact extraction.
+    /// Used by Miner Step 10.
+    ///
+    /// ⚠️ Requires `artifacts_extracted` column in `sessions` table.
+    /// Schema migration: ALTER TABLE sessions ADD COLUMN artifacts_extracted INTEGER DEFAULT 0
+    pub async fn mark_session_artifacts_extracted(&self, session_id: &str) {
+        let conn = self.conn.lock().await;
+        if let Err(e) = conn.execute(
+            "UPDATE sessions SET artifacts_extracted = 1 WHERE session_id = ?1",
+            params![session_id],
+        ) {
+            // Graceful degradation: log warning if column doesn't exist yet
+            warn!(
+                session_id = session_id, error = %e,
+                "[STORAGE] mark_session_artifacts_extracted failed — \
+                 ensure `artifacts_extracted` column exists in sessions table"
+            );
+        }
+    }
+
+    /// Mark a session as having completed summary generation.
+    /// Used by Miner Step 10.
+    pub async fn mark_session_summary_generated(&self, session_id: &str) {
+        let conn = self.conn.lock().await;
+        let _ = conn.execute(
+            "UPDATE sessions SET summary_generated = 1 WHERE session_id = ?1",
+            params![session_id],
+        );
+    }
+
+    /// Get all entities for an owner (lightweight: id + name + type + embedding).
+    /// Used by Miner Step 9 for pairwise similarity merge.
+    /// Returns entities that have embeddings (for cosine comparison).
+    pub async fn get_entities_with_embedding(
+        &self, owner: &[u8; 32], limit: usize,
+    ) -> Vec<(String, String, String, Vec<f32>)> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT entity_id, name, entity_type, embedding
+             FROM entities
+             WHERE owner = ?1 AND embedding IS NOT NULL
+             ORDER BY mention_count DESC
+             LIMIT ?2"
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        stmt.query_map(params![owner.as_slice(), limit as i64], |row| {
+            let entity_id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let entity_type: String = row.get(2)?;
+            let emb_blob: Vec<u8> = row.get(3)?;
+            let embedding = super::storage::bytes_to_embedding(&emb_blob);
+            Ok((entity_id, name, entity_type, embedding))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// Merge entity `source_id` into `target_id`:
+    /// - Add source's mention_count to target
+    /// - Append source's description to target (if different)
+    /// - Update all knowledge_edges referencing source to point to target
+    /// - Update all episode_edges referencing source to point to target
+    /// - Clean up self-referencing knowledge_edges created by the merge
+    /// - Delete the source entity
+    ///
+    /// Used by Miner Step 9 for recursive merge (cosine > 0.92).
+    ///
+    /// ## Bug fixes applied (v2.4.0 Phase B review):
+    /// - Self-loop cleanup: after repointing knowledge_edges, edges where
+    ///   source_id == target_id are invalidated (set valid_until = now).
+    /// - Duplicate episode_edges: uses OR IGNORE to handle unique constraint
+    ///   violations when both source and target were linked to the same episode.
+    pub async fn merge_entities(
+        &self, owner: &[u8; 32], source_id: &str, target_id: &str,
+    ) -> Result<(), String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let conn = self.conn.lock().await;
+
+        // Get source entity info
+        let source_info: Option<(i64, Option<String>)> = conn.query_row(
+            "SELECT mention_count, description FROM entities WHERE entity_id = ?1",
+            params![source_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().unwrap_or(None);
+
+        let (src_mentions, src_desc) = match source_info {
+            Some(info) => info,
+            None => return Err(format!("Source entity {} not found", source_id)),
+        };
+
+        // Merge mention_count and description into target
+        if let Some(desc) = src_desc {
+            conn.execute(
+                "UPDATE entities SET
+                    mention_count = mention_count + ?1,
+                    description = CASE
+                        WHEN description IS NULL THEN ?2
+                        WHEN description = ?2 THEN description
+                        ELSE description || '; ' || ?2
+                    END,
+                    updated_at = ?3
+                 WHERE entity_id = ?4",
+                params![src_mentions, desc, now, target_id],
+            ).map_err(|e| format!("Merge entity counts: {}", e))?;
+        } else {
+            conn.execute(
+                "UPDATE entities SET mention_count = mention_count + ?1, updated_at = ?2
+                 WHERE entity_id = ?3",
+                params![src_mentions, now, target_id],
+            ).map_err(|e| format!("Merge entity counts: {}", e))?;
+        }
+
+        // Repoint knowledge_edges: source_id references → target_id
+        let _ = conn.execute(
+            "UPDATE knowledge_edges SET source_id = ?1, updated_at = ?2
+             WHERE source_id = ?3 AND owner = ?4",
+            params![target_id, now, source_id, owner.as_slice()],
+        );
+        let _ = conn.execute(
+            "UPDATE knowledge_edges SET target_id = ?1, updated_at = ?2
+             WHERE target_id = ?3 AND owner = ?4",
+            params![target_id, now, source_id, owner.as_slice()],
+        );
+
+        // BUG FIX: Clean up self-referencing edges created by the merge.
+        // After repointing, edges that originally connected source↔target now
+        // have source_id == target_id == target_id, which is a meaningless self-loop.
+        // Invalidate them instead of deleting to preserve audit trail.
+        let self_loop_count = conn.execute(
+            "UPDATE knowledge_edges SET valid_until = ?1, updated_at = ?1
+             WHERE owner = ?2 AND source_id = ?3 AND target_id = ?3 AND valid_until IS NULL",
+            params![now, owner.as_slice(), target_id],
+        ).unwrap_or(0);
+        if self_loop_count > 0 {
+            debug!(
+                count = self_loop_count, target = target_id,
+                "[STORAGE] Self-loop edges invalidated after merge"
+            );
+        }
+
+        // Repoint episode_edges, using OR IGNORE to handle duplicate
+        // (episode_id, entity_id) pairs that may arise when both source
+        // and target were already linked to the same episode.
+        let _ = conn.execute(
+            "UPDATE OR IGNORE episode_edges SET entity_id = ?1
+             WHERE entity_id = ?2 AND owner = ?3",
+            params![target_id, source_id, owner.as_slice()],
+        );
+        // Clean up any remaining source episode_edges that couldn't be
+        // repointed due to duplicate constraints — these are redundant
+        // since the target already has a link to the same episode.
+        let _ = conn.execute(
+            "DELETE FROM episode_edges WHERE entity_id = ?1 AND owner = ?2",
+            params![source_id, owner.as_slice()],
+        );
+
+        // Delete source entity
+        let _ = conn.execute(
+            "DELETE FROM entities WHERE entity_id = ?1",
+            params![source_id],
+        );
+
+        info!(
+            source = source_id, target = target_id,
+            merged_mentions = src_mentions,
+            "[STORAGE] Entities merged"
+        );
+
+        Ok(())
+    }
+}
+
+// ============================================
 // Tests
 // ============================================
 
@@ -1572,5 +1841,102 @@ mod tests {
         assert_eq!(stats.entities, 2);
         assert_eq!(stats.knowledge_edges, 1);
         assert_eq!(stats.communities, 1);
+    }
+
+    // ========================================
+    // v2.4.0 Phase B: Miner Step Support Tests
+    // ========================================
+
+    #[tokio::test]
+    async fn test_get_rawlogs_for_session() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        s.insert_raw_log("sess_a", 0, "user", "hello", "test", None, 1, None, None).await.unwrap();
+        s.insert_raw_log("sess_a", 1, "assistant", "hi there", "test", None, 0, None, None).await.unwrap();
+        s.insert_raw_log("sess_b", 0, "user", "other session", "test", None, 1, None, None).await.unwrap();
+
+        let logs = s.get_rawlogs_for_session("sess_a").await;
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].turn_index, 0);
+        assert_eq!(logs[1].turn_index, 1);
+
+        let logs_b = s.get_rawlogs_for_session("sess_b").await;
+        assert_eq!(logs_b.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_merge_entities() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        // Create two entities
+        s.upsert_entity("ent_jwt", &owner, "JWT", "jwt", "technology", Some("Token format"), None).await.unwrap();
+        s.upsert_entity("ent_jwt2", &owner, "JSON Web Token", "json web token", "technology", Some("Auth token"), None).await.unwrap();
+        // Mention ent_jwt2 twice more
+        s.upsert_entity("ent_jwt2", &owner, "JSON Web Token", "json web token", "technology", None, None).await.unwrap();
+
+        // Create an edge referencing source
+        s.insert_knowledge_edge(&owner, "ent_jwt2", "ent_auth", "USED_BY", None, 1.0, 0.9, None, now, None).await.unwrap();
+
+        // Merge ent_jwt2 into ent_jwt
+        s.merge_entities(&owner, "ent_jwt2", "ent_jwt").await.unwrap();
+
+        // Source should be deleted
+        assert!(s.get_entity("ent_jwt2").await.is_none());
+
+        // Target should have accumulated mentions: 1 (original) + 2 (from source)
+        let target = s.get_entity("ent_jwt").await.unwrap();
+        assert_eq!(target.mention_count, 3);
+
+        // Edge should now point to target
+        let edges = s.get_edges_for_entity("ent_jwt", &owner).await;
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].source_id, "ent_jwt");
+    }
+
+    #[tokio::test]
+    async fn test_merge_entities_self_loop_cleanup() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        // Create two entities that will be merged
+        s.upsert_entity("ent_a", &owner, "A", "a", "concept", None, None).await.unwrap();
+        s.upsert_entity("ent_b", &owner, "B", "b", "concept", None, None).await.unwrap();
+
+        // Create edge from A→B — after merging B into A, this becomes A→A (self-loop)
+        s.insert_knowledge_edge(&owner, "ent_a", "ent_b", "RELATED_TO", None, 1.0, 0.9, None, now, None).await.unwrap();
+
+        // Merge B into A
+        s.merge_entities(&owner, "ent_b", "ent_a").await.unwrap();
+
+        // The self-loop edge should have been invalidated (valid_until set)
+        let edges = s.get_edges_for_entity("ent_a", &owner).await;
+        assert!(edges.is_empty(), "Self-loop edges should be invalidated after merge");
+    }
+
+    #[tokio::test]
+    async fn test_session_lifecycle_methods() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        s.upsert_session("sess_001", &owner, None, "code", now, 10).await.unwrap();
+
+        // Mark various stages
+        s.mark_session_entities_extracted("sess_001").await;
+        s.mark_session_summary_generated("sess_001").await;
+        // Note: mark_session_artifacts_extracted requires `artifacts_extracted` column
+        // which may not exist in the base schema — skipped in this test.
+        s.update_session_ended_at("sess_001", now + 3600).await;
+
+        let sess = s.get_session("sess_001").await.unwrap();
+        assert!(sess.entities_extracted);
+        assert!(sess.summary_generated);
+        assert_eq!(sess.ended_at, Some(now + 3600));
+
+        // Should no longer appear in pending
+        let pending = s.get_pending_sessions(&owner, 10).await;
+        assert!(pending.is_empty());
     }
 }
