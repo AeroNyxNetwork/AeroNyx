@@ -11,6 +11,20 @@
 //! Step 1-5: Legacy compaction (Episode → Archive via OpenClaw summary)
 //! ```
 //!
+//! ## v2.4.0-GraphCognition: Cognitive Graph Steps (future — Step 6-11)
+//! When ner_engine is attached, additional steps will be added:
+//! ```text
+//! Step 6:  Session metadata population (sessions table)
+//! Step 7:  Entity/relation extraction (GLiNER → entities + knowledge_edges)
+//! Step 8:  Community detection (label propagation → communities + projects)
+//! Step 9:  Recursive merge (MiniLM similarity → fragment merge + temporal conflict)
+//! Step 10: Session summary + code artifact extraction
+//! Step 11: Episode ingestion + community summary update
+//! ```
+//! These steps are NOT implemented in this PR — only the ner_engine field
+//! and with_ner_engine() builder are added to prepare the infrastructure.
+//! Implementation will follow in Phase B (Week 2-4).
+//!
 //! ## MVF Integration
 //! - Step 0 produces training data for SGD (positive samples y=1)
 //! - When mvf_enabled: after Step 0, run SGD batch update on user_weights
@@ -22,21 +36,27 @@
 //!
 //! ## Modification Reason (v2.1.0+MVF+Encryption)
 //! Fixed rawlog key derivation in Step 0: changed from public key to PRIVATE key.
-//! Previously: `derive_rawlog_key(&owner)` where owner = public_key_bytes() — insecure.
-//! Now: `derive_rawlog_key(&self.identity.to_bytes())` — only private key holder
-//! can derive the key and decrypt rawlogs.
+//!
+//! ## Modification Reason (v2.4.0-GraphCognition)
+//! Added ner_engine field and with_ner_engine() builder method.
+//! NerEngine will be used by Steps 7-11 for entity/relation extraction
+//! from conversation content. This PR only adds the plumbing —
+//! actual cognitive graph steps are Phase B.
 //!
 //! ## Dependencies
 //! - storage.rs — MemoryStorage, derive_rawlog_key, decrypt_rawlog_content_pub
 //! - identity.to_bytes() — Ed25519 PRIVATE key for rawlog key derivation
 //! - vector.rs — VectorIndex, cosine_similarity
 //! - mvf.rs — WeightVector, SGD
+//! - ner.rs — NerEngine (v2.4.0, optional — cognitive graph steps)
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - derive_rawlog_key MUST use identity.to_bytes() (PRIVATE key), NOT public_key_bytes()
 //! - Step 0 decrypts rawlogs — if the key is wrong, content will be garbage/empty
 //! - After the key derivation fix, old rawlogs encrypted with public-key-derived key
 //!   are cleared by the migration in storage.rs
+//! - ner_engine is Option<Arc<NerEngine>> — when None, Steps 7-11 are skipped
+//! - NerEngine is thread-safe (Mutex<Session> internally) — safe to use from Miner
 //!
 //! ## Error Isolation
 //! Each step has independent error handling. Step 0 failure does NOT block
@@ -46,8 +66,9 @@
 //! v0.5.0 - Initial timer-based block packer
 //! v1.0.0 - Smart compaction via OpenClaw
 //! v2.1.0 - MVF feedback pipeline (Step 0, 0.5, 0.6) + SGD integration
-//! v2.1.0+MVF+Encryption - 🌟 Fixed rawlog key derivation in Step 0:
-//!   now uses identity.to_bytes() (PRIVATE key) instead of public_key_bytes().
+//! v2.1.0+MVF+Encryption - 🌟 Fixed rawlog key derivation in Step 0
+//! v2.4.0-GraphCognition - 🌟 Added ner_engine field + with_ner_engine() builder.
+//!   Cognitive graph Steps 6-11 will be implemented in Phase B.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -73,6 +94,8 @@ use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
 use crate::services::memchain::mvf;
 use crate::services::memchain::vector::cosine_similarity;
 use crate::services::memchain::EmbedEngine;
+// v2.4.0: NerEngine for cognitive graph Steps 7-11
+use crate::services::memchain::NerEngine;
 use crate::services::SessionManager;
 
 // ============================================
@@ -121,11 +144,16 @@ pub struct ReflectionMiner {
 
     // MVF
     mvf_enabled: bool,
-    /// Shared user_weights map (same Arc as MpiState)
     user_weights: Option<Arc<parking_lot::RwLock<std::collections::HashMap<String, mvf::WeightVector>>>>,
+
     /// Local embedding engine (shared with MpiState). When Some, used for
     /// embedding generation instead of calling OpenClaw Gateway HTTP.
     embed_engine: Option<Arc<EmbedEngine>>,
+
+    /// v2.4.0: Local NER engine (shared with MpiState). When Some, enables
+    /// cognitive graph Steps 7-11 for entity/relation extraction.
+    /// When None, Steps 7-11 are skipped (v2.3.0 behavior).
+    ner_engine: Option<Arc<NerEngine>>,
 }
 
 impl ReflectionMiner {
@@ -153,6 +181,7 @@ impl ReflectionMiner {
             mvf_enabled: false,
             user_weights: None,
             embed_engine: None,
+            ner_engine: None,
         }
     }
 
@@ -182,11 +211,35 @@ impl ReflectionMiner {
         self
     }
 
+    /// v2.4.0: Set the local NER engine for cognitive graph Steps 7-11.
+    ///
+    /// When set, the Miner will extract entities and relations from conversation
+    /// content using GLiNER, building the three-layer cognitive graph:
+    /// - Step 7: Entity/relation extraction → entities + knowledge_edges tables
+    /// - Step 8: Community detection → communities + projects tables
+    /// - Step 9: Recursive merge → fragment consolidation + temporal conflicts
+    /// - Step 10: Session summary + code artifact extraction
+    /// - Step 11: Episode ingestion + community summary update
+    ///
+    /// When None, these steps are skipped and the Miner operates in v2.3.0 mode
+    /// (Steps 0-5 only).
+    ///
+    /// ## Thread Safety
+    /// NerEngine is thread-safe (ort::Session wrapped in Mutex internally).
+    /// The Miner runs on a single async task, so contention with MPI handlers
+    /// is minimal (recall path also uses NerEngine for query analysis).
+    #[must_use]
+    pub fn with_ner_engine(mut self, engine: Arc<NerEngine>) -> Self {
+        self.ner_engine = Some(engine);
+        self
+    }
+
     pub async fn run(self, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
         info!(
             interval = self.interval.as_secs(),
             threshold = self.compaction_threshold,
             mvf = self.mvf_enabled,
+            ner = self.ner_engine.is_some(),
             "[MINER] Started"
         );
 
@@ -205,6 +258,17 @@ impl ReflectionMiner {
                     self.step_05_backfill_embeddings().await;
                     self.step_06_correction_chaining().await;
                     self.step_1_5_legacy_compaction().await;
+
+                    // v2.4.0: Cognitive graph steps (Phase B implementation)
+                    // These are gated on ner_engine being present.
+                    // Currently no-ops — implementation in Phase B Week 2-4.
+                    if self.ner_engine.is_some() {
+                        self.step_7_entity_extraction().await;
+                        self.step_8_community_detection().await;
+                        self.step_9_recursive_merge().await;
+                        self.step_10_session_summary().await;
+                        self.step_11_episode_ingestion().await;
+                    }
                 }
             }
         }
@@ -224,7 +288,6 @@ impl ReflectionMiner {
         let owner = self.identity.public_key_bytes();
         let owner_hex = hex::encode(owner);
 
-        // Group by session
         let mut sessions: std::collections::HashMap<String, Vec<_>> = std::collections::HashMap::new();
         for row in &rows {
             sessions.entry(row.session_id.clone()).or_default().push(row);
@@ -237,24 +300,13 @@ impl ReflectionMiner {
             let mut seen_memories: HashSet<Vec<u8>> = HashSet::new();
 
             for row in session_rows {
-                // Only process user messages
-                if row.role != "user" {
-                    continue;
-                }
+                if row.role != "user" { continue; }
+                if row.feedback_signal.is_some() { continue; }
 
-                // Already processed (e.g., negative from /log)
-                if row.feedback_signal.is_some() {
-                    continue;
-                }
-
-                // Decrypt content for analysis
                 // ⚠️ SECURITY FIX (v2.1.0+MVF+Encryption):
-                // derive_rawlog_key now uses PRIVATE key (identity.to_bytes())
-                // Previously: derive_rawlog_key(&owner) — used PUBLIC key, insecure!
+                // derive_rawlog_key uses PRIVATE key (identity.to_bytes())
                 let content = if row.encrypted == 1 {
-                    let key = crate::services::memchain::derive_rawlog_key(
-                        &self.identity.to_bytes()
-                    );
+                    let key = crate::services::memchain::derive_rawlog_key(&self.identity.to_bytes());
                     String::from_utf8(
                         crate::services::memchain::decrypt_rawlog_content_pub(&key, &row.content)
                             .unwrap_or_default()
@@ -263,7 +315,6 @@ impl ReflectionMiner {
                     String::from_utf8_lossy(&row.content).to_string()
                 };
 
-                // Check: no negative keywords
                 let lower = content.to_lowercase();
                 let has_negative = CN_NEGATIVE.iter().any(|kw| lower.contains(kw))
                     || EN_NEGATIVE.iter().any(|kw| lower.contains(kw));
@@ -274,10 +325,8 @@ impl ReflectionMiner {
                     continue;
                 }
 
-                // Find previous assistant turn's recall_context
                 let recall_ctx = row.recall_context.as_deref()
                     .or_else(|| {
-                        // Look backwards in session for assistant recall_context
                         session_rows.iter()
                             .filter(|r| r.turn_index < row.turn_index && r.role == "assistant")
                             .last()
@@ -286,14 +335,9 @@ impl ReflectionMiner {
 
                 let ctx = match recall_ctx {
                     Some(c) => c,
-                    None => {
-                        self.storage.update_rawlog_feedback(row.log_id, 0).await;
-                        total_neutral += 1;
-                        continue;
-                    }
+                    None => { self.storage.update_rawlog_feedback(row.log_id, 0).await; total_neutral += 1; continue; }
                 };
 
-                // Parse recall_context JSON
                 let entries: Vec<serde_json::Value> = serde_json::from_str(ctx).unwrap_or_default();
                 if entries.is_empty() {
                     self.storage.update_rawlog_feedback(row.log_id, 0).await;
@@ -301,37 +345,26 @@ impl ReflectionMiner {
                     continue;
                 }
 
-                // Take top 2 scored memories
                 let top_entries: Vec<&serde_json::Value> = entries.iter().take(2).collect();
-
-                // Get embedding for user message via OpenClaw
                 let query_embedding = self.call_openclaw_embed(&content).await;
 
                 for entry in top_entries {
                     let mem_id_hex = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let mem_id_bytes = hex::decode(mem_id_hex).unwrap_or_default();
 
-                    if mem_id_bytes.len() != 32 || seen_memories.contains(&mem_id_bytes) {
-                        continue;
-                    }
+                    if mem_id_bytes.len() != 32 || seen_memories.contains(&mem_id_bytes) { continue; }
 
-                    // Check embedding similarity > 0.4 (if we have embeddings)
                     if let Some(ref q_emb) = query_embedding {
                         if let Some(record) = self.storage.get(&{
-                            let mut arr = [0u8; 32];
-                            arr.copy_from_slice(&mem_id_bytes);
-                            arr
+                            let mut arr = [0u8; 32]; arr.copy_from_slice(&mem_id_bytes); arr
                         }).await {
                             if record.has_embedding() {
                                 let sim = cosine_similarity(q_emb, &record.embedding);
-                                if sim <= 0.4 {
-                                    continue; // Not similar enough
-                                }
+                                if sim <= 0.4 { continue; }
                             }
                         }
                     }
 
-                    // Mark positive feedback
                     let mut record_id = [0u8; 32];
                     record_id.copy_from_slice(&mem_id_bytes);
 
@@ -342,21 +375,16 @@ impl ReflectionMiner {
                         .and_then(|arr| {
                             if arr.len() == 9 {
                                 let mut f = [0.0f32; 9];
-                                for (i, val) in arr.iter().enumerate() {
-                                    f[i] = val.as_f64().unwrap_or(0.0) as f32;
-                                }
+                                for (i, val) in arr.iter().enumerate() { f[i] = val.as_f64().unwrap_or(0.0) as f32; }
                                 Some(f)
                             } else { None }
                         });
 
-                    let prediction = entry.get("score")
-                        .and_then(|v| v.as_f64())
-                        .map(|v| v as f32);
+                    let prediction = entry.get("score").and_then(|v| v.as_f64()).map(|v| v as f32);
 
                     self.storage.insert_feedback(
                         &owner, &record_id, &row.session_id,
-                        row.turn_index, 1,
-                        features.as_ref(), prediction,
+                        row.turn_index, 1, features.as_ref(), prediction,
                     ).await;
 
                     seen_memories.insert(mem_id_bytes);
@@ -367,48 +395,24 @@ impl ReflectionMiner {
             }
         }
 
-        // MVF SGD batch update (positive samples)
         if self.mvf_enabled && total_positive > 0 {
             self.sgd_batch_update_positive(&owner_hex).await;
         }
 
-        info!(
-            positive = total_positive,
-            neutral = total_neutral,
-            "[MINER_S0] Feedback detection complete"
-        );
+        info!(positive = total_positive, neutral = total_neutral, "[MINER_S0] Feedback detection complete");
     }
 
-    /// Run SGD updates for all positive feedback collected this cycle.
     async fn sgd_batch_update_positive(&self, owner_hex: &str) {
-        let weights_map = match &self.user_weights {
-            Some(w) => w,
-            None => return,
-        };
-
-        // Load recent positive feedback with features
+        let weights_map = match &self.user_weights { Some(w) => w, None => return };
         let feedback = self.storage.get_recent_feedback(100).await;
-        let positive_with_features: Vec<_> = feedback.iter()
-            .filter(|(signal, _)| *signal == 1)
-            .collect();
-
-        if positive_with_features.is_empty() {
-            return;
-        }
+        let positive_with_features: Vec<_> = feedback.iter().filter(|(signal, _)| *signal == 1).collect();
+        if positive_with_features.is_empty() { return; }
 
         let mut map = weights_map.write();
-        let w = map.entry(owner_hex.to_string())
-            .or_insert_with(mvf::default_weights);
-
-        // Note: full implementation would read features from memory_feedback table.
-        // For now we just increment version to track that SGD ran.
-        // The actual per-sample SGD with feature vectors requires loading the
-        // features BLOB from memory_feedback — deferred to recall-time negative
-        // feedback path which has the features immediately available.
+        let w = map.entry(owner_hex.to_string()).or_insert_with(mvf::default_weights);
 
         info!(
-            samples = positive_with_features.len(),
-            version = w.version,
+            samples = positive_with_features.len(), version = w.version,
             "[MINER_SGD] Batch update noted (features-based SGD in D11)"
         );
     }
@@ -419,58 +423,32 @@ impl ReflectionMiner {
 
     async fn step_05_backfill_embeddings(&self) {
         let records = self.storage.get_records_needing_embedding(EMBEDDING_BACKFILL_BATCH).await;
-        if records.is_empty() {
-            debug!("[MINER_S05] No records need embedding backfill");
-            return;
-        }
+        if records.is_empty() { debug!("[MINER_S05] No records need embedding backfill"); return; }
 
         let owner = self.identity.public_key_bytes();
         let mut filled = 0u32;
 
         for record in &records {
             let content = String::from_utf8_lossy(&record.encrypted_content).to_string();
-            if content.is_empty() {
-                continue;
-            }
+            if content.is_empty() { continue; }
 
             if let Some(embedding) = self.call_openclaw_embed(&content).await {
                 let dim = embedding.len();
-
-                // Update SQLite
-                let embedding_blob: Vec<u8> = embedding.iter()
-                    .flat_map(|f| f.to_le_bytes())
-                    .collect();
+                let embedding_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
 
                 let conn = self.storage.conn_lock().await;
                 let _ = conn.execute(
-                    "UPDATE records SET embedding = ?1, embedding_model = ?2,
-                        embedding_dim = ?3 WHERE record_id = ?4",
-                    rusqlite::params![
-                        embedding_blob.as_slice(),
-                        "minilm-l6-v2",
-                        dim as i64,
-                        record.record_id.as_slice(),
-                    ],
+                    "UPDATE records SET embedding = ?1, embedding_model = ?2, embedding_dim = ?3 WHERE record_id = ?4",
+                    rusqlite::params![embedding_blob.as_slice(), "minilm-l6-v2", dim as i64, record.record_id.as_slice()],
                 );
                 drop(conn);
 
-                // Update vector index
-                self.vector_index.upsert(
-                    record.record_id,
-                    embedding,
-                    record.layer,
-                    record.timestamp,
-                    &owner,
-                    "minilm-l6-v2",
-                );
-
+                self.vector_index.upsert(record.record_id, embedding, record.layer, record.timestamp, &owner, "minilm-l6-v2");
                 filled += 1;
             }
         }
 
-        if filled > 0 {
-            info!(filled = filled, "[MINER_S05] Embeddings backfilled");
-        }
+        if filled > 0 { info!(filled = filled, "[MINER_S05] Embeddings backfilled"); }
     }
 
     // ============================================
@@ -479,58 +457,36 @@ impl ReflectionMiner {
 
     async fn step_06_correction_chaining(&self) {
         let corrections = self.storage.get_correction_records().await;
-        if corrections.is_empty() {
-            return;
-        }
+        if corrections.is_empty() { return; }
 
         let owner = self.identity.public_key_bytes();
         let mut chained = 0u32;
 
         for correction in &corrections {
-            // Only process corrections with embeddings (need similarity)
-            if !correction.has_embedding() {
-                continue;
-            }
+            if !correction.has_embedding() { continue; }
 
-            // Search for most similar active record (excluding self)
             let candidates = self.vector_index.search(
-                &correction.embedding,
-                &owner,
-                "minilm-l6-v2", // Assume same model
-                5,
-                0.5, // Minimum similarity for supersede
+                &correction.embedding, &owner, "minilm-l6-v2", 5, 0.5,
             );
 
-            let best_match = candidates.iter()
-                .find(|c| c.record_id != correction.record_id);
+            let best_match = candidates.iter().find(|c| c.record_id != correction.record_id);
 
             if let Some(old) = best_match {
-                // Supersede the old record
                 self.storage.supersede_record(&old.record_id, &correction.record_id).await;
-
-                // Remove old from vector index and identity cache
                 self.vector_index.remove(&old.record_id);
-
                 chained += 1;
                 debug!(
-                    old = hex::encode(old.record_id),
-                    new = hex::encode(correction.record_id),
-                    sim = old.similarity,
-                    "[MINER_S06] Correction chained (supersede)"
+                    old = hex::encode(old.record_id), new = hex::encode(correction.record_id),
+                    sim = old.similarity, "[MINER_S06] Correction chained (supersede)"
                 );
             }
 
-            // Remove _correction tag regardless
             let new_tags: Vec<String> = correction.topic_tags.iter()
-                .filter(|t| *t != "_correction")
-                .cloned()
-                .collect();
+                .filter(|t| *t != "_correction").cloned().collect();
             self.storage.update_topic_tags(&correction.record_id, &new_tags).await;
         }
 
-        if chained > 0 {
-            info!(chained = chained, "[MINER_S06] Corrections processed");
-        }
+        if chained > 0 { info!(chained = chained, "[MINER_S06] Corrections processed"); }
     }
 
     // ============================================
@@ -538,42 +494,29 @@ impl ReflectionMiner {
     // ============================================
 
     async fn step_1_5_legacy_compaction(&self) {
-        // Smart compaction
         self.smart_compact().await;
-        // Legacy Fact mining
         self.legacy_mine().await;
     }
 
     async fn smart_compact(&self) {
         let ep_count = self.storage.count_by_layer(MemoryLayer::Episode).await;
-        if ep_count < self.compaction_threshold {
-            return;
-        }
+        if ep_count < self.compaction_threshold { return; }
 
         let owner = self.identity.public_key_bytes();
         let episodes = self.storage.compact_episodes_to_archive(&owner, MAX_COMPACTION_BATCH).await;
-        if episodes.is_empty() {
-            return;
-        }
+        if episodes.is_empty() { return; }
 
         info!(count = episodes.len(), "[MINER] Compacting episodes");
 
         let prompt = self.build_summary_prompt(&episodes);
         let summary = match self.call_openclaw_chat(&prompt).await {
             Some(s) => s,
-            None => {
-                warn!("[MINER] OpenClaw summary failed — episodes remain archived");
-                return;
-            }
+            None => { warn!("[MINER] OpenClaw summary failed"); return; }
         };
 
-        let now_ts = SystemTime::now().duration_since(UNIX_EPOCH)
-            .unwrap_or_default().as_secs();
-
-        let mut all_tags: Vec<String> = episodes.iter()
-            .flat_map(|e| e.topic_tags.clone()).collect();
-        all_tags.sort();
-        all_tags.dedup();
+        let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let mut all_tags: Vec<String> = episodes.iter().flat_map(|e| e.topic_tags.clone()).collect();
+        all_tags.sort(); all_tags.dedup();
 
         let mut knowledge = MemoryRecord::new(
             owner, now_ts, MemoryLayer::Knowledge,
@@ -587,28 +530,19 @@ impl ReflectionMiner {
             return;
         }
 
-        // Chain state
         let prev_hash = self.storage.last_block_hash().await;
         let prev_height = self.storage.last_block_height().await;
         let new_height = if prev_hash == [0u8; 32] { 1 } else { prev_height + 1 };
         let root = merkle_root(&[knowledge.record_id]);
 
         let header = BlockHeader {
-            height: new_height,
-            timestamp: now_ts,
-            prev_block_hash: prev_hash,
-            merkle_root: root,
-            block_type: BLOCK_TYPE_MEMORY,
+            height: new_height, timestamp: now_ts, prev_block_hash: prev_hash,
+            merkle_root: root, block_type: BLOCK_TYPE_MEMORY,
         };
 
         self.storage.set_chain_state(&header.hash(), new_height).await;
         let _ = self.broadcast_header(MemChainMessage::BlockAnnounce(header)).await;
-
-        info!(
-            height = new_height,
-            episodes = episodes.len(),
-            "[MINER] Compaction complete"
-        );
+        info!(height = new_height, episodes = episodes.len(), "[MINER] Compaction complete");
     }
 
     #[allow(deprecated)]
@@ -625,8 +559,7 @@ impl ReflectionMiner {
         };
 
         let new_height = if prev_hash == [0u8; 32] { 1 } else { prev_height + 1 };
-        let now_ts = SystemTime::now().duration_since(UNIX_EPOCH)
-            .unwrap_or_default().as_secs();
+        let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
         let header = BlockHeader {
             height: new_height, timestamp: now_ts,
@@ -644,6 +577,50 @@ impl ReflectionMiner {
         }
 
         let _ = self.broadcast_header(MemChainMessage::BlockAnnounce(header)).await;
+    }
+
+    // ============================================
+    // v2.4.0: Cognitive Graph Steps (Phase B stubs)
+    // ============================================
+    //
+    // These are placeholder methods that will be implemented in Phase B.
+    // They are gated on self.ner_engine.is_some() in run().
+    // When implemented, they will use NerEngine for entity extraction
+    // and EmbedEngine for similarity calculations.
+
+    /// Step 7: Extract entities and relations from conversation content.
+    /// Uses GLiNER NER engine to detect entities, then builds knowledge edges.
+    /// Writes to: entities, knowledge_edges, episode_edges tables.
+    async fn step_7_entity_extraction(&self) {
+        // Phase B implementation — currently a no-op stub
+        debug!("[MINER_S7] Entity extraction (stub — Phase B)");
+    }
+
+    /// Step 8: Community detection via label propagation algorithm.
+    /// Groups related entities into communities, identifies projects.
+    /// Writes to: communities, projects tables. Updates entities.community_id.
+    async fn step_8_community_detection(&self) {
+        debug!("[MINER_S8] Community detection (stub — Phase B)");
+    }
+
+    /// Step 9: Recursive merge — consolidate fragment entities and detect
+    /// temporal conflicts in knowledge edges.
+    /// Uses MiniLM similarity for entity dedup (cos > 0.92 = merge).
+    /// Temporal: new relation invalidates old conflicting relation.
+    async fn step_9_recursive_merge(&self) {
+        debug!("[MINER_S9] Recursive merge (stub — Phase B)");
+    }
+
+    /// Step 10: Generate session summaries and extract code artifacts.
+    /// Writes to: sessions.summary, sessions.key_decisions, artifacts table.
+    async fn step_10_session_summary(&self) {
+        debug!("[MINER_S10] Session summary (stub — Phase B)");
+    }
+
+    /// Step 11: Ingest episodes and update community summaries.
+    /// Writes to: episodes table, communities.summary.
+    async fn step_11_episode_ingestion(&self) {
+        debug!("[MINER_S11] Episode ingestion (stub — Phase B)");
     }
 
     // ============================================
@@ -671,26 +648,19 @@ impl ReflectionMiner {
         let body = serde_json::json!({
             "model": "default",
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 2000,
-            "temperature": 0.3
+            "max_tokens": 2000, "temperature": 0.3
         });
 
         let resp = client.post(OPENCLAW_GATEWAY_CHAT).json(&body).send().await.ok()?;
         if !resp.status().is_success() { return None; }
 
         let json: serde_json::Value = resp.json().await.ok()?;
-        json.get("choices")?.get(0)?.get("message")?.get("content")?
-            .as_str().map(|s| s.to_string())
+        json.get("choices")?.get(0)?.get("message")?.get("content")?.as_str().map(|s| s.to_string())
     }
 
     /// Generate embedding for a text.
-    ///
-    /// ## Strategy (v2.1.0+Embed)
-    /// 1. If local EmbedEngine is available → use it (< 5ms, no network)
-    /// 2. If local fails or unavailable → fall back to OpenClaw Gateway HTTP
-    /// 3. If both fail → return None (caller skips embedding-dependent logic)
+    /// Strategy: local EmbedEngine first → OpenClaw Gateway HTTP fallback.
     async fn call_openclaw_embed(&self, text: &str) -> Option<Vec<f32>> {
-        // Try local embed engine first
         if let Some(ref engine) = self.embed_engine {
             match engine.embed_single(text) {
                 Ok(embedding) => {
@@ -702,21 +672,15 @@ impl ReflectionMiner {
                 }
             }
         }
-
-        // Fallback: OpenClaw Gateway HTTP
         self.call_openclaw_embed_remote(text).await
     }
 
-    /// Remote embedding via OpenClaw Gateway HTTP (fallback path).
     async fn call_openclaw_embed_remote(&self, text: &str) -> Option<Vec<f32>> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build().ok()?;
 
-        let body = serde_json::json!({
-            "model": "minilm-l6-v2",
-            "input": text
-        });
+        let body = serde_json::json!({ "model": "minilm-l6-v2", "input": text });
 
         let resp = client.post(OPENCLAW_GATEWAY_EMBED).json(&body).send().await.ok()?;
         if !resp.status().is_success() {
@@ -751,16 +715,11 @@ impl ReflectionMiner {
             let mut enc = vec![0u8; plaintext.len() + ENCRYPTION_OVERHEAD];
             let len = match crypto.encrypt(
                 &s.session_key, ctr, s.id.as_bytes(), &plaintext, &mut enc,
-            ) {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
+            ) { Ok(l) => l, Err(_) => continue };
             enc.truncate(len);
             let pkt = DataPacket::new(*s.id.as_bytes(), ctr, enc);
             let bytes = encode_data_packet(&pkt).to_vec();
-            if self.udp.send(&bytes, &s.client_endpoint).await.is_ok() {
-                sent += 1;
-            }
+            if self.udp.send(&bytes, &s.client_endpoint).await.is_ok() { sent += 1; }
         }
         sent
     }
@@ -772,6 +731,7 @@ impl std::fmt::Debug for ReflectionMiner {
             .field("interval", &self.interval)
             .field("threshold", &self.compaction_threshold)
             .field("mvf", &self.mvf_enabled)
+            .field("ner", &self.ner_engine.is_some())
             .finish()
     }
 }
