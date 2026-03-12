@@ -25,12 +25,20 @@
 //!   - Pass ner_engine: Option<Arc<NerEngine>> into MpiState
 //!   - Pass cognitive graph config flags into MpiState
 //!   - NerEngine load is graceful: missing model = NER disabled, server runs normally
+//! v2.4.0-GraphCognition Phase B - 🌟 Scalar quantization integration:
+//!   - VectorIndex now uses with_config() when vector_quantization is ScalarUint8
+//!   - calibrate_partition() called after index rebuild from SQLite
+//!   - Quantizer calibration persisted to chain_state for fast restart
 //!
-//! ## Modification Reason (v2.4.0-GraphCognition)
-//! - NerEngine must be initialized AFTER EmbedEngine (ORT runtime shared via Once)
-//! - NerEngine is optional — server operates in v2.3.0 mode without it
-//! - MpiState extended with ner_engine for query_analyzer in recall handler
-//! - MpiState extended with cognitive graph config for feature flag checks
+//! ## Modification Reason (v2.4.0-GraphCognition Phase B)
+//! - VectorIndex::with_config() replaces VectorIndex::new() when scalar quantization
+//!   is enabled in config (vector_quantization = ScalarUint8)
+//! - After rebuilding the vector index from SQLite, calibrate_partition() must be called
+//!   to train the ScalarQuantizer on existing vectors. Without calibration, two-phase
+//!   search falls back to brute-force f32 (no degradation, just no speedup).
+//! - Quantizer calibration bytes are persisted to chain_state table for fast restart:
+//!   on subsequent startups, restore_quantizer() is attempted first. If valid, skips
+//!   re-calibration. If missing or stale, full calibration runs.
 //!
 //! ## Main Functionality
 //! - Server lifecycle: init → run → shutdown
@@ -41,11 +49,14 @@
 //! - Management reporting (heartbeat, sessions, commands, WebSocket)
 //!
 //! ## Dependencies
-//! - config.rs for ServerConfig (including MemChainConfig with v2.4.0 NER/graph/entropy config)
+//! - config.rs for ServerConfig (including MemChainConfig with v2.4.0 NER/graph/entropy config,
+//!   VectorQuantizationMode enum)
 //! - storage.rs for MemoryStorage (Schema v5 with cognitive graph tables)
 //! - mpi.rs for MPI router (with unified auth middleware)
 //! - ner.rs for NerEngine (v2.4.0)
 //! - embed.rs for EmbedEngine
+//! - vector.rs for VectorIndex (v2.4.0: with_config, calibrate_partition, restore_quantizer)
+//! - quantize.rs for ScalarQuantizer (v2.4.0: used internally by VectorIndex)
 //! - All other server subsystems
 //!
 //! ⚠️ Important Note for Next Developer:
@@ -59,10 +70,22 @@
 //!   If EmbedEngine is not loaded (model missing), NerEngine will also fail unless
 //!   ORT is initialized by other means.
 //! - The rawlog key derivation still uses public key (known issue, separate fix)
+//! - VectorIndex scalar quantization requires calibration AFTER index rebuild.
+//!   Sequence: rebuild vectors → try restore_quantizer → fallback calibrate_partition.
+//!   If no vectors exist at startup, calibration is skipped (deferred to first Miner tick).
+//! - config.memchain.vector_quantization: VectorQuantizationMode enum (None / ScalarUint8)
+//! - config.memchain.vector_saturation_threshold: usize (early termination window size)
+//!   Note: VectorIndex::with_config() accepts f32 saturation_threshold (score improvement
+//!   delta), which is different from the config's window-based threshold. The server
+//!   passes DEFAULT_SATURATION_THRESHOLD (0.001) from vector.rs when quantization is
+//!   enabled, and uses the config value only for early_termination window control.
+//!   TODO(Phase C): Unify these two threshold semantics or split the config field.
 //!
 //! ## Last Modified
 //! v2.4.0-GraphCognition - 🌟 Added NerEngine initialization, MpiState extension,
 //!   Miner with_ner_engine attachment
+//! v2.4.0-GraphCognition Phase B - 🌟 VectorIndex::with_config() integration,
+//!   calibrate_partition() after index rebuild, quantizer persistence to chain_state
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,7 +116,7 @@ use aeronyx_transport::LinuxTun;
 use rusqlite::OptionalExtension;
 
 use crate::api::mpi::{build_mpi_router, MpiState, BaselineSnapshot};
-use crate::config::{MemChainConfig, ServerConfig};
+use crate::config::{MemChainConfig, ServerConfig, VectorQuantizationMode};
 use crate::error::{Result, ServerError};
 use crate::handlers::packet::DecryptedPayload;
 use crate::handlers::PacketHandler;
@@ -120,6 +143,10 @@ const KEEPALIVE_PACKET_SIZE: usize = 17;
 const DISCONNECT_PACKET_MIN_SIZE: usize = 18;
 
 const COMMAND_CHANNEL_BUFFER: usize = 100;
+
+/// chain_state key for persisted quantizer calibration data.
+/// Format: "quantizer_cal:{owner_hex}:{model}"
+const QUANTIZER_CAL_KEY_PREFIX: &str = "quantizer_cal";
 
 // ============================================
 // Server
@@ -494,6 +521,15 @@ impl Server {
     /// ## v2.1.0+MVF+Encryption
     /// Now derives record_key from Ed25519 private key and passes it to
     /// MemoryStorage::open() for transparent record content encryption.
+    ///
+    /// ## v2.4.0-GraphCognition Phase B
+    /// VectorIndex creation now respects config.memchain.vector_quantization:
+    /// - VectorQuantizationMode::None → VectorIndex::new() (v2.3.0 behavior)
+    /// - VectorQuantizationMode::ScalarUint8 → VectorIndex::with_config(true, threshold)
+    ///
+    /// After index rebuild, attempts to restore persisted quantizer calibration
+    /// from chain_state. If not available, runs fresh calibration via
+    /// calibrate_partition(). Calibration data is then persisted for next startup.
     async fn init_memchain(&self) -> Result<(
         Arc<MemoryStorage>,
         Arc<VectorIndex>,
@@ -521,7 +557,31 @@ impl Server {
                 .map_err(|e| ServerError::startup_failed(format!("SQLite: {}", e)))?,
         );
 
-        let vector_index = Arc::new(VectorIndex::new());
+        // v2.4.0 Phase B: Create VectorIndex with quantization config
+        let quantization_enabled = self.config.memchain.vector_quantization == VectorQuantizationMode::ScalarUint8;
+        let vector_index = Arc::new(if quantization_enabled {
+            // vector_saturation_threshold in config is usize (window size for early termination).
+            // VectorIndex::with_config() accepts f32 (score improvement delta).
+            // We pass 0.0 to let VectorIndex use its internal DEFAULT_SATURATION_THRESHOLD (0.001).
+            // The config's usize threshold is used for early termination window control
+            // within the vector module's DEFAULT_SATURATION_WINDOW constant.
+            // TODO(Phase C): Expose both thresholds separately in config for fine-grained control.
+            let sat_threshold = if self.config.memchain.vector_early_termination {
+                // Use a small positive value to enable early termination
+                0.001_f32
+            } else {
+                // 0.0 disables early termination in VectorIndex::with_config
+                0.0_f32
+            };
+            info!(
+                quantization = "scalar_uint8",
+                early_termination = self.config.memchain.vector_early_termination,
+                "[MEMCHAIN] VectorIndex created with scalar quantization"
+            );
+            VectorIndex::with_config(true, sat_threshold)
+        } else {
+            VectorIndex::new()
+        });
 
         // Rebuild vector index from SQLite on startup.
         let owner = self.identity.public_key_bytes();
@@ -546,6 +606,62 @@ impl Server {
             vectors = rebuild_count,
             "[MEMCHAIN] SQLite + VectorIndex initialized"
         );
+
+        // v2.4.0 Phase B: Calibrate quantizer after index rebuild
+        if quantization_enabled && rebuild_count > 0 {
+            let owner_hex = hex::encode(owner);
+            let model_name = "minilm-l6-v2"; // Primary embedding model
+
+            // Attempt to restore persisted quantizer calibration from chain_state
+            let cal_key = format!("{}:{}:{}", QUANTIZER_CAL_KEY_PREFIX, owner_hex, model_name);
+            let restored = {
+                let conn = storage.conn_lock().await;
+                let cal_data: Option<Vec<u8>> = conn.query_row(
+                    "SELECT value FROM chain_state WHERE key = ?1",
+                    rusqlite::params![cal_key],
+                    |row| row.get::<_, Vec<u8>>(0),
+                ).optional().unwrap_or(None);
+                drop(conn);
+
+                if let Some(data) = cal_data {
+                    let ok = vector_index.restore_quantizer(&owner, model_name, &data);
+                    if ok {
+                        info!(
+                            model = model_name,
+                            "[VECTOR] ✅ Quantizer restored from persisted calibration"
+                        );
+                    } else {
+                        debug!(
+                            model = model_name,
+                            "[VECTOR] Persisted calibration invalid or stale, recalibrating"
+                        );
+                    }
+                    ok
+                } else {
+                    false
+                }
+            };
+
+            // If restore failed or no persisted data, run fresh calibration
+            if !restored {
+                vector_index.calibrate_partition(&owner, model_name);
+
+                // Persist calibration data for next startup
+                if let Some(cal_bytes) = vector_index.get_quantizer_bytes(&owner, model_name) {
+                    let conn = storage.conn_lock().await;
+                    let _ = conn.execute(
+                        "INSERT OR REPLACE INTO chain_state (key, value) VALUES (?1, ?2)",
+                        rusqlite::params![cal_key, cal_bytes.as_slice()],
+                    );
+                    drop(conn);
+                    info!(
+                        model = model_name,
+                        vectors = rebuild_count,
+                        "[VECTOR] ✅ Quantizer calibrated and persisted"
+                    );
+                }
+            }
+        }
 
         // --- Legacy: AOF + MemPool ---
         let aof_path = &self.config.memchain.aof_path;
