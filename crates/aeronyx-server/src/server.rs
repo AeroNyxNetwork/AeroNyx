@@ -305,11 +305,14 @@ impl Server {
             let embed_engine: Option<Arc<EmbedEngine>> = {
                 let model_path = &self.config.memchain.embed_model_path;
                 let max_tokens = self.config.memchain.embed_max_tokens;
-                match EmbedEngine::load(model_path, max_tokens) {
+                let output_dim = self.config.memchain.embed_output_dim;
+                match EmbedEngine::load(model_path, max_tokens, output_dim) {
                     Ok(engine) => {
                         info!(
                             model = %model_path,
+                            model_type = %engine.model_type(),
                             dim = engine.dim(),
+                            max_seq = engine.max_seq_length(),
                             "[EMBED] ✅ Local embedding engine loaded"
                         );
                         Some(Arc::new(engine))
@@ -610,7 +613,14 @@ impl Server {
         // v2.4.0 Phase B: Calibrate quantizer after index rebuild
         if quantization_enabled && rebuild_count > 0 {
             let owner_hex = hex::encode(owner);
-            let model_name = "minilm-l6-v2"; // Primary embedding model
+            // v2.5.0: model_name is no longer hardcoded — we detect it at startup.
+//     // However, at this point embed_engine hasn't been created yet (it's created
+//     // later in run()). The model_name is used as a partition key for quantizer
+//     // persistence. We use the config path basename as a stable identifier.
+            let model_name = std::path::Path::new(&self.config.memchain.embed_model_path)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("minilm-l6-v2");
 
             // Attempt to restore persisted quantizer calibration from chain_state
             let cal_key = format!("{}:{}:{}", QUANTIZER_CAL_KEY_PREFIX, owner_hex, model_name);
