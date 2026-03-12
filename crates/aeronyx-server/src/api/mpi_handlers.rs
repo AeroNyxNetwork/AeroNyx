@@ -23,6 +23,14 @@
 //! - mpi_status: +ner_ready, +graph_enabled, +graph_stats
 //! - compute_features: +graph_traverse_weight (φ₉, 13th parameter)
 //!
+//! ## v2.5.0 Changes in This File
+//! - mpi_recall: Auto-generate query embedding with EmbedPromptMode::Query when
+//!   client sends text query without pre-computed embedding. This ensures
+//!   EmbeddingGemma applies correct task prefix for query vs document.
+//! - mpi_embed: Returns dynamic model name from engine.model_name() instead
+//!   of hardcoded "minilm-l6-v2".
+//! - mpi_status: Added embed_model field reporting detected model type.
+//!
 //! ⚠️ Important Note for Next Developer:
 //! - All handlers extract owner from AuthenticatedOwner extension (never state.owner_key)
 //! - Shared helpers (extract_owner, parse_layer, etc.) are in mpi.rs
@@ -31,6 +39,10 @@
 //!   get_episodes_for_entity, get_session, get_entity, get_edges_for_entity
 //! - graph_memories use synthetic record_ids ("graph_session_*", "graph_entity_*")
 //!   which do NOT exist in the ledger — never pass them to storage.get()
+//! - v2.5.0: recall auto-generates query embedding using EmbedPromptMode::Query.
+//!   Documents/records are embedded with EmbedPromptMode::Document (default in embed_single).
+//!   This asymmetry is required by EmbeddingGemma for optimal retrieval quality.
+//!   For MiniLM, prompt mode is ignored (no prefix applied either way).
 //!
 //! ## Dependencies (Step 2c graph content retrieval)
 //! - `MemoryStorage::get_episodes_for_entity(entity_id)` → Vec<(episode_id, role)>
@@ -51,6 +63,8 @@
 //! ## Last Modified
 //! v2.4.0-GraphCognition - 🌟 Extracted from mpi.rs; hybrid recall; status extended;
 //!   Step 2c graph content retrieval merged; graph memories injection added
+//! v2.5.0-EmbeddingGemma - 🌟 Auto-generate query embedding with Query prompt mode;
+//!   dynamic model name in /embed response; embed_model in /status response
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -68,6 +82,8 @@ use crate::services::memchain::{MemoryStorage, VectorIndex, compute_recall_score
 use crate::services::memchain::mvf::{self, WeightVector};
 use crate::services::memchain::graph;
 use crate::services::memchain::query_analyzer::{self, QueryType};
+// v2.5.0: EmbedPromptMode for asymmetric query/document embedding
+use crate::services::memchain::embed::EmbedPromptMode;
 
 use super::mpi::{
     MpiState, AuthenticatedOwner, BaselineSnapshot,
@@ -129,9 +145,38 @@ pub async fn mpi_remember(
 
     let ts = now_secs();
 
-    if !req_body.embedding.is_empty() {
+    // v2.5.0: Auto-generate embedding if not provided by client.
+    // Uses Document prompt mode (for stored content), not Query mode.
+    let embedding = if req_body.embedding.is_empty() {
+        if let Some(ref engine) = state.embed_engine {
+            match engine.embed_single(&req_body.content) {
+                Ok(emb) => {
+                    debug!(dim = emb.len(), "[MPI_REMEMBER] Auto-generated embedding (Document mode)");
+                    emb
+                }
+                Err(e) => {
+                    warn!(error = %e, "[MPI_REMEMBER] Auto-embed failed, storing without embedding");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        req_body.embedding.clone()
+    };
+
+    let embedding_model = if !embedding.is_empty() && req_body.embedding.is_empty() {
+        // Auto-generated: use actual engine model name
+        state.embed_engine.as_ref().map(|e| e.model_name().to_string())
+            .unwrap_or_else(|| req_body.embedding_model.clone())
+    } else {
+        req_body.embedding_model.clone()
+    };
+
+    if !embedding.is_empty() {
         let dedup = state.vector_index.check_duplicate(
-            &req_body.embedding, &owner, &req_body.embedding_model, layer, ts,
+            &embedding, &owner, &embedding_model, layer, ts,
         );
         if dedup.is_duplicate {
             let dup_hex = hex::encode(dedup.existing_id.unwrap_or([0; 32]));
@@ -144,18 +189,18 @@ pub async fn mpi_remember(
     let encrypted_content = req_body.content.as_bytes().to_vec();
     let mut record = MemoryRecord::new(
         owner, ts, layer, req_body.topic_tags, req_body.source_ai,
-        encrypted_content, req_body.embedding.clone(),
+        encrypted_content, embedding.clone(),
     );
     record.signature = state.identity.sign(&record.record_id);
     let rid_hex = record.id_hex();
 
-    if !state.storage.insert(&record, &req_body.embedding_model).await {
+    if !state.storage.insert(&record, &embedding_model).await {
         return (StatusCode::CONFLICT, Json(serde_json::json!({"error":"exists","record_id":rid_hex})));
     }
 
-    if !req_body.embedding.is_empty() {
+    if !embedding.is_empty() {
         state.vector_index.upsert(
-            record.record_id, req_body.embedding, layer, ts, &owner, &req_body.embedding_model,
+            record.record_id, embedding, layer, ts, &owner, &embedding_model,
         );
     }
 
@@ -171,7 +216,7 @@ pub async fn mpi_remember(
 }
 
 // ============================================
-// POST /api/mpi/recall (v2.4.0 Hybrid)
+// POST /api/mpi/recall (v2.4.0 Hybrid + v2.5.0 Auto-embed)
 // ============================================
 
 #[derive(Debug, Deserialize)]
@@ -229,9 +274,10 @@ pub struct RecallResponse {
     pub matched_entities: Option<Vec<serde_json::Value>>,
 }
 
-/// `POST /api/mpi/recall` — v2.4.0 Hybrid retrieval pipeline.
+/// `POST /api/mpi/recall` — v2.4.0 Hybrid retrieval pipeline + v2.5.0 auto-embed.
 ///
 /// Pipeline:
+/// 0. Auto-generate query embedding if not provided (v2.5.0, Query prompt mode)
 /// 1. Query Analysis (GLiNER + regex + entity matching)
 /// 2a. Vector search (always runs)
 /// 2b. Graph BFS (if entities matched + graph enabled)
@@ -259,6 +305,40 @@ pub async fn mpi_recall(
     let layer_filter = rb.layer.as_deref().and_then(parse_layer);
     let top_k = rb.top_k.min(100).max(1);
 
+    // ── Step 0: Auto-generate query embedding if not provided (v2.5.0) ──
+    // When the client sends a text query without a pre-computed embedding,
+    // use the local embed engine with Query prompt mode.
+    // For EmbeddingGemma: applies "task: search result | query: " prefix.
+    // For MiniLM: no prefix (prompt mode ignored).
+    // Documents are embedded with Document mode (default in embed_single),
+    // creating the asymmetric query-document matching that EmbeddingGemma requires.
+    let query_embedding: Vec<f32> = if rb.embedding.is_empty() && !rb.query.is_empty() {
+        if let Some(ref engine) = state.embed_engine {
+            match engine.embed_single_with_mode(&rb.query, EmbedPromptMode::Query) {
+                Ok(emb) => {
+                    debug!(dim = emb.len(), "[MPI_RECALL] Auto-generated query embedding (Query mode)");
+                    emb
+                }
+                Err(e) => {
+                    warn!(error = %e, "[MPI_RECALL] Auto-embed failed, falling back to no vector search");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        rb.embedding.clone()
+    };
+
+    let embedding_model = if !query_embedding.is_empty() && rb.embedding.is_empty() {
+        // Auto-generated: use actual engine model name
+        state.embed_engine.as_ref().map(|e| e.model_name().to_string())
+            .unwrap_or_else(|| rb.embedding_model.clone())
+    } else {
+        rb.embedding_model.clone()
+    };
+
     // ── Step 1: Query Analysis (v2.4.0) ──
     let analysis = if !rb.query.is_empty() && (state.ner_engine.is_some() || state.graph_enabled) {
         let known = state.storage.get_entities_cached(&owner).await;
@@ -269,11 +349,11 @@ pub async fn mpi_recall(
 
     // ── Session centroid for φ₇ ──
     let session_centroid: Option<Vec<f32>> = if let Some(ref sid) = rb.session_id {
-        if !rb.embedding.is_empty() {
+        if !query_embedding.is_empty() {
             let mut map = state.session_embeddings.write();
             let buf = map.entry(sid.clone()).or_insert_with(|| VecDeque::with_capacity(5));
             if buf.len() >= 5 { buf.pop_front(); }
-            buf.push_back(rb.embedding.clone());
+            buf.push_back(query_embedding.clone());
             let dim = buf[0].len();
             let mut centroid = vec![0.0f32; dim];
             for emb in buf.iter() { for (i, &v) in emb.iter().enumerate() { if i < dim { centroid[i] += v; } } }
@@ -310,8 +390,8 @@ pub async fn mpi_recall(
 
     // ── Step 2a: Vector search (always runs) ──
     let idx_ready = state.index_ready.load(std::sync::atomic::Ordering::Relaxed);
-    let search = if !rb.embedding.is_empty() && idx_ready {
-        state.vector_index.search_filtered(&rb.embedding, &owner, &rb.embedding_model, layer_filter, top_k * 3, 0.0)
+    let search = if !query_embedding.is_empty() && idx_ready {
+        state.vector_index.search_filtered(&query_embedding, &owner, &embedding_model, layer_filter, top_k * 3, 0.0)
     } else { Vec::new() };
 
     // ── Step 2b: Graph BFS (v2.4.0 — if entities matched + graph enabled) ──
@@ -329,45 +409,34 @@ pub async fn mpi_recall(
     } else { HashMap::new() };
 
     // ── Step 2c: Graph content retrieval (v2.4.0) ──
-    // BFS found related entities. Now retrieve actual content from:
-    //   Path 1: episode_edges → episodes (original conversation snippets → session summaries)
-    //   Path 3: entity descriptions + edge fact_text (synthesized knowledge)
-    // These are injected as synthetic RecalledMemory entries with graph-derived scores.
     let mut graph_memories: Vec<RecalledMemory> = Vec::new();
 
     if !graph_traversed.is_empty() {
         let graph_entity_ids: Vec<String> = graph_traversed.keys().cloned().collect();
 
         // Path 1: Entity → episode_edges → episodes → session summary
-        // Get episodes linked to traversed entities, then retrieve session summaries.
         let mut seen_sessions: HashSet<String> = HashSet::new();
         for eid in &graph_entity_ids {
             let ep_links = state.storage.get_episodes_for_entity(eid).await;
             for (episode_id, _role) in &ep_links {
-                // Parse session_id from episode convention: "ep_{session_id}_{timestamp}"
-                // Use rfind('_') to split off the trailing timestamp segment.
                 let session_id = if episode_id.starts_with("ep_") {
-                    let rest = &episode_id[3..]; // skip "ep_"
+                    let rest = &episode_id[3..];
                     rest.rfind('_').map(|pos| rest[..pos].to_string())
                 } else {
                     None
                 };
 
                 if let Some(ref sid) = session_id {
-                    // BUG FIX: deduplicate by session_id, not episode_id.
-                    // Multiple episodes can reference the same session; avoid
-                    // injecting duplicate session summaries.
                     if seen_sessions.contains(sid) { continue; }
                     seen_sessions.insert(sid.clone());
 
-                    // Get session summary as a compact representation
                     if let Some(session) = state.storage.get_session(sid).await {
                         if let Some(ref summary) = session.summary {
                             let weight = graph_traversed.get(eid).copied().unwrap_or(0.5);
                             graph_memories.push(RecalledMemory {
                                 record_id: format!("graph_session_{}", sid),
                                 layer: "knowledge".to_string(),
-                                score: 2.0 + weight, // High score to surface graph results
+                                score: 2.0 + weight,
                                 content: format!("[Session: {}] {}", sid, summary),
                                 topic_tags: vec!["graph_result".into(), "session_summary".into()],
                                 source_ai: "cognitive-graph".into(),
@@ -382,13 +451,11 @@ pub async fn mpi_recall(
         }
 
         // Path 3: Synthesize entity knowledge from descriptions + edges
-        // Build a compact knowledge summary for each traversed entity
         for eid in &graph_entity_ids {
             if let Some(entity) = state.storage.get_entity(eid).await {
                 let edges = state.storage.get_edges_for_entity(eid, &owner).await;
                 let weight = graph_traversed.get(eid).copied().unwrap_or(0.5);
 
-                // Build entity description with relationships
                 let mut desc_parts: Vec<String> = Vec::new();
                 desc_parts.push(format!("{} ({})", entity.name, entity.entity_type));
 
@@ -396,7 +463,6 @@ pub async fn mpi_recall(
                     desc_parts.push(desc.clone());
                 }
 
-                // Add relationship descriptions (top 5 by weight)
                 let mut edge_descs: Vec<String> = Vec::new();
                 for edge in edges.iter().take(5) {
                     let other_id = if edge.source_id == *eid {
@@ -426,7 +492,7 @@ pub async fn mpi_recall(
                 graph_memories.push(RecalledMemory {
                     record_id: format!("graph_entity_{}", eid),
                     layer: "knowledge".to_string(),
-                    score: 1.5 + weight, // Slightly below session summaries
+                    score: 1.5 + weight,
                     content,
                     topic_tags: vec!["graph_result".into(), "entity_knowledge".into()],
                     source_ai: "cognitive-graph".into(),
@@ -445,8 +511,6 @@ pub async fn mpi_recall(
         }
     }
 
-    // BUG FIX: Include graph_memories count in total_candidates so the response
-    // accurately reflects all candidate sources (vector + identity + graph).
     let total_candidates = search.len() + seen_ids.len() + graph_memories.len();
 
     let max_degree = { let c = state.storage.conn_lock().await; graph::get_max_degree(&c, &owner) };
@@ -466,7 +530,6 @@ pub async fn mpi_recall(
                 _ => 0.0,
             };
 
-            // v2.4.0: graph_traverse_weight from BFS results
             let graph_weight: f32 = if !graph_traversed.is_empty() {
                 let tags_lower: HashSet<String> = record.topic_tags.iter().map(|t| t.to_lowercase()).collect();
                 graph_traversed.iter()
@@ -532,7 +595,6 @@ pub async fn mpi_recall(
     }
 
     // ── Inject graph-derived memories (v2.4.0) ──
-    // Add graph content before truncation so it competes on score
     for gm in graph_memories {
         let tokens = estimate_tokens(&gm.content);
         if total_tokens + tokens > rb.token_budget && !memories.is_empty() { break; }
@@ -618,7 +680,7 @@ pub async fn mpi_forget(
 }
 
 // ============================================
-// GET /api/mpi/status (v2.4.0 extended)
+// GET /api/mpi/status (v2.4.0 extended + v2.5.0 embed_model)
 // ============================================
 
 #[derive(Debug, Serialize)]
@@ -628,6 +690,7 @@ pub struct MpiStatusResponse {
     pub vector_index_total: usize, pub vector_partitions: usize,
     pub last_block_height: u64, pub index_ready: bool,
     pub embed_ready: bool, pub embed_dim: Option<usize>,
+    pub embed_model: Option<String>,
     pub mvf: MvfMetrics,
     pub remote_storage_enabled: bool,
     // v2.4.0
@@ -676,6 +739,7 @@ pub async fn mpi_status(
         index_ready: state.index_ready.load(std::sync::atomic::Ordering::Relaxed),
         embed_ready: state.embed_engine.is_some(),
         embed_dim: state.embed_engine.as_ref().map(|e| e.dim()),
+        embed_model: state.embed_engine.as_ref().map(|e| e.model_name().to_string()),
         mvf: MvfMetrics { enabled: state.mvf_enabled, alpha: state.mvf_alpha,
             total_positive_feedback: tp, total_negative_feedback: tn,
             baseline_positive_rate: bl.as_ref().map(|b| b.positive_rate),
@@ -751,6 +815,7 @@ pub async fn mpi_records_overview(
         "last_memory_at": ov.last_memory_at,
         "embed_ready": state.embed_engine.is_some(),
         "embed_dim": state.embed_engine.as_ref().map(|e| e.dim()),
+        "embed_model": state.embed_engine.as_ref().map(|e| e.model_name().to_string()),
     })))
 }
 
@@ -782,11 +847,13 @@ pub async fn mpi_embed(
     if rb.texts.len() > 100 { return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "batch too large", "max": 100}))); }
 
     let refs: Vec<&str> = rb.texts.iter().map(|s| s.as_str()).collect();
+    // v2.5.0: Use Document mode for /embed endpoint (most callers index content).
+    // Callers that need Query mode should use /recall (which auto-generates query embeddings).
     match engine.embed_batch(&refs) {
         Ok(embs) => {
             let dim = embs.first().map(|v| v.len()).unwrap_or(0);
             debug!(batch = embs.len(), dim = dim, "[MPI_EMBED] Generated");
-            (StatusCode::OK, Json(serde_json::json!({"embeddings": embs, "model": "minilm-l6-v2", "dim": dim})))
+            (StatusCode::OK, Json(serde_json::json!({"embeddings": embs, "model": engine.model_name(), "dim": dim})))
         }
         Err(e) => {
             warn!(error = %e, "[MPI_EMBED] Inference failed");
