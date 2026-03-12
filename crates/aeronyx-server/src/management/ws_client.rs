@@ -22,6 +22,9 @@
 //! v2.3.0 - 🌟 MPI proxy auth_headers passthrough (Ed25519 signature from CMS)
 //!   🐛 Fixed: MPI proxy now reuses self.http_client instead of creating new client
 //!   🐛 Fixed: MPI proxy + store_chat inject Bearer token when api_secret configured
+//! v2.4.0-GraphCognition Phase B - 🐛 Fixed: handle_mpi_proxy missing steps 3-4
+//!   (req_builder construction and has_remote_auth flag). Also added cognitive graph
+//!   read-only endpoints to MPI_ALLOWED_ACTIONS whitelist.
 //!
 //! ## MPI Proxy Auth Flow (v2.3.0)
 //! ```text
@@ -60,9 +63,13 @@
 //! - The 3 header names must match exactly what MPI middleware expects:
 //!   X-MemChain-PublicKey, X-MemChain-Timestamp, X-MemChain-Signature
 //! - api_secret is loaded once at construction time from the config file
+//! - handle_mpi_proxy steps: 1.whitelist → 2.route map → 3.build URL → 4.create builder
+//!   → 5.inject auth → 6.send+wrap response. All 6 steps must be present.
 //!
 //! ## Last Modified
 //! v2.3.0+RemoteStorage - 🌟 auth_headers passthrough + Bearer token injection + client reuse
+//! v2.4.0-GraphCognition Phase B - 🐛 Fixed missing steps 3-4 in handle_mpi_proxy
+//!   (req_builder + has_remote_auth). Added cognitive graph MPI actions.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -460,15 +467,6 @@ impl WsTunnel {
     // ============================================
 
     /// Handle `e2e_init` — frontend sends its ephemeral X25519 public key.
-    ///
-    /// Flow:
-    /// 1. Parse frontend's ephemeral_pk (32 bytes hex)
-    /// 2. Convert node's Ed25519 identity → X25519 key pair
-    /// 3. Compute shared_secret = X25519(node_sk, frontend_pk)
-    /// 4. Store E2eSession for this WebSocket connection
-    /// 5. Send `e2e_ready` with node's X25519 public key
-    ///
-    /// Frontend then computes the same shared_secret on its side.
     async fn handle_e2e_init(
         &self, msg: &serde_json::Value, sink: &mut WsSink,
     ) -> Result<(), String> {
@@ -486,17 +484,14 @@ impl WsTunnel {
         let mut frontend_pk_arr = [0u8; 32];
         frontend_pk_arr.copy_from_slice(&pk_bytes);
 
-        // Single call does: Ed25519→X25519 conversion + DH + E2eSession creation
         let (session, node_x25519_pk_bytes) = self.identity.e2e_handshake(&frontend_pk_arr);
 
-        // Store E2E session
         {
             let mut guard = self.e2e_session.lock()
                 .map_err(|e| format!("E2E session lock: {}", e))?;
             *guard = Some(session);
         }
 
-        // Send e2e_ready with node's X25519 public key
         let ready_msg = serde_json::json!({
             "type": "e2e_ready",
             "x25519_pk": hex::encode(node_x25519_pk_bytes),
@@ -513,12 +508,6 @@ impl WsTunnel {
     }
 
     /// Handle `e2e_message` — decrypt, process, encrypt response.
-    ///
-    /// Flow:
-    /// 1. Decrypt the incoming message using E2eSession
-    /// 2. Parse the plaintext JSON to get action + payload
-    /// 3. Dispatch to the appropriate handler (chat, MPI, etc.)
-    /// 4. Encrypt the response and send as `e2e_response` or `e2e_stream`
     async fn handle_e2e_message(
         &self, msg: &serde_json::Value, sink: &mut WsSink,
     ) -> Result<(), String> {
@@ -529,7 +518,6 @@ impl WsTunnel {
             .ok_or("e2e_message: missing ciphertext")?;
         let action = msg.get("action").and_then(|v| v.as_str()).unwrap_or("chat");
 
-        // Decrypt
         let plaintext_bytes = {
             let guard = self.e2e_session.lock()
                 .map_err(|e| format!("E2E session lock: {}", e))?;
@@ -543,30 +531,20 @@ impl WsTunnel {
             .map_err(|e| format!("E2E decrypted content is not valid UTF-8: {}", e))?;
 
         info!(
-            request_id = %request_id,
-            action = %action,
-            len = plaintext.len(),
+            request_id = %request_id, action = %action, len = plaintext.len(),
             "[WS_E2E] 📥 Decrypted message"
         );
 
-        // Parse the decrypted plaintext as JSON payload
         let payload: serde_json::Value = serde_json::from_str(&plaintext)
-            .unwrap_or_else(|_| {
-                // If not JSON, treat as a chat prompt string
-                serde_json::json!({"prompt": plaintext})
-            });
+            .unwrap_or_else(|_| serde_json::json!({"prompt": plaintext}));
 
-        // Dispatch based on action
         if action.starts_with("mpi_") {
-            // MPI proxy — same logic as non-E2E, but encrypt the response
-            // E2E MPI requests don't have auth_headers (they go through E2E encryption)
             let mpi_response = self.handle_mpi_proxy(action, request_id, &payload, None).await;
             let response_str = serde_json::to_string(&mpi_response.get("payload")
                 .unwrap_or(&serde_json::Value::Null))
                 .unwrap_or_default();
             self.send_e2e_response(request_id, &response_str, sink).await?;
         } else if action == "chat" {
-            // Chat — decrypt prompt, send to OpenClaw, encrypt streaming response
             self.handle_e2e_chat(request_id, &payload, sink).await?;
         } else {
             let error_msg = format!("Unknown E2E action: {}", action);
@@ -631,7 +609,6 @@ impl WsTunnel {
             return self.send_e2e_response(request_id, &serde_json::json!({"error": error}).to_string(), sink).await;
         }
 
-        // Stream SSE response with E2E encryption per chunk
         self.stream_e2e_sse_response(request_id, response, sink).await
     }
 
@@ -651,12 +628,9 @@ impl WsTunnel {
                 Ok(Ok(Some(bytes))) => {
                     current_timeout = idle_timeout;
                     line_buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-                    // Process SSE lines, encrypt each content chunk
                     let got_done = self.process_e2e_sse_lines(
                         request_id, &mut line_buffer, &mut full_response, sink
                     ).await?;
-
                     if got_done { current_timeout = tool_timeout; }
                 }
                 Ok(Ok(None)) => break,
@@ -672,11 +646,9 @@ impl WsTunnel {
             ).await?;
         }
 
-        // Send encrypted done + full response
         self.send_e2e_stream_done(request_id, sink).await?;
 
         if !full_response.is_empty() {
-            // Store chat to MPI /log (plaintext, locally)
             let _ = self.store_chat_to_mpi(request_id, &full_response).await;
         }
 
@@ -718,7 +690,6 @@ impl WsTunnel {
             if !content.is_empty() {
                 full_response.push_str(content);
 
-                // Encrypt the chunk
                 let (nonce_hex, ct_hex) = {
                     let guard = self.e2e_session.lock()
                         .map_err(|e| format!("E2E lock: {}", e))?;
@@ -787,7 +758,6 @@ impl WsTunnel {
     /// Store chat turn to local MPI /log (plaintext, for memory extraction).
     ///
     /// v2.3.0: Now injects Bearer token when api_secret is configured.
-    /// This is a local-only call (store_chat always uses the node's own identity).
     async fn store_chat_to_mpi(&self, request_id: &str, response: &str) -> Result<(), String> {
         let url = format!("{}/api/mpi/log", MPI_BASE_URL);
         let body = serde_json::json!({
@@ -803,7 +773,6 @@ impl WsTunnel {
             .timeout(Duration::from_secs(5))
             .json(&body);
 
-        // v2.3.0: Inject Bearer token for local MPI auth
         if let Some(ref secret) = self.mpi_api_secret {
             req = req.header("Authorization", format!("Bearer {}", secret));
         }
@@ -821,22 +790,17 @@ impl WsTunnel {
     /// Maps `action: "mpi_*"` to local HTTP requests to the MPI API,
     /// then wraps the response in `agent_response` format for the frontend.
     ///
+    /// ## Steps
+    /// 1. Whitelist check — only MPI_ALLOWED_ACTIONS are forwarded
+    /// 2. Route map — action → (HTTP method, path)
+    /// 3. Build URL — combine MPI_BASE_URL + path
+    /// 4. Create reqwest builder — method + URL + Content-Type + optional JSON body
+    /// 5. Inject auth — auth_headers (remote) OR Bearer token (local)
+    /// 6. Send and wrap response
+    ///
     /// ## v2.3.0: auth_headers passthrough
-    /// When the WS message contains `auth_headers` (a JSON object with
-    /// `X-MemChain-PublicKey`, `X-MemChain-Timestamp`, `X-MemChain-Signature`),
-    /// these are injected into the HTTP request to MPI. This enables remote
-    /// users (authenticated via CMS) to have their Ed25519 signatures verified
-    /// by the MPI unified_auth_middleware.
-    ///
-    /// When `auth_headers` is absent (e.g., MemExplorer frontend requests),
-    /// the Bearer token is injected if `mpi_api_secret` is configured.
-    ///
-    /// ## Security
-    /// - Only actions in MPI_ALLOWED_ACTIONS are forwarded
-    /// - `mpi_log` is deliberately excluded (local-only in v2.3.0)
-    /// - Requests go to localhost only (no external network access)
-    /// - 10s timeout prevents MPI hangs from blocking the WebSocket
-    /// - auth_headers are opaque to the proxy — validation happens in MPI middleware
+    /// When the WS message contains `auth_headers`, these are injected into
+    /// the HTTP request. When absent, Bearer token is injected if configured.
     async fn handle_mpi_proxy(
         &self,
         action: &str,
@@ -923,6 +887,23 @@ impl WsTunnel {
                 });
             }
         };
+
+        // 3. Build URL
+        let url = format!("{}{}", MPI_BASE_URL, path);
+
+        // 4. Create reqwest builder with method + Content-Type + optional JSON body
+        // v2.3.0 🐛 Fix: Reuse self.http_client instead of creating new client per request
+        let has_remote_auth = auth_headers
+            .and_then(|h| h.as_object())
+            .map_or(false, |obj| obj.contains_key(HEADER_MEMCHAIN_SIGNATURE));
+
+        let mut req_builder = match method {
+            "POST" => self.http_client.post(&url)
+                .header("Content-Type", "application/json")
+                .json(payload),
+            _ => self.http_client.get(&url),
+        };
+
         // 5. Inject auth headers
         if has_remote_auth {
             // v2.3.0: Passthrough Ed25519 signature headers from CMS
