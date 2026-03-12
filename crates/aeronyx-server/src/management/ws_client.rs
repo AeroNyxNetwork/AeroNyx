@@ -3,20 +3,15 @@
 // ============================================
 //! # WebSocket Tunnel — CMS ↔ Local Services
 //!
-//! ## Modification Reason (v2.2.0-MemExplorer)
-//! Added MPI proxy support: `action: "mpi_*"` messages from CMS are
-//! transparently forwarded to the local MPI API (http://127.0.0.1:8421)
-//! and the response is relayed back via WebSocket.
+//! ## Modification Reason (v2.3.0+RemoteStorage)
+//! MPI Proxy now supports `auth_headers` passthrough for Phase 1 remote storage.
+//! When CMS forwards a remote user's MPI request through the WebSocket tunnel,
+//! the `X-MemChain-*` Ed25519 signature headers are extracted from the WS message
+//! and injected into the HTTP request to the local MPI API.
 //!
-//! This enables the MemExplorer frontend (Next.js) to access MPI endpoints
-//! through the existing CMS WebSocket tunnel without direct MPI connectivity.
-//!
-//! ## MPI Proxy Design
-//! - Action whitelist: only allowed actions are forwarded (security)
-//! - Action → HTTP method + path mapping (mpi_status → GET /status, etc.)
-//! - 10s timeout per MPI request (prevents blocking WebSocket)
-//! - MPI unavailable → 503 error response to frontend
-//! - Bearer token from config automatically injected into MPI requests
+//! Also fixed:
+//! - Reuse `self.http_client` in MPI proxy (was creating new client per request)
+//! - Inject Bearer token when `api_secret` is available (MPI proxy + store_chat)
 //!
 //! ## Previous Modifications
 //! v1.3.0 - Initial creation (Phase 3: WebSocket Tunnel)
@@ -24,6 +19,50 @@
 //! v1.4.0 - Fixed SSE [DONE] signal lost in residual buffer
 //! v1.4.1 - Fixed done=true silently lost (missing flush after send)
 //! v2.2.0 - 🌟 Added MPI proxy for MemExplorer frontend
+//! v2.3.0 - 🌟 MPI proxy auth_headers passthrough (Ed25519 signature from CMS)
+//!   🐛 Fixed: MPI proxy now reuses self.http_client instead of creating new client
+//!   🐛 Fixed: MPI proxy + store_chat inject Bearer token when api_secret configured
+//!
+//! ## MPI Proxy Auth Flow (v2.3.0)
+//! ```text
+//! CMS WebSocket message:
+//!   {
+//!     "action": "mpi_remember",
+//!     "payload": { "content": "...", ... },
+//!     "auth_headers": {                          ← NEW (v2.3.0)
+//!       "X-MemChain-PublicKey": "abcd1234...",
+//!       "X-MemChain-Timestamp": "1741651200",
+//!       "X-MemChain-Signature": "deadbeef..."
+//!     }
+//!   }
+//!
+//! Rust MPI Proxy forwards to 127.0.0.1:8421:
+//!   POST /api/mpi/remember
+//!   X-MemChain-PublicKey: abcd1234...      ← Passthrough
+//!   X-MemChain-Timestamp: 1741651200       ← Passthrough
+//!   X-MemChain-Signature: deadbeef...      ← Passthrough
+//!   Content-Type: application/json
+//!   { "content": "...", ... }
+//!
+//! MPI unified_auth_middleware:
+//!   Detects X-MemChain-Signature → Ed25519 verification
+//!   owner = signer's public key (remote user)
+//! ```
+//!
+//! ## When auth_headers is absent (backward compatible):
+//! - If api_secret is configured → inject Bearer token (local owner)
+//! - If api_secret is not configured → no auth headers (open access)
+//! This preserves existing MemExplorer frontend behavior (no auth_headers).
+//!
+//! ⚠️ Important Note for Next Developer:
+//! - auth_headers in WS message takes priority over Bearer token
+//! - If auth_headers is present, Bearer token is NOT injected (they are mutually exclusive)
+//! - The 3 header names must match exactly what MPI middleware expects:
+//!   X-MemChain-PublicKey, X-MemChain-Timestamp, X-MemChain-Signature
+//! - api_secret is loaded once at construction time from the config file
+//!
+//! ## Last Modified
+//! v2.3.0+RemoteStorage - 🌟 auth_headers passthrough + Bearer token injection + client reuse
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -64,7 +103,7 @@ const MPI_PROXY_TIMEOUT_SECS: u64 = 10;
 ///
 /// ## Security
 /// - `mpi_log` is deliberately excluded: /log is called by the plugin
-///   after each session, not by the frontend.
+///   after each session, not by the frontend. Also local-only in v2.3.0.
 /// - Only read-oriented actions + remember/forget (user-initiated) are allowed.
 const MPI_ALLOWED_ACTIONS: &[&str] = &[
     "mpi_status",
@@ -75,6 +114,12 @@ const MPI_ALLOWED_ACTIONS: &[&str] = &[
     "mpi_record",
     "mpi_overview",
 ];
+
+/// v2.3.0: Header names for Ed25519 remote auth passthrough.
+/// These must match exactly what MPI unified_auth_middleware expects.
+const HEADER_MEMCHAIN_PUBKEY: &str = "X-MemChain-PublicKey";
+const HEADER_MEMCHAIN_TIMESTAMP: &str = "X-MemChain-Timestamp";
+const HEADER_MEMCHAIN_SIGNATURE: &str = "X-MemChain-Signature";
 
 // ============================================
 // Type aliases
@@ -108,6 +153,11 @@ pub struct WsTunnel {
     /// None until a frontend sends e2e_init with its ephemeral public key.
     /// Reset to None on disconnect (ephemeral — one per WS connection).
     e2e_session: std::sync::Mutex<Option<E2eSession>>,
+    /// v2.3.0: MPI Bearer token secret for local auth.
+    /// Loaded from config at construction time. When Some, injected into
+    /// MPI proxy requests that don't have auth_headers (local/MemExplorer requests).
+    /// When None, no Bearer token is injected (backward compatible).
+    mpi_api_secret: Option<String>,
 }
 
 impl WsTunnel {
@@ -119,11 +169,26 @@ impl WsTunnel {
         let http_client = reqwest::Client::builder()
             .pool_max_idle_per_host(4)
             .pool_idle_timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(MPI_PROXY_TIMEOUT_SECS))
             .build()
             .expect("Failed to build reqwest::Client");
 
-        Self { identity, cms_node_id, agent_manager, http_client,
-            e2e_session: std::sync::Mutex::new(None) }
+        Self {
+            identity, cms_node_id, agent_manager, http_client,
+            e2e_session: std::sync::Mutex::new(None),
+            mpi_api_secret: None,
+        }
+    }
+
+    /// Set the MPI API secret for Bearer token injection.
+    ///
+    /// Called from server.rs after reading config.memchain.effective_api_secret().
+    /// When set, MPI proxy requests without auth_headers will include
+    /// `Authorization: Bearer <secret>` for local MPI auth.
+    #[must_use]
+    pub fn with_mpi_api_secret(mut self, secret: Option<String>) -> Self {
+        self.mpi_api_secret = secret;
+        self
     }
 
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) {
@@ -328,8 +393,10 @@ impl WsTunnel {
         info!(request_id = %request_id, action = %action, "[WS_TUNNEL] 📥 Agent request");
 
         // ── v2.2.0: MPI proxy ──────────────────────────────────────
+        // v2.3.0: Extract auth_headers from the WS message for remote user passthrough
         if action.starts_with("mpi_") {
-            let response = self.handle_mpi_proxy(action, request_id, &payload).await;
+            let auth_headers = request.get("auth_headers");
+            let response = self.handle_mpi_proxy(action, request_id, &payload, auth_headers).await;
             ws_send_flush(cms_sink, ws_text(&response)).await
                 .map_err(|e| format!("MPI proxy response send failed: {}", e))?;
             return Ok(());
@@ -480,7 +547,8 @@ impl WsTunnel {
         // Dispatch based on action
         if action.starts_with("mpi_") {
             // MPI proxy — same logic as non-E2E, but encrypt the response
-            let mpi_response = self.handle_mpi_proxy(action, request_id, &payload).await;
+            // E2E MPI requests don't have auth_headers (they go through E2E encryption)
+            let mpi_response = self.handle_mpi_proxy(action, request_id, &payload, None).await;
             let response_str = serde_json::to_string(&mpi_response.get("payload")
                 .unwrap_or(&serde_json::Value::Null))
                 .unwrap_or_default();
@@ -705,6 +773,9 @@ impl WsTunnel {
     }
 
     /// Store chat turn to local MPI /log (plaintext, for memory extraction).
+    ///
+    /// v2.3.0: Now injects Bearer token when api_secret is configured.
+    /// This is a local-only call (store_chat always uses the node's own identity).
     async fn store_chat_to_mpi(&self, request_id: &str, response: &str) -> Result<(), String> {
         let url = format!("{}/api/mpi/log", MPI_BASE_URL);
         let body = serde_json::json!({
@@ -714,16 +785,23 @@ impl WsTunnel {
             ],
             "source_ai": "openclaw-e2e"
         });
-        let _ = self.http_client.post(&url)
+
+        let mut req = self.http_client.post(&url)
             .header("Content-Type", "application/json")
-            .json(&body)
             .timeout(Duration::from_secs(5))
-            .send().await;
+            .json(&body);
+
+        // v2.3.0: Inject Bearer token for local MPI auth
+        if let Some(ref secret) = self.mpi_api_secret {
+            req = req.header("Authorization", format!("Bearer {}", secret));
+        }
+
+        let _ = req.send().await;
         Ok(())
     }
 
     // ============================================
-    // MPI Proxy (v2.2.0-MemExplorer)
+    // MPI Proxy (v2.2.0 + v2.3.0 auth_headers)
     // ============================================
 
     /// Handle MPI proxy requests from CMS WebSocket.
@@ -731,16 +809,28 @@ impl WsTunnel {
     /// Maps `action: "mpi_*"` to local HTTP requests to the MPI API,
     /// then wraps the response in `agent_response` format for the frontend.
     ///
+    /// ## v2.3.0: auth_headers passthrough
+    /// When the WS message contains `auth_headers` (a JSON object with
+    /// `X-MemChain-PublicKey`, `X-MemChain-Timestamp`, `X-MemChain-Signature`),
+    /// these are injected into the HTTP request to MPI. This enables remote
+    /// users (authenticated via CMS) to have their Ed25519 signatures verified
+    /// by the MPI unified_auth_middleware.
+    ///
+    /// When `auth_headers` is absent (e.g., MemExplorer frontend requests),
+    /// the Bearer token is injected if `mpi_api_secret` is configured.
+    ///
     /// ## Security
     /// - Only actions in MPI_ALLOWED_ACTIONS are forwarded
-    /// - `mpi_log` is deliberately excluded (plugin-only endpoint)
+    /// - `mpi_log` is deliberately excluded (local-only in v2.3.0)
     /// - Requests go to localhost only (no external network access)
     /// - 10s timeout prevents MPI hangs from blocking the WebSocket
+    /// - auth_headers are opaque to the proxy — validation happens in MPI middleware
     async fn handle_mpi_proxy(
         &self,
         action: &str,
         request_id: &str,
         payload: &serde_json::Value,
+        auth_headers: Option<&serde_json::Value>,
     ) -> serde_json::Value {
         // 1. Whitelist check
         if !MPI_ALLOWED_ACTIONS.contains(&action) {
@@ -784,25 +874,53 @@ impl WsTunnel {
         };
 
         let url = format!("{}{}", MPI_BASE_URL, path);
-        debug!(action = %action, url = %url, method = %method, "[WS_MPI] Proxying request");
 
-        // 3. Build and send HTTP request with timeout
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(MPI_PROXY_TIMEOUT_SECS))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        // 3. Determine auth mode: remote (auth_headers) or local (Bearer token)
+        let has_remote_auth = auth_headers
+            .and_then(|h| h.as_object())
+            .map_or(false, |h| h.contains_key(HEADER_MEMCHAIN_SIGNATURE));
 
-        let result = match method {
-            "GET" => client.get(&url).send().await,
-            "POST" => client.post(&url)
+        if has_remote_auth {
+            debug!(
+                action = %action, url = %url, method = %method,
+                "[WS_MPI] Proxying with remote auth (Ed25519 passthrough)"
+            );
+        } else {
+            debug!(action = %action, url = %url, method = %method, "[WS_MPI] Proxying with local auth");
+        }
+
+        // 4. Build HTTP request
+        // v2.3.0: Reuse self.http_client (was creating new client per request — bug fix)
+        let mut req_builder = match method {
+            "GET" => self.http_client.get(&url),
+            "POST" => self.http_client.post(&url)
                 .header("Content-Type", "application/json")
-                .json(payload)
-                .send()
-                .await,
+                .json(payload),
             _ => unreachable!(),
         };
 
-        // 4. Wrap response
+        // 5. Inject auth headers
+        if has_remote_auth {
+            // v2.3.0: Passthrough Ed25519 signature headers from CMS
+            if let Some(headers_obj) = auth_headers.and_then(|h| h.as_object()) {
+                if let Some(pk) = headers_obj.get(HEADER_MEMCHAIN_PUBKEY).and_then(|v| v.as_str()) {
+                    req_builder = req_builder.header(HEADER_MEMCHAIN_PUBKEY, pk);
+                }
+                if let Some(ts) = headers_obj.get(HEADER_MEMCHAIN_TIMESTAMP).and_then(|v| v.as_str()) {
+                    req_builder = req_builder.header(HEADER_MEMCHAIN_TIMESTAMP, ts);
+                }
+                if let Some(sig) = headers_obj.get(HEADER_MEMCHAIN_SIGNATURE).and_then(|v| v.as_str()) {
+                    req_builder = req_builder.header(HEADER_MEMCHAIN_SIGNATURE, sig);
+                }
+            }
+        } else if let Some(ref secret) = self.mpi_api_secret {
+            // v2.3.0: Inject Bearer token for local auth (MemExplorer, E2E, etc.)
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", secret));
+        }
+
+        // 6. Send and wrap response
+        let result = req_builder.send().await;
+
         match result {
             Ok(resp) => {
                 let status_code = resp.status().as_u16();
