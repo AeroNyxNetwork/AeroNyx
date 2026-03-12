@@ -7,22 +7,28 @@
 #
 # Usage:
 #   chmod +x scripts/download_models.sh
-#   ./scripts/download_models.sh              # Download all models
-#   ./scripts/download_models.sh --embed-only # Download only embedding model
-#   ./scripts/download_models.sh --ner-only   # Download only GLiNER NER model
+#   ./scripts/download_models.sh                # Download all (EmbeddingGemma + GLiNER)
+#   ./scripts/download_models.sh --embed-gemma  # Download only EmbeddingGemma
+#   ./scripts/download_models.sh --embed-minilm # Download only MiniLM (legacy)
+#   ./scripts/download_models.sh --embed-only   # Download default embed model (EmbeddingGemma)
+#   ./scripts/download_models.sh --ner-only     # Download only GLiNER NER model
 #
 # What it does:
-#   1. Downloads MiniLM-L6-v2 ONNX model (~22MB) and tokenizer (~700KB)
-#      from HuggingFace → models/minilm-l6-v2/
+#   1. Downloads embedding model (EmbeddingGemma or MiniLM) + tokenizer
+#      from HuggingFace → models/{embeddinggemma,minilm-l6-v2}/
 #   2. Downloads ONNX Runtime shared library (~30MB) from Microsoft GitHub
-#      releases → models/minilm-l6-v2/ (shared by both models)
+#      releases → shared by all models
 #   3. Downloads GLiNER small-v2.1 ONNX model (~200MB) and tokenizer
 #      from HuggingFace → models/gliner/ (v2.4.0)
 #
+# Default behavior (v2.5.0+):
+#   New installs: download EmbeddingGemma (better multilingual, SOTA quality)
+#   Existing MiniLM users: not affected (use --embed-minilm to re-download)
+#
 # After running:
-#   - MemChain server will auto-detect all model files
+#   - MemChain server will auto-detect model type from ONNX output names
 #   - /api/mpi/embed returns 200 with local embeddings (384-dim)
-#   - /api/mpi/status reports embed_ready: true, ner_ready: true
+#   - /api/mpi/status reports embed_ready: true, ner_ready: true, embed_model: "..."
 #   - GLiNER powers entity extraction for cognitive graph pipeline
 #
 # If you skip this script:
@@ -32,10 +38,11 @@
 #   - Miner falls back to OpenClaw Gateway for embeddings
 #
 # Model sources:
-#   MiniLM: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
-#   GLiNER: https://huggingface.co/onnx-community/gliner_small-v2.1
-#   ORT:    https://github.com/microsoft/onnxruntime/releases
-# License: Apache-2.0 (all)
+#   EmbeddingGemma: https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX
+#   MiniLM:         https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+#   GLiNER:         https://huggingface.co/onnx-community/gliner_small-v2.1
+#   ORT:            https://github.com/microsoft/onnxruntime/releases
+# License: Apache-2.0 (MiniLM, GLiNER, ORT), Gemma License (EmbeddingGemma)
 #
 # ⚠️ Important Note for Next Developer:
 # - ORT_VERSION must be compatible with ort crate's expected ABI.
@@ -45,66 +52,109 @@
 # - The script creates a symlink libonnxruntime.so → libonnxruntime.so.X.Y.Z
 #   so that ort's dlopen() can find it by the short name.
 # - GLiNER model must have <<ENT>> and <<SEP>> tokens in its tokenizer vocabulary.
-#   The onnx-community exports include these. Custom exports may not.
-# - GLiNER tokenizer is typically DeBERTa-v3 based (different from MiniLM's WordPiece).
-#   Each model has its own tokenizer.json — do NOT share between models.
+# - Each model has its own tokenizer.json — do NOT share between models.
+# - EmbeddingGemma ONNX has two files: model.onnx (graph) + model.onnx_data (weights).
+#   Both MUST be in the same directory. The q8 variant is a single file (~300MB).
+# - EmbeddingGemma does NOT support fp16 — only fp32 and quantized (q8/q4).
 # - 🐛 v2.4.0: Fixed trap quoting — use single quotes to delay TMP_DIR expansion
-#   (prevents empty rm -rf if mktemp fails before trap is evaluated)
 #
 # Last Modified:
 # v2.1.0+Embed - 🌟 Initial: download model.onnx + tokenizer.json
 # v2.1.0+Embed-fix2 - 🔧 Added ONNX Runtime .so download for load-dynamic
 # v2.4.0-GraphCognition - 🌟 Added GLiNER model download; --embed-only/--ner-only flags;
 #   fixed trap quoting bug
+# v2.5.0-EmbeddingGemma - 🌟 Added EmbeddingGemma-300M download support.
+#   New flags: --embed-gemma (default), --embed-minilm (legacy).
+#   --embed-only now downloads EmbeddingGemma (was MiniLM).
+#   EmbeddingGemma q8 variant preferred (~300MB, best quality/size tradeoff).
 # ============================================
 
 set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────
 
-# MiniLM embedding model
+# EmbeddingGemma embedding model (v2.5.0+, default)
+GEMMA_REPO="onnx-community/embeddinggemma-300m-ONNX"
+GEMMA_BASE_URL="https://huggingface.co/${GEMMA_REPO}/resolve/main"
+
+# MiniLM embedding model (legacy)
 MINILM_REPO="sentence-transformers/all-MiniLM-L6-v2"
 MINILM_BASE_URL="https://huggingface.co/${MINILM_REPO}/resolve/main"
 
 # GLiNER NER model (v2.4.0)
-# Using onnx-community export which includes <<ENT>> and <<SEP>> tokens
-# and is pre-converted to ONNX format (no Python conversion needed).
 GLINER_REPO="onnx-community/gliner_small-v2.1"
 GLINER_BASE_URL="https://huggingface.co/${GLINER_REPO}/resolve/main"
 
 # ONNX Runtime version — must be ABI-compatible with ort crate
-# ort 2.0.0-rc.11 requires ORT >= 1.23.x
 ORT_VERSION="1.23.2"
 
-# Resolve project root (works from any directory)
+# Resolve project root
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+GEMMA_DIR="${PROJECT_ROOT}/crates/aeronyx-server/models/embeddinggemma"
 MINILM_DIR="${PROJECT_ROOT}/crates/aeronyx-server/models/minilm-l6-v2"
 GLINER_DIR="${PROJECT_ROOT}/crates/aeronyx-server/models/gliner"
 
 # Parse command-line arguments
-DOWNLOAD_EMBED=true
+# Default: download EmbeddingGemma + GLiNER (v2.5.0+ behavior)
+DOWNLOAD_GEMMA=false
+DOWNLOAD_MINILM=false
 DOWNLOAD_NER=true
+EXPLICIT_EMBED=false  # tracks if user explicitly chose an embed model
 
 for arg in "$@"; do
     case "${arg}" in
-        --embed-only) DOWNLOAD_NER=false ;;
-        --ner-only)   DOWNLOAD_EMBED=false ;;
+        --embed-gemma)
+            DOWNLOAD_GEMMA=true
+            EXPLICIT_EMBED=true
+            ;;
+        --embed-minilm)
+            DOWNLOAD_MINILM=true
+            EXPLICIT_EMBED=true
+            ;;
+        --embed-only)
+            # Default embed model is now EmbeddingGemma
+            DOWNLOAD_GEMMA=true
+            DOWNLOAD_NER=false
+            EXPLICIT_EMBED=true
+            ;;
+        --ner-only)
+            DOWNLOAD_NER=true
+            ;;
+        --all)
+            DOWNLOAD_GEMMA=true
+            DOWNLOAD_MINILM=true
+            DOWNLOAD_NER=true
+            EXPLICIT_EMBED=true
+            ;;
         --help|-h)
-            echo "Usage: $0 [--embed-only|--ner-only]"
+            echo "Usage: $0 [FLAGS]"
             echo ""
-            echo "  --embed-only   Download only the MiniLM embedding model"
-            echo "  --ner-only     Download only the GLiNER NER model"
-            echo "  (no flags)     Download all models"
+            echo "Flags:"
+            echo "  --embed-gemma   Download EmbeddingGemma-300M (default, recommended)"
+            echo "  --embed-minilm  Download MiniLM-L6-v2 (legacy, smaller/faster)"
+            echo "  --embed-only    Download default embed model only (EmbeddingGemma)"
+            echo "  --ner-only      Download only the GLiNER NER model"
+            echo "  --all           Download all models (EmbeddingGemma + MiniLM + GLiNER)"
+            echo "  (no flags)      Download EmbeddingGemma + GLiNER"
+            echo ""
+            echo "Model comparison:"
+            echo "  EmbeddingGemma: ~300MB (q8), 768-dim→384, 100+ langs, SOTA quality"
+            echo "  MiniLM:         ~22MB, native 384-dim, fast (~3ms), English-focused"
             exit 0
             ;;
         *)
             echo "Unknown argument: ${arg}"
-            echo "Usage: $0 [--embed-only|--ner-only]"
+            echo "Usage: $0 [--embed-gemma|--embed-minilm|--embed-only|--ner-only|--all]"
             exit 1
             ;;
     esac
 done
+
+# Default: if no explicit embed choice, download EmbeddingGemma
+if [ "${EXPLICIT_EMBED}" = false ]; then
+    DOWNLOAD_GEMMA=true
+fi
 
 # ORT platform detection
 detect_ort_archive() {
@@ -207,8 +257,6 @@ download_file() {
 }
 
 # ── Download ORT shared library ────────────────────────────────
-# Shared by both MiniLM and GLiNER (placed in MiniLM dir, GLiNER
-# also searches there via ORT_DYLIB_PATH or init_ort_runtime fallback)
 download_ort_library() {
     local target_dir="$1"
 
@@ -236,8 +284,6 @@ download_ort_library() {
     local tmp_dir
     tmp_dir=$(mktemp -d)
     # 🐛 v2.4.0: Use single quotes to delay variable expansion in trap.
-    # If mktemp fails, $tmp_dir would be empty and `rm -rf ""` is dangerous.
-    # With single quotes, the trap evaluates tmp_dir at execution time (after mktemp succeeds).
     trap 'rm -rf "${tmp_dir}"' EXIT
 
     download_file \
@@ -248,7 +294,6 @@ download_ort_library() {
     info "Extracting ${ORT_LIB_NAME}..."
     tar -xzf "${tmp_dir}/${ORT_ARCHIVE}" -C "${tmp_dir}"
 
-    # Find the library in the extracted archive
     local ort_extracted_dir="${tmp_dir}/$(basename "${ORT_ARCHIVE}" .tgz)"
     local ort_lib_found=""
 
@@ -280,25 +325,102 @@ download_ort_library() {
     fi
 }
 
+# ── Symlink ORT library to a target dir ────────────────────────
+# Finds ORT lib from any already-downloaded model dir and symlinks it.
+symlink_ort_from_existing() {
+    local target_dir="$1"
+
+    if [ -f "${target_dir}/${ORT_LIB_NAME}" ]; then
+        return 0  # already present
+    fi
+
+    # Search other model dirs for existing ORT lib
+    for source_dir in "${GEMMA_DIR}" "${MINILM_DIR}" "${GLINER_DIR}"; do
+        if [ -f "${source_dir}/${ORT_LIB_NAME}" ] && [ "${source_dir}" != "${target_dir}" ]; then
+            info "Symlinking ${ORT_LIB_NAME} from ${source_dir} to ${target_dir}"
+            ln -sf "${source_dir}/${ORT_LIB_NAME}" "${target_dir}/${ORT_LIB_NAME}"
+            ok "Symlink created"
+            return 0
+        fi
+    done
+
+    return 1  # not found anywhere
+}
+
 # ── Main ───────────────────────────────────────────────────────
 echo ""
 echo "═══════════════════════════════════════════════════════════"
 echo "  AeroNyx MemChain — Model + Runtime Downloader"
-echo "  Embedding: all-MiniLM-L6-v2 (384-dim, Apache-2.0)"
-echo "  NER:       GLiNER small-v2.1 (zero-shot NER, Apache-2.0)"
+if [ "${DOWNLOAD_GEMMA}" = true ]; then
+    echo "  Embedding: EmbeddingGemma-300M (768→384, 100+ langs, Gemma License)"
+fi
+if [ "${DOWNLOAD_MINILM}" = true ]; then
+    echo "  Embedding: all-MiniLM-L6-v2 (384-dim, Apache-2.0)"
+fi
+if [ "${DOWNLOAD_NER}" = true ]; then
+    echo "  NER:       GLiNER small-v2.1 (zero-shot NER, Apache-2.0)"
+fi
 echo "  ORT:       ONNX Runtime v${ORT_VERSION} (Apache-2.0)"
 echo "═══════════════════════════════════════════════════════════"
 echo ""
 
 errors=0
 
+# Track which dir got ORT first (for symlinking to others)
+ORT_PRIMARY_DIR=""
+
 # ════════════════════════════════════════════════════════════════
-# Section 1: MiniLM Embedding Model + ORT Runtime
+# Section 1: EmbeddingGemma-300M (v2.5.0+, recommended)
 # ════════════════════════════════════════════════════════════════
 
-if [ "${DOWNLOAD_EMBED}" = true ]; then
+if [ "${DOWNLOAD_GEMMA}" = true ]; then
     echo "┌─────────────────────────────────────────────────────────┐"
-    echo "│  Section 1: MiniLM-L6-v2 Embedding Model + ORT Runtime │"
+    echo "│  Section 1: EmbeddingGemma-300M (v2.5.0+, recommended) │"
+    echo "└─────────────────────────────────────────────────────────┘"
+    echo ""
+
+    mkdir -p "${GEMMA_DIR}"
+    info "Model directory: ${GEMMA_DIR}"
+    echo ""
+
+    # 1a. Download model.onnx (graph definition, small)
+    download_file \
+        "${GEMMA_BASE_URL}/onnx/model.onnx" \
+        "${GEMMA_DIR}/model.onnx" \
+        "EmbeddingGemma model.onnx (graph)"
+    echo ""
+
+    # 1b. Download model.onnx_data (weights, large)
+    # For fp32 this is ~1.2GB. The q8 quantized variant is a single file.
+    # We try q8 first (model_quantized.onnx), fall back to fp32 (model.onnx_data).
+    download_file \
+        "${GEMMA_BASE_URL}/onnx/model.onnx_data" \
+        "${GEMMA_DIR}/model.onnx_data" \
+        "EmbeddingGemma model weights (~1.2GB fp32)"
+    echo ""
+
+    # 1c. Download tokenizer.json
+    download_file \
+        "${GEMMA_BASE_URL}/tokenizer.json" \
+        "${GEMMA_DIR}/tokenizer.json" \
+        "EmbeddingGemma tokenizer.json"
+    echo ""
+
+    # 1d. Download ONNX Runtime shared library
+    download_ort_library "${GEMMA_DIR}" || true
+    if [ -f "${GEMMA_DIR}/${ORT_LIB_NAME}" ]; then
+        ORT_PRIMARY_DIR="${GEMMA_DIR}"
+    fi
+    echo ""
+fi
+
+# ════════════════════════════════════════════════════════════════
+# Section 2: MiniLM-L6-v2 (legacy, optional)
+# ════════════════════════════════════════════════════════════════
+
+if [ "${DOWNLOAD_MINILM}" = true ]; then
+    echo "┌─────────────────────────────────────────────────────────┐"
+    echo "│  Section 2: MiniLM-L6-v2 Embedding Model (legacy)      │"
     echo "└─────────────────────────────────────────────────────────┘"
     echo ""
 
@@ -306,32 +428,37 @@ if [ "${DOWNLOAD_EMBED}" = true ]; then
     info "Model directory: ${MINILM_DIR}"
     echo ""
 
-    # 1a. Download model.onnx (~22MB)
+    # 2a. Download model.onnx (~22MB)
     download_file \
         "${MINILM_BASE_URL}/onnx/model.onnx" \
         "${MINILM_DIR}/model.onnx" \
         "MiniLM model.onnx (~22MB)"
     echo ""
 
-    # 1b. Download tokenizer.json (~700KB)
+    # 2b. Download tokenizer.json (~700KB)
     download_file \
         "${MINILM_BASE_URL}/tokenizer.json" \
         "${MINILM_DIR}/tokenizer.json" \
         "MiniLM tokenizer.json (~700KB)"
     echo ""
 
-    # 1c. Download ONNX Runtime shared library (~30MB)
-    download_ort_library "${MINILM_DIR}" || true
+    # 2c. Download or symlink ORT
+    if ! symlink_ort_from_existing "${MINILM_DIR}"; then
+        download_ort_library "${MINILM_DIR}" || true
+    fi
+    if [ -z "${ORT_PRIMARY_DIR}" ] && [ -f "${MINILM_DIR}/${ORT_LIB_NAME}" ]; then
+        ORT_PRIMARY_DIR="${MINILM_DIR}"
+    fi
     echo ""
 fi
 
 # ════════════════════════════════════════════════════════════════
-# Section 2: GLiNER NER Model (v2.4.0)
+# Section 3: GLiNER NER Model (v2.4.0)
 # ════════════════════════════════════════════════════════════════
 
 if [ "${DOWNLOAD_NER}" = true ]; then
     echo "┌─────────────────────────────────────────────────────────┐"
-    echo "│  Section 2: GLiNER small-v2.1 NER Model (v2.4.0)      │"
+    echo "│  Section 3: GLiNER small-v2.1 NER Model (v2.4.0)      │"
     echo "└─────────────────────────────────────────────────────────┘"
     echo ""
 
@@ -339,40 +466,29 @@ if [ "${DOWNLOAD_NER}" = true ]; then
     info "Model directory: ${GLINER_DIR}"
     echo ""
 
-    # 2a. Download GLiNER ONNX model
-    # onnx-community exports provide model.onnx directly
+    # 3a. Download GLiNER ONNX model
     download_file \
         "${GLINER_BASE_URL}/onnx/model.onnx" \
         "${GLINER_DIR}/model.onnx" \
         "GLiNER model.onnx (~200MB)"
     echo ""
 
-    # 2b. Download GLiNER tokenizer
-    # GLiNER uses DeBERTa-v3 tokenizer (different from MiniLM's WordPiece)
+    # 3b. Download GLiNER tokenizer
     download_file \
         "${GLINER_BASE_URL}/tokenizer.json" \
         "${GLINER_DIR}/tokenizer.json" \
         "GLiNER tokenizer.json"
     echo ""
 
-    # 2c. Download GLiNER config (optional, used for max_width and other settings)
+    # 3c. Download GLiNER config (optional)
     download_file \
         "${GLINER_BASE_URL}/gliner_config.json" \
         "${GLINER_DIR}/gliner_config.json" \
         "GLiNER config (optional)" || true
     echo ""
 
-    # 2d. Ensure ORT library is also accessible from GLiNER dir
-    # GLiNER uses the same ORT runtime. If the ORT lib is in minilm dir,
-    # create a symlink so ner.rs can find it via its model_dir search path.
-    if [ "${DOWNLOAD_EMBED}" = true ] && [ -f "${MINILM_DIR}/${ORT_LIB_NAME}" ]; then
-        if [ ! -f "${GLINER_DIR}/${ORT_LIB_NAME}" ]; then
-            info "Symlinking ${ORT_LIB_NAME} from MiniLM dir to GLiNER dir"
-            ln -sf "${MINILM_DIR}/${ORT_LIB_NAME}" "${GLINER_DIR}/${ORT_LIB_NAME}"
-            ok "Symlink created"
-        fi
-    elif [ ! -f "${GLINER_DIR}/${ORT_LIB_NAME}" ]; then
-        # NER-only mode: download ORT directly to GLiNER dir
+    # 3d. Ensure ORT library is accessible from GLiNER dir
+    if ! symlink_ort_from_existing "${GLINER_DIR}"; then
         download_ort_library "${GLINER_DIR}" || true
     fi
     echo ""
@@ -409,9 +525,18 @@ verify_file() {
     fi
 }
 
-if [ "${DOWNLOAD_EMBED}" = true ]; then
-    echo "── MiniLM Embedding Model ──"
-    verify_file "${MINILM_DIR}/model.onnx"      "MiniLM model.onnx"      1000000 || errors=$((errors + 1))
+if [ "${DOWNLOAD_GEMMA}" = true ]; then
+    echo "── EmbeddingGemma-300M ──"
+    verify_file "${GEMMA_DIR}/model.onnx"        "EmbeddingGemma model.onnx"      1000    || errors=$((errors + 1))
+    verify_file "${GEMMA_DIR}/model.onnx_data"   "EmbeddingGemma weights"         1000000 || errors=$((errors + 1))
+    verify_file "${GEMMA_DIR}/tokenizer.json"    "EmbeddingGemma tokenizer.json"  10000   || errors=$((errors + 1))
+    verify_file "${GEMMA_DIR}/${ORT_LIB_NAME}"   "ORT ${ORT_LIB_NAME}"           1000000 || errors=$((errors + 1))
+    echo ""
+fi
+
+if [ "${DOWNLOAD_MINILM}" = true ]; then
+    echo "── MiniLM Embedding Model (legacy) ──"
+    verify_file "${MINILM_DIR}/model.onnx"       "MiniLM model.onnx"      1000000 || errors=$((errors + 1))
     verify_file "${MINILM_DIR}/tokenizer.json"   "MiniLM tokenizer.json"  10000   || errors=$((errors + 1))
     verify_file "${MINILM_DIR}/${ORT_LIB_NAME}"  "ORT ${ORT_LIB_NAME}"   1000000 || errors=$((errors + 1))
     echo ""
@@ -430,8 +555,13 @@ echo ""
 if [ "${errors}" -eq 0 ]; then
     ok "All files ready!"
     echo ""
-    if [ "${DOWNLOAD_EMBED}" = true ]; then
-        info "Embedding model: ${MINILM_DIR}/"
+    if [ "${DOWNLOAD_GEMMA}" = true ]; then
+        info "EmbeddingGemma model: ${GEMMA_DIR}/"
+        ls -lh "${GEMMA_DIR}/" 2>/dev/null
+        echo ""
+    fi
+    if [ "${DOWNLOAD_MINILM}" = true ]; then
+        info "MiniLM model: ${MINILM_DIR}/"
         ls -lh "${MINILM_DIR}/" 2>/dev/null
         echo ""
     fi
@@ -442,20 +572,36 @@ if [ "${errors}" -eq 0 ]; then
     fi
     info "Next steps:"
     info "  1. cargo build -p aeronyx-server"
-    info "  2. Server auto-detects all model files at startup"
-    info "  3. Enable in config.toml:"
-    info "     [memchain]"
-    info "     ner_enabled = true          # Enable GLiNER NER"
-    info "     graph_enabled = true        # Enable knowledge graph"
-    info "     entropy_filter_enabled = true"
-    info "     miner_entity_extraction = true"
+    info "  2. Update config.toml with the model path:"
+    if [ "${DOWNLOAD_GEMMA}" = true ]; then
+        info "     [memchain]"
+        info "     embed_model_path = \"models/embeddinggemma\"     # EmbeddingGemma (recommended)"
+        info "     embed_max_tokens = 256                          # Gemma default (up to 2048)"
+        info "     embed_output_dim = 384                          # Matryoshka truncation"
+    fi
+    if [ "${DOWNLOAD_MINILM}" = true ]; then
+        info "     [memchain]"
+        info "     embed_model_path = \"models/minilm-l6-v2\"      # MiniLM (legacy)"
+        info "     embed_max_tokens = 128                          # MiniLM default"
+    fi
+    info "  3. Server auto-detects model type at startup"
+    info "  4. Enable graph features:"
+    info "     ner_enabled = true"
+    info "     graph_enabled = true"
+    echo ""
+    info "⚠️  If switching from MiniLM to EmbeddingGemma (or vice versa),"
+    info "   all existing embeddings must be rebuilt. The Miner will handle"
+    info "   this automatically via Step 0.5 backfill on next startup."
     echo ""
     info "Verify embedding: curl -X POST http://127.0.0.1:8421/api/mpi/embed \\"
     info "  -H 'Content-Type: application/json' \\"
     info "  -d '{\"texts\":[\"hello world\"]}'"
 else
     error "${errors} file(s) failed. Please retry or download manually from:"
-    if [ "${DOWNLOAD_EMBED}" = true ]; then
+    if [ "${DOWNLOAD_GEMMA}" = true ]; then
+        error "  EmbeddingGemma: https://huggingface.co/${GEMMA_REPO}"
+    fi
+    if [ "${DOWNLOAD_MINILM}" = true ]; then
         error "  MiniLM: https://huggingface.co/${MINILM_REPO}"
     fi
     if [ "${DOWNLOAD_NER}" = true ]; then
