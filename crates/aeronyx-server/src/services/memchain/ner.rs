@@ -62,11 +62,11 @@
 //! text word spans (after <<SEP>>), producing span-level logits.
 //!
 //! ## Span Representation
-//! GLiNER enumerates all possible (start_word, end_word) spans up to
-//! `max_width` (default 12 words). For N text words and W max_width:
-//! - num_spans = N * W (capped by actual text length)
-//! - span_idx tensor: [batch, num_spans, 2] (start, end word indices)
-//! - span_mask tensor: [batch, num_spans] (valid span = true)
+//! GLiNER enumerates all possible (start_word, end_word) spans as a fixed-size
+//! grid of `num_words × max_width`. For N text words and W max_width:
+//! - num_spans = N × W (fixed size, padded with mask=false for invalid spans)
+//! - span_idx tensor: [batch, num_spans, 2] → reshapes to [batch, N, W, 2]
+//! - span_mask tensor: [batch, num_spans] → reshapes to [batch, N, W]
 //! - Output logits: [batch, num_spans, num_labels] → sigmoid → scores
 //!
 //! ## Performance Targets
@@ -92,20 +92,29 @@
 //!   means span indices won't align with the original text.
 //! - span_idx uses WORD indices (not token indices). Each span is (start_word, end_word)
 //!   where end_word is INCLUSIVE.
+//! - span_idx MUST be a fixed-size grid of num_words × max_width. The model
+//!   internally reshapes it to [batch, num_words, max_width, 2]. Variable-length
+//!   span lists cause reshape failures.
 //! - text_lengths counts only TEXT words (excludes prompt prefix tokens).
 //! - The tokenizer MUST match the model's training tokenizer (typically DeBERTa-v3
 //!   for v2.x models). Using the wrong tokenizer silently degrades quality.
 //! - ORT init is shared with embed.rs via std::sync::Once — safe to load both.
 //! - Session::run() requires &mut self → Mutex wrapper (same pattern as embed.rs).
 //! - max_width (max entity span in words) defaults to 12. Larger values increase
-//!   num_spans quadratically — only increase if needed.
+//!   num_spans linearly (N × W) — only increase if needed.
 //! - The `<<ENT>>` and `<<SEP>>` special tokens must be in the tokenizer vocabulary.
 //!   If they're missing, the model was not exported correctly.
+//! - span_mask tensor type is bool (not u8). ort 2.0.0-rc.11 supports bool directly.
 //!
 //! ## Last Modified
 //! v2.4.0-GraphCognition - 🌟 Initial implementation
+//! v2.4.0+BugFix - 🔧 Fixed span_indices to use fixed-size grid (num_words × max_width)
+//!   instead of variable-length list. Fixes GLiNER reshape error:
+//!   "input_shape:{1,210,512}, requested shape:{1,23,12,512}"
+//! v2.4.0+BugFix - 🔧 Fixed span_mask tensor type from u8 to bool (B2 bug fix).
+//!   GLiNER ONNX model expects tensor(bool), not tensor(uint8).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 
 use ort::session::builder::GraphOptimizationLevel;
@@ -261,12 +270,6 @@ impl NerEngine {
             ));
         }
 
-        // Note: ORT runtime should already be initialized by EmbedEngine.
-        // If not, init_ort_runtime() in embed.rs handles it via Once.
-        // We don't call it here to avoid circular dependency — the caller
-        // (server.rs) must ensure EmbedEngine is loaded first, or call
-        // init_ort_runtime() manually.
-
         // Load ONNX model — same settings as EmbedEngine
         let session = Session::builder()
             .map_err(|e| format!("GLiNER session builder: {}", e))?
@@ -317,9 +320,9 @@ impl NerEngine {
     ///
     /// ## Pipeline
     /// 1. Word-split the input text (whitespace + punctuation aware)
-    /// 2. Build GLiNER prompt: [CLS] <<ENT>> label1 <<ENT>> label2 ... <<SEP>> word1 word2 ... [SEP]
+    /// 2. Build GLiNER prompt: [CLS] <<ENT>> label1 ... <<SEP>> word1 word2 ... [SEP]
     /// 3. Subword-tokenize the prompt, tracking word boundaries
-    /// 4. Build span indices for all valid (start, end) word pairs up to max_width
+    /// 4. Build span indices as fixed-size grid (num_words × max_width)
     /// 5. Construct 6 input tensors
     /// 6. Run ONNX inference → logits
     /// 7. Sigmoid + threshold filter + greedy dedup
@@ -344,12 +347,12 @@ impl NerEngine {
         let words = &words[..num_text_words];
 
         // Step 2-3: Build prompt and tokenize
-        let (input_ids, attention_mask, words_mask, text_length, num_prompt_tokens) =
+        let (input_ids, attention_mask, words_mask, text_length, _num_prompt_tokens) =
             self.build_prompt_and_tokenize(labels, words)?;
 
         let seq_len = input_ids.len();
 
-        // Step 4: Build span indices
+        // Step 4: Build span indices (fixed-size grid: num_words × max_width)
         let (span_idx_flat, span_mask_flat, num_spans) =
             self.build_span_indices(num_text_words);
 
@@ -384,7 +387,8 @@ impl NerEngine {
             (shape_span_idx, span_idx_flat.into_boxed_slice())
         ).map_err(|e| format!("span_idx tensor: {}", e))?;
 
-        // span_mask is bool in GLiNER ONNX — ort 2.0.0-rc.11 supports bool directly
+        // v2.4.0+BugFix: span_mask is bool — ort 2.0.0-rc.11 supports bool directly.
+        // Previously used u8, which caused: "expected: (tensor(bool)), actual: (tensor(uint8))"
         let span_mask_tensor = Tensor::from_array(
             (shape_span_mask, span_mask_flat.into_boxed_slice())
         ).map_err(|e| format!("span_mask tensor: {}", e))?;
@@ -543,13 +547,10 @@ impl NerEngine {
         labels: &[&str],
         words: &[WordSpan],
     ) -> Result<(Vec<i64>, Vec<i64>, Vec<i64>, usize, usize), String> {
-        // Build the full prompt as token IDs manually to maintain precise control
-        // over word boundaries for the words_mask tensor.
-
         let mut all_token_ids: Vec<u32> = Vec::new();
         let mut all_words_mask: Vec<i64> = Vec::new();
 
-        // [CLS] token — get from tokenizer
+        // [CLS] token
         let cls_id = self.get_special_token_id("[CLS]")
             .or_else(|| self.get_special_token_id("<s>"))
             .unwrap_or(0);
@@ -586,7 +587,6 @@ impl NerEngine {
 
         // Add text words — each word may produce multiple subword tokens.
         // words_mask maps each subword token to its word index (1-based for GLiNER).
-        // Word index 0 means "not a text word" (prompt/special tokens).
         for (word_idx, word) in words.iter().enumerate() {
             let word_encoding = self.tokenizer.encode(
                 word.text.clone(), false
@@ -597,12 +597,10 @@ impl NerEngine {
                 // Unknown word — add UNK token
                 let unk_id = self.tokenizer.token_to_id("[UNK]").unwrap_or(0);
                 all_token_ids.push(unk_id);
-                // word_idx + 1 because GLiNER uses 1-based word indexing
                 all_words_mask.push((word_idx + 1) as i64);
             } else {
                 for &id in ids {
                     all_token_ids.push(id);
-                    // All subword tokens of this word get the same word index
                     all_words_mask.push((word_idx + 1) as i64);
                 }
             }
@@ -626,49 +624,58 @@ impl NerEngine {
     // Private: Span Index Construction
     // ========================================
 
-    /// Build span indices for all valid (start, end) word pairs.
+    /// Build span indices as a fixed-size grid of num_text_words × max_width.
     ///
-    /// Enumerates spans: for each start word, try end = start, start+1, ..., start+max_width-1.
-    /// Uses GLiNER's 1-based word indexing.
+    /// GLiNER internally reshapes span_idx from [batch, num_spans, 2] to
+    /// [batch, num_words, max_width, 2]. This requires num_spans to be
+    /// EXACTLY num_words × max_width. Invalid spans (where end >= num_words)
+    /// are filled with (0, 0) and masked with span_mask=false.
+    ///
+    /// ## Enumeration order
+    /// For each start word (0..num_words):
+    ///   For each offset (0..max_width):
+    ///     end = start + offset
+    ///     if end < num_words → valid span (start, end), mask=true
+    ///     else → padding (0, 0), mask=false
     ///
     /// Returns: (span_idx_flat [num_spans * 2], span_mask_flat [num_spans], num_spans)
+    /// where num_spans = num_text_words * max_width (FIXED size).
     fn build_span_indices(
         &self,
         num_text_words: usize,
     ) -> (Vec<i64>, Vec<bool>, usize) {
-        let mut span_idx: Vec<i64> = Vec::new();
-        let mut span_mask: Vec<bool> = Vec::new();
+        let num_spans = num_text_words * self.max_width;
+        let mut span_idx: Vec<i64> = Vec::with_capacity(num_spans * 2);
+        let mut span_mask: Vec<bool> = Vec::with_capacity(num_spans);
 
         for start in 0..num_text_words {
-            let end_limit = (start + self.max_width).min(num_text_words);
-            for end in start..end_limit {
-                // GLiNER uses 0-based word indices in span_idx
-                span_idx.push(start as i64);
-                span_idx.push(end as i64);
-                span_mask.push(true);
+            for offset in 0..self.max_width {
+                let end = start + offset;
+                if end < num_text_words {
+                    // Valid span
+                    span_idx.push(start as i64);
+                    span_idx.push(end as i64);
+                    span_mask.push(true);
+                } else {
+                    // Out of bounds — padding
+                    span_idx.push(0);
+                    span_idx.push(0);
+                    span_mask.push(false);
+                }
             }
         }
 
-        let num_spans = span_mask.len();
         (span_idx, span_mask, num_spans)
     }
 
     /// Convert a linear span index back to (start_word, end_word) pair.
     ///
-    /// Must match the enumeration order in build_span_indices().
-    fn span_index_to_words(&self, span_idx: usize, num_text_words: usize) -> (usize, usize) {
-        let mut idx = 0;
-        for start in 0..num_text_words {
-            let end_limit = (start + self.max_width).min(num_text_words);
-            for end in start..end_limit {
-                if idx == span_idx {
-                    return (start, end);
-                }
-                idx += 1;
-            }
-        }
-        // Fallback (should not reach here with valid span_idx)
-        (0, 0)
+    /// Must match the enumeration order in build_span_indices():
+    /// index = start * max_width + offset, where end = start + offset.
+    fn span_index_to_words(&self, span_idx: usize, _num_text_words: usize) -> (usize, usize) {
+        let start = span_idx / self.max_width;
+        let offset = span_idx % self.max_width;
+        (start, start + offset)
     }
 
     // ========================================
@@ -867,23 +874,64 @@ mod tests {
     #[test]
     fn test_span_indices() {
         // 3 words, max_width = 2
-        // Expected spans: (0,0), (0,1), (1,1), (1,2), (2,2)
-        let mut span_idx: Vec<i64> = Vec::new();
-        let mut span_mask: Vec<bool> = Vec::new();
+        // Grid: 3 × 2 = 6 spans
+        // (0,0), (0,1),   ← start=0, offset=0,1
+        // (1,1), (1,2),   ← start=1, offset=0,1
+        // (2,2), (2,3*)   ← start=2, offset=0,1 (*out of bounds → padding)
         let max_width = 2;
         let num_words = 3;
+        let num_spans = num_words * max_width;
+
+        let mut span_idx: Vec<i64> = Vec::new();
+        let mut span_mask: Vec<bool> = Vec::new();
 
         for start in 0..num_words {
-            let end_limit = (start + max_width).min(num_words);
-            for end in start..end_limit {
-                span_idx.push(start as i64);
-                span_idx.push(end as i64);
-                span_mask.push(true);
+            for offset in 0..max_width {
+                let end = start + offset;
+                if end < num_words {
+                    span_idx.push(start as i64);
+                    span_idx.push(end as i64);
+                    span_mask.push(true);
+                } else {
+                    span_idx.push(0);
+                    span_idx.push(0);
+                    span_mask.push(false);
+                }
             }
         }
 
-        assert_eq!(span_mask.len(), 5);
-        assert_eq!(span_idx, vec![0, 0, 0, 1, 1, 1, 1, 2, 2, 2]);
+        assert_eq!(span_mask.len(), 6); // 3 × 2 = 6
+        assert_eq!(span_idx, vec![
+            0, 0,  0, 1,   // start=0
+            1, 1,  1, 2,   // start=1
+            2, 2,  0, 0,   // start=2 (second is padding)
+        ]);
+        assert_eq!(span_mask, vec![true, true, true, true, true, false]);
+    }
+
+    #[test]
+    fn test_span_index_to_words() {
+        // Simulate max_width = 3, num_words = 4
+        // idx=0 → (0, 0+0) = (0,0)
+        // idx=1 → (0, 0+1) = (0,1)
+        // idx=2 → (0, 0+2) = (0,2)
+        // idx=3 → (1, 1+0) = (1,1)
+        // idx=4 → (1, 1+1) = (1,2)
+        // idx=5 → (1, 1+2) = (1,3)
+        let max_width = 3;
+
+        let check = |idx: usize, expected: (usize, usize)| {
+            let start = idx / max_width;
+            let offset = idx % max_width;
+            assert_eq!((start, start + offset), expected, "idx={}", idx);
+        };
+
+        check(0, (0, 0));
+        check(1, (0, 1));
+        check(2, (0, 2));
+        check(3, (1, 1));
+        check(4, (1, 2));
+        check(5, (1, 3));
     }
 
     #[test]
