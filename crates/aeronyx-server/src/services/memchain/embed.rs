@@ -289,7 +289,7 @@ pub enum EmbedPromptMode {
 /// which is characteristic of EmbeddingGemma's ONNX export.
 /// MiniLM only has "last_hidden_state" (and optionally "pooler_output").
 fn detect_model_type(session: &Session) -> EmbedModelType {
-    let outputs = session.outputs.iter()
+    let outputs = session.outputs().iter()
         .map(|o| o.name.as_str())
         .collect::<Vec<_>>();
 
@@ -813,7 +813,7 @@ impl EmbedEngine {
         //   [0] last_hidden_state: [batch, seq, 768] (token-level, not needed)
         //   [1] sentence_embedding: [batch, 768] (sentence-level, what we want)
         // The index may vary, so we search by name for robustness.
-        let se_idx = session.outputs.iter()
+        let se_idx = session.outputs().iter()
             .position(|o| o.name == "sentence_embedding")
             .ok_or_else(|| "EmbeddingGemma ONNX missing 'sentence_embedding' output".to_string())?;
 
