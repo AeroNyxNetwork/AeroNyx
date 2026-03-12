@@ -48,6 +48,18 @@
 //!   - Step 10: Session summary generation + Markdown code fence artifact extraction
 //!   - Step 11: Episode ingestion + community summary update
 //!
+//! ## Modification Reason (v2.4.0-GraphCognition Phase B Fixes)
+//! Merged two post-review fixes:
+//!   - Fix 1 (Step 8): Back-fill sessions.project_id after project community detection.
+//!     Traces project entities → episode_edges → episodes → session_id, then updates
+//!     sessions.project_id for all linked sessions. Uses batched conn_lock() for efficiency.
+//!   - Fix 2 (Step 7): Added stopword entity filtering via is_stopword_entity().
+//!     Filters out generic entities (e.g., "project", "user", "code") that create
+//!     hub nodes polluting community detection. Also fixes trim ordering in
+//!     name_normalized construction (trim before lowercase for correctness).
+//!   - Bug fix: is_stopword_entity() Rule 3 uppercase detection now uses original
+//!     entity text instead of already-lowercased name_normalized.
+//!
 //! ## Dependencies
 //! - storage.rs — MemoryStorage, derive_rawlog_key, decrypt_rawlog_content_pub
 //! - storage_ops.rs — get_rawlogs_for_session, merge_entities, get_entities_with_embedding,
@@ -73,12 +85,17 @@
 //! - Step 7 reads raw_logs (may be encrypted) — uses derive_rawlog_key with
 //!   self.identity.to_bytes() (PRIVATE key), same pattern as Step 0.
 //! - Entity ID = SHA256(owner_hex || ":" || name_normalized) — deterministic.
+//! - Step 7 filters stopword entities via is_stopword_entity() — entities whose
+//!   name matches their type label or is a generic word are skipped to avoid
+//!   creating hub nodes that pollute community detection (Step 8).
 //! - Step 9 merge threshold: cosine > 0.92 = merge, 0.85-0.92 = RELATED_TO edge.
 //! - Step 10 code block regex matches Markdown fences only (```lang\n...\n```).
 //! - Step 11 encrypts episode content using record_key (same as records table).
 //! - Step 8 and Step 11 call self.storage.conn_lock() — this method MUST be
 //!   exposed as a public method on MemoryStorage (returns MutexGuard<Connection>).
 //!   If it doesn't exist yet, add: `pub async fn conn_lock(&self) -> ... { self.conn.lock().await }`
+//! - Step 8 back-fills sessions.project_id by tracing entity → episode_edge → session.
+//!   Uses batched conn_lock() to avoid acquiring the lock per-session.
 //!
 //! ## Error Isolation
 //! Each step has independent error handling. Step 0 failure does NOT block
@@ -96,6 +113,10 @@
 //!   Added constants: DEFAULT_ENTITY_LABELS, DEFAULT_RELATION_LABELS,
 //!   MINER_SESSION_BATCH, MINER_MERGE_BATCH, ENTITY_MERGE/RELATED_THRESHOLD,
 //!   CODE_FENCE_PATTERN. Added free function: infer_relation_type().
+//! v2.4.0-GraphCognition Phase B Fixes - 🌟 Merged two post-review fixes:
+//!   Fix 1: Step 8 sessions.project_id back-fill (batched conn_lock).
+//!   Fix 2: Step 7 stopword entity filtering + is_stopword_entity() function.
+//!   Bug fix: trim ordering in name_normalized, uppercase detection in Rule 3.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -685,6 +706,9 @@ impl ReflectionMiner {
     /// 8. Insert knowledge_edges + episode_edges for provenance
     /// 9. Mark session as entities_extracted
     ///
+    /// v2.4.0 Phase B Fixes: Added stopword entity filtering via is_stopword_entity().
+    /// Fixed name_normalized construction: trim before lowercase for correctness.
+    ///
     /// Writes to: entities, knowledge_edges, episode_edges tables.
     async fn step_7_entity_extraction(&self) {
         let ner = match &self.ner_engine {
@@ -775,8 +799,23 @@ impl ReflectionMiner {
             let mut session_entity_ids: Vec<(String, String)> = Vec::new(); // (entity_id, entity_type)
 
             for entity in &entities {
-                let name_normalized = entity.text.to_lowercase().trim().to_string();
+                // Bug fix (Phase B Fixes): trim before lowercase for correctness.
+                // Previously: entity.text.to_lowercase().trim() — trim on already-lowercased
+                // string is fine functionally but trim-first is semantically clearer.
+                let name_normalized = entity.text.trim().to_lowercase();
                 if name_normalized.is_empty() || name_normalized.len() < 2 {
+                    continue;
+                }
+
+                // v2.4.0 Phase B Fixes: Filter out generic stopword entities.
+                // Entities whose name matches their type label (e.g., "project" as a
+                // project entity, "user" as a person) are noise — they lack specificity
+                // and become hub nodes that pollute community detection.
+                if is_stopword_entity(&name_normalized, &entity.text, &entity.label) {
+                    debug!(
+                        entity = %entity.text, label = %entity.label,
+                        "[MINER_S7] Skipped stopword entity"
+                    );
                     continue;
                 }
 
@@ -884,14 +923,21 @@ impl ReflectionMiner {
     /// from knowledge_edges. Then identifies project-type communities
     /// (those containing "module", "file", "project" entity types).
     ///
+    /// v2.4.0 Phase B Fixes: Added sessions.project_id back-fill after project
+    /// community detection. Traces project entities → episode_edges → episodes
+    /// → session_id, then batch-updates sessions.project_id for linked sessions.
+    /// Uses batched conn_lock() to avoid acquiring the lock per-session.
+    ///
     /// Pipeline:
     /// 1. Run label propagation (incremental: 1 round for efficiency)
     /// 2. For each community, count members and generate name
     /// 3. Upsert community records
     /// 4. Update entity → community assignments
     /// 5. Identify project communities → upsert projects
+    /// 6. Back-fill sessions.project_id for project communities (Fix 1)
     ///
-    /// Writes to: communities, projects tables. Updates entities.community_id.
+    /// Writes to: communities, projects tables. Updates entities.community_id,
+    /// sessions.project_id.
     async fn step_8_community_detection(&self) {
         let owner = self.identity.public_key_bytes();
 
@@ -980,6 +1026,43 @@ impl ReflectionMiner {
                     warn!(error = %e, "[MINER_S8] Project upsert failed");
                 } else {
                     total_projects += 1;
+
+                    // v2.4.0 Phase B Fixes (Fix 1): Back-fill sessions.project_id
+                    // Trace: project entities → episode_edges → episodes → session_id
+                    // Then update sessions.project_id for all linked sessions.
+                    let mut project_session_ids: HashSet<String> = HashSet::new();
+                    for eid in member_ids {
+                        let ep_links = self.storage.get_episodes_for_entity(eid).await;
+                        for (episode_id, _role) in &ep_links {
+                            // Parse session_id from episode_id convention: "ep_{session_id}_{ts}"
+                            if episode_id.starts_with("ep_") {
+                                let rest = &episode_id[3..];
+                                if let Some(last_underscore) = rest.rfind('_') {
+                                    let sid = &rest[..last_underscore];
+                                    project_session_ids.insert(sid.to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    // Batch update sessions.project_id for discovered sessions
+                    // ⚠️ Acquire conn_lock() once for all session updates (not per-session)
+                    if !project_session_ids.is_empty() {
+                        let conn = self.storage.conn_lock().await;
+                        for sid in &project_session_ids {
+                            let _ = conn.execute(
+                                "UPDATE sessions SET project_id = ?1 WHERE session_id = ?2 AND (project_id IS NULL OR project_id = '')",
+                                rusqlite::params![community_id, sid],
+                            );
+                        }
+                        drop(conn);
+
+                        debug!(
+                            project = community_id,
+                            sessions = project_session_ids.len(),
+                            "[MINER_S8] Back-filled sessions.project_id"
+                        );
+                    }
                 }
             }
         }
@@ -1545,6 +1628,68 @@ fn infer_relation_type(source_type: &str, target_type: &str) -> &'static str {
         ("concept", "module") | ("concept", "project") => "IMPLEMENTED_BY",
         _ => "CO_OCCURS",
     }
+}
+
+// ============================================
+// Helper: Stopword entity filter (v2.4.0 Phase B Fixes)
+// ============================================
+
+/// Check if an entity name is a generic stopword that should not be stored.
+///
+/// Filters out entities whose name is too generic to be useful in the
+/// knowledge graph. These create hub nodes that pollute community detection
+/// by connecting unrelated clusters.
+///
+/// ## Parameters
+/// - `name_normalized`: The lowercased, trimmed entity name.
+/// - `original_text`: The original entity text (before lowercasing), used for
+///   uppercase acronym detection in Rule 3.
+/// - `entity_label`: The entity type label from NER (e.g., "project", "person").
+///
+/// ## Rules
+/// 1. Name matches entity_type label exactly (e.g., "project" typed as project)
+/// 2. Name is in the stopword list (common words without specificity)
+/// 3. Name is a single common word of 2 chars: skip unless original text is ALL
+///    uppercase (acronym like "AI", "DB"). Note: 1-char entities are already
+///    filtered by the `len() < 2` check in Step 7 before this function is called.
+///
+/// ## v2.4.0-GraphCognition Phase B Fixes
+/// - Bug fix: Rule 3 now takes `original_text` parameter instead of checking
+///   `name_normalized` (which is already lowercased, making uppercase detection
+///   impossible). The original text preserves case for acronym detection.
+fn is_stopword_entity(name_normalized: &str, original_text: &str, entity_label: &str) -> bool {
+    // Rule 1: Name matches type label
+    if name_normalized == entity_label.to_lowercase() {
+        return true;
+    }
+
+    // Rule 2: Common stopwords that GLiNER sometimes picks up
+    const STOPWORDS: &[&str] = &[
+        "project", "module", "file", "user", "code", "system", "data",
+        "api", "app", "tool", "test", "type", "model", "server", "client",
+        "function", "method", "class", "table", "query", "task", "error",
+        "the", "this", "that", "implementation", "feature", "component",
+    ];
+
+    if STOPWORDS.contains(&name_normalized) {
+        return true;
+    }
+
+    // Rule 3: Very short single words (exactly 2 chars) unless ALL uppercase in
+    // original text (acronym like "AI", "DB"). 1-char entities are already
+    // filtered by len() < 2 in the caller.
+    // Bug fix: Use original_text (not name_normalized) for uppercase check,
+    // because name_normalized is already lowercased.
+    if name_normalized.len() == 2 {
+        let original_trimmed = original_text.trim();
+        let is_acronym = original_trimmed.len() == 2
+            && original_trimmed.chars().all(|c| c.is_uppercase() || !c.is_alphabetic());
+        if !is_acronym {
+            return true;
+        }
+    }
+
+    false
 }
 
 impl std::fmt::Debug for ReflectionMiner {
