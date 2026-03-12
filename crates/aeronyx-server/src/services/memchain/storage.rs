@@ -14,11 +14,22 @@
 //! All 3 files impl on the same `MemoryStorage` struct.
 //! External API is unchanged — mod.rs re-exports everything.
 //!
-//! ## Schema (v4)
-//! ```sql
-//! records (19 columns), raw_logs, memory_edges, user_weights,
-//! memory_feedback, chain_state, schema_version, sqlite_sequence
-//! ```
+//! ## Schema History
+//! - v1: Initial schema (records only)
+//! - v2: Added embedding column to records
+//! - v4: Added positive_feedback, negative_feedback, conflict_with to records
+//!        Added memory_edges, user_weights, memory_feedback, chain_state tables
+//! - v5 (v2.4.0-GraphCognition): Three-layer cognitive graph schema:
+//!   - episodes: Episode layer (complete original conversations, non-lossy)
+//!   - entities: Semantic Entity layer nodes (GLiNER-extracted)
+//!   - knowledge_edges: Semantic Entity layer edges (with temporal validity)
+//!   - episode_edges: Bridge layer (Episode ↔ Entity bidirectional links)
+//!   - communities: Community layer (label propagation auto-clustering)
+//!   - projects: Project table (Community specialization for code projects)
+//!   - sessions: Conversation session metadata + summaries
+//!   - artifacts: Code/document artifacts with version chains
+//!   - records ALTER: added project_id, session_id, episode_id columns
+//!   - memory_edges data migrated to knowledge_edges (relation_type = 'RELATED_TO')
 //!
 //! ## Thread Safety
 //! `rusqlite::Connection` behind `tokio::sync::Mutex`. Phase 2+ can use r2d2 pooling.
@@ -30,7 +41,13 @@
 //! - `query_rows()` is `&self` — it needs `self.record_key` for decryption.
 //! - LRU cache stores PLAINTEXT records (decrypted) for fast reads.
 //! - v4 migration is additive-only (ALTER TABLE ADD COLUMN).
+//! - v5 migration creates 8 new tables, ALTERs records, migrates memory_edges data.
+//!   All additive — no data loss on upgrade. Rollback: new tables are simply ignored
+//!   by v2.3.0 code (it doesn't query them).
 //! - Rawlog key migration clears old raw_logs on first run after key fix.
+//! - episodes.encrypted_content uses same ChaCha20 encryption as records.encrypted_content.
+//! - knowledge_edges.valid_until = NULL means "currently valid".
+//!   Query pattern: WHERE valid_until IS NULL (current state).
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
@@ -38,6 +55,8 @@
 //! v2.1.0+MVF - Schema v4, feedback columns, content dedup
 //! v2.1.0+MVF+Encryption - Record encryption, rawlog key fix
 //! v2.2.0 - 🌟 Split into storage.rs + storage_crypto.rs + storage_ops.rs
+//! v2.4.0-GraphCognition - 🌟 Schema v5: Three-layer cognitive graph (8 new tables,
+//!   records ALTER, memory_edges migration)
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -57,7 +76,10 @@ use super::storage_crypto::{encrypt_record_content, decrypt_record_content};
 // Constants
 // ============================================
 
-const SCHEMA_VERSION: u32 = 4;
+/// Current schema version.
+/// v4 → v5 migration adds cognitive graph tables.
+const SCHEMA_VERSION: u32 = 5;
+
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
 
@@ -217,6 +239,7 @@ impl MemoryStorage {
     }
 
     fn create_schema(conn: &Connection) -> Result<(), String> {
+        // ── v1-v4: Original tables (records, raw_logs, memory_edges, etc.) ──
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS records (
                 record_id           BLOB PRIMARY KEY,
@@ -237,12 +260,18 @@ impl MemoryStorage {
                 archived_at         INTEGER,
                 positive_feedback   INTEGER NOT NULL DEFAULT 0,
                 negative_feedback   INTEGER NOT NULL DEFAULT 0,
-                conflict_with       BLOB
+                conflict_with       BLOB,
+                project_id          TEXT,
+                session_id          TEXT,
+                episode_id          TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_owner ON records(owner);
             CREATE INDEX IF NOT EXISTS idx_owner_layer_status ON records(owner, layer, status);
             CREATE INDEX IF NOT EXISTS idx_status_layer ON records(status, layer);
             CREATE INDEX IF NOT EXISTS idx_timestamp ON records(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_records_project ON records(project_id, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_records_session ON records(session_id);
+            CREATE INDEX IF NOT EXISTS idx_records_episode ON records(episode_id);
 
             CREATE TABLE IF NOT EXISTS raw_logs (
                 log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -287,8 +316,154 @@ impl MemoryStorage {
 
             CREATE TABLE IF NOT EXISTS chain_state (key TEXT PRIMARY KEY, value BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);"
-        ).map_err(|e| format!("Schema creation failed: {}", e))?;
+        ).map_err(|e| format!("Schema creation failed (base tables): {}", e))?;
 
+        // ── v5 (v2.4.0): Three-layer cognitive graph tables ──
+        conn.execute_batch(
+            "-- Episode layer: complete original conversations (non-lossy)
+            CREATE TABLE IF NOT EXISTS episodes (
+                episode_id          TEXT PRIMARY KEY,
+                owner               BLOB NOT NULL,
+                episode_type        TEXT NOT NULL,
+                source              TEXT NOT NULL,
+                session_id          TEXT,
+                encrypted_content   BLOB NOT NULL,
+                content_hash        TEXT NOT NULL,
+                embedding           BLOB,
+                token_count         INTEGER,
+                created_at          INTEGER NOT NULL,
+                ingested_at         INTEGER NOT NULL,
+                metadata_json       TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_episodes_owner ON episodes(owner, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id);
+            CREATE INDEX IF NOT EXISTS idx_episodes_type ON episodes(owner, episode_type);
+
+            -- Semantic Entity layer: GLiNER-extracted entity nodes
+            CREATE TABLE IF NOT EXISTS entities (
+                entity_id           TEXT PRIMARY KEY,
+                owner               BLOB NOT NULL,
+                name                TEXT NOT NULL,
+                name_normalized     TEXT NOT NULL,
+                entity_type         TEXT NOT NULL,
+                description         TEXT,
+                embedding           BLOB,
+                community_id        TEXT,
+                created_at          INTEGER NOT NULL,
+                updated_at          INTEGER NOT NULL,
+                mention_count       INTEGER DEFAULT 1,
+                metadata_json       TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_entities_owner ON entities(owner);
+            CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(owner, entity_type);
+            CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(owner, name_normalized);
+            CREATE INDEX IF NOT EXISTS idx_entities_community ON entities(owner, community_id);
+
+            -- Semantic Entity layer: temporal knowledge edges
+            CREATE TABLE IF NOT EXISTS knowledge_edges (
+                edge_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner               BLOB NOT NULL,
+                source_id           TEXT NOT NULL,
+                target_id           TEXT NOT NULL,
+                relation_type       TEXT NOT NULL,
+                fact_text           TEXT,
+                weight              REAL DEFAULT 1.0,
+                confidence          REAL DEFAULT 1.0,
+                embedding           BLOB,
+                valid_from          INTEGER NOT NULL,
+                valid_until         INTEGER,
+                episode_id          TEXT,
+                created_at          INTEGER NOT NULL,
+                updated_at          INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_kedges_source ON knowledge_edges(owner, source_id, relation_type);
+            CREATE INDEX IF NOT EXISTS idx_kedges_target ON knowledge_edges(owner, target_id, relation_type);
+            CREATE INDEX IF NOT EXISTS idx_kedges_valid ON knowledge_edges(owner, valid_until);
+            CREATE INDEX IF NOT EXISTS idx_kedges_episode ON knowledge_edges(episode_id);
+
+            -- Bridge layer: Episode ↔ Entity bidirectional links
+            CREATE TABLE IF NOT EXISTS episode_edges (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner               BLOB NOT NULL,
+                episode_id          TEXT NOT NULL,
+                entity_id           TEXT NOT NULL,
+                role                TEXT NOT NULL,
+                created_at          INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ep_edges_episode ON episode_edges(episode_id);
+            CREATE INDEX IF NOT EXISTS idx_ep_edges_entity ON episode_edges(entity_id);
+
+            -- Community layer: auto-clustering via label propagation
+            CREATE TABLE IF NOT EXISTS communities (
+                community_id        TEXT PRIMARY KEY,
+                owner               BLOB NOT NULL,
+                name                TEXT NOT NULL,
+                summary             TEXT,
+                description         TEXT,
+                entity_count        INTEGER DEFAULT 0,
+                created_at          INTEGER NOT NULL,
+                updated_at          INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_communities_owner ON communities(owner);
+
+            -- Projects: Community specialization for code projects
+            CREATE TABLE IF NOT EXISTS projects (
+                project_id          TEXT PRIMARY KEY,
+                owner               BLOB NOT NULL,
+                name                TEXT NOT NULL,
+                status              TEXT DEFAULT 'active',
+                community_id        TEXT NOT NULL,
+                summary             TEXT,
+                created_at          INTEGER NOT NULL,
+                updated_at          INTEGER NOT NULL,
+                last_active_at      INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner, status);
+            CREATE INDEX IF NOT EXISTS idx_projects_active ON projects(owner, last_active_at DESC);
+
+            -- Sessions: conversation session metadata
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id          TEXT PRIMARY KEY,
+                owner               BLOB NOT NULL,
+                project_id          TEXT,
+                session_type        TEXT DEFAULT 'chat',
+                started_at          INTEGER NOT NULL,
+                ended_at            INTEGER,
+                turn_count          INTEGER DEFAULT 0,
+                summary             TEXT,
+                key_decisions       TEXT,
+                files_touched       TEXT,
+                entities_extracted  INTEGER DEFAULT 0,
+                summary_generated   INTEGER DEFAULT 0,
+                artifacts_extracted INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner, started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id, started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sessions_pending ON sessions(entities_extracted, summary_generated);
+
+            -- Artifacts: code/document artifacts with version chains
+            CREATE TABLE IF NOT EXISTS artifacts (
+                artifact_id         TEXT PRIMARY KEY,
+                owner               BLOB NOT NULL,
+                session_id          TEXT NOT NULL,
+                project_id          TEXT,
+                artifact_type       TEXT NOT NULL,
+                filename            TEXT,
+                language            TEXT,
+                version             INTEGER DEFAULT 1,
+                parent_id           TEXT,
+                encrypted_content   BLOB NOT NULL,
+                content_hash        TEXT NOT NULL,
+                embedding           BLOB,
+                line_count          INTEGER,
+                created_at          INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project_id, filename, version DESC);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_file ON artifacts(owner, filename, version DESC);"
+        ).map_err(|e| format!("Schema creation failed (v5 cognitive graph tables): {}", e))?;
+
+        // Insert schema version if not present
         let existing: Option<u32> = conn
             .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
             .optional()
@@ -341,9 +516,145 @@ impl MemoryStorage {
                     .map_err(|e| format!("Add conflict_with: {}", e))?;
             }
 
-            conn.execute("UPDATE schema_version SET version = ?1", params![SCHEMA_VERSION])
+            conn.execute("UPDATE schema_version SET version = 4", [])
                 .map_err(|e| format!("Update schema version to v4: {}", e))?;
             info!("[STORAGE] ✅ Migration to v4 complete");
+        }
+
+        // v4 → v5 (v2.4.0-GraphCognition): Three-layer cognitive graph
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
+            .unwrap_or(4);
+
+        if current < 5 {
+            info!("[STORAGE] Migrating schema v{} → v5 (cognitive graph)", current);
+
+            // 5a: ALTER records — add project_id, session_id, episode_id
+            //     These link existing records to the new cognitive graph.
+            if !conn.prepare("SELECT project_id FROM records LIMIT 0").is_ok() {
+                conn.execute_batch("ALTER TABLE records ADD COLUMN project_id TEXT;")
+                    .map_err(|e| format!("Add project_id to records: {}", e))?;
+                info!("[STORAGE] Added records.project_id");
+            }
+            if !conn.prepare("SELECT session_id FROM records LIMIT 0").is_ok() {
+                conn.execute_batch("ALTER TABLE records ADD COLUMN session_id TEXT;")
+                    .map_err(|e| format!("Add session_id to records: {}", e))?;
+                info!("[STORAGE] Added records.session_id");
+            }
+            if !conn.prepare("SELECT episode_id FROM records LIMIT 0").is_ok() {
+                conn.execute_batch("ALTER TABLE records ADD COLUMN episode_id TEXT;")
+                    .map_err(|e| format!("Add episode_id to records: {}", e))?;
+                info!("[STORAGE] Added records.episode_id");
+            }
+
+            // 5b: Create indexes for new records columns
+            let _ = conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_records_project ON records(project_id, timestamp DESC);
+                 CREATE INDEX IF NOT EXISTS idx_records_session ON records(session_id);
+                 CREATE INDEX IF NOT EXISTS idx_records_episode ON records(episode_id);"
+            );
+
+            // 5c: Create v5 tables (IF NOT EXISTS — safe if create_schema already ran)
+            // This handles the case where the DB file is new (create_schema creates them)
+            // vs upgrade from v4 (create_schema may not have created them if the file
+            // already existed before the code update).
+            //
+            // Note: The full CREATE TABLE statements are in create_schema().
+            // Here we just ensure they exist for the migration path where
+            // create_schema() ran on the OLD code without these tables.
+            let v5_tables = [
+                "episodes", "entities", "knowledge_edges", "episode_edges",
+                "communities", "projects", "sessions", "artifacts",
+            ];
+            for table in &v5_tables {
+                let exists: bool = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get::<_, i64>(0),
+                ).unwrap_or(0) > 0;
+
+                if !exists {
+                    warn!(
+                        "[STORAGE] v5 table '{}' missing after create_schema — \
+                         this is expected when upgrading from v2.3.0. \
+                         Table will be created by create_schema on next restart.",
+                        table
+                    );
+                    // The tables are created by create_schema() which runs BEFORE
+                    // maybe_migrate(). If we get here, something is unusual.
+                    // We don't re-create them here to avoid duplicating the
+                    // CREATE TABLE SQL. The next server restart will fix it.
+                }
+            }
+
+            // 5d: Migrate memory_edges → knowledge_edges
+            //     Existing co-occurrence edges become RELATED_TO knowledge edges.
+            //     This preserves the graph structure from v2.3.0.
+            {
+                let migrated: bool = conn.query_row(
+                    "SELECT value FROM chain_state WHERE key = 'memory_edges_migrated_v5'",
+                    [], |row| { let v: Vec<u8> = row.get(0)?; Ok(v == b"1") },
+                ).unwrap_or(false);
+
+                if !migrated {
+                    let edge_count: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM memory_edges", [], |row| row.get(0),
+                    ).unwrap_or(0);
+
+                    if edge_count > 0 {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+
+                        // Check if knowledge_edges table exists before attempting migration
+                        let ke_exists: bool = conn.query_row(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='knowledge_edges'",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        ).unwrap_or(0) > 0;
+
+                        if ke_exists {
+                            match conn.execute(
+                                "INSERT OR IGNORE INTO knowledge_edges
+                                    (owner, source_id, target_id, relation_type, weight,
+                                     confidence, valid_from, created_at, updated_at)
+                                 SELECT
+                                    source_id, hex(source_id), hex(target_id), 'RELATED_TO', weight,
+                                    1.0, created_at, ?1, ?1
+                                 FROM memory_edges",
+                                params![now],
+                            ) {
+                                Ok(migrated_count) => {
+                                    info!(
+                                        count = migrated_count,
+                                        "[STORAGE] Migrated memory_edges → knowledge_edges"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        "[STORAGE] memory_edges migration failed (non-fatal, edges preserved)"
+                                    );
+                                }
+                            }
+                        } else {
+                            warn!("[STORAGE] knowledge_edges table not found, skipping memory_edges migration");
+                        }
+                    }
+
+                    let _ = conn.execute(
+                        "INSERT OR REPLACE INTO chain_state (key, value) VALUES ('memory_edges_migrated_v5', ?1)",
+                        params![b"1".as_slice()],
+                    );
+                    info!("[STORAGE] ✅ memory_edges migration marker set");
+                }
+            }
+
+            // 5e: Update schema version to v5
+            conn.execute("UPDATE schema_version SET version = ?1", params![SCHEMA_VERSION])
+                .map_err(|e| format!("Update schema version to v5: {}", e))?;
+            info!("[STORAGE] ✅ Migration to v5 (cognitive graph) complete");
         }
 
         // Rawlog key migration: clear old raw_logs encrypted with public key
@@ -680,6 +991,10 @@ mod tests {
             format!("content_{}", ts).into_bytes(), vec![0.5; 4])
     }
 
+    // ========================================
+    // Existing tests (preserved from v2.3.0)
+    // ========================================
+
     #[tokio::test]
     async fn test_open_in_memory() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
@@ -731,14 +1046,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_schema_version_is_4() {
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        let conn = s.conn.lock().await;
-        let v: u32 = conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 4);
-    }
-
-    #[tokio::test]
     async fn test_encrypted_insert_and_get() {
         use super::super::storage_crypto::derive_record_key;
         let key = derive_record_key(&[0x42; 32]);
@@ -748,5 +1055,314 @@ mod tests {
         s.cache.write().clear();
         let got = s.get(&r.record_id).await.unwrap();
         assert_eq!(got.encrypted_content, b"encrypted_data");
+    }
+
+    // ========================================
+    // v2.4.0: Schema v5 Tests
+    // ========================================
+
+    #[tokio::test]
+    async fn test_schema_version_is_5() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let conn = s.conn.lock().await;
+        let v: u32 = conn.query_row(
+            "SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(v, 5);
+    }
+
+    #[tokio::test]
+    async fn test_v5_tables_exist() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let conn = s.conn.lock().await;
+
+        let expected_tables = [
+            "episodes", "entities", "knowledge_edges", "episode_edges",
+            "communities", "projects", "sessions", "artifacts",
+        ];
+
+        for table in &expected_tables {
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                params![table],
+                |row| row.get::<_, i64>(0),
+            ).unwrap() > 0;
+
+            assert!(exists, "Table '{}' should exist in schema v5", table);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v5_records_has_new_columns() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let conn = s.conn.lock().await;
+
+        // Verify new columns exist by selecting them
+        let result = conn.prepare(
+            "SELECT project_id, session_id, episode_id FROM records LIMIT 0"
+        );
+        assert!(result.is_ok(), "records should have project_id, session_id, episode_id columns");
+    }
+
+    #[tokio::test]
+    async fn test_v5_episodes_table_schema() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let conn = s.conn.lock().await;
+
+        // Insert a test episode
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let result = conn.execute(
+            "INSERT INTO episodes (episode_id, owner, episode_type, source,
+                session_id, encrypted_content, content_hash, token_count,
+                created_at, ingested_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                "ep_001", [0xAAu8; 32].as_slice(), "conversation", "test",
+                "session_001", b"encrypted".as_slice(), "hash123", 100i64,
+                now, now,
+            ],
+        );
+        assert!(result.is_ok(), "Episode insert should succeed: {:?}", result.err());
+
+        // Verify we can read it back
+        let ep_type: String = conn.query_row(
+            "SELECT episode_type FROM episodes WHERE episode_id = 'ep_001'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(ep_type, "conversation");
+    }
+
+    #[tokio::test]
+    async fn test_v5_entities_table_schema() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let conn = s.conn.lock().await;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let result = conn.execute(
+            "INSERT INTO entities (entity_id, owner, name, name_normalized,
+                entity_type, description, community_id, created_at, updated_at, mention_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                "ent_jwt", [0xAAu8; 32].as_slice(), "JWT", "jwt",
+                "technology", "JSON Web Token", Option::<String>::None,
+                now, now, 3i64,
+            ],
+        );
+        assert!(result.is_ok(), "Entity insert should succeed: {:?}", result.err());
+
+        let mention_count: i64 = conn.query_row(
+            "SELECT mention_count FROM entities WHERE entity_id = 'ent_jwt'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(mention_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_v5_knowledge_edges_temporal() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let conn = s.conn.lock().await;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // Insert a currently valid edge
+        conn.execute(
+            "INSERT INTO knowledge_edges (owner, source_id, target_id, relation_type,
+                fact_text, weight, confidence, valid_from, valid_until, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)",
+            params![
+                [0xAAu8; 32].as_slice(), "ent_auth", "ent_jwt", "USES",
+                "auth module uses JWT", 1.0f64, 0.95f64,
+                now, now, now,
+            ],
+        ).unwrap();
+
+        // Insert an invalidated edge
+        conn.execute(
+            "INSERT INTO knowledge_edges (owner, source_id, target_id, relation_type,
+                fact_text, weight, confidence, valid_from, valid_until, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                [0xAAu8; 32].as_slice(), "ent_auth", "ent_basic", "USES",
+                "auth module uses Basic Auth", 1.0f64, 0.9f64,
+                now - 86400, now, now - 86400, now,
+            ],
+        ).unwrap();
+
+        // Query only currently valid edges
+        let valid_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM knowledge_edges WHERE valid_until IS NULL",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(valid_count, 1);
+
+        // Query all edges (including invalidated)
+        let total_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM knowledge_edges",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(total_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_v5_episode_edges_bidirectional() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let conn = s.conn.lock().await;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // Link episode to entity
+        conn.execute(
+            "INSERT INTO episode_edges (owner, episode_id, entity_id, role, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![[0xAAu8; 32].as_slice(), "ep_001", "ent_jwt", "mentioned", now],
+        ).unwrap();
+
+        // Forward: Episode → Entities
+        let entity_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM episode_edges WHERE episode_id = 'ep_001'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(entity_count, 1);
+
+        // Reverse: Entity → Episodes
+        let episode_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM episode_edges WHERE entity_id = 'ent_jwt'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(episode_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_v5_sessions_and_projects() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let conn = s.conn.lock().await;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // Create community
+        conn.execute(
+            "INSERT INTO communities (community_id, owner, name, summary, entity_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params!["comm_1", [0xAAu8; 32].as_slice(), "Project B", "Auth system", 5i64, now, now],
+        ).unwrap();
+
+        // Create project from community
+        conn.execute(
+            "INSERT INTO projects (project_id, owner, name, status, community_id, summary,
+                created_at, updated_at, last_active_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params!["comm_1", [0xAAu8; 32].as_slice(), "Project B", "active", "comm_1",
+                "Auth system project", now, now, now],
+        ).unwrap();
+
+        // Create session linked to project
+        conn.execute(
+            "INSERT INTO sessions (session_id, owner, project_id, session_type,
+                started_at, turn_count, summary)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params!["sess_001", [0xAAu8; 32].as_slice(), "comm_1", "code",
+                now, 15i64, "Implemented JWT auth"],
+        ).unwrap();
+
+        // Query sessions for project
+        let session_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE project_id = 'comm_1'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(session_count, 1);
+
+        // Query active projects
+        let project_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM projects WHERE owner = ?1 AND status = 'active'",
+            params![[0xAAu8; 32].as_slice()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(project_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_v5_artifacts_version_chain() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let conn = s.conn.lock().await;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // Version 1
+        conn.execute(
+            "INSERT INTO artifacts (artifact_id, owner, session_id, artifact_type,
+                filename, language, version, parent_id, encrypted_content, content_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10)",
+            params![
+                "art_v1", [0xAAu8; 32].as_slice(), "sess_001", "code",
+                "auth.rs", "rust", 1i64,
+                b"fn auth() {}".as_slice(), "hash_v1", now,
+            ],
+        ).unwrap();
+
+        // Version 2 (parent = v1)
+        conn.execute(
+            "INSERT INTO artifacts (artifact_id, owner, session_id, artifact_type,
+                filename, language, version, parent_id, encrypted_content, content_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                "art_v2", [0xAAu8; 32].as_slice(), "sess_002", "code",
+                "auth.rs", "rust", 2i64, "art_v1",
+                b"fn auth() { jwt() }".as_slice(), "hash_v2", now + 100,
+            ],
+        ).unwrap();
+
+        // Query latest version
+        let latest_version: i64 = conn.query_row(
+            "SELECT MAX(version) FROM artifacts WHERE owner = ?1 AND filename = 'auth.rs'",
+            params![[0xAAu8; 32].as_slice()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(latest_version, 2);
+
+        // Query version chain
+        let parent: Option<String> = conn.query_row(
+            "SELECT parent_id FROM artifacts WHERE artifact_id = 'art_v2'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(parent, Some("art_v1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_v5_backward_compat_insert_without_new_cols() {
+        // Ensure existing insert() works without providing new columns
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let r = make_rec(100, MemoryLayer::Episode, "test");
+        assert!(s.insert(&r, "minilm").await);
+
+        // The new columns should be NULL
+        let conn = s.conn.lock().await;
+        let (pid, sid, eid): (Option<String>, Option<String>, Option<String>) = conn.query_row(
+            "SELECT project_id, session_id, episode_id FROM records WHERE record_id = ?1",
+            params![r.record_id.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert!(pid.is_none());
+        assert!(sid.is_none());
+        assert!(eid.is_none());
     }
 }
