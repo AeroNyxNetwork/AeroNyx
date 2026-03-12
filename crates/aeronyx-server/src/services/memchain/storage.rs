@@ -269,9 +269,6 @@ impl MemoryStorage {
             CREATE INDEX IF NOT EXISTS idx_owner_layer_status ON records(owner, layer, status);
             CREATE INDEX IF NOT EXISTS idx_status_layer ON records(status, layer);
             CREATE INDEX IF NOT EXISTS idx_timestamp ON records(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_records_project ON records(project_id, timestamp DESC);
-            CREATE INDEX IF NOT EXISTS idx_records_session ON records(session_id);
-            CREATE INDEX IF NOT EXISTS idx_records_episode ON records(episode_id);
 
             CREATE TABLE IF NOT EXISTS raw_logs (
                 log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
