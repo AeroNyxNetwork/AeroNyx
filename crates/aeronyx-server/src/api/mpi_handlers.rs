@@ -18,6 +18,8 @@
 //! - mpi_recall: Hybrid retrieval pipeline (query_analyzer → multi-source → rerank)
 //! - mpi_recall: RecallRequest +project_id, +time_range, +include_graph
 //! - mpi_recall: RecallResponse +query_type, +matched_entities
+//! - mpi_recall: Step 2c graph content retrieval (episode→session, entity knowledge)
+//! - mpi_recall: Graph memories injection before truncation with re-sort
 //! - mpi_status: +ner_ready, +graph_enabled, +graph_stats
 //! - compute_features: +graph_traverse_weight (φ₉, 13th parameter)
 //!
@@ -25,9 +27,30 @@
 //! - All handlers extract owner from AuthenticatedOwner extension (never state.owner_key)
 //! - Shared helpers (extract_owner, parse_layer, etc.) are in mpi.rs
 //! - When adding new original-style endpoints, add them here, not in mpi_graph_handlers.rs
+//! - Step 2c graph content retrieval depends on storage methods:
+//!   get_episodes_for_entity, get_session, get_entity, get_edges_for_entity
+//! - graph_memories use synthetic record_ids ("graph_session_*", "graph_entity_*")
+//!   which do NOT exist in the ledger — never pass them to storage.get()
+//!
+//! ## Dependencies (Step 2c graph content retrieval)
+//! - `MemoryStorage::get_episodes_for_entity(entity_id)` → Vec<(episode_id, role)>
+//! - `MemoryStorage::get_session(session_id)` → Option<Session>  (needs .summary field)
+//! - `MemoryStorage::get_entity(entity_id)` → Option<Entity>  (needs .name, .entity_type, .description, .updated_at, .mention_count)
+//! - `MemoryStorage::get_edges_for_entity(entity_id, owner)` → Vec<Edge>  (needs .source_id, .target_id, .relation_type, .fact_text)
+//!
+//! ## Merge History
+//! - v2.4.0-merge: Applied merge patch from 合并指令 (Step 2c + graph memories injection)
+//!   - Insert location 1: After Step 2b (graph BFS), before `total_candidates`
+//!   - Insert location 2: Before `memories.truncate(top_k)`
+//!   - Bug fixes applied during merge:
+//!     1. Removed dead code: unused `get_episodes_for_session()` call (variable `eps` never read)
+//!     2. Fixed `total_candidates` to include `graph_memories.len()`
+//!     3. Changed dedup from `seen_episodes` (by episode_id) to `seen_sessions` (by session_id)
+//!     4. Simplified episode ID parsing: removed redundant `splitn` branch, kept `rfind` only
 //!
 //! ## Last Modified
-//! v2.4.0-GraphCognition - 🌟 Extracted from mpi.rs; hybrid recall; status extended
+//! v2.4.0-GraphCognition - 🌟 Extracted from mpi.rs; hybrid recall; status extended;
+//!   Step 2c graph content retrieval merged; graph memories injection added
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -210,9 +233,11 @@ pub struct RecallResponse {
 ///
 /// Pipeline:
 /// 1. Query Analysis (GLiNER + regex + entity matching)
-/// 2. Multi-source: vector + graph BFS
+/// 2a. Vector search (always runs)
+/// 2b. Graph BFS (if entities matched + graph enabled)
+/// 2c. Graph content retrieval (episode→session summaries, entity knowledge)
 /// 3. MVF φ₀-φ₉ scoring with graph_traverse_weight
-/// 4. Token budget trimming
+/// 4. Token budget trimming (including injected graph memories)
 pub async fn mpi_recall(
     State(state): State<Arc<MpiState>>,
     req: Request<axum::body::Body>,
@@ -303,7 +328,126 @@ pub async fn mpi_recall(
         } else { HashMap::new() }
     } else { HashMap::new() };
 
-    let total_candidates = search.len() + seen_ids.len();
+    // ── Step 2c: Graph content retrieval (v2.4.0) ──
+    // BFS found related entities. Now retrieve actual content from:
+    //   Path 1: episode_edges → episodes (original conversation snippets → session summaries)
+    //   Path 3: entity descriptions + edge fact_text (synthesized knowledge)
+    // These are injected as synthetic RecalledMemory entries with graph-derived scores.
+    let mut graph_memories: Vec<RecalledMemory> = Vec::new();
+
+    if !graph_traversed.is_empty() {
+        let graph_entity_ids: Vec<String> = graph_traversed.keys().cloned().collect();
+
+        // Path 1: Entity → episode_edges → episodes → session summary
+        // Get episodes linked to traversed entities, then retrieve session summaries.
+        let mut seen_sessions: HashSet<String> = HashSet::new();
+        for eid in &graph_entity_ids {
+            let ep_links = state.storage.get_episodes_for_entity(eid).await;
+            for (episode_id, _role) in &ep_links {
+                // Parse session_id from episode convention: "ep_{session_id}_{timestamp}"
+                // Use rfind('_') to split off the trailing timestamp segment.
+                let session_id = if episode_id.starts_with("ep_") {
+                    let rest = &episode_id[3..]; // skip "ep_"
+                    rest.rfind('_').map(|pos| rest[..pos].to_string())
+                } else {
+                    None
+                };
+
+                if let Some(ref sid) = session_id {
+                    // BUG FIX: deduplicate by session_id, not episode_id.
+                    // Multiple episodes can reference the same session; avoid
+                    // injecting duplicate session summaries.
+                    if seen_sessions.contains(sid) { continue; }
+                    seen_sessions.insert(sid.clone());
+
+                    // Get session summary as a compact representation
+                    if let Some(session) = state.storage.get_session(sid).await {
+                        if let Some(ref summary) = session.summary {
+                            let weight = graph_traversed.get(eid).copied().unwrap_or(0.5);
+                            graph_memories.push(RecalledMemory {
+                                record_id: format!("graph_session_{}", sid),
+                                layer: "knowledge".to_string(),
+                                score: 2.0 + weight, // High score to surface graph results
+                                content: format!("[Session: {}] {}", sid, summary),
+                                topic_tags: vec!["graph_result".into(), "session_summary".into()],
+                                source_ai: "cognitive-graph".into(),
+                                timestamp: session.started_at as u64,
+                                access_count: 0,
+                                proactive: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Path 3: Synthesize entity knowledge from descriptions + edges
+        // Build a compact knowledge summary for each traversed entity
+        for eid in &graph_entity_ids {
+            if let Some(entity) = state.storage.get_entity(eid).await {
+                let edges = state.storage.get_edges_for_entity(eid, &owner).await;
+                let weight = graph_traversed.get(eid).copied().unwrap_or(0.5);
+
+                // Build entity description with relationships
+                let mut desc_parts: Vec<String> = Vec::new();
+                desc_parts.push(format!("{} ({})", entity.name, entity.entity_type));
+
+                if let Some(ref desc) = entity.description {
+                    desc_parts.push(desc.clone());
+                }
+
+                // Add relationship descriptions (top 5 by weight)
+                let mut edge_descs: Vec<String> = Vec::new();
+                for edge in edges.iter().take(5) {
+                    let other_id = if edge.source_id == *eid {
+                        &edge.target_id
+                    } else {
+                        &edge.source_id
+                    };
+                    if let Some(other) = state.storage.get_entity(other_id).await {
+                        let rel = if edge.source_id == *eid {
+                            format!("{} → {}", edge.relation_type, other.name)
+                        } else {
+                            format!("{} ← {}", other.name, edge.relation_type)
+                        };
+                        edge_descs.push(rel);
+                    }
+                    if let Some(ref fact) = edge.fact_text {
+                        edge_descs.push(fact.clone());
+                    }
+                }
+
+                if !edge_descs.is_empty() {
+                    desc_parts.push(format!("Relations: {}", edge_descs.join("; ")));
+                }
+
+                let content = desc_parts.join(". ");
+
+                graph_memories.push(RecalledMemory {
+                    record_id: format!("graph_entity_{}", eid),
+                    layer: "knowledge".to_string(),
+                    score: 1.5 + weight, // Slightly below session summaries
+                    content,
+                    topic_tags: vec!["graph_result".into(), "entity_knowledge".into()],
+                    source_ai: "cognitive-graph".into(),
+                    timestamp: entity.updated_at as u64,
+                    access_count: entity.mention_count as u32,
+                    proactive: false,
+                });
+            }
+        }
+
+        if !graph_memories.is_empty() {
+            debug!(
+                graph_results = graph_memories.len(),
+                "[MPI_RECALL] Graph content retrieved"
+            );
+        }
+    }
+
+    // BUG FIX: Include graph_memories count in total_candidates so the response
+    // accurately reflects all candidate sources (vector + identity + graph).
+    let total_candidates = search.len() + seen_ids.len() + graph_memories.len();
 
     let max_degree = { let c = state.storage.conn_lock().await; graph::get_max_degree(&c, &owner) };
     let time_hint_tuple = rb.time_hint.as_ref().map(|th| (th.start, th.end));
@@ -386,6 +530,21 @@ pub async fn mpi_recall(
         let st = Arc::clone(&state.storage); let rid = r.record_id;
         tokio::spawn(async move { st.increment_access(&rid).await; });
     }
+
+    // ── Inject graph-derived memories (v2.4.0) ──
+    // Add graph content before truncation so it competes on score
+    for gm in graph_memories {
+        let tokens = estimate_tokens(&gm.content);
+        if total_tokens + tokens > rb.token_budget && !memories.is_empty() { break; }
+        total_tokens += tokens;
+        memories.push(gm);
+    }
+
+    // Re-sort after injecting graph memories
+    memories.sort_unstable_by(|a, b| {
+        b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     memories.truncate(top_k);
 
     // Async graph update
