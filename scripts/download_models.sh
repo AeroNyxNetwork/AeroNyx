@@ -283,8 +283,13 @@ download_ort_library() {
     info "Downloading ONNX Runtime v${ORT_VERSION}..."
     local tmp_dir
     tmp_dir=$(mktemp -d)
-    # 🐛 v2.4.0: Use single quotes to delay variable expansion in trap.
-    trap 'rm -rf "${tmp_dir}"' EXIT
+    # 🐛 v2.5.0: Use a subshell-safe cleanup approach. The old trap approach
+    # caused "unbound variable" on script EXIT because tmp_dir is local to
+    # this function and not visible when the trap fires at script exit.
+    # Instead, we clean up explicitly at end of function and use trap only
+    # as a safety net with a global variable.
+    _ORT_TMP_DIR="${tmp_dir}"
+    trap 'rm -rf "${_ORT_TMP_DIR:-}" 2>/dev/null || true' EXIT
 
     download_file \
         "${ORT_URL}" \
@@ -316,11 +321,15 @@ download_ort_library() {
         local final_size
         final_size=$(wc -c < "${target_dir}/${ORT_LIB_NAME}" | tr -d ' ')
         ok "${ORT_LIB_NAME} installed (${final_size} bytes)"
+        rm -rf "${tmp_dir}"
+        _ORT_TMP_DIR=""
         return 0
     else
         error "Could not find ${ORT_LIB_NAME} in extracted archive"
         error "Contents of ${ort_extracted_dir}/lib/:"
         ls -la "${ort_extracted_dir}/lib/" 2>/dev/null || echo "  (directory not found)"
+        rm -rf "${tmp_dir}"
+        _ORT_TMP_DIR=""
         return 1
     fi
 }
