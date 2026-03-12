@@ -288,19 +288,31 @@ pub enum EmbedPromptMode {
 /// Checks if the model has a "sentence_embedding" output tensor,
 /// which is characteristic of EmbeddingGemma's ONNX export.
 /// MiniLM only has "last_hidden_state" (and optionally "pooler_output").
-fn detect_model_type(session: &Session) -> EmbedModelType {
-    let outputs = session.outputs().iter()
-        .map(|o| o.name().as_str())
-        .collect::<Vec<_>>();
+/// Detect model type and optionally return the index of "sentence_embedding" output.
+///
+/// Returns (model_type, sentence_embedding_index).
+/// For EmbeddingGemma: index is Some(N) where N is the output position.
+/// For MiniLM: index is None.
+///
+/// We resolve the index here (before Session::run()) to avoid borrow conflicts:
+/// Session::run() returns SessionOutputs that borrows &mut Session, so we
+/// cannot call session.outputs() while SessionOutputs is alive.
+fn detect_model_type(session: &Session) -> (EmbedModelType, Option<usize>) {
+    let output_names: Vec<String> = session.outputs().iter()
+        .map(|o| o.name().to_string())
+        .collect();
 
-    debug!(outputs = ?outputs, "[EMBED] ONNX model output tensor names");
+    debug!(outputs = ?output_names, "[EMBED] ONNX model output tensor names");
 
-    if outputs.iter().any(|name| *name == "sentence_embedding") {
+    let se_idx = output_names.iter()
+        .position(|name| name == "sentence_embedding");
+
+    if se_idx.is_some() {
         info!("[EMBED] Detected EmbeddingGemma model (sentence_embedding output found)");
-        EmbedModelType::EmbeddingGemma
+        (EmbedModelType::EmbeddingGemma, se_idx)
     } else {
         info!("[EMBED] Detected MiniLM model (no sentence_embedding output)");
-        EmbedModelType::MiniLM
+        (EmbedModelType::MiniLM, None)
     }
 }
 
@@ -421,6 +433,10 @@ pub struct EmbedEngine {
     max_seq_length: usize,
     /// Auto-detected model type (MiniLM or EmbeddingGemma).
     model_type: EmbedModelType,
+    /// Index of "sentence_embedding" output in ONNX session outputs.
+    /// Only Some for EmbeddingGemma; None for MiniLM.
+    /// Pre-resolved at load time to avoid borrow conflicts with Session::run().
+    se_output_idx: Option<usize>,
     /// Output embedding dimension after Matryoshka truncation.
     /// For MiniLM: always 384 (native dimension, no truncation).
     /// For EmbeddingGemma: configurable, default 384 (truncated from 768).
@@ -485,7 +501,7 @@ impl EmbedEngine {
         info!(model = %model_path.display(), "[EMBED] ONNX model loaded");
 
         // Auto-detect model type from ONNX output tensor names
-        let model_type = detect_model_type(&session);
+        let (model_type, se_output_idx) = detect_model_type(&session);
 
         // Resolve max_seq_length: 0 → model-specific default
         let max_seq_length = if max_seq_length == 0 {
@@ -526,6 +542,7 @@ impl EmbedEngine {
             tokenizer,
             max_seq_length,
             model_type,
+            se_output_idx,
             output_dim,
         })
     }
@@ -808,14 +825,9 @@ impl EmbedEngine {
         )
         .map_err(|e| format!("ONNX inference: {}", e))?;
 
-        // Find the "sentence_embedding" output by name.
-        // EmbeddingGemma ONNX has two outputs:
-        //   [0] last_hidden_state: [batch, seq, 768] (token-level, not needed)
-        //   [1] sentence_embedding: [batch, 768] (sentence-level, what we want)
-        // The index may vary, so we search by name for robustness.
-        let se_idx = session.outputs().iter()
-            .position(|o| o.name() == "sentence_embedding")
-            .ok_or_else(|| "EmbeddingGemma ONNX missing 'sentence_embedding' output".to_string())?;
+        // Use pre-resolved output index (computed at load time to avoid borrow conflict).
+        let se_idx = self.se_output_idx
+            .ok_or_else(|| "EmbeddingGemma ONNX missing 'sentence_embedding' output index".to_string())?;
 
         let embeddings = outputs[se_idx]
             .try_extract_array::<f32>()
