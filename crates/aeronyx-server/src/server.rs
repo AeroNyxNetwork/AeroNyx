@@ -20,25 +20,32 @@
 //!   MpiState now receives api_secret from config for Bearer token auth.
 //! v2.3.0+RemoteStorage - 🌟 MpiState now receives allow_remote_storage and
 //!   max_remote_owners from config for Phase 1 remote MPI Gateway support.
+//! v2.4.0-GraphCognition - 🌟 NerEngine initialization + MpiState extension:
+//!   - Load GLiNER ONNX model alongside EmbedEngine (shared ORT runtime)
+//!   - Pass ner_engine: Option<Arc<NerEngine>> into MpiState
+//!   - Pass cognitive graph config flags into MpiState
+//!   - NerEngine load is graceful: missing model = NER disabled, server runs normally
 //!
-//! ## Modification Reason (v2.3.0+RemoteStorage)
-//! - MpiState construction now includes allow_remote_storage and max_remote_owners
-//!   from config.memchain, enabling the unified auth middleware to accept or reject
-//!   Ed25519-signed remote storage requests.
+//! ## Modification Reason (v2.4.0-GraphCognition)
+//! - NerEngine must be initialized AFTER EmbedEngine (ORT runtime shared via Once)
+//! - NerEngine is optional — server operates in v2.3.0 mode without it
+//! - MpiState extended with ner_engine for query_analyzer in recall handler
+//! - MpiState extended with cognitive graph config for feature flag checks
 //!
 //! ## Main Functionality
 //! - Server lifecycle: init → run → shutdown
 //! - Dual-engine MemChain initialization (SQLite+Vector + legacy MemPool+AOF)
 //! - MPI API server with auth middleware
-//! - Smart Miner with MVF integration
+//! - Smart Miner with MVF integration + cognitive graph steps (v2.4.0)
 //! - UDP/TUN packet handling
 //! - Management reporting (heartbeat, sessions, commands, WebSocket)
 //!
 //! ## Dependencies
-//! - config.rs for ServerConfig (including MemChainConfig.api_secret,
-//!   allow_remote_storage, max_remote_owners)
-//! - storage.rs for MemoryStorage (with record_key encryption)
+//! - config.rs for ServerConfig (including MemChainConfig with v2.4.0 NER/graph/entropy config)
+//! - storage.rs for MemoryStorage (Schema v5 with cognitive graph tables)
 //! - mpi.rs for MPI router (with unified auth middleware)
+//! - ner.rs for NerEngine (v2.4.0)
+//! - embed.rs for EmbedEngine
 //! - All other server subsystems
 //!
 //! ⚠️ Important Note for Next Developer:
@@ -47,7 +54,15 @@
 //! - api_secret flows: config.rs → server.rs → MpiState → auth middleware
 //! - allow_remote_storage + max_remote_owners flow: config.rs → server.rs → MpiState
 //!   → unified_auth_middleware (Ed25519 signature verification + capacity check)
+//! - NerEngine MUST be loaded AFTER EmbedEngine — both share ORT runtime via Once.
+//!   EmbedEngine::load() calls init_ort_runtime(). NerEngine::load() relies on it.
+//!   If EmbedEngine is not loaded (model missing), NerEngine will also fail unless
+//!   ORT is initialized by other means.
 //! - The rawlog key derivation still uses public key (known issue, separate fix)
+//!
+//! ## Last Modified
+//! v2.4.0-GraphCognition - 🌟 Added NerEngine initialization, MpiState extension,
+//!   Miner with_ner_engine attachment
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -91,6 +106,8 @@ use crate::miner::ReflectionMiner;
 use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
 use crate::services::memchain::derive_record_key;
 use crate::services::memchain::EmbedEngine;
+// v2.4.0: NerEngine for cognitive graph pipeline
+use crate::services::memchain::NerEngine;
 use crate::services::{HandshakeService, IpPoolService, RoutingService, SessionManager};
 
 // ============================================
@@ -257,7 +274,7 @@ impl Server {
             let api_secret = self.config.memchain.effective_api_secret()
                 .map(|s| s.to_string());
 
-            // Initialize local embedding engine (optional — graceful if missing)
+            // ── Initialize local embedding engine (optional — graceful if missing) ──
             let embed_engine: Option<Arc<EmbedEngine>> = {
                 let model_path = &self.config.memchain.embed_model_path;
                 let max_tokens = self.config.memchain.embed_max_tokens;
@@ -282,6 +299,40 @@ impl Server {
                 }
             };
 
+            // ── v2.4.0: Initialize local NER engine (optional — graceful if missing) ──
+            // NerEngine MUST be loaded AFTER EmbedEngine because both share ORT runtime.
+            // EmbedEngine::load() calls init_ort_runtime() via std::sync::Once.
+            // If EmbedEngine wasn't loaded (model missing), we still try NerEngine —
+            // it will call init_ort_runtime() from its own model directory.
+            let ner_engine: Option<Arc<NerEngine>> = if self.config.memchain.ner_enabled {
+                let model_path = &self.config.memchain.ner_model_path;
+                let threshold = self.config.memchain.ner_confidence_threshold;
+                // max_width defaults to 12 in NerEngine::load() when 0 is passed
+                match NerEngine::load(model_path, threshold, 0) {
+                    Ok(engine) => {
+                        info!(
+                            model = %model_path,
+                            threshold = threshold,
+                            max_width = engine.max_width(),
+                            "[NER] ✅ Local NER engine loaded (GLiNER)"
+                        );
+                        Some(Arc::new(engine))
+                    }
+                    Err(e) => {
+                        warn!(
+                            model = %model_path,
+                            error = %e,
+                            "[NER] ⚠️ Local NER unavailable — cognitive graph pipeline disabled. \
+                             Run `scripts/download_models.sh` to download GLiNER model."
+                        );
+                        None
+                    }
+                }
+            } else {
+                debug!("[NER] Disabled (ner_enabled=false)");
+                None
+            };
+
             let mpi_state = Arc::new(MpiState {
                 storage: Arc::clone(st),
                 vector_index: Arc::clone(vi),
@@ -299,6 +350,10 @@ impl Server {
                 // v2.3.0: Phase 1 Remote Storage configuration
                 allow_remote_storage: self.config.memchain.allow_remote_storage,
                 max_remote_owners: self.config.memchain.max_remote_owners,
+                // v2.4.0: Cognitive Graph Pipeline
+                ner_engine: ner_engine.clone(),
+                graph_enabled: self.config.memchain.graph_enabled,
+                entropy_filter_enabled: self.config.memchain.entropy_filter_enabled,
             });
 
             // Pre-populate Identity cache
@@ -354,7 +409,7 @@ impl Server {
             );
             tasks.push(("memchain-api", api_task));
 
-            // Smart Miner (with MVF integration)
+            // Smart Miner (with MVF integration + v2.4.0 cognitive graph)
             if self.config.memchain.miner_interval_secs > 0 {
                 let miner = ReflectionMiner::new(
                     self.config.memchain.miner_interval_secs,
@@ -372,6 +427,13 @@ impl Server {
                 // Attach local embed engine if available
                 let miner = if let Some(ref ee) = embed_engine {
                     miner.with_embed_engine(Arc::clone(ee))
+                } else {
+                    miner
+                };
+
+                // v2.4.0: Attach NER engine for cognitive graph Steps 7-11
+                let miner = if let Some(ref ne) = ner_engine {
+                    miner.with_ner_engine(Arc::clone(ne))
                 } else {
                     miner
                 };
@@ -449,7 +511,6 @@ impl Server {
         }
 
         // Derive record encryption key from Ed25519 PRIVATE key.
-        // This ensures only the holder of the private key can decrypt record content.
         // ⚠️ SECURITY: identity.to_bytes() returns the PRIVATE key (32 bytes).
         //    Do NOT use public_key_bytes() here — that would defeat the purpose.
         let record_key = derive_record_key(&self.identity.to_bytes());
@@ -463,8 +524,6 @@ impl Server {
         let vector_index = Arc::new(VectorIndex::new());
 
         // Rebuild vector index from SQLite on startup.
-        // Each record is inserted into the correct (owner, model) partition
-        // based on the embedding_model stored in SQLite.
         let owner = self.identity.public_key_bytes();
         let records_with_model = storage.get_records_with_embedding(&owner).await;
         let rebuild_count = records_with_model.len();
@@ -617,24 +676,16 @@ impl Server {
 
         // Heartbeat reporter
         // v2.3.0: Build memchain_status callback if MemChain is enabled.
-        // The callback captures config values + storage Arc for lazy evaluation
-        // on each heartbeat tick. It's cheap: one SQL COUNT query (~0.1ms).
         let memchain_status_fn: Option<crate::management::reporter::MemChainStatusFn> =
             if self.config.memchain.is_enabled() {
                 let allow_remote = self.config.memchain.allow_remote_storage;
                 let max_owners = self.config.memchain.max_remote_owners;
-                // Note: storage may not be initialized yet at this point in
-                // init_management_reporter (it's created later in run()).
-                // We capture the config values only; current_remote_owners
-                // will be reported as 0 until storage is available.
-                // TODO: Once server.rs is refactored to init storage before
-                // management, capture Arc<MemoryStorage> here for live counts.
                 Some(Box::new(move || {
                     Some(crate::management::client::MemChainHeartbeatStatus {
                         enabled: true,
                         allow_remote_storage: allow_remote,
                         max_remote_owners: max_owners,
-                        current_remote_owners: 0, // Updated when storage is available
+                        current_remote_owners: 0,
                     })
                 }))
             } else {
@@ -664,7 +715,6 @@ impl Server {
         let node_info_path = &self.config.management.node_info_path;
         if let Ok(node_info) = crate::management::models::StoredNodeInfo::load(node_info_path) {
             // v2.3.0: Pass MPI api_secret to WsTunnel for Bearer token injection
-            // in MPI proxy requests and store_chat_to_mpi calls.
             let ws = crate::management::WsTunnel::new(
                 self.identity.clone(),
                 node_info.node_id.clone(),
@@ -890,7 +940,6 @@ impl Server {
             MemChainMessage::BroadcastFact(fact) => {
                 let origin_hex = hex::encode(fact.origin);
 
-                // Signature verification
                 let sig_ok = match IdentityPublicKey::from_bytes(&fact.origin) {
                     Ok(pk) => pk.verify(&fact.fact_id, &fact.signature).is_ok(),
                     Err(_) => false,
