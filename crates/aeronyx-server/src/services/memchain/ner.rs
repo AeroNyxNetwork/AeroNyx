@@ -414,50 +414,63 @@ impl NerEngine {
             .map_err(|e| format!("GLiNER output extraction: {}", e))?;
 
         let logits_shape = logits.shape();
-        if logits_shape.len() != 3 {
-            return Err(format!(
-                "Expected 3D logits [batch, spans, labels], got {}D",
-                logits_shape.len()
-            ));
-        }
-        let out_num_spans = logits_shape[1];
-        let out_num_labels = logits_shape[2];
+
+        // GLiNER output can be either:
+        //   3D: [batch, num_spans, num_labels] — flattened
+        //   4D: [batch, num_words, max_width, num_labels] — grid form
+        // We handle both by indexing appropriately.
+        let (out_num_words, out_max_width, out_num_labels, is_4d) = match logits_shape.len() {
+            3 => {
+                // [batch, num_spans, num_labels]
+                let nl = logits_shape[2];
+                (num_text_words, self.max_width, nl, false)
+            }
+            4 => {
+                // [batch, num_words, max_width, num_labels]
+                (logits_shape[1], logits_shape[2], logits_shape[3], true)
+            }
+            other => {
+                return Err(format!(
+                    "Expected 3D or 4D logits, got {}D (shape: {:?})",
+                    other, logits_shape
+                ));
+            }
+        };
 
         // Step 7: Sigmoid + threshold + decode
         let mut raw_detections: Vec<DetectedEntity> = Vec::new();
 
-        for s in 0..out_num_spans {
-            if s >= num_spans {
-                break;
-            }
-            // Reconstruct span word indices from our span generation order
-            let (word_start, word_end) = self.span_index_to_words(s, num_text_words);
-            if word_end >= num_text_words {
-                continue;
-            }
-
-            for l in 0..out_num_labels {
-                if l >= labels.len() {
+        for start in 0..out_num_words.min(num_text_words) {
+            for offset in 0..out_max_width {
+                let end = start + offset;
+                if end >= num_text_words {
                     break;
                 }
-                let logit = logits[[0, s, l]];
-                let score = sigmoid(logit);
 
-                if score >= self.confidence_threshold {
-                    // Reconstruct text from word spans
-                    let char_start = words[word_start].byte_start;
-                    let char_end = words[word_end].byte_end;
-                    let entity_text = &text[char_start..char_end];
+                for l in 0..out_num_labels.min(labels.len()) {
+                    let logit = if is_4d {
+                        logits[[0, start, offset, l]]
+                    } else {
+                        let span_idx = start * self.max_width + offset;
+                        logits[[0, span_idx, l]]
+                    };
+                    let score = sigmoid(logit);
 
-                    raw_detections.push(DetectedEntity {
-                        text: entity_text.to_string(),
-                        label: labels[l].to_string(),
-                        confidence: score,
-                        char_start,
-                        char_end,
-                        word_start,
-                        word_end,
-                    });
+                    if score >= self.confidence_threshold {
+                        let char_start = words[start].byte_start;
+                        let char_end = words[end].byte_end;
+                        let entity_text = &text[char_start..char_end];
+
+                        raw_detections.push(DetectedEntity {
+                            text: entity_text.to_string(),
+                            label: labels[l].to_string(),
+                            confidence: score,
+                            char_start,
+                            char_end,
+                            word_start: start,
+                            word_end: end,
+                        });
+                    }
                 }
             }
         }
