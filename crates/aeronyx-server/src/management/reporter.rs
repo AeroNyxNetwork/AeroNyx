@@ -5,46 +5,42 @@
 //!
 //! Async tasks for periodic heartbeat and session event reporting.
 //!
-//! ## Modification Reason (v1.3.0)
-//! - 🌟 HeartbeatReporter now parses `HeartbeatResponse.commands` and forwards
-//!   structured `Command` objects to the `CommandHandler` via an `mpsc` channel.
-//! - 🌟 Added `command_tx: Option<mpsc::Sender<Command>>` to HeartbeatReporter
-//!   so it can be wired up from `server.rs` during initialisation.
-//! - 🌟 Added dynamic heartbeat interval adjustment from `next_heartbeat_in`.
+//! ## Modification Reason (v2.3.0+RemoteStorage)
+//! - 🌟 HeartbeatReporter now reports `memchain_status` in heartbeats
+//! - Added `memchain_status_fn` callback for lazy MemChain status collection
+//! - `send_heartbeat()` signature extended with `memchain_status` parameter
+//! - CMS uses this data to update Node's remote storage fields
+//!
+//! ## Previous Modifications
+//! v1.3.0 - HeartbeatReporter parses commands from response, dynamic interval
+//! v1.3.1 - Added agent_manager for status reporting
 //!
 //! Main Components:
 //!   - HeartbeatReporter: Sends periodic heartbeats to CMS
 //!   - SessionReporter: Reports session events (create/end) to CMS
 //!   - SessionEventSender: Thread-safe sender for session events
 //!
-//! ## Main Logical Flow (HeartbeatReporter)
-//! 1. Tick at configured interval (default 30s)
-//! 2. Call `ManagementClient::send_heartbeat()`
-//! 3. On success: parse `HeartbeatResponse`
-//!    a. If `commands` present → forward each `Command` to channel
-//!    b. If `next_heartbeat_in` present → adjust next tick interval
-//! 4. On failure: increment failure counter, log warning/error
-//!
 //! ⚠️ Important Note for Next Developer:
 //!   - HeartbeatReporter runs on a fixed interval (default 30s)
 //!   - SessionReporter processes events from a channel
 //!   - Both respect shutdown signals for graceful termination
-//!   - 🌟 The command channel is Optional — if `None`, commands from
+//!   - The command channel is Optional — if `None`, commands from
 //!     CMS are logged but not dispatched (graceful degradation)
-//!   - 🌟 Dynamic interval adjustment is clamped to [10, 300] seconds
-//!     to prevent CMS from setting dangerously low or high intervals
+//!   - Dynamic interval adjustment is clamped to [10, 300] seconds
+//!   - memchain_status_fn is Optional — if None, no memchain_status in heartbeat
 //!
 //! Last Modified:
 //!   v1.0.0 - Initial implementation
 //!   v1.2.0 - Fixed SessionEventType import and client_wallet type
-//!   v1.3.0 - 🌟 Added command forwarding from heartbeat response
+//!   v1.3.0 - Added command forwarding from heartbeat response
+//!   v2.3.0+RemoteStorage - 🌟 Added memchain_status reporting in heartbeat
 //! ============================================
 
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
-use super::client::ManagementClient;
+use super::client::{ManagementClient, MemChainHeartbeatStatus};
 use super::models::{Command, SessionEventReport, SessionEventType};
 use crate::services::AgentManager;
 
@@ -70,6 +66,19 @@ const COLD_START_GRACE_BEATS: u32 = 5;
 /// Normal timeout is from config (default 10s), but during
 /// the grace period we allow up to 30s for CMS to warm up.
 const COLD_START_TIMEOUT_SECS: u64 = 30;
+
+// ============================================
+// MemChainStatusFn type alias (v2.3.0)
+// ============================================
+
+/// Callback type for collecting MemChain status at heartbeat time.
+///
+/// Returns `Option<MemChainHeartbeatStatus>` — None if MemChain is disabled.
+/// The callback is invoked on each heartbeat tick, so it must be cheap.
+///
+/// Typically constructed as a closure capturing `Arc<MemoryStorage>` and
+/// config values, called from `server.rs`.
+pub type MemChainStatusFn = Box<dyn Fn() -> Option<MemChainHeartbeatStatus> + Send + Sync>;
 
 // ============================================
 // Session Events
@@ -135,26 +144,23 @@ impl SessionEvent {
 
 /// Background task for sending periodic heartbeats to CMS.
 ///
-/// 🌟 v1.3.0: Now also parses `commands` from `HeartbeatResponse`
-/// and forwards them to the `CommandHandler` via an internal channel.
+/// 🌟 v1.3.0: Parses `commands` from `HeartbeatResponse` and forwards them.
+/// 🌟 v2.3.0: Reports `memchain_status` for remote storage field sync.
 pub struct HeartbeatReporter {
     client: Arc<ManagementClient>,
     interval: Duration,
     public_ip: String,
-    /// 🌟 Optional channel to forward commands to CommandHandler.
-    /// If `None`, commands from CMS are logged but not dispatched.
+    /// Optional channel to forward commands to CommandHandler.
     command_tx: Option<mpsc::Sender<Command>>,
-    /// 🌟 v1.3.1: Optional reference to AgentManager for status reporting.
-    /// If `Some`, heartbeat includes `agent_status` in `system_stats`.
+    /// v1.3.1: Optional reference to AgentManager for status reporting.
     agent_manager: Option<Arc<AgentManager>>,
+    /// v2.3.0: Optional callback to collect MemChain status for heartbeat.
+    /// Called on each heartbeat tick. Returns None if MemChain is disabled.
+    memchain_status_fn: Option<MemChainStatusFn>,
 }
 
 impl HeartbeatReporter {
     /// Creates a new HeartbeatReporter.
-    ///
-    /// # Arguments
-    /// * `client` - Shared ManagementClient for API calls
-    /// * `public_ip` - Node's public IP address to report
     pub fn new(client: Arc<ManagementClient>, public_ip: String) -> Self {
         let interval = Duration::from_secs(client.config().heartbeat_interval_secs);
         Self {
@@ -163,32 +169,40 @@ impl HeartbeatReporter {
             public_ip,
             command_tx: None,
             agent_manager: None,
+            memchain_status_fn: None,
         }
     }
 
-    /// 🌟 Attaches a command sender channel for forwarding CMS commands.
+    /// Attaches a command sender channel for forwarding CMS commands.
     pub fn with_command_sender(mut self, tx: mpsc::Sender<Command>) -> Self {
         self.command_tx = Some(tx);
         self
     }
 
-    /// 🌟 v1.3.1: Attaches an AgentManager for status reporting in heartbeat.
+    /// v1.3.1: Attaches an AgentManager for status reporting in heartbeat.
     pub fn with_agent_manager(mut self, am: Arc<AgentManager>) -> Self {
         self.agent_manager = Some(am);
         self
     }
 
-    /// Runs the heartbeat loop until shutdown signal received.
+    /// v2.3.0: Attaches a MemChain status callback for heartbeat reporting.
     ///
-    /// # Arguments
-    /// * `session_count_fn` - Closure that returns current active session count
-    /// * `shutdown` - Broadcast receiver for shutdown signal
+    /// The callback is invoked on each heartbeat tick to collect current
+    /// MemChain state (allow_remote_storage, owner counts, etc.).
+    /// CMS uses this data to update Node's remote storage fields.
+    pub fn with_memchain_status(mut self, f: MemChainStatusFn) -> Self {
+        self.memchain_status_fn = Some(f);
+        self
+    }
+
+    /// Runs the heartbeat loop until shutdown signal received.
     pub async fn run<F>(self, session_count_fn: F, mut shutdown: tokio::sync::broadcast::Receiver<()>)
     where F: Fn() -> u32 + Send + 'static
     {
         info!(
             interval_secs = self.interval.as_secs(),
             has_command_channel = self.command_tx.is_some(),
+            has_memchain_status = self.memchain_status_fn.is_some(),
             "[HEARTBEAT] Reporter started"
         );
 
@@ -206,12 +220,16 @@ impl HeartbeatReporter {
                     total_beats += 1;
                     let in_cold_start = total_beats <= COLD_START_GRACE_BEATS;
 
-                    // 🌟 v1.3.1: Fetch agent status if AgentManager is available
+                    // v1.3.1: Fetch agent status if AgentManager is available
                     let agent_status = if let Some(ref am) = self.agent_manager {
                         Some(am.status().await)
                     } else {
                         None
                     };
+
+                    // v2.3.0: Collect MemChain status if callback is configured
+                    let memchain_status = self.memchain_status_fn.as_ref()
+                        .and_then(|f| f());
 
                     // Use extended timeout during cold-start grace period
                     let result = if in_cold_start {
@@ -227,6 +245,7 @@ impl HeartbeatReporter {
                                 &self.public_ip,
                                 session_count_fn(),
                                 agent_status,
+                                memchain_status,
                             ),
                         ).await
                     } else {
@@ -236,6 +255,7 @@ impl HeartbeatReporter {
                                 &self.public_ip,
                                 session_count_fn(),
                                 agent_status,
+                                memchain_status,
                             ),
                         ).await
                     };
@@ -267,7 +287,7 @@ impl HeartbeatReporter {
                             }
                             failures = 0;
 
-                            // 🌟 Process commands from CMS
+                            // Process commands from CMS
                             if let Some(commands) = response.commands {
                                 if !commands.is_empty() {
                                     info!(
@@ -280,7 +300,7 @@ impl HeartbeatReporter {
                                 }
                             }
 
-                            // 🌟 Dynamic interval adjustment
+                            // Dynamic interval adjustment
                             if let Some(next_in) = response.next_heartbeat_in {
                                 let clamped = next_in
                                     .max(MIN_HEARTBEAT_INTERVAL_SECS)
@@ -333,10 +353,7 @@ impl HeartbeatReporter {
         }
     }
 
-    /// 🌟 Forwards received commands to the CommandHandler channel.
-    ///
-    /// If the channel is not configured or is full, commands are logged
-    /// as warnings but not dropped silently.
+    /// Forwards received commands to the CommandHandler channel.
     async fn forward_commands(&self, commands: Vec<Command>) {
         let Some(ref tx) = self.command_tx else {
             warn!(
@@ -388,21 +405,12 @@ pub struct SessionReporter {
 
 impl SessionReporter {
     /// Creates a new SessionReporter and returns the event sender.
-    ///
-    /// # Arguments
-    /// * `client` - Shared ManagementClient for API calls
-    ///
-    /// # Returns
-    /// Tuple of (SessionReporter, event sender channel)
     pub fn new(client: Arc<ManagementClient>) -> (Self, mpsc::Sender<SessionEvent>) {
         let (tx, rx) = mpsc::channel(1000);
         (Self { client, event_rx: rx }, tx)
     }
 
     /// Runs the session reporter loop until shutdown signal received.
-    ///
-    /// # Arguments
-    /// * `shutdown` - Broadcast receiver for shutdown signal
     pub async fn run(mut self, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
         info!("[SESSION_REPORTER] Started");
         loop {
@@ -426,39 +434,21 @@ impl SessionReporter {
 // ============================================
 
 /// Thread-safe sender for session events.
-///
-/// Can be cloned and shared across threads to send session events
-/// to the SessionReporter.
 #[derive(Clone)]
 pub struct SessionEventSender {
     tx: Option<mpsc::Sender<SessionEvent>>,
 }
 
 impl SessionEventSender {
-    /// Creates a new enabled sender with the given channel.
     pub fn new(tx: mpsc::Sender<SessionEvent>) -> Self { Self { tx: Some(tx) } }
-
-    /// Creates a disabled sender that discards all events.
     pub fn disabled() -> Self { Self { tx: None } }
 
-    /// Sends a session_created event.
-    ///
-    /// # Arguments
-    /// * `session_id` - Unique session identifier
-    /// * `client_wallet` - Optional client wallet address
     pub fn session_created(&self, session_id: &str, client_wallet: Option<String>) {
         if let Some(ref tx) = self.tx {
             let _ = tx.try_send(SessionEvent::created(session_id.to_string(), client_wallet));
         }
     }
 
-    /// Sends a session_ended event with traffic statistics.
-    ///
-    /// # Arguments
-    /// * `session_id` - Unique session identifier
-    /// * `client_wallet` - Optional client wallet address
-    /// * `bytes_in` - Total bytes received from client
-    /// * `bytes_out` - Total bytes sent to client
     pub fn session_ended(&self, session_id: &str, client_wallet: Option<String>, bytes_in: u64, bytes_out: u64) {
         if let Some(ref tx) = self.tx {
             let _ = tx.try_send(SessionEvent::ended(session_id.to_string(), client_wallet, bytes_in, bytes_out));
