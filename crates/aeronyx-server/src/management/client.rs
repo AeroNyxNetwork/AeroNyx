@@ -17,6 +17,13 @@ Modification Reason (v1.3.0):
   - 🌟 Refactored duplicate `json!` body construction into helper to reduce
     risk of signing/sending field mismatch
 
+Modification Reason (v2.3.0+RemoteStorage):
+  - 🌟 send_heartbeat() now accepts optional `memchain_status` parameter
+  - When present, injects `memchain_status` into `system_stats` with:
+    allow_remote_storage, max_remote_owners, current_remote_owners
+  - CMS heartbeat_service.py reads these fields to update Node model
+  - Pattern follows existing agent_status injection (conditional, backward compatible)
+
 Main Logical Flow:
   1. create_signature() - Creates Ed25519 signature over message hash
   2. send_heartbeat() - Sends node status with signature verification
@@ -28,6 +35,8 @@ Main Logical Flow:
   - The body_json used for signing MUST be the same as what's sent
   - Do NOT use HeartbeatRequest struct for sending - use json! macro directly
   - 🌟 `report_command_status()` uses the same signature scheme as heartbeat
+  - 🌟 memchain_status is injected into system_stats (not top-level body)
+    to match CMS heartbeat_service.py's _update_remote_storage_fields() logic
 
 Dependencies:
   - super::config::ManagementConfig
@@ -39,6 +48,7 @@ Last Modified:
   v1.0.0 - Initial implementation
   v1.2.0 - Fixed JSON field ordering issue by using json! macro
   v1.3.0 - 🌟 Added report_command_status(), fixed eprintln!, refactored signing
+  v2.3.0+RemoteStorage - 🌟 Added memchain_status to heartbeat system_stats
 ============================================
 */
 
@@ -50,7 +60,22 @@ use serde_json::json;
 
 use aeronyx_core::crypto::IdentityKeyPair;
 use super::config::ManagementConfig;
-use super::models::*;/// Management API client for communicating with the CMS backend.
+use super::models::*;
+
+/// MemChain status data for heartbeat reporting (v2.3.0).
+///
+/// Sent as part of `system_stats.memchain_status` in the heartbeat body.
+/// CMS `heartbeat_service.py` reads these fields to update the Node model's
+/// `allow_remote_storage`, `max_remote_owners`, and `current_remote_owners`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemChainHeartbeatStatus {
+    pub enabled: bool,
+    pub allow_remote_storage: bool,
+    pub max_remote_owners: usize,
+    pub current_remote_owners: usize,
+}
+
+/// Management API client for communicating with the CMS backend.
 ///
 /// Handles:
 /// - Node registration with binding codes
@@ -196,11 +221,18 @@ impl ManagementClient {
     /// 3. public_ip
     /// 4. version
     /// 5. binary_hash
-    /// 6. system_stats (with cpu_usage, memory_mb, active_sessions)
+    /// 6. system_stats (with cpu_usage, memory_mb, active_sessions,
+    ///    and optionally agent_status, memchain_status, net_rx_bytes, etc.)
+    ///
+    /// ## v2.3.0: memchain_status
+    /// When provided, injected into `system_stats` as `memchain_status` object.
+    /// CMS reads this to update Node's remote storage fields.
     ///
     /// # Arguments
     /// * `public_ip` - Node's public IP address
     /// * `active_sessions` - Number of active client sessions
+    /// * `agent_status` - Optional OpenClaw agent status
+    /// * `memchain_status` - Optional MemChain remote storage status (v2.3.0)
     ///
     /// # Returns
     /// HeartbeatResponse on success, error message on failure
@@ -209,6 +241,7 @@ impl ManagementClient {
         public_ip: &str,
         active_sessions: u32,
         agent_status: Option<AgentStatusInfo>,
+        memchain_status: Option<MemChainHeartbeatStatus>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/node/heartbeat/", self.config.cms_url);
         let timestamp = Self::current_timestamp();
@@ -233,6 +266,15 @@ impl ManagementClient {
                     serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
                 );
             }
+
+            // v2.3.0: Inject memchain_status for remote storage field updates
+            if let Some(ref mc_status) = memchain_status {
+                obj.insert(
+                    "memchain_status".to_string(),
+                    serde_json::to_value(mc_status).unwrap_or(serde_json::Value::Null),
+                );
+            }
+
             if let Some(rx) = stats.net_rx_bytes {
                 obj.insert("net_rx_bytes".to_string(), serde_json::json!(rx));
             }
