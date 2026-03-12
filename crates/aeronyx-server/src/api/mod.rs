@@ -9,51 +9,53 @@
 //! loopback by default (`127.0.0.1:8421`) and is NOT exposed to the
 //! public network.
 //!
-//! ## Modification Reason
-//! - 🌟 v0.4.0: `start_api_server` now accepts `SessionManager`,
-//!   `UdpTransport`, `MemChainConfig`, and `DefaultTransportCrypto`
-//!   to support P2P broadcast from the API layer and the new
-//!   `POST /api/sync` endpoint.
+//! ## v2.4.0 File Split
+//! mpi.rs was split into 3 files for maintainability:
+//! - `mpi.rs` — MpiState, AuthenticatedOwner, auth middleware, router, helpers
+//! - `mpi_handlers.rs` — Original 7 endpoint handlers (remember, recall, forget,
+//!   status, embed, record, overview)
+//! - `mpi_graph_handlers.rs` — v2.4.0 cognitive graph endpoints (11 new)
 //!
-//! ## Main Functionality
+//! External API is UNCHANGED — this file re-exports the same symbols:
+//! `{build_mpi_router, MpiState, BaselineSnapshot}`
 //!
-//! ### Submodules
-//! - [`local`]: Axum router, route handlers, shared state
+//! server.rs, log_handler.rs, and ws_client.rs all import from
+//! `crate::api::mpi::` — their code does NOT need to change.
 //!
-//! ## Architecture Position
-//! ```text
-//! AI Agent (OpenClaw / curl / Python)
-//!     │
-//!     │ HTTP POST /api/fact   — write a new memory (+ P2P broadcast)
-//!     │ HTTP GET  /api/facts  — read recent memories
-//!     │ HTTP GET  /api/status — check MemChain health
-//!     │ HTTP POST /api/sync   — 🌟 trigger P2P catch-up
-//!     ▼
-//! api/local.rs  (axum, 127.0.0.1:8421)
-//!     │
-//!     ├─► MemPool.add_fact()       — store in memory
-//!     ├─► AofWriter.append_fact()  — persist to disk
-//!     ├─► IdentityKeyPair.sign()   — Ed25519 signature
-//!     └─► UdpTransport.send()      — 🌟 P2P broadcast / sync
-//! ```
+//! ## Submodules
+//! - [`mpi`]: Core MPI types, auth, router (entry point)
+//! - [`mpi_handlers`]: Original endpoint handlers (remember, recall, etc.)
+//! - [`mpi_graph_handlers`]: v2.4.0 cognitive graph endpoints
+//! - [`log_handler`]: /log endpoint with rule engine + entropy filter
+//! - [`local`]: Legacy Axum router (deprecated)
 //!
-//! ## ⚠️ Important Note for Next Developer
-//! - API is loopback-only by default. Binding to 0.0.0.0 is allowed
-//!   but generates a warning in config validation.
-//! - All routes are prefixed with `/api/`.
-//! - State is shared via `Arc` and injected through `axum::extract::State`.
-//! - The API task is spawned in `server.rs` and respects shutdown signals.
-//! - P2P broadcast happens async (tokio::spawn) so it never blocks the
-//!   HTTP response.
+//! ⚠️ Important Note for Next Developer:
+//! - When adding new ORIGINAL-style endpoints → add to mpi_handlers.rs
+//! - When adding new GRAPH/COGNITIVE endpoints → add to mpi_graph_handlers.rs
+//! - Register all routes in mpi.rs::build_mpi_router() regardless of which file
+//!   the handler lives in
+//! - Re-exports below MUST stay in sync — server.rs depends on them
 //!
 //! ## Last Modified
 //! v0.3.0 - 🌟 Initial Agent API for MemChain Phase 1
 //! v0.4.0 - 🌟 Extended for Phase 3: P2P broadcast + POST /api/sync
+//! v2.4.0-GraphCognition - 🌟 Split mpi.rs into 3 files; added mpi_handlers
+//!   and mpi_graph_handlers submodules
 
+// ── Core MPI module (state, auth, router) ──
 pub mod mpi;
+
+// ── Handler modules (split from mpi.rs in v2.4.0) ──
+pub mod mpi_handlers;
+pub mod mpi_graph_handlers;
+
+// ── /log endpoint (separate since v2.1.0) ──
 pub mod log_handler;
+
+// ── Legacy API (deprecated) ──
 pub mod local;
 
+// ── Re-exports (unchanged from v2.3.0 — external callers unaffected) ──
 pub use mpi::{build_mpi_router, MpiState, BaselineSnapshot};
 
 #[allow(deprecated)]
