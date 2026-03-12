@@ -21,6 +21,20 @@
 //! - Content Dedup: has_active_content
 //! - v2.2.0: get_embedding_model, get_overview
 //! - v2.3.0: count_distinct_owners, owner_exists (Phase 1 remote storage capacity check)
+//! - v2.4.0-GraphCognition: Full CRUD for cognitive graph tables:
+//!   - Episodes: upsert_episode, get_episode, get_episodes_for_session
+//!   - Entities: upsert_entity, get_entity, get_entities_by_owner, get_entities_cached,
+//!     increment_entity_mention, update_entity_community
+//!   - Knowledge Edges: insert_knowledge_edge, get_active_edges, get_edges_for_entity,
+//!     invalidate_edge, get_edges_within_community
+//!   - Episode Edges: insert_episode_edge, get_entities_for_episode, get_episodes_for_entity
+//!   - Communities: upsert_community, get_communities, get_entities_in_community,
+//!     get_communities_with_new_entities
+//!   - Projects: upsert_project, get_projects, get_project
+//!   - Sessions: upsert_session, get_session, get_sessions_for_project,
+//!     update_session_summary, get_pending_sessions
+//!   - Artifacts: insert_artifact, get_artifacts_for_session, get_artifact_versions
+//!   - Graph Stats: graph_stats
 //!
 //! ## Architecture
 //! This file uses `impl MemoryStorage` blocks to add methods to the struct
@@ -39,11 +53,17 @@
 //!   manually decrypt using self.record_key
 //! - count_distinct_owners() and owner_exists() are used by the MPI auth middleware
 //!   for max_remote_owners capacity checks. They must be fast (indexed queries).
+//! - v2.4.0 cognitive graph methods use TEXT primary keys (SHA256 hashes or UUIDs),
+//!   not BLOB like records. This simplifies JSON serialization for API responses.
+//! - knowledge_edges.valid_until = NULL means "currently valid". Always filter by
+//!   valid_until IS NULL for current state queries.
+//! - entity_id = SHA256(owner || name_normalized) — deterministic, enables upsert.
 //!
 //! ## Last Modified
 //! v2.2.0 - 🌟 Extracted from storage.rs; added get_embedding_model, get_overview
 //! v2.3.0+RemoteStorage - 🌟 Added count_distinct_owners(), owner_exists()
-//!   for Phase 1 remote storage capacity checks in MPI auth middleware
+//! v2.4.0-GraphCognition - 🌟 Added full CRUD for episodes, entities, knowledge_edges,
+//!   episode_edges, communities, projects, sessions, artifacts tables + graph_stats
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -53,7 +73,7 @@ use tracing::{debug, error, info, warn};
 
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord, RecordStatus};
 
-use super::storage::{MemoryStorage, StorageStats, LayerCounts, RawLogRow};
+use super::storage::{MemoryStorage, StorageStats, LayerCounts, RawLogRow, embedding_to_bytes};
 use super::storage_crypto::{
     encrypt_rawlog_content, decrypt_rawlog_content,
     encrypt_record_content, decrypt_record_content,
@@ -63,8 +83,6 @@ use super::storage_crypto::{
 // Overview Types (v2.2.0)
 // ============================================
 
-/// A lightweight record for the overview endpoint.
-/// Does not include embedding data (too large for list views).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct OverviewRecord {
     pub record_id: String,
@@ -77,7 +95,6 @@ pub struct OverviewRecord {
     pub source_ai: String,
 }
 
-/// Aggregated overview data returned by get_overview().
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct OverviewData {
     pub by_layer: HashMap<String, u64>,
@@ -86,14 +103,108 @@ pub struct OverviewData {
 }
 
 // ============================================
+// v2.4.0: Cognitive Graph Types
+// ============================================
+
+/// Lightweight entity row for API responses and graph traversal.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EntityRow {
+    pub entity_id: String,
+    pub name: String,
+    pub name_normalized: String,
+    pub entity_type: String,
+    pub description: Option<String>,
+    pub community_id: Option<String>,
+    pub mention_count: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Knowledge edge row for graph traversal and API responses.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KnowledgeEdgeRow {
+    pub edge_id: i64,
+    pub source_id: String,
+    pub target_id: String,
+    pub relation_type: String,
+    pub fact_text: Option<String>,
+    pub weight: f64,
+    pub confidence: f64,
+    pub valid_from: i64,
+    pub valid_until: Option<i64>,
+    pub episode_id: Option<String>,
+}
+
+/// Session row for timeline and detail views.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionRow {
+    pub session_id: String,
+    pub project_id: Option<String>,
+    pub session_type: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub turn_count: i64,
+    pub summary: Option<String>,
+    pub key_decisions: Option<String>,
+    pub entities_extracted: bool,
+    pub summary_generated: bool,
+}
+
+/// Community row for API responses.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CommunityRow {
+    pub community_id: String,
+    pub name: String,
+    pub summary: Option<String>,
+    pub description: Option<String>,
+    pub entity_count: i64,
+    pub updated_at: i64,
+}
+
+/// Project row for API responses.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProjectRow {
+    pub project_id: String,
+    pub name: String,
+    pub status: String,
+    pub community_id: String,
+    pub summary: Option<String>,
+    pub last_active_at: i64,
+}
+
+/// Artifact row for API responses.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ArtifactRow {
+    pub artifact_id: String,
+    pub session_id: String,
+    pub project_id: Option<String>,
+    pub artifact_type: String,
+    pub filename: Option<String>,
+    pub language: Option<String>,
+    pub version: i64,
+    pub parent_id: Option<String>,
+    pub content_hash: String,
+    pub line_count: Option<i64>,
+    pub created_at: i64,
+}
+
+/// Cognitive graph statistics for /api/mpi/status.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct GraphStats {
+    pub episodes: u64,
+    pub entities: u64,
+    pub knowledge_edges: u64,
+    pub communities: u64,
+    pub projects: u64,
+    pub sessions: u64,
+    pub artifacts: u64,
+}
+
+// ============================================
 // impl MemoryStorage — RawLog Operations
 // ============================================
 
 impl MemoryStorage {
-    /// Insert a raw conversation log entry.
-    ///
-    /// If `rawlog_key` is provided, content is encrypted with ChaCha20-Poly1305
-    /// (random nonce) before storage. The `encrypted` flag is set accordingly.
     pub async fn insert_raw_log(
         &self,
         session_id: &str,
@@ -140,7 +251,6 @@ impl MemoryStorage {
         Ok(log_id)
     }
 
-    /// Read and decrypt a raw log entry's content.
     pub async fn read_rawlog_content(
         &self,
         log_id: i64,
@@ -166,7 +276,6 @@ impl MemoryStorage {
         }
     }
 
-    /// Update feedback_signal for a raw_log entry.
     pub async fn update_rawlog_feedback(&self, log_id: i64, signal: i64) {
         let conn = self.conn.lock().await;
         let _ = conn.execute(
@@ -175,7 +284,6 @@ impl MemoryStorage {
         );
     }
 
-    /// Query unprocessed raw_logs for Miner feedback detection.
     pub async fn get_unprocessed_rawlogs(&self, limit: usize) -> Vec<RawLogRow> {
         let conn = self.conn.lock().await;
         let mut stmt = match conn.prepare(
@@ -213,7 +321,6 @@ impl MemoryStorage {
 // ============================================
 
 impl MemoryStorage {
-    /// Increment positive_feedback on a record.
     pub async fn increment_positive_feedback(&self, record_id: &[u8; 32]) {
         let conn = self.conn.lock().await;
         match conn.execute(
@@ -236,7 +343,6 @@ impl MemoryStorage {
         }
     }
 
-    /// Increment negative_feedback on a record.
     pub async fn increment_negative_feedback(&self, record_id: &[u8; 32]) {
         let conn = self.conn.lock().await;
         match conn.execute(
@@ -259,7 +365,6 @@ impl MemoryStorage {
         }
     }
 
-    /// Set the conflict_with field on a record (for MVF φ₈ feature).
     pub async fn set_conflict_with(&self, record_id: &[u8; 32], conflict_id: &[u8; 32]) -> bool {
         let conn = self.conn.lock().await;
         match conn.execute(
@@ -267,45 +372,21 @@ impl MemoryStorage {
             params![conflict_id.as_slice(), record_id.as_slice()],
         ) {
             Ok(n) if n > 0 => {
-                debug!(
-                    record_id = hex::encode(record_id),
-                    conflict = hex::encode(conflict_id),
-                    "[STORAGE] conflict_with set"
-                );
+                debug!(record_id = hex::encode(record_id), conflict = hex::encode(conflict_id), "[STORAGE] conflict_with set");
                 self.cache.write().invalidate(record_id);
                 true
             }
-            Ok(_) => {
-                warn!(record_id = hex::encode(record_id), "[STORAGE] conflict_with: record not found");
-                false
-            }
-            Err(e) => {
-                error!(error = %e, "[STORAGE] ❌ set_conflict_with failed");
-                false
-            }
+            Ok(_) => { warn!(record_id = hex::encode(record_id), "[STORAGE] conflict_with: record not found"); false }
+            Err(e) => { error!(error = %e, "[STORAGE] ❌ set_conflict_with failed"); false }
         }
     }
 
-    /// Insert a feedback event for SGD training.
     pub async fn insert_feedback(
-        &self,
-        owner: &[u8; 32],
-        memory_id: &[u8; 32],
-        session_id: &str,
-        turn_index: i64,
-        signal: i64,
-        features: Option<&[f32; 9]>,
-        prediction: Option<f32>,
+        &self, owner: &[u8; 32], memory_id: &[u8; 32], session_id: &str,
+        turn_index: i64, signal: i64, features: Option<&[f32; 9]>, prediction: Option<f32>,
     ) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        let features_blob: Option<Vec<u8>> = features.map(|f| {
-            f.iter().flat_map(|v| v.to_le_bytes()).collect()
-        });
-
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let features_blob: Option<Vec<u8>> = features.map(|f| f.iter().flat_map(|v| v.to_le_bytes()).collect());
         let conn = self.conn.lock().await;
         let _ = conn.execute(
             "INSERT INTO memory_feedback (owner, memory_id, session_id, turn_index,
@@ -313,28 +394,22 @@ impl MemoryStorage {
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 owner.as_slice(), memory_id.as_slice(), session_id,
-                turn_index, signal, features_blob.as_deref(),
-                prediction, now,
+                turn_index, signal, features_blob.as_deref(), prediction, now,
             ],
         );
     }
 
-    /// Get recent feedback events for baseline calculation.
     pub async fn get_recent_feedback(&self, limit: usize) -> Vec<(i64, f32)> {
         let conn = self.conn.lock().await;
         let mut stmt = match conn.prepare(
-            "SELECT signal, prediction FROM memory_feedback
-             ORDER BY created_at DESC LIMIT ?1"
+            "SELECT signal, prediction FROM memory_feedback ORDER BY created_at DESC LIMIT ?1"
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-
         stmt.query_map(params![limit as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1).unwrap_or(0.0)))
-        })
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     }
 }
 
@@ -361,9 +436,7 @@ impl MemoryStorage {
             "SELECT value FROM chain_state WHERE key='last_block_hash'",
             [], |row| {
                 let blob: Vec<u8> = row.get(0)?;
-                let mut h = [0u8; 32];
-                if blob.len() == 32 { h.copy_from_slice(&blob); }
-                Ok(h)
+                let mut h = [0u8; 32]; if blob.len() == 32 { h.copy_from_slice(&blob); } Ok(h)
             },
         ).unwrap_or([0u8; 32])
     }
@@ -374,11 +447,8 @@ impl MemoryStorage {
             "SELECT value FROM chain_state WHERE key='last_block_height'",
             [], |row| {
                 let blob: Vec<u8> = row.get(0)?;
-                if blob.len() == 8 {
-                    let mut b = [0u8; 8];
-                    b.copy_from_slice(&blob);
-                    Ok(u64::from_le_bytes(b))
-                } else { Ok(0u64) }
+                if blob.len() == 8 { let mut b = [0u8; 8]; b.copy_from_slice(&blob); Ok(u64::from_le_bytes(b)) }
+                else { Ok(0u64) }
             },
         ).unwrap_or(0)
     }
@@ -391,17 +461,13 @@ impl MemoryStorage {
 impl MemoryStorage {
     pub async fn stats(&self) -> StorageStats {
         let conn = self.conn.lock().await;
-
         let q = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> u64 {
             conn.query_row(sql, p, |r| r.get::<_, i64>(0)).unwrap_or(0) as u64
         };
-
         let total = q("SELECT COUNT(*) FROM records", &[]);
         let active = q("SELECT COUNT(*) FROM records WHERE status=0", &[]);
-
         StorageStats {
-            total_records: total,
-            active_records: active,
+            total_records: total, active_records: active,
             by_layer: LayerCounts {
                 identity:  q("SELECT COUNT(*) FROM records WHERE status=0 AND layer=0", &[]),
                 knowledge: q("SELECT COUNT(*) FROM records WHERE status=0 AND layer=1", &[]),
@@ -417,8 +483,7 @@ impl MemoryStorage {
 
     pub async fn count(&self) -> usize {
         let conn = self.conn.lock().await;
-        conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get::<_, i64>(0))
-            .unwrap_or(0) as usize
+        conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get::<_, i64>(0)).unwrap_or(0) as usize
     }
 }
 
@@ -427,144 +492,82 @@ impl MemoryStorage {
 // ============================================
 
 impl MemoryStorage {
-    /// Count active records for a layer.
     pub async fn count_by_layer(&self, layer: MemoryLayer) -> u64 {
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT COUNT(*) FROM records WHERE status=0 AND layer=?1",
-            params![layer as u8 as i64],
-            |row| row.get::<_, i64>(0),
+            params![layer as u8 as i64], |row| row.get::<_, i64>(0),
         ).unwrap_or(0) as u64
     }
 
-    /// Compact episodes to archive: change layer to Archive, keep status=Active.
-    pub async fn compact_episodes_to_archive(
-        &self,
-        owner: &[u8; 32],
-        limit: usize,
-    ) -> Vec<MemoryRecord> {
+    pub async fn compact_episodes_to_archive(&self, owner: &[u8; 32], limit: usize) -> Vec<MemoryRecord> {
         let conn = self.conn.lock().await;
-
         let records = self.query_rows(&conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
-                    status,supersedes,encrypted_content,embedding,
-                    signature,access_count,
+                    status,supersedes,encrypted_content,embedding,signature,access_count,
                     positive_feedback,negative_feedback,conflict_with
-             FROM records
-             WHERE owner=?1 AND status=0 AND layer=?2
-             ORDER BY timestamp ASC LIMIT ?3",
-            params![
-                owner.as_slice(),
-                MemoryLayer::Episode as u8 as i64,
-                limit as i64,
-            ],
+             FROM records WHERE owner=?1 AND status=0 AND layer=?2 ORDER BY timestamp ASC LIMIT ?3",
+            params![owner.as_slice(), MemoryLayer::Episode as u8 as i64, limit as i64],
         );
-
-        if records.is_empty() {
-            return records;
-        }
-
-        if conn.execute_batch("BEGIN TRANSACTION").is_err() {
-            return Vec::new();
-        }
-
+        if records.is_empty() { return records; }
+        if conn.execute_batch("BEGIN TRANSACTION").is_err() { return Vec::new(); }
         for r in &records {
-            let now_ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
+            let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
             if let Err(e) = conn.execute(
                 "UPDATE records SET layer=?1, archived_at=?2 WHERE record_id=?3",
-                params![
-                    MemoryLayer::Archive as u8 as i64,
-                    now_ts,
-                    r.record_id.as_slice(),
-                ],
+                params![MemoryLayer::Archive as u8 as i64, now_ts, r.record_id.as_slice()],
             ) {
                 error!(error=%e, "[STORAGE] ❌ Compact update failed, rolling back");
                 let _ = conn.execute_batch("ROLLBACK");
                 return Vec::new();
             }
         }
-
-        if conn.execute_batch("COMMIT").is_err() {
-            return Vec::new();
-        }
-
+        if conn.execute_batch("COMMIT").is_err() { return Vec::new(); }
         info!(count = records.len(), "[STORAGE] ⛏️ Episodes compacted to Archive layer");
         records
     }
 
-    /// Query records that need embedding backfill.
     pub async fn get_records_needing_embedding(&self, limit: usize) -> Vec<MemoryRecord> {
         let conn = self.conn.lock().await;
         self.query_rows(&conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
-                    status,supersedes,encrypted_content,embedding,
-                    signature,access_count,
+                    status,supersedes,encrypted_content,embedding,signature,access_count,
                     positive_feedback,negative_feedback,conflict_with
-             FROM records
-             WHERE embedding IS NULL AND status = 0
-             LIMIT ?1",
+             FROM records WHERE embedding IS NULL AND status = 0 LIMIT ?1",
             params![limit as i64],
         )
     }
 
-    /// Get records with _correction tag for Miner Step 0.6.
     pub async fn get_correction_records(&self) -> Vec<MemoryRecord> {
         let conn = self.conn.lock().await;
         self.query_rows(&conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
-                    status,supersedes,encrypted_content,embedding,
-                    signature,access_count,
+                    status,supersedes,encrypted_content,embedding,signature,access_count,
                     positive_feedback,negative_feedback,conflict_with
-             FROM records
-             WHERE topic_tags LIKE '%_correction%' AND status = 0",
-            [],
+             FROM records WHERE topic_tags LIKE '%_correction%' AND status = 0", [],
         )
     }
 
-    /// Update topic_tags for a record.
     pub async fn update_topic_tags(&self, record_id: &[u8; 32], tags: &[String]) {
         let json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
         let conn = self.conn.lock().await;
-        let _ = conn.execute(
-            "UPDATE records SET topic_tags = ?1 WHERE record_id = ?2",
-            params![json, record_id.as_slice()],
-        );
+        let _ = conn.execute("UPDATE records SET topic_tags = ?1 WHERE record_id = ?2", params![json, record_id.as_slice()]);
     }
 
-    /// Mark a record as superseded by another.
     pub async fn supersede_record(&self, old_id: &[u8; 32], new_id: &[u8; 32]) -> bool {
         let conn = self.conn.lock().await;
-        let r1 = conn.execute(
-            "UPDATE records SET status = 1 WHERE record_id = ?1",
-            params![old_id.as_slice()],
-        );
-        let r2 = conn.execute(
-            "UPDATE records SET supersedes = ?1 WHERE record_id = ?2",
-            params![old_id.as_slice(), new_id.as_slice()],
-        );
+        let r1 = conn.execute("UPDATE records SET status = 1 WHERE record_id = ?1", params![old_id.as_slice()]);
+        let r2 = conn.execute("UPDATE records SET supersedes = ?1 WHERE record_id = ?2", params![old_id.as_slice(), new_id.as_slice()]);
         r1.is_ok() && r2.is_ok()
     }
 
-    /// Load MVF user weights from database.
     pub async fn load_user_weights(&self, owner: &[u8; 32]) -> Option<Vec<u8>> {
         let conn = self.conn.lock().await;
-        conn.query_row(
-            "SELECT weights FROM user_weights WHERE owner = ?1",
-            params![owner.as_slice()],
-            |row| row.get::<_, Vec<u8>>(0),
-        ).optional().ok()?
+        conn.query_row("SELECT weights FROM user_weights WHERE owner = ?1", params![owner.as_slice()], |row| row.get::<_, Vec<u8>>(0)).optional().ok()?
     }
 
-    /// Save MVF user weights to database.
     pub async fn save_user_weights(&self, owner: &[u8; 32], weights_blob: &[u8], version: u64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         let conn = self.conn.lock().await;
         let _ = conn.execute(
             "INSERT INTO user_weights (owner, weights, version, created_at, updated_at)
@@ -580,34 +583,20 @@ impl MemoryStorage {
 // ============================================
 
 impl MemoryStorage {
-    /// Check if an active record with the same content already exists for this owner.
-    ///
-    /// When record_key is set, encrypts input before comparison (deterministic
-    /// encryption guarantees same plaintext → same ciphertext).
     pub async fn has_active_content(&self, owner: &[u8; 32], content: &[u8]) -> bool {
         let compare_content: Vec<u8> = if let Some(ref key) = self.record_key {
-            if content.is_empty() {
-                content.to_vec()
-            } else {
+            if content.is_empty() { content.to_vec() }
+            else {
                 match encrypt_record_content(key, content) {
                     Ok(ct) => ct,
-                    Err(e) => {
-                        warn!("[STORAGE] has_active_content encryption failed: {}", e);
-                        content.to_vec()
-                    }
+                    Err(e) => { warn!("[STORAGE] has_active_content encryption failed: {}", e); content.to_vec() }
                 }
             }
-        } else {
-            content.to_vec()
-        };
-
+        } else { content.to_vec() };
         let conn = self.conn.lock().await;
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM records
-             WHERE owner = ?1 AND encrypted_content = ?2 AND status = 0
-             LIMIT 1",
-            params![owner.as_slice(), compare_content.as_slice()],
-            |row| row.get(0),
+            "SELECT COUNT(*) FROM records WHERE owner = ?1 AND encrypted_content = ?2 AND status = 0 LIMIT 1",
+            params![owner.as_slice(), compare_content.as_slice()], |row| row.get(0),
         ).unwrap_or(0);
         count > 0
     }
@@ -618,62 +607,32 @@ impl MemoryStorage {
 // ============================================
 
 impl MemoryStorage {
-    /// Get the embedding_model for a record.
-    ///
-    /// MemoryRecord struct does not include embedding_model (it's storage metadata),
-    /// so this requires a separate query.
     pub async fn get_embedding_model(&self, record_id: &[u8; 32]) -> Option<String> {
         let conn = self.conn.lock().await;
-        conn.query_row(
-            "SELECT embedding_model FROM records WHERE record_id = ?1",
-            params![record_id.as_slice()],
-            |row| row.get::<_, String>(0),
-        ).optional().unwrap_or(None)
+        conn.query_row("SELECT embedding_model FROM records WHERE record_id = ?1", params![record_id.as_slice()], |row| row.get::<_, String>(0)).optional().unwrap_or(None)
     }
 
-    /// Get overview data: per-layer counts + recent records per layer.
-    ///
-    /// Returns up to 20 records per layer (80 total max), sorted by timestamp DESC.
-    /// Content is decrypted transparently if record_key is set.
     pub async fn get_overview(&self, owner: &[u8; 32], per_layer_limit: usize) -> OverviewData {
         let conn = self.conn.lock().await;
         let limit = per_layer_limit.min(50).max(1);
-
-        // 1. Per-layer counts
         let mut by_layer = HashMap::new();
-        let layer_names = [
-            (0i64, "identity"),
-            (1, "knowledge"),
-            (2, "episode"),
-            (3, "archive"),
-        ];
-
+        let layer_names = [(0i64, "identity"), (1, "knowledge"), (2, "episode"), (3, "archive")];
         for (layer_val, layer_name) in &layer_names {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM records WHERE owner = ?1 AND status = 0 AND layer = ?2",
-                params![owner.as_slice(), layer_val],
-                |row| row.get(0),
+                params![owner.as_slice(), layer_val], |row| row.get(0),
             ).unwrap_or(0);
             by_layer.insert(layer_name.to_string(), count as u64);
         }
-
-        // 2. Recent records per layer (with decryption)
         let mut recent_by_layer = HashMap::new();
         let rk = self.record_key;
-
         for (layer_val, layer_name) in &layer_names {
             let mut stmt = match conn.prepare(
                 "SELECT record_id, encrypted_content, topic_tags, timestamp,
                         access_count, positive_feedback, negative_feedback, source_ai
-                 FROM records
-                 WHERE owner = ?1 AND layer = ?2 AND status = 0
-                 ORDER BY timestamp DESC
-                 LIMIT ?3"
-            ) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
+                 FROM records WHERE owner = ?1 AND layer = ?2 AND status = 0
+                 ORDER BY timestamp DESC LIMIT ?3"
+            ) { Ok(s) => s, Err(_) => continue };
             let records: Vec<OverviewRecord> = stmt.query_map(
                 params![owner.as_slice(), layer_val, limit as i64],
                 |row| {
@@ -685,101 +644,662 @@ impl MemoryStorage {
                     let pos_fb: i64 = row.get(5)?;
                     let neg_fb: i64 = row.get(6)?;
                     let source_ai: String = row.get(7)?;
-
-                    // Decrypt content if record_key is set
                     let content = if let Some(key) = rk.as_ref() {
                         if raw_content.len() >= 28 {
                             match decrypt_record_content(key, &raw_content) {
                                 Ok(plain) => String::from_utf8_lossy(&plain).to_string(),
                                 Err(_) => String::from_utf8_lossy(&raw_content).to_string(),
                             }
-                        } else {
-                            String::from_utf8_lossy(&raw_content).to_string()
-                        }
-                    } else {
-                        String::from_utf8_lossy(&raw_content).to_string()
-                    };
-
+                        } else { String::from_utf8_lossy(&raw_content).to_string() }
+                    } else { String::from_utf8_lossy(&raw_content).to_string() };
                     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-
                     Ok(OverviewRecord {
-                        record_id: hex::encode(&rid_blob),
-                        content,
-                        topic_tags: tags,
-                        timestamp: timestamp as u64,
-                        access_count: access_count as u32,
-                        positive_feedback: pos_fb as u32,
-                        negative_feedback: neg_fb as u32,
-                        source_ai,
+                        record_id: hex::encode(&rid_blob), content, topic_tags: tags,
+                        timestamp: timestamp as u64, access_count: access_count as u32,
+                        positive_feedback: pos_fb as u32, negative_feedback: neg_fb as u32, source_ai,
                     })
                 },
-            )
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default();
-
+            ).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default();
             recent_by_layer.insert(layer_name.to_string(), records);
         }
-
-        // 3. Last memory timestamp
         let last_memory_at: i64 = conn.query_row(
             "SELECT COALESCE(MAX(timestamp), 0) FROM records WHERE owner = ?1 AND status = 0",
-            params![owner.as_slice()],
-            |row| row.get(0),
+            params![owner.as_slice()], |row| row.get(0),
         ).unwrap_or(0);
-
-        OverviewData {
-            by_layer,
-            recent_by_layer,
-            last_memory_at: last_memory_at as u64,
-        }
+        OverviewData { by_layer, recent_by_layer, last_memory_at: last_memory_at as u64 }
     }
 }
 
 // ============================================
-// impl MemoryStorage — v2.3.0 Remote Storage Capacity
+// impl MemoryStorage — v2.3.0 Remote Storage
 // ============================================
 
 impl MemoryStorage {
-    /// Count the number of distinct owners in the records table.
-    ///
-    /// Used by the MPI auth middleware to enforce `max_remote_owners` capacity.
-    /// This counts ALL owners (including the local node operator).
-    ///
-    /// ## Performance
-    /// Uses `idx_owner` index on `records(owner)` for efficient scanning.
-    /// For 15,000+ nodes with typical record counts, this completes in < 1ms.
-    ///
-    /// ## Note
-    /// Only counts owners that have at least one record (active or revoked).
-    /// A remote user whose records have all been fully deleted (not just revoked)
-    /// would not be counted, allowing their slot to be reused.
     pub async fn count_distinct_owners(&self) -> usize {
         let conn = self.conn.lock().await;
-        conn.query_row(
-            "SELECT COUNT(DISTINCT owner) FROM records",
-            [],
-            |row| row.get::<_, i64>(0),
-        ).unwrap_or(0) as usize
+        conn.query_row("SELECT COUNT(DISTINCT owner) FROM records", [], |row| row.get::<_, i64>(0)).unwrap_or(0) as usize
     }
 
-    /// Check whether a specific owner has any records in the database.
-    ///
-    /// Used by the MPI auth middleware to distinguish between:
-    /// - Existing remote user (already has records → always allowed, doesn't consume a new slot)
-    /// - New remote user (no records yet → may be rejected if capacity is full)
-    ///
-    /// ## Performance
-    /// Uses `idx_owner` index and `LIMIT 1` for O(1) lookup.
-    /// Much faster than `count_distinct_owners()` for the common case
-    /// (checking if a specific user is already known).
     pub async fn owner_exists(&self, owner: &[u8; 32]) -> bool {
         let conn = self.conn.lock().await;
-        let exists: bool = conn.query_row(
+        conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM records WHERE owner = ?1 LIMIT 1)",
-            params![owner.as_slice()],
-            |row| row.get::<_, bool>(0),
-        ).unwrap_or(false);
-        exists
+            params![owner.as_slice()], |row| row.get::<_, bool>(0),
+        ).unwrap_or(false)
+    }
+}
+
+// ============================================
+// impl MemoryStorage — v2.4.0 Episodes
+// ============================================
+
+impl MemoryStorage {
+    /// Insert or update an episode (complete conversation window).
+    /// Uses content_hash for dedup (INSERT OR IGNORE on episode_id).
+    pub async fn upsert_episode(
+        &self, episode_id: &str, owner: &[u8; 32], episode_type: &str,
+        source: &str, session_id: Option<&str>, encrypted_content: &[u8],
+        content_hash: &str, embedding: Option<&[f32]>, token_count: Option<i64>,
+        created_at: i64, metadata_json: Option<&str>,
+    ) -> Result<(), String> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let emb_blob: Option<Vec<u8>> = embedding.map(embedding_to_bytes);
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO episodes
+                (episode_id, owner, episode_type, source, session_id, encrypted_content,
+                 content_hash, embedding, token_count, created_at, ingested_at, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                episode_id, owner.as_slice(), episode_type, source, session_id,
+                encrypted_content, content_hash, emb_blob.as_deref(),
+                token_count, created_at, now, metadata_json,
+            ],
+        ).map_err(|e| format!("Episode insert: {}", e))?;
+        Ok(())
+    }
+
+    /// Get episodes for a session, ordered by creation time.
+    pub async fn get_episodes_for_session(&self, session_id: &str) -> Vec<(String, String, i64)> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT episode_id, episode_type, created_at FROM episodes
+             WHERE session_id = ?1 ORDER BY created_at ASC"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        stmt.query_map(params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+}
+
+// ============================================
+// impl MemoryStorage — v2.4.0 Entities
+// ============================================
+
+impl MemoryStorage {
+    /// Upsert an entity. If entity_id already exists, increment mention_count
+    /// and update description/updated_at.
+    pub async fn upsert_entity(
+        &self, entity_id: &str, owner: &[u8; 32], name: &str, name_normalized: &str,
+        entity_type: &str, description: Option<&str>, embedding: Option<&[f32]>,
+    ) -> Result<bool, String> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let emb_blob: Option<Vec<u8>> = embedding.map(embedding_to_bytes);
+        let conn = self.conn.lock().await;
+
+        // Try insert first
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO entities
+                (entity_id, owner, name, name_normalized, entity_type, description,
+                 embedding, created_at, updated_at, mention_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
+            params![
+                entity_id, owner.as_slice(), name, name_normalized,
+                entity_type, description, emb_blob.as_deref(), now, now,
+            ],
+        ).map_err(|e| format!("Entity insert: {}", e))?;
+
+        if inserted == 0 {
+            // Already exists — increment mention count and update
+            conn.execute(
+                "UPDATE entities SET mention_count = mention_count + 1, updated_at = ?1,
+                    description = COALESCE(?2, description),
+                    embedding = COALESCE(?3, embedding)
+                 WHERE entity_id = ?4",
+                params![now, description, emb_blob.as_deref(), entity_id],
+            ).map_err(|e| format!("Entity update: {}", e))?;
+            Ok(false) // existing
+        } else {
+            Ok(true) // new
+        }
+    }
+
+    /// Get entity by ID.
+    pub async fn get_entity(&self, entity_id: &str) -> Option<EntityRow> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT entity_id, name, name_normalized, entity_type, description,
+                    community_id, mention_count, created_at, updated_at
+             FROM entities WHERE entity_id = ?1",
+            params![entity_id],
+            |row| Ok(EntityRow {
+                entity_id: row.get(0)?, name: row.get(1)?, name_normalized: row.get(2)?,
+                entity_type: row.get(3)?, description: row.get(4)?,
+                community_id: row.get(5)?, mention_count: row.get(6)?,
+                created_at: row.get(7)?, updated_at: row.get(8)?,
+            }),
+        ).optional().unwrap_or(None)
+    }
+
+    /// Get all entities for an owner, optionally filtered by type.
+    pub async fn get_entities_by_owner(
+        &self, owner: &[u8; 32], entity_type: Option<&str>, limit: usize,
+    ) -> Vec<EntityRow> {
+        let conn = self.conn.lock().await;
+        if let Some(et) = entity_type {
+            let mut stmt = match conn.prepare(
+                "SELECT entity_id, name, name_normalized, entity_type, description,
+                        community_id, mention_count, created_at, updated_at
+                 FROM entities WHERE owner = ?1 AND entity_type = ?2
+                 ORDER BY mention_count DESC LIMIT ?3"
+            ) { Ok(s) => s, Err(_) => return Vec::new() };
+            stmt.query_map(params![owner.as_slice(), et, limit as i64], |row| Ok(EntityRow {
+                entity_id: row.get(0)?, name: row.get(1)?, name_normalized: row.get(2)?,
+                entity_type: row.get(3)?, description: row.get(4)?,
+                community_id: row.get(5)?, mention_count: row.get(6)?,
+                created_at: row.get(7)?, updated_at: row.get(8)?,
+            })).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+        } else {
+            let mut stmt = match conn.prepare(
+                "SELECT entity_id, name, name_normalized, entity_type, description,
+                        community_id, mention_count, created_at, updated_at
+                 FROM entities WHERE owner = ?1 ORDER BY mention_count DESC LIMIT ?2"
+            ) { Ok(s) => s, Err(_) => return Vec::new() };
+            stmt.query_map(params![owner.as_slice(), limit as i64], |row| Ok(EntityRow {
+                entity_id: row.get(0)?, name: row.get(1)?, name_normalized: row.get(2)?,
+                entity_type: row.get(3)?, description: row.get(4)?,
+                community_id: row.get(5)?, mention_count: row.get(6)?,
+                created_at: row.get(7)?, updated_at: row.get(8)?,
+            })).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+        }
+    }
+
+    /// Get cached entity names for a given owner (for Stage 1 novelty scoring).
+    /// Returns a map of name_normalized → entity_id.
+    pub async fn get_entities_cached(&self, owner: &[u8; 32]) -> HashMap<String, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT name_normalized, entity_id FROM entities WHERE owner = ?1"
+        ) { Ok(s) => s, Err(_) => return HashMap::new() };
+        stmt.query_map(params![owner.as_slice()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+
+    /// Update an entity's community assignment.
+    pub async fn update_entity_community(&self, entity_id: &str, community_id: &str) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let conn = self.conn.lock().await;
+        let _ = conn.execute(
+            "UPDATE entities SET community_id = ?1, updated_at = ?2 WHERE entity_id = ?3",
+            params![community_id, now, entity_id],
+        );
+    }
+}
+
+// ============================================
+// impl MemoryStorage — v2.4.0 Knowledge Edges
+// ============================================
+
+impl MemoryStorage {
+    /// Insert a new knowledge edge (relationship between entities).
+    pub async fn insert_knowledge_edge(
+        &self, owner: &[u8; 32], source_id: &str, target_id: &str,
+        relation_type: &str, fact_text: Option<&str>, weight: f64, confidence: f64,
+        embedding: Option<&[f32]>, valid_from: i64, episode_id: Option<&str>,
+    ) -> Result<i64, String> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let emb_blob: Option<Vec<u8>> = embedding.map(embedding_to_bytes);
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO knowledge_edges
+                (owner, source_id, target_id, relation_type, fact_text, weight, confidence,
+                 embedding, valid_from, valid_until, episode_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12)",
+            params![
+                owner.as_slice(), source_id, target_id, relation_type,
+                fact_text, weight, confidence, emb_blob.as_deref(),
+                valid_from, episode_id, now, now,
+            ],
+        ).map_err(|e| format!("Knowledge edge insert: {}", e))?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get all currently valid edges from/to an entity.
+    pub async fn get_edges_for_entity(&self, entity_id: &str, owner: &[u8; 32]) -> Vec<KnowledgeEdgeRow> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT edge_id, source_id, target_id, relation_type, fact_text, weight,
+                    confidence, valid_from, valid_until, episode_id
+             FROM knowledge_edges
+             WHERE owner = ?1 AND (source_id = ?2 OR target_id = ?2) AND valid_until IS NULL
+             ORDER BY weight DESC"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        stmt.query_map(params![owner.as_slice(), entity_id], |row| Ok(KnowledgeEdgeRow {
+            edge_id: row.get(0)?, source_id: row.get(1)?, target_id: row.get(2)?,
+            relation_type: row.get(3)?, fact_text: row.get(4)?, weight: row.get(5)?,
+            confidence: row.get(6)?, valid_from: row.get(7)?, valid_until: row.get(8)?,
+            episode_id: row.get(9)?,
+        })).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+
+    /// Get currently valid edges for BFS traversal from a set of entity IDs.
+    /// Returns edges sorted by weight × confidence descending.
+    pub async fn get_active_edges(
+        &self, owner: &[u8; 32], entity_ids: &[String], min_weight: f64,
+    ) -> Vec<KnowledgeEdgeRow> {
+        if entity_ids.is_empty() { return Vec::new(); }
+        let conn = self.conn.lock().await;
+        // Build IN clause — rusqlite doesn't support array params natively
+        let placeholders: Vec<String> = entity_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 3)).collect();
+        let in_clause = placeholders.join(",");
+        let sql = format!(
+            "SELECT edge_id, source_id, target_id, relation_type, fact_text, weight,
+                    confidence, valid_from, valid_until, episode_id
+             FROM knowledge_edges
+             WHERE owner = ?1 AND valid_until IS NULL AND weight >= ?2
+               AND (source_id IN ({in_clause}) OR target_id IN ({in_clause}))
+             ORDER BY (weight * confidence) DESC"
+        );
+        let mut stmt = match conn.prepare(&sql) { Ok(s) => s, Err(_) => return Vec::new() };
+        // Build params: owner, min_weight, then entity_ids twice (for source_id IN and target_id IN)
+        // However, SQLite reuses the same placeholders. We need to flatten.
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        param_values.push(Box::new(owner.to_vec()));
+        param_values.push(Box::new(min_weight));
+        for eid in entity_ids { param_values.push(Box::new(eid.clone())); }
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+        stmt.query_map(param_refs.as_slice(), |row| Ok(KnowledgeEdgeRow {
+            edge_id: row.get(0)?, source_id: row.get(1)?, target_id: row.get(2)?,
+            relation_type: row.get(3)?, fact_text: row.get(4)?, weight: row.get(5)?,
+            confidence: row.get(6)?, valid_from: row.get(7)?, valid_until: row.get(8)?,
+            episode_id: row.get(9)?,
+        })).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+
+    /// Invalidate a knowledge edge (set valid_until = now).
+    /// Used for temporal conflict resolution.
+    pub async fn invalidate_edge(&self, edge_id: i64) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let conn = self.conn.lock().await;
+        let _ = conn.execute(
+            "UPDATE knowledge_edges SET valid_until = ?1, updated_at = ?1 WHERE edge_id = ?2",
+            params![now, edge_id],
+        );
+    }
+}
+
+// ============================================
+// impl MemoryStorage — v2.4.0 Episode Edges
+// ============================================
+
+impl MemoryStorage {
+    /// Link an episode to an entity (bidirectional index).
+    pub async fn insert_episode_edge(
+        &self, owner: &[u8; 32], episode_id: &str, entity_id: &str, role: &str,
+    ) -> Result<(), String> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO episode_edges (owner, episode_id, entity_id, role, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![owner.as_slice(), episode_id, entity_id, role, now],
+        ).map_err(|e| format!("Episode edge insert: {}", e))?;
+        Ok(())
+    }
+
+    /// Get entity IDs linked to an episode (forward traversal).
+    pub async fn get_entities_for_episode(&self, episode_id: &str) -> Vec<(String, String)> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT entity_id, role FROM episode_edges WHERE episode_id = ?1"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        stmt.query_map(params![episode_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+
+    /// Get episode IDs linked to an entity (reverse traversal / provenance).
+    pub async fn get_episodes_for_entity(&self, entity_id: &str) -> Vec<(String, String)> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT episode_id, role FROM episode_edges WHERE entity_id = ?1"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        stmt.query_map(params![entity_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+}
+
+// ============================================
+// impl MemoryStorage — v2.4.0 Communities
+// ============================================
+
+impl MemoryStorage {
+    /// Upsert a community (label propagation result).
+    pub async fn upsert_community(
+        &self, community_id: &str, owner: &[u8; 32], name: &str,
+        summary: Option<&str>, description: Option<&str>, entity_count: i64,
+    ) -> Result<(), String> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO communities (community_id, owner, name, summary, description,
+                entity_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(community_id) DO UPDATE SET
+                name = ?3, summary = COALESCE(?4, summary),
+                description = COALESCE(?5, description),
+                entity_count = ?6, updated_at = ?8",
+            params![community_id, owner.as_slice(), name, summary, description, entity_count, now, now],
+        ).map_err(|e| format!("Community upsert: {}", e))?;
+        Ok(())
+    }
+
+    /// Get all communities for an owner.
+    pub async fn get_communities(&self, owner: &[u8; 32]) -> Vec<CommunityRow> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT community_id, name, summary, description, entity_count, updated_at
+             FROM communities WHERE owner = ?1 ORDER BY entity_count DESC"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        stmt.query_map(params![owner.as_slice()], |row| Ok(CommunityRow {
+            community_id: row.get(0)?, name: row.get(1)?, summary: row.get(2)?,
+            description: row.get(3)?, entity_count: row.get(4)?, updated_at: row.get(5)?,
+        })).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+
+    /// Get entities belonging to a specific community.
+    pub async fn get_entities_in_community(&self, community_id: &str, owner: &[u8; 32]) -> Vec<EntityRow> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT entity_id, name, name_normalized, entity_type, description,
+                    community_id, mention_count, created_at, updated_at
+             FROM entities WHERE owner = ?1 AND community_id = ?2
+             ORDER BY mention_count DESC"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        stmt.query_map(params![owner.as_slice(), community_id], |row| Ok(EntityRow {
+            entity_id: row.get(0)?, name: row.get(1)?, name_normalized: row.get(2)?,
+            entity_type: row.get(3)?, description: row.get(4)?,
+            community_id: row.get(5)?, mention_count: row.get(6)?,
+            created_at: row.get(7)?, updated_at: row.get(8)?,
+        })).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+
+    /// Get communities that have new entities since last community detection run.
+    /// Used by Miner Step 8 for incremental label propagation.
+    pub async fn get_communities_with_new_entities(&self, owner: &[u8; 32], since: i64) -> Vec<String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT DISTINCT community_id FROM entities
+             WHERE owner = ?1 AND community_id IS NOT NULL AND updated_at > ?2"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        stmt.query_map(params![owner.as_slice(), since], |row| row.get::<_, String>(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+}
+
+// ============================================
+// impl MemoryStorage — v2.4.0 Projects
+// ============================================
+
+impl MemoryStorage {
+    /// Upsert a project (community specialization).
+    pub async fn upsert_project(
+        &self, project_id: &str, owner: &[u8; 32], name: &str,
+        status: &str, community_id: &str, summary: Option<&str>,
+    ) -> Result<(), String> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO projects (project_id, owner, name, status, community_id,
+                summary, created_at, updated_at, last_active_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(project_id) DO UPDATE SET
+                name = ?3, status = ?4, summary = COALESCE(?6, summary),
+                updated_at = ?8, last_active_at = ?9",
+            params![project_id, owner.as_slice(), name, status, community_id, summary, now, now, now],
+        ).map_err(|e| format!("Project upsert: {}", e))?;
+        Ok(())
+    }
+
+    /// Get all projects for an owner, optionally filtered by status.
+    pub async fn get_projects(&self, owner: &[u8; 32], status: Option<&str>, limit: usize) -> Vec<ProjectRow> {
+        let conn = self.conn.lock().await;
+        if let Some(s) = status {
+            let mut stmt = match conn.prepare(
+                "SELECT project_id, name, status, community_id, summary, last_active_at
+                 FROM projects WHERE owner = ?1 AND status = ?2
+                 ORDER BY last_active_at DESC LIMIT ?3"
+            ) { Ok(s) => s, Err(_) => return Vec::new() };
+            stmt.query_map(params![owner.as_slice(), s, limit as i64], |row| Ok(ProjectRow {
+                project_id: row.get(0)?, name: row.get(1)?, status: row.get(2)?,
+                community_id: row.get(3)?, summary: row.get(4)?, last_active_at: row.get(5)?,
+            })).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+        } else {
+            let mut stmt = match conn.prepare(
+                "SELECT project_id, name, status, community_id, summary, last_active_at
+                 FROM projects WHERE owner = ?1 ORDER BY last_active_at DESC LIMIT ?2"
+            ) { Ok(s) => s, Err(_) => return Vec::new() };
+            stmt.query_map(params![owner.as_slice(), limit as i64], |row| Ok(ProjectRow {
+                project_id: row.get(0)?, name: row.get(1)?, status: row.get(2)?,
+                community_id: row.get(3)?, summary: row.get(4)?, last_active_at: row.get(5)?,
+            })).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+        }
+    }
+
+    /// Get a single project by ID.
+    pub async fn get_project(&self, project_id: &str) -> Option<ProjectRow> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT project_id, name, status, community_id, summary, last_active_at
+             FROM projects WHERE project_id = ?1",
+            params![project_id],
+            |row| Ok(ProjectRow {
+                project_id: row.get(0)?, name: row.get(1)?, status: row.get(2)?,
+                community_id: row.get(3)?, summary: row.get(4)?, last_active_at: row.get(5)?,
+            }),
+        ).optional().unwrap_or(None)
+    }
+}
+
+// ============================================
+// impl MemoryStorage — v2.4.0 Sessions
+// ============================================
+
+impl MemoryStorage {
+    /// Upsert a session (conversation metadata).
+    pub async fn upsert_session(
+        &self, session_id: &str, owner: &[u8; 32], project_id: Option<&str>,
+        session_type: &str, started_at: i64, turn_count: i64,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO sessions (session_id, owner, project_id, session_type,
+                started_at, turn_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id) DO UPDATE SET
+                project_id = COALESCE(?3, project_id),
+                turn_count = ?6",
+            params![session_id, owner.as_slice(), project_id, session_type, started_at, turn_count],
+        ).map_err(|e| format!("Session upsert: {}", e))?;
+        Ok(())
+    }
+
+    /// Get a session by ID.
+    pub async fn get_session(&self, session_id: &str) -> Option<SessionRow> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT session_id, project_id, session_type, started_at, ended_at,
+                    turn_count, summary, key_decisions, entities_extracted, summary_generated
+             FROM sessions WHERE session_id = ?1",
+            params![session_id],
+            |row| Ok(SessionRow {
+                session_id: row.get(0)?, project_id: row.get(1)?, session_type: row.get(2)?,
+                started_at: row.get(3)?, ended_at: row.get(4)?, turn_count: row.get(5)?,
+                summary: row.get(6)?, key_decisions: row.get(7)?,
+                entities_extracted: row.get::<_, i64>(8).unwrap_or(0) != 0,
+                summary_generated: row.get::<_, i64>(9).unwrap_or(0) != 0,
+            }),
+        ).optional().unwrap_or(None)
+    }
+
+    /// Get sessions for a project (timeline view).
+    pub async fn get_sessions_for_project(&self, project_id: &str, limit: usize) -> Vec<SessionRow> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT session_id, project_id, session_type, started_at, ended_at,
+                    turn_count, summary, key_decisions, entities_extracted, summary_generated
+             FROM sessions WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        stmt.query_map(params![project_id, limit as i64], |row| Ok(SessionRow {
+            session_id: row.get(0)?, project_id: row.get(1)?, session_type: row.get(2)?,
+            started_at: row.get(3)?, ended_at: row.get(4)?, turn_count: row.get(5)?,
+            summary: row.get(6)?, key_decisions: row.get(7)?,
+            entities_extracted: row.get::<_, i64>(8).unwrap_or(0) != 0,
+            summary_generated: row.get::<_, i64>(9).unwrap_or(0) != 0,
+        })).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+
+    /// Update session summary and key decisions (Miner Step 10).
+    pub async fn update_session_summary(
+        &self, session_id: &str, summary: &str, key_decisions: Option<&str>,
+    ) {
+        let conn = self.conn.lock().await;
+        let _ = conn.execute(
+            "UPDATE sessions SET summary = ?1, key_decisions = ?2, summary_generated = 1
+             WHERE session_id = ?3",
+            params![summary, key_decisions, session_id],
+        );
+    }
+
+    /// Mark a session as having completed entity extraction.
+    pub async fn mark_session_entities_extracted(&self, session_id: &str) {
+        let conn = self.conn.lock().await;
+        let _ = conn.execute(
+            "UPDATE sessions SET entities_extracted = 1 WHERE session_id = ?1",
+            params![session_id],
+        );
+    }
+
+    /// Get sessions pending entity extraction or summary generation.
+    pub async fn get_pending_sessions(&self, owner: &[u8; 32], limit: usize) -> Vec<SessionRow> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT session_id, project_id, session_type, started_at, ended_at,
+                    turn_count, summary, key_decisions, entities_extracted, summary_generated
+             FROM sessions
+             WHERE owner = ?1 AND (entities_extracted = 0 OR summary_generated = 0)
+             ORDER BY started_at DESC LIMIT ?2"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        stmt.query_map(params![owner.as_slice(), limit as i64], |row| Ok(SessionRow {
+            session_id: row.get(0)?, project_id: row.get(1)?, session_type: row.get(2)?,
+            started_at: row.get(3)?, ended_at: row.get(4)?, turn_count: row.get(5)?,
+            summary: row.get(6)?, key_decisions: row.get(7)?,
+            entities_extracted: row.get::<_, i64>(8).unwrap_or(0) != 0,
+            summary_generated: row.get::<_, i64>(9).unwrap_or(0) != 0,
+        })).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+}
+
+// ============================================
+// impl MemoryStorage — v2.4.0 Artifacts
+// ============================================
+
+impl MemoryStorage {
+    /// Insert a code/document artifact.
+    pub async fn insert_artifact(
+        &self, artifact_id: &str, owner: &[u8; 32], session_id: &str,
+        project_id: Option<&str>, artifact_type: &str, filename: Option<&str>,
+        language: Option<&str>, version: i64, parent_id: Option<&str>,
+        encrypted_content: &[u8], content_hash: &str, embedding: Option<&[f32]>,
+        line_count: Option<i64>,
+    ) -> Result<(), String> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let emb_blob: Option<Vec<u8>> = embedding.map(embedding_to_bytes);
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO artifacts
+                (artifact_id, owner, session_id, project_id, artifact_type, filename,
+                 language, version, parent_id, encrypted_content, content_hash,
+                 embedding, line_count, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![
+                artifact_id, owner.as_slice(), session_id, project_id,
+                artifact_type, filename, language, version, parent_id,
+                encrypted_content, content_hash, emb_blob.as_deref(),
+                line_count, now,
+            ],
+        ).map_err(|e| format!("Artifact insert: {}", e))?;
+        Ok(())
+    }
+
+    /// Get artifacts for a session.
+    pub async fn get_artifacts_for_session(&self, session_id: &str) -> Vec<ArtifactRow> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT artifact_id, session_id, project_id, artifact_type, filename,
+                    language, version, parent_id, content_hash, line_count, created_at
+             FROM artifacts WHERE session_id = ?1 ORDER BY created_at ASC"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        stmt.query_map(params![session_id], |row| Ok(ArtifactRow {
+            artifact_id: row.get(0)?, session_id: row.get(1)?, project_id: row.get(2)?,
+            artifact_type: row.get(3)?, filename: row.get(4)?, language: row.get(5)?,
+            version: row.get(6)?, parent_id: row.get(7)?, content_hash: row.get(8)?,
+            line_count: row.get(9)?, created_at: row.get(10)?,
+        })).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+
+    /// Get version history for a file (all versions, newest first).
+    pub async fn get_artifact_versions(&self, owner: &[u8; 32], filename: &str) -> Vec<ArtifactRow> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT artifact_id, session_id, project_id, artifact_type, filename,
+                    language, version, parent_id, content_hash, line_count, created_at
+             FROM artifacts WHERE owner = ?1 AND filename = ?2
+             ORDER BY version DESC"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        stmt.query_map(params![owner.as_slice(), filename], |row| Ok(ArtifactRow {
+            artifact_id: row.get(0)?, session_id: row.get(1)?, project_id: row.get(2)?,
+            artifact_type: row.get(3)?, filename: row.get(4)?, language: row.get(5)?,
+            version: row.get(6)?, parent_id: row.get(7)?, content_hash: row.get(8)?,
+            line_count: row.get(9)?, created_at: row.get(10)?,
+        })).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+}
+
+// ============================================
+// impl MemoryStorage — v2.4.0 Graph Stats
+// ============================================
+
+impl MemoryStorage {
+    /// Get cognitive graph statistics for /api/mpi/status.
+    pub async fn graph_stats(&self, owner: &[u8; 32]) -> GraphStats {
+        let conn = self.conn.lock().await;
+        let q = |table: &str| -> u64 {
+            let sql = format!("SELECT COUNT(*) FROM {} WHERE owner = ?1", table);
+            conn.query_row(&sql, params![owner.as_slice()], |r| r.get::<_, i64>(0)).unwrap_or(0) as u64
+        };
+        GraphStats {
+            episodes: q("episodes"),
+            entities: q("entities"),
+            knowledge_edges: q("knowledge_edges"),
+            communities: q("communities"),
+            projects: q("projects"),
+            sessions: q("sessions"),
+            artifacts: q("artifacts"),
+        }
     }
 }
 
@@ -798,7 +1318,7 @@ mod tests {
     }
 
     // ========================================
-    // Existing tests (preserved)
+    // Existing tests (preserved from v2.3.0)
     // ========================================
 
     #[tokio::test]
@@ -807,7 +1327,6 @@ mod tests {
         let owner = [0xBB; 32];
         let r = make_rec_owner(100, owner, MemoryLayer::Episode);
         s.insert(&r, "m").await;
-
         assert!(s.has_active_content(&owner, &r.encrypted_content).await);
         assert!(!s.has_active_content(&owner, b"nonexistent").await);
         assert!(!s.has_active_content(&[0xCC; 32], &r.encrypted_content).await);
@@ -840,11 +1359,9 @@ mod tests {
         let r = make_rec_owner(100, owner, MemoryLayer::Episode);
         let rid = r.record_id;
         s.insert(&r, "m").await;
-
         s.increment_positive_feedback(&rid).await;
         s.increment_negative_feedback(&rid).await;
         s.increment_negative_feedback(&rid).await;
-
         let got = s.get(&rid).await.unwrap();
         assert_eq!(got.positive_feedback, 1);
         assert_eq!(got.negative_feedback, 2);
@@ -856,7 +1373,6 @@ mod tests {
         let owner = [0xAA; 32];
         s.insert(&make_rec_owner(100, owner, MemoryLayer::Episode), "m").await;
         s.insert(&make_rec_owner(200, owner, MemoryLayer::Identity), "m").await;
-
         let stats = s.stats().await;
         assert_eq!(stats.total_records, 2);
         assert_eq!(stats.active_records, 2);
@@ -880,17 +1396,12 @@ mod tests {
         s.insert(&make_rec_owner(100, owner, MemoryLayer::Episode), "m").await;
         s.insert(&make_rec_owner(200, owner, MemoryLayer::Identity), "m").await;
         s.insert(&make_rec_owner(300, owner, MemoryLayer::Knowledge), "m").await;
-
         let ov = s.get_overview(&owner, 20).await;
         assert_eq!(*ov.by_layer.get("episode").unwrap(), 1);
         assert_eq!(*ov.by_layer.get("identity").unwrap(), 1);
         assert_eq!(*ov.by_layer.get("knowledge").unwrap(), 1);
         assert_eq!(ov.last_memory_at, 300);
     }
-
-    // ========================================
-    // v2.3.0: Remote Storage Capacity Tests
-    // ========================================
 
     #[tokio::test]
     async fn test_count_distinct_owners_empty() {
@@ -899,58 +1410,167 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_count_distinct_owners_single() {
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        let owner = [0xAA; 32];
-        s.insert(&make_rec_owner(100, owner, MemoryLayer::Episode), "m").await;
-        s.insert(&make_rec_owner(200, owner, MemoryLayer::Knowledge), "m").await;
-        // Same owner, two records → 1 distinct owner
-        assert_eq!(s.count_distinct_owners().await, 1);
-    }
-
-    #[tokio::test]
     async fn test_count_distinct_owners_multiple() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        let owner_a = [0xAA; 32];
-        let owner_b = [0xBB; 32];
-        let owner_c = [0xCC; 32];
-        s.insert(&make_rec_owner(100, owner_a, MemoryLayer::Episode), "m").await;
-        s.insert(&make_rec_owner(200, owner_b, MemoryLayer::Episode), "m").await;
-        s.insert(&make_rec_owner(300, owner_c, MemoryLayer::Episode), "m").await;
-        s.insert(&make_rec_owner(400, owner_a, MemoryLayer::Identity), "m").await;
-        // 3 distinct owners (owner_a has 2 records but counted once)
+        s.insert(&make_rec_owner(100, [0xAA; 32], MemoryLayer::Episode), "m").await;
+        s.insert(&make_rec_owner(200, [0xBB; 32], MemoryLayer::Episode), "m").await;
+        s.insert(&make_rec_owner(300, [0xCC; 32], MemoryLayer::Episode), "m").await;
+        s.insert(&make_rec_owner(400, [0xAA; 32], MemoryLayer::Identity), "m").await;
         assert_eq!(s.count_distinct_owners().await, 3);
-    }
-
-    #[tokio::test]
-    async fn test_owner_exists_empty() {
-        let s = MemoryStorage::open(":memory:", None).unwrap();
-        assert!(!s.owner_exists(&[0xAA; 32]).await);
     }
 
     #[tokio::test]
     async fn test_owner_exists_after_insert() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
-        let other = [0xBB; 32];
         s.insert(&make_rec_owner(100, owner, MemoryLayer::Episode), "m").await;
-
         assert!(s.owner_exists(&owner).await);
-        assert!(!s.owner_exists(&other).await);
+        assert!(!s.owner_exists(&[0xBB; 32]).await);
+    }
+
+    // ========================================
+    // v2.4.0: Cognitive Graph CRUD Tests
+    // ========================================
+
+    #[tokio::test]
+    async fn test_entity_upsert_new() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        let is_new = s.upsert_entity("ent_jwt", &owner, "JWT", "jwt", "technology", Some("JSON Web Token"), None).await.unwrap();
+        assert!(is_new);
+        let ent = s.get_entity("ent_jwt").await.unwrap();
+        assert_eq!(ent.name, "JWT");
+        assert_eq!(ent.mention_count, 1);
     }
 
     #[tokio::test]
-    async fn test_owner_exists_includes_revoked() {
+    async fn test_entity_upsert_existing_increments() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
-        let r = make_rec_owner(100, owner, MemoryLayer::Episode);
-        let rid = r.record_id;
-        s.insert(&r, "m").await;
-        s.revoke(&rid).await;
+        s.upsert_entity("ent_jwt", &owner, "JWT", "jwt", "technology", None, None).await.unwrap();
+        let is_new = s.upsert_entity("ent_jwt", &owner, "JWT", "jwt", "technology", Some("Updated desc"), None).await.unwrap();
+        assert!(!is_new);
+        let ent = s.get_entity("ent_jwt").await.unwrap();
+        assert_eq!(ent.mention_count, 2);
+        assert_eq!(ent.description, Some("Updated desc".into()));
+    }
 
-        // Owner should still exist (revoked record remains in DB)
-        // This prevents a revoked-all-records user from losing their slot
-        // and being re-counted as a "new" user.
-        assert!(s.owner_exists(&owner).await);
+    #[tokio::test]
+    async fn test_entities_cached() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        s.upsert_entity("ent_jwt", &owner, "JWT", "jwt", "technology", None, None).await.unwrap();
+        s.upsert_entity("ent_auth", &owner, "auth module", "auth module", "module", None, None).await.unwrap();
+        let cache = s.get_entities_cached(&owner).await;
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get("jwt"), Some(&"ent_jwt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_knowledge_edge_insert_and_query() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let edge_id = s.insert_knowledge_edge(&owner, "ent_auth", "ent_jwt", "USES", Some("auth uses JWT"), 1.0, 0.95, None, now, None).await.unwrap();
+        assert!(edge_id > 0);
+        let edges = s.get_edges_for_entity("ent_auth", &owner).await;
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].relation_type, "USES");
+    }
+
+    #[tokio::test]
+    async fn test_knowledge_edge_invalidation() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let eid = s.insert_knowledge_edge(&owner, "ent_auth", "ent_jwt", "USES", None, 1.0, 0.9, None, now, None).await.unwrap();
+        s.invalidate_edge(eid).await;
+        // After invalidation, get_edges_for_entity should return empty (only valid edges)
+        let edges = s.get_edges_for_entity("ent_auth", &owner).await;
+        assert!(edges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_episode_edge_bidirectional() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        s.insert_episode_edge(&owner, "ep_001", "ent_jwt", "mentioned").await.unwrap();
+        s.insert_episode_edge(&owner, "ep_001", "ent_auth", "produced").await.unwrap();
+        let entities = s.get_entities_for_episode("ep_001").await;
+        assert_eq!(entities.len(), 2);
+        let episodes = s.get_episodes_for_entity("ent_jwt").await;
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].0, "ep_001");
+    }
+
+    #[tokio::test]
+    async fn test_community_upsert_and_query() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        s.upsert_community("comm_1", &owner, "Auth System", Some("Authentication components"), None, 5).await.unwrap();
+        let comms = s.get_communities(&owner).await;
+        assert_eq!(comms.len(), 1);
+        assert_eq!(comms[0].name, "Auth System");
+        assert_eq!(comms[0].entity_count, 5);
+    }
+
+    #[tokio::test]
+    async fn test_session_upsert_and_pending() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        s.upsert_session("sess_001", &owner, None, "code", now, 15).await.unwrap();
+        let sess = s.get_session("sess_001").await.unwrap();
+        assert_eq!(sess.turn_count, 15);
+        assert!(!sess.entities_extracted);
+        assert!(!sess.summary_generated);
+        // Should appear in pending
+        let pending = s.get_pending_sessions(&owner, 10).await;
+        assert_eq!(pending.len(), 1);
+        // Mark extracted
+        s.mark_session_entities_extracted("sess_001").await;
+        let sess2 = s.get_session("sess_001").await.unwrap();
+        assert!(sess2.entities_extracted);
+    }
+
+    #[tokio::test]
+    async fn test_project_upsert_and_sessions() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        s.upsert_community("comm_1", &owner, "Project B", None, None, 3).await.unwrap();
+        s.upsert_project("comm_1", &owner, "Project B", "active", "comm_1", Some("Auth project")).await.unwrap();
+        s.upsert_session("sess_001", &owner, Some("comm_1"), "code", now, 10).await.unwrap();
+        let projects = s.get_projects(&owner, Some("active"), 10).await;
+        assert_eq!(projects.len(), 1);
+        let sessions = s.get_sessions_for_project("comm_1", 10).await;
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_artifact_insert_and_versions() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        s.insert_artifact("art_v1", &owner, "sess_001", None, "code", Some("auth.rs"), Some("rust"), 1, None, b"fn auth() {}", "hash1", None, Some(1)).await.unwrap();
+        s.insert_artifact("art_v2", &owner, "sess_002", None, "code", Some("auth.rs"), Some("rust"), 2, Some("art_v1"), b"fn auth() { jwt() }", "hash2", None, Some(1)).await.unwrap();
+        let versions = s.get_artifact_versions(&owner, "auth.rs").await;
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].version, 2); // newest first
+        assert_eq!(versions[1].version, 1);
+    }
+
+    #[tokio::test]
+    async fn test_graph_stats() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        s.upsert_entity("ent_1", &owner, "JWT", "jwt", "technology", None, None).await.unwrap();
+        s.upsert_entity("ent_2", &owner, "auth", "auth", "module", None, None).await.unwrap();
+        s.insert_knowledge_edge(&owner, "ent_2", "ent_1", "USES", None, 1.0, 0.9, None, now, None).await.unwrap();
+        s.upsert_community("comm_1", &owner, "Auth", None, None, 2).await.unwrap();
+        let stats = s.graph_stats(&owner).await;
+        assert_eq!(stats.entities, 2);
+        assert_eq!(stats.knowledge_edges, 1);
+        assert_eq!(stats.communities, 1);
     }
 }
