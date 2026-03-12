@@ -243,6 +243,20 @@ pub struct MemChainConfig {
     #[serde(default = "default_embed_max_tokens")]
     pub embed_max_tokens: usize,
 
+    /// Output embedding dimension after Matryoshka truncation (v2.5.0).
+    ///
+    /// For MiniLM-L6-v2: native dimension is 384, this value must be ≤ 384.
+    /// For EmbeddingGemma-300M: native dimension is 768, truncated to this value
+    ///   via Matryoshka Representation Learning. Supported: 768, 512, 384, 256, 128.
+    ///
+    /// Default: 384 (compatible with both models, no downstream changes needed).
+    /// Pass 0 to EmbedEngine::load() to use this default.
+    ///
+    /// ⚠️ Changing this value requires rebuilding ALL existing embeddings.
+    ///    Miner Step 0.5 handles this automatically on next startup.
+    #[serde(default = "default_embed_output_dim")]
+    pub embed_output_dim: usize,
+
     // ── MPI Auth (v2.1.0+MVF+Auth) ──
 
     /// MPI Bearer token secret for API authentication.
@@ -432,6 +446,7 @@ fn default_rawlog_batch_threshold() -> usize { 100 }
 fn default_embed_model_path() -> String { "models/minilm-l6-v2".into() }
 fn default_embed_dim() -> usize { 384 }
 fn default_embed_max_tokens() -> usize { 128 }
+fn default_embed_output_dim() -> usize { 384 }
 fn default_max_remote_owners() -> usize { 100 }
 
 // v2.4.0 defaults
@@ -513,6 +528,14 @@ impl MemChainConfig {
             if self.embed_max_tokens == 0 {
                 return Err(ServerError::config_invalid(
                     "memchain.embed_max_tokens",
+                    "must be > 0",
+                ));
+            }
+
+            // v2.5.0: Validate embed_output_dim > 0
+            if self.embed_output_dim == 0 {
+                return Err(ServerError::config_invalid(
+                    "memchain.embed_output_dim",
                     "must be > 0",
                 ));
             }
@@ -717,6 +740,7 @@ impl Default for MemChainConfig {
             embed_model_path: default_embed_model_path(),
             embed_dim: default_embed_dim(),
             embed_max_tokens: default_embed_max_tokens(),
+            embed_output_dim: default_embed_output_dim(),
             api_secret: None,
             allow_remote_storage: false,
             max_remote_owners: default_max_remote_owners(),
@@ -965,6 +989,35 @@ mod tests {
     }
 
     #[test]
+    fn test_embed_output_dim_zero_rejected() {
+        let mc = MemChainConfig { embed_output_dim: 0, ..Default::default() };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_embed_output_dim_custom_valid() {
+        let mc = MemChainConfig { embed_output_dim: 768, ..Default::default() };
+        assert!(mc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_v250_toml_embed_gemma_config() {
+        let toml_str = r#"
+[memchain]
+mode = "local"
+embed_model_path = "models/embeddinggemma"
+embed_max_tokens = 256
+embed_output_dim = 384
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        let mc = &config.memchain;
+        assert_eq!(mc.embed_model_path, "models/embeddinggemma");
+        assert_eq!(mc.embed_max_tokens, 256);
+        assert_eq!(mc.embed_output_dim, 384);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn test_memchain_defaults() {
         let mc = MemChainConfig::default();
         assert_eq!(mc.db_path, "memchain.db");
@@ -977,6 +1030,7 @@ mod tests {
         assert_eq!(mc.embed_model_path, "models/minilm-l6-v2");
         assert_eq!(mc.embed_dim, 384);
         assert_eq!(mc.embed_max_tokens, 128);
+        assert_eq!(mc.embed_output_dim, 384);
         assert!(mc.api_secret.is_none());
         assert!(mc.effective_api_secret().is_none());
         // v2.3.0
