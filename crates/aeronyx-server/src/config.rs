@@ -12,16 +12,27 @@
 //!   to MemChainConfig for Phase 1 remote MPI Gateway support.
 //!   Also added validation for `mvf_alpha`, `miner_interval_secs`, `embed_dim`,
 //!   and `embed_max_tokens` (bug fixes from code review).
+//! v2.4.0-GraphCognition — 🌟 Added cognitive graph configuration:
+//!   - NER engine: ner_enabled, ner_model_path, ner_tokenizer_path, ner_confidence_threshold
+//!   - Knowledge graph: graph_enabled, graph_max_depth, graph_max_nodes_per_hop, graph_min_edge_weight
+//!   - Entropy filter: entropy_filter_enabled, entropy_filter_threshold, entropy_window_size, entropy_window_overlap
+//!   - Miner cognitive steps: miner_entity_extraction, miner_community_detection,
+//!     miner_session_summary, miner_artifact_extraction, miner_llm_endpoint
+//!   - Vector optimization: vector_quantization, vector_early_termination, vector_saturation_threshold
 //!
 //! ## Main Functionality
 //! - ServerConfig: top-level config with network, vpn, tun, limits, logging, management, memchain
-//! - MemChainConfig: memory system config with MVF parameters, DB paths, API auth, and remote storage
+//! - MemChainConfig: memory system config with MVF parameters, DB paths, API auth, remote storage,
+//!   NER engine, cognitive graph, entropy filter, miner steps, and vector optimization
 //! - Validation for all config sections
 //!
 //! ## Dependencies
 //! - Used by server.rs to initialize all subsystems
 //! - MemChainConfig consumed by MPI router (api/mpi.rs) for auth middleware + remote storage checks
 //! - MemChainConfig consumed by storage.rs for DB path
+//! - MemChainConfig consumed by ner.rs for NER engine configuration (v2.4.0)
+//! - MemChainConfig consumed by log_handler.rs for entropy filter configuration (v2.4.0)
+//! - MemChainConfig consumed by miner/reflection.rs for cognitive steps configuration (v2.4.0)
 //!
 //! ## Main Logical Flow
 //! 1. Load TOML file → deserialize into ServerConfig
@@ -39,6 +50,12 @@
 //! - mvf_alpha must be in [0.0, 1.0] — validated since v2.3.0
 //! - miner_interval_secs must be > 0 — validated since v2.3.0
 //! - embed_dim and embed_max_tokens must be > 0 when memchain is enabled — validated since v2.3.0
+//! - v2.4.0 NER/graph/entropy configs all default to disabled or safe values —
+//!   existing nodes upgrading to v2.4.0 see zero behavior change until explicitly enabled
+//! - ner_confidence_threshold must be in (0.0, 1.0) when NER is enabled
+//! - graph_max_depth max is 3 (to prevent runaway BFS)
+//! - entropy_filter_threshold must be in [0.0, 1.0]
+//! - vector_quantization only supports "none" or "scalar_uint8"
 //!
 //! ## Last Modified
 //! v2.1.0 - Added db_path, compaction_threshold, mvf_alpha, mvf_enabled,
@@ -48,6 +65,8 @@
 //! v2.3.0+RemoteStorage - 🌟 Added allow_remote_storage, max_remote_owners for Phase 1
 //!   🐛 Added validation for mvf_alpha range, miner_interval_secs > 0,
 //!      embed_dim > 0, embed_max_tokens > 0
+//! v2.4.0-GraphCognition - 🌟 Added ner_*, graph_*, entropy_*, miner cognitive,
+//!   vector optimization config fields
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -156,6 +175,29 @@ impl Default for MemChainMode {
 }
 
 // ============================================
+// VectorQuantizationMode (v2.4.0)
+// ============================================
+
+/// Vector quantization strategy for the HNSW index.
+///
+/// - `None`: Full f32 vectors (1536 bytes/vector for 384-dim). Maximum precision.
+/// - `ScalarUint8`: float32 → uint8 quantization (384 bytes/vector). ~75% memory savings.
+///   Uses coarse quantized search for candidate retrieval, then f32 re-ranking for final results.
+///   Expected precision loss < 3%.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorQuantizationMode {
+    /// No quantization — full f32 precision (default)
+    None,
+    /// Scalar uint8 quantization — 75% memory reduction, < 3% precision loss
+    ScalarUint8,
+}
+
+impl Default for VectorQuantizationMode {
+    fn default() -> Self { Self::None }
+}
+
+// ============================================
 // MemChainConfig
 // ============================================
 
@@ -185,91 +227,198 @@ pub struct MemChainConfig {
     pub cold_start_until: usize,
     #[serde(default = "default_rawlog_batch_threshold")]
     pub rawlog_batch_threshold: usize,
+
+    // ── Embedding Engine (v2.1.0) ──
+
     /// Path to the local embedding model directory.
-    ///
-    /// The directory must contain `model.onnx` and `tokenizer.json` for
-    /// MiniLM-L6-v2 (or compatible BERT-family model).
-    /// If the path does not exist or files are missing, embedding is disabled
-    /// and the system falls back to OpenClaw Gateway `/v1/embeddings`.
-    ///
-    /// ## Configuration Example
-    /// ```toml
-    /// [memchain]
-    /// embed_model_path = "models/minilm-l6-v2"
-    /// ```
+    /// Must contain `model.onnx` and `tokenizer.json` for MiniLM-L6-v2.
     #[serde(default = "default_embed_model_path")]
     pub embed_model_path: String,
 
-    /// Expected embedding dimension from the local model.
-    /// MiniLM-L6-v2 produces 384-dim vectors. Used for validation only.
+    /// Expected embedding dimension from the local model (384 for MiniLM-L6-v2).
     #[serde(default = "default_embed_dim")]
     pub embed_dim: usize,
 
     /// Maximum token sequence length for embedding inference.
-    /// Inputs longer than this are truncated. MiniLM supports up to 512
-    /// but 128 is optimal for MemChain's short content (preferences, facts).
-    /// 512 would quadruple inference time with no quality benefit.
     #[serde(default = "default_embed_max_tokens")]
     pub embed_max_tokens: usize,
 
+    // ── MPI Auth (v2.1.0+MVF+Auth) ──
+
     /// MPI Bearer token secret for API authentication.
-    ///
-    /// When set (non-empty, >= 16 chars), all MPI endpoints require:
-    ///   `Authorization: Bearer <api_secret>`
-    /// When None or empty, MPI is open (backward compatible, loopback-only mitigates).
-    ///
-    /// ## Configuration Example
-    /// ```toml
-    /// [memchain]
-    /// api_secret = "your-secret-at-least-16-chars"
-    /// ```
+    /// When set (non-empty, >= 16 chars), all MPI endpoints require Bearer auth.
     #[serde(default)]
     pub api_secret: Option<String>,
 
-    /// ## Phase 1: Remote Storage Configuration (v2.3.0)
-    ///
-    /// When `true`, this node accepts MPI requests from remote users
-    /// authenticated via Ed25519 signature (not just local Bearer token).
-    ///
-    /// Remote requests use the signer's public key as the `owner` field,
-    /// isolating their data from the node operator's own data.
-    ///
-    /// When `false` (default), only local requests (Bearer token auth) are
-    /// accepted — existing behavior is completely unchanged.
-    ///
-    /// ## Security Model
-    /// - Remote users cannot read/modify each other's data (owner isolation)
-    /// - Remote users cannot access the node operator's data
-    /// - Node operator can see encrypted content but cannot decrypt it
-    ///   (record_key derived from user's private key via HKDF)
-    /// - Embeddings are stored in plaintext (required for vector search)
-    ///
-    /// ## Configuration Example
-    /// ```toml
-    /// [memchain]
-    /// allow_remote_storage = true
-    /// max_remote_owners = 100
-    /// ```
+    // ── Remote Storage (v2.3.0) ──
+
+    /// When true, accepts MPI requests from remote users via Ed25519 signature auth.
     #[serde(default)]
     pub allow_remote_storage: bool,
 
     /// Maximum number of distinct remote owners this node will serve.
+    #[serde(default = "default_max_remote_owners")]
+    pub max_remote_owners: usize,
+
+    // ── NER Engine (v2.4.0-GraphCognition) ──
+
+    /// Enable the local GLiNER NER engine for entity extraction.
     ///
-    /// Prevents a single node from being overwhelmed by too many remote users.
-    /// Once the limit is reached, new remote users receive 503 Service Unavailable
-    /// and should be reassigned to another node by CMS.
-    ///
-    /// Only effective when `allow_remote_storage = true`.
-    /// Set to 0 for unlimited (not recommended for resource-constrained nodes).
+    /// When false (default), the entire cognitive graph pipeline is disabled:
+    /// - Stage 1 entropy filter uses only semantic divergence (no entity novelty)
+    /// - Stage 2 skips entity/relation extraction
+    /// - Query analyzer uses regex-only entity detection
     ///
     /// ## Configuration Example
     /// ```toml
     /// [memchain]
-    /// max_remote_owners = 100
+    /// ner_enabled = true
+    /// ner_model_path = "models/gliner"
+    /// ner_confidence_threshold = 0.5
     /// ```
-    #[serde(default = "default_max_remote_owners")]
-    pub max_remote_owners: usize,
+    #[serde(default)]
+    pub ner_enabled: bool,
+
+    /// Path to the GLiNER ONNX model directory.
+    /// Must contain `model.onnx` and `tokenizer.json`.
+    /// Downloaded via `scripts/download_models.sh`.
+    #[serde(default = "default_ner_model_path")]
+    pub ner_model_path: String,
+
+    /// Path to the GLiNER tokenizer file.
+    /// Typically `tokenizer.json` inside the model directory.
+    /// If empty, defaults to `{ner_model_path}/tokenizer.json`.
+    #[serde(default)]
+    pub ner_tokenizer_path: String,
+
+    /// Minimum confidence score (sigmoid output) to accept an entity detection.
+    /// Must be in (0.0, 1.0). Lower values → more entities (higher recall, lower precision).
+    /// Recommended: 0.4-0.6 for MemChain use case.
+    #[serde(default = "default_ner_confidence_threshold")]
+    pub ner_confidence_threshold: f32,
+
+    // ── Knowledge Graph (v2.4.0-GraphCognition) ──
+
+    /// Enable knowledge graph traversal in recall queries.
+    ///
+    /// When false, recall uses pure vector search (v2.3.0 behavior).
+    /// When true, matched entities trigger BFS graph traversal for richer context.
+    ///
+    /// Requires ner_enabled = true to populate the graph.
+    /// If the graph is empty (no entities extracted yet), automatically falls back
+    /// to pure vector search.
+    #[serde(default)]
+    pub graph_enabled: bool,
+
+    /// Maximum BFS traversal depth from matched entities.
+    /// 1 = direct relationships only, 2 = relationships of relationships.
+    /// Max allowed: 3 (validated). Higher values risk exponential node expansion.
+    #[serde(default = "default_graph_max_depth")]
+    pub graph_max_depth: usize,
+
+    /// Maximum nodes to expand per BFS hop.
+    /// Nodes are sorted by weight × confidence; only top-k are expanded.
+    /// Prevents runaway traversal on densely connected entities.
+    #[serde(default = "default_graph_max_nodes_per_hop")]
+    pub graph_max_nodes_per_hop: usize,
+
+    /// Minimum edge weight to traverse during BFS.
+    /// Edges with weight below this threshold are skipped.
+    /// Range [0.0, 1.0]. Lower = more edges traversed.
+    #[serde(default = "default_graph_min_edge_weight")]
+    pub graph_min_edge_weight: f32,
+
+    // ── Entropy Filter (v2.4.0-GraphCognition) ──
+
+    /// Enable entropy-aware filtering on /log ingestion (Stage 1).
+    ///
+    /// When enabled, conversation windows with low information scores
+    /// (repetitive, confirmatory, greeting-only) are discarded before
+    /// entering the Rule Engine pipeline.
+    ///
+    /// Requires ner_enabled = true for entity novelty scoring.
+    /// Without NER, only semantic divergence is used (less effective).
+    #[serde(default)]
+    pub entropy_filter_enabled: bool,
+
+    /// Information score threshold for entropy filtering.
+    /// Windows scoring below this are discarded.
+    /// Range [0.0, 1.0]. Default 0.35.
+    /// - 0.0 = keep everything (filter disabled effectively)
+    /// - 1.0 = discard everything (too aggressive)
+    /// - 0.35 = recommended for typical dev conversations
+    #[serde(default = "default_entropy_filter_threshold")]
+    pub entropy_filter_threshold: f32,
+
+    /// Number of messages per sliding window for entropy calculation.
+    #[serde(default = "default_entropy_window_size")]
+    pub entropy_window_size: usize,
+
+    /// Number of overlapping messages between consecutive windows.
+    #[serde(default = "default_entropy_window_overlap")]
+    pub entropy_window_overlap: usize,
+
+    // ── Miner Cognitive Steps (v2.4.0-GraphCognition) ──
+
+    /// Enable Miner Step 7: Entity/relation extraction from conversations.
+    /// Writes to entities + knowledge_edges tables.
+    /// Requires ner_enabled = true.
+    #[serde(default)]
+    pub miner_entity_extraction: bool,
+
+    /// Enable Miner Step 8: Community detection via label propagation.
+    /// Writes to communities + projects tables.
+    /// Requires miner_entity_extraction = true (needs entities to cluster).
+    #[serde(default)]
+    pub miner_community_detection: bool,
+
+    /// Enable Miner Step 10: Session summary generation.
+    /// Updates sessions.summary and sessions.key_decisions.
+    #[serde(default)]
+    pub miner_session_summary: bool,
+
+    /// Enable Miner Step 10: Code artifact extraction from conversations.
+    /// Detects code blocks and stores them in the artifacts table.
+    #[serde(default)]
+    pub miner_artifact_extraction: bool,
+
+    /// Optional LLM endpoint for enhanced cognitive processing.
+    ///
+    /// When empty (default), all processing is done with local models only
+    /// (MiniLM + GLiNER). This is the recommended zero-LLM configuration.
+    ///
+    /// When set to a valid URL (e.g., "http://localhost:11434/v1/chat/completions"),
+    /// the Miner uses LLM for:
+    /// - Better session summaries (Step 10)
+    /// - Ambiguous conflict resolution (Step 9)
+    /// - Richer community descriptions (Step 8)
+    ///
+    /// Supports any OpenAI-compatible API endpoint (Ollama, vLLM, etc.).
+    #[serde(default)]
+    pub miner_llm_endpoint: String,
+
+    // ── Vector Optimization (v2.4.0-GraphCognition) ──
+
+    /// Vector quantization strategy.
+    /// - "none": Full f32 precision (default, backward compatible)
+    /// - "scalar_uint8": 75% memory reduction, < 3% precision loss
+    #[serde(default)]
+    pub vector_quantization: VectorQuantizationMode,
+
+    /// Enable HNSW early termination via saturation detection.
+    /// When true, search stops after `vector_saturation_threshold` consecutive
+    /// steps with no improvement. Saves 40-60% unnecessary node visits.
+    #[serde(default)]
+    pub vector_early_termination: bool,
+
+    /// Number of consecutive non-improving search steps before early termination.
+    /// Only effective when vector_early_termination = true.
+    /// Lower = faster but potentially less accurate. Default 5.
+    #[serde(default = "default_vector_saturation_threshold")]
+    pub vector_saturation_threshold: usize,
 }
+
+// ── Default functions ──
 
 fn default_memchain_api_addr() -> SocketAddr { "127.0.0.1:8421".parse().unwrap() }
 fn default_memchain_db_path() -> String { "memchain.db".into() }
@@ -284,6 +433,17 @@ fn default_embed_model_path() -> String { "models/minilm-l6-v2".into() }
 fn default_embed_dim() -> usize { 384 }
 fn default_embed_max_tokens() -> usize { 128 }
 fn default_max_remote_owners() -> usize { 100 }
+
+// v2.4.0 defaults
+fn default_ner_model_path() -> String { "models/gliner".into() }
+fn default_ner_confidence_threshold() -> f32 { 0.5 }
+fn default_graph_max_depth() -> usize { 2 }
+fn default_graph_max_nodes_per_hop() -> usize { 20 }
+fn default_graph_min_edge_weight() -> f32 { 0.3 }
+fn default_entropy_filter_threshold() -> f32 { 0.35 }
+fn default_entropy_window_size() -> usize { 10 }
+fn default_entropy_window_overlap() -> usize { 2 }
+fn default_vector_saturation_threshold() -> usize { 5 }
 
 impl MemChainConfig {
     pub fn validate(&self) -> Result<()> {
@@ -316,8 +476,6 @@ impl MemChainConfig {
             }
 
             // Validate api_secret: if set, must be >= 16 characters
-            // This prevents weak secrets that could be easily brute-forced.
-            // None or empty string = open access (backward compatible).
             if let Some(ref secret) = self.api_secret {
                 if !secret.is_empty() && secret.len() < 16 {
                     return Err(ServerError::config_invalid(
@@ -328,8 +486,6 @@ impl MemChainConfig {
             }
 
             // 🐛 v2.3.0: Validate mvf_alpha range [0.0, 1.0]
-            // mvf_alpha is used in mvf::fuse_scores(vm, v_old, alpha) as a blend factor.
-            // Values outside [0.0, 1.0] produce nonsensical recall scores.
             if self.mvf_alpha < 0.0 || self.mvf_alpha > 1.0 {
                 return Err(ServerError::config_invalid(
                     "memchain.mvf_alpha",
@@ -338,8 +494,6 @@ impl MemChainConfig {
             }
 
             // 🐛 v2.3.0: Validate miner_interval_secs > 0
-            // A zero interval would cause the Smart Miner timer to fire continuously,
-            // consuming CPU with no benefit (no time for new data to accumulate).
             if self.miner_interval_secs == 0 {
                 return Err(ServerError::config_invalid(
                     "memchain.miner_interval_secs",
@@ -348,8 +502,6 @@ impl MemChainConfig {
             }
 
             // 🐛 v2.3.0: Validate embed_dim > 0
-            // A zero-dimension embedding is meaningless and would cause
-            // vector index operations to fail or produce empty results.
             if self.embed_dim == 0 {
                 return Err(ServerError::config_invalid(
                     "memchain.embed_dim",
@@ -358,8 +510,6 @@ impl MemChainConfig {
             }
 
             // 🐛 v2.3.0: Validate embed_max_tokens > 0
-            // Zero max tokens would truncate all input to nothing,
-            // producing empty embeddings.
             if self.embed_max_tokens == 0 {
                 return Err(ServerError::config_invalid(
                     "memchain.embed_max_tokens",
@@ -375,10 +525,6 @@ impl MemChainConfig {
                     else { self.max_remote_owners.to_string() }
                 );
 
-                // Warn if remote storage is enabled but no api_secret is set.
-                // Remote auth uses Ed25519 signatures (not Bearer token), but having
-                // api_secret protects local MPI from unauthorized access via loopback.
-                // Without it, anyone on the same machine can call MPI without auth.
                 if self.effective_api_secret().is_none() {
                     tracing::warn!(
                         "[MEMCHAIN] allow_remote_storage=true but api_secret is not set. \
@@ -386,6 +532,115 @@ impl MemChainConfig {
                          to prevent unauthorized local access."
                     );
                 }
+            }
+
+            // ── v2.4.0: NER Engine validation ──
+
+            if self.ner_enabled {
+                // ner_confidence_threshold must be in (0.0, 1.0)
+                if self.ner_confidence_threshold <= 0.0 || self.ner_confidence_threshold >= 1.0 {
+                    return Err(ServerError::config_invalid(
+                        "memchain.ner_confidence_threshold",
+                        format!("must be in (0.0, 1.0), got {}", self.ner_confidence_threshold),
+                    ));
+                }
+
+                if self.ner_model_path.is_empty() {
+                    return Err(ServerError::config_invalid(
+                        "memchain.ner_model_path",
+                        "cannot be empty when ner_enabled = true",
+                    ));
+                }
+
+                info!(
+                    "[MEMCHAIN] NER engine enabled (model: {}, threshold: {})",
+                    self.ner_model_path, self.ner_confidence_threshold
+                );
+            }
+
+            // ── v2.4.0: Knowledge Graph validation ──
+
+            if self.graph_enabled {
+                if self.graph_max_depth == 0 || self.graph_max_depth > 3 {
+                    return Err(ServerError::config_invalid(
+                        "memchain.graph_max_depth",
+                        format!("must be in [1, 3], got {}", self.graph_max_depth),
+                    ));
+                }
+
+                if self.graph_max_nodes_per_hop == 0 {
+                    return Err(ServerError::config_invalid(
+                        "memchain.graph_max_nodes_per_hop",
+                        "must be > 0",
+                    ));
+                }
+
+                if self.graph_min_edge_weight < 0.0 || self.graph_min_edge_weight > 1.0 {
+                    return Err(ServerError::config_invalid(
+                        "memchain.graph_min_edge_weight",
+                        format!("must be in [0.0, 1.0], got {}", self.graph_min_edge_weight),
+                    ));
+                }
+
+                if !self.ner_enabled {
+                    tracing::warn!(
+                        "[MEMCHAIN] graph_enabled=true but ner_enabled=false. \
+                         Graph traversal will have no data until NER is enabled."
+                    );
+                }
+            }
+
+            // ── v2.4.0: Entropy Filter validation ──
+
+            if self.entropy_filter_enabled {
+                if self.entropy_filter_threshold < 0.0 || self.entropy_filter_threshold > 1.0 {
+                    return Err(ServerError::config_invalid(
+                        "memchain.entropy_filter_threshold",
+                        format!("must be in [0.0, 1.0], got {}", self.entropy_filter_threshold),
+                    ));
+                }
+
+                if self.entropy_window_size < 2 {
+                    return Err(ServerError::config_invalid(
+                        "memchain.entropy_window_size",
+                        format!("must be >= 2, got {}", self.entropy_window_size),
+                    ));
+                }
+
+                if self.entropy_window_overlap >= self.entropy_window_size {
+                    return Err(ServerError::config_invalid(
+                        "memchain.entropy_window_overlap",
+                        format!(
+                            "must be < entropy_window_size ({}), got {}",
+                            self.entropy_window_size, self.entropy_window_overlap
+                        ),
+                    ));
+                }
+            }
+
+            // ── v2.4.0: Miner cognitive steps validation ──
+
+            if self.miner_entity_extraction && !self.ner_enabled {
+                tracing::warn!(
+                    "[MEMCHAIN] miner_entity_extraction=true but ner_enabled=false. \
+                     Entity extraction will be skipped until NER is enabled."
+                );
+            }
+
+            if self.miner_community_detection && !self.miner_entity_extraction {
+                tracing::warn!(
+                    "[MEMCHAIN] miner_community_detection=true but miner_entity_extraction=false. \
+                     Community detection requires entities to cluster."
+                );
+            }
+
+            // ── v2.4.0: Vector optimization validation ──
+
+            if self.vector_early_termination && self.vector_saturation_threshold == 0 {
+                return Err(ServerError::config_invalid(
+                    "memchain.vector_saturation_threshold",
+                    "must be > 0 when vector_early_termination is enabled",
+                ));
             }
         }
         Ok(())
@@ -395,33 +650,50 @@ impl MemChainConfig {
     #[must_use] pub fn is_p2p(&self) -> bool { self.mode == MemChainMode::P2p }
 
     /// Returns the effective API secret, or None if auth is disabled.
-    ///
-    /// Empty string is treated as None (no auth) for backward compatibility.
     #[must_use]
     pub fn effective_api_secret(&self) -> Option<&str> {
         self.api_secret.as_deref().filter(|s| !s.is_empty())
     }
 
-    /// Check whether remote storage is enabled and accepting new owners.
-    ///
-    /// This is a config-level check only. The actual owner count check
-    /// happens in mpi.rs middleware where the storage layer can be queried.
-    ///
-    /// ## Returns
-    /// - `true` if `allow_remote_storage` is enabled
-    /// - `false` otherwise
+    /// Check whether remote storage is enabled.
     #[must_use]
     pub fn is_remote_storage_enabled(&self) -> bool {
         self.allow_remote_storage
     }
 
+    /// v2.4.0: Check whether the cognitive graph pipeline is fully enabled.
+    ///
+    /// Requires both NER and graph to be enabled. If NER is disabled,
+    /// the graph has no data to traverse.
+    #[must_use]
+    pub fn is_cognitive_graph_enabled(&self) -> bool {
+        self.ner_enabled && self.graph_enabled
+    }
+
+    /// v2.4.0: Check whether any Miner cognitive steps are enabled.
+    #[must_use]
+    pub fn has_cognitive_miner_steps(&self) -> bool {
+        self.miner_entity_extraction
+            || self.miner_community_detection
+            || self.miner_session_summary
+            || self.miner_artifact_extraction
+    }
+
+    /// v2.4.0: Get the effective NER tokenizer path.
+    ///
+    /// If ner_tokenizer_path is empty, defaults to `{ner_model_path}/tokenizer.json`.
+    #[must_use]
+    pub fn effective_ner_tokenizer_path(&self) -> String {
+        if self.ner_tokenizer_path.is_empty() {
+            format!("{}/tokenizer.json", self.ner_model_path)
+        } else {
+            self.ner_tokenizer_path.clone()
+        }
+    }
+
     #[must_use]
     pub fn is_origin_trusted(&self, origin_hex: &str, server_pubkey_hex: &str) -> bool {
-        // If origin is the server itself, always trusted
         if origin_hex == server_pubkey_hex { return true; }
-        // If trusted_agents list is empty, all origins are trusted (backward compatible).
-        // ⚠️ Note for Phase 1: this applies to local/P2P trust only.
-        // Remote storage auth uses Ed25519 signatures, not this trust check.
         if self.trusted_agents.is_empty() { return true; }
         self.trusted_agents.iter().any(|t| t == origin_hex)
     }
@@ -448,6 +720,31 @@ impl Default for MemChainConfig {
             api_secret: None,
             allow_remote_storage: false,
             max_remote_owners: default_max_remote_owners(),
+            // v2.4.0: NER Engine — disabled by default
+            ner_enabled: false,
+            ner_model_path: default_ner_model_path(),
+            ner_tokenizer_path: String::new(),
+            ner_confidence_threshold: default_ner_confidence_threshold(),
+            // v2.4.0: Knowledge Graph — disabled by default
+            graph_enabled: false,
+            graph_max_depth: default_graph_max_depth(),
+            graph_max_nodes_per_hop: default_graph_max_nodes_per_hop(),
+            graph_min_edge_weight: default_graph_min_edge_weight(),
+            // v2.4.0: Entropy Filter — disabled by default
+            entropy_filter_enabled: false,
+            entropy_filter_threshold: default_entropy_filter_threshold(),
+            entropy_window_size: default_entropy_window_size(),
+            entropy_window_overlap: default_entropy_window_overlap(),
+            // v2.4.0: Miner Cognitive Steps — disabled by default
+            miner_entity_extraction: false,
+            miner_community_detection: false,
+            miner_session_summary: false,
+            miner_artifact_extraction: false,
+            miner_llm_endpoint: String::new(),
+            // v2.4.0: Vector Optimization — disabled by default
+            vector_quantization: VectorQuantizationMode::default(),
+            vector_early_termination: false,
+            vector_saturation_threshold: default_vector_saturation_threshold(),
         }
     }
 }
@@ -642,6 +939,10 @@ impl Default for LoggingConfig {
 mod tests {
     use super::*;
 
+    // ========================================
+    // Existing tests (preserved from v2.3.0)
+    // ========================================
+
     #[test]
     fn test_default_config() {
         let config = ServerConfig::default();
@@ -653,6 +954,14 @@ mod tests {
         // v2.3.0: remote storage defaults
         assert!(!config.memchain.allow_remote_storage);
         assert_eq!(config.memchain.max_remote_owners, 100);
+        // v2.4.0: cognitive graph defaults
+        assert!(!config.memchain.ner_enabled);
+        assert!(!config.memchain.graph_enabled);
+        assert!(!config.memchain.entropy_filter_enabled);
+        assert!(!config.memchain.miner_entity_extraction);
+        assert!(!config.memchain.miner_community_detection);
+        assert!(!config.memchain.vector_early_termination);
+        assert_eq!(config.memchain.vector_quantization, VectorQuantizationMode::None);
     }
 
     #[test]
@@ -674,6 +983,30 @@ mod tests {
         assert!(!mc.allow_remote_storage);
         assert!(!mc.is_remote_storage_enabled());
         assert_eq!(mc.max_remote_owners, 100);
+        // v2.4.0
+        assert!(!mc.ner_enabled);
+        assert_eq!(mc.ner_model_path, "models/gliner");
+        assert!(mc.ner_tokenizer_path.is_empty());
+        assert!((mc.ner_confidence_threshold - 0.5).abs() < f32::EPSILON);
+        assert!(!mc.graph_enabled);
+        assert_eq!(mc.graph_max_depth, 2);
+        assert_eq!(mc.graph_max_nodes_per_hop, 20);
+        assert!((mc.graph_min_edge_weight - 0.3).abs() < f32::EPSILON);
+        assert!(!mc.entropy_filter_enabled);
+        assert!((mc.entropy_filter_threshold - 0.35).abs() < f32::EPSILON);
+        assert_eq!(mc.entropy_window_size, 10);
+        assert_eq!(mc.entropy_window_overlap, 2);
+        assert!(!mc.miner_entity_extraction);
+        assert!(!mc.miner_community_detection);
+        assert!(!mc.miner_session_summary);
+        assert!(!mc.miner_artifact_extraction);
+        assert!(mc.miner_llm_endpoint.is_empty());
+        assert_eq!(mc.vector_quantization, VectorQuantizationMode::None);
+        assert!(!mc.vector_early_termination);
+        assert_eq!(mc.vector_saturation_threshold, 5);
+        // Convenience methods
+        assert!(!mc.is_cognitive_graph_enabled());
+        assert!(!mc.has_cognitive_miner_steps());
     }
 
     #[test]
@@ -700,9 +1033,7 @@ mod tests {
             api_secret: Some(String::new()),
             ..Default::default()
         };
-        // Empty string passes validation (treated as disabled)
         assert!(mc.validate().is_ok());
-        // effective_api_secret returns None for empty string
         assert!(mc.effective_api_secret().is_none());
     }
 
@@ -742,7 +1073,7 @@ mod tests {
     }
 
     // ========================================
-    // v2.3.0: Remote Storage Tests
+    // v2.3.0: Remote Storage Tests (preserved)
     // ========================================
 
     #[test]
@@ -761,7 +1092,6 @@ mod tests {
         };
         assert!(mc.is_remote_storage_enabled());
         assert_eq!(mc.max_remote_owners, 50);
-        // Validation passes (warn about missing api_secret is just a log warning)
         assert!(mc.validate().is_ok());
     }
 
@@ -781,7 +1111,7 @@ mod tests {
     fn test_remote_storage_unlimited_owners() {
         let mc = MemChainConfig {
             allow_remote_storage: true,
-            max_remote_owners: 0, // unlimited
+            max_remote_owners: 0,
             ..Default::default()
         };
         assert!(mc.validate().is_ok());
@@ -804,7 +1134,6 @@ api_secret = "a-very-secure-secret-key"
 
     #[test]
     fn test_remote_storage_toml_backward_compat() {
-        // Old TOML without remote storage fields → defaults to false
         let toml_str = r#"
 [memchain]
 mode = "local"
@@ -817,21 +1146,15 @@ db_path = "memchain.db"
     }
 
     // ========================================
-    // v2.3.0: Bug Fix Validation Tests
+    // v2.3.0: Bug Fix Validation Tests (preserved)
     // ========================================
 
     #[test]
     fn test_mvf_alpha_out_of_range_rejected() {
-        let mc = MemChainConfig {
-            mvf_alpha: 1.5,
-            ..Default::default()
-        };
+        let mc = MemChainConfig { mvf_alpha: 1.5, ..Default::default() };
         assert!(mc.validate().is_err());
 
-        let mc2 = MemChainConfig {
-            mvf_alpha: -0.1,
-            ..Default::default()
-        };
+        let mc2 = MemChainConfig { mvf_alpha: -0.1, ..Default::default() };
         assert!(mc2.validate().is_err());
     }
 
@@ -846,34 +1169,24 @@ db_path = "memchain.db"
 
     #[test]
     fn test_miner_interval_zero_rejected() {
-        let mc = MemChainConfig {
-            miner_interval_secs: 0,
-            ..Default::default()
-        };
+        let mc = MemChainConfig { miner_interval_secs: 0, ..Default::default() };
         assert!(mc.validate().is_err());
     }
 
     #[test]
     fn test_embed_dim_zero_rejected() {
-        let mc = MemChainConfig {
-            embed_dim: 0,
-            ..Default::default()
-        };
+        let mc = MemChainConfig { embed_dim: 0, ..Default::default() };
         assert!(mc.validate().is_err());
     }
 
     #[test]
     fn test_embed_max_tokens_zero_rejected() {
-        let mc = MemChainConfig {
-            embed_max_tokens: 0,
-            ..Default::default()
-        };
+        let mc = MemChainConfig { embed_max_tokens: 0, ..Default::default() };
         assert!(mc.validate().is_err());
     }
 
     #[test]
     fn test_memchain_off_skips_all_validation() {
-        // When mode = Off, no validation is performed (even invalid values pass)
         let mc = MemChainConfig {
             mode: MemChainMode::Off,
             mvf_alpha: 999.0,
@@ -881,8 +1194,447 @@ db_path = "memchain.db"
             embed_dim: 0,
             embed_max_tokens: 0,
             db_path: String::new(),
+            // v2.4.0: invalid values should also pass when mode=off
+            ner_enabled: true,
+            ner_confidence_threshold: 2.0,
+            graph_max_depth: 99,
+            entropy_filter_threshold: -1.0,
             ..Default::default()
         };
         assert!(mc.validate().is_ok());
+    }
+
+    // ========================================
+    // v2.4.0: NER Engine Tests
+    // ========================================
+
+    #[test]
+    fn test_ner_disabled_by_default() {
+        let mc = MemChainConfig::default();
+        assert!(!mc.ner_enabled);
+        assert_eq!(mc.ner_model_path, "models/gliner");
+        assert!((mc.ner_confidence_threshold - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_ner_enabled_valid() {
+        let mc = MemChainConfig {
+            ner_enabled: true,
+            ner_model_path: "models/gliner".into(),
+            ner_confidence_threshold: 0.4,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_ner_confidence_out_of_range() {
+        // threshold = 0.0 (must be > 0.0)
+        let mc = MemChainConfig {
+            ner_enabled: true,
+            ner_confidence_threshold: 0.0,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+
+        // threshold = 1.0 (must be < 1.0)
+        let mc2 = MemChainConfig {
+            ner_enabled: true,
+            ner_confidence_threshold: 1.0,
+            ..Default::default()
+        };
+        assert!(mc2.validate().is_err());
+
+        // threshold = -0.1 (must be > 0.0)
+        let mc3 = MemChainConfig {
+            ner_enabled: true,
+            ner_confidence_threshold: -0.1,
+            ..Default::default()
+        };
+        assert!(mc3.validate().is_err());
+    }
+
+    #[test]
+    fn test_ner_empty_model_path_rejected() {
+        let mc = MemChainConfig {
+            ner_enabled: true,
+            ner_model_path: String::new(),
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_ner_disabled_skips_validation() {
+        // Invalid threshold but NER disabled → should pass
+        let mc = MemChainConfig {
+            ner_enabled: false,
+            ner_confidence_threshold: 2.0,
+            ner_model_path: String::new(),
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+    }
+
+    // ========================================
+    // v2.4.0: Knowledge Graph Tests
+    // ========================================
+
+    #[test]
+    fn test_graph_disabled_by_default() {
+        let mc = MemChainConfig::default();
+        assert!(!mc.graph_enabled);
+        assert!(!mc.is_cognitive_graph_enabled());
+    }
+
+    #[test]
+    fn test_graph_enabled_valid() {
+        let mc = MemChainConfig {
+            ner_enabled: true,
+            graph_enabled: true,
+            graph_max_depth: 2,
+            graph_max_nodes_per_hop: 20,
+            graph_min_edge_weight: 0.3,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+        assert!(mc.is_cognitive_graph_enabled());
+    }
+
+    #[test]
+    fn test_graph_max_depth_zero_rejected() {
+        let mc = MemChainConfig {
+            graph_enabled: true,
+            graph_max_depth: 0,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_graph_max_depth_too_large_rejected() {
+        let mc = MemChainConfig {
+            graph_enabled: true,
+            graph_max_depth: 4,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_graph_max_depth_boundary() {
+        // depth = 1 (minimum valid)
+        let mc1 = MemChainConfig {
+            graph_enabled: true, graph_max_depth: 1, ..Default::default()
+        };
+        assert!(mc1.validate().is_ok());
+
+        // depth = 3 (maximum valid)
+        let mc3 = MemChainConfig {
+            graph_enabled: true, graph_max_depth: 3, ..Default::default()
+        };
+        assert!(mc3.validate().is_ok());
+    }
+
+    #[test]
+    fn test_graph_nodes_per_hop_zero_rejected() {
+        let mc = MemChainConfig {
+            graph_enabled: true,
+            graph_max_nodes_per_hop: 0,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_graph_edge_weight_out_of_range() {
+        let mc = MemChainConfig {
+            graph_enabled: true,
+            graph_min_edge_weight: -0.1,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+
+        let mc2 = MemChainConfig {
+            graph_enabled: true,
+            graph_min_edge_weight: 1.1,
+            ..Default::default()
+        };
+        assert!(mc2.validate().is_err());
+    }
+
+    #[test]
+    fn test_graph_disabled_skips_validation() {
+        let mc = MemChainConfig {
+            graph_enabled: false,
+            graph_max_depth: 99,
+            graph_max_nodes_per_hop: 0,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+    }
+
+    // ========================================
+    // v2.4.0: Entropy Filter Tests
+    // ========================================
+
+    #[test]
+    fn test_entropy_filter_disabled_by_default() {
+        let mc = MemChainConfig::default();
+        assert!(!mc.entropy_filter_enabled);
+    }
+
+    #[test]
+    fn test_entropy_filter_enabled_valid() {
+        let mc = MemChainConfig {
+            entropy_filter_enabled: true,
+            entropy_filter_threshold: 0.35,
+            entropy_window_size: 10,
+            entropy_window_overlap: 2,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_entropy_threshold_out_of_range() {
+        let mc = MemChainConfig {
+            entropy_filter_enabled: true,
+            entropy_filter_threshold: -0.1,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+
+        let mc2 = MemChainConfig {
+            entropy_filter_enabled: true,
+            entropy_filter_threshold: 1.1,
+            ..Default::default()
+        };
+        assert!(mc2.validate().is_err());
+    }
+
+    #[test]
+    fn test_entropy_window_too_small() {
+        let mc = MemChainConfig {
+            entropy_filter_enabled: true,
+            entropy_window_size: 1,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_entropy_overlap_exceeds_window() {
+        let mc = MemChainConfig {
+            entropy_filter_enabled: true,
+            entropy_window_size: 5,
+            entropy_window_overlap: 5,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+
+        let mc2 = MemChainConfig {
+            entropy_filter_enabled: true,
+            entropy_window_size: 5,
+            entropy_window_overlap: 6,
+            ..Default::default()
+        };
+        assert!(mc2.validate().is_err());
+    }
+
+    #[test]
+    fn test_entropy_disabled_skips_validation() {
+        let mc = MemChainConfig {
+            entropy_filter_enabled: false,
+            entropy_filter_threshold: -99.0,
+            entropy_window_size: 0,
+            entropy_window_overlap: 999,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+    }
+
+    // ========================================
+    // v2.4.0: Miner Cognitive Steps Tests
+    // ========================================
+
+    #[test]
+    fn test_miner_cognitive_steps_disabled_by_default() {
+        let mc = MemChainConfig::default();
+        assert!(!mc.has_cognitive_miner_steps());
+    }
+
+    #[test]
+    fn test_miner_cognitive_steps_enabled() {
+        let mc = MemChainConfig {
+            ner_enabled: true,
+            miner_entity_extraction: true,
+            miner_community_detection: true,
+            miner_session_summary: true,
+            miner_artifact_extraction: true,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+        assert!(mc.has_cognitive_miner_steps());
+    }
+
+    #[test]
+    fn test_miner_llm_endpoint_empty_is_local_only() {
+        let mc = MemChainConfig::default();
+        assert!(mc.miner_llm_endpoint.is_empty());
+    }
+
+    // ========================================
+    // v2.4.0: Vector Optimization Tests
+    // ========================================
+
+    #[test]
+    fn test_vector_quantization_default_none() {
+        let mc = MemChainConfig::default();
+        assert_eq!(mc.vector_quantization, VectorQuantizationMode::None);
+    }
+
+    #[test]
+    fn test_vector_early_termination_valid() {
+        let mc = MemChainConfig {
+            vector_early_termination: true,
+            vector_saturation_threshold: 5,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_vector_early_termination_zero_threshold_rejected() {
+        let mc = MemChainConfig {
+            vector_early_termination: true,
+            vector_saturation_threshold: 0,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_vector_disabled_early_term_skips_threshold_validation() {
+        let mc = MemChainConfig {
+            vector_early_termination: false,
+            vector_saturation_threshold: 0,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+    }
+
+    // ========================================
+    // v2.4.0: TOML Parsing Tests
+    // ========================================
+
+    #[test]
+    fn test_v240_toml_full_config() {
+        let toml_str = r#"
+[memchain]
+mode = "local"
+ner_enabled = true
+ner_model_path = "models/gliner"
+ner_confidence_threshold = 0.45
+graph_enabled = true
+graph_max_depth = 2
+graph_max_nodes_per_hop = 30
+graph_min_edge_weight = 0.25
+entropy_filter_enabled = true
+entropy_filter_threshold = 0.4
+entropy_window_size = 8
+entropy_window_overlap = 1
+miner_entity_extraction = true
+miner_community_detection = true
+miner_session_summary = true
+miner_artifact_extraction = true
+miner_llm_endpoint = ""
+vector_quantization = "scalar_uint8"
+vector_early_termination = true
+vector_saturation_threshold = 3
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        let mc = &config.memchain;
+
+        assert!(mc.ner_enabled);
+        assert_eq!(mc.ner_model_path, "models/gliner");
+        assert!((mc.ner_confidence_threshold - 0.45).abs() < f32::EPSILON);
+        assert!(mc.graph_enabled);
+        assert_eq!(mc.graph_max_depth, 2);
+        assert_eq!(mc.graph_max_nodes_per_hop, 30);
+        assert!((mc.graph_min_edge_weight - 0.25).abs() < f32::EPSILON);
+        assert!(mc.entropy_filter_enabled);
+        assert!((mc.entropy_filter_threshold - 0.4).abs() < f32::EPSILON);
+        assert_eq!(mc.entropy_window_size, 8);
+        assert_eq!(mc.entropy_window_overlap, 1);
+        assert!(mc.miner_entity_extraction);
+        assert!(mc.miner_community_detection);
+        assert!(mc.miner_session_summary);
+        assert!(mc.miner_artifact_extraction);
+        assert!(mc.miner_llm_endpoint.is_empty());
+        assert_eq!(mc.vector_quantization, VectorQuantizationMode::ScalarUint8);
+        assert!(mc.vector_early_termination);
+        assert_eq!(mc.vector_saturation_threshold, 3);
+
+        assert!(config.validate().is_ok());
+        assert!(mc.is_cognitive_graph_enabled());
+        assert!(mc.has_cognitive_miner_steps());
+    }
+
+    #[test]
+    fn test_v240_toml_backward_compat() {
+        // Old TOML without any v2.4.0 fields → all default to disabled
+        let toml_str = r#"
+[memchain]
+mode = "local"
+db_path = "memchain.db"
+mvf_alpha = 0.5
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        let mc = &config.memchain;
+
+        assert!(!mc.ner_enabled);
+        assert!(!mc.graph_enabled);
+        assert!(!mc.entropy_filter_enabled);
+        assert!(!mc.miner_entity_extraction);
+        assert!(!mc.vector_early_termination);
+        assert_eq!(mc.vector_quantization, VectorQuantizationMode::None);
+
+        assert!(config.validate().is_ok());
+    }
+
+    // ========================================
+    // v2.4.0: Convenience Method Tests
+    // ========================================
+
+    #[test]
+    fn test_is_cognitive_graph_enabled() {
+        // Both NER and graph must be enabled
+        let mc1 = MemChainConfig {
+            ner_enabled: true, graph_enabled: true, ..Default::default()
+        };
+        assert!(mc1.is_cognitive_graph_enabled());
+
+        let mc2 = MemChainConfig {
+            ner_enabled: true, graph_enabled: false, ..Default::default()
+        };
+        assert!(!mc2.is_cognitive_graph_enabled());
+
+        let mc3 = MemChainConfig {
+            ner_enabled: false, graph_enabled: true, ..Default::default()
+        };
+        assert!(!mc3.is_cognitive_graph_enabled());
+    }
+
+    #[test]
+    fn test_effective_ner_tokenizer_path() {
+        let mc1 = MemChainConfig::default();
+        assert_eq!(mc1.effective_ner_tokenizer_path(), "models/gliner/tokenizer.json");
+
+        let mc2 = MemChainConfig {
+            ner_tokenizer_path: "/custom/tokenizer.json".into(),
+            ..Default::default()
+        };
+        assert_eq!(mc2.effective_ner_tokenizer_path(), "/custom/tokenizer.json");
     }
 }
