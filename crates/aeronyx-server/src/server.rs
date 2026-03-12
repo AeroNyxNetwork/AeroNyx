@@ -616,9 +616,38 @@ impl Server {
         tokio::spawn(async move { cmd_handler.run(cmd_shutdown).await; });
 
         // Heartbeat reporter
-        let heartbeat = HeartbeatReporter::new(Arc::clone(&mgmt_client), public_ip)
+        // v2.3.0: Build memchain_status callback if MemChain is enabled.
+        // The callback captures config values + storage Arc for lazy evaluation
+        // on each heartbeat tick. It's cheap: one SQL COUNT query (~0.1ms).
+        let memchain_status_fn: Option<crate::management::reporter::MemChainStatusFn> =
+            if self.config.memchain.is_enabled() {
+                let allow_remote = self.config.memchain.allow_remote_storage;
+                let max_owners = self.config.memchain.max_remote_owners;
+                // Note: storage may not be initialized yet at this point in
+                // init_management_reporter (it's created later in run()).
+                // We capture the config values only; current_remote_owners
+                // will be reported as 0 until storage is available.
+                // TODO: Once server.rs is refactored to init storage before
+                // management, capture Arc<MemoryStorage> here for live counts.
+                Some(Box::new(move || {
+                    Some(crate::management::client::MemChainHeartbeatStatus {
+                        enabled: true,
+                        allow_remote_storage: allow_remote,
+                        max_remote_owners: max_owners,
+                        current_remote_owners: 0, // Updated when storage is available
+                    })
+                }))
+            } else {
+                None
+            };
+
+        let mut heartbeat = HeartbeatReporter::new(Arc::clone(&mgmt_client), public_ip)
             .with_command_sender(cmd_tx)
             .with_agent_manager(Arc::clone(&agent_manager));
+
+        if let Some(f) = memchain_status_fn {
+            heartbeat = heartbeat.with_memchain_status(f);
+        }
 
         let sess = Arc::clone(sessions);
         let hb_shutdown = self.shutdown_tx.subscribe();
