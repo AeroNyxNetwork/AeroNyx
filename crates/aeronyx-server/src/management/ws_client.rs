@@ -113,6 +113,18 @@ const MPI_ALLOWED_ACTIONS: &[&str] = &[
     "mpi_embed",
     "mpi_record",
     "mpi_overview",
+    // v2.4.0-GraphCognition: cognitive graph read-only endpoints
+    "mpi_projects",
+    "mpi_project_detail",
+    "mpi_project_timeline",
+    "mpi_session_detail",
+    "mpi_session_conversation",
+    "mpi_session_artifacts",
+    "mpi_artifact_detail",
+    "mpi_artifact_versions",
+    "mpi_entity_detail",
+    "mpi_entity_graph",
+    "mpi_communities",
 ];
 
 /// v2.3.0: Header names for Ed25519 remote auth passthrough.
@@ -863,6 +875,45 @@ impl WsTunnel {
                 }
                 ("GET", format!("/api/mpi/record/{}", record_id))
             }
+            // ── v2.4.0-GraphCognition: cognitive graph read-only endpoints ──
+            "mpi_projects" => ("GET", "/api/mpi/projects".to_string()),
+            "mpi_project_detail" => {
+                let id = payload.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+                ("GET", format!("/api/mpi/projects/{}", id))
+            }
+            "mpi_project_timeline" => {
+                let id = payload.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
+                ("GET", format!("/api/mpi/projects/{}/timeline", id))
+            }
+            "mpi_session_detail" => {
+                let id = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+                ("GET", format!("/api/mpi/sessions/{}", id))
+            }
+            "mpi_session_conversation" => {
+                let id = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+                ("GET", format!("/api/mpi/sessions/{}/conversation", id))
+            }
+            "mpi_session_artifacts" => {
+                let id = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+                ("GET", format!("/api/mpi/sessions/{}/artifacts", id))
+            }
+            "mpi_artifact_detail" => {
+                let id = payload.get("artifact_id").and_then(|v| v.as_str()).unwrap_or("");
+                ("GET", format!("/api/mpi/artifacts/{}", id))
+            }
+            "mpi_artifact_versions" => {
+                let id = payload.get("artifact_id").and_then(|v| v.as_str()).unwrap_or("");
+                ("GET", format!("/api/mpi/artifacts/{}/versions", id))
+            }
+            "mpi_entity_detail" => {
+                let id = payload.get("entity_id").and_then(|v| v.as_str()).unwrap_or("");
+                ("GET", format!("/api/mpi/entities/{}", id))
+            }
+            "mpi_entity_graph" => {
+                let id = payload.get("entity_id").and_then(|v| v.as_str()).unwrap_or("");
+                ("GET", format!("/api/mpi/entities/{}/graph", id))
+            }
+            "mpi_communities" => ("GET", "/api/mpi/communities".to_string()),
             _ => {
                 return serde_json::json!({
                     "type": "agent_response",
@@ -872,33 +923,6 @@ impl WsTunnel {
                 });
             }
         };
-
-        let url = format!("{}{}", MPI_BASE_URL, path);
-
-        // 3. Determine auth mode: remote (auth_headers) or local (Bearer token)
-        let has_remote_auth = auth_headers
-            .and_then(|h| h.as_object())
-            .map_or(false, |h| h.contains_key(HEADER_MEMCHAIN_SIGNATURE));
-
-        if has_remote_auth {
-            debug!(
-                action = %action, url = %url, method = %method,
-                "[WS_MPI] Proxying with remote auth (Ed25519 passthrough)"
-            );
-        } else {
-            debug!(action = %action, url = %url, method = %method, "[WS_MPI] Proxying with local auth");
-        }
-
-        // 4. Build HTTP request
-        // v2.3.0: Reuse self.http_client (was creating new client per request — bug fix)
-        let mut req_builder = match method {
-            "GET" => self.http_client.get(&url),
-            "POST" => self.http_client.post(&url)
-                .header("Content-Type", "application/json")
-                .json(payload),
-            _ => unreachable!(),
-        };
-
         // 5. Inject auth headers
         if has_remote_auth {
             // v2.3.0: Passthrough Ed25519 signature headers from CMS
