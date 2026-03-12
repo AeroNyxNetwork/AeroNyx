@@ -46,6 +46,8 @@
 //! v2.3.0+RemoteStorage - Local-only access restriction (remote → 403)
 //! v2.4.0-GraphCognition - 🌟 Stage 1 entropy filter (pre-Rule Engine).
 //!   Pre-computed entities + embeddings cached for Stage 2 Miner reuse.
+//! v2.4.0+BugFix - 🔧 Fixed E0282 type inference in tests; pre-compiled
+//!   regex patterns via LazyLock for rule engine performance.
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - /log is LOCAL-ONLY: remote users get 403
@@ -55,11 +57,14 @@
 //!   (non-lossy), but extractable is set to 0 (Miner won't process them)
 //! - The filter operates on the ENTIRE turns array as one window,
 //!   not per-turn (consistent with document's 10-message window design)
+//! - Rule engine regex patterns are pre-compiled via std::sync::LazyLock
+//!   to avoid repeated Regex::new() overhead on every request.
 //!
 //! ## Last Modified
-//! v2.4.0-GraphCognition - 🌟 Added Stage 1 entropy filter
+//! v2.4.0+BugFix - 🔧 Fixed E0282, pre-compiled regex, minor test improvements
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
@@ -178,7 +183,7 @@ fn run_entropy_filter(
     // We don't have a persistent recent-embeddings buffer yet (Phase C),
     // so for now we use a simpler heuristic: text length and variety.
     // TODO: Implement proper embedding comparison with sliding window buffer.
-    if let Some(ref embed_engine) = state.embed_engine {
+    if state.embed_engine.is_some() {
         // Simple heuristic: short, repetitive text = low divergence
         let unique_words: std::collections::HashSet<&str> = window_text
             .split_whitespace()
@@ -237,10 +242,12 @@ fn has_persistent_info(content: &str) -> bool {
     let lower = content.to_lowercase();
     let trimmed = lower.trim();
 
+    // v2.4.0+BugFix: Also match bare "i" without trailing space (edge case)
     let has_first_person = CN_FIRST_PERSON.iter().any(|p| trimmed.contains(p))
         || EN_FIRST_PERSON.iter().any(|p| {
             trimmed.starts_with(p) || trimmed.contains(&format!(" {}", p.trim()))
-        });
+        })
+        || trimmed == "i"; // bare "i" alone edge case
     if has_first_person { return true; }
 
     let starts_with_task = CN_TASK_VERBS.iter().any(|v| trimmed.starts_with(v))
@@ -271,8 +278,84 @@ fn contains_negative_feedback(content: &str) -> bool {
 }
 
 // ============================================
-// Rule Engine (D2c)
+// Rule Engine (D2c) — Pre-compiled Regex via LazyLock
 // ============================================
+// v2.4.0+BugFix: All regex patterns are compiled once via std::sync::LazyLock.
+// Previously, Regex::new() was called on every invocation of check_* functions,
+// which incurred unnecessary overhead on the hot path. LazyLock ensures each
+// pattern is compiled exactly once, on first use, and reused thereafter.
+
+/// Helper: compile a list of pattern strings into Vec<Regex>, skipping invalid ones.
+fn compile_patterns(patterns: &[&str]) -> Vec<Regex> {
+    patterns.iter()
+        .filter_map(|p| Regex::new(p).ok())
+        .collect()
+}
+
+// ── P0: Explicit remember ──
+static RE_EXPLICIT_REMEMBER_PATTERNS: &[&str] = &[
+    // Note: explicit remember uses string matching, not regex. No LazyLock needed.
+];
+
+// ── P1: Identity declarations ──
+static RE_IDENTITY_CN: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
+    r"我(?:是|叫|的职业是|住在|来自|在.{1,15}工作|的名字是)(.{1,30})",
+    r"我.{0,2}(?:岁|年纪)",
+    r"我有(?:一个|两个|三个)?(.{1,10})(?:儿子|女儿|孩子|老婆|丈夫|男友|女友)",
+]));
+
+static RE_IDENTITY_EN: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
+    r"(?i)(?:I am|I'm|I work (?:at|as|in)|my name is|I live in|I'm from)(.{1,50})",
+    r"(?i)I'm (\d+) years old",
+    r"(?i)I have (?:a |an )?(\w+ (?:son|daughter|child|wife|husband|partner))",
+]));
+
+// ── P3: Corrections ──
+static RE_CORRECTION_CN: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
+    r"不是.{1,15}[，,]是", r"其实是", r"我说错了", r"更正一下", r"我之前说的不对",
+]));
+
+static RE_CORRECTION_EN: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
+    r"(?i)actually", r"(?i)I was wrong", r"(?i)let me correct", r"(?i)not .{1,20}, it's",
+]));
+
+// ── P4: Preferences — language ──
+static RE_PREF_LANG: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
+    r"用(?:中文|英文|英语|日文|日语|法语|韩语).{0,5}(?:回答|说|写)",
+    r"(?i)(?:reply|respond|answer|write) in (?:English|Chinese|Japanese|French)",
+]));
+
+// ── P4: Preferences — format ──
+static RE_PREF_FMT: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
+    r"(?:简短一点|详细一点|简洁|不要用.{1,8}术语|口语化|正式一点|用列表|用表格)",
+    r"(?i)(?:keep it short|more detail|avoid jargon|be casual|be formal|use bullet)",
+]));
+
+// ── P4: Preferences — role ──
+static RE_PREF_ROLE: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
+    r"你(?:扮演|是|充当)(.{1,20})",
+    r"(?i)(?:act as|you are|pretend to be|play the role of)(.{1,30})",
+]));
+
+// ── P5: Avoidance — allergy ──
+static RE_ALLERGY: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
+    r"我?对(.{1,10})过敏",
+    r"(?i)(?:I'm |I am )?allergic to (.{1,20})",
+]));
+
+// ── P5: Avoidance — general ──
+static RE_AVOID: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
+    r"(?:不要|别|没有|不含|不加|避开|避免|我不[吃喝用看听做])(.{1,15})",
+    r"(?i)(?:no|without|avoid|skip|don't want|don't like)\s+(.{1,20})",
+]));
+
+// ── P6: Environment ──
+static RE_ENV: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
+    r"我(?:用的是|在用|用)(.{1,20})",
+    r"(?i)(?:I use|I'm on|I'm using|I'm running|my .{1,15} version is)(.{1,30})",
+]));
+
+// ────────────────────────────────────────────
 
 struct Extraction {
     content: String,
@@ -293,6 +376,7 @@ fn run_rule_engine(content: &str) -> Vec<Extraction> {
 }
 
 fn check_explicit_remember(content: &str) -> Option<Extraction> {
+    // P0 uses simple string matching (no regex needed)
     let patterns = ["记住", "帮我记下", "帮我记住", "请记住", "remember ", "keep in mind", "don't forget"];
     let lower = content.to_lowercase();
     for pat in &patterns {
@@ -309,38 +393,22 @@ fn check_explicit_remember(content: &str) -> Option<Extraction> {
 
 fn check_identity_declarations(content: &str) -> Vec<Extraction> {
     let mut results = Vec::new();
-    let cn_patterns = [
-        r"我(?:是|叫|的职业是|住在|来自|在.{1,15}工作|的名字是)(.{1,30})",
-        r"我.{0,2}(?:岁|年纪)",
-        r"我有(?:一个|两个|三个)?(.{1,10})(?:儿子|女儿|孩子|老婆|丈夫|男友|女友)",
-    ];
-    let en_patterns = [
-        r"(?i)(?:I am|I'm|I work (?:at|as|in)|my name is|I live in|I'm from)(.{1,50})",
-        r"(?i)I'm (\d+) years old",
-        r"(?i)I have (?:a |an )?(\w+ (?:son|daughter|child|wife|husband|partner))",
-    ];
-    for pat_str in cn_patterns.iter().chain(en_patterns.iter()) {
-        if let Ok(re) = Regex::new(pat_str) {
-            if re.is_match(content) {
-                results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
-                    tags: vec!["identity".into()], confidence: 0.85 });
-                break;
-            }
+    for re in RE_IDENTITY_CN.iter().chain(RE_IDENTITY_EN.iter()) {
+        if re.is_match(content) {
+            results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
+                tags: vec!["identity".into()], confidence: 0.85 });
+            break;
         }
     }
     results
 }
 
 fn check_corrections(content: &str) -> Option<Extraction> {
-    let cn = [r"不是.{1,15}[，,]是", r"其实是", r"我说错了", r"更正一下", r"我之前说的不对"];
-    let en = [r"(?i)actually", r"(?i)I was wrong", r"(?i)let me correct", r"(?i)not .{1,20}, it's"];
     let lower = content.to_lowercase();
-    for pat in cn.iter().chain(en.iter()) {
-        if let Ok(re) = Regex::new(pat) {
-            if re.is_match(&lower) || re.is_match(content) {
-                return Some(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
-                    tags: vec!["_correction".into()], confidence: 0.90 });
-            }
+    for re in RE_CORRECTION_CN.iter().chain(RE_CORRECTION_EN.iter()) {
+        if re.is_match(&lower) || re.is_match(content) {
+            return Some(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
+                tags: vec!["_correction".into()], confidence: 0.90 });
         }
     }
     None
@@ -348,78 +416,66 @@ fn check_corrections(content: &str) -> Option<Extraction> {
 
 fn check_preferences(content: &str) -> Vec<Extraction> {
     let mut results = Vec::new();
-    let lang_cn = r"用(?:中文|英文|英语|日文|日语|法语|韩语).{0,5}(?:回答|说|写)";
-    let lang_en = r"(?i)(?:reply|respond|answer|write) in (?:English|Chinese|Japanese|French)";
-    for pat in &[lang_cn, lang_en] {
-        if let Ok(re) = Regex::new(pat) {
-            if re.is_match(content) {
-                results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
-                    tags: vec!["preference".into(), "language".into()], confidence: 0.80 });
-                break;
-            }
+
+    // Language preference
+    for re in RE_PREF_LANG.iter() {
+        if re.is_match(content) {
+            results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
+                tags: vec!["preference".into(), "language".into()], confidence: 0.80 });
+            break;
         }
     }
-    let fmt_cn = r"(?:简短一点|详细一点|简洁|不要用.{1,8}术语|口语化|正式一点|用列表|用表格)";
-    let fmt_en = r"(?i)(?:keep it short|more detail|avoid jargon|be casual|be formal|use bullet)";
-    for pat in &[fmt_cn, fmt_en] {
-        if let Ok(re) = Regex::new(pat) {
-            if re.is_match(content) {
-                results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
-                    tags: vec!["preference".into(), "format".into()], confidence: 0.80 });
-                break;
-            }
+
+    // Format preference
+    for re in RE_PREF_FMT.iter() {
+        if re.is_match(content) {
+            results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
+                tags: vec!["preference".into(), "format".into()], confidence: 0.80 });
+            break;
         }
     }
-    let role_cn = r"你(?:扮演|是|充当)(.{1,20})";
-    let role_en = r"(?i)(?:act as|you are|pretend to be|play the role of)(.{1,30})";
-    for pat in &[role_cn, role_en] {
-        if let Ok(re) = Regex::new(pat) {
-            if re.is_match(content) {
-                results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
-                    tags: vec!["role".into()], confidence: 0.80 });
-                break;
-            }
+
+    // Role preference
+    for re in RE_PREF_ROLE.iter() {
+        if re.is_match(content) {
+            results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
+                tags: vec!["role".into()], confidence: 0.80 });
+            break;
         }
     }
+
     results
 }
 
 fn check_avoidance(content: &str) -> Vec<Extraction> {
     let mut results = Vec::new();
-    let allergy_cn = r"我?对(.{1,10})过敏";
-    let allergy_en = r"(?i)(?:I'm |I am )?allergic to (.{1,20})";
-    for pat in &[allergy_cn, allergy_en] {
-        if let Ok(re) = Regex::new(pat) {
-            if re.is_match(content) {
-                results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
-                    tags: vec!["health".into(), "allergy".into()], confidence: 0.90 });
-                return results;
-            }
+
+    // Allergy (higher confidence, early return)
+    for re in RE_ALLERGY.iter() {
+        if re.is_match(content) {
+            results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
+                tags: vec!["health".into(), "allergy".into()], confidence: 0.90 });
+            return results;
         }
     }
-    let avoid_cn = r"(?:不要|别|没有|不含|不加|避开|避免|我不[吃喝用看听做])(.{1,15})";
-    let avoid_en = r"(?i)(?:no|without|avoid|skip|don't want|don't like)\s+(.{1,20})";
-    for pat in &[avoid_cn, avoid_en] {
-        if let Ok(re) = Regex::new(pat) {
-            if re.is_match(content) {
-                results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
-                    tags: vec!["avoidance".into()], confidence: 0.70 });
-                break;
-            }
+
+    // General avoidance
+    for re in RE_AVOID.iter() {
+        if re.is_match(content) {
+            results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
+                tags: vec!["avoidance".into()], confidence: 0.70 });
+            break;
         }
     }
+
     results
 }
 
 fn check_environment(content: &str) -> Option<Extraction> {
-    let cn = r"我(?:用的是|在用|用)(.{1,20})";
-    let en = r"(?i)(?:I use|I'm on|I'm using|I'm running|my .{1,15} version is)(.{1,30})";
-    for pat in &[cn, en] {
-        if let Ok(re) = Regex::new(pat) {
-            if re.is_match(content) {
-                return Some(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
-                    tags: vec!["environment".into()], confidence: 0.75 });
-            }
+    for re in RE_ENV.iter() {
+        if re.is_match(content) {
+            return Some(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
+                tags: vec!["environment".into()], confidence: 0.75 });
         }
     }
     None
@@ -750,19 +806,21 @@ mod tests {
     }
 
     // ── v2.4.0: Entropy filter unit tests ──
+    // v2.4.0+BugFix: Fixed E0282 by adding explicit type annotation to HashSet<String>
 
     #[test]
     fn test_entropy_filter_empty_window() {
-        let known = std::collections::HashSet::new();
+        let _known: std::collections::HashSet<String> = std::collections::HashSet::new();
         let turns = vec![Turn { role: "user".into(), content: "".into() }];
-        // Can't call run_entropy_filter without MpiState in unit tests,
-        // but we can test the helper logic
+        // Verify window text assembly produces empty string for empty content
         let window_text: String = turns.iter()
             .filter(|t| t.role == "user")
             .map(|t| t.content.as_str())
             .collect::<Vec<_>>()
             .join(" ");
         assert!(window_text.trim().is_empty());
+        // Note: run_entropy_filter() returns EntropyResult { score: 0.0, passes: false }
+        // for empty windows. Full integration test requires MpiState mock (Phase C).
     }
 
     #[test]
@@ -778,5 +836,15 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(window_text, "hello world");
+    }
+
+    // v2.4.0+BugFix: Additional test for bare "i" edge case in has_persistent_info
+    #[test]
+    fn test_skip_bare_i() {
+        // Bare "i" should be treated as first person (edge case fix)
+        assert!(has_persistent_info("i"));
+        // But very short non-first-person should not
+        assert!(!has_persistent_info("ok"));
+        assert!(!has_persistent_info("no"));
     }
 }
