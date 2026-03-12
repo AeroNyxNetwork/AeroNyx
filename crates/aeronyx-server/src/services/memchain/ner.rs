@@ -384,10 +384,9 @@ impl NerEngine {
             (shape_span_idx, span_idx_flat.into_boxed_slice())
         ).map_err(|e| format!("span_idx tensor: {}", e))?;
 
-        // span_mask is bool in GLiNER ONNX — ort expects u8 for bool tensors
-        let span_mask_u8: Vec<u8> = span_mask_flat.iter().map(|&b| b as u8).collect();
+        // span_mask is bool in GLiNER ONNX — ort 2.0.0-rc.11 supports bool directly
         let span_mask_tensor = Tensor::from_array(
-            (shape_span_mask, span_mask_u8.into_boxed_slice())
+            (shape_span_mask, span_mask_flat.into_boxed_slice())
         ).map_err(|e| format!("span_mask tensor: {}", e))?;
 
         // Step 6: ONNX inference
