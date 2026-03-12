@@ -973,15 +973,23 @@ impl ReflectionMiner {
             let community_name = {
                 let mut best_name = community_id.clone();
                 let mut best_mentions = 0i64;
+                let mut project_name: Option<String> = None;
+
                 for eid in member_ids {
                     if let Some(entity) = self.storage.get_entity(eid).await {
+                        // T1: Priority — entity_type="project" wins regardless of mention_count
+                        if entity.entity_type == "project" && project_name.is_none() {
+                            project_name = Some(entity.name.clone());
+                        }
                         if entity.mention_count > best_mentions {
                             best_mentions = entity.mention_count;
                             best_name = entity.name.clone();
                         }
                     }
                 }
-                best_name
+
+                // Use project entity name if available, otherwise fallback to highest mention
+                project_name.unwrap_or(best_name)
             };
 
             // Upsert community
@@ -1065,6 +1073,78 @@ impl ReflectionMiner {
                     }
                 }
             }
+        }
+
+        // ── T3: Merge small communities (entity_count < 3) into nearest large community ──
+        // Small communities often contain entities that didn't get enough edges
+        // during label propagation (e.g., a person mentioned once). We merge them
+        // into the large community they have the most connections to.
+        let mut merged_small = 0u32;
+        let small_communities: Vec<(String, Vec<String>)> = communities.iter()
+            .filter(|(_, members)| members.len() < 3)
+            .map(|(cid, members)| (cid.clone(), members.clone()))
+            .collect();
+
+        let large_communities: Vec<(String, Vec<String>)> = communities.iter()
+            .filter(|(_, members)| members.len() >= 3)
+            .map(|(cid, members)| (cid.clone(), members.clone()))
+            .collect();
+
+        if !small_communities.is_empty() && !large_communities.is_empty() {
+            for (small_cid, small_members) in &small_communities {
+                // Count edges from small community members to each large community
+                let mut edge_counts: HashMap<String, usize> = HashMap::new();
+
+                for eid in small_members {
+                    let edges = self.storage.get_edges_for_entity(eid, &owner).await;
+                    for edge in &edges {
+                        let other_id = if edge.source_id == *eid {
+                            &edge.target_id
+                        } else {
+                            &edge.source_id
+                        };
+                        // Find which large community this neighbor belongs to
+                        for (large_cid, large_members) in &large_communities {
+                            if large_members.contains(other_id) {
+                                *edge_counts.entry(large_cid.clone()).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Merge into the large community with most connections
+                if let Some((best_large_cid, _count)) = edge_counts.iter()
+                    .max_by_key(|(_, count)| *count)
+                {
+                    for eid in small_members {
+                        self.storage.update_entity_community(eid, best_large_cid).await;
+                    }
+                    merged_small += 1;
+                    debug!(
+                        small = small_cid, target = best_large_cid,
+                        members = small_members.len(),
+                        "[MINER_S8] Merged small community"
+                    );
+                }
+            }
+        }
+
+        if merged_small > 0 {
+            // Re-count entities in communities after merging
+            for (large_cid, _) in &large_communities {
+                let members = self.storage.get_entities_in_community(large_cid, &owner).await;
+                // Retrieve existing community name for the upsert
+                let cname = if let Some(c) = self.storage.get_community(large_cid).await {
+                    c.name.clone()
+                } else {
+                    large_cid.clone()
+                };
+                let _ = self.storage.upsert_community(
+                    large_cid, &owner, &cname,
+                    None, None, members.len() as i64,
+                ).await;
+            }
+            info!(merged = merged_small, "[MINER_S8] Small communities merged");
         }
 
         if total_communities > 0 {
@@ -1264,16 +1344,41 @@ impl ReflectionMiner {
             // --- Generate summary ---
             // Get top entities for this session (from episode_edges)
             let entity_names: Vec<String> = {
-                let entities_by_owner = self.storage.get_entities_by_owner(
-                    &owner, None, 100
-                ).await;
-                // Filter to entities that were extracted from this session
-                // (Heuristic: recently updated entities — in a real impl we'd
-                //  query episode_edges, but this is simpler for now)
-                entities_by_owner.into_iter()
-                    .take(5)
-                    .map(|e| e.name)
-                    .collect()
+                // T2: Get entities specific to THIS session via episode_edges.
+                // Episode ID convention: "ep_{session_id}_{timestamp}"
+                let mut session_entity_ids: HashSet<String> = HashSet::new();
+
+                // Find all episodes for this session
+                let episodes = self.storage.get_episodes_for_session(&session.session_id).await;
+                for (episode_id, _, _) in &episodes {
+                    let linked = self.storage.get_entities_for_episode(episode_id).await;
+                    for (entity_id, _role) in linked {
+                        session_entity_ids.insert(entity_id);
+                    }
+                }
+
+                // Also check episode_edges with the ep_{session_id}_ prefix pattern
+                // (episodes created by Step 7 before Step 11 writes to episodes table)
+                let ep_prefix = format!("ep_{}_", session.session_id);
+                let all_entities = self.storage.get_entities_by_owner(&owner, None, 500).await;
+                for entity in &all_entities {
+                    let ep_links = self.storage.get_episodes_for_entity(&entity.entity_id).await;
+                    for (episode_id, _role) in &ep_links {
+                        if episode_id.starts_with(&ep_prefix) {
+                            session_entity_ids.insert(entity.entity_id.clone());
+                        }
+                    }
+                }
+
+                // Resolve entity names, sorted by mention_count desc
+                let mut named: Vec<(String, i64)> = Vec::new();
+                for eid in &session_entity_ids {
+                    if let Some(entity) = self.storage.get_entity(eid).await {
+                        named.push((entity.name, entity.mention_count));
+                    }
+                }
+                named.sort_by(|a, b| b.1.cmp(&a.1));
+                named.into_iter().take(5).map(|(name, _)| name).collect()
             };
 
             let summary = if entity_names.is_empty() {
