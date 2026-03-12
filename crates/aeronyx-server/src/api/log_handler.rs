@@ -673,7 +673,31 @@ pub async fn mpi_log(
         if result.is_ok() { logged += 1; }
     }
 
+    // ── v2.4.0: Register session in sessions table for Miner Steps 7-11 ──
+    // Without this, get_pending_sessions() returns empty and the entire
+    // cognitive graph pipeline (entity extraction, community detection, etc.)
+    // never runs. The sessions table tracks which sessions have been processed.
+    if logged > 0 {
+        let turn_count = log_req.turns.len() as i64;
+        if let Err(e) = state.storage.upsert_session(
+            &log_req.session_id,
+            &owner,
+            None,  // project_id — assigned later by Step 8
+            "chat",
+            now_ts as i64,
+            turn_count,
+        ).await {
+            warn!(
+                session = %log_req.session_id,
+                error = %e,
+                "[MPI_LOG] Failed to register session (non-fatal)"
+            );
+        }
+    }
+
     debug!(logged = logged, session = %log_req.session_id, "[LOG] Processed");
+
+    
 
     (StatusCode::ACCEPTED, Json(serde_json::json!(LogResponse {
         logged, session_id: log_req.session_id,
