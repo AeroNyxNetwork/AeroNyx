@@ -634,10 +634,15 @@ impl Server {
         // WebSocket tunnel
         let node_info_path = &self.config.management.node_info_path;
         if let Ok(node_info) = crate::management::models::StoredNodeInfo::load(node_info_path) {
+            // v2.3.0: Pass MPI api_secret to WsTunnel for Bearer token injection
+            // in MPI proxy requests and store_chat_to_mpi calls.
             let ws = crate::management::WsTunnel::new(
                 self.identity.clone(),
                 node_info.node_id.clone(),
                 Arc::clone(&agent_manager),
+            )
+            .with_mpi_api_secret(
+                self.config.memchain.effective_api_secret().map(|s| s.to_string())
             );
             let ws_shutdown = self.shutdown_tx.subscribe();
             tokio::spawn(async move { ws.run(ws_shutdown).await; });
