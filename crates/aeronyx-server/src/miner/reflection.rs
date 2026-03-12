@@ -1130,17 +1130,18 @@ impl ReflectionMiner {
         }
 
         if merged_small > 0 {
-            // Re-count entities in communities after merging
+            // Re-count entities in communities after merging.
+            // Look up the community name from the get_communities() result we
+            // already fetched earlier (avoids needing a get_community() method).
+            let existing_communities = self.storage.get_communities(&owner).await;
             for (large_cid, _) in &large_communities {
                 let members = self.storage.get_entities_in_community(large_cid, &owner).await;
-                // Retrieve existing community name for the upsert
-                let cname = if let Some(c) = self.storage.get_community(large_cid).await {
-                    c.name.clone()
-                } else {
-                    large_cid.clone()
-                };
+                let cname = existing_communities.iter()
+                    .find(|c| c.community_id == *large_cid)
+                    .map(|c| c.name.as_str())
+                    .unwrap_or(large_cid.as_str());
                 let _ = self.storage.upsert_community(
-                    large_cid, &owner, &cname,
+                    large_cid, &owner, cname,
                     None, None, members.len() as i64,
                 ).await;
             }
