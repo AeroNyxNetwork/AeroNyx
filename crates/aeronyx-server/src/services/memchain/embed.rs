@@ -569,13 +569,21 @@ impl EmbedEngine {
         }
     }
 
-    /// Generate embedding for a single text with default prompt mode (Query).
+    /// Generate embedding for a single text with default prompt mode (Document).
     ///
     /// This is the backward-compatible API used by all existing callers.
-    /// For EmbeddingGemma, applies Query prefix by default.
-    /// For MiniLM, prompt mode is ignored (no prefix).
+    /// Default is Document mode because most callers store/index content:
+    /// - /remember endpoint stores memory records
+    /// - Miner Step 0.5 backfills record embeddings
+    /// - Miner Step 7 generates entity embeddings
+    /// - log_handler stores conversation embeddings
+    ///
+    /// For **query** embedding (recall, search), use embed_single_with_mode()
+    /// with EmbedPromptMode::Query explicitly.
+    ///
+    /// For MiniLM, prompt mode is ignored (no prefix applied).
     pub fn embed_single(&self, text: &str) -> Result<Vec<f32>, String> {
-        self.embed_single_with_mode(text, EmbedPromptMode::Query)
+        self.embed_single_with_mode(text, EmbedPromptMode::Document)
     }
 
     /// Generate embedding for a single text with explicit prompt mode.
@@ -592,11 +600,12 @@ impl EmbedEngine {
         results.into_iter().next().ok_or_else(|| "Empty result from embed_batch".into())
     }
 
-    /// Generate embeddings for a batch of texts with default prompt mode (Query).
+    /// Generate embeddings for a batch of texts with default prompt mode (Document).
     ///
-    /// Backward-compatible API. All existing callers use this.
+    /// Backward-compatible API. Most callers index content (not search queries).
+    /// For query embedding, use embed_with_mode() with EmbedPromptMode::Query.
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
-        self.embed_with_mode(texts, EmbedPromptMode::Query)
+        self.embed_with_mode(texts, EmbedPromptMode::Document)
     }
 
     /// Generate embeddings for a batch of texts with explicit prompt mode.
