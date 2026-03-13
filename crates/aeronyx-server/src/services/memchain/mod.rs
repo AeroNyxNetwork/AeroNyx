@@ -41,6 +41,7 @@
 pub mod storage;
 pub mod storage_crypto;
 pub mod storage_ops;
+pub mod storage_fts;
 
 // Cognitive engine
 pub mod vector;
