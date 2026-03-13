@@ -846,6 +846,11 @@ impl ReflectionMiner {
                 ).await {
                     Ok(is_new) => {
                         if is_new { total_entities += 1; }
+                        // v2.4.0+BM25: Index entity in FTS5
+                        self.storage.fts_index_entity(
+                            &entity_id, &owner, &entity.text,
+                            description.as_deref(), &entity.label,
+                        ).await;
                     }
                     Err(e) => {
                         warn!(entity = %entity.text, error = %e, "[MINER_S7] Entity upsert failed");
@@ -1393,6 +1398,10 @@ impl ReflectionMiner {
 
             self.storage.update_session_summary(
                 &session.session_id, &summary, None
+            ).await;
+            // v2.4.0+BM25: Index session summary in FTS5
+            self.storage.fts_index_session(
+                &session.session_id, &owner, &summary,
             ).await;
             self.storage.mark_session_summary_generated(&session.session_id).await;
             self.storage.update_session_ended_at(&session.session_id, now_ts).await;
