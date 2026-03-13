@@ -48,6 +48,7 @@ pub mod mpi;
 // ── Handler modules (split from mpi.rs in v2.4.0) ──
 pub mod mpi_handlers;
 pub mod mpi_graph_handlers;
+pub mod recall_handler;
 
 // ── /log endpoint (separate since v2.1.0) ──
 pub mod log_handler;
