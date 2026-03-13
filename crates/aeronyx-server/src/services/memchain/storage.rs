@@ -474,7 +474,7 @@ impl MemoryStorage {
         //   owner_hex: owner public key hex — for access control filtering
         //   content: searchable text content
         //   tags: topic_tags or entity_type for boosting
-        conn.execute_batch(
+        match conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS fts_index USING fts5(
                 source_type,
                 source_id,
@@ -483,7 +483,10 @@ impl MemoryStorage {
                 tags,
                 tokenize='porter unicode61'
             );"
-        ).map_err(|e| format!("Schema creation failed (FTS5): {}", e))?;
+        ) {
+            Ok(_) => info!("[STORAGE] ✅ FTS5 index ready"),
+            Err(e) => warn!("[STORAGE] ⚠️ FTS5 creation failed (BM25 disabled): {}", e),
+        }
 
         // Insert schema version if not present
         let existing: Option<u32> = conn
