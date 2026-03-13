@@ -100,54 +100,66 @@ impl MemoryStorage {
     /// - "rate OR limiting" → matches documents containing either
     /// - "RS256" → exact keyword match (porter stemmer preserves it)
     pub async fn bm25_search(
-        &self,
-        query: &str,
-        owner: &[u8; 32],
-        limit: usize,
-    ) -> Vec<(String, String, f64)> {
-        if query.trim().is_empty() {
-            return Vec::new();
-        }
-
-        let owner_hex = hex::encode(owner);
-
-        // Sanitize query for FTS5: remove special characters that could break syntax
-        let sanitized = sanitize_fts_query(query);
-        if sanitized.is_empty() {
-            return Vec::new();
-        }
-
-        let conn = self.conn.lock().await;
-
-        // bm25(fts_index, 0, 0, 0, 1, 0) → only score the `content` column (index 3)
-        // source_type(0), source_id(1), owner_hex(2) are not scored
-        // tags(4) is not scored (could be added later for boosting)
-        let mut stmt = match conn.prepare(
-            "SELECT source_type, source_id, -bm25(fts_index, 0, 0, 0, 1, 0) as score
-             FROM fts_index
-             WHERE fts_index MATCH ?1 AND owner_hex = ?2
-             ORDER BY score DESC
-             LIMIT ?3"
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                debug!("[BM25] Query prepare failed (FTS5 may not be available): {}", e);
-                return Vec::new();
-            }
-        };
-
-        stmt.query_map(
-            params![sanitized, owner_hex, limit as i64],
-            |row| Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, f64>(2)?,
-            ))
-        )
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+    &self,
+    query: &str,
+    owner: &[u8; 32],
+    limit: usize,
+) -> Vec<(String, String, f64)> {
+    if query.trim().is_empty() {
+        return Vec::new();
     }
+
+    let owner_hex = hex::encode(owner);
+    let sanitized = sanitize_fts_query(query);
+    if sanitized.is_empty() {
+        return Vec::new();
+    }
+
+
+    debug!(
+        raw_query = %query,
+        sanitized = %sanitized,
+        owner_hex = %owner_hex,
+        limit = limit,
+        "[BM25] Search params"
+    );
+
+    let conn = self.conn.lock().await;
+
+    let mut stmt = match conn.prepare(
+        "SELECT source_type, source_id, -bm25(fts_index, 0, 0, 0, 1, 0) as score
+         FROM fts_index
+         WHERE fts_index MATCH ?1 AND owner_hex = ?2
+         ORDER BY score DESC
+         LIMIT ?3"
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("[BM25] Query prepare failed: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let results: Vec<(String, String, f64)> = stmt.query_map(
+        params![sanitized, owner_hex, limit as i64],
+        |row| Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, f64>(2)?,
+        ))
+    )
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default();
+
+
+    debug!(
+        result_count = results.len(),
+        "[BM25] Search complete"
+    );
+
+    results
 }
+
 
 // ============================================
 // impl MemoryStorage — FTS5 Index Maintenance
