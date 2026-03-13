@@ -128,7 +128,7 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", features = ["ring"], default-features = false }
 
 # 🌟 v2.0.0: SQLite persistence for MemoryRecord (MRS-1)
-rusqlite = { version = "0.31", features = ["bundled", "bundled-full"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 # 🌟 v2.1.0: MVF + Rule Engine + RawLog encryption
 regex = "1.10"
