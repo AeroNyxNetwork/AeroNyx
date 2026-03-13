@@ -196,13 +196,11 @@ pub async fn mpi_recall(
     // These are injected directly as memories so keyword queries like "JWT" or
     // "RS256" return relevant results from the knowledge graph.
     let mut bm25_direct_memories: Vec<RecalledMemory> = Vec::new();
-
     for (source_type, source_id, bm25_score) in &bm25_results {
         match source_type.as_str() {
             "entity" => {
                 if let Some(entity) = state.storage.get_entity(source_id).await {
                     let edges = state.storage.get_edges_for_entity(source_id, &owner).await;
-
                     let mut parts: Vec<String> = vec![
                         format!("{} ({})", entity.name, entity.entity_type)
                     ];
@@ -211,7 +209,6 @@ pub async fn mpi_recall(
                             parts.push(desc.clone());
                         }
                     }
-
                     let mut edge_descs: Vec<String> = Vec::new();
                     for edge in edges.iter().take(5) {
                         let other_id = if edge.source_id == *source_id {
@@ -230,7 +227,6 @@ pub async fn mpi_recall(
                     if !edge_descs.is_empty() {
                         parts.push(format!("Relations: {}", edge_descs.join("; ")));
                     }
-
                     bm25_direct_memories.push(RecalledMemory {
                         record_id: format!("bm25_entity_{}", source_id),
                         layer: "knowledge".into(),
@@ -261,7 +257,51 @@ pub async fn mpi_recall(
                     }
                 }
             }
-            _ => {} // "record" type handled by RRF fusion below
+            "record" => {
+                // BM25 "record" hits can be either:
+                // 1. Real records (from remember/rule engine) — have valid record_id in records table
+                // 2. Conversation turns (from /log FTS indexing) — source_id is a SHA256 hash
+                //    that does NOT exist in the records table
+                //
+                // Real records are handled by RRF fusion below (they'll match via hex decode).
+                // Conversation turns must be injected directly here, with content from FTS index.
+                if let Ok(id_bytes) = hex::decode(source_id) {
+                    if id_bytes.len() == 32 {
+                        let mut rid = [0u8; 32];
+                        rid.copy_from_slice(&id_bytes);
+
+                        // Check if this source_id exists in the records table
+                        if state.storage.get(&rid).await.is_none() {
+                            // Not a real record — this is a conversation turn indexed by /log.
+                            // Retrieve the original content directly from the FTS index.
+                            let content: Option<String> = {
+                                let conn = state.storage.conn_lock().await;
+                                conn.query_row(
+                                    "SELECT content FROM fts_index WHERE source_type = 'record' AND source_id = ?1",
+                                    rusqlite::params![source_id.as_str()],
+                                    |row| row.get(0),
+                                ).ok()
+                            };
+
+                            if let Some(text) = content {
+                                bm25_direct_memories.push(RecalledMemory {
+                                    record_id: format!("bm25_turn_{}", &source_id[..source_id.len().min(16)]),
+                                    layer: "episode".into(),
+                                    score: 1.2 + bm25_score.min(1.0),
+                                    content: text,
+                                    topic_tags: vec!["bm25_result".into(), "conversation_turn".into()],
+                                    source_ai: "bm25-search".into(),
+                                    timestamp: now,
+                                    access_count: 0,
+                                    proactive: false,
+                                });
+                            }
+                        }
+                        // If it IS a real record, it stays in bm25_results for RRF processing below
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
