@@ -362,7 +362,7 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
     let router = Router::new()
         // ── Original endpoints (mpi_handlers.rs) ──
         .route("/api/mpi/remember", post(mpi_handlers::mpi_remember))
-        .route("/api/mpi/recall", post(mpi_handlers::mpi_recall))
+        .route("/api/mpi/recall", post(super::recall_handler::mpi_recall))
         .route("/api/mpi/forget", post(mpi_handlers::mpi_forget))
         .route("/api/mpi/status", get(mpi_handlers::mpi_status))
         .route("/api/mpi/embed", post(mpi_handlers::mpi_embed))
