@@ -58,21 +58,27 @@
 //!   Chinese/CJK tokenization uses character bigrams (unicode61 default).
 //!   For better CJK support, consider adding a custom tokenizer in Phase C.
 //! - bm25() weight array must match column count (5 columns → 5 weights).
-//! - FTS5 MATCH syntax: simple words are OR'd by default. Use "word1 word2"
-//!   for implicit AND. Use "word1 OR word2" for explicit OR.
+//! - FTS5 MATCH syntax: space between words = implicit AND (requires all terms).
+//!   Use "word1 OR word2" for explicit OR.
 //! - When records are encrypted (record_key is set), FTS5 indexes the
 //!   PLAINTEXT content (decrypted at insert time). The FTS index itself
 //!   is NOT encrypted — this is acceptable because the DB file is local-only.
-//! - fts_reindex_all() is expensive (full table scan). Only call at startup
-//!   or when migration detects missing FTS data.
+//! - fts_reindex_all() is expensive (full table scan + per-row decryption).
+//!   Only call at startup or when migration detects missing FTS data.
+//! - fts_reindex_all() now decrypts record content before indexing (v2.4.0+BM25-fix).
+//!   Previous version indexed raw encrypted_content from DB, which was ciphertext
+//!   when record_key was set — causing BM25 searches to return no results.
 //!
 //! ## Last Modified
 //! v2.4.0+BM25 - 🌟 Initial implementation
+//! v2.4.0+BM25-fix - 🐛 Fixed: bm25_search debug logging, fts_reindex_all decryption,
+//!   impl block brace mismatch
 
 use rusqlite::params;
 use tracing::{debug, info, warn};
 
 use super::storage::MemoryStorage;
+use super::storage_crypto::decrypt_record_content;
 
 // ============================================
 // impl MemoryStorage — BM25 Search
@@ -96,70 +102,73 @@ impl MemoryStorage {
     ///
     /// ## Query Syntax
     /// FTS5 tokenizes the query using the same `porter unicode61` tokenizer.
-    /// - "JWT authentication" → matches documents containing both stems
+    /// - "JWT authentication" → matches documents containing both stems (implicit AND)
     /// - "rate OR limiting" → matches documents containing either
     /// - "RS256" → exact keyword match (porter stemmer preserves it)
     pub async fn bm25_search(
-    &self,
-    query: &str,
-    owner: &[u8; 32],
-    limit: usize,
-) -> Vec<(String, String, f64)> {
-    if query.trim().is_empty() {
-        return Vec::new();
-    }
-
-    let owner_hex = hex::encode(owner);
-    let sanitized = sanitize_fts_query(query);
-    if sanitized.is_empty() {
-        return Vec::new();
-    }
-
-
-    debug!(
-        raw_query = %query,
-        sanitized = %sanitized,
-        owner_hex = %owner_hex,
-        limit = limit,
-        "[BM25] Search params"
-    );
-
-    let conn = self.conn.lock().await;
-
-    let mut stmt = match conn.prepare(
-        "SELECT source_type, source_id, -bm25(fts_index, 0, 0, 0, 1, 0) as score
-         FROM fts_index
-         WHERE fts_index MATCH ?1 AND owner_hex = ?2
-         ORDER BY score DESC
-         LIMIT ?3"
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            debug!("[BM25] Query prepare failed: {}", e);
+        &self,
+        query: &str,
+        owner: &[u8; 32],
+        limit: usize,
+    ) -> Vec<(String, String, f64)> {
+        if query.trim().is_empty() {
             return Vec::new();
         }
-    };
 
-    let results: Vec<(String, String, f64)> = stmt.query_map(
-        params![sanitized, owner_hex, limit as i64],
-        |row| Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, f64>(2)?,
-        ))
-    )
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default();
+        let owner_hex = hex::encode(owner);
 
+        // Sanitize query for FTS5: remove special characters that could break syntax
+        let sanitized = sanitize_fts_query(query);
+        if sanitized.is_empty() {
+            return Vec::new();
+        }
 
-    debug!(
-        result_count = results.len(),
-        "[BM25] Search complete"
-    );
+        debug!(
+            raw_query = %query,
+            sanitized = %sanitized,
+            owner_hex = %owner_hex,
+            limit = limit,
+            "[BM25] Search params"
+        );
 
-    results
+        let conn = self.conn.lock().await;
+
+        // bm25(fts_index, 0, 0, 0, 1, 0) → only score the `content` column (index 3)
+        // source_type(0), source_id(1), owner_hex(2) are not scored
+        // tags(4) is not scored (could be added later for boosting)
+        let mut stmt = match conn.prepare(
+            "SELECT source_type, source_id, -bm25(fts_index, 0, 0, 0, 1, 0) as score
+             FROM fts_index
+             WHERE fts_index MATCH ?1 AND owner_hex = ?2
+             ORDER BY score DESC
+             LIMIT ?3"
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("[BM25] Query prepare failed (FTS5 may not be available): {}", e);
+                return Vec::new();
+            }
+        };
+
+        let results: Vec<(String, String, f64)> = stmt.query_map(
+            params![sanitized, owner_hex, limit as i64],
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        )
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+
+        debug!(
+            result_count = results.len(),
+            "[BM25] Search complete"
+        );
+
+        results
+    }
 }
-
 
 // ============================================
 // impl MemoryStorage — FTS5 Index Maintenance
@@ -258,6 +267,11 @@ impl MemoryStorage {
     ///
     /// Called at startup if FTS index is empty or after migration.
     /// Expensive operation — scans all three source tables.
+    ///
+    /// ## v2.4.0+BM25-fix: Decryption support
+    /// Records are stored encrypted in DB when record_key is set. Previous version
+    /// did a bulk `INSERT ... SELECT encrypted_content` which indexed ciphertext.
+    /// Now iterates rows and decrypts each before indexing into FTS5.
     pub async fn fts_reindex_all(&self, owner: &[u8; 32]) {
         let owner_hex = hex::encode(owner);
         let conn = self.conn.lock().await;
@@ -268,16 +282,59 @@ impl MemoryStorage {
             params![owner_hex],
         );
 
-        // Index records
-        let records_indexed = conn.execute(
-            "INSERT INTO fts_index (source_type, source_id, owner_hex, content, tags)
-             SELECT 'record', hex(record_id), ?1, encrypted_content, topic_tags
-             FROM records
-             WHERE owner = ?2 AND status = 0 AND encrypted_content != x''",
-            params![owner_hex, owner.as_slice()],
-        ).unwrap_or(0);
+        // ── Index records (with decryption) ──
+        // Cannot use bulk INSERT...SELECT because encrypted_content may be
+        // ciphertext that needs Rust-side ChaCha20 decryption.
+        let records_indexed = {
+            let mut stmt = match conn.prepare(
+                "SELECT record_id, encrypted_content, topic_tags
+                 FROM records
+                 WHERE owner = ?1 AND status = 0 AND encrypted_content != x''"
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("[FTS] Reindex: failed to prepare records query: {}", e);
+                    return;
+                }
+            };
 
-        // Index entities
+            let rk = self.record_key;
+            let rows: Vec<(Vec<u8>, Vec<u8>, String)> = stmt
+                .query_map(params![owner.as_slice()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map(|r| r.filter_map(|x| x.ok()).collect())
+                .unwrap_or_default();
+
+            let mut count = 0usize;
+            for (rid, encrypted, tags) in &rows {
+                // Decrypt if record_key is set and content looks like ciphertext
+                // (ChaCha20-Poly1305: 12-byte nonce + 16-byte tag = 28 byte overhead minimum)
+                let plaintext = if let Some(key) = rk.as_ref() {
+                    if encrypted.len() >= 28 {
+                        decrypt_record_content(key, encrypted)
+                            .unwrap_or_else(|_| encrypted.clone())
+                    } else {
+                        encrypted.clone()
+                    }
+                } else {
+                    encrypted.clone()
+                };
+
+                let text = String::from_utf8_lossy(&plaintext);
+                if text.trim().is_empty() { continue; }
+
+                let _ = conn.execute(
+                    "INSERT INTO fts_index (source_type, source_id, owner_hex, content, tags)
+                     VALUES ('record', ?1, ?2, ?3, ?4)",
+                    params![hex::encode(rid), &owner_hex, text.as_ref(), tags],
+                );
+                count += 1;
+            }
+            count
+        };
+
+        // ── Index entities (plaintext, bulk is fine) ──
         let entities_indexed = conn.execute(
             "INSERT INTO fts_index (source_type, source_id, owner_hex, content, tags)
              SELECT 'entity', entity_id, ?1,
@@ -288,7 +345,7 @@ impl MemoryStorage {
             params![owner_hex, owner.as_slice()],
         ).unwrap_or(0);
 
-        // Index sessions
+        // ── Index sessions (plaintext summaries, bulk is fine) ──
         let sessions_indexed = conn.execute(
             "INSERT INTO fts_index (source_type, source_id, owner_hex, content, tags)
              SELECT 'session', session_id, ?1, summary, 'session_summary'
@@ -316,8 +373,9 @@ impl MemoryStorage {
 /// - Quotes, parentheses, asterisks, carets, etc.
 /// - We strip these and keep only alphanumeric + spaces + basic punctuation.
 ///
-/// Also converts the query to implicit AND (FTS5 default is OR for multiple words,
-/// but AND gives better precision for recall).
+/// Also converts the query to explicit AND for multi-word queries.
+/// FTS5 with `porter unicode61` tokenizer: space between words = implicit AND
+/// (requires all terms present). We use explicit AND for clarity.
 fn sanitize_fts_query(query: &str) -> String {
     let cleaned: String = query.chars()
         .map(|c| {
@@ -338,14 +396,14 @@ fn sanitize_fts_query(query: &str) -> String {
         return String::new();
     }
 
-    // FTS5 implicit AND: wrap each word in quotes to prevent OR behavior
-    // "word1" "word2" → must match both stems
-    // For single words, just return as-is (FTS5 handles it)
     if words.len() == 1 {
         words[0].to_string()
     } else {
-        // Use AND between words for better precision
-        words.join(" AND ")
+        // FTS5: space between words = implicit AND (requires all terms)
+        // Explicit "AND" also works but space is simpler and avoids edge cases
+        // where "AND" itself could be misinterpreted by stemmer or locale.
+        // Using space (implicit AND) for robustness.
+        words.join(" ")
     }
 }
 
@@ -359,12 +417,12 @@ mod tests {
 
     #[test]
     fn test_sanitize_fts_query_basic() {
-        assert_eq!(sanitize_fts_query("hello world"), "hello AND world");
+        assert_eq!(sanitize_fts_query("hello world"), "hello world");
     }
 
     #[test]
     fn test_sanitize_fts_query_special_chars() {
-        assert_eq!(sanitize_fts_query("JWT (RS256)"), "JWT AND RS256");
+        assert_eq!(sanitize_fts_query("JWT (RS256)"), "JWT RS256");
     }
 
     #[test]
@@ -380,17 +438,17 @@ mod tests {
 
     #[test]
     fn test_sanitize_fts_query_short_words_filtered() {
-        assert_eq!(sanitize_fts_query("I am a developer"), "am AND developer");
+        assert_eq!(sanitize_fts_query("I am a developer"), "am developer");
     }
 
     #[test]
     fn test_sanitize_fts_query_unicode() {
-        assert_eq!(sanitize_fts_query("认证模块 JWT"), "认证模块 AND JWT");
+        assert_eq!(sanitize_fts_query("认证模块 JWT"), "认证模块 JWT");
     }
 
     #[test]
     fn test_sanitize_fts_query_hyphenated() {
-        assert_eq!(sanitize_fts_query("rate-limiting approach"), "rate-limiting AND approach");
+        assert_eq!(sanitize_fts_query("rate-limiting approach"), "rate-limiting approach");
     }
 
     // Integration tests require MemoryStorage with FTS5 — tested via end-to-end
@@ -492,7 +550,8 @@ mod tests {
         s.fts_index_entity("ent_rl", &owner, "rate limiting", Some("Token bucket algorithm"), "technology").await;
         s.fts_index_session("sess_rl", &owner, "Discussed rate limiting approach using token bucket").await;
 
-        let results = s.bm25_search("rate AND limiting", &owner, 10).await;
+        // Space = implicit AND in FTS5, matches all three sources
+        let results = s.bm25_search("rate limiting", &owner, 10).await;
         assert_eq!(results.len(), 3, "Should find record + entity + session");
 
         let types: Vec<&str> = results.iter().map(|(t, _, _)| t.as_str()).collect();
