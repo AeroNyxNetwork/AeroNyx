@@ -670,7 +670,32 @@ pub async fn mpi_log(
             Some(&rawlog_key),
         ).await;
 
-        if result.is_ok() { logged += 1; }
+        if result.is_ok() {
+            logged += 1;
+
+            // v2.4.0+BM25: Index ALL turns (user + assistant) in FTS5.
+            // Raw conversation is the source of truth — entities/summaries are
+            // derived and incomplete. Indexing both roles ensures BM25 can find:
+            // - User: "implement rate limiting" → keyword match
+            // - Assistant: "token bucket algorithm, 100 req/min" → technical details
+            if !turn.content.trim().is_empty() {
+                let turn_rid = {
+                    use sha2::{Sha256, Digest};
+                    let mut h = Sha256::new();
+                    h.update(log_req.session_id.as_bytes());
+                    h.update(b":");
+                    h.update(turn_index.to_le_bytes());
+                    let hash = h.finalize();
+                    let mut rid = [0u8; 32];
+                    rid.copy_from_slice(&hash);
+                    rid
+                };
+                state.storage.fts_index_record(
+                    &turn_rid, &owner, &turn.content,
+                    &format!("turn:{}:{}", log_req.session_id, turn.role),
+                ).await;
+            }
+        }
     }
 
     // ── v2.4.0: Register session in sessions table for Miner Steps 7-11 ──
