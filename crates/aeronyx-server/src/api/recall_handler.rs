@@ -4,7 +4,7 @@
 //! # POST /api/mpi/recall — Hybrid Retrieval Pipeline
 //!
 //! ## Creation Reason (v2.4.0+BM25 Split)
-//! Extracted from mpi_handlers.rs because the recall handler grew to ~300 lines
+//! Extracted from mpi_handlers.rs because the recall handler grew to ~350 lines
 //! with the addition of graph traversal (v2.4.0) and BM25 search (v2.4.0+BM25).
 //! The recall pipeline is the most complex single handler in the MPI API.
 //!
@@ -12,17 +12,18 @@
 //! ```text
 //! POST /api/mpi/recall {query, embedding, top_k, ...}
 //!   │
-//!   ├─ Step 1: Query Analysis (GLiNER + regex + entity matching)
+//!   ├─ Step 1:      Query Analysis (GLiNER + regex + entity matching)
 //!   │
-//!   ├─ Step 2a: Vector search (cosine similarity, always runs)
-//!   ├─ Step 2a-bis: BM25 search (FTS5 keyword matching) ← NEW
-//!   ├─ Step 2b: Graph BFS (knowledge_edges traversal)
-//!   ├─ Step 2c: Graph content retrieval (episodes + entities)
+//!   ├─ Step 2a:     Vector search (cosine similarity, always runs)
+//!   ├─ Step 2a-bis: BM25 search (FTS5 keyword matching)
+//!   ├─ Step 2a-ter: BM25 entity/session direct injection
+//!   ├─ Step 2b:     Graph BFS (knowledge_edges traversal)
+//!   ├─ Step 2c:     Graph content retrieval (episodes + entities)
 //!   │
-//!   ├─ Step 3: RRF fusion (vector + BM25 rank merging) ← NEW
+//!   ├─ Step 3:      RRF fusion (vector + BM25 rank merging)
 //!   │   └─ MVF φ₀-φ₉ scoring with graph_traverse_weight
 //!   │
-//!   └─ Step 4: Token budget trimming → Response
+//!   └─ Step 4:      Token budget trimming → Response
 //! ```
 //!
 //! ## Reciprocal Rank Fusion (RRF)
@@ -33,6 +34,12 @@
 //! Rank-based fusion — no score normalization needed. Documents appearing
 //! in multiple retrieval sources get boosted naturally.
 //!
+//! ## Three content retrieval paths
+//! 1. **RRF path** (records): Vector + BM25 rankings merged → scored records
+//! 2. **Graph path** (Step 2c): BFS entities → session summaries + entity knowledge
+//! 3. **BM25 direct path** (Step 2a-ter): BM25 entity/session hits injected directly
+//!    even when graph traversal doesn't trigger (e.g., no embedding, short query)
+//!
 //! ## Dependencies
 //! - mpi.rs — MpiState, AuthenticatedOwner, helpers
 //! - mpi_handlers.rs — RecallRequest/Response types (re-exported)
@@ -42,17 +49,22 @@
 //! - mvf.rs — compute_features(), fuse_scores()
 //!
 //! ⚠️ Important Note for Next Developer:
-//! - RRF k=60 is the standard value. Changing it affects fusion behavior:
-//!   lower k → more weight on top-ranked results, higher k → more uniform.
+//! - RRF k=60 is the standard value. Lower k → more weight on top ranks.
 //! - BM25 and vector results use DIFFERENT score scales. RRF avoids this
-//!   problem by using ranks, not raw scores.
-//! - Graph memories (Step 2c) bypass RRF — they have fixed scores (2.0-3.0)
-//!   because they don't participate in the vector/BM25 ranking.
-//! - BM25 hits of type "entity" and "session" are already covered by Step 2c.
-//!   Only "record" type BM25 hits add new candidates to RRF.
+//!   by using ranks, not raw scores.
+//! - Graph memories (Step 2c) and BM25 direct memories (Step 2a-ter) bypass
+//!   RRF — they have fixed scores because they don't participate in ranking.
+//! - BM25 hits of type "record" go through RRF. "entity" and "session" go
+//!   through direct injection (Step 2a-ter) to ensure they appear even when
+//!   graph traversal doesn't trigger.
+//! - f64::min() on bm25_score caps the BM25 contribution to prevent a single
+//!   very high BM25 score from dominating.
 //!
 //! ## Last Modified
 //! v2.4.0+BM25 - 🌟 Extracted from mpi_handlers.rs; added BM25 + RRF fusion
+//! v2.4.0+BM25-fix - 🔧 Added Step 2a-ter: BM25 entity/session direct injection.
+//!   Fixes issue where keyword queries (e.g., "JWT", "RS256") found FTS matches
+//!   but returned empty results because graph traversal didn't trigger.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -86,19 +98,15 @@ pub use super::mpi_handlers::{
 // ============================================
 
 /// Reciprocal Rank Fusion constant (Cormack et al. 2009).
-/// k=60 is the standard value. Higher = more uniform weighting across ranks.
 const RRF_K: f64 = 60.0;
 
 /// Scale factor for RRF scores when adding to recall base scores.
-/// RRF raw scores are ~0.01-0.03, which is tiny compared to recall scores (~1-3).
-/// Scaling by 10 makes RRF meaningfully influence final ranking.
 const RRF_SCALE: f64 = 10.0;
 
 // ============================================
 // POST /api/mpi/recall — Hybrid Pipeline
 // ============================================
 
-/// Hybrid recall handler: vector + BM25 + graph → RRF fusion → MVF rerank.
 pub async fn mpi_recall(
     State(state): State<Arc<MpiState>>,
     req: Request<axum::body::Body>,
@@ -181,6 +189,88 @@ pub async fn mpi_recall(
     } else {
         Vec::new()
     };
+
+    // ── Step 2a-ter: BM25 entity/session direct injection (v2.4.0+BM25-fix) ──
+    // BM25 may find entities and sessions by keyword even when graph traversal
+    // doesn't trigger (no embedding provided, query too short for GLiNER, etc.).
+    // These are injected directly as memories so keyword queries like "JWT" or
+    // "RS256" return relevant results from the knowledge graph.
+    let mut bm25_direct_memories: Vec<RecalledMemory> = Vec::new();
+
+    for (source_type, source_id, bm25_score) in &bm25_results {
+        match source_type.as_str() {
+            "entity" => {
+                if let Some(entity) = state.storage.get_entity(source_id).await {
+                    let edges = state.storage.get_edges_for_entity(source_id, &owner).await;
+
+                    let mut parts: Vec<String> = vec![
+                        format!("{} ({})", entity.name, entity.entity_type)
+                    ];
+                    if let Some(ref desc) = entity.description {
+                        if !desc.contains(&entity.name) {
+                            parts.push(desc.clone());
+                        }
+                    }
+
+                    let mut edge_descs: Vec<String> = Vec::new();
+                    for edge in edges.iter().take(5) {
+                        let other_id = if edge.source_id == *source_id {
+                            &edge.target_id
+                        } else {
+                            &edge.source_id
+                        };
+                        if let Some(other) = state.storage.get_entity(other_id).await {
+                            edge_descs.push(if edge.source_id == *source_id {
+                                format!("{} → {}", edge.relation_type, other.name)
+                            } else {
+                                format!("{} ← {}", other.name, edge.relation_type)
+                            });
+                        }
+                    }
+                    if !edge_descs.is_empty() {
+                        parts.push(format!("Relations: {}", edge_descs.join("; ")));
+                    }
+
+                    bm25_direct_memories.push(RecalledMemory {
+                        record_id: format!("bm25_entity_{}", source_id),
+                        layer: "knowledge".into(),
+                        score: 1.5 + bm25_score.min(1.0),
+                        content: parts.join(". "),
+                        topic_tags: vec!["bm25_result".into(), "entity_knowledge".into()],
+                        source_ai: "bm25-search".into(),
+                        timestamp: entity.updated_at as u64,
+                        access_count: entity.mention_count as u32,
+                        proactive: false,
+                    });
+                }
+            }
+            "session" => {
+                if let Some(session) = state.storage.get_session(source_id).await {
+                    if let Some(ref summary) = session.summary {
+                        bm25_direct_memories.push(RecalledMemory {
+                            record_id: format!("bm25_session_{}", source_id),
+                            layer: "knowledge".into(),
+                            score: 1.8 + bm25_score.min(1.0),
+                            content: format!("[Session: {}] {}", source_id, summary),
+                            topic_tags: vec!["bm25_result".into(), "session_summary".into()],
+                            source_ai: "bm25-search".into(),
+                            timestamp: session.started_at as u64,
+                            access_count: 0,
+                            proactive: false,
+                        });
+                    }
+                }
+            }
+            _ => {} // "record" type handled by RRF fusion below
+        }
+    }
+
+    if !bm25_direct_memories.is_empty() {
+        debug!(
+            bm25_direct = bm25_direct_memories.len(),
+            "[RECALL] BM25 direct entity/session injection"
+        );
+    }
 
     // ── Step 2b: Graph BFS (v2.4.0) ──
     let graph_traversed: HashMap<String, f64> = if state.graph_enabled && rb.include_graph {
@@ -291,13 +381,14 @@ pub async fn mpi_recall(
     // ── Step 3: RRF Fusion + Scoring ──
     let total_candidates = search.len() + bm25_results.len() + seen_ids.len();
 
-    // Build RRF score map from vector + BM25 rankings
     let mut rrf_scores: HashMap<[u8; 32], f64> = HashMap::new();
 
+    // Vector search ranks
     for (rank, sr) in search.iter().enumerate() {
         *rrf_scores.entry(sr.record_id).or_insert(0.0) += 1.0 / (RRF_K + rank as f64 + 1.0);
     }
 
+    // BM25 ranks (record type only — entity/session handled by direct injection)
     for (rank, (source_type, source_id, _bm25_score)) in bm25_results.iter().enumerate() {
         if source_type == "record" {
             if let Ok(id_bytes) = hex::decode(source_id) {
@@ -364,13 +455,13 @@ pub async fn mpi_recall(
                 v_old_h + (graph_weight as f64 * 0.1)
             };
 
-            // v2.4.0+BM25: RRF boost for records in both vector + BM25
+            // RRF boost for records appearing in both vector + BM25
             let rrf_boost = rrf_scores.get(&sr.record_id).copied().unwrap_or(0.0) * RRF_SCALE;
             scored.push((record, final_score + rrf_boost));
         }
     }
 
-    // BM25-only candidates (not in vector search)
+    // BM25-only candidates (found by keyword but not by vector similarity)
     for rid in &bm25_only_ids {
         if seen_ids.contains(rid) { continue; }
         if let Some(record) = state.storage.get(rid).await {
@@ -382,7 +473,7 @@ pub async fn mpi_recall(
         }
     }
 
-    // Fallback: if no search results, use recent records
+    // Fallback: if no search results at all, use recent records
     if search.is_empty() && bm25_results.is_empty() {
         let recent = state.storage.get_active_records(&owner, layer_filter, top_k).await;
         for r in recent {
@@ -393,7 +484,7 @@ pub async fn mpi_recall(
 
     scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // ── Step 4: Token budget + graph memories injection ──
+    // ── Step 4: Token budget + inject graph + BM25 direct memories ──
     let mut returned_ids = seen_ids.clone();
     for (r, score) in &scored {
         let content = String::from_utf8_lossy(&r.encrypted_content).to_string();
@@ -419,7 +510,15 @@ pub async fn mpi_recall(
         memories.push(gm);
     }
 
-    // Re-sort after injection and truncate
+    // Inject BM25 direct entity/session memories
+    for bm in bm25_direct_memories {
+        let tokens = estimate_tokens(&bm.content);
+        if total_tokens + tokens > rb.token_budget && !memories.is_empty() { break; }
+        total_tokens += tokens;
+        memories.push(bm);
+    }
+
+    // Final sort and truncate
     memories.sort_unstable_by(|a, b| {
         b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
     });
