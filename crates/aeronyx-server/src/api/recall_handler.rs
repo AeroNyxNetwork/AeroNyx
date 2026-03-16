@@ -23,6 +23,12 @@
 //!   ├─ Step 3:      RRF fusion (vector + BM25 rank merging)
 //!   │   └─ MVF φ₀-φ₉ scoring with graph_traverse_weight
 //!   │
+//!   ├─ Step 3.5:    Cross-encoder rerank (v2.4.0+Reranker) ← NEW
+//!   │   ├─ Take top RERANK_TOP_N candidates from scored list
+//!   │   ├─ reranker.rerank_batch(query, doc_texts) → CE logits
+//!   │   ├─ Dynamic min-max normalize CE scores → [0, 1]
+//!   │   └─ Blend: 0.7 * CE_normalized + 0.3 * RRF_score → new ranked order
+//!   │
 //!   └─ Step 4:      Token budget trimming → Response
 //! ```
 //!
@@ -31,40 +37,50 @@
 //! RRF_score(d) = Σ 1/(k + rank_i(d))
 //! k = 60 (standard value from Cormack et al. 2009)
 //! ```
-//! Rank-based fusion — no score normalization needed. Documents appearing
-//! in multiple retrieval sources get boosted naturally.
 //!
 //! ## Three content retrieval paths
 //! 1. **RRF path** (records): Vector + BM25 rankings merged → scored records
 //! 2. **Graph path** (Step 2c): BFS entities → session summaries + entity knowledge
 //! 3. **BM25 direct path** (Step 2a-ter): BM25 entity/session hits injected directly
-//!    even when graph traversal doesn't trigger (e.g., no embedding, short query)
+//!
+//! ## Step 3.5 Notes
+//! - Only runs when `state.reranker_engine.is_some()` AND `!rb.query.is_empty()`
+//! - Only reranks the `RERANK_TOP_N` (30) top candidates from the RRF-scored list
+//! - Candidates beyond RERANK_TOP_N are appended unchanged after reranked portion
+//! - Graph memories (Step 2c) and BM25 direct memories (Step 2a-ter) are NOT
+//!   reranked — they are injected after Step 4's token budget loop. This is
+//!   intentional: they carry structural knowledge that reranking might demote.
+//! - Document text for reranking: uses decrypted/plaintext content from
+//!   `encrypted_content` field. In MemChain, content in `encrypted_content` is
+//!   stored as raw UTF-8 bytes (the field name is historical; actual encryption
+//!   happens at the storage layer before insert, and records returned from
+//!   `storage.get()` have already been decrypted). String::from_utf8_lossy is safe.
 //!
 //! ## Dependencies
 //! - mpi.rs — MpiState, AuthenticatedOwner, helpers
 //! - mpi_handlers.rs — RecallRequest/Response types (re-exported)
+//! - recall_handler.rs — RERANK_TOP_N constant (re-exported for mpi_handlers status)
 //! - storage_fts.rs — bm25_search()
 //! - graph.rs — bfs_traverse()
 //! - query_analyzer.rs — analyze_query()
 //! - mvf.rs — compute_features(), fuse_scores()
+//! - reranker.rs — RerankerEngine, RERANK_TOP_N (v2.4.0+Reranker)
 //!
 //! ⚠️ Important Note for Next Developer:
-//! - RRF k=60 is the standard value. Lower k → more weight on top ranks.
-//! - BM25 and vector results use DIFFERENT score scales. RRF avoids this
-//!   by using ranks, not raw scores.
-//! - Graph memories (Step 2c) and BM25 direct memories (Step 2a-ter) bypass
-//!   RRF — they have fixed scores because they don't participate in ranking.
-//! - BM25 hits of type "record" go through RRF. "entity" and "session" go
-//!   through direct injection (Step 2a-ter) to ensure they appear even when
-//!   graph traversal doesn't trigger.
-//! - f64::min() on bm25_score caps the BM25 contribution to prevent a single
-//!   very high BM25 score from dominating.
+//! - RRF k=60 is the standard value. Do NOT change without re-tuning blend weight.
+//! - BM25 and vector results use DIFFERENT score scales. RRF avoids this by using ranks.
+//! - Graph memories (Step 2c) and BM25 direct memories (Step 2a-ter) bypass RRF
+//!   because they don't have a natural rank in the scored list.
+//! - Step 3.5 reranks ONLY the scored (RRF) candidates, not graph/BM25-direct memories.
+//!   If you want to rerank graph memories too, you'll need a second rerank call —
+//!   but be careful about latency (graph memories are already high-confidence results).
+//! - CE_BLEND_WEIGHT (0.7) in reranker.rs controls how aggressively the cross-encoder
+//!   overrides RRF scores. Tune this if reranker degrades graph/BM25 results.
 //!
 //! ## Last Modified
 //! v2.4.0+BM25 - 🌟 Extracted from mpi_handlers.rs; added BM25 + RRF fusion
-//! v2.4.0+BM25-fix - 🔧 Added Step 2a-ter: BM25 entity/session direct injection.
-//!   Fixes issue where keyword queries (e.g., "JWT", "RS256") found FTS matches
-//!   but returned empty results because graph traversal didn't trigger.
+//! v2.4.0+BM25-fix - 🔧 Added Step 2a-ter: BM25 entity/session direct injection
+//! v2.4.0+Reranker - 🌟 Added Step 3.5: cross-encoder rerank between RRF and token budget
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -93,6 +109,9 @@ pub use super::mpi_handlers::{
     TimeHint, TimeRangeParam,
 };
 
+// Re-export RERANK_TOP_N so mpi_handlers.rs status can reference it
+pub use crate::services::memchain::reranker::RERANK_TOP_N;
+
 // ============================================
 // Constants
 // ============================================
@@ -100,7 +119,7 @@ pub use super::mpi_handlers::{
 /// Reciprocal Rank Fusion constant (Cormack et al. 2009).
 const RRF_K: f64 = 60.0;
 
-/// Scale factor for RRF scores when adding to recall base scores.
+/// Scale factor applied to RRF scores when adding to recall base scores.
 const RRF_SCALE: f64 = 10.0;
 
 // ============================================
@@ -191,10 +210,6 @@ pub async fn mpi_recall(
     };
 
     // ── Step 2a-ter: BM25 entity/session direct injection (v2.4.0+BM25-fix) ──
-    // BM25 may find entities and sessions by keyword even when graph traversal
-    // doesn't trigger (no embedding provided, query too short for GLiNER, etc.).
-    // These are injected directly as memories so keyword queries like "JWT" or
-    // "RS256" return relevant results from the knowledge graph.
     let mut bm25_direct_memories: Vec<RecalledMemory> = Vec::new();
     for (source_type, source_id, bm25_score) in &bm25_results {
         match source_type.as_str() {
@@ -205,17 +220,11 @@ pub async fn mpi_recall(
                         format!("{} ({})", entity.name, entity.entity_type)
                     ];
                     if let Some(ref desc) = entity.description {
-                        if !desc.contains(&entity.name) {
-                            parts.push(desc.clone());
-                        }
+                        if !desc.contains(&entity.name) { parts.push(desc.clone()); }
                     }
                     let mut edge_descs: Vec<String> = Vec::new();
                     for edge in edges.iter().take(5) {
-                        let other_id = if edge.source_id == *source_id {
-                            &edge.target_id
-                        } else {
-                            &edge.source_id
-                        };
+                        let other_id = if edge.source_id == *source_id { &edge.target_id } else { &edge.source_id };
                         if let Some(other) = state.storage.get_entity(other_id).await {
                             edge_descs.push(if edge.source_id == *source_id {
                                 format!("{} → {}", edge.relation_type, other.name)
@@ -258,22 +267,11 @@ pub async fn mpi_recall(
                 }
             }
             "record" => {
-                // BM25 "record" hits can be either:
-                // 1. Real records (from remember/rule engine) — have valid record_id in records table
-                // 2. Conversation turns (from /log FTS indexing) — source_id is a SHA256 hash
-                //    that does NOT exist in the records table
-                //
-                // Real records are handled by RRF fusion below (they'll match via hex decode).
-                // Conversation turns must be injected directly here, with content from FTS index.
                 if let Ok(id_bytes) = hex::decode(source_id) {
                     if id_bytes.len() == 32 {
                         let mut rid = [0u8; 32];
                         rid.copy_from_slice(&id_bytes);
-
-                        // Check if this source_id exists in the records table
                         if state.storage.get(&rid).await.is_none() {
-                            // Not a real record — this is a conversation turn indexed by /log.
-                            // Retrieve the original content directly from the FTS index.
                             let content: Option<String> = {
                                 let conn = state.storage.conn_lock().await;
                                 conn.query_row(
@@ -282,7 +280,6 @@ pub async fn mpi_recall(
                                     |row| row.get(0),
                                 ).ok()
                             };
-
                             if let Some(text) = content {
                                 bm25_direct_memories.push(RecalledMemory {
                                     record_id: format!("bm25_turn_{}", &source_id[..source_id.len().min(16)]),
@@ -297,7 +294,6 @@ pub async fn mpi_recall(
                                 });
                             }
                         }
-                        // If it IS a real record, it stays in bm25_results for RRF processing below
                     }
                 }
             }
@@ -306,10 +302,7 @@ pub async fn mpi_recall(
     }
 
     if !bm25_direct_memories.is_empty() {
-        debug!(
-            bm25_direct = bm25_direct_memories.len(),
-            "[RECALL] BM25 direct entity/session injection"
-        );
+        debug!(bm25_direct = bm25_direct_memories.len(), "[RECALL] BM25 direct entity/session injection");
     }
 
     // ── Step 2b: Graph BFS (v2.4.0) ──
@@ -339,12 +332,10 @@ pub async fn mpi_recall(
             for (episode_id, _role) in &ep_links {
                 if seen_episodes.contains(episode_id) { continue; }
                 seen_episodes.insert(episode_id.clone());
-
                 let session_id = if episode_id.starts_with("ep_") {
                     let rest = &episode_id[3..];
                     rest.rfind('_').map(|i| rest[..i].to_string())
                 } else { None };
-
                 if let Some(ref sid) = session_id {
                     if let Some(session) = state.storage.get_session(sid).await {
                         if let Some(ref summary) = session.summary {
@@ -370,16 +361,11 @@ pub async fn mpi_recall(
             if let Some(entity) = state.storage.get_entity(eid).await {
                 let edges = state.storage.get_edges_for_entity(eid, &owner).await;
                 let weight = graph_traversed.get(eid).copied().unwrap_or(0.5);
-
                 let mut desc_parts: Vec<String> = Vec::new();
                 desc_parts.push(format!("{} ({})", entity.name, entity.entity_type));
-
                 if let Some(ref desc) = entity.description {
-                    if !desc.contains(&entity.name) {
-                        desc_parts.push(desc.clone());
-                    }
+                    if !desc.contains(&entity.name) { desc_parts.push(desc.clone()); }
                 }
-
                 let mut edge_descs: Vec<String> = Vec::new();
                 for edge in edges.iter().take(5) {
                     let other_id = if edge.source_id == *eid { &edge.target_id } else { &edge.source_id };
@@ -391,15 +377,11 @@ pub async fn mpi_recall(
                         };
                         edge_descs.push(rel);
                     }
-                    if let Some(ref fact) = edge.fact_text {
-                        edge_descs.push(fact.clone());
-                    }
+                    if let Some(ref fact) = edge.fact_text { edge_descs.push(fact.clone()); }
                 }
-
                 if !edge_descs.is_empty() {
                     desc_parts.push(format!("Relations: {}", edge_descs.join("; ")));
                 }
-
                 graph_memories.push(RecalledMemory {
                     record_id: format!("graph_entity_{}", eid),
                     layer: "knowledge".to_string(),
@@ -423,18 +405,14 @@ pub async fn mpi_recall(
 
     let mut rrf_scores: HashMap<[u8; 32], f64> = HashMap::new();
 
-    // Vector search ranks
     for (rank, sr) in search.iter().enumerate() {
         *rrf_scores.entry(sr.record_id).or_insert(0.0) += 1.0 / (RRF_K + rank as f64 + 1.0);
     }
-
-    // BM25 ranks (record type only — entity/session handled by direct injection)
     for (rank, (source_type, source_id, _bm25_score)) in bm25_results.iter().enumerate() {
         if source_type == "record" {
             if let Ok(id_bytes) = hex::decode(source_id) {
                 if id_bytes.len() == 32 {
-                    let mut rid = [0u8; 32];
-                    rid.copy_from_slice(&id_bytes);
+                    let mut rid = [0u8; 32]; rid.copy_from_slice(&id_bytes);
                     *rrf_scores.entry(rid).or_insert(0.0) += 1.0 / (RRF_K + rank as f64 + 1.0);
                 }
             }
@@ -449,7 +427,6 @@ pub async fn mpi_recall(
     let max_degree = { let c = state.storage.conn_lock().await; graph::get_max_degree(&c, &owner) };
     let time_hint_tuple = rb.time_hint.as_ref().map(|th| (th.start, th.end));
 
-    // Score vector search candidates
     let mut scored: Vec<(MemoryRecord, f64)> = Vec::new();
 
     for sr in &search {
@@ -462,7 +439,6 @@ pub async fn mpi_recall(
                 Some(th) if (record.timestamp as i64) >= th.start && (record.timestamp as i64) <= th.end => 0.15,
                 _ => 0.0,
             };
-
             let graph_weight: f32 = if !graph_traversed.is_empty() {
                 let tags_lower: HashSet<String> = record.topic_tags.iter().map(|t| t.to_lowercase()).collect();
                 graph_traversed.iter()
@@ -479,12 +455,10 @@ pub async fn mpi_recall(
                     .filter(|c| record.has_embedding() && c.len() == record.embedding.len())
                     .map(|c| cosine_similarity(c, &record.embedding))
                     .unwrap_or(0.0);
-
                 let phi = mvf::compute_features(
                     sr.similarity, record.layer as u8, record.timestamp, now,
                     record.access_count, record.positive_feedback, record.negative_feedback,
-                    record.has_conflict(), time_hint_tuple, cs, gd, max_degree,
-                    graph_weight,
+                    record.has_conflict(), time_hint_tuple, cs, gd, max_degree, graph_weight,
                 );
                 let mut uw = { state.user_weights.read().get(&owner_hex).cloned().unwrap_or_else(mvf::default_weights) };
                 let pn = mvf::normalize(&phi, &mut uw);
@@ -495,25 +469,21 @@ pub async fn mpi_recall(
                 v_old_h + (graph_weight as f64 * 0.1)
             };
 
-            // RRF boost for records appearing in both vector + BM25
             let rrf_boost = rrf_scores.get(&sr.record_id).copied().unwrap_or(0.0) * RRF_SCALE;
             scored.push((record, final_score + rrf_boost));
         }
     }
 
-    // BM25-only candidates (found by keyword but not by vector similarity)
     for rid in &bm25_only_ids {
         if seen_ids.contains(rid) { continue; }
         if let Some(record) = state.storage.get(rid).await {
             if !record.is_active() || record.owner != owner { continue; }
-
             let rrf = rrf_scores.get(rid).copied().unwrap_or(0.0);
             let base_score = compute_recall_score(0.5, record.timestamp, now, record.access_count, record.layer);
             scored.push((record, base_score + rrf * RRF_SCALE));
         }
     }
 
-    // Fallback: if no search results at all, use recent records
     if search.is_empty() && bm25_results.is_empty() {
         let recent = state.storage.get_active_records(&owner, layer_filter, top_k).await;
         for r in recent {
@@ -523,6 +493,80 @@ pub async fn mpi_recall(
     }
 
     scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // ── Step 3.5: Cross-encoder rerank (v2.4.0+Reranker) ──
+    // Reranks the top RERANK_TOP_N candidates from the RRF-scored list using
+    // a cross-encoder model for improved precision. Only runs when:
+    //   1. state.reranker_engine is Some (reranker enabled and model loaded)
+    //   2. rb.query is non-empty (cross-encoder needs a query string)
+    //   3. scored list is non-empty (nothing to rerank otherwise)
+    //
+    // Score blend: 0.7 * normalized_CE + 0.3 * original_RRF_score
+    // CE scores are dynamic min-max normalized to [0,1] in reranker.rerank_batch().
+    // Candidates beyond RERANK_TOP_N are appended unchanged at the end.
+    //
+    // NOTE: Graph memories (Step 2c) and BM25-direct memories (Step 2a-ter) are
+    // injected AFTER Step 4 and are not subject to reranking. They carry structural
+    // knowledge that reranking might incorrectly demote for narrow queries.
+    if let Some(ref reranker) = state.reranker_engine {
+        if !rb.query.is_empty() && !scored.is_empty() {
+            let rerank_n = scored.len().min(RERANK_TOP_N);
+            let rerank_candidates = &scored[..rerank_n];
+
+            // Extract document text for each candidate.
+            // encrypted_content stores the decrypted plaintext as UTF-8 bytes
+            // (the field name is historical — records returned from storage.get()
+            // have already been decrypted by the storage layer).
+            let doc_texts: Vec<String> = rerank_candidates.iter()
+                .map(|(r, _)| String::from_utf8_lossy(&r.encrypted_content).to_string())
+                .collect();
+            let doc_refs: Vec<&str> = doc_texts.iter().map(|s| s.as_str()).collect();
+
+            match reranker.rerank_batch(&rb.query, &doc_refs) {
+                Ok(reranked) => {
+                    // Rebuild scored list: reranked candidates get blended scores,
+                    // candidates beyond rerank_n keep their original scores.
+                    let blend_w = crate::services::memchain::reranker::RerankerEngine::blend_weight();
+                    let mut new_scored: Vec<(MemoryRecord, f64)> = Vec::with_capacity(scored.len());
+
+                    for rc in &reranked {
+                        let (record, old_score) = &scored[rc.original_index];
+                        // Blend: CE_BLEND_WEIGHT * normalized_CE + (1 - CE_BLEND_WEIGHT) * RRF_score
+                        // Both inputs are in compatible ranges:
+                        //   normalized_CE ∈ [0, 1]  (from dynamic min-max in reranker)
+                        //   old_score ∈ [0, ~5]     (RRF + MVF scores, typically < 5)
+                        // We normalize old_score to [0,1] using a practical cap of 5.0
+                        let rrf_norm = (old_score / 5.0).min(1.0);
+                        let blended = blend_w * rc.ce_score_normalized + (1.0 - blend_w) * rrf_norm;
+                        new_scored.push((record.clone(), blended));
+                    }
+
+                    // Append candidates beyond rerank_n unchanged
+                    for i in rerank_n..scored.len() {
+                        new_scored.push(scored[i].clone());
+                    }
+
+                    new_scored.sort_unstable_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+
+                    scored = new_scored;
+
+                    debug!(
+                        reranked = reranked.len(),
+                        total = scored.len(),
+                        top_ce = format!("{:.3}", reranked.first().map(|r| r.ce_score).unwrap_or(0.0)),
+                        top_blended = format!("{:.3}", scored.first().map(|(_, s)| *s).unwrap_or(0.0)),
+                        "[RECALL] Step 3.5 cross-encoder rerank complete"
+                    );
+                }
+                Err(e) => {
+                    // Reranker failure is non-fatal: fall back to RRF-only ordering
+                    warn!(error = %e, "[RECALL] Reranker failed, using RRF scores only");
+                }
+            }
+        }
+    }
 
     // ── Step 4: Token budget + inject graph + BM25 direct memories ──
     let mut returned_ids = seen_ids.clone();
@@ -542,7 +586,7 @@ pub async fn mpi_recall(
         tokio::spawn(async move { st.increment_access(&rid).await; });
     }
 
-    // Inject graph-derived memories
+    // Inject graph-derived memories (not subject to reranking — see Step 3.5 note)
     for gm in graph_memories {
         let tokens = estimate_tokens(&gm.content);
         if total_tokens + tokens > rb.token_budget && !memories.is_empty() { break; }
@@ -550,7 +594,7 @@ pub async fn mpi_recall(
         memories.push(gm);
     }
 
-    // Inject BM25 direct entity/session memories
+    // Inject BM25 direct entity/session memories (not subject to reranking)
     for bm in bm25_direct_memories {
         let tokens = estimate_tokens(&bm.content);
         if total_tokens + tokens > rb.token_budget && !memories.is_empty() { break; }
@@ -565,10 +609,15 @@ pub async fn mpi_recall(
     memories.truncate(top_k);
 
     // Async graph co-occurrence update
-    { let st = Arc::clone(&state.storage); let ids = returned_ids;
-      tokio::spawn(async move { let c = st.conn_lock().await;
-        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-        graph::update_cooccurrence(&c, &ids, n); }); }
+    {
+        let st = Arc::clone(&state.storage);
+        let ids = returned_ids;
+        tokio::spawn(async move {
+            let c = st.conn_lock().await;
+            let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            graph::update_cooccurrence(&c, &ids, n);
+        });
+    }
 
     let matched_json = analysis.as_ref().map(|qa| {
         qa.matched_entities.iter().map(|e| serde_json::json!({
