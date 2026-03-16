@@ -23,7 +23,7 @@
 //! ## Model
 //! `cross-encoder/ms-marco-MiniLM-L-6-v2` — 22MB ONNX
 //! - Input: [CLS] query [SEP] document [SEP] → single relevance logit
-//! - Output: float32 relevance score (higher = more relevant)
+//! - Output: float32 relevance score (raw logit, higher = more relevant)
 //! - Latency: ~1ms per (query, document) pair on CPU
 //! - 30 pairs → ~30ms total (acceptable for recall endpoint)
 //!
@@ -33,10 +33,19 @@
 //! - attention_mask: [batch, seq_len] — 1 for real tokens, 0 for padding
 //! - token_type_ids: [batch, seq_len] — 0 for query tokens, 1 for doc tokens
 //!
-//! ## Performance
-//! - 30 pairs × ~1ms = ~30ms rerank latency
-//! - Memory: ~22MB model weights + tokenizer
-//! - Output: single float per pair (no pooling needed)
+//! ## Score Normalization
+//! Raw CE logits are in an unbounded range (empirically ~[-8, +8] for ms-marco).
+//! We use dynamic min-max normalization across the batch to scale scores to [0, 1]:
+//!   normalized = (score - min) / (max - min + epsilon)
+//! This is then blended with the original RRF score:
+//!   final = CE_BLEND_WEIGHT * normalized_ce + (1 - CE_BLEND_WEIGHT) * rrf_score
+//! Fallback: if all CE scores are identical (degenerate batch), sigmoid is used instead.
+//!
+//! ## ORT Runtime Sharing
+//! init_ort_runtime() in embed.rs uses std::sync::Once. RerankerEngine::load() calls
+//! it with the reranker model directory — if ORT is already initialized (by EmbedEngine),
+//! the Once is a no-op and the existing runtime is reused. If EmbedEngine is not loaded,
+//! RerankerEngine will initialize ORT itself.
 //!
 //! ## Fallback
 //! If model files are missing or reranker disabled:
@@ -49,19 +58,29 @@
 //! - `tokenizers` 0.21 — shared with embed.rs and ner.rs
 //!
 //! ⚠️ Important Note for Next Developer:
-//! - Cross-encoder output is a RAW LOGIT, not a probability. Higher = more relevant.
-//!   Do NOT apply sigmoid — the raw score is used directly for ranking.
-//! - The tokenizer MUST be the cross-encoder's own tokenizer (BERT-base uncased),
+//! - Cross-encoder output is a RAW LOGIT, not a probability. Do NOT apply sigmoid
+//!   for ranking — use raw scores for sort order. Sigmoid is only used as a
+//!   normalization fallback when the entire batch has identical scores.
+//! - The tokenizer MUST be the cross-encoder's own tokenizer (BERT-base uncased).
 //!   NOT the MiniLM embedding tokenizer or GLiNER DeBERTa tokenizer.
-//! - max_seq_length for cross-encoder is typically 512 (query+doc combined).
-//!   Truncation happens on the DOCUMENT side, not the query.
-//! - ORT runtime is shared via Once — safe to load alongside embed + ner.
-//! - Session::run() requires &mut self → Mutex wrapper (same pattern).
-//! - Batch inference (multiple pairs at once) is much more efficient than
-//!   one-by-one. Always use `rerank_batch()`.
+//! - max_seq_length for cross-encoder is 512 (query+doc combined). Truncation
+//!   happens on the DOCUMENT side (TruncationParams::max_length applies to the pair).
+//! - ORT runtime is shared via Once in embed.rs — safe to load alongside embed + ner.
+//! - Session::run() requires &mut self → Mutex wrapper (same pattern as embed.rs/ner.rs).
+//! - Always use rerank_batch() — it processes all pairs in one ONNX session.run() call,
+//!   which is significantly faster than calling one-by-one due to batching overhead.
+//! - tokenizer is cloned and configured per-call (same pattern as embed.rs embed_minilm).
+//!   This is the project-standard pattern for tokenizers 0.21 + Rust Send + Sync.
+//! - CE_BLEND_WEIGHT = 0.7 is the initial value. If retrieval quality tests show
+//!   the reranker is too aggressive (degrading good BM25/graph results), lower to 0.5.
 //!
 //! ## Last Modified
 //! v2.4.0+Reranker - 🌟 Initial implementation
+//!   Bug fixes vs original spec:
+//!   - RERANK_TOP_N: Option<usize> → usize (the Option wrapper was meaningless)
+//!   - CE score normalization: hardcoded +10/6 range → dynamic min-max normalization
+//!     with sigmoid fallback for degenerate batches (all-identical scores)
+//!   - tokenizer clone pattern aligned with embed.rs (project standard)
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -71,6 +90,9 @@ use ort::session::Session;
 use ort::value::Tensor;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use tracing::{debug, info, warn};
+
+// Re-use the ORT initialization from embed.rs — it's process-global via Once.
+use super::embed::init_ort_runtime;
 
 // ============================================
 // Constants
@@ -84,12 +106,20 @@ const TOKENIZER_FILENAME: &str = "tokenizer.json";
 const DEFAULT_MAX_SEQ_LENGTH: usize = 512;
 
 /// Maximum number of (query, document) pairs per batch.
-/// 50 is generous — typical usage is 30.
 const MAX_BATCH_SIZE: usize = 50;
 
-/// Default number of candidates to rerank.
-/// The recall pipeline sends the top 30 merged candidates.
-pub const DEFAULT_RERANK_TOP_N: usize = 30;
+/// Number of RRF+graph candidates to send to cross-encoder reranker.
+/// 30 pairs × ~1ms/pair ≈ 30ms added latency — acceptable for recall endpoint.
+/// Used by recall_handler.rs to slice the candidate list before reranking.
+pub const RERANK_TOP_N: usize = 30;
+
+/// Weight of cross-encoder score in the final blended score.
+/// Final = CE_BLEND_WEIGHT * normalized_ce + (1 - CE_BLEND_WEIGHT) * rrf_score
+/// 0.7 means cross-encoder has strong influence but doesn't completely override RRF.
+const CE_BLEND_WEIGHT: f64 = 0.7;
+
+/// Minimum denominator for min-max normalization to avoid division by zero.
+const NORM_EPSILON: f32 = 1e-6;
 
 // ============================================
 // RerankerEngine
@@ -102,11 +132,12 @@ pub const DEFAULT_RERANK_TOP_N: usize = 30;
 /// ## Usage
 /// ```rust,ignore
 /// let engine = RerankerEngine::load("models/reranker", 512)?;
-/// let scores = engine.rerank_batch("what is RS256?", &[
+/// let candidates = engine.rerank_batch("what is RS256?", &[
 ///     "RS256 uses RSA public-key cryptography for JWT signing",
 ///     "User likes spicy food",
 /// ])?;
-/// // scores[0] >> scores[1] (first doc much more relevant)
+/// // candidates[0].original_index == 0 (first doc ranked highest)
+/// // candidates[0].ce_score >> candidates[1].ce_score
 /// ```
 pub struct RerankerEngine {
     session: Mutex<Session>,
@@ -114,24 +145,28 @@ pub struct RerankerEngine {
     max_seq_length: usize,
 }
 
-/// A reranked candidate with its cross-encoder score.
+/// A reranked candidate with its cross-encoder score and blended final score.
 #[derive(Debug, Clone)]
 pub struct RerankedCandidate {
-    /// Index into the original candidates array.
+    /// Index into the original candidates array (before reranking).
     pub original_index: usize,
-    /// Cross-encoder relevance score (raw logit, higher = better).
+    /// Raw cross-encoder logit (higher = more relevant). Use for debugging/logging.
     pub ce_score: f32,
+    /// Normalized CE score in [0, 1] after min-max normalization.
+    /// Used for blending with RRF score in recall_handler.rs Step 3.5.
+    pub ce_score_normalized: f64,
 }
 
 impl RerankerEngine {
     /// Load cross-encoder ONNX model and tokenizer.
     ///
-    /// ## Prerequisites
-    /// ORT runtime must be initialized (by EmbedEngine::load or init_ort_runtime).
+    /// Shares the ORT runtime with EmbedEngine/NerEngine via the Once in embed.rs.
+    /// If EmbedEngine was loaded first, ORT is already initialized — this is a no-op.
+    /// If EmbedEngine was not loaded, this will initialize ORT from the reranker model dir.
     ///
     /// ## Arguments
     /// * `model_dir` - Directory containing model.onnx and tokenizer.json
-    /// * `max_seq_length` - Max combined query+document length (default 512)
+    /// * `max_seq_length` - Max combined query+document token length (pass 0 for default 512)
     pub fn load(
         model_dir: impl AsRef<Path>,
         max_seq_length: usize,
@@ -155,6 +190,9 @@ impl RerankerEngine {
             ));
         }
 
+        // Initialize (or reuse) ORT runtime — same Once cell as embed.rs.
+        init_ort_runtime(model_dir)?;
+
         let session = Session::builder()
             .map_err(|e| format!("Reranker session builder: {}", e))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -164,16 +202,12 @@ impl RerankerEngine {
             .commit_from_file(&model_path)
             .map_err(|e| format!("Reranker model load ({}): {}", model_path.display(), e))?;
 
-        info!(model = %model_path.display(), "[RERANKER] ONNX model loaded");
+        info!(model = %model_path.display(), max_seq = max_seq_length, "[RERANKER] ONNX model loaded");
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| format!("Reranker tokenizer ({}): {}", tokenizer_path.display(), e))?;
 
-        info!(
-            tokenizer = %tokenizer_path.display(),
-            max_seq_length = max_seq_length,
-            "[RERANKER] Tokenizer loaded"
-        );
+        info!(tokenizer = %tokenizer_path.display(), "[RERANKER] Tokenizer loaded");
 
         Ok(Self {
             session: Mutex::new(session),
@@ -184,19 +218,11 @@ impl RerankerEngine {
 
     /// Rerank a batch of documents against a query.
     ///
-    /// ## Arguments
-    /// * `query` - The search query
-    /// * `documents` - Candidate document texts to rerank
+    /// Uses dynamic min-max normalization to scale raw CE logits to [0, 1].
+    /// Falls back to sigmoid normalization if all scores are identical (degenerate batch).
     ///
     /// ## Returns
     /// `Vec<RerankedCandidate>` sorted by ce_score descending (best first).
-    /// Each entry contains the original index and the cross-encoder score.
-    ///
-    /// ## Pipeline
-    /// 1. For each document, create "[CLS] query [SEP] document [SEP]" input
-    /// 2. Batch tokenize with padding + truncation
-    /// 3. ONNX inference → one logit per pair
-    /// 4. Sort by logit descending
     pub fn rerank_batch(
         &self,
         query: &str,
@@ -214,21 +240,25 @@ impl RerankerEngine {
 
         let batch_size = documents.len();
 
-        // Step 1: Tokenize each (query, document) pair
+        // ── Tokenize (query, document) pairs ──
+        // Clone tokenizer and configure truncation+padding (project-standard pattern
+        // from embed.rs: tokenizer is Send but not Sync, so we clone per inference call).
         let mut tokenizer = self.tokenizer.clone();
         tokenizer
             .with_truncation(Some(TruncationParams {
                 max_length: self.max_seq_length,
                 ..Default::default()
             }))
-            .map_err(|e| format!("Reranker truncation: {}", e))?;
-
+            .map_err(|e| format!("Reranker truncation config: {}", e))?;
         tokenizer.with_padding(Some(PaddingParams {
             strategy: PaddingStrategy::BatchLongest,
             ..Default::default()
         }));
 
-        // Cross-encoder input: encode pairs (query, document)
+        // Cross-encoder: encode (query, document) pairs as sentence pairs.
+        // tokenizers encode_batch with add_special_tokens=true produces:
+        //   [CLS] query tokens [SEP] doc tokens [SEP]
+        // token_type_ids: 0 for query side, 1 for doc side.
         let pairs: Vec<(String, String)> = documents.iter()
             .map(|doc| (query.to_string(), doc.to_string()))
             .collect();
@@ -244,16 +274,15 @@ impl RerankerEngine {
         let seq_len = encodings[0].get_ids().len();
         let total = batch_size * seq_len;
 
-        // Step 2: Build tensors
+        // ── Build input tensors ──
         let mut input_ids = Vec::with_capacity(total);
         let mut attention_mask = Vec::with_capacity(total);
         let mut token_type_ids = Vec::with_capacity(total);
 
         for enc in &encodings {
-            let ids = enc.get_ids();
-            let mask = enc.get_attention_mask();
+            let ids   = enc.get_ids();
+            let mask  = enc.get_attention_mask();
             let types = enc.get_type_ids();
-
             for i in 0..seq_len {
                 input_ids.push(ids.get(i).copied().unwrap_or(0) as i64);
                 attention_mask.push(mask.get(i).copied().unwrap_or(0) as i64);
@@ -270,9 +299,9 @@ impl RerankerEngine {
         let types_tensor = Tensor::from_array((shape, token_type_ids.into_boxed_slice()))
             .map_err(|e| format!("Reranker token_type_ids tensor: {}", e))?;
 
-        // Step 3: ONNX inference
+        // ── ONNX inference ──
         let mut session = self.session.lock()
-            .map_err(|e| format!("Reranker session lock: {}", e))?;
+            .map_err(|e| format!("Reranker session lock poisoned: {}", e))?;
 
         let outputs = session.run(
             ort::inputs![
@@ -280,36 +309,62 @@ impl RerankerEngine {
                 "attention_mask" => mask_tensor,
                 "token_type_ids" => types_tensor,
             ]
-        ).map_err(|e| format!("Reranker inference: {}", e))?;
+        ).map_err(|e| format!("Reranker ONNX inference: {}", e))?;
 
-        // Output: logits [batch_size, 1] or [batch_size]
+        // Output: logits shaped [batch_size, 1] or [batch_size]
         let logits = outputs[0]
             .try_extract_array::<f32>()
-            .map_err(|e| format!("Reranker output: {}", e))?;
+            .map_err(|e| format!("Reranker output extraction: {}", e))?;
 
         let logits_shape = logits.shape();
 
-        // Step 4: Extract scores and sort
-        let mut candidates: Vec<RerankedCandidate> = Vec::with_capacity(batch_size);
-
+        // ── Extract raw scores ──
+        let mut raw_scores: Vec<f32> = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
-            let score = if logits_shape.len() == 2 {
-                logits[[i, 0]] // [batch, 1]
-            } else if logits_shape.len() == 1 {
-                logits[[i]] // [batch]
-            } else {
-                // Unexpected shape — try flat index
-                let flat = logits.as_slice().unwrap_or(&[]);
-                flat.get(i).copied().unwrap_or(0.0)
+            let score = match logits_shape.len() {
+                2 => logits[[i, 0]],  // [batch, 1] — most common
+                1 => logits[[i]],     // [batch] — some exports
+                _ => logits.as_slice().and_then(|s| s.get(i)).copied().unwrap_or(0.0),
             };
-
-            candidates.push(RerankedCandidate {
-                original_index: i,
-                ce_score: score,
-            });
+            raw_scores.push(score);
         }
 
-        // Sort by score descending
+        // ── Dynamic min-max normalization ──
+        // Scale raw CE logits to [0, 1] for blending with RRF scores.
+        // Fallback to sigmoid if all scores are identical (degenerate batch).
+        let score_min = raw_scores.iter().cloned().fold(f32::INFINITY, f32::min);
+        let score_max = raw_scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let score_range = score_max - score_min;
+
+        let normalized_scores: Vec<f64> = if score_range > NORM_EPSILON {
+            // Standard min-max: maps [min, max] → [0, 1]
+            raw_scores.iter()
+                .map(|&s| ((s - score_min) / score_range) as f64)
+                .collect()
+        } else {
+            // Degenerate: all scores identical → sigmoid fallback
+            // sigmoid(x) = 1 / (1 + e^-x), maps ℝ → (0, 1)
+            warn!(
+                batch = batch_size,
+                score = score_min,
+                "[RERANKER] All CE scores identical — using sigmoid normalization fallback"
+            );
+            raw_scores.iter()
+                .map(|&s| 1.0 / (1.0 + (-s as f64).exp()))
+                .collect()
+        };
+
+        // ── Build candidates and sort by raw CE score descending ──
+        let mut candidates: Vec<RerankedCandidate> = raw_scores.iter().zip(normalized_scores.iter())
+            .enumerate()
+            .map(|(i, (&ce, &norm))| RerankedCandidate {
+                original_index: i,
+                ce_score: ce,
+                ce_score_normalized: norm,
+            })
+            .collect();
+
+        // Sort by raw CE score descending (raw logit is the true relevance signal)
         candidates.sort_by(|a, b| {
             b.ce_score.partial_cmp(&a.ce_score).unwrap_or(std::cmp::Ordering::Equal)
         });
@@ -317,14 +372,16 @@ impl RerankerEngine {
         debug!(
             batch = batch_size,
             seq_len = seq_len,
-            top_score = format!("{:.3}", candidates.first().map(|c| c.ce_score).unwrap_or(0.0)),
+            top_ce = format!("{:.3}", candidates.first().map(|c| c.ce_score).unwrap_or(0.0)),
+            top_norm = format!("{:.3}", candidates.first().map(|c| c.ce_score_normalized).unwrap_or(0.0)),
+            score_range = format!("{:.3}", score_range),
             "[RERANKER] Batch rerank complete"
         );
 
         Ok(candidates)
     }
 
-    /// Rerank a single (query, document) pair. Returns the relevance score.
+    /// Rerank a single (query, document) pair. Returns the raw relevance score.
     pub fn rerank_single(&self, query: &str, document: &str) -> Result<f32, String> {
         let results = self.rerank_batch(query, &[document])?;
         Ok(results.first().map(|c| c.ce_score).unwrap_or(0.0))
@@ -332,9 +389,12 @@ impl RerankerEngine {
 
     /// Returns the configured max sequence length.
     #[must_use]
-    pub fn max_seq_length(&self) -> usize {
-        self.max_seq_length
-    }
+    pub fn max_seq_length(&self) -> usize { self.max_seq_length }
+
+    /// Returns the CE blend weight used in recall_handler Step 3.5.
+    /// Exposed for testing and transparency.
+    #[must_use]
+    pub fn blend_weight() -> f64 { CE_BLEND_WEIGHT }
 }
 
 impl std::fmt::Debug for RerankerEngine {
@@ -353,13 +413,6 @@ impl std::fmt::Debug for RerankerEngine {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_missing_model_returns_error() {
-        let result = RerankerEngine::load("/nonexistent/path", 512);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not found"));
-    }
-
     fn reranker_model_dir() -> String {
         std::env::var("MEMCHAIN_RERANKER_MODEL_PATH")
             .unwrap_or_else(|_| "models/reranker".to_string())
@@ -376,13 +429,44 @@ mod tests {
     }
 
     #[test]
-    fn test_rerank_basic() {
+    fn test_missing_model_returns_error() {
+        let result = RerankerEngine::load("/nonexistent/path", 512);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("not found"), "Error should mention 'not found': {}", err);
+        assert!(err.contains("download_models.sh"), "Error should hint at download script: {}", err);
+    }
+
+    #[test]
+    fn test_rerank_empty_docs_returns_empty() {
+        let engine = match try_load_reranker() {
+            Some(e) => e,
+            None => return,
+        };
+        let result = engine.rerank_batch("test query", &[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_rerank_batch_too_large_returns_error() {
+        let engine = match try_load_reranker() {
+            Some(e) => e,
+            None => return,
+        };
+        let docs: Vec<&str> = (0..51).map(|_| "test").collect();
+        let result = engine.rerank_batch("query", &docs);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("exceeds max"));
+    }
+
+    #[test]
+    fn test_rerank_relevance_ordering() {
         let engine = match try_load_reranker() {
             Some(e) => e,
             None => return,
         };
 
-        let scores = engine.rerank_batch(
+        let candidates = engine.rerank_batch(
             "What signing algorithm does the auth module use?",
             &[
                 "The auth module uses RS256 signing with the ring crate for RSA operations",
@@ -391,25 +475,20 @@ mod tests {
             ],
         ).unwrap();
 
-        assert_eq!(scores.len(), 3);
-        // The first document should score highest (most relevant)
-        assert_eq!(scores[0].original_index, 0,
-            "RS256 document should be ranked first, got index {}", scores[0].original_index);
+        assert_eq!(candidates.len(), 3);
+        // Most relevant doc (index 0) should be ranked first
+        assert_eq!(
+            candidates[0].original_index, 0,
+            "RS256 document should rank first, got index {} (score={:.3})",
+            candidates[0].original_index, candidates[0].ce_score
+        );
+        // Scores should be descending
+        assert!(candidates[0].ce_score >= candidates[1].ce_score);
+        assert!(candidates[1].ce_score >= candidates[2].ce_score);
     }
 
     #[test]
-    fn test_rerank_empty() {
-        let engine = match try_load_reranker() {
-            Some(e) => e,
-            None => return,
-        };
-
-        let scores = engine.rerank_batch("test query", &[]).unwrap();
-        assert!(scores.is_empty());
-    }
-
-    #[test]
-    fn test_rerank_single() {
+    fn test_rerank_single_returns_score() {
         let engine = match try_load_reranker() {
             Some(e) => e,
             None => return,
@@ -417,10 +496,58 @@ mod tests {
 
         let score = engine.rerank_single(
             "rate limiting",
-            "Token bucket rate limiting at 100 requests per minute",
+            "Token bucket rate limiting at 100 requests per minute using tower middleware",
         ).unwrap();
 
-        // Should be a positive relevance score
+        // Highly relevant pair should have a positive raw logit
         assert!(score > 0.0, "Relevant pair should have positive score, got {}", score);
+    }
+
+    #[test]
+    fn test_normalized_scores_in_range() {
+        let engine = match try_load_reranker() {
+            Some(e) => e,
+            None => return,
+        };
+
+        let candidates = engine.rerank_batch(
+            "JWT authentication",
+            &[
+                "JWT uses RS256 for token signing",
+                "PostgreSQL database connection pool settings",
+                "React component lifecycle hooks",
+            ],
+        ).unwrap();
+
+        for c in &candidates {
+            assert!(
+                c.ce_score_normalized >= 0.0 && c.ce_score_normalized <= 1.0,
+                "Normalized score out of [0,1]: {} (raw={})",
+                c.ce_score_normalized, c.ce_score
+            );
+        }
+    }
+
+    #[test]
+    fn test_blend_weight_constant() {
+        // Ensure the blend weight is in a sensible range
+        let w = RerankerEngine::blend_weight();
+        assert!(w > 0.0 && w < 1.0, "CE_BLEND_WEIGHT should be in (0, 1), got {}", w);
+    }
+
+    #[test]
+    fn test_rerank_single_doc() {
+        let engine = match try_load_reranker() {
+            Some(e) => e,
+            None => return,
+        };
+
+        // Single-doc batch should not fail (no division issues with min-max)
+        let candidates = engine.rerank_batch("test", &["a single document"]).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].original_index, 0);
+        // With one doc, min == max → sigmoid fallback, score should be in (0, 1)
+        assert!(candidates[0].ce_score_normalized > 0.0);
+        assert!(candidates[0].ce_score_normalized < 1.0);
     }
 }
