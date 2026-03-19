@@ -9,9 +9,11 @@
 //! ready to wrap in a `ChatRequest`.
 //!
 //! ## Privacy Levels
-//! All builders respect `PrivacyLevel`:
+//! All builders respect `PrivacyLevel` (defined in config_supernode.rs):
 //! - `Structured`: Only metadata (entity names, relation types, IDs).
 //!   Safe to send to external providers (DeepSeek, Anthropic, etc.).
+//! - `Summary`: Anonymized summary text. Currently treated same as Structured
+//!   by most builders — future enhancement will differentiate.
 //! - `Full`: Includes decrypted conversation content.
 //!   Should only be used with local providers (Ollama) unless user has
 //!   explicitly consented to external content sharing.
@@ -33,52 +35,24 @@
 //! - Never: more than one `system` message
 //!
 //! ⚠️ Important Note for Next Developer:
-//! - Keep prompts SHORT on the system side — most cheap models (deepseek-chat,
-//!   claude-haiku) have good instruction following. Verbose system prompts
-//!   waste input tokens.
+//! - PrivacyLevel is defined in config_supernode.rs and re-exported here.
+//!   Do NOT define a second PrivacyLevel in this file.
 //! - `conflict_resolution` returns JSON wrapped in `<r>...</r>` tags.
 //!   The parser in task_worker.rs tries <r> tags FIRST, then markdown fences.
-//!   Both the prompt instruction AND the parser MUST stay in sync.
-//! - `ConflictingEdge` fields: source_name, relation_type, target_name, confidence.
-//!   task_worker.rs constructs ConflictingEdge — field names must match exactly.
-//! - `CodeAnalysisInput` fields: filename, language, line_count, code_content,
-//!   related_entities. task_worker.rs constructs CodeAnalysisInput — must match.
-//! - `build_entity_description()` added in v2.5.0+Fix (was missing).
+//! - Keep prompts SHORT — most cheap models have good instruction following.
 //!
 //! ## Last Modified
 //! v2.5.0+SuperNode Phase B - 🌟 Created.
-//! v2.5.0+Audit Fix 6  - 🔧 PrivacyLevel re-exported from config_supernode instead
-//!   of redefining a separate type with different variants. The local definition had
-//!   Structured/Summary/Full while config had Structured/Full — two types with the same
-//!   name caused confusion and conversion errors. Now prompts.rs imports and re-exports
-//!   config_supernode::PrivacyLevel. The Summary variant is retained in config for
-//!   future use; prompts.rs treats Summary the same as Structured for now.
-//! v2.5.0+Audit Fix 7  - 🔧 ConflictingEdge doc comment updated to match actual
-//!   field names (source, relation, target — not source_name/relation_type/target_name).
-//! v2.5.0+Audit Fix 8  - 🔧 entity_description Full and Structured branches were
-//!   identical — merged into single format!, added TODO for Full enhancement.
-//! v2.5.0+Audit Fix 12 - 🔧 CodeAnalysis Structured mode has debug_assert that
-//!   code_content is not used in the prompt (safety check for privacy compliance).
-//! v2.5.0+Audit Fix 13 - 🔧 Doc comments now specify recommended max_tokens per
-//!   task type for task_worker.rs to use when building ChatRequest.
-//! v2.5.0+Fix              - 🔧 [FIX 3] conflict_resolution prompt updated:
-//!   system message now instructs model to wrap JSON in <r>...</r> tags.
-//!   parse_json_result() in task_worker.rs extracts <r> tags first.
-//!                         - 🔧 [BUG FIX] ConflictingEdge fields aligned with
-//!   task_worker.rs construction: source_name, relation_type, target_name,
-//!   confidence (removed source/relation/target aliases).
-//!                         - 🔧 [BUG FIX] CodeAnalysisInput fields aligned with
-//!   task_worker.rs: filename, language, line_count, code_content, related_entities.
-//!                         - 🌟 Added build_entity_description() + EntityDescriptionInput
-//!   (was missing — task_worker.rs calls it for entity_description tasks).
+//! v2.5.0+Audit Fix 6-13   - 🔧 Various fixes (see previous doc comments).
+//! v2.5.0+Fix               - 🔧 Added build_entity_description + EntityDescriptionInput.
+//! v2.5.0+Unify             - 🔧 [BUG FIX] PrivacyLevel re-exported from
+//!   config_supernode.rs which now has all 3 variants (Structured/Summary/Full).
+//!   Removed any local PrivacyLevel definition. recall_synthesis builder now
+//!   correctly matches PrivacyLevel::Summary variant.
 
 use super::llm_provider::ChatMessage;
-// Audit Fix 6: re-export PrivacyLevel from config_supernode instead of redefining.
-// The original local definition had Structured/Summary/Full, while config_supernode
-// had Structured/Full. Two types with the same name and different variants caused
-// conversion confusion. Now we use a single canonical type from config_supernode.
-// Summary variant exists in config for future use; prompts treat it as Structured.
-// config_supernode is declared at crate root in lib.rs (not under config/)
+// PrivacyLevel is defined in config_supernode.rs — re-export it here.
+// config_supernode.rs now has Structured / Summary / Full variants.
 pub use crate::config_supernode::PrivacyLevel;
 
 // ============================================
@@ -124,6 +98,7 @@ pub fn build_session_title(input: &SessionTitleInput<'_>) -> Vec<ChatMessage> {
             parts.push("Generate the session title.".to_string());
             parts.join("\n")
         }
+        // Structured and Summary use the same prompt for session_title
         _ => {
             if !input.entity_names.is_empty() {
                 let topics = input.entity_names.join(", ");
@@ -198,12 +173,6 @@ pub fn build_community_narrative(input: &CommunityNarrativeInput<'_>) -> Vec<Cha
 // ============================================
 
 /// A conflicting knowledge edge.
-///
-/// ## Field Names (v2.5.0+Audit Fix 7)
-/// Fields are: `source`, `relation`, `target` (owned Strings).
-/// These match the construction in task_worker.rs build_prompt_for_task().
-/// A previous doc comment incorrectly listed source_name/relation_type/target_name —
-/// that was the pre-fix state where struct and docs diverged. Now aligned.
 pub struct ConflictingEdge {
     pub edge_id: i64,
     pub source: String,
@@ -216,32 +185,19 @@ pub struct ConflictingEdge {
 
 /// Inputs for conflict resolution.
 pub struct ConflictResolutionInput<'a> {
-    /// The edge IDs involved in the conflict (for writeback reference).
     pub conflict_edge_ids: &'a [i64],
-    /// The conflicting edges with full detail.
     pub edges: &'a [ConflictingEdge],
     pub privacy_level: PrivacyLevel,
 }
 
 /// Build prompt for `conflict_resolution` task.
 ///
-/// ## Output Contract (v2.5.0+Fix)
+/// ## Output Contract
 /// JSON object wrapped in `<r>...</r>` tags:
 /// ```text
 /// <r>{"keep_edge_id": 123, "reason": "Edge 123 is newer..."}</r>
 /// ```
-///
-/// The `<r>` tag format is required because:
-/// 1. It's more reliable than markdown fences (models don't always add them)
-/// 2. `parse_json_result()` in task_worker.rs extracts `<r>` tags FIRST
-/// 3. Models follow explicit XML-like tag instructions reliably
-///
-/// The `keep_edge_id` must be one of the provided edge IDs.
-/// All other edges will be invalidated by task_worker.rs.
 pub fn build_conflict_resolution(input: &ConflictResolutionInput<'_>) -> Vec<ChatMessage> {
-    // v2.5.0+Fix: Added <r>...</r> tag instruction to match parse_json_result() priority 1.
-    // The model is instructed to wrap JSON in <r> tags — this is the most reliable
-    // extraction method because models follow explicit format instructions well.
     let system = ChatMessage::system(
         "You resolve conflicts in a knowledge graph by choosing which edge to keep. \
          You will be shown conflicting facts about the same entity relationship. \
@@ -279,7 +235,6 @@ pub fn build_conflict_resolution(input: &ConflictResolutionInput<'_>) -> Vec<Cha
 /// Inputs for recall synthesis.
 pub struct RecallSynthesisInput<'a> {
     pub session_id: &'a str,
-    /// Existing mechanical summary (entity list) to upgrade.
     pub existing_summary: Option<&'a str>,
     pub entity_names: &'a [&'a str],
     pub turn_count: i64,
@@ -291,10 +246,7 @@ pub struct RecallSynthesisInput<'a> {
 /// Build prompt for `recall_synthesis` task.
 ///
 /// ## Output Contract
-/// JSON with two fields:
-/// ```json
-/// {"summary": "...", "key_decisions": "..." | null}
-/// ```
+/// JSON: `{"summary": "...", "key_decisions": "..." | null}`
 pub fn build_recall_synthesis(input: &RecallSynthesisInput<'_>) -> Vec<ChatMessage> {
     let system = ChatMessage::system(
         "You synthesize AI conversation sessions into structured summaries. \
@@ -340,6 +292,7 @@ pub fn build_recall_synthesis(input: &RecallSynthesisInput<'_>) -> Vec<ChatMessa
             )
         }
         _ => {
+            // Structured (and Full with no turns)
             format!(
                 "Session ID: {}\nTurns: {}\nKey topics discussed: {}\n\n\
                  Generate the summary JSON based on these topics.",
@@ -358,18 +311,12 @@ pub fn build_recall_synthesis(input: &RecallSynthesisInput<'_>) -> Vec<ChatMessa
 // ============================================
 
 /// Inputs for code artifact analysis.
-///
-/// ## Field Names (v2.5.0+Fix)
-/// Fields are: filename, language, line_count, code_content, related_entities.
-/// These MUST match construction in task_worker.rs build_prompt_for_task().
 pub struct CodeAnalysisInput<'a> {
     pub artifact_id: &'a str,
     pub language: &'a str,
-    /// Line count of the code artifact.
     pub line_count: Option<i64>,
     /// Code content (only populated in Full mode).
     pub code_content: &'a str,
-    /// Existing tags from the artifact (used as context).
     pub existing_tags: &'a [&'a str],
     pub privacy_level: PrivacyLevel,
 }
@@ -377,13 +324,7 @@ pub struct CodeAnalysisInput<'a> {
 /// Build prompt for `code_analysis` task.
 ///
 /// ## Output Contract
-/// JSON object:
-/// ```json
-/// {"description": "...", "complexity": "low|medium|high", "suggested_tags": ["tag1"]}
-/// ```
-///
-/// ## Recommended max_tokens (Audit Fix 13)
-/// Set `max_tokens = 300` in ChatRequest for this task type.
+/// JSON: `{"description": "...", "complexity": "low|medium|high", "suggested_tags": ["tag1"]}`
 pub fn build_code_analysis(input: &CodeAnalysisInput<'_>) -> Vec<ChatMessage> {
     let system = ChatMessage::system(
         "You analyze code artifacts extracted from AI conversations. \
@@ -410,13 +351,7 @@ pub fn build_code_analysis(input: &CodeAnalysisInput<'_>) -> Vec<ChatMessage> {
             )
         }
         _ => {
-            // Structured: metadata only — code_content MUST NOT appear in prompt.
-            // Audit Fix 12: assert code_content is not used (privacy compliance check).
-            // This fires in debug builds if a future refactor accidentally leaks code content.
-            debug_assert!(
-                !input.code_content.is_empty() || true, // always passes, just documents intent
-                "Structured mode: code_content must not be included in the prompt"
-            );
+            // Structured/Summary: metadata only — code_content MUST NOT appear in prompt.
             format!(
                 "Artifact ID: {}\nLanguage: {}\nLines: {}\nExisting tags: {}\n\n\
                  Analyze this code artifact metadata and respond with JSON.",
@@ -433,22 +368,14 @@ pub fn build_code_analysis(input: &CodeAnalysisInput<'_>) -> Vec<ChatMessage> {
 }
 
 // ============================================
-// Task 6: entity_description (v2.5.0+Fix — was missing)
+// Task 6: entity_description
 // ============================================
 
 /// Inputs for entity description generation.
-///
-/// ## v2.5.0+Fix
-/// This struct and builder were missing from the original file.
-/// task_worker.rs calls build_entity_description() for entity_description tasks
-/// (enqueued by Step 9 tail in reflection.rs when entities are merged).
 pub struct EntityDescriptionInput<'a> {
-    /// The entity name (as extracted by GLiNER).
     pub entity_name: &'a str,
-    /// The entity type label (e.g., "technology", "module", "person").
     pub entity_type: &'a str,
     /// Known relationships: (relation_type, other_entity_name).
-    /// Used to give the model context about how this entity relates to others.
     pub relations: &'a [(&'a str, &'a str)],
     pub privacy_level: PrivacyLevel,
 }
@@ -457,17 +384,6 @@ pub struct EntityDescriptionInput<'a> {
 ///
 /// ## Output Contract
 /// Plain text, 1-2 sentences. No preamble. No bullet points.
-///
-/// ## Recommended max_tokens (Audit Fix 13)
-/// Set `max_tokens = 200` in ChatRequest for this task type.
-///
-/// ## Privacy note (Audit Fix 8)
-/// Full and Structured modes produce the same prompt for entity_description.
-/// Entity names and relation types are structural metadata — they don't expose
-/// raw conversation content even in Structured mode. Full mode enhancement
-/// (e.g., including conversation snippets where this entity was mentioned) is
-/// a future improvement.
-/// TODO(Phase C): Full mode could pass `recent_mentions: &[&str]` for richer context.
 pub fn build_entity_description(input: &EntityDescriptionInput<'_>) -> Vec<ChatMessage> {
     let system = ChatMessage::system(
         "You write concise technical descriptions for code knowledge graph entities. \
@@ -481,9 +397,6 @@ pub fn build_entity_description(input: &EntityDescriptionInput<'_>) -> Vec<ChatM
         .map(|(rel, other)| format!("{} {}", rel, other))
         .collect();
 
-    // Audit Fix 8: Full and Structured branches were identical — merged into one.
-    // Both modes use the same structured metadata (entity name, type, relations).
-    // See doc comment above for future Full mode enhancement plan.
     let user_content = format!(
         "Entity: {} (type: {})\nRelationships: {}\n\nWrite the 1-2 sentence description.",
         input.entity_name,
@@ -498,8 +411,6 @@ pub fn build_entity_description(input: &EntityDescriptionInput<'_>) -> Vec<ChatM
 // Private helpers
 // ============================================
 
-/// Truncate a string to approximately `max_chars` Unicode characters.
-/// Appends "..." if truncated. Uses char_indices for UTF-8 safety.
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max_chars {
@@ -585,7 +496,6 @@ mod tests {
 
     #[test]
     fn test_conflict_resolution_uses_r_tags() {
-        // v2.5.0+Fix: system prompt must instruct model to use <r> tags
         let edges = vec![
             ConflictingEdge {
                 edge_id: 1, source: "auth".into(), relation: "USES".into(),
@@ -607,15 +517,10 @@ mod tests {
         let system = &msgs[0].content;
         let user = &msgs[1].content;
 
-        // System must instruct <r> tag usage
-        assert!(system.contains("<r>"), "System prompt must contain <r> tag example");
+        assert!(system.contains("<r>"));
         assert!(system.contains("keep_edge_id"));
-
-        // User must contain both edge IDs
         assert!(user.contains("Edge ID 1"));
         assert!(user.contains("Edge ID 2"));
-
-        // User reminder about <r> format
         assert!(user.contains("<r>"));
     }
 
@@ -625,7 +530,7 @@ mod tests {
             ConflictingEdge {
                 edge_id: 5, source: "mod_a".into(), relation: "DEPENDS_ON".into(),
                 target: "mod_b".into(), fact_text: None,
-                valid_from: 500, confidence: None, // confidence is optional
+                valid_from: 500, confidence: None,
             },
         ];
         let input = ConflictResolutionInput {
@@ -677,6 +582,23 @@ mod tests {
     }
 
     #[test]
+    fn test_recall_synthesis_summary_mode() {
+        // v2.5.0+Unify: Summary variant now exists in PrivacyLevel
+        let input = RecallSynthesisInput {
+            session_id: "sess_003",
+            existing_summary: Some("Topics: Docker, Kubernetes"),
+            entity_names: &["Docker", "Kubernetes"],
+            turn_count: 8,
+            turns: &[],
+            privacy_level: PrivacyLevel::Summary,
+        };
+        let msgs = build_recall_synthesis(&input);
+        let user = &msgs[1].content;
+        assert!(user.contains("Existing summary"));
+        assert!(user.contains("Docker"));
+    }
+
+    #[test]
     fn test_code_analysis_full_includes_code() {
         let code = "fn rate_limit(requests: u32, window: u64) -> bool { requests < 100 }";
         let input = CodeAnalysisInput {
@@ -711,7 +633,6 @@ mod tests {
 
     #[test]
     fn test_entity_description_basic() {
-        // v2.5.0+Fix: build_entity_description was missing — verify it works
         let input = EntityDescriptionInput {
             entity_name: "JWT",
             entity_type: "technology",
@@ -748,11 +669,14 @@ mod tests {
 
     #[test]
     fn test_privacy_level_roundtrip() {
+        // v2.5.0+Unify: PrivacyLevel from_str/as_str defined in config_supernode
         assert_eq!(PrivacyLevel::from_str("full"), PrivacyLevel::Full);
         assert_eq!(PrivacyLevel::from_str("summary"), PrivacyLevel::Summary);
         assert_eq!(PrivacyLevel::from_str("structured"), PrivacyLevel::Structured);
         assert_eq!(PrivacyLevel::from_str("unknown"), PrivacyLevel::Structured);
         assert_eq!(PrivacyLevel::Full.as_str(), "full");
+        assert_eq!(PrivacyLevel::Summary.as_str(), "summary");
+        assert_eq!(PrivacyLevel::Structured.as_str(), "structured");
     }
 
     #[test]
@@ -799,6 +723,6 @@ mod tests {
         let chinese = "这是一个很长的中文字符串，用来测试截断功能";
         let result = truncate_chars(chinese, 5);
         assert!(result.ends_with("..."));
-        assert!(result.is_char_boundary(result.len() - 3)); // "..." is ASCII
+        assert!(result.is_char_boundary(result.len() - 3));
     }
 }
