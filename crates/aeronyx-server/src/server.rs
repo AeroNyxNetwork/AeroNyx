@@ -878,7 +878,6 @@ impl Server {
         );
         Some(Arc::new(router))
     }
-
     // ============================================
     // MemChain Initialization (dual-engine)
     // ============================================
