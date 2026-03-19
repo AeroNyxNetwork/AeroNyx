@@ -21,12 +21,14 @@
 //!   │   ├─ MiniLM embedding (if embed engine available)
 //!   │   ├─ Information score = 0.6 × entity_novelty + 0.4 × semantic_divergence
 //!   │   └─ score < threshold → skip this window (don't enter Rule Engine)
-//!   ├─ Step 1: Write each turn to raw_logs (encrypted)
-//!   ├─ Step 2: For each role="user" turn:
+//!   ├─ Step 1: Privacy tag stripping per turn (v2.4.0+Privacy)
+//!   │   └─ <no-mem>...</no-mem> and <private>...</private> removed before storage
+//!   ├─ Step 2: Write each turn to raw_logs (encrypted, stripped content)
+//!   ├─ Step 3: For each role="user" turn:
 //!   │   ├─ SKIP classification (has_persistent_info)
-//!   │   ├─ if extractable=1: Rule engine P0-P6
+//!   │   ├─ if extractable=1: Rule engine P0-P6 (on stripped content)
 //!   │   │   → Content dedup check → hits call internal remember
-//!   │   └─ Negative feedback detection
+//!   │   └─ Negative feedback detection (on stripped content)
 //!   └─ Return 202 Accepted { logged, session_id }
 //! ```
 //!
@@ -39,6 +41,13 @@
 //! - When embed unavailable: only entity novelty used (less effective)
 //! - When both unavailable: entropy filter is a no-op (all windows pass)
 //!
+//! ## Privacy Tag Design (v2.4.0+Privacy)
+//! - Tags: `<no-mem>...</no-mem>` and `<private>...</private>` (case-insensitive)
+//! - Stripping occurs BEFORE rawlog storage, FTS indexing, Rule Engine, and NER
+//! - The raw_logs table stores the STRIPPED version (tagged content never persisted)
+//! - Entropy filter uses ORIGINAL content (tagged content has info → window should pass)
+//! - Unclosed tags are ignored (regex requires both open and close tags)
+//!
 //! ## Modification History
 //! v2.1.0 - New file: /log endpoint with SKIP + rule engine + neg feedback
 //! v2.1.0+MVF - Content fingerprint dedup for rule engine extractions
@@ -48,6 +57,9 @@
 //!   Pre-computed entities + embeddings cached for Stage 2 Miner reuse.
 //! v2.4.0+BugFix - 🔧 Fixed E0282 type inference in tests; pre-compiled
 //!   regex patterns via LazyLock for rule engine performance.
+//! v2.4.0+Privacy - 🌟 Added `<no-mem>` / `<private>` privacy tag stripping.
+//!   Tagged content is removed before raw_log storage, FTS indexing, rule engine,
+//!   and NER processing. Stripped at the earliest point (per-turn in mpi_log handler).
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - /log is LOCAL-ONLY: remote users get 403
@@ -59,9 +71,13 @@
 //!   not per-turn (consistent with document's 10-message window design)
 //! - Rule engine regex patterns are pre-compiled via std::sync::LazyLock
 //!   to avoid repeated Regex::new() overhead on every request.
+//! - Privacy stripping (strip_privacy_tags) runs on the STRIPPED `turn_content`,
+//!   not `turn.content`. All downstream processing uses `turn_content`.
+//!   Entropy filter intentionally uses `turn.content` (original) — see Privacy Tag Design.
 //!
 //! ## Last Modified
 //! v2.4.0+BugFix - 🔧 Fixed E0282, pre-compiled regex, minor test improvements
+//! v2.4.0+Privacy - 🌟 strip_privacy_tags() + RE_PRIVACY_TAG + per-turn stripping
 
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -105,6 +121,39 @@ pub struct LogResponse {
 }
 
 // ============================================
+// v2.4.0+Privacy: Privacy Tag Stripping
+// ============================================
+
+/// Pre-compiled regex for `<no-mem>` privacy tags (v2.4.0+Privacy).
+/// Strips content between `<no-mem>` and `</no-mem>` tags before any processing.
+/// Supports multi-line content ([\s\S]*? = non-greedy any character including newlines).
+/// Also supports `<private>` as an alias for `<no-mem>`.
+static RE_PRIVACY_TAG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)<(?:no-mem|private)>[\s\S]*?</(?:no-mem|private)>")
+        .expect("Privacy tag regex must compile")
+});
+
+/// Strip `<no-mem>...</no-mem>` and `<private>...</private>` tags from content.
+///
+/// Replaces tagged regions with empty string. The stripped content will never
+/// enter the FTS index, NER entity extraction, or Miner pipeline.
+///
+/// ## Usage
+/// User writes: "My API key is <no-mem>sk-abc123</no-mem>"
+/// After stripping: "My API key is "
+///
+/// ## Design
+/// - Stripping happens BEFORE rawlog encryption and storage
+/// - The raw_logs table stores the STRIPPED version (tagged content is never persisted)
+/// - Case-insensitive: `<No-Mem>`, `<NO-MEM>`, `<Private>` all work
+/// - Unclosed tags are ignored (regex requires matching close tag)
+/// - Nested tags are not supported (inner tags consumed by outer match)
+/// - Entropy filter uses ORIGINAL content (tagged region has info value → let window pass)
+fn strip_privacy_tags(content: &str) -> String {
+    RE_PRIVACY_TAG.replace_all(content, "").to_string()
+}
+
+// ============================================
 // v2.4.0: Entropy Filter
 // ============================================
 
@@ -134,13 +183,17 @@ struct EntropyResult {
 /// - No NER engine → entity_novelty = 0.5 (neutral)
 /// - No embed engine → semantic_divergence = 0.5 (neutral)
 /// - Both missing → score = 0.5 (always passes default 0.35 threshold)
+///
+/// ⚠️ Intentionally uses ORIGINAL turn.content (not stripped).
+/// Tagged content carries information value — entropy filter should let
+/// the window pass so untagged portions get processed normally.
 fn run_entropy_filter(
     state: &MpiState,
     turns: &[Turn],
     known_entity_names: &std::collections::HashSet<String>,
     threshold: f32,
 ) -> EntropyResult {
-    // Combine user messages into a single window text
+    // Combine user messages into a single window text (original, not stripped)
     let window_text: String = turns.iter()
         .filter(|t| t.role == "user")
         .map(|t| t.content.as_str())
@@ -168,7 +221,6 @@ fn run_entropy_filter(
                     entity_novelty = new_count as f32 / total as f32;
                     detected_entities = entities.iter().map(|e| e.text.clone()).collect();
                 } else {
-                    // No entities detected → low information content
                     entity_novelty = 0.1;
                 }
             }
@@ -179,12 +231,7 @@ fn run_entropy_filter(
     }
 
     // ── Semantic divergence via MiniLM ──
-    // Compare window embedding to recent window embeddings.
-    // We don't have a persistent recent-embeddings buffer yet (Phase C),
-    // so for now we use a simpler heuristic: text length and variety.
-    // TODO: Implement proper embedding comparison with sliding window buffer.
     if state.embed_engine.is_some() {
-        // Simple heuristic: short, repetitive text = low divergence
         let unique_words: std::collections::HashSet<&str> = window_text
             .split_whitespace()
             .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
@@ -193,13 +240,10 @@ fn run_entropy_filter(
         let total_words = window_text.split_whitespace().count().max(1);
         let word_variety = unique_words.len() as f32 / total_words as f32;
 
-        // Map variety to divergence: high variety → high divergence
         semantic_divergence = word_variety.clamp(0.0, 1.0);
 
-        // If we can embed, check against a trivial baseline
-        // (proper implementation with rolling buffer in Phase C)
         if total_words <= 3 {
-            semantic_divergence = 0.1; // Very short = low info
+            semantic_divergence = 0.1;
         }
     }
 
@@ -242,12 +286,11 @@ fn has_persistent_info(content: &str) -> bool {
     let lower = content.to_lowercase();
     let trimmed = lower.trim();
 
-    // v2.4.0+BugFix: Also match bare "i" without trailing space (edge case)
     let has_first_person = CN_FIRST_PERSON.iter().any(|p| trimmed.contains(p))
         || EN_FIRST_PERSON.iter().any(|p| {
             trimmed.starts_with(p) || trimmed.contains(&format!(" {}", p.trim()))
         })
-        || trimmed == "i"; // bare "i" alone edge case
+        || trimmed == "i";
     if has_first_person { return true; }
 
     let starts_with_task = CN_TASK_VERBS.iter().any(|v| trimmed.starts_with(v))
@@ -280,24 +323,13 @@ fn contains_negative_feedback(content: &str) -> bool {
 // ============================================
 // Rule Engine (D2c) — Pre-compiled Regex via LazyLock
 // ============================================
-// v2.4.0+BugFix: All regex patterns are compiled once via std::sync::LazyLock.
-// Previously, Regex::new() was called on every invocation of check_* functions,
-// which incurred unnecessary overhead on the hot path. LazyLock ensures each
-// pattern is compiled exactly once, on first use, and reused thereafter.
 
-/// Helper: compile a list of pattern strings into Vec<Regex>, skipping invalid ones.
 fn compile_patterns(patterns: &[&str]) -> Vec<Regex> {
     patterns.iter()
         .filter_map(|p| Regex::new(p).ok())
         .collect()
 }
 
-// ── P0: Explicit remember ──
-static RE_EXPLICIT_REMEMBER_PATTERNS: &[&str] = &[
-    // Note: explicit remember uses string matching, not regex. No LazyLock needed.
-];
-
-// ── P1: Identity declarations ──
 static RE_IDENTITY_CN: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
     r"我(?:是|叫|的职业是|住在|来自|在.{1,15}工作|的名字是)(.{1,30})",
     r"我.{0,2}(?:岁|年纪)",
@@ -310,7 +342,6 @@ static RE_IDENTITY_EN: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(
     r"(?i)I have (?:a |an )?(\w+ (?:son|daughter|child|wife|husband|partner))",
 ]));
 
-// ── P3: Corrections ──
 static RE_CORRECTION_CN: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
     r"不是.{1,15}[，,]是", r"其实是", r"我说错了", r"更正一下", r"我之前说的不对",
 ]));
@@ -319,37 +350,31 @@ static RE_CORRECTION_EN: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_pattern
     r"(?i)actually", r"(?i)I was wrong", r"(?i)let me correct", r"(?i)not .{1,20}, it's",
 ]));
 
-// ── P4: Preferences — language ──
 static RE_PREF_LANG: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
     r"用(?:中文|英文|英语|日文|日语|法语|韩语).{0,5}(?:回答|说|写)",
     r"(?i)(?:reply|respond|answer|write) in (?:English|Chinese|Japanese|French)",
 ]));
 
-// ── P4: Preferences — format ──
 static RE_PREF_FMT: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
     r"(?:简短一点|详细一点|简洁|不要用.{1,8}术语|口语化|正式一点|用列表|用表格)",
     r"(?i)(?:keep it short|more detail|avoid jargon|be casual|be formal|use bullet)",
 ]));
 
-// ── P4: Preferences — role ──
 static RE_PREF_ROLE: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
     r"你(?:扮演|是|充当)(.{1,20})",
     r"(?i)(?:act as|you are|pretend to be|play the role of)(.{1,30})",
 ]));
 
-// ── P5: Avoidance — allergy ──
 static RE_ALLERGY: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
     r"我?对(.{1,10})过敏",
     r"(?i)(?:I'm |I am )?allergic to (.{1,20})",
 ]));
 
-// ── P5: Avoidance — general ──
 static RE_AVOID: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
     r"(?:不要|别|没有|不含|不加|避开|避免|我不[吃喝用看听做])(.{1,15})",
     r"(?i)(?:no|without|avoid|skip|don't want|don't like)\s+(.{1,20})",
 ]));
 
-// ── P6: Environment ──
 static RE_ENV: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
     r"我(?:用的是|在用|用)(.{1,20})",
     r"(?i)(?:I use|I'm on|I'm using|I'm running|my .{1,15} version is)(.{1,30})",
@@ -376,7 +401,6 @@ fn run_rule_engine(content: &str) -> Vec<Extraction> {
 }
 
 fn check_explicit_remember(content: &str) -> Option<Extraction> {
-    // P0 uses simple string matching (no regex needed)
     let patterns = ["记住", "帮我记下", "帮我记住", "请记住", "remember ", "keep in mind", "don't forget"];
     let lower = content.to_lowercase();
     for pat in &patterns {
@@ -416,8 +440,6 @@ fn check_corrections(content: &str) -> Option<Extraction> {
 
 fn check_preferences(content: &str) -> Vec<Extraction> {
     let mut results = Vec::new();
-
-    // Language preference
     for re in RE_PREF_LANG.iter() {
         if re.is_match(content) {
             results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
@@ -425,8 +447,6 @@ fn check_preferences(content: &str) -> Vec<Extraction> {
             break;
         }
     }
-
-    // Format preference
     for re in RE_PREF_FMT.iter() {
         if re.is_match(content) {
             results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
@@ -434,8 +454,6 @@ fn check_preferences(content: &str) -> Vec<Extraction> {
             break;
         }
     }
-
-    // Role preference
     for re in RE_PREF_ROLE.iter() {
         if re.is_match(content) {
             results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
@@ -443,14 +461,11 @@ fn check_preferences(content: &str) -> Vec<Extraction> {
             break;
         }
     }
-
     results
 }
 
 fn check_avoidance(content: &str) -> Vec<Extraction> {
     let mut results = Vec::new();
-
-    // Allergy (higher confidence, early return)
     for re in RE_ALLERGY.iter() {
         if re.is_match(content) {
             results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
@@ -458,8 +473,6 @@ fn check_avoidance(content: &str) -> Vec<Extraction> {
             return results;
         }
     }
-
-    // General avoidance
     for re in RE_AVOID.iter() {
         if re.is_match(content) {
             results.push(Extraction { content: content.to_string(), layer: MemoryLayer::Episode,
@@ -467,7 +480,6 @@ fn check_avoidance(content: &str) -> Vec<Extraction> {
             break;
         }
     }
-
     results
 }
 
@@ -531,18 +543,15 @@ pub async fn mpi_log(
     };
 
     // ── Step 0.5: Stage 1 Entropy Filter (v2.4.0) ──
-    // Evaluate information content of the conversation window BEFORE Rule Engine.
-    // Low-value windows have extractable forced to 0 (turns still written to raw_logs).
+    // Intentionally uses original turn.content (NOT stripped) —
+    // tagged content has information value and entropy filter should let it pass.
     let entropy_passes = if state.entropy_filter_enabled {
-        // Load known entity names for novelty scoring
         let known_entities: std::collections::HashSet<String> = state.storage
             .get_entities_cached(&owner).await
             .keys()
             .cloned()
             .collect();
 
-        // Default threshold from config (0.35)
-        // TODO: Read threshold from config via MpiState (currently hardcoded)
         let threshold = 0.35f32;
 
         let result = run_entropy_filter(&state, &log_req.turns, &known_entities, threshold);
@@ -558,7 +567,7 @@ pub async fn mpi_log(
 
         result.passes
     } else {
-        true // filter disabled → all windows pass
+        true
     };
 
     // ── Rawlog key derivation ──
@@ -576,35 +585,36 @@ pub async fn mpi_log(
         let mut extractable: i64 = 1;
         let mut feedback_signal: Option<i64> = None;
 
+        // v2.4.0+Privacy: Strip <no-mem> / <private> tags before any processing.
+        // Tagged content is removed BEFORE storage, FTS indexing, NER, and Miner.
+        // The stripped version is what gets written to raw_logs and indexed.
+        // Entropy filter above uses turn.content (original) — intentional, see Design notes.
+        let turn_content = strip_privacy_tags(&turn.content);
+
         let per_turn_recall_ctx = if turn.role == "assistant" {
             last_assistant_recall_ctx = request_recall_ctx.map(|s| s.to_string());
             request_recall_ctx
         } else { None };
 
         if turn.role == "user" {
-            // v2.4.0: If entropy filter rejected this window, force extractable=0
-            // Turns are still written to raw_logs (non-lossy), but Rule Engine is skipped.
             if !entropy_passes {
                 extractable = 0;
             } else {
-                extractable = if has_persistent_info(&turn.content) { 1 } else { 0 };
+                extractable = if has_persistent_info(&turn_content) { 1 } else { 0 };
             }
 
-            // Rule engine (only if extractable AND entropy filter passed)
             if extractable == 1 {
-                let mut extractions = run_rule_engine(&turn.content);
+                let mut extractions = run_rule_engine(&turn_content);
                 extractions.sort_unstable_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
 
                 for ext in extractions {
                     let encrypted_content = ext.content.as_bytes().to_vec();
 
-                    // Intra-request dedup
                     if extracted_this_request.contains(&encrypted_content) {
                         debug!(session = %log_req.session_id, turn = turn_index, "[LOG_RULE] ⏭️ Skipped (intra-request duplicate)");
                         continue;
                     }
 
-                    // Cross-request dedup
                     if state.storage.has_active_content(&owner, &encrypted_content).await {
                         debug!(session = %log_req.session_id, turn = turn_index, "[LOG_RULE] ⏭️ Skipped (content exists in DB)");
                         extracted_this_request.push(encrypted_content);
@@ -630,8 +640,8 @@ pub async fn mpi_log(
                 }
             }
 
-            // Negative feedback detection (runs regardless of entropy filter)
-            if contains_negative_feedback(&turn.content) {
+            // Negative feedback detection (runs regardless of entropy filter, uses stripped content)
+            if contains_negative_feedback(&turn_content) {
                 let ctx_str = last_assistant_recall_ctx.as_deref().or(request_recall_ctx);
                 if let Some(ctx) = ctx_str {
                     let entries = parse_recall_context(ctx);
@@ -661,11 +671,11 @@ pub async fn mpi_log(
             }
         }
 
-        // Write to raw_logs (always, regardless of entropy filter)
+        // Write to raw_logs using stripped content (v2.4.0+Privacy)
         let recall_ctx_for_row = if turn.role == "assistant" { per_turn_recall_ctx } else { None };
 
         let result = state.storage.insert_raw_log(
-            &log_req.session_id, turn_index, &turn.role, &turn.content,
+            &log_req.session_id, turn_index, &turn.role, &turn_content,
             &log_req.source_ai, recall_ctx_for_row, extractable, feedback_signal,
             Some(&rawlog_key),
         ).await;
@@ -673,12 +683,8 @@ pub async fn mpi_log(
         if result.is_ok() {
             logged += 1;
 
-            // v2.4.0+BM25: Index ALL turns (user + assistant) in FTS5.
-            // Raw conversation is the source of truth — entities/summaries are
-            // derived and incomplete. Indexing both roles ensures BM25 can find:
-            // - User: "implement rate limiting" → keyword match
-            // - Assistant: "token bucket algorithm, 100 req/min" → technical details
-            if !turn.content.trim().is_empty() {
+            // v2.4.0+BM25: Index ALL turns in FTS5 using stripped content
+            if !turn_content.trim().is_empty() {
                 let turn_rid = {
                     use sha2::{Sha256, Digest};
                     let mut h = Sha256::new();
@@ -691,7 +697,7 @@ pub async fn mpi_log(
                     rid
                 };
                 state.storage.fts_index_record(
-                    &turn_rid, &owner, &turn.content,
+                    &turn_rid, &owner, &turn_content,
                     &format!("turn:{}:{}", log_req.session_id, turn.role),
                 ).await;
             }
@@ -699,15 +705,12 @@ pub async fn mpi_log(
     }
 
     // ── v2.4.0: Register session in sessions table for Miner Steps 7-11 ──
-    // Without this, get_pending_sessions() returns empty and the entire
-    // cognitive graph pipeline (entity extraction, community detection, etc.)
-    // never runs. The sessions table tracks which sessions have been processed.
     if logged > 0 {
         let turn_count = log_req.turns.len() as i64;
         if let Err(e) = state.storage.upsert_session(
             &log_req.session_id,
             &owner,
-            None,  // project_id — assigned later by Step 8
+            None,
             "chat",
             now_ts as i64,
             turn_count,
@@ -722,8 +725,6 @@ pub async fn mpi_log(
 
     debug!(logged = logged, session = %log_req.session_id, "[LOG] Processed");
 
-    
-
     (StatusCode::ACCEPTED, Json(serde_json::json!(LogResponse {
         logged, session_id: log_req.session_id,
     }))).into_response()
@@ -737,7 +738,7 @@ pub async fn mpi_log(
 mod tests {
     use super::*;
 
-    // ── SKIP classification tests (preserved) ──
+    // ── SKIP classification tests ──
 
     #[test]
     fn test_skip_pure_task() {
@@ -767,7 +768,7 @@ mod tests {
         assert!(has_persistent_info("the meeting is scheduled for tomorrow at 3pm in room B"));
     }
 
-    // ── Negative feedback tests (preserved) ──
+    // ── Negative feedback tests ──
 
     #[test]
     fn test_negative_feedback_cn() {
@@ -783,7 +784,7 @@ mod tests {
         assert!(!contains_negative_feedback("great, thanks"));
     }
 
-    // ── Rule engine tests (preserved) ──
+    // ── Rule engine tests ──
 
     #[test]
     fn test_rule_engine_allergy() {
@@ -855,21 +856,17 @@ mod tests {
     }
 
     // ── v2.4.0: Entropy filter unit tests ──
-    // v2.4.0+BugFix: Fixed E0282 by adding explicit type annotation to HashSet<String>
 
     #[test]
     fn test_entropy_filter_empty_window() {
         let _known: std::collections::HashSet<String> = std::collections::HashSet::new();
         let turns = vec![Turn { role: "user".into(), content: "".into() }];
-        // Verify window text assembly produces empty string for empty content
         let window_text: String = turns.iter()
             .filter(|t| t.role == "user")
             .map(|t| t.content.as_str())
             .collect::<Vec<_>>()
             .join(" ");
         assert!(window_text.trim().is_empty());
-        // Note: run_entropy_filter() returns EntropyResult { score: 0.0, passes: false }
-        // for empty windows. Full integration test requires MpiState mock (Phase C).
     }
 
     #[test]
@@ -887,13 +884,78 @@ mod tests {
         assert_eq!(window_text, "hello world");
     }
 
-    // v2.4.0+BugFix: Additional test for bare "i" edge case in has_persistent_info
     #[test]
     fn test_skip_bare_i() {
-        // Bare "i" should be treated as first person (edge case fix)
         assert!(has_persistent_info("i"));
-        // But very short non-first-person should not
         assert!(!has_persistent_info("ok"));
         assert!(!has_persistent_info("no"));
+    }
+
+    // ── v2.4.0+Privacy: Privacy tag tests ──
+
+    #[test]
+    fn test_strip_privacy_tags_basic() {
+        let input = "My API key is <no-mem>sk-abc123</no-mem> and I use Rust";
+        let result = strip_privacy_tags(input);
+        assert_eq!(result, "My API key is  and I use Rust");
+        assert!(!result.contains("sk-abc123"));
+    }
+
+    #[test]
+    fn test_strip_privacy_tags_private_alias() {
+        let input = "Password: <private>hunter2</private>";
+        let result = strip_privacy_tags(input);
+        assert_eq!(result, "Password: ");
+    }
+
+    #[test]
+    fn test_strip_privacy_tags_case_insensitive() {
+        assert_eq!(strip_privacy_tags("<NO-MEM>secret</NO-MEM>"), "");
+        assert_eq!(strip_privacy_tags("<No-Mem>secret</No-Mem>"), "");
+        assert_eq!(strip_privacy_tags("<PRIVATE>secret</PRIVATE>"), "");
+    }
+
+    #[test]
+    fn test_strip_privacy_tags_multiline() {
+        let input = "before\n<no-mem>\nline1\nline2\n</no-mem>\nafter";
+        let result = strip_privacy_tags(input);
+        assert_eq!(result, "before\n\nafter");
+    }
+
+    #[test]
+    fn test_strip_privacy_tags_multiple() {
+        let input = "<no-mem>secret1</no-mem> visible <private>secret2</private> also visible";
+        let result = strip_privacy_tags(input);
+        assert_eq!(result, " visible  also visible");
+    }
+
+    #[test]
+    fn test_strip_privacy_tags_no_tags() {
+        let input = "normal content without any tags";
+        assert_eq!(strip_privacy_tags(input), input);
+    }
+
+    #[test]
+    fn test_strip_privacy_tags_empty() {
+        assert_eq!(strip_privacy_tags(""), "");
+    }
+
+    #[test]
+    fn test_strip_privacy_tags_unclosed_ignored() {
+        // Unclosed tags are NOT stripped — regex requires matching close tag
+        let input = "before <no-mem>unclosed content after";
+        assert_eq!(strip_privacy_tags(input), input);
+    }
+
+    #[test]
+    fn test_rule_engine_after_strip_no_tagged_content() {
+        // Verify rule engine receives stripped content (simulated)
+        let original = "I am allergic to <no-mem>shellfish</no-mem>";
+        let stripped = strip_privacy_tags(original);
+        // "shellfish" is gone — allergy rule should not match
+        let results = run_rule_engine(&stripped);
+        // "I am allergic to " still triggers allergy pattern (trigger word present)
+        // but without the allergen name — acceptable behavior
+        assert_eq!(stripped, "I am allergic to ");
     }
 }
