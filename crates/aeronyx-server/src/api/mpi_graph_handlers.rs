@@ -13,7 +13,7 @@
 //! - GET /api/mpi/projects/:id — Project detail
 //! - GET /api/mpi/projects/:id/timeline — Session summaries by date
 //! - GET /api/mpi/sessions/:id — Session detail
-//! - GET /api/mpi/sessions/:id/conversation — Full conversation (episodes)
+//! - GET /api/mpi/sessions/:id/conversation — Full conversation (decrypted turns)
 //! - GET /api/mpi/sessions/:id/artifacts — Session artifacts
 //! - GET /api/mpi/artifacts/:id — Artifact detail
 //! - GET /api/mpi/artifacts/:id/versions — Artifact version history
@@ -24,26 +24,54 @@
 //! ## Dependencies
 //! - super::mpi::{MpiState, extract_owner, default_list_limit} — shared types/helpers
 //! - storage_ops.rs — CRUD methods for cognitive graph tables
+//! - storage_crypto.rs — decrypt_rawlog_content_pub for conversation replay
 //! - graph.rs — bfs_traverse() for entity subgraph
+//!
+//! ## v2.4.0+Conversation: Session Conversation Replay
+//! The `/sessions/:id/conversation` endpoint now returns full decrypted
+//! conversation turns (user + assistant messages) for Local auth requests.
+//!
+//! Data flow:
+//! ```text
+//! GET /sessions/:id/conversation
+//!   → storage.get_rawlogs_for_session(session_id)  // RawLogRow with encrypted content
+//!   → for each row: decrypt_rawlog_content_pub(rawlog_key, content)
+//!   → return JSON array of {turn_index, role, content, created_at}
+//! ```
+//!
+//! Security:
+//! - Local requests: server-side decryption using rawlog_key derived from
+//!   Ed25519 private key (state.rawlog_key). Full plaintext returned.
+//! - Remote requests: rawlog_key is not available for remote owners.
+//!   Returns raw_log metadata without decrypted content (content field = null).
+//!   Remote clients must decrypt using their own rawlog_key.
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - All endpoints extract owner from AuthenticatedOwner (via extract_owner)
 //! - artifact_detail and artifact_versions are partial stubs (Phase D to complete)
-//! - session_conversation returns episode metadata, not decrypted content
-//!   (client must decrypt using ChaCha20 key)
+//! - session_conversation uses state.rawlog_key for decryption — this key is
+//!   derived from the LOCAL node's identity private key. It can ONLY decrypt
+//!   rawlogs belonging to the local owner. Remote owners' rawlogs cannot be
+//!   decrypted server-side (they were encrypted with a different key).
 //! - entity_graph calls graph::bfs_traverse() which queries knowledge_edges
+//! - The conversation endpoint also returns session metadata (summary, project)
+//!   alongside the turns, so the UI can show context without extra API calls.
 //!
 //! ## Last Modified
 //! v2.4.0-GraphCognition - 🌟 Initial implementation (11 endpoints)
+//! v2.4.0+Conversation - 🌟 session_conversation now returns decrypted turns
+//!   via rawlog_key server-side decryption. Added ConversationTurn type.
+//!   Remote requests get metadata only (content=null).
 
 use std::sync::Arc;
 
 use axum::{extract::{State, Path, Query}, http::StatusCode, response::IntoResponse, Json};
 use axum::http::Request;
-use serde::Deserialize;
-use tracing::debug;
+use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
 
 use crate::services::memchain::graph;
+use crate::services::memchain::storage_crypto::decrypt_rawlog_content_pub;
 
 use super::mpi::{MpiState, extract_owner, default_list_limit};
 
@@ -56,6 +84,27 @@ pub struct ListParams {
     #[serde(default = "default_list_limit")]
     pub limit: usize,
     pub status: Option<String>,
+}
+
+// ============================================
+// Conversation Types (v2.4.0+Conversation)
+// ============================================
+
+/// A single conversation turn (user or assistant message).
+///
+/// Returned by `/sessions/:id/conversation` endpoint.
+/// Content is decrypted server-side for Local requests,
+/// null for Remote requests (client must decrypt).
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationTurn {
+    /// Turn index within the session (0-based, ordered by conversation flow).
+    pub turn_index: i64,
+    /// Role: "user" or "assistant".
+    pub role: String,
+    /// Decrypted message content. None if decryption failed or Remote request.
+    pub content: Option<String>,
+    /// Whether this turn's content is encrypted (true = content is null, client must decrypt).
+    pub encrypted: bool,
 }
 
 // ============================================
@@ -129,24 +178,156 @@ pub async fn mpi_session_detail(
     }
 }
 
-/// `GET /api/mpi/sessions/:id/conversation` — Full conversation (episodes).
+/// `GET /api/mpi/sessions/:id/conversation` — Full conversation replay.
 ///
-/// Returns episode metadata (episode_id, type, created_at).
-/// Encrypted content must be fetched separately and decrypted client-side.
-/// In Remote mode, returns ciphertext — plugin decryptContent() handles it.
+/// Returns the complete conversation turns (user + assistant messages) for a session.
+///
+/// ## Local requests (Bearer token / open access)
+/// Server-side decrypts raw_logs using the node's rawlog_key, returns plaintext
+/// content for each turn. This is the primary use case for the MemExplorer UI.
+///
+/// ## Remote requests (Ed25519 signature auth)
+/// The node's rawlog_key cannot decrypt remote owners' rawlogs (different key).
+/// Returns turns with `content: null` and `encrypted: true`. The remote client
+/// must decrypt using their own rawlog_key.
+///
+/// ## Response format
+/// ```json
+/// {
+///   "session_id": "sess_alpha_001",
+///   "session": { /* SessionRow metadata */ },
+///   "turns": [
+///     {"turn_index": 0, "role": "user", "content": "...", "encrypted": false},
+///     {"turn_index": 1, "role": "assistant", "content": "...", "encrypted": false}
+///   ],
+///   "turn_count": 2
+/// }
+/// ```
 pub async fn mpi_session_conversation(
     State(state): State<Arc<MpiState>>,
     Path(session_id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    let _owner = extract_owner(&req).owner_bytes();
-    let episodes = state.storage.get_episodes_for_session(&session_id).await;
+    let auth = extract_owner(&req);
+    let is_remote = auth.is_remote();
 
-    debug!(session = %session_id, episodes = episodes.len(), "[MPI] GET /sessions/:id/conversation");
+    // Fetch session metadata (summary, project, etc.) for context
+    let session_meta = state.storage.get_session(&session_id).await;
+
+    // Fetch raw conversation turns
+    let raw_logs = state.storage.get_rawlogs_for_session(&session_id).await;
+
+    if raw_logs.is_empty() {
+        // No raw_logs found — might be an old session before /log was implemented,
+        // or the session_id is invalid. Fall back to episode metadata.
+        let episodes = state.storage.get_episodes_for_session(&session_id).await;
+
+        debug!(
+            session = %session_id,
+            episodes = episodes.len(),
+            "[MPI] GET /sessions/:id/conversation (no raw_logs, fallback to episodes)"
+        );
+
+        return (StatusCode::OK, Json(serde_json::json!({
+            "session_id": session_id,
+            "session": session_meta,
+            "turns": serde_json::Value::Null,
+            "episodes": episodes,
+            "turn_count": 0,
+            "note": "No raw conversation logs available for this session. Showing episode metadata only."
+        }))).into_response();
+    }
+
+    // Decrypt turns
+    // For Local requests: use state.rawlog_key to decrypt
+    // For Remote requests: cannot decrypt (different owner's key), return encrypted flag
+    let rawlog_key = if !is_remote {
+        state.rawlog_key.as_ref()
+    } else {
+        None
+    };
+
+    let mut turns: Vec<ConversationTurn> = Vec::with_capacity(raw_logs.len());
+    let mut decrypt_failures = 0u32;
+
+    for log in &raw_logs {
+        let (content, encrypted) = if log.encrypted == 1 {
+            // Content is encrypted
+            if let Some(key) = rawlog_key {
+                // Local request — attempt server-side decryption
+                match decrypt_rawlog_content_pub(key, &log.content) {
+                    Ok(plaintext_bytes) => {
+                        match String::from_utf8(plaintext_bytes) {
+                            Ok(text) => (Some(text), false),
+                            Err(_) => {
+                                warn!(
+                                    session = %session_id,
+                                    turn = log.turn_index,
+                                    "[MPI] Decrypted content is not valid UTF-8"
+                                );
+                                decrypt_failures += 1;
+                                (None, true)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Decryption failed — key mismatch or corrupt data
+                        // This can happen if rawlog_key was rotated or data is corrupted
+                        warn!(
+                            session = %session_id,
+                            turn = log.turn_index,
+                            error = %e,
+                            "[MPI] RawLog decryption failed"
+                        );
+                        decrypt_failures += 1;
+                        (None, true)
+                    }
+                }
+            } else {
+                // Remote request or no rawlog_key — return as encrypted
+                (None, true)
+            }
+        } else {
+            // Content is plaintext (unencrypted rawlog)
+            match String::from_utf8(log.content.clone()) {
+                Ok(text) => (Some(text), false),
+                Err(_) => (None, true),
+            }
+        };
+
+        turns.push(ConversationTurn {
+            turn_index: log.turn_index,
+            role: log.role.clone(),
+            content,
+            encrypted,
+        });
+    }
+
+    let turn_count = turns.len();
+
+    if decrypt_failures > 0 {
+        warn!(
+            session = %session_id,
+            failures = decrypt_failures,
+            total = turn_count,
+            "[MPI] Some turns could not be decrypted"
+        );
+    }
+
+    debug!(
+        session = %session_id,
+        turns = turn_count,
+        decrypted = turn_count as u32 - decrypt_failures,
+        remote = is_remote,
+        "[MPI] GET /sessions/:id/conversation"
+    );
+
     (StatusCode::OK, Json(serde_json::json!({
         "session_id": session_id,
-        "episodes": episodes,
-    })))
+        "session": session_meta,
+        "turns": turns,
+        "turn_count": turn_count,
+    }))).into_response()
 }
 
 /// `GET /api/mpi/sessions/:id/artifacts` — Artifacts linked to a session.
@@ -277,6 +458,347 @@ pub async fn mpi_entity_graph(
 }
 
 // ============================================
+// Search (v2.4.0+Search)
+// ============================================
+
+/// Query params for search endpoint.
+#[derive(Debug, Deserialize)]
+pub struct SearchParams {
+    /// Search query string (natural language).
+    pub q: String,
+    /// Maximum results to return (default 20, max 100).
+    #[serde(default = "default_list_limit")]
+    pub limit: usize,
+}
+
+/// `GET /api/mpi/search?q=token+bucket&limit=20` — Human-facing search.
+///
+/// Returns search results grouped by session, with highlighted snippets
+/// showing where the match occurred. Each result includes session metadata
+/// (title, project, date) for navigation context.
+///
+/// ## Response Format
+/// ```json
+/// {
+///   "query": "token bucket",
+///   "results": [
+///     {
+///       "session_id": "sess_alpha_002",
+///       "session_title": "Project Alpha: RS256 迁移 + 限流方案",
+///       "project_name": "Project Alpha",
+///       "started_at": 1710400000,
+///       "hits": [
+///         {"source_type": "record", "snippet": "...用 <mark>token bucket</mark>...", "score": 2.8}
+///       ],
+///       "best_score": 2.8
+///     }
+///   ],
+///   "total_results": 1
+/// }
+/// ```
+pub async fn mpi_search(
+    State(state): State<Arc<MpiState>>,
+    Query(params): Query<SearchParams>,
+    req: Request<axum::body::Body>,
+) -> impl IntoResponse {
+    let owner = extract_owner(&req).owner_bytes();
+    let limit = params.limit.min(100).max(1);
+
+    if params.q.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "query parameter 'q' is required and cannot be empty"
+        }))).into_response();
+    }
+
+    // Step 1: FTS5 snippet search
+    let hits = state.storage.search_with_snippets(&params.q, &owner, limit).await;
+
+    // Step 2: Group by session with metadata enrichment
+    let groups = state.storage.group_hits_by_session(&hits).await;
+
+    let total_results: usize = groups.iter().map(|g| g.hits.len()).sum();
+
+    debug!(
+        query = %params.q,
+        groups = groups.len(),
+        total_hits = total_results,
+        "[MPI] GET /search"
+    );
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "query": params.q,
+        "results": groups,
+        "total_results": total_results,
+    }))).into_response()
+}
+
+// ============================================
+// Entity Timeline (v2.4.0+Search)
+// ============================================
+
+/// `GET /api/mpi/entities/:id/timeline` — Entity event timeline.
+///
+/// Returns a chronological list of events for an entity across all sessions:
+/// - "mentioned": entity appeared in a conversation
+/// - "relation_created": a new relationship was established
+/// - "relation_invalidated": an old relationship was superseded
+///
+/// Used by the frontend to show how a concept/tool/person evolved over time.
+///
+/// ## Response Format
+/// ```json
+/// {
+///   "entity": { "name": "auth module", "type": "module" },
+///   "timeline": [
+///     {
+///       "session_id": "sess_001",
+///       "session_title": "JWT 认证设计",
+///       "started_at": 1710300000,
+///       "event_type": "mentioned",
+///       "detail": "Role: mentioned"
+///     },
+///     {
+///       "started_at": 1710300000,
+///       "event_type": "relation_created",
+///       "detail": "→ USES JWT",
+///       "relation_type": "USES",
+///       "related_entity": "JWT"
+///     }
+///   ]
+/// }
+/// ```
+pub async fn mpi_entity_timeline(
+    State(state): State<Arc<MpiState>>,
+    Path(entity_id): Path<String>,
+    Query(params): Query<ListParams>,
+    req: Request<axum::body::Body>,
+) -> impl IntoResponse {
+    let owner = extract_owner(&req).owner_bytes();
+    let limit = params.limit.min(200).max(1);
+
+    // Get entity metadata
+    let entity = match state.storage.get_entity(&entity_id).await {
+        Some(e) => e,
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "entity not found"
+        }))).into_response(),
+    };
+
+    // Get timeline events
+    let timeline = state.storage.get_entity_timeline(&entity_id, &owner, limit).await;
+
+    debug!(
+        entity = %entity_id,
+        events = timeline.len(),
+        "[MPI] GET /entities/:id/timeline"
+    );
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "entity": {
+            "entity_id": entity.entity_id,
+            "name": entity.name,
+            "entity_type": entity.entity_type,
+            "description": entity.description,
+            "mention_count": entity.mention_count,
+        },
+        "timeline": timeline,
+    }))).into_response()
+}
+
+// ============================================
+// Context Injection (v2.4.0+Context)
+// ============================================
+
+/// Query params for context injection endpoint.
+#[derive(Debug, Deserialize)]
+pub struct ContextInjectParams {
+    /// Optional project ID to scope context to a specific project.
+    /// When None, returns context from the most recently active project.
+    pub project_id: Option<String>,
+    /// Maximum tokens for the formatted context (default 500).
+    #[serde(default = "default_context_max_tokens")]
+    pub max_tokens: usize,
+    /// Number of recent sessions to include (default 3).
+    #[serde(default = "default_context_sessions")]
+    pub recent_sessions: usize,
+}
+
+fn default_context_max_tokens() -> usize { 500 }
+fn default_context_sessions() -> usize { 3 }
+
+/// `GET /api/mpi/context/inject` — Auto-inject project context for new sessions.
+///
+/// Called by the plugin at session start to prime the AI with relevant memory.
+/// Returns a pre-formatted markdown string ready for system prompt injection.
+///
+/// ## Usage Flow
+/// ```text
+/// Plugin: user opens a new conversation
+///   → GET /api/mpi/context/inject?project_id=comm_alpha&max_tokens=500
+///   → receives formatted_context markdown
+///   → injects into system prompt: "## Project Context\n{formatted_context}"
+///   → AI naturally "remembers" recent work
+/// ```
+///
+/// ## Response
+/// ```json
+/// {
+///   "project": {"name": "Project Alpha", "status": "active"},
+///   "recent_sessions": [
+///     {"session_id": "...", "title": "RS256 迁移", "started_at": 1710400000, "summary": "..."}
+///   ],
+///   "key_entities": [
+///     {"name": "auth module", "type": "module", "mentions": 8},
+///     {"name": "RS256", "type": "technology", "mentions": 5}
+///   ],
+///   "formatted_context": "# Project Alpha\n\n## Recent Sessions\n...",
+///   "token_estimate": 320
+/// }
+/// ```
+pub async fn mpi_context_inject(
+    State(state): State<Arc<MpiState>>,
+    Query(params): Query<ContextInjectParams>,
+    req: Request<axum::body::Body>,
+) -> impl IntoResponse {
+    let owner = extract_owner(&req).owner_bytes();
+    let max_tokens = params.max_tokens.min(2000).max(100);
+    let recent_count = params.recent_sessions.min(10).max(1);
+
+    // Resolve project: explicit ID or most recently active
+    let project = if let Some(ref pid) = params.project_id {
+        state.storage.get_project(pid).await
+    } else {
+        // Get the most recently active project
+        let projects = state.storage.get_projects(&owner, Some("active"), 1).await;
+        projects.into_iter().next()
+    };
+
+    let project_name = project.as_ref().map(|p| p.name.clone());
+    let project_id = project.as_ref().map(|p| p.project_id.clone());
+
+    // Get recent sessions for this project (or all sessions if no project)
+    let recent_sessions = if let Some(ref pid) = project_id {
+        state.storage.get_sessions_for_project(pid, recent_count).await
+    } else {
+        // No project → get most recent sessions for this owner
+        state.storage.get_pending_sessions(&owner, recent_count).await
+    };
+
+    // Get key entities (top by mention count)
+    let key_entities = if let Some(ref pid) = project_id {
+        state.storage.get_entities_in_community(pid, &owner).await
+    } else {
+        state.storage.get_entities_by_owner(&owner, None, 10).await
+    };
+
+    // Build formatted context markdown
+    let mut ctx = String::new();
+    let mut token_est: usize = 0;
+
+    if let Some(ref name) = project_name {
+        ctx.push_str(&format!("# {}\n\n", name));
+        token_est += name.len() / 4 + 5;
+    }
+
+    // Recent sessions
+    if !recent_sessions.is_empty() {
+        ctx.push_str("## Recent Sessions\n");
+        token_est += 5;
+
+        for sess in &recent_sessions {
+            if token_est >= max_tokens { break; }
+
+            let title = sess.title.as_deref()
+                .or(sess.summary.as_deref())
+                .unwrap_or(&sess.session_id);
+
+            // Format date from timestamp
+            let date_str = {
+                let ts = sess.started_at;
+                // Simple date formatting (YYYY-MM-DD)
+                let secs = ts as u64;
+                let days = secs / 86400;
+                let y = 1970 + (days * 400 / 146097); // rough year estimate
+                format!("ts:{}", ts) // Frontend should format this
+            };
+
+            let line = format!("- **{}** ({})\n", title, date_str);
+            token_est += line.len() / 4;
+            ctx.push_str(&line);
+
+            if let Some(ref summary) = sess.summary {
+                let summary_line = format!("  {}\n", summary);
+                token_est += summary_line.len() / 4;
+                if token_est < max_tokens {
+                    ctx.push_str(&summary_line);
+                }
+            }
+        }
+        ctx.push('\n');
+    }
+
+    // Key entities
+    if !key_entities.is_empty() && token_est < max_tokens {
+        ctx.push_str("## Key Concepts\n");
+        token_est += 5;
+
+        let entity_names: Vec<String> = key_entities.iter()
+            .take(10)
+            .filter(|e| {
+                token_est += e.name.len() / 4 + 5;
+                token_est < max_tokens
+            })
+            .map(|e| format!("{} ({})", e.name, e.entity_type))
+            .collect();
+
+        if !entity_names.is_empty() {
+            ctx.push_str(&entity_names.join(", "));
+            ctx.push('\n');
+        }
+    }
+
+    // Build response JSON
+    let sessions_json: Vec<serde_json::Value> = recent_sessions.iter()
+        .map(|s| serde_json::json!({
+            "session_id": s.session_id,
+            "title": s.title,
+            "started_at": s.started_at,
+            "summary": s.summary,
+            "turn_count": s.turn_count,
+        }))
+        .collect();
+
+    let entities_json: Vec<serde_json::Value> = key_entities.iter()
+        .take(10)
+        .map(|e| serde_json::json!({
+            "name": e.name,
+            "type": e.entity_type,
+            "mentions": e.mention_count,
+        }))
+        .collect();
+
+    debug!(
+        project = project_name.as_deref().unwrap_or("none"),
+        sessions = sessions_json.len(),
+        entities = entities_json.len(),
+        tokens = token_est,
+        "[MPI] GET /context/inject"
+    );
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "project": project.as_ref().map(|p| serde_json::json!({
+            "project_id": p.project_id,
+            "name": p.name,
+            "status": p.status,
+        })),
+        "recent_sessions": sessions_json,
+        "key_entities": entities_json,
+        "formatted_context": ctx.trim(),
+        "token_estimate": token_est,
+    }))).into_response()
+}
+
+// ============================================
 // Communities
 // ============================================
 
@@ -304,6 +826,7 @@ mod tests {
     use crate::api::mpi::{build_mpi_router, MpiState, BaselineSnapshot};
     use crate::services::memchain::{MemoryStorage, VectorIndex};
     use crate::services::memchain::mvf::WeightVector;
+    use crate::services::memchain::storage_crypto::derive_rawlog_key;
     use aeronyx_core::crypto::IdentityKeyPair;
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::AtomicBool;
@@ -317,6 +840,7 @@ mod tests {
         let vi = Arc::new(VectorIndex::new());
         let id = IdentityKeyPair::generate();
         let ok = id.public_key_bytes();
+        let rlk = derive_rawlog_key(&id.to_bytes());
         Arc::new(MpiState {
             storage, vector_index: vi, identity: id,
             identity_cache: RwLock::new(HashMap::new()),
@@ -328,6 +852,8 @@ mod tests {
             owner_key: ok, api_secret: None, embed_engine: None,
             allow_remote_storage: false, max_remote_owners: 0,
             ner_engine: None, graph_enabled: false, entropy_filter_enabled: false,
+            reranker_engine: None,
+            rawlog_key: Some(rlk),
         })
     }
 
@@ -389,12 +915,11 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["root"], "some_entity");
-        // Should have at least the seed node (if it exists) or empty
         assert!(json["nodes"].as_array().is_some());
     }
 
     #[tokio::test]
-    async fn test_session_conversation_empty() {
+    async fn test_session_conversation_no_rawlogs() {
         let s = make_state().await;
         let app = build_mpi_router(s);
         let req = Request::builder().uri("/api/mpi/sessions/s1/conversation").body(Body::empty()).unwrap();
@@ -403,6 +928,88 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["session_id"], "s1");
+        assert_eq!(json["turn_count"], 0);
+        // Should have a note about no raw_logs
+        assert!(json["note"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_session_conversation_plaintext_turns() {
+        let state = make_state().await;
+        // Insert plaintext raw_logs
+        state.storage.insert_raw_log(
+            "sess_test", 0, "user", "Hello, let's discuss auth", "test",
+            None, 1, None, None,
+        ).await.unwrap();
+        state.storage.insert_raw_log(
+            "sess_test", 1, "assistant", "Sure! What auth method?", "test",
+            None, 0, None, None,
+        ).await.unwrap();
+        state.storage.insert_raw_log(
+            "sess_test", 2, "user", "RS256 with ring crate", "test",
+            None, 1, None, None,
+        ).await.unwrap();
+
+        let app = build_mpi_router(state);
+        let req = Request::builder()
+            .uri("/api/mpi/sessions/sess_test/conversation")
+            .body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["session_id"], "sess_test");
+        assert_eq!(json["turn_count"], 3);
+
+        let turns = json["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 3);
+
+        assert_eq!(turns[0]["turn_index"], 0);
+        assert_eq!(turns[0]["role"], "user");
+        assert_eq!(turns[0]["content"], "Hello, let's discuss auth");
+        assert_eq!(turns[0]["encrypted"], false);
+
+        assert_eq!(turns[1]["turn_index"], 1);
+        assert_eq!(turns[1]["role"], "assistant");
+        assert_eq!(turns[1]["content"], "Sure! What auth method?");
+
+        assert_eq!(turns[2]["turn_index"], 2);
+        assert_eq!(turns[2]["content"], "RS256 with ring crate");
+    }
+
+    #[tokio::test]
+    async fn test_session_conversation_encrypted_turns() {
+        let state = make_state().await;
+        let rlk = state.rawlog_key.unwrap();
+
+        // Insert encrypted raw_logs
+        state.storage.insert_raw_log(
+            "sess_enc", 0, "user", "Secret project discussion", "test",
+            None, 1, None, Some(&rlk),
+        ).await.unwrap();
+        state.storage.insert_raw_log(
+            "sess_enc", 1, "assistant", "Understood, proceeding with encryption", "test",
+            None, 0, None, Some(&rlk),
+        ).await.unwrap();
+
+        let app = build_mpi_router(state);
+        let req = Request::builder()
+            .uri("/api/mpi/sessions/sess_enc/conversation")
+            .body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["turn_count"], 2);
+        let turns = json["turns"].as_array().unwrap();
+
+        // Both turns should be decrypted successfully (Local auth with matching key)
+        assert_eq!(turns[0]["content"], "Secret project discussion");
+        assert_eq!(turns[0]["encrypted"], false);
+        assert_eq!(turns[1]["content"], "Understood, proceeding with encryption");
+        assert_eq!(turns[1]["encrypted"], false);
     }
 
     #[tokio::test]
@@ -442,5 +1049,88 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["project_id"], "proj1");
+    }
+
+    // ── v2.4.0+Search: Search endpoint tests ──
+
+    #[tokio::test]
+    async fn test_search_empty_query_rejected() {
+        let s = make_state().await;
+        let app = build_mpi_router(s);
+        let req = Request::builder()
+            .uri("/api/mpi/search?q=")
+            .body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_search_no_results() {
+        let s = make_state().await;
+        let app = build_mpi_router(s);
+        let req = Request::builder()
+            .uri("/api/mpi/search?q=nonexistent_term_xyz")
+            .body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["query"], "nonexistent_term_xyz");
+        assert_eq!(json["total_results"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_search_with_indexed_content() {
+        let state = make_state().await;
+        let owner = state.owner_key;
+        // Index some content
+        state.storage.fts_index_record(
+            &[0x01; 32], &owner,
+            "token bucket rate limiting at 100 requests per minute", "",
+        ).await;
+
+        let app = build_mpi_router(state);
+        let req = Request::builder()
+            .uri("/api/mpi/search?q=token+bucket")
+            .body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["total_results"].as_u64().unwrap() > 0, "Should find indexed content");
+    }
+
+    // ── v2.4.0+Search: Entity timeline tests ──
+
+    #[tokio::test]
+    async fn test_entity_timeline_not_found() {
+        let s = make_state().await;
+        let app = build_mpi_router(s);
+        let req = Request::builder()
+            .uri("/api/mpi/entities/nonexistent/timeline")
+            .body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_entity_timeline_empty_events() {
+        let state = make_state().await;
+        let owner = state.owner_key;
+        // Create an entity with no episode_edges or knowledge_edges
+        state.storage.upsert_entity(
+            "ent_test", &owner, "TestEntity", "testentity", "concept", None, None,
+        ).await.unwrap();
+
+        let app = build_mpi_router(state);
+        let req = Request::builder()
+            .uri("/api/mpi/entities/ent_test/timeline")
+            .body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["entity"]["name"], "TestEntity");
+        assert!(json["timeline"].as_array().unwrap().is_empty());
     }
 }
