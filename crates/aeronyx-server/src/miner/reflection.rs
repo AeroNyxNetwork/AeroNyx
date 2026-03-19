@@ -1530,9 +1530,12 @@ impl ReflectionMiner {
     /// (description IS NULL OR length < 50 chars). The "no rich description" check
     /// avoids re-enqueuing entities that already got an LLM description.
     async fn enqueue_entity_description_tasks(&self, owner: &[u8]) {
-        // Get entities that need description enrichment.
-        // Use the same MINER_MERGE_BATCH limit to avoid flooding the queue.
-        let entities = self.storage.get_entities_by_owner(owner, None, MINER_MERGE_BATCH).await;
+        // get_entities_by_owner expects &[u8; 32] — convert from &[u8]
+        let owner32: [u8; 32] = match owner.try_into() {
+            Ok(arr) => arr,
+            Err(_) => { warn!("[MINER_S9] owner is not 32 bytes"); return; }
+        };
+        let entities = self.storage.get_entities_by_owner(&owner32, None, MINER_MERGE_BATCH).await;
 
         let mut enqueued = 0u32;
         let mut skipped = 0u32;
