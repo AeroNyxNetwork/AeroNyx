@@ -14,18 +14,21 @@
 //! - `ChatResponse` — model output + token usage
 //! - `ChatMessage` — role + content pair
 //! - `TokenUsage` — input/output/cached token counts
-//! - `CognitiveTaskType` — enum of all task types the SuperNode can execute
 //! - `LlmError` — structured error type for provider failures
+//!
+//! ## CognitiveTaskType — RE-EXPORTED from config_supernode.rs
+//! ⚠️ CognitiveTaskType is defined in config_supernode.rs (the single source of truth)
+//! and re-exported here for backward compatibility with code that imports from
+//! `llm_provider::CognitiveTaskType`. Do NOT define CognitiveTaskType in this file.
 //!
 //! ## Design Decisions
 //! - `LlmProvider` is object-safe (`async_trait` macro expands to boxed futures)
 //! - `TokenUsage` intentionally omits `cost_usd` — fee rates change; compute at query time
-//! - `CognitiveTaskType` maps to `cognitive_tasks.task_type` TEXT column
 //! - All types derive `serde::Serialize/Deserialize` for JSON storage in DB
 //!
 //! ⚠️ Important Note for Next Developer:
-//! - When adding a new task type, add a variant to `CognitiveTaskType` AND
-//!   update `task_type_str()` AND add a handler branch in `TaskWorker`.
+//! - When adding a new task type, add the variant to config_supernode::CognitiveTaskType,
+//!   NOT here. This file only re-exports it.
 //! - `ChatRequest::system` is optional. For task types that don't need a system
 //!   prompt (simple completion), leave it None.
 //! - `LlmProvider::chat()` must be cancel-safe — the caller may drop the future
@@ -33,8 +36,23 @@
 //!
 //! ## Last Modified
 //! v2.5.0+SuperNode - 🌟 Created.
+//! v2.5.0+Unify     - 🔧 [BUG FIX] Removed duplicate CognitiveTaskType definition.
+//!   CognitiveTaskType is now defined ONLY in config_supernode.rs and re-exported
+//!   here. The old definition had different variant names (CommunitySummary vs
+//!   CommunityNarrative, NaturalSummary vs RecallSynthesis, CustomPrompt vs
+//!   ConflictResolution/CodeAnalysis) which caused compilation errors across
+//!   task_worker.rs, llm_router.rs, and mod.rs re-exports.
 
 use std::fmt;
+
+// ============================================
+// Re-export CognitiveTaskType from canonical location
+// ============================================
+
+/// Re-exported from config_supernode.rs — the SINGLE SOURCE OF TRUTH.
+/// All code that previously imported `llm_provider::CognitiveTaskType`
+/// will continue to work without changes.
+pub use crate::config_supernode::CognitiveTaskType;
 
 // ============================================
 // Error Type
@@ -207,93 +225,5 @@ pub trait LlmProvider: Send + Sync {
     /// Default: always healthy. Providers can override to implement circuit breaking.
     fn is_healthy(&self) -> bool {
         true
-    }
-}
-
-// ============================================
-// CognitiveTaskType
-// ============================================
-
-/// All task types the SuperNode LLM worker can execute.
-///
-/// Maps to `cognitive_tasks.task_type` TEXT column. Use `task_type_str()` to
-/// get the canonical string representation for DB storage.
-///
-/// ## Privacy Levels per Task Type
-/// - `SessionTitle`: structured (only session_id + top entity names)
-/// - `CommunitySummary`: structured (only entity names + types)
-/// - `EntityDescription`: structured (only entity name + type + relation names)
-/// - `NaturalSummary`: summary (anonymized summary text)
-/// - `CustomPrompt`: full (caller-provided prompt, may contain raw content)
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CognitiveTaskType {
-    /// Generate a human-readable session title from entity names.
-    /// Target: sessions.title
-    SessionTitle,
-    /// Generate a natural language community summary from member entity names.
-    /// Target: communities.summary
-    CommunitySummary,
-    /// Generate a concise entity description from name, type, and relations.
-    /// Target: entities.description
-    EntityDescription,
-    /// Generate a natural language session summary (replaces entity-list summary).
-    /// Target: sessions.summary
-    NaturalSummary,
-    /// Custom prompt for ad-hoc enrichment (e.g. key decision extraction).
-    /// Target: specified in task payload
-    CustomPrompt,
-}
-
-impl CognitiveTaskType {
-    /// Canonical string representation for DB storage in `task_type` column.
-    pub fn task_type_str(&self) -> &'static str {
-        match self {
-            Self::SessionTitle => "session_title",
-            Self::CommunitySummary => "community_summary",
-            Self::EntityDescription => "entity_description",
-            Self::NaturalSummary => "natural_summary",
-            Self::CustomPrompt => "custom_prompt",
-        }
-    }
-
-    /// Default privacy level for this task type.
-    pub fn default_privacy_level(&self) -> &'static str {
-        match self {
-            Self::SessionTitle => "structured",
-            Self::CommunitySummary => "structured",
-            Self::EntityDescription => "structured",
-            Self::NaturalSummary => "summary",
-            Self::CustomPrompt => "full",
-        }
-    }
-
-    /// Default task priority (1-10, higher = processed sooner).
-    pub fn default_priority(&self) -> i64 {
-        match self {
-            Self::SessionTitle => 7,       // Users see this in search results — high priority
-            Self::CommunitySummary => 5,   // Background enrichment — medium
-            Self::EntityDescription => 4,  // Graph quality — medium-low
-            Self::NaturalSummary => 6,     // Session recall quality — medium-high
-            Self::CustomPrompt => 5,       // Caller specifies
-        }
-    }
-
-    /// Parse from the `task_type` TEXT stored in cognitive_tasks.
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "session_title" => Some(Self::SessionTitle),
-            "community_summary" => Some(Self::CommunitySummary),
-            "entity_description" => Some(Self::EntityDescription),
-            "natural_summary" => Some(Self::NaturalSummary),
-            "custom_prompt" => Some(Self::CustomPrompt),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for CognitiveTaskType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.task_type_str())
     }
 }
