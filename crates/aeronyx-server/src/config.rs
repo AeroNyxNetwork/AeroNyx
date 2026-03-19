@@ -19,11 +19,16 @@
 //!   - Miner cognitive steps: miner_entity_extraction, miner_community_detection,
 //!     miner_session_summary, miner_artifact_extraction, miner_llm_endpoint
 //!   - Vector optimization: vector_quantization, vector_early_termination, vector_saturation_threshold
+//! v2.5.0-SuperNode — 🌟 Added SuperNode configuration:
+//!   - Extracted SuperNode config to config_supernode.rs (nested structures too complex for flat fields)
+//!   - MemChainConfig.supernode: SuperNodeConfig (LLM providers, routing, privacy, worker)
+//!   - validate() delegates to SuperNodeConfig.validate()
+//!   - Backward compatible: missing [memchain.supernode] section → disabled (v2.4.0 behavior)
 //!
 //! ## Main Functionality
 //! - ServerConfig: top-level config with network, vpn, tun, limits, logging, management, memchain
 //! - MemChainConfig: memory system config with MVF parameters, DB paths, API auth, remote storage,
-//!   NER engine, cognitive graph, entropy filter, miner steps, and vector optimization
+//!   NER engine, cognitive graph, entropy filter, miner steps, vector optimization, and SuperNode
 //! - Validation for all config sections
 //!
 //! ## Dependencies
@@ -33,10 +38,13 @@
 //! - MemChainConfig consumed by ner.rs for NER engine configuration (v2.4.0)
 //! - MemChainConfig consumed by log_handler.rs for entropy filter configuration (v2.4.0)
 //! - MemChainConfig consumed by miner/reflection.rs for cognitive steps configuration (v2.4.0)
+//! - MemChainConfig.supernode consumed by server.rs for LlmRouter + TaskWorker initialization (v2.5.0)
+//! - config_supernode.rs — SuperNodeConfig, ProviderConfig, CognitiveTaskType etc. (v2.5.0)
 //!
 //! ## Main Logical Flow
 //! 1. Load TOML file → deserialize into ServerConfig
 //! 2. Validate all sections (network, vpn, tun, limits, management, memchain)
+//!    2a. MemChainConfig.validate() includes self.supernode.validate() (v2.5.0)
 //! 3. Return validated config for server initialization
 //!
 //! ⚠️ Important Note for Next Developer:
@@ -56,6 +64,10 @@
 //! - graph_max_depth max is 3 (to prevent runaway BFS)
 //! - entropy_filter_threshold must be in [0.0, 1.0]
 //! - vector_quantization only supports "none" or "scalar_uint8"
+//! - v2.5.0 SuperNode config is in config_supernode.rs — MemChainConfig.supernode field.
+//!   SuperNodeConfig::default() has enabled=false, so upgrading nodes see no behavior change.
+//!   SuperNode validation is only performed when enabled=true.
+//!   See config_supernode.rs for detailed documentation.
 //!
 //! ## Last Modified
 //! v2.1.0 - Added db_path, compaction_threshold, mvf_alpha, mvf_enabled,
@@ -67,6 +79,8 @@
 //!      embed_dim > 0, embed_max_tokens > 0
 //! v2.4.0-GraphCognition - 🌟 Added ner_*, graph_*, entropy_*, miner cognitive,
 //!   vector optimization config fields
+//! v2.5.0-SuperNode - 🌟 Added SuperNode configuration (config_supernode.rs),
+//!   MemChainConfig.supernode field, validate() delegation, is_supernode_enabled()
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -76,6 +90,10 @@ use tracing::info;
 
 use crate::error::{Result, ServerError};
 use crate::management::ManagementConfig;
+
+// v2.5.0-SuperNode: SuperNode configuration (providers, routing, privacy, worker)
+pub mod config_supernode;
+pub use config_supernode::SuperNodeConfig;
 
 // ============================================
 // ServerConfig
@@ -408,6 +426,10 @@ pub struct MemChainConfig {
     /// - Richer community descriptions (Step 8)
     ///
     /// Supports any OpenAI-compatible API endpoint (Ollama, vLLM, etc.).
+    ///
+    /// ⚠️ v2.5.0 Note: This field is superseded by [memchain.supernode] configuration.
+    /// When supernode.enabled = true, this field is ignored. Kept for backward
+    /// compatibility with v2.4.0 configs that used this single-endpoint approach.
     #[serde(default)]
     pub miner_llm_endpoint: String,
 
@@ -430,6 +452,51 @@ pub struct MemChainConfig {
     /// Lower = faster but potentially less accurate. Default 5.
     #[serde(default = "default_vector_saturation_threshold")]
     pub vector_saturation_threshold: usize,
+
+    // ── Reranker (v2.4.0+Reranker) ──
+
+    /// Enable cross-encoder reranking for recall Step 3.5.
+    #[serde(default)]
+    pub reranker_enabled: bool,
+
+    /// Path to the cross-encoder model directory.
+    #[serde(default = "default_reranker_model_path")]
+    pub reranker_model_path: String,
+
+    /// Maximum sequence length for reranker input (query + document).
+    #[serde(default = "default_reranker_max_seq_length")]
+    pub reranker_max_seq_length: usize,
+
+    // ── SuperNode (v2.5.0) ──
+
+    /// LLM cognitive enhancement layer configuration.
+    ///
+    /// When supernode.enabled = false (default), the system behaves identically
+    /// to v2.4.0 — all processing uses local models only.
+    ///
+    /// When supernode.enabled = true, cognitive tasks (session title generation,
+    /// community narratives, conflict resolution, recall synthesis, code analysis)
+    /// are dispatched to configurable LLM providers via an async task queue.
+    ///
+    /// See config_supernode.rs for full documentation.
+    ///
+    /// ## Configuration Example
+    /// ```toml
+    /// [memchain.supernode]
+    /// enabled = true
+    ///
+    /// [[memchain.supernode.providers]]
+    /// name = "deepseek"
+    /// type = "openai_compatible"
+    /// api_base = "https://api.deepseek.com/v1"
+    /// api_key = "$DEEPSEEK_API_KEY"
+    /// model = "deepseek-reasoner"
+    ///
+    /// [memchain.supernode.routing]
+    /// fallback = "deepseek"
+    /// ```
+    #[serde(default)]
+    pub supernode: SuperNodeConfig,
 }
 
 // ── Default functions ──
@@ -459,6 +526,10 @@ fn default_entropy_filter_threshold() -> f32 { 0.35 }
 fn default_entropy_window_size() -> usize { 10 }
 fn default_entropy_window_overlap() -> usize { 2 }
 fn default_vector_saturation_threshold() -> usize { 5 }
+
+// v2.4.0+Reranker defaults
+fn default_reranker_model_path() -> String { "models/reranker".into() }
+fn default_reranker_max_seq_length() -> usize { 512 }
 
 impl MemChainConfig {
     pub fn validate(&self) -> Result<()> {
@@ -665,6 +736,11 @@ impl MemChainConfig {
                     "must be > 0 when vector_early_termination is enabled",
                 ));
             }
+
+            // ── v2.5.0: SuperNode validation ──
+            // Delegates to SuperNodeConfig.validate() which performs its own
+            // enabled-gated checks. When supernode.enabled = false, this is a no-op.
+            self.supernode.validate()?;
         }
         Ok(())
     }
@@ -700,6 +776,15 @@ impl MemChainConfig {
             || self.miner_community_detection
             || self.miner_session_summary
             || self.miner_artifact_extraction
+    }
+
+    /// v2.5.0: Check whether the SuperNode cognitive enhancement layer is enabled.
+    ///
+    /// When true, the server should initialize LlmRouter + TaskWorker
+    /// from self.supernode configuration.
+    #[must_use]
+    pub fn is_supernode_enabled(&self) -> bool {
+        self.supernode.enabled
     }
 
     /// v2.4.0: Get the effective NER tokenizer path.
@@ -769,6 +854,12 @@ impl Default for MemChainConfig {
             vector_quantization: VectorQuantizationMode::default(),
             vector_early_termination: false,
             vector_saturation_threshold: default_vector_saturation_threshold(),
+            // v2.4.0+Reranker — disabled by default
+            reranker_enabled: false,
+            reranker_model_path: default_reranker_model_path(),
+            reranker_max_seq_length: default_reranker_max_seq_length(),
+            // v2.5.0: SuperNode — disabled by default
+            supernode: SuperNodeConfig::default(),
         }
     }
 }
@@ -986,6 +1077,10 @@ mod tests {
         assert!(!config.memchain.miner_community_detection);
         assert!(!config.memchain.vector_early_termination);
         assert_eq!(config.memchain.vector_quantization, VectorQuantizationMode::None);
+        // v2.5.0: supernode defaults
+        assert!(!config.memchain.supernode.enabled);
+        assert!(!config.memchain.is_supernode_enabled());
+        assert!(config.memchain.supernode.providers.is_empty());
     }
 
     #[test]
@@ -1058,9 +1153,13 @@ embed_output_dim = 384
         assert_eq!(mc.vector_quantization, VectorQuantizationMode::None);
         assert!(!mc.vector_early_termination);
         assert_eq!(mc.vector_saturation_threshold, 5);
+        // v2.5.0
+        assert!(!mc.supernode.enabled);
+        assert!(mc.supernode.providers.is_empty());
         // Convenience methods
         assert!(!mc.is_cognitive_graph_enabled());
         assert!(!mc.has_cognitive_miner_steps());
+        assert!(!mc.is_supernode_enabled());
     }
 
     #[test]
@@ -1253,6 +1352,8 @@ db_path = "memchain.db"
             ner_confidence_threshold: 2.0,
             graph_max_depth: 99,
             entropy_filter_threshold: -1.0,
+            // v2.5.0: invalid supernode config should also pass when mode=off
+            supernode: SuperNodeConfig { enabled: true, providers: Vec::new(), ..Default::default() },
             ..Default::default()
         };
         assert!(mc.validate().is_ok());
@@ -1633,6 +1734,8 @@ vector_saturation_threshold = 3
         assert!(config.validate().is_ok());
         assert!(mc.is_cognitive_graph_enabled());
         assert!(mc.has_cognitive_miner_steps());
+        // Supernode should be disabled (not in TOML)
+        assert!(!mc.is_supernode_enabled());
     }
 
     #[test]
@@ -1653,6 +1756,8 @@ mvf_alpha = 0.5
         assert!(!mc.miner_entity_extraction);
         assert!(!mc.vector_early_termination);
         assert_eq!(mc.vector_quantization, VectorQuantizationMode::None);
+        // v2.5.0: supernode defaults when section missing
+        assert!(!mc.is_supernode_enabled());
 
         assert!(config.validate().is_ok());
     }
@@ -1690,5 +1795,189 @@ mvf_alpha = 0.5
             ..Default::default()
         };
         assert_eq!(mc2.effective_ner_tokenizer_path(), "/custom/tokenizer.json");
+    }
+
+    // ========================================
+    // v2.5.0: SuperNode Integration Tests
+    // ========================================
+
+    #[test]
+    fn test_supernode_disabled_by_default() {
+        let mc = MemChainConfig::default();
+        assert!(!mc.is_supernode_enabled());
+        assert!(!mc.supernode.enabled);
+        assert!(mc.supernode.providers.is_empty());
+    }
+
+    #[test]
+    fn test_supernode_validate_delegation() {
+        // When supernode is enabled with no providers, MemChainConfig.validate() should fail
+        let mc = MemChainConfig {
+            supernode: SuperNodeConfig {
+                enabled: true,
+                providers: Vec::new(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_supernode_validate_passes_with_valid_provider() {
+        let mc = MemChainConfig {
+            supernode: SuperNodeConfig {
+                enabled: true,
+                providers: vec![config_supernode::ProviderConfig {
+                    name: "ollama".into(),
+                    provider_type: config_supernode::ProviderType::OpenaiCompatible,
+                    api_base: "http://localhost:11434/v1".into(),
+                    api_key: None,
+                    model: "llama3".into(),
+                    max_tokens: None,
+                    temperature: None,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+        assert!(mc.is_supernode_enabled());
+    }
+
+    #[test]
+    fn test_supernode_toml_full_integration() {
+        let toml_str = r#"
+[memchain]
+mode = "local"
+ner_enabled = true
+ner_model_path = "models/gliner"
+graph_enabled = true
+miner_entity_extraction = true
+
+[memchain.supernode]
+enabled = true
+
+[[memchain.supernode.providers]]
+name = "deepseek"
+type = "openai_compatible"
+api_base = "https://api.deepseek.com/v1"
+api_key = "$DEEPSEEK_API_KEY"
+model = "deepseek-reasoner"
+max_tokens = 2000
+temperature = 0.6
+
+[[memchain.supernode.providers]]
+name = "claude"
+type = "anthropic"
+api_key = "$ANTHROPIC_API_KEY"
+model = "claude-sonnet-4-20250514"
+
+[memchain.supernode.routing]
+session_title = "deepseek"
+code_analysis = "claude"
+fallback = "deepseek"
+
+[memchain.supernode.privacy]
+default_level = "structured"
+allow_full_for = ["code_analysis"]
+
+[memchain.supernode.worker]
+poll_interval_secs = 10
+max_concurrent = 5
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        let mc = &config.memchain;
+
+        // v2.4.0 fields work alongside v2.5.0 supernode
+        assert!(mc.ner_enabled);
+        assert!(mc.graph_enabled);
+        assert!(mc.miner_entity_extraction);
+
+        // v2.5.0 supernode fields
+        assert!(mc.is_supernode_enabled());
+        assert_eq!(mc.supernode.providers.len(), 2);
+        assert_eq!(mc.supernode.providers[0].name, "deepseek");
+        assert_eq!(mc.supernode.providers[1].name, "claude");
+        assert_eq!(mc.supernode.routing.session_title, Some("deepseek".into()));
+        assert_eq!(mc.supernode.routing.code_analysis, Some("claude".into()));
+        assert_eq!(mc.supernode.routing.fallback, Some("deepseek".into()));
+        assert_eq!(mc.supernode.privacy.default_level, config_supernode::PrivacyLevel::Structured);
+        assert_eq!(mc.supernode.worker.poll_interval_secs, 10);
+        assert_eq!(mc.supernode.worker.max_concurrent, 5);
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_supernode_toml_backward_compat_no_section() {
+        // TOML from v2.4.0 without any supernode section → disabled
+        let toml_str = r#"
+[memchain]
+mode = "local"
+ner_enabled = true
+graph_enabled = true
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.memchain.is_supernode_enabled());
+        assert!(config.memchain.supernode.providers.is_empty());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_supernode_disabled_with_partial_config_passes() {
+        // User started configuring supernode but left enabled = false
+        let toml_str = r#"
+[memchain]
+mode = "local"
+
+[memchain.supernode]
+enabled = false
+
+[[memchain.supernode.providers]]
+name = "deepseek"
+type = "openai_compatible"
+api_base = "https://api.deepseek.com/v1"
+model = "deepseek-reasoner"
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.memchain.is_supernode_enabled());
+        assert_eq!(config.memchain.supernode.providers.len(), 1);
+        // Should pass because enabled=false skips validation
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_supernode_routing_bad_reference_rejected() {
+        let toml_str = r#"
+[memchain]
+mode = "local"
+
+[memchain.supernode]
+enabled = true
+
+[[memchain.supernode.providers]]
+name = "deepseek"
+type = "openai_compatible"
+api_base = "https://api.deepseek.com/v1"
+model = "deepseek-reasoner"
+
+[memchain.supernode.routing]
+session_title = "nonexistent_provider"
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_is_supernode_enabled_method() {
+        let mc1 = MemChainConfig::default();
+        assert!(!mc1.is_supernode_enabled());
+
+        let mc2 = MemChainConfig {
+            supernode: SuperNodeConfig { enabled: true, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(mc2.is_supernode_enabled());
     }
 }
