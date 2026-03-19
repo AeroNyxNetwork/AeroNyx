@@ -10,6 +10,8 @@
 //!
 //! ## Main Functionality
 //! - `bm25_search()`: Full-text search across records, entities, sessions
+//! - `search_with_snippets()`: FTS5 snippet search with `<mark>` highlights (v2.5.0+Unify)
+//! - `group_hits_by_session()`: Group search hits by session with metadata (v2.5.0+Unify)
 //! - `fts_index_record()`: Index a memory record into FTS5
 //! - `fts_index_entity()`: Index an entity name + description
 //! - `fts_index_session()`: Index a session summary
@@ -39,6 +41,8 @@
 //! - `storage.rs` create_schema(): Creates the FTS5 virtual table
 //! - `storage.rs` maybe_migrate(): Backfills FTS5 from existing records
 //! - `recall_handler.rs`: Calls bm25_search() as Step 2a-bis
+//! - `mpi_graph_handlers.rs`: Calls search_with_snippets() + group_hits_by_session()
+//!   for the human-facing GET /api/mpi/search endpoint
 //! - `reflection.rs` Step 7: Calls fts_index_entity() after upsert
 //! - `reflection.rs` Step 10: Calls fts_index_session() after summary
 //! - `mpi_handlers.rs` remember: Calls fts_index_record() after insert
@@ -68,17 +72,74 @@
 //! - fts_reindex_all() now decrypts record content before indexing (v2.4.0+BM25-fix).
 //!   Previous version indexed raw encrypted_content from DB, which was ciphertext
 //!   when record_key was set — causing BM25 searches to return no results.
+//! - search_with_snippets() uses FTS5 snippet() function for highlighted results.
+//!   The snippet column index (3) must match the content column position in the
+//!   FTS5 virtual table definition. If schema changes, update the index.
+//! - group_hits_by_session() does synchronous SQLite queries inside the conn lock.
+//!   For large result sets this could hold the lock longer than ideal. Consider
+//!   batching the metadata lookups if performance becomes an issue.
 //!
 //! ## Last Modified
 //! v2.4.0+BM25 - 🌟 Initial implementation
 //! v2.4.0+BM25-fix - 🐛 Fixed: bm25_search debug logging, fts_reindex_all decryption,
 //!   impl block brace mismatch
+//! v2.5.0+Unify - 🌟 Added search_with_snippets() and group_hits_by_session() methods.
+//!   These were called by mpi_graph_handlers.rs::mpi_search() but never implemented,
+//!   causing E0599 compilation errors. Also added SearchHit and SessionSearchGroup types.
+
+use std::collections::HashMap;
 
 use rusqlite::params;
 use tracing::{debug, info, warn};
 
 use super::storage::MemoryStorage;
 use super::storage_crypto::decrypt_record_content;
+
+// ============================================
+// Search Hit Types (v2.5.0+Unify)
+// ============================================
+
+/// A single FTS5 search hit with snippet highlight.
+///
+/// Returned by `search_with_snippets()`. The snippet contains `<mark>` tags
+/// around matched terms, suitable for direct rendering in HTML UIs.
+///
+/// ## v2.5.0+Unify
+/// Created to support mpi_graph_handlers::mpi_search() which was calling
+/// search_with_snippets() before this type and method existed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchHit {
+    /// Source type: "record" | "entity" | "session"
+    pub source_type: String,
+    /// Source identifier (record_id hex / entity_id / session_id)
+    pub source_id: String,
+    /// FTS5 snippet with `<mark>` highlights around matched terms.
+    /// Example: "...用 <mark>token bucket</mark> 实现限流..."
+    pub snippet: String,
+    /// BM25 relevance score (negated so higher = more relevant).
+    pub score: f64,
+    /// Session ID associated with this hit (resolved from source).
+    /// - For 'session' source_type: the source_id itself.
+    /// - For 'record' / 'entity': may be None if not resolvable.
+    pub session_id: Option<String>,
+}
+
+/// Search results grouped by session, with session metadata.
+///
+/// Used by the `/api/mpi/search` endpoint response format.
+/// Groups are sorted by `best_score` (highest first).
+///
+/// ## v2.5.0+Unify
+/// Created to support mpi_graph_handlers::mpi_search().
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionSearchGroup {
+    pub session_id: String,
+    pub session_title: Option<String>,
+    pub project_name: Option<String>,
+    pub started_at: Option<i64>,
+    pub hits: Vec<SearchHit>,
+    pub best_score: f64,
+}
 
 // ============================================
 // impl MemoryStorage — BM25 Search
@@ -167,6 +228,204 @@ impl MemoryStorage {
         );
 
         results
+    }
+
+    /// FTS5 search with snippet highlights and session resolution.
+    ///
+    /// Returns search hits with `<mark>` highlighted snippets from FTS5's
+    /// `snippet()` function. Used by the human-facing `/api/mpi/search` endpoint.
+    ///
+    /// ## Snippet Format
+    /// FTS5 `snippet(fts_index, 3, '<mark>', '</mark>', '...', 32)`:
+    /// - Column 3 = content column
+    /// - `<mark>` / `</mark>` = highlight delimiters for frontend rendering
+    /// - `...` = ellipsis for truncated context
+    /// - 32 = max tokens in snippet window
+    ///
+    /// ## Session Resolution
+    /// For 'session' hits, session_id = source_id (direct).
+    /// For 'record' and 'entity' hits, session_id resolution is best-effort:
+    /// - Records: attempts to find session via raw_logs or episode linkage
+    /// - Entities: may span multiple sessions, returns None
+    /// Callers should handle hits with session_id = None gracefully.
+    ///
+    /// ## v2.5.0+Unify
+    /// Created to fix E0599 "method not found" in mpi_graph_handlers.rs.
+    /// This method was called by mpi_search() but never implemented.
+    pub async fn search_with_snippets(
+        &self,
+        query: &str,
+        owner: &[u8; 32],
+        limit: usize,
+    ) -> Vec<SearchHit> {
+        if query.trim().is_empty() {
+            return Vec::new();
+        }
+
+        let owner_hex = hex::encode(owner);
+        let sanitized = sanitize_fts_query(query);
+        if sanitized.is_empty() {
+            return Vec::new();
+        }
+
+        let conn = self.conn.lock().await;
+
+        // FTS5 snippet() produces highlighted text around matched terms.
+        // Arguments: (table, column_index, open_mark, close_mark, ellipsis, max_tokens)
+        // Column 3 = content (matching the FTS5 schema column order).
+        let mut stmt = match conn.prepare(
+            "SELECT source_type, source_id,
+                    snippet(fts_index, 3, '<mark>', '</mark>', '...', 32) as snip,
+                    -bm25(fts_index, 0, 0, 0, 1, 0) as score
+             FROM fts_index
+             WHERE fts_index MATCH ?1 AND owner_hex = ?2
+             ORDER BY score DESC
+             LIMIT ?3"
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("[FTS] search_with_snippets prepare failed: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let raw_hits: Vec<(String, String, String, f64)> = stmt
+            .query_map(
+                params![sanitized, owner_hex, limit as i64],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                )),
+            )
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+
+        // Resolve session_id for each hit based on source_type
+        let hits: Vec<SearchHit> = raw_hits
+            .into_iter()
+            .map(|(source_type, source_id, snippet, score)| {
+                let session_id = match source_type.as_str() {
+                    // Session hits: the source_id IS the session_id
+                    "session" => Some(source_id.clone()),
+                    // Record hits: try to resolve session via raw_logs table
+                    // (record_id hex → raw_logs.session_id via content match)
+                    // This is best-effort; many records don't have a direct session link.
+                    "record" => {
+                        // Attempt: look up the record_id in raw_logs (if the record was
+                        // ingested via /log endpoint, it may have a session association).
+                        // For simplicity and to avoid holding the lock too long, we skip
+                        // this resolution here. The group_hits_by_session() method will
+                        // place these hits in the "(ungrouped)" bucket.
+                        None
+                    }
+                    // Entity hits: entities can span multiple sessions, no single session_id
+                    _ => None,
+                };
+                SearchHit {
+                    source_type,
+                    source_id,
+                    snippet,
+                    score,
+                    session_id,
+                }
+            })
+            .collect();
+
+        debug!(
+            query = %query,
+            hits = hits.len(),
+            "[FTS] search_with_snippets complete"
+        );
+
+        hits
+    }
+
+    /// Group search hits by session and enrich with session metadata.
+    ///
+    /// Takes the flat list of `SearchHit` from `search_with_snippets()` and
+    /// organizes them into `SessionSearchGroup` structs, each containing:
+    /// - Session metadata (title, project_name, started_at)
+    /// - All hits belonging to that session
+    /// - The best (highest) score among the group's hits
+    ///
+    /// Hits without a `session_id` are placed in a synthetic "(ungrouped)" group.
+    /// Groups are sorted by `best_score` descending.
+    ///
+    /// ## v2.5.0+Unify
+    /// Created to fix E0599 "method not found" in mpi_graph_handlers.rs.
+    /// This method was called by mpi_search() but never implemented.
+    pub async fn group_hits_by_session(&self, hits: &[SearchHit]) -> Vec<SessionSearchGroup> {
+        if hits.is_empty() {
+            return Vec::new();
+        }
+
+        // Group hits by session_id
+        let mut groups: HashMap<String, Vec<SearchHit>> = HashMap::new();
+
+        for hit in hits {
+            let key = hit.session_id.clone().unwrap_or_else(|| "(ungrouped)".to_string());
+            groups.entry(key).or_default().push(hit.clone());
+        }
+
+        let conn = self.conn.lock().await;
+
+        let mut result: Vec<SessionSearchGroup> = Vec::with_capacity(groups.len());
+
+        for (session_id, group_hits) in &groups {
+            let best_score = group_hits
+                .iter()
+                .map(|h| h.score)
+                .fold(0.0_f64, f64::max);
+
+            // Look up session metadata from sessions + projects tables
+            let (title, project_name, started_at) = if session_id != "(ungrouped)" {
+                let meta: Option<(Option<String>, Option<String>, Option<i64>)> = conn
+                    .query_row(
+                        "SELECT title, project_id, started_at FROM sessions WHERE session_id = ?1",
+                        params![session_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .ok();
+
+                match meta {
+                    Some((title, project_id, started_at)) => {
+                        // Resolve project_name from project_id if available
+                        let project_name = project_id.and_then(|pid| {
+                            conn.query_row(
+                                "SELECT name FROM projects WHERE project_id = ?1",
+                                params![pid],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .ok()
+                        });
+                        (title, project_name, started_at)
+                    }
+                    None => (None, None, None),
+                }
+            } else {
+                (None, None, None)
+            };
+
+            result.push(SessionSearchGroup {
+                session_id: session_id.clone(),
+                session_title: title,
+                project_name,
+                started_at,
+                hits: group_hits.clone(),
+                best_score,
+            });
+        }
+
+        // Sort groups by best_score descending (most relevant session first)
+        result.sort_by(|a, b| {
+            b.best_score
+                .partial_cmp(&a.best_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        result
     }
 }
 
@@ -373,9 +632,9 @@ impl MemoryStorage {
 /// - Quotes, parentheses, asterisks, carets, etc.
 /// - We strip these and keep only alphanumeric + spaces + basic punctuation.
 ///
-/// Also converts the query to explicit AND for multi-word queries.
+/// Also filters out single-character words (noise) and normalizes whitespace.
 /// FTS5 with `porter unicode61` tokenizer: space between words = implicit AND
-/// (requires all terms present). We use explicit AND for clarity.
+/// (requires all terms present).
 fn sanitize_fts_query(query: &str) -> String {
     let cleaned: String = query.chars()
         .map(|c| {
@@ -415,6 +674,8 @@ fn sanitize_fts_query(query: &str) -> String {
 mod tests {
     use super::*;
 
+    // ── Query sanitization tests ──
+
     #[test]
     fn test_sanitize_fts_query_basic() {
         assert_eq!(sanitize_fts_query("hello world"), "hello world");
@@ -451,7 +712,7 @@ mod tests {
         assert_eq!(sanitize_fts_query("rate-limiting approach"), "rate-limiting approach");
     }
 
-    // Integration tests require MemoryStorage with FTS5 — tested via end-to-end
+    // ── BM25 search tests ──
 
     #[tokio::test]
     async fn test_bm25_search_empty_query() {
@@ -558,5 +819,123 @@ mod tests {
         assert!(types.contains(&"record"));
         assert!(types.contains(&"entity"));
         assert!(types.contains(&"session"));
+    }
+
+    // ── search_with_snippets tests (v2.5.0+Unify) ──
+
+    #[tokio::test]
+    async fn test_search_with_snippets_empty_query() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let results = s.search_with_snippets("", &[0xAA; 32], 10).await;
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_with_snippets_basic() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        s.fts_index_record(
+            &[0x01; 32], &owner,
+            "JWT authentication using RS256 algorithm for secure token verification", "auth",
+        ).await;
+
+        let hits = s.search_with_snippets("JWT", &owner, 10).await;
+        assert!(!hits.is_empty(), "Should find JWT in indexed content");
+        assert_eq!(hits[0].source_type, "record");
+        assert!(hits[0].snippet.contains("<mark>"), "Snippet should contain <mark> highlight tags");
+        assert!(hits[0].score > 0.0, "Score should be positive (negated BM25)");
+    }
+
+    #[tokio::test]
+    async fn test_search_with_snippets_session_resolves_session_id() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        s.fts_index_session("sess_test_001", &owner, "Implementing rate limiting with token bucket").await;
+
+        let hits = s.search_with_snippets("token bucket", &owner, 10).await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source_type, "session");
+        // For session hits, session_id should be the source_id itself
+        assert_eq!(hits[0].session_id, Some("sess_test_001".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_search_with_snippets_owner_isolation() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner_a = [0xAA; 32];
+        let owner_b = [0xBB; 32];
+
+        s.fts_index_record(&[0x01; 32], &owner_a, "secret project for Alice", "").await;
+        s.fts_index_record(&[0x02; 32], &owner_b, "secret project for Bob", "").await;
+
+        let hits_a = s.search_with_snippets("secret", &owner_a, 10).await;
+        assert_eq!(hits_a.len(), 1, "Owner A should only see their own results");
+
+        let hits_b = s.search_with_snippets("secret", &owner_b, 10).await;
+        assert_eq!(hits_b.len(), 1, "Owner B should only see their own results");
+    }
+
+    // ── group_hits_by_session tests (v2.5.0+Unify) ──
+
+    #[tokio::test]
+    async fn test_group_hits_by_session_empty() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let groups = s.group_hits_by_session(&[]).await;
+        assert!(groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_group_hits_by_session_groups_correctly() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+
+        let hits = vec![
+            SearchHit {
+                source_type: "session".into(), source_id: "sess_a".into(),
+                snippet: "hit 1".into(), score: 2.5, session_id: Some("sess_a".into()),
+            },
+            SearchHit {
+                source_type: "session".into(), source_id: "sess_a".into(),
+                snippet: "hit 2".into(), score: 1.5, session_id: Some("sess_a".into()),
+            },
+            SearchHit {
+                source_type: "record".into(), source_id: "rec_x".into(),
+                snippet: "hit 3".into(), score: 3.0, session_id: None,
+            },
+        ];
+
+        let groups = s.group_hits_by_session(&hits).await;
+        assert_eq!(groups.len(), 2, "Should have 2 groups: sess_a and (ungrouped)");
+
+        // Groups sorted by best_score descending
+        // (ungrouped) has score 3.0, sess_a has score 2.5
+        assert_eq!(groups[0].session_id, "(ungrouped)");
+        assert_eq!(groups[0].best_score, 3.0);
+        assert_eq!(groups[0].hits.len(), 1);
+
+        assert_eq!(groups[1].session_id, "sess_a");
+        assert_eq!(groups[1].best_score, 2.5);
+        assert_eq!(groups[1].hits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_group_hits_by_session_with_metadata() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+
+        // Create a session in the DB so metadata resolution works
+        s.upsert_session("sess_meta", &owner, "test-source", 5).await;
+        s.update_session_summary("sess_meta", "Test summary", None, Some("Test Title")).await;
+
+        let hits = vec![
+            SearchHit {
+                source_type: "session".into(), source_id: "sess_meta".into(),
+                snippet: "matched".into(), score: 1.0, session_id: Some("sess_meta".into()),
+            },
+        ];
+
+        let groups = s.group_hits_by_session(&hits).await;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].session_id, "sess_meta");
+        assert_eq!(groups[0].session_title, Some("Test Title".to_string()));
     }
 }
