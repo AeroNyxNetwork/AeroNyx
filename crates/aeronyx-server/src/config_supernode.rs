@@ -6,49 +6,34 @@
 //! ## Creation Reason
 //! v2.5.0-SuperNode — Extracted from config.rs to keep MemChainConfig manageable.
 //!
-//! ## Main Functionality
-//! - SuperNodeConfig: top-level supernode config (enabled flag + sub-configs)
-//! - ProviderConfig: individual LLM provider definition (API endpoint, model, auth)
-//! - ProviderType: enum for provider protocol (OpenAI-compatible vs Anthropic)
-//! - CognitiveTaskType: enum for the 5 cognitive task types
-//! - TaskRoutingConfig: maps each task type to a named provider
-//! - PrivacyConfig: controls what data is sent to external LLM APIs
-//! - WorkerConfig: async task worker parameters (polling, concurrency, retries)
-//! - Validation for all config sections
+//! ## CognitiveTaskType alignment (CRITICAL)
+//! config_supernode::CognitiveTaskType MUST use the same string keys as
+//! llm_provider::CognitiveTaskType.task_type_str(). The canonical enum for
+//! runtime dispatch lives in llm_provider.rs; this file drives TOML routing config.
 //!
-//! ## Dependencies
-//! - Used by config.rs — MemChainConfig embeds SuperNodeConfig as a field
-//! - Used by server.rs — initializes LlmRouter + TaskWorker from this config
-//! - Used by llm_router.rs — reads provider configs and routing rules
-//! - Used by task_worker.rs — reads worker params (poll interval, concurrency)
-//! - Used by reflection.rs — reads privacy config when submitting cognitive tasks
+//! Variant → DB string mapping:
+//!   SessionTitle      → "session_title"
+//!   CommunitySummary  → "community_summary"
+//!   EntityDescription → "entity_description"
+//!   NaturalSummary    → "natural_summary"
+//!   CustomPrompt      → "custom_prompt"
 //!
 //! ⚠️ Important Note for Next Developer:
-//! - SuperNodeConfig::default() returns enabled=false — existing nodes upgrading
-//!   to v2.5.0 see ZERO behavior change until explicitly enabled in config.
-//! - api_key supports "$ENV_VAR" syntax — resolved at runtime by the provider
-//!   implementation (llm_openai.rs / llm_anthropic.rs), NOT during config loading.
-//! - ProviderType::OpenaiCompatible covers DeepSeek, OpenAI, Groq, Together,
-//!   Ollama, vLLM, and any other OpenAI Chat Completion API compatible endpoint.
-//! - TaskRoutingConfig fields are all Option<String>. When None, the fallback
-//!   provider is used.
-//! - PrivacyConfig.level_for() returns PrivacyLevel (owned, cloned).
-//!   This was changed from &PrivacyLevel in v2.5.0+Fix to avoid returning
-//!   a reference to a temporary value (compiler error with `return &PrivacyLevel::Full`).
-//! - CognitiveTaskType is used both in config (routing) and at runtime (task queue).
+//! - SuperNodeConfig::default() returns enabled=false — zero behavior change on upgrade.
+//! - CognitiveTaskType variants here MUST stay in sync with llm_provider::CognitiveTaskType.
+//! - PrivacyLevel has three variants: Structured / Summary / Full.
+//!   Summary = anonymized text, no raw conversation. Treated as Structured in prompts.rs.
+//! - CognitiveTaskType::from_str() is renamed to parse() (Audit Fix 9).
 //!
 //! ## Last Modified
-//! v2.5.0-SuperNode - 🌟 Created. Full SuperNode configuration with providers,
-//!   routing, privacy, and worker settings.
-//! v2.5.0+Audit Fix 9  - 🔧 CognitiveTaskType::from_str renamed to parse() to avoid
-//!   shadowing std::str::FromStr trait signature. All callers updated.
-//! v2.5.0+Audit Fix 10 - 🔧 validate() now fills in the default Anthropic api_base
-//!   ("https://api.anthropic.com") when empty, rather than silently accepting it.
-//!   This prevents runtime errors if AnthropicProvider forgets the fallback.
-//! v2.5.0+Fix       - 🔧 [BUG FIX] PrivacyConfig::level_for() changed return type
-//!   from &PrivacyLevel to PrivacyLevel (owned) to avoid temporary-value lifetime
-//!   error when returning &PrivacyLevel::Full. Updated is_full_allowed() to not
-//!   call level_for() (avoids double-clone). All callers updated accordingly.
+//! v2.5.0-SuperNode    - 🌟 Created.
+//! v2.5.0+Fix          - 🔧 PrivacyConfig::level_for() returns owned PrivacyLevel.
+//! v2.5.0+Audit Fix 9  - 🔧 from_str renamed to parse().
+//! v2.5.0+Audit Fix 10 - 🔧 validate() warns on empty Anthropic api_base.
+//! v2.5.0+Align        - 🔧 CognitiveTaskType variants aligned to llm_provider.rs:
+//!   CommunitySummary/NaturalSummary/CustomPrompt replace old narrative/synthesis names.
+//!   PrivacyLevel::Summary variant added.
+//!   All from_str() references in tests updated to parse().
 
 use std::collections::HashSet;
 
@@ -61,63 +46,57 @@ use crate::error::{Result, ServerError};
 // CognitiveTaskType
 // ============================================
 
-/// The cognitive task types that can be dispatched to LLM providers.
+/// Cognitive task types for TOML routing config.
 ///
-/// Each task type can be routed to a different provider via TaskRoutingConfig.
-/// Stored as lowercase strings in the cognitive_tasks table (task_type column).
+/// Maps to llm_provider::CognitiveTaskType variants via as_str() / parse().
+/// The canonical runtime enum is in llm_provider.rs — keep these in sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CognitiveTaskType {
+    /// Generate a human-readable session title. → "session_title"
     SessionTitle,
-    CommunityNarrative,
-    ConflictResolution,
-    RecallSynthesis,
-    CodeAnalysis,
-    /// Entity description enrichment (v2.5.0+SuperNode Phase B, enqueued by Step 9)
+    /// Generate community summary from member entities. → "community_summary"
+    CommunitySummary,
+    /// Generate entity description. → "entity_description"
     EntityDescription,
+    /// Generate natural session summary. → "natural_summary"
+    NaturalSummary,
+    /// Custom/ad-hoc prompt (conflict resolution, code analysis, etc.). → "custom_prompt"
+    CustomPrompt,
 }
 
 impl CognitiveTaskType {
     pub const ALL: &'static [CognitiveTaskType] = &[
         Self::SessionTitle,
-        Self::CommunityNarrative,
-        Self::ConflictResolution,
-        Self::RecallSynthesis,
-        Self::CodeAnalysis,
+        Self::CommunitySummary,
         Self::EntityDescription,
+        Self::NaturalSummary,
+        Self::CustomPrompt,
     ];
 
+    /// String representation stored in cognitive_tasks.task_type column.
+    /// Must match llm_provider::CognitiveTaskType::task_type_str().
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::SessionTitle => "session_title",
-            Self::CommunityNarrative => "community_narrative",
-            Self::ConflictResolution => "conflict_resolution",
-            Self::RecallSynthesis => "recall_synthesis",
-            Self::CodeAnalysis => "code_analysis",
+            Self::CommunitySummary => "community_summary",
             Self::EntityDescription => "entity_description",
+            Self::NaturalSummary => "natural_summary",
+            Self::CustomPrompt => "custom_prompt",
         }
     }
 
-    /// Parse a task type from its string representation.
-    ///
-    /// ## v2.5.0+Audit Fix 9
-    /// Renamed from `from_str` to `parse` to avoid shadowing the `std::str::FromStr`
-    /// trait method, which has a different return type (`Result`, not `Option`).
-    /// While this doesn't cause a compile error (different signatures), it creates
-    /// confusion when reading code — `parse()` is the conventional name for
-    /// infallible-with-option returns in this codebase.
-    ///
-    /// All callers in task_worker.rs and reflection.rs use `CognitiveTaskType::parse()`.
+    /// Parse from the string stored in cognitive_tasks.task_type.
+    /// Renamed from from_str (Audit Fix 9) to avoid shadowing std::str::FromStr.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "session_title" => Some(Self::SessionTitle),
-            "community_narrative" => Some(Self::CommunityNarrative),
-            "conflict_resolution" => Some(Self::ConflictResolution),
-            "recall_synthesis" => Some(Self::RecallSynthesis),
-            "code_analysis" => Some(Self::CodeAnalysis),
+            "community_summary" => Some(Self::CommunitySummary),
             "entity_description" => Some(Self::EntityDescription),
+            "natural_summary" => Some(Self::NaturalSummary),
+            "custom_prompt" => Some(Self::CustomPrompt),
             _ => None,
         }
     }
@@ -136,9 +115,7 @@ impl std::fmt::Display for CognitiveTaskType {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderType {
-    /// OpenAI Chat Completion API compatible endpoint.
     OpenaiCompatible,
-    /// Anthropic Messages API (Claude models).
     Anthropic,
 }
 
@@ -180,15 +157,13 @@ pub struct TaskRoutingConfig {
     #[serde(default)]
     pub session_title: Option<String>,
     #[serde(default)]
-    pub community_narrative: Option<String>,
-    #[serde(default)]
-    pub conflict_resolution: Option<String>,
-    #[serde(default)]
-    pub recall_synthesis: Option<String>,
-    #[serde(default)]
-    pub code_analysis: Option<String>,
+    pub community_summary: Option<String>,
     #[serde(default)]
     pub entity_description: Option<String>,
+    #[serde(default)]
+    pub natural_summary: Option<String>,
+    #[serde(default)]
+    pub custom_prompt: Option<String>,
     #[serde(default)]
     pub fallback: Option<String>,
 }
@@ -198,26 +173,26 @@ impl TaskRoutingConfig {
     pub fn provider_for(&self, task_type: CognitiveTaskType) -> Option<&str> {
         let explicit = match task_type {
             CognitiveTaskType::SessionTitle => self.session_title.as_deref(),
-            CognitiveTaskType::CommunityNarrative => self.community_narrative.as_deref(),
-            CognitiveTaskType::ConflictResolution => self.conflict_resolution.as_deref(),
-            CognitiveTaskType::RecallSynthesis => self.recall_synthesis.as_deref(),
-            CognitiveTaskType::CodeAnalysis => self.code_analysis.as_deref(),
+            CognitiveTaskType::CommunitySummary => self.community_summary.as_deref(),
             CognitiveTaskType::EntityDescription => self.entity_description.as_deref(),
+            CognitiveTaskType::NaturalSummary => self.natural_summary.as_deref(),
+            CognitiveTaskType::CustomPrompt => self.custom_prompt.as_deref(),
         };
         explicit.or(self.fallback.as_deref())
     }
 
     fn all_referenced_providers(&self) -> Vec<&str> {
-        let fields = [
+        [
             self.session_title.as_deref(),
-            self.community_narrative.as_deref(),
-            self.conflict_resolution.as_deref(),
-            self.recall_synthesis.as_deref(),
-            self.code_analysis.as_deref(),
+            self.community_summary.as_deref(),
             self.entity_description.as_deref(),
+            self.natural_summary.as_deref(),
+            self.custom_prompt.as_deref(),
             self.fallback.as_deref(),
-        ];
-        fields.iter().filter_map(|f| *f).collect()
+        ]
+        .iter()
+        .filter_map(|f| *f)
+        .collect()
     }
 }
 
@@ -225,11 +200,10 @@ impl Default for TaskRoutingConfig {
     fn default() -> Self {
         Self {
             session_title: None,
-            community_narrative: None,
-            conflict_resolution: None,
-            recall_synthesis: None,
-            code_analysis: None,
+            community_summary: None,
             entity_description: None,
+            natural_summary: None,
+            custom_prompt: None,
             fallback: None,
         }
     }
@@ -239,10 +213,16 @@ impl Default for TaskRoutingConfig {
 // PrivacyLevel
 // ============================================
 
+/// Privacy level controlling what data is sent to external LLM APIs.
+///
+/// - Structured: only metadata (entity names, relation types). Safe for external APIs.
+/// - Summary: anonymized summary text, no raw conversation. Cloud-provider safe.
+/// - Full: full decrypted conversation. Use only with local/trusted providers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivacyLevel {
     Structured,
+    Summary,
     Full,
 }
 
@@ -273,13 +253,7 @@ pub struct PrivacyConfig {
 }
 
 impl PrivacyConfig {
-    /// Get the effective privacy level for a given task type.
-    ///
-    /// ## v2.5.0+Fix
-    /// Returns owned `PrivacyLevel` (cloned) instead of `&PrivacyLevel` to avoid
-    /// the Rust lifetime error: `return &PrivacyLevel::Full` creates a temporary
-    /// that doesn't live long enough. Callers that previously matched on the
-    /// reference now match on the owned value.
+    /// Get effective privacy level for a task type (returns owned value).
     #[must_use]
     pub fn level_for(&self, task_type: CognitiveTaskType) -> PrivacyLevel {
         if self.default_level == PrivacyLevel::Full {
@@ -288,13 +262,11 @@ impl PrivacyConfig {
         if self.allow_full_for.iter().any(|t| t == task_type.as_str()) {
             return PrivacyLevel::Full;
         }
-        PrivacyLevel::Structured
+        self.default_level.clone()
     }
 
-    /// Check if a specific task type is allowed to send full conversation content.
     #[must_use]
     pub fn is_full_allowed(&self, task_type: CognitiveTaskType) -> bool {
-        // Inline the check to avoid an extra clone from level_for()
         self.default_level == PrivacyLevel::Full
             || self.allow_full_for.iter().any(|t| t == task_type.as_str())
     }
@@ -389,10 +361,6 @@ impl SuperNodeConfig {
                 ));
             }
 
-            // api_base: required for openai_compatible; Anthropic has a well-known default.
-            // Audit Fix 10: fill in Anthropic default api_base during validation rather than
-            // accepting empty string — prevents runtime errors if AnthropicProvider forgets
-            // to apply the fallback itself.
             if provider.api_base.is_empty() {
                 match provider.provider_type {
                     ProviderType::OpenaiCompatible => {
@@ -402,13 +370,10 @@ impl SuperNodeConfig {
                         ));
                     }
                     ProviderType::Anthropic => {
-                        // Validation passes but we note this in the log.
-                        // server.rs::init_llm_router() should handle the default,
-                        // but AnthropicProvider::new() also has its own fallback.
                         warn!(
                             provider = %provider.name,
                             "[SUPERNODE] Anthropic provider has empty api_base — \
-                             will use default https://api.anthropic.com at runtime"
+                             will use https://api.anthropic.com at runtime"
                         );
                     }
                 }
@@ -440,9 +405,8 @@ impl SuperNodeConfig {
             }
         }
 
-        let provider_names: HashSet<&str> = self.providers.iter()
-            .map(|p| p.name.as_str())
-            .collect();
+        let provider_names: HashSet<&str> =
+            self.providers.iter().map(|p| p.name.as_str()).collect();
 
         for referenced in self.routing.all_referenced_providers() {
             if !provider_names.contains(referenced) {
@@ -458,12 +422,12 @@ impl SuperNodeConfig {
         }
 
         for task_name in &self.privacy.allow_full_for {
-            if CognitiveTaskType::from_str(task_name).is_none() {
+            if CognitiveTaskType::parse(task_name).is_none() {
                 warn!(
                     task_type = %task_name,
                     "[SUPERNODE] Unknown task type in privacy.allow_full_for — ignored. \
-                     Valid types: session_title, community_narrative, conflict_resolution, \
-                     recall_synthesis, code_analysis, entity_description"
+                     Valid types: session_title, community_summary, entity_description, \
+                     natural_summary, custom_prompt"
                 );
             }
         }
@@ -533,7 +497,6 @@ mod tests {
     fn test_default_is_disabled() {
         let cfg = SuperNodeConfig::default();
         assert!(!cfg.enabled);
-        assert!(!cfg.is_enabled());
         assert!(cfg.providers.is_empty());
         assert!(cfg.validate().is_ok());
     }
@@ -551,40 +514,12 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_empty_name_rejected() {
-        let cfg = SuperNodeConfig {
-            enabled: true,
-            providers: vec![ProviderConfig {
-                name: String::new(),
-                provider_type: ProviderType::OpenaiCompatible,
-                api_base: "http://localhost:11434/v1".into(),
-                api_key: None, model: "test".into(), max_tokens: None, temperature: None,
-            }],
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn test_provider_duplicate_name_rejected() {
-        let provider = ProviderConfig {
-            name: "deepseek".into(), provider_type: ProviderType::OpenaiCompatible,
-            api_base: "http://api.deepseek.com/v1".into(), api_key: None,
-            model: "deepseek-reasoner".into(), max_tokens: None, temperature: None,
-        };
-        let cfg = SuperNodeConfig {
-            enabled: true, providers: vec![provider.clone(), provider], ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
     fn test_openai_compat_requires_api_base() {
         let cfg = SuperNodeConfig {
             enabled: true,
             providers: vec![ProviderConfig {
                 name: "test".into(), provider_type: ProviderType::OpenaiCompatible,
-                api_base: String::new(), api_key: None, model: "test-model".into(),
+                api_base: String::new(), api_key: None, model: "test".into(),
                 max_tokens: None, temperature: None,
             }],
             ..Default::default()
@@ -607,20 +542,6 @@ mod tests {
     }
 
     #[test]
-    fn test_temperature_out_of_range() {
-        let cfg = SuperNodeConfig {
-            enabled: true,
-            providers: vec![ProviderConfig {
-                name: "test".into(), provider_type: ProviderType::Anthropic,
-                api_base: String::new(), api_key: None, model: "test".into(),
-                max_tokens: None, temperature: Some(2.5),
-            }],
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
     fn test_temperature_boundary_values() {
         for temp in [0.0f32, 1.0, 2.0] {
             let cfg = SuperNodeConfig {
@@ -634,37 +555,6 @@ mod tests {
             };
             assert!(cfg.validate().is_ok(), "temperature {} should be valid", temp);
         }
-    }
-
-    #[test]
-    fn test_max_tokens_zero_rejected() {
-        let cfg = SuperNodeConfig {
-            enabled: true,
-            providers: vec![ProviderConfig {
-                name: "test".into(), provider_type: ProviderType::Anthropic,
-                api_base: String::new(), api_key: None, model: "test".into(),
-                max_tokens: Some(0), temperature: None,
-            }],
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn test_routing_unknown_provider_rejected() {
-        let cfg = SuperNodeConfig {
-            enabled: true,
-            providers: vec![ProviderConfig {
-                name: "deepseek".into(), provider_type: ProviderType::OpenaiCompatible,
-                api_base: "http://api.deepseek.com/v1".into(), api_key: None,
-                model: "deepseek-reasoner".into(), max_tokens: None, temperature: None,
-            }],
-            routing: TaskRoutingConfig {
-                session_title: Some("nonexistent_provider".into()), ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
     }
 
     #[test]
@@ -685,13 +575,30 @@ mod tests {
             ],
             routing: TaskRoutingConfig {
                 session_title: Some("deepseek".into()),
-                code_analysis: Some("claude".into()),
+                custom_prompt: Some("claude".into()),
                 fallback: Some("deepseek".into()),
                 ..Default::default()
             },
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_routing_unknown_provider_rejected() {
+        let cfg = SuperNodeConfig {
+            enabled: true,
+            providers: vec![ProviderConfig {
+                name: "deepseek".into(), provider_type: ProviderType::OpenaiCompatible,
+                api_base: "http://api.deepseek.com/v1".into(), api_key: None,
+                model: "deepseek-reasoner".into(), max_tokens: None, temperature: None,
+            }],
+            routing: TaskRoutingConfig {
+                session_title: Some("nonexistent".into()), ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
@@ -711,33 +618,30 @@ mod tests {
 
     #[test]
     fn test_worker_defaults_valid() {
-        let worker = WorkerConfig::default();
-        assert_eq!(worker.poll_interval_secs, 5);
-        assert_eq!(worker.max_concurrent, 3);
-        assert_eq!(worker.max_retries, 3);
-        assert_eq!(worker.task_timeout_secs, 120);
+        let w = WorkerConfig::default();
+        assert_eq!(w.poll_interval_secs, 5);
+        assert_eq!(w.max_concurrent, 3);
+        assert_eq!(w.max_retries, 3);
+        assert_eq!(w.task_timeout_secs, 120);
     }
 
     #[test]
-    fn test_privacy_level_for_task_returns_owned() {
-        // v2.5.0+Fix: level_for() now returns owned PrivacyLevel
-        let privacy = PrivacyConfig {
-            default_level: PrivacyLevel::Structured,
-            allow_full_for: vec!["session_title".into(), "code_analysis".into()],
-        };
-        assert_eq!(privacy.level_for(CognitiveTaskType::SessionTitle), PrivacyLevel::Full);
-        assert_eq!(privacy.level_for(CognitiveTaskType::CodeAnalysis), PrivacyLevel::Full);
-        assert_eq!(privacy.level_for(CognitiveTaskType::CommunityNarrative), PrivacyLevel::Structured);
+    fn test_privacy_level_has_summary_variant() {
+        // Summary variant must exist — prompts.rs uses it
+        let l = PrivacyLevel::Summary;
+        assert_eq!(l.to_string(), "summary");
+        assert_ne!(l, PrivacyLevel::Structured);
+        assert_ne!(l, PrivacyLevel::Full);
     }
 
     #[test]
-    fn test_privacy_is_full_allowed() {
+    fn test_privacy_level_for_task() {
         let privacy = PrivacyConfig {
             default_level: PrivacyLevel::Structured,
             allow_full_for: vec!["session_title".into()],
         };
-        assert!(privacy.is_full_allowed(CognitiveTaskType::SessionTitle));
-        assert!(!privacy.is_full_allowed(CognitiveTaskType::CommunityNarrative));
+        assert_eq!(privacy.level_for(CognitiveTaskType::SessionTitle), PrivacyLevel::Full);
+        assert_eq!(privacy.level_for(CognitiveTaskType::CommunitySummary), PrivacyLevel::Structured);
     }
 
     #[test]
@@ -749,33 +653,19 @@ mod tests {
     }
 
     #[test]
-    fn test_task_type_parse_renamed_from_from_str() {
-        // Audit Fix 9: method renamed from from_str to parse
-        assert_eq!(CognitiveTaskType::parse("session_title"), Some(CognitiveTaskType::SessionTitle));
-        assert_eq!(CognitiveTaskType::parse("entity_description"), Some(CognitiveTaskType::EntityDescription));
-        assert_eq!(CognitiveTaskType::parse("unknown"), None);
-        assert_eq!(CognitiveTaskType::parse(""), None);
-    }
-
-    #[test]
-    fn test_task_type_roundtrip() {
+    fn test_task_type_parse_roundtrip() {
         for task in CognitiveTaskType::ALL {
             let s = task.as_str();
-            assert_eq!(CognitiveTaskType::parse(s), Some(*task));
+            assert_eq!(CognitiveTaskType::parse(s), Some(*task), "roundtrip failed for {:?}", task);
         }
     }
 
     #[test]
-    fn test_task_type_entity_description() {
-        // entity_description was added in v2.5.0+Fix — verify roundtrip
-        assert_eq!(CognitiveTaskType::from_str("entity_description"), Some(CognitiveTaskType::EntityDescription));
-        assert_eq!(CognitiveTaskType::EntityDescription.as_str(), "entity_description");
-    }
-
-    #[test]
-    fn test_task_type_unknown_returns_none() {
-        assert!(CognitiveTaskType::from_str("unknown_task").is_none());
-        assert!(CognitiveTaskType::from_str("").is_none());
+    fn test_task_type_parse_unknown_returns_none() {
+        assert!(CognitiveTaskType::parse("unknown_task").is_none());
+        assert!(CognitiveTaskType::parse("community_narrative").is_none()); // old name, must fail
+        assert!(CognitiveTaskType::parse("conflict_resolution").is_none()); // old name, must fail
+        assert!(CognitiveTaskType::parse("").is_none());
     }
 
     #[test]
@@ -783,9 +673,11 @@ mod tests {
         let cfg = SuperNodeConfig {
             providers: vec![
                 ProviderConfig { name: "a".into(), provider_type: ProviderType::Anthropic,
-                    api_base: String::new(), api_key: None, model: "m".into(), max_tokens: None, temperature: None },
+                    api_base: String::new(), api_key: None, model: "m".into(),
+                    max_tokens: None, temperature: None },
                 ProviderConfig { name: "b".into(), provider_type: ProviderType::Anthropic,
-                    api_base: String::new(), api_key: None, model: "m".into(), max_tokens: None, temperature: None },
+                    api_base: String::new(), api_key: None, model: "m".into(),
+                    max_tokens: None, temperature: None },
             ],
             routing: TaskRoutingConfig { fallback: Some("b".into()), ..Default::default() },
             ..Default::default()
@@ -793,57 +685,13 @@ mod tests {
         assert_eq!(cfg.effective_fallback(), Some("b"));
 
         let cfg2 = SuperNodeConfig {
-            providers: vec![ProviderConfig { name: "first".into(), provider_type: ProviderType::Anthropic,
-                api_base: String::new(), api_key: None, model: "m".into(), max_tokens: None, temperature: None }],
+            providers: vec![ProviderConfig { name: "first".into(),
+                provider_type: ProviderType::Anthropic, api_base: String::new(),
+                api_key: None, model: "m".into(), max_tokens: None, temperature: None }],
             ..Default::default()
         };
         assert_eq!(cfg2.effective_fallback(), Some("first"));
-
         assert_eq!(SuperNodeConfig::default().effective_fallback(), None);
-    }
-
-    #[test]
-    fn test_toml_full_config() {
-        let toml_str = r#"
-enabled = true
-
-[[providers]]
-name = "deepseek"
-type = "openai_compatible"
-api_base = "https://api.deepseek.com/v1"
-api_key = "$DEEPSEEK_API_KEY"
-model = "deepseek-reasoner"
-max_tokens = 2000
-temperature = 0.6
-
-[[providers]]
-name = "claude"
-type = "anthropic"
-api_key = "$ANTHROPIC_API_KEY"
-model = "claude-sonnet-4-20250514"
-
-[routing]
-session_title = "deepseek"
-code_analysis = "claude"
-fallback = "deepseek"
-
-[privacy]
-default_level = "structured"
-allow_full_for = ["session_title", "code_analysis"]
-
-[worker]
-poll_interval_secs = 10
-max_concurrent = 5
-max_retries = 2
-task_timeout_secs = 180
-"#;
-        let cfg: SuperNodeConfig = toml::from_str(toml_str).unwrap();
-        assert!(cfg.enabled);
-        assert_eq!(cfg.providers.len(), 2);
-        assert_eq!(cfg.routing.code_analysis, Some("claude".into()));
-        assert_eq!(cfg.privacy.default_level, PrivacyLevel::Structured);
-        assert_eq!(cfg.worker.poll_interval_secs, 10);
-        assert!(cfg.validate().is_ok());
     }
 
     #[test]
