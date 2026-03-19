@@ -1496,7 +1496,7 @@ impl ReflectionMiner {
             });
 
             match self.storage.insert_cognitive_task(
-                "community_summary",   // CommunitySummary variant → "community_summary" in DB
+                "community_narrative",   // CommunitySummary variant → "community_summary" in DB
                 SUPERNODE_PRIORITY_COMMUNITY_NARRATIVE,
                 &payload.to_string(),
                 None, // prompt_messages — built by task_worker using prompts.rs
