@@ -35,6 +35,12 @@
 //! v2.4.0+Conversation - 🌟 Added derive_rawlog_key import and rawlog_key field in MpiState.
 //!   Enables conversation replay decryption for GET /sessions/:id/conversation endpoint.
 //!   Key derived from Ed25519 PRIVATE key — can only decrypt local owner's rawlogs.
+//! v2.5.0+SuperNode - 🌟 LlmRouter initialization + MpiState.llm_router field.
+//!   - init_llm_router() reads supernode config, constructs providers + router
+//!   - reset_stale_processing_tasks() called at startup before TaskWorker spawn
+//!   - TaskWorker spawned as background task when supernode.enabled=true
+//!   - ReflectionMiner receives .with_llm_router() for Steps 8/9/10 enqueue
+//!   - All SuperNode paths gated on is_supernode_enabled() — safe to disable
 //!
 //! ## Modification Reason (v2.4.0+Reranker)
 //! - RerankerEngine provides cross-encoder reranking for recall Step 3.5
@@ -57,6 +63,14 @@
 //!   on subsequent startups, restore_quantizer() is attempted first. If valid, skips
 //!   re-calibration. If missing or stale, full calibration runs.
 //!
+//! ## Modification Reason (v2.5.0+SuperNode)
+//! - LlmRouter wraps N providers (OpenAI-compatible + Anthropic) with per-task routing
+//! - init_llm_router() is a private async helper that reads supernode config and
+//!   constructs the router. Returns None if supernode.enabled=false or no providers.
+//! - reset_stale_processing_tasks() MUST run before TaskWorker to recover orphaned tasks
+//! - TaskWorker polls cognitive_tasks table and dispatches to LlmRouter
+//! - MpiState.llm_router gates all /supernode/* endpoints and SuperNode status in /status
+//!
 //! ## Main Functionality
 //! - Server lifecycle: init → run → shutdown
 //! - Dual-engine MemChain initialization (SQLite+Vector + legacy MemPool+AOF)
@@ -67,14 +81,16 @@
 //!
 //! ## Dependencies
 //! - config.rs for ServerConfig (including MemChainConfig with v2.4.0 NER/graph/entropy config,
-//!   VectorQuantizationMode enum, v2.4.0+Reranker config)
-//! - storage.rs for MemoryStorage (Schema v5 with cognitive graph tables)
+//!   VectorQuantizationMode enum, v2.4.0+Reranker config, v2.5.0+SuperNode supernode config)
+//! - storage.rs for MemoryStorage (Schema v6 with cognitive graph + SuperNode tables)
 //! - mpi.rs for MPI router (with unified auth middleware)
 //! - ner.rs for NerEngine (v2.4.0)
 //! - reranker.rs for RerankerEngine (v2.4.0+Reranker)
 //! - embed.rs for EmbedEngine
 //! - vector.rs for VectorIndex (v2.4.0: with_config, calibrate_partition, restore_quantizer)
 //! - quantize.rs for ScalarQuantizer (v2.4.0: used internally by VectorIndex)
+//! - llm_router.rs for LlmRouter (v2.5.0+SuperNode)
+//! - task_worker.rs for TaskWorker (v2.5.0+SuperNode)
 //! - All other server subsystems
 //!
 //! ⚠️ Important Note for Next Developer:
@@ -104,6 +120,11 @@
 //!   passes DEFAULT_SATURATION_THRESHOLD (0.001) from vector.rs when quantization is
 //!   enabled, and uses the config value only for early_termination window control.
 //!   TODO(Phase C): Unify these two threshold semantics or split the config field.
+//! - SuperNode init order: init_llm_router() → reset_stale_processing_tasks() → TaskWorker::spawn()
+//!   This order is MANDATORY. reset_stale must run before TaskWorker to avoid re-claiming
+//!   tasks that were already being processed at the previous crash point.
+//! - is_supernode_enabled() check gates all SuperNode code paths. Setting enabled=false
+//!   in config gives exact v2.4.0 behavior with zero SuperNode code paths active.
 //!
 //! ## Last Modified
 //! v2.4.0-GraphCognition - 🌟 Added NerEngine initialization, MpiState extension,
@@ -112,6 +133,8 @@
 //!   calibrate_partition() after index rebuild, quantizer persistence to chain_state
 //! v2.4.0+Reranker - 🌟 RerankerEngine initialization, MpiState.reranker_engine field
 //! v2.4.0+Conversation - 🌟 derive_rawlog_key import, MpiState.rawlog_key field
+//! v2.5.0+SuperNode - 🌟 init_llm_router(), reset_stale_processing_tasks() on startup,
+//!   TaskWorker spawn, MpiState.llm_router, ReflectionMiner.with_llm_router()
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -135,7 +158,6 @@ use aeronyx_core::protocol::{DataPacket, MessageType};
 use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::UdpTransport;
 
-// Single cfg-gated import — removed the duplicate that was at line 50
 #[cfg(target_os = "linux")]
 use aeronyx_transport::LinuxTun;
 
@@ -162,6 +184,8 @@ use crate::services::memchain::EmbedEngine;
 use crate::services::memchain::NerEngine;
 // v2.4.0+Reranker: Cross-encoder reranker for recall Step 3.5
 use crate::services::memchain::RerankerEngine;
+// v2.5.0+SuperNode: LLM routing + async task worker
+use crate::services::memchain::{LlmRouter, TaskWorker};
 use crate::services::{HandshakeService, IpPoolService, RoutingService, SessionManager};
 
 // ============================================
@@ -176,14 +200,12 @@ const DISCONNECT_PACKET_MIN_SIZE: usize = 18;
 const COMMAND_CHANNEL_BUFFER: usize = 100;
 
 /// chain_state key for persisted quantizer calibration data.
-/// Format: "quantizer_cal:{owner_hex}:{model}"
 const QUANTIZER_CAL_KEY_PREFIX: &str = "quantizer_cal";
 
 // ============================================
 // Server
 // ============================================
 
-/// Main AeroNyx server.
 pub struct Server {
     config: ServerConfig,
     identity: IdentityKeyPair,
@@ -192,7 +214,6 @@ pub struct Server {
 }
 
 impl Server {
-    /// Creates a new server instance.
     pub fn new(config: ServerConfig, identity: IdentityKeyPair) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
         Self {
@@ -203,7 +224,6 @@ impl Server {
         }
     }
 
-    /// Runs the server until shutdown.
     pub async fn run(&self) -> Result<()> {
         info!("Starting AeroNyx server v{}", env!("CARGO_PKG_VERSION"));
 
@@ -233,7 +253,6 @@ impl Server {
             (None, None, None, None)
         };
 
-        // Initialize transport
         let udp = Arc::new(
             UdpTransport::bind_addr(self.config.listen_addr())
                 .await
@@ -246,12 +265,8 @@ impl Server {
 
         let server_pubkey_hex = hex::encode(self.identity.public_key_bytes());
 
-        // ============================================
-        // Spawn worker tasks
-        // ============================================
         let mut tasks: Vec<(&str, JoinHandle<()>)> = Vec::new();
 
-        // UDP receive task
         let udp_task = self.spawn_udp_task(
             Arc::clone(&udp),
             #[cfg(target_os = "linux")]
@@ -269,7 +284,6 @@ impl Server {
         );
         tasks.push(("udp", udp_task));
 
-        // TUN receive task
         #[cfg(target_os = "linux")]
         {
             let tun_task = self.spawn_tun_task(
@@ -280,7 +294,6 @@ impl Server {
             tasks.push(("tun", tun_task));
         }
 
-        // Cleanup task
         let cleanup_task = self.spawn_cleanup_task(
             Arc::clone(&sessions),
             Arc::clone(&ip_pool),
@@ -290,15 +303,13 @@ impl Server {
         tasks.push(("cleanup", cleanup_task));
 
         // ============================================
-        // Start MemChain API + Miner
+        // Start MemChain API + Miner + SuperNode
         // ============================================
         if let (Some(ref st), Some(ref vi), Some(ref mp), Some(ref aw)) =
             (&storage, &vector_index, &mempool, &aof_writer)
         {
-            // Combined API server with MVF state
             let user_weights = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
 
-            // Load existing user weights from SQLite
             {
                 let owner = self.identity.public_key_bytes();
                 if let Some(blob) = st.load_user_weights(&owner).await {
@@ -310,7 +321,6 @@ impl Server {
                 }
             }
 
-            // Load or create MVF baseline from chain_state
             let mvf_baseline: Option<BaselineSnapshot> = {
                 let conn = st.conn_lock().await;
                 let raw: Option<Vec<u8>> = conn.query_row(
@@ -327,12 +337,9 @@ impl Server {
             };
 
             let owner_key = self.identity.public_key_bytes();
+            let api_secret = self.config.memchain.effective_api_secret().map(|s| s.to_string());
 
-            // Get api_secret from config for MPI auth middleware
-            let api_secret = self.config.memchain.effective_api_secret()
-                .map(|s| s.to_string());
-
-            // ── Initialize local embedding engine (optional — graceful if missing) ──
+            // ── Embedding engine ────────────────────────────────────────────
             let embed_engine: Option<Arc<EmbedEngine>> = {
                 let model_path = &self.config.memchain.embed_model_path;
                 let max_tokens = self.config.memchain.embed_max_tokens;
@@ -350,8 +357,7 @@ impl Server {
                     }
                     Err(e) => {
                         warn!(
-                            model = %model_path,
-                            error = %e,
+                            model = %model_path, error = %e,
                             "[EMBED] ⚠️ Local embedding unavailable — /embed returns 503, \
                              Miner falls back to OpenClaw Gateway"
                         );
@@ -360,20 +366,15 @@ impl Server {
                 }
             };
 
-            // ── v2.4.0: Initialize local NER engine (optional — graceful if missing) ──
-            // NerEngine MUST be loaded AFTER EmbedEngine because both share ORT runtime.
-            // EmbedEngine::load() calls init_ort_runtime() via std::sync::Once.
-            // If EmbedEngine wasn't loaded (model missing), we still try NerEngine —
-            // it will call init_ort_runtime() from its own model directory.
+            // ── NER engine (v2.4.0) ─────────────────────────────────────────
+            // Must be loaded AFTER EmbedEngine (shared ORT runtime via Once)
             let ner_engine: Option<Arc<NerEngine>> = if self.config.memchain.ner_enabled {
                 let model_path = &self.config.memchain.ner_model_path;
                 let threshold = self.config.memchain.ner_confidence_threshold;
-                // max_width defaults to 12 in NerEngine::load() when 0 is passed
                 match NerEngine::load(model_path, threshold, 0) {
                     Ok(engine) => {
                         info!(
-                            model = %model_path,
-                            threshold = threshold,
+                            model = %model_path, threshold = threshold,
                             max_width = engine.max_width(),
                             "[NER] ✅ Local NER engine loaded (GLiNER)"
                         );
@@ -381,8 +382,7 @@ impl Server {
                     }
                     Err(e) => {
                         warn!(
-                            model = %model_path,
-                            error = %e,
+                            model = %model_path, error = %e,
                             "[NER] ⚠️ Local NER unavailable — cognitive graph pipeline disabled. \
                              Run `scripts/download_models.sh` to download GLiNER model."
                         );
@@ -394,18 +394,15 @@ impl Server {
                 None
             };
 
-            // ── v2.4.0+Reranker: Initialize cross-encoder reranker (optional) ──
-            // RerankerEngine MUST be loaded AFTER EmbedEngine — both share ORT runtime.
-            // Load order: EmbedEngine → NerEngine → RerankerEngine (all share Once init).
-            // Load failure is graceful: server starts without reranking (Step 3.5 skipped).
+            // ── Reranker engine (v2.4.0+Reranker) ──────────────────────────
+            // Must be loaded AFTER EmbedEngine + NerEngine (all share ORT Once)
             let reranker_engine: Option<Arc<RerankerEngine>> = if self.config.memchain.reranker_enabled {
                 let model_path = &self.config.memchain.reranker_model_path;
                 let max_seq = self.config.memchain.reranker_max_seq_length;
                 match RerankerEngine::load(model_path, max_seq) {
                     Ok(engine) => {
                         info!(
-                            model = %model_path,
-                            max_seq = max_seq,
+                            model = %model_path, max_seq = max_seq,
                             blend_weight = %RerankerEngine::blend_weight(),
                             "[RERANKER] ✅ Cross-encoder loaded"
                         );
@@ -413,9 +410,8 @@ impl Server {
                     }
                     Err(e) => {
                         warn!(
-                            model = %model_path,
-                            error = %e,
-                            "[RERANKER] ⚠️ Cross-encoder unavailable — recall uses RRF-only ranking. \
+                            model = %model_path, error = %e,
+                            "[RERANKER] ⚠️ Cross-encoder unavailable — recall uses RRF-only. \
                              Run `scripts/download_models.sh --reranker-only` to download model."
                         );
                         None
@@ -425,6 +421,37 @@ impl Server {
                 debug!("[RERANKER] Disabled (reranker_enabled=false)");
                 None
             };
+
+            // ── v2.5.0+SuperNode: LlmRouter initialization ──────────────────
+            //
+            // init_llm_router() reads supernode config and constructs the router.
+            // Returns None if:
+            //   - supernode.enabled = false
+            //   - no providers configured
+            //   - all providers fail validation
+            //
+            // ⚠️ SuperNode init order is MANDATORY:
+            //   1. init_llm_router()             — build router
+            //   2. reset_stale_processing_tasks() — recover orphaned tasks
+            //   3. TaskWorker::spawn()            — start processing
+            // Do NOT reorder these three steps.
+            let llm_router: Option<Arc<LlmRouter>> = self.init_llm_router().await;
+
+            // ── v2.5.0+SuperNode: Crash recovery ───────────────────────────
+            // Reset tasks that were stuck in 'processing' at the last crash/restart.
+            // Must run BEFORE TaskWorker spawns to avoid race with re-claiming.
+            // Uses task_timeout_secs from worker config as the stale threshold.
+            if llm_router.is_some() {
+                let timeout_secs = self.config.memchain.supernode.worker.task_timeout_secs as i64;
+                let recovered = st.reset_stale_processing_tasks(timeout_secs).await;
+                if recovered > 0 {
+                    info!(
+                        recovered = recovered,
+                        timeout_secs = timeout_secs,
+                        "[SUPERNODE] Recovered stale tasks from previous run"
+                    );
+                }
+            }
 
             let mpi_state = Arc::new(MpiState {
                 storage: Arc::clone(st),
@@ -440,22 +467,24 @@ impl Server {
                 owner_key,
                 api_secret,
                 embed_engine: embed_engine.clone(),
-                // v2.3.0: Phase 1 Remote Storage configuration
+                // v2.3.0: Phase 1 Remote Storage
                 allow_remote_storage: self.config.memchain.allow_remote_storage,
                 max_remote_owners: self.config.memchain.max_remote_owners,
                 // v2.4.0: Cognitive Graph Pipeline
                 ner_engine: ner_engine.clone(),
                 graph_enabled: self.config.memchain.graph_enabled,
                 entropy_filter_enabled: self.config.memchain.entropy_filter_enabled,
-                // v2.4.0+Reranker: Cross-encoder for recall Step 3.5
+                // v2.4.0+Reranker
                 reranker_engine,
-                // v2.4.0+Conversation: RawLog decryption key for conversation replay.
-                // Derived from Ed25519 PRIVATE key — can only decrypt local owner's rawlogs.
-                // ⚠️ Uses derive_rawlog_key(), NOT derive_record_key() — different KDF contexts.
+                // v2.4.0+Conversation: RawLog decryption key for conversation replay
+                // ⚠️ Uses derive_rawlog_key(), NOT derive_record_key() — different KDF contexts
                 rawlog_key: Some(derive_rawlog_key(&self.identity.to_bytes())),
+                // v2.5.0+SuperNode: LLM router for /supernode/* endpoints + /status
+                // None when supernode.enabled=false — all SuperNode endpoints return 404
+                llm_router: llm_router.clone(),
             });
 
-            // Pre-populate Identity cache
+            // Pre-populate identity cache
             {
                 let owner_hex = hex::encode(owner_key);
                 let identity_records = st
@@ -467,10 +496,9 @@ impl Server {
                 }
             }
 
-            // Mark index ready
             mpi_state.index_ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
-            // Freeze MVF baseline if mvf_enabled just turned on and no baseline exists
+            // Freeze MVF baseline if needed
             if self.config.memchain.mvf_enabled && mpi_state.mvf_baseline.read().is_none() {
                 let feedback = st.get_recent_feedback(200).await;
                 if !feedback.is_empty() {
@@ -500,7 +528,7 @@ impl Server {
 
             let api_task = self.start_combined_api(
                 self.config.memchain.api_listen_addr,
-                mpi_state,
+                Arc::clone(&mpi_state),
                 Arc::clone(mp),
                 Arc::clone(aw),
                 Arc::clone(&sessions),
@@ -508,7 +536,27 @@ impl Server {
             );
             tasks.push(("memchain-api", api_task));
 
-            // Smart Miner (with MVF integration + v2.4.0 cognitive graph)
+            // ── v2.5.0+SuperNode: TaskWorker spawn ─────────────────────────
+            // Spawned AFTER reset_stale_processing_tasks() to avoid claiming
+            // tasks that were just recovered.
+            if let Some(ref router) = llm_router {
+                let worker = TaskWorker::new(
+                    Arc::clone(st),
+                    Arc::clone(router),
+                    self.config.memchain.supernode.worker.clone(),
+                );
+                let worker_shutdown = self.shutdown_tx.subscribe();
+                tasks.push(("supernode-worker", tokio::spawn(async move {
+                    worker.run(worker_shutdown).await;
+                })));
+                info!(
+                    poll_interval = self.config.memchain.supernode.worker.poll_interval_secs,
+                    max_concurrent = self.config.memchain.supernode.worker.max_concurrent,
+                    "[SUPERNODE] TaskWorker spawned"
+                );
+            }
+
+            // ── Smart Miner (with MVF + v2.4.0 cognitive graph + v2.5.0 SuperNode) ──
             if self.config.memchain.miner_interval_secs > 0 {
                 let miner = ReflectionMiner::new(
                     self.config.memchain.miner_interval_secs,
@@ -537,6 +585,14 @@ impl Server {
                     miner
                 };
 
+                // v2.5.0+SuperNode: Attach LlmRouter for Steps 8/9/10 task enqueue.
+                // When None, Steps 8/9/10 run without SuperNode enqueue (v2.4.0 behavior).
+                let miner = if let Some(ref lr) = llm_router {
+                    miner.with_llm_router(Arc::clone(lr))
+                } else {
+                    miner
+                };
+
                 let miner_shutdown = self.shutdown_tx.subscribe();
                 tasks.push(("miner", tokio::spawn(async move {
                     miner.run(miner_shutdown).await;
@@ -548,7 +604,6 @@ impl Server {
 
         info!("Server started successfully");
 
-        // Wait for shutdown
         self.wait_for_shutdown().await;
 
         info!("Shutting down server...");
@@ -567,7 +622,6 @@ impl Server {
             warn!("UDP shutdown error: {}", e);
         }
 
-        // Shutdown stats
         if let (Some(ref st), Some(ref mp), Some(ref aw)) = (&storage, &mempool, &aof_writer) {
             info!(
                 sqlite = st.count().await,
@@ -582,33 +636,129 @@ impl Server {
     }
 
     // ============================================
+    // v2.5.0+SuperNode: LlmRouter Initialization
+    // ============================================
+
+    /// Initialize LlmRouter from supernode config.
+    ///
+    /// ## Returns
+    /// - `Some(Arc<LlmRouter>)` — SuperNode enabled, at least one provider configured
+    /// - `None` — SuperNode disabled OR no valid providers
+    ///
+    /// ## Provider Construction Order
+    /// 1. Read `supernode.providers[]` from config
+    /// 2. Construct each provider (OpenAiCompatProvider or AnthropicProvider)
+    /// 3. Build LlmRouter with provider list + routing config
+    ///
+    /// ## Graceful Failure
+    /// If a provider fails to construct (e.g., missing api_key), it is skipped
+    /// with a warning. The router is returned if at least one provider succeeded.
+    /// If all providers fail, returns None.
+    ///
+    /// ⚠️ This method does NOT ping providers or validate connectivity.
+    ///    Health checks happen at runtime via /supernode/health endpoint.
+    async fn init_llm_router(&self) -> Option<Arc<LlmRouter>> {
+        use crate::services::memchain::{
+            LlmProvider, OpenAiCompatProvider, AnthropicProvider,
+            ProviderType,
+        };
+
+        if !self.config.memchain.is_supernode_enabled() {
+            debug!("[SUPERNODE] Disabled (supernode.enabled=false)");
+            return None;
+        }
+
+        let supernode = &self.config.memchain.supernode;
+
+        if supernode.providers.is_empty() {
+            warn!("[SUPERNODE] enabled=true but no providers configured — SuperNode disabled");
+            return None;
+        }
+
+        let mut providers: Vec<(String, Arc<dyn LlmProvider>)> = Vec::new();
+
+        for provider_cfg in &supernode.providers {
+            // Resolve $ENV_VAR syntax in api_key
+            let api_key: Option<String> = provider_cfg.api_key.as_ref().map(|k| {
+                if k.starts_with('$') {
+                    std::env::var(&k[1..]).unwrap_or_else(|_| {
+                        warn!(
+                            key = %k, provider = %provider_cfg.name,
+                            "[SUPERNODE] ENV var not set for api_key"
+                        );
+                        String::new()
+                    })
+                } else {
+                    k.clone()
+                }
+            });
+
+            let provider: Arc<dyn LlmProvider> = match provider_cfg.provider_type {
+                ProviderType::OpenAiCompatible => {
+                    Arc::new(OpenAiCompatProvider::new(
+                        provider_cfg.name.clone(),
+                        provider_cfg.api_base.clone(),
+                        api_key,
+                        provider_cfg.model.clone(),
+                        provider_cfg.max_tokens,
+                        provider_cfg.temperature,
+                    ))
+                }
+                ProviderType::Anthropic => {
+                    let key = match api_key {
+                        Some(k) if !k.is_empty() => k,
+                        _ => {
+                            warn!(
+                                provider = %provider_cfg.name,
+                                "[SUPERNODE] Anthropic provider requires api_key — skipped"
+                            );
+                            continue;
+                        }
+                    };
+                    Arc::new(AnthropicProvider::new(
+                        provider_cfg.name.clone(),
+                        provider_cfg.api_base.clone(),
+                        key,
+                        provider_cfg.model.clone(),
+                        provider_cfg.max_tokens,
+                        provider_cfg.temperature,
+                    ))
+                }
+            };
+
+            info!(
+                name = %provider_cfg.name,
+                type_ = ?provider_cfg.provider_type,
+                model = %provider_cfg.model,
+                "[SUPERNODE] Provider registered"
+            );
+            providers.push((provider_cfg.name.clone(), provider));
+        }
+
+        if providers.is_empty() {
+            warn!("[SUPERNODE] All providers failed to construct — SuperNode disabled");
+            return None;
+        }
+
+        let router = LlmRouter::new(providers, supernode.routing.clone());
+        info!(
+            providers = supernode.providers.len(),
+            fallback = ?supernode.routing.fallback,
+            "[SUPERNODE] ✅ LlmRouter initialized"
+        );
+        Some(Arc::new(router))
+    }
+
+    // ============================================
     // MemChain Initialization (dual-engine)
     // ============================================
 
-    /// Initializes both the new MRS-1 engine (SQLite + VectorIndex)
-    /// and the legacy engine (MemPool + AofWriter) for P2P compat.
-    ///
-    /// Also rebuilds the vector index from SQLite on startup.
-    ///
-    /// ## v2.1.0+MVF+Encryption
-    /// Now derives record_key from Ed25519 private key and passes it to
-    /// MemoryStorage::open() for transparent record content encryption.
-    ///
-    /// ## v2.4.0-GraphCognition Phase B
-    /// VectorIndex creation now respects config.memchain.vector_quantization:
-    /// - VectorQuantizationMode::None → VectorIndex::new() (v2.3.0 behavior)
-    /// - VectorQuantizationMode::ScalarUint8 → VectorIndex::with_config(true, threshold)
-    ///
-    /// After index rebuild, attempts to restore persisted quantizer calibration
-    /// from chain_state. If not available, runs fresh calibration via
-    /// calibrate_partition(). Calibration data is then persisted for next startup.
     async fn init_memchain(&self) -> Result<(
         Arc<MemoryStorage>,
         Arc<VectorIndex>,
         Arc<MemPool>,
         Arc<TokioMutex<AofWriter>>,
     )> {
-        // --- New: SQLite ---
         let db_path = &self.config.memchain.db_path;
         if let Some(parent) = std::path::Path::new(db_path).parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -618,9 +768,8 @@ impl Server {
             }
         }
 
-        // Derive record encryption key from Ed25519 PRIVATE key.
         // ⚠️ SECURITY: identity.to_bytes() returns the PRIVATE key (32 bytes).
-        //    Do NOT use public_key_bytes() here — that would defeat the purpose.
+        //    Do NOT use public_key_bytes() here.
         let record_key = derive_record_key(&self.identity.to_bytes());
         info!("[MEMCHAIN] Record content encryption enabled (key derived from identity)");
 
@@ -629,61 +778,38 @@ impl Server {
                 .map_err(|e| ServerError::startup_failed(format!("SQLite: {}", e)))?,
         );
 
-        // v2.4.0 Phase B: Create VectorIndex with quantization config
+        // v2.4.0 Phase B: VectorIndex with quantization config
         let quantization_enabled = self.config.memchain.vector_quantization == VectorQuantizationMode::ScalarUint8;
         let vector_index = Arc::new(if quantization_enabled {
-            // vector_saturation_threshold in config is usize (window size for early termination).
-            // VectorIndex::with_config() accepts f32 (score improvement delta).
-            // We pass 0.0 to let VectorIndex use its internal DEFAULT_SATURATION_THRESHOLD (0.001).
-            // The config's usize threshold is used for early termination window control
-            // within the vector module's DEFAULT_SATURATION_WINDOW constant.
-            // TODO(Phase C): Expose both thresholds separately in config for fine-grained control.
-            let sat_threshold = if self.config.memchain.vector_early_termination {
-                0.001_f32
-            } else {
-                0.0_f32
-            };
-            info!(
-                quantization = "scalar_uint8",
-                early_termination = self.config.memchain.vector_early_termination,
-                "[MEMCHAIN] VectorIndex created with scalar quantization"
-            );
+            let sat_threshold = if self.config.memchain.vector_early_termination { 0.001_f32 } else { 0.0_f32 };
+            info!(quantization = "scalar_uint8", "[MEMCHAIN] VectorIndex with scalar quantization");
             VectorIndex::with_config(true, sat_threshold)
         } else {
             VectorIndex::new()
         });
 
-        // Rebuild vector index from SQLite on startup.
         let owner = self.identity.public_key_bytes();
         let records_with_model = storage.get_records_with_embedding(&owner).await;
         let rebuild_count = records_with_model.len();
         for (r, model) in records_with_model {
             if r.has_embedding() {
                 vector_index.upsert(
-                    r.record_id,
-                    r.embedding.clone(),
-                    r.layer,
-                    r.timestamp,
-                    &r.owner,
-                    &model,
+                    r.record_id, r.embedding.clone(), r.layer,
+                    r.timestamp, &r.owner, &model,
                 );
             }
         }
 
         info!(
-            db = %db_path,
-            records = storage.count().await,
-            vectors = rebuild_count,
+            db = %db_path, records = storage.count().await, vectors = rebuild_count,
             "[MEMCHAIN] SQLite + VectorIndex initialized"
         );
 
-        // v2.4.0 Phase B: Calibrate quantizer after index rebuild
+        // Quantizer calibration (v2.4.0 Phase B)
         if quantization_enabled && rebuild_count > 0 {
             let owner_hex = hex::encode(owner);
             let model_name = std::path::Path::new(&self.config.memchain.embed_model_path)
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or("minilm-l6-v2");
+                .file_name().and_then(|f| f.to_str()).unwrap_or("minilm-l6-v2");
 
             let cal_key = format!("{}:{}:{}", QUANTIZER_CAL_KEY_PREFIX, owner_hex, model_name);
             let restored = {
@@ -698,15 +824,7 @@ impl Server {
                 if let Some(data) = cal_data {
                     let ok = vector_index.restore_quantizer(&owner, model_name, &data);
                     if ok {
-                        info!(
-                            model = model_name,
-                            "[VECTOR] ✅ Quantizer restored from persisted calibration"
-                        );
-                    } else {
-                        debug!(
-                            model = model_name,
-                            "[VECTOR] Persisted calibration invalid or stale, recalibrating"
-                        );
+                        info!(model = model_name, "[VECTOR] ✅ Quantizer restored from persisted calibration");
                     }
                     ok
                 } else {
@@ -716,7 +834,6 @@ impl Server {
 
             if !restored {
                 vector_index.calibrate_partition(&owner, model_name);
-
                 if let Some(cal_bytes) = vector_index.get_quantizer_bytes(&owner, model_name) {
                     let conn = storage.conn_lock().await;
                     let _ = conn.execute(
@@ -724,16 +841,12 @@ impl Server {
                         rusqlite::params![cal_key, cal_bytes.as_slice()],
                     );
                     drop(conn);
-                    info!(
-                        model = model_name,
-                        vectors = rebuild_count,
-                        "[VECTOR] ✅ Quantizer calibrated and persisted"
-                    );
+                    info!(model = model_name, vectors = rebuild_count, "[VECTOR] ✅ Quantizer calibrated and persisted");
                 }
             }
         }
 
-        // --- Legacy: AOF + MemPool ---
+        // Legacy: AOF + MemPool
         let aof_path = &self.config.memchain.aof_path;
         if let Some(parent) = std::path::Path::new(aof_path).parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -750,9 +863,7 @@ impl Server {
         let mempool = Arc::new(MemPool::new());
         let mut loaded = 0u64;
         for fact in existing_facts {
-            if mempool.add_fact(fact) {
-                loaded += 1;
-            }
+            if mempool.add_fact(fact) { loaded += 1; }
         }
 
         let aof_writer = AofWriter::open(aof_path)
@@ -761,10 +872,7 @@ impl Server {
         aof_writer.set_chain_state(last_block.as_ref());
         let aof_writer = Arc::new(TokioMutex::new(aof_writer));
 
-        info!(
-            facts = loaded,
-            "[MEMCHAIN] Legacy MemPool + AOF initialized"
-        );
+        info!(facts = loaded, "[MEMCHAIN] Legacy MemPool + AOF initialized");
 
         Ok((storage, vector_index, mempool, aof_writer))
     }
@@ -773,7 +881,6 @@ impl Server {
     // Combined API Server (MPI + Legacy)
     // ============================================
 
-    /// Starts a single Axum server hosting MPI routes.
     fn start_combined_api(
         &self,
         listen_addr: std::net::SocketAddr,
@@ -789,14 +896,8 @@ impl Server {
             let app = build_mpi_router(mpi_state);
 
             let listener = match tokio::net::TcpListener::bind(listen_addr).await {
-                Ok(l) => {
-                    info!("[API] MemChain API on http://{}", listen_addr);
-                    l
-                }
-                Err(e) => {
-                    error!("[API] Bind failed {}: {}", listen_addr, e);
-                    return;
-                }
+                Ok(l) => { info!("[API] MemChain API on http://{}", listen_addr); l }
+                Err(e) => { error!("[API] Bind failed {}: {}", listen_addr, e); return; }
             };
 
             let server = axum::serve(listener, app)
@@ -805,15 +906,13 @@ impl Server {
                     info!("[API] Shutdown signal received");
                 });
 
-            if let Err(e) = server.await {
-                error!("[API] Server error: {}", e);
-            }
+            if let Err(e) = server.await { error!("[API] Server error: {}", e); }
             info!("[API] Stopped");
         })
     }
 
     // ============================================
-    // Management Reporter (unchanged from v1.3.0)
+    // Management Reporter
     // ============================================
 
     async fn init_management_reporter(
@@ -830,10 +929,7 @@ impl Server {
 
         let public_ip = self.resolve_public_ip().await;
 
-        // Agent manager
-        let agent_manager = Arc::new(crate::services::AgentManager::new(
-            Arc::clone(&mgmt_client),
-        ));
+        let agent_manager = Arc::new(crate::services::AgentManager::new(Arc::clone(&mgmt_client)));
         agent_manager.detect_existing().await;
 
         {
@@ -850,17 +946,11 @@ impl Server {
             });
         }
 
-        // Command channel + handler
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_BUFFER);
-        let cmd_handler = CommandHandler::new(
-            cmd_rx,
-            Arc::clone(&mgmt_client),
-            Arc::clone(&agent_manager),
-        );
+        let cmd_handler = CommandHandler::new(cmd_rx, Arc::clone(&mgmt_client), Arc::clone(&agent_manager));
         let cmd_shutdown = self.shutdown_tx.subscribe();
         tokio::spawn(async move { cmd_handler.run(cmd_shutdown).await; });
 
-        // Heartbeat reporter
         let memchain_status_fn: Option<crate::management::reporter::MemChainStatusFn> =
             if self.config.memchain.is_enabled() {
                 let allow_remote = self.config.memchain.allow_remote_storage;
@@ -891,12 +981,10 @@ impl Server {
             heartbeat.run(move || sess.count() as u32, hb_shutdown).await;
         });
 
-        // Session reporter
         let (session_reporter, event_tx) = SessionReporter::new(Arc::clone(&mgmt_client));
         let sr_shutdown = self.shutdown_tx.subscribe();
         tokio::spawn(async move { session_reporter.run(sr_shutdown).await; });
 
-        // WebSocket tunnel
         let node_info_path = &self.config.management.node_info_path;
         if let Ok(node_info) = crate::management::models::StoredNodeInfo::load(node_info_path) {
             let ws = crate::management::WsTunnel::new(
@@ -904,9 +992,7 @@ impl Server {
                 node_info.node_id.clone(),
                 Arc::clone(&agent_manager),
             )
-            .with_mpi_api_secret(
-                self.config.memchain.effective_api_secret().map(|s| s.to_string())
-            );
+            .with_mpi_api_secret(self.config.memchain.effective_api_secret().map(|s| s.to_string()));
             let ws_shutdown = self.shutdown_tx.subscribe();
             tokio::spawn(async move { ws.run(ws_shutdown).await; });
             info!(node_id = %node_info.node_id, "[WS_TUNNEL] Spawned");
@@ -919,7 +1005,7 @@ impl Server {
     }
 
     // ============================================
-    // Public IP Resolution (unchanged)
+    // Public IP Resolution
     // ============================================
 
     async fn resolve_public_ip(&self) -> String {
@@ -961,14 +1047,10 @@ impl Server {
     }
 
     // ============================================
-    // Core Services (unchanged)
+    // Core Services
     // ============================================
 
-    fn init_services(&self) -> Result<(
-        Arc<IpPoolService>,
-        Arc<SessionManager>,
-        Arc<RoutingService>,
-    )> {
+    fn init_services(&self) -> Result<(Arc<IpPoolService>, Arc<SessionManager>, Arc<RoutingService>)> {
         let (network, prefix) = self.config.parse_ip_range()?;
         let ip_pool = Arc::new(IpPoolService::new(network, prefix, self.config.gateway_ip())?);
         let sessions = Arc::new(SessionManager::new(
@@ -1055,9 +1137,7 @@ impl Server {
                                             let mut sid = [0u8; 16];
                                             sid.copy_from_slice(&data[1..17]);
                                             if let Some(id) = SessionId::from_bytes(&sid) {
-                                                if let Some(s) = sessions.get(&id) {
-                                                    s.touch();
-                                                }
+                                                if let Some(s) = sessions.get(&id) { s.touch(); }
                                             }
                                         }
                                     }
@@ -1068,29 +1148,23 @@ impl Server {
                                                 #[cfg(target_os = "linux")]
                                                 { let _ = tun.write(&pkt).await; }
                                             }
-
                                             Ok((session, DecryptedPayload::MemChain(msg))) => {
                                                 if let (Some(ref mp), Some(ref aw)) = (&mempool, &aof_writer) {
                                                     Self::handle_memchain_message(
-                                                        msg, mp, aw,
-                                                        &storage, &vector_index,
+                                                        msg, mp, aw, &storage, &vector_index,
                                                         &memchain_config, &server_pubkey_hex,
                                                         &session, &udp_reply, &crypto,
                                                     ).await;
                                                 }
                                             }
-
                                             Err(_) => {}
                                         }
                                     }
-
                                     _ => {}
                                 }
                             }
                             Err(e) => {
-                                if !shutdown.load(Ordering::SeqCst) {
-                                    error!("UDP recv error: {}", e);
-                                }
+                                if !shutdown.load(Ordering::SeqCst) { error!("UDP recv error: {}", e); }
                             }
                         }
                     }
@@ -1100,7 +1174,7 @@ impl Server {
     }
 
     // ============================================
-    // MemChain Message Handler
+    // MemChain Message Handler (unchanged)
     // ============================================
 
     #[allow(clippy::too_many_arguments)]
@@ -1123,13 +1197,9 @@ impl Server {
                     Ok(pk) => pk.verify(&fact.fact_id, &fact.signature).is_ok(),
                     Err(_) => false,
                 };
-                if !sig_ok {
-                    warn!("[MEMCHAIN] BroadcastFact sig failed");
-                    return;
-                }
+                if !sig_ok { warn!("[MEMCHAIN] BroadcastFact sig failed"); return; }
                 if !config.is_origin_trusted(&origin_hex, server_pubkey_hex) {
-                    warn!("[MEMCHAIN] BroadcastFact untrusted origin");
-                    return;
+                    warn!("[MEMCHAIN] BroadcastFact untrusted origin"); return;
                 }
                 if mempool.add_fact(fact.clone()) {
                     let mut w = aof_writer.lock().await;
@@ -1143,23 +1213,17 @@ impl Server {
                     Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                     Err(_) => false,
                 };
-                if !sig_ok {
-                    warn!("[MEMCHAIN] BroadcastRecord sig failed");
-                    return;
-                }
+                if !sig_ok { warn!("[MEMCHAIN] BroadcastRecord sig failed"); return; }
                 if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
-                    warn!("[MEMCHAIN] BroadcastRecord untrusted owner");
-                    return;
+                    warn!("[MEMCHAIN] BroadcastRecord untrusted owner"); return;
                 }
                 if let Some(ref st) = storage {
                     if st.insert(&record, "p2p-remote").await {
                         info!(id = hex::encode(record.record_id), "[MEMCHAIN] BroadcastRecord stored");
                         if record.has_embedding() {
                             if let Some(ref vi) = vector_index {
-                                vi.upsert(
-                                    record.record_id, record.embedding.clone(),
-                                    record.layer, record.timestamp, &record.owner, "p2p-remote",
-                                );
+                                vi.upsert(record.record_id, record.embedding.clone(),
+                                    record.layer, record.timestamp, &record.owner, "p2p-remote");
                             }
                         }
                     }
@@ -1179,9 +1243,7 @@ impl Server {
                         Ok(pk) => pk.verify(&fact.fact_id, &fact.signature).is_ok(),
                         Err(_) => false,
                     };
-                    if !sig_ok || !config.is_origin_trusted(&origin_hex, server_pubkey_hex) {
-                        continue;
-                    }
+                    if !sig_ok || !config.is_origin_trusted(&origin_hex, server_pubkey_hex) { continue; }
                     if mempool.add_fact(fact.clone()) {
                         let mut w = aof_writer.lock().await;
                         let _ = w.append_fact(&fact).await;
@@ -1205,9 +1267,7 @@ impl Server {
                             Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                             Err(_) => false,
                         };
-                        if !sig_ok || !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
-                            continue;
-                        }
+                        if !sig_ok || !config.is_origin_trusted(&owner_hex, server_pubkey_hex) { continue; }
                         let _ = st.insert(&record, "p2p-sync").await;
                     }
                 }
@@ -1215,15 +1275,12 @@ impl Server {
 
             MemChainMessage::BlockAnnounce(header) => {
                 info!(
-                    height = header.height,
-                    hash = hex::encode(header.hash()),
+                    height = header.height, hash = hex::encode(header.hash()),
                     "[MEMCHAIN] BlockAnnounce received"
                 );
             }
 
-            _ => {
-                debug!("[MEMCHAIN] Unhandled message variant");
-            }
+            _ => { debug!("[MEMCHAIN] Unhandled message variant"); }
         }
     }
 
@@ -1246,8 +1303,7 @@ impl Server {
         let mut encrypted = vec![0u8; plaintext.len() + ENCRYPTION_OVERHEAD];
 
         let len = match crypto.encrypt(
-            &session.session_key, counter, session.id.as_bytes(),
-            &plaintext, &mut encrypted,
+            &session.session_key, counter, session.id.as_bytes(), &plaintext, &mut encrypted,
         ) {
             Ok(l) => l,
             Err(e) => { error!("[MEMCHAIN_TX] Encrypt: {}", e); return; }
@@ -1260,7 +1316,7 @@ impl Server {
     }
 
     // ============================================
-    // TUN Task (unchanged)
+    // TUN Task
     // ============================================
 
     #[cfg(target_os = "linux")]
@@ -1296,7 +1352,7 @@ impl Server {
     }
 
     // ============================================
-    // Cleanup Task (unchanged)
+    // Cleanup Task
     // ============================================
 
     fn spawn_cleanup_task(
@@ -1335,7 +1391,6 @@ impl Server {
         info!("Shutdown signal received");
     }
 
-    /// Programmatic shutdown trigger.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
