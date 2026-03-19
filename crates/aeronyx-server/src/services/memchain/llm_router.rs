@@ -134,9 +134,12 @@ impl LlmRouter {
             provider_map.insert(name, p);
         }
 
-        // Build routing table from TaskRoutingConfig
+        // Build routing table from TaskRoutingConfig.
+        // CognitiveTaskType::ALL comes from config_supernode (our canonical list).
+        // task_type_str() is the method on llm_provider::CognitiveTaskType.
+        // We use config_supernode::CognitiveTaskType here because it drives routing config.
         let mut routing_table: HashMap<String, String> = HashMap::new();
-        for task_type in CognitiveTaskType::ALL {
+        for task_type in crate::config_supernode::CognitiveTaskType::ALL {
             if let Some(provider_name) = routing.provider_for(*task_type) {
                 if provider_map.contains_key(provider_name) {
                     routing_table.insert(task_type.as_str().to_string(), provider_name.to_string());
@@ -177,8 +180,8 @@ impl LlmRouter {
         task_type: &CognitiveTaskType,
         req: &ChatRequest,
     ) -> Result<ChatResponse, LlmError> {
-        // Audit Fix: use as_str() not task_type_str() (the latter doesn't exist)
-        let task_str = task_type.as_str();
+        // Use task_type_str() — this is the method on llm_provider::CognitiveTaskType
+        let task_str = task_type.task_type_str();
 
         // Determine primary provider name from routing table
         let primary_name = self.routing.get(task_str)
