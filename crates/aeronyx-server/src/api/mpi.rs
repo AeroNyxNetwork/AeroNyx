@@ -1,43 +1,25 @@
 // ============================================
 // File: crates/aeronyx-server/src/api/mpi.rs
 // ============================================
-//! # MPI — Memory Protocol Interface (v2.4.0 — Core Module)
+//! # MPI — Memory Protocol Interface (Core Module)
 //!
-//! ## File Split (v2.4.0)
-//! mpi.rs was split into 3 files for maintainability:
-//! - `mpi.rs` (THIS FILE) — MpiState, AuthenticatedOwner, auth middleware, router,
-//!   helpers, request/response types. This is the entry point; mod.rs re-exports from here.
-//! - `mpi_handlers.rs` — Original 8 endpoint handlers (remember, recall, forget,
-//!   status, embed, record, overview) + their tests
-//! - `mpi_graph_handlers.rs` — v2.4.0 cognitive graph endpoints (11 new) + their tests
-//!
-//! All 3 files impl handlers that share MpiState via Arc<MpiState>.
-//! External API is unchanged — api/mod.rs re-exports {build_mpi_router, MpiState, BaselineSnapshot}.
-//!
-//! ## Main Functionality
-//! - MpiState: shared state for all 19 MPI endpoints
-//! - AuthenticatedOwner: request extension for owner identification
-//! - Unified auth middleware: Bearer token (local) + Ed25519 signature (remote)
-//! - Router construction with all 19 routes + auth middleware layer
-//! - Shared helper functions used by handlers in all 3 files
-//!
-//! ⚠️ Important Note for Next Developer:
-//! - AuthenticatedOwner is the SINGLE source of truth for "who is making this request"
-//! - NEVER use state.owner_key directly in handlers — always use the extension
-//! - mpi_handlers.rs and mpi_graph_handlers.rs import types from this file via `super::mpi::`
-//! - When adding new endpoints, register the route in build_mpi_router() here,
-//!   but implement the handler in the appropriate handlers file
+//! ## File Split
+//! - `mpi.rs` (THIS FILE) — MpiState, auth middleware, router, helpers
+//! - `mpi_handlers.rs`       — remember, forget, status, embed, record, overview
+//! - `recall_handler.rs`     — hybrid recall pipeline
+//! - `mpi_graph_handlers.rs` — v2.4.0 cognitive graph endpoints
+//! - `log_handler.rs`        — /log ingestion
+//! - `supernode_handlers.rs` — v2.5.0 SuperNode management
 //!
 //! ## Last Modified
 //! v2.1.0 - MPI endpoints with MVF fusion scoring
-//! v2.1.0+MVF+Auth - Added Bearer token auth middleware
+//! v2.1.0+MVF+Auth - Bearer token auth middleware
 //! v2.2.0 - Added record/:id, records/overview, embed endpoints
 //! v2.3.0+RemoteStorage - Unified auth middleware (Bearer + Ed25519)
-//! v2.4.0-GraphCognition - 🌟 Split into 3 files; MpiState extended with
-//!   ner_engine, graph_enabled, entropy_filter_enabled; 11 new graph endpoints;
-//!   hybrid recall pipeline; status extended with graph_stats
-//! v2.4.0+Reranker - 🌟 MpiState extended with reranker_engine: Option<Arc<RerankerEngine>>
-//!   for cross-encoder reranking in recall Step 3.5
+//! v2.4.0-GraphCognition - 🌟 Split into files; MpiState + graph extensions
+//! v2.4.0+Reranker - 🌟 MpiState.reranker_engine
+//! v2.4.0+Conversation - 🌟 MpiState.rawlog_key
+//! v2.5.0+SuperNode Phase D - 🌟 MpiState.llm_router; 6 supernode routes; count 23→29
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -61,56 +43,46 @@ use crate::services::memchain::{MemoryStorage, VectorIndex};
 use crate::services::memchain::mvf::WeightVector;
 use crate::services::memchain::EmbedEngine;
 use crate::services::memchain::NerEngine;
-// v2.4.0+Reranker: Cross-encoder reranker for recall Step 3.5
 use crate::services::memchain::RerankerEngine;
+use crate::services::memchain::LlmRouter;
 
-// Sibling handler modules
 use super::mpi_handlers;
 use super::mpi_graph_handlers;
+use super::supernode_handlers;
 
 // ============================================
 // Constants
 // ============================================
 
-/// Maximum allowed clock skew for Ed25519 signature timestamps (seconds).
 pub(crate) const AUTH_TIMESTAMP_TOLERANCE_SECS: u64 = 300;
 
 // ============================================
-// AuthenticatedOwner (v2.3.0)
+// AuthenticatedOwner
 // ============================================
 
-/// Represents the authenticated identity making the current request.
-///
-/// Inserted as a request extension by the unified auth middleware.
-/// All handlers MUST extract this instead of using `state.owner_key` directly.
 #[derive(Debug, Clone)]
 pub enum AuthenticatedOwner {
-    /// Local node operator (Bearer token auth or open access).
-    Local { owner: [u8; 32] },
-    /// Remote user (Ed25519 signature auth).
+    Local  { owner: [u8; 32] },
     Remote { owner: [u8; 32], owner_hex: String },
 }
 
 impl AuthenticatedOwner {
-    /// Get the 32-byte owner key for storage operations.
     #[must_use]
     pub fn owner_bytes(&self) -> [u8; 32] {
         match self {
-            Self::Local { owner } => *owner,
-            Self::Remote { owner, .. } => *owner,
+            Self::Local  { owner }      => *owner,
+            Self::Remote { owner, .. }  => *owner,
         }
     }
 
-    /// Get the hex-encoded owner key.
     #[must_use]
     pub fn owner_hex(&self) -> String {
         match self {
-            Self::Local { owner } => hex::encode(owner),
-            Self::Remote { owner_hex, .. } => owner_hex.clone(),
+            Self::Local  { owner }          => hex::encode(owner),
+            Self::Remote { owner_hex, .. }  => owner_hex.clone(),
         }
     }
 
-    /// Whether this is a remote (Ed25519 signature) authenticated request.
     #[must_use]
     pub fn is_remote(&self) -> bool {
         matches!(self, Self::Remote { .. })
@@ -118,7 +90,7 @@ impl AuthenticatedOwner {
 }
 
 // ============================================
-// Shared State
+// MpiState
 // ============================================
 
 pub struct MpiState {
@@ -135,39 +107,23 @@ pub struct MpiState {
     pub owner_key: [u8; 32],
     pub api_secret: Option<String>,
     pub embed_engine: Option<Arc<EmbedEngine>>,
-    /// v2.3.0: Whether this node accepts remote storage requests.
+    /// v2.3.0: Remote storage config.
     pub allow_remote_storage: bool,
-    /// v2.3.0: Maximum number of distinct remote owners this node serves.
     pub max_remote_owners: usize,
-    /// v2.4.0: Local NER engine (GLiNER via ONNX Runtime).
+    /// v2.4.0: NER engine (GLiNER).
     pub ner_engine: Option<Arc<NerEngine>>,
-    /// v2.4.0: Whether knowledge graph traversal is enabled in recall.
+    /// v2.4.0: Knowledge graph config.
     pub graph_enabled: bool,
-    /// v2.4.0: Whether entropy filtering is enabled on /log ingestion.
     pub entropy_filter_enabled: bool,
-    /// v2.4.0+Reranker: Cross-encoder reranker engine.
-    ///
-    /// When Some, recall pipeline reranks top-30 candidates for improved precision
-    /// (Step 3.5 in recall_handler.rs). Uses ms-marco-MiniLM-L-6-v2 (~22MB ONNX).
-    /// When None, Step 3.5 is skipped and recall returns RRF-fused results directly.
-    ///
-    /// Initialized in server.rs from config.memchain.reranker_enabled.
-    /// Load failure is graceful: server starts normally with reranker_engine = None.
+    /// v2.4.0+Reranker: Cross-encoder reranker.
     pub reranker_engine: Option<Arc<RerankerEngine>>,
-
-    /// v2.4.0+Conversation: RawLog decryption key for conversation replay.
-    ///
-    /// Derived from Ed25519 PRIVATE key via derive_rawlog_key().
-    /// Used by mpi_graph_handlers::mpi_session_conversation to decrypt
-    /// raw_logs server-side for Local auth requests.
-    ///
-    /// When Some, /sessions/:id/conversation returns decrypted plaintext turns.
-    /// When None, encrypted turns are returned with content=null.
-    ///
-    /// ⚠️ This key can ONLY decrypt rawlogs belonging to the local owner.
-    /// Remote owners' rawlogs were encrypted with a different key derived
-    /// from their own private key — they cannot be decrypted server-side.
+    /// v2.4.0+Conversation: RawLog decryption key (PRIVATE key derived).
     pub rawlog_key: Option<[u8; 32]>,
+    /// v2.5.0+SuperNode: LLM router for cognitive task dispatch.
+    ///
+    /// When Some, TaskWorker polls cognitive_tasks and dispatches to providers.
+    /// When None, SuperNode is disabled — /supernode/* returns 404.
+    pub llm_router: Option<Arc<LlmRouter>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,11 +134,9 @@ pub struct BaselineSnapshot {
 }
 
 // ============================================
-// Shared Helpers (used by all handler files)
+// Shared Helpers
 // ============================================
 
-/// Extract AuthenticatedOwner from request extensions.
-/// Panics if the auth middleware was not applied (programming error).
 pub(crate) fn extract_owner<B>(req: &Request<B>) -> &AuthenticatedOwner {
     req.extensions()
         .get::<AuthenticatedOwner>()
@@ -203,32 +157,27 @@ pub(crate) fn estimate_tokens(text: &str) -> usize {
     let len = text.len();
     if len == 0 { return 0; }
     let sample_len = len.min(100);
-    let ascii_count = text.as_bytes()[..sample_len].iter().filter(|b| b.is_ascii()).count();
-    if (ascii_count as f64 / sample_len as f64) > 0.80 {
-        (len + 3) / 4
-    } else {
-        (len * 2 / 3).max(1)
-    }
+    let ascii = text.as_bytes()[..sample_len].iter().filter(|b| b.is_ascii()).count();
+    if (ascii as f64 / sample_len as f64) > 0.80 { (len + 3) / 4 }
+    else { (len * 2 / 3).max(1) }
 }
 
 pub(crate) fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
-pub(crate) fn default_layer() -> String { "episode".into() }
-pub(crate) fn default_source() -> String { "unknown".into() }
-pub(crate) fn default_model() -> String { "default".into() }
-pub(crate) fn default_top_k() -> usize { 10 }
-pub(crate) fn default_token_budget() -> usize { 4000 }
-pub(crate) fn default_include_graph() -> bool { true }
-pub(crate) fn default_list_limit() -> usize { 20 }
+pub(crate) fn default_layer()         -> String { "episode".into() }
+pub(crate) fn default_source()        -> String { "unknown".into() }
+pub(crate) fn default_model()         -> String { "default".into() }
+pub(crate) fn default_top_k()         -> usize  { 10 }
+pub(crate) fn default_token_budget()  -> usize  { 4000 }
+pub(crate) fn default_include_graph() -> bool   { true }
+pub(crate) fn default_list_limit()    -> usize  { 20 }
 
 // ============================================
-// Unified Auth Middleware (v2.3.0)
+// Unified Auth Middleware
 // ============================================
 
-/// Unified authentication middleware for all MPI endpoints.
-/// Handles Ed25519 signature (remote) and Bearer token (local) in one pass.
 async fn unified_auth_middleware(
     State(state): State<Arc<MpiState>>,
     req: Request<axum::body::Body>,
@@ -240,38 +189,55 @@ async fn unified_auth_middleware(
     handle_local_auth(state, req, next).await
 }
 
-/// Handle Ed25519 signature authentication for remote users.
 async fn handle_remote_auth(
     state: Arc<MpiState>,
     req: Request<axum::body::Body>,
     next: Next,
 ) -> axum::response::Response {
-    let pubkey_hex = match req.headers().get("x-memchain-publickey").and_then(|v| v.to_str().ok()) {
+    let pubkey_hex = match req.headers()
+        .get("x-memchain-publickey").and_then(|v| v.to_str().ok())
+    {
         Some(v) => v.to_string(),
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "missing X-MemChain-PublicKey header"}))).into_response(),
+        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
+            {"error":"missing X-MemChain-PublicKey header"}
+        ))).into_response(),
     };
-    let timestamp_str = match req.headers().get("x-memchain-timestamp").and_then(|v| v.to_str().ok()) {
+    let timestamp_str = match req.headers()
+        .get("x-memchain-timestamp").and_then(|v| v.to_str().ok())
+    {
         Some(v) => v.to_string(),
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "missing X-MemChain-Timestamp header"}))).into_response(),
+        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
+            {"error":"missing X-MemChain-Timestamp header"}
+        ))).into_response(),
     };
-    let signature_hex = match req.headers().get("x-memchain-signature").and_then(|v| v.to_str().ok()) {
+    let signature_hex = match req.headers()
+        .get("x-memchain-signature").and_then(|v| v.to_str().ok())
+    {
         Some(v) => v.to_string(),
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "missing X-MemChain-Signature header"}))).into_response(),
+        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
+            {"error":"missing X-MemChain-Signature header"}
+        ))).into_response(),
     };
 
     let pubkey_bytes = match hex::decode(&pubkey_hex) {
-        Ok(b) if b.len() == 32 => { let mut arr = [0u8; 32]; arr.copy_from_slice(&b); arr }
-        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid X-MemChain-PublicKey: expected 64 hex chars"}))).into_response(),
+        Ok(b) if b.len() == 32 => { let mut a = [0u8;32]; a.copy_from_slice(&b); a }
+        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
+            {"error":"invalid X-MemChain-PublicKey"}
+        ))).into_response(),
     };
 
     let identity_pubkey = match IdentityPublicKey::from_bytes(&pubkey_bytes) {
         Ok(pk) => pk,
-        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid Ed25519 public key"}))).into_response(),
+        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
+            {"error":"invalid Ed25519 public key"}
+        ))).into_response(),
     };
 
     let timestamp: u64 = match timestamp_str.parse() {
         Ok(ts) => ts,
-        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid X-MemChain-Timestamp"}))).into_response(),
+        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
+            {"error":"invalid X-MemChain-Timestamp"}
+        ))).into_response(),
     };
 
     let now = now_secs();
@@ -285,12 +251,16 @@ async fn handle_remote_auth(
     }
 
     if !state.allow_remote_storage {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "this node does not accept remote storage requests"}))).into_response();
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!(
+            {"error":"this node does not accept remote storage requests"}
+        ))).into_response();
     }
 
-    let signature_bytes = match hex::decode(&signature_hex) {
-        Ok(b) if b.len() == 64 => { let mut arr = [0u8; 64]; arr.copy_from_slice(&b); arr }
-        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid X-MemChain-Signature: expected 128 hex chars"}))).into_response(),
+    let sig_bytes = match hex::decode(&signature_hex) {
+        Ok(b) if b.len() == 64 => { let mut a = [0u8;64]; a.copy_from_slice(&b); a }
+        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
+            {"error":"invalid X-MemChain-Signature"}
+        ))).into_response(),
     };
 
     let method = req.method().as_str().to_string();
@@ -298,28 +268,32 @@ async fn handle_remote_auth(
     let (parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "failed to read request body"}))).into_response(),
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
+            {"error":"failed to read request body"}
+        ))).into_response(),
     };
 
     let body_hash = Sha256::digest(&body_bytes);
-    let mut message_hasher = Sha256::new();
-    message_hasher.update(timestamp_str.as_bytes());
-    message_hasher.update(method.as_bytes());
-    message_hasher.update(path.as_bytes());
-    message_hasher.update(&body_hash);
-    let signed_message = message_hasher.finalize();
+    let mut msg_hasher = Sha256::new();
+    msg_hasher.update(timestamp_str.as_bytes());
+    msg_hasher.update(method.as_bytes());
+    msg_hasher.update(path.as_bytes());
+    msg_hasher.update(&body_hash);
+    let signed_msg = msg_hasher.finalize();
 
-    if identity_pubkey.verify(&signed_message, &signature_bytes).is_err() {
-        warn!("[MPI_AUTH] Ed25519 signature verification failed for {}", pubkey_hex);
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "signature verification failed"}))).into_response();
+    if identity_pubkey.verify(&signed_msg, &sig_bytes).is_err() {
+        warn!("[MPI_AUTH] Ed25519 sig verification failed for {}", pubkey_hex);
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
+            {"error":"signature verification failed"}
+        ))).into_response();
     }
 
     if state.max_remote_owners > 0 {
-        let current_owners = state.storage.count_distinct_owners().await;
-        let remote_count = current_owners.saturating_sub(1);
-        let owner_exists = state.storage.owner_exists(&pubkey_bytes).await;
-        if !owner_exists && remote_count >= state.max_remote_owners {
-            warn!("[MPI_AUTH] Remote owner capacity reached: {}/{}", remote_count, state.max_remote_owners);
+        let current = state.storage.count_distinct_owners().await;
+        let remote = current.saturating_sub(1);
+        let exists = state.storage.owner_exists(&pubkey_bytes).await;
+        if !exists && remote >= state.max_remote_owners {
+            warn!("[MPI_AUTH] Remote capacity reached: {}/{}", remote, state.max_remote_owners);
             return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
                 "error": "this node has reached maximum remote user capacity",
                 "max_remote_owners": state.max_remote_owners,
@@ -327,7 +301,7 @@ async fn handle_remote_auth(
         }
     }
 
-    debug!("[MPI_AUTH] Remote auth OK: {} (method={}, path={})", &pubkey_hex[..8], method, path);
+    debug!("[MPI_AUTH] Remote OK: {} ({} {})", &pubkey_hex[..8], method, path);
 
     let auth = AuthenticatedOwner::Remote { owner: pubkey_bytes, owner_hex: pubkey_hex };
     let mut req = Request::from_parts(parts, axum::body::Body::from(body_bytes));
@@ -335,7 +309,6 @@ async fn handle_remote_auth(
     next.run(req).await.into_response()
 }
 
-/// Handle Bearer token authentication for local node operator.
 async fn handle_local_auth(
     state: Arc<MpiState>,
     req: Request<axum::body::Body>,
@@ -354,18 +327,20 @@ async fn handle_local_auth(
         let token = match auth_header {
             Some(h) if h.starts_with("Bearer ") => &h[7..],
             Some(h) if h.starts_with("bearer ") => &h[7..],
-            _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "missing Authorization: Bearer <token>"}))).into_response(),
+            _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
+                {"error":"missing Authorization: Bearer <token>"}
+            ))).into_response(),
         };
 
-        let token_bytes = token.as_bytes();
-        let expected_bytes = expected.as_bytes();
-        let valid = if token_bytes.len() == expected_bytes.len() {
-            token_bytes.iter().zip(expected_bytes.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
-        } else { false };
+        let valid = token.len() == expected.len()
+            && token.as_bytes().iter().zip(expected.as_bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
 
         if !valid {
-            warn!("[MPI_AUTH] Invalid Bearer token from request");
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid token"}))).into_response();
+            warn!("[MPI_AUTH] Invalid Bearer token");
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
+                {"error":"invalid token"}
+            ))).into_response();
         }
     }
 
@@ -376,53 +351,53 @@ async fn handle_local_auth(
 }
 
 // ============================================
-// Router (v2.4.0: 19 endpoints across 3 files)
+// Router — 29 endpoints
 // ============================================
 
-/// Build the MPI router with unified auth middleware.
-///
-/// Routes are registered here but handlers live in sibling files:
-/// - mpi_handlers.rs: remember, recall, forget, status, embed, record, overview
-/// - mpi_graph_handlers.rs: projects, sessions, artifacts, entities, communities
-/// - log_handler.rs: /log (already separate since v2.1.0)
 pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
     let router = Router::new()
         // ── Original endpoints (mpi_handlers.rs) ──
-        .route("/api/mpi/remember", post(mpi_handlers::mpi_remember))
-        .route("/api/mpi/recall", post(super::recall_handler::mpi_recall))
-        .route("/api/mpi/recall/detail", post(super::recall_handler::mpi_recall_detail))
-        .route("/api/mpi/forget", post(mpi_handlers::mpi_forget))
-        .route("/api/mpi/status", get(mpi_handlers::mpi_status))
-        .route("/api/mpi/embed", post(mpi_handlers::mpi_embed))
-        .route("/api/mpi/record/:record_id", get(mpi_handlers::mpi_get_record))
-        .route("/api/mpi/records/overview", get(mpi_handlers::mpi_records_overview))
-        // ── /log (log_handler.rs — separate since v2.1.0) ──
-        .route("/api/mpi/log", post(crate::api::log_handler::mpi_log))
-        // ── v2.4.0: Cognitive graph endpoints (mpi_graph_handlers.rs) ──
-        .route("/api/mpi/projects", get(mpi_graph_handlers::mpi_projects))
-        .route("/api/mpi/projects/:id", get(mpi_graph_handlers::mpi_project_detail))
-        .route("/api/mpi/projects/:id/timeline", get(mpi_graph_handlers::mpi_project_timeline))
-        .route("/api/mpi/sessions/:id", get(mpi_graph_handlers::mpi_session_detail))
-        .route("/api/mpi/sessions/:id/conversation", get(mpi_graph_handlers::mpi_session_conversation))
-        .route("/api/mpi/sessions/:id/artifacts", get(mpi_graph_handlers::mpi_session_artifacts))
-        .route("/api/mpi/artifacts/:id", get(mpi_graph_handlers::mpi_artifact_detail))
-        .route("/api/mpi/artifacts/:id/versions", get(mpi_graph_handlers::mpi_artifact_versions))
-        .route("/api/mpi/entities/:id", get(mpi_graph_handlers::mpi_entity_detail))
-        .route("/api/mpi/entities/:id/graph", get(mpi_graph_handlers::mpi_entity_graph))
-        .route("/api/mpi/communities", get(mpi_graph_handlers::mpi_communities))
-        // ── v2.4.0+Search: Human-facing search + entity timeline ──
-        .route("/api/mpi/search", get(mpi_graph_handlers::mpi_search))
-        .route("/api/mpi/entities/:id/timeline", get(mpi_graph_handlers::mpi_entity_timeline))
-        // ── v2.4.0+Context: Auto context injection for new sessions ──
-        .route("/api/mpi/context/inject", get(mpi_graph_handlers::mpi_context_inject));
+        .route("/api/mpi/remember",           post(mpi_handlers::mpi_remember))
+        .route("/api/mpi/recall",             post(super::recall_handler::mpi_recall))
+        .route("/api/mpi/recall/detail",      post(super::recall_handler::mpi_recall_detail))
+        .route("/api/mpi/forget",             post(mpi_handlers::mpi_forget))
+        .route("/api/mpi/status",             get(mpi_handlers::mpi_status))
+        .route("/api/mpi/embed",              post(mpi_handlers::mpi_embed))
+        .route("/api/mpi/record/:record_id",  get(mpi_handlers::mpi_get_record))
+        .route("/api/mpi/records/overview",   get(mpi_handlers::mpi_records_overview))
+        // ── /log (log_handler.rs) ──
+        .route("/api/mpi/log",                post(crate::api::log_handler::mpi_log))
+        // ── v2.4.0: Cognitive graph (mpi_graph_handlers.rs) ──
+        .route("/api/mpi/projects",                    get(mpi_graph_handlers::mpi_projects))
+        .route("/api/mpi/projects/:id",                get(mpi_graph_handlers::mpi_project_detail))
+        .route("/api/mpi/projects/:id/timeline",       get(mpi_graph_handlers::mpi_project_timeline))
+        .route("/api/mpi/sessions/:id",                get(mpi_graph_handlers::mpi_session_detail))
+        .route("/api/mpi/sessions/:id/conversation",   get(mpi_graph_handlers::mpi_session_conversation))
+        .route("/api/mpi/sessions/:id/artifacts",      get(mpi_graph_handlers::mpi_session_artifacts))
+        .route("/api/mpi/artifacts/:id",               get(mpi_graph_handlers::mpi_artifact_detail))
+        .route("/api/mpi/artifacts/:id/versions",      get(mpi_graph_handlers::mpi_artifact_versions))
+        .route("/api/mpi/entities/:id",                get(mpi_graph_handlers::mpi_entity_detail))
+        .route("/api/mpi/entities/:id/graph",          get(mpi_graph_handlers::mpi_entity_graph))
+        .route("/api/mpi/communities",                 get(mpi_graph_handlers::mpi_communities))
+        .route("/api/mpi/search",                      get(mpi_graph_handlers::mpi_search))
+        .route("/api/mpi/entities/:id/timeline",       get(mpi_graph_handlers::mpi_entity_timeline))
+        .route("/api/mpi/context/inject",              get(mpi_graph_handlers::mpi_context_inject))
+        // ── v2.5.0+SuperNode: Task queue management (supernode_handlers.rs) ──
+        .route("/api/mpi/supernode/tasks",                  get(supernode_handlers::supernode_list_tasks))
+        .route("/api/mpi/supernode/tasks/:id",              get(supernode_handlers::supernode_task_detail))
+        .route("/api/mpi/supernode/tasks/:id/retry",        post(supernode_handlers::supernode_retry_task))
+        .route("/api/mpi/supernode/tasks/:id/cancel",       post(supernode_handlers::supernode_cancel_task))
+        .route("/api/mpi/supernode/usage",                  get(supernode_handlers::supernode_usage))
+        .route("/api/mpi/supernode/health",                 get(supernode_handlers::supernode_health));
 
     info!(
-        "[MPI] Router: 23 endpoints (bearer={}, remote={}, ner={}, graph={}, reranker={})",
+        "[MPI] Router: 29 endpoints (bearer={}, remote={}, ner={}, graph={}, reranker={}, supernode={})",
         state.api_secret.as_ref().map_or(false, |s| !s.is_empty()),
         state.allow_remote_storage,
         state.ner_engine.is_some(),
         state.graph_enabled,
         state.reranker_engine.is_some(),
+        state.llm_router.is_some(),
     );
 
     router
