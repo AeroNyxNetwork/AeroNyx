@@ -335,7 +335,7 @@ static mut ORT_INIT_ERROR: Option<String> = None;
 /// 1. `{model_dir}/libonnxruntime.so` (co-located with model, preferred)
 /// 2. `ORT_DYLIB_PATH` environment variable (user override)
 /// 3. System library paths (`/usr/lib`, `/usr/local/lib`)
-fn init_ort_runtime(model_dir: &Path) -> Result<(), String> {
+pub(crate) fn init_ort_runtime(model_dir: &Path) -> Result<(), String> {
     let mut init_error: Option<String> = None;
 
     ORT_INIT.call_once(|| {
