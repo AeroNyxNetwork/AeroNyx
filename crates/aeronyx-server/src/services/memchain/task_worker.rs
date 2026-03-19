@@ -395,17 +395,19 @@ impl TaskWorker {
             CognitiveTaskType::CommunityNarrative => {
                 let summary = result.trim();
                 if summary.is_empty() { return Err("LLM returned empty community summary".to_string()); }
-                if let Some(comm) = storage.get_community(target_id).await {
-                    let owner_dummy = [0u8; 32];
-                    storage.upsert_community(
-                        target_id, &owner_dummy, &comm.name,
-                        Some(summary), comm.description.as_deref(),
-                        comm.entity_count,
-                    ).await.map_err(|e| format!("communities.summary writeback: {}", e))?;
-                    debug!(community = target_id, "[TASK_WORKER] community_narrative written");
-                } else {
+                // Write summary directly via SQL — avoids needing get_community()
+                // which doesn't exist on MemoryStorage. upsert_community requires
+                // owner + name which we don't have in the task context, so direct
+                // UPDATE is the correct approach for writeback.
+                let conn = storage.conn_lock().await;
+                let affected = conn.execute(
+                    "UPDATE communities SET summary = ?1 WHERE community_id = ?2",
+                    rusqlite::params![summary, target_id],
+                ).map_err(|e| format!("communities.summary writeback: {}", e))?;
+                if affected == 0 {
                     return Err(format!("Community {} not found for writeback", target_id));
                 }
+                debug!(community = target_id, "[TASK_WORKER] community_narrative written");
             }
 
             CognitiveTaskType::RecallSynthesis => {
