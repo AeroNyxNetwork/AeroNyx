@@ -4,90 +4,131 @@
 //! # MemChain Storage Engine
 //!
 //! ## Submodules
-//! - [`storage`] + [`storage_crypto`] + [`storage_ops`]: SQLite persistence (split for maintainability)
+//! - [`storage`] + [`storage_crypto`] + [`storage_ops`]: SQLite persistence (core/legacy)
+//! - [`storage_graph`]: Cognitive graph CRUD (Episodes/Entities/Edges/Communities/Projects/Sessions/Artifacts)
+//! - [`storage_miner`]: Miner step support + EntityTimeline (Steps 7/9/10/11)
+//! - [`storage_fts`]: FTS5 BM25 full-text search + snippet highlight
 //! - [`vector`]: Partitioned vector index for cosine similarity search
-//! - [`mvf`]: Multi-Variate Feature scoring (9-dim SGD → 10-dim with φ₉ in v2.4.0)
-//! - [`graph`]: Co-occurrence graph for memory relationships + BFS traversal (v2.4.0)
-//! - [`embed`]: Local MiniLM embedding inference (ort + tokenizers)
+//! - [`mvf`]: Multi-Variate Feature scoring (10-dim with φ₉ since v2.4.0)
+//! - [`graph`]: Co-occurrence graph + BFS traversal + community detection (v2.4.0)
+//! - [`embed`]: Local MiniLM/Gemma embedding inference (ort + tokenizers)
 //! - [`ner`]: Local GLiNER NER inference (ort + tokenizers) (v2.4.0)
+//! - [`query_analyzer`]: Query analysis — GLiNER entity detection + regex + classification (v2.4.0)
+//! - [`quantize`]: Scalar Quantization float32→uint8 (v2.4.0)
+//! - [`reranker`]: Cross-encoder reranking ms-marco-MiniLM-L-6-v2 (v2.4.0+Reranker)
 //! - [`mempool`]: In-memory Fact buffer (legacy/deprecated)
 //! - [`aof`]: Append-Only File persistence (legacy/deprecated)
 //!
-//! ## v2.2.0 Split
-//! storage.rs was split into 3 files:
-//! - storage.rs — struct, open, schema, migration, core CRUD, LRU
-//! - storage_crypto.rs — derive_record_key, derive_rawlog_key, encrypt/decrypt
-//! - storage_ops.rs — rawlog, feedback, chain state, stats, miner, overview
+//! ## Storage Split History
+//! v2.2.0: storage.rs split into 3 files:
+//!   - storage.rs       — struct, open, schema, migration, core CRUD, LRU
+//!   - storage_crypto.rs — derive_record_key, derive_rawlog_key, encrypt/decrypt
+//!   - storage_ops.rs   — rawlog, feedback, chain state, stats, miner base, overview
 //!
-//! ## v2.4.0-GraphCognition Additions
-//! - ner.rs — GLiNER ONNX local NER engine (sister module to embed.rs)
-//!   Zero-shot entity detection + relation extraction for cognitive graph pipeline.
-//!   Shares ort load-dynamic mechanism with embed.rs.
-//!
-//! Future v2.4.0 additions (not yet created):
-//! - query_analyzer.rs — Query analysis (GLiNER entity detection + regex + classification)
-//! - quantize.rs — Scalar Quantization (float32 → uint8)
+//! v2.4.0+Search: storage_ops.rs split further into 3 files:
+//!   - storage_ops.rs   — (unchanged) core/legacy ops
+//!   - storage_graph.rs — cognitive graph CRUD (Episodes/Entities/Edges/etc.)
+//!   - storage_miner.rs — Miner step support + EntityTimelineEntry + get_entity_timeline
 //!
 //! External API unchanged — all types and functions re-exported below.
+//!
+//! ⚠️ Important Note for Next Developer:
+//! - storage_graph.rs and storage_miner.rs use `impl MemoryStorage` extension blocks,
+//!   same pattern as storage_ops.rs. Rust allows multiple impl blocks across files
+//!   within the same crate — no trait or wrapper needed.
+//! - When adding a new storage submodule, declare it here AND add re-exports below.
+//! - Re-export order matters for readability: storage types first, then engines, then legacy.
 //!
 //! ## Last Modified
 //! v0.2.0 - Initial MemChain storage engine
 //! v2.1.0 - Added storage, vector, mvf, graph modules
 //! v2.1.0+Embed - Added embed module
 //! v2.2.0 - 🌟 Split storage into 3 files; added storage_ops (overview, get_embedding_model)
-//! v2.4.0-GraphCognition - 🌟 Added ner module (GLiNER ONNX local NER engine)
+//! v2.4.0-GraphCognition - 🌟 Added ner, query_analyzer, quantize modules + re-exports
+//! v2.4.0+Reranker - 🌟 Added reranker module + RerankerEngine re-export
+//! v2.4.0+Search - 🌟 Split storage_ops into storage_graph + storage_miner.
+//!   Added storage_graph, storage_miner module declarations and re-exports:
+//!   EntityRow, KnowledgeEdgeRow, SessionRow, CommunityRow, ProjectRow, ArtifactRow,
+//!   GraphStats, EntityTimelineEntry.
 
-// Storage engine (split into 3 files)
+// ── Storage engine (split across multiple files) ──
 pub mod storage;
 pub mod storage_crypto;
 pub mod storage_ops;
+// v2.4.0+Search: Cognitive graph CRUD (split from storage_ops.rs)
+pub mod storage_graph;
+// v2.4.0+Search: Miner step support + entity timeline (split from storage_ops.rs)
+pub mod storage_miner;
+// v2.4.0: FTS5 BM25 full-text search
 pub mod storage_fts;
 
-// Cognitive engine
+// ── Cognitive engine ──
 pub mod vector;
 pub mod mvf;
 pub mod graph;
 
-// Local embedding engine
+// ── Local inference engines ──
 pub mod embed;
-
-// Local NER engine (v2.4.0-GraphCognition)
+// v2.4.0-GraphCognition: GLiNER ONNX NER engine
 pub mod ner;
-
-// Query analyzer (v2.4.0-GraphCognition)
+// v2.4.0-GraphCognition: Query analyzer
 pub mod query_analyzer;
-
-// Scalar quantization (v2.4.0-GraphCognition)
+// v2.4.0-GraphCognition: Scalar quantization
 pub mod quantize;
+// v2.4.0+Reranker: Cross-encoder reranker
+pub mod reranker;
 
-// Legacy engine (deprecated)
+// ── Legacy engine (deprecated) ──
 pub mod aof;
 pub mod mempool;
 
-// ── Re-exports: Storage (combined from all 3 files) ──
+// ============================================
+// Re-exports
+// ============================================
+
+// ── Storage core ──
 pub use storage::{MemoryStorage, StorageStats, LayerCounts, RawLogRow};
 pub use storage_crypto::{derive_record_key, derive_rawlog_key, decrypt_rawlog_content_pub};
 pub use storage_ops::{OverviewRecord, OverviewData};
 
-// ── Re-exports: Vector ──
+// ── Storage graph types (v2.4.0+Search) ──
+// These types were previously inline in storage_ops.rs.
+// Re-exported here so all callers (api handlers, recall_handler, etc.) are unaffected.
+pub use storage_graph::{
+    EntityRow,
+    KnowledgeEdgeRow,
+    SessionRow,
+    CommunityRow,
+    ProjectRow,
+    ArtifactRow,
+    GraphStats,
+};
+
+// ── Storage miner types (v2.4.0+Search) ──
+pub use storage_miner::EntityTimelineEntry;
+
+// ── Vector ──
 pub use vector::{
     VectorIndex, SearchResult, DedupResult,
     cosine_similarity, compute_recall_score,
     dedup_threshold_for_layer, EPISODE_DEDUP_WINDOW_SECS,
 };
 
-// ── Re-exports: Embed ──
+// ── Local embedding engine ──
 pub use embed::EmbedEngine;
 
-// ── Re-exports: NER (v2.4.0-GraphCognition) ──
+// ── NER engine (v2.4.0-GraphCognition) ──
 pub use ner::{NerEngine, DetectedEntity};
 
-// ── Re-exports: Query Analyzer (v2.4.0-GraphCognition) ──
+// ── Query analyzer (v2.4.0-GraphCognition) ──
 pub use query_analyzer::{analyze_query, QueryAnalysis, QueryType, MatchedEntity};
 
-// ── Re-exports: Scalar Quantization (v2.4.0-GraphCognition) ──
+// ── Scalar quantization (v2.4.0-GraphCognition) ──
 pub use quantize::ScalarQuantizer;
 
-// ── Re-exports: Legacy ──
+// ── Cross-encoder reranker (v2.4.0+Reranker) ──
+pub use reranker::RerankerEngine;
+
+// ── Legacy ──
 pub use aof::AofWriter;
 pub use mempool::MemPool;
