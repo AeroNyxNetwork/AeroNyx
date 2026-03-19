@@ -658,10 +658,8 @@ impl Server {
     /// ⚠️ This method does NOT ping providers or validate connectivity.
     ///    Health checks happen at runtime via /supernode/health endpoint.
     async fn init_llm_router(&self) -> Option<Arc<LlmRouter>> {
-        use crate::services::memchain::{
-            LlmProvider, OpenAiCompatProvider, AnthropicProvider,
-            ProviderType,
-        };
+        use crate::config_supernode::ProviderType;
+        use crate::services::memchain::{LlmProvider, OpenAiCompatProvider, AnthropicProvider};
 
         if !self.config.memchain.is_supernode_enabled() {
             debug!("[SUPERNODE] Disabled (supernode.enabled=false)");
@@ -675,7 +673,9 @@ impl Server {
             return None;
         }
 
-        let mut providers: Vec<(String, Arc<dyn LlmProvider>)> = Vec::new();
+        // LlmRouter::new() expects Vec<(name, api_base, model, Arc<dyn LlmProvider>)>
+        // api_base + model are stored separately for HTTP HEAD health checks.
+        let mut providers: Vec<(String, String, String, Arc<dyn LlmProvider>)> = Vec::new();
 
         for provider_cfg in &supernode.providers {
             // Resolve $ENV_VAR syntax in api_key
@@ -693,11 +693,21 @@ impl Server {
                 }
             });
 
+            // Resolve Anthropic default api_base when empty
+            // (validate() in config_supernode.rs warns but doesn't fill it in)
+            let api_base = if provider_cfg.api_base.is_empty()
+                && provider_cfg.provider_type == ProviderType::Anthropic
+            {
+                "https://api.anthropic.com".to_string()
+            } else {
+                provider_cfg.api_base.clone()
+            };
+
             let provider: Arc<dyn LlmProvider> = match provider_cfg.provider_type {
-                ProviderType::OpenAiCompatible => {
+                ProviderType::OpenaiCompatible => {
                     Arc::new(OpenAiCompatProvider::new(
                         provider_cfg.name.clone(),
-                        provider_cfg.api_base.clone(),
+                        api_base.clone(),
                         api_key,
                         provider_cfg.model.clone(),
                         provider_cfg.max_tokens,
@@ -717,7 +727,7 @@ impl Server {
                     };
                     Arc::new(AnthropicProvider::new(
                         provider_cfg.name.clone(),
-                        provider_cfg.api_base.clone(),
+                        api_base.clone(),
                         key,
                         provider_cfg.model.clone(),
                         provider_cfg.max_tokens,
@@ -730,9 +740,18 @@ impl Server {
                 name = %provider_cfg.name,
                 type_ = ?provider_cfg.provider_type,
                 model = %provider_cfg.model,
+                api_base = %api_base,
                 "[SUPERNODE] Provider registered"
             );
-            providers.push((provider_cfg.name.clone(), provider));
+
+            // 4-tuple: (name, api_base, model, provider)
+            // api_base and model stored separately for health check pings
+            providers.push((
+                provider_cfg.name.clone(),
+                api_base,
+                provider_cfg.model.clone(),
+                provider,
+            ));
         }
 
         if providers.is_empty() {
@@ -740,6 +759,8 @@ impl Server {
             return None;
         }
 
+        // Pass TaskRoutingConfig directly — LlmRouter::new() calls provider_for()
+        // for each CognitiveTaskType to build its internal routing table.
         let router = LlmRouter::new(providers, supernode.routing.clone());
         info!(
             providers = supernode.providers.len(),
