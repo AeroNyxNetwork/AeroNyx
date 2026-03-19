@@ -385,7 +385,7 @@ pub async fn mpi_artifact_versions(
     // TODO: Look up filename from artifact_id, then query versions
     debug!(artifact = %artifact_id, "[MPI] GET /artifacts/:id/versions (stub)");
 
-    let versions: Vec<crate::services::memchain::storage_ops::ArtifactRow> = Vec::new();
+    let versions: Vec<crate::services::memchain::ArtifactRow> = Vec::new();
     (StatusCode::OK, Json(serde_json::json!({
         "artifact_id": artifact_id,
         "versions": versions,
