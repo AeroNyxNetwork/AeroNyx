@@ -1,523 +1,773 @@
 // ============================================
-// File: crates/aeronyx-server/src/config_supernode.rs
+// File: crates/aeronyx-server/src/services/memchain/storage_supernode.rs
 // ============================================
-//! # SuperNode Configuration — LLM Cognitive Enhancement Layer
+//! # Storage SuperNode — Cognitive Task Queue + LLM Usage Log
 //!
-//! ## Creation Reason
-//! v2.5.0-SuperNode — Extracted from config.rs to keep MemChainConfig manageable.
+//! ## Creation Reason (v2.5.0+SuperNode)
+//! Split from storage_ops.rs to house all CRUD for the v2.5.0 LLM task queue
+//! and usage tracking tables introduced in Schema v6.
 //!
 //! ## Main Functionality
-//! - SuperNodeConfig: top-level supernode config (enabled flag + sub-configs)
-//! - ProviderConfig: individual LLM provider definition (API endpoint, model, auth)
-//! - ProviderType: enum for provider protocol (OpenAI-compatible vs Anthropic)
-//! - CognitiveTaskType: enum for the 5 cognitive task types
-//! - TaskRoutingConfig: maps each task type to a named provider
-//! - PrivacyConfig: controls what data is sent to external LLM APIs
-//! - WorkerConfig: async task worker parameters (polling, concurrency, retries)
-//! - Validation for all config sections
+//! ### cognitive_tasks CRUD
+//! - insert_cognitive_task()      — enqueue a new pending task (idempotent: skips if active duplicate exists)
+//! - claim_pending_tasks()        — atomic SELECT + UPDATE to 'processing'
+//! - complete_task()              — mark completed + write result + token_usage
+//! - fail_task()                  — increment retry_count or mark 'failed'
+//! - retry_task()                 — human-initiated reset of failed/cancelled → pending
+//! - cancel_task()                — pending → cancelled
+//! - get_task()                   — fetch single task by id
+//! - get_tasks_by_status()        — list tasks filtered by status
+//! - get_tasks_filtered()         — list tasks with optional status + task_type filters
+//! - get_tasks_for_target()       — find tasks for a specific (table, id) pair
+//! - count_tasks_by_status()      — HashMap<status, count> for queue summary
+//! - reset_stale_processing_tasks() — on startup: recover tasks stuck in 'processing'
 //!
-//! ## Dependencies
-//! - Used by config.rs — MemChainConfig embeds SuperNodeConfig as a field
-//! - Used by server.rs — initializes LlmRouter + TaskWorker from this config
-//! - Used by llm_router.rs — reads provider configs and routing rules
-//! - Used by task_worker.rs — reads worker params (poll interval, concurrency)
-//! - Used by reflection.rs — reads privacy config when submitting cognitive tasks
+//! ### llm_usage_log CRUD
+//! - insert_usage_log()              — write a single LLM call record
+//! - get_usage_stats()               — aggregate stats for a time window (by provider)
+//! - get_usage_stats_by_task_type()  — two-dimensional breakdown (task_type × provider)
+//!
+//! ## Architecture
+//! Same `impl MemoryStorage` extension pattern as storage_graph.rs, storage_miner.rs,
+//! and storage_ops.rs. Rust allows multiple impl blocks across files in the same crate.
+//!
+//! ## Schema (v6)
+//! cognitive_tasks:
+//!   status values: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled'
+//!   privacy_level: 'structured' | 'summary' | 'full'
+//!   payload: JSON task-specific input
+//!   result: JSON LLM output written back after completion
+//!   token_usage: JSON TokenUsage serialization
+//!
+//! llm_usage_log:
+//!   cost_usd NOT stored — fee rates change; compute at query time in LlmRouter.
 //!
 //! ⚠️ Important Note for Next Developer:
-//! - SuperNodeConfig::default() returns enabled=false — existing nodes upgrading
-//!   to v2.5.0 see ZERO behavior change until explicitly enabled in config.
-//! - api_key supports "$ENV_VAR" syntax — resolved at runtime by the provider
-//!   implementation (llm_openai.rs / llm_anthropic.rs), NOT during config loading.
-//! - ProviderType::OpenaiCompatible covers DeepSeek, OpenAI, Groq, Together,
-//!   Ollama, vLLM, and any other OpenAI Chat Completion API compatible endpoint.
-//! - TaskRoutingConfig fields are all Option<String>. When None, the fallback
-//!   provider is used.
-//! - PrivacyConfig.level_for() returns PrivacyLevel (owned, cloned).
-//!   This was changed from &PrivacyLevel in v2.5.0+Fix to avoid returning
-//!   a reference to a temporary value (compiler error with `return &PrivacyLevel::Full`).
-//! - CognitiveTaskType is used both in config (routing) and at runtime (task queue).
+//! - insert_cognitive_task() is NOW IDEMPOTENT. It skips insertion if an active
+//!   (pending/processing) task already exists for the same (target_table, target_id,
+//!   task_type) triple. Returns Ok(None) in that case. Callers must handle Option<i64>.
+//! - reset_stale_processing_tasks() MUST be called at server startup before TaskWorker
+//!   spawns. Recovers tasks stuck in 'processing' after a crash/restart.
+//! - claim_pending_tasks() uses a single conn lock (SELECT + UPDATE atomic).
+//!   Do NOT split into two separate conn.lock() calls.
+//! - fail_task() checks retry_count < max_retries before marking 'failed'.
+//!   retry_task() is the human override — always resets to pending regardless.
+//! - get_tasks_filtered() uses dynamic SQL with 4 variants. The (None,None) case
+//!   passes "" as unused params because rusqlite requires the same param count
+//!   for a prepared statement. This is safe: unused ?1/?2 are never referenced
+//!   in the None branch SQL.
+//! - get_usage_stats_by_task_type() JOINs cognitive_tasks — tasks without a
+//!   task_id in llm_usage_log (e.g. manual inserts) are excluded.
+//!
+//! ## Dependencies
+//! - storage.rs — MemoryStorage struct
+//!
+//! ## Depended by
+//! - task_worker.rs — claim_pending_tasks / complete_task / fail_task
+//! - miner/reflection.rs — insert_cognitive_task (Phase B)
+//! - api/supernode_handlers.rs — all management endpoints
+//! - api/mpi_handlers.rs — count_tasks_by_status for /status
+//! - server.rs — reset_stale_processing_tasks on startup
 //!
 //! ## Last Modified
-//! v2.5.0-SuperNode - 🌟 Created. Full SuperNode configuration with providers,
-//!   routing, privacy, and worker settings.
-//! v2.5.0+Audit Fix 9  - 🔧 CognitiveTaskType::from_str renamed to parse() to avoid
-//!   shadowing std::str::FromStr trait signature. All callers updated.
-//! v2.5.0+Audit Fix 10 - 🔧 validate() now fills in the default Anthropic api_base
-//!   ("https://api.anthropic.com") when empty, rather than silently accepting it.
-//!   This prevents runtime errors if AnthropicProvider forgets the fallback.
-//! v2.5.0+Fix       - 🔧 [BUG FIX] PrivacyConfig::level_for() changed return type
-//!   from &PrivacyLevel to PrivacyLevel (owned) to avoid temporary-value lifetime
-//!   error when returning &PrivacyLevel::Full. Updated is_full_allowed() to not
-//!   call level_for() (avoids double-clone). All callers updated accordingly.
+//! v2.5.0+SuperNode Phase A - 🌟 Created. Core CRUD.
+//! v2.5.0+SuperNode Phase C - 🔧 Fixed by_provider borrow issue in get_usage_stats.
+//! v2.5.0+SuperNode Phase D - 🌟 Added retry_task, count_tasks_by_status,
+//!   get_usage_stats_by_task_type, get_tasks_filtered, TaskTypeUsage type.
+//! v2.5.0+Fix              - 🔧 [BUG FIX] insert_cognitive_task: added idempotency
+//!   guard (WHERE NOT EXISTS) to prevent duplicate pending/processing tasks for
+//!   the same (target_table, target_id, task_type). Return type changed from
+//!   Result<i64> to Result<Option<i64>> — Ok(None) = skipped (duplicate).
+//!                         - 🔧 [BUG FIX] Added reset_stale_processing_tasks() for
+//!   crash-recovery on server startup. Tasks stuck in 'processing' beyond the
+//!   timeout threshold are reset to 'pending'.
+//!                         - 🧪 Added test_insert_cognitive_task_dedup and
+//!   test_get_usage_stats_by_task_type (previously untested).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use rusqlite::{params, OptionalExtension};
+use tracing::{debug, info, warn};
 
-use crate::error::{Result, ServerError};
+use super::storage::MemoryStorage;
 
 // ============================================
-// CognitiveTaskType
+// Row Types
 // ============================================
 
-/// The cognitive task types that can be dispatched to LLM providers.
-///
-/// Each task type can be routed to a different provider via TaskRoutingConfig.
-/// Stored as lowercase strings in the cognitive_tasks table (task_type column).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CognitiveTaskType {
-    SessionTitle,
-    CommunityNarrative,
-    ConflictResolution,
-    RecallSynthesis,
-    CodeAnalysis,
-    /// Entity description enrichment (v2.5.0+SuperNode Phase B, enqueued by Step 9)
-    EntityDescription,
+/// Full cognitive task row.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CognitiveTaskRow {
+    pub id: i64,
+    pub task_type: String,
+    pub priority: i64,
+    pub status: String,
+    pub payload: String,
+    pub result: Option<String>,
+    pub target_table: Option<String>,
+    pub target_id: Option<String>,
+    pub privacy_level: String,
+    pub provider_used: Option<String>,
+    pub model_used: Option<String>,
+    pub token_usage: Option<String>,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub retry_count: i64,
+    pub max_retries: i64,
+    pub error_message: Option<String>,
 }
 
-impl CognitiveTaskType {
-    pub const ALL: &'static [CognitiveTaskType] = &[
-        Self::SessionTitle,
-        Self::CommunityNarrative,
-        Self::ConflictResolution,
-        Self::RecallSynthesis,
-        Self::CodeAnalysis,
-        Self::EntityDescription,
-    ];
+/// LLM usage statistics for a time window (by provider).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LlmUsageStats {
+    pub window_start: i64,
+    pub window_end: i64,
+    pub total_calls: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cached_tokens: i64,
+    pub avg_latency_ms: f64,
+    pub by_provider: Vec<ProviderUsage>,
+}
 
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::SessionTitle => "session_title",
-            Self::CommunityNarrative => "community_narrative",
-            Self::ConflictResolution => "conflict_resolution",
-            Self::RecallSynthesis => "recall_synthesis",
-            Self::CodeAnalysis => "code_analysis",
-            Self::EntityDescription => "entity_description",
-        }
-    }
+/// Per-provider usage aggregation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderUsage {
+    pub provider: String,
+    pub calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub avg_latency_ms: f64,
+}
 
-    /// Parse a task type from its string representation.
+/// Per-(task_type, provider) usage aggregation (v2.5.0+SuperNode Phase D).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskTypeUsage {
+    pub task_type: String,
+    pub provider: String,
+    pub calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_tokens: i64,
+    pub avg_latency_ms: f64,
+}
+
+// ============================================
+// impl MemoryStorage — cognitive_tasks CRUD
+// ============================================
+
+impl MemoryStorage {
+    /// Enqueue a new cognitive task in 'pending' status.
     ///
-    /// ## v2.5.0+Audit Fix 9
-    /// Renamed from `from_str` to `parse` to avoid shadowing the `std::str::FromStr`
-    /// trait method, which has a different return type (`Result`, not `Option`).
-    /// While this doesn't cause a compile error (different signatures), it creates
-    /// confusion when reading code — `parse()` is the conventional name for
-    /// infallible-with-option returns in this codebase.
+    /// ## Idempotency Guard (v2.5.0+Fix)
+    /// Returns `Ok(None)` (skips insertion) if an active task — status IN
+    /// ('pending', 'processing') — already exists for the same
+    /// `(target_table, target_id, task_type)` triple.
     ///
-    /// All callers in task_worker.rs and reflection.rs use `CognitiveTaskType::parse()`.
-    #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "session_title" => Some(Self::SessionTitle),
-            "community_narrative" => Some(Self::CommunityNarrative),
-            "conflict_resolution" => Some(Self::ConflictResolution),
-            "recall_synthesis" => Some(Self::RecallSynthesis),
-            "code_analysis" => Some(Self::CodeAnalysis),
-            "entity_description" => Some(Self::EntityDescription),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for CognitiveTaskType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-// ============================================
-// ProviderType
-// ============================================
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderType {
-    /// OpenAI Chat Completion API compatible endpoint.
-    OpenaiCompatible,
-    /// Anthropic Messages API (Claude models).
-    Anthropic,
-}
-
-impl std::fmt::Display for ProviderType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OpenaiCompatible => write!(f, "openai_compatible"),
-            Self::Anthropic => write!(f, "anthropic"),
-        }
-    }
-}
-
-// ============================================
-// ProviderConfig
-// ============================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderConfig {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub provider_type: ProviderType,
-    #[serde(default)]
-    pub api_base: String,
-    #[serde(default)]
-    pub api_key: Option<String>,
-    pub model: String,
-    #[serde(default)]
-    pub max_tokens: Option<u32>,
-    #[serde(default)]
-    pub temperature: Option<f32>,
-}
-
-// ============================================
-// TaskRoutingConfig
-// ============================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskRoutingConfig {
-    #[serde(default)]
-    pub session_title: Option<String>,
-    #[serde(default)]
-    pub community_narrative: Option<String>,
-    #[serde(default)]
-    pub conflict_resolution: Option<String>,
-    #[serde(default)]
-    pub recall_synthesis: Option<String>,
-    #[serde(default)]
-    pub code_analysis: Option<String>,
-    #[serde(default)]
-    pub entity_description: Option<String>,
-    #[serde(default)]
-    pub fallback: Option<String>,
-}
-
-impl TaskRoutingConfig {
-    #[must_use]
-    pub fn provider_for(&self, task_type: CognitiveTaskType) -> Option<&str> {
-        let explicit = match task_type {
-            CognitiveTaskType::SessionTitle => self.session_title.as_deref(),
-            CognitiveTaskType::CommunityNarrative => self.community_narrative.as_deref(),
-            CognitiveTaskType::ConflictResolution => self.conflict_resolution.as_deref(),
-            CognitiveTaskType::RecallSynthesis => self.recall_synthesis.as_deref(),
-            CognitiveTaskType::CodeAnalysis => self.code_analysis.as_deref(),
-            CognitiveTaskType::EntityDescription => self.entity_description.as_deref(),
-        };
-        explicit.or(self.fallback.as_deref())
-    }
-
-    fn all_referenced_providers(&self) -> Vec<&str> {
-        let fields = [
-            self.session_title.as_deref(),
-            self.community_narrative.as_deref(),
-            self.conflict_resolution.as_deref(),
-            self.recall_synthesis.as_deref(),
-            self.code_analysis.as_deref(),
-            self.entity_description.as_deref(),
-            self.fallback.as_deref(),
-        ];
-        fields.iter().filter_map(|f| *f).collect()
-    }
-}
-
-impl Default for TaskRoutingConfig {
-    fn default() -> Self {
-        Self {
-            session_title: None,
-            community_narrative: None,
-            conflict_resolution: None,
-            recall_synthesis: None,
-            code_analysis: None,
-            entity_description: None,
-            fallback: None,
-        }
-    }
-}
-
-// ============================================
-// PrivacyLevel
-// ============================================
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrivacyLevel {
-    Structured,
-    Full,
-}
-
-impl Default for PrivacyLevel {
-    fn default() -> Self { Self::Structured }
-}
-
-impl std::fmt::Display for PrivacyLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Structured => write!(f, "structured"),
-            Self::Full => write!(f, "full"),
-        }
-    }
-}
-
-// ============================================
-// PrivacyConfig
-// ============================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrivacyConfig {
-    #[serde(default)]
-    pub default_level: PrivacyLevel,
-    #[serde(default)]
-    pub allow_full_for: Vec<String>,
-}
-
-impl PrivacyConfig {
-    /// Get the effective privacy level for a given task type.
+    /// This prevents Miner ticks from accumulating duplicate tasks for the
+    /// same target object across repeated cycles.
     ///
-    /// ## v2.5.0+Fix
-    /// Returns owned `PrivacyLevel` (cloned) instead of `&PrivacyLevel` to avoid
-    /// the Rust lifetime error: `return &PrivacyLevel::Full` creates a temporary
-    /// that doesn't live long enough. Callers that previously matched on the
-    /// reference now match on the owned value.
-    #[must_use]
-    pub fn level_for(&self, task_type: CognitiveTaskType) -> PrivacyLevel {
-        if self.default_level == PrivacyLevel::Full {
-            return PrivacyLevel::Full;
-        }
-        if self.allow_full_for.iter().any(|t| t == task_type.as_str()) {
-            return PrivacyLevel::Full;
-        }
-        PrivacyLevel::Structured
-    }
+    /// ## Return Values
+    /// - `Ok(Some(id))` — new task inserted, `id` is the new row id
+    /// - `Ok(None)`     — active duplicate found, insertion skipped
+    /// - `Err(msg)`     — database error
+    ///
+    /// ⚠️ Callers in reflection.rs must be updated to handle `Option<i64>`.
+    pub async fn insert_cognitive_task(
+        &self,
+        task_type: &str,
+        priority: i64,
+        payload: &str,
+        prompt_messages: Option<&str>,
+        target_table: Option<&str>,
+        target_id: Option<&str>,
+        privacy_level: &str,
+        max_retries: i64,
+    ) -> Result<Option<i64>, String> {
+        let now = now_ts();
+        let conn = self.conn.lock().await;
 
-    /// Check if a specific task type is allowed to send full conversation content.
-    #[must_use]
-    pub fn is_full_allowed(&self, task_type: CognitiveTaskType) -> bool {
-        // Inline the check to avoid an extra clone from level_for()
-        self.default_level == PrivacyLevel::Full
-            || self.allow_full_for.iter().any(|t| t == task_type.as_str())
-    }
-}
+        // ── Idempotency check ──────────────────────────────────────────────
+        // Only guard when both target_table and target_id are provided.
+        // Tasks without a target (e.g. one-off recall_synthesis) always insert.
+        if let (Some(tbl), Some(tid)) = (target_table, target_id) {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM cognitive_tasks
+                    WHERE target_table = ?1
+                      AND target_id   = ?2
+                      AND task_type   = ?3
+                      AND status IN ('pending', 'processing')
+                )",
+                params![tbl, tid, task_type],
+                |row| row.get(0),
+            ).unwrap_or(false);
 
-impl Default for PrivacyConfig {
-    fn default() -> Self {
-        Self {
-            default_level: PrivacyLevel::Structured,
-            allow_full_for: Vec::new(),
-        }
-    }
-}
-
-// ============================================
-// WorkerConfig
-// ============================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerConfig {
-    #[serde(default = "default_poll_interval")]
-    pub poll_interval_secs: u64,
-    #[serde(default = "default_max_concurrent")]
-    pub max_concurrent: usize,
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
-    #[serde(default = "default_task_timeout")]
-    pub task_timeout_secs: u64,
-}
-
-fn default_poll_interval() -> u64 { 5 }
-fn default_max_concurrent() -> usize { 3 }
-fn default_max_retries() -> u32 { 3 }
-fn default_task_timeout() -> u64 { 120 }
-
-impl Default for WorkerConfig {
-    fn default() -> Self {
-        Self {
-            poll_interval_secs: default_poll_interval(),
-            max_concurrent: default_max_concurrent(),
-            max_retries: default_max_retries(),
-            task_timeout_secs: default_task_timeout(),
-        }
-    }
-}
-
-// ============================================
-// SuperNodeConfig
-// ============================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SuperNodeConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub providers: Vec<ProviderConfig>,
-    #[serde(default)]
-    pub routing: TaskRoutingConfig,
-    #[serde(default)]
-    pub privacy: PrivacyConfig,
-    #[serde(default)]
-    pub worker: WorkerConfig,
-}
-
-impl SuperNodeConfig {
-    pub fn validate(&self) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        if self.providers.is_empty() {
-            return Err(ServerError::config_invalid(
-                "memchain.supernode.providers",
-                "at least one provider must be configured when supernode is enabled",
-            ));
-        }
-
-        let mut seen_names: HashSet<String> = HashSet::new();
-        for (i, provider) in self.providers.iter().enumerate() {
-            let prefix = format!("memchain.supernode.providers[{}]", i);
-
-            if provider.name.is_empty() {
-                return Err(ServerError::config_invalid(
-                    &format!("{}.name", prefix),
-                    "provider name cannot be empty",
-                ));
-            }
-            if !seen_names.insert(provider.name.clone()) {
-                return Err(ServerError::config_invalid(
-                    &format!("{}.name", prefix),
-                    format!("duplicate provider name '{}'", provider.name),
-                ));
-            }
-
-            // api_base: required for openai_compatible; Anthropic has a well-known default.
-            // Audit Fix 10: fill in Anthropic default api_base during validation rather than
-            // accepting empty string — prevents runtime errors if AnthropicProvider forgets
-            // to apply the fallback itself.
-            if provider.api_base.is_empty() {
-                match provider.provider_type {
-                    ProviderType::OpenaiCompatible => {
-                        return Err(ServerError::config_invalid(
-                            &format!("{}.api_base", prefix),
-                            "api_base is required for openai_compatible providers",
-                        ));
-                    }
-                    ProviderType::Anthropic => {
-                        // Validation passes but we note this in the log.
-                        // server.rs::init_llm_router() should handle the default,
-                        // but AnthropicProvider::new() also has its own fallback.
-                        warn!(
-                            provider = %provider.name,
-                            "[SUPERNODE] Anthropic provider has empty api_base — \
-                             will use default https://api.anthropic.com at runtime"
-                        );
-                    }
-                }
-            }
-
-            if provider.model.is_empty() {
-                return Err(ServerError::config_invalid(
-                    &format!("{}.model", prefix),
-                    "model cannot be empty",
-                ));
-            }
-
-            if let Some(temp) = provider.temperature {
-                if temp < 0.0 || temp > 2.0 {
-                    return Err(ServerError::config_invalid(
-                        &format!("{}.temperature", prefix),
-                        format!("must be in [0.0, 2.0], got {}", temp),
-                    ));
-                }
-            }
-
-            if let Some(max_t) = provider.max_tokens {
-                if max_t == 0 {
-                    return Err(ServerError::config_invalid(
-                        &format!("{}.max_tokens", prefix),
-                        "must be > 0 when set",
-                    ));
-                }
-            }
-        }
-
-        let provider_names: HashSet<&str> = self.providers.iter()
-            .map(|p| p.name.as_str())
-            .collect();
-
-        for referenced in self.routing.all_referenced_providers() {
-            if !provider_names.contains(referenced) {
-                return Err(ServerError::config_invalid(
-                    "memchain.supernode.routing",
-                    format!(
-                        "references unknown provider '{}'. Available: {:?}",
-                        referenced,
-                        provider_names.iter().collect::<Vec<_>>()
-                    ),
-                ));
-            }
-        }
-
-        for task_name in &self.privacy.allow_full_for {
-            if CognitiveTaskType::from_str(task_name).is_none() {
-                warn!(
-                    task_type = %task_name,
-                    "[SUPERNODE] Unknown task type in privacy.allow_full_for — ignored. \
-                     Valid types: session_title, community_narrative, conflict_resolution, \
-                     recall_synthesis, code_analysis, entity_description"
+            if exists {
+                debug!(
+                    task_type = task_type,
+                    target = %format!("{}/{}", tbl, tid),
+                    "[STORAGE_SN] Duplicate active task — skipped"
                 );
+                return Ok(None);
             }
         }
 
-        if self.worker.poll_interval_secs == 0 {
-            return Err(ServerError::config_invalid(
-                "memchain.supernode.worker.poll_interval_secs",
-                "must be >= 1",
-            ));
+        // ── Insert ────────────────────────────────────────────────────────
+        conn.execute(
+            "INSERT INTO cognitive_tasks
+                (task_type, priority, status, payload, prompt_messages,
+                 target_table, target_id, privacy_level, max_retries, created_at)
+             VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                task_type, priority, payload, prompt_messages,
+                target_table, target_id, privacy_level, max_retries, now,
+            ],
+        ).map_err(|e| format!("Insert cognitive_task: {}", e))?;
+
+        let id = conn.last_insert_rowid();
+        debug!(id = id, task_type = task_type, "[STORAGE_SN] Task enqueued");
+        Ok(Some(id))
+    }
+
+    /// Recover tasks stuck in 'processing' after a server crash or restart.
+    ///
+    /// ## When to Call
+    /// Call ONCE at server startup, before TaskWorker spawns. Typical location:
+    /// `server.rs::init_llm_router()` or immediately before `TaskWorker::spawn()`.
+    ///
+    /// ## Logic
+    /// Any task that has been in 'processing' for longer than `timeout_secs`
+    /// is assumed to have been orphaned by a crash. It is reset to 'pending'
+    /// so the TaskWorker can re-claim it.
+    ///
+    /// The `retry_count` is NOT incremented here — the crash was not the task's
+    /// fault. The error_message is set to indicate the recovery event for audit.
+    ///
+    /// ## Parameters
+    /// - `timeout_secs` — should match `supernode.worker.task_timeout_secs` from config.
+    ///   Recommended: 120–300 seconds.
+    ///
+    /// Returns the number of tasks recovered.
+    pub async fn reset_stale_processing_tasks(&self, timeout_secs: i64) -> usize {
+        let now = now_ts();
+        let stale_before = now - timeout_secs;
+
+        let conn = self.conn.lock().await;
+        match conn.execute(
+            "UPDATE cognitive_tasks
+             SET status        = 'pending',
+                 started_at    = NULL,
+                 error_message = 'Recovered: task was in processing at server startup'
+             WHERE status     = 'processing'
+               AND started_at < ?1",
+            params![stale_before],
+        ) {
+            Ok(n) => {
+                if n > 0 {
+                    info!(
+                        recovered = n,
+                        timeout_secs = timeout_secs,
+                        "[STORAGE_SN] Recovered stale processing tasks on startup"
+                    );
+                }
+                n
+            }
+            Err(e) => {
+                warn!("[STORAGE_SN] reset_stale_processing_tasks failed: {}", e);
+                0
+            }
+        }
+    }
+
+    /// Atomically claim up to `batch_size` pending tasks for processing.
+    ///
+    /// Uses a single connection lock (SELECT + UPDATE atomic).
+    /// ⚠️ Do NOT split into two conn.lock() calls — would allow double-claiming.
+    pub async fn claim_pending_tasks(&self, batch_size: usize) -> Vec<CognitiveTaskRow> {
+        let now = now_ts();
+        let conn = self.conn.lock().await;
+
+        let mut stmt = match conn.prepare(
+            "SELECT id, task_type, priority, status, payload, result,
+                    target_table, target_id, privacy_level, provider_used, model_used,
+                    token_usage, created_at, started_at, completed_at,
+                    retry_count, max_retries, error_message
+             FROM cognitive_tasks
+             WHERE status = 'pending' AND retry_count < max_retries
+             ORDER BY priority DESC, created_at ASC
+             LIMIT ?1"
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("[STORAGE_SN] claim_pending_tasks prepare failed: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let tasks: Vec<CognitiveTaskRow> = stmt
+            .query_map(params![batch_size as i64], |row| Ok(task_row(row)?))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+
+        if tasks.is_empty() {
+            return tasks;
         }
 
-        info!(
-            providers = self.providers.len(),
-            fallback = ?self.routing.fallback,
-            privacy = %self.privacy.default_level,
-            poll_interval = self.worker.poll_interval_secs,
-            max_concurrent = self.worker.max_concurrent,
-            "[SUPERNODE] Configuration validated"
-        );
+        for task in &tasks {
+            let _ = conn.execute(
+                "UPDATE cognitive_tasks SET status = 'processing', started_at = ?1
+                 WHERE id = ?2 AND status = 'pending'",
+                params![now, task.id],
+            );
+        }
 
+        debug!(claimed = tasks.len(), "[STORAGE_SN] Tasks claimed");
+        tasks
+    }
+
+    /// Mark a task as completed.
+    pub async fn complete_task(
+        &self,
+        task_id: i64,
+        result: &str,
+        provider_used: &str,
+        model_used: &str,
+        token_usage_json: &str,
+    ) -> Result<(), String> {
+        let now = now_ts();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE cognitive_tasks SET
+                status = 'completed', result = ?1,
+                provider_used = ?2, model_used = ?3,
+                token_usage = ?4, completed_at = ?5
+             WHERE id = ?6",
+            params![result, provider_used, model_used, token_usage_json, now, task_id],
+        ).map_err(|e| format!("complete_task {}: {}", task_id, e))?;
+        debug!(id = task_id, "[STORAGE_SN] Task completed");
         Ok(())
     }
 
-    #[must_use]
-    pub fn is_enabled(&self) -> bool { self.enabled }
+    /// Record a task failure. Resets to 'pending' if retries remain, else 'failed'.
+    pub async fn fail_task(&self, task_id: i64, error_message: &str) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        let (retry_count, max_retries): (i64, i64) = conn.query_row(
+            "SELECT retry_count, max_retries FROM cognitive_tasks WHERE id = ?1",
+            params![task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(|e| format!("fail_task fetch {}: {}", task_id, e))?;
 
-    #[must_use]
-    pub fn effective_fallback(&self) -> Option<&str> {
-        self.routing.fallback.as_deref()
-            .or_else(|| self.providers.first().map(|p| p.name.as_str()))
+        let new_count = retry_count + 1;
+        let new_status = if new_count >= max_retries { "failed" } else { "pending" };
+
+        conn.execute(
+            "UPDATE cognitive_tasks SET
+                status = ?1, retry_count = ?2,
+                error_message = ?3, started_at = NULL
+             WHERE id = ?4",
+            params![new_status, new_count, error_message, task_id],
+        ).map_err(|e| format!("fail_task update {}: {}", task_id, e))?;
+
+        debug!(id = task_id, retries = new_count, status = new_status, "[STORAGE_SN] Task failed");
+        Ok(())
     }
 
-    #[must_use]
-    pub fn get_provider(&self, name: &str) -> Option<&ProviderConfig> {
-        self.providers.iter().find(|p| p.name == name)
+    /// Human-initiated retry: reset failed/cancelled task to pending.
+    ///
+    /// Unlike fail_task() (worker-called), this is the management API override.
+    /// Increments retry_count by 1 (audit trail), but always allows the reset
+    /// regardless of retry_count vs max_retries.
+    /// Clears error_message and started_at for a clean attempt.
+    pub async fn retry_task(&self, task_id: i64) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+
+        let (status, retry_count): (String, i64) = conn.query_row(
+            "SELECT status, retry_count FROM cognitive_tasks WHERE id = ?1",
+            params![task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(|e| format!("retry_task fetch {}: {}", task_id, e))?;
+
+        if status != "failed" && status != "cancelled" {
+            return Err(format!(
+                "Task {} is '{}', can only retry 'failed' or 'cancelled'",
+                task_id, status
+            ));
+        }
+
+        conn.execute(
+            "UPDATE cognitive_tasks SET
+                status = 'pending', retry_count = ?1,
+                error_message = NULL, started_at = NULL
+             WHERE id = ?2",
+            params![retry_count + 1, task_id],
+        ).map_err(|e| format!("retry_task update {}: {}", task_id, e))?;
+
+        debug!(id = task_id, new_retry_count = retry_count + 1, "[STORAGE_SN] Task queued for retry");
+        Ok(())
     }
 
-    #[must_use]
-    pub fn provider_for_task(&self, task_type: CognitiveTaskType) -> Option<&ProviderConfig> {
-        let provider_name = self.routing.provider_for(task_type)
-            .or_else(|| self.effective_fallback())?;
-        self.get_provider(provider_name)
+    /// Cancel a pending task (pending → cancelled). No-op if not pending.
+    pub async fn cancel_task(&self, task_id: i64) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE cognitive_tasks SET status = 'cancelled'
+             WHERE id = ?1 AND status = 'pending'",
+            params![task_id],
+        ).map_err(|e| format!("cancel_task {}: {}", task_id, e))?;
+        debug!(id = task_id, "[STORAGE_SN] Task cancelled");
+        Ok(())
+    }
+
+    /// Get a single task by id.
+    pub async fn get_task(&self, task_id: i64) -> Option<CognitiveTaskRow> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT id, task_type, priority, status, payload, result,
+                    target_table, target_id, privacy_level, provider_used, model_used,
+                    token_usage, created_at, started_at, completed_at,
+                    retry_count, max_retries, error_message
+             FROM cognitive_tasks WHERE id = ?1",
+            params![task_id],
+            |row| task_row(row),
+        ).optional().unwrap_or(None)
+    }
+
+    /// List tasks filtered by status, newest first.
+    pub async fn get_tasks_by_status(&self, status: &str, limit: usize) -> Vec<CognitiveTaskRow> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT id, task_type, priority, status, payload, result,
+                    target_table, target_id, privacy_level, provider_used, model_used,
+                    token_usage, created_at, started_at, completed_at,
+                    retry_count, max_retries, error_message
+             FROM cognitive_tasks
+             WHERE status = ?1
+             ORDER BY created_at DESC
+             LIMIT ?2"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+
+        stmt.query_map(params![status, limit as i64], |row| task_row(row))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// List tasks with optional status and task_type filters (Phase D).
+    ///
+    /// Either filter may be None (wildcard). Ordered by priority DESC, created_at ASC.
+    pub async fn get_tasks_filtered(
+        &self,
+        status: Option<&str>,
+        task_type: Option<&str>,
+        limit: usize,
+    ) -> Vec<CognitiveTaskRow> {
+        let conn = self.conn.lock().await;
+        let limit_i = limit.min(100) as i64;
+
+        // Four SQL variants to avoid dynamic string building
+        match (status, task_type) {
+            (Some(s), Some(t)) => {
+                let mut stmt = match conn.prepare(
+                    "SELECT id, task_type, priority, status, payload, result,
+                            target_table, target_id, privacy_level, provider_used, model_used,
+                            token_usage, created_at, started_at, completed_at,
+                            retry_count, max_retries, error_message
+                     FROM cognitive_tasks
+                     WHERE status = ?1 AND task_type = ?2
+                     ORDER BY priority DESC, created_at ASC LIMIT ?3"
+                ) { Ok(s) => s, Err(_) => return Vec::new() };
+                stmt.query_map(params![s, t, limit_i], |row| task_row(row))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
+            }
+            (Some(s), None) => {
+                let mut stmt = match conn.prepare(
+                    "SELECT id, task_type, priority, status, payload, result,
+                            target_table, target_id, privacy_level, provider_used, model_used,
+                            token_usage, created_at, started_at, completed_at,
+                            retry_count, max_retries, error_message
+                     FROM cognitive_tasks
+                     WHERE status = ?1
+                     ORDER BY priority DESC, created_at ASC LIMIT ?2"
+                ) { Ok(s) => s, Err(_) => return Vec::new() };
+                stmt.query_map(params![s, limit_i], |row| task_row(row))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
+            }
+            (None, Some(t)) => {
+                let mut stmt = match conn.prepare(
+                    "SELECT id, task_type, priority, status, payload, result,
+                            target_table, target_id, privacy_level, provider_used, model_used,
+                            token_usage, created_at, started_at, completed_at,
+                            retry_count, max_retries, error_message
+                     FROM cognitive_tasks
+                     WHERE task_type = ?1
+                     ORDER BY priority DESC, created_at ASC LIMIT ?2"
+                ) { Ok(s) => s, Err(_) => return Vec::new() };
+                stmt.query_map(params![t, limit_i], |row| task_row(row))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
+            }
+            (None, None) => {
+                let mut stmt = match conn.prepare(
+                    "SELECT id, task_type, priority, status, payload, result,
+                            target_table, target_id, privacy_level, provider_used, model_used,
+                            token_usage, created_at, started_at, completed_at,
+                            retry_count, max_retries, error_message
+                     FROM cognitive_tasks
+                     ORDER BY priority DESC, created_at ASC LIMIT ?1"
+                ) { Ok(s) => s, Err(_) => return Vec::new() };
+                stmt.query_map(params![limit_i], |row| task_row(row))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    /// Find tasks for a specific (target_table, target_id) pair.
+    pub async fn get_tasks_for_target(
+        &self,
+        target_table: &str,
+        target_id: &str,
+        status_filter: Option<&str>,
+    ) -> Vec<CognitiveTaskRow> {
+        let conn = self.conn.lock().await;
+
+        match status_filter {
+            Some(s) => {
+                let mut stmt = match conn.prepare(
+                    "SELECT id, task_type, priority, status, payload, result,
+                            target_table, target_id, privacy_level, provider_used, model_used,
+                            token_usage, created_at, started_at, completed_at,
+                            retry_count, max_retries, error_message
+                     FROM cognitive_tasks
+                     WHERE target_table = ?1 AND target_id = ?2 AND status = ?3
+                     ORDER BY created_at DESC"
+                ) { Ok(s) => s, Err(_) => return Vec::new() };
+                stmt.query_map(params![target_table, target_id, s], |row| task_row(row))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
+            }
+            None => {
+                let mut stmt = match conn.prepare(
+                    "SELECT id, task_type, priority, status, payload, result,
+                            target_table, target_id, privacy_level, provider_used, model_used,
+                            token_usage, created_at, started_at, completed_at,
+                            retry_count, max_retries, error_message
+                     FROM cognitive_tasks
+                     WHERE target_table = ?1 AND target_id = ?2
+                     ORDER BY created_at DESC"
+                ) { Ok(s) => s, Err(_) => return Vec::new() };
+                stmt.query_map(params![target_table, target_id], |row| task_row(row))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    /// Get task counts grouped by status (Phase D).
+    ///
+    /// Returns HashMap<status, count>. All 5 expected statuses always present.
+    /// Used by /status and /supernode/health for queue summary.
+    pub async fn count_tasks_by_status(&self) -> HashMap<String, i64> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT status, COUNT(*) FROM cognitive_tasks GROUP BY status"
+        ) {
+            Ok(s) => s,
+            Err(_) => return HashMap::new(),
+        };
+
+        let raw: HashMap<String, i64> = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+
+        // Ensure all expected statuses are present (prevents key-not-found panics in callers)
+        let mut result = HashMap::new();
+        for s in &["pending", "processing", "completed", "failed", "cancelled"] {
+            result.insert(s.to_string(), *raw.get(*s).unwrap_or(&0));
+        }
+        result
     }
 }
 
-impl Default for SuperNodeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            providers: Vec::new(),
-            routing: TaskRoutingConfig::default(),
-            privacy: PrivacyConfig::default(),
-            worker: WorkerConfig::default(),
+// ============================================
+// impl MemoryStorage — llm_usage_log CRUD
+// ============================================
+
+impl MemoryStorage {
+    /// Record a single LLM call.
+    pub async fn insert_usage_log(
+        &self,
+        task_id: Option<i64>,
+        provider: &str,
+        model: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        cached_tokens: i64,
+        latency_ms: i64,
+    ) -> Result<(), String> {
+        let now = now_ts();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO llm_usage_log
+                (task_id, provider, model, input_tokens, output_tokens,
+                 cached_tokens, latency_ms, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![task_id, provider, model, input_tokens, output_tokens,
+                    cached_tokens, latency_ms, now],
+        ).map_err(|e| format!("insert_usage_log: {}", e))?;
+        Ok(())
+    }
+
+    /// Get aggregated usage stats by provider for a time window.
+    ///
+    /// `since` = 0 means all time. `until` = 0 means now.
+    pub async fn get_usage_stats(&self, since: i64, until: i64) -> LlmUsageStats {
+        let now = now_ts();
+        let since = since.max(0);
+        let until = if until == 0 { now } else { until };
+
+        let conn = self.conn.lock().await;
+
+        let (total_calls, total_input, total_output, total_cached, avg_latency):
+            (i64, i64, i64, i64, f64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(cached_tokens),0), COALESCE(AVG(latency_ms),0.0)
+             FROM llm_usage_log
+             WHERE created_at >= ?1 AND created_at <= ?2",
+            params![since, until],
+            |row| Ok((
+                row.get(0).unwrap_or(0),
+                row.get(1).unwrap_or(0),
+                row.get(2).unwrap_or(0),
+                row.get(3).unwrap_or(0),
+                row.get(4).unwrap_or(0.0),
+            )),
+        ).unwrap_or((0, 0, 0, 0, 0.0));
+
+        // By-provider breakdown — isolated stmt scope to avoid borrow conflict
+        let by_provider: Vec<ProviderUsage> = {
+            let mut stmt = match conn.prepare(
+                "SELECT provider, COUNT(*), SUM(input_tokens), SUM(output_tokens), AVG(latency_ms)
+                 FROM llm_usage_log
+                 WHERE created_at >= ?1 AND created_at <= ?2
+                 GROUP BY provider
+                 ORDER BY COUNT(*) DESC"
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("[STORAGE_SN] get_usage_stats by_provider prepare failed: {}", e);
+                    return LlmUsageStats {
+                        window_start: since, window_end: until,
+                        total_calls, total_input_tokens: total_input,
+                        total_output_tokens: total_output, total_cached_tokens: total_cached,
+                        avg_latency_ms: avg_latency, by_provider: Vec::new(),
+                    };
+                }
+            };
+            stmt.query_map(params![since, until], |row| {
+                Ok(ProviderUsage {
+                    provider: row.get(0)?,
+                    calls: row.get(1)?,
+                    input_tokens: row.get(2)?,
+                    output_tokens: row.get(3)?,
+                    avg_latency_ms: row.get(4).unwrap_or(0.0),
+                })
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        };
+
+        LlmUsageStats {
+            window_start: since, window_end: until,
+            total_calls, total_input_tokens: total_input,
+            total_output_tokens: total_output, total_cached_tokens: total_cached,
+            avg_latency_ms: avg_latency, by_provider,
         }
     }
+
+    /// Get usage stats aggregated by both task_type AND provider (Phase D).
+    ///
+    /// Two-dimensional breakdown for the management UI.
+    /// Tasks without a task_id in llm_usage_log are excluded (JOIN filters them).
+    pub async fn get_usage_stats_by_task_type(
+        &self, since: i64, until: i64,
+    ) -> Vec<TaskTypeUsage> {
+        let now = now_ts();
+        let since = since.max(0);
+        let until = if until == 0 { now } else { until };
+
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT ct.task_type, ul.provider,
+                    COUNT(*), SUM(ul.input_tokens), SUM(ul.output_tokens),
+                    SUM(ul.cached_tokens), AVG(ul.latency_ms)
+             FROM llm_usage_log ul
+             JOIN cognitive_tasks ct ON ct.id = ul.task_id
+             WHERE ul.created_at >= ?1 AND ul.created_at <= ?2
+             GROUP BY ct.task_type, ul.provider
+             ORDER BY COUNT(*) DESC"
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("[STORAGE_SN] get_usage_stats_by_task_type prepare failed: {}", e);
+                return Vec::new();
+            }
+        };
+
+        stmt.query_map(params![since, until], |row| {
+            Ok(TaskTypeUsage {
+                task_type: row.get(0)?,
+                provider: row.get(1)?,
+                calls: row.get(2)?,
+                input_tokens: row.get(3)?,
+                output_tokens: row.get(4)?,
+                cached_tokens: row.get(5)?,
+                avg_latency_ms: row.get(6).unwrap_or(0.0),
+            })
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+}
+
+// ============================================
+// Private helpers
+// ============================================
+
+fn now_ts() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Map a rusqlite Row to CognitiveTaskRow (shared across all SELECT queries).
+fn task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CognitiveTaskRow> {
+    Ok(CognitiveTaskRow {
+        id: row.get(0)?,
+        task_type: row.get(1)?,
+        priority: row.get(2)?,
+        status: row.get(3)?,
+        payload: row.get(4)?,
+        result: row.get(5)?,
+        target_table: row.get(6)?,
+        target_id: row.get(7)?,
+        privacy_level: row.get(8)?,
+        provider_used: row.get(9)?,
+        model_used: row.get(10)?,
+        token_usage: row.get(11)?,
+        created_at: row.get(12)?,
+        started_at: row.get(13)?,
+        completed_at: row.get(14)?,
+        retry_count: row.get(15)?,
+        max_retries: row.get(16)?,
+        error_message: row.get(17)?,
+    })
 }
 
 // ============================================
@@ -528,343 +778,333 @@ impl Default for SuperNodeConfig {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_default_is_disabled() {
-        let cfg = SuperNodeConfig::default();
-        assert!(!cfg.enabled);
-        assert!(!cfg.is_enabled());
-        assert!(cfg.providers.is_empty());
-        assert!(cfg.validate().is_ok());
+    #[tokio::test]
+    async fn test_insert_and_claim_task() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let id = s.insert_cognitive_task(
+            "session_title", 5, r#"{"session_id":"sess_001"}"#,
+            None, Some("sessions"), Some("sess_001"), "structured", 3,
+        ).await.unwrap().expect("Should insert first task");
+        assert!(id > 0);
+
+        let claimed = s.claim_pending_tasks(10).await;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, id);
+
+        // Double-claim prevention
+        let claimed2 = s.claim_pending_tasks(10).await;
+        assert!(claimed2.is_empty());
     }
 
-    #[test]
-    fn test_disabled_skips_all_validation() {
-        let cfg = SuperNodeConfig { enabled: false, providers: Vec::new(), ..Default::default() };
-        assert!(cfg.validate().is_ok());
+    /// (v2.5.0+Fix) Verify idempotency: inserting the same (target_table, target_id,
+    /// task_type) while an active task exists must return Ok(None).
+    #[tokio::test]
+    async fn test_insert_cognitive_task_dedup() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+
+        // First insert — should succeed
+        let id1 = s.insert_cognitive_task(
+            "session_title", 5, r#"{"session_id":"sess_001"}"#,
+            None, Some("sessions"), Some("sess_001"), "structured", 3,
+        ).await.unwrap();
+        assert!(id1.is_some(), "First insert must succeed");
+
+        // Second insert — same triple, status=pending → must be skipped
+        let id2 = s.insert_cognitive_task(
+            "session_title", 5, r#"{"session_id":"sess_001"}"#,
+            None, Some("sessions"), Some("sess_001"), "structured", 3,
+        ).await.unwrap();
+        assert!(id2.is_none(), "Duplicate pending task must be skipped");
+
+        // Only one task should exist
+        let tasks = s.get_tasks_filtered(None, Some("session_title"), 10).await;
+        assert_eq!(tasks.len(), 1);
+
+        // Different task_type on same target → allowed
+        let id3 = s.insert_cognitive_task(
+            "code_analysis", 5, r#"{}"#,
+            None, Some("sessions"), Some("sess_001"), "structured", 3,
+        ).await.unwrap();
+        assert!(id3.is_some(), "Different task_type on same target must be allowed");
+
+        // After completion, same type may be re-inserted
+        let id1_unwrapped = id1.unwrap();
+        s.claim_pending_tasks(10).await;
+        s.complete_task(id1_unwrapped, r#"{"title":"Done"}"#, "openai", "gpt-4o-mini", "{}").await.unwrap();
+
+        let id4 = s.insert_cognitive_task(
+            "session_title", 5, r#"{"session_id":"sess_001"}"#,
+            None, Some("sessions"), Some("sess_001"), "structured", 3,
+        ).await.unwrap();
+        assert!(id4.is_some(), "Re-insert after completion must succeed");
     }
 
-    #[test]
-    fn test_enabled_requires_providers() {
-        let cfg = SuperNodeConfig { enabled: true, providers: Vec::new(), ..Default::default() };
-        assert!(cfg.validate().is_err());
+    /// Tasks with no target (recall_synthesis style) always insert regardless.
+    #[tokio::test]
+    async fn test_insert_no_target_always_inserts() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+
+        let id1 = s.insert_cognitive_task(
+            "recall_synthesis", 5, r#"{}"#,
+            None, None, None, "structured", 3,
+        ).await.unwrap();
+        let id2 = s.insert_cognitive_task(
+            "recall_synthesis", 5, r#"{}"#,
+            None, None, None, "structured", 3,
+        ).await.unwrap();
+
+        assert!(id1.is_some());
+        assert!(id2.is_some());
+        assert_ne!(id1.unwrap(), id2.unwrap());
     }
 
-    #[test]
-    fn test_provider_empty_name_rejected() {
-        let cfg = SuperNodeConfig {
-            enabled: true,
-            providers: vec![ProviderConfig {
-                name: String::new(),
-                provider_type: ProviderType::OpenaiCompatible,
-                api_base: "http://localhost:11434/v1".into(),
-                api_key: None, model: "test".into(), max_tokens: None, temperature: None,
-            }],
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
+    /// (v2.5.0+Fix) Verify startup recovery resets stale processing tasks.
+    #[tokio::test]
+    async fn test_reset_stale_processing_tasks() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
 
-    #[test]
-    fn test_provider_duplicate_name_rejected() {
-        let provider = ProviderConfig {
-            name: "deepseek".into(), provider_type: ProviderType::OpenaiCompatible,
-            api_base: "http://api.deepseek.com/v1".into(), api_key: None,
-            model: "deepseek-reasoner".into(), max_tokens: None, temperature: None,
-        };
-        let cfg = SuperNodeConfig {
-            enabled: true, providers: vec![provider.clone(), provider], ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
+        // Insert and claim a task (moves to 'processing')
+        let id = s.insert_cognitive_task(
+            "session_title", 5, r#"{}"#,
+            None, Some("sessions"), Some("s1"), "structured", 3,
+        ).await.unwrap().unwrap();
+        s.claim_pending_tasks(1).await;
 
-    #[test]
-    fn test_openai_compat_requires_api_base() {
-        let cfg = SuperNodeConfig {
-            enabled: true,
-            providers: vec![ProviderConfig {
-                name: "test".into(), provider_type: ProviderType::OpenaiCompatible,
-                api_base: String::new(), api_key: None, model: "test-model".into(),
-                max_tokens: None, temperature: None,
-            }],
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn test_anthropic_allows_empty_api_base() {
-        let cfg = SuperNodeConfig {
-            enabled: true,
-            providers: vec![ProviderConfig {
-                name: "claude".into(), provider_type: ProviderType::Anthropic,
-                api_base: String::new(), api_key: Some("$ANTHROPIC_API_KEY".into()),
-                model: "claude-sonnet-4-20250514".into(), max_tokens: None, temperature: None,
-            }],
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn test_temperature_out_of_range() {
-        let cfg = SuperNodeConfig {
-            enabled: true,
-            providers: vec![ProviderConfig {
-                name: "test".into(), provider_type: ProviderType::Anthropic,
-                api_base: String::new(), api_key: None, model: "test".into(),
-                max_tokens: None, temperature: Some(2.5),
-            }],
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn test_temperature_boundary_values() {
-        for temp in [0.0f32, 1.0, 2.0] {
-            let cfg = SuperNodeConfig {
-                enabled: true,
-                providers: vec![ProviderConfig {
-                    name: "test".into(), provider_type: ProviderType::Anthropic,
-                    api_base: String::new(), api_key: None, model: "test".into(),
-                    max_tokens: None, temperature: Some(temp),
-                }],
-                ..Default::default()
-            };
-            assert!(cfg.validate().is_ok(), "temperature {} should be valid", temp);
+        // Manually back-date started_at to simulate a stale task
+        {
+            let conn = s.conn.lock().await;
+            conn.execute(
+                "UPDATE cognitive_tasks SET started_at = started_at - 1000 WHERE id = ?1",
+                params![id],
+            ).unwrap();
         }
+
+        let recovered = s.reset_stale_processing_tasks(60).await;
+        assert_eq!(recovered, 1);
+
+        let task = s.get_task(id).await.unwrap();
+        assert_eq!(task.status, "pending");
+        assert_eq!(task.retry_count, 0, "retry_count must NOT be incremented by recovery");
+        assert!(task.error_message.unwrap_or_default().contains("Recovered"));
     }
 
-    #[test]
-    fn test_max_tokens_zero_rejected() {
-        let cfg = SuperNodeConfig {
-            enabled: true,
-            providers: vec![ProviderConfig {
-                name: "test".into(), provider_type: ProviderType::Anthropic,
-                api_base: String::new(), api_key: None, model: "test".into(),
-                max_tokens: Some(0), temperature: None,
-            }],
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
+    /// Within-timeout tasks must NOT be reset.
+    #[tokio::test]
+    async fn test_reset_stale_skips_fresh_processing() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        s.insert_cognitive_task(
+            "session_title", 5, r#"{}"#,
+            None, Some("sessions"), Some("s1"), "structured", 3,
+        ).await.unwrap();
+        s.claim_pending_tasks(1).await;
+
+        // started_at is just now — should NOT be reset with 120s timeout
+        let recovered = s.reset_stale_processing_tasks(120).await;
+        assert_eq!(recovered, 0);
     }
 
-    #[test]
-    fn test_routing_unknown_provider_rejected() {
-        let cfg = SuperNodeConfig {
-            enabled: true,
-            providers: vec![ProviderConfig {
-                name: "deepseek".into(), provider_type: ProviderType::OpenaiCompatible,
-                api_base: "http://api.deepseek.com/v1".into(), api_key: None,
-                model: "deepseek-reasoner".into(), max_tokens: None, temperature: None,
-            }],
-            routing: TaskRoutingConfig {
-                session_title: Some("nonexistent_provider".into()), ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
+    #[tokio::test]
+    async fn test_complete_task() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let id = s.insert_cognitive_task(
+            "session_title", 5, r#"{"session_id":"s1"}"#,
+            None, Some("sessions"), Some("s1"), "structured", 3,
+        ).await.unwrap().unwrap();
+        s.claim_pending_tasks(1).await;
+        s.complete_task(id, r#"{"title":"Project Alpha: JWT"}"#,
+            "openai", "gpt-4o-mini",
+            r#"{"input":50,"output":10,"cached":0}"#
+        ).await.unwrap();
+        let t = s.get_task(id).await.unwrap();
+        assert_eq!(t.status, "completed");
+        assert!(t.result.is_some());
     }
 
-    #[test]
-    fn test_routing_valid_references() {
-        let cfg = SuperNodeConfig {
-            enabled: true,
-            providers: vec![
-                ProviderConfig {
-                    name: "deepseek".into(), provider_type: ProviderType::OpenaiCompatible,
-                    api_base: "http://api.deepseek.com/v1".into(), api_key: None,
-                    model: "deepseek-reasoner".into(), max_tokens: None, temperature: None,
-                },
-                ProviderConfig {
-                    name: "claude".into(), provider_type: ProviderType::Anthropic,
-                    api_base: String::new(), api_key: Some("$ANTHROPIC_API_KEY".into()),
-                    model: "claude-sonnet-4-20250514".into(), max_tokens: None, temperature: None,
-                },
-            ],
-            routing: TaskRoutingConfig {
-                session_title: Some("deepseek".into()),
-                code_analysis: Some("claude".into()),
-                fallback: Some("deepseek".into()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_ok());
+    #[tokio::test]
+    async fn test_fail_task_retries() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let id = s.insert_cognitive_task(
+            "community_summary", 3, r#"{}"#,
+            None, None, None, "structured", 2,
+        ).await.unwrap().unwrap();
+        s.claim_pending_tasks(1).await;
+
+        // First fail → back to pending
+        s.fail_task(id, "timeout").await.unwrap();
+        let t = s.get_task(id).await.unwrap();
+        assert_eq!(t.status, "pending");
+        assert_eq!(t.retry_count, 1);
+
+        // Second fail → failed (retry_count=2 >= max_retries=2)
+        s.claim_pending_tasks(1).await;
+        s.fail_task(id, "timeout again").await.unwrap();
+        let t2 = s.get_task(id).await.unwrap();
+        assert_eq!(t2.status, "failed");
     }
 
-    #[test]
-    fn test_worker_poll_interval_zero_rejected() {
-        let cfg = SuperNodeConfig {
-            enabled: true,
-            providers: vec![ProviderConfig {
-                name: "test".into(), provider_type: ProviderType::Anthropic,
-                api_base: String::new(), api_key: None, model: "test".into(),
-                max_tokens: None, temperature: None,
-            }],
-            worker: WorkerConfig { poll_interval_secs: 0, ..Default::default() },
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
+    #[tokio::test]
+    async fn test_retry_task_resets_to_pending() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let id = s.insert_cognitive_task(
+            "session_title", 5, r#"{}"#,
+            None, None, None, "structured", 1,
+        ).await.unwrap().unwrap();
+        s.claim_pending_tasks(1).await;
+        // Exhaust retries
+        s.fail_task(id, "error").await.unwrap();
+        let t = s.get_task(id).await.unwrap();
+        assert_eq!(t.status, "failed");
+
+        // Human retry override
+        s.retry_task(id).await.unwrap();
+        let t2 = s.get_task(id).await.unwrap();
+        assert_eq!(t2.status, "pending");
+        assert_eq!(t2.retry_count, 2); // incremented, not reset
     }
 
-    #[test]
-    fn test_worker_defaults_valid() {
-        let worker = WorkerConfig::default();
-        assert_eq!(worker.poll_interval_secs, 5);
-        assert_eq!(worker.max_concurrent, 3);
-        assert_eq!(worker.max_retries, 3);
-        assert_eq!(worker.task_timeout_secs, 120);
+    #[tokio::test]
+    async fn test_retry_task_rejects_non_failed() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let id = s.insert_cognitive_task(
+            "session_title", 5, r#"{}"#,
+            None, None, None, "structured", 3,
+        ).await.unwrap().unwrap();
+        // Task is pending — retry should fail
+        let result = s.retry_task(id).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("pending"));
     }
 
-    #[test]
-    fn test_privacy_level_for_task_returns_owned() {
-        // v2.5.0+Fix: level_for() now returns owned PrivacyLevel
-        let privacy = PrivacyConfig {
-            default_level: PrivacyLevel::Structured,
-            allow_full_for: vec!["session_title".into(), "code_analysis".into()],
-        };
-        assert_eq!(privacy.level_for(CognitiveTaskType::SessionTitle), PrivacyLevel::Full);
-        assert_eq!(privacy.level_for(CognitiveTaskType::CodeAnalysis), PrivacyLevel::Full);
-        assert_eq!(privacy.level_for(CognitiveTaskType::CommunityNarrative), PrivacyLevel::Structured);
+    #[tokio::test]
+    async fn test_cancel_task() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let id = s.insert_cognitive_task(
+            "entity_description", 5, r#"{}"#,
+            None, None, None, "structured", 3,
+        ).await.unwrap().unwrap();
+        s.cancel_task(id).await.unwrap();
+        let t = s.get_task(id).await.unwrap();
+        assert_eq!(t.status, "cancelled");
+
+        let claimed = s.claim_pending_tasks(10).await;
+        assert!(claimed.is_empty());
     }
 
-    #[test]
-    fn test_privacy_is_full_allowed() {
-        let privacy = PrivacyConfig {
-            default_level: PrivacyLevel::Structured,
-            allow_full_for: vec!["session_title".into()],
-        };
-        assert!(privacy.is_full_allowed(CognitiveTaskType::SessionTitle));
-        assert!(!privacy.is_full_allowed(CognitiveTaskType::CommunityNarrative));
+    #[tokio::test]
+    async fn test_priority_ordering() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        s.insert_cognitive_task("t", 2, "{}", None, None, None, "structured", 3).await.unwrap();
+        s.insert_cognitive_task("t", 9, "{}", None, None, None, "structured", 3).await.unwrap();
+        s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3).await.unwrap();
+
+        let claimed = s.claim_pending_tasks(3).await;
+        assert_eq!(claimed.len(), 3);
+        assert_eq!(claimed[0].priority, 9);
+        assert_eq!(claimed[1].priority, 5);
+        assert_eq!(claimed[2].priority, 2);
     }
 
-    #[test]
-    fn test_privacy_full_default_overrides_all() {
-        let privacy = PrivacyConfig { default_level: PrivacyLevel::Full, allow_full_for: Vec::new() };
-        for task in CognitiveTaskType::ALL {
-            assert!(privacy.is_full_allowed(*task));
-        }
+    #[tokio::test]
+    async fn test_get_tasks_filtered() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        s.insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3).await.unwrap();
+        s.insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3).await.unwrap();
+        s.insert_cognitive_task("community_summary", 3, "{}", None, None, None, "structured", 3).await.unwrap();
+
+        // Filter by task_type only
+        let title_tasks = s.get_tasks_filtered(None, Some("session_title"), 10).await;
+        assert_eq!(title_tasks.len(), 2);
+
+        // Filter by status only
+        let pending = s.get_tasks_filtered(Some("pending"), None, 10).await;
+        assert_eq!(pending.len(), 3);
+
+        // Filter by both
+        let both = s.get_tasks_filtered(Some("pending"), Some("community_summary"), 10).await;
+        assert_eq!(both.len(), 1);
+
+        // No filter
+        let all = s.get_tasks_filtered(None, None, 10).await;
+        assert_eq!(all.len(), 3);
     }
 
-    #[test]
-    fn test_task_type_parse_renamed_from_from_str() {
-        // Audit Fix 9: method renamed from from_str to parse
-        assert_eq!(CognitiveTaskType::parse("session_title"), Some(CognitiveTaskType::SessionTitle));
-        assert_eq!(CognitiveTaskType::parse("entity_description"), Some(CognitiveTaskType::EntityDescription));
-        assert_eq!(CognitiveTaskType::parse("unknown"), None);
-        assert_eq!(CognitiveTaskType::parse(""), None);
+    #[tokio::test]
+    async fn test_count_tasks_by_status() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3).await.unwrap();
+        s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3).await.unwrap();
+        let id3 = s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3).await.unwrap().unwrap();
+        s.cancel_task(id3).await.unwrap();
+
+        let counts = s.count_tasks_by_status().await;
+        assert_eq!(counts["pending"], 2);
+        assert_eq!(counts["cancelled"], 1);
+        assert_eq!(counts["failed"], 0); // always present even if 0
     }
 
-    #[test]
-    fn test_task_type_roundtrip() {
-        for task in CognitiveTaskType::ALL {
-            let s = task.as_str();
-            assert_eq!(CognitiveTaskType::parse(s), Some(*task));
-        }
+    #[tokio::test]
+    async fn test_insert_usage_log_and_stats() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        s.insert_usage_log(Some(1), "openai", "gpt-4o-mini", 100, 50, 0, 850).await.unwrap();
+        s.insert_usage_log(Some(2), "openai", "gpt-4o-mini", 200, 80, 20, 1200).await.unwrap();
+        s.insert_usage_log(Some(3), "anthropic", "claude-haiku", 150, 60, 0, 950).await.unwrap();
+
+        let stats = s.get_usage_stats(0, 0).await;
+        assert_eq!(stats.total_calls, 3);
+        assert_eq!(stats.total_input_tokens, 450);
+        assert_eq!(stats.total_output_tokens, 190);
+        assert_eq!(stats.total_cached_tokens, 20);
+        assert_eq!(stats.by_provider.len(), 2);
+        assert_eq!(stats.by_provider[0].provider, "openai");
     }
 
-    #[test]
-    fn test_task_type_entity_description() {
-        // entity_description was added in v2.5.0+Fix — verify roundtrip
-        assert_eq!(CognitiveTaskType::from_str("entity_description"), Some(CognitiveTaskType::EntityDescription));
-        assert_eq!(CognitiveTaskType::EntityDescription.as_str(), "entity_description");
+    /// (v2.5.0+Fix) Test get_usage_stats_by_task_type (previously untested).
+    #[tokio::test]
+    async fn test_get_usage_stats_by_task_type() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+
+        // Insert tasks first so the JOIN resolves
+        let t1 = s.insert_cognitive_task(
+            "session_title", 5, "{}", None, None, None, "structured", 3,
+        ).await.unwrap().unwrap();
+        let t2 = s.insert_cognitive_task(
+            "community_narrative", 5, "{}", None, None, None, "structured", 3,
+        ).await.unwrap().unwrap();
+
+        s.insert_usage_log(Some(t1), "deepseek", "deepseek-reasoner", 100, 40, 0, 800).await.unwrap();
+        s.insert_usage_log(Some(t1), "deepseek", "deepseek-reasoner", 120, 50, 0, 900).await.unwrap();
+        s.insert_usage_log(Some(t2), "claude", "claude-sonnet-4-20250514", 200, 80, 30, 1100).await.unwrap();
+
+        let stats = s.get_usage_stats_by_task_type(0, 0).await;
+        assert_eq!(stats.len(), 2);
+
+        // session_title × deepseek should be first (2 calls vs 1)
+        let st = stats.iter().find(|r| r.task_type == "session_title").unwrap();
+        assert_eq!(st.provider, "deepseek");
+        assert_eq!(st.calls, 2);
+        assert_eq!(st.input_tokens, 220);
+
+        let cn = stats.iter().find(|r| r.task_type == "community_narrative").unwrap();
+        assert_eq!(cn.provider, "claude");
+        assert_eq!(cn.calls, 1);
+        assert_eq!(cn.cached_tokens, 30);
     }
 
-    #[test]
-    fn test_task_type_unknown_returns_none() {
-        assert!(CognitiveTaskType::from_str("unknown_task").is_none());
-        assert!(CognitiveTaskType::from_str("").is_none());
-    }
+    #[tokio::test]
+    async fn test_get_tasks_for_target() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        s.insert_cognitive_task(
+            "session_title", 5, "{}", None,
+            Some("sessions"), Some("sess_001"), "structured", 3,
+        ).await.unwrap();
 
-    #[test]
-    fn test_effective_fallback() {
-        let cfg = SuperNodeConfig {
-            providers: vec![
-                ProviderConfig { name: "a".into(), provider_type: ProviderType::Anthropic,
-                    api_base: String::new(), api_key: None, model: "m".into(), max_tokens: None, temperature: None },
-                ProviderConfig { name: "b".into(), provider_type: ProviderType::Anthropic,
-                    api_base: String::new(), api_key: None, model: "m".into(), max_tokens: None, temperature: None },
-            ],
-            routing: TaskRoutingConfig { fallback: Some("b".into()), ..Default::default() },
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_fallback(), Some("b"));
+        let tasks = s.get_tasks_for_target("sessions", "sess_001", None).await;
+        assert_eq!(tasks.len(), 1);
 
-        let cfg2 = SuperNodeConfig {
-            providers: vec![ProviderConfig { name: "first".into(), provider_type: ProviderType::Anthropic,
-                api_base: String::new(), api_key: None, model: "m".into(), max_tokens: None, temperature: None }],
-            ..Default::default()
-        };
-        assert_eq!(cfg2.effective_fallback(), Some("first"));
+        let pending = s.get_tasks_for_target("sessions", "sess_001", Some("pending")).await;
+        assert_eq!(pending.len(), 1);
 
-        assert_eq!(SuperNodeConfig::default().effective_fallback(), None);
-    }
-
-    #[test]
-    fn test_toml_full_config() {
-        let toml_str = r#"
-enabled = true
-
-[[providers]]
-name = "deepseek"
-type = "openai_compatible"
-api_base = "https://api.deepseek.com/v1"
-api_key = "$DEEPSEEK_API_KEY"
-model = "deepseek-reasoner"
-max_tokens = 2000
-temperature = 0.6
-
-[[providers]]
-name = "claude"
-type = "anthropic"
-api_key = "$ANTHROPIC_API_KEY"
-model = "claude-sonnet-4-20250514"
-
-[routing]
-session_title = "deepseek"
-code_analysis = "claude"
-fallback = "deepseek"
-
-[privacy]
-default_level = "structured"
-allow_full_for = ["session_title", "code_analysis"]
-
-[worker]
-poll_interval_secs = 10
-max_concurrent = 5
-max_retries = 2
-task_timeout_secs = 180
-"#;
-        let cfg: SuperNodeConfig = toml::from_str(toml_str).unwrap();
-        assert!(cfg.enabled);
-        assert_eq!(cfg.providers.len(), 2);
-        assert_eq!(cfg.routing.code_analysis, Some("claude".into()));
-        assert_eq!(cfg.privacy.default_level, PrivacyLevel::Structured);
-        assert_eq!(cfg.worker.poll_interval_secs, 10);
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn test_toml_minimal_config() {
-        let toml_str = r#"
-enabled = true
-
-[[providers]]
-name = "ollama"
-type = "openai_compatible"
-api_base = "http://localhost:11434/v1"
-model = "llama3"
-"#;
-        let cfg: SuperNodeConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.effective_fallback(), Some("ollama"));
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn test_toml_backward_compat_empty() {
-        let cfg: SuperNodeConfig = toml::from_str("").unwrap();
-        assert!(!cfg.enabled);
-        assert!(cfg.validate().is_ok());
+        let none = s.get_tasks_for_target("sessions", "sess_999", None).await;
+        assert!(none.is_empty());
     }
 }
