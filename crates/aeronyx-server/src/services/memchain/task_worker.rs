@@ -85,6 +85,7 @@ use super::storage::MemoryStorage;
 use super::llm_provider::{ChatMessage, ChatRequest, CognitiveTaskType};
 use super::llm_router::LlmRouter;
 use super::storage_supernode::CognitiveTaskRow;
+// config_supernode is declared at crate root in lib.rs (not under config/)
 use crate::config_supernode::{PrivacyLevel, WorkerConfig};
 use super::prompts::{
     SessionTitleInput, build_session_title,
