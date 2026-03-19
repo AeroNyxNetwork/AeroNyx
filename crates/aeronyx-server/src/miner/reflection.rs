@@ -1460,8 +1460,17 @@ impl ReflectionMiner {
     /// A summary is considered LLM-generated if it does NOT start with
     /// "Community with" (which is the no-LLM placeholder prefix written
     /// by Step 11 and Step 8 community name generation).
+    /// Step 8 tail: enqueue community_summary LLM tasks.
+    ///
+    /// Uses CommunitySummary variant (llm_provider::CognitiveTaskType).
+    /// DB task_type string: "community_summary".
     async fn enqueue_community_narrative_tasks(&self, owner: &[u8]) {
-        let communities = self.storage.get_communities(owner).await;
+        // get_communities expects &[u8; 32] — convert from &[u8]
+        let owner32: [u8; 32] = match owner.try_into() {
+            Ok(arr) => arr,
+            Err(_) => { warn!("[MINER_S8] owner is not 32 bytes"); return; }
+        };
+        let communities = self.storage.get_communities(&owner32).await;
 
         let mut enqueued = 0u32;
         let mut skipped = 0u32;
@@ -1487,7 +1496,7 @@ impl ReflectionMiner {
             });
 
             match self.storage.insert_cognitive_task(
-                "community_narrative",
+                "community_summary",   // CommunitySummary variant → "community_summary" in DB
                 SUPERNODE_PRIORITY_COMMUNITY_NARRATIVE,
                 &payload.to_string(),
                 None, // prompt_messages — built by task_worker using prompts.rs
@@ -1548,7 +1557,7 @@ impl ReflectionMiner {
             });
 
             match self.storage.insert_cognitive_task(
-                "entity_description",
+                "entity_description",  // EntityDescription variant → "entity_description" in DB
                 SUPERNODE_PRIORITY_ENTITY_DESCRIPTION,
                 &payload.to_string(),
                 None,
