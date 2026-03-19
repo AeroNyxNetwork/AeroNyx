@@ -10,7 +10,7 @@
 //!
 //! ## Pipeline Overview
 //! ```text
-//! POST /api/mpi/recall {query, embedding, top_k, ...}
+//! POST /api/mpi/recall {query, embedding, top_k, mode, ...}
 //!   │
 //!   ├─ Step 1:      Query Analysis (GLiNER + regex + entity matching)
 //!   │
@@ -23,13 +23,14 @@
 //!   ├─ Step 3:      RRF fusion (vector + BM25 rank merging)
 //!   │   └─ MVF φ₀-φ₉ scoring with graph_traverse_weight
 //!   │
-//!   ├─ Step 3.5:    Cross-encoder rerank (v2.4.0+Reranker) ← NEW
-//!   │   ├─ Take top RERANK_TOP_N candidates from scored list
-//!   │   ├─ reranker.rerank_batch(query, doc_texts) → CE logits
-//!   │   ├─ Dynamic min-max normalize CE scores → [0, 1]
-//!   │   └─ Blend: 0.7 * CE_normalized + 0.3 * RRF_score → new ranked order
+//!   ├─ Step 3.5:    Cross-encoder rerank (v2.4.0+Reranker)
 //!   │
-//!   └─ Step 4:      Token budget trimming → Response
+//!   ├─ Step 4:      Token budget trimming → Response
+//!   │
+//!   └─ Step 4.5:    Progressive mode branch (v2.4.0+Progressive)
+//!       ├─ mode="full": existing full-content response
+//!       └─ mode="index": lightweight preview response (content truncated to 80 chars)
+//!           Use /recall/detail to fetch full content for selected record_ids.
 //! ```
 //!
 //! ## Reciprocal Rank Fusion (RRF)
@@ -37,6 +38,14 @@
 //! RRF_score(d) = Σ 1/(k + rank_i(d))
 //! k = 60 (standard value from Cormack et al. 2009)
 //! ```
+//!
+//! ## Progressive Retrieval (v2.4.0+Progressive)
+//! Two-pass pattern for token-efficient retrieval:
+//!   Pass 1: POST /recall { mode: "index" } → lightweight index (~50 tokens/item)
+//!   Pass 2: POST /recall/detail { record_ids: [...] } → full content for selected items
+//!
+//! Index mode truncates content to 80 chars (UTF-8 safe via char_indices).
+//! Synthetic IDs (graph_*, bm25_*) are skipped by /recall/detail (no backing records).
 //!
 //! ## Three content retrieval paths
 //! 1. **RRF path** (records): Vector + BM25 rankings merged → scored records
@@ -46,41 +55,21 @@
 //! ## Step 3.5 Notes
 //! - Only runs when `state.reranker_engine.is_some()` AND `!rb.query.is_empty()`
 //! - Only reranks the `RERANK_TOP_N` (30) top candidates from the RRF-scored list
-//! - Candidates beyond RERANK_TOP_N are appended unchanged after reranked portion
-//! - Graph memories (Step 2c) and BM25 direct memories (Step 2a-ter) are NOT
-//!   reranked — they are injected after Step 4's token budget loop. This is
-//!   intentional: they carry structural knowledge that reranking might demote.
-//! - Document text for reranking: uses decrypted/plaintext content from
-//!   `encrypted_content` field. In MemChain, content in `encrypted_content` is
-//!   stored as raw UTF-8 bytes (the field name is historical; actual encryption
-//!   happens at the storage layer before insert, and records returned from
-//!   `storage.get()` have already been decrypted). String::from_utf8_lossy is safe.
-//!
-//! ## Dependencies
-//! - mpi.rs — MpiState, AuthenticatedOwner, helpers
-//! - mpi_handlers.rs — RecallRequest/Response types (re-exported)
-//! - recall_handler.rs — RERANK_TOP_N constant (re-exported for mpi_handlers status)
-//! - storage_fts.rs — bm25_search()
-//! - graph.rs — bfs_traverse()
-//! - query_analyzer.rs — analyze_query()
-//! - mvf.rs — compute_features(), fuse_scores()
-//! - reranker.rs — RerankerEngine, RERANK_TOP_N (v2.4.0+Reranker)
+//! - Graph memories (Step 2c) and BM25 direct memories (Step 2a-ter) are NOT reranked
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - RRF k=60 is the standard value. Do NOT change without re-tuning blend weight.
 //! - BM25 and vector results use DIFFERENT score scales. RRF avoids this by using ranks.
-//! - Graph memories (Step 2c) and BM25 direct memories (Step 2a-ter) bypass RRF
-//!   because they don't have a natural rank in the scored list.
-//! - Step 3.5 reranks ONLY the scored (RRF) candidates, not graph/BM25-direct memories.
-//!   If you want to rerank graph memories too, you'll need a second rerank call —
-//!   but be careful about latency (graph memories are already high-confidence results).
-//! - CE_BLEND_WEIGHT (0.7) in reranker.rs controls how aggressively the cross-encoder
-//!   overrides RRF scores. Tune this if reranker degrades graph/BM25 results.
+//! - matched_json is computed BEFORE the index-mode branch to avoid borrow-after-move.
+//!   This is intentional — do NOT move matched_json computation to after the truncate.
+//! - mpi_recall_detail uses extract_owner() (same pattern as other handlers),
+//!   NOT an AuthenticatedOwner extractor, to avoid consuming the request before body read.
 //!
 //! ## Last Modified
 //! v2.4.0+BM25 - 🌟 Extracted from mpi_handlers.rs; added BM25 + RRF fusion
 //! v2.4.0+BM25-fix - 🔧 Added Step 2a-ter: BM25 entity/session direct injection
 //! v2.4.0+Reranker - 🌟 Added Step 3.5: cross-encoder rerank between RRF and token budget
+//! v2.4.0+Progressive - 🌟 Added mode="index" branch after truncate + mpi_recall_detail handler
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -88,6 +77,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use axum::http::Request;
+use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
@@ -495,28 +485,11 @@ pub async fn mpi_recall(
     scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // ── Step 3.5: Cross-encoder rerank (v2.4.0+Reranker) ──
-    // Reranks the top RERANK_TOP_N candidates from the RRF-scored list using
-    // a cross-encoder model for improved precision. Only runs when:
-    //   1. state.reranker_engine is Some (reranker enabled and model loaded)
-    //   2. rb.query is non-empty (cross-encoder needs a query string)
-    //   3. scored list is non-empty (nothing to rerank otherwise)
-    //
-    // Score blend: 0.7 * normalized_CE + 0.3 * original_RRF_score
-    // CE scores are dynamic min-max normalized to [0,1] in reranker.rerank_batch().
-    // Candidates beyond RERANK_TOP_N are appended unchanged at the end.
-    //
-    // NOTE: Graph memories (Step 2c) and BM25-direct memories (Step 2a-ter) are
-    // injected AFTER Step 4 and are not subject to reranking. They carry structural
-    // knowledge that reranking might incorrectly demote for narrow queries.
     if let Some(ref reranker) = state.reranker_engine {
         if !rb.query.is_empty() && !scored.is_empty() {
             let rerank_n = scored.len().min(RERANK_TOP_N);
             let rerank_candidates = &scored[..rerank_n];
 
-            // Extract document text for each candidate.
-            // encrypted_content stores the decrypted plaintext as UTF-8 bytes
-            // (the field name is historical — records returned from storage.get()
-            // have already been decrypted by the storage layer).
             let doc_texts: Vec<String> = rerank_candidates.iter()
                 .map(|(r, _)| String::from_utf8_lossy(&r.encrypted_content).to_string())
                 .collect();
@@ -524,24 +497,16 @@ pub async fn mpi_recall(
 
             match reranker.rerank_batch(&rb.query, &doc_refs) {
                 Ok(reranked) => {
-                    // Rebuild scored list: reranked candidates get blended scores,
-                    // candidates beyond rerank_n keep their original scores.
                     let blend_w = crate::services::memchain::reranker::RerankerEngine::blend_weight();
                     let mut new_scored: Vec<(MemoryRecord, f64)> = Vec::with_capacity(scored.len());
 
                     for rc in &reranked {
                         let (record, old_score) = &scored[rc.original_index];
-                        // Blend: CE_BLEND_WEIGHT * normalized_CE + (1 - CE_BLEND_WEIGHT) * RRF_score
-                        // Both inputs are in compatible ranges:
-                        //   normalized_CE ∈ [0, 1]  (from dynamic min-max in reranker)
-                        //   old_score ∈ [0, ~5]     (RRF + MVF scores, typically < 5)
-                        // We normalize old_score to [0,1] using a practical cap of 5.0
                         let rrf_norm = (old_score / 5.0).min(1.0);
                         let blended = blend_w * rc.ce_score_normalized + (1.0 - blend_w) * rrf_norm;
                         new_scored.push((record.clone(), blended));
                     }
 
-                    // Append candidates beyond rerank_n unchanged
                     for i in rerank_n..scored.len() {
                         new_scored.push(scored[i].clone());
                     }
@@ -561,7 +526,6 @@ pub async fn mpi_recall(
                     );
                 }
                 Err(e) => {
-                    // Reranker failure is non-fatal: fall back to RRF-only ordering
                     warn!(error = %e, "[RECALL] Reranker failed, using RRF scores only");
                 }
             }
@@ -586,7 +550,7 @@ pub async fn mpi_recall(
         tokio::spawn(async move { st.increment_access(&rid).await; });
     }
 
-    // Inject graph-derived memories (not subject to reranking — see Step 3.5 note)
+    // Inject graph-derived memories
     for gm in graph_memories {
         let tokens = estimate_tokens(&gm.content);
         if total_tokens + tokens > rb.token_budget && !memories.is_empty() { break; }
@@ -594,7 +558,7 @@ pub async fn mpi_recall(
         memories.push(gm);
     }
 
-    // Inject BM25 direct entity/session memories (not subject to reranking)
+    // Inject BM25 direct entity/session memories
     for bm in bm25_direct_memories {
         let tokens = estimate_tokens(&bm.content);
         if total_tokens + tokens > rb.token_budget && !memories.is_empty() { break; }
@@ -608,7 +572,56 @@ pub async fn mpi_recall(
     });
     memories.truncate(top_k);
 
-    // Async graph co-occurrence update
+    // ── Compute matched_json before index-mode branch ──
+    // ⚠️ Must be computed here (not after the branch) to avoid borrow-after-move.
+    //    analysis is consumed by this computation; index branch uses the result.
+    let matched_json: Option<Vec<serde_json::Value>> = analysis.as_ref().map(|qa| {
+        qa.matched_entities.iter().map(|e| serde_json::json!({
+            "text": e.query_text, "label": e.label, "confidence": e.confidence,
+            "entity_id": e.entity_id, "entity_type": e.entity_type,
+        })).collect::<Vec<_>>()
+    });
+    let query_type_str = format!("{:?}", query_type).to_lowercase();
+
+    // ── v2.4.0+Progressive: Index mode returns lightweight summaries ──
+    // When mode="index", strip full content to ~80 chars and return early.
+    // AI reviews the index, then requests full content via /recall/detail
+    // for 2-3 selected items. Saves 60-80% of token budget on large stores.
+    //
+    // UTF-8 safe truncation via char_indices().nth(80) — avoids byte-slice panic
+    // on multi-byte characters (Chinese, Japanese, emoji, etc.).
+    //
+    // Synthetic IDs (graph_*, bm25_*) in index results will be silently skipped
+    // by /recall/detail since they have no backing records table rows.
+    if rb.mode == "index" {
+        let index_memories: Vec<RecalledMemory> = memories.into_iter().map(|mut m| {
+            if m.content.chars().count() > 80 {
+                // char_indices().nth(80) gives byte offset of 80th character safely
+                let byte_offset = m.content.char_indices()
+                    .nth(80)
+                    .map(|(i, _)| i)
+                    .unwrap_or(m.content.len());
+                m.content = format!("{}...", &m.content[..byte_offset]);
+            }
+            m
+        }).collect();
+
+        let token_estimate: usize = index_memories.iter()
+            .map(|m| estimate_tokens(&m.content) + 30) // +30 for metadata fields overhead
+            .sum();
+
+        return (StatusCode::OK, Json(serde_json::json!({
+            "mode": "index",
+            "memories": index_memories,
+            "total_candidates": total_candidates,
+            "token_estimate": token_estimate,
+            "query_type": query_type_str,
+            "matched_entities": matched_json,
+            "hint": "Use POST /api/mpi/recall/detail with record_ids to fetch full content for selected items.",
+        }))).into_response();
+    }
+
+    // ── Async graph co-occurrence update (full mode only) ──
     {
         let st = Arc::clone(&state.storage);
         let ids = returned_ids;
@@ -619,16 +632,135 @@ pub async fn mpi_recall(
         });
     }
 
-    let matched_json = analysis.as_ref().map(|qa| {
-        qa.matched_entities.iter().map(|e| serde_json::json!({
-            "text": e.query_text, "label": e.label, "confidence": e.confidence,
-            "entity_id": e.entity_id, "entity_type": e.entity_type,
-        })).collect::<Vec<_>>()
-    });
-
     (StatusCode::OK, Json(serde_json::json!(RecallResponse {
         memories, total_candidates, token_estimate: total_tokens,
-        query_type: Some(format!("{:?}", query_type).to_lowercase()),
+        query_type: Some(query_type_str),
         matched_entities: matched_json,
+    }))).into_response()
+}
+
+// ============================================
+// POST /api/mpi/recall/detail — Progressive retrieval detail fetch
+// ============================================
+
+/// Request body for /recall/detail.
+#[derive(Debug, Deserialize)]
+pub struct DetailRequest {
+    pub record_ids: Vec<String>,
+}
+
+/// POST /api/mpi/recall/detail — Fetch full content for selected memory IDs.
+///
+/// Used in progressive retrieval (v2.4.0+Progressive):
+///   1. AI calls POST /recall with mode="index" → gets lightweight summaries
+///   2. AI reviews candidates and selects 2-3 relevant items
+///   3. AI calls POST /recall/detail with those record_ids → gets full content
+///
+/// ## Request
+/// ```json
+/// { "record_ids": ["aabb1234...", "ccdd5678..."] }
+/// ```
+///
+/// ## Response
+/// ```json
+/// { "memories": [...RecalledMemory], "token_estimate": 1234 }
+/// ```
+///
+/// ## Limits
+/// - Max 20 record_ids per request (prevents abuse)
+/// - Synthetic IDs (graph_*, bm25_*) are silently skipped (no backing records)
+/// - Only returns records owned by the authenticated caller
+///
+/// ## Registration
+/// Registered at POST /api/mpi/recall/detail in mpi.rs router.
+///
+/// ⚠️ Important Note for Next Developer:
+/// - Uses extract_owner() (same as all other handlers) NOT an AuthenticatedOwner
+///   extractor — avoids consuming req before reading body.
+/// - Access count is incremented asynchronously via tokio::spawn.
+/// - score=0.0 in response because ordering is determined by the AI, not by score.
+pub async fn mpi_recall_detail(
+    State(state): State<Arc<MpiState>>,
+    req: Request<axum::body::Body>,
+) -> impl IntoResponse {
+    let auth = extract_owner(&req).clone();
+    let owner = auth.owner_bytes();
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "failed to read body"}))).into_response(),
+    };
+
+    let dr: DetailRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("invalid JSON: {}", e)
+        }))).into_response(),
+    };
+
+    if dr.record_ids.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "record_ids array is empty"
+        }))).into_response();
+    }
+    if dr.record_ids.len() > 20 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "max 20 record_ids per request"
+        }))).into_response();
+    }
+
+    let mut memories: Vec<RecalledMemory> = Vec::new();
+    let mut total_tokens = 0usize;
+
+    for rid_hex in &dr.record_ids {
+        // Synthetic IDs (graph/bm25 enrichment results) have no backing records.
+        // These are prefixed by recall_handler.rs Step 2a-ter / 2c when injecting
+        // graph/BM25 context. Skip silently — they are not addressable by record_id.
+        if rid_hex.starts_with("graph_") || rid_hex.starts_with("bm25_") {
+            continue;
+        }
+
+        // Decode hex record_id → [u8; 32]
+        let rid = match hex::decode(rid_hex) {
+            Ok(b) if b.len() == 32 => {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                a
+            }
+            _ => continue, // Invalid hex or wrong length — skip silently
+        };
+
+        if let Some(record) = state.storage.get(&rid).await {
+            // Security: only return records owned by the authenticated caller
+            if !record.is_active() || record.owner != owner {
+                continue;
+            }
+
+            let content = String::from_utf8_lossy(&record.encrypted_content).to_string();
+            let tokens = estimate_tokens(&content);
+            total_tokens += tokens;
+
+            memories.push(RecalledMemory {
+                record_id: rid_hex.clone(),
+                layer: record.layer.to_string(),
+                // score=0.0: ordering is determined by the caller (AI), not score
+                score: 0.0,
+                content,
+                topic_tags: record.topic_tags.clone(),
+                source_ai: record.source_ai.clone(),
+                timestamp: record.timestamp,
+                access_count: record.access_count,
+                proactive: false,
+            });
+
+            // Increment access count asynchronously
+            let st = Arc::clone(&state.storage);
+            tokio::spawn(async move { st.increment_access(&rid).await; });
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "memories": memories,
+        "token_estimate": total_tokens,
     }))).into_response()
 }
