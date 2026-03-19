@@ -29,6 +29,23 @@
 //!   - VectorIndex now uses with_config() when vector_quantization is ScalarUint8
 //!   - calibrate_partition() called after index rebuild from SQLite
 //!   - Quantizer calibration persisted to chain_state for fast restart
+//! v2.4.0+Reranker - 🌟 RerankerEngine initialization (cross-encoder/ms-marco-MiniLM-L-6-v2).
+//!   Loaded after NerEngine (shared ORT runtime). Graceful fallback on failure.
+//!   Passed into MpiState.reranker_engine for recall_handler.rs Step 3.5.
+//! v2.4.0+Conversation - 🌟 Added derive_rawlog_key import and rawlog_key field in MpiState.
+//!   Enables conversation replay decryption for GET /sessions/:id/conversation endpoint.
+//!   Key derived from Ed25519 PRIVATE key — can only decrypt local owner's rawlogs.
+//!
+//! ## Modification Reason (v2.4.0+Reranker)
+//! - RerankerEngine provides cross-encoder reranking for recall Step 3.5
+//! - Loaded AFTER EmbedEngine and NerEngine (all three share ORT runtime via Once)
+//! - Load failure is graceful: server starts without reranking, recall uses RRF-only
+//! - ~22MB model, loads in < 100ms, no calibration or persistent state needed
+//!
+//! ## Modification Reason (v2.4.0+Conversation)
+//! - rawlog_key enables mpi_graph_handlers.rs to decrypt raw_logs for conversation replay
+//! - Derived from identity.to_bytes() (Ed25519 PRIVATE key), same as Miner Step 0
+//! - Only local-mode requests can decrypt (remote requests see encrypted:true, content:null)
 //!
 //! ## Modification Reason (v2.4.0-GraphCognition Phase B)
 //! - VectorIndex::with_config() replaces VectorIndex::new() when scalar quantization
@@ -50,10 +67,11 @@
 //!
 //! ## Dependencies
 //! - config.rs for ServerConfig (including MemChainConfig with v2.4.0 NER/graph/entropy config,
-//!   VectorQuantizationMode enum)
+//!   VectorQuantizationMode enum, v2.4.0+Reranker config)
 //! - storage.rs for MemoryStorage (Schema v5 with cognitive graph tables)
 //! - mpi.rs for MPI router (with unified auth middleware)
 //! - ner.rs for NerEngine (v2.4.0)
+//! - reranker.rs for RerankerEngine (v2.4.0+Reranker)
 //! - embed.rs for EmbedEngine
 //! - vector.rs for VectorIndex (v2.4.0: with_config, calibrate_partition, restore_quantizer)
 //! - quantize.rs for ScalarQuantizer (v2.4.0: used internally by VectorIndex)
@@ -62,6 +80,9 @@
 //! ⚠️ Important Note for Next Developer:
 //! - record_key is derived from identity.to_bytes() (Ed25519 PRIVATE key)
 //! - Do NOT use public_key_bytes() for record_key derivation (security critical)
+//! - rawlog_key is ALSO derived from identity.to_bytes() (same PRIVATE key source)
+//!   but uses derive_rawlog_key() — a different KDF from derive_record_key().
+//!   Do NOT confuse the two — they are separate keys for separate encryption contexts.
 //! - api_secret flows: config.rs → server.rs → MpiState → auth middleware
 //! - allow_remote_storage + max_remote_owners flow: config.rs → server.rs → MpiState
 //!   → unified_auth_middleware (Ed25519 signature verification + capacity check)
@@ -69,7 +90,10 @@
 //!   EmbedEngine::load() calls init_ort_runtime(). NerEngine::load() relies on it.
 //!   If EmbedEngine is not loaded (model missing), NerEngine will also fail unless
 //!   ORT is initialized by other means.
-//! - The rawlog key derivation still uses public key (known issue, separate fix)
+//! - RerankerEngine MUST be loaded AFTER EmbedEngine and NerEngine (shared ORT Once).
+//!   Load order: EmbedEngine → NerEngine → RerankerEngine. All three are optional.
+//! - RerankerEngine::load() is ~22MB model, loads in < 100ms. No calibration needed.
+//!   Unlike VectorIndex quantizer, reranker has no persistent state to save/restore.
 //! - VectorIndex scalar quantization requires calibration AFTER index rebuild.
 //!   Sequence: rebuild vectors → try restore_quantizer → fallback calibrate_partition.
 //!   If no vectors exist at startup, calibration is skipped (deferred to first Miner tick).
@@ -86,6 +110,8 @@
 //!   Miner with_ner_engine attachment
 //! v2.4.0-GraphCognition Phase B - 🌟 VectorIndex::with_config() integration,
 //!   calibrate_partition() after index rebuild, quantizer persistence to chain_state
+//! v2.4.0+Reranker - 🌟 RerankerEngine initialization, MpiState.reranker_engine field
+//! v2.4.0+Conversation - 🌟 derive_rawlog_key import, MpiState.rawlog_key field
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -128,9 +154,14 @@ use crate::miner::ReflectionMiner;
 #[allow(deprecated)]
 use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
 use crate::services::memchain::derive_record_key;
+// v2.4.0+Conversation: rawlog key for conversation replay decryption
+// ⚠️ derive_rawlog_key uses a different KDF from derive_record_key — do NOT swap them
+use crate::services::memchain::derive_rawlog_key;
 use crate::services::memchain::EmbedEngine;
 // v2.4.0: NerEngine for cognitive graph pipeline
 use crate::services::memchain::NerEngine;
+// v2.4.0+Reranker: Cross-encoder reranker for recall Step 3.5
+use crate::services::memchain::RerankerEngine;
 use crate::services::{HandshakeService, IpPoolService, RoutingService, SessionManager};
 
 // ============================================
@@ -363,6 +394,38 @@ impl Server {
                 None
             };
 
+            // ── v2.4.0+Reranker: Initialize cross-encoder reranker (optional) ──
+            // RerankerEngine MUST be loaded AFTER EmbedEngine — both share ORT runtime.
+            // Load order: EmbedEngine → NerEngine → RerankerEngine (all share Once init).
+            // Load failure is graceful: server starts without reranking (Step 3.5 skipped).
+            let reranker_engine: Option<Arc<RerankerEngine>> = if self.config.memchain.reranker_enabled {
+                let model_path = &self.config.memchain.reranker_model_path;
+                let max_seq = self.config.memchain.reranker_max_seq_length;
+                match RerankerEngine::load(model_path, max_seq) {
+                    Ok(engine) => {
+                        info!(
+                            model = %model_path,
+                            max_seq = max_seq,
+                            blend_weight = %RerankerEngine::blend_weight(),
+                            "[RERANKER] ✅ Cross-encoder loaded"
+                        );
+                        Some(Arc::new(engine))
+                    }
+                    Err(e) => {
+                        warn!(
+                            model = %model_path,
+                            error = %e,
+                            "[RERANKER] ⚠️ Cross-encoder unavailable — recall uses RRF-only ranking. \
+                             Run `scripts/download_models.sh --reranker-only` to download model."
+                        );
+                        None
+                    }
+                }
+            } else {
+                debug!("[RERANKER] Disabled (reranker_enabled=false)");
+                None
+            };
+
             let mpi_state = Arc::new(MpiState {
                 storage: Arc::clone(st),
                 vector_index: Arc::clone(vi),
@@ -384,6 +447,12 @@ impl Server {
                 ner_engine: ner_engine.clone(),
                 graph_enabled: self.config.memchain.graph_enabled,
                 entropy_filter_enabled: self.config.memchain.entropy_filter_enabled,
+                // v2.4.0+Reranker: Cross-encoder for recall Step 3.5
+                reranker_engine,
+                // v2.4.0+Conversation: RawLog decryption key for conversation replay.
+                // Derived from Ed25519 PRIVATE key — can only decrypt local owner's rawlogs.
+                // ⚠️ Uses derive_rawlog_key(), NOT derive_record_key() — different KDF contexts.
+                rawlog_key: Some(derive_rawlog_key(&self.identity.to_bytes())),
             });
 
             // Pre-populate Identity cache
@@ -570,10 +639,8 @@ impl Server {
             // within the vector module's DEFAULT_SATURATION_WINDOW constant.
             // TODO(Phase C): Expose both thresholds separately in config for fine-grained control.
             let sat_threshold = if self.config.memchain.vector_early_termination {
-                // Use a small positive value to enable early termination
                 0.001_f32
             } else {
-                // 0.0 disables early termination in VectorIndex::with_config
                 0.0_f32
             };
             info!(
@@ -613,16 +680,11 @@ impl Server {
         // v2.4.0 Phase B: Calibrate quantizer after index rebuild
         if quantization_enabled && rebuild_count > 0 {
             let owner_hex = hex::encode(owner);
-            // v2.5.0: model_name is no longer hardcoded — we detect it at startup.
-//     // However, at this point embed_engine hasn't been created yet (it's created
-//     // later in run()). The model_name is used as a partition key for quantizer
-//     // persistence. We use the config path basename as a stable identifier.
             let model_name = std::path::Path::new(&self.config.memchain.embed_model_path)
                 .file_name()
                 .and_then(|f| f.to_str())
                 .unwrap_or("minilm-l6-v2");
 
-            // Attempt to restore persisted quantizer calibration from chain_state
             let cal_key = format!("{}:{}:{}", QUANTIZER_CAL_KEY_PREFIX, owner_hex, model_name);
             let restored = {
                 let conn = storage.conn_lock().await;
@@ -652,11 +714,9 @@ impl Server {
                 }
             };
 
-            // If restore failed or no persisted data, run fresh calibration
             if !restored {
                 vector_index.calibrate_partition(&owner, model_name);
 
-                // Persist calibration data for next startup
                 if let Some(cal_bytes) = vector_index.get_quantizer_bytes(&owner, model_name) {
                     let conn = storage.conn_lock().await;
                     let _ = conn.execute(
@@ -801,7 +861,6 @@ impl Server {
         tokio::spawn(async move { cmd_handler.run(cmd_shutdown).await; });
 
         // Heartbeat reporter
-        // v2.3.0: Build memchain_status callback if MemChain is enabled.
         let memchain_status_fn: Option<crate::management::reporter::MemChainStatusFn> =
             if self.config.memchain.is_enabled() {
                 let allow_remote = self.config.memchain.allow_remote_storage;
@@ -840,7 +899,6 @@ impl Server {
         // WebSocket tunnel
         let node_info_path = &self.config.management.node_info_path;
         if let Ok(node_info) = crate::management::models::StoredNodeInfo::load(node_info_path) {
-            // v2.3.0: Pass MPI api_secret to WsTunnel for Bearer token injection
             let ws = crate::management::WsTunnel::new(
                 self.identity.clone(),
                 node_info.node_id.clone(),
@@ -978,7 +1036,6 @@ impl Server {
                                 let data = &buf[..len];
 
                                 match ProtocolCodec::peek_message_type(data) {
-                                    // --- ClientHello ---
                                     Ok(MessageType::ClientHello) => {
                                         if let Ok(hello) = decode_client_hello(data) {
                                             match handshake.process(&hello, source.addr) {
@@ -993,7 +1050,6 @@ impl Server {
                                         }
                                     }
 
-                                    // --- Keepalive ---
                                     Ok(MessageType::Keepalive) => {
                                         if len >= KEEPALIVE_PACKET_SIZE {
                                             let mut sid = [0u8; 16];
@@ -1006,7 +1062,6 @@ impl Server {
                                         }
                                     }
 
-                                    // --- Data (VPN + MemChain) ---
                                     Ok(MessageType::Data) | Err(_) => {
                                         match packet_handler.handle_udp_packet(data) {
                                             Ok((_sess, DecryptedPayload::Vpn(pkt))) => {
@@ -1062,10 +1117,8 @@ impl Server {
         crypto: &DefaultTransportCrypto,
     ) {
         match msg {
-            // --- Legacy: BroadcastFact ---
             MemChainMessage::BroadcastFact(fact) => {
                 let origin_hex = hex::encode(fact.origin);
-
                 let sig_ok = match IdentityPublicKey::from_bytes(&fact.origin) {
                     Ok(pk) => pk.verify(&fact.fact_id, &fact.signature).is_ok(),
                     Err(_) => false,
@@ -1078,17 +1131,14 @@ impl Server {
                     warn!("[MEMCHAIN] BroadcastFact untrusted origin");
                     return;
                 }
-
                 if mempool.add_fact(fact.clone()) {
                     let mut w = aof_writer.lock().await;
                     let _ = w.append_fact(&fact).await;
                 }
             }
 
-            // --- New: BroadcastRecord ---
             MemChainMessage::BroadcastRecord(record) => {
                 let owner_hex = record.owner_hex();
-
                 let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
                     Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                     Err(_) => false,
@@ -1101,20 +1151,14 @@ impl Server {
                     warn!("[MEMCHAIN] BroadcastRecord untrusted owner");
                     return;
                 }
-
                 if let Some(ref st) = storage {
                     if st.insert(&record, "p2p-remote").await {
                         info!(id = hex::encode(record.record_id), "[MEMCHAIN] BroadcastRecord stored");
-
                         if record.has_embedding() {
                             if let Some(ref vi) = vector_index {
                                 vi.upsert(
-                                    record.record_id,
-                                    record.embedding.clone(),
-                                    record.layer,
-                                    record.timestamp,
-                                    &record.owner,
-                                    "p2p-remote",
+                                    record.record_id, record.embedding.clone(),
+                                    record.layer, record.timestamp, &record.owner, "p2p-remote",
                                 );
                             }
                         }
@@ -1122,14 +1166,12 @@ impl Server {
                 }
             }
 
-            // --- Legacy: SyncRequest ---
             MemChainMessage::SyncRequest { last_known_hash } => {
                 let facts = mempool.get_facts_after(last_known_hash);
                 let resp = MemChainMessage::SyncResponse { facts };
                 Self::send_to_session(&resp, session, udp, crypto).await;
             }
 
-            // --- Legacy: SyncResponse ---
             MemChainMessage::SyncResponse { facts } => {
                 for fact in facts {
                     let origin_hex = hex::encode(fact.origin);
@@ -1147,7 +1189,6 @@ impl Server {
                 }
             }
 
-            // --- New: SyncRecordRequest ---
             MemChainMessage::SyncRecordRequest { owner, after_timestamp } => {
                 if let Some(ref st) = storage {
                     let records = st.query_by_owner_after(&owner, after_timestamp).await;
@@ -1156,7 +1197,6 @@ impl Server {
                 }
             }
 
-            // --- New: SyncRecordResponse ---
             MemChainMessage::SyncRecordResponse { records } => {
                 if let Some(ref st) = storage {
                     for record in records {
@@ -1173,7 +1213,6 @@ impl Server {
                 }
             }
 
-            // --- BlockAnnounce ---
             MemChainMessage::BlockAnnounce(header) => {
                 info!(
                     height = header.height,
@@ -1182,7 +1221,6 @@ impl Server {
                 );
             }
 
-            // --- Everything else ---
             _ => {
                 debug!("[MEMCHAIN] Unhandled message variant");
             }
