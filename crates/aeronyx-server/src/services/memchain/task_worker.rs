@@ -3,25 +3,27 @@
 // ============================================
 //! # TaskWorker — Async Cognitive Task Queue Worker
 //!
-//! ## CognitiveTaskType variant names (CRITICAL — must match llm_provider.rs)
-//! The canonical enum lives in llm_provider.rs with these variants:
-//!   SessionTitle | CommunitySummary | EntityDescription | NaturalSummary | CustomPrompt
-//! All match arms in this file use those exact names.
-//! task_type_str() (not as_str()) is the method to get the DB string.
+//! ## CognitiveTaskType
+//! The canonical enum lives in config_supernode.rs with these variants:
+//!   SessionTitle | CommunityNarrative | ConflictResolution |
+//!   RecallSynthesis | CodeAnalysis | EntityDescription
+//! Re-exported via llm_provider.rs. All match arms in this file use those exact names.
+//! as_str() returns the DB string (e.g. "session_title").
 //!
 //! ## PrivacyLevel
-//! Re-exported from config_supernode via prompts.rs.
-//! Now has Structured / Summary / Full variants (Summary was missing before).
-//! PrivacyLevel::from_str() is NOT available — use match on the string directly.
+//! Defined in config_supernode.rs with variants: Structured / Summary / Full.
+//! Re-exported via prompts.rs. Use PrivacyLevel::from_str() for DB string parsing.
 //!
 //! ## Last Modified
 //! v2.5.0+SuperNode Phase A - 🌟 Created (skeleton).
 //! v2.5.0+SuperNode Phase B - 🌟 Full result parsing + writeback per task type.
 //! v2.5.0+Fix              - 🔧 Various alignment fixes.
-//! v2.5.0+Audit Fix        - 🔧 Aligned CognitiveTaskType variants to llm_provider.rs.
-//!   Fixed PrivacyLevel parsing (no from_str — match string directly).
-//!   Fixed target_table/target_id Option<String> destructuring.
-//!   Fixed AnthropicProvider arg count. Fixed provider new() Result handling.
+//! v2.5.0+Unify            - 🔧 [BUG FIX] Aligned to unified CognitiveTaskType from
+//!   config_supernode.rs. Replaced CommunitySummary→CommunityNarrative,
+//!   NaturalSummary→RecallSynthesis, CustomPrompt→ConflictResolution/CodeAnalysis.
+//!   Fixed PrivacyLevel parsing to use PrivacyLevel::from_str().
+//!   Fixed CognitiveTaskType::from_str → CognitiveTaskType::parse().
+//!   Fixed clean_llm_response match arms to use correct variant names.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,11 +32,11 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use super::storage::MemoryStorage;
-// CognitiveTaskType lives in llm_provider — use those exact variant names
+// CognitiveTaskType is re-exported from config_supernode via llm_provider
 use super::llm_provider::{ChatMessage, ChatRequest, CognitiveTaskType};
 use super::llm_router::LlmRouter;
 use super::storage_supernode::CognitiveTaskRow;
-// PrivacyLevel re-exported from config_supernode via prompts
+// PrivacyLevel is re-exported from config_supernode via prompts
 use crate::config_supernode::{PrivacyLevel, WorkerConfig};
 use super::prompts::{
     SessionTitleInput, build_session_title,
@@ -137,8 +139,8 @@ impl TaskWorker {
 
         debug!(id = task_id, task_type = task_type_str, "[TASK_WORKER] Processing");
 
-        // CognitiveTaskType::from_str() is the method on llm_provider's enum
-        let task_type = match CognitiveTaskType::from_str(task_type_str) {
+        // v2.5.0+Unify: Use CognitiveTaskType::parse() (defined in config_supernode.rs)
+        let task_type = match CognitiveTaskType::parse(task_type_str) {
             Some(t) => t,
             None => {
                 warn!(id = task_id, task_type = task_type_str, "[TASK_WORKER] Unknown task type");
@@ -156,12 +158,8 @@ impl TaskWorker {
             }
         };
 
-        // Parse privacy level from string — PrivacyLevel has no from_str(), match directly
-        let privacy = match task.privacy_level.as_str() {
-            "full" => PrivacyLevel::Full,
-            "summary" => PrivacyLevel::Summary,
-            _ => PrivacyLevel::Structured,
-        };
+        // v2.5.0+Unify: Use PrivacyLevel::from_str() (defined in config_supernode.rs)
+        let privacy = PrivacyLevel::from_str(task.privacy_level.as_str());
 
         let chat_req = match Self::build_prompt_for_task(&task_type, &payload, privacy).await {
             Ok(req) => req,
@@ -233,7 +231,7 @@ impl TaskWorker {
     }
 
     // ============================================
-    // Prompt Builders — variant names from llm_provider::CognitiveTaskType
+    // Prompt Builders — variant names from config_supernode::CognitiveTaskType
     // ============================================
 
     async fn build_prompt_for_task(
@@ -242,7 +240,6 @@ impl TaskWorker {
         privacy: PrivacyLevel,
     ) -> Result<ChatRequest, String> {
         let messages = match task_type {
-            // SessionTitle maps to session_title in DB
             CognitiveTaskType::SessionTitle => {
                 let entity_names_raw: Vec<String> = payload["entity_names"]
                     .as_array().unwrap_or(&vec![])
@@ -257,8 +254,7 @@ impl TaskWorker {
                 })
             }
 
-            // CommunitySummary maps to community_summary in DB
-            CognitiveTaskType::CommunitySummary => {
+            CognitiveTaskType::CommunityNarrative => {
                 let community_name = payload["community_name"].as_str()
                     .unwrap_or("unknown community");
                 let members_raw: Vec<(String, String, i64)> = payload["members"]
@@ -288,8 +284,7 @@ impl TaskWorker {
                 })
             }
 
-            // NaturalSummary maps to natural_summary in DB — uses recall_synthesis prompt
-            CognitiveTaskType::NaturalSummary => {
+            CognitiveTaskType::RecallSynthesis => {
                 let entity_names_raw: Vec<String> = payload["entity_names"]
                     .as_array().unwrap_or(&vec![])
                     .iter().filter_map(|v| v.as_str().map(String::from)).collect();
@@ -305,68 +300,45 @@ impl TaskWorker {
                 })
             }
 
-            // CustomPrompt — conflict resolution, code analysis, or caller-supplied
-            CognitiveTaskType::CustomPrompt => {
-                // Check if this is a conflict_resolution task (target_table = knowledge_edges)
-                if payload["conflict_edge_ids"].is_array() {
-                    let edge_ids: Vec<i64> = payload["conflict_edge_ids"]
-                        .as_array().unwrap_or(&vec![])
-                        .iter().filter_map(|v| v.as_i64()).collect();
-                    let edges_raw: Vec<ConflictingEdge> = payload["edges"]
-                        .as_array().unwrap_or(&vec![])
-                        .iter().filter_map(|v| Some(ConflictingEdge {
-                            edge_id: v["edge_id"].as_i64()?,
-                            source: v["source"].as_str().unwrap_or("").to_string(),
-                            relation: v["relation"].as_str().unwrap_or("").to_string(),
-                            target: v["target"].as_str().unwrap_or("").to_string(),
-                            valid_from: v["valid_from"].as_i64().unwrap_or(0),
-                            fact_text: v["fact_text"].as_str().map(String::from),
-                            confidence: v["confidence"].as_f64(),
-                        })).collect();
+            CognitiveTaskType::ConflictResolution => {
+                let edge_ids: Vec<i64> = payload["conflict_edge_ids"]
+                    .as_array().unwrap_or(&vec![])
+                    .iter().filter_map(|v| v.as_i64()).collect();
+                let edges_raw: Vec<ConflictingEdge> = payload["edges"]
+                    .as_array().unwrap_or(&vec![])
+                    .iter().filter_map(|v| Some(ConflictingEdge {
+                        edge_id: v["edge_id"].as_i64()?,
+                        source: v["source"].as_str().unwrap_or("").to_string(),
+                        relation: v["relation"].as_str().unwrap_or("").to_string(),
+                        target: v["target"].as_str().unwrap_or("").to_string(),
+                        valid_from: v["valid_from"].as_i64().unwrap_or(0),
+                        fact_text: v["fact_text"].as_str().map(String::from),
+                        confidence: v["confidence"].as_f64(),
+                    })).collect();
 
-                    build_conflict_resolution(&ConflictResolutionInput {
-                        conflict_edge_ids: &edge_ids,
-                        edges: &edges_raw,
-                        privacy_level: privacy,
-                    })
-                } else if payload.get("code_content").is_some() || payload.get("language").is_some() {
-                    // code_analysis sub-type
-                    let tags_raw: Vec<String> = payload["existing_tags"]
-                        .as_array().unwrap_or(&vec![])
-                        .iter().filter_map(|v| v.as_str().map(String::from)).collect();
-                    let tag_refs: Vec<&str> = tags_raw.iter().map(|s| s.as_str()).collect();
-
-                    build_code_analysis(&CodeAnalysisInput {
-                        artifact_id: payload["artifact_id"].as_str().unwrap_or(""),
-                        language: payload["language"].as_str().unwrap_or("unknown"),
-                        line_count: payload["line_count"].as_i64(),
-                        code_content: payload["code_content"].as_str().unwrap_or(""),
-                        existing_tags: &tag_refs,
-                        privacy_level: privacy,
-                    })
-                } else {
-                    // Raw custom prompt
-                    let messages_json = payload["messages"].as_array()
-                        .ok_or("custom_prompt requires 'messages' array")?;
-                    let messages: Vec<ChatMessage> = messages_json.iter()
-                        .filter_map(|v| Some(ChatMessage {
-                            role: v["role"].as_str()?.to_string(),
-                            content: v["content"].as_str()?.to_string(),
-                        })).collect();
-                    if messages.is_empty() {
-                        return Err("custom_prompt messages array is empty".to_string());
-                    }
-                    return Ok(ChatRequest {
-                        messages,
-                        model_override: payload["model"].as_str().map(String::from),
-                        max_tokens: payload["max_tokens"].as_u64().map(|v| v as u32),
-                        temperature: payload["temperature"].as_f64().map(|v| v as f32),
-                        stop: None,
-                    });
-                }
+                build_conflict_resolution(&ConflictResolutionInput {
+                    conflict_edge_ids: &edge_ids,
+                    edges: &edges_raw,
+                    privacy_level: privacy,
+                })
             }
 
-            // EntityDescription maps to entity_description in DB
+            CognitiveTaskType::CodeAnalysis => {
+                let tags_raw: Vec<String> = payload["existing_tags"]
+                    .as_array().unwrap_or(&vec![])
+                    .iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                let tag_refs: Vec<&str> = tags_raw.iter().map(|s| s.as_str()).collect();
+
+                build_code_analysis(&CodeAnalysisInput {
+                    artifact_id: payload["artifact_id"].as_str().unwrap_or(""),
+                    language: payload["language"].as_str().unwrap_or("unknown"),
+                    line_count: payload["line_count"].as_i64(),
+                    code_content: payload["code_content"].as_str().unwrap_or(""),
+                    existing_tags: &tag_refs,
+                    privacy_level: privacy,
+                })
+            }
+
             CognitiveTaskType::EntityDescription => {
                 let relations_raw: Vec<(String, String)> = payload["relations"]
                     .as_array().unwrap_or(&vec![])
@@ -420,7 +392,7 @@ impl TaskWorker {
                 debug!(session = target_id, title = title, "[TASK_WORKER] session_title written");
             }
 
-            CognitiveTaskType::CommunitySummary => {
+            CognitiveTaskType::CommunityNarrative => {
                 let summary = result.trim();
                 if summary.is_empty() { return Err("LLM returned empty community summary".to_string()); }
                 if let Some(comm) = storage.get_community(target_id).await {
@@ -430,49 +402,47 @@ impl TaskWorker {
                         Some(summary), comm.description.as_deref(),
                         comm.entity_count,
                     ).await.map_err(|e| format!("communities.summary writeback: {}", e))?;
-                    debug!(community = target_id, "[TASK_WORKER] community_summary written");
+                    debug!(community = target_id, "[TASK_WORKER] community_narrative written");
                 } else {
                     return Err(format!("Community {} not found for writeback", target_id));
                 }
             }
 
-            CognitiveTaskType::NaturalSummary => {
+            CognitiveTaskType::RecallSynthesis => {
                 let parsed = parse_json_result(result);
                 let summary = parsed["summary"].as_str().unwrap_or(result).trim();
                 let key_decisions = parsed["key_decisions"].as_str();
                 if summary.is_empty() { return Err("LLM returned empty summary".to_string()); }
                 storage.update_session_summary(target_id, summary, key_decisions, None).await;
-                debug!(session = target_id, "[TASK_WORKER] natural_summary written");
+                debug!(session = target_id, "[TASK_WORKER] recall_synthesis written");
             }
 
-            CognitiveTaskType::CustomPrompt => {
-                // conflict_resolution sub-type: invalidate losing edges
-                if payload["conflict_edge_ids"].is_array() {
-                    let parsed = parse_json_result(result);
-                    let keep_id = parsed["keep_edge_id"].as_i64()
-                        .ok_or_else(|| format!("conflict_resolution missing keep_edge_id: {}", result))?;
-                    if let Some(edge_ids) = payload["conflict_edge_ids"].as_array() {
-                        for val in edge_ids {
-                            if let Some(eid) = val.as_i64() {
-                                if eid != keep_id {
-                                    storage.invalidate_edge(eid).await;
-                                }
+            CognitiveTaskType::ConflictResolution => {
+                let parsed = parse_json_result(result);
+                let keep_id = parsed["keep_edge_id"].as_i64()
+                    .ok_or_else(|| format!("conflict_resolution missing keep_edge_id: {}", result))?;
+                if let Some(edge_ids) = payload["conflict_edge_ids"].as_array() {
+                    for val in edge_ids {
+                        if let Some(eid) = val.as_i64() {
+                            if eid != keep_id {
+                                storage.invalidate_edge(eid).await;
                             }
                         }
                     }
-                } else if payload.get("code_content").is_some() || payload.get("language").is_some() {
-                    // code_analysis sub-type
-                    let parsed = parse_json_result(result);
-                    let description = parsed["description"].as_str().unwrap_or(result).trim();
-                    if description.is_empty() { return Err("LLM returned empty code description".to_string()); }
-                    let conn = storage.conn_lock().await;
-                    conn.execute(
-                        "UPDATE artifacts SET description = ?1 WHERE artifact_id = ?2",
-                        rusqlite::params![description, target_id],
-                    ).map_err(|e| format!("artifacts.description writeback: {}", e))?;
-                } else {
-                    debug!(id = target_id, "[TASK_WORKER] custom_prompt: result in DB only");
                 }
+                debug!(target_id = target_id, keep_id = keep_id, "[TASK_WORKER] conflict_resolution written");
+            }
+
+            CognitiveTaskType::CodeAnalysis => {
+                let parsed = parse_json_result(result);
+                let description = parsed["description"].as_str().unwrap_or(result).trim();
+                if description.is_empty() { return Err("LLM returned empty code description".to_string()); }
+                let conn = storage.conn_lock().await;
+                conn.execute(
+                    "UPDATE artifacts SET description = ?1 WHERE artifact_id = ?2",
+                    rusqlite::params![description, target_id],
+                ).map_err(|e| format!("artifacts.description writeback: {}", e))?;
+                debug!(artifact = target_id, "[TASK_WORKER] code_analysis written");
             }
 
             CognitiveTaskType::EntityDescription => {
@@ -500,7 +470,14 @@ fn clean_llm_response(raw: &str, task_type: &CognitiveTaskType) -> String {
     let trimmed = after_think.trim();
 
     // JSON task types: return as-is, let parse_json_result handle
-    if matches!(task_type, CognitiveTaskType::NaturalSummary | CognitiveTaskType::CustomPrompt) {
+    // v2.5.0+Unify: RecallSynthesis (was NaturalSummary), ConflictResolution + CodeAnalysis
+    // (were CustomPrompt) produce JSON output
+    if matches!(
+        task_type,
+        CognitiveTaskType::RecallSynthesis
+        | CognitiveTaskType::ConflictResolution
+        | CognitiveTaskType::CodeAnalysis
+    ) {
         return trimmed.to_string();
     }
 
