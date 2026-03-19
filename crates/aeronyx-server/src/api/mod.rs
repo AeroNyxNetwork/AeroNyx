@@ -26,12 +26,15 @@
 //! - [`mpi`]: Core MPI types, auth, router (entry point)
 //! - [`mpi_handlers`]: Original endpoint handlers (remember, recall, etc.)
 //! - [`mpi_graph_handlers`]: v2.4.0 cognitive graph endpoints
-//! - [`log_handler`]: /log endpoint with rule engine + entropy filter
+//! - [`recall_handler`]: Hybrid recall pipeline (vector + BM25 + graph + RRF)
+//! - [`log_handler`]: /log endpoint with rule engine + entropy filter + privacy tags
+//! - [`supernode_handlers`]: v2.5.0 SuperNode management endpoints
 //! - [`local`]: Legacy Axum router (deprecated)
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - When adding new ORIGINAL-style endpoints → add to mpi_handlers.rs
 //! - When adding new GRAPH/COGNITIVE endpoints → add to mpi_graph_handlers.rs
+//! - When adding new SUPERNODE endpoints → add to supernode_handlers.rs
 //! - Register all routes in mpi.rs::build_mpi_router() regardless of which file
 //!   the handler lives in
 //! - Re-exports below MUST stay in sync — server.rs depends on them
@@ -39,25 +42,25 @@
 //! ## Last Modified
 //! v0.3.0 - 🌟 Initial Agent API for MemChain Phase 1
 //! v0.4.0 - 🌟 Extended for Phase 3: P2P broadcast + POST /api/sync
-//! v2.4.0-GraphCognition - 🌟 Split mpi.rs into 3 files; added mpi_handlers
-//!   and mpi_graph_handlers submodules
+//! v2.4.0-GraphCognition - 🌟 Split mpi.rs into 3 files; added mpi_handlers,
+//!   mpi_graph_handlers, recall_handler submodules
+//! v2.4.0+Privacy - 🌟 log_handler updated with privacy tag stripping
+//! v2.5.0+SuperNode Phase D - 🌟 Added supernode_handlers submodule
 
 // ── Core MPI module (state, auth, router) ──
 pub mod mpi;
-
-// ── Handler modules (split from mpi.rs in v2.4.0) ──
+// ── Handler modules ──
 pub mod mpi_handlers;
 pub mod mpi_graph_handlers;
 pub mod recall_handler;
-
-// ── /log endpoint (separate since v2.1.0) ──
+// ── /log endpoint ──
 pub mod log_handler;
-
+// ── v2.5.0+SuperNode: Task queue management + monitoring ──
+pub mod supernode_handlers;
 // ── Legacy API (deprecated) ──
 pub mod local;
 
 // ── Re-exports (unchanged from v2.3.0 — external callers unaffected) ──
 pub use mpi::{build_mpi_router, MpiState, BaselineSnapshot};
-
 #[allow(deprecated)]
 pub use local::start_legacy_api_server;
