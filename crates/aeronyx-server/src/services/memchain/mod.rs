@@ -22,7 +22,7 @@
 //! - [`llm_anthropic`]: Anthropic Messages API provider (v2.5.0+SuperNode)
 //! - [`llm_router`]: Task routing + fallback + cost estimation (v2.5.0+SuperNode)
 //! - [`task_worker`]: Async cognitive task queue worker (v2.5.0+SuperNode)
-//! - [`prompts`]: Prompt template engine for 5 cognitive task types (v2.5.0+SuperNode Phase B)
+//! - [`prompts`]: Prompt template engine for 6 cognitive task types (v2.5.0+SuperNode Phase B)
 //! - [`mempool`]: In-memory Fact buffer (legacy/deprecated)
 //! - [`aof`]: Append-Only File persistence (legacy/deprecated)
 //!
@@ -36,6 +36,9 @@
 //!   Rust allows multiple impl blocks across files within the same crate.
 //! - When adding a new storage submodule: declare `pub mod` here AND add re-exports.
 //! - Re-export order: storage types → engines → SuperNode → legacy.
+//! - CognitiveTaskType is defined in config_supernode.rs and re-exported through
+//!   llm_provider.rs. Do NOT define it here or in storage_supernode.rs.
+//! - PrivacyLevel is defined in config_supernode.rs and re-exported through prompts.rs.
 //!
 //! ## Last Modified
 //! v0.2.0 - Initial MemChain storage engine
@@ -48,6 +51,11 @@
 //! v2.5.0+SuperNode Phase A - 🌟 Added storage_supernode, llm_provider, llm_openai,
 //!   llm_anthropic, llm_router, task_worker modules + re-exports
 //! v2.5.0+SuperNode Phase B - 🌟 Added prompts module + PrivacyLevel re-export
+//! v2.5.0+Unify - 🔧 [BUG FIX] Fixed re-exports to match actual types defined in
+//!   storage_supernode.rs. CognitiveTaskType now re-exported from llm_provider
+//!   (which itself re-exports from config_supernode). Removed non-existent type
+//!   re-exports (LlmUsageStats, ProviderUsage, TaskTypeUsage) that were never
+//!   defined in storage_supernode.rs.
 
 // ── Storage engine ──
 pub mod storage;
@@ -115,7 +123,14 @@ pub use storage_graph::{
 pub use storage_miner::EntityTimelineEntry;
 
 // ── Storage SuperNode types (v2.5.0+SuperNode) ──
-pub use storage_supernode::{CognitiveTaskRow, LlmUsageStats, ProviderUsage, TaskTypeUsage};
+// v2.5.0+Unify: Only re-export types that actually exist in storage_supernode.rs.
+// CognitiveTaskRow is the task queue row struct.
+// LlmUsageStats, ProviderUsage, TaskTypeUsage were listed in the original mod.rs
+// but never defined in storage_supernode.rs — they need to be added there or
+// the re-exports removed. For now, only re-export what exists.
+pub use storage_supernode::CognitiveTaskRow;
+// TODO: Add these re-exports once the types are defined in storage_supernode.rs:
+// pub use storage_supernode::{LlmUsageStats, ProviderUsage, TaskTypeUsage};
 
 // ── Vector ──
 pub use vector::{
@@ -140,6 +155,8 @@ pub use quantize::ScalarQuantizer;
 pub use reranker::RerankerEngine;
 
 // ── LLM provider infrastructure (v2.5.0+SuperNode) ──
+// v2.5.0+Unify: CognitiveTaskType is re-exported from llm_provider, which itself
+// re-exports from config_supernode.rs (the single source of truth).
 pub use llm_provider::{
     LlmProvider, ChatRequest, ChatResponse, ChatMessage,
     TokenUsage, CognitiveTaskType, LlmError,
@@ -150,6 +167,8 @@ pub use llm_router::LlmRouter;
 pub use task_worker::TaskWorker;
 
 // ── Prompt template engine (v2.5.0+SuperNode Phase B) ──
+// v2.5.0+Unify: PrivacyLevel is re-exported from prompts, which itself
+// re-exports from config_supernode.rs (the single source of truth).
 pub use prompts::{PrivacyLevel, EntityDescriptionInput};
 
 // ── Legacy ──
