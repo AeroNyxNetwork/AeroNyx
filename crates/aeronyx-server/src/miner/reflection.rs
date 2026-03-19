@@ -22,6 +22,16 @@
 //! Step 11: Episode ingestion + community summary update
 //! ```
 //!
+//! ## v2.5.0+SuperNode: Cognitive Task Enqueue (Phase B — IMPLEMENTED)
+//! When llm_router is also attached, Steps 8/9/10 enqueue async LLM tasks:
+//! ```text
+//! Step 8 tail: enqueue_community_narrative_tasks() → community_narrative tasks
+//! Step 9 tail: enqueue_entity_description_tasks()  → entity_description tasks (if merged > 0)
+//! Step 10 tail: enqueue_session_title_tasks()       → session_title tasks
+//! ```
+//! Task enqueue is non-blocking. Failures are logged and do NOT cascade.
+//! TaskWorker (task_worker.rs) processes the queue asynchronously.
+//!
 //! ## MVF Integration
 //! - Step 0 produces training data for SGD (positive samples y=1)
 //! - When mvf_enabled: after Step 0, run SGD batch update on user_weights
@@ -74,18 +84,17 @@
 //!   - BUG-FIX-3: get_project() return type guarded — .ok() applied if Result,
 //!     .map(|p| p.name) only called on inner Option<Project>
 //!
-//! ## Dependencies
-//! - storage.rs — MemoryStorage, derive_rawlog_key, decrypt_rawlog_content_pub
-//! - storage_ops.rs — get_rawlogs_for_session, merge_entities, get_entities_with_embedding,
-//!   mark_session_artifacts_extracted, mark_session_summary_generated, update_session_ended_at,
-//!   update_session_summary (signature: session_id, summary, key_decisions, title)
-//! - identity.to_bytes() — Ed25519 PRIVATE key for rawlog key derivation
-//! - vector.rs — VectorIndex, cosine_similarity
-//! - mvf.rs — WeightVector, SGD
-//! - ner.rs — NerEngine (v2.4.0, optional — cognitive graph steps)
-//! - graph.rs — label_propagation (v2.4.0 Phase B — community detection)
-//! - sha2 crate — entity_id deterministic generation
-//! - regex crate — Markdown code fence extraction (Step 10)
+//! ## Modification Reason (v2.5.0+SuperNode)
+//! Added llm_router field (Option<Arc<LlmRouter>>) and with_llm_router() builder.
+//! Added three private cognitive task enqueue helpers (Steps 8/9/10 tail calls):
+//!   - enqueue_community_narrative_tasks(): skips communities that already have
+//!     an LLM-generated summary (not starting with "Community with").
+//!   - enqueue_entity_description_tasks(): enqueue only when merged > 0 and
+//!     entity has no rich description yet.
+//!   - enqueue_session_title_tasks(): targets sessions where title IS NULL OR
+//!     summary starts with "Topics:" (no-LLM placeholder).
+//! All three use insert_cognitive_task() which now returns Result<Option<i64>> —
+//! Ok(None) means duplicate skipped (idempotent), treated as success.
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - derive_rawlog_key MUST use identity.to_bytes() (PRIVATE key), NOT public_key_bytes()
@@ -93,6 +102,8 @@
 //! - After the key derivation fix, old rawlogs encrypted with public-key-derived key
 //!   are cleared by the migration in storage.rs
 //! - ner_engine is Option<Arc<NerEngine>> — when None, Steps 7-11 are skipped
+//! - llm_router is Option<Arc<LlmRouter>> — when None, SuperNode enqueue is skipped.
+//!   SuperNode steps are NESTED inside the ner_engine gate: ner must be present too.
 //! - NerEngine is thread-safe (Mutex<Session> internally) — safe to use from Miner
 //! - Steps 7-11 are gated on self.ner_engine.is_some() — if NER is disabled,
 //!   all cognitive graph steps are skipped (v2.3.0 behavior preserved).
@@ -105,6 +116,9 @@
 //!   creating hub nodes that pollute community detection (Step 8).
 //! - Step 9 merge threshold: cosine > 0.92 = merge, 0.85-0.92 = RELATED_TO edge.
 //! - Step 10 code block regex matches Markdown fences only (```lang\n...\n```).
+//! - Step 10 SuperNode enqueue: targets sessions where title IS NULL OR summary
+//!   starts with "Topics:" — this is the no-LLM placeholder marker. The SuperNode
+//!   worker will overwrite with an LLM-generated title after completion.
 //! - Step 11 encrypts episode content using record_key (same as records table).
 //! - Step 8 and Step 11 call self.storage.conn_lock() — this method MUST be
 //!   exposed as a public method on MemoryStorage (returns MutexGuard<Connection>).
@@ -141,6 +155,11 @@
 //!   Updated update_session_summary() call to pass generated title.
 //!   Bug fixes: UTF-8 safe truncation, unified rawlog_key derivation,
 //!   get_project() return type guard.
+//! v2.5.0+SuperNode - 🌟 Added llm_router field + with_llm_router() builder.
+//!   Added private helpers: enqueue_community_narrative_tasks(),
+//!   enqueue_entity_description_tasks(), enqueue_session_title_tasks().
+//!   Steps 8/9/10 call these helpers when llm_router is present.
+//!   All insert_cognitive_task() calls handle Result<Option<i64>> correctly.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -170,6 +189,8 @@ use crate::services::memchain::EmbedEngine;
 use crate::services::memchain::NerEngine;
 // v2.4.0 Phase B: Graph module for community detection (Step 8)
 use crate::services::memchain::graph;
+// v2.5.0: LlmRouter for SuperNode cognitive task enqueue
+use crate::services::memchain::LlmRouter;
 use crate::services::SessionManager;
 
 // ============================================
@@ -188,25 +209,12 @@ const EMBEDDING_BACKFILL_BATCH: usize = 50;
 // ============================================
 
 /// Default entity labels for GLiNER NER detection.
-/// These define WHAT types of entities to extract from conversations.
-/// Can be overridden via config.toml `ner_entity_labels`.
-///
-/// Rationale for each label:
-/// - project: software project names ("MemChain", "Project B")
-/// - module: code modules/components ("auth module", "storage engine")
-/// - technology: tools/frameworks/protocols ("JWT", "SQLite", "React")
-/// - person: people mentioned in conversations
-/// - file: file paths and filenames ("auth.rs", "config.toml")
-/// - concept: abstract concepts and decisions ("encryption", "zero-shot")
-/// - tool: development tools ("cargo", "git", "docker")
-/// - language: programming languages ("Rust", "TypeScript", "Python")
 const DEFAULT_ENTITY_LABELS: &[&str] = &[
     "project", "module", "technology", "person",
     "file", "concept", "tool", "language",
 ];
 
 /// Relation labels for GLiNER relation extraction (second pass).
-/// These define WHAT relationships to detect between entities.
 #[allow(dead_code)]
 const DEFAULT_RELATION_LABELS: &[&str] = &[
     "uses", "depends on", "contains", "belongs to",
@@ -220,15 +228,12 @@ const MINER_SESSION_BATCH: usize = 10;
 const MINER_MERGE_BATCH: usize = 200;
 
 /// Cosine similarity threshold for entity merge (Step 9).
-/// Above this → merge entities (they're the same thing with different names).
 const ENTITY_MERGE_THRESHOLD: f32 = 0.92;
 
 /// Cosine similarity threshold for RELATED_TO edge (Step 9).
-/// Between this and ENTITY_MERGE_THRESHOLD → create a relationship edge.
 const ENTITY_RELATED_THRESHOLD: f32 = 0.85;
 
 /// Regex pattern for Markdown code fences (Step 10).
-/// Captures: group 1 = language (optional), group 2 = code content.
 const CODE_FENCE_PATTERN: &str = r"```(\w*)\n([\s\S]*?)```";
 
 /// Negative feedback keywords (shared with log_handler, duplicated here
@@ -242,6 +247,19 @@ const EN_NEGATIVE: &[&str] = &[
     "actually no", "let me correct", "not what i asked",
     "try again", "that's not what i meant",
 ];
+
+// ============================================
+// v2.5.0+SuperNode: Task Priority Constants
+// ============================================
+
+/// Priority for session_title tasks (high — user-visible).
+const SUPERNODE_PRIORITY_SESSION_TITLE: i64 = 8;
+/// Priority for community_narrative tasks (medium).
+const SUPERNODE_PRIORITY_COMMUNITY_NARRATIVE: i64 = 5;
+/// Priority for entity_description tasks (low — background enrichment).
+const SUPERNODE_PRIORITY_ENTITY_DESCRIPTION: i64 = 3;
+/// Default max_retries for all cognitive tasks.
+const SUPERNODE_MAX_RETRIES: i64 = 3;
 
 // ============================================
 // ReflectionMiner
@@ -276,6 +294,19 @@ pub struct ReflectionMiner {
     /// cognitive graph Steps 7-11 for entity/relation extraction.
     /// When None, Steps 7-11 are skipped (v2.3.0 behavior).
     ner_engine: Option<Arc<NerEngine>>,
+
+    /// v2.5.0+SuperNode: LLM router for cognitive task enqueue.
+    ///
+    /// When Some AND ner_engine is also Some, Steps 8/9/10 will enqueue
+    /// async LLM tasks after their core logic completes:
+    ///   - Step 8 → community_narrative tasks
+    ///   - Step 9 → entity_description tasks (only if merged > 0)
+    ///   - Step 10 → session_title tasks
+    ///
+    /// When None, no cognitive tasks are enqueued (v2.4.0 behavior).
+    /// The llm_router is passed to helpers only for routing config checks;
+    /// actual LLM calls happen in TaskWorker (task_worker.rs).
+    llm_router: Option<Arc<LlmRouter>>,
 }
 
 impl ReflectionMiner {
@@ -304,6 +335,7 @@ impl ReflectionMiner {
             user_weights: None,
             embed_engine: None,
             ner_engine: None,
+            llm_router: None,
         }
     }
 
@@ -325,8 +357,6 @@ impl ReflectionMiner {
     }
 
     /// Set the local embedding engine for Miner steps.
-    /// When set, Miner uses local inference instead of OpenClaw Gateway HTTP.
-    /// Falls back to OpenClaw if local inference fails.
     #[must_use]
     pub fn with_embed_engine(mut self, engine: Arc<EmbedEngine>) -> Self {
         self.embed_engine = Some(engine);
@@ -334,25 +364,23 @@ impl ReflectionMiner {
     }
 
     /// v2.4.0: Set the local NER engine for cognitive graph Steps 7-11.
-    ///
-    /// When set, the Miner will extract entities and relations from conversation
-    /// content using GLiNER, building the three-layer cognitive graph:
-    /// - Step 7: Entity/relation extraction → entities + knowledge_edges tables
-    /// - Step 8: Community detection → communities + projects tables
-    /// - Step 9: Recursive merge → fragment consolidation + temporal conflicts
-    /// - Step 10: Session summary + code artifact extraction
-    /// - Step 11: Episode ingestion + community summary update
-    ///
-    /// When None, these steps are skipped and the Miner operates in v2.3.0 mode
-    /// (Steps 0-5 only).
-    ///
-    /// ## Thread Safety
-    /// NerEngine is thread-safe (ort::Session wrapped in Mutex internally).
-    /// The Miner runs on a single async task, so contention with MPI handlers
-    /// is minimal (recall path also uses NerEngine for query analysis).
     #[must_use]
     pub fn with_ner_engine(mut self, engine: Arc<NerEngine>) -> Self {
         self.ner_engine = Some(engine);
+        self
+    }
+
+    /// v2.5.0+SuperNode: Set the LLM router for cognitive task enqueue.
+    ///
+    /// When set (along with ner_engine), Steps 8/9/10 will enqueue async LLM
+    /// tasks after their core logic. The router is used only to check routing
+    /// config; actual dispatch happens in TaskWorker.
+    ///
+    /// ## Thread Safety
+    /// LlmRouter is Arc-wrapped and Send+Sync. Safe to use from Miner.
+    #[must_use]
+    pub fn with_llm_router(mut self, router: Arc<LlmRouter>) -> Self {
+        self.llm_router = Some(router);
         self
     }
 
@@ -362,6 +390,7 @@ impl ReflectionMiner {
             threshold = self.compaction_threshold,
             mvf = self.mvf_enabled,
             ner = self.ner_engine.is_some(),
+            supernode = self.llm_router.is_some(),
             "[MINER] Started"
         );
 
@@ -703,37 +732,7 @@ impl ReflectionMiner {
     // ============================================
     // v2.4.0: Cognitive Graph Steps (Phase B implementation)
     // ============================================
-    //
-    // These steps build the three-layer cognitive graph:
-    //   Episode layer → Semantic Entity layer → Community layer
-    //
-    // Execution order matters:
-    //   Step 7  → extracts entities + relations (populates entity/edge tables)
-    //   Step 8  → clusters entities into communities (requires Step 7 data)
-    //   Step 9  → merges duplicate entities (requires Step 7 data)
-    //   Step 10 → generates session summaries + extracts code artifacts
-    //   Step 11 → creates episodes + updates community summaries (requires Step 8)
-    //
-    // All steps are gated on self.ner_engine.is_some() in run().
-    // Each step has independent error handling — failures don't cascade.
 
-    /// Step 7: Extract entities and relations from conversation content.
-    ///
-    /// Pipeline:
-    /// 1. Get pending sessions (not yet entity-extracted)
-    /// 2. For each session, read raw_logs → decrypt → reconstruct conversation text
-    /// 3. Run GLiNER NER: detect entity spans with DEFAULT_ENTITY_LABELS
-    /// 4. Generate deterministic entity_id = SHA256(owner_hex + ":" + name_normalized)
-    /// 5. Upsert each entity (idempotent — mention_count auto-increments)
-    /// 6. Generate entity embeddings for future merge (Step 9)
-    /// 7. Detect relations between co-occurring entities in the same turn
-    /// 8. Insert knowledge_edges + episode_edges for provenance
-    /// 9. Mark session as entities_extracted
-    ///
-    /// v2.4.0 Phase B Fixes: Added stopword entity filtering via is_stopword_entity().
-    /// Fixed name_normalized construction: trim before lowercase for correctness.
-    ///
-    /// Writes to: entities, knowledge_edges, episode_edges tables.
     async fn step_7_entity_extraction(&self) {
         let ner = match &self.ner_engine {
             Some(n) => n,
@@ -746,7 +745,6 @@ impl ReflectionMiner {
             &self.identity.to_bytes()
         );
 
-        // 1. Get pending sessions
         let pending = self.storage.get_pending_sessions(&owner, MINER_SESSION_BATCH).await;
         let pending: Vec<_> = pending.into_iter()
             .filter(|s| !s.entities_extracted)
@@ -766,15 +764,12 @@ impl ReflectionMiner {
         let mut total_edges = 0u32;
 
         for session in &pending {
-            // 2. Read and decrypt raw_logs for this session
             let raw_logs = self.storage.get_rawlogs_for_session(&session.session_id).await;
             if raw_logs.is_empty() {
-                // No raw_logs → mark as extracted (nothing to extract)
                 self.storage.mark_session_entities_extracted(&session.session_id).await;
                 continue;
             }
 
-            // Reconstruct conversation text
             let mut conversation_text = String::new();
             for log in &raw_logs {
                 let content = if log.encrypted == 1 {
@@ -788,7 +783,6 @@ impl ReflectionMiner {
                 };
 
                 if content.is_empty() { continue; }
-
                 conversation_text.push_str(&format!("[{}] {}\n", log.role, content));
             }
 
@@ -797,16 +791,10 @@ impl ReflectionMiner {
                 continue;
             }
 
-            // 3. Run NER entity detection
-            let entities = match ner.detect_entities(
-                &conversation_text, DEFAULT_ENTITY_LABELS
-            ) {
+            let entities = match ner.detect_entities(&conversation_text, DEFAULT_ENTITY_LABELS) {
                 Ok(ents) => ents,
                 Err(e) => {
-                    warn!(
-                        session = %session.session_id, error = %e,
-                        "[MINER_S7] NER detection failed, skipping session"
-                    );
+                    warn!(session = %session.session_id, error = %e, "[MINER_S7] NER failed, skipping");
                     continue;
                 }
             };
@@ -816,34 +804,18 @@ impl ReflectionMiner {
                 continue;
             }
 
-            // Generate a pseudo episode_id for provenance tracking
             let episode_id = format!("ep_{}_{}", session.session_id, now_ts);
-
-            // 4-6. Upsert entities + generate embeddings
-            let mut session_entity_ids: Vec<(String, String)> = Vec::new(); // (entity_id, entity_type)
+            let mut session_entity_ids: Vec<(String, String)> = Vec::new();
 
             for entity in &entities {
-                // Bug fix (Phase B Fixes): trim before lowercase for correctness.
-                // Previously: entity.text.to_lowercase().trim() — trim on already-lowercased
-                // string is fine functionally but trim-first is semantically clearer.
                 let name_normalized = entity.text.trim().to_lowercase();
-                if name_normalized.is_empty() || name_normalized.len() < 2 {
-                    continue;
-                }
+                if name_normalized.is_empty() || name_normalized.len() < 2 { continue; }
 
-                // v2.4.0 Phase B Fixes: Filter out generic stopword entities.
-                // Entities whose name matches their type label (e.g., "project" as a
-                // project entity, "user" as a person) are noise — they lack specificity
-                // and become hub nodes that pollute community detection.
                 if is_stopword_entity(&name_normalized, &entity.text, &entity.label) {
-                    debug!(
-                        entity = %entity.text, label = %entity.label,
-                        "[MINER_S7] Skipped stopword entity"
-                    );
+                    debug!(entity = %entity.text, label = %entity.label, "[MINER_S7] Skipped stopword");
                     continue;
                 }
 
-                // Deterministic entity_id: SHA256(owner_hex + ":" + name_normalized)
                 let entity_id = {
                     use sha2::{Sha256, Digest};
                     let mut hasher = Sha256::new();
@@ -853,10 +825,7 @@ impl ReflectionMiner {
                     format!("ent_{}", &hex::encode(hasher.finalize())[..16])
                 };
 
-                // Generate embedding for entity name (for Step 9 merge)
                 let embedding = self.call_openclaw_embed(&entity.text).await;
-
-                // Upsert entity
                 let description = if entity.confidence > 0.8 {
                     Some(format!("{} ({})", entity.text, entity.label))
                 } else {
@@ -865,12 +834,10 @@ impl ReflectionMiner {
 
                 match self.storage.upsert_entity(
                     &entity_id, &owner, &entity.text, &name_normalized,
-                    &entity.label, description.as_deref(),
-                    embedding.as_deref(),
+                    &entity.label, description.as_deref(), embedding.as_deref(),
                 ).await {
                     Ok(is_new) => {
                         if is_new { total_entities += 1; }
-                        // v2.4.0+BM25: Index entity in FTS5
                         self.storage.fts_index_entity(
                             &entity_id, &owner, &entity.text,
                             description.as_deref(), &entity.label,
@@ -882,7 +849,6 @@ impl ReflectionMiner {
                     }
                 }
 
-                // 8. Insert episode_edge for provenance
                 let _ = self.storage.insert_episode_edge(
                     &owner, &episode_id, &entity_id, "mentioned"
                 ).await;
@@ -890,33 +856,18 @@ impl ReflectionMiner {
                 session_entity_ids.push((entity_id, entity.label.clone()));
             }
 
-            // 7. Detect relations between co-occurring entities
-            //    Simple heuristic: entities that appear in the same conversation
-            //    are likely related. For entities of different types that co-occur,
-            //    create a CO_OCCURS edge. More precise relation extraction can be
-            //    added later with a second GLiNER pass using relation labels.
             if session_entity_ids.len() >= 2 {
-                // Create edges between entity pairs (limit to top 10 to avoid N² explosion)
                 let pairs_limit = session_entity_ids.len().min(10);
                 for i in 0..pairs_limit {
                     for j in (i + 1)..pairs_limit {
                         let (ref src_id, ref src_type) = session_entity_ids[i];
                         let (ref tgt_id, ref tgt_type) = session_entity_ids[j];
-
-                        // Skip self-edges and same-type-same-name
                         if src_id == tgt_id { continue; }
 
-                        // Determine relation type based on entity types
                         let relation_type = infer_relation_type(src_type, tgt_type);
-
                         match self.storage.insert_knowledge_edge(
                             &owner, src_id, tgt_id, relation_type,
-                            None, // fact_text — no explicit text for co-occurrence
-                            0.5,  // weight — moderate for co-occurrence
-                            0.7,  // confidence — co-occurrence is indirect evidence
-                            None, // embedding
-                            now_ts,
-                            Some(&episode_id),
+                            None, 0.5, 0.7, None, now_ts, Some(&episode_id),
                         ).await {
                             Ok(_) => { total_edges += 1; }
                             Err(e) => {
@@ -927,55 +878,24 @@ impl ReflectionMiner {
                 }
             }
 
-            // 9. Mark session as extracted
             self.storage.mark_session_entities_extracted(&session.session_id).await;
-
-            debug!(
-                session = %session.session_id,
-                entities = entities.len(),
-                "[MINER_S7] Session entity extraction complete"
-            );
+            debug!(session = %session.session_id, entities = entities.len(), "[MINER_S7] Done");
         }
 
         if total_entities > 0 || total_edges > 0 {
-            info!(
-                entities = total_entities, edges = total_edges,
-                sessions = pending.len(),
-                "[MINER_S7] Entity extraction complete"
-            );
+            info!(entities = total_entities, edges = total_edges, "[MINER_S7] Entity extraction complete");
         }
     }
 
     /// Step 8: Community detection via label propagation.
     ///
-    /// Groups related entities into communities using the graph structure
-    /// from knowledge_edges. Then identifies project-type communities
-    /// (those containing "module", "file", "project" entity types).
-    ///
-    /// v2.4.0 Phase B Fixes: Added sessions.project_id back-fill after project
-    /// community detection. Traces project entities → episode_edges → episodes
-    /// → session_id, then batch-updates sessions.project_id for linked sessions.
-    /// Uses batched conn_lock() to avoid acquiring the lock per-session.
-    ///
-    /// Pipeline:
-    /// 1. Run label propagation (incremental: 1 round for efficiency)
-    /// 2. For each community, count members and generate name
-    /// 3. Upsert community records
-    /// 4. Update entity → community assignments
-    /// 5. Identify project communities → upsert projects
-    /// 6. Back-fill sessions.project_id for project communities (Fix 1)
-    ///
-    /// Writes to: communities, projects tables. Updates entities.community_id,
-    /// sessions.project_id.
+    /// v2.5.0+SuperNode tail: enqueue_community_narrative_tasks() if llm_router is set.
     async fn step_8_community_detection(&self) {
         let owner = self.identity.public_key_bytes();
 
-        // Run label propagation (needs raw Connection)
-        // ⚠️ Requires MemoryStorage::conn_lock() to be public.
-        // See storage.rs for the method definition.
         let labels = {
             let conn = self.storage.conn_lock().await;
-            graph::label_propagation(&conn, &owner, None, true) // incremental = true
+            graph::label_propagation(&conn, &owner, None, true)
         };
 
         if labels.is_empty() {
@@ -983,7 +903,6 @@ impl ReflectionMiner {
             return;
         }
 
-        // Group entities by community label
         let mut communities: HashMap<String, Vec<String>> = HashMap::new();
         for (entity_id, community_label) in &labels {
             communities.entry(community_label.clone())
@@ -997,8 +916,6 @@ impl ReflectionMiner {
         for (community_id, member_ids) in &communities {
             if member_ids.is_empty() { continue; }
 
-            // Generate community name from its members
-            // Use the entity with highest mention_count as the representative name
             let community_name = {
                 let mut best_name = community_id.clone();
                 let mut best_mentions = 0i64;
@@ -1006,7 +923,6 @@ impl ReflectionMiner {
 
                 for eid in member_ids {
                     if let Some(entity) = self.storage.get_entity(eid).await {
-                        // T1: Priority — entity_type="project" wins regardless of mention_count
                         if entity.entity_type == "project" && project_name.is_none() {
                             project_name = Some(entity.name.clone());
                         }
@@ -1016,37 +932,27 @@ impl ReflectionMiner {
                         }
                     }
                 }
-
-                // Use project entity name if available, otherwise fallback to highest mention
                 project_name.unwrap_or(best_name)
             };
 
-            // Upsert community
             if let Err(e) = self.storage.upsert_community(
                 community_id, &owner, &community_name,
-                None, // summary — will be generated in Step 11
-                None, // description
-                member_ids.len() as i64,
+                None, None, member_ids.len() as i64,
             ).await {
                 warn!(error = %e, "[MINER_S8] Community upsert failed");
                 continue;
             }
             total_communities += 1;
 
-            // Update entity → community assignment
             for eid in member_ids {
                 self.storage.update_entity_community(eid, community_id).await;
             }
 
-            // Check if this community contains project-type entities
             let has_project_entities = {
                 let mut found = false;
                 for eid in member_ids {
                     if let Some(entity) = self.storage.get_entity(eid).await {
-                        if matches!(
-                            entity.entity_type.as_str(),
-                            "project" | "module" | "file"
-                        ) {
+                        if matches!(entity.entity_type.as_str(), "project" | "module" | "file") {
                             found = true;
                             break;
                         }
@@ -1064,14 +970,10 @@ impl ReflectionMiner {
                 } else {
                     total_projects += 1;
 
-                    // v2.4.0 Phase B Fixes (Fix 1): Back-fill sessions.project_id
-                    // Trace: project entities → episode_edges → episodes → session_id
-                    // Then update sessions.project_id for all linked sessions.
                     let mut project_session_ids: HashSet<String> = HashSet::new();
                     for eid in member_ids {
                         let ep_links = self.storage.get_episodes_for_entity(eid).await;
                         for (episode_id, _role) in &ep_links {
-                            // Parse session_id from episode_id convention: "ep_{session_id}_{ts}"
                             if episode_id.starts_with("ep_") {
                                 let rest = &episode_id[3..];
                                 if let Some(last_underscore) = rest.rfind('_') {
@@ -1082,8 +984,6 @@ impl ReflectionMiner {
                         }
                     }
 
-                    // Batch update sessions.project_id for discovered sessions
-                    // ⚠️ Acquire conn_lock() once for all session updates (not per-session)
                     if !project_session_ids.is_empty() {
                         let conn = self.storage.conn_lock().await;
                         for sid in &project_session_ids {
@@ -1093,27 +993,18 @@ impl ReflectionMiner {
                             );
                         }
                         drop(conn);
-
-                        debug!(
-                            project = community_id,
-                            sessions = project_session_ids.len(),
-                            "[MINER_S8] Back-filled sessions.project_id"
-                        );
+                        debug!(project = community_id, sessions = project_session_ids.len(), "[MINER_S8] Back-filled project_id");
                     }
                 }
             }
         }
 
-        // ── T3: Merge small communities (entity_count < 3) into nearest large community ──
-        // Small communities often contain entities that didn't get enough edges
-        // during label propagation (e.g., a person mentioned once). We merge them
-        // into the large community they have the most connections to.
+        // Small community merge (unchanged from v2.4.0)
         let mut merged_small = 0u32;
         let small_communities: Vec<(String, Vec<String>)> = communities.iter()
             .filter(|(_, members)| members.len() < 3)
             .map(|(cid, members)| (cid.clone(), members.clone()))
             .collect();
-
         let large_communities: Vec<(String, Vec<String>)> = communities.iter()
             .filter(|(_, members)| members.len() >= 3)
             .map(|(cid, members)| (cid.clone(), members.clone()))
@@ -1121,18 +1012,11 @@ impl ReflectionMiner {
 
         if !small_communities.is_empty() && !large_communities.is_empty() {
             for (small_cid, small_members) in &small_communities {
-                // Count edges from small community members to each large community
                 let mut edge_counts: HashMap<String, usize> = HashMap::new();
-
                 for eid in small_members {
                     let edges = self.storage.get_edges_for_entity(eid, &owner).await;
                     for edge in &edges {
-                        let other_id = if edge.source_id == *eid {
-                            &edge.target_id
-                        } else {
-                            &edge.source_id
-                        };
-                        // Find which large community this neighbor belongs to
+                        let other_id = if edge.source_id == *eid { &edge.target_id } else { &edge.source_id };
                         for (large_cid, large_members) in &large_communities {
                             if large_members.contains(other_id) {
                                 *edge_counts.entry(large_cid.clone()).or_insert(0) += 1;
@@ -1140,75 +1024,49 @@ impl ReflectionMiner {
                         }
                     }
                 }
-
-                // Merge into the large community with most connections
-                if let Some((best_large_cid, _count)) = edge_counts.iter()
-                    .max_by_key(|(_, count)| *count)
-                {
+                if let Some((best_large_cid, _)) = edge_counts.iter().max_by_key(|(_, c)| *c) {
                     for eid in small_members {
                         self.storage.update_entity_community(eid, best_large_cid).await;
                     }
                     merged_small += 1;
-                    debug!(
-                        small = small_cid, target = best_large_cid,
-                        members = small_members.len(),
-                        "[MINER_S8] Merged small community"
-                    );
                 }
             }
         }
 
         if merged_small > 0 {
-            // Re-count entities in communities after merging.
-            // Look up the community name from the get_communities() result we
-            // already fetched earlier (avoids needing a get_community() method).
             let existing_communities = self.storage.get_communities(&owner).await;
             for (large_cid, _) in &large_communities {
                 let members = self.storage.get_entities_in_community(large_cid, &owner).await;
                 let cname = existing_communities.iter()
                     .find(|c| c.community_id == *large_cid)
-                    .map(|c| c.name.as_str())
-                    .unwrap_or(large_cid.as_str());
-                let _ = self.storage.upsert_community(
-                    large_cid, &owner, cname,
-                    None, None, members.len() as i64,
-                ).await;
+                    .map(|c| c.name.as_str()).unwrap_or(large_cid.as_str());
+                let _ = self.storage.upsert_community(large_cid, &owner, cname, None, None, members.len() as i64).await;
             }
             info!(merged = merged_small, "[MINER_S8] Small communities merged");
         }
 
         if total_communities > 0 {
-            info!(
-                communities = total_communities, projects = total_projects,
-                "[MINER_S8] Community detection complete"
-            );
+            info!(communities = total_communities, projects = total_projects, "[MINER_S8] Complete");
+        }
+
+        // ── v2.5.0+SuperNode tail ─────────────────────────────────────────
+        // Enqueue community_narrative tasks for communities that don't yet
+        // have an LLM-generated summary. Non-blocking — failures are logged.
+        if self.llm_router.is_some() {
+            self.enqueue_community_narrative_tasks(&owner).await;
         }
     }
 
     /// Step 9: Recursive merge — consolidate fragment entities.
     ///
-    /// Finds entities that represent the same real-world concept but have
-    /// different surface forms (e.g., "JWT" vs "JSON Web Token"), and
-    /// merges them using embedding similarity.
-    ///
-    /// Pipeline:
-    /// 1. Load all entities with embeddings
-    /// 2. Pairwise cosine similarity (O(N²), bounded by MINER_MERGE_BATCH)
-    /// 3. cos > 0.92 → merge (consolidate mention_count, repoint edges)
-    /// 4. 0.85 < cos < 0.92 → insert RELATED_TO edge (if not exists)
-    /// 5. Check for temporal conflicts: find_superseded_edges → invalidate
-    ///
-    /// Writes to: entities, knowledge_edges (merge/RELATED_TO/invalidate).
+    /// v2.5.0+SuperNode tail: enqueue_entity_description_tasks() if merged > 0.
     async fn step_9_recursive_merge(&self) {
         let owner = self.identity.public_key_bytes();
 
-        // 1. Load entities with embeddings
-        let entities = self.storage.get_entities_with_embedding(
-            &owner, MINER_MERGE_BATCH
-        ).await;
+        let entities = self.storage.get_entities_with_embedding(&owner, MINER_MERGE_BATCH).await;
 
         if entities.len() < 2 {
-            debug!("[MINER_S9] Not enough entities for merge ({} < 2)", entities.len());
+            debug!("[MINER_S9] Not enough entities ({} < 2)", entities.len());
             return;
         }
 
@@ -1219,9 +1077,8 @@ impl ReflectionMiner {
 
         let mut merged = 0u32;
         let mut related = 0u32;
-        let mut merged_ids: HashSet<String> = HashSet::new(); // track already-merged
+        let mut merged_ids: HashSet<String> = HashSet::new();
 
-        // 2. Pairwise comparison
         for i in 0..entities.len() {
             let (ref id_a, ref name_a, ref type_a, ref emb_a) = entities[i];
             if merged_ids.contains(id_a) { continue; }
@@ -1229,15 +1086,11 @@ impl ReflectionMiner {
             for j in (i + 1)..entities.len() {
                 let (ref id_b, ref name_b, ref type_b, ref emb_b) = entities[j];
                 if merged_ids.contains(id_b) { continue; }
-                if id_a == id_b { continue; }
-
-                // Only merge same-type entities (don't merge a "person" into a "technology")
-                if type_a != type_b { continue; }
+                if id_a == id_b || type_a != type_b { continue; }
 
                 let sim = cosine_similarity(emb_a, emb_b);
 
                 if sim > ENTITY_MERGE_THRESHOLD {
-                    // 3. Merge: keep the one with longer name (more descriptive)
                     let (keep_id, remove_id) = if name_a.len() >= name_b.len() {
                         (id_a.as_str(), id_b.as_str())
                     } else {
@@ -1248,49 +1101,29 @@ impl ReflectionMiner {
                         Ok(()) => {
                             merged += 1;
                             merged_ids.insert(remove_id.to_string());
-                            debug!(
-                                keep = keep_id, remove = remove_id,
-                                sim = format!("{:.3}", sim),
-                                "[MINER_S9] Entities merged"
-                            );
                         }
-                        Err(e) => {
-                            warn!(error = %e, "[MINER_S9] Entity merge failed");
-                        }
+                        Err(e) => { warn!(error = %e, "[MINER_S9] Entity merge failed"); }
                     }
                 } else if sim > ENTITY_RELATED_THRESHOLD {
-                    // 4. Create RELATED_TO edge
                     let _ = self.storage.insert_knowledge_edge(
                         &owner, id_a, id_b, "RELATED_TO",
                         Some(&format!("{} ~ {}", name_a, name_b)),
-                        sim as f64, sim as f64,
-                        None, now_ts, None,
+                        sim as f64, sim as f64, None, now_ts, None,
                     ).await;
                     related += 1;
                 }
             }
         }
 
-        // 5. Temporal conflict detection
-        // Check for superseded edges (e.g., "auth USES JWT" superseded by "auth USES OAuth")
-        // This is done by looking for edges with same source + relation_type but different targets
+        // Temporal conflict detection (unchanged)
         let mut invalidated = 0u32;
         {
-            // Get recently created edges (from this miner cycle or recent)
-            let entity_ids: Vec<String> = entities.iter()
-                .map(|(id, _, _, _)| id.clone())
-                .collect();
-            let recent_edges = self.storage.get_active_edges(
-                &owner, &entity_ids, 0.3,
-            ).await;
-
-            // For each entity with multiple same-relation-type edges, keep newest
+            let entity_ids: Vec<String> = entities.iter().map(|(id, _, _, _)| id.clone()).collect();
+            let recent_edges = self.storage.get_active_edges(&owner, &entity_ids, 0.3).await;
             let mut seen_relations: HashMap<(String, String), (i64, i64)> = HashMap::new();
             for edge in &recent_edges {
                 let key = (edge.source_id.clone(), edge.relation_type.clone());
-                let existing = seen_relations.get(&key);
-                if let Some(&(existing_edge_id, existing_valid_from)) = existing {
-                    // Keep the newer edge, invalidate the older one
+                if let Some(&(existing_edge_id, existing_valid_from)) = seen_relations.get(&key) {
                     if edge.valid_from > existing_valid_from {
                         self.storage.invalidate_edge(existing_edge_id).await;
                         seen_relations.insert(key, (edge.edge_id, edge.valid_from));
@@ -1306,32 +1139,20 @@ impl ReflectionMiner {
         }
 
         if merged > 0 || related > 0 || invalidated > 0 {
-            info!(
-                merged = merged, related = related, invalidated = invalidated,
-                "[MINER_S9] Recursive merge complete"
-            );
+            info!(merged = merged, related = related, invalidated = invalidated, "[MINER_S9] Complete");
+        }
+
+        // ── v2.5.0+SuperNode tail ─────────────────────────────────────────
+        // Only enqueue entity_description tasks when entities were actually
+        // merged this tick — merged entities need fresh descriptions.
+        if self.llm_router.is_some() && merged > 0 {
+            self.enqueue_entity_description_tasks(&owner).await;
         }
     }
 
     /// Step 10: Generate session summaries and extract code artifacts.
     ///
-    /// Pipeline:
-    /// 1. Get sessions pending summary generation
-    /// 2. For each session:
-    ///    a. Without LLM: top-5 entity names → summary
-    ///    b. With LLM: call miner_llm_endpoint for natural summary
-    /// 3. Generate human-readable title (v2.4.0+Search):
-    ///    - Has project → "{ProjectName}: {top-3 entities}"
-    ///    - Has entities but no project → "{top-3 entities}"
-    ///    - No entities → first user message (truncated to 60 chars, UTF-8 safe)
-    /// 4. Extract Markdown code fences → insert as artifacts
-    /// 5. Update session summary + title, mark as summary_generated
-    ///
-    /// ⚠️ Requires storage_ops.rs update_session_summary() to accept 4th param:
-    ///    `title: Option<&str>`. Apply the corresponding storage_ops change first.
-    ///
-    /// Writes to: sessions.summary, sessions.title, sessions.key_decisions,
-    /// artifacts table.
+    /// v2.5.0+SuperNode tail: enqueue_session_title_tasks() if llm_router is set.
     async fn step_10_session_summary(&self) {
         let owner = self.identity.public_key_bytes();
 
@@ -1353,22 +1174,16 @@ impl ReflectionMiner {
         let code_regex = regex::Regex::new(CODE_FENCE_PATTERN)
             .unwrap_or_else(|_| regex::Regex::new(r"```(\w*)\n([\s\S]*?)```").unwrap());
 
-        // v2.4.0+Search: Derive rawlog_key once per step tick, not per session.
-        // BUG-FIX-2: Previously the original code derived this key again inside
-        // the session loop, creating a redundant derivation. Unified here.
-        let rawlog_key = crate::services::memchain::derive_rawlog_key(
-            &self.identity.to_bytes()
-        );
+        // BUG-FIX-2: Derive rawlog_key once per step tick, not per session.
+        let rawlog_key = crate::services::memchain::derive_rawlog_key(&self.identity.to_bytes());
 
         let mut total_summaries = 0u32;
         let mut total_artifacts = 0u32;
 
         for session in &pending {
-            // Read conversation for code extraction and title fallback
             let raw_logs = self.storage.get_rawlogs_for_session(&session.session_id).await;
 
             let mut full_text = String::new();
-
             for log in &raw_logs {
                 let content = if log.encrypted == 1 {
                     String::from_utf8(
@@ -1383,14 +1198,9 @@ impl ReflectionMiner {
                 full_text.push('\n');
             }
 
-            // --- Generate summary ---
-            // Get top entities for this session (from episode_edges)
             let entity_names: Vec<String> = {
-                // T2: Get entities specific to THIS session via episode_edges.
-                // Episode ID convention: "ep_{session_id}_{timestamp}"
                 let mut session_entity_ids: HashSet<String> = HashSet::new();
 
-                // Find all episodes for this session
                 let episodes = self.storage.get_episodes_for_session(&session.session_id).await;
                 for (episode_id, _, _) in &episodes {
                     let linked = self.storage.get_entities_for_episode(episode_id).await;
@@ -1399,8 +1209,6 @@ impl ReflectionMiner {
                     }
                 }
 
-                // Also check episode_edges with the ep_{session_id}_ prefix pattern
-                // (episodes created by Step 7 before Step 11 writes to episodes table)
                 let ep_prefix = format!("ep_{}_", session.session_id);
                 let all_entities = self.storage.get_entities_by_owner(&owner, None, 500).await;
                 for entity in &all_entities {
@@ -1412,7 +1220,6 @@ impl ReflectionMiner {
                     }
                 }
 
-                // Resolve entity names, sorted by mention_count desc
                 let mut named: Vec<(String, i64)> = Vec::new();
                 for eid in &session_entity_ids {
                     if let Some(entity) = self.storage.get_entity(eid).await {
@@ -1423,27 +1230,16 @@ impl ReflectionMiner {
                 named.into_iter().take(5).map(|(name, _)| name).collect()
             };
 
+            // No-LLM summary placeholder (marker prefix "Topics:" used by SuperNode
+            // enqueue_session_title_tasks to identify sessions needing LLM title)
             let summary = if entity_names.is_empty() {
                 format!("Session with {} turns", session.turn_count)
             } else {
                 format!("Topics: {}", entity_names.join(", "))
             };
 
-            // TODO(Phase C): If miner_llm_endpoint is configured, call it for natural summary
-            // let summary = if let Some(llm_url) = &self.miner_llm_endpoint { ... }
-
-            // ── v2.4.0+Search: Generate human-readable session title ──
-            // Title strategy (no LLM):
-            //   1. Has project → "{ProjectName}: {top-3 entities}"
-            //   2. Has entities but no project → "{top-3 entities}"
-            //   3. No entities → first user message (truncated to 60 chars, UTF-8 safe)
-            //
-            // TODO(Phase C): If miner_llm_endpoint is configured, call it for natural title
+            // No-LLM title (placeholder — SuperNode will overwrite with LLM title)
             let title = {
-                // Look up project name if session has a project_id.
-                // BUG-FIX-3: get_project() may return Result<Option<Project>> or Option<Project>
-                // depending on the storage_ops implementation. The .await call here assumes
-                // it returns Option<Project> directly. If it returns Result, add .ok().flatten().
                 let project_name: Option<String> = if let Some(ref pid) = session.project_id {
                     self.storage.get_project(pid).await.map(|p| p.name)
                 } else {
@@ -1451,19 +1247,13 @@ impl ReflectionMiner {
                 };
 
                 if !entity_names.is_empty() {
-                    let top_entities = entity_names.iter().take(3)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let top_entities = entity_names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
                     match project_name {
                         Some(pname) => format!("{}: {}", pname, top_entities),
                         None => top_entities,
                     }
                 } else {
-                    // Fallback: first user message, truncated.
-                    // BUG-FIX-1: Use char_indices for UTF-8 safe truncation at ~60 chars.
-                    // The original `&content[..60]` byte slice panics on multi-byte characters
-                    // (e.g., Chinese, Japanese, emoji). char_indices iterates codepoints safely.
+                    // BUG-FIX-1: UTF-8 safe truncation via char_indices
                     let first_user_msg = raw_logs.iter()
                         .find(|l| l.role == "user")
                         .map(|l| {
@@ -1476,19 +1266,13 @@ impl ReflectionMiner {
                             } else {
                                 String::from_utf8_lossy(&l.content).to_string()
                             };
-                            // UTF-8 safe truncation at ~60 chars (character boundary)
                             let char_count = content.chars().count();
                             if char_count <= 60 {
                                 content
                             } else {
-                                // Find byte offset of the 60th character
-                                let byte_60 = content.char_indices()
-                                    .nth(60)
-                                    .map(|(byte_pos, _)| byte_pos)
-                                    .unwrap_or(content.len());
+                                let byte_60 = content.char_indices().nth(60)
+                                    .map(|(pos, _)| pos).unwrap_or(content.len());
                                 let truncated = &content[..byte_60];
-                                // Try to trim at last space boundary for readability
-                                // Only do this if the space is at least 20 chars in
                                 match truncated.rfind(' ') {
                                     Some(pos) if pos > 20 => format!("{}...", &truncated[..pos]),
                                     _ => format!("{}...", truncated),
@@ -1507,27 +1291,17 @@ impl ReflectionMiner {
             self.storage.update_session_summary(
                 &session.session_id, &summary, None, Some(&title)
             ).await;
-            // v2.4.0+BM25: Index session summary in FTS5
-            self.storage.fts_index_session(
-                &session.session_id, &owner, &summary,
-            ).await;
+            self.storage.fts_index_session(&session.session_id, &owner, &summary).await;
             self.storage.mark_session_summary_generated(&session.session_id).await;
             self.storage.update_session_ended_at(&session.session_id, now_ts).await;
             self.storage.mark_session_artifacts_extracted(&session.session_id).await;
             total_summaries += 1;
 
-            // --- Extract code artifacts ---
+            // Code artifact extraction (unchanged)
             for cap in code_regex.captures_iter(&full_text) {
-                let language = cap.get(1)
-                    .map(|m| m.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("unknown");
-                let code_content = match cap.get(2) {
-                    Some(m) => m.as_str().trim(),
-                    None => continue,
-                };
-
-                // Skip very short code blocks (likely inline snippets)
+                let language = cap.get(1).map(|m| m.as_str())
+                    .filter(|s| !s.is_empty()).unwrap_or("unknown");
+                let code_content = match cap.get(2) { Some(m) => m.as_str().trim(), None => continue };
                 if code_content.len() < 20 { continue; }
 
                 let content_hash = {
@@ -1539,25 +1313,14 @@ impl ReflectionMiner {
 
                 let artifact_id = format!("art_{}_{}", &content_hash[..12], now_ts);
                 let line_count = code_content.lines().count() as i64;
-
-                // Store content as plaintext bytes
-                // TODO(Phase C): Encrypt with record_key for at-rest protection
                 let stored_content = code_content.as_bytes().to_vec();
 
                 if let Err(e) = self.storage.insert_artifact(
                     &artifact_id, &owner, &session.session_id,
-                    session.project_id.as_deref(),
-                    "code",
-                    None, // filename — cannot determine from code fence alone
-                    Some(language),
-                    1, // version
-                    None, // parent_id
-                    &stored_content,
-                    &content_hash,
-                    None, // embedding
-                    Some(line_count),
+                    session.project_id.as_deref(), "code", None, Some(language),
+                    1, None, &stored_content, &content_hash, None, Some(line_count),
                 ).await {
-                    debug!(error = %e, "[MINER_S10] Artifact insert failed (likely duplicate hash)");
+                    debug!(error = %e, "[MINER_S10] Artifact insert failed (likely duplicate)");
                 } else {
                     total_artifacts += 1;
                 }
@@ -1565,25 +1328,21 @@ impl ReflectionMiner {
         }
 
         if total_summaries > 0 || total_artifacts > 0 {
-            info!(
-                summaries = total_summaries, artifacts = total_artifacts,
-                "[MINER_S10] Session summary complete"
-            );
+            info!(summaries = total_summaries, artifacts = total_artifacts, "[MINER_S10] Complete");
+        }
+
+        // ── v2.5.0+SuperNode tail ─────────────────────────────────────────
+        // Enqueue session_title tasks for sessions with no-LLM placeholder titles.
+        if self.llm_router.is_some() {
+            let owner = self.identity.public_key_bytes();
+            self.enqueue_session_title_tasks(&owner).await;
         }
     }
 
-    /// Step 11: Ingest episodes and update community summaries.
-    ///
-    /// Pipeline:
-    /// 1. For sessions with extracted entities, create episode records
-    /// 2. Update community summaries (aggregate entity names per community)
-    ///
-    /// Writes to: episodes table, communities.summary.
+    /// Step 11: Ingest episodes and update community summaries. (unchanged)
     async fn step_11_episode_ingestion(&self) {
         let owner = self.identity.public_key_bytes();
-        let rawlog_key = crate::services::memchain::derive_rawlog_key(
-            &self.identity.to_bytes()
-        );
+        let rawlog_key = crate::services::memchain::derive_rawlog_key(&self.identity.to_bytes());
 
         let now_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1592,11 +1351,6 @@ impl ReflectionMiner {
 
         let mut episodes_created = 0u32;
 
-        // 1. Find sessions that have been fully processed (entities_extracted=1)
-        //    but don't yet have episode records.
-        //    ⚠️ This uses conn_lock() for a custom query — requires public method on MemoryStorage.
-        //    TODO(Phase C): Move this query into a dedicated storage_ops method to avoid
-        //    direct SQL in reflection.rs.
         let processed_sessions = {
             let conn = self.storage.conn_lock().await;
             let mut stmt = match conn.prepare(
@@ -1612,10 +1366,7 @@ impl ReflectionMiner {
                  LIMIT ?2"
             ) {
                 Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %e, "[MINER_S11] Query processed sessions failed");
-                    return;
-                }
+                Err(e) => { warn!(error = %e, "[MINER_S11] Query failed"); return; }
             };
             stmt.query_map(
                 rusqlite::params![owner.as_slice(), MINER_SESSION_BATCH as i64],
@@ -1631,8 +1382,6 @@ impl ReflectionMiner {
 
         for (session_id, started_at, _turn_count, summary) in &processed_sessions {
             let episode_id = format!("ep_{}_{}", session_id, started_at);
-
-            // Read conversation content for episode storage
             let raw_logs = self.storage.get_rawlogs_for_session(session_id).await;
             let mut episode_text = String::new();
             for log in &raw_logs {
@@ -1648,7 +1397,6 @@ impl ReflectionMiner {
                 episode_text.push_str(&format!("[{}] {}\n", log.role, content));
             }
 
-            // Content hash for dedup
             let content_hash = {
                 use sha2::{Sha256, Digest};
                 let mut hasher = Sha256::new();
@@ -1656,17 +1404,10 @@ impl ReflectionMiner {
                 hex::encode(hasher.finalize())
             };
 
-            // Store episode (content as plaintext bytes)
-            // TODO(Phase C): Encrypt with record_key for at-rest protection
             if let Err(e) = self.storage.upsert_episode(
                 &episode_id, &owner, "conversation", "miner",
-                Some(session_id),
-                episode_text.as_bytes(),
-                &content_hash,
-                None, // embedding — could be generated but expensive
-                Some(episode_text.len() as i64),
-                *started_at,
-                summary.as_deref(),
+                Some(session_id), episode_text.as_bytes(), &content_hash,
+                None, Some(episode_text.len() as i64), *started_at, summary.as_deref(),
             ).await {
                 debug!(error = %e, "[MINER_S11] Episode upsert failed (likely duplicate)");
             } else {
@@ -1674,34 +1415,21 @@ impl ReflectionMiner {
             }
         }
 
-        // 2. Update community summaries
         let communities = self.storage.get_communities(&owner).await;
         let mut summaries_updated = 0u32;
 
         for community in &communities {
-            let members = self.storage.get_entities_in_community(
-                &community.community_id, &owner
-            ).await;
-
+            let members = self.storage.get_entities_in_community(&community.community_id, &owner).await;
             if members.is_empty() { continue; }
 
-            // Generate summary from member entity names and types
-            let member_desc: Vec<String> = members.iter()
-                .take(10) // top 10 by mention_count (already sorted)
+            let member_desc: Vec<String> = members.iter().take(10)
                 .map(|e| format!("{} ({})", e.name, e.entity_type))
                 .collect();
-
-            let summary = format!(
-                "Community with {} entities: {}",
-                members.len(),
-                member_desc.join(", ")
-            );
+            let summary = format!("Community with {} entities: {}", members.len(), member_desc.join(", "));
 
             if let Err(e) = self.storage.upsert_community(
                 &community.community_id, &owner, &community.name,
-                Some(&summary),
-                community.description.as_deref(),
-                members.len() as i64,
+                Some(&summary), community.description.as_deref(), members.len() as i64,
             ).await {
                 warn!(error = %e, "[MINER_S11] Community summary update failed");
             } else {
@@ -1710,11 +1438,225 @@ impl ReflectionMiner {
         }
 
         if episodes_created > 0 || summaries_updated > 0 {
-            info!(
-                episodes = episodes_created,
-                community_summaries = summaries_updated,
-                "[MINER_S11] Episode ingestion complete"
-            );
+            info!(episodes = episodes_created, community_summaries = summaries_updated, "[MINER_S11] Complete");
+        }
+    }
+
+    // ============================================
+    // v2.5.0+SuperNode: Cognitive Task Enqueue Helpers
+    // ============================================
+    //
+    // These three private helpers are called at the tail of Steps 8/9/10
+    // when llm_router is present. They are non-blocking: insert_cognitive_task()
+    // returns Result<Option<i64>> where Ok(None) = duplicate skipped (idempotent).
+    //
+    // ⚠️ Do NOT call these when llm_router is None — the caller gates them.
+    // ⚠️ insert_cognitive_task() may return Ok(None) for already-active tasks.
+    //    Treat Ok(None) as success (idempotency guard working correctly).
+
+    /// Step 8 tail: enqueue community_narrative LLM tasks.
+    ///
+    /// Skips communities that already have an LLM-generated summary.
+    /// A summary is considered LLM-generated if it does NOT start with
+    /// "Community with" (which is the no-LLM placeholder prefix written
+    /// by Step 11 and Step 8 community name generation).
+    async fn enqueue_community_narrative_tasks(&self, owner: &[u8]) {
+        let communities = self.storage.get_communities(owner).await;
+
+        let mut enqueued = 0u32;
+        let mut skipped = 0u32;
+
+        for community in &communities {
+            // Skip if already has LLM-generated summary
+            // "Community with" is the Step 11 no-LLM placeholder prefix
+            let needs_llm = match &community.summary {
+                None => true,
+                Some(s) => s.starts_with("Community with"),
+            };
+
+            if !needs_llm {
+                skipped += 1;
+                continue;
+            }
+
+            // Build minimal payload for the task worker
+            let payload = serde_json::json!({
+                "community_id": community.community_id,
+                "community_name": community.name,
+                "member_count": community.entity_count,
+            });
+
+            match self.storage.insert_cognitive_task(
+                "community_narrative",
+                SUPERNODE_PRIORITY_COMMUNITY_NARRATIVE,
+                &payload.to_string(),
+                None, // prompt_messages — built by task_worker using prompts.rs
+                Some("communities"),
+                Some(&community.community_id),
+                "structured",
+                SUPERNODE_MAX_RETRIES,
+            ).await {
+                Ok(Some(id)) => {
+                    debug!(id = id, community = %community.community_id, "[MINER_S8] Enqueued community_narrative");
+                    enqueued += 1;
+                }
+                Ok(None) => {
+                    // Duplicate skipped — idempotency guard working correctly
+                    skipped += 1;
+                }
+                Err(e) => {
+                    warn!(error = %e, community = %community.community_id, "[MINER_S8] Task enqueue failed");
+                }
+            }
+        }
+
+        if enqueued > 0 {
+            info!(enqueued = enqueued, skipped = skipped, "[MINER_S8] community_narrative tasks enqueued");
+        }
+    }
+
+    /// Step 9 tail: enqueue entity_description LLM tasks (only when merged > 0).
+    ///
+    /// Targets entities that have no description or a short auto-generated one
+    /// (description IS NULL OR length < 50 chars). The "no rich description" check
+    /// avoids re-enqueuing entities that already got an LLM description.
+    async fn enqueue_entity_description_tasks(&self, owner: &[u8]) {
+        // Get entities that need description enrichment.
+        // Use the same MINER_MERGE_BATCH limit to avoid flooding the queue.
+        let entities = self.storage.get_entities_by_owner(owner, None, MINER_MERGE_BATCH).await;
+
+        let mut enqueued = 0u32;
+        let mut skipped = 0u32;
+
+        for entity in &entities {
+            // Skip if already has a rich LLM-generated description (>= 50 chars)
+            let needs_description = match &entity.description {
+                None => true,
+                Some(d) => d.len() < 50,
+            };
+
+            if !needs_description {
+                skipped += 1;
+                continue;
+            }
+
+            let payload = serde_json::json!({
+                "entity_id": entity.entity_id,
+                "entity_name": entity.name,
+                "entity_type": entity.entity_type,
+                "mention_count": entity.mention_count,
+            });
+
+            match self.storage.insert_cognitive_task(
+                "entity_description",
+                SUPERNODE_PRIORITY_ENTITY_DESCRIPTION,
+                &payload.to_string(),
+                None,
+                Some("entities"),
+                Some(&entity.entity_id),
+                "structured",
+                SUPERNODE_MAX_RETRIES,
+            ).await {
+                Ok(Some(id)) => {
+                    debug!(id = id, entity = %entity.entity_id, "[MINER_S9] Enqueued entity_description");
+                    enqueued += 1;
+                }
+                Ok(None) => { skipped += 1; }
+                Err(e) => {
+                    warn!(error = %e, entity = %entity.entity_id, "[MINER_S9] Task enqueue failed");
+                }
+            }
+        }
+
+        if enqueued > 0 {
+            info!(enqueued = enqueued, skipped = skipped, "[MINER_S9] entity_description tasks enqueued");
+        }
+    }
+
+    /// Step 10 tail: enqueue session_title LLM tasks.
+    ///
+    /// ## Target Sessions
+    /// Sessions where the title needs LLM improvement:
+    ///   1. `title IS NULL` — new session, no title yet
+    ///   2. `summary LIKE 'Topics:%'` — no-LLM placeholder from Step 10
+    ///
+    /// The "Topics:" prefix is the marker written by step_10_session_summary()
+    /// when it generates a no-LLM summary. The SuperNode worker will overwrite
+    /// both the title and the summary with LLM-generated versions after completion.
+    ///
+    /// ## Why not check title content?
+    /// The no-LLM title may look reasonable (e.g., "JWT, React, TypeScript") but
+    /// lacks context. Checking summary prefix is more reliable as it's always
+    /// written by Step 10 before this tail is called.
+    async fn enqueue_session_title_tasks(&self, owner: &[u8]) {
+        // Query sessions needing LLM title via direct SQL for efficiency.
+        // Avoids loading all sessions and filtering in Rust.
+        let sessions_needing_title = {
+            let conn = self.storage.conn_lock().await;
+            let mut stmt = match conn.prepare(
+                "SELECT session_id, summary, turn_count
+                 FROM sessions
+                 WHERE owner = ?1
+                   AND summary_generated = 1
+                   AND (title IS NULL OR summary LIKE 'Topics:%')
+                 ORDER BY started_at DESC
+                 LIMIT ?2"
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "[MINER_S10] enqueue_session_title_tasks query failed");
+                    return;
+                }
+            };
+            stmt.query_map(
+                rusqlite::params![owner, MINER_SESSION_BATCH as i64 * 2],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            )
+            .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+            .unwrap_or_default()
+        };
+
+        if sessions_needing_title.is_empty() {
+            return;
+        }
+
+        let mut enqueued = 0u32;
+        let mut skipped = 0u32;
+
+        for (session_id, summary, turn_count) in &sessions_needing_title {
+            let payload = serde_json::json!({
+                "session_id": session_id,
+                "current_summary": summary,
+                "turn_count": turn_count,
+            });
+
+            match self.storage.insert_cognitive_task(
+                "session_title",
+                SUPERNODE_PRIORITY_SESSION_TITLE,
+                &payload.to_string(),
+                None,
+                Some("sessions"),
+                Some(session_id),
+                "structured",
+                SUPERNODE_MAX_RETRIES,
+            ).await {
+                Ok(Some(id)) => {
+                    debug!(id = id, session = %session_id, "[MINER_S10] Enqueued session_title");
+                    enqueued += 1;
+                }
+                Ok(None) => { skipped += 1; }
+                Err(e) => {
+                    warn!(error = %e, session = %session_id, "[MINER_S10] Task enqueue failed");
+                }
+            }
+        }
+
+        if enqueued > 0 {
+            info!(enqueued = enqueued, skipped = skipped, "[MINER_S10] session_title tasks enqueued");
         }
     }
 
@@ -1779,7 +1721,7 @@ impl ReflectionMiner {
 
         let resp = client.post(OPENCLAW_GATEWAY_EMBED).json(&body).send().await.ok()?;
         if !resp.status().is_success() {
-            warn!("[MINER] OpenClaw embed request failed: {}", resp.status());
+            warn!("[MINER] OpenClaw embed failed: {}", resp.status());
             return None;
         }
 
@@ -1824,19 +1766,6 @@ impl ReflectionMiner {
 // Helper: Infer relation type from entity type pair
 // ============================================
 
-/// Infer a relation type from the entity types of two co-occurring entities.
-///
-/// This is a simple heuristic — more precise relation extraction would use
-/// a second GLiNER pass with relation labels, or an LLM call.
-///
-/// ## v2.4.0-GraphCognition Phase B
-/// Created for Step 7 entity extraction pipeline.
-///
-/// ## Examples
-/// - (module, technology) → "USES"
-/// - (file, module) → "BELONGS_TO"
-/// - (person, project) → "WORKS_ON"
-/// - (anything, anything) → "CO_OCCURS"
 fn infer_relation_type(source_type: &str, target_type: &str) -> &'static str {
     match (source_type, target_type) {
         ("module", "technology") | ("project", "technology") => "USES",
@@ -1857,36 +1786,11 @@ fn infer_relation_type(source_type: &str, target_type: &str) -> &'static str {
 // Helper: Stopword entity filter (v2.4.0 Phase B Fixes)
 // ============================================
 
-/// Check if an entity name is a generic stopword that should not be stored.
-///
-/// Filters out entities whose name is too generic to be useful in the
-/// knowledge graph. These create hub nodes that pollute community detection
-/// by connecting unrelated clusters.
-///
-/// ## Parameters
-/// - `name_normalized`: The lowercased, trimmed entity name.
-/// - `original_text`: The original entity text (before lowercasing), used for
-///   uppercase acronym detection in Rule 3.
-/// - `entity_label`: The entity type label from NER (e.g., "project", "person").
-///
-/// ## Rules
-/// 1. Name matches entity_type label exactly (e.g., "project" typed as project)
-/// 2. Name is in the stopword list (common words without specificity)
-/// 3. Name is a single common word of 2 chars: skip unless original text is ALL
-///    uppercase (acronym like "AI", "DB"). Note: 1-char entities are already
-///    filtered by the `len() < 2` check in Step 7 before this function is called.
-///
-/// ## v2.4.0-GraphCognition Phase B Fixes
-/// - Bug fix: Rule 3 now takes `original_text` parameter instead of checking
-///   `name_normalized` (which is already lowercased, making uppercase detection
-///   impossible). The original text preserves case for acronym detection.
 fn is_stopword_entity(name_normalized: &str, original_text: &str, entity_label: &str) -> bool {
-    // Rule 1: Name matches type label
     if name_normalized == entity_label.to_lowercase() {
         return true;
     }
 
-    // Rule 2: Common stopwords that GLiNER sometimes picks up
     const STOPWORDS: &[&str] = &[
         "project", "module", "file", "user", "code", "system", "data",
         "api", "app", "tool", "test", "type", "model", "server", "client",
@@ -1898,11 +1802,8 @@ fn is_stopword_entity(name_normalized: &str, original_text: &str, entity_label: 
         return true;
     }
 
-    // Rule 3: Very short single words (exactly 2 chars) unless ALL uppercase in
-    // original text (acronym like "AI", "DB"). 1-char entities are already
-    // filtered by len() < 2 in the caller.
-    // Bug fix: Use original_text (not name_normalized) for uppercase check,
-    // because name_normalized is already lowercased.
+    // Rule 3: 2-char entities only pass if ALL uppercase in original (acronym like "AI", "DB")
+    // Bug fix (Phase B Fixes): use original_text not name_normalized for uppercase check
     if name_normalized.len() == 2 {
         let original_trimmed = original_text.trim();
         let is_acronym = original_trimmed.len() == 2
@@ -1922,6 +1823,7 @@ impl std::fmt::Debug for ReflectionMiner {
             .field("threshold", &self.compaction_threshold)
             .field("mvf", &self.mvf_enabled)
             .field("ner", &self.ner_engine.is_some())
+            .field("supernode", &self.llm_router.is_some())
             .finish()
     }
 }
