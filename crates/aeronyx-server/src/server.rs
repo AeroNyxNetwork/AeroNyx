@@ -680,8 +680,116 @@ impl Server {
 
         for provider_cfg in &supernode.providers {
             // Resolve $ENV_VAR syntax in api_key
-            let api_key: Option<String> = provider_cfg.api_key.as_ref().map(|k| {
-                if k.starts_with('$') {
+            let api_key: Option<String> = provider_cfg.api_key.as_ref().map(|k: &String| {
+                if k.starts_with('
+                    std::env::var(&k[1..]).unwrap_or_else(|_| {
+                        warn!(
+                            key = %k, provider = %provider_cfg.name,
+                            "[SUPERNODE] ENV var not set for api_key"
+                        );
+                        String::new()
+                    })
+                } else {
+                    k.clone()
+                }
+            });
+
+            // Resolve Anthropic default api_base when empty
+            // (validate() in config_supernode.rs warns but doesn't fill it in)
+            let api_base = if provider_cfg.api_base.is_empty()
+                && provider_cfg.provider_type == ProviderType::Anthropic
+            {
+                "https://api.anthropic.com".to_string()
+            } else {
+                provider_cfg.api_base.clone()
+            };
+
+            let provider: Arc<dyn LlmProvider> = match provider_cfg.provider_type {
+                ProviderType::OpenaiCompatible => {
+                    // new() returns Result<Self, String> — unwrap with warn+skip on error
+                    match OpenAiCompatProvider::new(
+                        provider_cfg.name.clone(),
+                        api_base.clone(),
+                        api_key.unwrap_or_default(),
+                        provider_cfg.model.clone(),
+                        provider_cfg.max_tokens,
+                        provider_cfg.temperature,
+                    ) {
+                        Ok(p) => Arc::new(p),
+                        Err(e) => {
+                            warn!(
+                                provider = %provider_cfg.name, error = %e,
+                                "[SUPERNODE] OpenAiCompatProvider construction failed — skipped"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                ProviderType::Anthropic => {
+                    let key = match api_key {
+                        Some(k) if !k.is_empty() => k,
+                        _ => {
+                            warn!(
+                                provider = %provider_cfg.name,
+                                "[SUPERNODE] Anthropic provider requires api_key — skipped"
+                            );
+                            continue;
+                        }
+                    };
+                    // AnthropicProvider::new() takes 5 args (no api_base — uses ANTHROPIC_API_BASE const)
+                    match AnthropicProvider::new(
+                        provider_cfg.name.clone(),
+                        key,
+                        provider_cfg.model.clone(),
+                        provider_cfg.max_tokens,
+                        provider_cfg.temperature,
+                    ) {
+                        Ok(p) => Arc::new(p),
+                        Err(e) => {
+                            warn!(
+                                provider = %provider_cfg.name, error = %e,
+                                "[SUPERNODE] AnthropicProvider construction failed — skipped"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            info!(
+                name = %provider_cfg.name,
+                type_ = ?provider_cfg.provider_type,
+                model = %provider_cfg.model,
+                api_base = %api_base,
+                "[SUPERNODE] Provider registered"
+            );
+
+            // 4-tuple: (name, api_base, model, provider)
+            // api_base and model stored separately for health check pings
+            providers.push((
+                provider_cfg.name.clone(),
+                api_base,
+                provider_cfg.model.clone(),
+                provider,
+            ));
+        }
+
+        if providers.is_empty() {
+            warn!("[SUPERNODE] All providers failed to construct — SuperNode disabled");
+            return None;
+        }
+
+        // Pass TaskRoutingConfig directly — LlmRouter::new() calls provider_for()
+        // for each CognitiveTaskType to build its internal routing table.
+        let router = LlmRouter::new(providers, supernode.routing.clone());
+        info!(
+            providers = supernode.providers.len(),
+            fallback = ?supernode.routing.fallback,
+            "[SUPERNODE] ✅ LlmRouter initialized"
+        );
+        Some(Arc::new(router))
+    }
+) {
                     std::env::var(&k[1..]).unwrap_or_else(|_| {
                         warn!(
                             key = %k, provider = %provider_cfg.name,
