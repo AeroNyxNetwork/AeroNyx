@@ -658,6 +658,7 @@ impl Server {
     /// ⚠️ This method does NOT ping providers or validate connectivity.
     ///    Health checks happen at runtime via /supernode/health endpoint.
     async fn init_llm_router(&self) -> Option<Arc<LlmRouter>> {
+        // config_supernode is declared at crate root in lib.rs (not under config/)
         use crate::config_supernode::ProviderType;
         use crate::services::memchain::{LlmProvider, OpenAiCompatProvider, AnthropicProvider};
 
