@@ -78,6 +78,7 @@ use super::llm_provider::ChatMessage;
 // had Structured/Full. Two types with the same name and different variants caused
 // conversion confusion. Now we use a single canonical type from config_supernode.
 // Summary variant exists in config for future use; prompts treat it as Structured.
+// config_supernode is declared at crate root in lib.rs (not under config/)
 pub use crate::config_supernode::PrivacyLevel;
 
 // ============================================
