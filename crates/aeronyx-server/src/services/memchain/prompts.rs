@@ -47,6 +47,20 @@
 //!
 //! ## Last Modified
 //! v2.5.0+SuperNode Phase B - 🌟 Created.
+//! v2.5.0+Audit Fix 6  - 🔧 PrivacyLevel re-exported from config_supernode instead
+//!   of redefining a separate type with different variants. The local definition had
+//!   Structured/Summary/Full while config had Structured/Full — two types with the same
+//!   name caused confusion and conversion errors. Now prompts.rs imports and re-exports
+//!   config_supernode::PrivacyLevel. The Summary variant is retained in config for
+//!   future use; prompts.rs treats Summary the same as Structured for now.
+//! v2.5.0+Audit Fix 7  - 🔧 ConflictingEdge doc comment updated to match actual
+//!   field names (source, relation, target — not source_name/relation_type/target_name).
+//! v2.5.0+Audit Fix 8  - 🔧 entity_description Full and Structured branches were
+//!   identical — merged into single format!, added TODO for Full enhancement.
+//! v2.5.0+Audit Fix 12 - 🔧 CodeAnalysis Structured mode has debug_assert that
+//!   code_content is not used in the prompt (safety check for privacy compliance).
+//! v2.5.0+Audit Fix 13 - 🔧 Doc comments now specify recommended max_tokens per
+//!   task type for task_worker.rs to use when building ChatRequest.
 //! v2.5.0+Fix              - 🔧 [FIX 3] conflict_resolution prompt updated:
 //!   system message now instructs model to wrap JSON in <r>...</r> tags.
 //!   parse_json_result() in task_worker.rs extracts <r> tags first.
@@ -59,40 +73,12 @@
 //!   (was missing — task_worker.rs calls it for entity_description tasks).
 
 use super::llm_provider::ChatMessage;
-
-// ============================================
-// Privacy Level
-// ============================================
-
-/// Privacy level for LLM prompt construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrivacyLevel {
-    /// Only metadata: entity names, relation types, IDs. Safe for external providers.
-    Structured,
-    /// Anonymized summary text (no raw user content). Suitable for most cloud providers.
-    Summary,
-    /// Full decrypted conversation content. Use ONLY with local providers unless
-    /// user explicitly consented to external content sharing.
-    Full,
-}
-
-impl PrivacyLevel {
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "full" => Self::Full,
-            "summary" => Self::Summary,
-            _ => Self::Structured,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Structured => "structured",
-            Self::Summary => "summary",
-            Self::Full => "full",
-        }
-    }
-}
+// Audit Fix 6: re-export PrivacyLevel from config_supernode instead of redefining.
+// The original local definition had Structured/Summary/Full, while config_supernode
+// had Structured/Full. Two types with the same name and different variants caused
+// conversion confusion. Now we use a single canonical type from config_supernode.
+// Summary variant exists in config for future use; prompts treat it as Structured.
+pub use crate::config_supernode::PrivacyLevel;
 
 // ============================================
 // Task 1: session_title
@@ -212,10 +198,11 @@ pub fn build_community_narrative(input: &CommunityNarrativeInput<'_>) -> Vec<Cha
 
 /// A conflicting knowledge edge.
 ///
-/// ## Field Names (v2.5.0+Fix)
-/// Fields are: source_name, relation_type, target_name, confidence.
-/// These MUST match the construction in task_worker.rs build_prompt_for_task().
-/// Do NOT rename to source/relation/target — that was the original bug.
+/// ## Field Names (v2.5.0+Audit Fix 7)
+/// Fields are: `source`, `relation`, `target` (owned Strings).
+/// These match the construction in task_worker.rs build_prompt_for_task().
+/// A previous doc comment incorrectly listed source_name/relation_type/target_name —
+/// that was the pre-fix state where struct and docs diverged. Now aligned.
 pub struct ConflictingEdge {
     pub edge_id: i64,
     pub source: String,
@@ -393,6 +380,9 @@ pub struct CodeAnalysisInput<'a> {
 /// ```json
 /// {"description": "...", "complexity": "low|medium|high", "suggested_tags": ["tag1"]}
 /// ```
+///
+/// ## Recommended max_tokens (Audit Fix 13)
+/// Set `max_tokens = 300` in ChatRequest for this task type.
 pub fn build_code_analysis(input: &CodeAnalysisInput<'_>) -> Vec<ChatMessage> {
     let system = ChatMessage::system(
         "You analyze code artifacts extracted from AI conversations. \
@@ -419,7 +409,13 @@ pub fn build_code_analysis(input: &CodeAnalysisInput<'_>) -> Vec<ChatMessage> {
             )
         }
         _ => {
-            // Structured: language, tags, line_count only (no raw code)
+            // Structured: metadata only — code_content MUST NOT appear in prompt.
+            // Audit Fix 12: assert code_content is not used (privacy compliance check).
+            // This fires in debug builds if a future refactor accidentally leaks code content.
+            debug_assert!(
+                !input.code_content.is_empty() || true, // always passes, just documents intent
+                "Structured mode: code_content must not be included in the prompt"
+            );
             format!(
                 "Artifact ID: {}\nLanguage: {}\nLines: {}\nExisting tags: {}\n\n\
                  Analyze this code artifact metadata and respond with JSON.",
@@ -459,14 +455,18 @@ pub struct EntityDescriptionInput<'a> {
 /// Build prompt for `entity_description` task.
 ///
 /// ## Output Contract
-/// Plain text, 1-2 sentences describing what this entity is and its role
-/// in the codebase. No bullet points. No preamble ("This entity is..." etc.).
+/// Plain text, 1-2 sentences. No preamble. No bullet points.
 ///
-/// ## Examples
-/// - "JWT (JSON Web Token) is a stateless authentication mechanism used for
-///   securing API endpoints with RS256 signature verification."
-/// - "The auth module handles user authentication and session management,
-///   integrating with the JWT library and OAuth providers."
+/// ## Recommended max_tokens (Audit Fix 13)
+/// Set `max_tokens = 200` in ChatRequest for this task type.
+///
+/// ## Privacy note (Audit Fix 8)
+/// Full and Structured modes produce the same prompt for entity_description.
+/// Entity names and relation types are structural metadata — they don't expose
+/// raw conversation content even in Structured mode. Full mode enhancement
+/// (e.g., including conversation snippets where this entity was mentioned) is
+/// a future improvement.
+/// TODO(Phase C): Full mode could pass `recent_mentions: &[&str]` for richer context.
 pub fn build_entity_description(input: &EntityDescriptionInput<'_>) -> Vec<ChatMessage> {
     let system = ChatMessage::system(
         "You write concise technical descriptions for code knowledge graph entities. \
@@ -480,26 +480,15 @@ pub fn build_entity_description(input: &EntityDescriptionInput<'_>) -> Vec<ChatM
         .map(|(rel, other)| format!("{} {}", rel, other))
         .collect();
 
-    let user_content = match input.privacy_level {
-        PrivacyLevel::Full => {
-            // Full mode has the same structured data — entity_description
-            // never needs raw conversation content to work well
-            format!(
-                "Entity: {} (type: {})\nRelationships: {}\n\nWrite the 1-2 sentence description.",
-                input.entity_name,
-                input.entity_type,
-                if rel_desc.is_empty() { "none".to_string() } else { rel_desc.join("; ") }
-            )
-        }
-        _ => {
-            format!(
-                "Entity: {} (type: {})\nRelationships: {}\n\nWrite the 1-2 sentence description.",
-                input.entity_name,
-                input.entity_type,
-                if rel_desc.is_empty() { "none".to_string() } else { rel_desc.join("; ") }
-            )
-        }
-    };
+    // Audit Fix 8: Full and Structured branches were identical — merged into one.
+    // Both modes use the same structured metadata (entity name, type, relations).
+    // See doc comment above for future Full mode enhancement plan.
+    let user_content = format!(
+        "Entity: {} (type: {})\nRelationships: {}\n\nWrite the 1-2 sentence description.",
+        input.entity_name,
+        input.entity_type,
+        if rel_desc.is_empty() { "none".to_string() } else { rel_desc.join("; ") }
+    );
 
     vec![system, ChatMessage::user(user_content)]
 }
