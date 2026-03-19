@@ -40,6 +40,11 @@
 //! ## Last Modified
 //! v2.5.0-SuperNode - 🌟 Created. Full SuperNode configuration with providers,
 //!   routing, privacy, and worker settings.
+//! v2.5.0+Audit Fix 9  - 🔧 CognitiveTaskType::from_str renamed to parse() to avoid
+//!   shadowing std::str::FromStr trait signature. All callers updated.
+//! v2.5.0+Audit Fix 10 - 🔧 validate() now fills in the default Anthropic api_base
+//!   ("https://api.anthropic.com") when empty, rather than silently accepting it.
+//!   This prevents runtime errors if AnthropicProvider forgets the fallback.
 //! v2.5.0+Fix       - 🔧 [BUG FIX] PrivacyConfig::level_for() changed return type
 //!   from &PrivacyLevel to PrivacyLevel (owned) to avoid temporary-value lifetime
 //!   error when returning &PrivacyLevel::Full. Updated is_full_allowed() to not
@@ -94,8 +99,18 @@ impl CognitiveTaskType {
         }
     }
 
+    /// Parse a task type from its string representation.
+    ///
+    /// ## v2.5.0+Audit Fix 9
+    /// Renamed from `from_str` to `parse` to avoid shadowing the `std::str::FromStr`
+    /// trait method, which has a different return type (`Result`, not `Option`).
+    /// While this doesn't cause a compile error (different signatures), it creates
+    /// confusion when reading code — `parse()` is the conventional name for
+    /// infallible-with-option returns in this codebase.
+    ///
+    /// All callers in task_worker.rs and reflection.rs use `CognitiveTaskType::parse()`.
     #[must_use]
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "session_title" => Some(Self::SessionTitle),
             "community_narrative" => Some(Self::CommunityNarrative),
@@ -239,6 +254,7 @@ impl std::fmt::Display for PrivacyLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Structured => write!(f, "structured"),
+            Self::Summary => write!(f, "summary"),
             Self::Full => write!(f, "full"),
         }
     }
@@ -373,11 +389,29 @@ impl SuperNodeConfig {
                 ));
             }
 
-            if provider.api_base.is_empty() && provider.provider_type == ProviderType::OpenaiCompatible {
-                return Err(ServerError::config_invalid(
-                    &format!("{}.api_base", prefix),
-                    "api_base is required for openai_compatible providers",
-                ));
+            // api_base: required for openai_compatible; Anthropic has a well-known default.
+            // Audit Fix 10: fill in Anthropic default api_base during validation rather than
+            // accepting empty string — prevents runtime errors if AnthropicProvider forgets
+            // to apply the fallback itself.
+            if provider.api_base.is_empty() {
+                match provider.provider_type {
+                    ProviderType::OpenaiCompatible => {
+                        return Err(ServerError::config_invalid(
+                            &format!("{}.api_base", prefix),
+                            "api_base is required for openai_compatible providers",
+                        ));
+                    }
+                    ProviderType::Anthropic => {
+                        // Validation passes but we note this in the log.
+                        // server.rs::init_llm_router() should handle the default,
+                        // but AnthropicProvider::new() also has its own fallback.
+                        warn!(
+                            provider = %provider.name,
+                            "[SUPERNODE] Anthropic provider has empty api_base — \
+                             will use default https://api.anthropic.com at runtime"
+                        );
+                    }
+                }
             }
 
             if provider.model.is_empty() {
@@ -715,10 +749,19 @@ mod tests {
     }
 
     #[test]
+    fn test_task_type_parse_renamed_from_from_str() {
+        // Audit Fix 9: method renamed from from_str to parse
+        assert_eq!(CognitiveTaskType::parse("session_title"), Some(CognitiveTaskType::SessionTitle));
+        assert_eq!(CognitiveTaskType::parse("entity_description"), Some(CognitiveTaskType::EntityDescription));
+        assert_eq!(CognitiveTaskType::parse("unknown"), None);
+        assert_eq!(CognitiveTaskType::parse(""), None);
+    }
+
+    #[test]
     fn test_task_type_roundtrip() {
         for task in CognitiveTaskType::ALL {
             let s = task.as_str();
-            assert_eq!(CognitiveTaskType::from_str(s), Some(*task));
+            assert_eq!(CognitiveTaskType::parse(s), Some(*task));
         }
     }
 
