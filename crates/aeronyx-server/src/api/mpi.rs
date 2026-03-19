@@ -36,6 +36,8 @@
 //! v2.4.0-GraphCognition - 🌟 Split into 3 files; MpiState extended with
 //!   ner_engine, graph_enabled, entropy_filter_enabled; 11 new graph endpoints;
 //!   hybrid recall pipeline; status extended with graph_stats
+//! v2.4.0+Reranker - 🌟 MpiState extended with reranker_engine: Option<Arc<RerankerEngine>>
+//!   for cross-encoder reranking in recall Step 3.5
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -59,6 +61,8 @@ use crate::services::memchain::{MemoryStorage, VectorIndex};
 use crate::services::memchain::mvf::WeightVector;
 use crate::services::memchain::EmbedEngine;
 use crate::services::memchain::NerEngine;
+// v2.4.0+Reranker: Cross-encoder reranker for recall Step 3.5
+use crate::services::memchain::RerankerEngine;
 
 // Sibling handler modules
 use super::mpi_handlers;
@@ -141,6 +145,29 @@ pub struct MpiState {
     pub graph_enabled: bool,
     /// v2.4.0: Whether entropy filtering is enabled on /log ingestion.
     pub entropy_filter_enabled: bool,
+    /// v2.4.0+Reranker: Cross-encoder reranker engine.
+    ///
+    /// When Some, recall pipeline reranks top-30 candidates for improved precision
+    /// (Step 3.5 in recall_handler.rs). Uses ms-marco-MiniLM-L-6-v2 (~22MB ONNX).
+    /// When None, Step 3.5 is skipped and recall returns RRF-fused results directly.
+    ///
+    /// Initialized in server.rs from config.memchain.reranker_enabled.
+    /// Load failure is graceful: server starts normally with reranker_engine = None.
+    pub reranker_engine: Option<Arc<RerankerEngine>>,
+
+    /// v2.4.0+Conversation: RawLog decryption key for conversation replay.
+    ///
+    /// Derived from Ed25519 PRIVATE key via derive_rawlog_key().
+    /// Used by mpi_graph_handlers::mpi_session_conversation to decrypt
+    /// raw_logs server-side for Local auth requests.
+    ///
+    /// When Some, /sessions/:id/conversation returns decrypted plaintext turns.
+    /// When None, encrypted turns are returned with content=null.
+    ///
+    /// ⚠️ This key can ONLY decrypt rawlogs belonging to the local owner.
+    /// Remote owners' rawlogs were encrypted with a different key derived
+    /// from their own private key — they cannot be decrypted server-side.
+    pub rawlog_key: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +390,7 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
         // ── Original endpoints (mpi_handlers.rs) ──
         .route("/api/mpi/remember", post(mpi_handlers::mpi_remember))
         .route("/api/mpi/recall", post(super::recall_handler::mpi_recall))
+        .route("/api/mpi/recall/detail", post(super::recall_handler::mpi_recall_detail))
         .route("/api/mpi/forget", post(mpi_handlers::mpi_forget))
         .route("/api/mpi/status", get(mpi_handlers::mpi_status))
         .route("/api/mpi/embed", post(mpi_handlers::mpi_embed))
@@ -381,14 +409,20 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
         .route("/api/mpi/artifacts/:id/versions", get(mpi_graph_handlers::mpi_artifact_versions))
         .route("/api/mpi/entities/:id", get(mpi_graph_handlers::mpi_entity_detail))
         .route("/api/mpi/entities/:id/graph", get(mpi_graph_handlers::mpi_entity_graph))
-        .route("/api/mpi/communities", get(mpi_graph_handlers::mpi_communities));
+        .route("/api/mpi/communities", get(mpi_graph_handlers::mpi_communities))
+        // ── v2.4.0+Search: Human-facing search + entity timeline ──
+        .route("/api/mpi/search", get(mpi_graph_handlers::mpi_search))
+        .route("/api/mpi/entities/:id/timeline", get(mpi_graph_handlers::mpi_entity_timeline))
+        // ── v2.4.0+Context: Auto context injection for new sessions ──
+        .route("/api/mpi/context/inject", get(mpi_graph_handlers::mpi_context_inject));
 
     info!(
-        "[MPI] Router: 19 endpoints (bearer={}, remote={}, ner={}, graph={})",
+        "[MPI] Router: 23 endpoints (bearer={}, remote={}, ner={}, graph={}, reranker={})",
         state.api_secret.as_ref().map_or(false, |s| !s.is_empty()),
         state.allow_remote_storage,
         state.ner_engine.is_some(),
         state.graph_enabled,
+        state.reranker_engine.is_some(),
     );
 
     router
