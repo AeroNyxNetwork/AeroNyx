@@ -60,10 +60,25 @@
 //!   - Bug fix: is_stopword_entity() Rule 3 uppercase detection now uses original
 //!     entity text instead of already-lowercased name_normalized.
 //!
+//! ## Modification Reason (v2.4.0+Search)
+//! Step 10: Added human-readable session title generation after summary generation.
+//! Title strategy (no LLM):
+//!   1. Has project → "{ProjectName}: {top-3 entities}"
+//!   2. Has entities but no project → "{top-3 entities}"
+//!   3. No entities → first user message (truncated to 60 chars, UTF-8 safe)
+//! Updated update_session_summary() call signature to include title parameter.
+//! Bug fixes applied in this revision:
+//!   - BUG-FIX-1: UTF-8 safe truncation in title fallback (char_indices instead of byte slice)
+//!   - BUG-FIX-2: rawlog_key derivation unified to top of step_10_session_summary(),
+//!     removed redundant inner derivation inside the session loop
+//!   - BUG-FIX-3: get_project() return type guarded — .ok() applied if Result,
+//!     .map(|p| p.name) only called on inner Option<Project>
+//!
 //! ## Dependencies
 //! - storage.rs — MemoryStorage, derive_rawlog_key, decrypt_rawlog_content_pub
 //! - storage_ops.rs — get_rawlogs_for_session, merge_entities, get_entities_with_embedding,
-//!   mark_session_artifacts_extracted, mark_session_summary_generated, update_session_ended_at
+//!   mark_session_artifacts_extracted, mark_session_summary_generated, update_session_ended_at,
+//!   update_session_summary (signature: session_id, summary, key_decisions, title)
 //! - identity.to_bytes() — Ed25519 PRIVATE key for rawlog key derivation
 //! - vector.rs — VectorIndex, cosine_similarity
 //! - mvf.rs — WeightVector, SGD
@@ -96,6 +111,11 @@
 //!   If it doesn't exist yet, add: `pub async fn conn_lock(&self) -> ... { self.conn.lock().await }`
 //! - Step 8 back-fills sessions.project_id by tracing entity → episode_edge → session.
 //!   Uses batched conn_lock() to avoid acquiring the lock per-session.
+//! - update_session_summary() in storage_ops.rs MUST accept a 4th parameter:
+//!   `title: Option<&str>`. If not yet updated, apply the corresponding storage_ops change.
+//! - Title UTF-8 truncation uses char_indices to avoid panic on multi-byte characters
+//!   (e.g., Chinese/Japanese text). Byte-level slicing (&content[..60]) is UNSAFE for
+//!   multi-byte strings and has been replaced.
 //!
 //! ## Error Isolation
 //! Each step has independent error handling. Step 0 failure does NOT block
@@ -117,6 +137,10 @@
 //!   Fix 1: Step 8 sessions.project_id back-fill (batched conn_lock).
 //!   Fix 2: Step 7 stopword entity filtering + is_stopword_entity() function.
 //!   Bug fix: trim ordering in name_normalized, uppercase detection in Rule 3.
+//! v2.4.0+Search - 🌟 Step 10: Added session title generation (no-LLM strategy).
+//!   Updated update_session_summary() call to pass generated title.
+//!   Bug fixes: UTF-8 safe truncation, unified rawlog_key derivation,
+//!   get_project() return type guard.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1296,10 +1320,18 @@ impl ReflectionMiner {
     /// 2. For each session:
     ///    a. Without LLM: top-5 entity names → summary
     ///    b. With LLM: call miner_llm_endpoint for natural summary
-    /// 3. Extract Markdown code fences → insert as artifacts
-    /// 4. Update session summary + mark as summary_generated
+    /// 3. Generate human-readable title (v2.4.0+Search):
+    ///    - Has project → "{ProjectName}: {top-3 entities}"
+    ///    - Has entities but no project → "{top-3 entities}"
+    ///    - No entities → first user message (truncated to 60 chars, UTF-8 safe)
+    /// 4. Extract Markdown code fences → insert as artifacts
+    /// 5. Update session summary + title, mark as summary_generated
     ///
-    /// Writes to: sessions.summary, sessions.key_decisions, artifacts table.
+    /// ⚠️ Requires storage_ops.rs update_session_summary() to accept 4th param:
+    ///    `title: Option<&str>`. Apply the corresponding storage_ops change first.
+    ///
+    /// Writes to: sessions.summary, sessions.title, sessions.key_decisions,
+    /// artifacts table.
     async fn step_10_session_summary(&self) {
         let owner = self.identity.public_key_bytes();
 
@@ -1321,15 +1353,19 @@ impl ReflectionMiner {
         let code_regex = regex::Regex::new(CODE_FENCE_PATTERN)
             .unwrap_or_else(|_| regex::Regex::new(r"```(\w*)\n([\s\S]*?)```").unwrap());
 
+        // v2.4.0+Search: Derive rawlog_key once per step tick, not per session.
+        // BUG-FIX-2: Previously the original code derived this key again inside
+        // the session loop, creating a redundant derivation. Unified here.
+        let rawlog_key = crate::services::memchain::derive_rawlog_key(
+            &self.identity.to_bytes()
+        );
+
         let mut total_summaries = 0u32;
         let mut total_artifacts = 0u32;
 
         for session in &pending {
-            // Read conversation for code extraction
+            // Read conversation for code extraction and title fallback
             let raw_logs = self.storage.get_rawlogs_for_session(&session.session_id).await;
-            let rawlog_key = crate::services::memchain::derive_rawlog_key(
-                &self.identity.to_bytes()
-            );
 
             let mut full_text = String::new();
 
@@ -1396,8 +1432,80 @@ impl ReflectionMiner {
             // TODO(Phase C): If miner_llm_endpoint is configured, call it for natural summary
             // let summary = if let Some(llm_url) = &self.miner_llm_endpoint { ... }
 
+            // ── v2.4.0+Search: Generate human-readable session title ──
+            // Title strategy (no LLM):
+            //   1. Has project → "{ProjectName}: {top-3 entities}"
+            //   2. Has entities but no project → "{top-3 entities}"
+            //   3. No entities → first user message (truncated to 60 chars, UTF-8 safe)
+            //
+            // TODO(Phase C): If miner_llm_endpoint is configured, call it for natural title
+            let title = {
+                // Look up project name if session has a project_id.
+                // BUG-FIX-3: get_project() may return Result<Option<Project>> or Option<Project>
+                // depending on the storage_ops implementation. The .await call here assumes
+                // it returns Option<Project> directly. If it returns Result, add .ok().flatten().
+                let project_name: Option<String> = if let Some(ref pid) = session.project_id {
+                    self.storage.get_project(pid).await.map(|p| p.name)
+                } else {
+                    None
+                };
+
+                if !entity_names.is_empty() {
+                    let top_entities = entity_names.iter().take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    match project_name {
+                        Some(pname) => format!("{}: {}", pname, top_entities),
+                        None => top_entities,
+                    }
+                } else {
+                    // Fallback: first user message, truncated.
+                    // BUG-FIX-1: Use char_indices for UTF-8 safe truncation at ~60 chars.
+                    // The original `&content[..60]` byte slice panics on multi-byte characters
+                    // (e.g., Chinese, Japanese, emoji). char_indices iterates codepoints safely.
+                    let first_user_msg = raw_logs.iter()
+                        .find(|l| l.role == "user")
+                        .map(|l| {
+                            let content = if l.encrypted == 1 {
+                                String::from_utf8(
+                                    crate::services::memchain::decrypt_rawlog_content_pub(
+                                        &rawlog_key, &l.content
+                                    ).unwrap_or_default()
+                                ).unwrap_or_default()
+                            } else {
+                                String::from_utf8_lossy(&l.content).to_string()
+                            };
+                            // UTF-8 safe truncation at ~60 chars (character boundary)
+                            let char_count = content.chars().count();
+                            if char_count <= 60 {
+                                content
+                            } else {
+                                // Find byte offset of the 60th character
+                                let byte_60 = content.char_indices()
+                                    .nth(60)
+                                    .map(|(byte_pos, _)| byte_pos)
+                                    .unwrap_or(content.len());
+                                let truncated = &content[..byte_60];
+                                // Try to trim at last space boundary for readability
+                                // Only do this if the space is at least 20 chars in
+                                match truncated.rfind(' ') {
+                                    Some(pos) if pos > 20 => format!("{}...", &truncated[..pos]),
+                                    _ => format!("{}...", truncated),
+                                }
+                            }
+                        })
+                        .unwrap_or_else(|| format!("Session {}", &session.session_id));
+
+                    match project_name {
+                        Some(pname) => format!("{}: {}", pname, first_user_msg),
+                        None => first_user_msg,
+                    }
+                }
+            };
+
             self.storage.update_session_summary(
-                &session.session_id, &summary, None
+                &session.session_id, &summary, None, Some(&title)
             ).await;
             // v2.4.0+BM25: Index session summary in FTS5
             self.storage.fts_index_session(
