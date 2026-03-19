@@ -410,17 +410,16 @@ impl MemoryStorage {
     }
 
     /// Cancel a pending task (pending → cancelled). No-op if not pending.
-    pub async fn cancel_task(&self, task_id: i64) -> Result<(), String> {
+    pub async fn cancel_task(&self, task_id: i64) -> Result<usize, String> {
         let conn = self.conn.lock().await;
-        conn.execute(
+        let affected = conn.execute(
             "UPDATE cognitive_tasks SET status = 'cancelled'
              WHERE id = ?1 AND status = 'pending'",
             params![task_id],
         ).map_err(|e| format!("cancel_task {}: {}", task_id, e))?;
-        debug!(id = task_id, "[STORAGE_SN] Task cancelled");
-        Ok(())
+        debug!(id = task_id, affected = affected, "[STORAGE_SN] Task cancel attempted");
+        Ok(affected)
     }
-
     /// Get a single task by id.
     pub async fn get_task(&self, task_id: i64) -> Option<CognitiveTaskRow> {
         let conn = self.conn.lock().await;
