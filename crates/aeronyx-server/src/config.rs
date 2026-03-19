@@ -92,7 +92,7 @@ use crate::error::{Result, ServerError};
 use crate::management::ManagementConfig;
 
 // v2.5.0-SuperNode: SuperNode configuration (providers, routing, privacy, worker)
-pub use crate::config_supernode::SuperNodeConfig
+pub use crate::config_supernode::SuperNodeConfig;
 
 // ============================================
 // ServerConfig
