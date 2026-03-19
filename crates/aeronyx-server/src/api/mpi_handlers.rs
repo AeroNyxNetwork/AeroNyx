@@ -20,6 +20,11 @@
 //! - mpi_forget: +fts_remove_record after revoke
 //! - mpi_status: +ner_ready, +graph_enabled, +graph_stats (from v2.4.0)
 //!
+//! ## v2.4.0+Progressive Changes
+//! - RecallRequest: added `mode: String` field (default "full")
+//!   "index" mode returns lightweight previews for progressive retrieval
+//! - Added default_recall_mode() helper function
+//!
 //! ⚠️ Important Note for Next Developer:
 //! - All handlers extract owner from AuthenticatedOwner extension
 //! - RecallRequest/RecallResponse types are defined here but the handler
@@ -30,6 +35,7 @@
 //! v2.4.0-GraphCognition - Extracted from mpi.rs; hybrid recall; status extended
 //! v2.4.0+BM25 - 🌟 Moved mpi_recall to recall_handler.rs; added FTS indexing
 //!   in remember/forget; recall types preserved for backward compat
+//! v2.4.0+Progressive - 🌟 Added mode field to RecallRequest + default_recall_mode()
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -180,7 +186,16 @@ pub struct RecallRequest {
     pub time_range: Option<TimeRangeParam>,
     #[serde(default = "default_include_graph")]
     pub include_graph: bool,
+    /// v2.4.0+Progressive: Retrieval mode.
+    /// - "full" (default): returns complete content for each memory (current behavior)
+    /// - "index": returns lightweight index only (id, title, score, entities, ~50 token each)
+    ///   AI reviews the index and calls /recall/detail for full content of selected items.
+    #[serde(default = "default_recall_mode")]
+    pub mode: String,
 }
+
+/// v2.4.0+Progressive: Default recall mode is "full" (existing behavior unchanged).
+pub(crate) fn default_recall_mode() -> String { "full".into() }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TimeHint { pub start: i64, pub end: i64 }
