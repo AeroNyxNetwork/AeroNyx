@@ -52,6 +52,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::llm_provider::{ChatRequest, ChatResponse, CognitiveTaskType, LlmError, LlmProvider};
+// config_supernode is declared at crate root in lib.rs (not under config/)
 use crate::config_supernode::TaskRoutingConfig;
 
 // ============================================
