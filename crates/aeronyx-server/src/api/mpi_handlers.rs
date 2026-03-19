@@ -1,41 +1,24 @@
 // ============================================
 // File: crates/aeronyx-server/src/api/mpi_handlers.rs
 // ============================================
-//! # MPI Handlers — Core Endpoints (remember, forget, status, embed, record, overview)
+//! # MPI Handlers — Core Endpoints
 //!
 //! ## Creation Reason (v2.4.0 Split)
-//! Extracted from mpi.rs to reduce file size. Contains the original core
-//! endpoint handlers. The /log handler is in log_handler.rs.
+//! Extracted from mpi.rs to reduce file size.
 //!
 //! ## Split Structure
-//! - `mpi.rs` — MpiState, AuthenticatedOwner, auth middleware, router, helpers
-//! - `mpi_handlers.rs` (THIS FILE) — remember, forget, status, embed, record, overview
-//! - `recall_handler.rs` — recall (hybrid: vector + BM25 + graph + RRF) ← v2.4.0+BM25
-//! - `mpi_graph_handlers.rs` — v2.4.0 cognitive graph endpoints (11 new)
+//! - `mpi.rs`             — MpiState, auth middleware, router, helpers
+//! - `mpi_handlers.rs`    (THIS FILE) — remember, forget, status, embed, record, overview
+//! - `recall_handler.rs`  — recall hybrid pipeline
+//! - `mpi_graph_handlers.rs` — v2.4.0 cognitive graph endpoints
+//! - `supernode_handlers.rs` — v2.5.0 SuperNode management endpoints
 //!
-//! ## v2.4.0+BM25 Changes
-//! - mpi_recall MOVED to recall_handler.rs (pipeline too complex for shared file)
-//! - Recall types (RecallRequest, RecallResponse, etc.) remain here for re-export
-//! - mpi_remember: +fts_index_record after insert
-//! - mpi_forget: +fts_remove_record after revoke
-//! - mpi_status: +ner_ready, +graph_enabled, +graph_stats (from v2.4.0)
-//!
-//! ## v2.4.0+Progressive Changes
-//! - RecallRequest: added `mode: String` field (default "full")
-//!   "index" mode returns lightweight previews for progressive retrieval
-//! - Added default_recall_mode() helper function
-//!
-//! ⚠️ Important Note for Next Developer:
-//! - All handlers extract owner from AuthenticatedOwner extension
-//! - RecallRequest/RecallResponse types are defined here but the handler
-//!   is in recall_handler.rs (which re-exports these types)
-//! - When adding new original-style endpoints, add them here
-//!
-//! ## Last Modified
-//! v2.4.0-GraphCognition - Extracted from mpi.rs; hybrid recall; status extended
-//! v2.4.0+BM25 - 🌟 Moved mpi_recall to recall_handler.rs; added FTS indexing
-//!   in remember/forget; recall types preserved for backward compat
-//! v2.4.0+Progressive - 🌟 Added mode field to RecallRequest + default_recall_mode()
+//! ## Modification History
+//! v2.4.0-GraphCognition - Extracted from mpi.rs; status extended with NER/graph
+//! v2.4.0+BM25 - Moved mpi_recall to recall_handler.rs; added FTS indexing
+//! v2.4.0+Progressive - Added mode field to RecallRequest + default_recall_mode()
+//! v2.5.0+SuperNode Phase D - 🌟 MpiStatusResponse + SuperNodeStatus struct;
+//!   mpi_status handler fills SuperNode queue counts + cost + provider info.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -49,6 +32,7 @@ use tracing::{debug, info, warn};
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 
 use crate::services::memchain::mvf;
+use crate::services::memchain::LlmRouter;
 
 use super::mpi::{
     MpiState, AuthenticatedOwner, BaselineSnapshot,
@@ -140,7 +124,6 @@ pub async fn mpi_remember(
         );
     }
 
-    // v2.4.0+BM25: Index in FTS5 for keyword search
     let tags_str = serde_json::to_string(&req_body.topic_tags).unwrap_or_default();
     state.storage.fts_index_record(
         &record.record_id, &owner, &req_body.content, &tags_str,
@@ -160,8 +143,6 @@ pub async fn mpi_remember(
 // ============================================
 // Recall Types (used by recall_handler.rs)
 // ============================================
-// These struct definitions remain here so that recall_handler.rs can
-// `pub use super::mpi_handlers::{RecallRequest, ...}` for backward compat.
 
 #[derive(Debug, Deserialize)]
 pub struct RecallRequest {
@@ -179,22 +160,17 @@ pub struct RecallRequest {
     pub time_hint: Option<TimeHint>,
     #[serde(default)]
     pub session_id: Option<String>,
-    // v2.4.0: Hybrid retrieval parameters
     #[serde(default)]
     pub project_id: Option<String>,
     #[serde(default)]
     pub time_range: Option<TimeRangeParam>,
     #[serde(default = "default_include_graph")]
     pub include_graph: bool,
-    /// v2.4.0+Progressive: Retrieval mode.
-    /// - "full" (default): returns complete content for each memory (current behavior)
-    /// - "index": returns lightweight index only (id, title, score, entities, ~50 token each)
-    ///   AI reviews the index and calls /recall/detail for full content of selected items.
+    /// v2.4.0+Progressive: "full" (default) | "index"
     #[serde(default = "default_recall_mode")]
     pub mode: String,
 }
 
-/// v2.4.0+Progressive: Default recall mode is "full" (existing behavior unchanged).
 pub(crate) fn default_recall_mode() -> String { "full".into() }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -222,7 +198,6 @@ pub struct RecallResponse {
     pub memories: Vec<RecalledMemory>,
     pub total_candidates: usize,
     pub token_estimate: usize,
-    // v2.4.0
     pub query_type: Option<String>,
     pub matched_entities: Option<Vec<serde_json::Value>>,
 }
@@ -260,44 +235,80 @@ pub async fn mpi_forget(
 
     if let Some(record) = state.storage.get(&rid).await {
         if record.owner != owner {
-            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "access denied: record belongs to another owner"})));
+            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"access denied"})));
         }
     } else {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!(ForgetResponse { status:"not_found".into(), record_id: rb.record_id })));
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!(ForgetResponse {
+            status:"not_found".into(), record_id: rb.record_id
+        })));
     }
 
     if !state.storage.revoke(&rid).await {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!(ForgetResponse { status:"not_found".into(), record_id: rb.record_id })));
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!(ForgetResponse {
+            status:"not_found".into(), record_id: rb.record_id
+        })));
     }
 
     state.vector_index.remove(&rid);
-
-    // v2.4.0+BM25: Remove from FTS5 index
     state.storage.fts_remove_record(&rid).await;
 
     { let oh = auth.owner_hex(); let mut c = state.identity_cache.write();
       if let Some(e) = c.get_mut(&oh) { e.retain(|r| r.record_id != rid); } }
 
-    (StatusCode::OK, Json(serde_json::json!(ForgetResponse { status:"revoked".into(), record_id: rb.record_id })))
+    (StatusCode::OK, Json(serde_json::json!(ForgetResponse {
+        status:"revoked".into(), record_id: rb.record_id
+    })))
 }
 
 // ============================================
-// GET /api/mpi/status (v2.4.0 extended)
+// GET /api/mpi/status (v2.5.0 extended)
 // ============================================
+
+/// SuperNode status embedded in /status response (v2.5.0+SuperNode).
+#[derive(Debug, Clone, Serialize)]
+pub struct SuperNodeStatus {
+    pub enabled: bool,
+    /// Names of configured providers.
+    pub providers: Vec<String>,
+    pub provider_count: usize,
+    pub queue: QueueStatus,
+    pub today: TodayStats,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueStatus {
+    pub pending: i64,
+    pub processing: i64,
+    pub failed: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TodayStats {
+    pub tasks_completed: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub estimated_cost_usd: String,
+}
 
 #[derive(Debug, Serialize)]
 pub struct MpiStatusResponse {
-    pub memchain_enabled: bool, pub mode: String,
+    pub memchain_enabled: bool,
+    pub mode: String,
     pub stats: crate::services::memchain::StorageStats,
-    pub vector_index_total: usize, pub vector_partitions: usize,
-    pub last_block_height: u64, pub index_ready: bool,
-    pub embed_ready: bool, pub embed_dim: Option<usize>,
+    pub vector_index_total: usize,
+    pub vector_partitions: usize,
+    pub last_block_height: u64,
+    pub index_ready: bool,
+    pub embed_ready: bool,
+    pub embed_dim: Option<usize>,
     pub mvf: MvfMetrics,
     pub remote_storage_enabled: bool,
     // v2.4.0
     pub ner_ready: bool,
     pub graph_enabled: bool,
-    pub graph_stats: Option<crate::services::memchain::storage_ops::GraphStats>,
+    pub graph_stats: Option<crate::services::memchain::storage_graph::GraphStats>,
+    // v2.5.0+SuperNode
+    pub supernode: SuperNodeStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -326,29 +337,85 @@ pub async fn mpi_status(
     let mr = if !fb.is_empty() { Some(tp as f32 / fb.len() as f32) } else { None };
     let ms = if !fb.is_empty() { Some(fb.len()) } else { None };
     let bl = state.mvf_baseline.read().clone();
-    let lift = match (&bl, mr) { (Some(b), Some(m)) if b.positive_rate > 0.0 => Some((m - b.positive_rate) / b.positive_rate), _ => None };
+    let lift = match (&bl, mr) {
+        (Some(b), Some(m)) if b.positive_rate > 0.0 => Some((m - b.positive_rate) / b.positive_rate),
+        _ => None,
+    };
 
     let gs = if state.graph_enabled || state.ner_engine.is_some() {
         Some(state.storage.graph_stats(&owner).await)
     } else { None };
 
+    // ── v2.5.0+SuperNode: queue counts + today usage ──
+    let supernode_status = {
+        let now = now_secs() as i64;
+        let today_start = now - (now % 86400);
+
+        let counts = state.storage.count_tasks_by_status().await;
+        let queue = QueueStatus {
+            pending:    *counts.get("pending").unwrap_or(&0),
+            processing: *counts.get("processing").unwrap_or(&0),
+            failed:     *counts.get("failed").unwrap_or(&0),
+        };
+
+        let today_stats = state.storage.get_usage_stats(today_start, now).await;
+        let cost_today: f64 = today_stats.by_provider.iter().map(|p| {
+            LlmRouter::estimate_cost(
+                &p.provider, p.input_tokens as u32, p.output_tokens as u32, 0,
+            )
+        }).sum();
+
+        // completed tasks today
+        let tasks_today = {
+            let conn = state.storage.conn_lock().await;
+            conn.query_row(
+                "SELECT COUNT(*) FROM cognitive_tasks WHERE status='completed' AND completed_at >= ?1",
+                rusqlite::params![today_start],
+                |r| r.get::<_, i64>(0),
+            ).unwrap_or(0)
+        };
+
+        let provider_names = state.llm_router.as_ref()
+            .map(|r| r.provider_names().into_iter().map(String::from).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        SuperNodeStatus {
+            enabled: state.llm_router.is_some(),
+            provider_count: provider_names.len(),
+            providers: provider_names,
+            queue,
+            today: TodayStats {
+                tasks_completed: tasks_today,
+                input_tokens: today_stats.total_input_tokens,
+                output_tokens: today_stats.total_output_tokens,
+                estimated_cost_usd: format!("{:.6}", cost_today),
+            },
+        }
+    };
+
     (StatusCode::OK, Json(serde_json::json!(MpiStatusResponse {
-        memchain_enabled: true, mode: "local".into(), stats,
+        memchain_enabled: true,
+        mode: "local".into(),
+        stats,
         vector_index_total: state.vector_index.total_vectors(),
         vector_partitions: state.vector_index.partition_count(),
         last_block_height: height,
         index_ready: state.index_ready.load(std::sync::atomic::Ordering::Relaxed),
         embed_ready: state.embed_engine.is_some(),
         embed_dim: state.embed_engine.as_ref().map(|e| e.dim()),
-        mvf: MvfMetrics { enabled: state.mvf_enabled, alpha: state.mvf_alpha,
+        mvf: MvfMetrics {
+            enabled: state.mvf_enabled, alpha: state.mvf_alpha,
             total_positive_feedback: tp, total_negative_feedback: tn,
             baseline_positive_rate: bl.as_ref().map(|b| b.positive_rate),
             baseline_sample_size: bl.as_ref().map(|b| b.sample_size),
-            mvf_positive_rate: mr, mvf_sample_size: ms, lift, weights_version: wv },
+            mvf_positive_rate: mr, mvf_sample_size: ms, lift,
+            weights_version: wv,
+        },
         remote_storage_enabled: state.allow_remote_storage,
         ner_ready: state.ner_engine.is_some(),
         graph_enabled: state.graph_enabled,
         graph_stats: gs,
+        supernode: supernode_status,
     })))
 }
 
@@ -375,14 +442,14 @@ pub async fn mpi_get_record(
 
     let rid = match hex::decode(&record_id_hex) {
         Ok(b) if b.len() == 32 => { let mut a = [0u8; 32]; a.copy_from_slice(&b); a }
-        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid record_id format"}))).into_response(),
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid record_id"}))).into_response(),
     };
     let record = match state.storage.get(&rid).await {
         Some(r) => r,
-        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "record not found"}))).into_response(),
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"record not found"}))).into_response(),
     };
     if record.owner != owner {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "access denied"}))).into_response();
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"access denied"}))).into_response();
     }
 
     let em = state.storage.get_embedding_model(&rid).await.unwrap_or_default();
@@ -392,8 +459,11 @@ pub async fn mpi_get_record(
         record_id: record_id_hex, layer: record.layer.to_string(), content,
         topic_tags: record.topic_tags.clone(), source_ai: record.source_ai.clone(),
         timestamp: record.timestamp, access_count: record.access_count,
-        positive_feedback: record.positive_feedback, negative_feedback: record.negative_feedback,
-        has_conflict: record.has_conflict(), embedding_model: em, has_embedding: record.has_embedding(),
+        positive_feedback: record.positive_feedback,
+        negative_feedback: record.negative_feedback,
+        has_conflict: record.has_conflict(),
+        embedding_model: em,
+        has_embedding: record.has_embedding(),
         status: if record.is_active() { "active" } else { "revoked" }.into(),
     }))).into_response()
 }
@@ -411,7 +481,9 @@ pub async fn mpi_records_overview(
     let ov = state.storage.get_overview(&owner, 20).await;
     let total: u64 = ov.by_layer.values().sum();
     (StatusCode::OK, Json(serde_json::json!({
-        "total": total, "by_layer": ov.by_layer, "recent_by_layer": ov.recent_by_layer,
+        "total": total,
+        "by_layer": ov.by_layer,
+        "recent_by_layer": ov.recent_by_layer,
         "last_memory_at": ov.last_memory_at,
         "embed_ready": state.embed_engine.is_some(),
         "embed_dim": state.embed_engine.as_ref().map(|e| e.dim()),
@@ -423,7 +495,11 @@ pub async fn mpi_records_overview(
 // ============================================
 
 #[derive(Debug, Deserialize)]
-pub struct EmbedRequest { pub texts: Vec<String>, #[serde(default = "default_model")] pub model: String }
+pub struct EmbedRequest {
+    pub texts: Vec<String>,
+    #[serde(default = "default_model")]
+    pub model: String,
+}
 
 pub async fn mpi_embed(
     State(state): State<Arc<MpiState>>,
@@ -440,21 +516,29 @@ pub async fn mpi_embed(
     };
     let engine = match &state.embed_engine {
         Some(e) => e,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "local embed engine not available"}))),
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"local embed engine not available"}))),
     };
-    if rb.texts.is_empty() { return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "texts array is empty"}))); }
-    if rb.texts.len() > 100 { return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "batch too large", "max": 100}))); }
+    if rb.texts.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"texts array is empty"})));
+    }
+    if rb.texts.len() > 100 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"batch too large","max":100})));
+    }
 
     let refs: Vec<&str> = rb.texts.iter().map(|s| s.as_str()).collect();
     match engine.embed_batch(&refs) {
         Ok(embs) => {
             let dim = embs.first().map(|v| v.len()).unwrap_or(0);
             debug!(batch = embs.len(), dim = dim, "[MPI_EMBED] Generated");
-            (StatusCode::OK, Json(serde_json::json!({"embeddings": embs, "model": "minilm-l6-v2", "dim": dim})))
+            (StatusCode::OK, Json(serde_json::json!({
+                "embeddings": embs, "model": "minilm-l6-v2", "dim": dim
+            })))
         }
         Err(e) => {
             warn!(error = %e, "[MPI_EMBED] Inference failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("embed failed: {}", e)})))
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("embed failed: {}", e)
+            })))
         }
     }
 }
