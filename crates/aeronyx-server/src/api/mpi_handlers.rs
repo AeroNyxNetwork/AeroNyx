@@ -388,7 +388,7 @@ pub async fn mpi_status(
                 tasks_completed: tasks_today,
                 input_tokens: today_stats.total_input_tokens,
                 output_tokens: today_stats.total_output_tokens,
-                estimated_cost_usd: format!("{:.6}", cost_today),
+                estimated_cost_usd: format!("{:.6}", cost_today.abs()),
             },
         }
     };
