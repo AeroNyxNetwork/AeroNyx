@@ -123,14 +123,8 @@ pub use storage_graph::{
 pub use storage_miner::EntityTimelineEntry;
 
 // ── Storage SuperNode types (v2.5.0+SuperNode) ──
-// v2.5.0+Unify: Only re-export types that actually exist in storage_supernode.rs.
-// CognitiveTaskRow is the task queue row struct.
-// LlmUsageStats, ProviderUsage, TaskTypeUsage were listed in the original mod.rs
-// but never defined in storage_supernode.rs — they need to be added there or
-// the re-exports removed. For now, only re-export what exists.
-pub use storage_supernode::CognitiveTaskRow;
-// TODO: Add these re-exports once the types are defined in storage_supernode.rs:
-// pub use storage_supernode::{LlmUsageStats, ProviderUsage, TaskTypeUsage};
+// v2.5.0+Unify: All 4 types confirmed present in storage_supernode.rs.
+pub use storage_supernode::{CognitiveTaskRow, LlmUsageStats, ProviderUsage, TaskTypeUsage};
 
 // ── Vector ──
 pub use vector::{
