@@ -9,7 +9,7 @@
 //!
 //! ## Main Functionality
 //! ### cognitive_tasks CRUD
-//! - insert_cognitive_task()      — enqueue a new pending task
+//! - insert_cognitive_task()      — enqueue a new pending task (idempotent: skips if active duplicate exists)
 //! - claim_pending_tasks()        — atomic SELECT + UPDATE to 'processing'
 //! - complete_task()              — mark completed + write result + token_usage
 //! - fail_task()                  — increment retry_count or mark 'failed'
@@ -20,6 +20,7 @@
 //! - get_tasks_filtered()         — list tasks with optional status + task_type filters
 //! - get_tasks_for_target()       — find tasks for a specific (table, id) pair
 //! - count_tasks_by_status()      — HashMap<status, count> for queue summary
+//! - reset_stale_processing_tasks() — on startup: recover tasks stuck in 'processing'
 //!
 //! ### llm_usage_log CRUD
 //! - insert_usage_log()              — write a single LLM call record
@@ -42,6 +43,11 @@
 //!   cost_usd NOT stored — fee rates change; compute at query time in LlmRouter.
 //!
 //! ⚠️ Important Note for Next Developer:
+//! - insert_cognitive_task() is NOW IDEMPOTENT. It skips insertion if an active
+//!   (pending/processing) task already exists for the same (target_table, target_id,
+//!   task_type) triple. Returns Ok(None) in that case. Callers must handle Option<i64>.
+//! - reset_stale_processing_tasks() MUST be called at server startup before TaskWorker
+//!   spawns. Recovers tasks stuck in 'processing' after a crash/restart.
 //! - claim_pending_tasks() uses a single conn lock (SELECT + UPDATE atomic).
 //!   Do NOT split into two separate conn.lock() calls.
 //! - fail_task() checks retry_count < max_retries before marking 'failed'.
@@ -61,18 +67,28 @@
 //! - miner/reflection.rs — insert_cognitive_task (Phase B)
 //! - api/supernode_handlers.rs — all management endpoints
 //! - api/mpi_handlers.rs — count_tasks_by_status for /status
+//! - server.rs — reset_stale_processing_tasks on startup
 //!
 //! ## Last Modified
 //! v2.5.0+SuperNode Phase A - 🌟 Created. Core CRUD.
 //! v2.5.0+SuperNode Phase C - 🔧 Fixed by_provider borrow issue in get_usage_stats.
 //! v2.5.0+SuperNode Phase D - 🌟 Added retry_task, count_tasks_by_status,
 //!   get_usage_stats_by_task_type, get_tasks_filtered, TaskTypeUsage type.
+//! v2.5.0+Fix              - 🔧 [BUG FIX] insert_cognitive_task: added idempotency
+//!   guard (WHERE NOT EXISTS) to prevent duplicate pending/processing tasks for
+//!   the same (target_table, target_id, task_type). Return type changed from
+//!   Result<i64> to Result<Option<i64>> — Ok(None) = skipped (duplicate).
+//!                         - 🔧 [BUG FIX] Added reset_stale_processing_tasks() for
+//!   crash-recovery on server startup. Tasks stuck in 'processing' beyond the
+//!   timeout threshold are reset to 'pending'.
+//!                         - 🧪 Added test_insert_cognitive_task_dedup and
+//!   test_get_usage_stats_by_task_type (previously untested).
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, OptionalExtension};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::storage::MemoryStorage;
 
@@ -145,7 +161,20 @@ pub struct TaskTypeUsage {
 impl MemoryStorage {
     /// Enqueue a new cognitive task in 'pending' status.
     ///
-    /// Returns the inserted row id on success.
+    /// ## Idempotency Guard (v2.5.0+Fix)
+    /// Returns `Ok(None)` (skips insertion) if an active task — status IN
+    /// ('pending', 'processing') — already exists for the same
+    /// `(target_table, target_id, task_type)` triple.
+    ///
+    /// This prevents Miner ticks from accumulating duplicate tasks for the
+    /// same target object across repeated cycles.
+    ///
+    /// ## Return Values
+    /// - `Ok(Some(id))` — new task inserted, `id` is the new row id
+    /// - `Ok(None)`     — active duplicate found, insertion skipped
+    /// - `Err(msg)`     — database error
+    ///
+    /// ⚠️ Callers in reflection.rs must be updated to handle `Option<i64>`.
     pub async fn insert_cognitive_task(
         &self,
         task_type: &str,
@@ -156,9 +185,37 @@ impl MemoryStorage {
         target_id: Option<&str>,
         privacy_level: &str,
         max_retries: i64,
-    ) -> Result<i64, String> {
+    ) -> Result<Option<i64>, String> {
         let now = now_ts();
         let conn = self.conn.lock().await;
+
+        // ── Idempotency check ──────────────────────────────────────────────
+        // Only guard when both target_table and target_id are provided.
+        // Tasks without a target (e.g. one-off recall_synthesis) always insert.
+        if let (Some(tbl), Some(tid)) = (target_table, target_id) {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM cognitive_tasks
+                    WHERE target_table = ?1
+                      AND target_id   = ?2
+                      AND task_type   = ?3
+                      AND status IN ('pending', 'processing')
+                )",
+                params![tbl, tid, task_type],
+                |row| row.get(0),
+            ).unwrap_or(false);
+
+            if exists {
+                debug!(
+                    task_type = task_type,
+                    target = %format!("{}/{}", tbl, tid),
+                    "[STORAGE_SN] Duplicate active task — skipped"
+                );
+                return Ok(None);
+            }
+        }
+
+        // ── Insert ────────────────────────────────────────────────────────
         conn.execute(
             "INSERT INTO cognitive_tasks
                 (task_type, priority, status, payload, prompt_messages,
@@ -169,9 +226,60 @@ impl MemoryStorage {
                 target_table, target_id, privacy_level, max_retries, now,
             ],
         ).map_err(|e| format!("Insert cognitive_task: {}", e))?;
+
         let id = conn.last_insert_rowid();
         debug!(id = id, task_type = task_type, "[STORAGE_SN] Task enqueued");
-        Ok(id)
+        Ok(Some(id))
+    }
+
+    /// Recover tasks stuck in 'processing' after a server crash or restart.
+    ///
+    /// ## When to Call
+    /// Call ONCE at server startup, before TaskWorker spawns. Typical location:
+    /// `server.rs::init_llm_router()` or immediately before `TaskWorker::spawn()`.
+    ///
+    /// ## Logic
+    /// Any task that has been in 'processing' for longer than `timeout_secs`
+    /// is assumed to have been orphaned by a crash. It is reset to 'pending'
+    /// so the TaskWorker can re-claim it.
+    ///
+    /// The `retry_count` is NOT incremented here — the crash was not the task's
+    /// fault. The error_message is set to indicate the recovery event for audit.
+    ///
+    /// ## Parameters
+    /// - `timeout_secs` — should match `supernode.worker.task_timeout_secs` from config.
+    ///   Recommended: 120–300 seconds.
+    ///
+    /// Returns the number of tasks recovered.
+    pub async fn reset_stale_processing_tasks(&self, timeout_secs: i64) -> usize {
+        let now = now_ts();
+        let stale_before = now - timeout_secs;
+
+        let conn = self.conn.lock().await;
+        match conn.execute(
+            "UPDATE cognitive_tasks
+             SET status        = 'pending',
+                 started_at    = NULL,
+                 error_message = 'Recovered: task was in processing at server startup'
+             WHERE status     = 'processing'
+               AND started_at < ?1",
+            params![stale_before],
+        ) {
+            Ok(n) => {
+                if n > 0 {
+                    info!(
+                        recovered = n,
+                        timeout_secs = timeout_secs,
+                        "[STORAGE_SN] Recovered stale processing tasks on startup"
+                    );
+                }
+                n
+            }
+            Err(e) => {
+                warn!("[STORAGE_SN] reset_stale_processing_tasks failed: {}", e);
+                0
+            }
+        }
     }
 
     /// Atomically claim up to `batch_size` pending tasks for processing.
@@ -477,7 +585,7 @@ impl MemoryStorage {
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default();
 
-        // Ensure all expected statuses are present
+        // Ensure all expected statuses are present (prevents key-not-found panics in callers)
         let mut result = HashMap::new();
         for s in &["pending", "processing", "completed", "failed", "cancelled"] {
             result.insert(s.to_string(), *raw.get(*s).unwrap_or(&0));
@@ -676,7 +784,7 @@ mod tests {
         let id = s.insert_cognitive_task(
             "session_title", 5, r#"{"session_id":"sess_001"}"#,
             None, Some("sessions"), Some("sess_001"), "structured", 3,
-        ).await.unwrap();
+        ).await.unwrap().expect("Should insert first task");
         assert!(id > 0);
 
         let claimed = s.claim_pending_tasks(10).await;
@@ -688,13 +796,120 @@ mod tests {
         assert!(claimed2.is_empty());
     }
 
+    /// (v2.5.0+Fix) Verify idempotency: inserting the same (target_table, target_id,
+    /// task_type) while an active task exists must return Ok(None).
+    #[tokio::test]
+    async fn test_insert_cognitive_task_dedup() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+
+        // First insert — should succeed
+        let id1 = s.insert_cognitive_task(
+            "session_title", 5, r#"{"session_id":"sess_001"}"#,
+            None, Some("sessions"), Some("sess_001"), "structured", 3,
+        ).await.unwrap();
+        assert!(id1.is_some(), "First insert must succeed");
+
+        // Second insert — same triple, status=pending → must be skipped
+        let id2 = s.insert_cognitive_task(
+            "session_title", 5, r#"{"session_id":"sess_001"}"#,
+            None, Some("sessions"), Some("sess_001"), "structured", 3,
+        ).await.unwrap();
+        assert!(id2.is_none(), "Duplicate pending task must be skipped");
+
+        // Only one task should exist
+        let tasks = s.get_tasks_filtered(None, Some("session_title"), 10).await;
+        assert_eq!(tasks.len(), 1);
+
+        // Different task_type on same target → allowed
+        let id3 = s.insert_cognitive_task(
+            "code_analysis", 5, r#"{}"#,
+            None, Some("sessions"), Some("sess_001"), "structured", 3,
+        ).await.unwrap();
+        assert!(id3.is_some(), "Different task_type on same target must be allowed");
+
+        // After completion, same type may be re-inserted
+        let id1_unwrapped = id1.unwrap();
+        s.claim_pending_tasks(10).await;
+        s.complete_task(id1_unwrapped, r#"{"title":"Done"}"#, "openai", "gpt-4o-mini", "{}").await.unwrap();
+
+        let id4 = s.insert_cognitive_task(
+            "session_title", 5, r#"{"session_id":"sess_001"}"#,
+            None, Some("sessions"), Some("sess_001"), "structured", 3,
+        ).await.unwrap();
+        assert!(id4.is_some(), "Re-insert after completion must succeed");
+    }
+
+    /// Tasks with no target (recall_synthesis style) always insert regardless.
+    #[tokio::test]
+    async fn test_insert_no_target_always_inserts() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+
+        let id1 = s.insert_cognitive_task(
+            "recall_synthesis", 5, r#"{}"#,
+            None, None, None, "structured", 3,
+        ).await.unwrap();
+        let id2 = s.insert_cognitive_task(
+            "recall_synthesis", 5, r#"{}"#,
+            None, None, None, "structured", 3,
+        ).await.unwrap();
+
+        assert!(id1.is_some());
+        assert!(id2.is_some());
+        assert_ne!(id1.unwrap(), id2.unwrap());
+    }
+
+    /// (v2.5.0+Fix) Verify startup recovery resets stale processing tasks.
+    #[tokio::test]
+    async fn test_reset_stale_processing_tasks() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+
+        // Insert and claim a task (moves to 'processing')
+        let id = s.insert_cognitive_task(
+            "session_title", 5, r#"{}"#,
+            None, Some("sessions"), Some("s1"), "structured", 3,
+        ).await.unwrap().unwrap();
+        s.claim_pending_tasks(1).await;
+
+        // Manually back-date started_at to simulate a stale task
+        {
+            let conn = s.conn.lock().await;
+            conn.execute(
+                "UPDATE cognitive_tasks SET started_at = started_at - 1000 WHERE id = ?1",
+                params![id],
+            ).unwrap();
+        }
+
+        let recovered = s.reset_stale_processing_tasks(60).await;
+        assert_eq!(recovered, 1);
+
+        let task = s.get_task(id).await.unwrap();
+        assert_eq!(task.status, "pending");
+        assert_eq!(task.retry_count, 0, "retry_count must NOT be incremented by recovery");
+        assert!(task.error_message.unwrap_or_default().contains("Recovered"));
+    }
+
+    /// Within-timeout tasks must NOT be reset.
+    #[tokio::test]
+    async fn test_reset_stale_skips_fresh_processing() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        s.insert_cognitive_task(
+            "session_title", 5, r#"{}"#,
+            None, Some("sessions"), Some("s1"), "structured", 3,
+        ).await.unwrap();
+        s.claim_pending_tasks(1).await;
+
+        // started_at is just now — should NOT be reset with 120s timeout
+        let recovered = s.reset_stale_processing_tasks(120).await;
+        assert_eq!(recovered, 0);
+    }
+
     #[tokio::test]
     async fn test_complete_task() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let id = s.insert_cognitive_task(
             "session_title", 5, r#"{"session_id":"s1"}"#,
             None, Some("sessions"), Some("s1"), "structured", 3,
-        ).await.unwrap();
+        ).await.unwrap().unwrap();
         s.claim_pending_tasks(1).await;
         s.complete_task(id, r#"{"title":"Project Alpha: JWT"}"#,
             "openai", "gpt-4o-mini",
@@ -711,7 +926,7 @@ mod tests {
         let id = s.insert_cognitive_task(
             "community_summary", 3, r#"{}"#,
             None, None, None, "structured", 2,
-        ).await.unwrap();
+        ).await.unwrap().unwrap();
         s.claim_pending_tasks(1).await;
 
         // First fail → back to pending
@@ -733,7 +948,7 @@ mod tests {
         let id = s.insert_cognitive_task(
             "session_title", 5, r#"{}"#,
             None, None, None, "structured", 1,
-        ).await.unwrap();
+        ).await.unwrap().unwrap();
         s.claim_pending_tasks(1).await;
         // Exhaust retries
         s.fail_task(id, "error").await.unwrap();
@@ -753,7 +968,7 @@ mod tests {
         let id = s.insert_cognitive_task(
             "session_title", 5, r#"{}"#,
             None, None, None, "structured", 3,
-        ).await.unwrap();
+        ).await.unwrap().unwrap();
         // Task is pending — retry should fail
         let result = s.retry_task(id).await;
         assert!(result.is_err());
@@ -766,7 +981,7 @@ mod tests {
         let id = s.insert_cognitive_task(
             "entity_description", 5, r#"{}"#,
             None, None, None, "structured", 3,
-        ).await.unwrap();
+        ).await.unwrap().unwrap();
         s.cancel_task(id).await.unwrap();
         let t = s.get_task(id).await.unwrap();
         assert_eq!(t.status, "cancelled");
@@ -818,7 +1033,7 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3).await.unwrap();
         s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3).await.unwrap();
-        let id3 = s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3).await.unwrap();
+        let id3 = s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3).await.unwrap().unwrap();
         s.cancel_task(id3).await.unwrap();
 
         let counts = s.count_tasks_by_status().await;
@@ -841,6 +1056,38 @@ mod tests {
         assert_eq!(stats.total_cached_tokens, 20);
         assert_eq!(stats.by_provider.len(), 2);
         assert_eq!(stats.by_provider[0].provider, "openai");
+    }
+
+    /// (v2.5.0+Fix) Test get_usage_stats_by_task_type (previously untested).
+    #[tokio::test]
+    async fn test_get_usage_stats_by_task_type() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+
+        // Insert tasks first so the JOIN resolves
+        let t1 = s.insert_cognitive_task(
+            "session_title", 5, "{}", None, None, None, "structured", 3,
+        ).await.unwrap().unwrap();
+        let t2 = s.insert_cognitive_task(
+            "community_narrative", 5, "{}", None, None, None, "structured", 3,
+        ).await.unwrap().unwrap();
+
+        s.insert_usage_log(Some(t1), "deepseek", "deepseek-reasoner", 100, 40, 0, 800).await.unwrap();
+        s.insert_usage_log(Some(t1), "deepseek", "deepseek-reasoner", 120, 50, 0, 900).await.unwrap();
+        s.insert_usage_log(Some(t2), "claude", "claude-sonnet-4-20250514", 200, 80, 30, 1100).await.unwrap();
+
+        let stats = s.get_usage_stats_by_task_type(0, 0).await;
+        assert_eq!(stats.len(), 2);
+
+        // session_title × deepseek should be first (2 calls vs 1)
+        let st = stats.iter().find(|r| r.task_type == "session_title").unwrap();
+        assert_eq!(st.provider, "deepseek");
+        assert_eq!(st.calls, 2);
+        assert_eq!(st.input_tokens, 220);
+
+        let cn = stats.iter().find(|r| r.task_type == "community_narrative").unwrap();
+        assert_eq!(cn.provider, "claude");
+        assert_eq!(cn.calls, 1);
+        assert_eq!(cn.cached_tokens, 30);
     }
 
     #[tokio::test]
