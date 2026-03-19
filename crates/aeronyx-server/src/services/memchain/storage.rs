@@ -4,6 +4,9 @@
 //! # MemoryStorage — SQLite Core (Schema, CRUD, LRU Cache)
 //!
 //! ## Creation Reason
+//! Core persistent storage layer for MemChain. Provides SQLite-backed
+//! memory record storage with optional ChaCha20 encryption, LRU caching,
+//! and schema migration support.
 //!
 //! ## Split Structure (v2.2.0)
 //! storage.rs was split into 3 files for maintainability:
@@ -30,9 +33,19 @@
 //!   - artifacts: Code/document artifacts with version chains
 //!   - records ALTER: added project_id, session_id, episode_id columns
 //!   - memory_edges data migrated to knowledge_edges (relation_type = 'RELATED_TO')
+//! - v6 (v2.5.0-SuperNode): Async cognitive task queue + LLM usage tracking:
+//!   - cognitive_tasks: SuperNode async LLM task queue
+//!   - llm_usage_log: Per-call token counts and latency log
+//!   - sessions ALTER: added title column (SuperNode-generated session title)
 //!
 //! ## Thread Safety
 //! `rusqlite::Connection` behind `tokio::sync::Mutex`. Phase 2+ can use r2d2 pooling.
+//!
+//! ## Dependencies
+//! - storage_crypto.rs: encrypt_record_content / decrypt_record_content
+//! - storage_ops.rs: rawlog, feedback, chain_state, stats, miner, overview
+//! - storage_graph.rs: cognitive graph CRUD (entities, edges, communities, sessions)
+//! - storage_supernode.rs: cognitive_tasks CRUD + llm_usage_log (v2.5.0)
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - Schema migrations: use `ALTER TABLE` in `maybe_migrate()`, NEVER drop tables.
@@ -42,8 +55,13 @@
 //! - LRU cache stores PLAINTEXT records (decrypted) for fast reads.
 //! - v4 migration is additive-only (ALTER TABLE ADD COLUMN).
 //! - v5 migration creates 8 new tables, ALTERs records, migrates memory_edges data.
-//!   All additive — no data loss on upgrade. Rollback: new tables are simply ignored
-//!   by v2.3.0 code (it doesn't query them).
+//!   All additive — no data loss on upgrade.
+//! - v6 migration creates cognitive_tasks + llm_usage_log tables, adds sessions.title.
+//!   All additive — no data loss on upgrade.
+//! - CRITICAL: Each migrate block MUST update schema_version to its own target
+//!   version number (hardcoded integer), NOT the SCHEMA_VERSION constant.
+//!   Using SCHEMA_VERSION would skip intermediate migrations when upgrading
+//!   across multiple versions (e.g., v4→v5 would set version=6, skipping v6 block).
 //! - Rawlog key migration clears old raw_logs on first run after key fix.
 //! - episodes.encrypted_content uses same ChaCha20 encryption as records.encrypted_content.
 //! - knowledge_edges.valid_until = NULL means "currently valid".
@@ -57,6 +75,9 @@
 //! v2.2.0 - 🌟 Split into storage.rs + storage_crypto.rs + storage_ops.rs
 //! v2.4.0-GraphCognition - 🌟 Schema v5: Three-layer cognitive graph (8 new tables,
 //!   records ALTER, memory_edges migration)
+//! v2.5.0-SuperNode - 🌟 Schema v6: cognitive_tasks + llm_usage_log + sessions.title
+//!   BUG FIX: v5 migrate block hardcoded version to 5 (was incorrectly using
+//!   SCHEMA_VERSION constant which would skip v6 migration on v4→v6 upgrades)
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -77,8 +98,14 @@ use super::storage_crypto::{encrypt_record_content, decrypt_record_content};
 // ============================================
 
 /// Current schema version.
-/// v4 → v5 migration adds cognitive graph tables.
-const SCHEMA_VERSION: u32 = 5;
+/// v4 → v5: cognitive graph tables
+/// v5 → v6: SuperNode cognitive_tasks + llm_usage_log + sessions.title
+///
+/// ⚠️ CRITICAL: When bumping this, you MUST also add a new migrate block
+/// in maybe_migrate(). The migrate block MUST use a hardcoded integer
+/// (not this constant) for UPDATE schema_version, to prevent skipping
+/// intermediate migrations on multi-version upgrades.
+const SCHEMA_VERSION: u32 = 6;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -418,7 +445,7 @@ impl MemoryStorage {
             CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner, status);
             CREATE INDEX IF NOT EXISTS idx_projects_active ON projects(owner, last_active_at DESC);
 
-            -- Sessions: conversation session metadata
+            -- Sessions: conversation session metadata (v2.5.0: added title column)
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id          TEXT PRIMARY KEY,
                 owner               BLOB NOT NULL,
@@ -427,6 +454,7 @@ impl MemoryStorage {
                 started_at          INTEGER NOT NULL,
                 ended_at            INTEGER,
                 turn_count          INTEGER DEFAULT 0,
+                title               TEXT,
                 summary             TEXT,
                 key_decisions       TEXT,
                 files_touched       TEXT,
@@ -488,6 +516,60 @@ impl MemoryStorage {
             Err(e) => warn!("[STORAGE] ⚠️ FTS5 creation failed (BM25 disabled): {}", e),
         }
 
+        // ── v6 (v2.5.0-SuperNode): Cognitive task queue + LLM usage log ──
+        // cognitive_tasks: async LLM task queue processed by TaskWorker
+        // llm_usage_log: per-call token usage + latency for cost tracking
+        //
+        // Design notes:
+        //   - Tasks are claimed atomically (UPDATE ... WHERE status='pending' LIMIT 1)
+        //   - result / prompt_messages stored as JSON TEXT for flexibility
+        //   - token_usage stored as JSON: {"input": N, "output": N, "cached": N}
+        //   - cost_usd NOT stored — computed dynamically at query time from token counts
+        //     so rate changes don't affect historical accuracy
+        conn.execute_batch(
+            "-- Cognitive task queue (SuperNode async LLM tasks)
+            CREATE TABLE IF NOT EXISTS cognitive_tasks (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_type       TEXT NOT NULL,
+                priority        INTEGER DEFAULT 5,
+                status          TEXT DEFAULT 'pending',
+                payload         TEXT NOT NULL,
+                result          TEXT,
+                prompt_messages TEXT,
+                target_table    TEXT,
+                target_id       TEXT,
+                privacy_level   TEXT DEFAULT 'structured',
+                provider_used   TEXT,
+                model_used      TEXT,
+                token_usage     TEXT,
+                created_at      INTEGER NOT NULL,
+                started_at      INTEGER,
+                completed_at    INTEGER,
+                retry_count     INTEGER DEFAULT 0,
+                max_retries     INTEGER DEFAULT 3,
+                error_message   TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_ct_status ON cognitive_tasks(status, priority DESC, created_at ASC);
+            CREATE INDEX IF NOT EXISTS idx_ct_target ON cognitive_tasks(target_table, target_id, task_type);
+            CREATE INDEX IF NOT EXISTS idx_ct_type ON cognitive_tasks(task_type, status);
+
+            -- LLM usage log (token counts + latency per call)
+            CREATE TABLE IF NOT EXISTS llm_usage_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id         INTEGER,
+                provider        TEXT NOT NULL,
+                model           TEXT NOT NULL,
+                input_tokens    INTEGER NOT NULL,
+                output_tokens   INTEGER NOT NULL,
+                cached_tokens   INTEGER DEFAULT 0,
+                latency_ms      INTEGER NOT NULL,
+                created_at      INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_usage_time ON llm_usage_log(created_at);
+            CREATE INDEX IF NOT EXISTS idx_usage_provider ON llm_usage_log(provider, created_at);
+            CREATE INDEX IF NOT EXISTS idx_usage_task ON llm_usage_log(task_id);"
+        ).map_err(|e| format!("Schema creation failed (v6 SuperNode tables): {}", e))?;
+
         // Insert schema version if not present
         let existing: Option<u32> = conn
             .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
@@ -506,78 +588,80 @@ impl MemoryStorage {
         let current: u32 = conn
             .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
             .unwrap_or(1);
-    
+
         // v1 → v2: embedding column
         if current < 2 {
             info!("[STORAGE] Migrating schema v{} → v2", current);
-            let has_embedding: bool = conn.prepare("SELECT embedding FROM records LIMIT 0").is_ok();
+            let has_embedding = conn.prepare("SELECT embedding FROM records LIMIT 0").is_ok();
             if !has_embedding {
                 let _ = conn.execute_batch("ALTER TABLE records ADD COLUMN embedding BLOB;");
                 info!("[STORAGE] Added `embedding` column");
             }
+            // ⚠️ BUG FIX: hardcoded 2, not SCHEMA_VERSION — prevents skipping v4/v5/v6
             conn.execute("UPDATE schema_version SET version = 2", [])
                 .map_err(|e| format!("Update schema version to v2: {}", e))?;
             info!("[STORAGE] ✅ Migration to v2 complete");
         }
-    
+
         // v2 → v4: MVF feedback + conflict
         let current: u32 = conn
             .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
             .unwrap_or(2);
-    
+
         if current < 4 {
             info!("[STORAGE] Migrating schema v{} → v4", current);
-    
-            if !conn.prepare("SELECT positive_feedback FROM records LIMIT 0").is_ok() {
+
+            if conn.prepare("SELECT positive_feedback FROM records LIMIT 0").is_err() {
                 conn.execute_batch("ALTER TABLE records ADD COLUMN positive_feedback INTEGER NOT NULL DEFAULT 0;")
                     .map_err(|e| format!("Add positive_feedback: {}", e))?;
             }
-            if !conn.prepare("SELECT negative_feedback FROM records LIMIT 0").is_ok() {
+            if conn.prepare("SELECT negative_feedback FROM records LIMIT 0").is_err() {
                 conn.execute_batch("ALTER TABLE records ADD COLUMN negative_feedback INTEGER NOT NULL DEFAULT 0;")
                     .map_err(|e| format!("Add negative_feedback: {}", e))?;
             }
-            if !conn.prepare("SELECT conflict_with FROM records LIMIT 0").is_ok() {
+            if conn.prepare("SELECT conflict_with FROM records LIMIT 0").is_err() {
                 conn.execute_batch("ALTER TABLE records ADD COLUMN conflict_with BLOB;")
                     .map_err(|e| format!("Add conflict_with: {}", e))?;
             }
-    
+
+            // ⚠️ BUG FIX: hardcoded 4, not SCHEMA_VERSION
             conn.execute("UPDATE schema_version SET version = 4", [])
                 .map_err(|e| format!("Update schema version to v4: {}", e))?;
             info!("[STORAGE] ✅ Migration to v4 complete");
         }
-    
+
         // v4 → v5 (v2.4.0-GraphCognition): Three-layer cognitive graph
         let current: u32 = conn
             .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
             .unwrap_or(4);
-    
+
         if current < 5 {
             info!("[STORAGE] Migrating schema v{} → v5 (cognitive graph)", current);
-    
+
             // 5a: ALTER records — add project_id, session_id, episode_id
-            if !conn.prepare("SELECT project_id FROM records LIMIT 0").is_ok() {
+            if conn.prepare("SELECT project_id FROM records LIMIT 0").is_err() {
                 conn.execute_batch("ALTER TABLE records ADD COLUMN project_id TEXT;")
                     .map_err(|e| format!("Add project_id to records: {}", e))?;
                 info!("[STORAGE] Added records.project_id");
             }
-            if !conn.prepare("SELECT session_id FROM records LIMIT 0").is_ok() {
+            if conn.prepare("SELECT session_id FROM records LIMIT 0").is_err() {
                 conn.execute_batch("ALTER TABLE records ADD COLUMN session_id TEXT;")
                     .map_err(|e| format!("Add session_id to records: {}", e))?;
                 info!("[STORAGE] Added records.session_id");
             }
-            if !conn.prepare("SELECT episode_id FROM records LIMIT 0").is_ok() {
+            if conn.prepare("SELECT episode_id FROM records LIMIT 0").is_err() {
                 conn.execute_batch("ALTER TABLE records ADD COLUMN episode_id TEXT;")
                     .map_err(|e| format!("Add episode_id to records: {}", e))?;
                 info!("[STORAGE] Added records.episode_id");
             }
-    
+
             // 5b: Create indexes for new records columns
             let _ = conn.execute_batch(
                 "CREATE INDEX IF NOT EXISTS idx_records_project ON records(project_id, timestamp DESC);
                  CREATE INDEX IF NOT EXISTS idx_records_session ON records(session_id);
                  CREATE INDEX IF NOT EXISTS idx_records_episode ON records(episode_id);"
             );
-    
+
             // 5c: Create v5 tables (IF NOT EXISTS — safe if create_schema already ran)
             let v5_tables = [
                 "episodes", "entities", "knowledge_edges", "episode_edges",
@@ -589,7 +673,7 @@ impl MemoryStorage {
                     params![table],
                     |row| row.get::<_, i64>(0),
                 ).unwrap_or(0) > 0;
-    
+
                 if !exists {
                     warn!(
                         "[STORAGE] v5 table '{}' missing after create_schema — \
@@ -599,31 +683,31 @@ impl MemoryStorage {
                     );
                 }
             }
-    
+
             // 5d: Migrate memory_edges → knowledge_edges
             {
                 let migrated: bool = conn.query_row(
                     "SELECT value FROM chain_state WHERE key = 'memory_edges_migrated_v5'",
                     [], |row| { let v: Vec<u8> = row.get(0)?; Ok(v == b"1") },
                 ).unwrap_or(false);
-    
+
                 if !migrated {
                     let edge_count: i64 = conn.query_row(
                         "SELECT COUNT(*) FROM memory_edges", [], |row| row.get(0),
                     ).unwrap_or(0);
-    
+
                     if edge_count > 0 {
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs() as i64;
-    
+
                         let ke_exists: bool = conn.query_row(
                             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='knowledge_edges'",
                             [],
                             |row| row.get::<_, i64>(0),
                         ).unwrap_or(0) > 0;
-    
+
                         if ke_exists {
                             match conn.execute(
                                 "INSERT OR IGNORE INTO knowledge_edges
@@ -652,7 +736,7 @@ impl MemoryStorage {
                             warn!("[STORAGE] knowledge_edges table not found, skipping memory_edges migration");
                         }
                     }
-    
+
                     let _ = conn.execute(
                         "INSERT OR REPLACE INTO chain_state (key, value) VALUES ('memory_edges_migrated_v5', ?1)",
                         params![b"1".as_slice()],
@@ -660,18 +744,21 @@ impl MemoryStorage {
                     info!("[STORAGE] ✅ memory_edges migration marker set");
                 }
             }
-    
+
             // 5e: Update schema version to v5
-            conn.execute("UPDATE schema_version SET version = ?1", params![SCHEMA_VERSION])
+            // ⚠️ BUG FIX: was `params![SCHEMA_VERSION]` (= 6), now hardcoded 5.
+            // Using SCHEMA_VERSION here would jump straight to v6, making the
+            // v6 migrate block unreachable for any DB upgrading from v4.
+            conn.execute("UPDATE schema_version SET version = 5", [])
                 .map_err(|e| format!("Update schema version to v5: {}", e))?;
-    
+
             // 5f: Backfill FTS5 index from existing records
             {
                 let fts_populated: bool = conn.query_row(
                     "SELECT value FROM chain_state WHERE key = 'fts_index_populated'",
                     [], |row| { let v: Vec<u8> = row.get(0)?; Ok(v == b"1") },
                 ).unwrap_or(false);
-    
+
                 if !fts_populated {
                     let indexed = conn.execute(
                         "INSERT OR IGNORE INTO fts_index (source_type, source_id, owner_hex, content, tags)
@@ -679,11 +766,11 @@ impl MemoryStorage {
                          FROM records WHERE status = 0 AND encrypted_content != x''",
                         [],
                     ).unwrap_or(0);
-    
+
                     if indexed > 0 {
                         info!(count = indexed, "[STORAGE] FTS5 backfill: records indexed");
                     }
-    
+
                     let _ = conn.execute(
                         "INSERT OR REPLACE INTO chain_state (key, value) VALUES ('fts_index_populated', ?1)",
                         params![b"1".as_slice()],
@@ -691,12 +778,101 @@ impl MemoryStorage {
                     info!("[STORAGE] ✅ FTS5 index populated");
                 }
             }
-    
+
             info!("[STORAGE] ✅ Migration to v5 (cognitive graph) complete");
         }
-    
+
+        // v5 → v6 (v2.5.0-SuperNode): Cognitive task queue + LLM usage log + sessions.title
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
+            .unwrap_or(5);
+
+        if current < 6 {
+            info!("[STORAGE] Migrating schema v{} → v6 (SuperNode)", current);
+
+            // 6a: Create cognitive_tasks table (IF NOT EXISTS — safe if create_schema already ran)
+            let ct_exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cognitive_tasks'",
+                [],
+                |row| row.get::<_, i64>(0),
+            ).unwrap_or(0) > 0;
+
+            if !ct_exists {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS cognitive_tasks (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        task_type       TEXT NOT NULL,
+                        priority        INTEGER DEFAULT 5,
+                        status          TEXT DEFAULT 'pending',
+                        payload         TEXT NOT NULL,
+                        result          TEXT,
+                        prompt_messages TEXT,
+                        target_table    TEXT,
+                        target_id       TEXT,
+                        privacy_level   TEXT DEFAULT 'structured',
+                        provider_used   TEXT,
+                        model_used      TEXT,
+                        token_usage     TEXT,
+                        created_at      INTEGER NOT NULL,
+                        started_at      INTEGER,
+                        completed_at    INTEGER,
+                        retry_count     INTEGER DEFAULT 0,
+                        max_retries     INTEGER DEFAULT 3,
+                        error_message   TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_ct_status ON cognitive_tasks(status, priority DESC, created_at ASC);
+                    CREATE INDEX IF NOT EXISTS idx_ct_target ON cognitive_tasks(target_table, target_id, task_type);
+                    CREATE INDEX IF NOT EXISTS idx_ct_type ON cognitive_tasks(task_type, status);"
+                ).map_err(|e| format!("v6 migration: create cognitive_tasks: {}", e))?;
+                info!("[STORAGE] Created cognitive_tasks table");
+            }
+
+            // 6b: Create llm_usage_log table
+            let ul_exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='llm_usage_log'",
+                [],
+                |row| row.get::<_, i64>(0),
+            ).unwrap_or(0) > 0;
+
+            if !ul_exists {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS llm_usage_log (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        task_id         INTEGER,
+                        provider        TEXT NOT NULL,
+                        model           TEXT NOT NULL,
+                        input_tokens    INTEGER NOT NULL,
+                        output_tokens   INTEGER NOT NULL,
+                        cached_tokens   INTEGER DEFAULT 0,
+                        latency_ms      INTEGER NOT NULL,
+                        created_at      INTEGER NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_usage_time ON llm_usage_log(created_at);
+                    CREATE INDEX IF NOT EXISTS idx_usage_provider ON llm_usage_log(provider, created_at);
+                    CREATE INDEX IF NOT EXISTS idx_usage_task ON llm_usage_log(task_id);"
+                ).map_err(|e| format!("v6 migration: create llm_usage_log: {}", e))?;
+                info!("[STORAGE] Created llm_usage_log table");
+            }
+
+            // 6c: Add sessions.title column
+            // ⚠️ FIX: use .is_err() instead of !x.is_ok() for clarity (clippy warning)
+            if conn.prepare("SELECT title FROM sessions LIMIT 0").is_err() {
+                conn.execute_batch("ALTER TABLE sessions ADD COLUMN title TEXT;")
+                    .map_err(|e| format!("v6 migration: add sessions.title: {}", e))?;
+                info!("[STORAGE] Added sessions.title column");
+            }
+
+            // 6d: Update schema version
+            // ⚠️ NOTE: hardcoded 6, not SCHEMA_VERSION constant — see module-level note
+            conn.execute("UPDATE schema_version SET version = 6", [])
+                .map_err(|e| format!("Update schema version to v6: {}", e))?;
+
+            info!("[STORAGE] ✅ Migration to v6 (SuperNode) complete");
+        }
+
         Ok(())
     }
+
     // ========================================
     // Insert
     // ========================================
@@ -1070,13 +1246,15 @@ mod tests {
     // ========================================
 
     #[tokio::test]
-    async fn test_schema_version_is_5() {
+    async fn test_schema_version_is_current() {
+        // ⚠️ BUG FIX: was test_schema_version_is_5 with assert_eq!(v, 5)
+        // Updated to track SCHEMA_VERSION constant so it stays valid on future bumps
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
         let v: u32 = conn.query_row(
             "SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0)
         ).unwrap();
-        assert_eq!(v, 5);
+        assert_eq!(v, SCHEMA_VERSION, "Schema version should be {}", SCHEMA_VERSION);
     }
 
     #[tokio::test]
@@ -1101,11 +1279,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_v6_tables_exist() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let conn = s.conn.lock().await;
+
+        let expected_tables = ["cognitive_tasks", "llm_usage_log"];
+        for table in &expected_tables {
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                params![table],
+                |row| row.get::<_, i64>(0),
+            ).unwrap() > 0;
+            assert!(exists, "Table '{}' should exist in schema v6", table);
+        }
+
+        // Verify sessions.title column exists
+        let title_ok = conn.prepare("SELECT title FROM sessions LIMIT 0").is_ok();
+        assert!(title_ok, "sessions.title column should exist in schema v6");
+    }
+
+    #[tokio::test]
+    async fn test_v6_cognitive_tasks_schema() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let conn = s.conn.lock().await;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // Insert a pending task
+        let result = conn.execute(
+            "INSERT INTO cognitive_tasks
+                (task_type, priority, status, payload, target_table, target_id,
+                 privacy_level, created_at, max_retries)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                "session_title", 5i64, "pending",
+                r#"{"session_id":"sess_001","summary":"JWT auth discussion"}"#,
+                "sessions", "sess_001", "structured", now, 3i64,
+            ],
+        );
+        assert!(result.is_ok(), "cognitive_tasks insert should succeed: {:?}", result.err());
+
+        // Verify claim pattern (atomic status transition)
+        let claimed = conn.execute(
+            "UPDATE cognitive_tasks SET status='processing', started_at=?1
+             WHERE id = (
+                 SELECT id FROM cognitive_tasks
+                 WHERE status='pending'
+                 ORDER BY priority DESC, created_at ASC
+                 LIMIT 1
+             )",
+            params![now],
+        ).unwrap();
+        assert_eq!(claimed, 1, "Should claim exactly 1 pending task");
+
+        let status: String = conn.query_row(
+            "SELECT status FROM cognitive_tasks WHERE id = 1",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(status, "processing");
+    }
+
+    #[tokio::test]
+    async fn test_v6_llm_usage_log_schema() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let conn = s.conn.lock().await;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        conn.execute(
+            "INSERT INTO llm_usage_log
+                (task_id, provider, model, input_tokens, output_tokens,
+                 cached_tokens, latency_ms, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![1i64, "deepseek", "deepseek-reasoner", 512i64, 128i64, 64i64, 1200i64, now],
+        ).unwrap();
+
+        // Verify aggregation query (used by /supernode/usage endpoint)
+        let (input_sum, output_sum): (i64, i64) = conn.query_row(
+            "SELECT SUM(input_tokens), SUM(output_tokens) FROM llm_usage_log WHERE provider = 'deepseek'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(input_sum, 512);
+        assert_eq!(output_sum, 128);
+    }
+
+    #[tokio::test]
+    async fn test_v6_sessions_title_column() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let conn = s.conn.lock().await;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // Insert session without title (NULL — not yet generated by SuperNode)
+        conn.execute(
+            "INSERT INTO sessions (session_id, owner, session_type, started_at, turn_count)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["sess_001", [0xAAu8; 32].as_slice(), "chat", now, 5i64],
+        ).unwrap();
+
+        let title: Option<String> = conn.query_row(
+            "SELECT title FROM sessions WHERE session_id = 'sess_001'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(title.is_none(), "New session should have NULL title");
+
+        // SuperNode writes back title
+        conn.execute(
+            "UPDATE sessions SET title = ?1 WHERE session_id = ?2",
+            params!["JWT Auth Implementation Discussion", "sess_001"],
+        ).unwrap();
+
+        let title: Option<String> = conn.query_row(
+            "SELECT title FROM sessions WHERE session_id = 'sess_001'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(title, Some("JWT Auth Implementation Discussion".to_string()));
+    }
+
+    // ========================================
+    // v2.4.0: Existing schema tests (preserved)
+    // ========================================
+
+    #[tokio::test]
     async fn test_v5_records_has_new_columns() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
 
-        // Verify new columns exist by selecting them
         let result = conn.prepare(
             "SELECT project_id, session_id, episode_id FROM records LIMIT 0"
         );
@@ -1117,7 +1425,6 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
 
-        // Insert a test episode
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1136,7 +1443,6 @@ mod tests {
         );
         assert!(result.is_ok(), "Episode insert should succeed: {:?}", result.err());
 
-        // Verify we can read it back
         let ep_type: String = conn.query_row(
             "SELECT episode_type FROM episodes WHERE episode_id = 'ep_001'",
             [], |row| row.get(0),
@@ -1183,7 +1489,6 @@ mod tests {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        // Insert a currently valid edge
         conn.execute(
             "INSERT INTO knowledge_edges (owner, source_id, target_id, relation_type,
                 fact_text, weight, confidence, valid_from, valid_until, created_at, updated_at)
@@ -1195,7 +1500,6 @@ mod tests {
             ],
         ).unwrap();
 
-        // Insert an invalidated edge
         conn.execute(
             "INSERT INTO knowledge_edges (owner, source_id, target_id, relation_type,
                 fact_text, weight, confidence, valid_from, valid_until, created_at, updated_at)
@@ -1207,14 +1511,12 @@ mod tests {
             ],
         ).unwrap();
 
-        // Query only currently valid edges
         let valid_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM knowledge_edges WHERE valid_until IS NULL",
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(valid_count, 1);
 
-        // Query all edges (including invalidated)
         let total_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM knowledge_edges",
             [], |row| row.get(0),
@@ -1232,21 +1534,18 @@ mod tests {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        // Link episode to entity
         conn.execute(
             "INSERT INTO episode_edges (owner, episode_id, entity_id, role, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![[0xAAu8; 32].as_slice(), "ep_001", "ent_jwt", "mentioned", now],
         ).unwrap();
 
-        // Forward: Episode → Entities
         let entity_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM episode_edges WHERE episode_id = 'ep_001'",
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(entity_count, 1);
 
-        // Reverse: Entity → Episodes
         let episode_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM episode_edges WHERE entity_id = 'ent_jwt'",
             [], |row| row.get(0),
@@ -1264,14 +1563,12 @@ mod tests {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        // Create community
         conn.execute(
             "INSERT INTO communities (community_id, owner, name, summary, entity_count, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params!["comm_1", [0xAAu8; 32].as_slice(), "Project B", "Auth system", 5i64, now, now],
         ).unwrap();
 
-        // Create project from community
         conn.execute(
             "INSERT INTO projects (project_id, owner, name, status, community_id, summary,
                 created_at, updated_at, last_active_at)
@@ -1280,7 +1577,6 @@ mod tests {
                 "Auth system project", now, now, now],
         ).unwrap();
 
-        // Create session linked to project
         conn.execute(
             "INSERT INTO sessions (session_id, owner, project_id, session_type,
                 started_at, turn_count, summary)
@@ -1289,14 +1585,12 @@ mod tests {
                 now, 15i64, "Implemented JWT auth"],
         ).unwrap();
 
-        // Query sessions for project
         let session_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sessions WHERE project_id = 'comm_1'",
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(session_count, 1);
 
-        // Query active projects
         let project_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM projects WHERE owner = ?1 AND status = 'active'",
             params![[0xAAu8; 32].as_slice()],
@@ -1315,7 +1609,6 @@ mod tests {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        // Version 1
         conn.execute(
             "INSERT INTO artifacts (artifact_id, owner, session_id, artifact_type,
                 filename, language, version, parent_id, encrypted_content, content_hash, created_at)
@@ -1327,7 +1620,6 @@ mod tests {
             ],
         ).unwrap();
 
-        // Version 2 (parent = v1)
         conn.execute(
             "INSERT INTO artifacts (artifact_id, owner, session_id, artifact_type,
                 filename, language, version, parent_id, encrypted_content, content_hash, created_at)
@@ -1339,7 +1631,6 @@ mod tests {
             ],
         ).unwrap();
 
-        // Query latest version
         let latest_version: i64 = conn.query_row(
             "SELECT MAX(version) FROM artifacts WHERE owner = ?1 AND filename = 'auth.rs'",
             params![[0xAAu8; 32].as_slice()],
@@ -1347,7 +1638,6 @@ mod tests {
         ).unwrap();
         assert_eq!(latest_version, 2);
 
-        // Query version chain
         let parent: Option<String> = conn.query_row(
             "SELECT parent_id FROM artifacts WHERE artifact_id = 'art_v2'",
             [], |row| row.get(0),
@@ -1357,12 +1647,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_v5_backward_compat_insert_without_new_cols() {
-        // Ensure existing insert() works without providing new columns
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let r = make_rec(100, MemoryLayer::Episode, "test");
         assert!(s.insert(&r, "minilm").await);
 
-        // The new columns should be NULL
         let conn = s.conn.lock().await;
         let (pid, sid, eid): (Option<String>, Option<String>, Option<String>) = conn.query_row(
             "SELECT project_id, session_id, episode_id FROM records WHERE record_id = ?1",
@@ -1372,5 +1660,56 @@ mod tests {
         assert!(pid.is_none());
         assert!(sid.is_none());
         assert!(eid.is_none());
+    }
+
+    /// Verifies that the v6 migrate block fires correctly when starting from
+    /// a simulated v5 database (i.e., create_schema NOT called first).
+    ///
+    /// This is the regression test for B2: previously, the v5 block wrote
+    /// SCHEMA_VERSION (=6) instead of 5, making the v6 block unreachable
+    /// on v4→v6 upgrades.
+    #[tokio::test]
+    async fn test_migration_v5_to_v6() {
+        use rusqlite::Connection;
+
+        // Simulate a v5 database: create tables manually, set version=5
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (5);
+             CREATE TABLE sessions (
+                 session_id TEXT PRIMARY KEY,
+                 owner BLOB NOT NULL,
+                 started_at INTEGER NOT NULL
+             );
+             CREATE TABLE chain_state (key TEXT PRIMARY KEY, value BLOB NOT NULL);"
+        ).unwrap();
+
+        // Run migration
+        MemoryStorage::maybe_migrate(&conn).unwrap();
+
+        // Verify v6 tables were created
+        let ct_exists: bool = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cognitive_tasks'",
+            [], |r| r.get::<_, i64>(0),
+        ).unwrap() > 0;
+        assert!(ct_exists, "cognitive_tasks should exist after v5→v6 migration");
+
+        let ul_exists: bool = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='llm_usage_log'",
+            [], |r| r.get::<_, i64>(0),
+        ).unwrap() > 0;
+        assert!(ul_exists, "llm_usage_log should exist after v5→v6 migration");
+
+        // Verify sessions.title was added
+        let title_ok = conn.prepare("SELECT title FROM sessions LIMIT 0").is_ok();
+        assert!(title_ok, "sessions.title should exist after v5→v6 migration");
+
+        // Verify final version
+        let v: u32 = conn.query_row(
+            "SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(v, 6);
     }
 }
