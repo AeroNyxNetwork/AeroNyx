@@ -22,29 +22,24 @@
 //!
 //! ## Prompt Builders
 //! Prompt construction lives entirely in `prompts.rs`. `LlmRouter` does NOT
-//! contain prompt-building logic (the original static builder methods were removed
-//! in v2.5.0+Audit Fix to eliminate duplication with prompts.rs).
+//! contain prompt-building logic.
 //!
 //! ⚠️ Important Note for Next Developer:
-//! - `new()` accepts `TaskRoutingConfig` (from config_supernode.rs), not a raw HashMap.
-//!   It calls `provider_for()` for each known task type to build the routing table.
-//! - `provider_configs()` returns (name, api_base, model) for health-check pings.
-//!   The api_base is stored at construction time from `ProviderConfig.api_base`.
+//! - CognitiveTaskType is defined in config_supernode.rs (single source of truth).
+//!   This file imports it via llm_provider.rs re-export.
+//! - `new()` accepts `TaskRoutingConfig` (from config_supernode.rs).
+//! - Routing table keys use as_str() which returns the DB string form.
 //! - `COST_TABLE` rates will go stale. Consider making them config-driven (Phase C).
-//! - Fallback order: routing-config provider first, then remaining providers in
-//!   declaration order.
-//! - Prompt builders belong in `prompts.rs`. Do NOT add them back here.
+//! - Prompt builders belong in `prompts.rs`. Do NOT add them here.
 //!
 //! ## Last Modified
 //! v2.5.0+SuperNode - 🌟 Created.
-//! v2.5.0+Audit Fix - 🔧 [BUG FIX] new() now accepts TaskRoutingConfig instead of
-//!   HashMap+Option — matches server.rs call site.
-//!                  - 🔧 [BUG FIX] route() uses task_type.as_str() (not task_type_str()).
-//!                  - 🔧 [BUG FIX] Routing pre-fill uses correct task type string names
-//!   (community_narrative, recall_synthesis, entity_description).
-//!                  - 🌟 Added provider_configs() → (name, api_base, model) for health pings.
-//!                  - 🗑️ Removed duplicate prompt builder methods (build_session_title_prompt
-//!   etc.) — prompts.rs is the single source of truth for prompt construction.
+//! v2.5.0+Audit Fix - 🔧 Various fixes (see previous doc).
+//! v2.5.0+Unify     - 🔧 [BUG FIX] Unified CognitiveTaskType from config_supernode.rs.
+//!   route() now uses as_str() consistently (as_str == task_type_str, they're aliases).
+//!   Routing table built using config_supernode::CognitiveTaskType::ALL which has
+//!   all 6 variants (SessionTitle, CommunityNarrative, ConflictResolution,
+//!   RecallSynthesis, CodeAnalysis, EntityDescription).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,7 +47,6 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::llm_provider::{ChatRequest, ChatResponse, CognitiveTaskType, LlmError, LlmProvider};
-// config_supernode is declared at crate root in lib.rs (not under config/)
 use crate::config_supernode::TaskRoutingConfig;
 
 // ============================================
@@ -82,8 +76,6 @@ fn cost_table() -> HashMap<&'static str, CostRate> {
 // Provider metadata (for health checks)
 // ============================================
 
-/// Per-provider metadata stored at construction time for health check pings.
-/// Separate from LlmProvider trait to avoid exposing config details there.
 struct ProviderMeta {
     api_base: String,
     model: String,
@@ -100,7 +92,7 @@ pub struct LlmRouter {
     providers: HashMap<String, Arc<dyn LlmProvider>>,
     /// Provider metadata for health checks (name → meta).
     provider_meta: HashMap<String, ProviderMeta>,
-    /// task_type_str → provider name.
+    /// task_type as_str() → provider name.
     routing: HashMap<String, String>,
     /// Ordered list of provider names for fallback traversal.
     provider_order: Vec<String>,
@@ -111,16 +103,7 @@ impl LlmRouter {
     ///
     /// ## Parameters
     /// - `providers`: Vec of `(name, api_base, model, Arc<dyn LlmProvider>)`.
-    ///   `api_base` and `model` are stored for health check pings.
     /// - `routing`: `TaskRoutingConfig` from `config_supernode.rs`.
-    ///   The router calls `provider_for(task_type)` for each known task type
-    ///   to build the internal routing table.
-    ///
-    /// ## v2.5.0+Audit Fix
-    /// Previously accepted `HashMap<String, String> + Option<String>` which
-    /// didn't match the `server.rs` call site (which passes `TaskRoutingConfig`).
-    /// Now accepts `TaskRoutingConfig` directly and builds the routing table
-    /// by calling `provider_for()` for each known `CognitiveTaskType`.
     pub fn new(
         providers: Vec<(String, String, String, Arc<dyn LlmProvider>)>,
         routing: TaskRoutingConfig,
@@ -135,9 +118,8 @@ impl LlmRouter {
         }
 
         // Build routing table from TaskRoutingConfig.
-        // CognitiveTaskType::ALL comes from config_supernode (our canonical list).
-        // task_type_str() is the method on llm_provider::CognitiveTaskType.
-        // We use config_supernode::CognitiveTaskType here because it drives routing config.
+        // v2.5.0+Unify: CognitiveTaskType::ALL is from config_supernode (canonical).
+        // as_str() returns the DB string form used as routing key.
         let mut routing_table: HashMap<String, String> = HashMap::new();
         for task_type in crate::config_supernode::CognitiveTaskType::ALL {
             if let Some(provider_name) = routing.provider_for(*task_type) {
@@ -170,18 +152,14 @@ impl LlmRouter {
     /// Route a request to the configured provider for this task type.
     /// Falls back to other healthy providers if the primary fails.
     ///
-    /// Returns `LlmError::NotConfigured` if no provider is available.
-    ///
-    /// ## v2.5.0+Audit Fix
-    /// Changed `task_type.task_type_str()` → `task_type.as_str()` to match
-    /// the actual method name on `CognitiveTaskType`.
+    /// v2.5.0+Unify: Uses as_str() which is the canonical string method.
+    /// (as_str and task_type_str are aliases — both return the same string.)
     pub async fn route(
         &self,
         task_type: &CognitiveTaskType,
         req: &ChatRequest,
     ) -> Result<ChatResponse, LlmError> {
-        // Use task_type_str() — this is the method on llm_provider::CognitiveTaskType
-        let task_str = task_type.task_type_str();
+        let task_str = task_type.as_str();
 
         // Determine primary provider name from routing table
         let primary_name = self.routing.get(task_str)
@@ -244,9 +222,6 @@ impl LlmRouter {
     }
 
     /// Estimate cost in USD for a given model + token counts.
-    ///
-    /// Uses approximate rates from `cost_table()`. Returns 0.0 for unknown models.
-    /// ⚠️ Approximate — use for budgeting, not billing.
     pub fn estimate_cost(model: &str, input_tokens: u32, output_tokens: u32, cached_tokens: u32) -> f64 {
         let table = cost_table();
         let rate = table.get(model)
@@ -280,14 +255,7 @@ impl LlmRouter {
     }
 
     /// Provider configs for health check pings.
-    ///
-    /// Returns `(name, api_base, model)` tuples for all configured providers.
-    /// Used by `supernode_handlers::supernode_health()` to issue HTTP HEAD pings
-    /// without consuming LLM API quota.
-    ///
-    /// ## v2.5.0+Audit Fix 2
-    /// Added to replace the invalid `CognitiveTaskType::CustomPrompt` approach
-    /// in the health handler, which referenced a non-existent enum variant.
+    /// Returns `(name, api_base, model)` tuples.
     pub fn provider_configs(&self) -> Vec<(String, String, String)> {
         self.provider_order.iter()
             .filter_map(|name| {
@@ -320,19 +288,17 @@ impl std::fmt::Debug for LlmRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_supernode::{CognitiveTaskType, TaskRoutingConfig};
+    use crate::config_supernode::TaskRoutingConfig;
 
     #[test]
     fn test_estimate_cost_known_model() {
-        // deepseek-chat: $0.07/M input, $1.10/M output
         let cost = LlmRouter::estimate_cost("deepseek-chat", 1_000_000, 1_000_000, 0);
-        let expected = (0.07 + 1.10) / 1.0; // per 1M tokens
+        let expected = (0.07 + 1.10) / 1.0;
         assert!((cost - expected).abs() < 0.001, "cost={} expected={}", cost, expected);
     }
 
     #[test]
     fn test_estimate_cost_prefix_match() {
-        // "deepseek-chat-v3" should prefix-match "deepseek-chat"
         let cost_exact = LlmRouter::estimate_cost("deepseek-chat", 100, 50, 0);
         let cost_prefix = LlmRouter::estimate_cost("deepseek-chat-v3", 100, 50, 0);
         assert_eq!(cost_exact, cost_prefix);
@@ -346,8 +312,6 @@ mod tests {
 
     #[test]
     fn test_estimate_cost_with_cached_tokens() {
-        // 1000 input (500 cached): billable_input = 500, cached = 500
-        // deepseek-reasoner: $0.55/M input, $0.14/M cached, $2.19/M output
         let cost = LlmRouter::estimate_cost("deepseek-reasoner", 1000, 200, 500);
         let expected = (500.0 * 0.55 + 500.0 * 0.14 + 200.0 * 2.19) / 1_000_000.0;
         assert!((cost - expected).abs() < 1e-10);
@@ -361,13 +325,11 @@ mod tests {
 
     #[test]
     fn test_routing_table_built_from_task_routing_config() {
-        use crate::services::memchain::{OpenAiCompatProvider, LlmProvider};
-
-        // Minimal stub provider for testing
         struct StubProvider;
         #[async_trait::async_trait]
         impl LlmProvider for StubProvider {
             fn name(&self) -> &str { "stub" }
+            fn default_model(&self) -> &str { "test-model" }
             fn is_healthy(&self) -> bool { true }
             async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
                 Err(LlmError::NotConfigured("stub".into()))
@@ -390,9 +352,8 @@ mod tests {
         );
 
         assert_eq!(router.provider_count(), 1);
-        // session_title should be routed to "stub"
         assert_eq!(router.routing.get("session_title").map(|s| s.as_str()), Some("stub"));
-        // conflict_resolution falls back to fallback provider → also "stub"
+        // conflict_resolution has no explicit route but fallback is "stub"
         assert_eq!(router.routing.get("conflict_resolution").map(|s| s.as_str()), Some("stub"));
     }
 
@@ -402,6 +363,7 @@ mod tests {
         #[async_trait::async_trait]
         impl LlmProvider for StubProvider {
             fn name(&self) -> &str { "stub" }
+            fn default_model(&self) -> &str { "test-model" }
             fn is_healthy(&self) -> bool { true }
             async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
                 Err(LlmError::NotConfigured("stub".into()))
