@@ -122,6 +122,9 @@ pub use storage_graph::{
 // ── Storage miner types (v2.4.0+Search) ──
 pub use storage_miner::EntityTimelineEntry;
 
+// ── Storage FTS types (v2.5.0+Unify) ──
+pub use storage_fts::{SearchHit, SessionSearchGroup};
+
 // ── Storage SuperNode types (v2.5.0+SuperNode) ──
 // v2.5.0+Unify: All 4 types confirmed present in storage_supernode.rs.
 pub use storage_supernode::{CognitiveTaskRow, LlmUsageStats, ProviderUsage, TaskTypeUsage};
