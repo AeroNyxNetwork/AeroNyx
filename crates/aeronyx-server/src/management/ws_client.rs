@@ -25,6 +25,10 @@
 //! v2.4.0-GraphCognition Phase B - 🐛 Fixed: handle_mpi_proxy missing steps 3-4
 //!   (req_builder construction and has_remote_auth flag). Also added cognitive graph
 //!   read-only endpoints to MPI_ALLOWED_ACTIONS whitelist.
+//! v2.5.0-SuperNode - 🌟 Added SuperNode management actions + entity_timeline +
+//!   context_inject + search_fts to whitelist and route map.
+//!   Note: reflection.rs comment "community_summary" was a typo — the canonical
+//!   DB string is "community_narrative" (matches CognitiveTaskType::as_str()).
 //!
 //! ## MPI Proxy Auth Flow (v2.3.0)
 //! ```text
@@ -67,9 +71,7 @@
 //!   → 5.inject auth → 6.send+wrap response. All 6 steps must be present.
 //!
 //! ## Last Modified
-//! v2.3.0+RemoteStorage - 🌟 auth_headers passthrough + Bearer token injection + client reuse
-//! v2.4.0-GraphCognition Phase B - 🐛 Fixed missing steps 3-4 in handle_mpi_proxy
-//!   (req_builder + has_remote_auth). Added cognitive graph MPI actions.
+//! v2.5.0-SuperNode - 🌟 Added SuperNode management + missing graph actions
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -103,7 +105,11 @@ const OPENCLAW_AGENT_ID: &str = "main";
 const MPI_BASE_URL: &str = "http://127.0.0.1:8421";
 
 /// Timeout for MPI proxy requests (embed is slowest at ~300ms).
+/// SuperNode health check may take longer due to external provider pings.
 const MPI_PROXY_TIMEOUT_SECS: u64 = 10;
+
+/// Extended timeout for SuperNode health check (pings external LLM providers).
+const MPI_SUPERNODE_HEALTH_TIMEOUT_SECS: u64 = 20;
 
 /// Allowed MPI actions that can be proxied from CMS WebSocket.
 /// Actions not in this list are rejected with an error response.
@@ -113,14 +119,16 @@ const MPI_PROXY_TIMEOUT_SECS: u64 = 10;
 ///   after each session, not by the frontend. Also local-only in v2.3.0.
 /// - Only read-oriented actions + remember/forget (user-initiated) are allowed.
 const MPI_ALLOWED_ACTIONS: &[&str] = &[
+    // v1.5.0: core memory
     "mpi_status",
     "mpi_recall",
+    "mpi_recall_detail",       // v2.4.0: progressive retrieval step 2
     "mpi_remember",
     "mpi_forget",
     "mpi_embed",
     "mpi_record",
     "mpi_overview",
-    // v2.4.0-GraphCognition: cognitive graph read-only endpoints
+    // v2.4.0: cognitive graph read-only endpoints
     "mpi_projects",
     "mpi_project_detail",
     "mpi_project_timeline",
@@ -131,7 +139,17 @@ const MPI_ALLOWED_ACTIONS: &[&str] = &[
     "mpi_artifact_versions",
     "mpi_entity_detail",
     "mpi_entity_graph",
+    "mpi_entity_timeline",     // v2.4.0: was missing in previous whitelist
     "mpi_communities",
+    "mpi_context_inject",      // v2.4.0: auto context injection
+    "mpi_search_fts",          // v2.4.0: FTS5 keyword search
+    // v2.5.0: SuperNode management
+    "mpi_supernode_tasks",
+    "mpi_supernode_task_detail",
+    "mpi_supernode_task_retry",
+    "mpi_supernode_task_cancel",
+    "mpi_supernode_usage",
+    "mpi_supernode_health",
 ];
 
 /// v2.3.0: Header names for Ed25519 remote auth passthrough.
@@ -782,7 +800,7 @@ impl WsTunnel {
     }
 
     // ============================================
-    // MPI Proxy (v2.2.0 + v2.3.0 auth_headers)
+    // MPI Proxy (v2.2.0 + v2.3.0 auth_headers + v2.5.0 SuperNode)
     // ============================================
 
     /// Handle MPI proxy requests from CMS WebSocket.
@@ -801,6 +819,10 @@ impl WsTunnel {
     /// ## v2.3.0: auth_headers passthrough
     /// When the WS message contains `auth_headers`, these are injected into
     /// the HTTP request. When absent, Bearer token is injected if configured.
+    ///
+    /// ## v2.5.0: SuperNode management actions
+    /// mpi_supernode_* actions map to GET/POST /api/mpi/supernode/* endpoints.
+    /// mpi_supernode_health uses an extended timeout constant.
     async fn handle_mpi_proxy(
         &self,
         action: &str,
@@ -820,88 +842,38 @@ impl WsTunnel {
         }
 
         // 2. Map action → HTTP method + path
-        let (method, path) = match action {
-            "mpi_status"   => ("GET",  "/api/mpi/status".to_string()),
-            "mpi_recall"   => ("POST", "/api/mpi/recall".to_string()),
-            "mpi_remember" => ("POST", "/api/mpi/remember".to_string()),
-            "mpi_forget"   => ("POST", "/api/mpi/forget".to_string()),
-            "mpi_embed"    => ("POST", "/api/mpi/embed".to_string()),
-            "mpi_overview" => ("GET",  "/api/mpi/records/overview".to_string()),
-            "mpi_record"   => {
-                let record_id = payload.get("record_id").and_then(|v| v.as_str()).unwrap_or("");
-                if record_id.is_empty() {
-                    return serde_json::json!({
-                        "type": "agent_response",
-                        "request_id": request_id,
-                        "status": "error",
-                        "payload": {"error": "missing record_id in payload"}
-                    });
-                }
-                ("GET", format!("/api/mpi/record/{}", record_id))
-            }
-            // ── v2.4.0-GraphCognition: cognitive graph read-only endpoints ──
-            "mpi_projects" => ("GET", "/api/mpi/projects".to_string()),
-            "mpi_project_detail" => {
-                let id = payload.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
-                ("GET", format!("/api/mpi/projects/{}", id))
-            }
-            "mpi_project_timeline" => {
-                let id = payload.get("project_id").and_then(|v| v.as_str()).unwrap_or("");
-                ("GET", format!("/api/mpi/projects/{}/timeline", id))
-            }
-            "mpi_session_detail" => {
-                let id = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-                ("GET", format!("/api/mpi/sessions/{}", id))
-            }
-            "mpi_session_conversation" => {
-                let id = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-                ("GET", format!("/api/mpi/sessions/{}/conversation", id))
-            }
-            "mpi_session_artifacts" => {
-                let id = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-                ("GET", format!("/api/mpi/sessions/{}/artifacts", id))
-            }
-            "mpi_artifact_detail" => {
-                let id = payload.get("artifact_id").and_then(|v| v.as_str()).unwrap_or("");
-                ("GET", format!("/api/mpi/artifacts/{}", id))
-            }
-            "mpi_artifact_versions" => {
-                let id = payload.get("artifact_id").and_then(|v| v.as_str()).unwrap_or("");
-                ("GET", format!("/api/mpi/artifacts/{}/versions", id))
-            }
-            "mpi_entity_detail" => {
-                let id = payload.get("entity_id").and_then(|v| v.as_str()).unwrap_or("");
-                ("GET", format!("/api/mpi/entities/{}", id))
-            }
-            "mpi_entity_graph" => {
-                let id = payload.get("entity_id").and_then(|v| v.as_str()).unwrap_or("");
-                ("GET", format!("/api/mpi/entities/{}/graph", id))
-            }
-            "mpi_communities" => ("GET", "/api/mpi/communities".to_string()),
-            _ => {
-                return serde_json::json!({
-                    "type": "agent_response",
-                    "request_id": request_id,
-                    "status": "error",
-                    "payload": {"error": format!("unknown mpi action: {}", action)}
-                });
-            }
+        let route = self.resolve_mpi_route(action, request_id, payload);
+        let (method, path) = match route {
+            Ok(r) => r,
+            Err(err_response) => return err_response,
         };
 
         // 3. Build URL
         let url = format!("{}{}", MPI_BASE_URL, path);
 
         // 4. Create reqwest builder with method + Content-Type + optional JSON body
-        // v2.3.0 🐛 Fix: Reuse self.http_client instead of creating new client per request
         let has_remote_auth = auth_headers
             .and_then(|h| h.as_object())
             .map_or(false, |obj| obj.contains_key(HEADER_MEMCHAIN_SIGNATURE));
 
-        let mut req_builder = match method {
-            "POST" => self.http_client.post(&url)
-                .header("Content-Type", "application/json")
-                .json(payload),
-            _ => self.http_client.get(&url),
+        // v2.5.0: SuperNode health needs a longer timeout for external provider pings.
+        // Build a one-shot client for this case; all others reuse self.http_client.
+        let mut req_builder = if action == "mpi_supernode_health" {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(MPI_SUPERNODE_HEALTH_TIMEOUT_SECS))
+                .build()
+                .unwrap_or_else(|_| self.http_client.clone());
+            match method {
+                "POST" => client.post(&url).header("Content-Type", "application/json").json(payload),
+                _ => client.get(&url),
+            }
+        } else {
+            match method {
+                "POST" => self.http_client.post(&url)
+                    .header("Content-Type", "application/json")
+                    .json(payload),
+                _ => self.http_client.get(&url),
+            }
         };
 
         // 5. Inject auth headers
@@ -964,6 +936,153 @@ impl WsTunnel {
                 })
             }
         }
+    }
+
+    /// Resolve an MPI action to (HTTP method, URL path).
+    ///
+    /// Returns Ok((method, path)) on success, or Err(pre-built error response)
+    /// when a required payload field is missing. Extracted from handle_mpi_proxy
+    /// to keep that function readable.
+    fn resolve_mpi_route(
+        &self,
+        action: &str,
+        request_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(&'static str, String), serde_json::Value> {
+        // Helper: extract a required string field or return an error response.
+        let require = |key: &str| -> Result<&str, serde_json::Value> {
+            payload.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).ok_or_else(|| {
+                serde_json::json!({
+                    "type": "agent_response",
+                    "request_id": request_id,
+                    "status": "error",
+                    "payload": {"error": format!("missing '{}' in payload", key)}
+                })
+            })
+        };
+
+        let route = match action {
+            // ── core memory ──────────────────────────────────────────────
+            "mpi_status"   => ("GET",  "/api/mpi/status".to_string()),
+            "mpi_recall"   => ("POST", "/api/mpi/recall".to_string()),
+            "mpi_recall_detail" => ("POST", "/api/mpi/recall/detail".to_string()),
+            "mpi_remember" => ("POST", "/api/mpi/remember".to_string()),
+            "mpi_forget"   => ("POST", "/api/mpi/forget".to_string()),
+            "mpi_embed"    => ("POST", "/api/mpi/embed".to_string()),
+            "mpi_overview" => ("GET",  "/api/mpi/records/overview".to_string()),
+            "mpi_record"   => {
+                let id = require("record_id")?;
+                ("GET", format!("/api/mpi/record/{}", id))
+            }
+
+            // ── cognitive graph (v2.4.0) ─────────────────────────────────
+            "mpi_projects" => ("GET", "/api/mpi/projects".to_string()),
+            "mpi_project_detail" => {
+                let id = require("project_id")?;
+                ("GET", format!("/api/mpi/projects/{}", id))
+            }
+            "mpi_project_timeline" => {
+                let id = require("project_id")?;
+                ("GET", format!("/api/mpi/projects/{}/timeline", id))
+            }
+            "mpi_session_detail" => {
+                let id = require("session_id")?;
+                ("GET", format!("/api/mpi/sessions/{}", id))
+            }
+            "mpi_session_conversation" => {
+                let id = require("session_id")?;
+                ("GET", format!("/api/mpi/sessions/{}/conversation", id))
+            }
+            "mpi_session_artifacts" => {
+                let id = require("session_id")?;
+                ("GET", format!("/api/mpi/sessions/{}/artifacts", id))
+            }
+            "mpi_artifact_detail" => {
+                let id = require("artifact_id")?;
+                ("GET", format!("/api/mpi/artifacts/{}", id))
+            }
+            "mpi_artifact_versions" => {
+                let id = require("artifact_id")?;
+                ("GET", format!("/api/mpi/artifacts/{}/versions", id))
+            }
+            "mpi_entity_detail" => {
+                let id = require("entity_id")?;
+                ("GET", format!("/api/mpi/entities/{}", id))
+            }
+            "mpi_entity_graph" => {
+                let id = require("entity_id")?;
+                ("GET", format!("/api/mpi/entities/{}/graph", id))
+            }
+            "mpi_entity_timeline" => {
+                let id = require("entity_id")?;
+                ("GET", format!("/api/mpi/entities/{}/timeline", id))
+            }
+            "mpi_communities" => ("GET", "/api/mpi/communities".to_string()),
+            "mpi_context_inject" => {
+                let q = payload.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                if q.is_empty() {
+                    ("GET", "/api/mpi/context/inject".to_string())
+                } else {
+                    ("GET", format!("/api/mpi/context/inject?query={}", urlencoding(q)))
+                }
+            }
+            "mpi_search_fts" => {
+                let q = payload.get("q").and_then(|v| v.as_str()).unwrap_or("");
+                ("GET", format!("/api/mpi/search?q={}", urlencoding(q)))
+            }
+
+            // ── SuperNode management (v2.5.0) ────────────────────────────
+            "mpi_supernode_tasks" => {
+                let mut params: Vec<String> = vec![];
+                if let Some(s) = payload.get("status").and_then(|v| v.as_str()) {
+                    params.push(format!("status={}", s));
+                }
+                if let Some(t) = payload.get("type").and_then(|v| v.as_str()) {
+                    params.push(format!("type={}", t));
+                }
+                if let Some(l) = payload.get("limit").and_then(|v| v.as_u64()) {
+                    params.push(format!("limit={}", l));
+                }
+                let qs = if params.is_empty() {
+                    String::new()
+                } else {
+                    format!("?{}", params.join("&"))
+                };
+                ("GET", format!("/api/mpi/supernode/tasks{}", qs))
+            }
+            "mpi_supernode_task_detail" => {
+                let id = require("task_id")?;
+                ("GET", format!("/api/mpi/supernode/tasks/{}", id))
+            }
+            "mpi_supernode_task_retry" => {
+                let id = require("task_id")?;
+                ("POST", format!("/api/mpi/supernode/tasks/{}/retry", id))
+            }
+            "mpi_supernode_task_cancel" => {
+                let id = require("task_id")?;
+                ("POST", format!("/api/mpi/supernode/tasks/{}/cancel", id))
+            }
+            "mpi_supernode_usage" => {
+                let period = payload.get("period").and_then(|v| v.as_str()).unwrap_or("");
+                if period.is_empty() {
+                    ("GET", "/api/mpi/supernode/usage".to_string())
+                } else {
+                    ("GET", format!("/api/mpi/supernode/usage?period={}", period))
+                }
+            }
+            "mpi_supernode_health" => ("GET", "/api/mpi/supernode/health".to_string()),
+
+            _ => {
+                return Err(serde_json::json!({
+                    "type": "agent_response",
+                    "request_id": request_id,
+                    "status": "error",
+                    "payload": {"error": format!("unknown mpi action: {}", action)}
+                }));
+            }
+        };
+
+        Ok(route)
     }
 
     // ============================================
@@ -1151,6 +1270,26 @@ impl WsTunnel {
         }
         Ok(got_done_marker)
     }
+}
+
+// ============================================
+// URL encoding helper (no external crate needed)
+// ============================================
+
+/// Percent-encode a query parameter value.
+/// Encodes space as %20 and other non-unreserved characters.
+/// This avoids adding the `urlencoding` crate as a dependency.
+fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            // RFC 3986 unreserved characters — pass through as-is
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 // ============================================
