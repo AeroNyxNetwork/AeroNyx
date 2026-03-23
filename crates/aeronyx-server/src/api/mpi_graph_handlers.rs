@@ -457,6 +457,16 @@ pub async fn mpi_entity_graph(
     })))
 }
 
+// GET /api/mpi/entities
+pub async fn mpi_entities_list(
+    State(state): State<Arc<MpiState>>,
+    req: Request<axum::body::Body>,
+) -> impl IntoResponse {
+    let owner = extract_owner(&req).owner_bytes();
+    let entities = state.storage.get_entities_by_owner(&owner, None, 200).await;
+    Json(serde_json::json!({ "entities": entities, "total": entities.len() }))
+}
+
 // ============================================
 // Search (v2.4.0+Search)
 // ============================================
