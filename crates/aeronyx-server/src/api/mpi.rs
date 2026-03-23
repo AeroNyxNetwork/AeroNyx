@@ -377,6 +377,7 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
         .route("/api/mpi/artifacts/:id",               get(mpi_graph_handlers::mpi_artifact_detail))
         .route("/api/mpi/artifacts/:id/versions",      get(mpi_graph_handlers::mpi_artifact_versions))
         .route("/api/mpi/entities/:id",                get(mpi_graph_handlers::mpi_entity_detail))
+        .route("/api/mpi/entities", get(mpi_graph_handlers::mpi_entities_list))
         .route("/api/mpi/entities/:id/graph",          get(mpi_graph_handlers::mpi_entity_graph))
         .route("/api/mpi/communities",                 get(mpi_graph_handlers::mpi_communities))
         .route("/api/mpi/search",                      get(mpi_graph_handlers::mpi_search))
@@ -389,6 +390,7 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
         .route("/api/mpi/supernode/tasks/:id/cancel",       post(supernode_handlers::supernode_cancel_task))
         .route("/api/mpi/supernode/usage",                  get(supernode_handlers::supernode_usage))
         .route("/api/mpi/supernode/health",                 get(supernode_handlers::supernode_health));
+        
 
     info!(
         "[MPI] Router: 29 endpoints (bearer={}, remote={}, ner={}, graph={}, reranker={}, supernode={})",
