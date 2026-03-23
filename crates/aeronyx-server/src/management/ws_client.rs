@@ -147,6 +147,7 @@ const MPI_ALLOWED_ACTIONS: &[&str] = &[
     "mpi_supernode_tasks",
     "mpi_supernode_task_detail",
     "mpi_supernode_task_retry",
+    "mpi_entities_list",
     "mpi_supernode_task_cancel",
     "mpi_supernode_usage",
     "mpi_supernode_health",
@@ -974,7 +975,7 @@ impl WsTunnel {
                 let id = require("record_id")?;
                 ("GET", format!("/api/mpi/record/{}", id))
             }
-
+            "mpi_entities_list" => ("GET", "/api/mpi/entities".to_string()),
             // ── cognitive graph (v2.4.0) ─────────────────────────────────
             "mpi_projects" => ("GET", "/api/mpi/projects".to_string()),
             "mpi_project_detail" => {
