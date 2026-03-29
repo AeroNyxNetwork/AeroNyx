@@ -637,7 +637,7 @@ impl WsTunnel {
     ) -> Result<(), String> {
         let mut full_response = String::new();
         let mut line_buffer = String::new();
-        let idle_timeout = Duration::from_secs(10);
+        let idle_timeout = Duration::from_secs(60);
         let tool_timeout = Duration::from_secs(45);
         let mut current_timeout = idle_timeout;
 
@@ -1185,7 +1185,7 @@ impl WsTunnel {
         let mut full_response = String::new();
         let mut line_buffer = String::new();
 
-        let idle_timeout = Duration::from_secs(10);
+        let idle_timeout = Duration::from_secs(60);
         let tool_timeout = Duration::from_secs(45);
         let mut current_timeout = idle_timeout;
 
