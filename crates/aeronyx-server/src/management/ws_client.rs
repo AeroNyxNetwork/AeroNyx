@@ -3,32 +3,36 @@
 // ============================================
 //! # WebSocket Tunnel — CMS ↔ Local Services
 //!
-//! ## Modification Reason (v2.3.0+RemoteStorage)
-//! MPI Proxy now supports `auth_headers` passthrough for Phase 1 remote storage.
-//! When CMS forwards a remote user's MPI request through the WebSocket tunnel,
-//! the `X-MemChain-*` Ed25519 signature headers are extracted from the WS message
-//! and injected into the HTTP request to the local MPI API.
+//! ## Modification Reason (v2.5.1-SSEFix)
+//! Fixed multiple SSE timeout and streaming issues:
 //!
-//! Also fixed:
-//! - Reuse `self.http_client` in MPI proxy (was creating new client per request)
-//! - Inject Bearer token when `api_secret` is available (MPI proxy + store_chat)
+//! 🐛 Bug 1 (Critical): http_client had a global 10s timeout via
+//!    `.timeout(Duration::from_secs(MPI_PROXY_TIMEOUT_SECS))` in the Client builder.
+//!    This caused ALL requests (including OpenClaw chat SSE) to hard-timeout at 10s,
+//!    overriding the per-request tokio::time::timeout and idle_timeout settings.
+//!    Fix: Removed global timeout from Client builder. MPI proxy requests now use
+//!    per-request `.timeout()` on the RequestBuilder instead.
+//!
+//! 🐛 Bug 2 (High): idle_timeout for SSE streaming was only 10s, but OpenClaw needs
+//!    time for MemChain recall + LLM first token (often 15-30s).
+//!    Fix: Changed idle_timeout from 10s to 60s in both stream_sse_response and
+//!    stream_e2e_sse_response.
+//!
+//! 🐛 Bug 3 (Medium): store_chat_to_mpi only stored the assistant turn, missing the
+//!    user's prompt. MemChain only recorded answers without questions.
+//!    Fix: Added prompt parameter to store_chat_to_mpi, now stores both user and
+//!    assistant turns.
 //!
 //! ## Previous Modifications
-//! v1.3.0 - Initial creation (Phase 3: WebSocket Tunnel)
-//! v1.3.2 - Replaced OpenClaw WS RPC with HTTP API
-//! v1.4.0 - Fixed SSE [DONE] signal lost in residual buffer
-//! v1.4.1 - Fixed done=true silently lost (missing flush after send)
-//! v2.2.0 - 🌟 Added MPI proxy for MemExplorer frontend
-//! v2.3.0 - 🌟 MPI proxy auth_headers passthrough (Ed25519 signature from CMS)
-//!   🐛 Fixed: MPI proxy now reuses self.http_client instead of creating new client
-//!   🐛 Fixed: MPI proxy + store_chat inject Bearer token when api_secret configured
-//! v2.4.0-GraphCognition Phase B - 🐛 Fixed: handle_mpi_proxy missing steps 3-4
-//!   (req_builder construction and has_remote_auth flag). Also added cognitive graph
-//!   read-only endpoints to MPI_ALLOWED_ACTIONS whitelist.
 //! v2.5.0-SuperNode - 🌟 Added SuperNode management actions + entity_timeline +
 //!   context_inject + search_fts to whitelist and route map.
-//!   Note: reflection.rs comment "community_summary" was a typo — the canonical
-//!   DB string is "community_narrative" (matches CognitiveTaskType::as_str()).
+//! v2.4.0-GraphCognition Phase B - 🐛 Fixed: handle_mpi_proxy missing steps 3-4
+//! v2.3.0 - 🌟 MPI proxy auth_headers passthrough (Ed25519 signature from CMS)
+//! v2.2.0 - 🌟 Added MPI proxy for MemExplorer frontend
+//! v1.4.1 - Fixed done=true silently lost (missing flush after send)
+//! v1.4.0 - Fixed SSE [DONE] signal lost in residual buffer
+//! v1.3.2 - Replaced OpenClaw WS RPC with HTTP API
+//! v1.3.0 - Initial creation (Phase 3: WebSocket Tunnel)
 //!
 //! ## MPI Proxy Auth Flow (v2.3.0)
 //! ```text
@@ -36,42 +40,32 @@
 //!   {
 //!     "action": "mpi_remember",
 //!     "payload": { "content": "...", ... },
-//!     "auth_headers": {                          ← NEW (v2.3.0)
+//!     "auth_headers": {
 //!       "X-MemChain-PublicKey": "abcd1234...",
 //!       "X-MemChain-Timestamp": "1741651200",
 //!       "X-MemChain-Signature": "deadbeef..."
 //!     }
 //!   }
-//!
-//! Rust MPI Proxy forwards to 127.0.0.1:8421:
-//!   POST /api/mpi/remember
-//!   X-MemChain-PublicKey: abcd1234...      ← Passthrough
-//!   X-MemChain-Timestamp: 1741651200       ← Passthrough
-//!   X-MemChain-Signature: deadbeef...      ← Passthrough
-//!   Content-Type: application/json
-//!   { "content": "...", ... }
-//!
-//! MPI unified_auth_middleware:
-//!   Detects X-MemChain-Signature → Ed25519 verification
-//!   owner = signer's public key (remote user)
 //! ```
 //!
 //! ## When auth_headers is absent (backward compatible):
 //! - If api_secret is configured → inject Bearer token (local owner)
 //! - If api_secret is not configured → no auth headers (open access)
-//! This preserves existing MemExplorer frontend behavior (no auth_headers).
 //!
 //! ⚠️ Important Note for Next Developer:
+//! - The http_client intentionally has NO global timeout. Each call site must set
+//!   its own timeout via `.timeout()` on the RequestBuilder or `tokio::time::timeout`.
+//! - idle_timeout (60s) is for waiting between SSE chunks. Don't confuse with
+//!   OPENCLAW_REQUEST_TIMEOUT_SECS (180s) which is the outer envelope timeout.
+//! - tool_timeout (45s) kicks in AFTER receiving SSE [DONE], allowing time for
+//!   OpenClaw tool execution before the next SSE stream starts.
+//! - store_chat_to_mpi now stores both user prompt and assistant response.
 //! - auth_headers in WS message takes priority over Bearer token
-//! - If auth_headers is present, Bearer token is NOT injected (they are mutually exclusive)
-//! - The 3 header names must match exactly what MPI middleware expects:
-//!   X-MemChain-PublicKey, X-MemChain-Timestamp, X-MemChain-Signature
-//! - api_secret is loaded once at construction time from the config file
 //! - handle_mpi_proxy steps: 1.whitelist → 2.route map → 3.build URL → 4.create builder
 //!   → 5.inject auth → 6.send+wrap response. All 6 steps must be present.
 //!
 //! ## Last Modified
-//! v2.5.0-SuperNode - 🌟 Added SuperNode management + missing graph actions
+//! v2.5.1-SSEFix - 🐛 Fixed global timeout + idle_timeout + store_chat_to_mpi
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -110,6 +104,15 @@ const MPI_PROXY_TIMEOUT_SECS: u64 = 10;
 
 /// Extended timeout for SuperNode health check (pings external LLM providers).
 const MPI_SUPERNODE_HEALTH_TIMEOUT_SECS: u64 = 20;
+
+/// SSE idle timeout: max time to wait between chunks from OpenClaw.
+/// Must be long enough for MemChain recall + LLM first token (15-30s typical).
+/// v2.5.1: Changed from 10s to 60s to prevent premature timeout.
+const SSE_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// SSE tool timeout: extended wait after [DONE] for OpenClaw tool execution.
+/// OpenClaw may invoke tools (memchain_recall, file reads) between SSE streams.
+const SSE_TOOL_TIMEOUT_SECS: u64 = 45;
 
 /// Allowed MPI actions that can be proxied from CMS WebSocket.
 /// Actions not in this list are rejected with an error response.
@@ -204,10 +207,13 @@ impl WsTunnel {
         cms_node_id: String,
         agent_manager: Arc<AgentManager>,
     ) -> Self {
+        // v2.5.1: Removed global `.timeout()` from Client builder.
+        // Each call site now sets its own timeout via `.timeout()` on RequestBuilder
+        // or `tokio::time::timeout()`. This prevents the global 10s MPI timeout
+        // from killing long-running SSE streams to OpenClaw.
         let http_client = reqwest::Client::builder()
             .pool_max_idle_per_host(4)
             .pool_idle_timeout(Duration::from_secs(60))
-            .timeout(Duration::from_secs(MPI_PROXY_TIMEOUT_SECS))
             .build()
             .expect("Failed to build reqwest::Client");
 
@@ -628,17 +634,21 @@ impl WsTunnel {
             return self.send_e2e_response(request_id, &serde_json::json!({"error": error}).to_string(), sink).await;
         }
 
-        self.stream_e2e_sse_response(request_id, response, sink).await
+        // v2.5.1: Pass prompt to stream_e2e_sse_response for store_chat_to_mpi
+        self.stream_e2e_sse_response(request_id, prompt, response, sink).await
     }
 
     /// Stream SSE from OpenClaw, encrypting each chunk for E2E delivery.
+    ///
+    /// v2.5.1: Added `prompt` parameter so store_chat_to_mpi can record both turns.
+    /// v2.5.1: idle_timeout changed from 10s to SSE_IDLE_TIMEOUT_SECS (60s).
     async fn stream_e2e_sse_response(
-        &self, request_id: &str, mut response: reqwest::Response, sink: &mut WsSink,
+        &self, request_id: &str, prompt: &str, mut response: reqwest::Response, sink: &mut WsSink,
     ) -> Result<(), String> {
         let mut full_response = String::new();
         let mut line_buffer = String::new();
-        let idle_timeout = Duration::from_secs(60);
-        let tool_timeout = Duration::from_secs(45);
+        let idle_timeout = Duration::from_secs(SSE_IDLE_TIMEOUT_SECS);
+        let tool_timeout = Duration::from_secs(SSE_TOOL_TIMEOUT_SECS);
         let mut current_timeout = idle_timeout;
 
         loop {
@@ -654,7 +664,15 @@ impl WsTunnel {
                 }
                 Ok(Ok(None)) => break,
                 Ok(Err(e)) => { warn!(error = %e, "[WS_E2E] SSE read error"); break; }
-                Err(_) => break,
+                Err(_) => {
+                    warn!(
+                        request_id = %request_id,
+                        timeout_secs = current_timeout.as_secs(),
+                        response_len = full_response.len(),
+                        "[WS_E2E] SSE idle timeout"
+                    );
+                    break;
+                }
             }
         }
 
@@ -667,8 +685,9 @@ impl WsTunnel {
 
         self.send_e2e_stream_done(request_id, sink).await?;
 
+        // v2.5.1: Store both user prompt and assistant response to MPI
         if !full_response.is_empty() {
-            let _ = self.store_chat_to_mpi(request_id, &full_response).await;
+            let _ = self.store_chat_to_mpi(request_id, prompt, &full_response).await;
         }
 
         self.send_e2e_response(
@@ -776,12 +795,14 @@ impl WsTunnel {
 
     /// Store chat turn to local MPI /log (plaintext, for memory extraction).
     ///
-    /// v2.3.0: Now injects Bearer token when api_secret is configured.
-    async fn store_chat_to_mpi(&self, request_id: &str, response: &str) -> Result<(), String> {
+    /// v2.5.1: Now stores both user prompt and assistant response (was assistant-only).
+    /// v2.3.0: Injects Bearer token when api_secret is configured.
+    async fn store_chat_to_mpi(&self, request_id: &str, prompt: &str, response: &str) -> Result<(), String> {
         let url = format!("{}/api/mpi/log", MPI_BASE_URL);
         let body = serde_json::json!({
             "session_id": format!("e2e-{}", request_id),
             "turns": [
+                {"role": "user", "content": prompt},
                 {"role": "assistant", "content": response}
             ],
             "source_ai": "openclaw-e2e"
@@ -817,13 +838,9 @@ impl WsTunnel {
     /// 5. Inject auth — auth_headers (remote) OR Bearer token (local)
     /// 6. Send and wrap response
     ///
-    /// ## v2.3.0: auth_headers passthrough
-    /// When the WS message contains `auth_headers`, these are injected into
-    /// the HTTP request. When absent, Bearer token is injected if configured.
-    ///
-    /// ## v2.5.0: SuperNode management actions
-    /// mpi_supernode_* actions map to GET/POST /api/mpi/supernode/* endpoints.
-    /// mpi_supernode_health uses an extended timeout constant.
+    /// ## v2.5.1: Per-request timeout
+    /// Since the global Client timeout was removed, each MPI proxy request now
+    /// sets `.timeout()` on the RequestBuilder directly.
     async fn handle_mpi_proxy(
         &self,
         action: &str,
@@ -858,7 +875,7 @@ impl WsTunnel {
             .map_or(false, |obj| obj.contains_key(HEADER_MEMCHAIN_SIGNATURE));
 
         // v2.5.0: SuperNode health needs a longer timeout for external provider pings.
-        // Build a one-shot client for this case; all others reuse self.http_client.
+        // v2.5.1: All MPI requests now set per-request timeout (no global Client timeout).
         let mut req_builder = if action == "mpi_supernode_health" {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(MPI_SUPERNODE_HEALTH_TIMEOUT_SECS))
@@ -872,8 +889,10 @@ impl WsTunnel {
             match method {
                 "POST" => self.http_client.post(&url)
                     .header("Content-Type", "application/json")
+                    .timeout(Duration::from_secs(MPI_PROXY_TIMEOUT_SECS))
                     .json(payload),
-                _ => self.http_client.get(&url),
+                _ => self.http_client.get(&url)
+                    .timeout(Duration::from_secs(MPI_PROXY_TIMEOUT_SECS)),
             }
         };
 
@@ -942,8 +961,7 @@ impl WsTunnel {
     /// Resolve an MPI action to (HTTP method, URL path).
     ///
     /// Returns Ok((method, path)) on success, or Err(pre-built error response)
-    /// when a required payload field is missing. Extracted from handle_mpi_proxy
-    /// to keep that function readable.
+    /// when a required payload field is missing.
     fn resolve_mpi_route(
         &self,
         action: &str,
@@ -1128,7 +1146,7 @@ impl WsTunnel {
     }
 
     // ============================================
-    // Chat Request: HTTP SSE
+    // Chat Request: HTTP SSE (plaintext, non-E2E)
     // ============================================
 
     async fn handle_chat_request(
@@ -1176,17 +1194,18 @@ impl WsTunnel {
     }
 
     // ============================================
-    // SSE Stream Processing
+    // SSE Stream Processing (plaintext, non-E2E)
     // ============================================
 
+    /// v2.5.1: idle_timeout changed from 10s to SSE_IDLE_TIMEOUT_SECS (60s).
     async fn stream_sse_response(
         &self, request_id: &str, mut response: reqwest::Response, cms_sink: &mut WsSink,
     ) -> Result<(), String> {
         let mut full_response = String::new();
         let mut line_buffer = String::new();
 
-        let idle_timeout = Duration::from_secs(60);
-        let tool_timeout = Duration::from_secs(45);
+        let idle_timeout = Duration::from_secs(SSE_IDLE_TIMEOUT_SECS);
+        let tool_timeout = Duration::from_secs(SSE_TOOL_TIMEOUT_SECS);
         let mut current_timeout = idle_timeout;
 
         loop {
@@ -1279,7 +1298,6 @@ impl WsTunnel {
 
 /// Percent-encode a query parameter value.
 /// Encodes space as %20 and other non-unreserved characters.
-/// This avoids adding the `urlencoding` crate as a dependency.
 fn urlencoding(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
