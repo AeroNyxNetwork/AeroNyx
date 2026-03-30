@@ -334,6 +334,11 @@ impl MemoryStorage {
     }
 
     /// Mark a task as completed.
+    ///
+    /// ## P1 SecAudit: status guard added
+    /// UPDATE now carries `AND status = 'processing'` to prevent accidentally
+    /// marking a cancelled or failed task as completed (e.g. a stale worker
+    /// finishing after a human cancel). Returns Err if no rows were affected.
     pub async fn complete_task(
         &self,
         task_id: i64,
@@ -344,14 +349,22 @@ impl MemoryStorage {
     ) -> Result<(), String> {
         let now = now_ts();
         let conn = self.conn.lock().await;
-        conn.execute(
+        let affected = conn.execute(
             "UPDATE cognitive_tasks SET
                 status = 'completed', result = ?1,
                 provider_used = ?2, model_used = ?3,
                 token_usage = ?4, completed_at = ?5
-             WHERE id = ?6",
+             WHERE id = ?6 AND status = 'processing'",
             params![result, provider_used, model_used, token_usage_json, now, task_id],
         ).map_err(|e| format!("complete_task {}: {}", task_id, e))?;
+
+        if affected == 0 {
+            return Err(format!(
+                "complete_task {}: task not found or not in 'processing' state \
+                 (may have been cancelled between claim and completion)",
+                task_id
+            ));
+        }
         debug!(id = task_id, "[STORAGE_SN] Task completed");
         Ok(())
     }
@@ -913,6 +926,24 @@ mod tests {
 
         let recovered = s.reset_stale_processing_tasks(120).await;
         assert_eq!(recovered, 0);
+    }
+
+    #[tokio::test]
+    async fn test_complete_task_rejects_non_processing() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let id = s.insert_cognitive_task(
+            "session_title", 5, r#"{"session_id":"s1"}"#,
+            None, Some("sessions"), Some("s1"), "structured", 3,
+        ).await.unwrap().unwrap();
+
+        // Task is still pending — complete should fail (not processing)
+        let result = s.complete_task(id, "{}", "openai", "gpt-4o-mini", "{}").await;
+        assert!(result.is_err(), "complete_task on pending task must return Err");
+
+        // Cancel it — complete should still fail
+        s.cancel_task(id).await.unwrap();
+        let result2 = s.complete_task(id, "{}", "openai", "gpt-4o-mini", "{}").await;
+        assert!(result2.is_err(), "complete_task on cancelled task must return Err");
     }
 
     #[tokio::test]
