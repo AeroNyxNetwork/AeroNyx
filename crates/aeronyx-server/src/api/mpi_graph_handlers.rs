@@ -728,7 +728,7 @@ pub async fn mpi_context_inject(
 
     // Resolve project: explicit ID or most recently active
     let project = if let Some(ref pid) = params.project_id {
-        state.storage.get_project(pid).await
+        state.storage.get_project(pid, &owner).await
     } else {
         let projects = state.storage.get_projects(&owner, Some("active"), 1).await;
         projects.into_iter().next()
