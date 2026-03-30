@@ -550,7 +550,7 @@ impl MemoryStorage {
             by_layer.insert(layer_name.to_string(), count as u64);
         }
         let mut recent_by_layer = HashMap::new();
-        let rk = self.record_key;
+        let rk = self.record_key.as_ref().map(|v| &**v);
         for (layer_val, layer_name) in &layer_names {
             let mut stmt = match conn.prepare(
                 "SELECT record_id, encrypted_content, topic_tags, timestamp,
@@ -569,7 +569,7 @@ impl MemoryStorage {
                     let pos_fb: i64 = row.get(5)?;
                     let neg_fb: i64 = row.get(6)?;
                     let source_ai: String = row.get(7)?;
-                    let content = if let Some(key) = rk.as_ref() {
+                    let content = if let Some(key) = rk {
                         if raw_content.len() >= 28 {
                             match decrypt_record_content(key, &raw_content) {
                                 Ok(plain) => String::from_utf8_lossy(&plain).to_string(),
