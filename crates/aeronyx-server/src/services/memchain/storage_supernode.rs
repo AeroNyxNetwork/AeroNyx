@@ -7,19 +7,24 @@
 //! Split from storage_ops.rs to house all CRUD for the v2.5.0 LLM task queue
 //! and usage tracking tables introduced in Schema v6.
 //!
+//! ## Modification Reason (v2.5.2+Pagination)
+//! Added `offset: usize` to `get_tasks_filtered()` for cursor-free pagination.
+//! SQL updated from `LIMIT ?N` to `LIMIT ?N OFFSET ?M` across all four variants.
+//! Caller: `supernode_handlers.rs::supernode_list_tasks()` passes `params.offset`.
+//!
 //! ## Main Functionality
 //! ### cognitive_tasks CRUD
-//! - insert_cognitive_task()      — enqueue a new pending task (idempotent: skips if active duplicate exists)
-//! - claim_pending_tasks()        — atomic SELECT + UPDATE to 'processing'
-//! - complete_task()              — mark completed + write result + token_usage
-//! - fail_task()                  — increment retry_count or mark 'failed'
-//! - retry_task()                 — human-initiated reset of failed/cancelled → pending
-//! - cancel_task()                — pending → cancelled
-//! - get_task()                   — fetch single task by id
-//! - get_tasks_by_status()        — list tasks filtered by status
-//! - get_tasks_filtered()         — list tasks with optional status + task_type filters
-//! - get_tasks_for_target()       — find tasks for a specific (table, id) pair
-//! - count_tasks_by_status()      — HashMap<status, count> for queue summary
+//! - insert_cognitive_task()        — enqueue a new pending task (idempotent: skips if active duplicate exists)
+//! - claim_pending_tasks()          — atomic SELECT + UPDATE to 'processing'
+//! - complete_task()                — mark completed + write result + token_usage
+//! - fail_task()                    — increment retry_count or mark 'failed'
+//! - retry_task()                   — human-initiated reset of failed/cancelled → pending
+//! - cancel_task()                  — pending → cancelled
+//! - get_task()                     — fetch single task by id
+//! - get_tasks_by_status()          — list tasks filtered by status
+//! - get_tasks_filtered()           — list tasks with optional status + task_type filters (paginated)
+//! - get_tasks_for_target()         — find tasks for a specific (table, id) pair
+//! - count_tasks_by_status()        — HashMap<status, count> for queue summary
 //! - reset_stale_processing_tasks() — on startup: recover tasks stuck in 'processing'
 //!
 //! ### llm_usage_log CRUD
@@ -42,8 +47,15 @@
 //! llm_usage_log:
 //!   cost_usd NOT stored — fee rates change; compute at query time in LlmRouter.
 //!
-//! ⚠️ Important Note for Next Developer:
-//! - insert_cognitive_task() is NOW IDEMPOTENT. It skips insertion if an active
+//! ## Calling Relationships
+//! - task_worker.rs          → claim_pending_tasks / complete_task / fail_task
+//! - miner/reflection.rs     → insert_cognitive_task (Phase B)
+//! - api/supernode_handlers  → all management endpoints; get_tasks_filtered passes offset
+//! - api/mpi_handlers.rs     → count_tasks_by_status for /status
+//! - server.rs               → reset_stale_processing_tasks on startup
+//!
+//! ⚠️ Important Notes for Next Developer:
+//! - insert_cognitive_task() is IDEMPOTENT. It skips insertion if an active
 //!   (pending/processing) task already exists for the same (target_table, target_id,
 //!   task_type) triple. Returns Ok(None) in that case. Callers must handle Option<i64>.
 //! - reset_stale_processing_tasks() MUST be called at server startup before TaskWorker
@@ -52,37 +64,30 @@
 //!   Do NOT split into two separate conn.lock() calls.
 //! - fail_task() checks retry_count < max_retries before marking 'failed'.
 //!   retry_task() is the human override — always resets to pending regardless.
-//! - get_tasks_filtered() uses dynamic SQL with 4 variants. The (None,None) case
-//!   passes "" as unused params because rusqlite requires the same param count
-//!   for a prepared statement. This is safe: unused ?1/?2 are never referenced
-//!   in the None branch SQL.
+//! - get_tasks_filtered() uses four SQL variants (no dynamic string building).
+//!   v2.5.2+Pagination: each variant now appends OFFSET ?M. The offset param is
+//!   the last bind param in every variant. Do NOT remove it.
 //! - get_usage_stats_by_task_type() JOINs cognitive_tasks — tasks without a
 //!   task_id in llm_usage_log (e.g. manual inserts) are excluded.
 //!
-//! ## Dependencies
-//! - storage.rs — MemoryStorage struct
-//!
-//! ## Depended by
-//! - task_worker.rs — claim_pending_tasks / complete_task / fail_task
-//! - miner/reflection.rs — insert_cognitive_task (Phase B)
-//! - api/supernode_handlers.rs — all management endpoints
-//! - api/mpi_handlers.rs — count_tasks_by_status for /status
-//! - server.rs — reset_stale_processing_tasks on startup
-//!
 //! ## Last Modified
-//! v2.5.0+SuperNode Phase A - 🌟 Created. Core CRUD.
-//! v2.5.0+SuperNode Phase C - 🔧 Fixed by_provider borrow issue in get_usage_stats.
-//! v2.5.0+SuperNode Phase D - 🌟 Added retry_task, count_tasks_by_status,
+//! v2.5.0+SuperNode Phase A - Created. Core CRUD.
+//! v2.5.0+SuperNode Phase C - Fixed by_provider borrow issue in get_usage_stats.
+//! v2.5.0+SuperNode Phase D - Added retry_task, count_tasks_by_status,
 //!   get_usage_stats_by_task_type, get_tasks_filtered, TaskTypeUsage type.
-//! v2.5.0+Fix              - 🔧 [BUG FIX] insert_cognitive_task: added idempotency
+//! v2.5.0+Fix              - [BUG FIX] insert_cognitive_task: added idempotency
 //!   guard (WHERE NOT EXISTS) to prevent duplicate pending/processing tasks for
 //!   the same (target_table, target_id, task_type). Return type changed from
 //!   Result<i64> to Result<Option<i64>> — Ok(None) = skipped (duplicate).
-//!                         - 🔧 [BUG FIX] Added reset_stale_processing_tasks() for
+//!                         - [BUG FIX] Added reset_stale_processing_tasks() for
 //!   crash-recovery on server startup. Tasks stuck in 'processing' beyond the
 //!   timeout threshold are reset to 'pending'.
-//!                         - 🧪 Added test_insert_cognitive_task_dedup and
+//!                         - Added test_insert_cognitive_task_dedup and
 //!   test_get_usage_stats_by_task_type (previously untested).
+//! v2.5.2+Pagination       - get_tasks_filtered gains `offset: usize` param.
+//!   All four SQL variants updated: LIMIT ?N → LIMIT ?N OFFSET ?M.
+//!   Added test_get_tasks_filtered_pagination to verify paging correctness.
+// ============================================
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -174,7 +179,7 @@ impl MemoryStorage {
     /// - `Ok(None)`     — active duplicate found, insertion skipped
     /// - `Err(msg)`     — database error
     ///
-    /// ⚠️ Callers in reflection.rs must be updated to handle `Option<i64>`.
+    /// ⚠️ Callers in reflection.rs must handle `Option<i64>`.
     pub async fn insert_cognitive_task(
         &self,
         task_type: &str,
@@ -308,7 +313,7 @@ impl MemoryStorage {
         };
 
         let tasks: Vec<CognitiveTaskRow> = stmt
-            .query_map(params![batch_size as i64], |row| Ok(task_row(row)?))
+            .query_map(params![batch_size as i64], |row| task_row(row))
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default();
 
@@ -388,7 +393,7 @@ impl MemoryStorage {
             "SELECT status, retry_count FROM cognitive_tasks WHERE id = ?1",
             params![task_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
-        ).map_err(|e| format!("retry_task fetch {}: {}", task_id, e))?;
+        ).map_err(|_| format!("retry_task: task {} not found", task_id))?;
 
         if status != "failed" && status != "cancelled" {
             return Err(format!(
@@ -409,7 +414,11 @@ impl MemoryStorage {
         Ok(())
     }
 
-    /// Cancel a pending task (pending → cancelled). No-op if not pending.
+    /// Cancel a pending task (pending → cancelled).
+    ///
+    /// Returns the number of affected rows (0 or 1).
+    /// ⚠️ Callers in supernode_handlers must check for 0 (TOCTOU: task was
+    /// claimed between the status check and this UPDATE) and return 409 Conflict.
     pub async fn cancel_task(&self, task_id: i64) -> Result<usize, String> {
         let conn = self.conn.lock().await;
         let affected = conn.execute(
@@ -420,6 +429,7 @@ impl MemoryStorage {
         debug!(id = task_id, affected = affected, "[STORAGE_SN] Task cancel attempted");
         Ok(affected)
     }
+
     /// Get a single task by id.
     pub async fn get_task(&self, task_id: i64) -> Option<CognitiveTaskRow> {
         let conn = self.conn.lock().await;
@@ -453,19 +463,26 @@ impl MemoryStorage {
             .unwrap_or_default()
     }
 
-    /// List tasks with optional status and task_type filters (Phase D).
+    /// List tasks with optional status and task_type filters, with pagination.
     ///
     /// Either filter may be None (wildcard). Ordered by priority DESC, created_at ASC.
+    ///
+    /// ## v2.5.2+Pagination
+    /// Added `offset: usize` (default 0 for callers that don't paginate).
+    /// SQL updated to `LIMIT ?N OFFSET ?M` in all four match arms.
+    ///
+    /// ⚠️ offset is the last bind parameter in every variant. Do NOT reorder params.
     pub async fn get_tasks_filtered(
         &self,
         status: Option<&str>,
         task_type: Option<&str>,
         limit: usize,
+        offset: usize,
     ) -> Vec<CognitiveTaskRow> {
         let conn = self.conn.lock().await;
         let limit_i = limit.min(100) as i64;
+        let offset_i = offset as i64;
 
-        // Four SQL variants to avoid dynamic string building
         match (status, task_type) {
             (Some(s), Some(t)) => {
                 let mut stmt = match conn.prepare(
@@ -475,9 +492,9 @@ impl MemoryStorage {
                             retry_count, max_retries, error_message
                      FROM cognitive_tasks
                      WHERE status = ?1 AND task_type = ?2
-                     ORDER BY priority DESC, created_at ASC LIMIT ?3"
+                     ORDER BY priority DESC, created_at ASC LIMIT ?3 OFFSET ?4"
                 ) { Ok(s) => s, Err(_) => return Vec::new() };
-                stmt.query_map(params![s, t, limit_i], |row| task_row(row))
+                stmt.query_map(params![s, t, limit_i, offset_i], |row| task_row(row))
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
                     .unwrap_or_default()
             }
@@ -489,9 +506,9 @@ impl MemoryStorage {
                             retry_count, max_retries, error_message
                      FROM cognitive_tasks
                      WHERE status = ?1
-                     ORDER BY priority DESC, created_at ASC LIMIT ?2"
+                     ORDER BY priority DESC, created_at ASC LIMIT ?2 OFFSET ?3"
                 ) { Ok(s) => s, Err(_) => return Vec::new() };
-                stmt.query_map(params![s, limit_i], |row| task_row(row))
+                stmt.query_map(params![s, limit_i, offset_i], |row| task_row(row))
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
                     .unwrap_or_default()
             }
@@ -503,9 +520,9 @@ impl MemoryStorage {
                             retry_count, max_retries, error_message
                      FROM cognitive_tasks
                      WHERE task_type = ?1
-                     ORDER BY priority DESC, created_at ASC LIMIT ?2"
+                     ORDER BY priority DESC, created_at ASC LIMIT ?2 OFFSET ?3"
                 ) { Ok(s) => s, Err(_) => return Vec::new() };
-                stmt.query_map(params![t, limit_i], |row| task_row(row))
+                stmt.query_map(params![t, limit_i, offset_i], |row| task_row(row))
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
                     .unwrap_or_default()
             }
@@ -516,9 +533,9 @@ impl MemoryStorage {
                             token_usage, created_at, started_at, completed_at,
                             retry_count, max_retries, error_message
                      FROM cognitive_tasks
-                     ORDER BY priority DESC, created_at ASC LIMIT ?1"
+                     ORDER BY priority DESC, created_at ASC LIMIT ?1 OFFSET ?2"
                 ) { Ok(s) => s, Err(_) => return Vec::new() };
-                stmt.query_map(params![limit_i], |row| task_row(row))
+                stmt.query_map(params![limit_i, offset_i], |row| task_row(row))
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
                     .unwrap_or_default()
             }
@@ -801,22 +818,20 @@ mod tests {
     async fn test_insert_cognitive_task_dedup() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
 
-        // First insert — should succeed
         let id1 = s.insert_cognitive_task(
             "session_title", 5, r#"{"session_id":"sess_001"}"#,
             None, Some("sessions"), Some("sess_001"), "structured", 3,
         ).await.unwrap();
         assert!(id1.is_some(), "First insert must succeed");
 
-        // Second insert — same triple, status=pending → must be skipped
+        // Same triple, status=pending → must be skipped
         let id2 = s.insert_cognitive_task(
             "session_title", 5, r#"{"session_id":"sess_001"}"#,
             None, Some("sessions"), Some("sess_001"), "structured", 3,
         ).await.unwrap();
         assert!(id2.is_none(), "Duplicate pending task must be skipped");
 
-        // Only one task should exist
-        let tasks = s.get_tasks_filtered(None, Some("session_title"), 10).await;
+        let tasks = s.get_tasks_filtered(None, Some("session_title"), 10, 0).await;
         assert_eq!(tasks.len(), 1);
 
         // Different task_type on same target → allowed
@@ -862,7 +877,6 @@ mod tests {
     async fn test_reset_stale_processing_tasks() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
 
-        // Insert and claim a task (moves to 'processing')
         let id = s.insert_cognitive_task(
             "session_title", 5, r#"{}"#,
             None, Some("sessions"), Some("s1"), "structured", 3,
@@ -897,7 +911,6 @@ mod tests {
         ).await.unwrap();
         s.claim_pending_tasks(1).await;
 
-        // started_at is just now — should NOT be reset with 120s timeout
         let recovered = s.reset_stale_processing_tasks(120).await;
         assert_eq!(recovered, 0);
     }
@@ -949,7 +962,6 @@ mod tests {
             None, None, None, "structured", 1,
         ).await.unwrap().unwrap();
         s.claim_pending_tasks(1).await;
-        // Exhaust retries
         s.fail_task(id, "error").await.unwrap();
         let t = s.get_task(id).await.unwrap();
         assert_eq!(t.status, "failed");
@@ -968,10 +980,17 @@ mod tests {
             "session_title", 5, r#"{}"#,
             None, None, None, "structured", 3,
         ).await.unwrap().unwrap();
-        // Task is pending — retry should fail
         let result = s.retry_task(id).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("pending"));
+    }
+
+    #[tokio::test]
+    async fn test_retry_task_not_found() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let result = s.retry_task(99999).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
     }
 
     #[tokio::test]
@@ -981,12 +1000,27 @@ mod tests {
             "entity_description", 5, r#"{}"#,
             None, None, None, "structured", 3,
         ).await.unwrap().unwrap();
-        s.cancel_task(id).await.unwrap();
+        let affected = s.cancel_task(id).await.unwrap();
+        assert_eq!(affected, 1);
         let t = s.get_task(id).await.unwrap();
         assert_eq!(t.status, "cancelled");
 
         let claimed = s.claim_pending_tasks(10).await;
         assert!(claimed.is_empty());
+    }
+
+    /// cancel_task returns 0 when task is already non-pending (TOCTOU guard).
+    #[tokio::test]
+    async fn test_cancel_task_already_claimed_returns_zero() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let id = s.insert_cognitive_task(
+            "session_title", 5, r#"{}"#,
+            None, None, None, "structured", 3,
+        ).await.unwrap().unwrap();
+        s.claim_pending_tasks(1).await; // moves to processing
+
+        let affected = s.cancel_task(id).await.unwrap();
+        assert_eq!(affected, 0, "Should return 0 when task is no longer pending");
     }
 
     #[tokio::test]
@@ -1010,21 +1044,44 @@ mod tests {
         s.insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3).await.unwrap();
         s.insert_cognitive_task("community_summary", 3, "{}", None, None, None, "structured", 3).await.unwrap();
 
-        // Filter by task_type only
-        let title_tasks = s.get_tasks_filtered(None, Some("session_title"), 10).await;
+        let title_tasks = s.get_tasks_filtered(None, Some("session_title"), 10, 0).await;
         assert_eq!(title_tasks.len(), 2);
 
-        // Filter by status only
-        let pending = s.get_tasks_filtered(Some("pending"), None, 10).await;
+        let pending = s.get_tasks_filtered(Some("pending"), None, 10, 0).await;
         assert_eq!(pending.len(), 3);
 
-        // Filter by both
-        let both = s.get_tasks_filtered(Some("pending"), Some("community_summary"), 10).await;
+        let both = s.get_tasks_filtered(Some("pending"), Some("community_summary"), 10, 0).await;
         assert_eq!(both.len(), 1);
 
-        // No filter
-        let all = s.get_tasks_filtered(None, None, 10).await;
+        let all = s.get_tasks_filtered(None, None, 10, 0).await;
         assert_eq!(all.len(), 3);
+    }
+
+    /// v2.5.2+Pagination: verify offset pages are non-overlapping and correctly sized.
+    #[tokio::test]
+    async fn test_get_tasks_filtered_pagination() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        for _ in 0..5 {
+            s.insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3).await.unwrap();
+        }
+
+        let page0 = s.get_tasks_filtered(None, None, 3, 0).await;
+        let page1 = s.get_tasks_filtered(None, None, 3, 3).await;
+        assert_eq!(page0.len(), 3);
+        assert_eq!(page1.len(), 2);
+
+        // No overlap
+        let ids0: std::collections::HashSet<i64> = page0.iter().map(|t| t.id).collect();
+        let ids1: std::collections::HashSet<i64> = page1.iter().map(|t| t.id).collect();
+        assert!(ids0.is_disjoint(&ids1), "Pages must not overlap");
+
+        // offset beyond total → empty
+        let page2 = s.get_tasks_filtered(None, None, 3, 10).await;
+        assert!(page2.is_empty());
+
+        // Filter + offset: 2 session_title tasks, offset=1 → 1 result
+        let filtered_page1 = s.get_tasks_filtered(None, Some("session_title"), 10, 1).await;
+        assert_eq!(filtered_page1.len(), 4); // 5 total - 1 offset
     }
 
     #[tokio::test]
@@ -1038,7 +1095,7 @@ mod tests {
         let counts = s.count_tasks_by_status().await;
         assert_eq!(counts["pending"], 2);
         assert_eq!(counts["cancelled"], 1);
-        assert_eq!(counts["failed"], 0); // always present even if 0
+        assert_eq!(counts["failed"], 0);
     }
 
     #[tokio::test]
@@ -1062,7 +1119,6 @@ mod tests {
     async fn test_get_usage_stats_by_task_type() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
 
-        // Insert tasks first so the JOIN resolves
         let t1 = s.insert_cognitive_task(
             "session_title", 5, "{}", None, None, None, "structured", 3,
         ).await.unwrap().unwrap();
@@ -1077,7 +1133,6 @@ mod tests {
         let stats = s.get_usage_stats_by_task_type(0, 0).await;
         assert_eq!(stats.len(), 2);
 
-        // session_title × deepseek should be first (2 calls vs 1)
         let st = stats.iter().find(|r| r.task_type == "session_title").unwrap();
         assert_eq!(st.provider, "deepseek");
         assert_eq!(st.calls, 2);
