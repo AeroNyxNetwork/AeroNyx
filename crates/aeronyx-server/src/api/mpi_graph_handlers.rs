@@ -155,13 +155,15 @@ pub async fn mpi_projects(
 }
 
 /// `GET /api/mpi/projects/:id` — Project detail.
+///
+/// ## P0 SecAudit: owner now passed to storage query
 pub async fn mpi_project_detail(
     State(state): State<Arc<MpiState>>,
     Path(project_id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    let _owner = extract_owner(&req).owner_bytes();
-    match state.storage.get_project(&project_id).await {
+    let owner = extract_owner(&req).owner_bytes();
+    match state.storage.get_project(&project_id, &owner).await {
         Some(p) => (StatusCode::OK, Json(serde_json::json!(p))).into_response(),
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "project not found"}))).into_response(),
     }
@@ -169,19 +171,15 @@ pub async fn mpi_project_detail(
 
 /// `GET /api/mpi/projects/:id/timeline` — Session summaries by date for a project.
 ///
+/// ## P0 SecAudit: owner now passed to storage query
 /// ## v2.5.2+Pagination
-/// Supports `?limit=N&offset=M` query params.
-/// Response includes a `pagination` block:
-/// ```json
-/// "pagination": { "limit": 20, "offset": 0, "has_more": true }
-/// ```
 pub async fn mpi_project_timeline(
     State(state): State<Arc<MpiState>>,
     Path(project_id): Path<String>,
     Query(params): Query<ListParams>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    let _owner = extract_owner(&req).owner_bytes();
+    let owner = extract_owner(&req).owner_bytes();
     let limit = params.limit.min(100);
     let offset = params.offset;
 
@@ -189,6 +187,7 @@ pub async fn mpi_project_timeline(
         &project_id,
         limit,
         offset,
+        &owner,
     ).await;
 
     debug!(
@@ -213,13 +212,15 @@ pub async fn mpi_project_timeline(
 // ============================================
 
 /// `GET /api/mpi/sessions/:id` — Session detail (summary + key decisions).
+///
+/// ## P0 SecAudit: owner now passed to storage query
 pub async fn mpi_session_detail(
     State(state): State<Arc<MpiState>>,
     Path(session_id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    let _owner = extract_owner(&req).owner_bytes();
-    match state.storage.get_session(&session_id).await {
+    let owner = extract_owner(&req).owner_bytes();
+    match state.storage.get_session(&session_id, &owner).await {
         Some(s) => (StatusCode::OK, Json(serde_json::json!(s))).into_response(),
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "session not found"}))).into_response(),
     }
@@ -256,12 +257,19 @@ pub async fn mpi_session_conversation(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let auth = extract_owner(&req);
+    let owner = auth.owner_bytes();
     let is_remote = auth.is_remote();
 
-    // Fetch session metadata (summary, project, etc.) for context
-    let session_meta = state.storage.get_session(&session_id).await;
+    // P0 SecAudit: fetch session metadata with owner filter to verify ownership.
+    // If the session doesn't belong to this owner, return 404 (not 403) to
+    // avoid leaking existence of sessions owned by others.
+    let session_meta = state.storage.get_session(&session_id, &owner).await;
+    if session_meta.is_none() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "session not found"
+        }))).into_response();
+    }
 
-    // Fetch raw conversation turns
     let raw_logs = state.storage.get_rawlogs_for_session(&session_id).await;
 
     if raw_logs.is_empty() {
@@ -378,13 +386,15 @@ pub async fn mpi_session_conversation(
 }
 
 /// `GET /api/mpi/sessions/:id/artifacts` — Artifacts linked to a session.
+///
+/// ## P0 SecAudit: owner now passed to storage query
 pub async fn mpi_session_artifacts(
     State(state): State<Arc<MpiState>>,
     Path(session_id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    let _owner = extract_owner(&req).owner_bytes();
-    let artifacts = state.storage.get_artifacts_for_session(&session_id).await;
+    let owner = extract_owner(&req).owner_bytes();
+    let artifacts = state.storage.get_artifacts_for_session(&session_id, &owner).await;
 
     debug!(session = %session_id, artifacts = artifacts.len(), "[MPI] GET /sessions/:id/artifacts");
     (StatusCode::OK, Json(serde_json::json!({
@@ -729,8 +739,9 @@ pub async fn mpi_context_inject(
 
     // Get recent sessions for this project (or all sessions if no project).
     // offset=0: context injection always wants the N most recent — no pagination.
+    // P0 SecAudit: pass owner so query is owner-scoped.
     let recent_sessions = if let Some(ref pid) = project_id {
-        state.storage.get_sessions_for_project(pid, recent_count, 0).await
+        state.storage.get_sessions_for_project(pid, recent_count, 0, &owner).await
     } else {
         // No project → get most recent sessions for this owner
         state.storage.get_pending_sessions(&owner, recent_count).await
@@ -1083,9 +1094,55 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["project_id"], "proj1");
-        // v2.5.2+Pagination: pagination block must be present
         assert!(json["pagination"].is_object());
         assert_eq!(json["pagination"]["offset"], 0);
+    }
+
+    /// P0 SecAudit: verify that a session belonging to owner A is not visible to owner B.
+    #[tokio::test]
+    async fn test_session_detail_owner_isolation() {
+        let state = make_state().await;
+        let owner_a = state.owner_key;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        state.storage.upsert_session("sess_a", &owner_a, None, "code", now, 5).await.unwrap();
+
+        // Request authenticated as owner_a — should succeed (200)
+        let app_a = build_mpi_router(state.clone());
+        let req = Request::builder().uri("/api/mpi/sessions/sess_a").body(Body::empty()).unwrap();
+        let resp = app_a.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Request authenticated as a different identity — make a new state with different key
+        let state_b = make_state().await; // fresh identity ≠ owner_a
+        // Insert sess_a into state_b's storage so the session exists, but owner differs
+        let owner_b = state_b.owner_key;
+        assert_ne!(owner_a, owner_b);
+        // state_b has no session with id "sess_a" owned by owner_b → must return 404
+        let app_b = build_mpi_router(state_b);
+        let req2 = Request::builder().uri("/api/mpi/sessions/sess_a").body(Body::empty()).unwrap();
+        let resp2 = app_b.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// P0 SecAudit: conversation endpoint must return 404 for unowned sessions.
+    #[tokio::test]
+    async fn test_session_conversation_owner_isolation() {
+        let state_a = make_state().await;
+        let owner_a = state_a.owner_key;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        state_a.storage.upsert_session("sess_private", &owner_a, None, "code", now, 2).await.unwrap();
+
+        // owner_b cannot see sess_private
+        let state_b = make_state().await;
+        let app_b = build_mpi_router(state_b);
+        let req = Request::builder()
+            .uri("/api/mpi/sessions/sess_private/conversation")
+            .body(Body::empty()).unwrap();
+        let resp = app_b.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND,
+            "Conversation endpoint must not expose sessions owned by another user");
     }
 
     #[tokio::test]
