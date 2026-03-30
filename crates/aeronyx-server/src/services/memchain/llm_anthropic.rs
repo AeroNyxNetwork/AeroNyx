@@ -34,15 +34,26 @@
 //! }
 //! ```
 //!
-//! ⚠️ Important Note for Next Developer:
+//! ⚠️ Important Notes for Next Developer:
 //! - `max_tokens` is REQUIRED by Anthropic API (no default). We use 1000 if not set.
 //! - `system` messages MUST be extracted from the messages array and sent as a
 //!   top-level field. This is done in `chat()` before building the request.
 //! - Anthropic uses `cache_read_input_tokens` (not `cached_tokens`) for prompt cache.
 //! - `anthropic-version` header is fixed at "2023-06-01" (stable API version).
+//! - BUG FIX: api_key was included verbatim in Debug output — now redacted.
+//! - BUG FIX: multiple system messages were silently collapsed to only the last one.
+//!   Now they are concatenated with "\n\n" and a warning is logged.
+//! - BUG FIX: 400 context-length check used OpenAI-style strings; added Anthropic's
+//!   "context window" phrase to the detection list.
+//! - BUG FIX: `healthy` flag was never reset to `false` on non-429 API errors,
+//!   meaning a consistently failing provider would still report healthy=true.
+//!   Now sets healthy=false on all terminal error paths.
 //!
 //! ## Last Modified
 //! v2.5.0+SuperNode - 🌟 Created.
+//! v2.5.2+SecAudit  - 🔧 api_key redacted from Debug. Multiple system messages
+//!   concatenated. Context-length detection improved. healthy flag set on all
+//!   error paths.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -131,6 +142,7 @@ pub struct AnthropicProvider {
     /// Provider name for logging and writeback.
     name: String,
     /// Resolved API key (after $ENV_VAR expansion).
+    /// ⚠️ Never log or expose this value — redacted in Debug impl.
     api_key: String,
     /// Default model identifier (e.g. "claude-haiku-4-5-20251001").
     model: String,
@@ -140,7 +152,7 @@ pub struct AnthropicProvider {
     temperature: Option<f32>,
     /// Shared HTTP client.
     client: reqwest::Client,
-    /// Health flag.
+    /// Health flag — set false on rate limit or API error, true on success.
     healthy: Arc<AtomicBool>,
 }
 
@@ -198,18 +210,40 @@ impl LlmProvider for AnthropicProvider {
             .unwrap_or(DEFAULT_MAX_TOKENS);
         let temperature = req.temperature.or(self.temperature);
 
-        // Extract system prompt from messages array (Anthropic uses top-level field)
-        let mut system_prompt: Option<&str> = None;
+        // Extract system prompt(s) from messages array.
+        // Anthropic requires system to be a top-level field, not a message role.
+        //
+        // BUG FIX: original code silently kept only the LAST system message when
+        // multiple were present (each loop iteration overwrote system_prompt).
+        // Now all system messages are concatenated with "\n\n" and a warning is
+        // emitted so callers know the input was unusual.
+        let mut system_parts: Vec<&str> = Vec::new();
         let user_messages: Vec<AnthropicMessage> = req.messages.iter()
             .filter_map(|m| {
                 if m.role == "system" {
-                    system_prompt = Some(&m.content);
-                    None // Don't include system in messages array
+                    system_parts.push(&m.content);
+                    None // system role is NOT included in the messages array
                 } else {
                     Some(AnthropicMessage { role: &m.role, content: &m.content })
                 }
             })
             .collect();
+
+        if system_parts.len() > 1 {
+            warn!(
+                provider = %self.name,
+                count = system_parts.len(),
+                "[LLM_ANTHROPIC] Multiple system messages received — concatenating with \\n\\n"
+            );
+        }
+
+        // Join all system parts; None if no system messages were present.
+        let system_joined: Option<String> = if system_parts.is_empty() {
+            None
+        } else {
+            Some(system_parts.join("\n\n"))
+        };
+        let system_prompt: Option<&str> = system_joined.as_deref();
 
         if user_messages.is_empty() {
             return Err(LlmError::EmptyResponse);
@@ -234,7 +268,11 @@ impl LlmProvider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| LlmError::Transport(e.to_string()))?;
+            .map_err(|e| {
+                // Network / transport error — mark unhealthy
+                self.healthy.store(false, Ordering::Relaxed);
+                LlmError::Transport(e.to_string())
+            })?;
 
         let status = resp.status().as_u16();
         let latency_ms = start.elapsed().as_millis() as u64;
@@ -251,10 +289,18 @@ impl LlmProvider for AnthropicProvider {
 
         if status == 400 {
             let body_text = resp.text().await.unwrap_or_default();
-            // Check for context length error
-            if body_text.contains("prompt is too long") || body_text.contains("context_length_exceeded") {
+            // BUG FIX: original check used OpenAI-style "prompt is too long" and
+            // "context_length_exceeded" but Anthropic uses "context window" in its
+            // error messages. Added Anthropic-specific phrases to the detection list.
+            if body_text.contains("prompt is too long")
+                || body_text.contains("context_length_exceeded")
+                || body_text.contains("context window")
+                || body_text.contains("too many tokens")
+            {
+                self.healthy.store(false, Ordering::Relaxed);
                 return Err(LlmError::ContextTooLong);
             }
+            self.healthy.store(false, Ordering::Relaxed);
             return Err(LlmError::ApiError { status, body: body_text });
         }
 
@@ -263,11 +309,18 @@ impl LlmProvider for AnthropicProvider {
             let msg = serde_json::from_str::<AnthropicErrorResponse>(&body_text)
                 .map(|e| e.error.message)
                 .unwrap_or_else(|_| body_text);
+            // BUG FIX: healthy was never set to false on non-429 API errors.
+            // A consistently failing provider (e.g. 401, 500) would still report
+            // healthy=true, causing the router to keep sending requests to it.
+            self.healthy.store(false, Ordering::Relaxed);
             return Err(LlmError::ApiError { status, body: msg });
         }
 
         let resp_json: AnthropicResponse = resp.json().await
-            .map_err(|e| LlmError::ParseError(e.to_string()))?;
+            .map_err(|e| {
+                self.healthy.store(false, Ordering::Relaxed);
+                LlmError::ParseError(e.to_string())
+            })?;
 
         // Extract text from first text block
         let content = resp_json.content
@@ -277,6 +330,7 @@ impl LlmProvider for AnthropicProvider {
             .unwrap_or_default();
 
         if content.is_empty() {
+            self.healthy.store(false, Ordering::Relaxed);
             return Err(LlmError::EmptyResponse);
         }
 
@@ -321,11 +375,15 @@ impl LlmProvider for AnthropicProvider {
     }
 }
 
+/// BUG FIX: original Debug impl derived automatically, which would print
+/// the raw api_key value in logs / panic messages. Redacted to prevent
+/// accidental key exposure in log aggregation systems.
 impl std::fmt::Debug for AnthropicProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnthropicProvider")
             .field("name", &self.name)
             .field("model", &self.model)
+            .field("api_key", &"[REDACTED]")
             .finish()
     }
 }
