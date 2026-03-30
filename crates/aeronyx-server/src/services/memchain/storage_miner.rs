@@ -3,54 +3,64 @@
 // ============================================
 //! # Storage Miner — Miner Step Support Methods + Entity Timeline
 //!
-//! ## Creation Reason (v2.4.0+Search)
-//! Split out from storage_ops.rs (which was too large) to group all methods
-//! that are exclusively called by the Miner pipeline (reflection.rs Steps 7/9/10/11)
-//! and the entity timeline API endpoint.
-//!
-//! ## Main Functionality
-//! - get_rawlogs_for_session     → Miner Step 7 (NER entity extraction)
-//! - get_entities_with_embedding → Miner Step 9 (pairwise cosine merge)
-//! - merge_entities              → Miner Step 9 (deduplicate similar entities)
-//! - update_session_ended_at     → Miner Step 10 (mark session end time)
-//! - mark_session_summary_generated → Miner Step 10
-//! - mark_session_artifacts_extracted → Miner Step 10
-//! - EntityTimelineEntry         → /api/mpi/entities/:id/timeline response type
-//! - get_entity_timeline         → /api/mpi/entities/:id/timeline handler
-//!
-//! ## Architecture
-//! Same `impl MemoryStorage` extension pattern as storage_ops.rs and storage_graph.rs.
-//! All three files are declared as `mod` in memchain/mod.rs.
-//!
-//! ## Dependencies
-//! - storage.rs — MemoryStorage struct, RawLogRow, bytes_to_embedding
-//! - storage_crypto.rs — decrypt_rawlog_content_pub (rawlog decryption in merge)
-//!
-//! ## Depended by
-//! - miner/reflection.rs — Steps 7, 9, 10, 11
-//! - api/mpi_graph_handlers.rs — entity timeline endpoint
+//! ## File Creation/Modification Notes
+//! ============================================
+//! Creation Reason: Split from storage_ops.rs to group all Miner pipeline
+//!   support methods (Steps 7/9/10/11) and entity timeline API endpoint.
+//! Modification Reason:
+//!   v2.5.2+Pagination     — get_entity_timeline gains `offset: usize` param
+//!   v2.5.3+ArtifactChain  — New methods for DEV-TASK-001:
+//!     get_latest_artifact_version() — Miner Step 10 version chain lookup
+//!     get_artifact_with_content()   — GET /artifacts/:id real implementation
+//!     search_artifacts_by_filename() — GET /artifacts/search endpoint
+//!     ArtifactWithContent struct    — return type for get_artifact_with_content
+//! Main Functionality:
+//!   - get_rawlogs_for_session       → Miner Step 7 (NER entity extraction)
+//!   - get_entities_with_embedding   → Miner Step 9 (pairwise cosine merge)
+//!   - merge_entities                → Miner Step 9 (deduplicate similar entities)
+//!   - update_session_ended_at       → Miner Step 10
+//!   - mark_session_summary_generated / mark_session_artifacts_extracted → Step 10
+//!   - EntityTimelineEntry + get_entity_timeline → /entities/:id/timeline
+//!   - get_latest_artifact_version   → Miner Step 10 (v2.5.3+ArtifactChain)
+//!   - get_artifact_with_content     → GET /artifacts/:id (v2.5.3+ArtifactChain)
+//!   - search_artifacts_by_filename  → GET /artifacts/search (v2.5.3+ArtifactChain)
+//! Dependencies:
+//!   - storage.rs — MemoryStorage struct, RawLogRow, bytes_to_embedding
+//!   - storage_crypto.rs — decrypt_rawlog_content_pub
+//! Depended by:
+//!   - miner/reflection.rs — Steps 7, 9, 10, 11
+//!   - api/mpi_graph_handlers.rs — entity timeline + artifact endpoints
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - mark_session_artifacts_extracted() requires `artifacts_extracted` column in
-//!   the `sessions` table. Added in Schema v5 migration. If missing, add:
+//!   sessions table. Schema v5 migration. If missing:
 //!   ALTER TABLE sessions ADD COLUMN artifacts_extracted INTEGER DEFAULT 0
 //! - merge_entities() performs cascading updates and self-loop cleanup.
-//!   episode_edges uses OR IGNORE to handle unique constraint on (episode_id, entity_id).
-//! - get_entity_timeline() fetches mentions (via episode_edges → sessions JOIN) and
-//!   relation events (via knowledge_edges). Events sorted by started_at ASC.
-//!   Relation events have empty session_id since knowledge_edges don't directly
-//!   reference sessions (TODO Phase C: trace via episode_id → session).
+//!   episode_edges uses OR IGNORE for unique constraint on (episode_id, entity_id).
+//! - get_entity_timeline() offset param is v2.5.2+Pagination — must be passed
+//!   from the handler; internal callers (mpi_context_inject) pass 0.
+//! - get_artifact_with_content() stores plaintext (Step 10 stores code_content
+//!   directly). Future encryption: decrypt here using record_key pattern.
+//! - search_artifacts_by_filename() escapes LIKE special chars (%, _, \) to
+//!   prevent injection via filename pattern parameter.
+//! - The core logic of this file cannot be deleted or significantly modified.
+//! - Maintain interface compatibility with reflection.rs and mpi_graph_handlers.rs.
+//!
+//! ## Modification History
+//! v2.4.0-GraphCognition Phase B - 🌟 get_rawlogs_for_session, update_session_ended_at,
+//!   mark_session_artifacts_extracted, mark_session_summary_generated,
+//!   get_entities_with_embedding, merge_entities
+//! v2.4.0+Search    - 🌟 EntityTimelineEntry + get_entity_timeline()
+//! v2.5.2+Pagination - 🌟 get_entity_timeline gains offset param
+//! v2.5.3+ArtifactChain - 🌟 get_latest_artifact_version, get_artifact_with_content,
+//!   search_artifacts_by_filename, ArtifactWithContent struct; 4 new tests
 //!
 //! ## Last Modified
-//! v2.4.0-GraphCognition Phase B - 🌟 Methods originally in storage_ops.rs.
-//!   get_rawlogs_for_session, update_session_ended_at, mark_session_artifacts_extracted,
-//!   mark_session_summary_generated, get_entities_with_embedding, merge_entities.
-//! v2.4.0+Search - 🌟 Split into dedicated file (storage_miner.rs).
-//!   Added EntityTimelineEntry struct + get_entity_timeline() method.
+//! v2.5.3+ArtifactChain - 🌟 DEV-TASK-001 artifact chain methods
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use tracing::{debug, info, warn};
 
 use super::storage::{MemoryStorage, RawLogRow};
@@ -83,14 +93,43 @@ pub struct EntityTimelineEntry {
 }
 
 // ============================================
+// v2.5.3+ArtifactChain: Artifact with Content
+// ============================================
+
+/// Artifact row with decrypted content.
+///
+/// Returned by `get_artifact_with_content()`.
+/// Content is always UTF-8 text (code artifacts store plaintext).
+///
+/// ## Encryption note
+/// Step 10 currently stores `code_content.as_bytes()` directly (plaintext).
+/// Future: if encryption is added, decrypt here using the record_key pattern.
+///
+/// v2.5.3+ArtifactChain
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ArtifactWithContent {
+    pub artifact_id: String,
+    pub session_id: String,
+    pub project_id: Option<String>,
+    pub artifact_type: String,
+    pub filename: Option<String>,
+    pub language: Option<String>,
+    pub version: i64,
+    pub parent_id: Option<String>,
+    /// Decrypted plaintext code content.
+    pub content: String,
+    pub content_hash: String,
+    pub line_count: Option<i64>,
+    pub created_at: i64,
+}
+
+// ============================================
 // impl MemoryStorage — Miner Step Support (Phase B)
 // ============================================
 
 impl MemoryStorage {
     /// Get raw_logs for a specific session, ordered by turn_index.
     /// Used by Miner Step 7 to reconstruct full conversation text for NER.
-    ///
-    /// Returns: Vec<RawLogRow> — all turns (user + assistant) for this session.
     pub async fn get_rawlogs_for_session(&self, session_id: &str) -> Vec<RawLogRow> {
         let conn = self.conn.lock().await;
         let mut stmt = match conn.prepare(
@@ -136,7 +175,6 @@ impl MemoryStorage {
     /// Mark a session as having completed artifact extraction. Used by Miner Step 10.
     ///
     /// ⚠️ Requires `artifacts_extracted` column in `sessions` table.
-    /// Schema migration: ALTER TABLE sessions ADD COLUMN artifacts_extracted INTEGER DEFAULT 0
     pub async fn mark_session_artifacts_extracted(&self, session_id: &str) {
         let conn = self.conn.lock().await;
         if let Err(e) = conn.execute(
@@ -191,16 +229,14 @@ impl MemoryStorage {
 
     /// Merge entity `source_id` into `target_id`.
     ///
-    /// Operations performed:
+    /// Operations:
     /// 1. Add source's mention_count to target
     /// 2. Append source's description to target (if different)
-    /// 3. Repoint all knowledge_edges from source → target
-    /// 4. Invalidate self-loops created by the merge (BUG FIX)
+    /// 3. Repoint all knowledge_edges source→target
+    /// 4. Invalidate self-loops created by the merge
     /// 5. Repoint episode_edges (OR IGNORE for unique constraint)
-    /// 6. Delete remaining orphaned source episode_edges
+    /// 6. Delete orphaned source episode_edges
     /// 7. Delete the source entity
-    ///
-    /// Used by Miner Step 9 (cosine > ENTITY_MERGE_THRESHOLD).
     pub async fn merge_entities(
         &self, owner: &[u8; 32], source_id: &str, target_id: &str,
     ) -> Result<(), String> {
@@ -211,22 +247,17 @@ impl MemoryStorage {
 
         let conn = self.conn.lock().await;
 
-        // Get source entity info
-        let source_info: Option<(i64, Option<String>)> = {
-            use rusqlite::OptionalExtension;
-            conn.query_row(
-                "SELECT mention_count, description FROM entities WHERE entity_id = ?1",
-                params![source_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional().unwrap_or(None)
-        };
+        let source_info: Option<(i64, Option<String>)> = conn.query_row(
+            "SELECT mention_count, description FROM entities WHERE entity_id = ?1",
+            params![source_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().unwrap_or(None);
 
         let (src_mentions, src_desc) = match source_info {
             Some(info) => info,
             None => return Err(format!("Source entity {} not found", source_id)),
         };
 
-        // Merge mention_count and description into target
         if let Some(desc) = src_desc {
             conn.execute(
                 "UPDATE entities SET
@@ -248,7 +279,6 @@ impl MemoryStorage {
             ).map_err(|e| format!("Merge entity counts: {}", e))?;
         }
 
-        // Repoint knowledge_edges: source_id references → target_id
         let _ = conn.execute(
             "UPDATE knowledge_edges SET source_id = ?1, updated_at = ?2
              WHERE source_id = ?3 AND owner = ?4",
@@ -260,76 +290,69 @@ impl MemoryStorage {
             params![target_id, now, source_id, owner.as_slice()],
         );
 
-        // BUG FIX: Clean up self-referencing edges created by the merge.
-        // After repointing, edges that connected source↔target now have
-        // source_id == target_id == target_id (self-loop). Invalidate them.
+        // Invalidate self-loops created by the merge (source↔target → target↔target)
         let self_loop_count = conn.execute(
             "UPDATE knowledge_edges SET valid_until = ?1, updated_at = ?1
              WHERE owner = ?2 AND source_id = ?3 AND target_id = ?3 AND valid_until IS NULL",
             params![now, owner.as_slice(), target_id],
         ).unwrap_or(0);
         if self_loop_count > 0 {
-            debug!(
-                count = self_loop_count, target = target_id,
-                "[STORAGE] Self-loop edges invalidated after merge"
-            );
+            debug!(count = self_loop_count, target = target_id,
+                "[STORAGE] Self-loop edges invalidated after merge");
         }
 
-        // Repoint episode_edges (OR IGNORE for unique constraint violations
-        // when both source and target were linked to the same episode)
         let _ = conn.execute(
             "UPDATE OR IGNORE episode_edges SET entity_id = ?1
              WHERE entity_id = ?2 AND owner = ?3",
             params![target_id, source_id, owner.as_slice()],
         );
-        // Delete remaining source episode_edges that couldn't be repointed
         let _ = conn.execute(
             "DELETE FROM episode_edges WHERE entity_id = ?1 AND owner = ?2",
             params![source_id, owner.as_slice()],
         );
-
-        // Delete source entity
         let _ = conn.execute(
             "DELETE FROM entities WHERE entity_id = ?1",
             params![source_id],
         );
 
-        info!(
-            source = source_id, target = target_id,
-            merged_mentions = src_mentions,
-            "[STORAGE] Entities merged"
-        );
+        info!(source = source_id, target = target_id,
+            merged_mentions = src_mentions, "[STORAGE] Entities merged");
 
         Ok(())
     }
 }
 
 // ============================================
-// impl MemoryStorage — v2.4.0+Search: Entity Timeline
+// impl MemoryStorage — Entity Timeline (v2.4.0+Search)
 // ============================================
 
 impl MemoryStorage {
     /// Get timeline of events for an entity across all sessions.
     ///
-    /// Returns events sorted by started_at ASC (chronological order).
+    /// Returns events sorted by started_at ASC (chronological).
+    ///
+    /// ## v2.5.2+Pagination
+    /// `offset` parameter added. Pass `0` for non-paginated callers
+    /// (e.g. mpi_context_inject internal call).
     ///
     /// ## Event Types
-    /// - "mentioned"            → entity appeared in a session (via episode_edges → sessions)
+    /// - "mentioned"            → entity appeared in a session
     /// - "relation_created"     → knowledge edge was created
-    /// - "relation_invalidated" → knowledge edge was invalidated (temporal conflict)
+    /// - "relation_invalidated" → knowledge edge was invalidated
     ///
-    /// ## Limitation
-    /// Relation events have `session_id = ""` because knowledge_edges don't
-    /// directly reference sessions. Can be improved in Phase C by tracing
-    /// knowledge_edges.episode_id → episodes.session_id.
+    /// ⚠️ Relation events have `session_id = ""` — knowledge_edges don't
+    /// directly reference sessions. TODO Phase C: trace via episode_id.
     pub async fn get_entity_timeline(
-        &self, entity_id: &str, owner: &[u8; 32], limit: usize,
+        &self,
+        entity_id: &str,
+        owner: &[u8; 32],
+        limit: usize,
+        offset: usize,
     ) -> Vec<EntityTimelineEntry> {
         let conn = self.conn.lock().await;
         let mut events: Vec<EntityTimelineEntry> = Vec::new();
 
         // ── Part 1: Mentions ──
-        // Trace: entity → episode_edges → episodes → sessions
         {
             let mut stmt = match conn.prepare(
                 "SELECT DISTINCT s.session_id, s.title, s.started_at, s.project_id, ee.role
@@ -338,26 +361,25 @@ impl MemoryStorage {
                  JOIN sessions s ON s.session_id = e.session_id
                  WHERE ee.entity_id = ?1 AND ee.owner = ?2
                  ORDER BY s.started_at ASC
-                 LIMIT ?3"
+                 LIMIT ?3 OFFSET ?4"
             ) {
                 Ok(s) => s,
                 Err(_) => return events,
             };
 
             let rows: Vec<(String, Option<String>, i64, Option<String>, String)> = stmt
-                .query_map(params![entity_id, owner.as_slice(), limit as i64], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-                })
+                .query_map(
+                    params![entity_id, owner.as_slice(), limit as i64, offset as i64],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                )
                 .map(|r| r.filter_map(|x| x.ok()).collect())
                 .unwrap_or_default();
 
             for (sid, title, started_at, project_id, role) in rows {
-                // Look up project name via project_id
                 let project_name: Option<String> = project_id.and_then(|pid| {
                     conn.query_row(
                         "SELECT name FROM projects WHERE project_id = ?1",
-                        params![pid],
-                        |row| row.get(0),
+                        params![pid], |row| row.get(0),
                     ).ok()
                 });
 
@@ -375,7 +397,6 @@ impl MemoryStorage {
         }
 
         // ── Part 2: Relations ──
-        // knowledge_edges where this entity is source or target
         {
             let mut stmt = match conn.prepare(
                 "SELECT ke.relation_type, ke.fact_text, ke.valid_from, ke.valid_until,
@@ -394,10 +415,11 @@ impl MemoryStorage {
             };
 
             let rows: Vec<(String, Option<String>, i64, Option<i64>, String, String, String, String)> = stmt
-                .query_map(params![owner.as_slice(), entity_id, limit as i64], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                        row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))
-                })
+                .query_map(
+                    params![owner.as_slice(), entity_id, limit as i64],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                              row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))
+                )
                 .map(|r| r.filter_map(|x| x.ok()).collect())
                 .unwrap_or_default();
 
@@ -421,8 +443,6 @@ impl MemoryStorage {
                 });
 
                 events.push(EntityTimelineEntry {
-                    // Relation events are not tied to a specific session directly.
-                    // TODO(Phase C): trace knowledge_edges.episode_id → episodes.session_id
                     session_id: String::new(),
                     session_title: None,
                     project_name: None,
@@ -435,14 +455,161 @@ impl MemoryStorage {
             }
         }
 
-        // Sort all events chronologically
         events.sort_by_key(|e| e.started_at);
         events
     }
 }
 
 // ============================================
-// Tests — Miner Step Support + Entity Timeline
+// impl MemoryStorage — v2.5.3+ArtifactChain
+// ============================================
+
+impl MemoryStorage {
+    /// Get the latest artifact version for a given owner + filename.
+    ///
+    /// Returns `(version, artifact_id)`:
+    /// - `(0, None)` if no artifact with this filename exists yet (first version)
+    /// - `(n, Some(id))` if version n exists (next insert should use version n+1)
+    ///
+    /// Used by Miner Step 10 to build version chains across sessions.
+    ///
+    /// v2.5.3+ArtifactChain
+    pub async fn get_latest_artifact_version(
+        &self,
+        owner: &[u8; 32],
+        filename: &str,
+    ) -> (i64, Option<String>) {
+        let conn = self.conn.lock().await;
+        let result: Option<(i64, String)> = conn.query_row(
+            "SELECT version, artifact_id FROM artifacts
+             WHERE owner = ?1 AND filename = ?2
+             ORDER BY version DESC
+             LIMIT 1",
+            params![owner.as_slice(), filename],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().unwrap_or(None);
+
+        match result {
+            Some((v, id)) => (v, Some(id)),
+            None => (0, None),
+        }
+    }
+
+    /// Get artifact metadata + decrypted content by artifact_id.
+    ///
+    /// Returns `None` if artifact not found or owner mismatch.
+    /// Content is returned as UTF-8 string (code is always text).
+    ///
+    /// Used by `GET /api/mpi/artifacts/:id` endpoint.
+    ///
+    /// v2.5.3+ArtifactChain
+    pub async fn get_artifact_with_content(
+        &self,
+        artifact_id: &str,
+        owner: &[u8; 32],
+    ) -> Option<ArtifactWithContent> {
+        let conn = self.conn.lock().await;
+
+        conn.query_row(
+            "SELECT artifact_id, session_id, project_id, artifact_type,
+                    filename, language, version, parent_id,
+                    encrypted_content, content_hash, line_count, created_at
+             FROM artifacts
+             WHERE artifact_id = ?1 AND owner = ?2",
+            params![artifact_id, owner.as_slice()],
+            |row| {
+                let raw_content: Vec<u8> = row.get(8)?;
+                // Step 10 stores code_content.as_bytes() directly (plaintext).
+                // Future: if encryption is added, decrypt here using record_key.
+                let content = String::from_utf8(raw_content)
+                    .unwrap_or_else(|_| String::from("[binary content]"));
+
+                Ok(ArtifactWithContent {
+                    artifact_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    project_id: row.get(2)?,
+                    artifact_type: row.get(3)?,
+                    filename: row.get(4)?,
+                    language: row.get(5)?,
+                    version: row.get(6)?,
+                    parent_id: row.get(7)?,
+                    content,
+                    content_hash: row.get(9)?,
+                    line_count: row.get(10)?,
+                    created_at: row.get(11)?,
+                })
+            },
+        ).optional().unwrap_or(None)
+    }
+
+    /// Search artifacts by filename pattern (LIKE %pattern%) for an owner.
+    ///
+    /// Returns all versions matching the filename, ordered by filename ASC,
+    /// version DESC (latest version first within each file).
+    ///
+    /// Used by `GET /api/mpi/artifacts/search?filename=auth.rs`.
+    ///
+    /// ## LIKE injection prevention
+    /// Escapes `%`, `_`, `\` in the pattern before building the LIKE clause.
+    ///
+    /// v2.5.3+ArtifactChain
+    pub async fn search_artifacts_by_filename(
+        &self,
+        owner: &[u8; 32],
+        filename_pattern: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<crate::services::memchain::ArtifactRow> {
+        if filename_pattern.trim().is_empty() {
+            return Vec::new();
+        }
+
+        // Escape LIKE special chars to prevent injection via filename param
+        let escaped = filename_pattern
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{}%", escaped.to_lowercase());
+
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT artifact_id, session_id, project_id, artifact_type, filename,
+                    language, version, parent_id, content_hash, line_count, created_at
+             FROM artifacts
+             WHERE owner = ?1 AND lower(COALESCE(filename, '')) LIKE ?2 ESCAPE '\\'
+             ORDER BY filename ASC, version DESC
+             LIMIT ?3 OFFSET ?4"
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("[STORAGE] search_artifacts_by_filename prepare failed: {}", e);
+                return Vec::new();
+            }
+        };
+
+        stmt.query_map(
+            params![owner.as_slice(), pattern, limit as i64, offset as i64],
+            |row| Ok(crate::services::memchain::ArtifactRow {
+                artifact_id: row.get(0)?,
+                session_id: row.get(1)?,
+                project_id: row.get(2)?,
+                artifact_type: row.get(3)?,
+                filename: row.get(4)?,
+                language: row.get(5)?,
+                version: row.get(6)?,
+                parent_id: row.get(7)?,
+                content_hash: row.get(8)?,
+                line_count: row.get(9)?,
+                created_at: row.get(10)?,
+            }),
+        )
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+}
+
+// ============================================
+// Tests
 // ============================================
 
 #[cfg(test)]
@@ -474,21 +641,17 @@ mod tests {
 
         s.upsert_entity("ent_jwt", &owner, "JWT", "jwt", "technology", Some("Token format"), None).await.unwrap();
         s.upsert_entity("ent_jwt2", &owner, "JSON Web Token", "json web token", "technology", Some("Auth token"), None).await.unwrap();
-        // Mention ent_jwt2 twice more
         s.upsert_entity("ent_jwt2", &owner, "JSON Web Token", "json web token", "technology", None, None).await.unwrap();
 
         s.insert_knowledge_edge(&owner, "ent_jwt2", "ent_auth", "USED_BY", None, 1.0, 0.9, None, now, None).await.unwrap();
 
         s.merge_entities(&owner, "ent_jwt2", "ent_jwt").await.unwrap();
 
-        // Source deleted
         assert!(s.get_entity("ent_jwt2").await.is_none());
 
-        // Target accumulated: 1 (original) + 2 (from source)
         let target = s.get_entity("ent_jwt").await.unwrap();
         assert_eq!(target.mention_count, 3);
 
-        // Edge repointed to target
         let edges = s.get_edges_for_entity("ent_jwt", &owner).await;
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].source_id, "ent_jwt");
@@ -503,12 +666,10 @@ mod tests {
         s.upsert_entity("ent_a", &owner, "A", "a", "concept", None, None).await.unwrap();
         s.upsert_entity("ent_b", &owner, "B", "b", "concept", None, None).await.unwrap();
 
-        // A→B edge; after merging B into A becomes A→A (self-loop)
         s.insert_knowledge_edge(&owner, "ent_a", "ent_b", "RELATED_TO", None, 1.0, 0.9, None, now, None).await.unwrap();
 
         s.merge_entities(&owner, "ent_b", "ent_a").await.unwrap();
 
-        // Self-loop should be invalidated
         let edges = s.get_edges_for_entity("ent_a", &owner).await;
         assert!(edges.is_empty(), "Self-loop edges should be invalidated after merge");
     }
@@ -532,5 +693,97 @@ mod tests {
 
         let pending = s.get_pending_sessions(&owner, 10).await;
         assert!(pending.is_empty());
+    }
+
+    // ── v2.5.3+ArtifactChain tests ──
+
+    #[tokio::test]
+    async fn test_get_latest_artifact_version_empty() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        // No artifacts exist → should return (0, None)
+        let (v, id) = s.get_latest_artifact_version(&owner, "auth.rs").await;
+        assert_eq!(v, 0);
+        assert!(id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_artifact_version_chain() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+
+        s.insert_artifact(
+            "art_v1", &owner, "sess_001", None, "code",
+            Some("auth.rs"), Some("rust"), 1, None,
+            b"fn auth() {}", "hash1", None, Some(1),
+        ).await.unwrap();
+
+        let (v, id) = s.get_latest_artifact_version(&owner, "auth.rs").await;
+        assert_eq!(v, 1);
+        assert_eq!(id, Some("art_v1".to_string()));
+
+        s.insert_artifact(
+            "art_v2", &owner, "sess_002", None, "code",
+            Some("auth.rs"), Some("rust"), 2, Some("art_v1"),
+            b"fn auth() { jwt() }", "hash2", None, Some(1),
+        ).await.unwrap();
+
+        let (v2, id2) = s.get_latest_artifact_version(&owner, "auth.rs").await;
+        assert_eq!(v2, 2);
+        assert_eq!(id2, Some("art_v2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_artifact_with_content() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+
+        s.insert_artifact(
+            "art_001", &owner, "sess_001", None, "code",
+            Some("main.rs"), Some("rust"), 1, None,
+            b"fn main() { println!(\"hello\"); }", "abc123",
+            None, Some(1),
+        ).await.unwrap();
+
+        let result = s.get_artifact_with_content("art_001", &owner).await;
+        assert!(result.is_some());
+        let art = result.unwrap();
+        assert_eq!(art.filename, Some("main.rs".to_string()));
+        assert_eq!(art.version, 1);
+        assert!(art.content.contains("println"));
+
+        // Other owner must not access
+        let other_owner = [0xBB; 32];
+        assert!(s.get_artifact_with_content("art_001", &other_owner).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_search_artifacts_by_filename() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+
+        s.insert_artifact("art_1", &owner, "s1", None, "code",
+            Some("auth.rs"), Some("rust"), 1, None, b"v1", "h1", None, None).await.unwrap();
+        s.insert_artifact("art_2", &owner, "s2", None, "code",
+            Some("auth.rs"), Some("rust"), 2, Some("art_1"), b"v2", "h2", None, None).await.unwrap();
+        s.insert_artifact("art_3", &owner, "s3", None, "code",
+            Some("main.rs"), Some("rust"), 1, None, b"main", "h3", None, None).await.unwrap();
+
+        // "auth" matches auth.rs (both versions)
+        let results = s.search_artifacts_by_filename(&owner, "auth", 10, 0).await;
+        assert_eq!(results.len(), 2);
+
+        // "main" matches only main.rs
+        let results2 = s.search_artifacts_by_filename(&owner, "main", 10, 0).await;
+        assert_eq!(results2.len(), 1);
+        assert_eq!(results2[0].filename, Some("main.rs".to_string()));
+
+        // offset beyond results → empty
+        let results3 = s.search_artifacts_by_filename(&owner, "auth", 10, 99).await;
+        assert!(results3.is_empty());
+
+        // empty pattern → empty (fast-path guard)
+        let results4 = s.search_artifacts_by_filename(&owner, "", 10, 0).await;
+        assert!(results4.is_empty());
     }
 }
