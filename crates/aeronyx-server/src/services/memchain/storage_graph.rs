@@ -597,12 +597,15 @@ impl MemoryStorage {
     }
 
     /// Get a single project by ID.
-    pub async fn get_project(&self, project_id: &str) -> Option<ProjectRow> {
+    ///
+    /// ## P0 SecAudit: owner filter added
+    /// Requires caller's owner bytes to prevent cross-user project access.
+    pub async fn get_project(&self, project_id: &str, owner: &[u8; 32]) -> Option<ProjectRow> {
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT project_id, name, status, community_id, summary, last_active_at
-             FROM projects WHERE project_id = ?1",
-            params![project_id],
+             FROM projects WHERE project_id = ?1 AND owner = ?2",
+            params![project_id, owner.as_slice()],
             |row| Ok(ProjectRow {
                 project_id: row.get(0)?, name: row.get(1)?, status: row.get(2)?,
                 community_id: row.get(3)?, summary: row.get(4)?, last_active_at: row.get(5)?,
@@ -636,15 +639,18 @@ impl MemoryStorage {
 
     /// Get a session by ID.
     ///
+    /// ## P0 SecAudit: owner filter added
+    /// Without owner filter, any authenticated user could read any session by ID.
+    ///
     /// ## v2.4.0+Search
     /// SELECT now includes `title` (column index 3).
-    pub async fn get_session(&self, session_id: &str) -> Option<SessionRow> {
+    pub async fn get_session(&self, session_id: &str, owner: &[u8; 32]) -> Option<SessionRow> {
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT session_id, project_id, session_type, title, started_at, ended_at,
                     turn_count, summary, key_decisions, entities_extracted, summary_generated
-             FROM sessions WHERE session_id = ?1",
-            params![session_id],
+             FROM sessions WHERE session_id = ?1 AND owner = ?2",
+            params![session_id, owner.as_slice()],
             |row| Ok(SessionRow {
                 session_id: row.get(0)?, project_id: row.get(1)?, session_type: row.get(2)?,
                 title: row.get(3)?,
@@ -658,6 +664,10 @@ impl MemoryStorage {
 
     /// Get sessions for a project (timeline view), with pagination support.
     ///
+    /// ## P0 SecAudit: owner filter added
+    /// project_id alone is not sufficient — a caller could enumerate sessions of
+    /// projects they don't own. SQL now requires owner = ?4.
+    ///
     /// ## v2.4.0+Search
     /// SELECT now includes `title` (column index 3).
     ///
@@ -665,19 +675,19 @@ impl MemoryStorage {
     /// Added `offset: usize` parameter. SQL updated to `LIMIT ?2 OFFSET ?3`.
     ///
     /// ⚠️ Call sites:
-    /// - mpi_project_timeline() → pass `params.offset`
-    /// - mpi_context_inject()   → pass `0` (no pagination needed)
+    /// - mpi_project_timeline() → pass `params.offset`, owner
+    /// - mpi_context_inject()   → pass `0`, owner
     pub async fn get_sessions_for_project(
-        &self, project_id: &str, limit: usize, offset: usize,
+        &self, project_id: &str, limit: usize, offset: usize, owner: &[u8; 32],
     ) -> Vec<SessionRow> {
         let conn = self.conn.lock().await;
         let mut stmt = match conn.prepare(
             "SELECT session_id, project_id, session_type, title, started_at, ended_at,
                     turn_count, summary, key_decisions, entities_extracted, summary_generated
-             FROM sessions WHERE project_id = ?1
+             FROM sessions WHERE project_id = ?1 AND owner = ?4
              ORDER BY started_at DESC LIMIT ?2 OFFSET ?3"
         ) { Ok(s) => s, Err(_) => return Vec::new() };
-        stmt.query_map(params![project_id, limit as i64, offset as i64], |row| Ok(SessionRow {
+        stmt.query_map(params![project_id, limit as i64, offset as i64, owner.as_slice()], |row| Ok(SessionRow {
             session_id: row.get(0)?, project_id: row.get(1)?, session_type: row.get(2)?,
             title: row.get(3)?,
             started_at: row.get(4)?, ended_at: row.get(5)?, turn_count: row.get(6)?,
@@ -813,14 +823,17 @@ impl MemoryStorage {
     }
 
     /// Get artifacts for a session.
-    pub async fn get_artifacts_for_session(&self, session_id: &str) -> Vec<ArtifactRow> {
+    ///
+    /// ## P0 SecAudit: owner filter added
+    /// session_id alone does not prove ownership — SQL now requires owner = ?2.
+    pub async fn get_artifacts_for_session(&self, session_id: &str, owner: &[u8; 32]) -> Vec<ArtifactRow> {
         let conn = self.conn.lock().await;
         let mut stmt = match conn.prepare(
             "SELECT artifact_id, session_id, project_id, artifact_type, filename,
                     language, version, parent_id, content_hash, line_count, created_at
-             FROM artifacts WHERE session_id = ?1 ORDER BY created_at ASC"
+             FROM artifacts WHERE session_id = ?1 AND owner = ?2 ORDER BY created_at ASC"
         ) { Ok(s) => s, Err(_) => return Vec::new() };
-        stmt.query_map(params![session_id], |row| Ok(ArtifactRow {
+        stmt.query_map(params![session_id, owner.as_slice()], |row| Ok(ArtifactRow {
             artifact_id: row.get(0)?, session_id: row.get(1)?, project_id: row.get(2)?,
             artifact_type: row.get(3)?, filename: row.get(4)?, language: row.get(5)?,
             version: row.get(6)?, parent_id: row.get(7)?, content_hash: row.get(8)?,
@@ -852,20 +865,25 @@ impl MemoryStorage {
 
 impl MemoryStorage {
     /// Get cognitive graph statistics for /api/mpi/status.
+    ///
+    /// ## P1 SecAudit: removed dynamic table-name format!()
+    /// Using format!("SELECT COUNT(*) FROM {}", table) is safe when table is a
+    /// compile-time constant, but the pattern invites future SQL injection if
+    /// anyone makes table dynamic. Replaced with 7 explicit queries.
     pub async fn graph_stats(&self, owner: &[u8; 32]) -> GraphStats {
         let conn = self.conn.lock().await;
-        let q = |table: &str| -> u64 {
-            let sql = format!("SELECT COUNT(*) FROM {} WHERE owner = ?1", table);
-            conn.query_row(&sql, params![owner.as_slice()], |r| r.get::<_, i64>(0)).unwrap_or(0) as u64
+        let count = |sql: &str| -> u64 {
+            conn.query_row(sql, params![owner.as_slice()], |r| r.get::<_, i64>(0))
+                .unwrap_or(0) as u64
         };
         GraphStats {
-            episodes: q("episodes"),
-            entities: q("entities"),
-            knowledge_edges: q("knowledge_edges"),
-            communities: q("communities"),
-            projects: q("projects"),
-            sessions: q("sessions"),
-            artifacts: q("artifacts"),
+            episodes:       count("SELECT COUNT(*) FROM episodes       WHERE owner = ?1"),
+            entities:       count("SELECT COUNT(*) FROM entities        WHERE owner = ?1"),
+            knowledge_edges:count("SELECT COUNT(*) FROM knowledge_edges WHERE owner = ?1"),
+            communities:    count("SELECT COUNT(*) FROM communities     WHERE owner = ?1"),
+            projects:       count("SELECT COUNT(*) FROM projects        WHERE owner = ?1"),
+            sessions:       count("SELECT COUNT(*) FROM sessions        WHERE owner = ?1"),
+            artifacts:      count("SELECT COUNT(*) FROM artifacts       WHERE owner = ?1"),
         }
     }
 }
@@ -1002,8 +1020,8 @@ mod tests {
         s.upsert_session("sess_001", &owner, Some("comm_1"), "code", now, 10).await.unwrap();
         let projects = s.get_projects(&owner, Some("active"), 10).await;
         assert_eq!(projects.len(), 1);
-        // v2.5.2+Pagination: pass explicit offset=0
-        let sessions = s.get_sessions_for_project("comm_1", 10, 0).await;
+        // v2.5.2+Pagination + SecAudit: pass explicit offset=0 and owner
+        let sessions = s.get_sessions_for_project("comm_1", 10, 0, &owner).await;
         assert_eq!(sessions.len(), 1);
     }
 
@@ -1016,14 +1034,19 @@ mod tests {
         for i in 0..5u64 {
             s.upsert_session(&format!("sess_{i:03}"), &owner, Some("comm_1"), "code", now + i as i64, 1).await.unwrap();
         }
-        let page0 = s.get_sessions_for_project("comm_1", 3, 0).await;
-        let page1 = s.get_sessions_for_project("comm_1", 3, 3).await;
+        let page0 = s.get_sessions_for_project("comm_1", 3, 0, &owner).await;
+        let page1 = s.get_sessions_for_project("comm_1", 3, 3, &owner).await;
         assert_eq!(page0.len(), 3);
         assert_eq!(page1.len(), 2);
         // No overlap between pages
         let ids0: std::collections::HashSet<_> = page0.iter().map(|s| &s.session_id).collect();
         let ids1: std::collections::HashSet<_> = page1.iter().map(|s| &s.session_id).collect();
         assert!(ids0.is_disjoint(&ids1));
+
+        // Cross-owner isolation: different owner must see 0 sessions
+        let other_owner = [0xBB; 32];
+        let isolated = s.get_sessions_for_project("comm_1", 10, 0, &other_owner).await;
+        assert!(isolated.is_empty(), "Different owner must not see other's sessions");
     }
 
     #[tokio::test]
