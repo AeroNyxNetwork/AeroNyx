@@ -7,10 +7,16 @@
 //! Provides operational visibility and control over the cognitive task queue
 //! and LLM provider health. All endpoints are local-only (remote → 403).
 //!
+//! ## Modification Reason (v2.5.2+Pagination)
+//! Added `offset: usize` to `TaskListParams` for cursor-free pagination of the
+//! task list. `get_tasks_filtered()` in storage_supernode.rs must also accept
+//! the new `offset` parameter (SQL: `LIMIT ?N OFFSET ?M`).
+//! Response JSON now includes `has_more` and `filters.offset`.
+//!
 //! ## Endpoints (6)
 //! | Method | Path | Description |
 //! |--------|------|-------------|
-//! | GET  | /supernode/tasks?status=&type=&limit= | List tasks with optional filters |
+//! | GET  | /supernode/tasks?status=&type=&limit=&offset= | List tasks (paginated) |
 //! | GET  | /supernode/tasks/:id | Task detail (payload + result + token_usage) |
 //! | POST | /supernode/tasks/:id/retry | Reset failed/cancelled to pending |
 //! | POST | /supernode/tasks/:id/cancel | Cancel pending task |
@@ -21,7 +27,7 @@
 //! All endpoints enforce local-only access via `AuthenticatedOwner::is_remote()`.
 //! Remote callers receive 403.
 //!
-//! ⚠️ Important Note for Next Developer:
+//! ⚠️ Important Notes for Next Developer:
 //! - GET /supernode/health does NOT make LLM API calls (Fix 3). It sends a lightweight
 //!   HTTP HEAD request to the provider's api_base to check reachability, avoiding
 //!   real API quota consumption. This means it validates connectivity only, not auth.
@@ -34,6 +40,8 @@
 //!   Callers in non-UTC timezones should use explicit `since`/`until` params instead.
 //! - Numeric fields in JSON responses are actual numbers (f64/i64), not strings.
 //!   avg_latency_ms and estimated_cost_usd are f64, not formatted strings (Fix 10).
+//! - v2.5.2+Pagination: `get_tasks_filtered()` in storage_supernode.rs must accept
+//!   `offset: usize` and use `LIMIT ?N OFFSET ?M` in SQL. Update that call site too.
 //!
 //! ## Period Format (usage endpoint)
 //! - `"YYYY-MM"` — calendar month in UTC (e.g. "2026-03")
@@ -43,21 +51,25 @@
 //! - No params — all time
 //!
 //! ## Last Modified
-//! v2.5.0+SuperNode Phase C - 🌟 Created (6 endpoints).
-//! v2.5.0+SuperNode Phase D - 🌟 tasks list adds `type=` filter;
+//! v2.5.0+SuperNode Phase C - Created (6 endpoints).
+//! v2.5.0+SuperNode Phase D - tasks list adds `type=` filter;
 //!   usage adds by_task_type breakdown; retry uses storage.retry_task();
 //!   health uses count_tasks_by_status().
-//! v2.5.0+Audit Fix 1  - 🔧 days_since_epoch replaced with chrono-based
+//! v2.5.0+Audit Fix 1  - days_since_epoch replaced with chrono-based
 //!   calculation to fix Gregorian leap year math errors for years far from 1970.
-//! v2.5.0+Audit Fix 2  - 🔧 health check uses router.ping_provider() instead of
+//! v2.5.0+Audit Fix 2  - health check uses router.ping_provider() instead of
 //!   CognitiveTaskType::CustomPrompt (which doesn't exist → compile error).
-//! v2.5.0+Audit Fix 3  - 🔧 health check issues HTTP HEAD to api_base instead of
+//! v2.5.0+Audit Fix 3  - health check issues HTTP HEAD to api_base instead of
 //!   real LLM completion requests, eliminating API quota consumption.
-//! v2.5.0+Audit Fix 4  - 🔧 "today" period documented and labeled as UTC in response.
-//! v2.5.0+Audit Fix 5  - 🔧 cancel_task checks affected rows; returns 409 if task
+//! v2.5.0+Audit Fix 4  - "today" period documented and labeled as UTC in response.
+//! v2.5.0+Audit Fix 5  - cancel_task checks affected rows; returns 409 if task
 //!   was already claimed between status check and cancel SQL.
-//! v2.5.0+Audit Fix 10 - 🔧 avg_latency_ms and estimated_cost_usd are now f64 in
+//! v2.5.0+Audit Fix 10 - avg_latency_ms and estimated_cost_usd are now f64 in
 //!   JSON responses, not formatted strings. Frontend can use them as numbers directly.
+//! v2.5.2+Pagination   - TaskListParams gains `offset: usize` (default 0).
+//!   supernode_list_tasks passes offset to get_tasks_filtered().
+//!   Response includes `has_more` and `filters.offset`.
+// ============================================
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -76,6 +88,16 @@ use crate::services::memchain::LlmRouter;
 // Query Param Types
 // ============================================
 
+/// Query params for `GET /supernode/tasks`.
+///
+/// ## v2.5.2+Pagination
+/// Added `offset: usize` (default 0). Use with `limit` for page-based traversal:
+///   - Page 1: `?limit=20&offset=0`
+///   - Page 2: `?limit=20&offset=20`
+/// If the response `has_more` is true, increment offset by limit for the next page.
+///
+/// ⚠️ `storage_supernode.rs::get_tasks_filtered()` must also accept `offset: usize`
+/// and append `OFFSET ?M` to its SQL. See that file's v2.5.2+Pagination change.
 #[derive(Debug, Deserialize)]
 pub struct TaskListParams {
     #[serde(default)]
@@ -84,6 +106,9 @@ pub struct TaskListParams {
     pub task_type: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// Pagination offset (default 0). v2.5.2+Pagination.
+    #[serde(default)]
+    pub offset: usize,
 }
 
 fn default_limit() -> usize { 20 }
@@ -243,7 +268,7 @@ fn unix_days_for_date(year: i32, month: u32, day: u32) -> i64 {
         y * 365 + y / 4 - y / 100 + y / 400
     }
 
-    // Days from year 1 to Jan 1 of each month in `year`
+    // Days from year 1 to Jan 1 of each month in a non-leap year
     const MONTH_DAYS: [i64; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
     let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
     let leap_correction = if month > 2 && is_leap { 1 } else { 0 };
@@ -281,6 +306,15 @@ fn row_to_summary(t: &crate::services::memchain::CognitiveTaskRow) -> TaskSummar
 // GET /supernode/tasks
 // ============================================
 
+/// `GET /supernode/tasks` — List cognitive tasks with optional filters.
+///
+/// ## v2.5.2+Pagination
+/// Accepts `?offset=N` in addition to existing `?status=`, `?type=`, `?limit=`.
+/// Response now includes:
+/// - `filters.offset` — the offset used
+/// - `has_more` — true when `count == limit`, indicating a next page exists
+///
+/// ⚠️ `storage_supernode.rs::get_tasks_filtered()` must accept `offset: usize`.
 pub async fn supernode_list_tasks(
     State(state): State<Arc<MpiState>>,
     Query(params): Query<TaskListParams>,
@@ -291,17 +325,27 @@ pub async fn supernode_list_tasks(
     if state.llm_router.is_none() { return supernode_disabled().into_response(); }
 
     let limit = params.limit.min(100).max(1);
+    let offset = params.offset;
+
     let tasks = state.storage.get_tasks_filtered(
         params.status.as_deref(),
         params.task_type.as_deref(),
         limit,
+        offset,
     ).await;
 
     let summaries: Vec<TaskSummary> = tasks.iter().map(row_to_summary).collect();
+    let has_more = summaries.len() == limit;
 
     (StatusCode::OK, Json(serde_json::json!({
-        "filters": { "status": params.status, "type": params.task_type, "limit": limit },
+        "filters": {
+            "status": params.status,
+            "type": params.task_type,
+            "limit": limit,
+            "offset": offset,
+        },
         "count": summaries.len(),
+        "has_more": has_more,
         "tasks": summaries,
     }))).into_response()
 }
@@ -375,7 +419,6 @@ pub async fn supernode_retry_task(
             (StatusCode::CONFLICT, Json(serde_json::json!({ "error": e }))).into_response()
         }
         // Audit Fix 8: absolute retry ceiling hit → 422 Unprocessable Entity
-        // with actionable guidance for the operator
         Err(e) if e.contains("absolute retry ceiling") => {
             warn!(id = task_id, "[SUPERNODE] Retry blocked by absolute ceiling");
             (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({
@@ -424,7 +467,7 @@ pub async fn supernode_cancel_task(
         }))).into_response();
     }
 
-    // Audit Fix 5: cancel_task now returns the number of affected rows.
+    // Audit Fix 5: cancel_task returns the number of affected rows.
     // If 0 rows were affected, the task was claimed between our GET and the UPDATE
     // (TOCTOU window). Return 409 so the caller knows the cancel didn't take effect.
     match state.storage.cancel_task(task_id).await {
@@ -436,7 +479,6 @@ pub async fn supernode_cancel_task(
             }))).into_response()
         }
         Ok(0) => {
-            // Task was claimed by TaskWorker between our status check and the UPDATE
             (StatusCode::CONFLICT, Json(serde_json::json!({
                 "error": format!(
                     "task {} could not be cancelled — it may have been claimed by the worker \
@@ -473,7 +515,7 @@ pub async fn supernode_usage(
     let stats = state.storage.get_usage_stats(since, until).await;
     let by_task_type = state.storage.get_usage_stats_by_task_type(since, until).await;
 
-    // Audit Fix 10: use f64 for numeric fields, not formatted strings
+    // Audit Fix 10: use numeric types (i64/f64), not formatted strings
     let by_provider_with_cost: Vec<serde_json::Value> = stats.by_provider.iter().map(|p| {
         let cost = LlmRouter::estimate_cost(
             &p.provider, p.input_tokens as u32, p.output_tokens as u32, 0,
@@ -556,11 +598,11 @@ pub async fn supernode_health(
         cancelled:  *counts.get("cancelled").unwrap_or(&0),
     };
 
-    // Audit Fix 2+3: use router.ping_provider() instead of CognitiveTaskType::CustomPrompt
-    // (which doesn't exist). ping_provider() sends HTTP HEAD to api_base — checks
-    // reachability only, does NOT consume LLM API quota or auth credits.
+    // Audit Fix 2+3: use router.ping_provider() / HTTP HEAD instead of
+    // CognitiveTaskType::CustomPrompt (which doesn't exist → compile error).
+    // HTTP HEAD checks reachability only — does NOT consume LLM API quota or auth credits.
     //
-    // Audit Fix 12: run all provider pings concurrently via tokio::join!/FuturesUnordered
+    // Audit Fix 12: run all provider pings concurrently via futures::future::join_all
     // so total health check latency = max(provider latencies) rather than sum.
     let provider_configs = router.provider_configs();
     let client = reqwest::Client::builder()
@@ -576,15 +618,12 @@ pub async fn supernode_health(
         async move {
             let t0 = std::time::Instant::now();
             // HTTP HEAD to api_base — checks network reachability without consuming quota.
-            // Note: this validates connectivity only, NOT authentication or model availability.
             // A 401/403 response still means the endpoint is reachable (healthy = true here).
             let result = client.head(&api_base).send().await;
             let latency_ms = t0.elapsed().as_millis() as u64;
 
             match result {
                 Ok(resp) => {
-                    // Any HTTP response (even 4xx) means the endpoint is reachable
-                    let reachable = true;
                     debug!(
                         provider = %name,
                         status = resp.status().as_u16(),
@@ -594,7 +633,7 @@ pub async fn supernode_health(
                     ProviderHealthInfo {
                         name,
                         model,
-                        healthy: reachable,
+                        healthy: true,
                         latency_ms: Some(latency_ms),
                         error: None,
                         check_type: "http_head",
@@ -657,11 +696,9 @@ mod tests {
         assert_eq!(unix_days_for_date(1972, 1, 1), 730);
         // 1972-03-01 = 730 + 31 + 29 = 790 (1972 is a leap year)
         assert_eq!(unix_days_for_date(1972, 3, 1), 790);
-        // 2026-01-01: verified against known Unix timestamp 1735689600 / 86400 = 20089
+        // 2026-01-01: verified against Unix timestamp 1735689600 / 86400 = 20089
         assert_eq!(unix_days_for_date(2026, 1, 1), 20089);
-        // 2100-01-01: 2100 is NOT a leap year (div by 100, not div by 400)
-        // Days = unix_days_for_date(2100, 1, 1). Manual: 130 years from 1970.
-        // Just verify it's consistent and leap years are counted correctly
+        // 2100 is NOT a leap year (div by 100, not div by 400)
         let y2100 = unix_days_for_date(2100, 1, 1);
         let y2099 = unix_days_for_date(2099, 1, 1);
         // 2099 is not a leap year → 365 days
@@ -676,7 +713,6 @@ mod tests {
     fn test_parse_year_month_2026_03() {
         let params = UsageParams { period: Some("2026-03".into()), since: None, until: None };
         let (since, until) = parse_period(&params);
-        // 2026-03-01 00:00:00 UTC = unix_days_for_date(2026, 3, 1) * 86400
         let expected_start = unix_days_for_date(2026, 3, 1) * 86400;
         let expected_end = unix_days_for_date(2026, 4, 1) * 86400;
         assert_eq!(since, expected_start);
@@ -688,8 +724,7 @@ mod tests {
         let params = UsageParams { period: Some("today".into()), since: None, until: None };
         let (since, _until) = parse_period(&params);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-        // since should be today's UTC midnight
-        assert_eq!(since % 86400, 0);
+        assert_eq!(since % 86400, 0, "since should be UTC midnight");
         assert!(since <= now);
     }
 
@@ -712,5 +747,38 @@ mod tests {
         let (since, until) = parse_period(&params);
         assert!(until - since >= 7 * 86400 - 1);
         assert!(until - since <= 7 * 86400 + 1);
+    }
+
+    // ── v2.5.2+Pagination: TaskListParams ──
+
+    #[test]
+    fn test_task_list_params_defaults() {
+        // Simulate query string with no offset → offset should default to 0
+        let qs = "limit=10&status=pending";
+        let params: TaskListParams = serde_urlencoded::from_str(qs).unwrap();
+        assert_eq!(params.limit, 10);
+        assert_eq!(params.offset, 0);
+        assert_eq!(params.status.as_deref(), Some("pending"));
+        assert!(params.task_type.is_none());
+    }
+
+    #[test]
+    fn test_task_list_params_with_offset() {
+        let qs = "limit=20&offset=40&status=failed&type=summarize";
+        let params: TaskListParams = serde_urlencoded::from_str(qs).unwrap();
+        assert_eq!(params.limit, 20);
+        assert_eq!(params.offset, 40);
+        assert_eq!(params.status.as_deref(), Some("failed"));
+        assert_eq!(params.task_type.as_deref(), Some("summarize"));
+    }
+
+    #[test]
+    fn test_task_list_params_default_limit() {
+        // No params → all defaults
+        let params: TaskListParams = serde_urlencoded::from_str("").unwrap();
+        assert_eq!(params.limit, 20); // default_limit()
+        assert_eq!(params.offset, 0);
+        assert!(params.status.is_none());
+        assert!(params.task_type.is_none());
     }
 }
