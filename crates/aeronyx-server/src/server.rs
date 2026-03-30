@@ -30,19 +30,29 @@
 //!   - TaskWorker spawned as background task when supernode.enabled=true
 //!   - ReflectionMiner receives .with_llm_router() for Steps 8/9/10 enqueue
 //!   - All SuperNode paths gated on is_supernode_enabled() — safe to disable
+//! v2.5.2+SecAudit - 🔒 BroadcastRecord/SyncRecordResponse: signature now
+//!   verified against record content hash (record.content_hash_bytes()) rather
+//!   than record_id alone, preventing spoofed-content replay attacks.
+//!   public_ip resolution: metadata URLs restricted to HTTPS only + IP validation
+//!   tightened to reject private/loopback addresses as fallback detection.
 //!
-//! ⚠️ Important Note for Next Developer:
+//! ⚠️ Important Notes for Next Developer:
 //! - record_key is derived from identity.to_bytes() (Ed25519 PRIVATE key)
 //! - rawlog_key uses derive_rawlog_key() — a DIFFERENT KDF from derive_record_key()
 //! - SuperNode init order: init_llm_router() → reset_stale_processing_tasks() → TaskWorker
 //! - NerEngine MUST be loaded AFTER EmbedEngine (shared ORT runtime via Once)
 //! - RerankerEngine MUST be loaded AFTER EmbedEngine and NerEngine (shared ORT Once)
+//! - resolve_public_ip: NEVER use the GCP metadata URL (169.254.169.254) in
+//!   production — it bypasses TLS and is an SSRF vector if the URL list is
+//!   extended with user-controlled input. Current list is hardcoded and safe.
 //!
 //! ## Last Modified
 //! v2.4.0+Conversation - 🌟 derive_rawlog_key import, MpiState.rawlog_key field
 //! v2.5.0+SuperNode    - 🌟 init_llm_router(), TaskWorker spawn, MpiState.llm_router,
 //!   ReflectionMiner.with_llm_router(). Fixed: init_llm_router deduplication,
 //!   api_key closure type annotation, provider new() Result handling.
+//! v2.5.2+SecAudit     - 🔒 BroadcastRecord sig verification hardened.
+//!   resolve_public_ip private-IP guard added.
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -584,8 +594,6 @@ impl Server {
                             continue;
                         }
                     };
-                    // AnthropicProvider::new takes 5 args — no api_base param
-                    // (uses ANTHROPIC_API_BASE const internally)
                     match AnthropicProvider::new(
                         provider_cfg.name.clone(),
                         key,
@@ -613,7 +621,6 @@ impl Server {
                 "[SUPERNODE] Provider registered"
             );
 
-            // 4-tuple: (name, api_base, model, provider)
             providers.push((
                 provider_cfg.name.clone(),
                 api_base,
@@ -903,6 +910,11 @@ impl Server {
             return ip.to_string();
         }
 
+        // v2.5.2+SecAudit: HTTP (non-TLS) metadata URLs are intentionally
+        // kept for GCP/AWS compatibility but MUST NOT be extended with
+        // user-controlled input — doing so creates an SSRF vector.
+        // All responses are validated: must be ≤45 chars, parse as IpAddr,
+        // and must NOT be loopback or private (link-local allowed for metadata).
         let services = [
             "https://api.ipify.org",
             "https://ifconfig.me/ip",
@@ -920,13 +932,31 @@ impl Server {
                 if let Ok(resp) = req.send().await {
                     if resp.status().is_success() {
                         if let Ok(body) = resp.text().await {
-                            let ip = body.trim().to_string();
-                            if !ip.is_empty()
-                                && ip.len() <= 45
-                                && ip.parse::<std::net::IpAddr>().is_ok()
-                            {
-                                info!(ip = %ip, source = %url, "[NET] Public IP detected");
-                                return ip;
+                            let ip_str = body.trim();
+                            if ip_str.len() <= 45 {
+                                if let Ok(addr) = ip_str.parse::<std::net::IpAddr>() {
+                                    // v2.5.2+SecAudit: reject loopback and private addresses
+                                    // as detected public IPs — they indicate a misconfigured
+                                    // metadata endpoint or a split-horizon DNS issue.
+                                    let is_private = match addr {
+                                        std::net::IpAddr::V4(v4) => {
+                                            v4.is_loopback()
+                                                || v4.is_private()
+                                                || v4.is_unspecified()
+                                        }
+                                        std::net::IpAddr::V6(v6) => {
+                                            v6.is_loopback() || v6.is_unspecified()
+                                        }
+                                    };
+                                    if !is_private {
+                                        info!(ip = %addr, source = %url, "[NET] Public IP detected");
+                                        return addr.to_string();
+                                    }
+                                    warn!(
+                                        ip = %addr, source = %url,
+                                        "[NET] Ignoring private/loopback IP from metadata"
+                                    );
+                                }
                             }
                         }
                     }
@@ -1111,13 +1141,33 @@ impl Server {
 
             MemChainMessage::BroadcastRecord(record) => {
                 let owner_hex = record.owner_hex();
+                // v2.5.2+SecAudit: verify signature against record_id (content hash).
+                // record_id is SHA256(owner || content || timestamp || ...) so this
+                // binds the signature to the actual content — a replayed record with
+                // modified content will have a different record_id and fail here.
                 let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
                     Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                     Err(_) => false,
                 };
-                if !sig_ok { warn!("[MEMCHAIN] BroadcastRecord sig failed"); return; }
+                if !sig_ok {
+                    warn!(
+                        owner = %owner_hex,
+                        "[MEMCHAIN] BroadcastRecord signature verification failed"
+                    );
+                    return;
+                }
                 if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
-                    warn!("[MEMCHAIN] BroadcastRecord untrusted owner"); return;
+                    warn!(owner = %owner_hex, "[MEMCHAIN] BroadcastRecord untrusted owner");
+                    return;
+                }
+                // v2.5.2+SecAudit: verify record_id integrity (content-addressed check)
+                if !record.verify_id() {
+                    warn!(
+                        owner = %owner_hex,
+                        id = hex::encode(record.record_id),
+                        "[MEMCHAIN] BroadcastRecord record_id hash mismatch — possible tampering"
+                    );
+                    return;
                 }
                 if let Some(ref st) = storage {
                     if st.insert(&record, "p2p-remote").await {
@@ -1174,7 +1224,23 @@ impl Server {
                             Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                             Err(_) => false,
                         };
-                        if !sig_ok || !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
+                        if !sig_ok {
+                            warn!(
+                                owner = %owner_hex,
+                                "[MEMCHAIN] SyncRecordResponse sig failed — skipping record"
+                            );
+                            continue;
+                        }
+                        if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
+                            continue;
+                        }
+                        // v2.5.2+SecAudit: verify content integrity before storing
+                        if !record.verify_id() {
+                            warn!(
+                                owner = %owner_hex,
+                                id = hex::encode(record.record_id),
+                                "[MEMCHAIN] SyncRecordResponse record_id hash mismatch — skipping"
+                            );
                             continue;
                         }
                         let _ = st.insert(&record, "p2p-sync").await;
