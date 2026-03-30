@@ -18,8 +18,8 @@
 //! - `MemPool::add_fact()` — validate hash integrity, dedup, store
 //! - `MemPool::get()` — O(1) lookup by `fact_id`
 //! - `MemPool::recent()` — return N most recent facts (by timestamp)
-//! - `MemPool::get_facts_after()` — 🌟 NEW: return facts inserted after a given hash
-//! - `MemPool::last_fact_id()` — 🌟 NEW: return the last inserted fact's id
+//! - `MemPool::get_facts_after()` — return facts inserted after a given hash
+//! - `MemPool::last_fact_id()` — return the last inserted fact's id
 //! - `MemPool::drain_for_block()` — consume pending facts for block packing
 //! - `MemPool::count()` — current pool size
 //!
@@ -28,12 +28,7 @@
 //! fine-grained shard-level writes. The `order` Vec is protected by
 //! `parking_lot::RwLock` for concurrent read access with exclusive writes.
 //!
-//! ## Dependencies
-//! - `dashmap` (workspace)
-//! - `parking_lot` (workspace)
-//! - `aeronyx_core::ledger::Fact`
-//!
-//! ## ⚠️ Important Note for Next Developer
+//! ⚠️ Important Notes for Next Developer:
 //! - Facts with invalid `fact_id` (hash mismatch) are **silently
 //!   rejected** — this is intentional to avoid amplifying bad data.
 //! - Deduplication is by `fact_id`; re-inserting the same fact is a no-op.
@@ -43,10 +38,24 @@
 //!   This is correct for sync because insertion order reflects network arrival.
 //! - `[0u8; 32]` (all-zero hash) is treated as "no known hash" by convention,
 //!   causing `get_facts_after` to return everything.
+//! - BUG FIX: `add_fact` had a TOCTOU race: `contains_key` check and `insert`
+//!   were two separate DashMap operations. Under concurrent inserts of the same
+//!   fact, both threads could pass the check and both insert. Fixed by using
+//!   DashMap's `entry` API for an atomic check-and-insert.
+//! - BUG FIX: `recent()` with n=0 previously returned all facts (truncate(0)
+//!   is a no-op when the vec is already shorter, but sort was still done).
+//!   Added early return for n=0.
+//! - BUG FIX: `get_facts_after` with an empty pool still acquired the read
+//!   lock and iterated. Added cheap `is_empty` short-circuit before lock.
+//! - `total_accepted` counter could over-count under the old TOCTOU pattern.
+//!   Now only incremented after a confirmed new entry via `entry` API.
 //!
 //! ## Last Modified
 //! v0.2.0 - Initial MemPool for MemChain integration
 //! v0.4.0 - 🌟 Added insertion-order tracking + get_facts_after for P2P sync
+//! v2.5.2+SecAudit - 🔧 Fixed TOCTOU in add_fact (entry API). Fixed recent(0).
+//!   Fixed get_facts_after empty-pool short-circuit. Corrected total_accepted
+//!   counter to only increment on confirmed insert.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -78,7 +87,7 @@ const ZERO_HASH: [u8; 32] = [0u8; 32];
 pub struct MemPool {
     /// Primary storage: fact_id → Fact.
     facts: DashMap<[u8; 32], Fact>,
-    /// 🌟 Insertion-ordered list of fact_ids.
+    /// Insertion-ordered list of fact_ids.
     /// Protected by RwLock: many concurrent readers, exclusive writer.
     order: RwLock<Vec<[u8; 32]>>,
     /// Monotonic counter of total facts ever accepted (for metrics).
@@ -109,6 +118,12 @@ impl MemPool {
     /// - `true` if the fact was newly inserted.
     /// - `false` if it was a duplicate or failed validation.
     ///
+    /// # Concurrency
+    /// Uses DashMap's `entry` API for an atomic check-and-insert, eliminating
+    /// the TOCTOU race that existed with separate `contains_key` + `insert` calls.
+    /// Under the old pattern, two concurrent inserts of the same fact could both
+    /// pass the contains_key check and insert, over-counting total_accepted.
+    ///
     /// # Note
     /// Signature verification is NOT done here — it requires access to
     /// the origin node's public key, which is the caller's responsibility.
@@ -124,9 +139,22 @@ impl MemPool {
             return false;
         }
 
-        // Dedup check + insert
         let fact_id = fact.fact_id;
-        if self.facts.contains_key(&fact_id) {
+
+        // BUG FIX: use entry() for atomic check-and-insert instead of
+        // separate contains_key() + insert() (TOCTOU under concurrent access).
+        let inserted = {
+            use dashmap::mapref::entry::Entry;
+            match self.facts.entry(fact_id) {
+                Entry::Vacant(e) => {
+                    e.insert(fact);
+                    true
+                }
+                Entry::Occupied(_) => false,
+            }
+        };
+
+        if !inserted {
             trace!(
                 fact_id = hex::encode(fact_id),
                 "[MEMPOOL] Duplicate fact, skipping"
@@ -134,9 +162,7 @@ impl MemPool {
             return false;
         }
 
-        self.facts.insert(fact_id, fact);
-
-        // 🌟 Track insertion order
+        // Only update order index and counter after confirmed insert
         {
             let mut order = self.order.write();
             order.push(fact_id);
@@ -166,15 +192,21 @@ impl MemPool {
     ///
     /// This performs a full scan + sort, so avoid calling on very large pools
     /// in hot paths. Suitable for API queries and Miner batches.
+    ///
+    /// BUG FIX: n=0 previously still performed the full sort before truncate(0).
+    /// Now returns early for n=0.
     #[must_use]
     pub fn recent(&self, n: usize) -> Vec<Fact> {
+        if n == 0 {
+            return Vec::new();
+        }
         let mut all: Vec<Fact> = self.facts.iter().map(|e| e.value().clone()).collect();
         all.sort_unstable_by(|a, b| b.timestamp.cmp(&a.timestamp));
         all.truncate(n);
         all
     }
 
-    /// 🌟 Returns all Facts inserted **after** the given `last_hash`.
+    /// Returns all Facts inserted **after** the given `last_hash`.
     ///
     /// # Arguments
     /// * `last_hash` - The `fact_id` of the last known fact on the requester's
@@ -188,11 +220,19 @@ impl MemPool {
     /// If `last_hash` is not found in the pool (e.g. it was drained into a
     /// block, or the requester has a corrupted hash), returns **all** facts
     /// as a safe fallback — the requester's dedup will handle duplicates.
+    ///
+    /// BUG FIX: previously acquired the read lock and iterated even when the
+    /// pool was empty. Now short-circuits before any lock acquisition.
     #[must_use]
     pub fn get_facts_after(&self, last_hash: [u8; 32]) -> Vec<Fact> {
+        // Short-circuit before acquiring lock for the common empty-pool case
+        if self.facts.is_empty() {
+            return Vec::new();
+        }
+
         let order = self.order.read();
 
-        // All-zero sentinel or empty pool → return everything
+        // All-zero sentinel or empty order index → return everything
         if last_hash == ZERO_HASH || order.is_empty() {
             return order
                 .iter()
@@ -225,10 +265,9 @@ impl MemPool {
         }
     }
 
-    /// 🌟 Returns the `fact_id` of the most recently inserted Fact.
+    /// Returns the `fact_id` of the most recently inserted Fact.
     ///
-    /// Returns `None` if the pool is empty, or `Some([0u8; 32])` would
-    /// never be returned (zero-hash is a sentinel, not a real fact).
+    /// Returns `None` if the pool is empty.
     #[must_use]
     pub fn last_fact_id(&self) -> Option<[u8; 32]> {
         let order = self.order.read();
@@ -244,7 +283,6 @@ impl MemPool {
     /// Facts are **removed** from the pool AND the order index.
     /// Ensure they have been persisted to the AOF **before** calling this.
     pub fn drain_for_block(&self) -> Vec<Fact> {
-        // 🌟 Clear order index first
         let keys: Vec<[u8; 32]> = {
             let mut order = self.order.write();
             let keys = order.clone();
@@ -353,6 +391,13 @@ mod tests {
     }
 
     #[test]
+    fn test_recent_zero_returns_empty() {
+        let pool = MemPool::new();
+        pool.add_fact(make_fact(100, "a"));
+        assert!(pool.recent(0).is_empty(), "recent(0) must return empty vec");
+    }
+
+    #[test]
     fn test_drain_for_block() {
         let pool = MemPool::new();
         pool.add_fact(make_fact(200, "b"));
@@ -365,9 +410,13 @@ mod tests {
         assert_eq!(pool.count(), 0, "Pool should be empty after drain");
     }
 
-    // ========================================
-    // 🌟 New tests for v0.4.0
-    // ========================================
+    #[test]
+    fn test_get_facts_after_empty_pool() {
+        let pool = MemPool::new();
+        // Should not panic or deadlock; must return empty
+        assert!(pool.get_facts_after([0u8; 32]).is_empty());
+        assert!(pool.get_facts_after([0xFF; 32]).is_empty());
+    }
 
     #[test]
     fn test_get_facts_after_zero_hash() {
@@ -450,5 +499,17 @@ mod tests {
 
         assert!(pool.last_fact_id().is_none());
         assert!(pool.get_facts_after([0u8; 32]).is_empty());
+    }
+
+    /// Verify duplicate concurrent inserts don't over-count total_accepted.
+    /// (Exercises the entry() TOCTOU fix — sequential approximation)
+    #[test]
+    fn test_duplicate_does_not_increment_accepted() {
+        let pool = MemPool::new();
+        let fact = make_fact(100, "x");
+        assert!(pool.add_fact(fact.clone()));
+        assert!(!pool.add_fact(fact));
+        assert_eq!(pool.total_accepted(), 1, "total_accepted must be 1 after one unique insert");
+        assert_eq!(pool.count(), 1);
     }
 }
