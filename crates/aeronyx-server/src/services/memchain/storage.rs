@@ -993,6 +993,7 @@ impl MemoryStorage {
         let stored_content: Option<Vec<u8>> = if let Some(text) = new_content {
             let bytes = text.as_bytes().to_vec();
             if let Some(ref key) = self.record_key {
+                let key: &[u8; 32] = &**key;
                 // P1: encryption failure returns Err — no silent plaintext fallback
                 let ct = encrypt_record_content(key, &bytes)
                     .map_err(|e| format!("encrypt new content: {}", e))?;
@@ -1285,6 +1286,7 @@ impl MemoryStorage {
         let conflict_with_blob: Option<Vec<u8>> = record.conflict_with.map(|c| c.to_vec());
 
         let stored_content: Vec<u8> = if let Some(ref key) = self.record_key {
+            let key: &[u8; 32] = &**key;
             if record.encrypted_content.is_empty() {
                 record.encrypted_content.clone()
             } else {
@@ -1357,7 +1359,7 @@ impl MemoryStorage {
             }
         }
         let conn = self.conn.lock().await;
-        let rk = self.record_key;
+        let rk = self.record_key.as_ref().map(|v| &**v);
         let result = conn.query_row(
             Self::SELECT_RECORD_COLS,
             params![record_id.as_slice()],
@@ -1417,9 +1419,9 @@ impl MemoryStorage {
             Ok(s) => s,
             Err(e) => { error!(error=%e, "[STORAGE] Prepare failed"); return Vec::new(); }
         };
-        let rk = self.record_key;
+        let rk = self.record_key.as_ref().map(|v| &**v);
         stmt.query_map(params![owner.as_slice()], |row| {
-            let record = Self::row_to_record(row, rk.as_ref())?;
+            let record = Self::row_to_record(row, rk)?;
             let model: String = row.get(15)?;
             Ok((record, model))
         }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
@@ -1487,8 +1489,8 @@ impl MemoryStorage {
             Ok(s) => s,
             Err(e) => { error!(error=%e, "[STORAGE] Prepare failed"); return Vec::new(); }
         };
-        let rk = self.record_key;
-        stmt.query_map(p, |row| Self::row_to_record(row, rk.as_ref()))
+        let rk = self.record_key.as_ref().map(|v| &**v);
+        stmt.query_map(p, |row| Self::row_to_record(row, rk))
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
     }
