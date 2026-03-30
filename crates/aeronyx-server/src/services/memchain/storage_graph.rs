@@ -752,43 +752,10 @@ impl MemoryStorage {
 }
 
 // ============================================
-// impl MemoryStorage — v2.4.0+Search Entity Timeline
+// NOTE: get_entity_timeline lives in storage_miner.rs
 // ============================================
-
-impl MemoryStorage {
-    /// Get timeline events for a specific entity, ordered by event_time ASC.
-    ///
-    /// ## v2.5.2+Pagination
-    /// Added `offset: usize` parameter. SQL updated to `LIMIT ?4 OFFSET ?5`.
-    ///
-    /// ⚠️ If the entity_timeline table lives in storage_miner.rs, move this
-    ///    method there and keep the signature identical.
-    ///
-    /// Call sites:
-    /// - mpi_entity_timeline() → pass `params.offset`
-    pub async fn get_entity_timeline(
-        &self, entity_id: &str, owner: &[u8; 32], limit: usize, offset: usize,
-    ) -> Vec<EntityTimelineEntry> {
-        let conn = self.conn.lock().await;
-        let mut stmt = match conn.prepare(
-            "SELECT entity_id, event_type, event_time, session_id, episode_id, detail
-             FROM entity_timeline
-             WHERE entity_id = ?1 AND owner = ?2
-             ORDER BY event_time ASC LIMIT ?3 OFFSET ?4"
-        ) { Ok(s) => s, Err(_) => return Vec::new() };
-        stmt.query_map(
-            params![entity_id, owner.as_slice(), limit as i64, offset as i64],
-            |row| Ok(EntityTimelineEntry {
-                entity_id: row.get(0)?,
-                event_type: row.get(1)?,
-                event_time: row.get(2)?,
-                session_id: row.get(3)?,
-                episode_id: row.get(4)?,
-                detail: row.get(5)?,
-            }),
-        ).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
-    }
-}
+// The v2.5.2+Pagination offset parameter must be added there.
+// See storage_miner.rs — get_entity_timeline signature update.
 
 // ============================================
 // impl MemoryStorage — v2.4.0 Artifacts
