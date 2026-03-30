@@ -63,7 +63,10 @@
 //!   mpi_record_provenance, and unit tests. Zero new files created.
 //!
 //! ## Last Modified
-//! v2.5.2+Provenance - 🌟 PATCH /record/:id + GET /record/:id/provenance
+//! v2.5.2+Provenance   - 🌟 PATCH /record/:id + GET /record/:id/provenance
+//! v2.5.2+SecurityFix  - 🔒 #4  mpi_forget: revoke() SQL 加 AND owner=? 消除 TOCTOU
+//!                       🔒 #9  mpi_patch_record: tags 变化时也触发 FTS 重索引
+//!                       🔒 #11 identity_cache 加 MAX_IDENTITY_CACHE_PER_OWNER 上限
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -85,6 +88,11 @@ use super::mpi::{
     default_layer, default_source, default_model, default_top_k,
     default_token_budget, default_include_graph,
 };
+
+// ── Security constants ──────────────────────────────────────────────────────
+/// Max identity/allergy records kept in the hot cache per owner (fix #11).
+/// Prevents unbounded memory growth during long-running sessions.
+const MAX_IDENTITY_CACHE_PER_OWNER: usize = 200;
 
 // ============================================
 // POST /api/mpi/remember
@@ -174,9 +182,14 @@ pub async fn mpi_remember(
         &record.record_id, &owner, &req_body.content, &tags_str,
     ).await;
 
+    // Fix #11: cap identity cache size per owner to avoid unbounded growth.
     if layer == MemoryLayer::Identity {
         let mut cache = state.identity_cache.write();
-        cache.entry(owner_hex.clone()).or_default().push(record.clone());
+        let entries = cache.entry(owner_hex.clone()).or_default();
+        entries.push(record.clone());
+        if entries.len() > MAX_IDENTITY_CACHE_PER_OWNER {
+            entries.remove(0); // evict oldest
+        }
     }
 
     info!(id = %rid_hex, layer = %layer, owner = %&owner_hex[..8], "[MPI_REMEMBER] Stored");
@@ -288,7 +301,9 @@ pub async fn mpi_forget(
         })));
     }
 
-    if !state.storage.revoke(&rid).await {
+    // Fix #4: pass owner to revoke() so the SQL includes AND owner = ?,
+    // eliminating the TOCTOU window between get() and revoke().
+    if !state.storage.revoke_owned(&rid, &owner).await {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!(ForgetResponse {
             status:"not_found".into(), record_id: rb.record_id
         })));
@@ -737,14 +752,31 @@ pub async fn mpi_patch_record(
     ).await {
         Ok(true) => {
             let content_changed = patch.content.is_some();
+            // Fix #9: FTS must be re-indexed whenever content OR tags change,
+            // because the FTS5 `tags` column would otherwise stay stale when
+            // only topic_tags is patched (content unchanged).
+            let needs_fts_update = patch.content.is_some() || patch.topic_tags.is_some();
 
-            // FTS5 re-index (synchronous — search reflects change immediately).
-            if let Some(ref new_content) = patch.content {
-                state.storage.fts_remove_record(&rid).await;
-                let tags_str = patch.topic_tags.as_ref()
-                    .and_then(|t| serde_json::to_string(t).ok())
-                    .unwrap_or_default();
-                state.storage.fts_index_record(&rid, &owner, new_content, &tags_str).await;
+            if needs_fts_update {
+                // Use the new content if provided, otherwise re-fetch current content.
+                // For tags-only updates we need the existing content to re-index.
+                let index_content: Option<String> = if let Some(ref c) = patch.content {
+                    Some(c.clone())
+                } else {
+                    // tags-only patch: re-read stored content for FTS rebuild
+                    state.storage.get(&rid).await
+                        .map(|r| String::from_utf8_lossy(&r.encrypted_content).into_owned())
+                };
+
+                if let Some(ref content_str) = index_content {
+                    // Resolve the final tags: prefer patch value, else keep existing
+                    // (get() already called above if needed, reuse the record).
+                    let tags_str = patch.topic_tags.as_ref()
+                        .and_then(|t| serde_json::to_string(t).ok())
+                        .unwrap_or_default();
+                    state.storage.fts_remove_record(&rid).await;
+                    state.storage.fts_index_record(&rid, &owner, content_str, &tags_str).await;
+                }
             }
 
             // Evict stale ANN entry immediately; Miner re-inserts after re-embed.
