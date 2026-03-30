@@ -1363,7 +1363,7 @@ impl MemoryStorage {
         let result = conn.query_row(
             Self::SELECT_RECORD_COLS,
             params![record_id.as_slice()],
-            |row| Self::row_to_record(row, rk.as_ref()),
+            |row| Self::row_to_record(row, rk),
         ).optional().unwrap_or_else(|e| { error!(error=%e, "[STORAGE] Query failed"); None });
 
         if let Some(ref record) = result {
