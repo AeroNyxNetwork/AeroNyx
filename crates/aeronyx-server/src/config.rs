@@ -24,11 +24,19 @@
 //!   - MemChainConfig.supernode: SuperNodeConfig (LLM providers, routing, privacy, worker)
 //!   - validate() delegates to SuperNodeConfig.validate()
 //!   - Backward compatible: missing [memchain.supernode] section → disabled (v2.4.0 behavior)
+//! v1.0.0-MultiTenant — 🌟 Added SaaS multi-tenant mode:
+//!   - MemChainMode::Saas variant
+//!   - MemChainConfig: saas (SaasConfig), jwt_secret, token_ttl_secs
+//!   - SaasConfig: data_root, pool_max_connections, pool_idle_timeout_secs,
+//!     miner_max_owners_per_tick, miner_max_rounds_per_hour
+//!   - validate() SaaS-gated checks: jwt_secret length, token_ttl_secs > 0, SaasConfig field > 0
+//!   - Backward compatible: existing local/p2p/off configs unaffected
 //!
 //! ## Main Functionality
 //! - ServerConfig: top-level config with network, vpn, tun, limits, logging, management, memchain
 //! - MemChainConfig: memory system config with MVF parameters, DB paths, API auth, remote storage,
-//!   NER engine, cognitive graph, entropy filter, miner steps, vector optimization, and SuperNode
+//!   NER engine, cognitive graph, entropy filter, miner steps, vector optimization, SuperNode,
+//!   and SaaS multi-tenant
 //! - Validation for all config sections
 //!
 //! ## Dependencies
@@ -39,12 +47,14 @@
 //! - MemChainConfig consumed by log_handler.rs for entropy filter configuration (v2.4.0)
 //! - MemChainConfig consumed by miner/reflection.rs for cognitive steps configuration (v2.4.0)
 //! - MemChainConfig.supernode consumed by server.rs for LlmRouter + TaskWorker initialization (v2.5.0)
+//! - MemChainConfig.saas consumed by server.rs for StoragePool + MinerScheduler initialization (v1.0.0-MT)
 //! - config_supernode.rs — SuperNodeConfig, ProviderConfig, CognitiveTaskType etc. (v2.5.0)
 //!
 //! ## Main Logical Flow
 //! 1. Load TOML file → deserialize into ServerConfig
 //! 2. Validate all sections (network, vpn, tun, limits, management, memchain)
 //!    2a. MemChainConfig.validate() includes self.supernode.validate() (v2.5.0)
+//!    2b. MemChainConfig.validate() includes SaaS-gated checks (v1.0.0-MT)
 //! 3. Return validated config for server initialization
 //!
 //! ⚠️ Important Note for Next Developer:
@@ -68,6 +78,12 @@
 //!   SuperNodeConfig::default() has enabled=false, so upgrading nodes see no behavior change.
 //!   SuperNode validation is only performed when enabled=true.
 //!   See config_supernode.rs for detailed documentation.
+//! - v1.0.0-MT: SaaS mode adds jwt_secret (auto-generated if empty/None), token_ttl_secs (default 24h),
+//!   and SaasConfig (data_root, connection pool, miner quotas). All SaaS validation is skipped for
+//!   non-Saas modes (fully backward compatible). jwt_secret auto-generation is handled at server
+//!   startup, not here — validate() only rejects manually-set secrets that are too short.
+//!   If [memchain.saas] section is absent in Saas mode, a warning is emitted and server.rs
+//!   uses SaasConfig::default() at runtime.
 //!
 //! ## Last Modified
 //! v2.1.0 - Added db_path, compaction_threshold, mvf_alpha, mvf_enabled,
@@ -81,6 +97,8 @@
 //!   vector optimization config fields
 //! v2.5.0-SuperNode - 🌟 Added SuperNode configuration (config_supernode.rs),
 //!   MemChainConfig.supernode field, validate() delegation, is_supernode_enabled()
+//! v1.0.0-MultiTenant - 🌟 Added MemChainMode::Saas, SaasConfig, jwt_secret, token_ttl_secs,
+//!   SaaS-gated validate() checks
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -179,12 +197,21 @@ impl Default for ServerConfig {
 // MemChainMode
 // ============================================
 
+/// Operating mode for the MemChain memory subsystem.
+///
+/// ## Modification Reason
+/// v1.0.0-MultiTenant: Added `Saas` variant for multi-tenant SaaS deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MemChainMode {
     Off,
     Local,
     P2p,
+    /// v1.0.0-MultiTenant: SaaS multi-tenant mode.
+    ///
+    /// Each user gets their own isolated SQLite DB, JWT auth, and StoragePool entry.
+    /// Requires [memchain.saas] section (or defaults are used with a warning).
+    Saas,
 }
 
 impl Default for MemChainMode {
@@ -212,6 +239,103 @@ pub enum VectorQuantizationMode {
 
 impl Default for VectorQuantizationMode {
     fn default() -> Self { Self::None }
+}
+
+// ============================================
+// SaasConfig (v1.0.0-MultiTenant)
+// ============================================
+
+/// SaaS mode infrastructure configuration.
+///
+/// Controls the StoragePool connection limits, idle eviction,
+/// and MinerScheduler per-user quotas.
+///
+/// All fields have safe defaults — a minimal config only needs `data_root`.
+///
+/// ## Modification Reason
+/// v1.0.0-MultiTenant: Added for SaaS multi-tenant mode.
+///
+/// ## Configuration Example
+/// ```toml
+/// [memchain.saas]
+/// data_root = "data"
+/// pool_max_connections = 100
+/// pool_idle_timeout_secs = 1800
+/// miner_max_owners_per_tick = 10
+/// miner_max_rounds_per_hour = 6
+/// ```
+///
+/// ⚠️ Important Note for Next Developer:
+/// - `data_root` must be writable by the server process.
+/// - `pool_max_connections` limits how many SQLite files are open simultaneously.
+///   Each connection uses ~1-2 MB RAM. 100 connections ≈ 100-200 MB.
+/// - `pool_idle_timeout_secs` controls when idle connections are evicted.
+///   Lower = less RAM, more DB reopen cost on next request.
+/// - `miner_max_rounds_per_hour` is per-user. With 10 owners/tick and 6 rounds/hour,
+///   the scheduler can sustain ~60 cognitive cycles per hour across all users.
+// BUG FIX (v1.0.0-MT): Added PartialEq to enable structural equality assertions in tests.
+// Without this, downstream test authors cannot use assert_eq! on SaasConfig instances.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaasConfig {
+    /// Root directory for SaaS data files.
+    ///
+    /// Contains:
+    /// - `system.db` — global metadata (volume assignments, LLM usage, auth events)
+    /// - `volumes.toml` — volume configuration (auto-generated if missing)
+    /// - `volumes/vol-*/` — per-user SQLite DB files
+    ///
+    /// Created automatically on first SaaS startup.
+    /// Default: "data" (relative to working directory)
+    #[serde(default = "default_saas_data_root")]
+    pub data_root: std::path::PathBuf,
+
+    /// Maximum number of simultaneously open MemoryStorage connections.
+    ///
+    /// When the pool reaches this limit, the oldest idle connection is
+    /// evicted before opening a new one.
+    /// Default: 100
+    #[serde(default = "default_pool_max_connections")]
+    pub pool_max_connections: usize,
+
+    /// Seconds of inactivity before a connection is evicted from the pool.
+    ///
+    /// Eviction timer runs every 5 minutes (POOL_EVICTION_INTERVAL_SECS).
+    /// Default: 1800 (30 minutes)
+    #[serde(default = "default_pool_idle_timeout_secs")]
+    pub pool_idle_timeout_secs: u64,
+
+    /// Maximum number of users the MinerScheduler processes per 60-second tick.
+    ///
+    /// Users are selected by most-recently-active order.
+    /// Default: 10
+    #[serde(default = "default_miner_max_owners_per_tick")]
+    pub miner_max_owners_per_tick: usize,
+
+    /// Maximum Miner cognitive cycles per user per hour.
+    ///
+    /// Prevents runaway LLM API costs for highly active users.
+    /// Quota resets at the start of each hour.
+    /// Default: 6 (one cycle every ~10 minutes)
+    #[serde(default = "default_miner_max_rounds_per_hour")]
+    pub miner_max_rounds_per_hour: usize,
+}
+
+fn default_saas_data_root() -> std::path::PathBuf { std::path::PathBuf::from("data") }
+fn default_pool_max_connections() -> usize { 100 }
+fn default_pool_idle_timeout_secs() -> u64 { 1800 }
+fn default_miner_max_owners_per_tick() -> usize { 10 }
+fn default_miner_max_rounds_per_hour() -> usize { 6 }
+
+impl Default for SaasConfig {
+    fn default() -> Self {
+        Self {
+            data_root: default_saas_data_root(),
+            pool_max_connections: default_pool_max_connections(),
+            pool_idle_timeout_secs: default_pool_idle_timeout_secs(),
+            miner_max_owners_per_tick: default_miner_max_owners_per_tick(),
+            miner_max_rounds_per_hour: default_miner_max_rounds_per_hour(),
+        }
+    }
 }
 
 // ============================================
@@ -496,6 +620,38 @@ pub struct MemChainConfig {
     /// ```
     #[serde(default)]
     pub supernode: SuperNodeConfig,
+
+    // ── Multi-Tenant SaaS (v1.0.0-MultiTenant) ──────────────────────
+
+    /// SaaS mode infrastructure configuration.
+    ///
+    /// Only used when `mode = "saas"`. All fields have safe defaults.
+    /// The `data_root` directory is created automatically on first startup.
+    ///
+    /// ## Configuration Example
+    /// ```toml
+    /// [memchain.saas]
+    /// data_root = "data"
+    /// pool_max_connections = 100
+    /// pool_idle_timeout_secs = 1800
+    /// miner_max_owners_per_tick = 10
+    /// miner_max_rounds_per_hour = 6
+    /// ```
+    #[serde(default)]
+    pub saas: Option<SaasConfig>,
+
+    /// JWT signing secret for SaaS mode token issuance.
+    ///
+    /// When empty or None, auto-generated on first SaaS startup and written
+    /// back to config.toml. Minimum 32 chars when set manually.
+    /// Only used when `mode = "saas"`.
+    #[serde(default)]
+    pub jwt_secret: Option<String>,
+
+    /// JWT token validity duration in seconds. Default 86400 (24 hours).
+    /// Only used when `mode = "saas"`.
+    #[serde(default = "default_jwt_ttl")]
+    pub token_ttl_secs: u64,
 }
 
 // ── Default functions ──
@@ -529,6 +685,9 @@ fn default_vector_saturation_threshold() -> usize { 5 }
 // v2.4.0+Reranker defaults
 fn default_reranker_model_path() -> String { "models/reranker".into() }
 fn default_reranker_max_seq_length() -> usize { 512 }
+
+// v1.0.0-MultiTenant defaults
+fn default_jwt_ttl() -> u64 { 86400 }
 
 impl MemChainConfig {
     pub fn validate(&self) -> Result<()> {
@@ -740,12 +899,74 @@ impl MemChainConfig {
             // Delegates to SuperNodeConfig.validate() which performs its own
             // enabled-gated checks. When supernode.enabled = false, this is a no-op.
             self.supernode.validate()?;
+
+            // ── v1.0.0-MultiTenant: SaaS 模式校验 ──
+            if self.mode == MemChainMode::Saas {
+                // jwt_secret: 手动设置时不能太短（空值由自动生成兜底）
+                if let Some(ref secret) = self.jwt_secret {
+                    if !secret.is_empty() && secret.len() < 32 {
+                        return Err(ServerError::config_invalid(
+                            "memchain.jwt_secret",
+                            format!(
+                                "must be at least 32 characters when set manually, got {}",
+                                secret.len()
+                            ),
+                        ));
+                    }
+                }
+
+                // token_ttl_secs 不能为 0
+                if self.token_ttl_secs == 0 {
+                    return Err(ServerError::config_invalid(
+                        "memchain.token_ttl_secs",
+                        "must be > 0",
+                    ));
+                }
+
+                // SaasConfig 存在时校验各字段 > 0
+                if let Some(ref saas) = self.saas {
+                    if saas.pool_max_connections == 0 {
+                        return Err(ServerError::config_invalid(
+                            "memchain.saas.pool_max_connections",
+                            "must be > 0",
+                        ));
+                    }
+                    if saas.pool_idle_timeout_secs == 0 {
+                        return Err(ServerError::config_invalid(
+                            "memchain.saas.pool_idle_timeout_secs",
+                            "must be > 0",
+                        ));
+                    }
+                    if saas.miner_max_owners_per_tick == 0 {
+                        return Err(ServerError::config_invalid(
+                            "memchain.saas.miner_max_owners_per_tick",
+                            "must be > 0",
+                        ));
+                    }
+                    if saas.miner_max_rounds_per_hour == 0 {
+                        return Err(ServerError::config_invalid(
+                            "memchain.saas.miner_max_rounds_per_hour",
+                            "must be > 0",
+                        ));
+                    }
+                }
+                // saas 段缺失时 server.rs 会在运行时用 SaasConfig::default()，这里只警告
+                if self.saas.is_none() {
+                    tracing::warn!(
+                        "[MEMCHAIN] mode=saas but [memchain.saas] section is missing — \
+                         server will use default SaaS configuration"
+                    );
+                }
+            }
         }
         Ok(())
     }
 
     #[must_use] pub fn is_enabled(&self) -> bool { self.mode != MemChainMode::Off }
     #[must_use] pub fn is_p2p(&self) -> bool { self.mode == MemChainMode::P2p }
+
+    /// v1.0.0-MultiTenant: Returns true when running in SaaS multi-tenant mode.
+    #[must_use] pub fn is_saas(&self) -> bool { self.mode == MemChainMode::Saas }
 
     /// Returns the effective API secret, or None if auth is disabled.
     #[must_use]
@@ -795,6 +1016,22 @@ impl MemChainConfig {
             format!("{}/tokenizer.json", self.ner_model_path)
         } else {
             self.ner_tokenizer_path.clone()
+        }
+    }
+
+    /// v1.0.0-MultiTenant: Returns the effective SaasConfig.
+    ///
+    /// Returns a reference to the configured SaasConfig when present,
+    /// or a lazily constructed default. Callers in SaaS mode should use
+    /// this rather than accessing `self.saas` directly.
+    ///
+    /// ⚠️ This returns a value (not a reference to `self.saas`) when `saas` is None.
+    ///    Cache the result if calling in a hot path.
+    #[must_use]
+    pub fn effective_saas_config(&self) -> std::borrow::Cow<'_, SaasConfig> {
+        match &self.saas {
+            Some(c) => std::borrow::Cow::Borrowed(c),
+            None => std::borrow::Cow::Owned(SaasConfig::default()),
         }
     }
 
@@ -859,6 +1096,10 @@ impl Default for MemChainConfig {
             reranker_max_seq_length: default_reranker_max_seq_length(),
             // v2.5.0: SuperNode — disabled by default
             supernode: SuperNodeConfig::default(),
+            // v1.0.0-MultiTenant: SaaS — disabled by default
+            saas: None,
+            jwt_secret: None,
+            token_ttl_secs: default_jwt_ttl(),
         }
     }
 }
@@ -1080,6 +1321,11 @@ mod tests {
         assert!(!config.memchain.supernode.enabled);
         assert!(!config.memchain.is_supernode_enabled());
         assert!(config.memchain.supernode.providers.is_empty());
+        // v1.0.0-MultiTenant: SaaS defaults
+        assert!(config.memchain.saas.is_none());
+        assert!(config.memchain.jwt_secret.is_none());
+        assert_eq!(config.memchain.token_ttl_secs, 86400);
+        assert!(!config.memchain.is_saas());
     }
 
     #[test]
@@ -1155,6 +1401,11 @@ embed_output_dim = 384
         // v2.5.0
         assert!(!mc.supernode.enabled);
         assert!(mc.supernode.providers.is_empty());
+        // v1.0.0-MT
+        assert!(mc.saas.is_none());
+        assert!(mc.jwt_secret.is_none());
+        assert_eq!(mc.token_ttl_secs, 86400);
+        assert!(!mc.is_saas());
         // Convenience methods
         assert!(!mc.is_cognitive_graph_enabled());
         assert!(!mc.has_cognitive_miner_steps());
@@ -1353,6 +1604,10 @@ db_path = "memchain.db"
             entropy_filter_threshold: -1.0,
             // v2.5.0: invalid supernode config should also pass when mode=off
             supernode: SuperNodeConfig { enabled: true, providers: Vec::new(), ..Default::default() },
+            // v1.0.0-MT: invalid SaaS config should also pass when mode=off
+            jwt_secret: Some("short".into()),
+            token_ttl_secs: 0,
+            saas: Some(SaasConfig { pool_max_connections: 0, ..Default::default() }),
             ..Default::default()
         };
         assert!(mc.validate().is_ok());
@@ -1383,7 +1638,6 @@ db_path = "memchain.db"
 
     #[test]
     fn test_ner_confidence_out_of_range() {
-        // threshold = 0.0 (must be > 0.0)
         let mc = MemChainConfig {
             ner_enabled: true,
             ner_confidence_threshold: 0.0,
@@ -1391,7 +1645,6 @@ db_path = "memchain.db"
         };
         assert!(mc.validate().is_err());
 
-        // threshold = 1.0 (must be < 1.0)
         let mc2 = MemChainConfig {
             ner_enabled: true,
             ner_confidence_threshold: 1.0,
@@ -1399,7 +1652,6 @@ db_path = "memchain.db"
         };
         assert!(mc2.validate().is_err());
 
-        // threshold = -0.1 (must be > 0.0)
         let mc3 = MemChainConfig {
             ner_enabled: true,
             ner_confidence_threshold: -0.1,
@@ -1420,7 +1672,6 @@ db_path = "memchain.db"
 
     #[test]
     fn test_ner_disabled_skips_validation() {
-        // Invalid threshold but NER disabled → should pass
         let mc = MemChainConfig {
             ner_enabled: false,
             ner_confidence_threshold: 2.0,
@@ -1477,13 +1728,11 @@ db_path = "memchain.db"
 
     #[test]
     fn test_graph_max_depth_boundary() {
-        // depth = 1 (minimum valid)
         let mc1 = MemChainConfig {
             graph_enabled: true, graph_max_depth: 1, ..Default::default()
         };
         assert!(mc1.validate().is_ok());
 
-        // depth = 3 (maximum valid)
         let mc3 = MemChainConfig {
             graph_enabled: true, graph_max_depth: 3, ..Default::default()
         };
@@ -1735,11 +1984,12 @@ vector_saturation_threshold = 3
         assert!(mc.has_cognitive_miner_steps());
         // Supernode should be disabled (not in TOML)
         assert!(!mc.is_supernode_enabled());
+        // SaaS should be disabled (not in TOML)
+        assert!(!mc.is_saas());
     }
 
     #[test]
     fn test_v240_toml_backward_compat() {
-        // Old TOML without any v2.4.0 fields → all default to disabled
         let toml_str = r#"
 [memchain]
 mode = "local"
@@ -1755,8 +2005,11 @@ mvf_alpha = 0.5
         assert!(!mc.miner_entity_extraction);
         assert!(!mc.vector_early_termination);
         assert_eq!(mc.vector_quantization, VectorQuantizationMode::None);
-        // v2.5.0: supernode defaults when section missing
         assert!(!mc.is_supernode_enabled());
+        // v1.0.0-MT: SaaS defaults when section missing
+        assert!(!mc.is_saas());
+        assert!(mc.saas.is_none());
+        assert_eq!(mc.token_ttl_secs, 86400);
 
         assert!(config.validate().is_ok());
     }
@@ -1767,7 +2020,6 @@ mvf_alpha = 0.5
 
     #[test]
     fn test_is_cognitive_graph_enabled() {
-        // Both NER and graph must be enabled
         let mc1 = MemChainConfig {
             ner_enabled: true, graph_enabled: true, ..Default::default()
         };
@@ -1810,7 +2062,6 @@ mvf_alpha = 0.5
 
     #[test]
     fn test_supernode_validate_delegation() {
-        // When supernode is enabled with no providers, MemChainConfig.validate() should fail
         let mc = MemChainConfig {
             supernode: SuperNodeConfig {
                 enabled: true,
@@ -1888,12 +2139,10 @@ max_concurrent = 5
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
         let mc = &config.memchain;
 
-        // v2.4.0 fields work alongside v2.5.0 supernode
         assert!(mc.ner_enabled);
         assert!(mc.graph_enabled);
         assert!(mc.miner_entity_extraction);
 
-        // v2.5.0 supernode fields
         assert!(mc.is_supernode_enabled());
         assert_eq!(mc.supernode.providers.len(), 2);
         assert_eq!(mc.supernode.providers[0].name, "deepseek");
@@ -1910,7 +2159,6 @@ max_concurrent = 5
 
     #[test]
     fn test_supernode_toml_backward_compat_no_section() {
-        // TOML from v2.4.0 without any supernode section → disabled
         let toml_str = r#"
 [memchain]
 mode = "local"
@@ -1925,7 +2173,6 @@ graph_enabled = true
 
     #[test]
     fn test_supernode_disabled_with_partial_config_passes() {
-        // User started configuring supernode but left enabled = false
         let toml_str = r#"
 [memchain]
 mode = "local"
@@ -1942,7 +2189,6 @@ model = "deepseek-reasoner"
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.memchain.is_supernode_enabled());
         assert_eq!(config.memchain.supernode.providers.len(), 1);
-        // Should pass because enabled=false skips validation
         assert!(config.validate().is_ok());
     }
 
@@ -1978,5 +2224,202 @@ session_title = "nonexistent_provider"
             ..Default::default()
         };
         assert!(mc2.is_supernode_enabled());
+    }
+
+    // ========================================
+    // v1.0.0-MultiTenant: SaaS Config Tests
+    // ========================================
+
+    #[test]
+    fn test_saas_mode_enum_parses() {
+        let toml_str = r#"
+[memchain]
+mode = "saas"
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.memchain.mode, MemChainMode::Saas);
+        assert!(config.memchain.is_saas());
+    }
+
+    #[test]
+    fn test_saas_mode_default_fields() {
+        let mc = MemChainConfig::default();
+        assert!(mc.saas.is_none());
+        assert!(mc.jwt_secret.is_none());
+        assert_eq!(mc.token_ttl_secs, 86400);
+    }
+
+    #[test]
+    fn test_saas_config_defaults() {
+        let sc = SaasConfig::default();
+        assert_eq!(sc.data_root, std::path::PathBuf::from("data"));
+        assert_eq!(sc.pool_max_connections, 100);
+        assert_eq!(sc.pool_idle_timeout_secs, 1800);
+        assert_eq!(sc.miner_max_owners_per_tick, 10);
+        assert_eq!(sc.miner_max_rounds_per_hour, 6);
+    }
+
+    #[test]
+    fn test_saas_mode_off_skips_jwt_validation() {
+        // mode=off → jwt_secret 长度校验跳过（整个 if mode != Off 块被跳过）
+        let mc = MemChainConfig {
+            mode: MemChainMode::Off,
+            jwt_secret: Some("short".into()),
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_saas_jwt_secret_too_short_rejected() {
+        let mc = MemChainConfig {
+            mode: MemChainMode::Saas,
+            jwt_secret: Some("tooshort".into()), // < 32 chars
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_saas_jwt_secret_empty_is_ok() {
+        // 空值由自动生成兜底，validate 不拒绝
+        let mc = MemChainConfig {
+            mode: MemChainMode::Saas,
+            jwt_secret: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_saas_jwt_secret_none_is_ok() {
+        let mc = MemChainConfig {
+            mode: MemChainMode::Saas,
+            jwt_secret: None,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_saas_jwt_secret_valid_length() {
+        let mc = MemChainConfig {
+            mode: MemChainMode::Saas,
+            jwt_secret: Some("a".repeat(32)),
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_saas_token_ttl_zero_rejected() {
+        let mc = MemChainConfig {
+            mode: MemChainMode::Saas,
+            token_ttl_secs: 0,
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_saas_config_pool_max_zero_rejected() {
+        let mc = MemChainConfig {
+            mode: MemChainMode::Saas,
+            saas: Some(SaasConfig {
+                pool_max_connections: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
+    }
+
+    #[test]
+    fn test_saas_config_full_toml_parses() {
+        let toml_str = r#"
+[memchain]
+mode = "saas"
+jwt_secret = "a-very-long-secret-key-that-is-at-least-32-chars"
+token_ttl_secs = 3600
+
+[memchain.saas]
+data_root = "/var/memchain"
+pool_max_connections = 200
+pool_idle_timeout_secs = 900
+miner_max_owners_per_tick = 5
+miner_max_rounds_per_hour = 3
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        let mc = &config.memchain;
+
+        assert_eq!(mc.mode, MemChainMode::Saas);
+        assert!(mc.is_saas());
+        assert_eq!(mc.token_ttl_secs, 3600);
+
+        let saas = mc.saas.as_ref().unwrap();
+        assert_eq!(saas.data_root, std::path::PathBuf::from("/var/memchain"));
+        assert_eq!(saas.pool_max_connections, 200);
+        assert_eq!(saas.pool_idle_timeout_secs, 900);
+        assert_eq!(saas.miner_max_owners_per_tick, 5);
+        assert_eq!(saas.miner_max_rounds_per_hour, 3);
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_saas_mode_backward_compat_no_saas_section() {
+        // 旧 TOML 没有 [memchain.saas] → 默认值，不报错，只 warn
+        let toml_str = r#"
+[memchain]
+mode = "saas"
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.memchain.saas.is_none());
+        // validate 对缺失的 saas 段只 warn，不 error
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_local_mode_unaffected_by_saas_fields() {
+        // mode=local 时 saas 字段完全忽略
+        let mc = MemChainConfig {
+            mode: MemChainMode::Local,
+            saas: Some(SaasConfig {
+                pool_max_connections: 0, // 会触发 SaaS 校验错误，但 local 模式跳过
+                ..Default::default()
+            }),
+            jwt_secret: Some("x".into()), // 太短，但 local 模式跳过
+            token_ttl_secs: 0,            // 为 0，但 local 模式跳过
+            ..Default::default()
+        };
+        assert!(mc.validate().is_ok());
+    }
+
+    /// v1.0.0-MT: effective_saas_config() 在 saas=None 时返回默认值
+    #[test]
+    fn test_effective_saas_config_fallback() {
+        let mc = MemChainConfig {
+            mode: MemChainMode::Saas,
+            saas: None,
+            ..Default::default()
+        };
+        let esc = mc.effective_saas_config();
+        assert_eq!(esc.pool_max_connections, 100);
+        assert_eq!(esc.data_root, std::path::PathBuf::from("data"));
+    }
+
+    /// v1.0.0-MT: effective_saas_config() 在 saas=Some(...) 时返回实际值
+    #[test]
+    fn test_effective_saas_config_custom() {
+        let mc = MemChainConfig {
+            mode: MemChainMode::Saas,
+            saas: Some(SaasConfig {
+                pool_max_connections: 50,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let esc = mc.effective_saas_config();
+        assert_eq!(esc.pool_max_connections, 50);
     }
 }
