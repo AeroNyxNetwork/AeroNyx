@@ -31,6 +31,11 @@
 #   leading to `From<ArrayBase<OwnedRepr<i64>, Dim<[usize; 2]>>>` not
 #   being implemented for `SessionInputValue`.
 #
+# Modification Reason (v2.5.2+SecAudit):
+# - 🔒 Added `zeroize` for Zeroizing<[u8; 32]> wrapping of record_key
+#   in MemoryStorage. Ensures the encryption key is wiped from memory
+#   on drop, preventing key exposure in core dumps / /proc/pid/mem scans.
+#
 # Main Functionality:
 # - Server binary with CLI interface
 # - Configuration management
@@ -47,6 +52,7 @@
 # - External: tokio, clap, tracing
 # - 🌟 v1.3.0: tokio-tungstenite (WebSocket client)
 # - 🌟 v2.0.0: rusqlite (SQLite persistence)
+# - 🔒 v2.5.2: zeroize (key memory wipe on drop)
 #
 # Binary:
 # - aeronyx-server: Main server executable
@@ -66,6 +72,9 @@
 # - ⚠️ ndarray version MUST match ort's dependency. ort 2.0.0-rc.12
 #   requires ndarray ^0.17. Do NOT downgrade to 0.16 or Tensor
 #   conversions will fail at compile time.
+# - 🔒 zeroize: do NOT remove. Required for Zeroizing<[u8;32]> in
+#   storage.rs::MemoryStorage::record_key. Removing it causes a compile
+#   error and leaves the encryption key unwiped in process memory.
 #
 # Last Modified:
 # v0.1.0 - Initial server implementation
@@ -73,6 +82,7 @@
 # v1.3.0 - 🌟 Added tokio-tungstenite for WebSocket tunnel
 # v2.0.0 - 🌟 Added rusqlite for SQLite MemoryRecord storage
 # v2.1.0+Embed - 🔧 ndarray 0.16 → 0.17 for ort rc.12 compatibility
+# v2.5.2+SecAudit - 🔒 Added zeroize for record_key memory safety
 # ============================================
 
 [package]
@@ -149,6 +159,12 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 # 🔧 v2.1.0+Embed: upgraded from 0.16 → 0.17 to match ort rc.12 dependency
 ndarray = "0.17"
 hmac = "0.12"
+
+# 🔒 v2.5.2+SecAudit: Zeroizing wrapper for record_key in MemoryStorage.
+# Wipes the [u8; 32] encryption key from memory on drop, preventing
+# exposure in core dumps and /proc/pid/mem reads.
+# ⚠️ Do NOT remove — storage.rs::MemoryStorage::record_key depends on this.
+zeroize = "1"
 
 # Error handling
 thiserror = { workspace = true }
