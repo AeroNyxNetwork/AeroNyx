@@ -21,6 +21,7 @@
 //! - Content Dedup: has_active_content
 //! - v2.2.0: get_embedding_model, get_overview
 //! - v2.3.0: count_distinct_owners, owner_exists (Phase 1 remote storage capacity check)
+//! - v2.5.3+Isolation: get_active_records_by_context (project_id context filter for /recall)
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -45,14 +46,20 @@
 //!   for max_remote_owners capacity checks. They must be fast (indexed queries).
 //! - Cognitive graph methods have been moved to storage_graph.rs.
 //! - Miner Step support methods have been moved to storage_miner.rs.
+//! - get_active_records_by_context() uses LEFT JOIN records→sessions to check
+//!   project_id on EITHER the record directly OR via its session. Records inserted
+//!   via /remember directly (no session) are matched by records.project_id only.
 //!
-//! ## Last Modified
-//! v2.2.0 - 🌟 Extracted from storage.rs; added get_embedding_model, get_overview
+//! ## Modification History
+//! v2.2.0               - 🌟 Extracted from storage.rs; added get_embedding_model, get_overview
 //! v2.3.0+RemoteStorage - 🌟 Added count_distinct_owners(), owner_exists()
 //! v2.4.0-GraphCognition - 🌟 Added full CRUD for cognitive graph tables
 //!   (now in storage_graph.rs) + Miner Step support (now in storage_miner.rs)
-//! v2.4.0+Search - 🌟 Split into storage_ops.rs / storage_graph.rs / storage_miner.rs
-//!   to reduce file size. No functional changes to this file's methods.
+//! v2.4.0+Search        - 🌟 Split into storage_ops.rs / storage_graph.rs / storage_miner.rs
+//! v2.5.3+Isolation     - 🌟 Added get_active_records_by_context() for /recall context filter
+//!
+//! ## Last Modified
+//! v2.5.3+Isolation - 🌟 get_active_records_by_context() + 2 tests
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -615,7 +622,76 @@ impl MemoryStorage {
 }
 
 // ============================================
-// Tests (core/legacy ops only)
+// impl MemoryStorage — v2.5.3+Isolation: Context Filter
+// ============================================
+
+impl MemoryStorage {
+    /// Get active records filtered by project_id (context isolation).
+    ///
+    /// Matches records via TWO paths:
+    /// 1. `records.project_id = project_id` — direct tag (set by future /remember context param)
+    /// 2. `records.session_id → sessions.project_id = project_id` — via session association
+    ///    (set by /log handler when `context` field is provided, stored by upsert_session)
+    ///
+    /// Records inserted via `/remember` directly without a session use path 1 only.
+    /// Records inserted via `/log` with `context` field use path 2.
+    ///
+    /// ## Usage
+    /// Called by `recall_handler.rs` Step 4.1 when `RecallRequest.context` is
+    /// a non-"all" value. The caller builds a HashSet of returned record_ids
+    /// and filters `scored` with `retain()`.
+    ///
+    /// ## Performance
+    /// LEFT JOIN on session_id. For best performance, ensure an index exists on
+    /// `records.session_id` and `sessions.project_id`. With typical MemChain
+    /// data sizes (< 100k records per user) this is fast without extra indexes.
+    ///
+    /// v2.5.3+Isolation
+    pub async fn get_active_records_by_context(
+        &self,
+        owner: &[u8; 32],
+        project_id: &str,
+        layer: Option<MemoryLayer>,
+        limit: usize,
+    ) -> Vec<MemoryRecord> {
+        let limit = limit.min(1000).max(1);
+        let conn = self.conn.lock().await;
+
+        if let Some(l) = layer {
+            self.query_rows(&conn,
+                "SELECT r.record_id, r.owner, r.timestamp, r.layer, r.topic_tags, r.source_ai,
+                        r.status, r.supersedes, r.encrypted_content, r.embedding, r.signature,
+                        r.access_count, r.positive_feedback, r.negative_feedback, r.conflict_with
+                 FROM records r
+                 LEFT JOIN sessions s ON r.session_id = s.session_id
+                 WHERE r.owner = ?1
+                   AND r.status = 0
+                   AND r.layer = ?2
+                   AND (r.project_id = ?3 OR s.project_id = ?3)
+                 ORDER BY r.timestamp DESC
+                 LIMIT ?4",
+                params![owner.as_slice(), l as u8 as i64, project_id, limit as i64],
+            )
+        } else {
+            self.query_rows(&conn,
+                "SELECT r.record_id, r.owner, r.timestamp, r.layer, r.topic_tags, r.source_ai,
+                        r.status, r.supersedes, r.encrypted_content, r.embedding, r.signature,
+                        r.access_count, r.positive_feedback, r.negative_feedback, r.conflict_with
+                 FROM records r
+                 LEFT JOIN sessions s ON r.session_id = s.session_id
+                 WHERE r.owner = ?1
+                   AND r.status = 0
+                   AND (r.project_id = ?2 OR s.project_id = ?2)
+                 ORDER BY r.timestamp DESC
+                 LIMIT ?3",
+                params![owner.as_slice(), project_id, limit as i64],
+            )
+        }
+    }
+}
+
+// ============================================
+// Tests
 // ============================================
 // v2.4.0+Search: Cognitive graph tests moved to storage_graph.rs.
 //   Miner step support tests moved to storage_miner.rs.
@@ -735,5 +811,68 @@ mod tests {
         s.insert(&make_rec_owner(100, owner, MemoryLayer::Episode), "m").await;
         assert!(s.owner_exists(&owner).await);
         assert!(!s.owner_exists(&[0xBB; 32]).await);
+    }
+
+    // ── v2.5.3+Isolation: get_active_records_by_context tests ──
+
+    #[tokio::test]
+    async fn test_get_active_records_by_context_via_session() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        // Register a session with project_id = "work"
+        s.upsert_session("sess_work", &owner, Some("work"), "chat", now, 2).await.unwrap();
+
+        // Insert two records linked to the work session
+        let mut r1 = make_rec_owner(100, owner, MemoryLayer::Episode);
+        // Manually set session_id on the record row after insert
+        s.insert(&r1, "m").await;
+        {
+            let conn = s.conn_lock().await;
+            let _ = conn.execute(
+                "UPDATE records SET session_id = 'sess_work' WHERE record_id = ?1",
+                params![r1.record_id.as_slice()],
+            );
+        }
+
+        // Insert a record with no session (personal — untagged)
+        let r2 = make_rec_owner(200, owner, MemoryLayer::Episode);
+        s.insert(&r2, "m").await;
+
+        // Query context = "work" should return only r1
+        let results = s.get_active_records_by_context(&owner, "work", None, 100).await;
+        assert_eq!(results.len(), 1, "Only the work-tagged record should be returned");
+        assert_eq!(results[0].record_id, r1.record_id);
+
+        // Query context = "personal" should return nothing (no records tagged personal)
+        let personal = s.get_active_records_by_context(&owner, "personal", None, 100).await;
+        assert!(personal.is_empty(), "No personal records exist");
+    }
+
+    #[tokio::test]
+    async fn test_get_active_records_by_context_no_cross_owner() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner_a = [0xAA; 32];
+        let owner_b = [0xBB; 32];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        s.upsert_session("sess_a", &owner_a, Some("work"), "chat", now, 1).await.unwrap();
+
+        let r = make_rec_owner(100, owner_a, MemoryLayer::Episode);
+        s.insert(&r, "m").await;
+        {
+            let conn = s.conn_lock().await;
+            let _ = conn.execute(
+                "UPDATE records SET session_id = 'sess_a' WHERE record_id = ?1",
+                params![r.record_id.as_slice()],
+            );
+        }
+
+        // owner_b querying "work" must see nothing (different owner)
+        let results = s.get_active_records_by_context(&owner_b, "work", None, 100).await;
+        assert!(results.is_empty(), "Cross-owner isolation must be enforced");
     }
 }
