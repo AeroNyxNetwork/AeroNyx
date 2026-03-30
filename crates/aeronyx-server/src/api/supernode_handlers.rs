@@ -429,8 +429,9 @@ pub async fn supernode_retry_task(
         }
         Err(e) => {
             warn!(id = task_id, error = %e, "[SUPERNODE] retry_task failed");
+            // P2 SecAudit: don't expose internal error details (may contain SQL/table info)
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": format!("failed to retry task: {}", e)
+                "error": "internal error — task retry failed"
             }))).into_response()
         }
     }
@@ -493,7 +494,8 @@ pub async fn supernode_cancel_task(
             (StatusCode::OK, Json(serde_json::json!({ "task_id": task_id, "status": "cancelled" }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("failed to cancel task: {}", e)
+            // P2 SecAudit: internal error detail logged, not exposed to caller
+            "error": "internal error — task cancel failed"
         }))).into_response(),
     }
 }
