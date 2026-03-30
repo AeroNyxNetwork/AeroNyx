@@ -5,21 +5,41 @@
 //!
 //! ## File Split
 //! - `mpi.rs` (THIS FILE) — MpiState, auth middleware, router, helpers
-//! - `mpi_handlers.rs`       — remember, forget, status, embed, record, overview
+//! - `mpi_handlers.rs`       — remember, forget, status, embed, record, overview,
+//!                             patch record, provenance (v2.5.2)
 //! - `recall_handler.rs`     — hybrid recall pipeline
 //! - `mpi_graph_handlers.rs` — v2.4.0 cognitive graph endpoints
 //! - `log_handler.rs`        — /log ingestion
 //! - `supernode_handlers.rs` — v2.5.0 SuperNode management
 //!
+//! ⚠️ Important Note for Next Developer:
+//! - unified_auth_middleware MUST be applied to all routes via route_layer.
+//!   AuthenticatedOwner is injected into extensions here; handlers depend on it.
+//! - Remote auth path consumes the request body for signature verification,
+//!   then reconstructs the request. Any body size > 1MB is rejected (BAD_REQUEST).
+//! - .patch() on a MethodRouter does NOT require importing patch from axum::routing.
+//!   axum::routing::{get, post} is sufficient — .patch() is a MethodRouter method.
+//! - Route registration order matters for path param routes:
+//!   `/record/:record_id/provenance` must be registered AFTER `/record/:record_id`
+//!   to prevent `:record_id` from greedily matching "xxxx/provenance".
+//!   Current order is correct — do not reorder.
+//! - Endpoint count in the info! log must be kept in sync with actual route count.
+//!
+//! ## Modification History
+//! v2.1.0                   - MPI endpoints with MVF fusion scoring
+//! v2.1.0+MVF+Auth          - Bearer token auth middleware
+//! v2.2.0                   - Added record/:id, records/overview, embed endpoints
+//! v2.3.0+RemoteStorage     - Unified auth middleware (Bearer + Ed25519)
+//! v2.4.0-GraphCognition    - 🌟 Split into files; MpiState + graph extensions
+//! v2.4.0+Reranker          - 🌟 MpiState.reranker_engine
+//! v2.4.0+Conversation      - 🌟 MpiState.rawlog_key
+//! v2.5.0+SuperNode Phase D - 🌟 MpiState.llm_router; 6 supernode routes; 23→29
+//! v2.5.2+Provenance        - 🌟 PATCH /record/:id + GET /record/:id/provenance;
+//!                            29→31 endpoints. No new files — routes added to
+//!                            existing mpi_handlers.rs.
+//!
 //! ## Last Modified
-//! v2.1.0 - MPI endpoints with MVF fusion scoring
-//! v2.1.0+MVF+Auth - Bearer token auth middleware
-//! v2.2.0 - Added record/:id, records/overview, embed endpoints
-//! v2.3.0+RemoteStorage - Unified auth middleware (Bearer + Ed25519)
-//! v2.4.0-GraphCognition - 🌟 Split into files; MpiState + graph extensions
-//! v2.4.0+Reranker - 🌟 MpiState.reranker_engine
-//! v2.4.0+Conversation - 🌟 MpiState.rawlog_key
-//! v2.5.0+SuperNode Phase D - 🌟 MpiState.llm_router; 6 supernode routes; count 23→29
+//! v2.5.2+Provenance - 🌟 +2 routes (patch record, provenance); 29→31
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -351,22 +371,29 @@ async fn handle_local_auth(
 }
 
 // ============================================
-// Router — 29 endpoints
+// Router — 31 endpoints (v2.5.2+Provenance)
 // ============================================
 
 pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
     let router = Router::new()
-        // ── Original endpoints (mpi_handlers.rs) ──
-        .route("/api/mpi/remember",           post(mpi_handlers::mpi_remember))
-        .route("/api/mpi/recall",             post(super::recall_handler::mpi_recall))
-        .route("/api/mpi/recall/detail",      post(super::recall_handler::mpi_recall_detail))
-        .route("/api/mpi/forget",             post(mpi_handlers::mpi_forget))
-        .route("/api/mpi/status",             get(mpi_handlers::mpi_status))
-        .route("/api/mpi/embed",              post(mpi_handlers::mpi_embed))
-        .route("/api/mpi/record/:record_id",  get(mpi_handlers::mpi_get_record))
-        .route("/api/mpi/records/overview",   get(mpi_handlers::mpi_records_overview))
+        // ── Core endpoints (mpi_handlers.rs) ──
+        .route("/api/mpi/remember",          post(mpi_handlers::mpi_remember))
+        .route("/api/mpi/recall",            post(super::recall_handler::mpi_recall))
+        .route("/api/mpi/recall/detail",     post(super::recall_handler::mpi_recall_detail))
+        .route("/api/mpi/forget",            post(mpi_handlers::mpi_forget))
+        .route("/api/mpi/status",            get(mpi_handlers::mpi_status))
+        .route("/api/mpi/embed",             post(mpi_handlers::mpi_embed))
+        // v2.5.2+Provenance: GET + PATCH on same path; provenance route registered after.
+        // ⚠️ Order matters: /record/:id/provenance must come AFTER /record/:id
+        //    to prevent `:record_id` greedily matching "xxxx/provenance".
+        .route("/api/mpi/record/:record_id",
+            get(mpi_handlers::mpi_get_record)
+                .patch(mpi_handlers::mpi_patch_record))          // ← v2.5.2 PATCH
+        .route("/api/mpi/record/:record_id/provenance",
+            get(mpi_handlers::mpi_record_provenance))            // ← v2.5.2 GET provenance
+        .route("/api/mpi/records/overview",  get(mpi_handlers::mpi_records_overview))
         // ── /log (log_handler.rs) ──
-        .route("/api/mpi/log",                post(crate::api::log_handler::mpi_log))
+        .route("/api/mpi/log",               post(crate::api::log_handler::mpi_log))
         // ── v2.4.0: Cognitive graph (mpi_graph_handlers.rs) ──
         .route("/api/mpi/projects",                    get(mpi_graph_handlers::mpi_projects))
         .route("/api/mpi/projects/:id",                get(mpi_graph_handlers::mpi_project_detail))
@@ -377,23 +404,22 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
         .route("/api/mpi/artifacts/:id",               get(mpi_graph_handlers::mpi_artifact_detail))
         .route("/api/mpi/artifacts/:id/versions",      get(mpi_graph_handlers::mpi_artifact_versions))
         .route("/api/mpi/entities/:id",                get(mpi_graph_handlers::mpi_entity_detail))
-        .route("/api/mpi/entities", get(mpi_graph_handlers::mpi_entities_list))
+        .route("/api/mpi/entities",                    get(mpi_graph_handlers::mpi_entities_list))
         .route("/api/mpi/entities/:id/graph",          get(mpi_graph_handlers::mpi_entity_graph))
         .route("/api/mpi/communities",                 get(mpi_graph_handlers::mpi_communities))
         .route("/api/mpi/search",                      get(mpi_graph_handlers::mpi_search))
         .route("/api/mpi/entities/:id/timeline",       get(mpi_graph_handlers::mpi_entity_timeline))
         .route("/api/mpi/context/inject",              get(mpi_graph_handlers::mpi_context_inject))
         // ── v2.5.0+SuperNode: Task queue management (supernode_handlers.rs) ──
-        .route("/api/mpi/supernode/tasks",                  get(supernode_handlers::supernode_list_tasks))
-        .route("/api/mpi/supernode/tasks/:id",              get(supernode_handlers::supernode_task_detail))
-        .route("/api/mpi/supernode/tasks/:id/retry",        post(supernode_handlers::supernode_retry_task))
-        .route("/api/mpi/supernode/tasks/:id/cancel",       post(supernode_handlers::supernode_cancel_task))
-        .route("/api/mpi/supernode/usage",                  get(supernode_handlers::supernode_usage))
-        .route("/api/mpi/supernode/health",                 get(supernode_handlers::supernode_health));
-        
+        .route("/api/mpi/supernode/tasks",             get(supernode_handlers::supernode_list_tasks))
+        .route("/api/mpi/supernode/tasks/:id",         get(supernode_handlers::supernode_task_detail))
+        .route("/api/mpi/supernode/tasks/:id/retry",   post(supernode_handlers::supernode_retry_task))
+        .route("/api/mpi/supernode/tasks/:id/cancel",  post(supernode_handlers::supernode_cancel_task))
+        .route("/api/mpi/supernode/usage",             get(supernode_handlers::supernode_usage))
+        .route("/api/mpi/supernode/health",            get(supernode_handlers::supernode_health));
 
     info!(
-        "[MPI] Router: 29 endpoints (bearer={}, remote={}, ner={}, graph={}, reranker={}, supernode={})",
+        "[MPI] Router: 31 endpoints (bearer={}, remote={}, ner={}, graph={}, reranker={}, supernode={})",
         state.api_secret.as_ref().map_or(false, |s| !s.is_empty()),
         state.allow_remote_storage,
         state.ner_engine.is_some(),
