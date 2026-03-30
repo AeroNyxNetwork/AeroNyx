@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # ============================================
-# scripts/init.sh — AeroNyx MemChain 
+# scripts/init.sh — AeroNyx MemChain
 # ============================================
 # Interactive setup wizard that:
 #   1. Detects system resources (CPU, RAM, disk)
 #   2. Downloads AI models (EmbeddingGemma + GLiNER + ORT)
 #   3. Asks user preferences (LLM provider, privacy level)
 #   4. Generates server.toml configuration
-#   5. Optionally builds and starts the server
+#   5. Configures IP forwarding + NAT (VPN routing)
+#   6. Optionally builds and starts the server
 #
 # Usage:
 #   chmod +x scripts/init.sh
@@ -16,7 +17,7 @@
 #   ./scripts/init.sh --help       # Show help
 #
 # Last Modified:
-# v2.5.0 - 🌟 Created. Full interactive setup wizard.
+# v2.6.0 - Added Step 4.5: IP forwarding + iptables NAT setup
 
 set -euo pipefail
 
@@ -62,7 +63,6 @@ for arg in "$@"; do
 done
 
 # ── Prompt helper ──────────────────────────────────────────────
-# Usage: result=$(prompt "Question?" "default_value")
 prompt() {
     local question="$1"
     local default="$2"
@@ -78,10 +78,9 @@ prompt() {
     echo "${answer:-${default}}"
 }
 
-# Yes/No prompt, returns 0 for yes, 1 for no
 prompt_yn() {
     local question="$1"
-    local default="$2"  # "y" or "n"
+    local default="$2"
 
     if [ "${USE_DEFAULTS}" = true ]; then
         [ "${default}" = "y" ] && return 0 || return 1
@@ -120,7 +119,7 @@ echo -e "${BOLD}${CYAN}"
 echo "    ╔══════════════════════════════════════════╗"
 echo "    ║                                          ║"
 echo "    ║     AeroNyx MemChain — Setup Wizard      ║"
-echo "    ║     AI Cognitive Engine v2.5.0            ║"
+echo "    ║     AI Cognitive Engine v2.6.0            ║"
 echo "    ║                                          ║"
 echo "    ╚══════════════════════════════════════════╝"
 echo -e "${NC}"
@@ -141,7 +140,6 @@ echo -e "  OS:       ${BOLD}${OS}${NC}"
 echo -e "  Project:  ${DIM}${PROJECT_ROOT}${NC}"
 echo ""
 
-# Warn on low resources
 if [ "${RAM_MB}" -lt 3072 ]; then
     warn "Low RAM (${RAM_MB}MB). Minimum 4GB recommended."
     warn "EmbeddingGemma may fail. Consider using MiniLM (--embed-minilm)."
@@ -316,13 +314,11 @@ if prompt_yn "  Enable SuperNode LLM enhancement?" "n"; then
             ;;
     esac
 
-    # Default provider type
     if [ -z "${SUPERNODE_PROVIDER}" ]; then
         SUPERNODE_PROVIDER="openai_compatible"
     fi
 
     if [ "${SUPERNODE_ENABLED}" = true ] && [ -n "${SUPERNODE_API_KEY}" ]; then
-        # Quick connectivity test
         echo ""
         info "Testing API connectivity..."
         TEST_URL="${SUPERNODE_API_BASE}/v1/chat/completions"
@@ -365,18 +361,15 @@ fi
 
 header "Step 4/5 — Generate Configuration"
 
-# Create directories
 sudo mkdir -p "${CONFIG_DIR}" 2>/dev/null || mkdir -p "${CONFIG_DIR}"
 sudo mkdir -p "${DB_DIR}" 2>/dev/null || mkdir -p "${DB_DIR}"
 
-# Backup existing config
 if [ -f "${CONFIG_FILE}" ]; then
     BACKUP="${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
     cp "${CONFIG_FILE}" "${BACKUP}"
     warn "Existing config backed up to: ${BACKUP}"
 fi
 
-# Generate config
 cat > "${CONFIG_FILE}" << TOML
 # ════════════════════════════════════════════════════════════════
 # AeroNyx Server Configuration
@@ -413,14 +406,12 @@ aof_path = "${DB_DIR}/.memchain"
 miner_interval_secs = ${MINER_INTERVAL}
 TOML
 
-# API secret
 if [ -n "${API_SECRET}" ]; then
     cat >> "${CONFIG_FILE}" << TOML
 api_secret = "${API_SECRET}"
 TOML
 fi
 
-# Embedding model
 cat >> "${CONFIG_FILE}" << TOML
 
 # Local AI Models
@@ -440,7 +431,6 @@ miner_community_detection = true
 miner_session_summary = true
 TOML
 
-# SuperNode config
 if [ "${SUPERNODE_ENABLED}" = true ]; then
     cat >> "${CONFIG_FILE}" << TOML
 
@@ -490,6 +480,114 @@ cat "${CONFIG_FILE}"
 echo -e "${DIM}────────────────────────${NC}"
 
 # ════════════════════════════════════════════════════════════════
+# Step 4.5: Network Setup (IP Forwarding + NAT)
+# ════════════════════════════════════════════════════════════════
+
+header "Step 4.5/5 — Network Setup (IP Forwarding + NAT)"
+
+# VPN 子网和 TUN 设备（与 server.toml 保持一致）
+VPN_SUBNET="100.64.0.0/24"
+TUN_DEVICE="aeronyx0"
+
+# 自动检测默认网卡
+DEFAULT_IFACE=$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')
+if [ -z "${DEFAULT_IFACE}" ]; then
+    DEFAULT_IFACE="eth0"
+    warn "Could not detect default interface, using fallback: ${DEFAULT_IFACE}"
+fi
+info "Detected default network interface: ${DEFAULT_IFACE}"
+
+# ── 1. IP Forwarding ──────────────────────────────────────────
+info "Enabling IP forwarding..."
+
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+if grep -q "net.ipv4.ip_forward" /etc/sysctl.conf 2>/dev/null; then
+    sed -i 's/^#*net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+else
+    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+fi
+sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
+ok "IP forwarding enabled"
+
+# ── 2. 安装 iptables（如果没有）─────────────────────────────
+if ! command -v iptables &>/dev/null; then
+    info "Installing iptables..."
+    if command -v apt-get &>/dev/null; then
+        apt-get install -y iptables iptables-persistent 2>&1 | tail -3
+    elif command -v yum &>/dev/null; then
+        yum install -y iptables iptables-services 2>&1 | tail -3
+    else
+        warn "Cannot install iptables automatically. Please install manually."
+    fi
+fi
+
+# ── 3. 应用 iptables NAT 规则 ─────────────────────────────────
+if command -v iptables &>/dev/null; then
+    info "Applying iptables NAT rules (interface: ${DEFAULT_IFACE})..."
+
+    # 避免重复添加（-C 检查已存在则跳过，否则 -A 添加）
+    iptables -t nat -C POSTROUTING -s "${VPN_SUBNET}" -o "${DEFAULT_IFACE}" -j MASQUERADE 2>/dev/null \
+        || iptables -t nat -A POSTROUTING -s "${VPN_SUBNET}" -o "${DEFAULT_IFACE}" -j MASQUERADE
+
+    iptables -C FORWARD -i "${TUN_DEVICE}" -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -i "${TUN_DEVICE}" -j ACCEPT
+
+    iptables -C FORWARD -o "${TUN_DEVICE}" -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -o "${TUN_DEVICE}" -j ACCEPT
+
+    ok "iptables NAT rules applied"
+
+    # ── 4. 持久化 iptables ────────────────────────────────────
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save >/dev/null 2>&1
+        ok "iptables rules persisted (netfilter-persistent)"
+    elif command -v iptables-save &>/dev/null; then
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4
+        ok "iptables rules saved to /etc/iptables/rules.v4"
+
+        # 开机自动恢复
+        RC_LOCAL="/etc/rc.local"
+        RESTORE_CMD="iptables-restore < /etc/iptables/rules.v4"
+        if [ -f "${RC_LOCAL}" ]; then
+            if ! grep -q "iptables-restore" "${RC_LOCAL}"; then
+                sed -i "s|^exit 0|${RESTORE_CMD}\nexit 0|" "${RC_LOCAL}"
+                ok "Added iptables restore to ${RC_LOCAL}"
+            fi
+        else
+            cat > "${RC_LOCAL}" << EOF
+#!/bin/sh
+${RESTORE_CMD}
+exit 0
+EOF
+            chmod +x "${RC_LOCAL}"
+            ok "Created ${RC_LOCAL} with iptables restore"
+        fi
+    fi
+else
+    warn "iptables not available. VPN clients will connect but have no internet."
+    warn "Run manually after install:"
+    warn "  iptables -t nat -A POSTROUTING -s ${VPN_SUBNET} -o ${DEFAULT_IFACE} -j MASQUERADE"
+    warn "  iptables -A FORWARD -i ${TUN_DEVICE} -j ACCEPT"
+    warn "  iptables -A FORWARD -o ${TUN_DEVICE} -j ACCEPT"
+fi
+
+# ── 5. 开放 UDP 51820（ufw / firewalld）──────────────────────
+if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+    ufw allow 51820/udp >/dev/null 2>&1
+    ok "ufw: opened UDP 51820"
+elif command -v firewall-cmd &>/dev/null; then
+    firewall-cmd --permanent --add-port=51820/udp >/dev/null 2>&1
+    firewall-cmd --reload >/dev/null 2>&1
+    ok "firewalld: opened UDP 51820"
+fi
+
+echo ""
+ok "Network setup complete"
+info "Note: On GCP/AWS/Azure, also open UDP 51820 in the cloud security group."
+
+# ════════════════════════════════════════════════════════════════
 # Step 5: Build & Start
 # ════════════════════════════════════════════════════════════════
 
@@ -527,7 +625,6 @@ if [ "${BUILD_NOW}" = true ]; then
         SERVER_PID=$!
         sleep 5
 
-        # Quick health check
         if curl -s "http://${API_ADDR}/api/mpi/status" >/dev/null 2>&1; then
             ok "Server is running! (PID: ${SERVER_PID})"
             echo ""
