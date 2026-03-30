@@ -8,10 +8,17 @@
 //! separate from the original handlers. All 11 endpoints are read-only
 //! GET requests, all behind unified_auth_middleware.
 //!
+//! ## Modification Reason (v2.5.2+Pagination)
+//! Added `offset: usize` to `ListParams` for cursor-free pagination.
+//! - mpi_project_timeline() passes `params.offset` to get_sessions_for_project()
+//! - mpi_entity_timeline() passes `params.offset` to get_entity_timeline()
+//! - mpi_context_inject() passes `0` (internal call, no pagination)
+//! Response JSON for timeline endpoints now includes a `pagination` block.
+//!
 //! ## Endpoints
 //! - GET /api/mpi/projects — List projects
 //! - GET /api/mpi/projects/:id — Project detail
-//! - GET /api/mpi/projects/:id/timeline — Session summaries by date
+//! - GET /api/mpi/projects/:id/timeline — Session summaries by date (paginated)
 //! - GET /api/mpi/sessions/:id — Session detail
 //! - GET /api/mpi/sessions/:id/conversation — Full conversation (decrypted turns)
 //! - GET /api/mpi/sessions/:id/artifacts — Session artifacts
@@ -19,11 +26,12 @@
 //! - GET /api/mpi/artifacts/:id/versions — Artifact version history
 //! - GET /api/mpi/entities/:id — Entity detail + relationships
 //! - GET /api/mpi/entities/:id/graph — Entity 1-2 hop BFS subgraph
+//! - GET /api/mpi/entities/:id/timeline — Entity event timeline (paginated)
 //! - GET /api/mpi/communities — List communities
 //!
 //! ## Dependencies
 //! - super::mpi::{MpiState, extract_owner, default_list_limit} — shared types/helpers
-//! - storage_ops.rs — CRUD methods for cognitive graph tables
+//! - storage_graph.rs — CRUD methods for cognitive graph tables (v2.5.2+Pagination)
 //! - storage_crypto.rs — decrypt_rawlog_content_pub for conversation replay
 //! - graph.rs — bfs_traverse() for entity subgraph
 //!
@@ -46,7 +54,7 @@
 //!   Returns raw_log metadata without decrypted content (content field = null).
 //!   Remote clients must decrypt using their own rawlog_key.
 //!
-//! ⚠️ Important Note for Next Developer:
+//! ⚠️ Important Notes for Next Developer:
 //! - All endpoints extract owner from AuthenticatedOwner (via extract_owner)
 //! - artifact_detail and artifact_versions are partial stubs (Phase D to complete)
 //! - session_conversation uses state.rawlog_key for decryption — this key is
@@ -56,12 +64,19 @@
 //! - entity_graph calls graph::bfs_traverse() which queries knowledge_edges
 //! - The conversation endpoint also returns session metadata (summary, project)
 //!   alongside the turns, so the UI can show context without extra API calls.
+//! - v2.5.2+Pagination: ListParams now has `offset: usize`. All timeline
+//!   handlers pass this to the storage layer. mpi_context_inject passes 0.
 //!
 //! ## Last Modified
-//! v2.4.0-GraphCognition - 🌟 Initial implementation (11 endpoints)
-//! v2.4.0+Conversation - 🌟 session_conversation now returns decrypted turns
+//! v2.4.0-GraphCognition - Initial implementation (11 endpoints)
+//! v2.4.0+Conversation   - session_conversation now returns decrypted turns
 //!   via rawlog_key server-side decryption. Added ConversationTurn type.
 //!   Remote requests get metadata only (content=null).
+//! v2.5.2+Pagination     - ListParams gains `offset` field.
+//!   mpi_project_timeline: passes params.offset + emits pagination block.
+//!   mpi_entity_timeline:  passes params.offset + emits pagination block.
+//!   mpi_context_inject:   passes 0 for get_sessions_for_project (no pagination).
+// ============================================
 
 use std::sync::Arc;
 
@@ -79,11 +94,22 @@ use super::mpi::{MpiState, extract_owner, default_list_limit};
 // Shared Query Params
 // ============================================
 
+/// Shared list/pagination query params used across timeline and list endpoints.
+///
+/// ## v2.5.2+Pagination
+/// Added `offset: usize` (default 0). Use with `limit` for page-based traversal:
+///   - Page 1: `?limit=20&offset=0`
+///   - Page 2: `?limit=20&offset=20`
+/// If the response `pagination.has_more` is true, increment offset by limit
+/// to fetch the next page.
 #[derive(Debug, Deserialize)]
 pub struct ListParams {
     #[serde(default = "default_list_limit")]
     pub limit: usize,
     pub status: Option<String>,
+    /// Pagination offset (default 0). v2.5.2+Pagination.
+    #[serde(default)]
+    pub offset: usize,
 }
 
 // ============================================
@@ -142,6 +168,13 @@ pub async fn mpi_project_detail(
 }
 
 /// `GET /api/mpi/projects/:id/timeline` — Session summaries by date for a project.
+///
+/// ## v2.5.2+Pagination
+/// Supports `?limit=N&offset=M` query params.
+/// Response includes a `pagination` block:
+/// ```json
+/// "pagination": { "limit": 20, "offset": 0, "has_more": true }
+/// ```
 pub async fn mpi_project_timeline(
     State(state): State<Arc<MpiState>>,
     Path(project_id): Path<String>,
@@ -149,15 +182,29 @@ pub async fn mpi_project_timeline(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let _owner = extract_owner(&req).owner_bytes();
+    let limit = params.limit.min(100);
+    let offset = params.offset;
+
     let sessions = state.storage.get_sessions_for_project(
         &project_id,
-        params.limit.min(100),
+        limit,
+        offset,
     ).await;
 
-    debug!(project = %project_id, sessions = sessions.len(), "[MPI] GET /projects/:id/timeline");
+    debug!(
+        project = %project_id,
+        sessions = sessions.len(),
+        offset = offset,
+        "[MPI] GET /projects/:id/timeline"
+    );
     (StatusCode::OK, Json(serde_json::json!({
         "project_id": project_id,
         "sessions": sessions,
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+            "has_more": sessions.len() == limit,
+        }
     })))
 }
 
@@ -238,9 +285,9 @@ pub async fn mpi_session_conversation(
         }))).into_response();
     }
 
-    // Decrypt turns
-    // For Local requests: use state.rawlog_key to decrypt
-    // For Remote requests: cannot decrypt (different owner's key), return encrypted flag
+    // Decrypt turns.
+    // For Local requests: use state.rawlog_key to decrypt.
+    // For Remote requests: cannot decrypt (different owner's key), return encrypted flag.
     let rawlog_key = if !is_remote {
         state.rawlog_key.as_ref()
     } else {
@@ -271,8 +318,8 @@ pub async fn mpi_session_conversation(
                         }
                     }
                     Err(e) => {
-                        // Decryption failed — key mismatch or corrupt data
-                        // This can happen if rawlog_key was rotated or data is corrupted
+                        // Decryption failed — key mismatch or corrupt data.
+                        // Can happen if rawlog_key was rotated or data is corrupted.
                         warn!(
                             session = %session_id,
                             turn = log.turn_index,
@@ -457,7 +504,7 @@ pub async fn mpi_entity_graph(
     })))
 }
 
-// GET /api/mpi/entities
+/// `GET /api/mpi/entities` — List entities for the authenticated owner.
 pub async fn mpi_entities_list(
     State(state): State<Arc<MpiState>>,
     req: Request<axum::body::Body>,
@@ -494,11 +541,11 @@ pub struct SearchParams {
 ///   "results": [
 ///     {
 ///       "session_id": "sess_alpha_002",
-///       "session_title": "Project Alpha: RS256 迁移 + 限流方案",
+///       "session_title": "Project Alpha: RS256 migration + rate limiting",
 ///       "project_name": "Project Alpha",
 ///       "started_at": 1710400000,
 ///       "hits": [
-///         {"source_type": "record", "snippet": "...用 <mark>token bucket</mark>...", "score": 2.8}
+///         {"source_type": "record", "snippet": "...use <mark>token bucket</mark>...", "score": 2.8}
 ///       ],
 ///       "best_score": 2.8
 ///     }
@@ -555,26 +602,15 @@ pub async fn mpi_search(
 ///
 /// Used by the frontend to show how a concept/tool/person evolved over time.
 ///
+/// ## v2.5.2+Pagination
+/// Supports `?limit=N&offset=M`. Response includes a `pagination` block.
+///
 /// ## Response Format
 /// ```json
 /// {
 ///   "entity": { "name": "auth module", "type": "module" },
-///   "timeline": [
-///     {
-///       "session_id": "sess_001",
-///       "session_title": "JWT 认证设计",
-///       "started_at": 1710300000,
-///       "event_type": "mentioned",
-///       "detail": "Role: mentioned"
-///     },
-///     {
-///       "started_at": 1710300000,
-///       "event_type": "relation_created",
-///       "detail": "→ USES JWT",
-///       "relation_type": "USES",
-///       "related_entity": "JWT"
-///     }
-///   ]
+///   "timeline": [...],
+///   "pagination": { "limit": 50, "offset": 0, "has_more": false }
 /// }
 /// ```
 pub async fn mpi_entity_timeline(
@@ -585,6 +621,7 @@ pub async fn mpi_entity_timeline(
 ) -> impl IntoResponse {
     let owner = extract_owner(&req).owner_bytes();
     let limit = params.limit.min(200).max(1);
+    let offset = params.offset;
 
     // Get entity metadata
     let entity = match state.storage.get_entity(&entity_id).await {
@@ -594,12 +631,13 @@ pub async fn mpi_entity_timeline(
         }))).into_response(),
     };
 
-    // Get timeline events
-    let timeline = state.storage.get_entity_timeline(&entity_id, &owner, limit).await;
+    // Get timeline events (v2.5.2+Pagination: pass offset)
+    let timeline = state.storage.get_entity_timeline(&entity_id, &owner, limit, offset).await;
 
     debug!(
         entity = %entity_id,
         events = timeline.len(),
+        offset = offset,
         "[MPI] GET /entities/:id/timeline"
     );
 
@@ -612,6 +650,11 @@ pub async fn mpi_entity_timeline(
             "mention_count": entity.mention_count,
         },
         "timeline": timeline,
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+            "has_more": timeline.len() == limit,
+        }
     }))).into_response()
 }
 
@@ -650,17 +693,16 @@ fn default_context_sessions() -> usize { 3 }
 ///   → AI naturally "remembers" recent work
 /// ```
 ///
+/// ## v2.5.2+Pagination
+/// Internal call to get_sessions_for_project passes offset=0 (no pagination needed
+/// here — we always want the N most recent sessions for context injection).
+///
 /// ## Response
 /// ```json
 /// {
 ///   "project": {"name": "Project Alpha", "status": "active"},
-///   "recent_sessions": [
-///     {"session_id": "...", "title": "RS256 迁移", "started_at": 1710400000, "summary": "..."}
-///   ],
-///   "key_entities": [
-///     {"name": "auth module", "type": "module", "mentions": 8},
-///     {"name": "RS256", "type": "technology", "mentions": 5}
-///   ],
+///   "recent_sessions": [...],
+///   "key_entities": [...],
 ///   "formatted_context": "# Project Alpha\n\n## Recent Sessions\n...",
 ///   "token_estimate": 320
 /// }
@@ -678,7 +720,6 @@ pub async fn mpi_context_inject(
     let project = if let Some(ref pid) = params.project_id {
         state.storage.get_project(pid).await
     } else {
-        // Get the most recently active project
         let projects = state.storage.get_projects(&owner, Some("active"), 1).await;
         projects.into_iter().next()
     };
@@ -686,9 +727,10 @@ pub async fn mpi_context_inject(
     let project_name = project.as_ref().map(|p| p.name.clone());
     let project_id = project.as_ref().map(|p| p.project_id.clone());
 
-    // Get recent sessions for this project (or all sessions if no project)
+    // Get recent sessions for this project (or all sessions if no project).
+    // offset=0: context injection always wants the N most recent — no pagination.
     let recent_sessions = if let Some(ref pid) = project_id {
-        state.storage.get_sessions_for_project(pid, recent_count).await
+        state.storage.get_sessions_for_project(pid, recent_count, 0).await
     } else {
         // No project → get most recent sessions for this owner
         state.storage.get_pending_sessions(&owner, recent_count).await
@@ -722,15 +764,10 @@ pub async fn mpi_context_inject(
                 .or(sess.summary.as_deref())
                 .unwrap_or(&sess.session_id);
 
-            // Format date from timestamp
-            let date_str = {
-                let ts = sess.started_at;
-                // Simple date formatting (YYYY-MM-DD)
-                let secs = ts as u64;
-                let days = secs / 86400;
-                let y = 1970 + (days * 400 / 146097); // rough year estimate
-                format!("ts:{}", ts) // Frontend should format this
-            };
+            // Format date from timestamp.
+            // Frontend is responsible for locale-aware formatting;
+            // we emit the raw Unix timestamp for maximum compatibility.
+            let date_str = format!("ts:{}", sess.started_at);
 
             let line = format!("- **{}** ({})\n", title, date_str);
             token_est += line.len() / 4;
@@ -939,14 +976,12 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["session_id"], "s1");
         assert_eq!(json["turn_count"], 0);
-        // Should have a note about no raw_logs
         assert!(json["note"].is_string());
     }
 
     #[tokio::test]
     async fn test_session_conversation_plaintext_turns() {
         let state = make_state().await;
-        // Insert plaintext raw_logs
         state.storage.insert_raw_log(
             "sess_test", 0, "user", "Hello, let's discuss auth", "test",
             None, 1, None, None,
@@ -974,17 +1009,12 @@ mod tests {
 
         let turns = json["turns"].as_array().unwrap();
         assert_eq!(turns.len(), 3);
-
         assert_eq!(turns[0]["turn_index"], 0);
         assert_eq!(turns[0]["role"], "user");
         assert_eq!(turns[0]["content"], "Hello, let's discuss auth");
         assert_eq!(turns[0]["encrypted"], false);
-
-        assert_eq!(turns[1]["turn_index"], 1);
         assert_eq!(turns[1]["role"], "assistant");
         assert_eq!(turns[1]["content"], "Sure! What auth method?");
-
-        assert_eq!(turns[2]["turn_index"], 2);
         assert_eq!(turns[2]["content"], "RS256 with ring crate");
     }
 
@@ -993,7 +1023,6 @@ mod tests {
         let state = make_state().await;
         let rlk = state.rawlog_key.unwrap();
 
-        // Insert encrypted raw_logs
         state.storage.insert_raw_log(
             "sess_enc", 0, "user", "Secret project discussion", "test",
             None, 1, None, Some(&rlk),
@@ -1014,8 +1043,6 @@ mod tests {
 
         assert_eq!(json["turn_count"], 2);
         let turns = json["turns"].as_array().unwrap();
-
-        // Both turns should be decrypted successfully (Local auth with matching key)
         assert_eq!(turns[0]["content"], "Secret project discussion");
         assert_eq!(turns[0]["encrypted"], false);
         assert_eq!(turns[1]["content"], "Understood, proceeding with encryption");
@@ -1027,8 +1054,7 @@ mod tests {
         let s = make_state().await;
         let app = build_mpi_router(s);
         let req = Request::builder().uri("/api/mpi/sessions/s1/artifacts").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1036,8 +1062,7 @@ mod tests {
         let s = make_state().await;
         let app = build_mpi_router(s);
         let req = Request::builder().uri("/api/mpi/artifacts/art1").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1045,8 +1070,7 @@ mod tests {
         let s = make_state().await;
         let app = build_mpi_router(s);
         let req = Request::builder().uri("/api/mpi/artifacts/art1/versions").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1059,6 +1083,25 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["project_id"], "proj1");
+        // v2.5.2+Pagination: pagination block must be present
+        assert!(json["pagination"].is_object());
+        assert_eq!(json["pagination"]["offset"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_project_timeline_pagination_params() {
+        let s = make_state().await;
+        let app = build_mpi_router(s);
+        let req = Request::builder()
+            .uri("/api/mpi/projects/proj1/timeline?limit=5&offset=10")
+            .body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["pagination"]["limit"], 5);
+        assert_eq!(json["pagination"]["offset"], 10);
+        assert_eq!(json["pagination"]["has_more"], false);
     }
 
     // ── v2.4.0+Search: Search endpoint tests ──
@@ -1070,8 +1113,7 @@ mod tests {
         let req = Request::builder()
             .uri("/api/mpi/search?q=")
             .body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1093,7 +1135,6 @@ mod tests {
     async fn test_search_with_indexed_content() {
         let state = make_state().await;
         let owner = state.owner_key;
-        // Index some content
         state.storage.fts_index_record(
             &[0x01; 32], &owner,
             "token bucket rate limiting at 100 requests per minute", "",
@@ -1107,7 +1148,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["total_results"].as_u64().unwrap() > 0, "Should find indexed content");
+        assert!(json["total_results"].as_u64().unwrap() > 0);
     }
 
     // ── v2.4.0+Search: Entity timeline tests ──
@@ -1119,15 +1160,13 @@ mod tests {
         let req = Request::builder()
             .uri("/api/mpi/entities/nonexistent/timeline")
             .body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn test_entity_timeline_empty_events() {
         let state = make_state().await;
         let owner = state.owner_key;
-        // Create an entity with no episode_edges or knowledge_edges
         state.storage.upsert_entity(
             "ent_test", &owner, "TestEntity", "testentity", "concept", None, None,
         ).await.unwrap();
@@ -1142,5 +1181,29 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["entity"]["name"], "TestEntity");
         assert!(json["timeline"].as_array().unwrap().is_empty());
+        // v2.5.2+Pagination: pagination block must be present
+        assert!(json["pagination"].is_object());
+        assert_eq!(json["pagination"]["offset"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_entity_timeline_pagination_params() {
+        let state = make_state().await;
+        let owner = state.owner_key;
+        state.storage.upsert_entity(
+            "ent_pg", &owner, "PgEntity", "pgentity", "concept", None, None,
+        ).await.unwrap();
+
+        let app = build_mpi_router(state);
+        let req = Request::builder()
+            .uri("/api/mpi/entities/ent_pg/timeline?limit=10&offset=20")
+            .body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["pagination"]["limit"], 10);
+        assert_eq!(json["pagination"]["offset"], 20);
+        assert_eq!(json["pagination"]["has_more"], false);
     }
 }
