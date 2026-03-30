@@ -14,26 +14,49 @@
 //! Step 3:      RRF fusion + MVF scoring
 //! Step 3.5:    Cross-encoder rerank (v2.4.0+Reranker)
 //! Step 4:      Token budget trimming
+//! Step 4.1:    🆕 v2.5.3+Isolation: Context filter (project_id isolation)
 //! Step 4.5:    Progressive mode branch (v2.4.0+Progressive)
-//!              mode="full"  → full content response
-//!              mode="index" → lightweight preview (80 chars), use /recall/detail for full
 //! ```
 //!
 //! ## Progressive Retrieval (v2.4.0+Progressive)
 //! Pass 1: POST /recall { mode: "index" } → ~50 tokens/item
 //! Pass 2: POST /recall/detail { record_ids: [...] } → full content
 //!
+//! ## v2.5.3+Isolation: Context filter (Step 4.1)
+//! When `context` is set to a non-"all" value, `scored` is filtered to only
+//! include records whose session is tagged with that project_id.
+//! The filter is applied AFTER RRF/MVF scoring and reranking (post-filter)
+//! because vector search doesn't carry project_id metadata.
+//!
+//! Context mapping:
+//! - None / "all" / "" → no filter (all records returned)
+//! - "work"            → project_id = "work"
+//! - "personal"        → project_id = "personal"
+//! - any other string  → treated as literal project_id
+//!
+//! Known limitation: post-filter can reduce results below top_k when many
+//! records are in other contexts. Future: tag VectorIndex entries with
+//! project_id for pre-filter.
+//!
 //! ⚠️ Important Note for Next Developer:
-//! - matched_json is computed BEFORE the index-mode early-return to avoid borrow-after-move.
-//! - mpi_recall_detail uses extract_owner() (same as all handlers), NOT an Axum extractor,
-//!   to avoid consuming the request before reading the body.
-//! - Synthetic IDs (graph_*, bm25_*) in index results are silently skipped by /recall/detail.
+//! - matched_json is computed BEFORE the index-mode early-return (borrow-after-move).
+//! - mpi_recall_detail uses extract_owner() (same as all handlers).
+//! - Synthetic IDs (graph_*, bm25_*) in index results are silently skipped
+//!   by /recall/detail.
+//! - Context filter (Step 4.1) calls get_active_records_by_context() which
+//!   does a LEFT JOIN records → sessions. For records inserted via /remember
+//!   directly (no session), project_id on the record row itself is checked.
+//! - The core logic of this file cannot be deleted or significantly modified.
+//!
+//! ## Modification History
+//! v2.4.0+BM25          - 🌟 Extracted from mpi_handlers.rs; BM25 + RRF fusion
+//! v2.4.0+BM25-fix      - 🔧 BM25 entity/session direct injection (Step 2a-ter)
+//! v2.4.0+Reranker      - 🌟 Step 3.5 cross-encoder rerank
+//! v2.4.0+Progressive   - 🌟 mode="index" branch + mpi_recall_detail handler
+//! v2.5.3+Isolation     - 🌟 Step 4.1 context filter; RecallRequest.context field
 //!
 //! ## Last Modified
-//! v2.4.0+BM25 - 🌟 Extracted from mpi_handlers.rs; BM25 + RRF fusion
-//! v2.4.0+BM25-fix - 🔧 BM25 entity/session direct injection (Step 2a-ter)
-//! v2.4.0+Reranker - 🌟 Step 3.5 cross-encoder rerank
-//! v2.4.0+Progressive - 🌟 mode="index" branch + mpi_recall_detail handler
+//! v2.5.3+Isolation - 🌟 Step 4.1 context post-filter for memory isolation
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -188,7 +211,7 @@ pub async fn mpi_recall(
                 }
             }
             "session" => {
-                if let Some(session) = state.storage.get_session(source_id).await {
+                if let Some(session) = state.storage.get_session(source_id, &owner).await {
                     if let Some(ref summary) = session.summary {
                         bm25_direct_memories.push(RecalledMemory {
                             record_id: format!("bm25_session_{}", source_id),
@@ -255,7 +278,6 @@ pub async fn mpi_recall(
     if !graph_traversed.is_empty() {
         let graph_entity_ids: Vec<String> = graph_traversed.keys().cloned().collect();
 
-        // Path 1: Entity → episodes → session summary
         let mut seen_episodes: HashSet<String> = HashSet::new();
         for eid in &graph_entity_ids {
             for (episode_id, _role) in state.storage.get_episodes_for_entity(eid).await {
@@ -266,7 +288,7 @@ pub async fn mpi_recall(
                     rest.rfind('_').map(|i| rest[..i].to_string())
                 } else { None };
                 if let Some(ref sid) = session_id {
-                    if let Some(session) = state.storage.get_session(sid).await {
+                    if let Some(session) = state.storage.get_session(sid, &owner).await {
                         if let Some(ref summary) = session.summary {
                             let weight = graph_traversed.get(eid).copied().unwrap_or(0.5);
                             graph_memories.push(RecalledMemory {
@@ -284,7 +306,6 @@ pub async fn mpi_recall(
             }
         }
 
-        // Path 3: Entity descriptions + edges
         for eid in &graph_entity_ids {
             if let Some(entity) = state.storage.get_entity(eid).await {
                 let edges = state.storage.get_edges_for_entity(eid, &owner).await;
@@ -434,6 +455,40 @@ pub async fn mpi_recall(
         }
     }
 
+    // ── Step 4.1: Context filter (v2.5.3+Isolation) ───────────────────────
+    // Applied AFTER scoring/reranking (post-filter).
+    // Vector search has no project_id awareness; context isolation is
+    // enforced here by looking up which records belong to the target context.
+    //
+    // Performance note: for large datasets, batch the lookup into a HashSet
+    // of valid record_ids rather than per-record DB calls.
+    let context_project_id: Option<String> = match rb.context.as_deref() {
+        None | Some("all") | Some("") => None,
+        Some(ctx) => Some(ctx.to_string()),
+    };
+
+    if let Some(ref pid) = context_project_id {
+        // Load record_ids that belong to this project context.
+        // get_active_records_by_context checks BOTH records.project_id
+        // and records → sessions.project_id (via LEFT JOIN).
+        let ctx_records = state.storage
+            .get_active_records_by_context(&owner, pid, layer_filter, top_k * 10)
+            .await;
+        let ctx_ids: HashSet<[u8; 32]> =
+            ctx_records.iter().map(|r| r.record_id).collect();
+
+        let before = scored.len();
+        scored.retain(|(r, _)| ctx_ids.contains(&r.record_id));
+
+        debug!(
+            context = %pid,
+            before = before,
+            after = scored.len(),
+            "[RECALL] Step 4.1 context filter applied"
+        );
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
     // ── Step 4: Token budget ──
     let mut returned_ids = seen_ids.clone();
     for (r, score) in &scored {
@@ -452,6 +507,9 @@ pub async fn mpi_recall(
         tokio::spawn(async move { st.increment_access(&rid).await; });
     }
 
+    // Graph and BM25 direct memories are NOT filtered by context —
+    // they are synthesized/virtual records without a project_id.
+    // If needed in future, filter by checking the underlying session's project_id.
     for gm in graph_memories {
         let tokens = estimate_tokens(&gm.content);
         if total_tokens + tokens > rb.token_budget && !memories.is_empty() { break; }
@@ -476,7 +534,6 @@ pub async fn mpi_recall(
     let query_type_str = format!("{:?}", query_type).to_lowercase();
 
     // ── Step 4.5: Progressive index mode ──
-    // UTF-8 safe truncation at 80 chars via char_indices
     if rb.mode == "index" {
         let index_memories: Vec<RecalledMemory> = memories.into_iter().map(|mut m| {
             if m.content.chars().count() > 80 {
@@ -566,7 +623,6 @@ pub async fn mpi_recall_detail(
     let mut total_tokens = 0usize;
 
     for rid_hex in &dr.record_ids {
-        // Synthetic IDs have no backing records — skip silently
         if rid_hex.starts_with("graph_") || rid_hex.starts_with("bm25_") { continue; }
 
         let rid = match hex::decode(rid_hex) {
@@ -583,7 +639,7 @@ pub async fn mpi_recall_detail(
             memories.push(RecalledMemory {
                 record_id: rid_hex.clone(),
                 layer: record.layer.to_string(),
-                score: 0.0, // ordering determined by caller
+                score: 0.0,
                 content,
                 topic_tags: record.topic_tags.clone(),
                 source_ai: record.source_ai.clone(),
