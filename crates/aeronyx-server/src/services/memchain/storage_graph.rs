@@ -7,6 +7,11 @@
 //! Split out from storage_ops.rs (which was too large) to improve
 //! maintainability. Contains all CRUD for the v2.4.0 cognitive graph tables.
 //!
+//! ## Modification Reason (v2.5.2+Pagination)
+//! Added `offset: usize` parameter to `get_sessions_for_project` and
+//! `get_entity_timeline` to support cursor-free pagination for API consumers.
+//! All internal callers that do not paginate pass `offset = 0`.
+//!
 //! ## Main Functionality
 //! - Episodes: upsert_episode, get_episode, get_episodes_for_session
 //! - Entities: upsert_entity, get_entity, get_entities_by_owner, get_entities_cached,
@@ -17,8 +22,9 @@
 //! - Communities: upsert_community, get_communities, get_entities_in_community,
 //!   get_communities_with_new_entities
 //! - Projects: upsert_project, get_projects, get_project
-//! - Sessions: upsert_session, get_session, get_sessions_for_project,
+//! - Sessions: upsert_session, get_session, get_sessions_for_project (paginated),
 //!   update_session_summary (v2.4.0+Search: + title param), get_pending_sessions
+//! - Entity Timeline: get_entity_timeline (paginated) — see also storage_miner.rs
 //! - Artifacts: insert_artifact, get_artifacts_for_session, get_artifact_versions
 //! - Graph Stats: graph_stats
 //!
@@ -30,7 +36,12 @@
 //! All public types (EntityRow, SessionRow, KnowledgeEdgeRow, etc.) are defined
 //! here and re-exported via memchain/mod.rs for use by API handlers.
 //!
-//! ⚠️ Important Note for Next Developer:
+//! ## Calling Relationships
+//! - mpi_graph_handlers.rs::mpi_project_timeline()  → get_sessions_for_project(..., params.offset)
+//! - mpi_graph_handlers.rs::mpi_entity_timeline()   → get_entity_timeline(..., params.offset)
+//! - mpi_graph_handlers.rs::mpi_context_inject()    → get_sessions_for_project(..., 0)
+//!
+//! ⚠️ Important Notes for Next Developer:
 //! - knowledge_edges.valid_until = NULL means "currently valid".
 //!   Always filter by valid_until IS NULL for current state queries.
 //! - entity_id = SHA256(owner || name_normalized) — deterministic, enables upsert.
@@ -38,15 +49,22 @@
 //!   update_session_summary() now accepts a 4th param `title: Option<&str>`.
 //!   Both changes require a `sessions.title` column — added in Schema v5 migration.
 //! - sessions.title is COALESCE-guarded: passing None preserves the existing title.
+//! - v2.5.2+Pagination: get_sessions_for_project and get_entity_timeline now take
+//!   `offset: usize`. ALL call sites must be updated. Internal non-paginating callers
+//!   must pass `0` explicitly. Do NOT remove the offset parameter.
 //!
 //! ## Last Modified
-//! v2.4.0-GraphCognition - 🌟 Extracted from storage_ops.rs (was inline).
+//! v2.4.0-GraphCognition - Extracted from storage_ops.rs (was inline).
 //!   Full CRUD for episodes, entities, knowledge_edges, episode_edges,
 //!   communities, projects, sessions, artifacts tables + graph_stats.
-//! v2.4.0+Search - 🌟 Split into dedicated file (storage_graph.rs).
+//! v2.4.0+Search - Split into dedicated file (storage_graph.rs).
 //!   Added SessionRow.title field.
 //!   Updated update_session_summary() to accept title: Option<&str>.
 //!   Added EntityTimelineEntry struct (see storage_miner.rs for get_entity_timeline).
+//! v2.5.2+Pagination - Added offset param to get_sessions_for_project and
+//!   get_entity_timeline. SQL updated to LIMIT ?N OFFSET ?M pattern.
+//!   mpi_context_inject internal call passes offset=0 (no pagination).
+// ============================================
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -100,7 +118,7 @@ pub struct SessionRow {
     pub project_id: Option<String>,
     pub session_type: String,
     /// Human-readable session title (v2.4.0+Search).
-    /// Examples: "Project Alpha: JWT, auth module" / "RS256 换算方案..."
+    /// Examples: "Project Alpha: JWT, auth module" / "RS256 migration plan..."
     /// None until Miner Step 10 processes the session.
     pub title: Option<String>,
     pub started_at: i64,
@@ -148,6 +166,18 @@ pub struct ArtifactRow {
     pub content_hash: String,
     pub line_count: Option<i64>,
     pub created_at: i64,
+}
+
+/// Entity timeline entry — one event in an entity's history.
+/// Defined here; populated by get_entity_timeline (storage_miner.rs or below).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EntityTimelineEntry {
+    pub entity_id: String,
+    pub event_type: String,
+    pub event_time: i64,
+    pub session_id: Option<String>,
+    pub episode_id: Option<String>,
+    pub detail: Option<String>,
 }
 
 /// Cognitive graph statistics for /api/mpi/status.
@@ -608,7 +638,6 @@ impl MemoryStorage {
     ///
     /// ## v2.4.0+Search
     /// SELECT now includes `title` (column index 3).
-    /// Row mapping updated to include `title: row.get(3)?`.
     pub async fn get_session(&self, session_id: &str) -> Option<SessionRow> {
         let conn = self.conn.lock().await;
         conn.query_row(
@@ -627,18 +656,28 @@ impl MemoryStorage {
         ).optional().unwrap_or(None)
     }
 
-    /// Get sessions for a project (timeline view).
+    /// Get sessions for a project (timeline view), with pagination support.
     ///
     /// ## v2.4.0+Search
     /// SELECT now includes `title` (column index 3).
-    pub async fn get_sessions_for_project(&self, project_id: &str, limit: usize) -> Vec<SessionRow> {
+    ///
+    /// ## v2.5.2+Pagination
+    /// Added `offset: usize` parameter. SQL updated to `LIMIT ?2 OFFSET ?3`.
+    ///
+    /// ⚠️ Call sites:
+    /// - mpi_project_timeline() → pass `params.offset`
+    /// - mpi_context_inject()   → pass `0` (no pagination needed)
+    pub async fn get_sessions_for_project(
+        &self, project_id: &str, limit: usize, offset: usize,
+    ) -> Vec<SessionRow> {
         let conn = self.conn.lock().await;
         let mut stmt = match conn.prepare(
             "SELECT session_id, project_id, session_type, title, started_at, ended_at,
                     turn_count, summary, key_decisions, entities_extracted, summary_generated
-             FROM sessions WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2"
+             FROM sessions WHERE project_id = ?1
+             ORDER BY started_at DESC LIMIT ?2 OFFSET ?3"
         ) { Ok(s) => s, Err(_) => return Vec::new() };
-        stmt.query_map(params![project_id, limit as i64], |row| Ok(SessionRow {
+        stmt.query_map(params![project_id, limit as i64, offset as i64], |row| Ok(SessionRow {
             session_id: row.get(0)?, project_id: row.get(1)?, session_type: row.get(2)?,
             title: row.get(3)?,
             started_at: row.get(4)?, ended_at: row.get(5)?, turn_count: row.get(6)?,
@@ -699,6 +738,45 @@ impl MemoryStorage {
             entities_extracted: row.get::<_, i64>(9).unwrap_or(0) != 0,
             summary_generated: row.get::<_, i64>(10).unwrap_or(0) != 0,
         })).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+}
+
+// ============================================
+// impl MemoryStorage — v2.4.0+Search Entity Timeline
+// ============================================
+
+impl MemoryStorage {
+    /// Get timeline events for a specific entity, ordered by event_time ASC.
+    ///
+    /// ## v2.5.2+Pagination
+    /// Added `offset: usize` parameter. SQL updated to `LIMIT ?4 OFFSET ?5`.
+    ///
+    /// ⚠️ If the entity_timeline table lives in storage_miner.rs, move this
+    ///    method there and keep the signature identical.
+    ///
+    /// Call sites:
+    /// - mpi_entity_timeline() → pass `params.offset`
+    pub async fn get_entity_timeline(
+        &self, entity_id: &str, owner: &[u8; 32], limit: usize, offset: usize,
+    ) -> Vec<EntityTimelineEntry> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT entity_id, event_type, event_time, session_id, episode_id, detail
+             FROM entity_timeline
+             WHERE entity_id = ?1 AND owner = ?2
+             ORDER BY event_time ASC LIMIT ?3 OFFSET ?4"
+        ) { Ok(s) => s, Err(_) => return Vec::new() };
+        stmt.query_map(
+            params![entity_id, owner.as_slice(), limit as i64, offset as i64],
+            |row| Ok(EntityTimelineEntry {
+                entity_id: row.get(0)?,
+                event_type: row.get(1)?,
+                event_time: row.get(2)?,
+                session_id: row.get(3)?,
+                episode_id: row.get(4)?,
+                detail: row.get(5)?,
+            }),
+        ).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     }
 }
 
@@ -924,8 +1002,28 @@ mod tests {
         s.upsert_session("sess_001", &owner, Some("comm_1"), "code", now, 10).await.unwrap();
         let projects = s.get_projects(&owner, Some("active"), 10).await;
         assert_eq!(projects.len(), 1);
-        let sessions = s.get_sessions_for_project("comm_1", 10).await;
+        // v2.5.2+Pagination: pass explicit offset=0
+        let sessions = s.get_sessions_for_project("comm_1", 10, 0).await;
         assert_eq!(sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sessions_for_project_pagination() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        s.upsert_community("comm_1", &owner, "Proj", None, None, 1).await.unwrap();
+        for i in 0..5u64 {
+            s.upsert_session(&format!("sess_{i:03}"), &owner, Some("comm_1"), "code", now + i as i64, 1).await.unwrap();
+        }
+        let page0 = s.get_sessions_for_project("comm_1", 3, 0).await;
+        let page1 = s.get_sessions_for_project("comm_1", 3, 3).await;
+        assert_eq!(page0.len(), 3);
+        assert_eq!(page1.len(), 2);
+        // No overlap between pages
+        let ids0: std::collections::HashSet<_> = page0.iter().map(|s| &s.session_id).collect();
+        let ids1: std::collections::HashSet<_> = page1.iter().map(|s| &s.session_id).collect();
+        assert!(ids0.is_disjoint(&ids1));
     }
 
     #[tokio::test]
