@@ -342,26 +342,31 @@ impl ManagementClient {
     ///
     /// # Returns
     /// SessionReportResponse on success, error message on failure
-    pub async fn report_session_event(&self, event: SessionEventReport) -> Result<SessionReportResponse, String> {
+    pub async fn report_session_event(&self, event: SessionEventReport) -> Result<(), String> {
         let url = format!("{}/node/sessions/report/", self.config.cms_url);
         let timestamp = Self::current_timestamp();
         let node_id = self.node_id();
         let body_str = serde_json::to_string(&event).map_err(|e| e.to_string())?;
         let signature = self.create_signature(timestamp, &body_str);
-
+    
         let mut request = self.http.post(&url);
         for (header, value) in Self::signed_headers(&node_id, timestamp, &signature) {
             request = request.header(header, value);
         }
-
+    
         let response = request
             .json(&event)
             .send().await
             .map_err(|e| e.to_string())?;
-
-        response.json().await.map_err(|e| e.to_string())
+    
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(format!("Status: {}, Body: {}", status, body_text));
+        }
+    
+        Ok(())
     }
-
     /// 🌟 v1.3.0: Reports command execution status to CMS.
     ///
     /// Called by `CommandHandler` after executing (or attempting) a command.
