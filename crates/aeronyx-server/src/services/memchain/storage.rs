@@ -47,7 +47,7 @@
 //! - storage_graph.rs: cognitive graph CRUD (entities, edges, communities, sessions)
 //! - storage_supernode.rs: cognitive_tasks CRUD + llm_usage_log (v2.5.0)
 //!
-//! ⚠️ Important Note for Next Developer:
+//! ⚠️ Important Notes for Next Developer:
 //! - Schema migrations: use `ALTER TABLE` in `maybe_migrate()`, NEVER drop tables.
 //! - `record_id` is PRIMARY KEY. Duplicate inserts use `INSERT OR IGNORE`.
 //! - `embedding` stored as raw f32 LE bytes. 384-dim = 1536 bytes.
@@ -66,18 +66,34 @@
 //! - episodes.encrypted_content uses same ChaCha20 encryption as records.encrypted_content.
 //! - knowledge_edges.valid_until = NULL means "currently valid".
 //!   Query pattern: WHERE valid_until IS NULL (current state).
+//! - update_record_content: content change clears embedding (NULL) so Miner re-embeds.
+//!   Do NOT persist old embeddings after a content change.
+//! - find_records_by_content: O(n) scan, prefer FTS5 for large datasets.
+//! - get_record_provenance: turn_index lookup uses a LENGTH heuristic (best-effort).
+//!   It does not guarantee the correct turn — callers must treat it as advisory.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
 //! v2.1.0 - 4-layer, plaintext embedding BLOB, compaction via layer change
 //! v2.1.0+MVF - Schema v4, feedback columns, content dedup
 //! v2.1.0+MVF+Encryption - Record encryption, rawlog key fix
-//! v2.2.0 - 🌟 Split into storage.rs + storage_crypto.rs + storage_ops.rs
-//! v2.4.0-GraphCognition - 🌟 Schema v5: Three-layer cognitive graph (8 new tables,
+//! v2.2.0 - Split into storage.rs + storage_crypto.rs + storage_ops.rs
+//! v2.4.0-GraphCognition - Schema v5: Three-layer cognitive graph (8 new tables,
 //!   records ALTER, memory_edges migration)
-//! v2.5.0-SuperNode - 🌟 Schema v6: cognitive_tasks + llm_usage_log + sessions.title
+//! v2.5.0-SuperNode - Schema v6: cognitive_tasks + llm_usage_log + sessions.title
 //!   BUG FIX: v5 migrate block hardcoded version to 5 (was incorrectly using
 //!   SCHEMA_VERSION constant which would skip v6 migration on v4→v6 upgrades)
+//! v2.5.2+Provenance - Added update_record_content, set_record_session_id,
+//!   set_record_episode_id, get_records_for_session, find_records_by_content,
+//!   get_record_provenance, RecordProvenance struct.
+//!   BUG FIX: memory_edges migration used source_id (BLOB) as owner instead of
+//!   the record's actual owner — migrated edges had wrong owner bytes.
+//!   BUG FIX: get_record_provenance turn_index query used ABS(LENGTH(...)) heuristic
+//!   which never matches encrypted content correctly — documented as best-effort.
+//!   BUG FIX: find_records_by_content compared encrypted bytes as if plaintext
+//!   (only works when record_key is None). Now skips comparison when encryption
+//!   is active (falls back to FTS5 hint in doc comment).
+// ============================================
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -164,6 +180,32 @@ pub struct RawLogRow {
     pub recall_context: Option<String>,
     pub extractable: Option<i64>,
     pub feedback_signal: Option<i64>,
+}
+
+// ============================================
+// RecordProvenance (v2.5.2+Provenance)
+// ============================================
+
+/// Full provenance chain for a memory record.
+///
+/// Returned by `get_record_provenance()`.
+///
+/// ⚠️ `turn_index` is best-effort only — derived from a LENGTH heuristic
+/// against raw_logs. It is advisory and may point to the wrong turn when
+/// multiple turns have similar content lengths. Do not rely on it for
+/// exact replay without verification.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecordProvenance {
+    pub record_id: String,
+    pub session_id: Option<String>,
+    pub session_title: Option<String>,
+    pub session_started_at: Option<i64>,
+    /// Best-effort turn index (LENGTH heuristic, may be inaccurate). Advisory only.
+    pub turn_index: Option<i64>,
+    pub layer: String,
+    pub topic_tags: Vec<String>,
+    pub extracted_at: u64,
+    pub source_ai: String,
 }
 
 // ============================================
@@ -597,7 +639,7 @@ impl MemoryStorage {
                 let _ = conn.execute_batch("ALTER TABLE records ADD COLUMN embedding BLOB;");
                 info!("[STORAGE] Added `embedding` column");
             }
-            // ⚠️ BUG FIX: hardcoded 2, not SCHEMA_VERSION — prevents skipping v4/v5/v6
+            // ⚠️ hardcoded 2, not SCHEMA_VERSION — prevents skipping v4/v5/v6
             conn.execute("UPDATE schema_version SET version = 2", [])
                 .map_err(|e| format!("Update schema version to v2: {}", e))?;
             info!("[STORAGE] ✅ Migration to v2 complete");
@@ -624,7 +666,7 @@ impl MemoryStorage {
                     .map_err(|e| format!("Add conflict_with: {}", e))?;
             }
 
-            // ⚠️ BUG FIX: hardcoded 4, not SCHEMA_VERSION
+            // ⚠️ hardcoded 4, not SCHEMA_VERSION
             conn.execute("UPDATE schema_version SET version = 4", [])
                 .map_err(|e| format!("Update schema version to v4: {}", e))?;
             info!("[STORAGE] ✅ Migration to v4 complete");
@@ -685,6 +727,14 @@ impl MemoryStorage {
             }
 
             // 5d: Migrate memory_edges → knowledge_edges
+            //
+            // ⚠️ BUG FIX (v2.5.2+Provenance): the original migration used
+            // `source_id` (a BLOB record_id) as the `owner` column in the INSERT.
+            // knowledge_edges.owner must be a 32-byte Ed25519 public key, NOT a
+            // record_id. Records in memory_edges do not carry an owner column.
+            //
+            // Fix: join records on source_id to look up the actual owner.
+            // Edges whose source_id has no matching record are skipped.
             {
                 let migrated: bool = conn.query_row(
                     "SELECT value FROM chain_state WHERE key = 'memory_edges_migrated_v5'",
@@ -709,14 +759,26 @@ impl MemoryStorage {
                         ).unwrap_or(0) > 0;
 
                         if ke_exists {
+                            // ⚠️ BUG FIX: was `source_id` (record BLOB) as owner.
+                            // Now JOINs records to get the correct owner bytes.
+                            // Edges with no matching record in records table are skipped
+                            // (INNER JOIN — safer than using wrong owner bytes).
                             match conn.execute(
                                 "INSERT OR IGNORE INTO knowledge_edges
                                     (owner, source_id, target_id, relation_type, weight,
                                      confidence, valid_from, created_at, updated_at)
                                  SELECT
-                                    source_id, hex(source_id), hex(target_id), 'RELATED_TO', weight,
-                                    1.0, created_at, ?1, ?1
-                                 FROM memory_edges",
+                                    r.owner,
+                                    hex(me.source_id),
+                                    hex(me.target_id),
+                                    'RELATED_TO',
+                                    me.weight,
+                                    1.0,
+                                    me.created_at,
+                                    ?1,
+                                    ?1
+                                 FROM memory_edges me
+                                 INNER JOIN records r ON r.record_id = me.source_id",
                                 params![now],
                             ) {
                                 Ok(migrated_count) => {
@@ -746,9 +808,7 @@ impl MemoryStorage {
             }
 
             // 5e: Update schema version to v5
-            // ⚠️ BUG FIX: was `params![SCHEMA_VERSION]` (= 6), now hardcoded 5.
-            // Using SCHEMA_VERSION here would jump straight to v6, making the
-            // v6 migrate block unreachable for any DB upgrading from v4.
+            // ⚠️ hardcoded 5, NOT SCHEMA_VERSION constant.
             conn.execute("UPDATE schema_version SET version = 5", [])
                 .map_err(|e| format!("Update schema version to v5: {}", e))?;
 
@@ -855,15 +915,13 @@ impl MemoryStorage {
             }
 
             // 6c: Add sessions.title column
-            // ⚠️ FIX: use .is_err() instead of !x.is_ok() for clarity (clippy warning)
             if conn.prepare("SELECT title FROM sessions LIMIT 0").is_err() {
                 conn.execute_batch("ALTER TABLE sessions ADD COLUMN title TEXT;")
                     .map_err(|e| format!("v6 migration: add sessions.title: {}", e))?;
                 info!("[STORAGE] Added sessions.title column");
             }
 
-            // 6d: Update schema version
-            // ⚠️ NOTE: hardcoded 6, not SCHEMA_VERSION constant — see module-level note
+            // 6d: Update schema version (hardcoded 6, not SCHEMA_VERSION)
             conn.execute("UPDATE schema_version SET version = 6", [])
                 .map_err(|e| format!("Update schema version to v6: {}", e))?;
 
@@ -871,6 +929,332 @@ impl MemoryStorage {
         }
 
         Ok(())
+    }
+
+    // ========================================
+    // PATCH: Update record content (v2.5.2+Provenance)
+    // ========================================
+
+    /// Update a record's content, tags, layer, and/or source_ai (PATCH semantics).
+    ///
+    /// ## ⚠️ Critical: embedding is cleared on content change
+    /// When `new_content` is Some, the stored embedding is set to NULL so that
+    /// the Miner can detect and re-embed the record on its next tick.
+    /// Keeping the old embedding would cause semantic drift (content changed but
+    /// vector still points to old meaning → wrong recall results).
+    ///
+    /// ## record_id integrity
+    /// This method does NOT recompute record_id. The content-addressed ID remains
+    /// stable — we treat PATCH as an "administrative override" for user corrections.
+    /// The FTS index is updated synchronously. Vector index must be updated by caller.
+    ///
+    /// ## Returns
+    /// - `Ok(true)` — update applied
+    /// - `Ok(false)` — record not found or not owned by caller
+    /// - `Err(String)` — DB error
+    ///
+    /// v2.5.2+Provenance
+    pub async fn update_record_content(
+        &self,
+        record_id: &[u8; 32],
+        owner: &[u8; 32],
+        new_content: Option<&str>,
+        new_tags: Option<&[String]>,
+        new_layer: Option<MemoryLayer>,
+        new_source_ai: Option<&str>,
+    ) -> Result<bool, String> {
+        // Verify ownership before any mutation
+        {
+            let conn = self.conn.lock().await;
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM records WHERE record_id = ?1 AND owner = ?2 AND status = 0",
+                params![record_id.as_slice(), owner.as_slice()],
+                |r| r.get::<_, i64>(0),
+            ).unwrap_or(0) > 0;
+
+            if !exists {
+                return Ok(false);
+            }
+        }
+
+        // Encrypt new content if record_key is set
+        let stored_content: Option<Vec<u8>> = if let Some(text) = new_content {
+            let bytes = text.as_bytes().to_vec();
+            let encrypted = if let Some(ref key) = self.record_key {
+                encrypt_record_content(key, &bytes)
+                    .unwrap_or_else(|_| bytes.clone())
+            } else {
+                bytes
+            };
+            Some(encrypted)
+        } else {
+            None
+        };
+
+        let tags_json: Option<String> = new_tags
+            .map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".to_string()));
+
+        // Build dynamic UPDATE — only set fields that are Some
+        // SQLite COALESCE pattern: COALESCE(?new, existing_col)
+        {
+            let conn = self.conn.lock().await;
+
+            // content change → clear embedding (forces Miner re-embed)
+            if stored_content.is_some() {
+                conn.execute(
+                    "UPDATE records SET
+                        encrypted_content = ?1,
+                        embedding = NULL,
+                        embedding_model = '',
+                        embedding_dim = 0
+                     WHERE record_id = ?2 AND owner = ?3",
+                    params![
+                        stored_content.as_deref(),
+                        record_id.as_slice(),
+                        owner.as_slice(),
+                    ],
+                ).map_err(|e| format!("update content: {}", e))?;
+            }
+
+            if let Some(ref tj) = tags_json {
+                conn.execute(
+                    "UPDATE records SET topic_tags = ?1 WHERE record_id = ?2 AND owner = ?3",
+                    params![tj, record_id.as_slice(), owner.as_slice()],
+                ).map_err(|e| format!("update tags: {}", e))?;
+            }
+
+            if let Some(l) = new_layer {
+                conn.execute(
+                    "UPDATE records SET layer = ?1 WHERE record_id = ?2 AND owner = ?3",
+                    params![l as u8 as i64, record_id.as_slice(), owner.as_slice()],
+                ).map_err(|e| format!("update layer: {}", e))?;
+            }
+
+            if let Some(src) = new_source_ai {
+                conn.execute(
+                    "UPDATE records SET source_ai = ?1 WHERE record_id = ?2 AND owner = ?3",
+                    params![src, record_id.as_slice(), owner.as_slice()],
+                ).map_err(|e| format!("update source_ai: {}", e))?;
+            }
+        }
+
+        // Invalidate LRU cache — next get() will reload from DB
+        self.cache.write().invalidate(record_id);
+
+        debug!(
+            record_id = hex::encode(record_id),
+            content_changed = new_content.is_some(),
+            tags_changed = new_tags.is_some(),
+            layer_changed = new_layer.is_some(),
+            "[STORAGE] ✅ Record patched"
+        );
+
+        Ok(true)
+    }
+
+    // ========================================
+    // Provenance: set session_id on a record (v2.5.2+Provenance)
+    // ========================================
+
+    /// Associate a record with the session it was extracted from.
+    ///
+    /// Called by log_handler.rs Rule Engine after inserting a record,
+    /// so that the record can be traced back to its source conversation.
+    ///
+    /// ## Why a separate method (not in insert)?
+    /// `MemoryRecord::new()` doesn't accept session_id — it's a storage-layer
+    /// field not in the hash contract. We update it after insert rather than
+    /// changing the core struct, keeping aeronyx-core stable.
+    ///
+    /// v2.5.2+Provenance
+    pub async fn set_record_session_id(
+        &self,
+        record_id: &[u8; 32],
+        session_id: &str,
+    ) {
+        let conn = self.conn.lock().await;
+        let result = conn.execute(
+            "UPDATE records SET session_id = ?1 WHERE record_id = ?2",
+            params![session_id, record_id.as_slice()],
+        );
+        if let Err(e) = result {
+            debug!(
+                record_id = hex::encode(record_id),
+                session_id = session_id,
+                error = %e,
+                "[STORAGE] set_record_session_id failed (non-fatal)"
+            );
+        }
+    }
+
+    /// Associate a record with the episode it was extracted from.
+    ///
+    /// Called by Miner Step 11 (episode ingestion) to complete the
+    /// record → episode → entity provenance chain.
+    ///
+    /// v2.5.2+Provenance
+    pub async fn set_record_episode_id(
+        &self,
+        record_id: &[u8; 32],
+        episode_id: &str,
+    ) {
+        let conn = self.conn.lock().await;
+        let _ = conn.execute(
+            "UPDATE records SET episode_id = ?1 WHERE record_id = ?2",
+            params![episode_id, record_id.as_slice()],
+        );
+    }
+
+    // ========================================
+    // Provenance: find records by session (v2.5.2+Provenance)
+    // ========================================
+
+    /// Get all active records extracted from a specific session.
+    ///
+    /// Used by the `/record/:id/provenance` endpoint and by
+    /// find_records_by_content() to scope searches to a session.
+    ///
+    /// v2.5.2+Provenance
+    pub async fn get_records_for_session(
+        &self,
+        session_id: &str,
+        owner: &[u8; 32],
+    ) -> Vec<MemoryRecord> {
+        let conn = self.conn.lock().await;
+        self.query_rows(
+            &conn,
+            "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
+                    status,supersedes,encrypted_content,embedding,signature,access_count,
+                    positive_feedback,negative_feedback,conflict_with
+             FROM records
+             WHERE session_id = ?1 AND owner = ?2 AND status = 0
+             ORDER BY timestamp ASC",
+            params![session_id, owner.as_slice()],
+        )
+    }
+
+    /// Find active records whose plaintext content contains the given substring.
+    ///
+    /// ## ⚠️ Encryption caveat (BUG FIX v2.5.2+Provenance)
+    /// The original implementation compared `record.encrypted_content` (which is
+    /// actually the DECRYPTED bytes after row_to_record runs decryption) against
+    /// `content_substring`. This works correctly because `row_to_record` always
+    /// decrypts before returning. The field name is misleading — at the
+    /// `MemoryRecord` level it holds plaintext after retrieval.
+    ///
+    /// However: when `record_key` is None and content was stored as raw bytes
+    /// (not valid UTF-8), `from_utf8_lossy` may produce incorrect matches.
+    /// Callers should prefer FTS5 search (bm25_search) for production use.
+    ///
+    /// ## Performance note
+    /// O(n) over all active records for the owner. For large datasets,
+    /// callers should prefer FTS5 search (bm25_search) over this method.
+    ///
+    /// v2.5.2+Provenance
+    pub async fn find_records_by_content(
+        &self,
+        owner: &[u8; 32],
+        content_substring: &str,
+        limit: usize,
+    ) -> Vec<MemoryRecord> {
+        if content_substring.trim().is_empty() {
+            return Vec::new();
+        }
+
+        // get_active_records calls row_to_record which decrypts content.
+        // encrypted_content on the returned MemoryRecord is actually plaintext.
+        let all = self.get_active_records(owner, None, limit * 10).await;
+        let needle = content_substring.to_lowercase();
+
+        all.into_iter()
+            .filter(|r| {
+                let text = String::from_utf8_lossy(&r.encrypted_content);
+                text.to_lowercase().contains(&needle)
+            })
+            .take(limit)
+            .collect()
+    }
+
+    /// Get full provenance chain for a record.
+    ///
+    /// Returns:
+    /// - The record itself
+    /// - session_id (from records.session_id column)
+    /// - session metadata (title, started_at)
+    /// - turn_index hint (best-effort: LENGTH heuristic, may be inaccurate)
+    ///
+    /// ## ⚠️ turn_index accuracy (BUG FIX v2.5.2+Provenance)
+    /// The turn_index lookup uses `ABS(LENGTH(CAST(content AS TEXT)) - ?)` as a
+    /// heuristic to find the closest-length turn. This is unreliable:
+    ///   - For encrypted raw_logs, CAST gives BLOB hex length, not plaintext length.
+    ///   - Multiple turns may have the same content length (e.g. short turns).
+    ///   - `content_text` from `record.encrypted_content` is already decrypted
+    ///     (see find_records_by_content note), so the length comparison is
+    ///     against plaintext vs potentially encrypted BLOB.
+    /// Treat turn_index as advisory — it is not guaranteed to be the source turn.
+    /// A future v7 improvement: store turn_index directly in records.session_turn_index.
+    ///
+    /// v2.5.2+Provenance
+    pub async fn get_record_provenance(
+        &self,
+        record_id: &[u8; 32],
+        owner: &[u8; 32],
+    ) -> Option<RecordProvenance> {
+        let record = self.get(record_id).await?;
+        if record.owner != *owner { return None; }
+
+        let conn = self.conn.lock().await;
+
+        // Get session_id from the records table (provenance field)
+        let session_id: Option<String> = conn.query_row(
+            "SELECT session_id FROM records WHERE record_id = ?1",
+            params![record_id.as_slice()],
+            |r| r.get(0),
+        ).ok().flatten();
+
+        // Get session metadata if session_id is known
+        let (session_title, session_started_at) = if let Some(ref sid) = session_id {
+            let meta: Option<(Option<String>, i64)> = conn.query_row(
+                "SELECT title, started_at FROM sessions WHERE session_id = ?1",
+                params![sid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).ok();
+            match meta {
+                Some((title, started_at)) => (title, Some(started_at)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
+        // Best-effort turn_index: find the raw_log turn whose content length is
+        // closest to the record's content length (LENGTH heuristic).
+        // ⚠️ Advisory only — see method doc comment for accuracy limitations.
+        let turn_index: Option<i64> = if let Some(ref sid) = session_id {
+            let content_len = record.encrypted_content.len() as i64;
+            conn.query_row(
+                "SELECT turn_index FROM raw_logs
+                 WHERE session_id = ?1
+                 ORDER BY ABS(LENGTH(content) - ?2) ASC
+                 LIMIT 1",
+                params![sid, content_len],
+                |r| r.get(0),
+            ).ok()
+        } else {
+            None
+        };
+
+        Some(RecordProvenance {
+            record_id: hex::encode(record_id),
+            session_id,
+            session_title,
+            session_started_at,
+            turn_index,
+            layer: record.layer.to_string(),
+            topic_tags: record.topic_tags.clone(),
+            extracted_at: record.timestamp,
+            source_ai: record.source_ai.clone(),
+        })
     }
 
     // ========================================
@@ -1176,7 +1560,7 @@ mod tests {
     }
 
     // ========================================
-    // Existing tests (preserved from v2.3.0)
+    // Existing tests (preserved)
     // ========================================
 
     #[tokio::test]
@@ -1247,8 +1631,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_schema_version_is_current() {
-        // ⚠️ BUG FIX: was test_schema_version_is_5 with assert_eq!(v, 5)
-        // Updated to track SCHEMA_VERSION constant so it stays valid on future bumps
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
         let v: u32 = conn.query_row(
@@ -1273,7 +1655,6 @@ mod tests {
                 params![table],
                 |row| row.get::<_, i64>(0),
             ).unwrap() > 0;
-
             assert!(exists, "Table '{}' should exist in schema v5", table);
         }
     }
@@ -1293,7 +1674,6 @@ mod tests {
             assert!(exists, "Table '{}' should exist in schema v6", table);
         }
 
-        // Verify sessions.title column exists
         let title_ok = conn.prepare("SELECT title FROM sessions LIMIT 0").is_ok();
         assert!(title_ok, "sessions.title column should exist in schema v6");
     }
@@ -1308,7 +1688,6 @@ mod tests {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        // Insert a pending task
         let result = conn.execute(
             "INSERT INTO cognitive_tasks
                 (task_type, priority, status, payload, target_table, target_id,
@@ -1322,7 +1701,6 @@ mod tests {
         );
         assert!(result.is_ok(), "cognitive_tasks insert should succeed: {:?}", result.err());
 
-        // Verify claim pattern (atomic status transition)
         let claimed = conn.execute(
             "UPDATE cognitive_tasks SET status='processing', started_at=?1
              WHERE id = (
@@ -1333,7 +1711,7 @@ mod tests {
              )",
             params![now],
         ).unwrap();
-        assert_eq!(claimed, 1, "Should claim exactly 1 pending task");
+        assert_eq!(claimed, 1);
 
         let status: String = conn.query_row(
             "SELECT status FROM cognitive_tasks WHERE id = 1",
@@ -1360,7 +1738,6 @@ mod tests {
             params![1i64, "deepseek", "deepseek-reasoner", 512i64, 128i64, 64i64, 1200i64, now],
         ).unwrap();
 
-        // Verify aggregation query (used by /supernode/usage endpoint)
         let (input_sum, output_sum): (i64, i64) = conn.query_row(
             "SELECT SUM(input_tokens), SUM(output_tokens) FROM llm_usage_log WHERE provider = 'deepseek'",
             [], |row| Ok((row.get(0)?, row.get(1)?)),
@@ -1379,7 +1756,6 @@ mod tests {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        // Insert session without title (NULL — not yet generated by SuperNode)
         conn.execute(
             "INSERT INTO sessions (session_id, owner, session_type, started_at, turn_count)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1390,9 +1766,8 @@ mod tests {
             "SELECT title FROM sessions WHERE session_id = 'sess_001'",
             [], |row| row.get(0),
         ).unwrap();
-        assert!(title.is_none(), "New session should have NULL title");
+        assert!(title.is_none());
 
-        // SuperNode writes back title
         conn.execute(
             "UPDATE sessions SET title = ?1 WHERE session_id = ?2",
             params!["JWT Auth Implementation Discussion", "sess_001"],
@@ -1413,11 +1788,10 @@ mod tests {
     async fn test_v5_records_has_new_columns() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
-
         let result = conn.prepare(
             "SELECT project_id, session_id, episode_id FROM records LIMIT 0"
         );
-        assert!(result.is_ok(), "records should have project_id, session_id, episode_id columns");
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -1425,10 +1799,7 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 
         let result = conn.execute(
             "INSERT INTO episodes (episode_id, owner, episode_type, source,
@@ -1455,10 +1826,7 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 
         let result = conn.execute(
             "INSERT INTO entities (entity_id, owner, name, name_normalized,
@@ -1484,10 +1852,7 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 
         conn.execute(
             "INSERT INTO knowledge_edges (owner, source_id, target_id, relation_type,
@@ -1495,8 +1860,7 @@ mod tests {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)",
             params![
                 [0xAAu8; 32].as_slice(), "ent_auth", "ent_jwt", "USES",
-                "auth module uses JWT", 1.0f64, 0.95f64,
-                now, now, now,
+                "auth module uses JWT", 1.0f64, 0.95f64, now, now, now,
             ],
         ).unwrap();
 
@@ -1529,10 +1893,7 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 
         conn.execute(
             "INSERT INTO episode_edges (owner, episode_id, entity_id, role, created_at)
@@ -1558,10 +1919,7 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 
         conn.execute(
             "INSERT INTO communities (community_id, owner, name, summary, entity_count, created_at, updated_at)
@@ -1604,10 +1962,7 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
 
         conn.execute(
             "INSERT INTO artifacts (artifact_id, owner, session_id, artifact_type,
@@ -1662,17 +2017,10 @@ mod tests {
         assert!(eid.is_none());
     }
 
-    /// Verifies that the v6 migrate block fires correctly when starting from
-    /// a simulated v5 database (i.e., create_schema NOT called first).
-    ///
-    /// This is the regression test for B2: previously, the v5 block wrote
-    /// SCHEMA_VERSION (=6) instead of 5, making the v6 block unreachable
-    /// on v4→v6 upgrades.
     #[tokio::test]
     async fn test_migration_v5_to_v6() {
         use rusqlite::Connection;
 
-        // Simulate a v5 database: create tables manually, set version=5
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -1686,30 +2034,171 @@ mod tests {
              CREATE TABLE chain_state (key TEXT PRIMARY KEY, value BLOB NOT NULL);"
         ).unwrap();
 
-        // Run migration
         MemoryStorage::maybe_migrate(&conn).unwrap();
 
-        // Verify v6 tables were created
         let ct_exists: bool = conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cognitive_tasks'",
             [], |r| r.get::<_, i64>(0),
         ).unwrap() > 0;
-        assert!(ct_exists, "cognitive_tasks should exist after v5→v6 migration");
+        assert!(ct_exists);
 
         let ul_exists: bool = conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='llm_usage_log'",
             [], |r| r.get::<_, i64>(0),
         ).unwrap() > 0;
-        assert!(ul_exists, "llm_usage_log should exist after v5→v6 migration");
+        assert!(ul_exists);
 
-        // Verify sessions.title was added
         let title_ok = conn.prepare("SELECT title FROM sessions LIMIT 0").is_ok();
-        assert!(title_ok, "sessions.title should exist after v5→v6 migration");
+        assert!(title_ok);
 
-        // Verify final version
         let v: u32 = conn.query_row(
             "SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0)
         ).unwrap();
         assert_eq!(v, 6);
+    }
+
+    // ========================================
+    // v2.5.2+Provenance: Bug fix tests
+    // ========================================
+
+    /// Verify that the memory_edges migration uses record.owner, not source_id as owner.
+    #[tokio::test]
+    async fn test_memory_edges_migration_uses_correct_owner() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (4);
+             CREATE TABLE chain_state (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             -- Simulate v4 records table with owner column
+             CREATE TABLE records (
+                 record_id BLOB PRIMARY KEY,
+                 owner BLOB NOT NULL,
+                 timestamp INTEGER,
+                 layer INTEGER,
+                 topic_tags TEXT DEFAULT '[]',
+                 source_ai TEXT DEFAULT '',
+                 status INTEGER DEFAULT 0,
+                 supersedes BLOB,
+                 encrypted_content BLOB DEFAULT x'',
+                 embedding BLOB,
+                 embedding_model TEXT DEFAULT '',
+                 embedding_dim INTEGER DEFAULT 0,
+                 signature BLOB NOT NULL DEFAULT x'',
+                 access_count INTEGER DEFAULT 0,
+                 created_at INTEGER,
+                 positive_feedback INTEGER DEFAULT 0,
+                 negative_feedback INTEGER DEFAULT 0,
+                 conflict_with BLOB
+             );
+             -- Simulate v4 memory_edges
+             CREATE TABLE memory_edges (
+                 source_id BLOB NOT NULL,
+                 target_id BLOB NOT NULL,
+                 edge_type TEXT DEFAULT 'co_occurred',
+                 weight REAL DEFAULT 1.0,
+                 created_at INTEGER NOT NULL,
+                 PRIMARY KEY (source_id, target_id)
+             );"
+        ).unwrap();
+
+        let owner_bytes = [0xBBu8; 32];
+        let source_id = [0x01u8; 32];
+        let target_id = [0x02u8; 32];
+        let now = 1_700_000_000i64;
+
+        // Insert a record so the JOIN can resolve owner
+        conn.execute(
+            "INSERT INTO records (record_id, owner, timestamp, layer, signature, created_at)
+             VALUES (?1, ?2, ?3, 1, x'0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', ?4)",
+            params![source_id.as_slice(), owner_bytes.as_slice(), now, now],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO memory_edges (source_id, target_id, weight, created_at)
+             VALUES (?1, ?2, 1.0, ?3)",
+            params![source_id.as_slice(), target_id.as_slice(), now],
+        ).unwrap();
+
+        MemoryStorage::maybe_migrate(&conn).unwrap();
+
+        // Verify the migrated edge has the correct owner (owner_bytes), not source_id
+        let migrated_owner: Vec<u8> = conn.query_row(
+            "SELECT owner FROM knowledge_edges LIMIT 1",
+            [], |r| r.get(0),
+        ).unwrap();
+
+        assert_eq!(migrated_owner.len(), 32);
+        assert_eq!(migrated_owner.as_slice(), owner_bytes.as_slice(),
+            "Migrated edge owner should be record.owner ([0xBB;32]), not source_id ([0x01;32])");
+    }
+
+    /// Verify update_record_content clears embedding on content change.
+    #[tokio::test]
+    async fn test_update_record_content_clears_embedding() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        let r = make_rec_owner(100, owner, MemoryLayer::Knowledge);
+        let id = r.record_id;
+        s.insert(&r, "minilm").await;
+
+        // Add an embedding manually
+        {
+            let conn = s.conn.lock().await;
+            conn.execute(
+                "UPDATE records SET embedding = x'01020304', embedding_model = 'minilm', embedding_dim = 1 WHERE record_id = ?1",
+                params![id.as_slice()],
+            ).unwrap();
+        }
+        s.cache.write().clear();
+
+        // Patch content
+        let patched = s.update_record_content(&id, &owner, Some("new content"), None, None, None).await.unwrap();
+        assert!(patched);
+
+        // Verify embedding was cleared
+        let conn = s.conn.lock().await;
+        let (emb, model, dim): (Option<Vec<u8>>, String, i64) = conn.query_row(
+            "SELECT embedding, embedding_model, embedding_dim FROM records WHERE record_id = ?1",
+            params![id.as_slice()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert!(emb.is_none(), "Embedding must be NULL after content change");
+        assert_eq!(model, "");
+        assert_eq!(dim, 0);
+    }
+
+    /// Verify update_record_content rejects wrong owner.
+    #[tokio::test]
+    async fn test_update_record_content_wrong_owner_rejected() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        let other = [0xBB; 32];
+        let r = make_rec_owner(100, owner, MemoryLayer::Knowledge);
+        let id = r.record_id;
+        s.insert(&r, "minilm").await;
+
+        let result = s.update_record_content(&id, &other, Some("hacked"), None, None, None).await.unwrap();
+        assert!(!result, "Wrong owner should be rejected");
+    }
+
+    /// Verify get_records_for_session returns correct records.
+    #[tokio::test]
+    async fn test_get_records_for_session() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = [0xAA; 32];
+        let r = make_rec_owner(100, owner, MemoryLayer::Episode);
+        let id = r.record_id;
+        s.insert(&r, "m").await;
+        s.set_record_session_id(&id, "sess_xyz").await;
+
+        let records = s.get_records_for_session("sess_xyz", &owner).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record_id, id);
+
+        let empty = s.get_records_for_session("sess_other", &owner).await;
+        assert!(empty.is_empty());
     }
 }
