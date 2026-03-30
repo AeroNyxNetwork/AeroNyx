@@ -557,7 +557,7 @@ impl MemoryStorage {
                 }
             };
 
-            let rk = self.record_key;
+            let rk = self.record_key.as_ref().map(|v| &**v);
             let rows: Vec<(Vec<u8>, Vec<u8>, String)> = stmt
                 .query_map(params![owner.as_slice()], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
