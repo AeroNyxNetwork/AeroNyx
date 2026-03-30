@@ -162,6 +162,17 @@ pub struct LogRequest {
     pub source_ai: String,
     #[serde(default)]
     pub recall_context: Option<String>,
+    /// v2.5.3+Isolation: Memory context for this conversation.
+    ///
+    /// - `None` / `"all"` → default context (no isolation)
+    /// - `"work"`         → tag as work memory
+    /// - `"personal"`     → tag as personal memory
+    /// - any string       → used as project_id for session registration
+    ///
+    /// When set, the session is registered with this project_id,
+    /// enabling context-filtered recall later.
+    #[serde(default)]
+    pub context: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -765,6 +776,7 @@ pub async fn mpi_log(
                     // Failure is absorbed inside the storage method. Non-fatal.
                     state.storage.set_record_session_id(
                         &record.record_id,
+                        &owner,
                         &log_req.session_id,
                     ).await;
 
@@ -876,10 +888,18 @@ pub async fn mpi_log(
     // ── Register session for Miner Steps 7-11 ──
     if logged > 0 {
         let turn_count = log_req.turns.len() as i64;
+
+        // v2.5.3+Isolation: map context → project_id for session registration.
+        // "all" and empty string are treated as no project (None).
+        let context_project_id: Option<&str> = match log_req.context.as_deref() {
+            None | Some("all") | Some("") => None,
+            Some(ctx) => Some(ctx),
+        };
+
         if let Err(e) = state.storage.upsert_session(
             &log_req.session_id,
             &owner,
-            None,
+            context_project_id,   // v2.5.3: context as project_id
             "chat",
             now_ts as i64,
             turn_count,
