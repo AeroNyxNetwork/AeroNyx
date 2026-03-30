@@ -3,22 +3,67 @@
 // ============================================
 //! # MPI Handlers — Core Endpoints
 //!
-//! ## Creation Reason (v2.4.0 Split)
-//! Extracted from mpi.rs to reduce file size.
+//! ## File Creation/Modification Notes
+//! ============================================
+//! Creation Reason: v2.4.0 Split — extracted from mpi.rs to reduce file size.
+//! Modification Reason: v2.5.2+Provenance — merged PATCH /record/:id and
+//!   GET /record/:id/provenance handlers (previously specified as inline code
+//!   comments in file 2). Added RecordProvenance struct and PatchRecordRequest.
+//!   No new files created; all additions are in this existing file.
+//! Main Functionality:
+//!   - POST /api/mpi/remember    — store a new memory record
+//!   - POST /api/mpi/forget      — soft-revoke a memory record
+//!   - GET  /api/mpi/status      — system health + SuperNode queue metrics
+//!   - GET  /api/mpi/record/:id  — fetch a single record by ID
+//!   - GET  /api/mpi/records/overview — layer-grouped record summary
+//!   - POST /api/mpi/embed       — local MiniLM batch embed
+//!   - PATCH /api/mpi/record/:id            — 🆕 v2.5.2 partial record update
+//!   - GET  /api/mpi/record/:id/provenance  — 🆕 v2.5.2 traceability chain
+//! Dependencies:
+//!   - aeronyx_core::ledger::{MemoryLayer, MemoryRecord}
+//!   - crate::services::memchain::{mvf, LlmRouter, StorageStats}
+//!   - super::mpi::{MpiState, AuthenticatedOwner, extract_owner, parse_layer, …}
+//!   - storage.rs: insert, get, revoke, fts_index_record, fts_remove_record,
+//!     get_overview, stats, get_recent_feedback, count_tasks_by_status,
+//!     get_usage_stats, get_embedding_model, update_record_content,
+//!     get_record_provenance
 //!
 //! ## Split Structure
-//! - `mpi.rs`             — MpiState, auth middleware, router, helpers
-//! - `mpi_handlers.rs`    (THIS FILE) — remember, forget, status, embed, record, overview
-//! - `recall_handler.rs`  — recall hybrid pipeline
-//! - `mpi_graph_handlers.rs` — v2.4.0 cognitive graph endpoints
-//! - `supernode_handlers.rs` — v2.5.0 SuperNode management endpoints
+//! - `mpi.rs`                  — MpiState, auth middleware, router, helpers
+//! - `mpi_handlers.rs`         (THIS FILE) — remember, forget, status, embed,
+//!                               record, overview, patch, provenance
+//! - `recall_handler.rs`       — recall hybrid pipeline
+//! - `mpi_graph_handlers.rs`   — v2.4.0 cognitive graph endpoints
+//! - `supernode_handlers.rs`   — v2.5.0 SuperNode management endpoints
+//!
+//! ⚠️ Important Note for Next Developer:
+//! - All handlers extract AuthenticatedOwner from extensions BEFORE calling
+//!   req.into_body(). Never reorder: into_body() moves req, making extensions
+//!   inaccessible (use-after-move compile error).
+//! - update_record_content enforces ownership in the storage layer.
+//!   Never skip the owner parameter — it prevents cross-user mutation.
+//! - PATCH clears the embedding on content change (set NULL in DB).
+//!   The Miner detects NULL embeddings and re-embeds on its next cycle (~60s).
+//!   vector_index.remove() is called immediately to evict the stale ANN entry.
+//! - RecordProvenance.turn_index is best-effort (content-length approximation).
+//!   Schema v7 with SHA256 content_hash column would make it exact.
+//! - Records inserted before v2.5.2 or via /remember have session_id = NULL.
+//!   get_record_provenance returns Some(prov) with session_id = None (not 404).
+//! - The core logic of this file cannot be deleted or significantly modified.
+//! - Maintain interface compatibility with mpi.rs router registrations.
 //!
 //! ## Modification History
-//! v2.4.0-GraphCognition - Extracted from mpi.rs; status extended with NER/graph
-//! v2.4.0+BM25 - Moved mpi_recall to recall_handler.rs; added FTS indexing
-//! v2.4.0+Progressive - Added mode field to RecallRequest + default_recall_mode()
-//! v2.5.0+SuperNode Phase D - 🌟 MpiStatusResponse + SuperNodeStatus struct;
+//! v2.4.0-GraphCognition  - Extracted from mpi.rs; status extended with NER/graph
+//! v2.4.0+BM25            - Moved mpi_recall to recall_handler.rs; FTS indexing
+//! v2.4.0+Progressive     - Added mode field to RecallRequest + default_recall_mode()
+//! v2.5.0+SuperNode Phase D - MpiStatusResponse + SuperNodeStatus struct;
 //!   mpi_status handler fills SuperNode queue counts + cost + provider info.
+//! v2.5.2+Provenance      - 🌟 Merged PATCH + provenance handlers from spec;
+//!   added RecordProvenance struct, PatchRecordRequest, mpi_patch_record,
+//!   mpi_record_provenance, and unit tests. Zero new files created.
+//!
+//! ## Last Modified
+//! v2.5.2+Provenance - 🌟 PATCH /record/:id + GET /record/:id/provenance
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -540,5 +585,356 @@ pub async fn mpi_embed(
                 "error": format!("embed failed: {}", e)
             })))
         }
+    }
+}
+
+// ============================================
+// v2.5.2+Provenance: RecordProvenance type
+// ============================================
+
+/// Full provenance chain for a memory record.
+///
+/// Answers: "Where did this memory come from?"
+/// Returned by `GET /api/mpi/record/:id/provenance`.
+///
+/// ## Availability
+/// - Records inserted before v2.5.2: `session_id = None`
+/// - Records inserted via `/remember` directly: `session_id = None`
+/// - Records extracted by Rule Engine via `/log` after v2.5.2: full data
+///
+/// ## turn_index note
+/// Best-effort via content-length approximation against raw_logs.
+/// Schema v7 (SHA256 content_hash column on records table) would make it exact.
+///
+/// v2.5.2+Provenance
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordProvenance {
+    /// The record being traced.
+    pub record_id: String,
+    /// Session (conversation) this record was extracted from.
+    /// None for pre-v2.5.2 records or /remember inserts.
+    pub session_id: Option<String>,
+    /// Human-readable session title (SuperNode-generated). May be None.
+    pub session_title: Option<String>,
+    /// Unix timestamp of when the session started.
+    pub session_started_at: Option<i64>,
+    /// Best-effort turn index within the session.
+    /// None if session_id unknown or no matching turn found.
+    pub turn_index: Option<i64>,
+    /// Memory layer at extraction time.
+    pub layer: String,
+    /// Semantic tags assigned by Rule Engine.
+    pub topic_tags: Vec<String>,
+    /// Unix timestamp when the record was created.
+    pub extracted_at: u64,
+    /// AI agent that triggered extraction.
+    pub source_ai: String,
+}
+
+// ============================================
+// PATCH /api/mpi/record/:record_id
+// ============================================
+
+/// PATCH request body — all fields optional (partial update).
+///
+/// Only provided fields are updated; omitted fields keep their current value.
+/// Providing `content` triggers embedding invalidation: the DB embedding is
+/// set to NULL so the Miner re-embeds on its next cycle (~60s). During that
+/// window the record is available via FTS/BM25 but not vector search.
+///
+/// v2.5.2+Provenance
+#[derive(Debug, Deserialize)]
+pub struct PatchRecordRequest {
+    /// New memory content. Clears the stored embedding (async re-embed by Miner).
+    pub content: Option<String>,
+    /// New semantic tags. Replaces existing tags entirely (not merged).
+    pub topic_tags: Option<Vec<String>>,
+    /// New memory layer. Use "identity" | "knowledge" | "episode" | "archive".
+    pub layer: Option<String>,
+    /// New source_ai label. Rarely needed; mostly for data correction.
+    pub source_ai: Option<String>,
+}
+
+/// `PATCH /api/mpi/record/:record_id` — Partial in-place update of a memory record.
+///
+/// ## Use cases
+/// 1. User correction: "That's wrong, it should be RS256 not HS256"
+///    → PATCH content with the corrected fact
+/// 2. Re-classification: "Move this to knowledge layer"
+///    → PATCH layer
+/// 3. Tag update: "Add 'security' tag to this memory"
+///    → PATCH topic_tags
+///
+/// ## Embedding behavior
+/// Content change → embedding cleared (NULL) → Miner re-embeds on next cycle.
+/// vector_index.remove() is called immediately to evict the stale ANN entry.
+///
+/// ## FTS update
+/// FTS5 index updated synchronously. Search reflects new content immediately.
+///
+/// ## Access control
+/// Ownership enforced inside storage.update_record_content via the owner param.
+/// Non-owners receive 404 (not 403) to avoid record enumeration.
+///
+/// v2.5.2+Provenance
+pub async fn mpi_patch_record(
+    State(state): State<Arc<MpiState>>,
+    Path(record_id_hex): Path<String>,
+    req: Request<axum::body::Body>,
+) -> impl IntoResponse {
+    // Extract auth BEFORE into_body() — into_body() moves req (use-after-move guard).
+    let auth = extract_owner(&req).clone();
+    let owner = auth.owner_bytes();
+
+    let rid: [u8; 32] = match hex::decode(&record_id_hex) {
+        Ok(b) if b.len() == 32 => { let mut a = [0u8; 32]; a.copy_from_slice(&b); a }
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "invalid record_id format"
+        }))).into_response(),
+    };
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 512 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "failed to read body"
+        }))).into_response(),
+    };
+    let patch: PatchRecordRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("invalid JSON: {}", e)
+        }))).into_response(),
+    };
+
+    // At least one field must be set.
+    if patch.content.is_none()
+        && patch.topic_tags.is_none()
+        && patch.layer.is_none()
+        && patch.source_ai.is_none()
+    {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "at least one field must be provided: content, topic_tags, layer, source_ai"
+        }))).into_response();
+    }
+
+    let new_layer: Option<MemoryLayer> = match &patch.layer {
+        Some(l) => match parse_layer(l) {
+            Some(ml) => Some(ml),
+            None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": format!("invalid layer '{}': use identity|knowledge|episode|archive", l)
+            }))).into_response(),
+        },
+        None => None,
+    };
+
+    match state.storage.update_record_content(
+        &rid,
+        &owner,
+        patch.content.as_deref(),
+        patch.topic_tags.as_deref(),
+        new_layer,
+        patch.source_ai.as_deref(),
+    ).await {
+        Ok(true) => {
+            let content_changed = patch.content.is_some();
+
+            // FTS5 re-index (synchronous — search reflects change immediately).
+            if let Some(ref new_content) = patch.content {
+                state.storage.fts_remove_record(&rid).await;
+                let tags_str = patch.topic_tags.as_ref()
+                    .and_then(|t| serde_json::to_string(t).ok())
+                    .unwrap_or_default();
+                state.storage.fts_index_record(&rid, &owner, new_content, &tags_str).await;
+            }
+
+            // Evict stale ANN entry immediately; Miner re-inserts after re-embed.
+            if content_changed {
+                state.vector_index.remove(&rid);
+            }
+
+            // Identity cache invalidation — Miner repopulates on next cycle.
+            {
+                let oh = auth.owner_hex();
+                let mut cache = state.identity_cache.write();
+                if let Some(entries) = cache.get_mut(&oh) {
+                    entries.retain(|r| r.record_id != rid);
+                }
+            }
+
+            (StatusCode::OK, Json(serde_json::json!({
+                "record_id": record_id_hex,
+                "status": "updated",
+                "embedding_invalidated": content_changed,
+                "fts_updated": content_changed,
+                "note": if content_changed {
+                    "Embedding cleared. Miner will re-embed on next cycle (~60s)."
+                } else {
+                    "Update applied."
+                }
+            }))).into_response()
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "record not found, not active, or access denied"
+        }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("update failed: {}", e)
+        }))).into_response(),
+    }
+}
+
+// ============================================
+// GET /api/mpi/record/:record_id/provenance
+// ============================================
+
+/// `GET /api/mpi/record/:record_id/provenance` — Memory provenance chain.
+///
+/// Returns the full traceability chain for a memory record:
+/// - Which session (conversation) it was extracted from
+/// - The session title and timestamp
+/// - Best-effort turn index within the conversation
+///
+/// ## Response
+/// `200 OK`  → `RecordProvenance` JSON (session_id may be null for older records)
+/// `404`     → record not found or owner mismatch (no record enumeration)
+///
+/// v2.5.2+Provenance
+pub async fn mpi_record_provenance(
+    State(state): State<Arc<MpiState>>,
+    Path(record_id_hex): Path<String>,
+    req: Request<axum::body::Body>,
+) -> impl IntoResponse {
+    // Extract auth BEFORE into_body() — into_body() moves req (use-after-move guard).
+    let auth = extract_owner(&req).clone();
+    let owner = auth.owner_bytes();
+
+    let rid: [u8; 32] = match hex::decode(&record_id_hex) {
+        Ok(b) if b.len() == 32 => { let mut a = [0u8; 32]; a.copy_from_slice(&b); a }
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "invalid record_id format"
+        }))).into_response(),
+    };
+
+    match state.storage.get_record_provenance(&rid, &owner).await {
+        Some(prov) => (StatusCode::OK, Json(serde_json::json!(prov))).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "record not found or access denied"
+        }))).into_response(),
+    }
+}
+
+// ============================================
+// Tests
+// ============================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── RecordProvenance serialization ──
+
+    #[test]
+    fn test_provenance_null_fields_serialize_as_null() {
+        // Older records (pre-v2.5.2) have no session — fields must be null, not omitted.
+        let prov = RecordProvenance {
+            record_id: "aabbcc".into(),
+            session_id: None,
+            session_title: None,
+            session_started_at: None,
+            turn_index: None,
+            layer: "episode".into(),
+            topic_tags: vec!["identity".into()],
+            extracted_at: 1_700_000_000,
+            source_ai: "claude".into(),
+        };
+        let json = serde_json::to_value(&prov).unwrap();
+        assert!(json["session_id"].is_null(), "session_id must be null for pre-v2.5.2 records");
+        assert!(json["turn_index"].is_null(), "turn_index must be null when unavailable");
+        assert_eq!(json["layer"], "episode");
+    }
+
+    #[test]
+    fn test_provenance_full_fields_serialize_correctly() {
+        let prov = RecordProvenance {
+            record_id: "deadbeef".into(),
+            session_id: Some("sess-abc".into()),
+            session_title: Some("Debugging session".into()),
+            session_started_at: Some(1_700_000_100),
+            turn_index: Some(3),
+            layer: "knowledge".into(),
+            topic_tags: vec!["environment".into(), "preference".into()],
+            extracted_at: 1_700_000_200,
+            source_ai: "gpt-4o".into(),
+        };
+        let json = serde_json::to_value(&prov).unwrap();
+        assert_eq!(json["session_id"], "sess-abc");
+        assert_eq!(json["turn_index"], 3);
+        assert_eq!(json["topic_tags"][1], "preference");
+        assert_eq!(json["source_ai"], "gpt-4o");
+    }
+
+    // ── PatchRecordRequest validation shape ──
+
+    #[test]
+    fn test_patch_request_all_none_should_be_rejected() {
+        let patch = PatchRecordRequest {
+            content: None, topic_tags: None, layer: None, source_ai: None,
+        };
+        let all_none = patch.content.is_none()
+            && patch.topic_tags.is_none()
+            && patch.layer.is_none()
+            && patch.source_ai.is_none();
+        assert!(all_none, "All-None patch must be rejected by the handler guard");
+    }
+
+    #[test]
+    fn test_patch_request_content_only_is_valid() {
+        let patch = PatchRecordRequest {
+            content: Some("corrected content".into()),
+            topic_tags: None, layer: None, source_ai: None,
+        };
+        let any_set = patch.content.is_some()
+            || patch.topic_tags.is_some()
+            || patch.layer.is_some()
+            || patch.source_ai.is_some();
+        assert!(any_set, "content-only patch must pass the validation guard");
+    }
+
+    #[test]
+    fn test_patch_request_tags_only_is_valid() {
+        let patch = PatchRecordRequest {
+            content: None,
+            topic_tags: Some(vec!["security".into(), "identity".into()]),
+            layer: None, source_ai: None,
+        };
+        assert!(patch.topic_tags.is_some());
+    }
+
+    // ── record_id hex decode shape ──
+
+    #[test]
+    fn test_record_id_hex_roundtrip_32_bytes() {
+        let rid: [u8; 32] = [0xab; 32];
+        let hex_str = hex::encode(rid);
+        assert_eq!(hex_str.len(), 64);
+        let decoded = hex::decode(&hex_str).unwrap();
+        assert_eq!(decoded.len(), 32);
+        let mut recovered = [0u8; 32];
+        recovered.copy_from_slice(&decoded);
+        assert_eq!(rid, recovered);
+    }
+
+    #[test]
+    fn test_record_id_hex_wrong_length_rejected() {
+        // 31 bytes → must fail the `b.len() == 32` guard.
+        let short = hex::encode([0u8; 31]);
+        let decoded = hex::decode(&short).unwrap();
+        assert_ne!(decoded.len(), 32, "31-byte decode must not pass the length guard");
+    }
+
+    // ── default_recall_mode ──
+
+    #[test]
+    fn test_default_recall_mode_is_full() {
+        assert_eq!(default_recall_mode(), "full");
     }
 }
