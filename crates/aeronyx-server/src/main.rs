@@ -12,6 +12,9 @@
 //! v0.1.0 - Initial CLI implementation
 //! v0.2.0 - Added register command, simplified user flow
 //! v0.3.0 - 🌟 Added MemChain status and config display
+//! v2.5.2 - 🔧 Server::new now takes config_path as third argument so the
+//!   server can persist any runtime-generated tokens / keys back to the config
+//!   file. Pass Some(config_path.clone()) from cmd_start.
 
 use std::path::PathBuf;
 
@@ -263,7 +266,11 @@ async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
     info!("Owner:      {}", node_info.owner_wallet);
     info!("════════════════════════════════════════");
 
-    let server = Server::new(config, identity);
+    // v2.5.2: pass config_path so Server can persist runtime-generated tokens
+    // back to the config file. Use config_path.clone() — ownership stays here
+    // in case the caller needs it after this call (currently it doesn't, but
+    // clone is cheap and prevents future borrow errors).
+    let server = Server::new(config, identity, Some(config_path.clone()));
     server.run().await?;
 
     Ok(())
@@ -416,7 +423,7 @@ async fn cmd_pubkey(config_path: PathBuf, format: String) -> anyhow::Result<()> 
 
     match format.as_str() {
         "base64" => println!("{}", identity.public_key()),
-        "hex" | _ => println!("{}", hex::encode(identity.public_key_bytes())),
+        _ => println!("{}", hex::encode(identity.public_key_bytes())),
     }
 
     Ok(())
