@@ -29,15 +29,18 @@
 //! - [`recall_handler`]: Hybrid recall pipeline (vector + BM25 + graph + RRF)
 //! - [`log_handler`]: /log endpoint with rule engine + entropy filter + privacy tags
 //! - [`supernode_handlers`]: v2.5.0 SuperNode management endpoints
+//! - [`chat_handlers`]: 🌟 v1.1.0-ChatRelay blob upload/download/delete endpoints
 //! - [`local`]: Legacy Axum router (deprecated)
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - When adding new ORIGINAL-style endpoints → add to mpi_handlers.rs
 //! - When adding new GRAPH/COGNITIVE endpoints → add to mpi_graph_handlers.rs
 //! - When adding new SUPERNODE endpoints → add to supernode_handlers.rs
-//! - Register all routes in mpi.rs::build_mpi_router() regardless of which file
-//!   the handler lives in
+//! - When adding new CHAT endpoints → add to chat_handlers.rs
+//! - Register all routes in the appropriate router builder function
 //! - Re-exports below MUST stay in sync — server.rs depends on them
+//! - chat_handlers::build_chat_router() is merged into the MPI app in
+//!   server.rs::start_combined_api() ONLY when chat_relay.enabled = true
 //!
 //! ## Last Modified
 //! v0.3.0 - 🌟 Initial Agent API for MemChain Phase 1
@@ -46,6 +49,7 @@
 //!   mpi_graph_handlers, recall_handler submodules
 //! v2.4.0+Privacy - 🌟 log_handler updated with privacy tag stripping
 //! v2.5.0+SuperNode Phase D - 🌟 Added supernode_handlers submodule
+//! v1.1.0-ChatRelay - 🌟 Added chat_handlers submodule for blob HTTP API
 
 // ── Core MPI module (state, auth, router) ──
 pub mod mpi;
@@ -57,10 +61,13 @@ pub mod recall_handler;
 pub mod log_handler;
 // ── v2.5.0+SuperNode: Task queue management + monitoring ──
 pub mod supernode_handlers;
+// ── 🌟 v1.1.0-ChatRelay: Encrypted blob upload/download/delete ──
+pub mod chat_handlers;
 // ── Legacy API (deprecated) ──
 pub mod local;
 
 // ── Re-exports (unchanged from v2.3.0 — external callers unaffected) ──
 pub use mpi::{build_mpi_router, MpiState, BaselineSnapshot};
+pub use chat_handlers::{build_chat_router, ChatBlobState};
 #[allow(deprecated)]
 pub use local::start_legacy_api_server;
