@@ -80,7 +80,7 @@ use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
-use sha2::{Digest, Sha256};
+
 use tracing::{debug, info, warn};
 
 use aeronyx_core::protocol::chat::{decode_envelope, encode_envelope, ChatEnvelope};
@@ -895,6 +895,7 @@ pub fn derive_node_secret(ed25519_sk_bytes: &[u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::protocol::chat::ChatContentType;
 
