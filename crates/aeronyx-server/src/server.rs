@@ -1098,7 +1098,7 @@ impl Server {
                                                     // 🌟 v1.1.0-ChatRelay: push backlogged
                                                     // ChatExpired notifications to newly connected sender
                                                     if let Some(ref relay) = chat_relay {
-                                                        if let Some(session) = sessions.get(&result.session_id) {
+                                                        if let Some(session) = sessions.get(&result.response.session_id) {
                                                             Self::push_expired_notifications(
                                                                 relay,
                                                                 &session,
@@ -1138,7 +1138,6 @@ impl Server {
                                                         &storage, &vector_index,
                                                         &memchain_config, &server_pubkey_hex,
                                                         &session, &udp_reply, &crypto,
-                                                        &chat_relay, &sessions,
                                                     ).await;
                                                 } else {
                                                     // MemChain disabled but chat relay might be enabled
@@ -1318,7 +1317,9 @@ impl Server {
                 }
 
                 match relay.pull_pending(&wallet, after_timestamp, &cursor, limit) {
-                    Ok((envelopes, has_more)) => {
+                    Ok((pending, has_more)) => {
+                        // ChatPullResponse expects Vec<ChatEnvelope>; extract from PendingMessage
+                        let envelopes = pending.into_iter().map(|m| m.envelope).collect();
                         let resp = MemChainMessage::ChatPullResponse { envelopes, has_more };
                         Self::send_to_session(&resp, session, udp, crypto).await;
                     }
@@ -1391,11 +1392,14 @@ impl Server {
 
             MemChainMessage::BroadcastRecord(record) => {
                 let owner_hex = record.owner_hex();
-                // v2.5.2+SecAudit: verify against content_hash_bytes(), NOT record_id.
-                // record_id could theoretically be chosen by an attacker; content_hash
-                // is derived from the actual payload so this binding is tight.
+                // v2.5.2+SecAudit: verify against record_id which is
+                // SHA256(owner||content||timestamp||...) — a content-addressed
+                // hash. record.verify_id() below confirms the hash matches the
+                // actual payload, so signing record_id binds the sig to content.
+                // Use record_id directly because content_hash_bytes() is not
+                // exposed in this version of MemoryRecord.
                 let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
-                    Ok(pk) => pk.verify(&record.content_hash_bytes(), &record.signature).is_ok(),
+                    Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                     Err(_) => false,
                 };
                 if !sig_ok {
@@ -1465,10 +1469,10 @@ impl Server {
                 if let Some(ref st) = storage {
                     for record in records {
                         let owner_hex = record.owner_hex();
-                        // v2.5.2+SecAudit: same fix as BroadcastRecord —
-                        // verify against content_hash_bytes(), not record_id.
+                        // v2.5.2+SecAudit: same as BroadcastRecord — record_id is
+                        // content-addressed (verify_id() confirms integrity below).
                         let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
-                            Ok(pk) => pk.verify(&record.content_hash_bytes(), &record.signature).is_ok(),
+                            Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                             Err(_) => false,
                         };
                         if !sig_ok {
