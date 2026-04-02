@@ -59,7 +59,7 @@
 //! ## Last Modified
 //! v1.0.0-ChatRelay — Initial implementation
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use bincode::Options;
 
@@ -74,6 +74,36 @@ use crate::error::CoreError;
 /// Text ciphertext ≤ 64 KB + fixed fields ≤ ~1 KB overhead.
 /// Prevents bincode length-prefix OOM attacks.
 const MAX_ENVELOPE_BYTES: u64 = 128 * 1024; // 128 KB
+
+// ============================================
+// Serde helper for [u8; 64]
+// ============================================
+// serde only auto-derives array impls up to [T; 32]. Ed25519 signatures
+// are 64 bytes, so we need a manual helper. We serialise as a fixed-length
+// byte sequence (no length prefix in bincode, just 64 raw bytes).
+
+mod serde_bytes64 {
+    use super::*;
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(v: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+        // Serialize as a tuple of two [u8;32] — both halves have stable serde impls.
+        // This produces exactly 64 bytes in bincode (no length prefix).
+        let (lo, hi) = v.split_at(32);
+        let lo: [u8; 32] = lo.try_into().unwrap();
+        let hi: [u8; 32] = hi.try_into().unwrap();
+        (lo, hi).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+        let (lo, hi): ([u8; 32], [u8; 32]) = Deserialize::deserialize(d)?;
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&lo);
+        out[32..].copy_from_slice(&hi);
+        Ok(out)
+    }
+}
 
 // ============================================
 // ChatContentType
@@ -173,6 +203,10 @@ pub struct ChatEnvelope {
     /// Ed25519 signature over `sign_envelope_data(self)`.
     /// Signed with the sender's Ed25519 private key.
     /// Verified using `self.sender` as the public key.
+    ///
+    /// Serialised as two consecutive `[u8; 32]` halves (bincode has no
+    /// built-in impl for arrays larger than 32 bytes).
+    #[serde(with = "serde_bytes64")]
     pub signature: [u8; 64],
 }
 
