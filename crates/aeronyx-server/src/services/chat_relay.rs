@@ -79,6 +79,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
+use sha2::Sha256;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use tracing::{debug, info, warn};
