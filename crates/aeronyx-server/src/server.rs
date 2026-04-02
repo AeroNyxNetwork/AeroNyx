@@ -1098,7 +1098,8 @@ impl Server {
                                                     // 🌟 v1.1.0-ChatRelay: push backlogged
                                                     // ChatExpired notifications to newly connected sender
                                                     if let Some(ref relay) = chat_relay {
-                                                        if let Some(session) = sessions.get(&result.response.session_id) {
+                                                        if let Some(sid) = SessionId::from_bytes(&result.response.session_id) {
+                                                            if let Some(session) = sessions.get(&sid) {
                                                             Self::push_expired_notifications(
                                                                 relay,
                                                                 &session,
