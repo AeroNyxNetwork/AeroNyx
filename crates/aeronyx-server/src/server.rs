@@ -37,10 +37,17 @@
 //!   tightened to reject private/loopback addresses as fallback detection.
 //! v1.1.0-ChatRelay - 🌟 Zero-knowledge P2P chat relay integration.
 //!   - ChatRelayService initialised when chat_relay.enabled=true
-//!   - handle_memchain_message: 5 new match arms (ChatRelay/Pull/PullResponse/Ack/Expired)
-//!   - spawn_cleanup_task: chat TTL cleanup + expired notification push
+//!   - handle_chat_message: handles ChatRelay/Pull/PullResponse/Ack/Expired
+//!   - is_chat_message(): classifier used in UDP dispatch to route BEFORE
+//!     MemChain storage engine — chat works even when mode="off"
+//!   - spawn_cleanup_task: separate chat_timer with configured interval,
+//!     SQLite I/O offloaded via spawn_blocking
 //!   - start_combined_api: merges build_chat_router() when chat relay enabled
 //!   - Session creation triggers push of backlogged ChatExpired notifications
+//!   🐛 Fixed: removed unsafe { std::mem::zeroed() } AofWriter placeholder
+//!      (was UB); chat-only path now dispatched directly without MemChain refs
+//!   🐛 Fixed: push_expired_notifications bracket mismatch corrected
+//!   🐛 Fixed: spawn_udp_task parameter count corrected
 //!
 //! ⚠️ Important Notes for Next Developer:
 //! - record_key is derived from identity.to_bytes() (Ed25519 PRIVATE key)
@@ -49,7 +56,9 @@
 //! - NerEngine MUST be loaded AFTER EmbedEngine (shared ORT runtime via Once)
 //! - RerankerEngine MUST be loaded AFTER EmbedEngine and NerEngine (shared ORT Once)
 //! - ChatRelayService is gated on config.memchain.chat_relay.enabled — safe to disable
-//! - Chat relay does NOT require memchain to be enabled (independent subsystem)
+//! - Chat relay does NOT require memchain to be enabled (independent subsystem).
+//!   The UDP dispatch calls is_chat_message() BEFORE entering handle_memchain_message,
+//!   so chat variants never reach handle_memchain_message's storage-dependent arms.
 //! - resolve_public_ip: NEVER use the GCP metadata URL (169.254.169.254) in
 //!   production — it bypasses TLS and is an SSRF vector if the URL list is
 //!   extended with user-controlled input. Current list is hardcoded and safe.
@@ -63,6 +72,7 @@
 //!   resolve_public_ip private-IP guard added.
 //! v1.1.0-ChatRelay    - 🌟 ChatRelayService, chat MemChain handlers, blob HTTP API,
 //!   cleanup task extension, expired notification push on session create.
+//!   🐛 UB fix: unsafe zeroed() removed; chat dispatch separated from memchain path.
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,7 +102,6 @@ use aeronyx_transport::LinuxTun;
 use rusqlite::OptionalExtension;
 
 use crate::api::mpi::{build_mpi_router, MpiState, BaselineSnapshot};
-// 🌟 v1.1.0-ChatRelay: chat blob HTTP router
 use crate::api::chat_handlers::build_chat_router;
 use crate::config::{MemChainConfig, ServerConfig, VectorQuantizationMode};
 use crate::error::{Result, ServerError};
@@ -111,9 +120,8 @@ use crate::services::memchain::EmbedEngine;
 use crate::services::memchain::NerEngine;
 use crate::services::memchain::RerankerEngine;
 use crate::services::memchain::{LlmRouter, TaskWorker};
-// 🌟 v1.1.0-ChatRelay: chat relay service
 use crate::services::chat_relay::{ChatRelayService, derive_node_secret};
-use crate::services::{HandshakeService, IpPoolService, RoutingService, SessionManager};
+use crate::services::{HandshakeService, IpPoolService, RoutingService, Session, SessionManager};
 
 // ============================================
 // Constants
@@ -176,7 +184,7 @@ impl Server {
             (None, None, None, None)
         };
 
-        // 🌟 v1.1.0-ChatRelay: initialise chat relay (independent of memchain mode)
+        // Chat relay is independent of MemChain mode — init first
         let chat_relay: Option<Arc<ChatRelayService>> = self.init_chat_relay()?;
 
         let udp = Arc::new(
@@ -313,34 +321,36 @@ impl Server {
             };
 
             // ── Reranker engine ─────────────────────────────────────────────
-            let reranker_engine: Option<Arc<RerankerEngine>> = if self.config.memchain.reranker_enabled {
-                let model_path = &self.config.memchain.reranker_model_path;
-                let max_seq = self.config.memchain.reranker_max_seq_length;
-                match RerankerEngine::load(model_path, max_seq) {
-                    Ok(engine) => {
-                        info!(
-                            model = %model_path,
-                            blend_weight = %RerankerEngine::blend_weight(),
-                            "[RERANKER] ✅ Cross-encoder loaded"
-                        );
-                        Some(Arc::new(engine))
+            let reranker_engine: Option<Arc<RerankerEngine>> =
+                if self.config.memchain.reranker_enabled {
+                    let model_path = &self.config.memchain.reranker_model_path;
+                    let max_seq = self.config.memchain.reranker_max_seq_length;
+                    match RerankerEngine::load(model_path, max_seq) {
+                        Ok(engine) => {
+                            info!(
+                                model = %model_path,
+                                blend_weight = %RerankerEngine::blend_weight(),
+                                "[RERANKER] ✅ Cross-encoder loaded"
+                            );
+                            Some(Arc::new(engine))
+                        }
+                        Err(e) => {
+                            warn!(model = %model_path, error = %e, "[RERANKER] ⚠️ Unavailable");
+                            None
+                        }
                     }
-                    Err(e) => {
-                        warn!(model = %model_path, error = %e, "[RERANKER] ⚠️ Unavailable");
-                        None
-                    }
-                }
-            } else {
-                debug!("[RERANKER] Disabled (reranker_enabled=false)");
-                None
-            };
+                } else {
+                    debug!("[RERANKER] Disabled (reranker_enabled=false)");
+                    None
+                };
 
             // ── v2.5.0+SuperNode: LlmRouter initialization ──────────────────
             let llm_router: Option<Arc<LlmRouter>> = self.init_llm_router().await;
 
             // ── v2.5.0+SuperNode: Crash recovery ────────────────────────────
             if llm_router.is_some() {
-                let timeout_secs = self.config.memchain.supernode.worker.task_timeout_secs as i64;
+                let timeout_secs =
+                    self.config.memchain.supernode.worker.task_timeout_secs as i64;
                 let recovered = st.reset_stale_processing_tasks(timeout_secs).await;
                 if recovered > 0 {
                     info!(
@@ -412,7 +422,8 @@ impl Server {
                     if let Ok(json) = serde_json::to_string(&baseline) {
                         let conn = st.conn_lock().await;
                         let _ = conn.execute(
-                            "INSERT OR REPLACE INTO chain_state (key, value) VALUES ('mvf_baseline', ?1)",
+                            "INSERT OR REPLACE INTO chain_state (key, value) \
+                             VALUES ('mvf_baseline', ?1)",
                             rusqlite::params![json.as_bytes()],
                         );
                     }
@@ -468,21 +479,15 @@ impl Server {
 
                 let miner = if let Some(ref ee) = embed_engine {
                     miner.with_embed_engine(Arc::clone(ee))
-                } else {
-                    miner
-                };
+                } else { miner };
 
                 let miner = if let Some(ref ne) = ner_engine {
                     miner.with_ner_engine(Arc::clone(ne))
-                } else {
-                    miner
-                };
+                } else { miner };
 
                 let miner = if let Some(ref lr) = llm_router {
                     miner.with_llm_router(Arc::clone(lr))
-                } else {
-                    miner
-                };
+                } else { miner };
 
                 let miner_shutdown = self.shutdown_tx.subscribe();
                 tasks.push(("miner", tokio::spawn(async move {
@@ -527,10 +532,10 @@ impl Server {
     }
 
     // ============================================
-    // 🌟 v1.1.0-ChatRelay: Chat Relay Initialization
+    // v1.1.0-ChatRelay: Chat Relay Initialization
     // ============================================
 
-    /// Initialises the `ChatRelayService` when `chat_relay.enabled = true`.
+    /// Initialises `ChatRelayService` when `chat_relay.enabled = true`.
     ///
     /// Chat relay is independent of the MemChain mode — it can run even when
     /// `memchain.mode = "off"`. Returns `None` when disabled (safe no-op).
@@ -540,8 +545,8 @@ impl Server {
             return Ok(None);
         }
 
-        // Derive stable node secret from Ed25519 private key via HKDF
-        // ⚠️ Uses identity.to_bytes() (PRIVATE key) — same pattern as record_key
+        // Derive stable node secret from Ed25519 private key via HKDF.
+        // ⚠️ Uses identity.to_bytes() (PRIVATE key) — same pattern as record_key.
         let node_secret = derive_node_secret(&self.identity.to_bytes());
 
         match ChatRelayService::new(self.config.memchain.chat_relay.clone(), node_secret) {
@@ -574,7 +579,6 @@ impl Server {
         }
 
         let supernode = &self.config.memchain.supernode;
-
         if supernode.providers.is_empty() {
             warn!("[SUPERNODE] enabled=true but no providers configured — SuperNode disabled");
             return None;
@@ -583,8 +587,7 @@ impl Server {
         let mut providers: Vec<(String, String, String, Arc<dyn LlmProvider>)> = Vec::new();
 
         for provider_cfg in &supernode.providers {
-            let api_key: Option<String> = provider_cfg.api_key.as_ref().map(|k| {
-                let k: &String = k;
+            let api_key: Option<String> = provider_cfg.api_key.as_ref().map(|k: &String| {
                 if k.starts_with('$') {
                     std::env::var(&k[1..]).unwrap_or_else(|_| {
                         warn!(
@@ -716,7 +719,11 @@ impl Server {
         let quantization_enabled =
             self.config.memchain.vector_quantization == VectorQuantizationMode::ScalarUint8;
         let vector_index = Arc::new(if quantization_enabled {
-            let sat = if self.config.memchain.vector_early_termination { 0.001_f32 } else { 0.0_f32 };
+            let sat = if self.config.memchain.vector_early_termination {
+                0.001_f32
+            } else {
+                0.0_f32
+            };
             info!(quantization = "scalar_uint8", "[MEMCHAIN] VectorIndex with scalar quantization");
             VectorIndex::with_config(true, sat)
         } else {
@@ -743,9 +750,13 @@ impl Server {
         if quantization_enabled && rebuild_count > 0 {
             let owner_hex = hex::encode(owner);
             let model_name = std::path::Path::new(&self.config.memchain.embed_model_path)
-                .file_name().and_then(|f| f.to_str()).unwrap_or("minilm-l6-v2");
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("minilm-l6-v2");
 
-            let cal_key = format!("{}:{}:{}", QUANTIZER_CAL_KEY_PREFIX, owner_hex, model_name);
+            let cal_key = format!(
+                "{}:{}:{}", QUANTIZER_CAL_KEY_PREFIX, owner_hex, model_name
+            );
             let restored = {
                 let conn = storage.conn_lock().await;
                 let cal_data: Option<Vec<u8>> = conn.query_row(
@@ -820,7 +831,6 @@ impl Server {
         _aof_writer: Arc<TokioMutex<AofWriter>>,
         _sessions: Arc<SessionManager>,
         _udp: Arc<UdpTransport>,
-        // 🌟 v1.1.0-ChatRelay: optional chat relay for blob endpoints
         chat_relay: Option<Arc<ChatRelayService>>,
     ) -> JoinHandle<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -828,7 +838,6 @@ impl Server {
         tokio::spawn(async move {
             let mut app = build_mpi_router(mpi_state);
 
-            // 🌟 v1.1.0-ChatRelay: mount blob endpoints when relay is enabled
             if let Some(relay) = chat_relay {
                 app = app.merge(build_chat_router(relay));
                 info!("[CHAT_RELAY] Blob API mounted on /api/chat/blob");
@@ -958,20 +967,22 @@ impl Server {
             return ip.to_string();
         }
 
-        // v2.5.2+SecAudit: HTTP metadata endpoints (169.254.169.254, metadata.google.internal)
-        // removed — they bypass TLS and are SSRF vectors. IMDSv1 can leak AWS session tokens.
-        // If running in a cloud environment, set network.public_endpoint explicitly in config,
-        // or use IMDSv2 (requires a PUT pre-flight for the token) in a dedicated cloud feature.
+        // v2.5.2+SecAudit: HTTP metadata endpoints (169.254.169.254,
+        // metadata.google.internal) removed — they bypass TLS and are SSRF
+        // vectors. If running in a cloud environment, set
+        // network.public_endpoint explicitly in config.toml.
         let services = [
             "https://api.ipify.org",
             "https://ifconfig.me/ip",
             "https://ipinfo.io/ip",
         ];
 
-        if let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(5)).build() {
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
             for url in &services {
-                let req = client.get(*url);
-                if let Ok(resp) = req.send().await {
+                if let Ok(resp) = client.get(*url).send().await {
                     if resp.status().is_success() {
                         if let Ok(body) = resp.text().await {
                             let ip_str = body.trim();
@@ -1065,7 +1076,6 @@ impl Server {
         vector_index: Option<Arc<VectorIndex>>,
         memchain_config: MemChainConfig,
         server_pubkey_hex: String,
-        // 🌟 v1.1.0-ChatRelay
         chat_relay: Option<Arc<ChatRelayService>>,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
@@ -1090,26 +1100,39 @@ impl Server {
                                         if let Ok(hello) = decode_client_hello(data) {
                                             match handshake.process(&hello, source.addr) {
                                                 Ok(result) => {
-                                                    let sid = BASE64.encode(&result.response.session_id);
+                                                    let sid = BASE64.encode(
+                                                        &result.response.session_id
+                                                    );
                                                     session_events.session_created(&sid, None);
                                                     let resp = encode_server_hello(&result.response);
                                                     let _ = udp.send(&resp, &source.addr).await;
 
-                                                    // 🌟 v1.1.0-ChatRelay: push backlogged
-                                                    // ChatExpired notifications to newly connected sender
+                                                    // v1.1.0-ChatRelay: push backlogged
+                                                    // ChatExpired notifications to newly
+                                                    // connected sender.
                                                     if let Some(ref relay) = chat_relay {
-                                                        if let Some(sid) = SessionId::from_bytes(&result.response.session_id) {
-                                                            if let Some(session) = sessions.get(&sid) {
-                                                            Self::push_expired_notifications(
-                                                                relay,
-                                                                &session,
-                                                                &udp_reply,
-                                                                &crypto,
-                                                            ).await;
+                                                        if let Some(session_id) =
+                                                            SessionId::from_bytes(
+                                                                &result.response.session_id
+                                                            )
+                                                        {
+                                                            if let Some(session) =
+                                                                sessions.get(&session_id)
+                                                            {
+                                                                Self::push_expired_notifications(
+                                                                    relay,
+                                                                    &session,
+                                                                    &udp_reply,
+                                                                    &crypto,
+                                                                ).await;
+                                                            }
                                                         }
                                                     }
                                                 }
-                                                Err(e) => warn!("[HANDSHAKE] Failed {}: {}", source.addr, e),
+                                                Err(e) => warn!(
+                                                    "[HANDSHAKE] Failed {}: {}",
+                                                    source.addr, e
+                                                ),
                                             }
                                         }
                                     }
@@ -1119,7 +1142,9 @@ impl Server {
                                             let mut sid = [0u8; 16];
                                             sid.copy_from_slice(&data[1..17]);
                                             if let Some(id) = SessionId::from_bytes(&sid) {
-                                                if let Some(s) = sessions.get(&id) { s.touch(); }
+                                                if let Some(s) = sessions.get(&id) {
+                                                    s.touch();
+                                                }
                                             }
                                         }
                                     }
@@ -1131,39 +1156,31 @@ impl Server {
                                                 { let _ = tun.write(&pkt).await; }
                                             }
                                             Ok((session, DecryptedPayload::MemChain(msg))) => {
-                                                if let (Some(ref mp), Some(ref aw)) =
-                                                    (&mempool, &aof_writer)
+                                                // v1.1.0-ChatRelay: chat variants are dispatched
+                                                // FIRST, before the MemChain storage engine.
+                                                // This allows chat relay to work even when
+                                                // memchain.mode = "off" (storage is None).
+                                                if Self::is_chat_message(&msg) {
+                                                    Self::handle_chat_message(
+                                                        msg, &session,
+                                                        &udp_reply, &crypto,
+                                                        &chat_relay, &sessions,
+                                                    ).await;
+                                                } else if let (
+                                                    Some(ref mp),
+                                                    Some(ref aw),
+                                                ) = (&mempool, &aof_writer)
                                                 {
                                                     Self::handle_memchain_message(
                                                         msg, mp, aw,
                                                         &storage, &vector_index,
-                                                        &memchain_config, &server_pubkey_hex,
+                                                        &memchain_config,
+                                                        &server_pubkey_hex,
                                                         &session, &udp_reply, &crypto,
                                                     ).await;
-                                                } else {
-                                                    // MemChain disabled but chat relay might be enabled
-                                                    // Still handle chat messages
-                                                    if chat_relay.is_some() {
-                                                        Self::handle_memchain_message(
-                                                            msg,
-                                                            // dummy refs — chat handler doesn't use them
-                                                            // when mempool/aof are None we pass empty stubs
-                                                            // but mempool/aof are None so we go the else branch
-                                                            // Restructured below for clarity
-                                                            &Arc::new(MemPool::new()),
-                                                            &Arc::new(TokioMutex::new(
-                                                                // AofWriter::noop() would be ideal;
-                                                                // for now gate chat-only path separately
-                                                                // See handle_chat_only_message below
-                                                                unsafe { std::mem::zeroed() }
-                                                            )),
-                                                            &None, &None,
-                                                            &memchain_config, &server_pubkey_hex,
-                                                            &session, &udp_reply, &crypto,
-                                                            &chat_relay, &sessions,
-                                                        ).await;
-                                                    }
                                                 }
+                                                // else: MemChain disabled and not a chat message
+                                                // — silently drop (expected when mode=off).
                                             }
                                             Err(_) => {}
                                         }
@@ -1184,17 +1201,15 @@ impl Server {
     }
 
     // ============================================
-    // MemChain Message Handler
+    // v1.1.0-ChatRelay: Chat message classifier
     // ============================================
 
-    // ============================================
-    // 🌟 v1.1.0-ChatRelay: Chat message classifier
-    // ============================================
-
-    /// Returns `true` for MemChain variants handled by `handle_chat_message`.
+    /// Returns `true` for `MemChainMessage` variants handled by
+    /// `handle_chat_message`.
     ///
-    /// These variants are routed independently of the MemChain storage engine,
-    /// allowing chat relay to work even when `memchain.mode = "off"`.
+    /// Called in the UDP dispatch loop BEFORE checking whether the MemChain
+    /// storage engine is available. This ensures chat relay works even when
+    /// `memchain.mode = "off"`.
     #[inline]
     fn is_chat_message(msg: &MemChainMessage) -> bool {
         matches!(
@@ -1208,17 +1223,18 @@ impl Server {
     }
 
     // ============================================
-    // 🌟 v1.1.0-ChatRelay: Chat-only message handler
+    // v1.1.0-ChatRelay: Chat message handler
     // ============================================
 
     /// Handles all `ChatRelay` / `ChatPull` / `ChatAck` / `ChatExpired` variants.
     ///
     /// Deliberately separated from `handle_memchain_message` so that chat relay
     /// works even when the MemChain storage engine is disabled (mode = "off").
-    /// This function has NO dependency on `MemPool`, `AofWriter`, or `MemoryStorage`.
+    /// This function has NO dependency on `MemPool`, `AofWriter`, or
+    /// `MemoryStorage`.
     async fn handle_chat_message(
         msg: MemChainMessage,
-        session: &Arc<crate::services::Session>,
+        session: &Arc<Session>,
         udp: &Arc<UdpTransport>,
         crypto: &DefaultTransportCrypto,
         chat_relay: &Option<Arc<ChatRelayService>>,
@@ -1234,7 +1250,7 @@ impl Server {
                     }
                 };
 
-                // 1. Verify timestamp (anti-replay: ±5 minutes)
+                // 1. Anti-replay: timestamp skew must be ≤ 5 minutes
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -1242,8 +1258,7 @@ impl Server {
                 let skew = (now as i64 - envelope.timestamp as i64).unsigned_abs();
                 if skew > 300 {
                     warn!(
-                        id = %envelope.short_id(),
-                        skew = skew,
+                        id = %envelope.short_id(), skew = skew,
                         "[CHAT_RELAY] ChatRelay rejected: timestamp skew"
                     );
                     return;
@@ -1259,7 +1274,7 @@ impl Server {
                     return;
                 }
 
-                // 3. Check message size
+                // 3. Enforce message size limit
                 if envelope.ciphertext.len() > relay.config().max_message_size {
                     warn!(
                         id = %envelope.short_id(),
@@ -1269,11 +1284,14 @@ impl Server {
                     return;
                 }
 
-                // 4. Route: online → forward, offline → store
+                // 4. Route: receiver online → forward; offline → store
                 match sessions.get_by_wallet(&envelope.receiver) {
                     Some(receiver_session) => {
                         if relay.is_online_duplicate(&envelope.message_id) {
-                            debug!(id = %envelope.short_id(), "[CHAT_RELAY] Online duplicate suppressed");
+                            debug!(
+                                id = %envelope.short_id(),
+                                "[CHAT_RELAY] Online duplicate suppressed"
+                            );
                             return;
                         }
                         let fwd = MemChainMessage::ChatRelay(envelope.clone());
@@ -1291,10 +1309,16 @@ impl Server {
                                     message_ids: vec![envelope.message_id],
                                 };
                                 Self::send_to_session(&ack, session, udp, crypto).await;
-                                debug!(id = %envelope.short_id(), "[CHAT_RELAY] Message stored (offline)");
+                                debug!(
+                                    id = %envelope.short_id(),
+                                    "[CHAT_RELAY] Message stored (offline)"
+                                );
                             }
                             Err(e) => {
-                                warn!(id = %envelope.short_id(), error = %e, "[CHAT_RELAY] store_pending failed");
+                                warn!(
+                                    id = %envelope.short_id(), error = %e,
+                                    "[CHAT_RELAY] store_pending failed"
+                                );
                             }
                         }
                     }
@@ -1304,9 +1328,13 @@ impl Server {
             MemChainMessage::ChatPull { wallet, after_timestamp, cursor, limit } => {
                 let relay = match chat_relay {
                     Some(r) => r,
-                    None => { debug!("[CHAT_RELAY] ChatPull received but relay disabled"); return; }
+                    None => {
+                        debug!("[CHAT_RELAY] ChatPull received but relay disabled");
+                        return;
+                    }
                 };
 
+                // Wallet must match the authenticated session
                 let session_wallet = session.wallet_bytes();
                 if session_wallet != wallet {
                     warn!(
@@ -1319,7 +1347,6 @@ impl Server {
 
                 match relay.pull_pending(&wallet, after_timestamp, &cursor, limit) {
                     Ok((pending, has_more)) => {
-                        // ChatPullResponse expects Vec<ChatEnvelope>; extract from PendingMessage
                         let envelopes = pending.into_iter().map(|m| m.envelope).collect();
                         let resp = MemChainMessage::ChatPullResponse { envelopes, has_more };
                         Self::send_to_session(&resp, session, udp, crypto).await;
@@ -1329,29 +1356,39 @@ impl Server {
             }
 
             MemChainMessage::ChatPullResponse { .. } => {
+                // Server never expects a PullResponse from a client
                 debug!("[CHAT_RELAY] Unexpected ChatPullResponse from client — ignored");
             }
 
             MemChainMessage::ChatAck { message_ids } => {
                 let relay = match chat_relay {
                     Some(r) => r,
-                    None => { debug!("[CHAT_RELAY] ChatAck received but relay disabled"); return; }
+                    None => {
+                        debug!("[CHAT_RELAY] ChatAck received but relay disabled");
+                        return;
+                    }
                 };
 
                 let receiver_wallet = session.wallet_bytes();
                 match relay.ack_messages(&message_ids, &receiver_wallet) {
                     Ok(deleted) => {
-                        debug!(deleted, count = message_ids.len(), "[CHAT_RELAY] ChatAck processed");
+                        debug!(
+                            deleted, count = message_ids.len(),
+                            "[CHAT_RELAY] ChatAck processed"
+                        );
                     }
                     Err(e) => { warn!(error = %e, "[CHAT_RELAY] ack_messages failed"); }
                 }
             }
 
             MemChainMessage::ChatExpired { .. } => {
+                // Server pushes ChatExpired to clients; receiving one from a
+                // client is unexpected.
                 debug!("[CHAT_RELAY] Unexpected ChatExpired from client — ignored");
             }
 
-            _ => {} // is_chat_message() guarantees only chat variants reach here
+            // is_chat_message() guarantees only chat variants reach here
+            _ => {}
         }
     }
 
@@ -1368,13 +1405,15 @@ impl Server {
         vector_index: &Option<Arc<VectorIndex>>,
         config: &MemChainConfig,
         server_pubkey_hex: &str,
-        session: &Arc<crate::services::Session>,
+        session: &Arc<Session>,
         udp: &Arc<UdpTransport>,
         crypto: &DefaultTransportCrypto,
     ) {
+        // ⚠️ Chat variants are handled by handle_chat_message (called earlier
+        // in the UDP dispatch loop). They must never reach this function.
+        // If a new chat variant is added to MemChainMessage, also add it to
+        // is_chat_message() above.
         match msg {
-            // ── Existing handlers (preserved verbatim) ──────────────────────
-
             MemChainMessage::BroadcastFact(fact) => {
                 let origin_hex = hex::encode(fact.origin);
                 let sig_ok = match IdentityPublicKey::from_bytes(&fact.origin) {
@@ -1393,18 +1432,17 @@ impl Server {
 
             MemChainMessage::BroadcastRecord(record) => {
                 let owner_hex = record.owner_hex();
-                // v2.5.2+SecAudit: verify against record_id which is
-                // SHA256(owner||content||timestamp||...) — a content-addressed
-                // hash. record.verify_id() below confirms the hash matches the
-                // actual payload, so signing record_id binds the sig to content.
-                // Use record_id directly because content_hash_bytes() is not
-                // exposed in this version of MemoryRecord.
+                // v2.5.2+SecAudit: record_id is SHA256(owner||content||…),
+                // a content-addressed hash. Signing record_id binds the
+                // signature to content. verify_id() below confirms the hash
+                // matches the actual payload, preventing spoofed-content replay.
                 let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
                     Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                     Err(_) => false,
                 };
                 if !sig_ok {
-                    warn!(owner = %owner_hex, "[MEMCHAIN] BroadcastRecord signature verification failed");
+                    warn!(owner = %owner_hex,
+                        "[MEMCHAIN] BroadcastRecord signature verification failed");
                     return;
                 }
                 if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
@@ -1448,7 +1486,9 @@ impl Server {
                         Ok(pk) => pk.verify(&fact.fact_id, &fact.signature).is_ok(),
                         Err(_) => false,
                     };
-                    if !sig_ok || !config.is_origin_trusted(&origin_hex, server_pubkey_hex) {
+                    if !sig_ok
+                        || !config.is_origin_trusted(&origin_hex, server_pubkey_hex)
+                    {
                         continue;
                     }
                     if mempool.add_fact(fact.clone()) {
@@ -1470,17 +1510,19 @@ impl Server {
                 if let Some(ref st) = storage {
                     for record in records {
                         let owner_hex = record.owner_hex();
-                        // v2.5.2+SecAudit: same as BroadcastRecord — record_id is
-                        // content-addressed (verify_id() confirms integrity below).
+                        // v2.5.2+SecAudit: same as BroadcastRecord
                         let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
                             Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                             Err(_) => false,
                         };
                         if !sig_ok {
-                            warn!(owner = %owner_hex, "[MEMCHAIN] SyncRecordResponse sig failed — skipping record");
+                            warn!(owner = %owner_hex,
+                                "[MEMCHAIN] SyncRecordResponse sig failed — skipping");
                             continue;
                         }
-                        if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) { continue; }
+                        if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
+                            continue;
+                        }
                         if !record.verify_id() {
                             warn!(
                                 owner = %owner_hex,
@@ -1507,7 +1549,7 @@ impl Server {
     }
 
     // ============================================
-    // 🌟 v1.1.0-ChatRelay: Push expired notifications
+    // v1.1.0-ChatRelay: Push expired notifications
     // ============================================
 
     /// Pushes backlogged `ChatExpired` notifications to a newly connected sender.
@@ -1517,7 +1559,7 @@ impl Server {
     /// in `expired_notifications`. This method delivers them now.
     async fn push_expired_notifications(
         relay: &Arc<ChatRelayService>,
-        session: &Arc<crate::services::Session>,
+        session: &Arc<Session>,
         udp: &Arc<UdpTransport>,
         crypto: &DefaultTransportCrypto,
     ) {
@@ -1541,7 +1583,10 @@ impl Server {
             let message_ids = match notif.message_ids() {
                 Ok(ids) => ids,
                 Err(e) => {
-                    warn!(error = %e, id = notif.id, "[CHAT_RELAY] Failed to decode notification ids");
+                    warn!(
+                        error = %e, id = notif.id,
+                        "[CHAT_RELAY] Failed to decode notification ids"
+                    );
                     continue;
                 }
             };
@@ -1573,7 +1618,7 @@ impl Server {
 
     async fn send_to_session(
         msg: &MemChainMessage,
-        session: &Arc<crate::services::Session>,
+        session: &Arc<Session>,
         udp: &Arc<UdpTransport>,
         crypto: &DefaultTransportCrypto,
     ) {
@@ -1645,22 +1690,20 @@ impl Server {
         ip_pool: Arc<IpPoolService>,
         routing: Arc<RoutingService>,
         events: SessionEventSender,
-        // 🌟 v1.1.0-ChatRelay
         chat_relay: Option<Arc<ChatRelayService>>,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut rx = self.shutdown_tx.subscribe();
 
-        // Chat cleanup interval (may differ from session cleanup interval)
+        // Use configured cleanup interval; fall back to 60 s when relay disabled.
+        // The timer still fires when relay is None (harmless — the select arm
+        // is an instant no-op), but an interval of 60 s is acceptable overhead.
         let chat_interval_secs = chat_relay
             .as_ref()
-            .map(|r| r.config().cleanup_interval_secs)
-            .unwrap_or(60);
+            .map_or(60, |r| r.config().cleanup_interval_secs);
 
         tokio::spawn(async move {
-            // Session cleanup runs every 60 seconds
             let mut session_timer = tokio::time::interval(Duration::from_secs(60));
-            // Chat cleanup runs at its own configured interval
             let mut chat_timer = tokio::time::interval(
                 Duration::from_secs(chat_interval_secs)
             );
@@ -1678,9 +1721,9 @@ impl Server {
                         }
                     }
 
-                    // 🌟 v1.1.0-ChatRelay: TTL cleanup for messages and blobs.
-                    // run_cleanup() is synchronous SQLite I/O — must run in
-                    // spawn_blocking to avoid blocking the tokio executor.
+                    // v1.1.0-ChatRelay: TTL cleanup for pending messages and blobs.
+                    // run_cleanup() performs synchronous SQLite I/O — offloaded to
+                    // spawn_blocking to avoid blocking the tokio executor thread.
                     _ = chat_timer.tick() => {
                         if shutdown.load(Ordering::SeqCst) { break; }
                         if let Some(relay) = chat_relay.clone() {
@@ -1695,9 +1738,7 @@ impl Server {
                                             );
                                         }
                                     }
-                                    Err(e) => {
-                                        warn!(error = %e, "[CHAT_RELAY] Cleanup error");
-                                    }
+                                    Err(e) => warn!(error = %e, "[CHAT_RELAY] Cleanup error"),
                                 }
                             });
                         }
