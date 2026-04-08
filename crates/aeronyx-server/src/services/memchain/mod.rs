@@ -107,6 +107,8 @@ pub mod mempool;
 pub use storage::{MemoryStorage, StorageStats, LayerCounts, RawLogRow};
 pub use storage_crypto::{derive_record_key, derive_rawlog_key, decrypt_rawlog_content_pub};
 pub use storage_ops::{OverviewRecord, OverviewData};
+pub use system_db::{SystemDb, SystemDbError, ActiveOwner, OwnerUsageStats};
+pub use volume_router::{VolumeRouter, VolumeRouterError, VolumeConfig, VolumeStatus, VolumeStats, ensure_volumes_config};
 
 // ── Storage graph types (v2.4.0+Search) ──
 pub use storage_graph::{
@@ -171,3 +173,6 @@ pub use prompts::{PrivacyLevel, EntityDescriptionInput};
 // ── Legacy ──
 pub use aof::AofWriter;
 pub use mempool::MemPool;
+
+pub mod system_db;
+pub mod volume_router;
