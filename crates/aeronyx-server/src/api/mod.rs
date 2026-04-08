@@ -29,27 +29,31 @@
 //! - [`recall_handler`]: Hybrid recall pipeline (vector + BM25 + graph + RRF)
 //! - [`log_handler`]: /log endpoint with rule engine + entropy filter + privacy tags
 //! - [`supernode_handlers`]: v2.5.0 SuperNode management endpoints
-//! - [`chat_handlers`]: 🌟 v1.1.0-ChatRelay blob upload/download/delete endpoints
+//! - [`auth`]: v1.0.0-MultiTenant JWT token issuance for SaaS mode
+//! - [`admin_handlers`]: v1.0.0-MultiTenant Admin endpoints (volumes, pool, usage)
 //! - [`local`]: Legacy Axum router (deprecated)
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - When adding new ORIGINAL-style endpoints → add to mpi_handlers.rs
 //! - When adding new GRAPH/COGNITIVE endpoints → add to mpi_graph_handlers.rs
 //! - When adding new SUPERNODE endpoints → add to supernode_handlers.rs
-//! - When adding new CHAT endpoints → add to chat_handlers.rs
-//! - Register all routes in the appropriate router builder function
+//! - When adding new ADMIN endpoints → add to admin_handlers.rs
+//! - Register all routes in mpi.rs::build_mpi_router() regardless of which file
+//!   the handler lives in
 //! - Re-exports below MUST stay in sync — server.rs depends on them
-//! - chat_handlers::build_chat_router() is merged into the MPI app in
-//!   server.rs::start_combined_api() ONLY when chat_relay.enabled = true
+//! - auth.rs and admin_handlers.rs are SaaS-mode only but always compiled.
+//!   The routes are conditionally registered in build_mpi_router() based on mode.
 //!
 //! ## Last Modified
-//! v0.3.0 - 🌟 Initial Agent API for MemChain Phase 1
-//! v0.4.0 - 🌟 Extended for Phase 3: P2P broadcast + POST /api/sync
-//! v2.4.0-GraphCognition - 🌟 Split mpi.rs into 3 files; added mpi_handlers,
+//! v0.3.0 - Initial Agent API for MemChain Phase 1
+//! v0.4.0 - Extended for Phase 3: P2P broadcast + POST /api/sync
+//! v2.4.0-GraphCognition - Split mpi.rs into 3 files; added mpi_handlers,
 //!   mpi_graph_handlers, recall_handler submodules
-//! v2.4.0+Privacy - 🌟 log_handler updated with privacy tag stripping
-//! v2.5.0+SuperNode Phase D - 🌟 Added supernode_handlers submodule
-//! v1.1.0-ChatRelay - 🌟 Added chat_handlers submodule for blob HTTP API
+//! v2.4.0+Privacy - log_handler updated with privacy tag stripping
+//! v2.5.0+SuperNode Phase D - Added supernode_handlers submodule
+//! v1.0.0-MultiTenant - Added auth + admin_handlers submodules for SaaS mode;
+//!   MpiState extended with Mode enum + SaaS pool fields;
+//!   build_mpi_router conditionally registers auth + admin routes in SaaS mode.
 
 // ── Core MPI module (state, auth, router) ──
 pub mod mpi;
@@ -61,13 +65,16 @@ pub mod recall_handler;
 pub mod log_handler;
 // ── v2.5.0+SuperNode: Task queue management + monitoring ──
 pub mod supernode_handlers;
-// ── 🌟 v1.1.0-ChatRelay: Encrypted blob upload/download/delete ──
-pub mod chat_handlers;
+// ── v1.0.0-MultiTenant: JWT token issuance (SaaS mode only, always compiled) ──
+pub mod auth;
+// ── v1.0.0-MultiTenant: Admin endpoints (SaaS mode only, always compiled) ──
+pub mod admin_handlers;
 // ── Legacy API (deprecated) ──
 pub mod local;
 
 // ── Re-exports (unchanged from v2.3.0 — external callers unaffected) ──
 pub use mpi::{build_mpi_router, MpiState, BaselineSnapshot};
-pub use chat_handlers::{build_chat_router, ChatBlobState};
+// v1.0.0-MultiTenant: export Mode for server.rs SaaS init branch
+pub use mpi::Mode;
 #[allow(deprecated)]
 pub use local::start_legacy_api_server;
