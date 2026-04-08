@@ -23,6 +23,8 @@
 //! - [`llm_router`]: Task routing + fallback + cost estimation (v2.5.0+SuperNode)
 //! - [`task_worker`]: Async cognitive task queue worker (v2.5.0+SuperNode)
 //! - [`prompts`]: Prompt template engine for 6 cognitive task types (v2.5.0+SuperNode Phase B)
+//! - [`system_db`]: Global metadata DB — volume assignments, LLM usage, auth events (v1.0.0-MultiTenant)
+//! - [`volume_router`]: Per-user disk volume routing + hot-reload (v1.0.0-MultiTenant)
 //! - [`mempool`]: In-memory Fact buffer (legacy/deprecated)
 //! - [`aof`]: Append-Only File persistence (legacy/deprecated)
 //!
@@ -30,32 +32,36 @@
 //! v2.2.0: storage.rs → storage.rs + storage_crypto.rs + storage_ops.rs
 //! v2.4.0+Search: storage_ops.rs → storage_ops.rs + storage_graph.rs + storage_miner.rs
 //! v2.5.0+SuperNode: added storage_supernode.rs
+//! v1.0.0-MultiTenant: added system_db.rs + volume_router.rs
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - All storage_*.rs files use `impl MemoryStorage` extension pattern.
 //!   Rust allows multiple impl blocks across files within the same crate.
 //! - When adding a new storage submodule: declare `pub mod` here AND add re-exports.
-//! - Re-export order: storage types → engines → SuperNode → legacy.
+//! - Re-export order: storage types → engines → SuperNode → multi-tenant → legacy.
 //! - CognitiveTaskType is defined in config_supernode.rs and re-exported through
 //!   llm_provider.rs. Do NOT define it here or in storage_supernode.rs.
 //! - PrivacyLevel is defined in config_supernode.rs and re-exported through prompts.rs.
+//! - SystemDb::open() returns Arc<SystemDb> — callers should not re-wrap in Arc.
+//! - VolumeRouter::new() returns Arc<VolumeRouter> — same pattern.
 //!
 //! ## Last Modified
 //! v0.2.0 - Initial MemChain storage engine
 //! v2.1.0 - Added storage, vector, mvf, graph modules
 //! v2.1.0+Embed - Added embed module
-//! v2.2.0 - 🌟 Split storage into 3 files; storage_ops added
-//! v2.4.0-GraphCognition - 🌟 Added ner, query_analyzer, quantize + re-exports
-//! v2.4.0+Search - 🌟 Split storage_ops → storage_graph + storage_miner
-//! v2.4.0+Reranker - 🌟 Added reranker module + RerankerEngine re-export
-//! v2.5.0+SuperNode Phase A - 🌟 Added storage_supernode, llm_provider, llm_openai,
+//! v2.2.0 - Split storage into 3 files; storage_ops added
+//! v2.4.0-GraphCognition - Added ner, query_analyzer, quantize + re-exports
+//! v2.4.0+Search - Split storage_ops → storage_graph + storage_miner
+//! v2.4.0+Reranker - Added reranker module + RerankerEngine re-export
+//! v2.5.0+SuperNode Phase A - Added storage_supernode, llm_provider, llm_openai,
 //!   llm_anthropic, llm_router, task_worker modules + re-exports
-//! v2.5.0+SuperNode Phase B - 🌟 Added prompts module + PrivacyLevel re-export
-//! v2.5.0+Unify - 🔧 [BUG FIX] Fixed re-exports to match actual types defined in
+//! v2.5.0+SuperNode Phase B - Added prompts module + PrivacyLevel re-export
+//! v2.5.0+Unify - [BUG FIX] Fixed re-exports to match actual types defined in
 //!   storage_supernode.rs. CognitiveTaskType now re-exported from llm_provider
 //!   (which itself re-exports from config_supernode). Removed non-existent type
 //!   re-exports (LlmUsageStats, ProviderUsage, TaskTypeUsage) that were never
 //!   defined in storage_supernode.rs.
+//! v1.0.0-MultiTenant - Added system_db + volume_router for SaaS multi-tenant mode
 
 // ── Storage engine ──
 pub mod storage;
@@ -95,6 +101,14 @@ pub mod task_worker;
 // v2.5.0+SuperNode Phase B: Prompt template engine
 pub mod prompts;
 
+// ── v1.0.0-MultiTenant: Volume routing + global metadata ──
+// system_db: Stores volume assignments, LLM usage logs, auth audit events.
+//            Does NOT store user memory content — metadata only.
+pub mod system_db;
+// volume_router: Routes owner pubkeys to their assigned storage volume.
+//                Supports hot-reload of volumes.toml for zero-downtime disk expansion.
+pub mod volume_router;
+
 // ── Legacy engine (deprecated) ──
 pub mod aof;
 pub mod mempool;
@@ -107,8 +121,6 @@ pub mod mempool;
 pub use storage::{MemoryStorage, StorageStats, LayerCounts, RawLogRow};
 pub use storage_crypto::{derive_record_key, derive_rawlog_key, decrypt_rawlog_content_pub};
 pub use storage_ops::{OverviewRecord, OverviewData};
-pub use system_db::{SystemDb, SystemDbError, ActiveOwner, OwnerUsageStats};
-pub use volume_router::{VolumeRouter, VolumeRouterError, VolumeConfig, VolumeStatus, VolumeStats, ensure_volumes_config};
 
 // ── Storage graph types (v2.4.0+Search) ──
 pub use storage_graph::{
@@ -170,9 +182,16 @@ pub use task_worker::TaskWorker;
 // re-exports from config_supernode.rs (the single source of truth).
 pub use prompts::{PrivacyLevel, EntityDescriptionInput};
 
+// ── Multi-tenant infrastructure (v1.0.0-MultiTenant) ──
+// SystemDb::open() returns Arc<SystemDb> — do not re-wrap.
+// VolumeRouter::new() returns Arc<VolumeRouter> — do not re-wrap.
+pub use system_db::{SystemDb, SystemDbError, ActiveOwner, OwnerUsageStats};
+pub use volume_router::{
+    VolumeRouter, VolumeRouterError,
+    VolumeConfig, VolumeStatus, VolumeStats,
+    ensure_volumes_config,
+};
+
 // ── Legacy ──
 pub use aof::AofWriter;
 pub use mempool::MemPool;
-
-pub mod system_db;
-pub mod volume_router;
