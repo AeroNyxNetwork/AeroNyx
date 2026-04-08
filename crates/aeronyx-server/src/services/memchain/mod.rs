@@ -108,6 +108,10 @@ pub mod system_db;
 // volume_router: Routes owner pubkeys to their assigned storage volume.
 //                Supports hot-reload of volumes.toml for zero-downtime disk expansion.
 pub mod volume_router;
+// storage_pool: Per-user MemoryStorage connection pool with idle eviction.
+pub mod storage_pool;
+// vector_pool: Per-user VectorIndex pool with idle eviction.
+pub mod vector_pool;
 
 // ── Legacy engine (deprecated) ──
 pub mod aof;
@@ -185,12 +189,16 @@ pub use prompts::{PrivacyLevel, EntityDescriptionInput};
 // ── Multi-tenant infrastructure (v1.0.0-MultiTenant) ──
 // SystemDb::open() returns Arc<SystemDb> — do not re-wrap.
 // VolumeRouter::new() returns Arc<VolumeRouter> — do not re-wrap.
+// StoragePool::new() returns Arc<StoragePool> — do not re-wrap.
+// VectorIndexPool::new() returns Arc<VectorIndexPool> — do not re-wrap.
 pub use system_db::{SystemDb, SystemDbError, ActiveOwner, OwnerUsageStats};
 pub use volume_router::{
     VolumeRouter, VolumeRouterError,
     VolumeConfig, VolumeStatus, VolumeStats,
     ensure_volumes_config,
 };
+pub use storage_pool::{StoragePool, StoragePoolError, derive_record_key_from_pubkey};
+pub use vector_pool::{VectorIndexPool, VectorPoolError};
 
 // ── Legacy ──
 pub use aof::AofWriter;
