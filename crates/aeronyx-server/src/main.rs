@@ -4,14 +4,19 @@
 //! # AeroNyx Server Entry Point
 //!
 //! ## Modification Reason
-//! - 🌟 Added MemChain status display in `status` command (AOF file size,
+//! - Added MemChain status display in `status` command (AOF file size,
 //!   mode, API address).
-//! - 🌟 Added MemChain config display in `validate` command.
+//! - Added MemChain config display in `validate` command.
+//! - v2.5.3+Security / v1.0.0-MultiTenant: Server::new() gains third
+//!   argument `config_path: Option<PathBuf>` for auto-generated secret
+//!   persistence. cmd_start passes Some(config_path.clone()) so that
+//!   api_secret and jwt_secret are written back to disk on first startup.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
 //! v0.2.0 - Added register command, simplified user flow
-//! v0.3.0 - 🌟 Added MemChain status and config display
+//! v0.3.0 - Added MemChain status and config display
+//! v1.0.0-MultiTenant - Pass config_path to Server::new() (3rd argument)
 
 use std::path::PathBuf;
 
@@ -204,6 +209,10 @@ async fn cmd_register(
 }
 
 /// Starts the server.
+///
+/// v1.0.0-MultiTenant: passes `Some(config_path.clone())` to Server::new()
+/// so auto-generated api_secret and jwt_secret are persisted to the config
+/// file on first SaaS startup.
 async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
     info!("Starting AeroNyx server...");
 
@@ -263,13 +272,15 @@ async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
     info!("Owner:      {}", node_info.owner_wallet);
     info!("════════════════════════════════════════");
 
-    let server = Server::new(config, identity);
+    // v1.0.0-MultiTenant: pass config_path so auto-generated secrets
+    // (api_secret, jwt_secret) are written back to disk on first startup.
+    let server = Server::new(config, identity, Some(config_path.clone()));
     server.run().await?;
 
     Ok(())
 }
 
-/// Shows node registration status + 🌟 MemChain status.
+/// Shows node registration status + MemChain status.
 async fn cmd_status(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_or_default_config(&config_path).await;
     let node_info_path = &config.management.node_info_path;
@@ -306,7 +317,10 @@ async fn cmd_status(config_path: PathBuf) -> anyhow::Result<()> {
         match load_key(&key_path).await {
             Ok(identity) => {
                 println!("Server Key:    ✅ Valid");
-                println!("   Public Key:    {}", hex::encode(identity.public_key_bytes()));
+                println!(
+                    "   Public Key:    {}",
+                    hex::encode(identity.public_key_bytes())
+                );
             }
             Err(_) => {
                 println!("Server Key:    ⚠️  Invalid or corrupted");
@@ -318,9 +332,7 @@ async fn cmd_status(config_path: PathBuf) -> anyhow::Result<()> {
 
     println!();
 
-    // ====================================================
-    // 🌟 MemChain Status
-    // ====================================================
+    // MemChain Status
     println!("MemChain:");
     println!("   Mode:          {:?}", config.memchain.mode);
 
@@ -328,7 +340,6 @@ async fn cmd_status(config_path: PathBuf) -> anyhow::Result<()> {
         println!("   API Address:   {}", config.memchain.api_listen_addr);
         println!("   AOF Path:      {}", config.memchain.aof_path);
 
-        // Check AOF file size
         let aof_path = std::path::Path::new(&config.memchain.aof_path);
         if aof_path.exists() {
             match std::fs::metadata(aof_path) {
@@ -345,7 +356,9 @@ async fn cmd_status(config_path: PathBuf) -> anyhow::Result<()> {
                 }
             }
         } else {
-            println!("   AOF File:      (not yet created — will be created on first write)");
+            println!(
+                "   AOF File:      (not yet created — will be created on first write)"
+            );
         }
     } else {
         println!("   Status:        Disabled");
@@ -358,10 +371,13 @@ async fn cmd_status(config_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Validates configuration file + 🌟 shows MemChain config.
+/// Validates configuration file + shows MemChain config.
 async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
     if !config_path.exists() {
-        println!("⚠️  Config file not found: {}", config_path.display());
+        println!(
+            "⚠️  Config file not found: {}",
+            config_path.display()
+        );
         println!("   Server will use default values.");
         return Ok(());
     }
@@ -388,8 +404,6 @@ async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
     println!("   Max Connections:  {}", config.max_sessions());
     println!("   Session Timeout:  {}s", config.session_timeout_secs());
     println!();
-
-    // 🌟 MemChain config
     println!("MemChain:");
     println!("   Mode:             {:?}", config.memchain.mode);
     if config.memchain.is_enabled() {
@@ -468,8 +482,10 @@ async fn save_key(identity: &IdentityKeyPair, path: &PathBuf) -> anyhow::Result<
     let key_data = KeyFile {
         version: "1.0".to_string(),
         key_type: "ed25519".to_string(),
-        public_key: base64::engine::general_purpose::STANDARD.encode(identity.public_key_bytes()),
-        private_key: base64::engine::general_purpose::STANDARD.encode(identity.to_bytes()),
+        public_key: base64::engine::general_purpose::STANDARD
+            .encode(identity.public_key_bytes()),
+        private_key: base64::engine::general_purpose::STANDARD
+            .encode(identity.to_bytes()),
         created_at: chrono_lite_timestamp(),
     };
 
