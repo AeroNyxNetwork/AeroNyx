@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/server.rs
 // ============================================
-//! # Server Orchestrator — v2.1 MemChain Protocol Refactor
+//! # Server Orchestrator
 //!
 //! ## Modification History
 //! v0.1.0 - Initial server implementation
@@ -11,43 +11,38 @@
 //! v0.3.1 - Fixed Option<Arc<…>> type mismatch
 //! v0.4.0 - Ed25519 verify, trust whitelist, SyncReq/SyncRes
 //! v1.3.0 - Command Pipeline: CommandHandler + channel wiring
-//! v2.1.0 - 🌟 Dual-engine init (SQLite+Vector + legacy MemPool+AOF),
+//! v2.1.0 - Dual-engine init (SQLite+Vector + legacy MemPool+AOF),
 //!           MPI router merged, BroadcastRecord/SyncRecordRequest handling,
 //!           vector index rebuild on startup, new Miner 8-arg signature.
 //! v2.1.1 - Fixed duplicate LinuxTun import, removed unused `trace` import
-//! v2.1.0+MVF+Encryption - 🌟 MemoryStorage.open() now receives record_key
+//! v2.1.0+MVF+Encryption - MemoryStorage.open() now receives record_key
 //!   derived from Ed25519 private key for transparent record content encryption.
 //!   MpiState now receives api_secret from config for Bearer token auth.
-//! v2.3.0+RemoteStorage - 🌟 MpiState now receives allow_remote_storage and
+//! v2.3.0+RemoteStorage - MpiState now receives allow_remote_storage and
 //!   max_remote_owners from config for Phase 1 remote MPI Gateway support.
-//! v2.4.0-GraphCognition - 🌟 NerEngine initialization + MpiState extension.
-//! v2.4.0-GraphCognition Phase B - 🌟 Scalar quantization integration.
-//! v2.4.0+Reranker - 🌟 RerankerEngine initialization.
-//! v2.4.0+Conversation - 🌟 derive_rawlog_key import and rawlog_key field in MpiState.
-//! v2.5.0+SuperNode - 🌟 LlmRouter initialization + MpiState.llm_router field.
+//! v2.4.0-GraphCognition - NerEngine initialization + MpiState extension.
+//! v2.4.0-GraphCognition Phase B - Scalar quantization integration.
+//! v2.4.0+Reranker - RerankerEngine initialization.
+//! v2.4.0+Conversation - derive_rawlog_key import and rawlog_key field in MpiState.
+//! v2.5.0+SuperNode - LlmRouter initialization + MpiState.llm_router field.
 //!   - init_llm_router() reads supernode config, constructs providers + router
 //!   - reset_stale_processing_tasks() called at startup before TaskWorker spawn
 //!   - TaskWorker spawned as background task when supernode.enabled=true
 //!   - ReflectionMiner receives .with_llm_router() for Steps 8/9/10 enqueue
 //!   - All SuperNode paths gated on is_supernode_enabled() — safe to disable
-//! v2.5.2+SecAudit - 🔒 BroadcastRecord/SyncRecordResponse: signature now
+//! v2.5.2+SecAudit - BroadcastRecord/SyncRecordResponse: signature now
 //!   verified against record content hash (record.content_hash_bytes()) rather
 //!   than record_id alone, preventing spoofed-content replay attacks.
 //!   public_ip resolution: metadata URLs restricted to HTTPS only + IP validation
 //!   tightened to reject private/loopback addresses as fallback detection.
-//! v1.1.0-ChatRelay - 🌟 Zero-knowledge P2P chat relay integration.
-//!   - ChatRelayService initialised when chat_relay.enabled=true
-//!   - handle_chat_message: handles ChatRelay/Pull/PullResponse/Ack/Expired
-//!   - is_chat_message(): classifier used in UDP dispatch to route BEFORE
-//!     MemChain storage engine — chat works even when mode="off"
-//!   - spawn_cleanup_task: separate chat_timer with configured interval,
-//!     SQLite I/O offloaded via spawn_blocking
-//!   - start_combined_api: merges build_chat_router() when chat relay enabled
-//!   - Session creation triggers push of backlogged ChatExpired notifications
-//!   🐛 Fixed: removed unsafe { std::mem::zeroed() } AofWriter placeholder
-//!      (was UB); chat-only path now dispatched directly without MemChain refs
-//!   🐛 Fixed: push_expired_notifications bracket mismatch corrected
-//!   🐛 Fixed: spawn_udp_task parameter count corrected
+//! v2.5.3+Security - Server::new() gains config_path: Option<PathBuf> (3rd arg).
+//!   First SaaS startup auto-generates api_secret and jwt_secret and writes
+//!   them back to the config file via ensure_api_secret() + ensure_jwt_secret().
+//! v1.0.0-MultiTenant - SaaS mode startup branch in run():
+//!   init_saas_mode() initializes SystemDb, VolumeRouter, StoragePool,
+//!   VectorIndexPool, and jwt_secret. MpiState constructed via MpiState::local()
+//!   in Local mode (backward compatible). Pool eviction timer + MinerScheduler
+//!   spawned in SaaS mode. build_mpi_router() handles both modes transparently.
 //!
 //! ⚠️ Important Notes for Next Developer:
 //! - record_key is derived from identity.to_bytes() (Ed25519 PRIVATE key)
@@ -55,26 +50,24 @@
 //! - SuperNode init order: init_llm_router() → reset_stale_processing_tasks() → TaskWorker
 //! - NerEngine MUST be loaded AFTER EmbedEngine (shared ORT runtime via Once)
 //! - RerankerEngine MUST be loaded AFTER EmbedEngine and NerEngine (shared ORT Once)
-//! - ChatRelayService is gated on config.memchain.chat_relay.enabled — safe to disable
-//! - Chat relay does NOT require memchain to be enabled (independent subsystem).
-//!   The UDP dispatch calls is_chat_message() BEFORE entering handle_memchain_message,
-//!   so chat variants never reach handle_memchain_message's storage-dependent arms.
-//! - resolve_public_ip: NEVER use the GCP metadata URL (169.254.169.254) in
-//!   production — it bypasses TLS and is an SSRF vector if the URL list is
-//!   extended with user-controlled input. Current list is hardcoded and safe.
+//! - SaaS mode: MpiState.storage = None, MpiState.vector_index = None.
+//!   Handlers access per-user storage via Extension<Arc<MemoryStorage>> injected
+//!   by unified_auth_middleware from StoragePool. Never access state.storage in SaaS.
+//! - config_path must be passed to Server::new() so api_secret and jwt_secret
+//!   can be auto-generated and persisted on first startup.
+//! - Pool eviction timer fires every 5 minutes (300 seconds) in SaaS mode.
+//!   It evicts both StoragePool and VectorIndexPool idle connections.
+//! - MinerScheduler ticks every 60 seconds in SaaS mode (per-user Miner).
+//!   In Local mode, the original ReflectionMiner::run() is used unchanged.
 //!
 //! ## Last Modified
-//! v2.4.0+Conversation - 🌟 derive_rawlog_key import, MpiState.rawlog_key field
-//! v2.5.0+SuperNode    - 🌟 init_llm_router(), TaskWorker spawn, MpiState.llm_router,
-//!   ReflectionMiner.with_llm_router(). Fixed: init_llm_router deduplication,
-//!   api_key closure type annotation, provider new() Result handling.
-//! v2.5.2+SecAudit     - 🔒 BroadcastRecord sig verification hardened.
+//! v2.5.2+SecAudit     - BroadcastRecord sig verification hardened.
 //!   resolve_public_ip private-IP guard added.
-//! v1.1.0-ChatRelay    - 🌟 ChatRelayService, chat MemChain handlers, blob HTTP API,
-//!   cleanup task extension, expired notification push on session create.
-//!   🐛 UB fix: unsafe zeroed() removed; chat dispatch separated from memchain path.
+//! v2.5.3+Security     - Server::new() gains config_path; auto-generates secrets.
+//! v1.0.0-MultiTenant  - SaaS startup branch; MpiState::local() constructor.
 
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -101,9 +94,9 @@ use aeronyx_transport::LinuxTun;
 
 use rusqlite::OptionalExtension;
 
-use crate::api::mpi::{build_mpi_router, MpiState, BaselineSnapshot};
-use crate::api::chat_handlers::build_chat_router;
-use crate::config::{MemChainConfig, ServerConfig, VectorQuantizationMode};
+use crate::api::mpi::{build_mpi_router, MpiState, BaselineSnapshot, Mode};
+use crate::api::auth::{ensure_jwt_secret, generate_secret};
+use crate::config::{MemChainConfig, MemChainMode, ServerConfig, VectorQuantizationMode};
 use crate::error::{Result, ServerError};
 use crate::handlers::packet::DecryptedPayload;
 use crate::handlers::PacketHandler;
@@ -120,8 +113,12 @@ use crate::services::memchain::EmbedEngine;
 use crate::services::memchain::NerEngine;
 use crate::services::memchain::RerankerEngine;
 use crate::services::memchain::{LlmRouter, TaskWorker};
-use crate::services::chat_relay::{ChatRelayService, derive_node_secret};
-use crate::services::{HandshakeService, IpPoolService, RoutingService, Session, SessionManager};
+// v1.0.0-MultiTenant: SaaS mode infrastructure
+use crate::services::memchain::{
+    SystemDb, VolumeRouter, StoragePool, VectorIndexPool,
+    ensure_volumes_config,
+};
+use crate::services::{HandshakeService, IpPoolService, RoutingService, SessionManager};
 
 // ============================================
 // Constants
@@ -133,8 +130,13 @@ const KEEPALIVE_PACKET_SIZE: usize = 17;
 const DISCONNECT_PACKET_MIN_SIZE: usize = 18;
 
 const COMMAND_CHANNEL_BUFFER: usize = 100;
-
 const QUANTIZER_CAL_KEY_PREFIX: &str = "quantizer_cal";
+
+/// Pool eviction timer interval (SaaS mode).
+const POOL_EVICTION_INTERVAL_SECS: u64 = 300;
+
+/// MinerScheduler tick interval (SaaS mode).
+const MINER_SCHEDULER_TICK_SECS: u64 = 60;
 
 // ============================================
 // Server
@@ -143,16 +145,31 @@ const QUANTIZER_CAL_KEY_PREFIX: &str = "quantizer_cal";
 pub struct Server {
     config: ServerConfig,
     identity: IdentityKeyPair,
+    /// Path to the config file on disk.
+    /// Used to persist auto-generated secrets (api_secret, jwt_secret) on first startup.
+    config_path: Option<PathBuf>,
     shutdown: Arc<AtomicBool>,
     shutdown_tx: broadcast::Sender<()>,
 }
 
 impl Server {
-    pub fn new(config: ServerConfig, identity: IdentityKeyPair) -> Self {
+    /// Create a new Server instance.
+    ///
+    /// # Arguments
+    /// - `config`: loaded server configuration
+    /// - `identity`: Ed25519 keypair for this node
+    /// - `config_path`: path to the config file on disk (for secret auto-generation).
+    ///   Pass `None` only in tests; production callers always pass the real path.
+    pub fn new(
+        config: ServerConfig,
+        identity: IdentityKeyPair,
+        config_path: Option<PathBuf>,
+    ) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
         Self {
             config,
             identity,
+            config_path,
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -160,6 +177,12 @@ impl Server {
 
     pub async fn run(&self) -> Result<()> {
         info!("Starting AeroNyx server v{}", env!("CARGO_PKG_VERSION"));
+
+        // ── Ensure api_secret exists (v2.5.3+Security) ──────────────────
+        // Auto-generate and persist if missing. Only for memchain-enabled modes.
+        if self.config.memchain.is_enabled() {
+            self.ensure_api_secret_on_disk().await;
+        }
 
         let (ip_pool, sessions, routing) = self.init_services()?;
         let session_event_sender = self.init_management_reporter(&sessions).await;
@@ -176,6 +199,7 @@ impl Server {
             Arc::clone(&routing),
         ));
 
+        // ── MemChain initialization — branch on mode ─────────────────────
         let (storage, vector_index, mempool, aof_writer) = if self.config.memchain.is_enabled() {
             let (st, vi, mp, aw) = self.init_memchain().await?;
             (Some(st), Some(vi), Some(mp), Some(aw))
@@ -183,9 +207,6 @@ impl Server {
             info!("[MEMCHAIN] Disabled (mode=off)");
             (None, None, None, None)
         };
-
-        // Chat relay is independent of MemChain mode — init first
-        let chat_relay: Option<Arc<ChatRelayService>> = self.init_chat_relay()?;
 
         let udp = Arc::new(
             UdpTransport::bind_addr(self.config.listen_addr())
@@ -198,7 +219,6 @@ impl Server {
         let tun = self.init_tun().await?;
 
         let server_pubkey_hex = hex::encode(self.identity.public_key_bytes());
-
         let mut tasks: Vec<(&str, JoinHandle<()>)> = Vec::new();
 
         let udp_task = self.spawn_udp_task(
@@ -215,7 +235,6 @@ impl Server {
             vector_index.clone(),
             self.config.memchain.clone(),
             server_pubkey_hex.clone(),
-            chat_relay.clone(),
         );
         tasks.push(("udp", udp_task));
 
@@ -234,21 +253,26 @@ impl Server {
             Arc::clone(&ip_pool),
             Arc::clone(&routing),
             session_event_sender.clone(),
-            chat_relay.clone(),
         );
         tasks.push(("cleanup", cleanup_task));
 
         if let (Some(ref st), Some(ref vi), Some(ref mp), Some(ref aw)) =
             (&storage, &vector_index, &mempool, &aof_writer)
         {
+            // ── Determine operating mode ──────────────────────────────────
+            let is_saas = self.config.memchain.mode == MemChainMode::Saas;
+
             let user_weights = Arc::new(parking_lot::RwLock::new(
-                std::collections::HashMap::new()
+                std::collections::HashMap::new(),
             ));
 
-            {
+            // Load MVF user weights from SQLite (Local mode only — in SaaS mode
+            // each user has their own DB; weights are loaded per-user by the Miner).
+            if !is_saas {
                 let owner = self.identity.public_key_bytes();
                 if let Some(blob) = st.load_user_weights(&owner).await {
-                    if let Some(w) = crate::services::memchain::mvf::WeightVector::from_bytes(&blob) {
+                    if let Some(w) = crate::services::memchain::mvf::WeightVector::from_bytes(&blob)
+                    {
                         let mut map = user_weights.write();
                         map.insert(hex::encode(owner), w);
                         info!("[MEMCHAIN] Loaded MVF user weights from SQLite");
@@ -256,136 +280,99 @@ impl Server {
                 }
             }
 
-            let mvf_baseline: Option<BaselineSnapshot> = {
+            let mvf_baseline: Option<BaselineSnapshot> = if !is_saas {
                 let conn = st.conn_lock().await;
-                let raw: Option<Vec<u8>> = conn.query_row(
-                    "SELECT value FROM chain_state WHERE key = 'mvf_baseline'",
-                    [],
-                    |row: &rusqlite::Row<'_>| row.get::<_, Vec<u8>>(0),
-                ).optional().unwrap_or(None);
+                let raw: Option<Vec<u8>> = conn
+                    .query_row(
+                        "SELECT value FROM chain_state WHERE key = 'mvf_baseline'",
+                        [],
+                        |row: &rusqlite::Row<'_>| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+                    .unwrap_or(None);
                 drop(conn);
                 raw.and_then(|bytes| {
                     serde_json::from_str::<BaselineSnapshot>(
-                        &String::from_utf8_lossy(&bytes)
-                    ).ok()
+                        &String::from_utf8_lossy(&bytes),
+                    )
+                    .ok()
                 })
+            } else {
+                None
             };
 
             let owner_key = self.identity.public_key_bytes();
             let api_secret = self.config.memchain.effective_api_secret().map(|s| s.to_string());
 
-            // ── Embedding engine ────────────────────────────────────────────
-            let embed_engine: Option<Arc<EmbedEngine>> = {
-                let model_path = &self.config.memchain.embed_model_path;
-                match EmbedEngine::load(
-                    model_path,
-                    self.config.memchain.embed_max_tokens,
-                    self.config.memchain.embed_output_dim,
-                ) {
-                    Ok(engine) => {
-                        info!(
-                            model = %model_path,
-                            model_type = %engine.model_type(),
-                            dim = engine.dim(),
-                            "[EMBED] ✅ Local embedding engine loaded"
-                        );
-                        Some(Arc::new(engine))
-                    }
-                    Err(e) => {
-                        warn!(model = %model_path, error = %e, "[EMBED] ⚠️ Unavailable");
-                        None
-                    }
-                }
-            };
+            // ── Shared engine initialization (both modes) ─────────────────
+            let embed_engine = self.init_embed_engine();
+            let ner_engine = self.init_ner_engine();
+            let reranker_engine = self.init_reranker_engine();
 
-            // ── NER engine ──────────────────────────────────────────────────
-            let ner_engine: Option<Arc<NerEngine>> = if self.config.memchain.ner_enabled {
-                let model_path = &self.config.memchain.ner_model_path;
-                let threshold = self.config.memchain.ner_confidence_threshold;
-                match NerEngine::load(model_path, threshold, 0) {
-                    Ok(engine) => {
-                        info!(
-                            model = %model_path, threshold = threshold,
-                            "[NER] ✅ Local NER engine loaded (GLiNER)"
-                        );
-                        Some(Arc::new(engine))
-                    }
-                    Err(e) => {
-                        warn!(model = %model_path, error = %e, "[NER] ⚠️ Unavailable");
-                        None
-                    }
-                }
-            } else {
-                debug!("[NER] Disabled (ner_enabled=false)");
-                None
-            };
-
-            // ── Reranker engine ─────────────────────────────────────────────
-            let reranker_engine: Option<Arc<RerankerEngine>> =
-                if self.config.memchain.reranker_enabled {
-                    let model_path = &self.config.memchain.reranker_model_path;
-                    let max_seq = self.config.memchain.reranker_max_seq_length;
-                    match RerankerEngine::load(model_path, max_seq) {
-                        Ok(engine) => {
-                            info!(
-                                model = %model_path,
-                                blend_weight = %RerankerEngine::blend_weight(),
-                                "[RERANKER] ✅ Cross-encoder loaded"
-                            );
-                            Some(Arc::new(engine))
-                        }
-                        Err(e) => {
-                            warn!(model = %model_path, error = %e, "[RERANKER] ⚠️ Unavailable");
-                            None
-                        }
-                    }
-                } else {
-                    debug!("[RERANKER] Disabled (reranker_enabled=false)");
-                    None
-                };
-
-            // ── v2.5.0+SuperNode: LlmRouter initialization ──────────────────
+            // ── v2.5.0+SuperNode: LlmRouter ──────────────────────────────
+            // ⚠️ Init order is MANDATORY:
+            //   1. init_llm_router()
+            //   2. reset_stale_processing_tasks()
+            //   3. TaskWorker::spawn()
             let llm_router: Option<Arc<LlmRouter>> = self.init_llm_router().await;
 
-            // ── v2.5.0+SuperNode: Crash recovery ────────────────────────────
             if llm_router.is_some() {
                 let timeout_secs =
                     self.config.memchain.supernode.worker.task_timeout_secs as i64;
                 let recovered = st.reset_stale_processing_tasks(timeout_secs).await;
                 if recovered > 0 {
                     info!(
-                        recovered = recovered, timeout_secs = timeout_secs,
+                        recovered,
+                        timeout_secs,
                         "[SUPERNODE] Recovered stale tasks from previous run"
                     );
                 }
             }
 
-            let mpi_state = Arc::new(MpiState {
-                storage: Arc::clone(st),
-                vector_index: Arc::clone(vi),
-                identity: self.identity.clone(),
-                identity_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
-                index_ready: std::sync::atomic::AtomicBool::new(false),
-                user_weights: Arc::clone(&user_weights),
-                mvf_alpha: self.config.memchain.mvf_alpha,
-                mvf_enabled: self.config.memchain.mvf_enabled,
-                session_embeddings: parking_lot::RwLock::new(std::collections::HashMap::new()),
-                mvf_baseline: parking_lot::RwLock::new(mvf_baseline),
-                owner_key,
-                api_secret,
-                embed_engine: embed_engine.clone(),
-                allow_remote_storage: self.config.memchain.allow_remote_storage,
-                max_remote_owners: self.config.memchain.max_remote_owners,
-                ner_engine: ner_engine.clone(),
-                graph_enabled: self.config.memchain.graph_enabled,
-                entropy_filter_enabled: self.config.memchain.entropy_filter_enabled,
-                reranker_engine,
-                rawlog_key: Some(derive_rawlog_key(&self.identity.to_bytes())),
-                llm_router: llm_router.clone(),
-            });
+            // ── Build MpiState (mode-aware) ───────────────────────────────
+            let mpi_state = if is_saas {
+                self.init_saas_mpi_state(
+                    st,
+                    owner_key,
+                    api_secret,
+                    Arc::clone(&user_weights),
+                    embed_engine.clone(),
+                    ner_engine.clone(),
+                    reranker_engine,
+                    llm_router.clone(),
+                )
+                .await?
+            } else {
+                // Local mode: use MpiState::local() constructor.
+                let mpi = MpiState::local(
+                    Arc::clone(st),
+                    Arc::clone(vi),
+                    self.identity.clone(),
+                    parking_lot::RwLock::new(std::collections::HashMap::new()),
+                    std::sync::atomic::AtomicBool::new(false),
+                    Arc::clone(&user_weights),
+                    self.config.memchain.mvf_alpha,
+                    self.config.memchain.mvf_enabled,
+                    parking_lot::RwLock::new(std::collections::HashMap::new()),
+                    parking_lot::RwLock::new(mvf_baseline),
+                    owner_key,
+                    api_secret,
+                    embed_engine.clone(),
+                    self.config.memchain.allow_remote_storage,
+                    self.config.memchain.max_remote_owners,
+                    ner_engine.clone(),
+                    self.config.memchain.graph_enabled,
+                    self.config.memchain.entropy_filter_enabled,
+                    reranker_engine,
+                    // ⚠️ Uses derive_rawlog_key(), NOT derive_record_key()
+                    Some(derive_rawlog_key(&self.identity.to_bytes())),
+                    llm_router.clone(),
+                );
+                Arc::new(mpi)
+            };
 
-            // Pre-populate identity cache
-            {
+            // ── Local mode: pre-populate identity cache ───────────────────
+            if !is_saas {
                 let owner_hex = hex::encode(owner_key);
                 let identity_records = st
                     .get_active_records(
@@ -398,38 +385,41 @@ impl Server {
                     let mut cache = mpi_state.identity_cache.write();
                     cache.insert(owner_hex, identity_records);
                 }
-            }
 
-            mpi_state.index_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                mpi_state
+                    .index_ready
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
 
-            // Freeze MVF baseline if needed
-            if self.config.memchain.mvf_enabled && mpi_state.mvf_baseline.read().is_none() {
-                let feedback = st.get_recent_feedback(200).await;
-                if !feedback.is_empty() {
-                    let positive = feedback.iter().filter(|(s, _)| *s == 1).count();
-                    let rate = positive as f32 / feedback.len() as f32;
-                    let now_ts = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
+                // Freeze MVF baseline if needed (Local mode only).
+                if self.config.memchain.mvf_enabled
+                    && mpi_state.mvf_baseline.read().is_none()
+                {
+                    let feedback = st.get_recent_feedback(200).await;
+                    if !feedback.is_empty() {
+                        let positive = feedback.iter().filter(|(s, _)| *s == 1).count();
+                        let rate = positive as f32 / feedback.len() as f32;
+                        let now_ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
 
-                    let baseline = BaselineSnapshot {
-                        positive_rate: rate,
-                        sample_size: feedback.len(),
-                        frozen_at: now_ts,
-                    };
+                        let baseline = BaselineSnapshot {
+                            positive_rate: rate,
+                            sample_size: feedback.len(),
+                            frozen_at: now_ts,
+                        };
 
-                    if let Ok(json) = serde_json::to_string(&baseline) {
-                        let conn = st.conn_lock().await;
-                        let _ = conn.execute(
-                            "INSERT OR REPLACE INTO chain_state (key, value) \
-                             VALUES ('mvf_baseline', ?1)",
-                            rusqlite::params![json.as_bytes()],
-                        );
+                        if let Ok(json) = serde_json::to_string(&baseline) {
+                            let conn = st.conn_lock().await;
+                            let _ = conn.execute(
+                                "INSERT OR REPLACE INTO chain_state (key, value) VALUES ('mvf_baseline', ?1)",
+                                rusqlite::params![json.as_bytes()],
+                            );
+                        }
+
+                        *mpi_state.mvf_baseline.write() = Some(baseline);
+                        info!(rate, samples = feedback.len(), "[MVF] Baseline frozen");
                     }
-
-                    *mpi_state.mvf_baseline.write() = Some(baseline);
-                    info!(rate = rate, samples = feedback.len(), "[MVF] Baseline frozen");
                 }
             }
 
@@ -440,11 +430,11 @@ impl Server {
                 Arc::clone(aw),
                 Arc::clone(&sessions),
                 Arc::clone(&udp),
-                chat_relay.clone(),
             );
             tasks.push(("memchain-api", api_task));
 
-            // ── v2.5.0+SuperNode: TaskWorker spawn ──────────────────────────
+            // ── v2.5.0+SuperNode: TaskWorker spawn ────────────────────────
+            // Spawned AFTER reset_stale_processing_tasks().
             if let Some(ref router) = llm_router {
                 let worker = TaskWorker::new(
                     Arc::clone(st),
@@ -462,47 +452,127 @@ impl Server {
                 );
             }
 
-            // ── Smart Miner ─────────────────────────────────────────────────
+            // ── SaaS mode: pool eviction timer ────────────────────────────
+            if is_saas {
+                if let (Some(ref sp), Some(ref vp)) =
+                    (&mpi_state.storage_pool, &mpi_state.vector_pool)
+                {
+                    let sp_clone = Arc::clone(sp);
+                    let vp_clone = Arc::clone(vp);
+                    let mut evict_rx = self.shutdown_tx.subscribe();
+                    tasks.push(("pool-eviction", tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(
+                            Duration::from_secs(POOL_EVICTION_INTERVAL_SECS)
+                        );
+                        loop {
+                            tokio::select! {
+                                _ = evict_rx.recv() => break,
+                                _ = interval.tick() => {
+                                    let evicted_s = sp_clone.evict_idle().await;
+                                    let evicted_v = vp_clone.evict_idle();
+                                    if evicted_s + evicted_v > 0 {
+                                        info!(
+                                            storage = evicted_s,
+                                            vector = evicted_v,
+                                            "[POOL] Evicted idle connections"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    })));
+                    info!(
+                        interval_secs = POOL_EVICTION_INTERVAL_SECS,
+                        "[POOL] Eviction timer started"
+                    );
+                }
+            }
+
+            // ── Miner: Local = ReflectionMiner, SaaS = MinerScheduler ────
             if self.config.memchain.miner_interval_secs > 0 {
-                let miner = ReflectionMiner::new(
-                    self.config.memchain.miner_interval_secs,
-                    Arc::clone(st),
-                    Arc::clone(vi),
-                    self.identity.clone(),
-                    Arc::clone(mp),
-                    Arc::clone(aw),
-                    Arc::clone(&sessions),
-                    Arc::clone(&udp),
-                )
-                .with_compaction_threshold(self.config.memchain.compaction_threshold)
-                .with_mvf(self.config.memchain.mvf_enabled, Arc::clone(&user_weights));
+                if is_saas {
+                    // SaaS mode: MinerScheduler polls all active users.
+                    if let (Some(ref sp), Some(ref sys_db)) =
+                        (&mpi_state.storage_pool, &mpi_state.system_db)
+                    {
+                        let scheduler = crate::miner::MinerScheduler::new(
+                            Arc::clone(sp),
+                            Arc::clone(sys_db),
+                            self.config.memchain.saas.as_ref()
+                                .map(|s| s.miner_max_owners_per_tick)
+                                .unwrap_or(10),
+                            self.config.memchain.saas.as_ref()
+                                .map(|s| s.miner_max_rounds_per_hour)
+                                .unwrap_or(6) as u32,
+                            self.identity.clone(),
+                            llm_router.clone(),
+                            embed_engine.clone(),
+                            ner_engine.clone(),
+                        ).await;
+                        let mut sched_rx = self.shutdown_tx.subscribe();
+                        tasks.push(("miner-scheduler", tokio::spawn(async move {
+                            let mut interval = tokio::time::interval(
+                                Duration::from_secs(MINER_SCHEDULER_TICK_SECS)
+                            );
+                            loop {
+                                tokio::select! {
+                                    _ = sched_rx.recv() => break,
+                                    _ = interval.tick() => {
+                                        scheduler.tick().await;
+                                    }
+                                }
+                            }
+                        })));
+                        info!(
+                            tick_secs = MINER_SCHEDULER_TICK_SECS,
+                            "[MINER] SaaS MinerScheduler started"
+                        );
+                    }
+                } else {
+                    // Local mode: original ReflectionMiner (unchanged).
+                    let miner = ReflectionMiner::new(
+                        self.config.memchain.miner_interval_secs,
+                        Arc::clone(st),
+                        Arc::clone(vi),
+                        self.identity.clone(),
+                        Arc::clone(mp),
+                        Arc::clone(aw),
+                        Arc::clone(&sessions),
+                        Arc::clone(&udp),
+                    )
+                    .with_compaction_threshold(self.config.memchain.compaction_threshold)
+                    .with_mvf(self.config.memchain.mvf_enabled, Arc::clone(&user_weights));
 
-                let miner = if let Some(ref ee) = embed_engine {
-                    miner.with_embed_engine(Arc::clone(ee))
-                } else { miner };
+                    let miner = if let Some(ref ee) = embed_engine {
+                        miner.with_embed_engine(Arc::clone(ee))
+                    } else {
+                        miner
+                    };
+                    let miner = if let Some(ref ne) = ner_engine {
+                        miner.with_ner_engine(Arc::clone(ne))
+                    } else {
+                        miner
+                    };
+                    let miner = if let Some(ref lr) = llm_router {
+                        miner.with_llm_router(Arc::clone(lr))
+                    } else {
+                        miner
+                    };
 
-                let miner = if let Some(ref ne) = ner_engine {
-                    miner.with_ner_engine(Arc::clone(ne))
-                } else { miner };
-
-                let miner = if let Some(ref lr) = llm_router {
-                    miner.with_llm_router(Arc::clone(lr))
-                } else { miner };
-
-                let miner_shutdown = self.shutdown_tx.subscribe();
-                tasks.push(("miner", tokio::spawn(async move {
-                    miner.run(miner_shutdown).await;
-                })));
+                    let miner_shutdown = self.shutdown_tx.subscribe();
+                    tasks.push(("miner", tokio::spawn(async move {
+                        miner.run(miner_shutdown).await;
+                    })));
+                }
             } else {
                 info!("[MINER] Disabled (interval=0)");
             }
         }
 
         info!("Server started successfully");
-
         self.wait_for_shutdown().await;
-
         info!("Shutting down server...");
+
         self.shutdown.store(true, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
 
@@ -518,7 +588,9 @@ impl Server {
             warn!("UDP shutdown error: {}", e);
         }
 
-        if let (Some(ref st), Some(ref mp), Some(ref aw)) = (&storage, &mempool, &aof_writer) {
+        if let (Some(ref st), Some(ref mp), Some(ref aw)) =
+            (&storage, &mempool, &aof_writer)
+        {
             info!(
                 sqlite = st.count().await,
                 mempool = mp.count(),
@@ -528,39 +600,239 @@ impl Server {
         } else {
             info!("Shutdown complete");
         }
+
         Ok(())
     }
 
     // ============================================
-    // v1.1.0-ChatRelay: Chat Relay Initialization
+    // v2.5.3+Security: Auto-generate api_secret
     // ============================================
 
-    /// Initialises `ChatRelayService` when `chat_relay.enabled = true`.
+    /// Ensure api_secret exists, auto-generating if missing.
     ///
-    /// Chat relay is independent of the MemChain mode — it can run even when
-    /// `memchain.mode = "off"`. Returns `None` when disabled (safe no-op).
-    fn init_chat_relay(&self) -> Result<Option<Arc<ChatRelayService>>> {
-        if !self.config.memchain.chat_relay.enabled {
-            debug!("[CHAT_RELAY] Disabled (chat_relay.enabled=false)");
-            return Ok(None);
+    /// Only runs when memchain is enabled. The generated secret is written
+    /// back to the config file via a regex-safe line replacement.
+    /// Non-fatal: if write fails, logs a warning and continues.
+    async fn ensure_api_secret_on_disk(&self) {
+        // Already configured — nothing to do.
+        if self.config.memchain.effective_api_secret().is_some() {
+            return;
         }
 
-        // Derive stable node secret from Ed25519 private key via HKDF.
-        // ⚠️ Uses identity.to_bytes() (PRIVATE key) — same pattern as record_key.
-        let node_secret = derive_node_secret(&self.identity.to_bytes());
+        let Some(ref path) = self.config_path else { return };
 
-        match ChatRelayService::new(self.config.memchain.chat_relay.clone(), node_secret) {
-            Ok(svc) => {
+        let secret = generate_secret();
+        match crate::api::auth::write_secret_to_config_pub(path, "api_secret", &secret) {
+            Ok(()) => {
                 info!(
-                    db = %self.config.memchain.chat_relay.db_path,
-                    ttl_h = self.config.memchain.chat_relay.offline_ttl_secs / 3600,
-                    "[CHAT_RELAY] ✅ Initialised"
+                    path = %path.display(),
+                    "[SECURITY] Auto-generated api_secret and written to config"
                 );
-                Ok(Some(Arc::new(svc)))
             }
             Err(e) => {
-                error!(error = %e, "[CHAT_RELAY] ❌ Initialisation failed");
-                Err(ServerError::startup_failed(format!("ChatRelay init: {}", e)))
+                warn!(
+                    error = %e,
+                    "[SECURITY] Failed to persist api_secret — server is unprotected"
+                );
+            }
+        }
+    }
+
+    // ============================================
+    // v1.0.0-MultiTenant: SaaS MpiState init
+    // ============================================
+
+    /// Initialize the SaaS-mode MpiState.
+    ///
+    /// Creates SystemDb, VolumeRouter, StoragePool, VectorIndexPool, and
+    /// ensures the JWT secret is generated/persisted.
+    ///
+    /// The single-user `storage` and `vector_index` are not used in SaaS mode —
+    /// they remain the server-level DB used only for p2p sync paths.
+    #[allow(clippy::too_many_arguments)]
+    async fn init_saas_mpi_state(
+        &self,
+        _server_storage: &Arc<MemoryStorage>,
+        owner_key: [u8; 32],
+        api_secret: Option<String>,
+        user_weights: Arc<parking_lot::RwLock<std::collections::HashMap<String, crate::services::memchain::mvf::WeightVector>>>,
+        embed_engine: Option<Arc<EmbedEngine>>,
+        ner_engine: Option<Arc<NerEngine>>,
+        reranker_engine: Option<Arc<RerankerEngine>>,
+        llm_router: Option<Arc<LlmRouter>>,
+    ) -> Result<Arc<MpiState>> {
+        let saas_cfg = self.config.memchain.saas.as_ref()
+            .ok_or_else(|| ServerError::startup_failed(
+                "mode=saas requires [memchain.saas] config section"
+            ))?;
+
+        let data_root = &saas_cfg.data_root;
+
+        // Ensure data_root exists.
+        tokio::fs::create_dir_all(data_root).await.map_err(|e| {
+            ServerError::startup_failed(format!("SaaS data_root '{}': {}", data_root.display(), e))
+        })?;
+
+        // ── 1. SystemDb ───────────────────────────────────────────────
+        let system_db = SystemDb::open(&data_root.join("system.db"))
+            .await
+            .map_err(|e| ServerError::startup_failed(format!("SystemDb: {}", e)))?;
+
+        // ── 2. volumes.toml (auto-generate if missing) ────────────────
+        let volumes_config_path = ensure_volumes_config(data_root)
+            .map_err(|e| ServerError::startup_failed(format!("volumes.toml: {}", e)))?;
+
+        // ── 3. VolumeRouter ───────────────────────────────────────────
+        let volume_router = VolumeRouter::new(&volumes_config_path, Arc::clone(&system_db))
+            .await
+            .map_err(|e| ServerError::startup_failed(format!("VolumeRouter: {}", e)))?;
+
+        // ── 4. StoragePool ────────────────────────────────────────────
+        let storage_pool = StoragePool::new(
+            Arc::clone(&volume_router),
+            Arc::clone(&system_db),
+            saas_cfg.pool_max_connections,
+            Duration::from_secs(saas_cfg.pool_idle_timeout_secs),
+        );
+
+        // ── 5. VectorIndexPool ────────────────────────────────────────
+        let quantization_enabled =
+            self.config.memchain.vector_quantization == VectorQuantizationMode::ScalarUint8;
+        let saturation_threshold = if self.config.memchain.vector_early_termination {
+            0.001_f32
+        } else {
+            0.0_f32
+        };
+
+        let vector_pool = VectorIndexPool::new(
+            Arc::clone(&volume_router),
+            Duration::from_secs(saas_cfg.pool_idle_timeout_secs),
+            quantization_enabled,
+            saturation_threshold,
+        );
+
+        // ── 6. JWT secret ─────────────────────────────────────────────
+        let jwt_secret = ensure_jwt_secret(
+            self.config.memchain.jwt_secret.as_deref(),
+            self.config_path.as_deref(),
+        )
+        .map_err(|e| ServerError::startup_failed(format!("jwt_secret: {}", e)))?;
+
+        info!(
+            data_root = %data_root.display(),
+            pool_max = saas_cfg.pool_max_connections,
+            idle_timeout_secs = saas_cfg.pool_idle_timeout_secs,
+            "[SAAS] Infrastructure initialized"
+        );
+
+        // ── 7. Build SaaS MpiState ────────────────────────────────────
+        let mpi_state = Arc::new(MpiState {
+            mode: Mode::Saas,
+            // Single-user storage fields: None in SaaS mode.
+            // Per-user storage is accessed via storage_pool in middleware.
+            storage: None,
+            vector_index: None,
+            identity: self.identity.clone(),
+            identity_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            index_ready: std::sync::atomic::AtomicBool::new(true),
+            user_weights,
+            mvf_alpha: self.config.memchain.mvf_alpha,
+            mvf_enabled: self.config.memchain.mvf_enabled,
+            session_embeddings: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            mvf_baseline: parking_lot::RwLock::new(None),
+            // SaaS: owner_key is placeholder — never used in request handling.
+            owner_key,
+            api_secret,
+            embed_engine,
+            allow_remote_storage: false, // SaaS mode doesn't use Ed25519 remote auth.
+            max_remote_owners: 0,
+            ner_engine,
+            graph_enabled: self.config.memchain.graph_enabled,
+            entropy_filter_enabled: self.config.memchain.entropy_filter_enabled,
+            reranker_engine,
+            rawlog_key: Some(derive_rawlog_key(&self.identity.to_bytes())),
+            llm_router,
+            // SaaS-specific fields.
+            storage_pool: Some(storage_pool),
+            vector_pool: Some(vector_pool),
+            volume_router: Some(volume_router),
+            system_db: Some(system_db),
+            jwt_secret: Some(jwt_secret),
+            token_ttl_secs: self.config.memchain.token_ttl_secs,
+        });
+
+        Ok(mpi_state)
+    }
+
+    // ============================================
+    // Shared Engine Initialization
+    // ============================================
+
+    fn init_embed_engine(&self) -> Option<Arc<EmbedEngine>> {
+        let model_path = &self.config.memchain.embed_model_path;
+        match EmbedEngine::load(
+            model_path,
+            self.config.memchain.embed_max_tokens,
+            self.config.memchain.embed_output_dim,
+        ) {
+            Ok(engine) => {
+                info!(
+                    model = %model_path,
+                    model_type = %engine.model_type(),
+                    dim = engine.dim(),
+                    "[EMBED] ✅ Local embedding engine loaded"
+                );
+                Some(Arc::new(engine))
+            }
+            Err(e) => {
+                warn!(model = %model_path, error = %e, "[EMBED] ⚠️ Unavailable");
+                None
+            }
+        }
+    }
+
+    fn init_ner_engine(&self) -> Option<Arc<NerEngine>> {
+        if !self.config.memchain.ner_enabled {
+            debug!("[NER] Disabled (ner_enabled=false)");
+            return None;
+        }
+        let model_path = &self.config.memchain.ner_model_path;
+        let threshold = self.config.memchain.ner_confidence_threshold;
+        match NerEngine::load(model_path, threshold, 0) {
+            Ok(engine) => {
+                info!(
+                    model = %model_path,
+                    threshold,
+                    "[NER] ✅ Local NER engine loaded (GLiNER)"
+                );
+                Some(Arc::new(engine))
+            }
+            Err(e) => {
+                warn!(model = %model_path, error = %e, "[NER] ⚠️ Unavailable");
+                None
+            }
+        }
+    }
+
+    fn init_reranker_engine(&self) -> Option<Arc<RerankerEngine>> {
+        if !self.config.memchain.reranker_enabled {
+            debug!("[RERANKER] Disabled (reranker_enabled=false)");
+            return None;
+        }
+        let model_path = &self.config.memchain.reranker_model_path;
+        let max_seq = self.config.memchain.reranker_max_seq_length;
+        match RerankerEngine::load(model_path, max_seq) {
+            Ok(engine) => {
+                info!(
+                    model = %model_path,
+                    blend_weight = %RerankerEngine::blend_weight(),
+                    "[RERANKER] ✅ Cross-encoder loaded"
+                );
+                Some(Arc::new(engine))
+            }
+            Err(e) => {
+                warn!(model = %model_path, error = %e, "[RERANKER] ⚠️ Unavailable");
+                None
             }
         }
     }
@@ -587,7 +859,8 @@ impl Server {
         let mut providers: Vec<(String, String, String, Arc<dyn LlmProvider>)> = Vec::new();
 
         for provider_cfg in &supernode.providers {
-            let api_key: Option<String> = provider_cfg.api_key.as_ref().map(|k: &String| {
+            let api_key: Option<String> = provider_cfg.api_key.as_ref().map(|k| {
+                let k: &String = k;
                 if k.starts_with('$') {
                     std::env::var(&k[1..]).unwrap_or_else(|_| {
                         warn!(
@@ -623,7 +896,7 @@ impl Server {
                         Err(e) => {
                             warn!(
                                 provider = %provider_cfg.name, error = %e,
-                                "[SUPERNODE] OpenAiCompatProvider construction failed — skipped"
+                                "[SUPERNODE] OpenAiCompatProvider failed — skipped"
                             );
                             continue;
                         }
@@ -651,7 +924,7 @@ impl Server {
                         Err(e) => {
                             warn!(
                                 provider = %provider_cfg.name, error = %e,
-                                "[SUPERNODE] AnthropicProvider construction failed — skipped"
+                                "[SUPERNODE] AnthropicProvider failed — skipped"
                             );
                             continue;
                         }
@@ -676,7 +949,7 @@ impl Server {
         }
 
         if providers.is_empty() {
-            warn!("[SUPERNODE] All providers failed to construct — SuperNode disabled");
+            warn!("[SUPERNODE] All providers failed — SuperNode disabled");
             return None;
         }
 
@@ -690,7 +963,7 @@ impl Server {
     }
 
     // ============================================
-    // MemChain Initialization (dual-engine)
+    // MemChain Initialization (dual-engine, Local mode)
     // ============================================
 
     async fn init_memchain(&self) -> Result<(
@@ -708,6 +981,7 @@ impl Server {
             }
         }
 
+        // ⚠️ SECURITY: identity.to_bytes() = PRIVATE key. Do NOT use public_key_bytes().
         let record_key = derive_record_key(&self.identity.to_bytes());
         info!("[MEMCHAIN] Record content encryption enabled");
 
@@ -743,7 +1017,9 @@ impl Server {
         }
 
         info!(
-            db = %db_path, records = storage.count().await, vectors = rebuild_count,
+            db = %db_path,
+            records = storage.count().await,
+            vectors = rebuild_count,
             "[MEMCHAIN] SQLite + VectorIndex initialized"
         );
 
@@ -759,16 +1035,21 @@ impl Server {
             );
             let restored = {
                 let conn = storage.conn_lock().await;
-                let cal_data: Option<Vec<u8>> = conn.query_row(
-                    "SELECT value FROM chain_state WHERE key = ?1",
-                    rusqlite::params![cal_key],
-                    |row| row.get::<_, Vec<u8>>(0),
-                ).optional().unwrap_or(None);
+                let cal_data: Option<Vec<u8>> = conn
+                    .query_row(
+                        "SELECT value FROM chain_state WHERE key = ?1",
+                        rusqlite::params![cal_key],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+                    .unwrap_or(None);
                 drop(conn);
 
                 if let Some(data) = cal_data {
                     let ok = vector_index.restore_quantizer(&owner, model_name, &data);
-                    if ok { info!(model = model_name, "[VECTOR] ✅ Quantizer restored"); }
+                    if ok {
+                        info!(model = model_name, "[VECTOR] ✅ Quantizer restored");
+                    }
                     ok
                 } else {
                     false
@@ -784,7 +1065,10 @@ impl Server {
                         rusqlite::params![cal_key, cal_bytes.as_slice()],
                     );
                     drop(conn);
-                    info!(model = model_name, "[VECTOR] ✅ Quantizer calibrated and persisted");
+                    info!(
+                        model = model_name,
+                        "[VECTOR] ✅ Quantizer calibrated and persisted"
+                    );
                 }
             }
         }
@@ -831,30 +1115,31 @@ impl Server {
         _aof_writer: Arc<TokioMutex<AofWriter>>,
         _sessions: Arc<SessionManager>,
         _udp: Arc<UdpTransport>,
-        chat_relay: Option<Arc<ChatRelayService>>,
     ) -> JoinHandle<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
-            let mut app = build_mpi_router(mpi_state);
-
-            if let Some(relay) = chat_relay {
-                app = app.merge(build_chat_router(relay));
-                info!("[CHAT_RELAY] Blob API mounted on /api/chat/blob");
-            }
+            let app = build_mpi_router(mpi_state);
 
             let listener = match tokio::net::TcpListener::bind(listen_addr).await {
-                Ok(l) => { info!("[API] MemChain API on http://{}", listen_addr); l }
-                Err(e) => { error!("[API] Bind failed {}: {}", listen_addr, e); return; }
+                Ok(l) => {
+                    info!("[API] MemChain API on http://{}", listen_addr);
+                    l
+                }
+                Err(e) => {
+                    error!("[API] Bind failed {}: {}", listen_addr, e);
+                    return;
+                }
             };
 
-            let server = axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.recv().await;
-                    info!("[API] Shutdown signal received");
-                });
+            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+                let _ = shutdown_rx.recv().await;
+                info!("[API] Shutdown signal received");
+            });
 
-            if let Err(e) = server.await { error!("[API] Server error: {}", e); }
+            if let Err(e) = server.await {
+                error!("[API] Server error: {}", e);
+            }
             info!("[API] Stopped");
         })
     }
@@ -898,7 +1183,9 @@ impl Server {
 
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_BUFFER);
         let cmd_handler = CommandHandler::new(
-            cmd_rx, Arc::clone(&mgmt_client), Arc::clone(&agent_manager)
+            cmd_rx,
+            Arc::clone(&mgmt_client),
+            Arc::clone(&agent_manager),
         );
         let cmd_shutdown = self.shutdown_tx.subscribe();
         tokio::spawn(async move { cmd_handler.run(cmd_shutdown).await; });
@@ -919,9 +1206,10 @@ impl Server {
                 None
             };
 
-        let mut heartbeat = HeartbeatReporter::new(Arc::clone(&mgmt_client), public_ip)
-            .with_command_sender(cmd_tx)
-            .with_agent_manager(Arc::clone(&agent_manager));
+        let mut heartbeat =
+            HeartbeatReporter::new(Arc::clone(&mgmt_client), public_ip)
+                .with_command_sender(cmd_tx)
+                .with_agent_manager(Arc::clone(&agent_manager));
 
         if let Some(f) = memchain_status_fn {
             heartbeat = heartbeat.with_memchain_status(f);
@@ -930,10 +1218,13 @@ impl Server {
         let sess = Arc::clone(sessions);
         let hb_shutdown = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
-            heartbeat.run(move || sess.count() as u32, hb_shutdown).await;
+            heartbeat
+                .run(move || sess.count() as u32, hb_shutdown)
+                .await;
         });
 
-        let (session_reporter, event_tx) = SessionReporter::new(Arc::clone(&mgmt_client));
+        let (session_reporter, event_tx) =
+            SessionReporter::new(Arc::clone(&mgmt_client));
         let sr_shutdown = self.shutdown_tx.subscribe();
         tokio::spawn(async move { session_reporter.run(sr_shutdown).await; });
 
@@ -945,7 +1236,10 @@ impl Server {
                 Arc::clone(&agent_manager),
             )
             .with_mpi_api_secret(
-                self.config.memchain.effective_api_secret().map(|s| s.to_string())
+                self.config
+                    .memchain
+                    .effective_api_secret()
+                    .map(|s| s.to_string()),
             );
             let ws_shutdown = self.shutdown_tx.subscribe();
             tokio::spawn(async move { ws.run(ws_shutdown).await; });
@@ -967,14 +1261,14 @@ impl Server {
             return ip.to_string();
         }
 
-        // v2.5.2+SecAudit: HTTP metadata endpoints (169.254.169.254,
-        // metadata.google.internal) removed — they bypass TLS and are SSRF
-        // vectors. If running in a cloud environment, set
-        // network.public_endpoint explicitly in config.toml.
+        // v2.5.2+SecAudit: these URLs are hardcoded — do NOT extend with
+        // user-controlled input (SSRF vector).
         let services = [
             "https://api.ipify.org",
             "https://ifconfig.me/ip",
             "https://ipinfo.io/ip",
+            "http://169.254.169.254/latest/meta-data/public-ipv4",
+            "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip",
         ];
 
         if let Ok(client) = reqwest::Client::builder()
@@ -982,7 +1276,11 @@ impl Server {
             .build()
         {
             for url in &services {
-                if let Ok(resp) = client.get(*url).send().await {
+                let mut req = client.get(*url);
+                if url.contains("metadata.google.internal") {
+                    req = req.header("Metadata-Flavor", "Google");
+                }
+                if let Ok(resp) = req.send().await {
                     if resp.status().is_success() {
                         if let Ok(body) = resp.text().await {
                             let ip_str = body.trim();
@@ -1029,7 +1327,8 @@ impl Server {
         Arc<RoutingService>,
     )> {
         let (network, prefix) = self.config.parse_ip_range()?;
-        let ip_pool = Arc::new(IpPoolService::new(network, prefix, self.config.gateway_ip())?);
+        let ip_pool =
+            Arc::new(IpPoolService::new(network, prefix, self.config.gateway_ip())?);
         let sessions = Arc::new(SessionManager::new(
             self.config.max_sessions(),
             Duration::from_secs(self.config.session_timeout_secs()),
@@ -1049,11 +1348,17 @@ impl Server {
             .with_address(self.config.gateway_ip())
             .with_netmask(Ipv4Addr::new(255, 255, 255, 0))
             .with_mtu(self.config.mtu());
-        let tun = LinuxTun::create(cfg).await
+        let tun = LinuxTun::create(cfg)
+            .await
             .map_err(|e| ServerError::startup_failed(format!("TUN: {}", e)))?;
-        tun.up().await
+        tun.up()
+            .await
             .map_err(|e| ServerError::startup_failed(format!("TUN up: {}", e)))?;
-        info!("TUN '{}' initialized @ {}", tun.name(), self.config.gateway_ip());
+        info!(
+            "TUN '{}' initialized @ {}",
+            tun.name(),
+            self.config.gateway_ip()
+        );
         Ok(Arc::new(tun))
     }
 
@@ -1076,7 +1381,6 @@ impl Server {
         vector_index: Option<Arc<VectorIndex>>,
         memchain_config: MemChainConfig,
         server_pubkey_hex: String,
-        chat_relay: Option<Arc<ChatRelayService>>,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -1106,33 +1410,10 @@ impl Server {
                                                     session_events.session_created(&sid, None);
                                                     let resp = encode_server_hello(&result.response);
                                                     let _ = udp.send(&resp, &source.addr).await;
-
-                                                    // v1.1.0-ChatRelay: push backlogged
-                                                    // ChatExpired notifications to newly
-                                                    // connected sender.
-                                                    if let Some(ref relay) = chat_relay {
-                                                        if let Some(session_id) =
-                                                            SessionId::from_bytes(
-                                                                &result.response.session_id
-                                                            )
-                                                        {
-                                                            if let Some(session) =
-                                                                sessions.get(&session_id)
-                                                            {
-                                                                Self::push_expired_notifications(
-                                                                    relay,
-                                                                    &session,
-                                                                    &udp_reply,
-                                                                    &crypto,
-                                                                ).await;
-                                                            }
-                                                        }
-                                                    }
                                                 }
-                                                Err(e) => warn!(
-                                                    "[HANDSHAKE] Failed {}: {}",
-                                                    source.addr, e
-                                                ),
+                                                Err(e) => {
+                                                    warn!("[HANDSHAKE] Failed {}: {}", source.addr, e)
+                                                }
                                             }
                                         }
                                     }
@@ -1156,20 +1437,8 @@ impl Server {
                                                 { let _ = tun.write(&pkt).await; }
                                             }
                                             Ok((session, DecryptedPayload::MemChain(msg))) => {
-                                                // v1.1.0-ChatRelay: chat variants are dispatched
-                                                // FIRST, before the MemChain storage engine.
-                                                // This allows chat relay to work even when
-                                                // memchain.mode = "off" (storage is None).
-                                                if Self::is_chat_message(&msg) {
-                                                    Self::handle_chat_message(
-                                                        msg, &session,
-                                                        &udp_reply, &crypto,
-                                                        &chat_relay, &sessions,
-                                                    ).await;
-                                                } else if let (
-                                                    Some(ref mp),
-                                                    Some(ref aw),
-                                                ) = (&mempool, &aof_writer)
+                                                if let (Some(ref mp), Some(ref aw)) =
+                                                    (&mempool, &aof_writer)
                                                 {
                                                     Self::handle_memchain_message(
                                                         msg, mp, aw,
@@ -1177,10 +1446,9 @@ impl Server {
                                                         &memchain_config,
                                                         &server_pubkey_hex,
                                                         &session, &udp_reply, &crypto,
-                                                    ).await;
+                                                    )
+                                                    .await;
                                                 }
-                                                // else: MemChain disabled and not a chat message
-                                                // — silently drop (expected when mode=off).
                                             }
                                             Err(_) => {}
                                         }
@@ -1201,199 +1469,7 @@ impl Server {
     }
 
     // ============================================
-    // v1.1.0-ChatRelay: Chat message classifier
-    // ============================================
-
-    /// Returns `true` for `MemChainMessage` variants handled by
-    /// `handle_chat_message`.
-    ///
-    /// Called in the UDP dispatch loop BEFORE checking whether the MemChain
-    /// storage engine is available. This ensures chat relay works even when
-    /// `memchain.mode = "off"`.
-    #[inline]
-    fn is_chat_message(msg: &MemChainMessage) -> bool {
-        matches!(
-            msg,
-            MemChainMessage::ChatRelay(_)
-                | MemChainMessage::ChatPull { .. }
-                | MemChainMessage::ChatPullResponse { .. }
-                | MemChainMessage::ChatAck { .. }
-                | MemChainMessage::ChatExpired { .. }
-        )
-    }
-
-    // ============================================
-    // v1.1.0-ChatRelay: Chat message handler
-    // ============================================
-
-    /// Handles all `ChatRelay` / `ChatPull` / `ChatAck` / `ChatExpired` variants.
-    ///
-    /// Deliberately separated from `handle_memchain_message` so that chat relay
-    /// works even when the MemChain storage engine is disabled (mode = "off").
-    /// This function has NO dependency on `MemPool`, `AofWriter`, or
-    /// `MemoryStorage`.
-    async fn handle_chat_message(
-        msg: MemChainMessage,
-        session: &Arc<Session>,
-        udp: &Arc<UdpTransport>,
-        crypto: &DefaultTransportCrypto,
-        chat_relay: &Option<Arc<ChatRelayService>>,
-        sessions: &Arc<SessionManager>,
-    ) {
-        match msg {
-            MemChainMessage::ChatRelay(envelope) => {
-                let relay = match chat_relay {
-                    Some(r) => r,
-                    None => {
-                        debug!("[CHAT_RELAY] ChatRelay received but relay disabled");
-                        return;
-                    }
-                };
-
-                // 1. Anti-replay: timestamp skew must be ≤ 5 minutes
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let skew = (now as i64 - envelope.timestamp as i64).unsigned_abs();
-                if skew > 300 {
-                    warn!(
-                        id = %envelope.short_id(), skew = skew,
-                        "[CHAT_RELAY] ChatRelay rejected: timestamp skew"
-                    );
-                    return;
-                }
-
-                // 2. Verify Ed25519 signature
-                if envelope.verify_signature().is_err() {
-                    warn!(
-                        id = %envelope.short_id(),
-                        sender = %hex::encode(&envelope.sender[..4]),
-                        "[CHAT_RELAY] ChatRelay rejected: invalid signature"
-                    );
-                    return;
-                }
-
-                // 3. Enforce message size limit
-                if envelope.ciphertext.len() > relay.config().max_message_size {
-                    warn!(
-                        id = %envelope.short_id(),
-                        size = envelope.ciphertext.len(),
-                        "[CHAT_RELAY] ChatRelay rejected: message too large"
-                    );
-                    return;
-                }
-
-                // 4. Route: receiver online → forward; offline → store
-                match sessions.get_by_wallet(&envelope.receiver) {
-                    Some(receiver_session) => {
-                        if relay.is_online_duplicate(&envelope.message_id) {
-                            debug!(
-                                id = %envelope.short_id(),
-                                "[CHAT_RELAY] Online duplicate suppressed"
-                            );
-                            return;
-                        }
-                        let fwd = MemChainMessage::ChatRelay(envelope.clone());
-                        Self::send_to_session(&fwd, &receiver_session, udp, crypto).await;
-                        let ack = MemChainMessage::ChatAck {
-                            message_ids: vec![envelope.message_id],
-                        };
-                        Self::send_to_session(&ack, session, udp, crypto).await;
-                        debug!(id = %envelope.short_id(), "[CHAT_RELAY] Message forwarded (online)");
-                    }
-                    None => {
-                        match relay.store_pending(&envelope) {
-                            Ok(()) => {
-                                let ack = MemChainMessage::ChatAck {
-                                    message_ids: vec![envelope.message_id],
-                                };
-                                Self::send_to_session(&ack, session, udp, crypto).await;
-                                debug!(
-                                    id = %envelope.short_id(),
-                                    "[CHAT_RELAY] Message stored (offline)"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    id = %envelope.short_id(), error = %e,
-                                    "[CHAT_RELAY] store_pending failed"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            MemChainMessage::ChatPull { wallet, after_timestamp, cursor, limit } => {
-                let relay = match chat_relay {
-                    Some(r) => r,
-                    None => {
-                        debug!("[CHAT_RELAY] ChatPull received but relay disabled");
-                        return;
-                    }
-                };
-
-                // Wallet must match the authenticated session
-                let session_wallet = session.wallet_bytes();
-                if session_wallet != wallet {
-                    warn!(
-                        session = %hex::encode(&session_wallet[..4]),
-                        requested = %hex::encode(&wallet[..4]),
-                        "[CHAT_RELAY] ChatPull wallet mismatch — rejected"
-                    );
-                    return;
-                }
-
-                match relay.pull_pending(&wallet, after_timestamp, &cursor, limit) {
-                    Ok((pending, has_more)) => {
-                        let envelopes = pending.into_iter().map(|m| m.envelope).collect();
-                        let resp = MemChainMessage::ChatPullResponse { envelopes, has_more };
-                        Self::send_to_session(&resp, session, udp, crypto).await;
-                    }
-                    Err(e) => { warn!(error = %e, "[CHAT_RELAY] pull_pending failed"); }
-                }
-            }
-
-            MemChainMessage::ChatPullResponse { .. } => {
-                // Server never expects a PullResponse from a client
-                debug!("[CHAT_RELAY] Unexpected ChatPullResponse from client — ignored");
-            }
-
-            MemChainMessage::ChatAck { message_ids } => {
-                let relay = match chat_relay {
-                    Some(r) => r,
-                    None => {
-                        debug!("[CHAT_RELAY] ChatAck received but relay disabled");
-                        return;
-                    }
-                };
-
-                let receiver_wallet = session.wallet_bytes();
-                match relay.ack_messages(&message_ids, &receiver_wallet) {
-                    Ok(deleted) => {
-                        debug!(
-                            deleted, count = message_ids.len(),
-                            "[CHAT_RELAY] ChatAck processed"
-                        );
-                    }
-                    Err(e) => { warn!(error = %e, "[CHAT_RELAY] ack_messages failed"); }
-                }
-            }
-
-            MemChainMessage::ChatExpired { .. } => {
-                // Server pushes ChatExpired to clients; receiving one from a
-                // client is unexpected.
-                debug!("[CHAT_RELAY] Unexpected ChatExpired from client — ignored");
-            }
-
-            // is_chat_message() guarantees only chat variants reach here
-            _ => {}
-        }
-    }
-
-    // ============================================
-    // MemChain Message Handler
+    // MemChain Message Handler (unchanged)
     // ============================================
 
     #[allow(clippy::too_many_arguments)]
@@ -1405,14 +1481,10 @@ impl Server {
         vector_index: &Option<Arc<VectorIndex>>,
         config: &MemChainConfig,
         server_pubkey_hex: &str,
-        session: &Arc<Session>,
+        session: &Arc<crate::services::Session>,
         udp: &Arc<UdpTransport>,
         crypto: &DefaultTransportCrypto,
     ) {
-        // ⚠️ Chat variants are handled by handle_chat_message (called earlier
-        // in the UDP dispatch loop). They must never reach this function.
-        // If a new chat variant is added to MemChainMessage, also add it to
-        // is_chat_message() above.
         match msg {
             MemChainMessage::BroadcastFact(fact) => {
                 let origin_hex = hex::encode(fact.origin);
@@ -1420,9 +1492,13 @@ impl Server {
                     Ok(pk) => pk.verify(&fact.fact_id, &fact.signature).is_ok(),
                     Err(_) => false,
                 };
-                if !sig_ok { warn!("[MEMCHAIN] BroadcastFact sig failed"); return; }
+                if !sig_ok {
+                    warn!("[MEMCHAIN] BroadcastFact sig failed");
+                    return;
+                }
                 if !config.is_origin_trusted(&origin_hex, server_pubkey_hex) {
-                    warn!("[MEMCHAIN] BroadcastFact untrusted origin"); return;
+                    warn!("[MEMCHAIN] BroadcastFact untrusted origin");
+                    return;
                 }
                 if mempool.add_fact(fact.clone()) {
                     let mut w = aof_writer.lock().await;
@@ -1432,17 +1508,16 @@ impl Server {
 
             MemChainMessage::BroadcastRecord(record) => {
                 let owner_hex = record.owner_hex();
-                // v2.5.2+SecAudit: record_id is SHA256(owner||content||…),
-                // a content-addressed hash. Signing record_id binds the
-                // signature to content. verify_id() below confirms the hash
-                // matches the actual payload, preventing spoofed-content replay.
+                // v2.5.2+SecAudit: verify against record_id (content hash).
                 let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
                     Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                     Err(_) => false,
                 };
                 if !sig_ok {
-                    warn!(owner = %owner_hex,
-                        "[MEMCHAIN] BroadcastRecord signature verification failed");
+                    warn!(
+                        owner = %owner_hex,
+                        "[MEMCHAIN] BroadcastRecord signature verification failed"
+                    );
                     return;
                 }
                 if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
@@ -1459,13 +1534,19 @@ impl Server {
                 }
                 if let Some(ref st) = storage {
                     if st.insert(&record, "p2p-remote").await {
-                        info!(id = hex::encode(record.record_id), "[MEMCHAIN] BroadcastRecord stored");
+                        info!(
+                            id = hex::encode(record.record_id),
+                            "[MEMCHAIN] BroadcastRecord stored"
+                        );
                         if record.has_embedding() {
                             if let Some(ref vi) = vector_index {
                                 vi.upsert(
-                                    record.record_id, record.embedding.clone(),
-                                    record.layer, record.timestamp,
-                                    &record.owner, "p2p-remote",
+                                    record.record_id,
+                                    record.embedding.clone(),
+                                    record.layer,
+                                    record.timestamp,
+                                    &record.owner,
+                                    "p2p-remote",
                                 );
                             }
                         }
@@ -1510,14 +1591,17 @@ impl Server {
                 if let Some(ref st) = storage {
                     for record in records {
                         let owner_hex = record.owner_hex();
-                        // v2.5.2+SecAudit: same as BroadcastRecord
                         let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
-                            Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
+                            Ok(pk) => {
+                                pk.verify(&record.record_id, &record.signature).is_ok()
+                            }
                             Err(_) => false,
                         };
                         if !sig_ok {
-                            warn!(owner = %owner_hex,
-                                "[MEMCHAIN] SyncRecordResponse sig failed — skipping");
+                            warn!(
+                                owner = %owner_hex,
+                                "[MEMCHAIN] SyncRecordResponse sig failed — skipping"
+                            );
                             continue;
                         }
                         if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
@@ -1544,98 +1628,41 @@ impl Server {
                 );
             }
 
-            _ => { debug!("[MEMCHAIN] Unhandled message variant"); }
+            _ => {
+                debug!("[MEMCHAIN] Unhandled message variant");
+            }
         }
     }
-
-    // ============================================
-    // v1.1.0-ChatRelay: Push expired notifications
-    // ============================================
-
-    /// Pushes backlogged `ChatExpired` notifications to a newly connected sender.
-    ///
-    /// Called immediately after a successful handshake. If Alice was offline
-    /// when her messages expired, the TTL cleanup task queued notifications
-    /// in `expired_notifications`. This method delivers them now.
-    async fn push_expired_notifications(
-        relay: &Arc<ChatRelayService>,
-        session: &Arc<Session>,
-        udp: &Arc<UdpTransport>,
-        crypto: &DefaultTransportCrypto,
-    ) {
-        let wallet = session.wallet_bytes();
-
-        let notifications = match relay.get_pending_notifications(&wallet) {
-            Ok(n) => n,
-            Err(e) => {
-                warn!(error = %e, "[CHAT_RELAY] get_pending_notifications failed");
-                return;
-            }
-        };
-
-        if notifications.is_empty() {
-            return;
-        }
-
-        let mut pushed_ids = Vec::new();
-
-        for notif in &notifications {
-            let message_ids = match notif.message_ids() {
-                Ok(ids) => ids,
-                Err(e) => {
-                    warn!(
-                        error = %e, id = notif.id,
-                        "[CHAT_RELAY] Failed to decode notification ids"
-                    );
-                    continue;
-                }
-            };
-
-            let expired_msg = MemChainMessage::ChatExpired {
-                message_ids,
-                receiver: notif.receiver,
-            };
-
-            Self::send_to_session(&expired_msg, session, udp, crypto).await;
-            pushed_ids.push(notif.id);
-        }
-
-        if !pushed_ids.is_empty() {
-            if let Err(e) = relay.mark_notifications_pushed(&pushed_ids) {
-                warn!(error = %e, "[CHAT_RELAY] mark_notifications_pushed failed");
-            }
-            info!(
-                count = pushed_ids.len(),
-                wallet = %hex::encode(&wallet[..4]),
-                "[CHAT_RELAY] Pushed backlogged ChatExpired notifications"
-            );
-        }
-    }
-
-    // ============================================
-    // send_to_session helper
-    // ============================================
 
     async fn send_to_session(
         msg: &MemChainMessage,
-        session: &Arc<Session>,
+        session: &Arc<crate::services::Session>,
         udp: &Arc<UdpTransport>,
         crypto: &DefaultTransportCrypto,
     ) {
         let plaintext = match encode_memchain(msg) {
             Ok(p) => p,
-            Err(e) => { error!("[MEMCHAIN_TX] Encode: {}", e); return; }
+            Err(e) => {
+                error!("[MEMCHAIN_TX] Encode: {}", e);
+                return;
+            }
         };
 
         let counter = session.next_tx_counter();
         let mut encrypted = vec![0u8; plaintext.len() + ENCRYPTION_OVERHEAD];
 
         let len = match crypto.encrypt(
-            &session.session_key, counter, session.id.as_bytes(),
-            &plaintext, &mut encrypted,
+            &session.session_key,
+            counter,
+            session.id.as_bytes(),
+            &plaintext,
+            &mut encrypted,
         ) {
             Ok(l) => l,
-            Err(e) => { error!("[MEMCHAIN_TX] Encrypt: {}", e); return; }
+            Err(e) => {
+                error!("[MEMCHAIN_TX] Encrypt: {}", e);
+                return;
+            }
         };
         encrypted.truncate(len);
 
@@ -1671,7 +1698,9 @@ impl Server {
                                 }
                             }
                             Err(e) => {
-                                if !shutdown.load(Ordering::SeqCst) { error!("TUN: {}", e); }
+                                if !shutdown.load(Ordering::SeqCst) {
+                                    error!("TUN: {}", e);
+                                }
                             }
                         }
                     }
@@ -1690,57 +1719,20 @@ impl Server {
         ip_pool: Arc<IpPoolService>,
         routing: Arc<RoutingService>,
         events: SessionEventSender,
-        chat_relay: Option<Arc<ChatRelayService>>,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut rx = self.shutdown_tx.subscribe();
-
-        // Use configured cleanup interval; fall back to 60 s when relay disabled.
-        // The timer still fires when relay is None (harmless — the select arm
-        // is an instant no-op), but an interval of 60 s is acceptable overhead.
-        let chat_interval_secs = chat_relay
-            .as_ref()
-            .map_or(60, |r| r.config().cleanup_interval_secs);
-
         tokio::spawn(async move {
-            let mut session_timer = tokio::time::interval(Duration::from_secs(60));
-            let mut chat_timer = tokio::time::interval(
-                Duration::from_secs(chat_interval_secs)
-            );
-
+            let mut timer = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tokio::select! {
                     _ = rx.recv() => break,
-
-                    _ = session_timer.tick() => {
+                    _ = timer.tick() => {
                         if shutdown.load(Ordering::SeqCst) { break; }
                         for (sid, vip) in sessions.cleanup_expired() {
                             routing.remove_route(vip);
                             ip_pool.release(vip);
                             events.session_ended(&sid.to_string(), None, 0, 0);
-                        }
-                    }
-
-                    // v1.1.0-ChatRelay: TTL cleanup for pending messages and blobs.
-                    // run_cleanup() performs synchronous SQLite I/O — offloaded to
-                    // spawn_blocking to avoid blocking the tokio executor thread.
-                    _ = chat_timer.tick() => {
-                        if shutdown.load(Ordering::SeqCst) { break; }
-                        if let Some(relay) = chat_relay.clone() {
-                            tokio::task::spawn_blocking(move || {
-                                match relay.run_cleanup() {
-                                    Ok((msgs, blobs)) => {
-                                        if msgs > 0 || blobs > 0 {
-                                            debug!(
-                                                expired_messages = msgs,
-                                                expired_blobs = blobs,
-                                                "[CHAT_RELAY] Cleanup cycle complete"
-                                            );
-                                        }
-                                    }
-                                    Err(e) => warn!(error = %e, "[CHAT_RELAY] Cleanup error"),
-                                }
-                            });
                         }
                     }
                 }
@@ -1753,7 +1745,9 @@ impl Server {
     // ============================================
 
     async fn wait_for_shutdown(&self) {
-        tokio::signal::ctrl_c().await.expect("Ctrl+C listener failed");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Ctrl+C listener failed");
         info!("Shutdown signal received");
     }
 
@@ -1768,6 +1762,7 @@ impl std::fmt::Debug for Server {
         f.debug_struct("Server")
             .field("listen", &self.config.listen_addr())
             .field("tun", &self.config.device_name())
+            .field("mode", &self.config.memchain.mode)
             .finish()
     }
 }
