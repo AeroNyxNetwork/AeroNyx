@@ -3,21 +3,26 @@
 // ============================================
 //! # Auth — JWT Token Issuance for SaaS Mode
 //!
-//! ## Creation Reason
-//! Part of the MemChain Multi-Tenant Architecture (v1.0).
-//! Provides the `POST /api/auth/token` endpoint and JWT utility functions
-//! for SaaS mode authentication. Local mode is unaffected.
+//! ## Modification History
+//! v1.0.0-MultiTenant - Initial implementation (Task 2)
+//! v1.0.1-Fix         - write_secret_to_config promoted to `pub`.
+//!                      Added `write_secret_to_config_pub` as an explicit
+//!                      public alias used by server.rs for api_secret
+//!                      persistence (ensure_api_secret_on_disk).
+//!                      Comment-line guard added to write_secret_to_config
+//!                      to prevent false replacement of commented-out keys.
 //!
 //! ## Main Functionality
 //! - `POST /api/auth/token`: Verify Ed25519 challenge signature, issue JWT
 //! - `issue_jwt()`: Sign a JWT with HS256 using the configured secret
 //! - `verify_jwt()`: Validate JWT signature + expiry, extract Claims
 //! - `ensure_jwt_secret()`: Auto-generate and persist the JWT secret
+//! - `write_secret_to_config_pub()`: Public alias for config file writes
 //!
 //! ## Authentication Flow
 //! 1. Client signs `"{pubkey_hex}:{unix_timestamp}"` with their Ed25519 private key
 //! 2. Server verifies signature using the pubkey in the request body
-//! 3. Timestamp must be within ±60 seconds of server time
+//! 3. Timestamp must be within +/-60 seconds of server time
 //! 4. On success, server issues a JWT where `sub = pubkey_hex`
 //! 5. All subsequent API requests include `Authorization: Bearer <jwt>`
 //! 6. `unified_auth_middleware` (in mpi.rs) verifies JWT + extracts owner
@@ -35,7 +40,7 @@
 //!   request headers or body fields.
 //! - JWT secret auto-generation: 64-char alphanumeric random string,
 //!   written back to config.toml on first SaaS startup.
-//! - Timestamp window is ±60 seconds (not 300s like the remote storage path)
+//! - Timestamp window is +/-60 seconds (not 300s like the remote storage path)
 //!   because token issuance is more sensitive than request signing.
 //!
 //! ## Dependencies
@@ -43,8 +48,9 @@
 //! - `ed25519-dalek` via `aeronyx_core::crypto` for signature verification
 //! - Used by `mpi.rs` router (SaaS mode only, excluded from local mode)
 //! - `ensure_jwt_secret()` called from `server.rs` during SaaS init
+//! - `write_secret_to_config_pub()` called from `server.rs` for api_secret
 //!
-//! ⚠️ Important Note for Next Developer:
+//! ⚠️ Important Notes for Next Developer:
 //! - This endpoint is EXCLUDED from `unified_auth_middleware` — it must be
 //!   registered before the middleware layer in `build_mpi_router()`.
 //! - `ed25519-dalek` v2.x changed the Verifier trait API. This code uses
@@ -53,9 +59,15 @@
 //! - JWT secret minimum length: 32 bytes. Auto-generated secrets are 64 chars.
 //! - `ensure_jwt_secret()` returns Err if the config file cannot be written.
 //!   Server startup should fail loudly in this case.
+//! - `write_secret_to_config` is `pub` (v1.0.1 fix) so that `server.rs` can
+//!   call it for both api_secret and jwt_secret persistence. Use the
+//!   `write_secret_to_config_pub` alias at call sites for clarity.
+//! - Comment-line guard: lines whose first non-whitespace char is '#' are
+//!   never modified, preventing false replacement of commented-out examples.
 //!
 //! ## Last Modified
-//! v1.0.0-MultiTenant - Initial implementation (Task 2)
+//! v1.0.1-Fix - Promoted write_secret_to_config to pub; added _pub alias;
+//!              added comment-line guard in write_secret_to_config.
 // ============================================
 
 use std::path::Path;
@@ -116,21 +128,14 @@ pub struct TokenResponse {
     pub expires_at: u64,
 }
 
-/// Error response body.
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
-    error: &'static str,
-}
-
 // ============================================
 // Shared State for Auth Endpoint
 // ============================================
 
 /// Minimal state required by the auth endpoint.
 ///
-/// This is a subset of MpiState, extracted so the endpoint can be
-/// registered outside the unified_auth_middleware layer without
-/// needing the full MpiState. Passed as Axum State.
+/// Extracted from MpiState so the endpoint can be registered outside
+/// the unified_auth_middleware layer. Passed as Axum State.
 #[derive(Clone)]
 pub struct AuthState {
     /// HS256 signing secret for JWT issuance.
@@ -158,7 +163,7 @@ pub async fn issue_token(
     State(state): State<AuthState>,
     Json(req): Json<TokenRequest>,
 ) -> impl IntoResponse {
-    // ── Validate pubkey format ────────────────────────────────────────
+    // Validate pubkey format.
     let pubkey_bytes = match parse_pubkey_hex(&req.pubkey) {
         Ok(b) => b,
         Err(msg) => {
@@ -170,7 +175,7 @@ pub async fn issue_token(
         }
     };
 
-    // ── Validate timestamp (replay protection) ────────────────────────
+    // Validate timestamp (replay protection).
     let now = now_secs();
     let drift = if now > req.timestamp {
         now - req.timestamp
@@ -191,7 +196,7 @@ pub async fn issue_token(
             .into_response();
     }
 
-    // ── Parse Ed25519 signature ───────────────────────────────────────
+    // Parse Ed25519 signature.
     let sig_bytes = match parse_signature_base64(&req.signature) {
         Ok(b) => b,
         Err(msg) => {
@@ -203,7 +208,7 @@ pub async fn issue_token(
         }
     };
 
-    // ── Verify Ed25519 signature ──────────────────────────────────────
+    // Verify Ed25519 signature.
     // Challenge = "{pubkey_hex}:{timestamp}" as UTF-8 bytes.
     let challenge = format!("{}:{}", req.pubkey, req.timestamp);
     let identity_pubkey = match IdentityPublicKey::from_bytes(&pubkey_bytes) {
@@ -232,7 +237,7 @@ pub async fn issue_token(
             .into_response();
     }
 
-    // ── Issue JWT ─────────────────────────────────────────────────────
+    // Issue JWT.
     let expires_at = now + state.token_ttl_secs;
     match issue_jwt(&req.pubkey, now, expires_at, &state.jwt_secret) {
         Ok(token) => {
@@ -285,7 +290,6 @@ pub fn issue_jwt(
         exp,
         iss: JWT_ISSUER.to_string(),
     };
-
     let header = Header::new(Algorithm::HS256);
     let key = EncodingKey::from_secret(secret.as_bytes());
     encode(&header, &claims, &key)
@@ -293,10 +297,7 @@ pub fn issue_jwt(
 
 /// Verify a JWT and extract its claims.
 ///
-/// Validates:
-/// - HS256 signature
-/// - `exp` claim (not expired)
-/// - `iss` claim (must be "memchain")
+/// Validates HS256 signature, `exp` (not expired), and `iss` ("memchain").
 ///
 /// # Errors
 /// Returns `jsonwebtoken::errors::Error` for any validation failure.
@@ -305,13 +306,10 @@ pub fn verify_jwt(
     secret: &str,
 ) -> Result<Claims, jsonwebtoken::errors::Error> {
     let key = DecodingKey::from_secret(secret.as_bytes());
-
     let mut validation = Validation::new(Algorithm::HS256);
     validation.set_issuer(&[JWT_ISSUER]);
-    // exp validation is enabled by default in jsonwebtoken.
-    // We do not set leeway — clocks must be reasonably synchronized.
+    // exp validation is enabled by default. leeway=0: clocks must be in sync.
     validation.leeway = 0;
-
     let data = decode::<Claims>(token, &key, &validation)?;
     Ok(data.claims)
 }
@@ -320,26 +318,19 @@ pub fn verify_jwt(
 // JWT Secret Management
 // ============================================
 
-/// Ensure a JWT secret exists, generating one if needed.
+/// Ensure a JWT secret exists, generating and persisting one if needed.
 ///
-/// Reads the `jwt_secret` field from the auth config section.
-/// If empty or not set, generates a 64-char random alphanumeric string
-/// and writes it back to the config file at `config_path`.
-///
-/// This follows the same pattern as `api_secret` auto-generation
-/// described in v2.5.3+Security.
-///
-/// # Returns
-/// The effective JWT secret (existing or newly generated).
+/// If `current_secret` is non-empty and >= 32 chars, it is returned as-is.
+/// Otherwise a 64-char random alphanumeric secret is generated and written
+/// to `config_path` via `write_secret_to_config`.
 ///
 /// # Errors
-/// Returns Err if the secret cannot be generated or the config file
-/// cannot be written. Startup should fail in this case.
+/// Returns Err if the secret is too short, or if the config file cannot
+/// be written. Server startup should fail loudly on Err.
 pub fn ensure_jwt_secret(
     current_secret: Option<&str>,
     config_path: Option<&Path>,
 ) -> Result<String, String> {
-    // If a non-empty secret is already configured, use it.
     if let Some(s) = current_secret {
         if !s.is_empty() {
             if s.len() < 32 {
@@ -352,12 +343,9 @@ pub fn ensure_jwt_secret(
         }
     }
 
-    // Generate a new 64-char random alphanumeric secret.
     let secret = generate_secret();
-
     info!("[AUTH] Generated new JWT secret (64 chars alphanumeric)");
 
-    // Write back to config file if path is provided.
     if let Some(path) = config_path {
         if let Err(e) = write_secret_to_config(path, "jwt_secret", &secret) {
             return Err(format!(
@@ -412,34 +400,37 @@ pub fn parse_signature_base64(b64: &str) -> Result<[u8; 64], &'static str> {
 }
 
 // ============================================
-// Private Helpers
+// Config File Write Helpers
 // ============================================
 
-/// Current Unix timestamp in seconds.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-/// Write a key = "value" line into an existing TOML config file.
+/// Write a `key = "value"` line into an existing TOML config file.
 ///
-/// Strategy: read the whole file, replace the target key line if it exists,
-/// or append it under the `[auth]` section header if not.
+/// Scans the file line by line and replaces the first non-comment line
+/// that starts with `key =` or `key=`. If no such line is found, appends
+/// the entry under the `[auth]` section (creating the section if absent).
 ///
-/// This is a best-effort approach suitable for the simple flat config files
-/// used in this project. It does NOT attempt to parse/re-serialize TOML.
-fn write_secret_to_config(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+/// This is a best-effort text replacement — it does NOT parse/re-serialize
+/// the full TOML document. Suitable for the simple flat configs used here.
+///
+/// # Comment-line guard
+/// Lines whose first non-whitespace character is `#` are never replaced.
+/// This prevents false matches against commented-out example values like:
+///   `# jwt_secret = "example_do_not_use"`
+///
+/// `pub` since v1.0.1: required by server.rs for api_secret persistence.
+pub fn write_secret_to_config(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
     let content = std::fs::read_to_string(path)?;
     let new_line = format!("{} = \"{}\"", key, value);
 
-    // Replace an existing key line (e.g. `jwt_secret = ""`).
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
     let mut replaced = false;
 
     for line in lines.iter_mut() {
         let trimmed = line.trim_start();
+        // Skip comment lines — never replace `# key = "example"`.
+        if trimmed.starts_with('#') {
+            continue;
+        }
         if trimmed.starts_with(&format!("{} =", key))
             || trimmed.starts_with(&format!("{}=", key))
         {
@@ -450,7 +441,7 @@ fn write_secret_to_config(path: &Path, key: &str, value: &str) -> std::io::Resul
     }
 
     if !replaced {
-        // Append under [auth] section, or at end of file if section missing.
+        // Append under [auth] section, or at end of file if section absent.
         let mut in_auth = false;
         let mut insert_pos = lines.len();
 
@@ -461,8 +452,6 @@ fn write_secret_to_config(path: &Path, key: &str, value: &str) -> std::io::Resul
                 continue;
             }
             if in_auth {
-                // Insert after the last non-empty line in [auth] section,
-                // or before the next section header.
                 if t.starts_with('[') {
                     insert_pos = i;
                     break;
@@ -474,7 +463,6 @@ fn write_secret_to_config(path: &Path, key: &str, value: &str) -> std::io::Resul
         }
 
         if !in_auth {
-            // No [auth] section — append it.
             lines.push(String::new());
             lines.push("[auth]".to_string());
             lines.push(new_line);
@@ -490,6 +478,32 @@ fn write_secret_to_config(path: &Path, key: &str, value: &str) -> std::io::Resul
     std::fs::write(path, output)
 }
 
+/// Public alias for `write_secret_to_config`.
+///
+/// Used by `server.rs::ensure_api_secret_on_disk()` to persist the
+/// auto-generated api_secret. The `_pub` suffix makes the cross-module
+/// call site self-documenting without changing the underlying function.
+#[inline(always)]
+pub fn write_secret_to_config_pub(
+    path: &Path,
+    key: &str,
+    value: &str,
+) -> std::io::Result<()> {
+    write_secret_to_config(path, key, value)
+}
+
+// ============================================
+// Private Helpers
+// ============================================
+
+/// Current Unix timestamp in seconds.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 // ============================================
 // Tests
 // ============================================
@@ -501,11 +515,9 @@ mod tests {
 
     const TEST_SECRET: &str = "test-secret-that-is-at-least-32-chars-long-for-safety";
 
-    fn make_test_secret() -> String {
-        TEST_SECRET.to_string()
-    }
+    fn make_test_secret() -> String { TEST_SECRET.to_string() }
 
-    // ── JWT round-trip ────────────────────────────────────────────────
+    // -- JWT round-trip ---------------------------------------------------
 
     #[test]
     fn test_issue_and_verify_jwt() {
@@ -527,66 +539,42 @@ mod tests {
         let pubkey_hex = hex::encode([0xAAu8; 32]);
         let now = now_secs();
         let token = issue_jwt(&pubkey_hex, now, now + 3600, &make_test_secret()).unwrap();
-
         let result = verify_jwt(&token, "wrong-secret-at-least-32-chars-xxxxxxxxxxxx");
-        assert!(result.is_err(), "Wrong secret should fail verification");
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_verify_expired_token_fails() {
         let pubkey_hex = hex::encode([0xAAu8; 32]);
-        let past = now_secs() - 7200; // 2 hours ago
-        // exp is in the past
+        let past = now_secs() - 7200;
         let token = issue_jwt(&pubkey_hex, past - 3600, past, &make_test_secret()).unwrap();
-
-        let result = verify_jwt(&token, &make_test_secret());
-        assert!(result.is_err(), "Expired token should fail");
+        assert!(verify_jwt(&token, &make_test_secret()).is_err());
     }
 
     #[test]
     fn test_verify_wrong_issuer_fails() {
-        // Manually build a token with wrong issuer.
         let now = now_secs();
-        let claims = serde_json::json!({
-            "sub": hex::encode([0xAAu8; 32]),
-            "iat": now,
-            "exp": now + 3600,
-            "iss": "wrong-issuer"
-        });
-        // Encode manually with jsonwebtoken to inject wrong issuer.
         #[derive(Serialize)]
-        struct BadClaims {
-            sub: String,
-            iat: u64,
-            exp: u64,
-            iss: String,
-        }
+        struct BadClaims { sub: String, iat: u64, exp: u64, iss: String }
         let bad = BadClaims {
             sub: hex::encode([0xAAu8; 32]),
-            iat: now,
-            exp: now + 3600,
+            iat: now, exp: now + 3600,
             iss: "evil".to_string(),
         };
         let key = jsonwebtoken::EncodingKey::from_secret(TEST_SECRET.as_bytes());
         let token = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-            &bad,
-            &key,
-        )
-        .unwrap();
-        let _ = claims; // suppress warning
-
-        let result = verify_jwt(&token, &make_test_secret());
-        assert!(result.is_err(), "Wrong issuer should fail");
+            &bad, &key,
+        ).unwrap();
+        assert!(verify_jwt(&token, &make_test_secret()).is_err());
     }
 
-    // ── parse_pubkey_hex ──────────────────────────────────────────────
+    // -- parse_pubkey_hex -------------------------------------------------
 
     #[test]
     fn test_parse_pubkey_hex_valid() {
         let hex = hex::encode([0xABu8; 32]);
-        let bytes = parse_pubkey_hex(&hex).unwrap();
-        assert_eq!(bytes, [0xABu8; 32]);
+        assert_eq!(parse_pubkey_hex(&hex).unwrap(), [0xABu8; 32]);
     }
 
     #[test]
@@ -602,15 +590,14 @@ mod tests {
         assert!(parse_pubkey_hex(&hex).is_err());
     }
 
-    // ── parse_signature_base64 ────────────────────────────────────────
+    // -- parse_signature_base64 -------------------------------------------
 
     #[test]
     fn test_parse_signature_base64_valid() {
         use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
         let sig = [0x42u8; 64];
         let b64 = BASE64.encode(sig);
-        let parsed = parse_signature_base64(&b64).unwrap();
-        assert_eq!(parsed, sig);
+        assert_eq!(parse_signature_base64(&b64).unwrap(), sig);
     }
 
     #[test]
@@ -620,33 +607,30 @@ mod tests {
         assert!(parse_signature_base64(&short).is_err());
     }
 
-    // ── ensure_jwt_secret ─────────────────────────────────────────────
+    // -- ensure_jwt_secret ------------------------------------------------
 
     #[test]
     fn test_ensure_jwt_secret_uses_existing() {
         let existing = "a".repeat(32);
-        let result = ensure_jwt_secret(Some(&existing), None).unwrap();
-        assert_eq!(result, existing);
+        assert_eq!(ensure_jwt_secret(Some(&existing), None).unwrap(), existing);
     }
 
     #[test]
     fn test_ensure_jwt_secret_too_short_fails() {
-        let short = "too-short";
-        let result = ensure_jwt_secret(Some(short), None);
-        assert!(result.is_err());
+        assert!(ensure_jwt_secret(Some("too-short"), None).is_err());
     }
 
     #[test]
     fn test_ensure_jwt_secret_generates_when_empty() {
-        let secret = ensure_jwt_secret(Some(""), None).unwrap();
-        assert_eq!(secret.len(), 64);
-        assert!(secret.chars().all(|c| c.is_alphanumeric()));
+        let s = ensure_jwt_secret(Some(""), None).unwrap();
+        assert_eq!(s.len(), 64);
+        assert!(s.chars().all(|c| c.is_alphanumeric()));
     }
 
     #[test]
     fn test_ensure_jwt_secret_generates_when_none() {
-        let secret = ensure_jwt_secret(None, None).unwrap();
-        assert_eq!(secret.len(), 64);
+        let s = ensure_jwt_secret(None, None).unwrap();
+        assert_eq!(s.len(), 64);
     }
 
     #[test]
@@ -656,13 +640,11 @@ mod tests {
         std::fs::write(
             &config_path,
             "[memchain]\nmode = \"saas\"\n\n[auth]\njwt_secret = \"\"\ntoken_ttl_secs = 86400\n",
-        )
-        .unwrap();
+        ).unwrap();
 
         let secret = ensure_jwt_secret(None, Some(&config_path)).unwrap();
         assert_eq!(secret.len(), 64);
 
-        // Verify it was written back.
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(content.contains(&secret));
         assert!(content.contains("jwt_secret ="));
@@ -675,13 +657,46 @@ mod tests {
         std::fs::write(&config_path, "[memchain]\nmode = \"saas\"\n").unwrap();
 
         let secret = ensure_jwt_secret(None, Some(&config_path)).unwrap();
-
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(content.contains("[auth]"));
         assert!(content.contains(&secret));
     }
 
-    // ── generate_secret ───────────────────────────────────────────────
+    // -- write_secret_to_config comment-line guard ------------------------
+
+    #[test]
+    fn test_write_secret_skips_comment_lines() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[auth]\n# jwt_secret = \"example_do_not_use\"\njwt_secret = \"\"\n",
+        ).unwrap();
+
+        write_secret_to_config(&config_path, "jwt_secret", "real_value").unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        // Comment line must be preserved unchanged.
+        assert!(content.contains("# jwt_secret = \"example_do_not_use\""));
+        // Real key line must be replaced.
+        assert!(content.contains("jwt_secret = \"real_value\""));
+    }
+
+    // -- write_secret_to_config_pub alias ---------------------------------
+
+    #[test]
+    fn test_write_secret_to_config_pub_alias() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[memchain]\napi_secret = \"\"\n").unwrap();
+
+        write_secret_to_config_pub(&config_path, "api_secret", "generated_secret").unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("api_secret = \"generated_secret\""));
+    }
+
+    // -- generate_secret --------------------------------------------------
 
     #[test]
     fn test_generate_secret_length_and_charset() {
@@ -694,9 +709,6 @@ mod tests {
 
     #[test]
     fn test_generate_secret_is_random() {
-        let s1 = generate_secret();
-        let s2 = generate_secret();
-        // With 64 alphanumeric chars, collision probability is negligible.
-        assert_ne!(s1, s2);
+        assert_ne!(generate_secret(), generate_secret());
     }
 }
