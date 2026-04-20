@@ -3,43 +3,58 @@
 // ============================================
 //! # MPI Handlers — Core Endpoints
 //!
-//! ## File Creation/Modification Notes
-//! ============================================
-//! Creation Reason: v2.4.0 Split — extracted from mpi.rs to reduce file size.
-//! Modification Reason:
-//!   v2.5.2+Provenance  — merged PATCH /record/:id and GET /record/:id/provenance
-//!   v2.5.2+SecurityFix — #4 revoke_owned; #9 tags-only FTS update; #11 cache cap
-//!   v2.5.3+Isolation   — RecallRequest gains `context: Option<String>` field
-//! Main Functionality:
-//!   - POST /api/mpi/remember    — store a new memory record
-//!   - POST /api/mpi/forget      — soft-revoke a memory record
-//!   - GET  /api/mpi/status      — system health + SuperNode queue metrics
-//!   - GET  /api/mpi/record/:id  — fetch a single record by ID
-//!   - GET  /api/mpi/records/overview — layer-grouped record summary
-//!   - POST /api/mpi/embed       — local MiniLM batch embed
-//!   - PATCH /api/mpi/record/:id            — v2.5.2 partial record update
-//!   - GET  /api/mpi/record/:id/provenance  — v2.5.2 traceability chain
+//! ## Modification History
+//! v2.4.0-GraphCognition  - Extracted from mpi.rs
+//! v2.4.0+BM25            - Moved mpi_recall to recall_handler.rs; FTS indexing
+//! v2.4.0+Progressive     - mode field in RecallRequest
+//! v2.5.0+SuperNode Phase D - SuperNodeStatus in mpi_status
+//! v2.5.2+Provenance      - PATCH + provenance handlers
+//! v2.5.2+SecurityFix     - #4 revoke_owned; #9 tags FTS; #11 cache cap
+//! v2.5.3+Isolation       - RecallRequest.context
+//! v1.0.1-SaaSFix        - BREAKING: all state.storage / state.vector_index
+//!                          direct accesses replaced with Extension extraction.
+//!                          mpi_status: SuperNode stats now use storage from
+//!                          Extension instead of state.storage (was panicking
+//!                          in SaaS mode). conn_lock() query moved behind a
+//!                          Local-mode guard.
 //!
-//! ⚠️ Important Note for Next Developer:
-//! - All handlers extract AuthenticatedOwner BEFORE calling req.into_body().
-//! - revoke_owned() enforces owner in SQL (fixes TOCTOU in mpi_forget).
-//! - PATCH clears embedding on content change; Miner re-embeds (~60s).
+//! ## Main Functionality
+//! - POST /api/mpi/remember    - store a new memory record
+//! - POST /api/mpi/forget      - soft-revoke a memory record
+//! - GET  /api/mpi/status      - system health + SuperNode queue metrics
+//! - GET  /api/mpi/record/:id  - fetch a single record by ID
+//! - GET  /api/mpi/records/overview - layer-grouped record summary
+//! - POST /api/mpi/embed       - local MiniLM batch embed
+//! - PATCH /api/mpi/record/:id - v2.5.2 partial record update
+//! - GET  /api/mpi/record/:id/provenance - v2.5.2 traceability chain
+//!
+//! ## SaaS Compatibility (v1.0.1-SaaSFix)
+//! All handlers now extract storage and vector_index from Extensions:
+//! ```
+//! let storage = req.extensions().get::<Arc<MemoryStorage>>()
+//!     .expect("[BUG] MemoryStorage extension not set").clone();
+//! let vi = req.extensions().get::<Arc<VectorIndex>>()
+//!     .expect("[BUG] VectorIndex extension not set").clone();
+//! ```
+//! unified_auth_middleware injects these in both Local and SaaS modes.
+//!
+//! mpi_status is an exception: SuperNode queue stats require conn_lock()
+//! which needs the per-request storage. In SaaS mode the cognitive_tasks
+//! table is per-user, so we use the Extension storage. The conn_lock query
+//! for today's completed tasks count is now gated safely.
+//!
+//! ⚠️ Important Notes for Next Developer:
+//! - Never access state.storage or state.vector_index directly in handlers.
+//!   Always use Extension<Arc<MemoryStorage>> and Extension<Arc<VectorIndex>>.
 //! - MAX_IDENTITY_CACHE_PER_OWNER caps hot cache to avoid unbounded growth.
 //! - RecallRequest.context is passed to recall_handler for project isolation.
-//!   "all"/None = no filter; "work"/"personal"/other = literal project_id.
-//!
-//! ## Modification History
-//! v2.4.0-GraphCognition  - Extracted from mpi.rs; status extended with NER/graph
-//! v2.4.0+BM25            - Moved mpi_recall to recall_handler.rs; FTS indexing
-//! v2.4.0+Progressive     - Added mode field to RecallRequest + default_recall_mode()
-//! v2.5.0+SuperNode Phase D - MpiStatusResponse + SuperNodeStatus struct
-//! v2.5.2+Provenance      - 🌟 PATCH + provenance handlers; PatchRecordRequest;
-//!                          RecordProvenance struct
-//! v2.5.2+SecurityFix     - 🔒 #4 revoke_owned; #9 tags FTS; #11 cache cap
-//! v2.5.3+Isolation       - 🌟 RecallRequest.context for memory isolation
+//! - revoke_owned() enforces owner in SQL (fix TOCTOU in mpi_forget).
+//! - PATCH clears embedding on content change; Miner re-embeds (~60s).
 //!
 //! ## Last Modified
-//! v2.5.3+Isolation - 🌟 RecallRequest.context field
+//! v1.0.1-SaaSFix - Replaced all direct state.storage/vector_index accesses
+//!                  with Extension extraction throughout all handlers.
+// ============================================
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,17 +67,16 @@ use tracing::{debug, info, warn};
 
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 
-use crate::services::memchain::mvf;
+use crate::services::memchain::{MemoryStorage, VectorIndex};
 use crate::services::memchain::LlmRouter;
 
 use super::mpi::{
-    MpiState, AuthenticatedOwner, BaselineSnapshot,
-    extract_owner, parse_layer, estimate_tokens, now_secs,
+    MpiState, AuthenticatedOwner, Mode,
+    extract_owner, parse_layer, now_secs,
     default_layer, default_source, default_model, default_top_k,
     default_token_budget, default_include_graph,
 };
 
-// ── Security constants (v2.5.2+SecurityFix) ────────────────────────────────
 /// Max identity/allergy records kept in the hot cache per owner (fix #11).
 const MAX_IDENTITY_CACHE_PER_OWNER: usize = 200;
 
@@ -100,61 +114,67 @@ pub async fn mpi_remember(
     let owner = auth.owner_bytes();
     let owner_hex = auth.owner_hex();
 
+    // SaaS fix: extract storage and vector_index from Extensions.
+    let storage = req.extensions().get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set").clone();
+    let vi = req.extensions().get::<Arc<VectorIndex>>()
+        .expect("[BUG] VectorIndex extension not set").clone();
+
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"failed to read body"}))),
+        Err(_) => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"failed to read body"}))).into_response(),
     };
-    let req_body: RememberRequest = match serde_json::from_slice(&body_bytes) {
+    let rb: RememberRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("invalid JSON: {}", e)}))),
+        Err(e) => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("invalid JSON: {}", e)}))).into_response(),
     };
 
-    if req_body.content.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"content empty"})));
+    if rb.content.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"content empty"}))).into_response();
     }
-    let layer = match parse_layer(&req_body.layer) {
+    let layer = match parse_layer(&rb.layer) {
         Some(l) => l,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid layer"}))),
+        None => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"invalid layer"}))).into_response(),
     };
 
     let ts = now_secs();
 
-    if !req_body.embedding.is_empty() {
-        let dedup = state.vector_index.check_duplicate(
-            &req_body.embedding, &owner, &req_body.embedding_model, layer, ts,
-        );
+    if !rb.embedding.is_empty() {
+        let dedup = vi.check_duplicate(&rb.embedding, &owner, &rb.embedding_model, layer, ts);
         if dedup.is_duplicate {
             let dup_hex = hex::encode(dedup.existing_id.unwrap_or([0; 32]));
             return (StatusCode::OK, Json(serde_json::json!(RememberResponse {
-                record_id: dup_hex.clone(), status: "duplicate".into(), duplicate_of: Some(dup_hex),
-            })));
+                record_id: dup_hex.clone(), status: "duplicate".into(),
+                duplicate_of: Some(dup_hex),
+            }))).into_response();
         }
     }
 
-    let encrypted_content = req_body.content.as_bytes().to_vec();
+    let encrypted_content = rb.content.as_bytes().to_vec();
     let mut record = MemoryRecord::new(
-        owner, ts, layer, req_body.topic_tags.clone(), req_body.source_ai.clone(),
-        encrypted_content, req_body.embedding.clone(),
+        owner, ts, layer, rb.topic_tags.clone(), rb.source_ai.clone(),
+        encrypted_content, rb.embedding.clone(),
     );
     record.signature = state.identity.sign(&record.record_id);
     let rid_hex = record.id_hex();
 
-    if !state.storage.insert(&record, &req_body.embedding_model).await {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({"error":"exists","record_id":rid_hex})));
+    if !storage.insert(&record, &rb.embedding_model).await {
+        return (StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"exists","record_id":rid_hex}))).into_response();
     }
 
-    if !req_body.embedding.is_empty() {
-        state.vector_index.upsert(
-            record.record_id, req_body.embedding, layer, ts, &owner, &req_body.embedding_model,
-        );
+    if !rb.embedding.is_empty() {
+        vi.upsert(record.record_id, rb.embedding, layer, ts, &owner, &rb.embedding_model);
     }
 
-    let tags_str = serde_json::to_string(&req_body.topic_tags).unwrap_or_default();
-    state.storage.fts_index_record(
-        &record.record_id, &owner, &req_body.content, &tags_str,
-    ).await;
+    let tags_str = serde_json::to_string(&rb.topic_tags).unwrap_or_default();
+    storage.fts_index_record(&record.record_id, &owner, &rb.content, &tags_str).await;
 
-    // Fix #11: cap identity cache size per owner
+    // Fix #11: cap identity cache size per owner.
     if layer == MemoryLayer::Identity {
         let mut cache = state.identity_cache.write();
         let entries = cache.entry(owner_hex.clone()).or_default();
@@ -167,7 +187,7 @@ pub async fn mpi_remember(
     info!(id = %rid_hex, layer = %layer, owner = %&owner_hex[..8], "[MPI_REMEMBER] Stored");
     (StatusCode::CREATED, Json(serde_json::json!(RememberResponse {
         record_id: rid_hex, status: "created".into(), duplicate_of: None,
-    })))
+    }))).into_response()
 }
 
 // ============================================
@@ -196,17 +216,10 @@ pub struct RecallRequest {
     pub time_range: Option<TimeRangeParam>,
     #[serde(default = "default_include_graph")]
     pub include_graph: bool,
-    /// v2.4.0+Progressive: "full" (default) | "index"
+    /// "full" (default) | "index"
     #[serde(default = "default_recall_mode")]
     pub mode: String,
-    /// v2.5.3+Isolation: Memory context filter.
-    ///
-    /// - `None` / `"all"` → no filter, recall from all memories (default)
-    /// - `"work"`         → only recall memories tagged with project_id="work"
-    /// - `"personal"`     → only recall memories tagged with project_id="personal"
-    /// - any other string → treat as literal project_id filter
-    ///
-    /// Maps to sessions.project_id and records.project_id filters in SQL.
+    /// v2.5.3+Isolation: None/"all" = no filter; other = project_id filter.
     #[serde(default)]
     pub context: Option<String>,
 }
@@ -259,56 +272,63 @@ pub async fn mpi_forget(
     let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
 
+    // SaaS fix: extract storage and vi from Extensions.
+    let storage = req.extensions().get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set").clone();
+    let vi = req.extensions().get::<Arc<VectorIndex>>()
+        .expect("[BUG] VectorIndex extension not set").clone();
+
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"failed to read body"}))),
+        Err(_) => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"failed to read body"}))).into_response(),
     };
     let rb: ForgetRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("invalid JSON: {}", e)}))),
+        Err(e) => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("invalid JSON: {}", e)}))).into_response(),
     };
 
     let rid = match hex::decode(&rb.record_id) {
         Ok(b) if b.len() == 32 => { let mut a = [0u8;32]; a.copy_from_slice(&b); a }
-        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"bad record_id"}))),
+        _ => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"bad record_id"}))).into_response(),
     };
 
-    // Fix #4: revoke_owned() atomically checks owner in SQL (eliminates TOCTOU).
-    // Returns false if record not found OR owner mismatch — both yield 404 to
-    // avoid leaking existence of records owned by others.
-    if let Some(record) = state.storage.get(&rid).await {
+    // Fix #4: check ownership before revoke to avoid TOCTOU.
+    if let Some(record) = storage.get(&rid).await {
         if record.owner != owner {
-            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"access denied"})));
+            return (StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error":"access denied"}))).into_response();
         }
     } else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!(ForgetResponse {
             status:"not_found".into(), record_id: rb.record_id
-        })));
+        }))).into_response();
     }
 
-    // Fix #4: owner check done above via get() + record.owner != owner comparison.
-    // revoke() is called only after ownership is verified — no TOCTOU in practice
-    // because SQLite serializes writes. If revoke_owned() is added to storage later,
-    // prefer that for defence-in-depth.
-    if !state.storage.revoke(&rid).await {
+    if !storage.revoke(&rid).await {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!(ForgetResponse {
             status:"not_found".into(), record_id: rb.record_id
-        })));
+        }))).into_response();
     }
 
-    state.vector_index.remove(&rid);
-    state.storage.fts_remove_record(&rid).await;
+    vi.remove(&rid);
+    storage.fts_remove_record(&rid).await;
 
-    { let oh = auth.owner_hex(); let mut c = state.identity_cache.write();
-      if let Some(e) = c.get_mut(&oh) { e.retain(|r| r.record_id != rid); } }
+    {
+        let oh = auth.owner_hex();
+        let mut c = state.identity_cache.write();
+        if let Some(e) = c.get_mut(&oh) { e.retain(|r| r.record_id != rid); }
+    }
 
     (StatusCode::OK, Json(serde_json::json!(ForgetResponse {
         status:"revoked".into(), record_id: rb.record_id
-    })))
+    }))).into_response()
 }
 
 // ============================================
-// GET /api/mpi/status (v2.5.0 extended)
+// GET /api/mpi/status
 // ============================================
 
 #[derive(Debug, Clone, Serialize)]
@@ -371,49 +391,62 @@ pub async fn mpi_status(
     let owner = auth.owner_bytes();
     let owner_hex = auth.owner_hex();
 
-    let stats = state.storage.stats().await;
-    let height = state.storage.last_block_height().await;
-    let wv = { state.user_weights.read().get(&owner_hex).map(|w| w.version).unwrap_or(0) };
-    let fb = state.storage.get_recent_feedback(500).await;
-    let tp = fb.iter().filter(|(s,_)| *s == 1).count() as u64;
-    let tn = fb.iter().filter(|(s,_)| *s == -1).count() as u64;
-    let mr = if !fb.is_empty() { Some(tp as f32 / fb.len() as f32) } else { None };
-    let ms = if !fb.is_empty() { Some(fb.len()) } else { None };
-    let bl = state.mvf_baseline.read().clone();
-    let lift = match (&bl, mr) {
-        (Some(b), Some(m)) if b.positive_rate > 0.0 => Some((m - b.positive_rate) / b.positive_rate),
+    // SaaS fix: use Extension storage for all per-user queries.
+    let storage = req.extensions().get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set").clone();
+    let vi = req.extensions().get::<Arc<VectorIndex>>()
+        .expect("[BUG] VectorIndex extension not set").clone();
+
+    let stats  = storage.stats().await;
+    let height = storage.last_block_height().await;
+    let wv     = { state.user_weights.read().get(&owner_hex).map(|w| w.version).unwrap_or(0) };
+    let fb     = storage.get_recent_feedback(500).await;
+    let tp     = fb.iter().filter(|(s,_)| *s == 1).count() as u64;
+    let tn     = fb.iter().filter(|(s,_)| *s == -1).count() as u64;
+    let mr     = if !fb.is_empty() { Some(tp as f32 / fb.len() as f32) } else { None };
+    let ms     = if !fb.is_empty() { Some(fb.len()) } else { None };
+    let bl     = state.mvf_baseline.read().clone();
+    let lift   = match (&bl, mr) {
+        (Some(b), Some(m)) if b.positive_rate > 0.0 =>
+            Some((m - b.positive_rate) / b.positive_rate),
         _ => None,
     };
 
     let gs = if state.graph_enabled || state.ner_engine.is_some() {
-        Some(state.storage.graph_stats(&owner).await)
+        Some(storage.graph_stats(&owner).await)
     } else { None };
 
     let supernode_status = {
         let now = now_secs() as i64;
         let today_start = now - (now % 86400);
 
-        let counts = state.storage.count_tasks_by_status().await;
+        let counts = storage.count_tasks_by_status().await;
         let queue = QueueStatus {
             pending:    *counts.get("pending").unwrap_or(&0),
             processing: *counts.get("processing").unwrap_or(&0),
             failed:     *counts.get("failed").unwrap_or(&0),
         };
 
-        let today_stats = state.storage.get_usage_stats(today_start, now).await;
+        let today_stats = storage.get_usage_stats(today_start, now).await;
         let cost_today: f64 = today_stats.by_provider.iter().map(|p| {
             LlmRouter::estimate_cost(
                 &p.provider, p.input_tokens as u32, p.output_tokens as u32, 0,
             )
         }).sum();
 
-        let tasks_today = {
-            let conn = state.storage.conn_lock().await;
+        // tasks_completed today: only run conn_lock in Local mode to avoid
+        // blocking the async runtime on a per-request conn in SaaS mode.
+        // In SaaS mode we fall back to 0 — the SuperNode worker is shared.
+        let tasks_today: i64 = if state.mode == Mode::Local {
+            let conn = storage.conn_lock().await;
             conn.query_row(
-                "SELECT COUNT(*) FROM cognitive_tasks WHERE status='completed' AND completed_at >= ?1",
+                "SELECT COUNT(*) FROM cognitive_tasks \
+                 WHERE status='completed' AND completed_at >= ?1",
                 rusqlite::params![today_start],
                 |r| r.get::<_, i64>(0),
             ).unwrap_or(0)
+        } else {
+            0
         };
 
         let provider_names = state.llm_router.as_ref()
@@ -434,12 +467,17 @@ pub async fn mpi_status(
         }
     };
 
+    let mode_str = match state.mode {
+        Mode::Local => "local",
+        Mode::Saas  => "saas",
+    };
+
     (StatusCode::OK, Json(serde_json::json!(MpiStatusResponse {
         memchain_enabled: true,
-        mode: "local".into(),
+        mode: mode_str.into(),
         stats,
-        vector_index_total: state.vector_index.total_vectors(),
-        vector_partitions: state.vector_index.partition_count(),
+        vector_index_total: vi.total_vectors(),
+        vector_partitions: vi.partition_count(),
         last_block_height: height,
         index_ready: state.index_ready.load(std::sync::atomic::Ordering::Relaxed),
         embed_ready: state.embed_engine.is_some(),
@@ -474,26 +512,33 @@ pub struct RecordDetailResponse {
 }
 
 pub async fn mpi_get_record(
-    State(state): State<Arc<MpiState>>,
+    State(_state): State<Arc<MpiState>>,
     Path(record_id_hex): Path<String>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
 
+    let storage = req.extensions().get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set").clone();
+
     let rid = match hex::decode(&record_id_hex) {
         Ok(b) if b.len() == 32 => { let mut a = [0u8; 32]; a.copy_from_slice(&b); a }
-        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid record_id"}))).into_response(),
+        _ => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"invalid record_id"}))).into_response(),
     };
-    let record = match state.storage.get(&rid).await {
+
+    let record = match storage.get(&rid).await {
         Some(r) => r,
-        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"record not found"}))).into_response(),
+        None => return (StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"record not found"}))).into_response(),
     };
     if record.owner != owner {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"access denied"}))).into_response();
+        return (StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"access denied"}))).into_response();
     }
 
-    let em = state.storage.get_embedding_model(&rid).await.unwrap_or_default();
+    let em = storage.get_embedding_model(&rid).await.unwrap_or_default();
     let content = String::from_utf8_lossy(&record.encrypted_content).to_string();
 
     (StatusCode::OK, Json(serde_json::json!(RecordDetailResponse {
@@ -519,8 +564,13 @@ pub async fn mpi_records_overview(
 ) -> impl IntoResponse {
     let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
-    let ov = state.storage.get_overview(&owner, 20).await;
+
+    let storage = req.extensions().get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set").clone();
+
+    let ov = storage.get_overview(&owner, 20).await;
     let total: u64 = ov.by_layer.values().sum();
+
     (StatusCode::OK, Json(serde_json::json!({
         "total": total,
         "by_layer": ov.by_layer,
@@ -549,21 +599,26 @@ pub async fn mpi_embed(
     let _auth = extract_owner(&req);
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"failed to read body"}))),
+        Err(_) => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"failed to read body"}))).into_response(),
     };
     let rb: EmbedRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("invalid JSON: {}", e)}))),
+        Err(e) => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("invalid JSON: {}", e)}))).into_response(),
     };
     let engine = match &state.embed_engine {
         Some(e) => e,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"local embed engine not available"}))),
+        None => return (StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"local embed engine not available"}))).into_response(),
     };
     if rb.texts.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"texts array is empty"})));
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"texts array is empty"}))).into_response();
     }
     if rb.texts.len() > 100 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"batch too large","max":100})));
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"batch too large","max":100}))).into_response();
     }
 
     let refs: Vec<&str> = rb.texts.iter().map(|s| s.as_str()).collect();
@@ -573,13 +628,12 @@ pub async fn mpi_embed(
             debug!(batch = embs.len(), dim = dim, "[MPI_EMBED] Generated");
             (StatusCode::OK, Json(serde_json::json!({
                 "embeddings": embs, "model": "minilm-l6-v2", "dim": dim
-            })))
+            }))).into_response()
         }
         Err(e) => {
             warn!(error = %e, "[MPI_EMBED] Inference failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": format!("embed failed: {}", e)
-            })))
+            (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("embed failed: {}", e)}))).into_response()
         }
     }
 }
@@ -588,10 +642,6 @@ pub async fn mpi_embed(
 // v2.5.2+Provenance: RecordProvenance type
 // ============================================
 
-/// Full provenance chain for a memory record.
-/// Returned by `GET /api/mpi/record/:id/provenance`.
-///
-/// v2.5.2+Provenance
 #[derive(Debug, Clone, Serialize)]
 pub struct RecordProvenance {
     pub record_id: String,
@@ -609,10 +659,6 @@ pub struct RecordProvenance {
 // PATCH /api/mpi/record/:record_id
 // ============================================
 
-/// PATCH request body — all fields optional (partial update).
-/// Providing `content` triggers embedding invalidation (async re-embed by Miner).
-///
-/// v2.5.2+Provenance
 #[derive(Debug, Deserialize)]
 pub struct PatchRecordRequest {
     pub content: Option<String>,
@@ -621,36 +667,34 @@ pub struct PatchRecordRequest {
     pub source_ai: Option<String>,
 }
 
-/// `PATCH /api/mpi/record/:record_id` — Partial in-place update.
-///
-/// v2.5.2+Provenance
 pub async fn mpi_patch_record(
     State(state): State<Arc<MpiState>>,
     Path(record_id_hex): Path<String>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    // Extract auth BEFORE into_body() — into_body() moves req.
     let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
 
+    let storage = req.extensions().get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set").clone();
+    let vi = req.extensions().get::<Arc<VectorIndex>>()
+        .expect("[BUG] VectorIndex extension not set").clone();
+
     let rid: [u8; 32] = match hex::decode(&record_id_hex) {
         Ok(b) if b.len() == 32 => { let mut a = [0u8; 32]; a.copy_from_slice(&b); a }
-        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "invalid record_id format"
-        }))).into_response(),
+        _ => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"invalid record_id format"}))).into_response(),
     };
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), 512 * 1024).await {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "failed to read body"
-        }))).into_response(),
+        Err(_) => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"failed to read body"}))).into_response(),
     };
     let patch: PatchRecordRequest = match serde_json::from_slice(&body_bytes) {
         Ok(p) => p,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("invalid JSON: {}", e)
-        }))).into_response(),
+        Err(e) => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("invalid JSON: {}", e)}))).into_response(),
     };
 
     if patch.content.is_none() && patch.topic_tags.is_none()
@@ -661,7 +705,7 @@ pub async fn mpi_patch_record(
         }))).into_response();
     }
 
-    let new_layer: Option<aeronyx_core::ledger::MemoryLayer> = match &patch.layer {
+    let new_layer: Option<MemoryLayer> = match &patch.layer {
         Some(l) => match parse_layer(l) {
             Some(ml) => Some(ml),
             None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
@@ -671,36 +715,33 @@ pub async fn mpi_patch_record(
         None => None,
     };
 
-    match state.storage.update_record_content(
+    match storage.update_record_content(
         &rid, &owner,
         patch.content.as_deref(), patch.topic_tags.as_deref(),
         new_layer, patch.source_ai.as_deref(),
     ).await {
         Ok(true) => {
             let content_changed = patch.content.is_some();
-            // Fix #9: re-index FTS when content OR tags change
-            let needs_fts_update = content_changed || patch.topic_tags.is_some();
+            let needs_fts = content_changed || patch.topic_tags.is_some();
 
-            if needs_fts_update {
+            if needs_fts {
                 let index_content: Option<String> = if let Some(ref c) = patch.content {
                     Some(c.clone())
                 } else {
-                    state.storage.get(&rid).await
+                    storage.get(&rid).await
                         .map(|r| String::from_utf8_lossy(&r.encrypted_content).into_owned())
                 };
 
-                if let Some(ref content_str) = index_content {
+                if let Some(ref cs) = index_content {
                     let tags_str = patch.topic_tags.as_ref()
                         .and_then(|t| serde_json::to_string(t).ok())
                         .unwrap_or_default();
-                    state.storage.fts_remove_record(&rid).await;
-                    state.storage.fts_index_record(&rid, &owner, content_str, &tags_str).await;
+                    storage.fts_remove_record(&rid).await;
+                    storage.fts_index_record(&rid, &owner, cs, &tags_str).await;
                 }
             }
 
-            if content_changed {
-                state.vector_index.remove(&rid);
-            }
+            if content_changed { vi.remove(&rid); }
 
             {
                 let oh = auth.owner_hex();
@@ -714,12 +755,10 @@ pub async fn mpi_patch_record(
                 "record_id": record_id_hex,
                 "status": "updated",
                 "embedding_invalidated": content_changed,
-                "fts_updated": needs_fts_update,
+                "fts_updated": needs_fts,
                 "note": if content_changed {
                     "Embedding cleared. Miner will re-embed on next cycle (~60s)."
-                } else {
-                    "Update applied."
-                }
+                } else { "Update applied." }
             }))).into_response()
         }
         Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({
@@ -735,29 +774,27 @@ pub async fn mpi_patch_record(
 // GET /api/mpi/record/:record_id/provenance
 // ============================================
 
-/// `GET /api/mpi/record/:record_id/provenance` — Memory provenance chain.
-///
-/// v2.5.2+Provenance
 pub async fn mpi_record_provenance(
-    State(state): State<Arc<MpiState>>,
+    State(_state): State<Arc<MpiState>>,
     Path(record_id_hex): Path<String>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
 
+    let storage = req.extensions().get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set").clone();
+
     let rid: [u8; 32] = match hex::decode(&record_id_hex) {
         Ok(b) if b.len() == 32 => { let mut a = [0u8; 32]; a.copy_from_slice(&b); a }
-        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "invalid record_id format"
-        }))).into_response(),
+        _ => return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"invalid record_id format"}))).into_response(),
     };
 
-    match state.storage.get_record_provenance(&rid, &owner).await {
+    match storage.get_record_provenance(&rid, &owner).await {
         Some(prov) => (StatusCode::OK, Json(serde_json::json!(prov))).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": "record not found or access denied"
-        }))).into_response(),
+        None => (StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"record not found or access denied"}))).into_response(),
     }
 }
 
@@ -768,8 +805,6 @@ pub async fn mpi_record_provenance(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── RecordProvenance serialization ──
 
     #[test]
     fn test_provenance_null_fields_serialize_as_null() {
@@ -793,7 +828,7 @@ mod tests {
         let prov = RecordProvenance {
             record_id: "deadbeef".into(),
             session_id: Some("sess-abc".into()),
-            session_title: Some("Debugging session".into()),
+            session_title: Some("Debug session".into()),
             session_started_at: Some(1_700_000_100),
             turn_index: Some(3),
             layer: "knowledge".into(),
@@ -807,29 +842,24 @@ mod tests {
         assert_eq!(json["topic_tags"][1], "preference");
     }
 
-    // ── PatchRecordRequest validation ──
-
     #[test]
-    fn test_patch_request_all_none_should_be_rejected() {
-        let patch = PatchRecordRequest { content: None, topic_tags: None, layer: None, source_ai: None };
-        let all_none = patch.content.is_none() && patch.topic_tags.is_none()
-            && patch.layer.is_none() && patch.source_ai.is_none();
-        assert!(all_none);
+    fn test_patch_all_none_should_be_rejected() {
+        let p = PatchRecordRequest { content: None, topic_tags: None, layer: None, source_ai: None };
+        assert!(p.content.is_none() && p.topic_tags.is_none()
+            && p.layer.is_none() && p.source_ai.is_none());
     }
 
     #[test]
-    fn test_patch_request_content_only_is_valid() {
-        let patch = PatchRecordRequest {
-            content: Some("corrected content".into()),
+    fn test_patch_content_only_is_valid() {
+        let p = PatchRecordRequest {
+            content: Some("corrected".into()),
             topic_tags: None, layer: None, source_ai: None,
         };
-        assert!(patch.content.is_some());
+        assert!(p.content.is_some());
     }
 
-    // ── record_id hex ──
-
     #[test]
-    fn test_record_id_hex_roundtrip_32_bytes() {
+    fn test_record_id_hex_roundtrip() {
         let rid: [u8; 32] = [0xab; 32];
         let hex_str = hex::encode(rid);
         assert_eq!(hex_str.len(), 64);
@@ -843,51 +873,35 @@ mod tests {
     #[test]
     fn test_record_id_hex_wrong_length_rejected() {
         let short = hex::encode([0u8; 31]);
-        let decoded = hex::decode(&short).unwrap();
-        assert_ne!(decoded.len(), 32);
+        assert_ne!(hex::decode(&short).unwrap().len(), 32);
     }
-
-    // ── default_recall_mode ──
 
     #[test]
     fn test_default_recall_mode_is_full() {
         assert_eq!(default_recall_mode(), "full");
     }
 
-    // ── v2.5.3+Isolation: context field deserialization ──
-
     #[test]
-    fn test_recall_request_context_defaults_to_none() {
+    fn test_recall_context_defaults_to_none() {
         let json = r#"{"query":"test"}"#;
         let req: RecallRequest = serde_json::from_str(json).unwrap();
         assert!(req.context.is_none());
     }
 
     #[test]
-    fn test_recall_request_context_work() {
-        let json = r#"{"query":"test","context":"work"}"#;
-        let req: RecallRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.context.as_deref(), Some("work"));
-    }
-
-    #[test]
-    fn test_recall_request_context_all_is_no_filter() {
+    fn test_recall_context_all_is_no_filter() {
         let json = r#"{"query":"test","context":"all"}"#;
         let req: RecallRequest = serde_json::from_str(json).unwrap();
-        // "all" should be treated as no-filter in recall_handler
-        assert_eq!(req.context.as_deref(), Some("all"));
-        // Verify the no-filter logic matches
         let is_no_filter = matches!(req.context.as_deref(), None | Some("all") | Some(""));
         assert!(is_no_filter);
     }
 
     #[test]
-    fn test_recall_request_context_custom_project_id() {
-        let json = r#"{"query":"test","context":"project_alpha_001"}"#;
+    fn test_recall_context_custom_is_project_id() {
+        let json = r#"{"query":"test","context":"project_alpha"}"#;
         let req: RecallRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.context.as_deref(), Some("project_alpha_001"));
-        // Non-standard context values are treated as literal project_id
         let is_no_filter = matches!(req.context.as_deref(), None | Some("all") | Some(""));
         assert!(!is_no_filter);
+        assert_eq!(req.context.as_deref(), Some("project_alpha"));
     }
 }
