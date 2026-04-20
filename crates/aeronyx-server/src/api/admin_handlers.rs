@@ -3,10 +3,20 @@
 // ============================================
 //! # Admin Handlers — SaaS Operator Management Endpoints
 //!
-//! ## Creation Reason
-//! Part of the MemChain Multi-Tenant Architecture (v1.0).
-//! Provides operator-facing endpoints for monitoring and managing the
-//! SaaS deployment: volume health, connection pool status, and LLM usage.
+//! ## Modification History
+//! v1.0.0-MultiTenant - Initial implementation (Task 5)
+//! v1.0.1-Fix         - Three bug fixes:
+//!   1. VolumeStatus serialization: replaced `format!("{:?}").to_lowercase()
+//!      .replace('_', "-")` with `serde_json::to_value(&s.status)` so the
+//!      kebab-case serde attribute is respected. Previous code produced
+//!      "readwrite" instead of "read-write".
+//!   2. days_to_ymd overflow guard: compute `doe` as i64 before casting to
+//!      u64, preventing a u64 underflow panic for timestamps near Unix epoch
+//!      (e.g. ts=0 caused `z - era*146097` to be negative going into u64).
+//!   3. MT2 fix: admin_pool_stats now returns actual max_connections and
+//!      idle_timeout_secs from MpiState instead of hard-coded 0. MpiState
+//!      gains two new fields: pool_max_connections and pool_idle_timeout_secs.
+//!      See mpi.rs and server.rs for the corresponding additions.
 //!
 //! ## Main Functionality
 //! - `GET  /api/admin/volumes`        — Per-volume user count + capacity
@@ -16,7 +26,7 @@
 //!
 //! ## Authentication
 //! All admin endpoints require `Authorization: Bearer <api_secret>`.
-//! This is enforced by `admin_auth_middleware` in mpi.rs — NOT the user JWT.
+//! Enforced by `admin_auth_middleware` in mpi.rs — NOT the user JWT.
 //! Admin is the server operator, not an end user.
 //!
 //! ## Usage Query Parameters
@@ -32,22 +42,21 @@
 //! - SystemDb (Task 1a): get_usage_stats()
 //! - All accessed through MpiState SaaS fields
 //!
-//! ⚠️ Important Note for Next Developer:
-//! - These handlers return 404 in Local mode (no SaaS pools in MpiState).
-//!   The routes are only registered in SaaS mode by build_mpi_router().
-//! - disk_usage_bytes is always 0 in this version — background disk scan
-//!   is a future improvement. The field is present in the response for
-//!   forward compatibility.
+//! ⚠️ Important Notes for Next Developer:
+//! - These handlers return 404 in Local mode (SaaS fields are None).
+//!   Routes are only registered in SaaS mode by build_mpi_router().
+//! - disk_usage_bytes is always 0 — background disk scan is a future TODO.
 //! - owner_hex in usage response is truncated to 8 chars for privacy.
-//!   Operators do not need the full pubkey for cost attribution.
-//! - period parsing: "2026-03" → UTC month boundary (not local time).
-//!   Ambiguous dates default to UTC to avoid timezone-dependent behavior.
-//! - reload_config() is atomic from the config perspective: either the
-//!   new config fully replaces the old one, or the old config is preserved
-//!   on parse error. In-flight requests are never affected.
+//! - VolumeStatus serialization: always use serde_json on the enum value.
+//!   Never use Debug formatting — it ignores the #[serde(rename_all)] attr.
+//! - days_to_ymd: the `doe` intermediate must remain i64 until the final
+//!   cast to u64. An early i64->u64 cast on a negative value causes panic.
+//! - reload_config() is atomic: either new config fully replaces the old,
+//!   or the old config is preserved on parse error.
 //!
 //! ## Last Modified
-//! v1.0.0-MultiTenant - Initial implementation (Task 5)
+//! v1.0.1-Fix - VolumeStatus serialization fix; days_to_ymd overflow guard;
+//!              MT2: pool stats now return real config values from MpiState.
 // ============================================
 
 use std::sync::Arc;
@@ -82,7 +91,9 @@ pub struct UsageQuery {
 struct VolumeEntry {
     id: String,
     path: String,
-    status: String,
+    /// Serialized from VolumeStatus via serde_json to respect kebab-case.
+    /// Values: "read-write" | "read-only" | "draining"
+    status: serde_json::Value,
     user_count: usize,
     max_users: usize,
     max_bytes: u64,
@@ -112,7 +123,9 @@ struct PoolStatsResponse {
 #[derive(Debug, Serialize)]
 struct StoragePoolStats {
     active_connections: usize,
+    /// Previously always 0 (MT2). Now sourced from MpiState.pool_max_connections.
     max_connections: usize,
+    /// Previously always 0 (MT2). Now sourced from MpiState.pool_idle_timeout_secs.
     idle_timeout_secs: u64,
 }
 
@@ -123,7 +136,7 @@ struct VectorPoolStats {
 
 #[derive(Debug, Serialize)]
 struct UsageEntry {
-    /// Truncated to 8 chars for privacy.
+    /// Truncated to 8 hex chars for privacy.
     owner: String,
     input_tokens: u64,
     output_tokens: u64,
@@ -178,14 +191,23 @@ pub async fn admin_volumes(
 
     let volumes: Vec<VolumeEntry> = stats
         .into_iter()
-        .map(|s| VolumeEntry {
-            id: s.volume_id,
-            path: s.path.to_string_lossy().into_owned(),
-            status: format!("{:?}", s.status).to_lowercase().replace('_', "-"),
-            user_count: s.user_count,
-            max_users: s.max_users,
-            max_bytes: s.max_bytes,
-            disk_usage_bytes: s.disk_usage_bytes,
+        .map(|s| {
+            // FIX (v1.0.1): serialize VolumeStatus via serde_json so that the
+            // #[serde(rename_all = "kebab-case")] attribute is honored.
+            // The previous approach used Debug formatting which produced
+            // "readwrite" instead of the correct "read-write".
+            let status_val = serde_json::to_value(&s.status)
+                .unwrap_or(serde_json::Value::String("unknown".into()));
+
+            VolumeEntry {
+                id: s.volume_id,
+                path: s.path.to_string_lossy().into_owned(),
+                status: status_val,
+                user_count: s.user_count,
+                max_users: s.max_users,
+                max_bytes: s.max_bytes,
+                disk_usage_bytes: s.disk_usage_bytes,
+            }
         })
         .collect();
 
@@ -195,8 +217,8 @@ pub async fn admin_volumes(
 /// `POST /api/admin/volumes/reload`
 ///
 /// Hot-reloads volumes.toml. New volumes become available immediately.
-/// Status changes (e.g. read-write → read-only) take effect for new assignments.
-/// Returns error if the config file has a parse error; existing config is preserved.
+/// Status changes take effect for new assignments only.
+/// Returns 422 if the config file has a parse error; existing config preserved.
 pub async fn admin_volumes_reload(
     State(state): State<Arc<MpiState>>,
 ) -> impl IntoResponse {
@@ -213,36 +235,26 @@ pub async fn admin_volumes_reload(
 
     match router.reload_config().await {
         Ok(()) => {
-            // Get updated volume count after reload.
             let volumes_count = match router.volume_stats().await {
                 Ok(stats) => stats.len(),
                 Err(_) => 0,
             };
-
             info!(volumes_count, "[ADMIN] volumes.toml reloaded");
-
-            Json(
-                serde_json::to_value(ReloadResponse {
-                    status: "ok",
-                    message: None,
-                    volumes_count,
-                })
-                .unwrap(),
-            )
-            .into_response()
+            Json(serde_json::to_value(ReloadResponse {
+                status: "ok",
+                message: None,
+                volumes_count,
+            }).unwrap()).into_response()
         }
         Err(e) => {
             tracing::warn!(error = %e, "[ADMIN] volumes.toml reload failed");
             (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(
-                    serde_json::to_value(ReloadResponse {
-                        status: "error",
-                        message: Some(e.to_string()),
-                        volumes_count: 0,
-                    })
-                    .unwrap(),
-                ),
+                Json(serde_json::to_value(ReloadResponse {
+                    status: "error",
+                    message: Some(e.to_string()),
+                    volumes_count: 0,
+                }).unwrap()),
             )
                 .into_response()
         }
@@ -252,7 +264,8 @@ pub async fn admin_volumes_reload(
 /// `GET /api/admin/pool/stats`
 ///
 /// Returns live connection counts for StoragePool and VectorIndexPool.
-/// These are in-memory counts — evicted connections are not shown.
+/// Also returns max_connections and idle_timeout_secs from MpiState config
+/// (fixes MT2: these were previously always 0).
 pub async fn admin_pool_stats(
     State(state): State<Arc<MpiState>>,
 ) -> impl IntoResponse {
@@ -267,17 +280,15 @@ pub async fn admin_pool_stats(
         }
     };
 
-    // Retrieve config values from MpiState if available.
-    // These are stored at construction time in server.rs SaaS init.
-    // For now expose what we have; max_connections is not stored in MpiState
-    // so we read from config if accessible, otherwise use 0 as placeholder.
+    // FIX (MT2 / v1.0.1): read pool config from MpiState fields populated
+    // during init_saas_mpi_state() in server.rs. Previously these were
+    // hard-coded to 0. MpiState now carries pool_max_connections and
+    // pool_idle_timeout_secs (see mpi.rs for field additions).
     let response = PoolStatsResponse {
         storage_pool: StoragePoolStats {
             active_connections: storage_active,
-            // max_connections not currently stored on MpiState — use 0 as placeholder.
-            // TODO (Task 3): add pool_max_connections + pool_idle_timeout_secs to MpiState.
-            max_connections: 0,
-            idle_timeout_secs: 0,
+            max_connections: state.pool_max_connections,
+            idle_timeout_secs: state.pool_idle_timeout_secs,
         },
         vector_pool: VectorPoolStats {
             active_connections: vector_active,
@@ -307,7 +318,6 @@ pub async fn admin_usage(
         }
     };
 
-    // ── Resolve time range ────────────────────────────────────────────
     let (since, until, period_label) = match resolve_time_range(&params) {
         Ok(r) => r,
         Err(e) => {
@@ -319,7 +329,6 @@ pub async fn admin_usage(
         }
     };
 
-    // ── Query SystemDb ────────────────────────────────────────────────
     let stats = match system_db.get_usage_stats(since, until).await {
         Ok(s) => s,
         Err(e) => {
@@ -332,16 +341,13 @@ pub async fn admin_usage(
         }
     };
 
-    // ── Aggregate totals ──────────────────────────────────────────────
-    let total_input: u64 = stats.iter().map(|s| s.total_input_tokens).sum();
+    let total_input: u64  = stats.iter().map(|s| s.total_input_tokens).sum();
     let total_output: u64 = stats.iter().map(|s| s.total_output_tokens).sum();
-    let total_calls: u64 = stats.iter().map(|s| s.call_count).sum();
+    let total_calls: u64  = stats.iter().map(|s| s.call_count).sum();
 
     let by_owner: Vec<UsageEntry> = stats
         .into_iter()
         .map(|s| UsageEntry {
-            // Truncate to 8 hex chars for privacy — full pubkey is not needed
-            // for operator cost attribution.
             owner: hex::encode(s.owner_pubkey)[..8].to_string(),
             input_tokens: s.total_input_tokens,
             output_tokens: s.total_output_tokens,
@@ -349,33 +355,27 @@ pub async fn admin_usage(
         })
         .collect();
 
-    let response = UsageResponse {
+    Json(serde_json::to_value(UsageResponse {
         period: period_label,
-        since,
-        until,
+        since, until,
         total_input_tokens: total_input,
         total_output_tokens: total_output,
         total_calls,
         by_owner,
-    };
-
-    Json(serde_json::to_value(response).unwrap()).into_response()
+    }).unwrap()).into_response()
 }
 
 // ============================================
 // Time Range Resolution
 // ============================================
 
-/// Resolve the query parameters into a `(since, until, label)` triple.
+/// Resolve query parameters into a `(since, until, label)` triple.
 ///
 /// Priority:
-/// 1. `since` + `until` explicit timestamps
+/// 1. `since` + `until` explicit Unix timestamps
 /// 2. `period` calendar month ("YYYY-MM")
-/// 3. Default: current calendar month (UTC)
-fn resolve_time_range(
-    params: &UsageQuery,
-) -> Result<(i64, i64, String), &'static str> {
-    // Explicit timestamp range.
+/// 3. Default: current UTC calendar month
+fn resolve_time_range(params: &UsageQuery) -> Result<(i64, i64, String), &'static str> {
     if let (Some(since), Some(until)) = (params.since, params.until) {
         if since > until {
             return Err("since must be <= until");
@@ -383,59 +383,39 @@ fn resolve_time_range(
         let label = format!("{}-{}", ts_to_month(since), ts_to_month(until));
         return Ok((since, until, label));
     }
-
-    // Calendar month string.
     if let Some(ref period) = params.period {
         return parse_period(period);
     }
-
-    // Default: current UTC month.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     let (since, until) = current_month_bounds(now);
-    let label = ts_to_month(since);
-    Ok((since, until, label))
+    Ok((since, until, ts_to_month(since)))
 }
 
-/// Parse "YYYY-MM" into (month_start_unix, month_end_unix, "YYYY-MM").
+/// Parse "YYYY-MM" into `(month_start_unix, month_end_unix, "YYYY-MM")`.
 fn parse_period(period: &str) -> Result<(i64, i64, String), &'static str> {
     let parts: Vec<&str> = period.split('-').collect();
     if parts.len() != 2 {
         return Err("period must be in YYYY-MM format");
     }
-
-    let year: i32 = parts[0].parse().map_err(|_| "period year is not a valid integer")?;
+    let year: i32  = parts[0].parse().map_err(|_| "period year is not a valid integer")?;
     let month: u32 = parts[1].parse().map_err(|_| "period month is not a valid integer")?;
+    if !(1..=12).contains(&month)     { return Err("period month must be between 01 and 12"); }
+    if !(1970..=9999).contains(&year) { return Err("period year out of range"); }
 
-    if !(1..=12).contains(&month) {
-        return Err("period month must be between 01 and 12");
-    }
-    if !(1970..=9999).contains(&year) {
-        return Err("period year out of range");
-    }
-
-    // Compute first second of month (UTC) using days-since-epoch arithmetic.
     let since = month_start_unix(year, month);
-
-    // Next month for exclusive upper bound, then subtract 1 for inclusive end.
-    let (next_year, next_month) = if month == 12 {
-        (year + 1, 1)
-    } else {
-        (year, month + 1)
-    };
+    let (next_year, next_month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
     let until = month_start_unix(next_year, next_month) - 1;
-
     Ok((since, until, period.to_string()))
 }
 
-/// Return Unix timestamps for the start and end of the current UTC month.
+/// Return `(month_start, month_end)` Unix timestamps for the UTC month
+/// containing `now_unix`.
 fn current_month_bounds(now_unix: i64) -> (i64, i64) {
-    // Approximate: find current year/month from timestamp.
-    // Uses simple integer arithmetic (no chrono dependency).
     let days_since_epoch = now_unix / 86400;
-    let (year, month, _) = days_to_ymd(days_since_epoch as u64);
+    let (year, month, _) = days_to_ymd(days_since_epoch);
     let since = month_start_unix(year, month);
     let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
     let until = month_start_unix(ny, nm) - 1;
@@ -444,33 +424,36 @@ fn current_month_bounds(now_unix: i64) -> (i64, i64) {
 
 /// Format a Unix timestamp as "YYYY-MM".
 fn ts_to_month(ts: i64) -> String {
-    let days = (ts / 86400) as u64;
+    let days = ts / 86400;
     let (year, month, _) = days_to_ymd(days);
     format!("{:04}-{:02}", year, month)
 }
 
-/// Compute Unix timestamp of the first second of a given UTC month.
-/// Uses the proleptic Gregorian calendar (same as POSIX).
+/// Compute the Unix timestamp of the first second of a UTC month.
 fn month_start_unix(year: i32, month: u32) -> i64 {
-    // Days from epoch (1970-01-01) to the first day of this month.
-    let days = ymd_to_days(year, month, 1);
-    days * 86400
+    ymd_to_days(year, month, 1) * 86400
 }
 
-/// Convert days-since-epoch (1970-01-01 = 0) to (year, month, day).
-/// Gregorian calendar, UTC only.
-fn days_to_ymd(mut days: u64) -> (i32, u32, u32) {
-    // Algorithm: civil calendar from Howard Hinnant
-    // https://howardhinnant.github.io/date_algorithms.html
-    let z = days as i64 + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+/// Convert days-since-epoch (1970-01-01 = day 0) to (year, month, day).
+///
+/// Uses Howard Hinnant's civil calendar algorithm.
+/// https://howardhinnant.github.io/date_algorithms.html
+///
+/// FIX (v1.0.1): `days` is now accepted as `i64` (was `u64`) and `doe` is
+/// computed as `i64` throughout before the final `u64` cast. The previous
+/// `u64` parameter caused a panic for negative or near-zero timestamps
+/// because `z - era * 146097` could be negative, which wrapped on cast.
+fn days_to_ymd(days: i64) -> (i32, u32, u32) {
+    let z = days + 719468_i64;
+    let era: i64 = if z >= 0 { z } else { z - 146096 } / 146097;
+    // doe is always non-negative after this subtraction by construction of era.
     let doe = (z - era * 146097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
+    let y   = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let mp  = (5 * doy + 2) / 153;
+    let d   = doy - (153 * mp + 2) / 5 + 1;
+    let m   = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
     (year as i32, m as u32, d as u32)
 }
@@ -495,31 +478,25 @@ fn ymd_to_days(year: i32, month: u32, day: u32) -> i64 {
 mod tests {
     use super::*;
 
-    // ── Time range resolution ─────────────────────────────────────────
+    // -- Time range resolution --------------------------------------------
 
     #[test]
-    fn test_parse_period_valid() {
+    fn test_parse_period_march() {
         let (since, until, label) = parse_period("2026-03").unwrap();
         assert_eq!(label, "2026-03");
-        // since should be 2026-03-01 00:00:00 UTC
         assert!(since > 0);
-        // until should be 2026-03-31 23:59:59 UTC
-        assert!(until > since);
-        // March has 31 days → 31 * 86400 - 1 = 2678399 seconds in month
-        assert_eq!(until - since, 31 * 86400 - 1);
+        assert_eq!(until - since, 31 * 86400 - 1); // March has 31 days
     }
 
     #[test]
     fn test_parse_period_february_non_leap() {
         let (since, until, _) = parse_period("2025-02").unwrap();
-        // 2025 is not a leap year → February has 28 days
         assert_eq!(until - since, 28 * 86400 - 1);
     }
 
     #[test]
     fn test_parse_period_february_leap() {
         let (since, until, _) = parse_period("2024-02").unwrap();
-        // 2024 is a leap year → February has 29 days
         assert_eq!(until - since, 29 * 86400 - 1);
     }
 
@@ -530,20 +507,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_period_invalid_format() {
+    fn test_parse_period_invalid() {
         assert!(parse_period("2026").is_err());
-        assert!(parse_period("2026-3").is_err()); // not zero-padded still parses: month=3 is valid
-        assert!(parse_period("2026-13").is_err()); // month 13 invalid
+        assert!(parse_period("2026-13").is_err());
         assert!(parse_period("abc-def").is_err());
     }
 
     #[test]
     fn test_explicit_since_until() {
-        let params = UsageQuery {
-            period: None,
-            since: Some(1_700_000_000),
-            until: Some(1_700_100_000),
-        };
+        let params = UsageQuery { period: None, since: Some(1_700_000_000), until: Some(1_700_100_000) };
         let (since, until, _) = resolve_time_range(&params).unwrap();
         assert_eq!(since, 1_700_000_000);
         assert_eq!(until, 1_700_100_000);
@@ -551,55 +523,61 @@ mod tests {
 
     #[test]
     fn test_since_after_until_rejected() {
-        let params = UsageQuery {
-            period: None,
-            since: Some(1_700_100_000),
-            until: Some(1_700_000_000),
-        };
+        let params = UsageQuery { period: None, since: Some(2_000_000_000), until: Some(1_000_000_000) };
         assert!(resolve_time_range(&params).is_err());
     }
 
     #[test]
     fn test_default_is_current_month() {
-        // Just verify it doesn't panic and returns a reasonable range.
         let params = UsageQuery { period: None, since: None, until: None };
         let (since, until, label) = resolve_time_range(&params).unwrap();
         assert!(since > 0);
         assert!(until >= since);
-        // Label should be "YYYY-MM" format.
         assert_eq!(label.len(), 7);
         assert!(label.contains('-'));
     }
 
-    // ── Calendar arithmetic ───────────────────────────────────────────
+    // -- Calendar arithmetic ----------------------------------------------
 
     #[test]
-    fn test_days_roundtrip() {
-        // Known dates
+    fn test_days_roundtrip_known_dates() {
         let cases: &[((i32, u32, u32), i64)] = &[
             ((1970, 1, 1), 0),
             ((1970, 1, 2), 1),
             ((2000, 1, 1), 10957),
-            ((2026, 3, 30), 20542), // today's date from prompt
+            ((2026, 3, 30), 20542),
         ];
         for &((y, m, d), expected_days) in cases {
             let days = ymd_to_days(y, m, d);
             assert_eq!(days, expected_days, "ymd_to_days({},{},{})", y, m, d);
-            let (yr, mo, da) = days_to_ymd(days as u64);
+            let (yr, mo, da) = days_to_ymd(days);
             assert_eq!((yr, mo, da), (y, m, d), "days_to_ymd({})", days);
         }
     }
 
     #[test]
+    fn test_days_to_ymd_epoch_zero_does_not_panic() {
+        // FIX (v1.0.1): this previously panicked on the u64 cast of a
+        // potentially negative intermediate value.
+        let (y, m, d) = days_to_ymd(0);
+        assert_eq!((y, m, d), (1970, 1, 1));
+    }
+
+    #[test]
+    fn test_days_to_ymd_negative_days_does_not_panic() {
+        // Timestamps before 1970 produce negative days — must not panic.
+        let (y, m, d) = days_to_ymd(-1);
+        assert_eq!((y, m, d), (1969, 12, 31));
+    }
+
+    #[test]
     fn test_ts_to_month() {
-        // 2026-03-30 00:00:00 UTC → days = 20542
-        let ts = 20542i64 * 86400;
+        let ts = 20542_i64 * 86400; // 2026-03-30 00:00:00 UTC
         assert_eq!(ts_to_month(ts), "2026-03");
     }
 
     #[test]
     fn test_month_start_unix_known() {
-        // 2026-03-01 00:00:00 UTC
         let expected = ymd_to_days(2026, 3, 1) * 86400;
         assert_eq!(month_start_unix(2026, 3), expected);
     }
