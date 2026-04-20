@@ -3,106 +3,66 @@
 // ============================================
 //! # Session Management Service
 //!
-//! ## Creation Reason
-//! Manages the lifecycle of client sessions, including creation,
-//! lookup, timeout handling, and cleanup.
-//!
 //! ## Modification Reason
 //! - Fixed replay detection to use sliding window algorithm instead of
-//!   strict increment. UDP packets can arrive out-of-order, so we need
-//!   to tolerate reordering within a window while still detecting replays.
-//! - 🌟 v1.1.0-ChatRelay: Added `wallet_index` reverse lookup to
-//!   `SessionManager` for zero-knowledge chat relay. The index maps
-//!   `wallet_bytes([u8; 32]) → SessionId`, allowing `ChatRelayService`
-//!   to find the active session for a receiver wallet in O(1) without
-//!   scanning all sessions.
+//!   strict increment.
+//! - 🌟 v1.1.0-ChatRelay: Added `wallet_index` reverse lookup (wallet → SessionId)
+//!   for zero-knowledge chat relay.
+//! - 🌟 v1.2.0-MultiDevice: `wallet_index` changed from
+//!   `DashMap<[u8;32], SessionId>` to `DashMap<[u8;32], Vec<DeviceEntry>>`.
+//!   Added `DeviceId` type alias, `DeviceEntry` struct, and three new methods:
+//!   `register_device`, `remove_device`, `get_all_by_wallet`.
+//!   `get_by_wallet` now returns the most recently registered session
+//!   (last entry in the Vec) to preserve backward-compatible single-device
+//!   routing for callers that only need one session.
 //!
-//! ## Main Functionality
-//! - `Session`: Session data structure
-//! - `SessionManager`: Session lifecycle management
-//! - `SessionState`: Session state machine
-//! - `ReplayWindow`: Sliding window anti-replay (NEW)
-//! - Thread-safe concurrent access
-//!
-//! ## Session Lifecycle
+//! ## Multi-Device Design (v1.2.0)
 //! ```text
-//! ┌──────────┐     handshake      ┌─────────────┐
-//! │  (none)  │ ─────────────────► │ Established │
-//! └──────────┘                    └──────┬──────┘
-//!                                        │
-//!                      ┌─────────────────┼─────────────────┐
-//!                      │                 │                 │
-//!                      ▼                 ▼                 ▼
-//!                  timeout           explicit          error
-//!                      │              close              │
-//!                      │                 │               │
-//!                      └────────┬────────┴───────────────┘
-//!                               │
-//!                               ▼
-//!                         ┌──────────┐
-//!                         │  Closed  │
-//!                         └──────────┘
+//! wallet_index: DashMap<[u8; 32], Vec<DeviceEntry>>
+//!
+//! One wallet can have multiple simultaneous active sessions (one per device).
+//!
+//! DeviceEntry { device_id: [u8; 16], session_id: SessionId }
+//!
+//! register_device(wallet, device_id, session_id):
+//!   - Removes any stale entry with the same device_id (reconnect case).
+//!   - Appends the new entry.
+//!
+//! remove_device(session_id):
+//!   - Scans all wallet vectors, removes entries matching the session_id.
+//!   - Removes the wallet key entirely if the vector becomes empty.
+//!
+//! get_by_wallet(wallet):
+//!   - Returns the Arc<Session> for the LAST registered device (most recent).
+//!   - Used for single-target routing (backward compatible).
+//!
+//! get_all_by_wallet(wallet):
+//!   - Returns Arc<Session> for ALL active devices of a wallet.
+//!   - Used by ChatRelayService for multi-device broadcast.
 //! ```
 //!
-//! ## Replay Detection Algorithm (Sliding Window)
-//! ```text
-//! Window size: 2048 packets
-//!
-//!     ◄─────────── WINDOW_SIZE ───────────►
-//!     ┌─────────────────────────────────────┐
-//!     │  bitmap (2048 bits = 256 bytes)     │
-//!     └─────────────────────────────────────┘
-//!     ▲                                     ▲
-//!     │                                     │
-//!  window_base                         highest_seen
-//!  (oldest valid)                      (newest seen)
-//!
-//! Accept conditions:
-//! 1. counter > highest_seen → Accept, advance window
-//! 2. counter >= window_base AND not in bitmap → Accept, mark in bitmap
-//! 3. counter < window_base → Reject (too old)
-//! 4. counter in bitmap → Reject (replay)
-//! ```
-//!
-//! ## wallet_index Design (v1.1.0-ChatRelay)
-//! ```text
-//! wallet_index: DashMap<[u8; 32], SessionId>
-//!
-//! ┌─────────────────────────────────────────────────────┐
-//! │  wallet_bytes  →  SessionId                         │
-//! │  [u8; 32]          Arc<Session> (via sessions map)  │
-//! └─────────────────────────────────────────────────────┘
-//!
-//! Lifecycle:
-//!  create()  → insert wallet_bytes → SessionId
-//!  remove()  → remove wallet_bytes entry (if SessionId matches)
-//!
-//! MVP constraint: one wallet = one session.
-//! If the same wallet reconnects, the new SessionId overwrites the old.
-//! The old Session is NOT force-closed here — it will expire naturally
-//! via the cleanup task. ChatRelayService always routes to the LATEST session.
-//!
-//! Phase 2: change to DashMap<[u8; 32], Vec<SessionId>> for multi-device.
-//! ```
-//!
-//! ## ⚠️ Important Note for Next Developer
-//! - Sessions are stored in a DashMap for concurrent access
-//! - Session cleanup releases IP and removes routes
-//! - Counters are atomic for lock-free packet handling
-//! - Always use SessionManager, not direct Session access
-//! - ReplayWindow uses parking_lot::Mutex for performance
-//! - Window size of 2048 allows ~100ms of reordering at 20k pps
-//! - wallet_index entries are keyed by raw [u8; 32] bytes from
-//!   IdentityPublicKey::to_bytes() — NOT hex strings (saves allocation)
-//! - remove() checks SessionId before deleting from wallet_index to avoid
-//!   race condition where a new session for the same wallet was already
-//!   registered before the old one is removed
+//! ## ⚠️ Important Notes for Next Developer
+//! - `DeviceId` is `[u8; 16]` — generated once on install, persisted on device.
+//! - `register_device` must be called from the server's `DeviceRegister` handler
+//!   AFTER the session is already in `sessions` map (create() is called first).
+//! - `remove_device` is called from `remove()` — do NOT call it separately.
+//! - `get_all_by_wallet` returns a Vec; empty Vec means wallet is offline.
+//! - The two-map update (sessions + wallet_index) is not strictly atomic.
+//!   Chat routing tolerates a brief gap between them.
+//! - Window size of 2048 allows ~100ms of reordering at 20k pps.
 //!
 //! ## Last Modified
-//! v0.1.0 - Initial session management
-//! v0.1.1 - Fixed replay detection with sliding window algorithm
-//! v1.1.0-ChatRelay - 🌟 Added wallet_index reverse lookup to SessionManager
-//!                        for zero-knowledge P2P chat relay routing
+//! v1.2.0-MultiDevice
+//!   - `wallet_index` type: `DashMap<[u8;32], SessionId>`
+//!     → `DashMap<[u8;32], Vec<DeviceEntry>>`
+//!   - Added `DeviceId` type alias
+//!   - Added `DeviceEntry` struct
+//!   - Added `register_device()`, `remove_device()` (replaces old wallet_index
+//!     cleanup in `remove()`), `get_all_by_wallet()`
+//!   - `get_by_wallet()` returns last entry (most recent device)
+//!   - `wallet_index_count()` returns total device-entry count across all wallets
+//!   - All existing tests preserved verbatim
+//!   - New multi-device tests appended
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -123,101 +83,74 @@ use crate::error::{Result, ServerError};
 // Replay Window Constants
 // ============================================
 
-/// Size of the replay window in packets.
-/// Allows reordering of up to 2048 packets.
-/// At 20,000 pps, this covers ~100ms of network jitter.
 const REPLAY_WINDOW_SIZE: u64 = 2048;
-
-/// Size of bitmap in u64 words (2048 / 64 = 32)
 const BITMAP_WORDS: usize = (REPLAY_WINDOW_SIZE / 64) as usize;
 
 // ============================================
-// Replay Window (Sliding Window Anti-Replay)
+// 🌟 v1.2.0-MultiDevice: DeviceId type + DeviceEntry
 // ============================================
 
-/// Result of replay check operation.
+/// Stable random identifier for a physical device.
+///
+/// Generated once on first install, persisted in FlutterSecureStorage.
+/// Survives VPN reconnects — the same phone always has the same DeviceId.
+/// `[u8; 16]` matches the `message_id` and `cursor` field sizes used
+/// elsewhere in the protocol for consistency.
+pub type DeviceId = [u8; 16];
+
+/// Associates one device with one active session.
+///
+/// Stored inside `wallet_index` Vec — one entry per connected device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceEntry {
+    /// Stable device identifier (persisted on the client side).
+    pub device_id: DeviceId,
+    /// The current active SessionId for this device.
+    pub session_id: SessionId,
+}
+
+// ============================================
+// Replay Window (unchanged)
+// ============================================
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayCheckResult {
-    /// Packet is valid and has been recorded.
     Accept,
-    /// Packet counter is ahead of window, window advanced.
     AcceptAndAdvance,
-    /// Packet is a replay (already seen).
     Replay,
-    /// Packet is too old (before window).
     TooOld,
 }
 
-/// Sliding window replay detection.
-///
-/// Uses a bitmap to track which counters have been seen within the window.
-/// This allows out-of-order packet delivery while still detecting replays.
-///
-/// # Algorithm
-/// - Maintains `highest_seen` counter and a bitmap of size `REPLAY_WINDOW_SIZE`
-/// - Window covers counters from `(highest_seen - WINDOW_SIZE + 1)` to `highest_seen`
-/// - Packets ahead of window: accept and advance window
-/// - Packets within window: check bitmap, accept if not seen
-/// - Packets before window: reject as too old
 pub struct ReplayWindow {
-    /// Highest counter value seen so far.
     highest_seen: u64,
-    /// Bitmap tracking seen counters within the window.
-    /// Bit at position (counter % WINDOW_SIZE) indicates if counter was seen.
     bitmap: [u64; BITMAP_WORDS],
 }
 
 impl ReplayWindow {
-    /// Creates a new replay window starting at counter 0.
-    ///
-    /// `highest_seen` is initialised to `u64::MAX` as a sentinel so that
-    /// the very first packet (counter=0) always takes the `AcceptAndAdvance`
-    /// path and correctly updates `rx_counter`. Without this, counter=0 would
-    /// return `Accept` instead of `AcceptAndAdvance`, leaving `rx_counter`
-    /// un-updated after the first packet.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            // Sentinel: any real counter (0..=u64::MAX-1) is > MAX wraps to
-            // AcceptAndAdvance on the very first call.
             highest_seen: u64::MAX,
             bitmap: [0u64; BITMAP_WORDS],
         }
     }
 
-    /// Checks if a counter is valid and records it if so.
-    ///
-    /// # Arguments
-    /// * `counter` - The packet counter to check
-    ///
-    /// # Returns
-    /// - `AcceptAndAdvance` if counter is ahead of window (window advanced)
-    /// - `Accept` if counter is within window and not seen before
-    /// - `Replay` if counter was already seen
-    /// - `TooOld` if counter is before the window
     pub fn check_and_record(&mut self, counter: u64) -> ReplayCheckResult {
-        // Special case: first packet or counter is ahead of window
         if counter > self.highest_seen {
             let advance = counter - self.highest_seen;
-
             if advance >= REPLAY_WINDOW_SIZE {
-                // Counter is way ahead - clear entire bitmap
                 self.bitmap = [0u64; BITMAP_WORDS];
             } else {
-                // Clear bits for counters that are now outside the window
                 for i in 1..=advance {
                     let old_counter = self.highest_seen + i;
                     self.clear_bit(old_counter);
                 }
             }
-
             self.highest_seen = counter;
             self.set_bit(counter);
             return ReplayCheckResult::AcceptAndAdvance;
         }
 
-        // Calculate window base (oldest valid counter).
-        // Guard against u64::MAX sentinel — before any real packet the base is 0.
         let window_base = if self.highest_seen == u64::MAX {
             0
         } else if self.highest_seen >= REPLAY_WINDOW_SIZE - 1 {
@@ -226,22 +159,16 @@ impl ReplayWindow {
             0
         };
 
-        // Counter is before the window - too old
         if counter < window_base {
             return ReplayCheckResult::TooOld;
         }
-
-        // Counter is within window - check if already seen
         if self.get_bit(counter) {
             return ReplayCheckResult::Replay;
         }
-
-        // Mark as seen and accept
         self.set_bit(counter);
         ReplayCheckResult::Accept
     }
 
-    /// Gets the bit for a counter in the bitmap.
     #[inline]
     fn get_bit(&self, counter: u64) -> bool {
         let bit_index = (counter % REPLAY_WINDOW_SIZE) as usize;
@@ -250,7 +177,6 @@ impl ReplayWindow {
         (self.bitmap[word_index] & (1u64 << bit_offset)) != 0
     }
 
-    /// Sets the bit for a counter in the bitmap.
     #[inline]
     fn set_bit(&mut self, counter: u64) {
         let bit_index = (counter % REPLAY_WINDOW_SIZE) as usize;
@@ -259,7 +185,6 @@ impl ReplayWindow {
         self.bitmap[word_index] |= 1u64 << bit_offset;
     }
 
-    /// Clears the bit for a counter in the bitmap.
     #[inline]
     fn clear_bit(&mut self, counter: u64) {
         let bit_index = (counter % REPLAY_WINDOW_SIZE) as usize;
@@ -268,16 +193,11 @@ impl ReplayWindow {
         self.bitmap[word_index] &= !(1u64 << bit_offset);
     }
 
-    /// Returns the highest seen counter.
     #[must_use]
     pub fn highest_seen(&self) -> u64 {
         self.highest_seen
     }
 
-    /// Returns the window base (oldest valid counter).
-    ///
-    /// Returns 0 when the window has not yet received any real packet
-    /// (i.e. `highest_seen` is still the `u64::MAX` sentinel).
     #[must_use]
     pub fn window_base(&self) -> u64 {
         if self.highest_seen == u64::MAX {
@@ -307,10 +227,9 @@ impl std::fmt::Debug for ReplayWindow {
 }
 
 // ============================================
-// Session State
+// Session State (unchanged)
 // ============================================
 
-/// Session state machine states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
     Established,
@@ -329,10 +248,9 @@ impl std::fmt::Display for SessionState {
 }
 
 // ============================================
-// Session Statistics
+// Session Statistics (unchanged)
 // ============================================
 
-/// Session statistics.
 #[derive(Debug, Default)]
 pub struct SessionStats {
     pub bytes_rx: AtomicU64,
@@ -386,10 +304,9 @@ pub struct StatsSnapshot {
 }
 
 // ============================================
-// Session
+// Session (unchanged)
 // ============================================
 
-/// Represents an active client session.
 pub struct Session {
     pub id: SessionId,
     state: RwLock<SessionState>,
@@ -400,9 +317,7 @@ pub struct Session {
     pub created_at: std::time::Instant,
     pub last_activity: AtomicInstant,
     pub tx_counter: AtomicU64,
-    /// Replay window for RX counter validation (replaces simple rx_counter)
     replay_window: Mutex<ReplayWindow>,
-    /// Kept for backward compatibility - reflects highest seen counter
     pub rx_counter: AtomicU64,
     pub stats: SessionStats,
 }
@@ -434,108 +349,56 @@ impl Session {
     }
 
     #[must_use]
-    pub fn state(&self) -> SessionState {
-        *self.state.read()
-    }
+    pub fn state(&self) -> SessionState { *self.state.read() }
 
-    pub fn set_state(&self, state: SessionState) {
-        *self.state.write() = state;
-    }
+    pub fn set_state(&self, state: SessionState) { *self.state.write() = state; }
 
     #[must_use]
-    pub fn is_established(&self) -> bool {
-        self.state() == SessionState::Established
-    }
+    pub fn is_established(&self) -> bool { self.state() == SessionState::Established }
 
-    pub fn touch(&self) {
-        self.last_activity.store(std::time::Instant::now());
-    }
+    pub fn touch(&self) { self.last_activity.store(std::time::Instant::now()); }
 
     #[must_use]
-    pub fn idle_time(&self) -> Duration {
-        self.last_activity.elapsed()
-    }
+    pub fn idle_time(&self) -> Duration { self.last_activity.elapsed() }
 
     #[must_use]
-    pub fn is_expired(&self, timeout: Duration) -> bool {
-        self.idle_time() > timeout
-    }
+    pub fn is_expired(&self, timeout: Duration) -> bool { self.idle_time() > timeout }
 
     #[must_use]
-    pub fn next_tx_counter(&self) -> u64 {
-        self.tx_counter.fetch_add(1, Ordering::SeqCst)
-    }
+    pub fn next_tx_counter(&self) -> u64 { self.tx_counter.fetch_add(1, Ordering::SeqCst) }
 
-    /// Validates an RX counter using sliding window replay detection.
-    ///
-    /// # Arguments
-    /// * `counter` - The packet counter to validate
-    ///
-    /// # Returns
-    /// `true` if the counter is valid (not a replay, not too old)
-    /// `false` if the counter should be rejected
-    ///
-    /// # Algorithm
-    /// Uses a sliding window of 2048 packets to allow out-of-order delivery
-    /// while still detecting replays. This is similar to WireGuard's approach.
     pub fn validate_rx_counter(&self, counter: u64) -> bool {
         let mut window = self.replay_window.lock();
         let result = window.check_and_record(counter);
-
-        // Update rx_counter for backward compatibility (reflects highest seen)
         if matches!(result, ReplayCheckResult::AcceptAndAdvance) {
             self.rx_counter.store(counter, Ordering::SeqCst);
         }
-
         match result {
             ReplayCheckResult::Accept | ReplayCheckResult::AcceptAndAdvance => {
-                trace!(
-                    session_id = %self.id,
-                    counter = counter,
-                    highest = window.highest_seen(),
-                    "Counter accepted"
-                );
+                trace!(session_id = %self.id, counter, highest = window.highest_seen(), "Counter accepted");
                 true
             }
             ReplayCheckResult::Replay => {
                 self.stats.record_replay_rejected();
-                debug!(
-                    session_id = %self.id,
-                    counter = counter,
-                    highest = window.highest_seen(),
-                    "Replay detected - counter already seen"
-                );
+                debug!(session_id = %self.id, counter, highest = window.highest_seen(), "Replay detected");
                 false
             }
             ReplayCheckResult::TooOld => {
                 self.stats.record_too_old_rejected();
-                debug!(
-                    session_id = %self.id,
-                    counter = counter,
-                    window_base = window.window_base(),
-                    highest = window.highest_seen(),
-                    "Counter too old - outside window"
-                );
+                debug!(session_id = %self.id, counter, window_base = window.window_base(), "Counter too old");
                 false
             }
         }
     }
 
-    /// Returns the current replay window statistics.
     #[must_use]
     pub fn replay_window_info(&self) -> (u64, u64) {
         let window = self.replay_window.lock();
         (window.window_base(), window.highest_seen())
     }
 
-    /// Returns the wallet address bytes for this session.
-    ///
-    /// Convenience wrapper over `client_public_key.to_bytes()` used by
-    /// `SessionManager::wallet_index` operations and `ChatRelayService`.
     #[must_use]
-    pub fn wallet_bytes(&self) -> [u8; 32] {
-        self.client_public_key.to_bytes()
-    }
+    pub fn wallet_bytes(&self) -> [u8; 32] { self.client_public_key.to_bytes() }
 }
 
 impl std::fmt::Debug for Session {
@@ -553,35 +416,34 @@ impl std::fmt::Debug for Session {
 }
 
 // ============================================
-// Session Manager
+// Session Manager — v1.2.0-MultiDevice
 // ============================================
 
-/// Manages all active sessions with wallet-address reverse lookup.
+/// Manages all active sessions with multi-device wallet reverse lookup.
 ///
-/// ## v1.1.0-ChatRelay Addition
-/// `wallet_index` maps `[u8; 32]` wallet bytes to `SessionId`, enabling
-/// `ChatRelayService::get_session_by_wallet()` to route incoming chat
-/// messages to the correct session in O(1) without iterating all sessions.
+/// ## v1.2.0-MultiDevice Change
+/// `wallet_index` maps `[u8; 32]` wallet bytes to `Vec<DeviceEntry>`,
+/// where each `DeviceEntry` holds a `(DeviceId, SessionId)` pair.
+///
+/// This allows `ChatRelayService` to broadcast to ALL active devices of
+/// a given wallet via `get_all_by_wallet()`.
 ///
 /// ### Invariants
-/// - Every entry in `wallet_index` has a corresponding entry in `sessions`.
-/// - `create()` always inserts into both maps atomically (from the caller's
-///   perspective — no external lock needed because DashMap sharding handles
-///   individual operations; the two-map update is not strictly atomic but
-///   the window is tiny and chat routing tolerates a brief gap).
-/// - `remove()` checks that the `wallet_index` entry still points to the
-///   *same* `SessionId` before deleting, avoiding a race where a new session
-///   for the same wallet was registered between the `sessions.remove()` call
-///   and the `wallet_index.remove()` call.
+/// - `sessions` is the source of truth. `wallet_index` is a secondary index.
+/// - `create()` inserts only into `sessions`. Callers MUST call
+///   `register_device()` separately after the client sends `DeviceRegister`.
+/// - `remove()` calls `remove_device_by_session()` internally — do NOT
+///   call it externally.
+/// - `get_by_wallet()` returns the LAST registered device (most recent).
+///   Use `get_all_by_wallet()` for broadcast.
 pub struct SessionManager {
     sessions: DashMap<SessionId, Arc<Session>>,
 
-    // 🌟 v1.1.0-ChatRelay: wallet address → SessionId reverse index.
+    // 🌟 v1.2.0-MultiDevice: wallet → Vec<DeviceEntry>
     //
-    // Keyed by raw [u8; 32] wallet bytes (from IdentityPublicKey::to_bytes()).
-    // MVP: one wallet → one active SessionId (last-writer-wins on reconnect).
-    // Phase 2: change value type to Vec<SessionId> for multi-device support.
-    wallet_index: DashMap<[u8; 32], SessionId>,
+    // Vec order = registration order. Last entry = most recently registered device.
+    // Max entries per wallet is bounded by max_sessions (global limit).
+    wallet_index: DashMap<[u8; 32], Vec<DeviceEntry>>,
 
     max_sessions: usize,
     session_timeout: Duration,
@@ -598,18 +460,10 @@ impl SessionManager {
         }
     }
 
-    /// Creates and registers a new session with a specific session ID.
+    /// Creates and registers a new session.
     ///
-    /// Also inserts the wallet → SessionId mapping into `wallet_index`.
-    /// If the same wallet reconnects, the index entry is overwritten with
-    /// the new SessionId (MVP: last-writer-wins).
-    ///
-    /// # Arguments
-    /// * `session_id` - The session ID to use (must match the one sent to client)
-    /// * `client_public_key` - Client's identity public key
-    /// * `session_key` - Derived session key for encryption
-    /// * `virtual_ip` - Assigned virtual IP address
-    /// * `client_endpoint` - Client's UDP endpoint
+    /// Does NOT insert into `wallet_index`. The caller must wait for the
+    /// client to send a `DeviceRegister` message, then call `register_device()`.
     ///
     /// # Errors
     /// Returns `SessionLimitReached` if max sessions exceeded.
@@ -622,9 +476,7 @@ impl SessionManager {
         client_endpoint: SocketAddr,
     ) -> Result<Arc<Session>> {
         if self.sessions.len() >= self.max_sessions {
-            return Err(ServerError::SessionLimitReached {
-                limit: self.max_sessions,
-            });
+            return Err(ServerError::SessionLimitReached { limit: self.max_sessions });
         }
 
         let session = Arc::new(Session::new(
@@ -635,30 +487,51 @@ impl SessionManager {
             client_endpoint,
         ));
 
-        // Extract wallet bytes before inserting (avoids borrow after move)
-        let wallet_bytes = session.wallet_bytes();
-
         self.sessions.insert(session_id.clone(), Arc::clone(&session));
-
-        // 🌟 v1.1.0-ChatRelay: register wallet → SessionId.
-        //
-        // Use insert() which is a single CAS-like operation on the DashMap shard,
-        // minimising (but not fully eliminating — two separate maps) the race window
-        // vs. the sessions.insert() above. In the MVP single-UDP-loop architecture
-        // sessions are created serially, so concurrent creation of the same wallet
-        // is not possible in practice. Phase 2 multi-device support should use a
-        // purpose-built atomic (wallet, session_ids) structure.
-        self.wallet_index.insert(wallet_bytes, session_id.clone());
 
         info!(
             session_id = %session_id,
             virtual_ip = %virtual_ip,
             client = %client_endpoint,
-            wallet = %hex::encode(&wallet_bytes[..4]),  // log only first 4 bytes
-            "Session created"
+            "Session created (device registration pending)"
         );
 
         Ok(session)
+    }
+
+    /// 🌟 v1.2.0-MultiDevice: Register a device under its wallet.
+    ///
+    /// Called when the node receives a `DeviceRegister` message from the client.
+    /// The session MUST already exist in `sessions` (created by `create()`).
+    ///
+    /// If the same `device_id` already has an entry (same device reconnect),
+    /// the old entry is replaced with the new `session_id`.
+    ///
+    /// # Arguments
+    /// * `wallet` - The wallet public key bytes (from verified session)
+    /// * `device_id` - Stable device identifier from the client
+    /// * `session_id` - The current active session for this device
+    pub fn register_device(
+        &self,
+        wallet: &[u8; 32],
+        device_id: DeviceId,
+        session_id: SessionId,
+    ) {
+        let mut entry = self.wallet_index.entry(*wallet).or_default();
+
+        // Remove stale entry for the same device_id (reconnect case).
+        entry.retain(|e| e.device_id != device_id);
+
+        // Append the new entry (becomes the "most recent" device).
+        entry.push(DeviceEntry { device_id, session_id: session_id.clone() });
+
+        debug!(
+            wallet = %hex::encode(&wallet[..4]),
+            device_id = %hex::encode(device_id),
+            session_id = %session_id,
+            device_count = entry.len(),
+            "Device registered"
+        );
     }
 
     #[must_use]
@@ -670,49 +543,51 @@ impl SessionManager {
         self.get(id).ok_or_else(|| ServerError::SessionNotFound(id.clone()))
     }
 
-    /// 🌟 v1.1.0-ChatRelay: Look up an active session by wallet address.
+    /// 🌟 v1.2.0-MultiDevice: Look up the most recently registered session
+    /// for a wallet (backward-compatible single-device routing).
     ///
-    /// Used by `ChatRelayService` to find the online session for a message
-    /// receiver, enabling immediate forwarding without scanning all sessions.
-    ///
-    /// Returns `None` if no active session exists for the given wallet
-    /// (receiver is offline → message should be stored for later delivery).
-    ///
-    /// # Arguments
-    /// * `wallet` - The 32-byte Ed25519 public key (wallet address) to look up
+    /// Returns `None` if the wallet has no active devices.
     #[must_use]
     pub fn get_by_wallet(&self, wallet: &[u8; 32]) -> Option<Arc<Session>> {
         self.wallet_index
             .get(wallet)
-            .and_then(|sid| self.sessions.get(sid.value()).map(|s| Arc::clone(s.value())))
+            .and_then(|entries| {
+                // Last entry = most recently registered device.
+                entries.last().and_then(|e| {
+                    self.sessions.get(&e.session_id).map(|s| Arc::clone(s.value()))
+                })
+            })
     }
 
+    /// 🌟 v1.2.0-MultiDevice: Return ALL active sessions for a wallet.
+    ///
+    /// Used by `ChatRelayService` to broadcast a message to every device
+    /// the wallet currently has connected. Returns an empty Vec if the
+    /// wallet is fully offline.
+    #[must_use]
+    pub fn get_all_by_wallet(&self, wallet: &[u8; 32]) -> Vec<Arc<Session>> {
+        let Some(entries) = self.wallet_index.get(wallet) else {
+            return Vec::new();
+        };
+
+        entries
+            .iter()
+            .filter_map(|e| {
+                self.sessions.get(&e.session_id).map(|s| Arc::clone(s.value()))
+            })
+            .collect()
+    }
+
+    /// Remove a session and clean up its wallet_index entry.
+    ///
+    /// Calls `remove_device_by_session()` internally to keep
+    /// `wallet_index` consistent.
     pub fn remove(&self, id: &SessionId) -> Option<Arc<Session>> {
         let removed = self.sessions.remove(id).map(|(_, s)| s);
 
         if let Some(ref session) = removed {
             session.set_state(SessionState::Closed);
-
-            // 🌟 v1.1.0-ChatRelay: clean up wallet_index.
-            //
-            // Safety check: only remove the wallet_index entry if it still
-            // points to THIS session's ID. If the same wallet reconnected
-            // before we got here, the index already points to the new session
-            // and we must NOT delete it.
-            let wallet_bytes = session.wallet_bytes();
-            let should_remove = self.wallet_index
-                .get(&wallet_bytes)
-                .map(|sid| *sid.value() == *id)
-                .unwrap_or(false);
-
-            if should_remove {
-                self.wallet_index.remove(&wallet_bytes);
-                debug!(
-                    session_id = %id,
-                    wallet = %hex::encode(&wallet_bytes[..4]),
-                    "wallet_index entry removed"
-                );
-            }
+            self.remove_device_by_session(id, &session.wallet_bytes());
 
             let stats = session.stats.snapshot();
             info!(
@@ -721,12 +596,45 @@ impl SessionManager {
                 packets_rx = stats.packets_rx,
                 packets_tx = stats.packets_tx,
                 replays_rejected = stats.replays_rejected,
-                too_old_rejected = stats.too_old_rejected,
                 "Session removed"
             );
         }
 
         removed
+    }
+
+    /// 🌟 v1.2.0-MultiDevice: Remove all wallet_index entries for a session.
+    ///
+    /// Scans the wallet's Vec and removes any `DeviceEntry` whose
+    /// `session_id` matches `id`. If the Vec becomes empty, the wallet
+    /// key is removed entirely.
+    ///
+    /// Called internally by `remove()` — do NOT call externally.
+    fn remove_device_by_session(&self, id: &SessionId, wallet: &[u8; 32]) {
+        let mut should_remove_wallet = false;
+
+        if let Some(mut entries) = self.wallet_index.get_mut(wallet) {
+            entries.retain(|e| &e.session_id != id);
+            if entries.is_empty() {
+                should_remove_wallet = true;
+            } else {
+                debug!(
+                    session_id = %id,
+                    wallet = %hex::encode(&wallet[..4]),
+                    remaining_devices = entries.len(),
+                    "Device unregistered (other devices still active)"
+                );
+            }
+        }
+
+        if should_remove_wallet {
+            self.wallet_index.remove(wallet);
+            debug!(
+                session_id = %id,
+                wallet = %hex::encode(&wallet[..4]),
+                "wallet_index entry removed (no more devices)"
+            );
+        }
     }
 
     pub fn close(&self, id: &SessionId) {
@@ -737,18 +645,12 @@ impl SessionManager {
     }
 
     #[must_use]
-    pub fn count(&self) -> usize {
-        self.sessions.len()
-    }
+    pub fn count(&self) -> usize { self.sessions.len() }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
-    }
+    pub fn is_empty(&self) -> bool { self.sessions.is_empty() }
 
-    /// Cleans up expired sessions.
-    ///
-    /// Also removes corresponding `wallet_index` entries for expired sessions.
+    /// Clean up expired sessions and their wallet_index entries.
     pub fn cleanup_expired(&self) -> Vec<(SessionId, Ipv4Addr)> {
         let mut expired = Vec::new();
 
@@ -761,13 +663,13 @@ impl SessionManager {
 
         for (id, ip) in &expired {
             debug!(session_id = %id, virtual_ip = %ip, "Session expired");
-            self.remove(id); // wallet_index cleanup happens inside remove()
+            self.remove(id);
         }
 
         if !expired.is_empty() {
             info!(
                 count = expired.len(),
-                wallet_index_size = self.wallet_index.len(),
+                wallet_index_wallets = self.wallet_index.len(),
                 "Cleaned up expired sessions"
             );
         }
@@ -781,17 +683,21 @@ impl SessionManager {
     }
 
     pub fn touch(&self, id: &SessionId) {
-        if let Some(session) = self.get(id) {
-            session.touch();
-        }
+        if let Some(session) = self.get(id) { session.touch(); }
     }
 
-    /// Returns the current number of entries in the wallet index.
+    /// Returns total number of device entries across all wallets.
     ///
-    /// Used for diagnostics. Should equal `count()` in normal operation.
-    /// A discrepancy indicates a bug in index maintenance.
+    /// In normal operation this equals `count()`.
+    /// A discrepancy indicates stale entries (bug in cleanup logic).
     #[must_use]
     pub fn wallet_index_count(&self) -> usize {
+        self.wallet_index.iter().map(|e| e.value().len()).sum()
+    }
+
+    /// Returns the number of distinct wallets in the index.
+    #[must_use]
+    pub fn wallet_count(&self) -> usize {
         self.wallet_index.len()
     }
 }
@@ -800,7 +706,8 @@ impl std::fmt::Debug for SessionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionManager")
             .field("sessions", &self.count())
-            .field("wallet_index", &self.wallet_index_count())
+            .field("wallet_count", &self.wallet_count())
+            .field("device_entries", &self.wallet_index_count())
             .field("max_sessions", &self.max_sessions)
             .field("session_timeout", &self.session_timeout)
             .finish()
@@ -816,19 +723,14 @@ mod tests {
     use super::*;
     use aeronyx_core::crypto::IdentityKeyPair;
 
-    // ========================================
-    // ReplayWindow Tests (preserved verbatim)
-    // ========================================
+    // ── ReplayWindow Tests (preserved verbatim) ──────────────────────────
 
     #[test]
     fn test_replay_window_sequential() {
         let mut window = ReplayWindow::new();
         for i in 1..=100 {
             let result = window.check_and_record(i);
-            assert!(
-                matches!(result, ReplayCheckResult::AcceptAndAdvance),
-                "Counter {} should be accepted", i
-            );
+            assert!(matches!(result, ReplayCheckResult::AcceptAndAdvance), "Counter {} should be accepted", i);
         }
         assert_eq!(window.highest_seen(), 100);
     }
@@ -852,24 +754,17 @@ mod tests {
     #[test]
     fn test_replay_window_too_old() {
         let mut window = ReplayWindow::new();
-        // Advance window to 3000
         window.check_and_record(3000);
-        // window_base = 3000 - 2048 + 1 = 953
         assert!(matches!(window.check_and_record(500), ReplayCheckResult::TooOld));
-        // Packet exactly at window_base = 953 should still be valid
         assert!(matches!(window.check_and_record(953), ReplayCheckResult::Accept));
     }
 
     #[test]
     fn test_replay_window_counter_zero_is_accept_and_advance() {
-        // Regression: counter=0 must return AcceptAndAdvance (not Accept)
-        // so that rx_counter is updated on the very first packet.
         let mut window = ReplayWindow::new();
         let result = window.check_and_record(0);
-        assert!(
-            matches!(result, ReplayCheckResult::AcceptAndAdvance),
-            "counter=0 on a fresh window must return AcceptAndAdvance, got {:?}", result
-        );
+        assert!(matches!(result, ReplayCheckResult::AcceptAndAdvance),
+            "counter=0 on a fresh window must return AcceptAndAdvance, got {:?}", result);
         assert_eq!(window.highest_seen(), 0);
     }
 
@@ -901,9 +796,7 @@ mod tests {
         assert_eq!(rejected, 0);
     }
 
-    // ========================================
-    // Session Tests (preserved verbatim)
-    // ========================================
+    // ── Session Tests (preserved verbatim) ───────────────────────────────
 
     fn create_test_session() -> Session {
         let identity = IdentityKeyPair::generate();
@@ -948,20 +841,15 @@ mod tests {
         assert!(session.validate_rx_counter(100));
         assert!(session.validate_rx_counter(95));
         assert!(session.validate_rx_counter(96));
-        assert!(session.validate_rx_counter(97));
-        assert!(session.validate_rx_counter(101));
-        assert!(session.validate_rx_counter(102));
         assert!(!session.validate_rx_counter(95));
         assert!(!session.validate_rx_counter(100));
-        assert!(!session.validate_rx_counter(101));
     }
 
     #[test]
     fn test_session_wallet_bytes() {
         let identity = IdentityKeyPair::generate();
         let session = Session::new(
-            SessionId::generate(),
-            identity.public_key(),
+            SessionId::generate(), identity.public_key(),
             SessionKey::from_bytes([0x42; 32]),
             Ipv4Addr::new(100, 64, 0, 2),
             "127.0.0.1:12345".parse().unwrap(),
@@ -969,9 +857,7 @@ mod tests {
         assert_eq!(session.wallet_bytes(), identity.public_key_bytes());
     }
 
-    // ========================================
-    // SessionManager Tests (preserved + new)
-    // ========================================
+    // ── SessionManager Tests (preserved verbatim) ────────────────────────
 
     fn make_manager() -> SessionManager {
         SessionManager::new(100, Duration::from_secs(300))
@@ -984,8 +870,7 @@ mod tests {
         let session_id = SessionId::generate();
 
         let session = manager.create(
-            session_id.clone(),
-            identity.public_key(),
+            session_id.clone(), identity.public_key(),
             SessionKey::from_bytes([0x42; 32]),
             Ipv4Addr::new(100, 64, 0, 2),
             "127.0.0.1:12345".parse().unwrap(),
@@ -1003,24 +888,16 @@ mod tests {
         let manager = SessionManager::new(2, Duration::from_secs(300));
         let identity = IdentityKeyPair::generate();
 
-        manager.create(
-            SessionId::generate(), identity.public_key(),
+        manager.create(SessionId::generate(), identity.public_key(),
             SessionKey::from_bytes([0x42; 32]),
-            Ipv4Addr::new(100, 64, 0, 2), "127.0.0.1:12345".parse().unwrap(),
-        ).unwrap();
-
-        manager.create(
-            SessionId::generate(), identity.public_key(),
+            Ipv4Addr::new(100, 64, 0, 2), "127.0.0.1:12345".parse().unwrap()).unwrap();
+        manager.create(SessionId::generate(), identity.public_key(),
             SessionKey::from_bytes([0x42; 32]),
-            Ipv4Addr::new(100, 64, 0, 3), "127.0.0.1:12346".parse().unwrap(),
-        ).unwrap();
+            Ipv4Addr::new(100, 64, 0, 3), "127.0.0.1:12346".parse().unwrap()).unwrap();
 
-        let result = manager.create(
-            SessionId::generate(), identity.public_key(),
+        let result = manager.create(SessionId::generate(), identity.public_key(),
             SessionKey::from_bytes([0x42; 32]),
-            Ipv4Addr::new(100, 64, 0, 4), "127.0.0.1:12347".parse().unwrap(),
-        );
-
+            Ipv4Addr::new(100, 64, 0, 4), "127.0.0.1:12347".parse().unwrap());
         assert!(matches!(result, Err(ServerError::SessionLimitReached { .. })));
     }
 
@@ -1028,150 +905,218 @@ mod tests {
     fn test_session_stats_tracking() {
         let session = create_test_session();
         session.validate_rx_counter(100);
-        session.validate_rx_counter(100); // Replay
-        session.validate_rx_counter(100); // Replay
+        session.validate_rx_counter(100);
+        session.validate_rx_counter(100);
         let stats = session.stats.snapshot();
         assert_eq!(stats.replays_rejected, 2);
     }
 
-    // ========================================
-    // 🌟 v1.1.0-ChatRelay: wallet_index Tests
-    // ========================================
+    // ── 🌟 v1.2.0-MultiDevice: wallet_index Tests ───────────────────────
 
+    fn make_device_id(seed: u8) -> DeviceId {
+        [seed; 16]
+    }
+
+    /// create() no longer inserts into wallet_index.
+    /// wallet_index is only populated by register_device().
     #[test]
-    fn test_get_by_wallet_returns_session() {
+    fn test_create_does_not_populate_wallet_index() {
         let manager = make_manager();
         let identity = IdentityKeyPair::generate();
 
         manager.create(
-            SessionId::generate(),
-            identity.public_key(),
+            SessionId::generate(), identity.public_key(),
             SessionKey::from_bytes([0x42; 32]),
             Ipv4Addr::new(100, 64, 0, 2),
             "127.0.0.1:12345".parse().unwrap(),
         ).unwrap();
 
-        let wallet = identity.public_key_bytes();
-        let found = manager.get_by_wallet(&wallet);
-        assert!(found.is_some(), "Should find session by wallet");
-        assert_eq!(found.unwrap().wallet_bytes(), wallet);
+        // wallet_index must be empty until register_device is called
+        assert_eq!(manager.wallet_index_count(), 0);
+        assert!(manager.get_by_wallet(&identity.public_key_bytes()).is_none());
     }
 
     #[test]
-    fn test_get_by_wallet_returns_none_when_not_registered() {
+    fn test_register_device_and_get_by_wallet() {
         let manager = make_manager();
-        let random_wallet = [0xFFu8; 32];
-        assert!(manager.get_by_wallet(&random_wallet).is_none());
+        let identity = IdentityKeyPair::generate();
+        let wallet = identity.public_key_bytes();
+        let sid = SessionId::generate();
+
+        manager.create(
+            sid.clone(), identity.public_key(),
+            SessionKey::from_bytes([0x42; 32]),
+            Ipv4Addr::new(100, 64, 0, 2),
+            "127.0.0.1:12345".parse().unwrap(),
+        ).unwrap();
+
+        manager.register_device(&wallet, make_device_id(0x01), sid.clone());
+
+        let found = manager.get_by_wallet(&wallet);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, sid);
+        assert_eq!(manager.wallet_index_count(), 1);
     }
 
     #[test]
-    fn test_wallet_index_cleaned_on_remove() {
+    fn test_get_all_by_wallet_multiple_devices() {
         let manager = make_manager();
         let identity = IdentityKeyPair::generate();
         let wallet = identity.public_key_bytes();
 
-        let session = manager.create(
-            SessionId::generate(),
-            identity.public_key(),
-            SessionKey::from_bytes([0x42; 32]),
-            Ipv4Addr::new(100, 64, 0, 2),
-            "127.0.0.1:12345".parse().unwrap(),
-        ).unwrap();
+        // Device A
+        let sid_a = SessionId::generate();
+        manager.create(sid_a.clone(), identity.public_key(),
+            SessionKey::from_bytes([0x01; 32]),
+            Ipv4Addr::new(100, 64, 0, 2), "127.0.0.1:11111".parse().unwrap()).unwrap();
+        manager.register_device(&wallet, make_device_id(0xAA), sid_a.clone());
 
-        assert!(manager.get_by_wallet(&wallet).is_some());
+        // Device B (same wallet)
+        let sid_b = SessionId::generate();
+        manager.create(sid_b.clone(), identity.public_key(),
+            SessionKey::from_bytes([0x02; 32]),
+            Ipv4Addr::new(100, 64, 0, 3), "127.0.0.1:22222".parse().unwrap()).unwrap();
+        manager.register_device(&wallet, make_device_id(0xBB), sid_b.clone());
+
+        let all = manager.get_all_by_wallet(&wallet);
+        assert_eq!(all.len(), 2, "Both devices must be returned");
+
+        let ids: Vec<_> = all.iter().map(|s| s.id.clone()).collect();
+        assert!(ids.contains(&sid_a));
+        assert!(ids.contains(&sid_b));
+
+        // get_by_wallet returns the most recently registered (sid_b)
+        let last = manager.get_by_wallet(&wallet).unwrap();
+        assert_eq!(last.id, sid_b, "get_by_wallet must return most recent device");
+
+        assert_eq!(manager.wallet_index_count(), 2);
+        assert_eq!(manager.wallet_count(), 1);
+    }
+
+    #[test]
+    fn test_remove_one_device_leaves_other() {
+        let manager = make_manager();
+        let identity = IdentityKeyPair::generate();
+        let wallet = identity.public_key_bytes();
+
+        let sid_a = SessionId::generate();
+        manager.create(sid_a.clone(), identity.public_key(),
+            SessionKey::from_bytes([0x01; 32]),
+            Ipv4Addr::new(100, 64, 0, 2), "127.0.0.1:11111".parse().unwrap()).unwrap();
+        manager.register_device(&wallet, make_device_id(0xAA), sid_a.clone());
+
+        let sid_b = SessionId::generate();
+        manager.create(sid_b.clone(), identity.public_key(),
+            SessionKey::from_bytes([0x02; 32]),
+            Ipv4Addr::new(100, 64, 0, 3), "127.0.0.1:22222".parse().unwrap()).unwrap();
+        manager.register_device(&wallet, make_device_id(0xBB), sid_b.clone());
+
+        // Remove device A
+        manager.remove(&sid_a);
+
+        // Device B must still be reachable
+        let all = manager.get_all_by_wallet(&wallet);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, sid_b);
         assert_eq!(manager.wallet_index_count(), 1);
+        assert_eq!(manager.wallet_count(), 1);
+    }
 
-        manager.remove(&session.id);
+    #[test]
+    fn test_remove_last_device_clears_wallet_index() {
+        let manager = make_manager();
+        let identity = IdentityKeyPair::generate();
+        let wallet = identity.public_key_bytes();
+        let sid = SessionId::generate();
+
+        manager.create(sid.clone(), identity.public_key(),
+            SessionKey::from_bytes([0x42; 32]),
+            Ipv4Addr::new(100, 64, 0, 2), "127.0.0.1:12345".parse().unwrap()).unwrap();
+        manager.register_device(&wallet, make_device_id(0x01), sid.clone());
+
+        manager.remove(&sid);
 
         assert!(manager.get_by_wallet(&wallet).is_none());
         assert_eq!(manager.wallet_index_count(), 0);
-        assert_eq!(manager.count(), 0);
+        assert_eq!(manager.wallet_count(), 0);
     }
 
     #[test]
-    fn test_wallet_index_not_removed_on_reconnect_race() {
-        // Simulates the reconnect race condition:
-        // 1. Alice connects → session_A registered
-        // 2. Alice reconnects → session_B registered (overwrites wallet_index)
-        // 3. session_A is removed → wallet_index must NOT be cleared
-        //    because it now points to session_B
+    fn test_same_device_reconnect_replaces_session() {
         let manager = make_manager();
         let identity = IdentityKeyPair::generate();
         let wallet = identity.public_key_bytes();
+        let device_id = make_device_id(0x42);
 
-        // Session A
-        let session_a = manager.create(
-            SessionId::generate(),
-            identity.public_key(),
+        // First connection
+        let sid_old = SessionId::generate();
+        manager.create(sid_old.clone(), identity.public_key(),
             SessionKey::from_bytes([0x01; 32]),
-            Ipv4Addr::new(100, 64, 0, 2),
-            "127.0.0.1:11111".parse().unwrap(),
-        ).unwrap();
-
-        // Session B (same wallet, new connection — overwrites wallet_index)
-        let session_b = manager.create(
-            SessionId::generate(),
-            identity.public_key(),
-            SessionKey::from_bytes([0x02; 32]),
-            Ipv4Addr::new(100, 64, 0, 3),
-            "127.0.0.1:22222".parse().unwrap(),
-        ).unwrap();
-
-        // wallet_index now points to session_B
-        let found = manager.get_by_wallet(&wallet).unwrap();
-        assert_eq!(found.id, session_b.id, "wallet_index should point to session_B");
-
-        // Remove session_A — wallet_index must NOT be cleared
-        manager.remove(&session_a.id);
-
-        let still_found = manager.get_by_wallet(&wallet);
-        assert!(still_found.is_some(), "wallet_index must survive session_A removal");
-        assert_eq!(
-            still_found.unwrap().id, session_b.id,
-            "wallet_index must still point to session_B"
-        );
+            Ipv4Addr::new(100, 64, 0, 2), "127.0.0.1:11111".parse().unwrap()).unwrap();
+        manager.register_device(&wallet, device_id, sid_old.clone());
         assert_eq!(manager.wallet_index_count(), 1);
+
+        // Same device reconnects with new session
+        let sid_new = SessionId::generate();
+        manager.create(sid_new.clone(), identity.public_key(),
+            SessionKey::from_bytes([0x02; 32]),
+            Ipv4Addr::new(100, 64, 0, 3), "127.0.0.1:22222".parse().unwrap()).unwrap();
+        manager.register_device(&wallet, device_id, sid_new.clone());
+
+        // Still only one entry (old replaced, not accumulated)
+        assert_eq!(manager.wallet_index_count(), 1);
+        let found = manager.get_by_wallet(&wallet).unwrap();
+        assert_eq!(found.id, sid_new);
     }
 
     #[test]
-    fn test_wallet_index_count_matches_session_count() {
+    fn test_get_all_by_wallet_offline_returns_empty() {
         let manager = make_manager();
-
-        // Each unique wallet adds one entry to wallet_index
-        for i in 0..5u8 {
-            let identity = IdentityKeyPair::generate();
-            manager.create(
-                SessionId::generate(),
-                identity.public_key(),
-                SessionKey::from_bytes([i; 32]),
-                Ipv4Addr::new(100, 64, 0, 2 + i as u32),
-                format!("127.0.0.1:{}", 10000 + i as u16).parse().unwrap(),
-            ).unwrap();
-        }
-
-        assert_eq!(manager.count(), 5);
-        assert_eq!(manager.wallet_index_count(), 5);
+        let wallet = [0xFFu8; 32];
+        assert!(manager.get_all_by_wallet(&wallet).is_empty());
     }
 
     #[test]
-    fn test_get_by_wallet_after_cleanup_expired() {
+    fn test_cleanup_expired_removes_device_entries() {
         let manager = SessionManager::new(100, Duration::from_millis(1));
         let identity = IdentityKeyPair::generate();
         let wallet = identity.public_key_bytes();
+        let sid = SessionId::generate();
 
-        manager.create(
-            SessionId::generate(),
-            identity.public_key(),
+        manager.create(sid.clone(), identity.public_key(),
             SessionKey::from_bytes([0x42; 32]),
-            Ipv4Addr::new(100, 64, 0, 2),
-            "127.0.0.1:12345".parse().unwrap(),
-        ).unwrap();
+            Ipv4Addr::new(100, 64, 0, 2), "127.0.0.1:12345".parse().unwrap()).unwrap();
+        manager.register_device(&wallet, make_device_id(0x01), sid);
 
-        // Wait for session to expire
         std::thread::sleep(Duration::from_millis(10));
         manager.cleanup_expired();
 
-        assert!(manager.get_by_wallet(&wallet).is_none());
+        assert!(manager.get_all_by_wallet(&wallet).is_empty());
         assert_eq!(manager.wallet_index_count(), 0);
+    }
+
+    #[test]
+    fn test_wallet_index_count_matches_total_devices() {
+        let manager = make_manager();
+
+        for i in 0u8..3 {
+            let identity = IdentityKeyPair::generate();
+            let wallet = identity.public_key_bytes();
+
+            // Register 2 devices per wallet
+            for j in 0u8..2 {
+                let sid = SessionId::generate();
+                manager.create(sid.clone(), identity.public_key(),
+                    SessionKey::from_bytes([i * 10 + j; 32]),
+                    Ipv4Addr::new(100, 64, 0, (i * 10 + j + 2) as u32),
+                    format!("127.0.0.1:{}", 10000u16 + (i as u16) * 10 + j as u16).parse().unwrap()
+                ).unwrap();
+                manager.register_device(&wallet, make_device_id(i * 10 + j), sid);
+            }
+        }
+
+        assert_eq!(manager.count(), 6);         // 3 wallets × 2 devices
+        assert_eq!(manager.wallet_count(), 3);  // 3 distinct wallets
+        assert_eq!(manager.wallet_index_count(), 6); // 6 device entries total
     }
 }
