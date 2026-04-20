@@ -759,6 +759,8 @@ impl Server {
             system_db: Some(system_db),
             jwt_secret: Some(jwt_secret),
             token_ttl_secs: self.config.memchain.token_ttl_secs,
+            pool_max_connections: saas_cfg.pool_max_connections,
+            pool_idle_timeout_secs: saas_cfg.pool_idle_timeout_secs,
         });
 
         Ok(mpi_state)
