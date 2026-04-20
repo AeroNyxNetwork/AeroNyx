@@ -22,6 +22,9 @@
 //!   `ChatRelay`, `ChatPull`, `ChatPullResponse`, `ChatAck`, `ChatExpired`.
 //!   These enable zero-knowledge P2P messaging: the node forwards
 //!   encrypted envelopes without being able to read message content.
+//! - 🌟 v1.2.0-MultiDevice: Added `DeviceRegister` variant at the END
+//!   for multi-device session routing. Clients send this after session
+//!   establishment so the node can maintain wallet→device mappings.
 //!
 //! ## Multiplexing Design (The 1st-Byte Hack)
 //! After decryption, the plaintext's first byte determines the payload type:
@@ -55,6 +58,8 @@
 //! - Chat Relay variants (11-15): the node validates the Ed25519 signature
 //!   in `ChatRelay` but cannot decrypt `ChatEnvelope.ciphertext`.
 //!   `ChatPull` is owner-authenticated by the session (wallet == session key).
+//! - `DeviceRegister` (16): authenticated via the established session key.
+//!   The wallet→DeviceId mapping is internal only, never exposed to peers.
 //!
 //! ## Last Modified
 //! v0.2.0 - Initial MemChain protocol messages for P2P memory sync
@@ -62,6 +67,7 @@
 //! v1.0.0 - 🌟 Added BroadcastRecord, SyncRecordRequest, SyncRecordResponse
 //! v1.1.0-ChatRelay - 🌟 Added ChatRelay, ChatPull, ChatPullResponse,
 //!                        ChatAck, ChatExpired for zero-knowledge P2P messaging
+//! v1.2.0-MultiDevice - 🌟 Added DeviceRegister for multi-device session routing
 
 use serde::{Deserialize, Serialize};
 use bincode::Options;
@@ -127,6 +133,7 @@ pub const MEMCHAIN_MAGIC: u8 = 0xAE;
 /// | 13    | ChatPullResponse     | v1.1.0-ChatRelay       |
 /// | 14    | ChatAck              | v1.1.0-ChatRelay       |
 /// | 15    | ChatExpired          | v1.1.0-ChatRelay       |
+/// | 16    | DeviceRegister       | v1.2.0-MultiDevice     |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(deprecated)] // BroadcastFact/SyncResponse use deprecated Fact type for P2P compat
 pub enum MemChainMessage {
@@ -305,6 +312,34 @@ pub enum MemChainMessage {
         /// The intended receiver wallet (helps Alice identify which conversation
         /// the expired messages belong to).
         receiver: [u8; 32],
+    },
+
+    // ====================================================
+    // 🌟 v1.2.0-MultiDevice: Device registration (index 16)
+    // ====================================================
+
+    /// 🌟 [index 16] Register a device under the authenticated wallet.
+    ///
+    /// Sent by the client immediately after session establishment (after
+    /// `ChatPull`). The node stores the mapping:
+    ///   wallet_pubkey → Vec<(DeviceId, SessionId)>
+    ///
+    /// `device_id` is a random [u8; 16] generated once on first app install
+    /// and persisted locally (FlutterSecureStorage). It survives VPN reconnects.
+    ///
+    /// `device_name` is a human-readable label (e.g. "iPhone 14", "Pixel 7")
+    /// for future multi-device management UI. Max 64 bytes, UTF-8, truncated
+    /// server-side if longer.
+    ///
+    /// # Security
+    /// The node authenticates the sender via the established session key —
+    /// no additional signature is required. The wallet→DeviceId mapping is
+    /// only used for internal routing and is never exposed to other users.
+    DeviceRegister {
+        /// Stable random ID generated once on device install. [u8; 16].
+        device_id: [u8; 16],
+        /// Human-readable device label, max 64 bytes UTF-8.
+        device_name: String,
     },
 }
 
@@ -496,6 +531,7 @@ mod tests {
 
     /// Verify that legacy discriminant indices are preserved.
     /// Extended in v1.1.0-ChatRelay to also verify indices 11-15.
+    /// Extended in v1.2.0-MultiDevice to also verify index 16.
     /// This test would catch accidental reordering of variants.
     #[test]
     fn test_discriminant_stability() {
@@ -581,6 +617,15 @@ mod tests {
         let expired_bytes = bincode::serialize(&expired_msg).expect("ser");
         let disc = u32::from_le_bytes([expired_bytes[0], expired_bytes[1], expired_bytes[2], expired_bytes[3]]);
         assert_eq!(disc, 15, "ChatExpired must be discriminant 15");
+
+        // DeviceRegister = index 16
+        let dev_msg = MemChainMessage::DeviceRegister {
+            device_id: [0x01u8; 16],
+            device_name: "test-device".to_string(),
+        };
+        let dev_bytes = bincode::serialize(&dev_msg).expect("ser");
+        let disc = u32::from_le_bytes([dev_bytes[0], dev_bytes[1], dev_bytes[2], dev_bytes[3]]);
+        assert_eq!(disc, 16, "DeviceRegister must be discriminant 16");
     }
 
     // ── Chat Relay variant roundtrip tests ───────────────────────────────
@@ -711,6 +756,25 @@ mod tests {
                 assert_eq!(after_timestamp, 9_999_999);
             }
             other => panic!("Backward compat failed: got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_device_register_roundtrip() {
+        let msg = MemChainMessage::DeviceRegister {
+            device_id: [0xABu8; 16],
+            device_name: "iPhone 14 Pro".to_string(),
+        };
+        let encoded = encode_memchain(&msg).expect("encode");
+        assert_eq!(encoded[0], MEMCHAIN_MAGIC);
+
+        let decoded = decode_memchain(&encoded[1..]).expect("decode");
+        match decoded {
+            MemChainMessage::DeviceRegister { device_id, device_name } => {
+                assert_eq!(device_id, [0xABu8; 16]);
+                assert_eq!(device_name, "iPhone 14 Pro");
+            }
+            other => panic!("Expected DeviceRegister, got {:?}", other),
         }
     }
 }
