@@ -203,6 +203,9 @@ pub struct MpiState {
     pub jwt_secret: Option<String>,
     /// JWT token TTL in seconds (default 86400 = 24h).
     pub token_ttl_secs: u64,
+
+    pub pool_max_connections: usize,
+    pub pool_idle_timeout_secs: u64,
 }
 
 // ── Backward-compatible constructor helpers ──────────────────────────
@@ -267,6 +270,8 @@ impl MpiState {
             system_db: None,
             jwt_secret: None,
             token_ttl_secs: 86400,
+            pool_max_connections: 0,
+            pool_idle_timeout_secs: 0,
         }
     }
 }
