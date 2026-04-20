@@ -43,6 +43,11 @@
 //!   VectorIndexPool, and jwt_secret. MpiState constructed via MpiState::local()
 //!   in Local mode (backward compatible). Pool eviction timer + MinerScheduler
 //!   spawned in SaaS mode. build_mpi_router() handles both modes transparently.
+//! v1.2.0-MultiDevice - ChatRelayService initialization in run().
+//!   spawn_udp_task gains `chat_relay` parameter.
+//!   handle_memchain_message gains `sessions` + `chat_relay` parameters.
+//!   Added ChatRelay branch: online multi-device broadcast + offline store_pending.
+//!   Added DeviceRegister branch: sessions.register_device() via session.wallet_bytes().
 //!
 //! ⚠️ Important Notes for Next Developer:
 //! - record_key is derived from identity.to_bytes() (Ed25519 PRIVATE key)
@@ -59,12 +64,17 @@
 //!   It evicts both StoragePool and VectorIndexPool idle connections.
 //! - MinerScheduler ticks every 60 seconds in SaaS mode (per-user Miner).
 //!   In Local mode, the original ReflectionMiner::run() is used unchanged.
+//! - ChatRelayService is initialized only when memchain.is_enabled().
+//!   chat_relay = None means chat relay is disabled; ChatRelay messages are dropped.
+//! - DeviceRegister handler uses session.wallet_bytes() ([u8;32]) — NOT a separate
+//!   method — to extract the wallet pubkey from the authenticated session.
 //!
 //! ## Last Modified
 //! v2.5.2+SecAudit     - BroadcastRecord sig verification hardened.
 //!   resolve_public_ip private-IP guard added.
 //! v2.5.3+Security     - Server::new() gains config_path; auto-generates secrets.
 //! v1.0.0-MultiTenant  - SaaS startup branch; MpiState::local() constructor.
+//! v1.2.0-MultiDevice  - ChatRelayService init; ChatRelay + DeviceRegister handlers.
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -118,6 +128,8 @@ use crate::services::memchain::{
     SystemDb, VolumeRouter, StoragePool, VectorIndexPool,
     ensure_volumes_config,
 };
+// v1.2.0-MultiDevice: Chat relay service
+use crate::services::chat_relay::{ChatRelayService, derive_node_secret};
 use crate::services::{HandshakeService, IpPoolService, RoutingService, SessionManager};
 
 // ============================================
@@ -208,6 +220,29 @@ impl Server {
             (None, None, None, None)
         };
 
+        // ── v1.2.0-MultiDevice: ChatRelayService initialization ──────────
+        // Initialized only when memchain is enabled. `chat_relay = None` means
+        // chat relay is disabled; incoming ChatRelay messages will be dropped.
+        let chat_relay: Option<Arc<ChatRelayService>> =
+            if self.config.memchain.is_enabled() {
+                let node_secret = derive_node_secret(&self.identity.to_bytes());
+                match ChatRelayService::new(
+                    self.config.memchain.chat_relay.clone(),
+                    node_secret,
+                ) {
+                    Ok(svc) => {
+                        info!("[CHAT_RELAY] Service initialized");
+                        Some(Arc::new(svc))
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "[CHAT_RELAY] Init failed — chat relay disabled");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         let udp = Arc::new(
             UdpTransport::bind_addr(self.config.listen_addr())
                 .await
@@ -235,6 +270,8 @@ impl Server {
             vector_index.clone(),
             self.config.memchain.clone(),
             server_pubkey_hex.clone(),
+            // 🌟 v1.2.0-MultiDevice
+            chat_relay.clone(),
         );
         tasks.push(("udp", udp_task));
 
@@ -1383,6 +1420,8 @@ impl Server {
         vector_index: Option<Arc<VectorIndex>>,
         memchain_config: MemChainConfig,
         server_pubkey_hex: String,
+        // 🌟 v1.2.0-MultiDevice
+        chat_relay: Option<Arc<ChatRelayService>>,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -1448,6 +1487,8 @@ impl Server {
                                                         &memchain_config,
                                                         &server_pubkey_hex,
                                                         &session, &udp_reply, &crypto,
+                                                        &sessions,
+                                                        &chat_relay,
                                                     )
                                                     .await;
                                                 }
@@ -1471,7 +1512,7 @@ impl Server {
     }
 
     // ============================================
-    // MemChain Message Handler (unchanged)
+    // MemChain Message Handler
     // ============================================
 
     #[allow(clippy::too_many_arguments)]
@@ -1486,6 +1527,9 @@ impl Server {
         session: &Arc<crate::services::Session>,
         udp: &Arc<UdpTransport>,
         crypto: &DefaultTransportCrypto,
+        // 🌟 v1.2.0-MultiDevice: new params
+        sessions: &Arc<SessionManager>,
+        chat_relay: &Option<Arc<ChatRelayService>>,
     ) {
         match msg {
             MemChainMessage::BroadcastFact(fact) => {
@@ -1627,6 +1671,124 @@ impl Server {
                     height = header.height,
                     hash = hex::encode(header.hash()),
                     "[MEMCHAIN] BlockAnnounce received"
+                );
+            }
+
+            // ====================================================
+            // 🌟 v1.1.0-ChatRelay: Zero-knowledge chat routing
+            // ====================================================
+
+            MemChainMessage::ChatRelay(envelope) => {
+                // Validate Ed25519 signature before any routing decision.
+                // The node cannot decrypt the ciphertext, but it CAN verify
+                // that the sender signed the envelope header fields.
+                if envelope.verify_signature().is_err() {
+                    warn!(
+                        receiver = %hex::encode(&envelope.receiver[..4]),
+                        "[CHAT_RELAY] Signature verification failed — dropped"
+                    );
+                    return;
+                }
+
+                let receiver = envelope.receiver;
+
+                // ── Online path ───────────────────────────────────────────
+                // Broadcast to ALL active devices of the receiver wallet.
+                // get_all_by_wallet returns an empty Vec when offline.
+                let target_sessions = sessions.get_all_by_wallet(&receiver);
+
+                if !target_sessions.is_empty() {
+                    // Deduplication: skip if this message_id was already forwarded
+                    // on the online path (sender retransmit guard).
+                    let is_dup = chat_relay
+                        .as_ref()
+                        .map(|r| r.is_online_duplicate(&envelope.message_id))
+                        .unwrap_or(false);
+
+                    if is_dup {
+                        debug!(
+                            id = %hex::encode(envelope.message_id),
+                            "[CHAT_RELAY] Online duplicate — dropped"
+                        );
+                        return;
+                    }
+
+                    let device_count = target_sessions.len();
+                    for target in &target_sessions {
+                        Self::send_to_session(
+                            &MemChainMessage::ChatRelay(envelope.clone()),
+                            target,
+                            udp,
+                            crypto,
+                        )
+                        .await;
+                    }
+                    debug!(
+                        receiver = %hex::encode(&receiver[..4]),
+                        devices = device_count,
+                        "[CHAT_RELAY] Online delivery to {} device(s)", device_count
+                    );
+                } else {
+                    // ── Offline path ──────────────────────────────────────
+                    // Store in chat_pending.db for later pull by the receiver.
+                    if let Some(ref relay) = chat_relay {
+                        if let Err(e) = relay.store_pending(&envelope) {
+                            warn!(
+                                error = %e,
+                                receiver = %hex::encode(&receiver[..4]),
+                                "[CHAT_RELAY] store_pending failed"
+                            );
+                        } else {
+                            debug!(
+                                receiver = %hex::encode(&receiver[..4]),
+                                id = %hex::encode(envelope.message_id),
+                                "[CHAT_RELAY] Stored for offline delivery"
+                            );
+                        }
+                    } else {
+                        warn!(
+                            receiver = %hex::encode(&receiver[..4]),
+                            "[CHAT_RELAY] Receiver offline and relay service unavailable — dropped"
+                        );
+                    }
+                }
+            }
+
+            // ====================================================
+            // 🌟 v1.2.0-MultiDevice: Device registration
+            // ====================================================
+
+            MemChainMessage::DeviceRegister { device_id, device_name } => {
+                // The session is already authenticated by the transport layer —
+                // no additional signature is required.
+                //
+                // wallet_bytes() returns client_public_key.to_bytes() ([u8; 32]).
+                // This IS the wallet: the Ed25519 public key used to establish
+                // the VPN session is the canonical wallet identity.
+                let wallet = session.wallet_bytes();
+
+                // Truncate device_name server-side if the client sent more than
+                // 64 bytes. Avoid panicking on multi-byte UTF-8 boundaries by
+                // truncating at a char boundary.
+                let name_display = if device_name.len() > 64 {
+                    // Find the last char boundary at or before byte 64.
+                    let mut end = 64;
+                    while !device_name.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    &device_name[..end]
+                } else {
+                    &device_name
+                };
+
+                sessions.register_device(&wallet, device_id, session.id.clone());
+
+                info!(
+                    session_id = %session.id,
+                    wallet = %hex::encode(&wallet[..4]),
+                    device_id = %hex::encode(device_id),
+                    device_name = %name_display,
+                    "[CHAT_RELAY] Device registered"
                 );
             }
 
