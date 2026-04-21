@@ -308,7 +308,8 @@ pub async fn mpi_artifacts_search(
     let limit = params.limit.min(100).max(1);
     let offset = params.offset;
 
-    let artifacts = storage.search_artifacts(
+    let artifacts: Vec<crate::services::memchain::ArtifactRow> =
+    storage.search_artifacts_by_filename(
         &owner,
         params.q.as_deref(),
         params.session_id.as_deref(),
