@@ -47,6 +47,8 @@
 //!   does a LEFT JOIN records → sessions. For records inserted via /remember
 //!   directly (no session), project_id on the record row itself is checked.
 //! - The core logic of this file cannot be deleted or significantly modified.
+//! - v1.0.1-SaaSFix: storage and vector_index are extracted from request
+//!   Extensions rather than state fields (which are None in SaaS mode).
 //!
 //! ## Modification History
 //! v2.4.0+BM25          - 🌟 Extracted from mpi_handlers.rs; BM25 + RRF fusion
@@ -54,9 +56,10 @@
 //! v2.4.0+Reranker      - 🌟 Step 3.5 cross-encoder rerank
 //! v2.4.0+Progressive   - 🌟 mode="index" branch + mpi_recall_detail handler
 //! v2.5.3+Isolation     - 🌟 Step 4.1 context filter; RecallRequest.context field
+//! v1.0.1-SaaSFix       - 🔧 Extract storage/vector_index from Extensions
 //!
 //! ## Last Modified
-//! v2.5.3+Isolation - 🌟 Step 4.1 context post-filter for memory isolation
+//! v1.0.1-SaaSFix - 🔧 Extension extraction for SaaS compatibility
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -69,7 +72,7 @@ use tracing::{debug, warn};
 
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 
-use crate::services::memchain::{compute_recall_score, cosine_similarity};
+use crate::services::memchain::{compute_recall_score, cosine_similarity, MemoryStorage, VectorIndex};
 use crate::services::memchain::mvf;
 use crate::services::memchain::graph;
 use crate::services::memchain::query_analyzer::{self, QueryType};
@@ -83,6 +86,34 @@ pub use super::mpi_handlers::{
     TimeHint, TimeRangeParam,
 };
 pub use crate::services::memchain::reranker::RERANK_TOP_N;
+
+// ============================================
+// Helper: extract storage + vector_index from Extensions (v1.0.1-SaaSFix)
+// ============================================
+
+/// Extract Arc<MemoryStorage> from request Extensions (SaaS) or fall back to
+/// state.storage (Local). Returns None if neither is available.
+fn get_storage(
+    req: &Request<axum::body::Body>,
+    state: &MpiState,
+) -> Option<Arc<MemoryStorage>> {
+    req.extensions()
+        .get::<Arc<MemoryStorage>>()
+        .cloned()
+        .or_else(|| state.storage.clone())
+}
+
+/// Extract Arc<VectorIndex> from request Extensions (SaaS) or fall back to
+/// state.vector_index (Local). Returns None if neither is available.
+fn get_vector_index(
+    req: &Request<axum::body::Body>,
+    state: &MpiState,
+) -> Option<Arc<VectorIndex>> {
+    req.extensions()
+        .get::<Arc<VectorIndex>>()
+        .cloned()
+        .or_else(|| state.vector_index.clone())
+}
 
 // ============================================
 // Constants
@@ -103,6 +134,18 @@ pub async fn mpi_recall(
     let owner = auth.owner_bytes();
     let owner_hex = auth.owner_hex();
 
+    // v1.0.1-SaaSFix: extract storage and vector_index from Extensions
+    let storage = match get_storage(&req, &state) {
+        Some(s) => s,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "storage unavailable"}))).into_response(),
+    };
+    let vector_index = match get_vector_index(&req, &state) {
+        Some(v) => v,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "vector index unavailable"}))).into_response(),
+    };
+
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"failed to read body"}))).into_response(),
@@ -118,7 +161,7 @@ pub async fn mpi_recall(
 
     // ── Step 1: Query Analysis ──
     let analysis = if !rb.query.is_empty() && (state.ner_engine.is_some() || state.graph_enabled) {
-        let known = state.storage.get_entities_cached(&owner).await;
+        let known = storage.get_entities_cached(&owner).await;
         Some(query_analyzer::analyze_query(&rb.query, state.ner_engine.as_deref(), &known, now as i64))
     } else { None };
 
@@ -160,7 +203,7 @@ pub async fn mpi_recall(
                 topic_tags: r.topic_tags.clone(), source_ai: r.source_ai.clone(),
                 timestamp: r.timestamp, access_count: r.access_count, proactive: false,
             });
-            let st = Arc::clone(&state.storage); let rid = r.record_id;
+            let st = Arc::clone(&storage); let rid = r.record_id;
             tokio::spawn(async move { st.increment_access(&rid).await; });
         }
     }
@@ -168,12 +211,12 @@ pub async fn mpi_recall(
     // ── Step 2a: Vector search ──
     let idx_ready = state.index_ready.load(std::sync::atomic::Ordering::Relaxed);
     let search = if !rb.embedding.is_empty() && idx_ready {
-        state.vector_index.search_filtered(&rb.embedding, &owner, &rb.embedding_model, layer_filter, top_k * 3, 0.0)
+        vector_index.search_filtered(&rb.embedding, &owner, &rb.embedding_model, layer_filter, top_k * 3, 0.0)
     } else { Vec::new() };
 
     // ── Step 2a-bis: BM25 FTS5 search ──
-    let bm25_results = if !rb.query.is_empty() {
-        state.storage.bm25_search(&rb.query, &owner, top_k * 3).await
+    let bm25_results: Vec<(String, String, f64)> = if !rb.query.is_empty() {
+        storage.bm25_search(&rb.query, &owner, top_k * 3).await
     } else { Vec::new() };
 
     // ── Step 2a-ter: BM25 entity/session direct injection ──
@@ -181,8 +224,8 @@ pub async fn mpi_recall(
     for (source_type, source_id, bm25_score) in &bm25_results {
         match source_type.as_str() {
             "entity" => {
-                if let Some(entity) = state.storage.get_entity(source_id).await {
-                    let edges = state.storage.get_edges_for_entity(source_id, &owner).await;
+                if let Some(entity) = storage.get_entity(source_id).await {
+                    let edges = storage.get_edges_for_entity(source_id, &owner).await;
                     let mut parts: Vec<String> = vec![format!("{} ({})", entity.name, entity.entity_type)];
                     if let Some(ref desc) = entity.description {
                         if !desc.contains(&entity.name) { parts.push(desc.clone()); }
@@ -190,7 +233,7 @@ pub async fn mpi_recall(
                     let mut edge_descs: Vec<String> = Vec::new();
                     for edge in edges.iter().take(5) {
                         let other_id = if edge.source_id == *source_id { &edge.target_id } else { &edge.source_id };
-                        if let Some(other) = state.storage.get_entity(other_id).await {
+                        if let Some(other) = storage.get_entity(other_id).await {
                             edge_descs.push(if edge.source_id == *source_id {
                                 format!("{} → {}", edge.relation_type, other.name)
                             } else {
@@ -211,7 +254,7 @@ pub async fn mpi_recall(
                 }
             }
             "session" => {
-                if let Some(session) = state.storage.get_session(source_id, &owner).await {
+                if let Some(session) = storage.get_session(source_id, &owner).await {
                     if let Some(ref summary) = session.summary {
                         bm25_direct_memories.push(RecalledMemory {
                             record_id: format!("bm25_session_{}", source_id),
@@ -229,12 +272,12 @@ pub async fn mpi_recall(
                 if let Ok(id_bytes) = hex::decode(source_id) {
                     if id_bytes.len() == 32 {
                         let mut rid = [0u8; 32]; rid.copy_from_slice(&id_bytes);
-                        if state.storage.get(&rid).await.is_none() {
+                        if storage.get(&rid).await.is_none() {
                             let content: Option<String> = {
-                                let conn = state.storage.conn_lock().await;
+                                let conn = storage.conn_lock().await;
                                 conn.query_row(
                                     "SELECT content FROM fts_index WHERE source_type = 'record' AND source_id = ?1",
-                                    rusqlite::params![source_id.as_str()], |row| row.get(0),
+                                    rusqlite::params![source_id.as_str()], |row| row.get::<_, String>(0),
                                 ).ok()
                             };
                             if let Some(text) = content {
@@ -265,7 +308,7 @@ pub async fn mpi_recall(
             let matched_ids: Vec<String> = qa.matched_entities.iter()
                 .filter_map(|e| e.entity_id.clone()).collect();
             if !matched_ids.is_empty() {
-                let conn = state.storage.conn_lock().await;
+                let conn = storage.conn_lock().await;
                 let nodes = graph::bfs_traverse(&conn, &owner, &matched_ids, 2, 20, 0.3);
                 drop(conn);
                 nodes.into_iter().map(|n| (n.entity_id, n.weight)).collect()
@@ -280,7 +323,7 @@ pub async fn mpi_recall(
 
         let mut seen_episodes: HashSet<String> = HashSet::new();
         for eid in &graph_entity_ids {
-            for (episode_id, _role) in state.storage.get_episodes_for_entity(eid).await {
+            for (episode_id, _role) in storage.get_episodes_for_entity(eid).await {
                 if seen_episodes.contains(&episode_id) { continue; }
                 seen_episodes.insert(episode_id.clone());
                 let session_id = if episode_id.starts_with("ep_") {
@@ -288,7 +331,7 @@ pub async fn mpi_recall(
                     rest.rfind('_').map(|i| rest[..i].to_string())
                 } else { None };
                 if let Some(ref sid) = session_id {
-                    if let Some(session) = state.storage.get_session(sid, &owner).await {
+                    if let Some(session) = storage.get_session(sid, &owner).await {
                         if let Some(ref summary) = session.summary {
                             let weight = graph_traversed.get(eid).copied().unwrap_or(0.5);
                             graph_memories.push(RecalledMemory {
@@ -307,8 +350,8 @@ pub async fn mpi_recall(
         }
 
         for eid in &graph_entity_ids {
-            if let Some(entity) = state.storage.get_entity(eid).await {
-                let edges = state.storage.get_edges_for_entity(eid, &owner).await;
+            if let Some(entity) = storage.get_entity(eid).await {
+                let edges = storage.get_edges_for_entity(eid, &owner).await;
                 let weight = graph_traversed.get(eid).copied().unwrap_or(0.5);
                 let mut desc_parts: Vec<String> = vec![format!("{} ({})", entity.name, entity.entity_type)];
                 if let Some(ref desc) = entity.description {
@@ -317,7 +360,7 @@ pub async fn mpi_recall(
                 let mut edge_descs: Vec<String> = Vec::new();
                 for edge in edges.iter().take(5) {
                     let other_id = if edge.source_id == *eid { &edge.target_id } else { &edge.source_id };
-                    if let Some(other) = state.storage.get_entity(other_id).await {
+                    if let Some(other) = storage.get_entity(other_id).await {
                         edge_descs.push(if edge.source_id == *eid {
                             format!("{} → {}", edge.relation_type, other.name)
                         } else {
@@ -362,14 +405,14 @@ pub async fn mpi_recall(
         .filter(|rid| !search.iter().any(|sr| sr.record_id == **rid))
         .cloned().collect();
 
-    let max_degree = { let c = state.storage.conn_lock().await; graph::get_max_degree(&c, &owner) };
+    let max_degree = { let c = storage.conn_lock().await; graph::get_max_degree(&c, &owner) };
     let time_hint_tuple = rb.time_hint.as_ref().map(|th| (th.start, th.end));
 
     let mut scored: Vec<(MemoryRecord, f64)> = Vec::new();
 
     for sr in &search {
         if seen_ids.contains(&sr.record_id) { continue; }
-        if let Some(record) = state.storage.get(&sr.record_id).await {
+        if let Some(record) = storage.get(&sr.record_id).await {
             if !record.is_active() || record.owner != owner { continue; }
             let v_old = compute_recall_score(sr.similarity, record.timestamp, now, record.access_count, record.layer);
             let time_bonus: f64 = match &rb.time_hint {
@@ -377,14 +420,14 @@ pub async fn mpi_recall(
                 _ => 0.0,
             };
             let graph_weight: f32 = if !graph_traversed.is_empty() {
-                let tags_lower: HashSet<String> = record.topic_tags.iter().map(|t| t.to_lowercase()).collect();
+                let tags_lower: HashSet<String> = record.topic_tags.iter().map(|t: &String| t.to_lowercase()).collect();
                 graph_traversed.iter()
                     .find(|(eid, _)| tags_lower.contains(&eid.to_lowercase()))
                     .map(|(_, w)| *w as f32).unwrap_or(0.0)
             } else { 0.0 };
             let v_old_h = v_old + time_bonus;
             let final_score = if state.mvf_enabled {
-                let gd = { let c = state.storage.conn_lock().await; graph::get_degree(&c, &record.record_id) };
+                let gd = { let c = storage.conn_lock().await; graph::get_degree(&c, &record.record_id) };
                 let cs = session_centroid.as_ref()
                     .filter(|c| record.has_embedding() && c.len() == record.embedding.len())
                     .map(|c| cosine_similarity(c, &record.embedding)).unwrap_or(0.0);
@@ -408,7 +451,7 @@ pub async fn mpi_recall(
 
     for rid in &bm25_only_ids {
         if seen_ids.contains(rid) { continue; }
-        if let Some(record) = state.storage.get(rid).await {
+        if let Some(record) = storage.get(rid).await {
             if !record.is_active() || record.owner != owner { continue; }
             let rrf = rrf_scores.get(rid).copied().unwrap_or(0.0);
             let base = compute_recall_score(0.5, record.timestamp, now, record.access_count, record.layer);
@@ -417,7 +460,7 @@ pub async fn mpi_recall(
     }
 
     if search.is_empty() && bm25_results.is_empty() {
-        let recent = state.storage.get_active_records(&owner, layer_filter, top_k).await;
+        let recent = storage.get_active_records(&owner, layer_filter, top_k).await;
         for r in recent {
             if seen_ids.contains(&r.record_id) { continue; }
             scored.push((r.clone(), compute_recall_score(1.0, r.timestamp, now, r.access_count, r.layer)));
@@ -455,23 +498,14 @@ pub async fn mpi_recall(
         }
     }
 
-    // ── Step 4.1: Context filter (v2.5.3+Isolation) ───────────────────────
-    // Applied AFTER scoring/reranking (post-filter).
-    // Vector search has no project_id awareness; context isolation is
-    // enforced here by looking up which records belong to the target context.
-    //
-    // Performance note: for large datasets, batch the lookup into a HashSet
-    // of valid record_ids rather than per-record DB calls.
+    // ── Step 4.1: Context filter (v2.5.3+Isolation) ──
     let context_project_id: Option<String> = match rb.context.as_deref() {
         None | Some("all") | Some("") => None,
         Some(ctx) => Some(ctx.to_string()),
     };
 
     if let Some(ref pid) = context_project_id {
-        // Load record_ids that belong to this project context.
-        // get_active_records_by_context checks BOTH records.project_id
-        // and records → sessions.project_id (via LEFT JOIN).
-        let ctx_records = state.storage
+        let ctx_records = storage
             .get_active_records_by_context(&owner, pid, layer_filter, top_k * 10)
             .await;
         let ctx_ids: HashSet<[u8; 32]> =
@@ -487,7 +521,6 @@ pub async fn mpi_recall(
             "[RECALL] Step 4.1 context filter applied"
         );
     }
-    // ─────────────────────────────────────────────────────────────────────
 
     // ── Step 4: Token budget ──
     let mut returned_ids = seen_ids.clone();
@@ -503,13 +536,10 @@ pub async fn mpi_recall(
             topic_tags: r.topic_tags.clone(), source_ai: r.source_ai.clone(),
             timestamp: r.timestamp, access_count: r.access_count, proactive,
         });
-        let st = Arc::clone(&state.storage); let rid = r.record_id;
+        let st = Arc::clone(&storage); let rid = r.record_id;
         tokio::spawn(async move { st.increment_access(&rid).await; });
     }
 
-    // Graph and BM25 direct memories are NOT filtered by context —
-    // they are synthesized/virtual records without a project_id.
-    // If needed in future, filter by checking the underlying session's project_id.
     for gm in graph_memories {
         let tokens = estimate_tokens(&gm.content);
         if total_tokens + tokens > rb.token_budget && !memories.is_empty() { break; }
@@ -561,7 +591,7 @@ pub async fn mpi_recall(
 
     // ── Async co-occurrence update (full mode only) ──
     {
-        let st = Arc::clone(&state.storage);
+        let st = Arc::clone(&storage);
         let ids = returned_ids;
         tokio::spawn(async move {
             let c = st.conn_lock().await;
@@ -597,6 +627,13 @@ pub async fn mpi_recall_detail(
     let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
 
+    // v1.0.1-SaaSFix: extract storage from Extensions
+    let storage = match get_storage(&req, &state) {
+        Some(s) => s,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "storage unavailable"}))).into_response(),
+    };
+
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"failed to read body"}))).into_response(),
@@ -630,7 +667,7 @@ pub async fn mpi_recall_detail(
             _ => continue,
         };
 
-        if let Some(record) = state.storage.get(&rid).await {
+        if let Some(record) = storage.get(&rid).await {
             if !record.is_active() || record.owner != owner { continue; }
             let content = String::from_utf8_lossy(&record.encrypted_content).to_string();
             let tokens = estimate_tokens(&content);
@@ -648,7 +685,7 @@ pub async fn mpi_recall_detail(
                 proactive: false,
             });
 
-            let st = Arc::clone(&state.storage);
+            let st = Arc::clone(&storage);
             tokio::spawn(async move { st.increment_access(&rid).await; });
         }
     }
