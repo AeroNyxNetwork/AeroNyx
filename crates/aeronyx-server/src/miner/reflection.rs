@@ -241,6 +241,21 @@ impl ReflectionMiner {
         }
     }
 
+    pub async fn run_one_tick(&self) {
+        self.step_0_positive_feedback().await;
+        self.step_05_backfill_embeddings().await;
+        self.step_06_correction_chaining().await;
+        self.step_1_5_legacy_compaction().await;
+
+        if self.ner_engine.is_some() {
+            self.step_7_entity_extraction().await;
+            self.step_8_community_detection().await;
+            self.step_9_recursive_merge().await;
+            self.step_10_session_summary().await;
+            self.step_11_episode_ingestion().await;
+        }
+    }
+
     // ============================================
     // Step 0: Positive Feedback Batch Detection
     // ============================================
