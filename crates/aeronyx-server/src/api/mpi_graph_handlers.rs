@@ -308,19 +308,34 @@ pub async fn mpi_artifacts_search(
     let limit = params.limit.min(100).max(1);
     let offset = params.offset;
 
-    let artifacts: Vec<crate::services::memchain::ArtifactRow> =
-    storage.search_artifacts_by_filename(
-        &owner,
-        params.q.as_deref(),
-        params.session_id.as_deref(),
-        params.language.as_deref(),
-        limit,
-        offset,
-    ).await;
+    // search_artifacts_by_filename only supports filename pattern search.
+    // session_id and language filters are applied post-query.
+    let pattern = params.q.as_deref().unwrap_or("");
+
+    let mut artifacts: Vec<crate::services::memchain::ArtifactRow> =
+        storage.search_artifacts_by_filename(
+            &owner,
+            pattern,
+            limit * 4, // fetch extra to account for post-filters
+            offset,
+        ).await;
+
+    // Post-filter: session_id
+    if let Some(ref sid) = params.session_id {
+        artifacts.retain(|a| a.session_id.as_deref() == Some(sid.as_str()));
+    }
+
+    // Post-filter: language
+    if let Some(ref lang) = params.language {
+        artifacts.retain(|a| a.language.as_deref() == Some(lang.as_str()));
+    }
+
+    // Re-apply limit after post-filtering
+    artifacts.truncate(limit);
 
     debug!(
         owner = &hex::encode(owner)[..8],
-        q = params.q.as_deref().unwrap_or(""),
+        q = pattern,
         results = artifacts.len(),
         "[MPI] GET /artifacts/search"
     );
