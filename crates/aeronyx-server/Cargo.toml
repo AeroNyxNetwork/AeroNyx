@@ -96,6 +96,7 @@ authors.workspace = true
 description = "AeroNyx privacy network server"
 keywords = ["aeronyx", "server", "privacy", "network"]
 categories = ["network-programming", "command-line-utilities"]
+jsonwebtoken = "9"
 
 [[bin]]
 name = "aeronyx-server"
