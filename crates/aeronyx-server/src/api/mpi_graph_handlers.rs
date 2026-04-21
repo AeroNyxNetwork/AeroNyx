@@ -322,7 +322,7 @@ pub async fn mpi_artifacts_search(
 
     // Post-filter: session_id
     if let Some(ref sid) = params.session_id {
-        artifacts.retain(|a| a.session_id.as_deref() == Some(sid.as_str()));
+        artifacts.retain(|a| a.session_id == *sid);
     }
 
     // Post-filter: language
@@ -349,7 +349,6 @@ pub async fn mpi_artifacts_search(
         }
     })))
 }
-
 /// `GET /api/mpi/artifacts/:id` — Artifact detail. (stub, Phase D)
 pub async fn mpi_artifact_detail(
     State(_state): State<Arc<MpiState>>,
