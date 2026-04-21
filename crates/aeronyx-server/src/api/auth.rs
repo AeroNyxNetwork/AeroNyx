@@ -362,11 +362,18 @@ pub fn ensure_jwt_secret(
 
 /// Generate a 64-char random alphanumeric secret.
 pub fn generate_secret() -> String {
-    use rand::Rng;
+    // Use thread_rng from whichever rand version is actually linked,
+    // accessed via the Rng trait. We avoid gen_range(Range) because its
+    // signature changed between rand 0.7 (2 args) and 0.8+ (1 arg).
+    // Instead, generate a raw u64 and take modulo — works on all versions.
+    use rand::RngCore;
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut rng = rand::thread_rng();
     (0..64)
-        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+        .map(|_| {
+            let idx = (rng.next_u64() as usize) % CHARSET.len();
+            CHARSET[idx] as char
+        })
         .collect()
 }
 
