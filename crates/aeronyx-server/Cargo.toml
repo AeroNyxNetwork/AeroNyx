@@ -96,7 +96,7 @@ authors.workspace = true
 description = "AeroNyx privacy network server"
 keywords = ["aeronyx", "server", "privacy", "network"]
 categories = ["network-programming", "command-line-utilities"]
-jsonwebtoken = "9"
+
 
 [[bin]]
 name = "aeronyx-server"
@@ -111,6 +111,7 @@ aeronyx-common = { workspace = true }
 reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
 sha2 = "0.10"
 hex = "0.4"
+jsonwebtoken = "9"
 
 # Async runtime
 tokio = { workspace = true }
