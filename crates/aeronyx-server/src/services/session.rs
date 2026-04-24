@@ -369,7 +369,17 @@ impl Session {
 
     pub fn validate_rx_counter(&self, counter: u64) -> bool {
         let mut window = self.replay_window.lock();
+        let highest_before = window.highest_seen;
         let result = window.check_and_record(counter);
+        
+        tracing::warn!(
+            "[DIAG] counter={} highest_before={} result={:?} window_base={}",
+            counter,
+            highest_before,
+            result,
+            window.window_base()
+        );
+        
         if matches!(result, ReplayCheckResult::AcceptAndAdvance) {
             self.rx_counter.store(counter, Ordering::SeqCst);
         }
