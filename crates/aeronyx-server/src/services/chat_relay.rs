@@ -62,7 +62,7 @@ use tracing::{debug, info, warn};
 use aeronyx_core::protocol::chat::{decode_envelope, encode_envelope, ChatEnvelope};
 
 use crate::config::ChatRelayConfig;
-use crate::services::chat_relay::wallet_routes::WalletRouteCache;
+use crate::services::wallet_routes::WalletRouteCache;
 
 // ============================================
 // Type aliases
