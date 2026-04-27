@@ -290,8 +290,33 @@ impl Server {
             Arc::clone(&ip_pool),
             Arc::clone(&routing),
             session_event_sender.clone(),
+            chat_relay.clone(),
         );
         tasks.push(("cleanup", cleanup_task));
+        
+        // 🌟 v1.3.0-Sovereign: wallet route cache stale-entry cleanup task
+        if let Some(ref relay) = chat_relay {
+            let routes = Arc::clone(&relay.wallet_routes);
+            let mut routes_rx = self.shutdown_tx.subscribe();
+            tasks.push(("wallet-routes-cleanup", tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    tokio::select! {
+                        _ = routes_rx.recv() => break,
+                        _ = interval.tick() => {
+                            let evicted = routes.cleanup_stale(Duration::from_secs(300));
+                            if evicted > 0 {
+                                debug!(
+                                    evicted,
+                                    "[CHAT_RELAY] Stale wallet routes evicted"
+                                );
+                            }
+                        }
+                    }
+                }
+            })));
+            info!("[CHAT_RELAY] Wallet route cleanup task started (ttl=300s, interval=60s)");
+        }
 
         if let (Some(ref st), Some(ref vi), Some(ref mp), Some(ref aw)) =
             (&storage, &vector_index, &mempool, &aof_writer)
@@ -1877,12 +1902,15 @@ impl Server {
     // Cleanup Task
     // ============================================
 
+    
     fn spawn_cleanup_task(
         &self,
         sessions: Arc<SessionManager>,
         ip_pool: Arc<IpPoolService>,
         routing: Arc<RoutingService>,
         events: SessionEventSender,
+        // 🌟 v1.3.0-Sovereign: notify wallet route cache on session expiry
+        chat_relay: Option<Arc<ChatRelayService>>,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut rx = self.shutdown_tx.subscribe();
@@ -1897,12 +1925,17 @@ impl Server {
                             routing.remove_route(vip);
                             ip_pool.release(vip);
                             events.session_ended(&sid.to_string(), None, 0, 0);
+                            // 🌟 v1.3.0-Sovereign: prune stale wallet route entries
+                            if let Some(ref relay) = chat_relay {
+                                relay.wallet_routes.remove_session(&sid);
+                            }
                         }
                     }
                 }
             }
         })
     }
+
 
     // ============================================
     // Shutdown
