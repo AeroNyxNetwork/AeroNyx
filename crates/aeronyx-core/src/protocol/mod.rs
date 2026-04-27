@@ -53,6 +53,7 @@ pub mod codec;
 pub mod memchain;
 pub mod messages;
 pub mod version;
+pub mod auth;
 
 // Re-export primary types
 pub use chat::{ChatContentType, ChatEnvelope, MediaPointer, decode_envelope, encode_envelope};
@@ -60,3 +61,7 @@ pub use codec::{Codec, ProtocolCodec};
 pub use memchain::{MemChainMessage, MEMCHAIN_MAGIC, decode_memchain, encode_memchain};
 pub use messages::{ClientHello, DataPacket, MessageType, ServerHello};
 pub use version::{ProtocolVersion, CURRENT_PROTOCOL_VERSION};
+pub use auth::{verify_signed_message, AuthError,
+               DOMAIN_DEVICE_REGISTER, DOMAIN_CHAT_PULL,
+               DOMAIN_CHAT_ACK, DOMAIN_WALLET_PRESENCE};
+
