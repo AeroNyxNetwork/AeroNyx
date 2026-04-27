@@ -317,9 +317,18 @@ impl PacketHandler {
                         DecryptedPayload::MemChain(msg)
                     }
                     Err(e) => {
+                        // Debug: dump the first 16 bytes of the raw plaintext
+                        // (including the 0xAE magic byte) to diagnose offset issues.
+                        // plaintext[0] = 0xAE (already confirmed)
+                        // plaintext[1..5] should be discriminant (u32 LE)
+                        // plaintext[5..] should be variant payload
+                        let dump_len = plaintext.len().min(16);
                         warn!(
                             session_id = %session_id,
                             error = %e,
+                            plaintext_total_len = plaintext.len(),
+                            header_hex = %hex::encode(&plaintext[..dump_len]),
+                            discriminant_bytes = %hex::encode(&plaintext[1..plaintext.len().min(5)]),
                             "[MEMCHAIN] ❌ Failed to decode MemChain payload"
                         );
                         return Err(ServerError::invalid_packet(
