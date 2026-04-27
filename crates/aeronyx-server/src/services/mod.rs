@@ -113,6 +113,7 @@ pub mod ip_pool;
 pub mod memchain;
 pub mod routing;
 pub mod session;
+pub mod wallet_routes;
 
 // Re-export primary types
 pub use agent_manager::AgentManager;
@@ -122,3 +123,4 @@ pub use ip_pool::IpPoolService;
 pub use memchain::{AofWriter, MemPool};
 pub use routing::RoutingService;
 pub use session::{Session, SessionManager, SessionState};
+pub use wallet_routes::WalletRouteCache;
