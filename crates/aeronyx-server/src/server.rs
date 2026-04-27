@@ -87,6 +87,12 @@ use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use aeronyx_core::protocol::auth::{
+    verify_signed_message,
+    DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_DEVICE_REGISTER, DOMAIN_WALLET_PRESENCE,
+};
+use sha2::{Digest, Sha256};
+
 use aeronyx_common::types::SessionId;
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::crypto::keys::IdentityPublicKey;
@@ -1552,11 +1558,12 @@ impl Server {
         session: &Arc<crate::services::Session>,
         udp: &Arc<UdpTransport>,
         crypto: &DefaultTransportCrypto,
-        // 🌟 v1.2.0-MultiDevice: new params
         sessions: &Arc<SessionManager>,
         chat_relay: &Option<Arc<ChatRelayService>>,
     ) {
         match msg {
+            // ── Legacy P2P sync variants (unchanged) ─────────────────────────
+    
             MemChainMessage::BroadcastFact(fact) => {
                 let origin_hex = hex::encode(fact.origin);
                 let sig_ok = match IdentityPublicKey::from_bytes(&fact.origin) {
@@ -1576,19 +1583,15 @@ impl Server {
                     let _ = w.append_fact(&fact).await;
                 }
             }
-
+    
             MemChainMessage::BroadcastRecord(record) => {
                 let owner_hex = record.owner_hex();
-                // v2.5.2+SecAudit: verify against record_id (content hash).
                 let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
                     Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                     Err(_) => false,
                 };
                 if !sig_ok {
-                    warn!(
-                        owner = %owner_hex,
-                        "[MEMCHAIN] BroadcastRecord signature verification failed"
-                    );
+                    warn!(owner = %owner_hex, "[MEMCHAIN] BroadcastRecord sig failed");
                     return;
                 }
                 if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
@@ -1599,38 +1602,32 @@ impl Server {
                     warn!(
                         owner = %owner_hex,
                         id = hex::encode(record.record_id),
-                        "[MEMCHAIN] BroadcastRecord record_id hash mismatch — possible tampering"
+                        "[MEMCHAIN] BroadcastRecord record_id hash mismatch"
                     );
                     return;
                 }
                 if let Some(ref st) = storage {
                     if st.insert(&record, "p2p-remote").await {
-                        info!(
-                            id = hex::encode(record.record_id),
-                            "[MEMCHAIN] BroadcastRecord stored"
-                        );
+                        info!(id = hex::encode(record.record_id), "[MEMCHAIN] BroadcastRecord stored");
                         if record.has_embedding() {
                             if let Some(ref vi) = vector_index {
                                 vi.upsert(
-                                    record.record_id,
-                                    record.embedding.clone(),
-                                    record.layer,
-                                    record.timestamp,
-                                    &record.owner,
-                                    "p2p-remote",
+                                    record.record_id, record.embedding.clone(),
+                                    record.layer, record.timestamp,
+                                    &record.owner, "p2p-remote",
                                 );
                             }
                         }
                     }
                 }
             }
-
+    
             MemChainMessage::SyncRequest { last_known_hash } => {
                 let facts = mempool.get_facts_after(last_known_hash);
                 let resp = MemChainMessage::SyncResponse { facts };
-                Self::send_to_session(&resp, session, udp, crypto).await;
+                Server::send_to_session(&resp, session, udp, crypto).await;
             }
-
+    
             MemChainMessage::SyncResponse { facts } => {
                 for fact in facts {
                     let origin_hex = hex::encode(fact.origin);
@@ -1638,9 +1635,7 @@ impl Server {
                         Ok(pk) => pk.verify(&fact.fact_id, &fact.signature).is_ok(),
                         Err(_) => false,
                     };
-                    if !sig_ok
-                        || !config.is_origin_trusted(&origin_hex, server_pubkey_hex)
-                    {
+                    if !sig_ok || !config.is_origin_trusted(&origin_hex, server_pubkey_hex) {
                         continue;
                     }
                     if mempool.add_fact(fact.clone()) {
@@ -1649,30 +1644,25 @@ impl Server {
                     }
                 }
             }
-
+    
             MemChainMessage::SyncRecordRequest { owner, after_timestamp } => {
                 if let Some(ref st) = storage {
                     let records = st.query_by_owner_after(&owner, after_timestamp).await;
                     let resp = MemChainMessage::SyncRecordResponse { records };
-                    Self::send_to_session(&resp, session, udp, crypto).await;
+                    Server::send_to_session(&resp, session, udp, crypto).await;
                 }
             }
-
+    
             MemChainMessage::SyncRecordResponse { records } => {
                 if let Some(ref st) = storage {
                     for record in records {
                         let owner_hex = record.owner_hex();
                         let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
-                            Ok(pk) => {
-                                pk.verify(&record.record_id, &record.signature).is_ok()
-                            }
+                            Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                             Err(_) => false,
                         };
                         if !sig_ok {
-                            warn!(
-                                owner = %owner_hex,
-                                "[MEMCHAIN] SyncRecordResponse sig failed — skipping"
-                            );
+                            warn!(owner = %owner_hex, "[MEMCHAIN] SyncRecordResponse sig failed");
                             continue;
                         }
                         if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
@@ -1682,7 +1672,7 @@ impl Server {
                             warn!(
                                 owner = %owner_hex,
                                 id = hex::encode(record.record_id),
-                                "[MEMCHAIN] SyncRecordResponse record_id hash mismatch — skipping"
+                                "[MEMCHAIN] SyncRecordResponse record_id hash mismatch"
                             );
                             continue;
                         }
@@ -1690,7 +1680,7 @@ impl Server {
                     }
                 }
             }
-
+    
             MemChainMessage::BlockAnnounce(header) => {
                 info!(
                     height = header.height,
@@ -1698,125 +1688,361 @@ impl Server {
                     "[MEMCHAIN] BlockAnnounce received"
                 );
             }
-
-            // ====================================================
-            // 🌟 v1.1.0-ChatRelay: Zero-knowledge chat routing
-            // ====================================================
-
+    
+            // ── v1.1.0-ChatRelay + v1.3.0-Sovereign: ChatRelay ───────────────
+    
             MemChainMessage::ChatRelay(envelope) => {
-                // Validate Ed25519 signature before any routing decision.
-                // The node cannot decrypt the ciphertext, but it CAN verify
-                // that the sender signed the envelope header fields.
+                // Step 1: validate ChatEnvelope Ed25519 signature (unchanged)
                 if envelope.verify_signature().is_err() {
                     warn!(
                         receiver = %hex::encode(&envelope.receiver[..4]),
-                        "[CHAT_RELAY] Signature verification failed — dropped"
+                        "[CHAT_RELAY] Envelope signature verification failed — dropped"
                     );
                     return;
                 }
-
-                let receiver = envelope.receiver;
-
-                // ── Online path ───────────────────────────────────────────
-                // Broadcast to ALL active devices of the receiver wallet.
-                // get_all_by_wallet returns an empty Vec when offline.
-                let target_sessions = sessions.get_all_by_wallet(&receiver);
-
-                if !target_sessions.is_empty() {
-                    // Deduplication: skip if this message_id was already forwarded
-                    // on the online path (sender retransmit guard).
-                    let is_dup = chat_relay
-                        .as_ref()
-                        .map(|r| r.is_online_duplicate(&envelope.message_id))
-                        .unwrap_or(false);
-
-                    if is_dup {
-                        debug!(
-                            id = %hex::encode(envelope.message_id),
-                            "[CHAT_RELAY] Online duplicate — dropped"
-                        );
-                        return;
-                    }
-
-                    let device_count = target_sessions.len();
-                    for target in &target_sessions {
-                        Self::send_to_session(
-                            &MemChainMessage::ChatRelay(envelope.clone()),
-                            target,
-                            udp,
-                            crypto,
-                        )
-                        .await;
-                    }
-                    debug!(
-                        receiver = %hex::encode(&receiver[..4]),
-                        devices = device_count,
-                        "[CHAT_RELAY] Online delivery to {} device(s)", device_count
+    
+                let Some(ref relay) = chat_relay else {
+                    warn!(
+                        receiver = %hex::encode(&envelope.receiver[..4]),
+                        "[CHAT_RELAY] Relay service unavailable — dropped"
                     );
-                } else {
-                    // ── Offline path ──────────────────────────────────────
-                    // Store in chat_pending.db for later pull by the receiver.
-                    if let Some(ref relay) = chat_relay {
+                    return;
+                };
+    
+                // Step 2: dedup check (online path)
+                if relay.is_online_duplicate(&envelope.message_id) {
+                    debug!(
+                        id = %hex::encode(envelope.message_id),
+                        "[CHAT_RELAY] Online duplicate — dropped"
+                    );
+                    return;
+                }
+    
+                // Step 3: announce sender to route cache (refreshes last_active)
+                relay.wallet_routes.announce(
+                    &envelope.sender,
+                    session.id.clone(),
+                    session.client_endpoint,
+                );
+    
+                let receiver = envelope.receiver;
+    
+                // Step 4: lookup receiver in route cache (sovereign routing)
+                let target_routes = relay.wallet_routes.lookup(&receiver);
+    
+                if !target_routes.is_empty() {
+                    // ── Online path: deliver to all active sessions ───────────
+                    let mut all_failed = true;
+                    let device_count = target_routes.len();
+    
+                    for (target_sid, _endpoint) in &target_routes {
+                        // Look up the live Session object so we can encrypt correctly
+                        if let Some(target_session) = sessions.get(target_sid) {
+                            Server::send_to_session(
+                                &MemChainMessage::ChatRelay(envelope.clone()),
+                                &target_session,
+                                udp,
+                                crypto,
+                            ).await;
+                            all_failed = false;
+                        } else {
+                            // Session gone — prune the stale route entry
+                            relay.wallet_routes.remove_session(target_sid);
+                            debug!(
+                                session = %target_sid,
+                                "[CHAT_RELAY] Pruned stale route entry during delivery"
+                            );
+                        }
+                    }
+    
+                    if all_failed {
+                        // All sessions were stale — fall back to offline store
                         if let Err(e) = relay.store_pending(&envelope) {
                             warn!(
                                 error = %e,
                                 receiver = %hex::encode(&receiver[..4]),
-                                "[CHAT_RELAY] store_pending failed"
+                                "[CHAT_RELAY] Fallback store_pending failed"
                             );
                         } else {
                             debug!(
                                 receiver = %hex::encode(&receiver[..4]),
-                                id = %hex::encode(envelope.message_id),
-                                "[CHAT_RELAY] Stored for offline delivery"
+                                "[CHAT_RELAY] All routes stale — stored for offline delivery"
                             );
                         }
                     } else {
-                        warn!(
+                        debug!(
                             receiver = %hex::encode(&receiver[..4]),
-                            "[CHAT_RELAY] Receiver offline and relay service unavailable — dropped"
+                            devices = device_count,
+                            "[CHAT_RELAY] Online delivery to {} device(s)", device_count
+                        );
+                    }
+                } else {
+                    // ── Offline path: store for later pull ────────────────────
+                    if let Err(e) = relay.store_pending(&envelope) {
+                        warn!(
+                            error = %e,
+                            receiver = %hex::encode(&receiver[..4]),
+                            "[CHAT_RELAY] store_pending failed"
+                        );
+                    } else {
+                        debug!(
+                            receiver = %hex::encode(&receiver[..4]),
+                            id = %hex::encode(envelope.message_id),
+                            "[CHAT_RELAY] Stored for offline delivery"
                         );
                     }
                 }
             }
-
-            // ====================================================
-            // 🌟 v1.2.0-MultiDevice: Device registration
-            // ====================================================
-
-            MemChainMessage::DeviceRegister { device_id, device_name } => {
-                // The session is already authenticated by the transport layer —
-                // no additional signature is required.
-                //
-                // wallet_bytes() returns client_public_key.to_bytes() ([u8; 32]).
-                // This IS the wallet: the Ed25519 public key used to establish
-                // the VPN session is the canonical wallet identity.
-                let wallet = session.wallet_bytes();
-
-                // Truncate device_name server-side if the client sent more than
-                // 64 bytes. Avoid panicking on multi-byte UTF-8 boundaries by
-                // truncating at a char boundary.
-                let name_display = if device_name.len() > 64 {
-                    // Find the last char boundary at or before byte 64.
-                    let mut end = 64;
-                    while !device_name.is_char_boundary(end) {
-                        end -= 1;
+    
+            // ── v1.1.0 + v1.3.0-Sovereign: ChatPull ──────────────────────────
+    
+            MemChainMessage::ChatPull {
+                wallet, after_timestamp, cursor, limit,
+                request_timestamp, signature,
+            } => {
+                let Some(ref relay) = chat_relay else { return; };
+    
+                // Signature input (per spec):
+                // wallet(32) || after_timestamp(8,LE) || cursor(16) || limit(4,LE) || request_timestamp(8,LE)
+                let at_bytes = after_timestamp.to_le_bytes();
+                let limit_bytes = limit.to_le_bytes();
+                let rts_bytes = request_timestamp.to_le_bytes();
+    
+                let verify_result = verify_signed_message(
+                    DOMAIN_CHAT_PULL,
+                    &[
+                        wallet.as_ref(),
+                        at_bytes.as_ref(),
+                        cursor.as_ref(),
+                        limit_bytes.as_ref(),
+                        rts_bytes.as_ref(),
+                    ],
+                    &wallet,
+                    &signature,
+                    request_timestamp,
+                );
+    
+                if verify_result.is_err() {
+                    // Silent drop — no feedback to attacker (anti-DoS)
+                    return;
+                }
+    
+                // Announce to route cache: client is alive
+                relay.wallet_routes.announce(
+                    &wallet,
+                    session.id.clone(),
+                    session.client_endpoint,
+                );
+    
+                // Query by wallet from the signed message (not session key)
+                match relay.pull_pending(&wallet, after_timestamp, &cursor, limit) {
+                    Ok((messages, has_more)) => {
+                        let envelopes: Vec<_> = messages.into_iter().map(|m| m.envelope).collect();
+                        let resp = MemChainMessage::ChatPullResponse { envelopes, has_more };
+                        Server::send_to_session(&resp, session, udp, crypto).await;
                     }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            wallet = %hex::encode(&wallet[..4]),
+                            "[CHAT_RELAY] pull_pending failed"
+                        );
+                    }
+                }
+            }
+    
+            // ── v1.1.0 + v1.3.0-Sovereign: ChatAck ───────────────────────────
+    
+            MemChainMessage::ChatAck { message_ids, wallet, ack_timestamp, signature } => {
+                let Some(ref relay) = chat_relay else { return; };
+    
+                if message_ids.is_empty() {
+                    return;
+                }
+    
+                // Build SHA-256 of concatenated message_ids (in list order)
+                // ids_hash = SHA256( id[0](16) || id[1](16) || … )
+                let mut id_hasher = Sha256::new();
+                for mid in &message_ids {
+                    id_hasher.update(mid.as_ref());
+                }
+                let ids_hash: [u8; 32] = id_hasher.finalize().into();
+    
+                let ack_ts_bytes = ack_timestamp.to_le_bytes();
+    
+                let verify_result = verify_signed_message(
+                    DOMAIN_CHAT_ACK,
+                    &[
+                        wallet.as_ref(),
+                        ack_ts_bytes.as_ref(),
+                        ids_hash.as_ref(),
+                    ],
+                    &wallet,
+                    &signature,
+                    ack_timestamp,
+                );
+    
+                if let Err(e) = verify_result {
+                    warn!(
+                        wallet = %hex::encode(&wallet[..4]),
+                        error = %e,
+                        "[CHAT_RELAY] ChatAck signature failed"
+                    );
+                    return;
+                }
+    
+                // receiver = wallet — enforced by ack_messages SQL (AND receiver = ?)
+                match relay.ack_messages(&message_ids, &wallet) {
+                    Ok(deleted) => {
+                        debug!(
+                            deleted,
+                            wallet = %hex::encode(&wallet[..4]),
+                            "[CHAT_RELAY] ChatAck processed"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            wallet = %hex::encode(&wallet[..4]),
+                            "[CHAT_RELAY] ack_messages failed"
+                        );
+                    }
+                }
+            }
+    
+            // ── v1.3.0-Sovereign: DeviceRegister (with signature) ────────────
+    
+            MemChainMessage::DeviceRegister {
+                device_id, device_name, wallet_pubkey, timestamp, signature,
+            } => {
+                // Signature input (per spec):
+                // session_id(16) || device_id(16) || wallet_pubkey(32) || timestamp(8,LE)
+                let ts_bytes = timestamp.to_le_bytes();
+    
+                let verify_result = verify_signed_message(
+                    DOMAIN_DEVICE_REGISTER,
+                    &[
+                        session.id.as_bytes().as_ref(),
+                        device_id.as_ref(),
+                        wallet_pubkey.as_ref(),
+                        ts_bytes.as_ref(),
+                    ],
+                    &wallet_pubkey,
+                    &signature,
+                    timestamp,
+                );
+    
+                if let Err(e) = verify_result {
+                    warn!(
+                        session = %session.id,
+                        wallet = %hex::encode(&wallet_pubkey[..4]),
+                        error = %e,
+                        "[CHAT_RELAY] DeviceRegister signature failed"
+                    );
+                    return;
+                }
+    
+                // Truncate device_name at a UTF-8 char boundary if > 64 bytes
+                let name_display = if device_name.len() > 64 {
+                    let mut end = 64;
+                    while !device_name.is_char_boundary(end) { end -= 1; }
                     &device_name[..end]
                 } else {
                     &device_name
                 };
-
-                sessions.register_device(&wallet, device_id, session.id.clone());
-
+    
+                // Announce wallet → session in route cache
+                let Some(ref relay) = chat_relay else { return; };
+                relay.wallet_routes.announce(
+                    &wallet_pubkey,
+                    session.id.clone(),
+                    session.client_endpoint,
+                );
+    
+                // Register device in SessionManager
+                sessions.register_device(&wallet_pubkey, device_id, session.id.clone());
+    
                 info!(
                     session_id = %session.id,
-                    wallet = %hex::encode(&wallet[..4]),
+                    wallet = %hex::encode(&wallet_pubkey[..4]),
                     device_id = %hex::encode(device_id),
                     device_name = %name_display,
-                    "[CHAT_RELAY] Device registered"
+                    "[CHAT_RELAY] Device registered (v1.3.0-Sovereign)"
                 );
+    
+                // Deliver pending offline messages immediately
+                match relay.pull_pending(&wallet_pubkey, 0, &[0u8; 16], 100) {
+                    Ok((messages, _has_more)) if !messages.is_empty() => {
+                        let count = messages.len();
+                        for pm in messages {
+                            Server::send_to_session(
+                                &MemChainMessage::ChatRelay(pm.envelope),
+                                session,
+                                udp,
+                                crypto,
+                            ).await;
+                        }
+                        info!(
+                            count,
+                            wallet = %hex::encode(&wallet_pubkey[..4]),
+                            "[CHAT_RELAY] Delivered pending messages on register"
+                        );
+                    }
+                    Ok(_) => {} // no pending messages
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            wallet = %hex::encode(&wallet_pubkey[..4]),
+                            "[CHAT_RELAY] pull_pending on register failed"
+                        );
+                    }
+                }
             }
-
+    
+            // ── v1.3.0-Sovereign: WalletPresence heartbeat ───────────────────
+    
+            MemChainMessage::WalletPresence { wallet_pubkey, timestamp, signature } => {
+                let Some(ref relay) = chat_relay else { return; };
+    
+                // Signature input:
+                // session_id(16) || wallet_pubkey(32) || timestamp(8,LE)
+                let ts_bytes = timestamp.to_le_bytes();
+    
+                let verify_result = verify_signed_message(
+                    DOMAIN_WALLET_PRESENCE,
+                    &[
+                        session.id.as_bytes().as_ref(),
+                        wallet_pubkey.as_ref(),
+                        ts_bytes.as_ref(),
+                    ],
+                    &wallet_pubkey,
+                    &signature,
+                    timestamp,
+                );
+    
+                if let Err(e) = verify_result {
+                    // Debug level — this heartbeat fires frequently; warn would be noisy
+                    debug!(
+                        wallet = %hex::encode(&wallet_pubkey[..4]),
+                        error = %e,
+                        "[CHAT_RELAY] WalletPresence signature failed"
+                    );
+                    return;
+                }
+    
+                relay.wallet_routes.announce(
+                    &wallet_pubkey,
+                    session.id.clone(),
+                    session.client_endpoint,
+                );
+    
+                debug!(
+                    wallet = %hex::encode(&wallet_pubkey[..4]),
+                    "[CHAT_RELAY] WalletPresence: route refreshed"
+                );
+                // No reply — presence is one-way
+            }
+    
             _ => {
                 debug!("[MEMCHAIN] Unhandled message variant");
             }
