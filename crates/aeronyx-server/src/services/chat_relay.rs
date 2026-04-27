@@ -76,6 +76,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
@@ -87,6 +88,10 @@ use tracing::{debug, info, warn};
 use aeronyx_core::protocol::chat::{decode_envelope, encode_envelope, ChatEnvelope};
 
 use crate::config::ChatRelayConfig;
+
+pub mod wallet_routes;
+pub use wallet_routes::WalletRouteCache;
+
 
 // ============================================
 // Type aliases
