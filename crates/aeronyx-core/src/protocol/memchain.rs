@@ -75,7 +75,7 @@ pub const MEMCHAIN_MAGIC: u8 = 0xAE;
 // DO NOT change the serialisation logic — it must stay wire-compatible.
 
 mod serde_bytes64 {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(v: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
         let (lo, hi) = v.split_at(32);
