@@ -170,6 +170,23 @@ pub fn verify_signed_message(
     }
     let digest: [u8; 32] = hasher.finalize().into();
 
+    // ── DEBUG: dump sign input and digest (remove before production) ──
+    {
+        let mut sign_input_debug = Vec::new();
+        sign_input_debug.extend_from_slice(domain.as_bytes());
+        for s in payload_slices {
+            sign_input_debug.extend_from_slice(s);
+        }
+        tracing::info!(
+            "[VERIFY] domain={} input_len={} input_hex={} hash_hex={} pubkey={}",
+            domain,
+            sign_input_debug.len(),
+            hex::encode(&sign_input_debug),
+            hex::encode(&digest),
+            hex::encode(wallet_pubkey),
+        );
+    }
+
     // ── 3. Ed25519 verification ───────────────────────────────────────
     let pk = IdentityPublicKey::from_bytes(wallet_pubkey)
         .map_err(|_| AuthError::InvalidPublicKey)?;
