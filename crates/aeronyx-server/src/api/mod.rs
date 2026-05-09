@@ -32,6 +32,7 @@
 //! - [`auth`]: v1.0.0-MultiTenant JWT token issuance for SaaS mode
 //! - [`admin_handlers`]: v1.0.0-MultiTenant Admin endpoints (volumes, pool, usage)
 //! - [`local`]: Legacy Axum router (deprecated)
+//! - [`voice`]: v1.0.0-Voice Peer virtual IP resolution for UDP direct-connect
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - When adding new ORIGINAL-style endpoints → add to mpi_handlers.rs
@@ -43,6 +44,8 @@
 //! - Re-exports below MUST stay in sync — server.rs depends on them
 //! - auth.rs and admin_handlers.rs are SaaS-mode only but always compiled.
 //!   The routes are conditionally registered in build_mpi_router() based on mode.
+//! - voice.rs injects its own Arc<SessionManager> State independently of MpiState.
+//!   It is merged into the combined API router in server.rs::start_combined_api().
 //!
 //! ## Last Modified
 //! v0.3.0 - Initial Agent API for MemChain Phase 1
@@ -54,6 +57,10 @@
 //! v1.0.0-MultiTenant - Added auth + admin_handlers submodules for SaaS mode;
 //!   MpiState extended with Mode enum + SaaS pool fields;
 //!   build_mpi_router conditionally registers auth + admin routes in SaaS mode.
+//! v1.0.0-Voice - Added voice submodule:
+//!   GET /api/peer-virtual-ip?pubkey=<hex> → { online, virtual_ip, last_seen }
+//!   Two-pass lookup: wallet_index (O(1)) → all_sessions fallback (O(n)).
+//!   No auth required (virtual IP is network-layer routing info, not PII).
 
 // ── Core MPI module (state, auth, router) ──
 pub mod mpi;
@@ -71,6 +78,8 @@ pub mod auth;
 pub mod admin_handlers;
 // ── Legacy API (deprecated) ──
 pub mod local;
+// ── v1.0.0-Voice: Peer virtual IP resolution for UDP direct-connect routing ──
+pub mod voice;
 
 // ── Re-exports (unchanged from v2.3.0 — external callers unaffected) ──
 pub use mpi::{build_mpi_router, MpiState, BaselineSnapshot};
