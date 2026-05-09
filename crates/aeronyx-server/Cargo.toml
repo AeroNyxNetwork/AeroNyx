@@ -12,29 +12,32 @@
 # note to dev-deps (already present, just documenting).
 #
 # Modification Reason (v1.3.0):
-# - 🌟 Added `tokio-tungstenite` with `rustls-tls-native-roots` for
+# - Added `tokio-tungstenite` with `rustls-tls-native-roots` for
 #   WebSocket tunnel to CMS (Phase 3: wss:// to CMS + ws:// to local OpenClaw)
 # - `futures` was already present (workspace), confirmed needed for
 #   Stream/Sink traits used by tokio-tungstenite split()
 #
 # Modification Reason (v2.0.0 — MemChain Protocol Refactor):
-# - 🌟 Added `rusqlite` with `bundled` feature for SQLite-backed
+# - Added `rusqlite` with `bundled` feature for SQLite-backed
 #   MemoryRecord persistence (replaces AOF as primary storage)
 # - bundled mode compiles SQLite from source, avoiding system
 #   library version issues on GCP Ubuntu 22.04
 #
 # Modification Reason (v2.1.0+Embed — ndarray version bump):
-# - 🔧 Upgraded `ndarray` from 0.16 to 0.17 to match ort 2.0.0-rc.12's
-#   dependency requirement. ort rc.12 internally depends on ndarray ^0.17;
-#   using ndarray 0.16 causes type incompatibility (Array2<i64> from 0.16
-#   is a different type than Array2<i64> from 0.17 in Rust's type system),
-#   leading to `From<ArrayBase<OwnedRepr<i64>, Dim<[usize; 2]>>>` not
-#   being implemented for `SessionInputValue`.
+# - Upgraded `ndarray` from 0.16 to 0.17 to match ort 2.0.0-rc.12's
+#   dependency requirement.
 #
 # Modification Reason (v2.5.2+SecAudit):
-# - 🔒 Added `zeroize` for Zeroizing<[u8; 32]> wrapping of record_key
-#   in MemoryStorage. Ensures the encryption key is wiped from memory
-#   on drop, preventing key exposure in core dumps / /proc/pid/mem scans.
+# - Added `zeroize` for Zeroizing<[u8; 32]> wrapping of record_key
+#   in MemoryStorage.
+#
+# Modification Reason (v1.0.0-Voice):
+# - Added `"limit"` feature to `tower` dependency.
+#   tower = "0.5" does NOT enable `limit` by default.
+#   `voice.rs` uses `tower::limit::RateLimitLayer` for the
+#   GET /api/peer-virtual-ip rate limiter (30 req/60s).
+#   Without this feature flag the crate compiles but the
+#   `tower::limit` module is missing → E0432 unresolved import.
 #
 # Main Functionality:
 # - Server binary with CLI interface
@@ -42,17 +45,19 @@
 # - Session management and routing
 # - Handshake processing
 # - Packet forwarding
-# - 🌟 MemChain storage engine (MemPool + AofWriter) — legacy
-# - 🌟 MemChain storage engine (SQLite + VectorIndex) — new primary
-# - 🌟 CMS command pipeline + AgentManager (v1.3.0)
-# - 🌟 WebSocket tunnel for real-time AI interaction (v1.3.0)
+# - MemChain storage engine (MemPool + AofWriter) — legacy
+# - MemChain storage engine (SQLite + VectorIndex) — new primary
+# - CMS command pipeline + AgentManager (v1.3.0)
+# - WebSocket tunnel for real-time AI interaction (v1.3.0)
+# - Voice API with rate limiting (v1.0.0-Voice)
 #
 # Dependencies:
 # - Depends on: aeronyx-core, aeronyx-transport, aeronyx-common
 # - External: tokio, clap, tracing
-# - 🌟 v1.3.0: tokio-tungstenite (WebSocket client)
-# - 🌟 v2.0.0: rusqlite (SQLite persistence)
-# - 🔒 v2.5.2: zeroize (key memory wipe on drop)
+# - v1.3.0: tokio-tungstenite (WebSocket client)
+# - v2.0.0: rusqlite (SQLite persistence)
+# - v2.5.2: zeroize (key memory wipe on drop)
+# - v1.0.0-Voice: tower with "limit" feature (RateLimitLayer)
 #
 # Binary:
 # - aeronyx-server: Main server executable
@@ -63,26 +68,22 @@
 # - Requires root/CAP_NET_ADMIN for TUN operations
 # - MemChain AOF file is created in the working directory (legacy)
 # - MemChain SQLite database replaces AOF as primary storage (new)
-# - 🌟 tokio-tungstenite uses rustls (not native-tls) to match
-#   the rest of the project's TLS strategy (reqwest also uses rustls-tls)
-# - 🌟 futures crate is needed for SinkExt/StreamExt traits
-#   used by tokio-tungstenite's split() WS streams
-# - 🌟 rusqlite bundled mode requires a C compiler (cc) at build time
-#   This is already available on the GCP Ubuntu 22.04 build server.
-# - ⚠️ ndarray version MUST match ort's dependency. ort 2.0.0-rc.12
-#   requires ndarray ^0.17. Do NOT downgrade to 0.16 or Tensor
-#   conversions will fail at compile time.
-# - 🔒 zeroize: do NOT remove. Required for Zeroizing<[u8;32]> in
-#   storage.rs::MemoryStorage::record_key. Removing it causes a compile
-#   error and leaves the encryption key unwiped in process memory.
+# - tokio-tungstenite uses rustls (not native-tls)
+# - futures crate is needed for SinkExt/StreamExt traits
+# - rusqlite bundled mode requires a C compiler (cc) at build time
+# - ndarray version MUST match ort's dependency (^0.17)
+# - zeroize: do NOT remove — storage.rs::MemoryStorage::record_key depends on it
+# - tower MUST include feature "limit" — voice.rs uses RateLimitLayer.
+#   Removing the feature causes E0432 at compile time.
 #
 # Last Modified:
 # v0.1.0 - Initial server implementation
 # v0.2.0 - Added bincode for MemChain integration
-# v1.3.0 - 🌟 Added tokio-tungstenite for WebSocket tunnel
-# v2.0.0 - 🌟 Added rusqlite for SQLite MemoryRecord storage
-# v2.1.0+Embed - 🔧 ndarray 0.16 → 0.17 for ort rc.12 compatibility
-# v2.5.2+SecAudit - 🔒 Added zeroize for record_key memory safety
+# v1.3.0 - Added tokio-tungstenite for WebSocket tunnel
+# v2.0.0 - Added rusqlite for SQLite MemoryRecord storage
+# v2.1.0+Embed - ndarray 0.16 -> 0.17 for ort rc.12 compatibility
+# v2.5.2+SecAudit - Added zeroize for record_key memory safety
+# v1.0.0-Voice - Added "limit" feature to tower for RateLimitLayer
 # ============================================
 
 [package]
@@ -126,45 +127,37 @@ toml = { workspace = true }
 serde = { workspace = true }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 
-# 🌟 Added for MemChain: AOF persistence + message handling
+# Added for MemChain: AOF persistence + message handling
 bincode = "1.3"
 
-# 🌟 Added for MemChain Phase 1: Agent HTTP API
+# Added for MemChain Phase 1: Agent HTTP API
 axum = "0.7"
-tower = "0.5"
 
-# 🌟 v1.3.0: WebSocket client for CMS tunnel + local OpenClaw Gateway
-# Uses rustls with ring crypto backend for TLS.
-# native-roots loads the system CA store for wss:// certificate validation.
+# v1.0.0-Voice: "limit" feature required for tower::limit::RateLimitLayer
+# used in api/voice.rs GET /api/peer-virtual-ip rate limiter.
+# tower = "0.5" does NOT enable this by default — must be explicit.
+tower = { version = "0.5", features = ["limit"] }
+
+# v1.3.0: WebSocket client for CMS tunnel + local OpenClaw Gateway
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", features = ["ring"], default-features = false }
 
-# 🌟 v2.0.0: SQLite persistence for MemoryRecord (MRS-1)
+# v2.0.0: SQLite persistence for MemoryRecord (MRS-1)
 rusqlite = { version = "0.31", features = ["bundled"] }
 
-# 🌟 v2.1.0: MVF + Rule Engine + RawLog encryption
+# v2.1.0: MVF + Rule Engine + RawLog encryption
 regex = "1.10"
 hkdf = "0.12"
 chacha20poly1305 = { workspace = true }
 
-# 🌟 v2.1.0+Embed: Local MiniLM embedding inference
+# v2.1.0+Embed: Local MiniLM embedding inference
 # ⚠️ ort 2.0.0-rc.12 requires ndarray ^0.17 — do NOT use ndarray 0.16
-# 🔧 v2.1.0+Embed-fix2: Switched from download-binaries to load-dynamic.
-#   Reason: pyke's prebuilt static binaries (download-binaries) require
-#   glibc ≥ 2.38 (__isoc23_strtol symbols), but Ubuntu 22.04 has glibc 2.35.
-#   load-dynamic uses dlopen() at runtime to load libonnxruntime.so from
-#   Microsoft's official release (glibc 2.28+ compatible).
-#   The .so is downloaded by scripts/download_models.sh alongside model files.
-#   EmbedEngine::load() auto-detects and initializes it — zero config for users.
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["ndarray", "load-dynamic"] }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
-# 🔧 v2.1.0+Embed: upgraded from 0.16 → 0.17 to match ort rc.12 dependency
 ndarray = "0.17"
 hmac = "0.12"
 
-# 🔒 v2.5.2+SecAudit: Zeroizing wrapper for record_key in MemoryStorage.
-# Wipes the [u8; 32] encryption key from memory on drop, preventing
-# exposure in core dumps and /proc/pid/mem reads.
+# v2.5.2+SecAudit: Zeroizing wrapper for record_key in MemoryStorage.
 # ⚠️ Do NOT remove — storage.rs::MemoryStorage::record_key depends on this.
 zeroize = "1"
 
@@ -188,7 +181,7 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.12"
-tower = { version = "0.5", features = ["util"] }
+tower = { version = "0.5", features = ["util", "limit"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 
 [lints]
