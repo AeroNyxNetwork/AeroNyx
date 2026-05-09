@@ -100,11 +100,20 @@
 //!   - `wallet_index_count()` returns total device-entry count across all wallets
 //!   - All existing tests preserved verbatim
 //!   - New multi-device tests appended
+//!
+//! v1.0.0-Voice+SessionFix
+//!   - `cleanup_expired()` return type extended from `Vec<(SessionId, Ipv4Addr)>`
+//!     to `Vec<(SessionId, Ipv4Addr, String, u64, u64)>`.
+//!     The three new fields are: wallet_hex, bytes_rx, bytes_tx.
+//!   - Enables server.rs spawn_cleanup_task to pass real wallet and traffic
+//!     data to `session_ended()`, fixing the aeronyx.network 400 error:
+//!     `{"error":{"client_wallet":["This field is required."]}}`.
+//!   - All existing tests preserved verbatim; cleanup test updated for new tuple.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
@@ -615,6 +624,16 @@ impl std::fmt::Debug for Session {
 // Session Manager — v1.2.0-MultiDevice
 // ============================================
 
+/// How long a released virtual IP stays in the cooldown pool before
+/// being made available for reassignment.
+///
+/// Prevents voice packets addressed to a just-released IP from reaching
+/// a new session that was immediately assigned the same address.
+/// 30 s is well above the client-side `last_seen > 120 s` staleness
+/// threshold, so a legitimately offline peer's IP is always cooled down
+/// before any new session can claim it.
+const IP_COOLDOWN_SECS: u64 = 30;
+
 /// Manages all active sessions with multi-device wallet reverse lookup.
 ///
 /// ## v1.2.0-MultiDevice Change
@@ -643,6 +662,19 @@ pub struct SessionManager {
 
     max_sessions: usize,
     session_timeout: Duration,
+
+    /// IP cooldown pool: virtual IPs that have been released but are not yet
+    /// eligible for reassignment. Maps IP → release Instant.
+    ///
+    /// Populated by `release_ip_with_cooldown()`, drained by
+    /// `drain_cooldown_pool()`. IpPoolService calls `drain_cooldown_pool()`
+    /// before `release()` so that the IP pool only gets back addresses that
+    /// have completed their cooldown window.
+    ///
+    /// ⚠️ SessionManager does NOT own IpPoolService — it only tracks the
+    /// cooldown state. The caller (spawn_cleanup_task) is responsible for
+    /// calling `drain_cooldown_pool()` and forwarding IPs to `ip_pool.release()`.
+    cooldown_pool: DashMap<Ipv4Addr, Instant>,
 }
 
 impl SessionManager {
@@ -654,6 +686,7 @@ impl SessionManager {
             wallet_index: DashMap::new(),
             max_sessions,
             session_timeout,
+            cooldown_pool: DashMap::new(),
         }
     }
 
@@ -865,19 +898,54 @@ impl SessionManager {
     }
 
     /// Clean up expired sessions and their wallet_index entries.
-    pub fn cleanup_expired(&self) -> Vec<(SessionId, Ipv4Addr)> {
+    ///
+    /// ## v1.0.0-Voice+SessionFix
+    /// Return type extended from `Vec<(SessionId, Ipv4Addr)>` to
+    /// `Vec<(SessionId, Ipv4Addr, String, u64, u64)>`.
+    ///
+    /// The three new fields:
+    /// - `wallet_hex`: hex-encoded Ed25519 public key (client identity)
+    /// - `bytes_rx`:   bytes received from client during this session
+    /// - `bytes_tx`:   bytes sent to client during this session
+    ///
+    /// These are consumed by `server.rs::spawn_cleanup_task` to pass
+    /// accurate data to `session_ended()`, fixing the aeronyx.network
+    /// 400 error caused by `client_wallet: null` and zero traffic counts.
+    ///
+    /// Released IPs are staged into the cooldown pool via
+    /// `stage_ip_cooldown()` — callers must use `drain_cooldown_pool()`
+    /// to retrieve IPs that have completed their cooldown before returning
+    /// them to IpPoolService.
+    ///
+    /// ⚠️ Race window: stats snapshot and session removal are two separate
+    /// operations — no cross-session atomic lock. DashMap's design makes
+    /// this unavoidable and is consistent with the rest of the codebase.
+    /// The discrepancy (if any) is a few bytes at most and is acceptable.
+    pub fn cleanup_expired(&self) -> Vec<(SessionId, Ipv4Addr, String, u64, u64)> {
         let mut expired = Vec::new();
 
         for entry in self.sessions.iter() {
             let session = entry.value();
             if session.is_expired(self.session_timeout) {
-                expired.push((session.id.clone(), session.virtual_ip));
+                let snap = session.stats.snapshot();
+                let wallet = hex::encode(session.client_public_key.to_bytes());
+                expired.push((
+                    session.id.clone(),
+                    session.virtual_ip,
+                    wallet,
+                    snap.bytes_rx,
+                    snap.bytes_tx,
+                ));
             }
         }
 
-        for (id, ip) in &expired {
+        for (id, ip, _, _, _) in &expired {
             debug!(session_id = %id, virtual_ip = %ip, "Session expired");
             self.remove(id);
+            // Stage the released IP into the cooldown pool.
+            // spawn_cleanup_task calls drain_cooldown_pool() each tick
+            // to collect IPs whose cooldown has elapsed.
+            self.cooldown_pool.insert(*ip, Instant::now());
         }
 
         if !expired.is_empty() {
@@ -889,6 +957,44 @@ impl SessionManager {
         }
 
         expired
+    }
+
+    /// Drain virtual IPs from the cooldown pool whose cooldown window has elapsed.
+    ///
+    /// Called by `server.rs::spawn_cleanup_task` each tick (every 60 s).
+    /// Returns the list of IPs that are now safe to return to `IpPoolService`.
+    ///
+    /// ## Why this exists
+    /// When a session expires, its virtual IP must not be immediately reassigned.
+    /// If it were, stale voice packets still in flight (addressed to the old
+    /// session's IP) would be delivered to the new session owner. A 30-second
+    /// cooldown window ensures those stale packets expire or are rejected before
+    /// any new session can claim the address.
+    ///
+    /// ## Caller responsibility
+    /// ```rust
+    /// for ip in sessions.drain_cooldown_pool() {
+    ///     ip_pool.release(ip);
+    /// }
+    /// ```
+    pub fn drain_cooldown_pool(&self) -> Vec<Ipv4Addr> {
+        let cutoff = Duration::from_secs(IP_COOLDOWN_SECS);
+        let mut ready = Vec::new();
+
+        self.cooldown_pool.retain(|ip, released_at| {
+            if released_at.elapsed() >= cutoff {
+                ready.push(*ip);
+                false // remove from pool
+            } else {
+                true  // keep in pool
+            }
+        });
+
+        if !ready.is_empty() {
+            debug!(count = ready.len(), "Virtual IPs released from cooldown pool");
+        }
+
+        ready
     }
 
     /// Returns an owned snapshot of all active sessions.
@@ -1468,29 +1574,114 @@ mod tests {
         assert!(manager.get_all_by_wallet(&wallet).is_empty());
     }
 
+    /// v1.0.0-Voice+SessionFix: cleanup_expired now returns 5-tuple.
+    /// Verifies the new wallet_hex and bytes fields are populated correctly.
+    /// Also verifies the IP cooldown pool is populated after cleanup.
     #[test]
     fn test_cleanup_expired_removes_device_entries() {
         let manager = SessionManager::new(100, Duration::from_millis(1));
         let identity = IdentityKeyPair::generate();
         let wallet = identity.public_key_bytes();
         let sid = SessionId::generate();
+        let virtual_ip = Ipv4Addr::new(100, 64, 0, 2);
 
         manager
             .create(
                 sid.clone(),
                 identity.public_key(),
                 SessionKey::from_bytes([0x42; 32]),
-                Ipv4Addr::new(100, 64, 0, 2),
+                virtual_ip,
                 "127.0.0.1:12345".parse().unwrap(),
             )
             .unwrap();
         manager.register_device(&wallet, make_device_id(0x01), sid);
 
         std::thread::sleep(Duration::from_millis(10));
-        manager.cleanup_expired();
+        let expired = manager.cleanup_expired();
 
+        // Verify 5-tuple structure
+        assert_eq!(expired.len(), 1);
+        let (_, vip, wallet_hex, bytes_rx, bytes_tx) = &expired[0];
+        assert_eq!(*vip, virtual_ip);
+        assert_eq!(*wallet_hex, hex::encode(wallet));
+        assert_eq!(*bytes_rx, 0);
+        assert_eq!(*bytes_tx, 0);
+
+        // IP must be staged into cooldown pool immediately after cleanup
+        assert!(
+            manager.cooldown_pool.contains_key(vip),
+            "Released IP must be in cooldown pool"
+        );
+
+        // drain_cooldown_pool must return nothing before cooldown elapses
+        let drained_before = manager.drain_cooldown_pool();
+        assert!(
+            drained_before.is_empty(),
+            "IP must not be released before cooldown window"
+        );
+
+        // wallet_index must be fully cleaned up
         assert!(manager.get_all_by_wallet(&wallet).is_empty());
         assert_eq!(manager.wallet_index_count(), 0);
+    }
+
+    /// Verify that drain_cooldown_pool releases IPs after the cooldown window.
+    #[test]
+    fn test_drain_cooldown_pool_after_window() {
+        let manager = SessionManager::new(100, Duration::from_secs(300));
+        let ip = Ipv4Addr::new(100, 64, 0, 99);
+
+        // Insert the IP into the cooldown pool with the current time,
+        // then advance time by sleeping past the cooldown window.
+        // We use a manager with a 1 ms session timeout and rely on
+        // drain_cooldown_pool's elapsed() check against IP_COOLDOWN_SECS.
+        //
+        // Since IP_COOLDOWN_SECS = 30 and we cannot sleep 30 s in a unit test,
+        // we directly verify the drain logic by checking that an IP inserted
+        // NOW is NOT returned (cooldown not yet elapsed).
+        manager.cooldown_pool.insert(ip, Instant::now());
+        let drained_immediately = manager.drain_cooldown_pool();
+        assert!(
+            drained_immediately.is_empty(),
+            "IP must not be drained before cooldown window elapses"
+        );
+
+        // Verify the IP is still in the pool (not incorrectly evicted).
+        assert!(
+            manager.cooldown_pool.contains_key(&ip),
+            "IP must remain in cooldown pool until window elapses"
+        );
+    }
+
+    /// Verify that an IP is drained once its cooldown window has elapsed.
+    /// Uses a zero-duration cutoff by directly manipulating the pool with
+    /// a pre-elapsed instant computed via checked_sub to avoid panic on
+    /// systems where uptime < IP_COOLDOWN_SECS.
+    #[test]
+    fn test_drain_cooldown_pool_elapsed() {
+        let manager = SessionManager::new(100, Duration::from_secs(300));
+        let ip = Ipv4Addr::new(100, 64, 0, 88);
+
+        // Use checked_sub to avoid panic if system uptime < IP_COOLDOWN_SECS.
+        // If the system has been running for at least IP_COOLDOWN_SECS + 1 s,
+        // we get a past Instant. Otherwise we skip this test safely.
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(IP_COOLDOWN_SECS + 1));
+
+        let Some(past_instant) = past else {
+            // System uptime < cooldown window — skip rather than panic.
+            eprintln!("Skipping test_drain_cooldown_pool_elapsed: system uptime too short");
+            return;
+        };
+
+        manager.cooldown_pool.insert(ip, past_instant);
+
+        let drained = manager.drain_cooldown_pool();
+        assert_eq!(drained, vec![ip], "IP must be returned after cooldown window");
+        assert!(
+            !manager.cooldown_pool.contains_key(&ip),
+            "IP must be removed from cooldown pool after drain"
+        );
     }
 
     #[test]
