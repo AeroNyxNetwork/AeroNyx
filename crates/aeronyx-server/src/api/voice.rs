@@ -14,81 +14,48 @@
 //!   returning its VPN virtual IP (100.64.0.x), online status, and last-seen
 //!   timestamp.
 //!
-//! ## Dependencies
-//! - `crate::services::SessionManager` — two-pass session lookup:
-//!   1. `get_by_wallet()` — O(1) DashMap lookup (P2P-mode clients)
-//!   2. `all_sessions().find()` — O(n) linear scan fallback (pure-VPN clients)
-//! - `axum` — HTTP handler + Router
-//! - Mounted by `server.rs::start_combined_api()` via `.merge()`
-//!
 //! ## Two-Pass Lookup Design
 //!
 //! ### Why two passes?
-//! Clients fall into two categories:
-//! - **P2P mode** (desktop auto, mobile after first P2P message):
-//!   Sends `DeviceRegister` → recorded in `wallet_index` → fast O(1) lookup.
-//! - **Pure VPN mode** (iOS/Android browsing only, no P2P chat):
-//!   Only performs WireGuard handshake, NEVER sends `DeviceRegister`.
-//!   `wallet_index` has no entry for these clients.
+//! - **P2P mode** clients send `DeviceRegister` → recorded in `wallet_index`
+//!   → O(1) lookup via `get_by_wallet()`.
+//! - **Pure VPN mode** clients (iOS/Android, no P2P chat) never send
+//!   `DeviceRegister` → not in `wallet_index` → need O(n) fallback via
+//!   `all_sessions().find()`.
 //!
-//! Using only `get_by_wallet()` would return `online: false` for pure-VPN
-//! clients even though they have an active session and valid virtual IP,
-//! causing voice call UDP direct-connect to fail.
+//! ## Rate Limiting
+//! Global token-bucket: 30 requests / 60 seconds across all callers.
+//! Blocks enumeration attacks that sweep pubkeys to map online users.
 //!
-//! ### Resolution
-//! Pass 1 — `wallet_index` (O(1)):
-//!   For P2P-mode clients. Hit rate is near 100%. Returns immediately on hit.
-//!
-//! Pass 2 — `all_sessions()` linear scan (O(n)):
-//!   Fallback for pure-VPN clients. Compares `session.client_public_key` bytes
-//!   directly. n is bounded by max_sessions (typically <= 1000). Acceptable
-//!   because Voice API is called at most once per call setup, not per packet.
-//!
-//! ## Main Logical Flow
-//! 1. Parse query param `pubkey` (64-char hex -> [u8; 32]); bad format -> offline
-//! 2. Pass 1: `SessionManager::get_by_wallet(&pubkey_bytes)` (O(1))
-//! 3. Pass 2: `all_sessions().find()` linear scan (O(n) fallback)
-//! 4. Session found -> compute `last_seen`, return online=true + virtual_ip
-//!    - `last_seen` = current unix seconds - `session.idle_time().as_secs()`
-//!    - `saturating_sub` guards against integer underflow
-//! 5. Not found -> return online=false, virtual_ip=null, last_seen=null
+//! Implementation uses a `DashMap`-backed counter (no external middleware)
+//! because `tower::limit::RateLimitLayer` produces a `RateLimit<Route>` that
+//! does not implement `Clone`, which axum's `Router::layer` requires.
+//! The DashMap approach is lock-free and Clone-safe.
 //!
 //! ## Auth
 //! No authentication required. Virtual IPs are network-layer routing
 //! information, not user PII.
 //!
 //! ## Client-Side Staleness Check
-//! A `get_by_wallet()` hit does not guarantee the session is truly active
-//! (it may have just timed out but not yet been evicted by `cleanup_expired`).
+//! A `get_by_wallet()` hit does not guarantee the session is truly active.
 //! Clients should apply a secondary check on `last_seen`:
 //! ```dart
-//! if (now - lastSeen > 120) return null; // treat as offline if idle > 2 min
-//! ```
-//!
-//! ## Response Format
-//! ```json
-//! // Online
-//! { "online": true,  "virtual_ip": "100.64.0.3", "last_seen": 1746614400 }
-//! // Offline / not found / bad pubkey
-//! { "online": false, "virtual_ip": null,          "last_seen": null }
+//! if (now - lastSeen > 120) return null; // treat as offline
 //! ```
 //!
 //! ## ⚠️ Important Notes for Next Developer
-//! - `wallet_index` key is the P2P identity public key (Ed25519, 32 bytes),
-//!   written by the client's `DeviceRegister` message; identical to
-//!   `session.client_public_key`.
+//! - `wallet_index` key is the P2P identity public key (Ed25519, 32 bytes).
 //! - `get_by_wallet()` returns the most recently registered session (last device).
-//!   Sufficient for voice calls; use `get_all_by_wallet()` for multi-device broadcast.
-//! - `session.idle_time()` returns a Duration (time since last activity).
-//!   Subtract from current unix time to get a timestamp.
-//! - This router does NOT share MpiState. It injects Arc<SessionManager>
-//!   as its own independent axum State.
-//! - Pass 2 accesses `client_public_key.to_bytes()` directly rather than
-//!   `wallet_bytes()` — functionally identical, avoids one extra method call.
+//! - `session.idle_time()` returns a Duration — subtract from unix time for timestamp.
+//! - This router uses `VoiceState` (sessions + rate_limiter) as its axum State,
+//!   independent of MpiState. The two routers are fully isolated.
+//! - Do NOT replace the DashMap rate limiter with `tower::limit::RateLimitLayer`
+//!   — it breaks axum's Clone requirement on Router::layer.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial implementation for AeroNyx Voice UDP direct-connect routing.
 //!   Two-pass lookup: wallet_index O(1) + all_sessions O(n) fallback.
+//!   DashMap-based global rate limiter (30 req / 60 s).
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -99,17 +66,81 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use tower::limit::RateLimitLayer;
-use std::time::Duration as StdDuration;
 
 use crate::services::SessionManager;
 
-// ── Rate limit: 30 requests per 60 seconds per server instance.
-// Voice API is called once per call setup — 30 req/min is generous
-// for legitimate use and blocks enumeration attacks.
+// ============================================
+// Rate Limiter
+// ============================================
+
+/// Rate limit: 30 requests per 60-second window (global, not per-IP).
+/// Sufficient to block bulk enumeration; legitimate voice clients call
+/// this endpoint at most once per call setup.
 const RATE_LIMIT_REQUESTS: u64 = 30;
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+
+/// Global token-bucket rate limiter backed by DashMap.
+///
+/// Tracks (window_start_unix_secs, request_count) under a single
+/// "global" key. Resets automatically when the window expires.
+///
+/// ## Why not tower::limit::RateLimitLayer?
+/// `RateLimit<Route>` does not implement `Clone`, which axum's
+/// `Router::layer` requires. This DashMap approach is lock-free
+/// and satisfies axum's Clone constraint.
+#[derive(Debug, Clone)]
+struct RateLimiter {
+    state: Arc<DashMap<&'static str, (u64, u64)>>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self { state: Arc::new(DashMap::new()) }
+    }
+
+    /// Returns `true` if the request is allowed, `false` if limit exceeded.
+    ///
+    /// Thread-safe: DashMap entry lock is held only during the counter update.
+    fn check(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut entry = self.state.entry("global").or_insert((now, 0));
+        let (window_start, count) = entry.value_mut();
+
+        // Reset window if the current window has expired.
+        if now.saturating_sub(*window_start) >= RATE_LIMIT_WINDOW_SECS {
+            *window_start = now;
+            *count = 0;
+        }
+
+        if *count >= RATE_LIMIT_REQUESTS {
+            return false;
+        }
+
+        *count += 1;
+        true
+    }
+}
+
+// ============================================
+// Combined Router State
+// ============================================
+
+/// Axum state for the Voice API router.
+///
+/// Bundles `SessionManager` and `RateLimiter` into a single `Clone`-able
+/// state, because axum `Router` supports only one State type per router.
+/// Both fields are cheaply cloneable (`Arc` / `Arc<DashMap>`).
+#[derive(Clone)]
+pub struct VoiceState {
+    sessions: Arc<SessionManager>,
+    rate_limiter: RateLimiter,
+}
 
 // ============================================
 // Request / Response Types
@@ -143,19 +174,13 @@ pub struct PeerVirtualIpResponse {
 }
 
 impl PeerVirtualIpResponse {
-    /// Constructs an offline / not-found response.
     #[inline]
     fn offline() -> Self {
-        Self {
-            online: false,
-            virtual_ip: None,
-            last_seen: None,
-        }
+        Self { online: false, virtual_ip: None, last_seen: None }
     }
 }
 
-/// Error response body (used for validation failures only).
-/// Rate limit errors are returned as plain 429 by Tower middleware.
+/// Error response body for HTTP 429 Too Many Requests.
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: &'static str,
@@ -169,75 +194,84 @@ struct ErrorResponse {
 ///
 /// Resolves a peer's P2P identity public key to its current VPN virtual IP.
 ///
+/// ## Rate limiting
+/// Returns HTTP 429 with `{"error":"rate limit exceeded"}` when the global
+/// limit (30 req / 60 s) is exceeded.
+///
 /// ## Lookup Strategy (Two-pass)
 ///
 /// **Pass 1** — `wallet_index` O(1):
-/// Serves P2P-mode clients whose `DeviceRegister` has already been processed.
-/// Returns immediately on hit; covers ~100% of desktop and post-first-message
-/// mobile clients.
+/// P2P-mode clients whose `DeviceRegister` has been processed. Covers ~100%
+/// of desktop and post-first-message mobile clients.
 ///
 /// **Pass 2** — `all_sessions()` O(n) linear scan:
-/// Fallback for pure-VPN clients (iOS/Android in VPN-only mode, or mobile
-/// before the first P2P message). Compares `session.client_public_key`
-/// bytes directly against the requested pubkey. n is bounded by
-/// `max_sessions` (typically <= 1000), and this endpoint is low-frequency
-/// (called once per call setup), so O(n) is acceptable.
+/// Fallback for pure-VPN clients that never send `DeviceRegister`.
+/// n ≤ max_sessions (typically ≤ 1000). Acceptable for low-frequency
+/// voice-setup calls (once per call, not per packet).
 ///
 /// # Query Parameters
 /// - `pubkey`: 64-char lowercase hex string (Ed25519 public key, 32 bytes)
 ///
 /// # Responses
-/// - Online  → `{ online: true,  virtual_ip: "100.64.0.x", last_seen: <unix_ts> }`
-/// - Offline → `{ online: false, virtual_ip: null,          last_seen: null }`
-/// - Bad key → `{ online: false, virtual_ip: null,          last_seen: null }`
+/// - Online      → `{ online: true,  virtual_ip: "100.64.0.x", last_seen: <ts> }`
+/// - Offline     → `{ online: false, virtual_ip: null,          last_seen: null }`
+/// - Bad pubkey  → `{ online: false, virtual_ip: null,          last_seen: null }`
+/// - Rate limit  → HTTP 429 `{ error: "rate limit exceeded" }`
 pub async fn peer_virtual_ip_handler(
-    State(sessions): State<Arc<SessionManager>>,
+    State(state): State<VoiceState>,
     Query(params): Query<PeerVirtualIpQuery>,
-) -> Json<PeerVirtualIpResponse> {
-    // ── Step 1: Decode hex pubkey → [u8; 32] ─────────────────────────────
-    // Malformed hex or wrong length: return offline without leaking error details.
+) -> Result<Json<PeerVirtualIpResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // ── Step 1: Rate limit check ──────────────────────────────────────────
+    if !state.rate_limiter.check() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse { error: "rate limit exceeded" }),
+        ));
+    }
+
+    // ── Step 2: Validate and decode hex pubkey → [u8; 32] ────────────────
+    // Reject anything that is not exactly 64 hex characters.
+    // Return offline (not an error) to avoid leaking structural information.
+    if params.pubkey.len() != 64 {
+        return Ok(Json(PeerVirtualIpResponse::offline()));
+    }
+
     let pubkey_bytes: [u8; 32] = match hex::decode(&params.pubkey) {
         Ok(bytes) if bytes.len() == 32 => {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
             arr
         }
-        _ => return Json(PeerVirtualIpResponse::offline()),
+        _ => return Ok(Json(PeerVirtualIpResponse::offline())),
     };
 
-    // ── Step 2: Pass 1 — wallet_index O(1) ───────────────────────────────
-    // Fast path for P2P-mode clients (DeviceRegister already received).
-    let session = if let Some(s) = sessions.get_by_wallet(&pubkey_bytes) {
+    // ── Step 3: Pass 1 — wallet_index O(1) ───────────────────────────────
+    let session = if let Some(s) = state.sessions.get_by_wallet(&pubkey_bytes) {
         s
     } else {
-        // ── Step 3: Pass 2 — full session scan O(n) ──────────────────────
-        // Fallback for pure-VPN clients that never send DeviceRegister.
-        // Iterates all active sessions and compares client_public_key bytes.
-        match sessions
+        // ── Step 4: Pass 2 — full session scan O(n) ──────────────────────
+        match state.sessions
             .all_sessions()
             .into_iter()
             .find(|s| s.client_public_key.to_bytes() == pubkey_bytes)
         {
             Some(s) => s,
-            None => return Json(PeerVirtualIpResponse::offline()),
+            None => return Ok(Json(PeerVirtualIpResponse::offline())),
         }
     };
 
-    // ── Step 4: Compute last_seen unix timestamp ──────────────────────────
-    // last_seen = now_unix_secs - idle_secs
-    // idle_time() returns Duration since last activity (AtomicInstant::elapsed).
-    // saturating_sub prevents underflow in pathological clock conditions.
+    // ── Step 5: Compute last_seen unix timestamp ──────────────────────────
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let last_seen = now_unix.saturating_sub(session.idle_time().as_secs());
 
-    Json(PeerVirtualIpResponse {
+    Ok(Json(PeerVirtualIpResponse {
         online: true,
         virtual_ip: Some(session.virtual_ip.to_string()),
         last_seen: Some(last_seen),
-    })
+    }))
 }
 
 // ============================================
@@ -249,29 +283,23 @@ pub async fn peer_virtual_ip_handler(
 /// Registers:
 /// - `GET /api/peer-virtual-ip` → [`peer_virtual_ip_handler`]
 ///
-/// ## Security layers applied
-/// - **Rate limit**: 30 requests / 60 s (Tower `RateLimitLayer`).
-///   Blocks enumeration attacks that sweep pubkeys to map online users.
-///   Returns HTTP 429 when exceeded; Tower handles this automatically.
+/// Uses `VoiceState` (sessions + rate_limiter) as axum State.
+/// Does NOT share `MpiState` — the two routers are fully isolated.
 ///
-/// Called from `server.rs::start_combined_api()` and merged into the
-/// main axum app via `.merge(build_voice_router(sessions))`.
-///
-/// This router does NOT share `MpiState`. It injects `Arc<SessionManager>`
-/// as its own independent axum `State`, keeping the two routers fully isolated.
+/// Called from `server.rs::start_combined_api()`:
+/// ```rust
+/// let app = build_mpi_router(mpi_state)
+///     .merge(build_voice_router(sessions));
+/// ```
 ///
 /// # Arguments
-/// - `sessions`: shared `SessionManager` reference, injected as axum State.
+/// - `sessions`: shared `SessionManager`, injected into `VoiceState`.
 pub fn build_voice_router(sessions: Arc<SessionManager>) -> Router {
+    let state = VoiceState {
+        sessions,
+        rate_limiter: RateLimiter::new(),
+    };
     Router::new()
         .route("/api/peer-virtual-ip", get(peer_virtual_ip_handler))
-        // Rate limit: 30 req / 60 s across all callers on this server instance.
-        // Tower RateLimitLayer is a token-bucket applied to the entire service,
-        // not per-IP. Per-IP limiting would require tower_governor (not in deps);
-        // this global limit is sufficient to block bulk enumeration.
-        .layer(RateLimitLayer::new(
-            RATE_LIMIT_REQUESTS,
-            StdDuration::from_secs(RATE_LIMIT_WINDOW_SECS),
-        ))
-        .with_state(sessions)
+        .with_state(state)
 }
