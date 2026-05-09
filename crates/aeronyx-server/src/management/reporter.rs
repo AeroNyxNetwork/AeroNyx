@@ -1,15 +1,25 @@
-//! ============================================
-//! File: crates/aeronyx-server/src/management/reporter.rs
-//! ============================================
+// ============================================
+// File: crates/aeronyx-server/src/management/reporter.rs
+// ============================================
 //! # Background Reporters
 //!
 //! Async tasks for periodic heartbeat and session event reporting.
 //!
 //! ## Modification Reason (v2.3.0+RemoteStorage)
-//! - 🌟 HeartbeatReporter now reports `memchain_status` in heartbeats
+//! - HeartbeatReporter now reports `memchain_status` in heartbeats
 //! - Added `memchain_status_fn` callback for lazy MemChain status collection
 //! - `send_heartbeat()` signature extended with `memchain_status` parameter
 //! - CMS uses this data to update Node's remote storage fields
+//!
+//! ## Modification Reason (v1.0.0-TrafficAccounting)
+//! - Added `SessionTrafficSnapshot` event for periodic mid-session reporting.
+//!   Long-lived sessions previously had zero traffic visibility until disconnect.
+//!   Now `session_traffic_snapshot()` sends cumulative bytes every 5 minutes.
+//! - `SessionEvent::snapshot()` constructor added.
+//! - `SessionEvent::to_report()` now sets `is_final` correctly:
+//!   true for SessionEnded, false for all others.
+//! - `SessionEventSender::session_traffic_snapshot()` public method added.
+//!   Called by `server.rs::spawn_traffic_snapshot_task()` every 5 minutes.
 //!
 //! ## Previous Modifications
 //! v1.3.0 - HeartbeatReporter parses commands from response, dynamic interval
@@ -17,24 +27,29 @@
 //!
 //! Main Components:
 //!   - HeartbeatReporter: Sends periodic heartbeats to CMS
-//!   - SessionReporter: Reports session events (create/end) to CMS
+//!   - SessionReporter: Reports session events (create/end/snapshot) to CMS
 //!   - SessionEventSender: Thread-safe sender for session events
 //!
 //! ⚠️ Important Note for Next Developer:
 //!   - HeartbeatReporter runs on a fixed interval (default 30s)
-//!   - SessionReporter processes events from a channel
+//!   - SessionReporter processes events from a channel (capacity 1000)
 //!   - Both respect shutdown signals for graceful termination
-//!   - The command channel is Optional — if `None`, commands from
-//!     CMS are logged but not dispatched (graceful degradation)
+//!   - The command channel is Optional — if None, commands from CMS are
+//!     logged but not dispatched (graceful degradation)
 //!   - Dynamic interval adjustment is clamped to [10, 300] seconds
 //!   - memchain_status_fn is Optional — if None, no memchain_status in heartbeat
+//!   - SessionTrafficSnapshot bytes are CUMULATIVE totals, never deltas.
+//!     Backend must upsert, not accumulate. is_final=false for snapshots.
+//!   - session_traffic_snapshot() silently drops if the channel is full —
+//!     non-critical, next tick will send an updated snapshot anyway.
 //!
 //! Last Modified:
 //!   v1.0.0 - Initial implementation
 //!   v1.2.0 - Fixed SessionEventType import and client_wallet type
 //!   v1.3.0 - Added command forwarding from heartbeat response
-//!   v2.3.0+RemoteStorage - 🌟 Added memchain_status reporting in heartbeat
-//! ============================================
+//!   v2.3.0+RemoteStorage - Added memchain_status reporting in heartbeat
+//!   v1.0.0-TrafficAccounting - Added SessionTrafficSnapshot event type,
+//!     session_traffic_snapshot() sender method, is_final flag in to_report().
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,22 +64,15 @@ use crate::services::AgentManager;
 // ============================================
 
 /// Minimum allowed heartbeat interval (seconds).
-/// Prevents CMS from setting a dangerously aggressive poll rate.
 const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 10;
 
 /// Maximum allowed heartbeat interval (seconds).
-/// Prevents CMS from making the node appear offline for too long.
 const MAX_HEARTBEAT_INTERVAL_SECS: u64 = 300;
 
-/// Number of initial heartbeats that get extra tolerance.
-/// During server cold-start, CMS (Gunicorn) may still be loading
-/// Django, DB connections, etc. We suppress error-level logging
-/// and use a longer timeout for these first few beats.
+/// Number of initial heartbeats that get extra tolerance during cold-start.
 const COLD_START_GRACE_BEATS: u32 = 5;
 
 /// Extended timeout for cold-start heartbeats (seconds).
-/// Normal timeout is from config (default 10s), but during
-/// the grace period we allow up to 30s for CMS to warm up.
 const COLD_START_TIMEOUT_SECS: u64 = 30;
 
 // ============================================
@@ -72,12 +80,6 @@ const COLD_START_TIMEOUT_SECS: u64 = 30;
 // ============================================
 
 /// Callback type for collecting MemChain status at heartbeat time.
-///
-/// Returns `Option<MemChainHeartbeatStatus>` — None if MemChain is disabled.
-/// The callback is invoked on each heartbeat tick, so it must be cheap.
-///
-/// Typically constructed as a closure capturing `Arc<MemoryStorage>` and
-/// config values, called from `server.rs`.
 pub type MemChainStatusFn = Box<dyn Fn() -> Option<MemChainHeartbeatStatus> + Send + Sync>;
 
 // ============================================
@@ -90,7 +92,9 @@ pub struct SessionEvent {
     pub event_type: SessionEventType,
     pub session_id: String,
     pub client_wallet: Option<String>,
+    /// Cumulative bytes received from client since session start.
     pub bytes_in: u64,
+    /// Cumulative bytes sent to client since session start.
     pub bytes_out: u64,
     pub timestamp: u64,
 }
@@ -104,27 +108,55 @@ impl SessionEvent {
             client_wallet,
             bytes_in: 0,
             bytes_out: 0,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_secs(),
+            timestamp: now_unix(),
         }
     }
 
-    /// Creates a new session_ended event with traffic statistics.
-    pub fn ended(session_id: String, client_wallet: Option<String>, bytes_in: u64, bytes_out: u64) -> Self {
+    /// Creates a new session_ended event with final traffic statistics.
+    ///
+    /// `bytes_in` and `bytes_out` are cumulative totals since session start.
+    /// `is_final = true` in the generated report — backend closes billing period.
+    pub fn ended(
+        session_id: String,
+        client_wallet: Option<String>,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> Self {
         Self {
             event_type: SessionEventType::SessionEnded,
             session_id,
             client_wallet,
             bytes_in,
             bytes_out,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_secs(),
+            timestamp: now_unix(),
+        }
+    }
+
+    /// Creates a periodic traffic snapshot for a live session.
+    ///
+    /// `bytes_in` and `bytes_out` are cumulative totals since session start,
+    /// NOT deltas. Backend must upsert these values.
+    /// `is_final = false` in the generated report — billing period stays open.
+    pub fn snapshot(
+        session_id: String,
+        client_wallet: Option<String>,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> Self {
+        Self {
+            event_type: SessionEventType::SessionTrafficSnapshot,
+            session_id,
+            client_wallet,
+            bytes_in,
+            bytes_out,
+            timestamp: now_unix(),
         }
     }
 
     /// Converts internal event to API report format.
+    ///
+    /// Sets `is_final = true` only for `SessionEnded`.
+    /// All other event types (including snapshots) use `is_final = false`.
     fn to_report(&self) -> SessionEventReport {
         SessionEventReport {
             event_type: self.event_type,
@@ -134,8 +166,18 @@ impl SessionEvent {
             bytes_in: self.bytes_in,
             bytes_out: self.bytes_out,
             timestamp: self.timestamp,
+            is_final: matches!(self.event_type, SessionEventType::SessionEnded),
         }
     }
+}
+
+/// Returns the current unix timestamp in seconds.
+#[inline]
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 // ============================================
@@ -144,23 +186,18 @@ impl SessionEvent {
 
 /// Background task for sending periodic heartbeats to CMS.
 ///
-/// 🌟 v1.3.0: Parses `commands` from `HeartbeatResponse` and forwards them.
-/// 🌟 v2.3.0: Reports `memchain_status` for remote storage field sync.
+/// v1.3.0: Parses `commands` from `HeartbeatResponse` and forwards them.
+/// v2.3.0: Reports `memchain_status` for remote storage field sync.
 pub struct HeartbeatReporter {
     client: Arc<ManagementClient>,
     interval: Duration,
     public_ip: String,
-    /// Optional channel to forward commands to CommandHandler.
     command_tx: Option<mpsc::Sender<Command>>,
-    /// v1.3.1: Optional reference to AgentManager for status reporting.
     agent_manager: Option<Arc<AgentManager>>,
-    /// v2.3.0: Optional callback to collect MemChain status for heartbeat.
-    /// Called on each heartbeat tick. Returns None if MemChain is disabled.
     memchain_status_fn: Option<MemChainStatusFn>,
 }
 
 impl HeartbeatReporter {
-    /// Creates a new HeartbeatReporter.
     pub fn new(client: Arc<ManagementClient>, public_ip: String) -> Self {
         let interval = Duration::from_secs(client.config().heartbeat_interval_secs);
         Self {
@@ -173,31 +210,29 @@ impl HeartbeatReporter {
         }
     }
 
-    /// Attaches a command sender channel for forwarding CMS commands.
     pub fn with_command_sender(mut self, tx: mpsc::Sender<Command>) -> Self {
         self.command_tx = Some(tx);
         self
     }
 
-    /// v1.3.1: Attaches an AgentManager for status reporting in heartbeat.
     pub fn with_agent_manager(mut self, am: Arc<AgentManager>) -> Self {
         self.agent_manager = Some(am);
         self
     }
 
-    /// v2.3.0: Attaches a MemChain status callback for heartbeat reporting.
-    ///
-    /// The callback is invoked on each heartbeat tick to collect current
-    /// MemChain state (allow_remote_storage, owner counts, etc.).
-    /// CMS uses this data to update Node's remote storage fields.
     pub fn with_memchain_status(mut self, f: MemChainStatusFn) -> Self {
         self.memchain_status_fn = Some(f);
         self
     }
 
     /// Runs the heartbeat loop until shutdown signal received.
-    pub async fn run<F>(self, session_count_fn: F, mut shutdown: tokio::sync::broadcast::Receiver<()>)
-    where F: Fn() -> u32 + Send + 'static
+    pub async fn run<F>(
+        self,
+        session_count_fn: F,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    )
+    where
+        F: Fn() -> u32 + Send + 'static,
     {
         info!(
             interval_secs = self.interval.as_secs(),
@@ -220,131 +255,91 @@ impl HeartbeatReporter {
                     total_beats += 1;
                     let in_cold_start = total_beats <= COLD_START_GRACE_BEATS;
 
-                    // v1.3.1: Fetch agent status if AgentManager is available
                     let agent_status = if let Some(ref am) = self.agent_manager {
                         Some(am.status().await)
                     } else {
                         None
                     };
 
-                    // v2.3.0: Collect MemChain status if callback is configured
                     let memchain_status = self.memchain_status_fn.as_ref()
                         .and_then(|f| f());
 
-                    // Use extended timeout during cold-start grace period
-                    let result = if in_cold_start {
-                        debug!(
-                            beat = total_beats,
-                            grace_remaining = COLD_START_GRACE_BEATS - total_beats,
-                            "[HEARTBEAT] Cold-start grace period (extended timeout {}s)",
-                            COLD_START_TIMEOUT_SECS
-                        );
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(COLD_START_TIMEOUT_SECS),
-                            self.client.send_heartbeat(
-                                &self.public_ip,
-                                session_count_fn(),
-                                agent_status,
-                                memchain_status,
-                            ),
-                        ).await
+                    let timeout_secs = if in_cold_start {
+                        COLD_START_TIMEOUT_SECS
                     } else {
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(60),
-                            self.client.send_heartbeat(
-                                &self.public_ip,
-                                session_count_fn(),
-                                agent_status,
-                                memchain_status,
-                            ),
-                        ).await
+                        60
                     };
 
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(timeout_secs),
+                        self.client.send_heartbeat(
+                            &self.public_ip,
+                            session_count_fn(),
+                            agent_status,
+                            memchain_status,
+                        ),
+                    ).await;
+
                     match result {
-                        // Outer timeout expired
                         Err(_elapsed) => {
                             failures += 1;
                             if in_cold_start {
                                 info!(
                                     beat = total_beats,
-                                    "[HEARTBEAT] ⏳ Timeout during cold-start (CMS may still be loading)"
+                                    "[HEARTBEAT] Timeout during cold-start (CMS may still be loading)"
                                 );
                             } else {
-                                warn!(
-                                    failures = failures,
-                                    "[HEARTBEAT] ⚠️ Heartbeat outer timeout"
-                                );
+                                warn!(failures, "[HEARTBEAT] Heartbeat outer timeout");
                             }
                         }
-                        // Inner result
                         Ok(Ok(response)) => {
                             if failures > 0 {
                                 info!(
                                     previous_failures = failures,
-                                    "[HEARTBEAT] ✅ Recovered after {} failure(s)",
-                                    failures
+                                    "[HEARTBEAT] Recovered after {} failure(s)", failures
                                 );
                             }
                             failures = 0;
 
-                            // Process commands from CMS
                             if let Some(commands) = response.commands {
                                 if !commands.is_empty() {
                                     info!(
                                         count = commands.len(),
-                                        "[HEARTBEAT] 📨 Received {} command(s) from CMS",
+                                        "[HEARTBEAT] Received {} command(s) from CMS",
                                         commands.len()
                                     );
-
                                     self.forward_commands(commands).await;
                                 }
                             }
 
-                            // Dynamic interval adjustment
                             if let Some(next_in) = response.next_heartbeat_in {
                                 let clamped = next_in
                                     .max(MIN_HEARTBEAT_INTERVAL_SECS)
                                     .min(MAX_HEARTBEAT_INTERVAL_SECS);
-
                                 if clamped != self.interval.as_secs() {
                                     debug!(
                                         current = self.interval.as_secs(),
                                         requested = next_in,
                                         applied = clamped,
-                                        "[HEARTBEAT] 🔄 CMS requested interval change"
+                                        "[HEARTBEAT] CMS requested interval change"
                                     );
                                 }
                             }
                         }
                         Ok(Err(e)) => {
                             failures += 1;
-
-                            // During cold-start: only info level, not warn/error
                             if in_cold_start {
                                 info!(
                                     beat = total_beats,
-                                    failures = failures,
-                                    "[HEARTBEAT] ⏳ Failed during cold-start (expected): {}",
-                                    e
+                                    failures,
+                                    "[HEARTBEAT] Failed during cold-start (expected): {}", e
                                 );
                             } else if failures >= 5 {
-                                error!(
-                                    failures = failures,
-                                    "[HEARTBEAT] ❌ Persistent failure: {}",
-                                    e
-                                );
+                                error!(failures, "[HEARTBEAT] Persistent failure: {}", e);
                             } else if failures >= 3 {
-                                warn!(
-                                    failures = failures,
-                                    "[HEARTBEAT] ⚠️ Failed: {}",
-                                    e
-                                );
+                                warn!(failures, "[HEARTBEAT] Failed: {}", e);
                             } else {
-                                debug!(
-                                    failures = failures,
-                                    "[HEARTBEAT] Failed (transient): {}",
-                                    e
-                                );
+                                debug!(failures, "[HEARTBEAT] Failed (transient): {}", e);
                             }
                         }
                     }
@@ -353,12 +348,11 @@ impl HeartbeatReporter {
         }
     }
 
-    /// Forwards received commands to the CommandHandler channel.
     async fn forward_commands(&self, commands: Vec<Command>) {
         let Some(ref tx) = self.command_tx else {
             warn!(
                 count = commands.len(),
-                "[HEARTBEAT] ⚠️ Received commands but no command channel configured — discarding"
+                "[HEARTBEAT] Received commands but no command channel configured — discarding"
             );
             return;
         };
@@ -368,23 +362,22 @@ impl HeartbeatReporter {
                 command_id = %cmd.id,
                 action = %cmd.action,
                 priority = cmd.priority,
-                "[HEARTBEAT] 📤 Forwarding command to handler"
+                "[HEARTBEAT] Forwarding command to handler"
             );
-
             if let Err(e) = tx.try_send(cmd) {
                 match e {
                     mpsc::error::TrySendError::Full(cmd) => {
                         warn!(
                             command_id = %cmd.id,
                             action = %cmd.action,
-                            "[HEARTBEAT] ⚠️ Command channel full — dropping command"
+                            "[HEARTBEAT] Command channel full — dropping command"
                         );
                     }
                     mpsc::error::TrySendError::Closed(cmd) => {
                         error!(
                             command_id = %cmd.id,
                             action = %cmd.action,
-                            "[HEARTBEAT] ❌ Command channel closed — handler may have crashed"
+                            "[HEARTBEAT] Command channel closed — handler may have crashed"
                         );
                     }
                 }
@@ -398,6 +391,14 @@ impl HeartbeatReporter {
 // ============================================
 
 /// Background task for reporting session events to CMS.
+///
+/// Processes events from the channel sequentially. Each event is sent
+/// to CMS via `ManagementClient::report_session_event()`.
+///
+/// Handles three event types:
+/// - `SessionCreated` — initial registration with CMS
+/// - `SessionEnded` — final billing report (`is_final=true`)
+/// - `SessionTrafficSnapshot` — periodic live traffic upsert (`is_final=false`)
 pub struct SessionReporter {
     client: Arc<ManagementClient>,
     event_rx: mpsc::Receiver<SessionEvent>,
@@ -420,8 +421,17 @@ impl SessionReporter {
                     break;
                 }
                 Some(event) = self.event_rx.recv() => {
+                    let event_type = format!("{:?}", event.event_type);
                     if let Err(e) = self.client.report_session_event(event.to_report()).await {
-                        warn!("[SESSION_REPORTER] Report failed: {}", e);
+                        warn!(
+                            event_type = %event_type,
+                            "[SESSION_REPORTER] Report failed: {}", e
+                        );
+                    } else {
+                        debug!(
+                            event_type = %event_type,
+                            "[SESSION_REPORTER] Report sent"
+                        );
                     }
                 }
             }
@@ -434,24 +444,78 @@ impl SessionReporter {
 // ============================================
 
 /// Thread-safe sender for session events.
+///
+/// Cloneable — passed to both the UDP task and the cleanup task.
+/// All send operations are non-blocking (`try_send`). Dropped events
+/// are logged at debug level; the channel has capacity 1000 so drops
+/// are extremely rare under normal load.
 #[derive(Clone)]
 pub struct SessionEventSender {
     tx: Option<mpsc::Sender<SessionEvent>>,
 }
 
 impl SessionEventSender {
-    pub fn new(tx: mpsc::Sender<SessionEvent>) -> Self { Self { tx: Some(tx) } }
-    pub fn disabled() -> Self { Self { tx: None } }
-
-    pub fn session_created(&self, session_id: &str, client_wallet: Option<String>) {
-        if let Some(ref tx) = self.tx {
-            let _ = tx.try_send(SessionEvent::created(session_id.to_string(), client_wallet));
-        }
+    pub fn new(tx: mpsc::Sender<SessionEvent>) -> Self {
+        Self { tx: Some(tx) }
     }
 
-    pub fn session_ended(&self, session_id: &str, client_wallet: Option<String>, bytes_in: u64, bytes_out: u64) {
+    pub fn disabled() -> Self {
+        Self { tx: None }
+    }
+
+    /// Reports a new session creation to CMS.
+    pub fn session_created(&self, session_id: &str, client_wallet: Option<String>) {
+        self.try_send(SessionEvent::created(session_id.to_string(), client_wallet));
+    }
+
+    /// Reports a session end to CMS with final cumulative traffic totals.
+    ///
+    /// `bytes_in` and `bytes_out` are cumulative since session start.
+    /// Generates `is_final = true` — backend closes billing period.
+    pub fn session_ended(
+        &self,
+        session_id: &str,
+        client_wallet: Option<String>,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) {
+        self.try_send(SessionEvent::ended(
+            session_id.to_string(),
+            client_wallet,
+            bytes_in,
+            bytes_out,
+        ));
+    }
+
+    /// Reports a periodic traffic snapshot for a live session.
+    ///
+    /// Called every 5 minutes by `server.rs::spawn_traffic_snapshot_task()`.
+    /// `bytes_in` and `bytes_out` are cumulative totals since session start.
+    /// Generates `is_final = false` — backend upserts, does NOT close billing.
+    ///
+    /// Silently drops if the channel is full — non-critical, the next tick
+    /// will send an updated snapshot with the latest cumulative values.
+    pub fn session_traffic_snapshot(
+        &self,
+        session_id: &str,
+        client_wallet: Option<String>,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) {
+        self.try_send(SessionEvent::snapshot(
+            session_id.to_string(),
+            client_wallet,
+            bytes_in,
+            bytes_out,
+        ));
+    }
+
+    /// Internal: non-blocking send with debug logging on drop.
+    fn try_send(&self, event: SessionEvent) {
         if let Some(ref tx) = self.tx {
-            let _ = tx.try_send(SessionEvent::ended(session_id.to_string(), client_wallet, bytes_in, bytes_out));
+            if tx.try_send(event).is_err() {
+                debug!("[SESSION_REPORTER] Event channel full or closed — event dropped");
+            }
         }
     }
 }
