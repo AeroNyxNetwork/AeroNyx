@@ -1,7 +1,7 @@
-//! ============================================
-//! File: crates/aeronyx-server/src/management/models.rs
-//! Path: aeronyx-server/src/management/models.rs
-//! ============================================
+// ============================================
+// File: crates/aeronyx-server/src/management/models.rs
+// Path: aeronyx-server/src/management/models.rs
+// ============================================
 //! Purpose: Management API data models for CMS communication
 //!
 //! Key Fix v1.2.0:
@@ -10,12 +10,22 @@
 //!   - SessionEventReport uses String for event_type (not enum) for flexibility
 //!
 //! Modification Reason (v1.3.0):
-//!   - 🌟 Added `Command` struct for CMS command dispatch (Phase 1: Command Pipeline)
-//!   - 🌟 Upgraded `HeartbeatResponse.commands` from `Option<Vec<String>>`
+//!   - Added `Command` struct for CMS command dispatch (Phase 1: Command Pipeline)
+//!   - Upgraded `HeartbeatResponse.commands` from `Option<Vec<String>>`
 //!     to `Option<Vec<Command>>` to support structured commands with params
-//!   - 🌟 Added `AgentStatus` enum and `AgentStatusInfo` for OpenClaw lifecycle tracking
-//!   - 🌟 Added `CommandStatusReport` for Rust → CMS command execution feedback
-//!   - 🌟 Added `agent_status` to `SystemStats` for heartbeat-based status reporting
+//!   - Added `AgentStatus` enum and `AgentStatusInfo` for OpenClaw lifecycle tracking
+//!   - Added `CommandStatusReport` for Rust -> CMS command execution feedback
+//!   - Added `agent_status` to `SystemStats` for heartbeat-based status reporting
+//!
+//! Modification Reason (v1.0.0-TrafficAccounting):
+//!   - Added `SessionTrafficSnapshot` to `SessionEventType` for periodic
+//!     mid-session traffic reporting. Long-lived sessions previously had zero
+//!     visibility until disconnect. Now a snapshot is sent every 5 minutes
+//!     with cumulative bytes_in / bytes_out since session start.
+//!   - Added `is_final` field to `SessionEventReport` so the backend can
+//!     distinguish a snapshot (upsert, no billing trigger) from a final
+//!     session_ended event (closes billing period).
+//!   - All existing fields and behaviour preserved verbatim.
 //!
 //! Main Data Structures:
 //!   - BindNodeRequest/Response: Node registration
@@ -23,33 +33,34 @@
 //!   - SessionEventReport/Response: Session event reporting
 //!   - HardwareInfo: System hardware information
 //!   - SystemStats: Runtime system statistics
-//!   - 🌟 Command: CMS → Rust structured command with params
-//!   - 🌟 AgentStatus / AgentStatusInfo: OpenClaw agent lifecycle state
-//!   - 🌟 CommandStatusReport: Rust → CMS command execution result
+//!   - Command: CMS -> Rust structured command with params
+//!   - AgentStatus / AgentStatusInfo: OpenClaw agent lifecycle state
+//!   - CommandStatusReport: Rust -> CMS command execution result
 //!
 //! ⚠️ Important Note for Next Developer:
 //!   - HeartbeatRequest struct field order is documented but struct is NOT used
-//!     for actual HTTP request
-//!   - The client.rs uses json! macro directly to ensure field order
+//!     for actual HTTP request — client.rs uses json! macro directly
 //!   - If you need to modify heartbeat fields, update BOTH models.rs AND client.rs
-//!     json! calls
-//!   - 🌟 `Command.id` is used by CMS to track command lifecycle — always include
+//!   - `Command.id` is used by CMS to track command lifecycle — always include
 //!     it in status reports
-//!   - 🌟 `Command.params` is `serde_json::Value` for maximum flexibility — each
-//!     action handler should define its own expected param schema
-//!   - 🌟 `AgentStatus` default is `NotInstalled` — do NOT change the variant names
-//!     as CMS relies on snake_case serialisation
+//!   - `Command.params` is `serde_json::Value` for maximum flexibility
+//!   - `AgentStatus` default is `NotInstalled` — do NOT rename variants,
+//!     CMS relies on snake_case serialisation
+//!   - `SessionTrafficSnapshot` bytes_in/bytes_out are CUMULATIVE since session
+//!     start, NOT deltas. Backend must upsert, not accumulate.
+//!   - `is_final=true` only on SessionEnded — backend uses this to close billing.
 //!
 //! Dependencies:
 //!   - serde for serialization/deserialization
 //!   - serde_json for `Command.params` (dynamic JSON value)
-//!   - System files (/proc/cpuinfo, /proc/meminfo, etc.) for Linux system information
+//!   - System files (/proc/cpuinfo, /proc/meminfo, etc.) for Linux stats
 //!
 //! Last Modified:
 //!   v1.0.0 - Initial models
-//!   v1.2.0 - Clarified that HeartbeatRequest is for documentation only
-//!   v1.3.0 - 🌟 Added Command, AgentStatus, AgentStatusInfo, CommandStatusReport
-//! ============================================
+//!   v1.2.0 - Clarified HeartbeatRequest is documentation only
+//!   v1.3.0 - Added Command, AgentStatus, AgentStatusInfo, CommandStatusReport
+//!   v1.0.0-TrafficAccounting - Added SessionTrafficSnapshot event type,
+//!     is_final field to SessionEventReport
 
 use serde::{Deserialize, Serialize};
 
@@ -193,7 +204,7 @@ pub struct NodeInfo {
 /// 6. system_stats
 /// 7. signature
 ///
-/// Do NOT use this struct directly with .json(&request) - it will serialize
+/// Do NOT use this struct directly with .json(&request) — it will serialize
 /// fields in alphabetical order, breaking signature verification!
 #[derive(Debug, Serialize)]
 pub struct HeartbeatRequest {
@@ -208,55 +219,46 @@ pub struct HeartbeatRequest {
 
 /// System statistics for heartbeat reporting.
 ///
-/// 🌟 v1.3.1: Enhanced for cloud/container compatibility.
+/// v1.3.1: Enhanced for cloud/container compatibility.
 /// All fields use best-effort collection — missing data defaults to 0/None.
 ///
-/// Field order matters for heartbeat signature verification.
 /// New optional fields use `skip_serializing_if` so they don't
 /// break CMS versions that don't expect them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemStats {
     /// CPU usage percentage (0.0 - 100.0).
-    /// Collected from /proc/loadavg (normalized by CPU count).
     pub cpu_usage: f32,
     /// Memory usage in megabytes.
-    /// Prefers cgroup limits (container-aware), falls back to /proc/meminfo.
     pub memory_mb: u64,
     /// Number of active VPN sessions.
     pub active_sessions: u32,
 
-    /// 🌟 v1.3.0: OpenClaw agent status for CMS dashboard display.
-    /// `None` = field omitted from JSON (backward compatible with old CMS).
+    /// v1.3.0: OpenClaw agent status for CMS dashboard display.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_status: Option<AgentStatusInfo>,
 
-    /// 🌟 v1.3.1: Total network bytes received since boot (all non-loopback interfaces).
+    /// v1.3.1: Total network bytes received since boot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub net_rx_bytes: Option<u64>,
 
-    /// 🌟 v1.3.1: Total network bytes transmitted since boot (all non-loopback interfaces).
+    /// v1.3.1: Total network bytes transmitted since boot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub net_tx_bytes: Option<u64>,
 
-    /// 🌟 v1.3.1: Total memory available on the system/container in MB.
-    /// Useful for CMS to calculate usage percentage.
+    /// v1.3.1: Total memory available on the system/container in MB.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_total_mb: Option<u64>,
 
-    /// 🌟 v1.3.1: Number of CPU cores (vCPU count).
+    /// v1.3.1: Number of CPU cores (vCPU count).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_count: Option<u32>,
 }
 
 impl SystemStats {
     /// Collects current system statistics.
-    ///
-    /// # Arguments
-    /// * `active_sessions` - Number of active client sessions
     pub fn collect(active_sessions: u32) -> Self {
         let (memory_mb, memory_total_mb) = Self::get_memory_info();
         let (net_rx, net_tx) = Self::get_network_stats();
-
         Self {
             cpu_usage: Self::get_cpu_usage(),
             memory_mb,
@@ -272,27 +274,13 @@ impl SystemStats {
     }
 
     /// Collects current system statistics with agent status.
-    ///
-    /// # Arguments
-    /// * `active_sessions` - Number of active client sessions
-    /// * `agent_status` - Current OpenClaw agent status
     pub fn collect_with_agent(active_sessions: u32, agent_status: AgentStatusInfo) -> Self {
         let mut stats = Self::collect(active_sessions);
         stats.agent_status = Some(agent_status);
         stats
     }
 
-    /// Gets CPU usage percentage.
-    ///
-    /// Strategy:
-    /// 1. Read /proc/loadavg (1-min average)
-    /// 2. Normalize by available CPU count
-    /// 3. Cap at 100%
-    ///
-    /// Works in: bare metal, VPS, GCP, AWS, Azure VMs.
-    /// In containers: reflects host load (not container-specific).
-    /// This is acceptable for our use case since the container
-    /// IS the entire node.
+    /// Gets CPU usage percentage from /proc/loadavg.
     fn get_cpu_usage() -> f32 {
         #[cfg(target_os = "linux")]
         {
@@ -310,77 +298,46 @@ impl SystemStats {
         { 0.0 }
     }
 
-    /// Gets memory usage and total memory.
+    /// Gets memory usage and total memory (cgroup-aware).
     ///
-    /// Strategy (in priority order):
-    /// 1. cgroup v2: /sys/fs/cgroup/memory.current + memory.max (Docker/K8s)
-    /// 2. cgroup v1: /sys/fs/cgroup/memory/memory.usage_in_bytes (older Docker)
-    /// 3. /proc/meminfo MemTotal - MemAvailable (VM/bare metal)
-    ///
-    /// Returns (used_mb, Some(total_mb)).
+    /// Priority: cgroup v2 → cgroup v1 → /proc/meminfo
     fn get_memory_info() -> (u64, Option<u64>) {
         #[cfg(target_os = "linux")]
         {
-            // Try cgroup v2 first (modern Docker, K8s, systemd)
-            if let Some(result) = Self::get_memory_cgroup_v2() {
-                return result;
-            }
-
-            // Try cgroup v1
-            if let Some(result) = Self::get_memory_cgroup_v1() {
-                return result;
-            }
-
-            // Fallback to /proc/meminfo
+            if let Some(r) = Self::get_memory_cgroup_v2() { return r; }
+            if let Some(r) = Self::get_memory_cgroup_v1() { return r; }
             Self::get_memory_procinfo()
         }
         #[cfg(not(target_os = "linux"))]
         { (0, None) }
     }
 
-    /// Reads memory from cgroup v2 (Docker with cgroup2, systemd).
     #[cfg(target_os = "linux")]
     fn get_memory_cgroup_v2() -> Option<(u64, Option<u64>)> {
-        let current = std::fs::read_to_string("/sys/fs/cgroup/memory.current").ok()?;
-        let current_bytes: u64 = current.trim().parse().ok()?;
-
+        let current: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+            .ok()?.trim().parse().ok()?;
         let max = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()
             .and_then(|s| {
-                let trimmed = s.trim();
-                if trimmed == "max" { None } // no limit set
-                else { trimmed.parse::<u64>().ok() }
+                let t = s.trim();
+                if t == "max" { None } else { t.parse::<u64>().ok() }
             });
-
-        let used_mb = current_bytes / 1024 / 1024;
-        let total_mb = max.map(|m| m / 1024 / 1024);
-
-        Some((used_mb, total_mb))
+        Some((current / 1024 / 1024, max.map(|m| m / 1024 / 1024)))
     }
 
-    /// Reads memory from cgroup v1 (older Docker).
     #[cfg(target_os = "linux")]
     fn get_memory_cgroup_v1() -> Option<(u64, Option<u64>)> {
-        let usage = std::fs::read_to_string(
+        let usage: u64 = std::fs::read_to_string(
             "/sys/fs/cgroup/memory/memory.usage_in_bytes"
-        ).ok()?;
-        let usage_bytes: u64 = usage.trim().parse().ok()?;
-
+        ).ok()?.trim().parse().ok()?;
         let limit = std::fs::read_to_string(
             "/sys/fs/cgroup/memory/memory.limit_in_bytes"
-        ).ok()
-            .and_then(|s| {
-                let val: u64 = s.trim().parse().ok()?;
-                // Very large value means "no limit" (usually 2^63 or similar)
-                if val > 1_000_000_000_000 { None } else { Some(val) }
-            });
-
-        let used_mb = usage_bytes / 1024 / 1024;
-        let total_mb = limit.map(|l| l / 1024 / 1024);
-
-        Some((used_mb, total_mb))
+        ).ok().and_then(|s| {
+            let v: u64 = s.trim().parse().ok()?;
+            if v > 1_000_000_000_000 { None } else { Some(v) }
+        });
+        Some((usage / 1024 / 1024, limit.map(|l| l / 1024 / 1024)))
     }
 
-    /// Reads memory from /proc/meminfo (standard Linux).
     #[cfg(target_os = "linux")]
     fn get_memory_procinfo() -> (u64, Option<u64>) {
         std::fs::read_to_string("/proc/meminfo")
@@ -395,21 +352,16 @@ impl SystemStats {
                         avail_kb = line.split_whitespace().nth(1)?.parse().ok()?;
                     }
                 }
-                let used_mb = (total_kb.saturating_sub(avail_kb)) / 1024;
-                let total_mb = total_kb / 1024;
-                Some((used_mb, Some(total_mb)))
+                Some((
+                    total_kb.saturating_sub(avail_kb) / 1024,
+                    Some(total_kb / 1024),
+                ))
             })
             .unwrap_or((0, None))
     }
 
     /// Gets network I/O stats from /proc/net/dev.
-    ///
-    /// Sums rx_bytes and tx_bytes across all non-loopback interfaces.
-    /// Works across all Linux environments (VM, container, bare metal).
-    /// Interface names vary (eth0, ens4, enp0s3, veth*, etc.) —
-    /// we include all except `lo`.
-    ///
-    /// Returns (Some(rx_bytes), Some(tx_bytes)) or (None, None) on failure.
+    /// Sums rx/tx across all non-loopback interfaces.
     fn get_network_stats() -> (Option<u64>, Option<u64>) {
         #[cfg(target_os = "linux")]
         {
@@ -418,32 +370,14 @@ impl SystemStats {
                 .map(|content| {
                     let mut total_rx = 0u64;
                     let mut total_tx = 0u64;
-
-                    for line in content.lines().skip(2) { // skip header lines
+                    for line in content.lines().skip(2) {
                         let line = line.trim();
-                        if line.is_empty() {
-                            continue;
-                        }
-
-                        // Format: "iface: rx_bytes rx_packets ... tx_bytes tx_packets ..."
+                        if line.is_empty() { continue; }
                         let parts: Vec<&str> = line.splitn(2, ':').collect();
-                        if parts.len() != 2 {
-                            continue;
-                        }
-
-                        let iface = parts[0].trim();
-
-                        // Skip loopback and virtual bridge interfaces
-                        if iface == "lo" {
-                            continue;
-                        }
-
+                        if parts.len() != 2 { continue; }
+                        if parts[0].trim() == "lo" { continue; }
                         let fields: Vec<&str> = parts[1].split_whitespace().collect();
-                        if fields.len() < 10 {
-                            continue;
-                        }
-
-                        // rx_bytes is field 0, tx_bytes is field 8
+                        if fields.len() < 10 { continue; }
                         if let (Ok(rx), Ok(tx)) = (
                             fields[0].parse::<u64>(),
                             fields[8].parse::<u64>(),
@@ -452,7 +386,6 @@ impl SystemStats {
                             total_tx += tx;
                         }
                     }
-
                     (Some(total_rx), Some(total_tx))
                 })
                 .unwrap_or((None, None))
@@ -463,21 +396,13 @@ impl SystemStats {
 }
 
 /// Response from heartbeat request.
-///
-/// 🌟 v1.3.0: `commands` upgraded from `Vec<String>` to `Vec<Command>`
-/// for structured command dispatch with params and tracking IDs.
-///
-/// CMS backward compatibility: if CMS sends no `commands` field or sends
-/// `null`, serde will deserialise it as `None`. If CMS sends an empty
-/// array `[]`, it becomes `Some(vec![])`.
 #[derive(Debug, Deserialize)]
 pub struct HeartbeatResponse {
     /// Whether the heartbeat was accepted
     pub success: bool,
     /// Suggested interval for next heartbeat (seconds)
     pub next_heartbeat_in: Option<u64>,
-    /// 🌟 v1.3.0: Structured commands from CMS to execute on this node.
-    /// Each command has a unique `id` for lifecycle tracking.
+    /// v1.3.0: Structured commands from CMS to execute on this node.
     #[serde(default)]
     pub commands: Option<Vec<Command>>,
     /// Error message (present on failure)
@@ -485,59 +410,32 @@ pub struct HeartbeatResponse {
 }
 
 // ============================================
-// 🌟 v1.3.0: Command Pipeline Models
+// Command Pipeline Models (v1.3.0)
 // ============================================
 
 /// A structured command dispatched from CMS to a Rust node.
 ///
-/// ## Lifecycle
-/// 1. CMS creates a command and places it in the node's queue
-/// 2. Rust receives it via `HeartbeatResponse.commands`
-/// 3. Rust executes the command and reports status via `CommandStatusReport`
-/// 4. CMS updates the command status for the Next.js dashboard
-///
 /// ## Known Actions
 /// - `"install_openclaw"` — Download and install OpenClaw agent
-/// - `"start_openclaw"` — Start the OpenClaw process
-/// - `"stop_openclaw"` — Stop the OpenClaw process
+/// - `"start_openclaw"`   — Start the OpenClaw process
+/// - `"stop_openclaw"`    — Stop the OpenClaw process
 /// - `"uninstall_openclaw"` — Remove OpenClaw from the system
-/// - `"update_openclaw"` — Update OpenClaw to a new version
+/// - `"update_openclaw"`  — Update OpenClaw to a new version
 ///
-/// ## Example JSON from CMS
-/// ```json
-/// {
-///     "id": "cmd-550e8400-e29b-41d4-a716-446655440000",
-///     "action": "install_openclaw",
-///     "params": {
-///         "version": "1.0.0",
-///         "download_url": "https://releases.openclaw.ai/v1.0.0/openclaw-linux-amd64"
-///     },
-///     "priority": 1,
-///     "issued_at": "2026-03-03T15:00:00Z"
-/// }
-/// ```
-///
-/// ⚠️ Important:
-/// - `id` MUST be included in all status reports back to CMS
-/// - `params` schema varies by action — handlers should validate internally
-/// - Unknown actions should be logged and reported as `failed` (not panic)
+/// ⚠️ `id` MUST be included in all status reports back to CMS.
+/// Unknown actions should be logged and reported as `failed`, never panic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Command {
     /// Unique command identifier (UUID from CMS) for lifecycle tracking.
     pub id: String,
-
-    /// Action to perform (e.g., "install_openclaw", "stop_openclaw").
+    /// Action to perform.
     pub action: String,
-
     /// Action-specific parameters. Schema depends on `action`.
-    /// Use `serde_json::Value` for maximum flexibility.
     #[serde(default = "default_empty_object")]
     pub params: serde_json::Value,
-
     /// Execution priority (lower = higher priority). Default: 10.
     #[serde(default = "default_priority")]
     pub priority: u8,
-
     /// ISO 8601 timestamp when the command was issued by CMS.
     #[serde(default)]
     pub issued_at: Option<String>,
@@ -547,155 +445,90 @@ fn default_empty_object() -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::new())
 }
 
-fn default_priority() -> u8 {
-    10
-}
+fn default_priority() -> u8 { 10 }
 
-/// Status report sent from Rust → CMS after executing (or attempting) a command.
-///
-/// Sent via `POST /node/agent/status` with the same Ed25519 signature auth
-/// as heartbeat requests.
-///
-/// ## Example JSON
-/// ```json
-/// {
-///     "command_id": "cmd-550e8400-e29b-41d4-a716-446655440000",
-///     "agent_type": "openclaw",
-///     "status": "in_progress",
-///     "progress": 45,
-///     "message": "Downloading OpenClaw binary...",
-///     "timestamp": 1709474400
-/// }
-/// ```
+/// Status report sent from Rust -> CMS after executing a command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandStatusReport {
     /// The command ID this report refers to (from `Command.id`).
     pub command_id: String,
-
-    /// Agent type identifier. CMS uses this to route the status
-    /// to the correct agent handler. Default: "openclaw".
+    /// Agent type identifier. Default: "openclaw".
     #[serde(default = "default_agent_type")]
     pub agent_type: String,
-
     /// Execution status.
     pub status: CommandExecutionStatus,
-
     /// Progress percentage (0–100). Meaningful for `in_progress` status.
     #[serde(default)]
     pub progress: u8,
-
     /// Human-readable status message for dashboard display.
     #[serde(default)]
     pub message: String,
-
     /// Unix timestamp of this status update.
     pub timestamp: u64,
 }
 
-fn default_agent_type() -> String {
-    "openclaw".to_string()
-}
+fn default_agent_type() -> String { "openclaw".to_string() }
 
 /// Execution status for a CMS command.
-///
-/// Serialised as snake_case strings for CMS compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandExecutionStatus {
-    /// Command received and queued for execution.
     Received,
-    /// Command is currently executing.
     InProgress,
-    /// Command completed successfully.
     Completed,
-    /// Command failed (see `message` for details).
     Failed,
-    /// Command was cancelled (e.g., superseded by a newer command).
     Cancelled,
 }
 
 // ============================================
-// 🌟 v1.3.0: Agent Status Models
+// Agent Status Models (v1.3.0)
 // ============================================
 
 /// OpenClaw agent lifecycle state.
-///
-/// Reported in `SystemStats.agent_status` during heartbeat,
-/// and used internally by `AgentManager` to track state.
 ///
 /// ⚠️ Do NOT rename variants — CMS relies on snake_case serialisation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
-    /// Agent is not installed on this node.
     NotInstalled,
-    /// Agent is currently being downloaded/installed.
     Installing,
-    /// Agent is installed but not running.
     Stopped,
-    /// Agent is running and healthy.
     Running,
-    /// Agent process has crashed or is unresponsive.
     Error,
-    /// Agent is being updated to a new version.
     Updating,
 }
 
 impl Default for AgentStatus {
-    fn default() -> Self {
-        Self::NotInstalled
-    }
+    fn default() -> Self { Self::NotInstalled }
 }
 
 /// Detailed agent status information for heartbeat reporting.
-///
-/// Combines the high-level `AgentStatus` enum with optional detail
-/// fields for richer dashboard display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentStatusInfo {
-    /// High-level lifecycle state.
     pub status: AgentStatus,
-
-    /// Agent version string (e.g., "1.0.0"), if installed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-
-    /// Human-readable detail message (e.g., "Downloading 45%", "Healthy").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-
-    /// PID of the running agent process, if applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
-
-    /// 🌟 v1.3.1: Local port the agent gateway is listening on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_port: Option<u16>,
-
-    /// 🌟 v1.3.1: Agent process CPU usage percentage (0.0 - 100.0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_usage: Option<f32>,
-
-    /// 🌟 v1.3.1: Agent process memory usage in MB.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mb: Option<u64>,
 }
 
 impl AgentStatusInfo {
-    /// Creates a status info indicating the agent is not installed.
     pub fn not_installed() -> Self {
         Self {
             status: AgentStatus::NotInstalled,
-            version: None,
-            message: None,
-            pid: None,
-            local_port: None,
-            cpu_usage: None,
-            memory_mb: None,
+            version: None, message: None, pid: None,
+            local_port: None, cpu_usage: None, memory_mb: None,
         }
     }
 
-    /// Creates a status info indicating the agent is running.
     pub fn running(version: String, pid: u32) -> Self {
         Self {
             status: AgentStatus::Running,
@@ -708,29 +541,19 @@ impl AgentStatusInfo {
         }
     }
 
-    /// Creates a status info indicating the agent is installing.
     pub fn installing(message: String) -> Self {
         Self {
             status: AgentStatus::Installing,
-            version: None,
-            message: Some(message),
-            pid: None,
-            local_port: None,
-            cpu_usage: None,
-            memory_mb: None,
+            version: None, message: Some(message), pid: None,
+            local_port: None, cpu_usage: None, memory_mb: None,
         }
     }
 
-    /// Creates a status info indicating the agent has errored.
     pub fn error(message: String) -> Self {
         Self {
             status: AgentStatus::Error,
-            version: None,
-            message: Some(message),
-            pid: None,
-            local_port: None,
-            cpu_usage: None,
-            memory_mb: None,
+            version: None, message: Some(message), pid: None,
+            local_port: None, cpu_usage: None, memory_mb: None,
         }
     }
 }
@@ -740,37 +563,66 @@ impl AgentStatusInfo {
 // ============================================
 
 /// Session event type enumeration.
+///
+/// ## v1.0.0-TrafficAccounting
+/// Added `SessionTrafficSnapshot` for periodic in-flight traffic reporting.
+///
+/// Long-lived sessions previously had zero traffic visibility until disconnect.
+/// Now every 5 minutes a snapshot is sent with cumulative bytes_in / bytes_out
+/// since session start.
+///
+/// ⚠️ Backend must treat `SessionTrafficSnapshot` as an upsert, NOT an
+/// accumulation. Values are cumulative totals, not deltas.
+/// Only `SessionEnded` (with `is_final=true`) closes the billing period.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionEventType {
-    /// A new session was created
+    /// A new session was created.
     SessionCreated,
-    /// An existing session was updated
+    /// An existing session was updated.
     SessionUpdated,
-    /// A session has ended
+    /// A session has ended — triggers final billing reconciliation.
+    /// Sent with `is_final = true`.
     SessionEnded,
+    /// Periodic cumulative traffic snapshot for a live session (every 5 min).
+    /// bytes_in / bytes_out are totals since session start.
+    /// Backend must upsert, NOT accumulate.
+    /// Sent with `is_final = false`.
+    SessionTrafficSnapshot,
 }
 
 /// Session event report sent to CMS.
+///
+/// ## v1.0.0-TrafficAccounting
+/// Added `is_final` to distinguish:
+/// - `SessionEnded`            → `is_final = true`  → backend closes billing
+/// - `SessionTrafficSnapshot`  → `is_final = false` → backend upserts live totals
+///
+/// `bytes_in` and `bytes_out` are always CUMULATIVE since session start.
+/// Reports are idempotent — safe to re-send after a network error.
 #[derive(Debug, Serialize)]
 pub struct SessionEventReport {
-    /// Event type: session_created, session_updated, or session_ended
+    /// Event type.
     #[serde(rename = "type")]
     pub event_type: SessionEventType,
-    /// Unique session identifier
+    /// Unique session identifier.
     pub session_id: String,
-    /// Client's wallet address (optional)
+    /// Client's wallet address (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_wallet: Option<String>,
-    /// Client's IP address (optional)
+    /// Client's IP address (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,
-    /// Bytes received from client
+    /// Cumulative bytes received from client since session start.
     pub bytes_in: u64,
-    /// Bytes sent to client
+    /// Cumulative bytes sent to client since session start.
     pub bytes_out: u64,
-    /// Unix timestamp of the event
+    /// Unix timestamp of the event.
     pub timestamp: u64,
+    /// Whether this is the final report for this session.
+    /// true  → SessionEnded, backend closes billing period.
+    /// false → SessionTrafficSnapshot, backend upserts live totals.
+    pub is_final: bool,
 }
 
 /// Response from session event report.
@@ -801,9 +653,6 @@ pub struct StoredNodeInfo {
 
 impl StoredNodeInfo {
     /// Loads stored node info from a file.
-    ///
-    /// # Arguments
-    /// * `path` - Path to the JSON file
     pub fn load(path: &str) -> std::io::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         serde_json::from_str(&content)
@@ -811,9 +660,6 @@ impl StoredNodeInfo {
     }
 
     /// Saves node info to a file.
-    ///
-    /// # Arguments
-    /// * `path` - Path to save the JSON file
     pub fn save(&self, path: &str) -> std::io::Result<()> {
         let content = serde_json::to_string_pretty(self)?;
         if let Some(parent) = std::path::Path::new(path).parent() {
