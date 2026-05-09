@@ -1210,6 +1210,20 @@ impl Server {
     /// - MPI router (`build_mpi_router`) — all /api/mpi/* and /api/admin/* endpoints
     /// - Voice router (`build_voice_router`) — GET /api/peer-virtual-ip
     ///
+    /// ## Dual-listener design (v1.0.0-Voice)
+    /// Binds two TCP listeners simultaneously:
+    ///   1. `listen_addr` (config value, typically 127.0.0.1:8421) — local processes
+    ///   2. `100.64.0.1:8421` (VPN gateway virtual IP) — VPN-connected clients
+    ///
+    /// The VPN listener allows clients that have established a VPN session to call
+    /// GET /api/peer-virtual-ip for voice call UDP direct-connect routing.
+    /// The public internet cannot reach 100.64.0.1 — it is only reachable through
+    /// the WireGuard tunnel, so no additional auth is needed for this endpoint.
+    ///
+    /// If the VPN virtual interface is not yet up when the server starts
+    /// (e.g. TUN not initialized), the VPN listener bind will fail gracefully —
+    /// a warning is logged and the server continues on listen_addr only.
+    ///
     /// ## v1.0.0-Voice
     /// `sessions` parameter renamed from `_sessions` (unused) to `sessions`.
     /// The Voice router is merged via `.merge(build_voice_router(sessions))`.
@@ -1226,6 +1240,15 @@ impl Server {
         _udp: Arc<UdpTransport>,
     ) -> JoinHandle<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        // Secondary shutdown receiver for the VPN listener task.
+        let mut shutdown_rx_vpn = self.shutdown_tx.subscribe();
+        // Gateway IP of the VPN virtual network (100.64.0.1).
+        // Clients connected to the VPN can reach this address through the tunnel.
+        // The port matches listen_addr so clients use a consistent port number.
+        let vpn_listen_addr: std::net::SocketAddr = format!(
+            "100.64.0.1:{}",
+            listen_addr.port()
+        ).parse().unwrap_or_else(|_| "100.64.0.1:8421".parse().unwrap());
 
         tokio::spawn(async move {
             // v1.0.0-Voice: merge Voice API router (GET /api/peer-virtual-ip).
@@ -1234,6 +1257,7 @@ impl Server {
             let app = build_mpi_router(mpi_state)
                 .merge(build_voice_router(sessions));
 
+            // ── Listener 1: configured address (127.0.0.1:8421 by default) ──
             let listener = match tokio::net::TcpListener::bind(listen_addr).await {
                 Ok(l) => {
                     info!("[API] MemChain API on http://{}", listen_addr);
@@ -1245,6 +1269,81 @@ impl Server {
                 }
             };
 
+            // ── Listener 2: VPN gateway address (100.64.0.1:<port>) ──────────
+            // Allows VPN-connected clients to query peer virtual IPs for voice calls.
+            // Retries binding every 10 seconds if TUN interface is not yet up.
+            match tokio::net::TcpListener::bind(vpn_listen_addr).await {
+                Ok(vpn_listener) => {
+                    info!(
+                        "[API] Voice API also available on http://{} (VPN clients only)",
+                        vpn_listen_addr
+                    );
+                    let app_clone = app.clone();
+                    tokio::spawn(async move {
+                        let server = axum::serve(vpn_listener, app_clone)
+                            .with_graceful_shutdown(async move {
+                                let _ = shutdown_rx_vpn.recv().await;
+                            });
+                        if let Err(e) = server.await {
+                            error!("[API] VPN listener error: {}", e);
+                        }
+                        info!("[API] VPN listener stopped");
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        "[API] VPN listener on {} not ready yet ({}), \
+                         will retry every 10s in background",
+                        vpn_listen_addr, e
+                    );
+                    // Spawn a background task that keeps trying to bind the VPN
+                    // listener until it succeeds (TUN comes up) or shutdown fires.
+                    let app_clone = app.clone();
+                    tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(
+                            std::time::Duration::from_secs(10)
+                        );
+                        // Skip the first immediate tick.
+                        interval.tick().await;
+                        loop {
+                            tokio::select! {
+                                _ = shutdown_rx_vpn.recv() => {
+                                    debug!("[API] VPN listener retry task shutting down");
+                                    break;
+                                }
+                                _ = interval.tick() => {
+                                    match tokio::net::TcpListener::bind(vpn_listen_addr).await {
+                                        Ok(vpn_listener) => {
+                                            info!(
+                                                "[API] VPN listener bound on {} (TUN is now up)",
+                                                vpn_listen_addr
+                                            );
+                                            let server = axum::serve(vpn_listener, app_clone)
+                                                .with_graceful_shutdown(async {
+                                                    // No shutdown signal here — the task
+                                                    // runs until the process exits.
+                                                    std::future::pending::<()>().await
+                                                });
+                                            if let Err(e) = server.await {
+                                                error!("[API] VPN listener error: {}", e);
+                                            }
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            debug!(
+                                                "[API] VPN listener retry failed ({}): {}",
+                                                vpn_listen_addr, e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+
+            // ── Primary server (blocking) ─────────────────────────────────────
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                 let _ = shutdown_rx.recv().await;
                 info!("[API] Shutdown signal received");
