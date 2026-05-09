@@ -133,10 +133,11 @@ bincode = "1.3"
 # Added for MemChain Phase 1: Agent HTTP API
 axum = "0.7"
 
-# v1.0.0-Voice: "limit" feature required for tower::limit::RateLimitLayer
-# used in api/voice.rs GET /api/peer-virtual-ip rate limiter.
-# tower = "0.5" does NOT enable this by default — must be explicit.
-tower = { version = "0.5", features = ["limit"] }
+# v1.0.0-Voice: voice.rs originally used tower::limit::RateLimitLayer,
+# but RateLimit<Route> does not implement Clone (axum Router::layer requires it).
+# Switched to a DashMap-based rate limiter in voice.rs instead.
+# tower is kept without the "limit" feature — only used for axum middleware.
+tower = "0.5"
 
 # v1.3.0: WebSocket client for CMS tunnel + local OpenClaw Gateway
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
@@ -181,7 +182,7 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.12"
-tower = { version = "0.5", features = ["util", "limit"] }
+tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 
 [lints]
