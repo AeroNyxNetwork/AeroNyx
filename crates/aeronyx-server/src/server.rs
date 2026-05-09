@@ -8,7 +8,7 @@
 //! v0.1.1 - Keepalive packet handling
 //! v0.2.0 - CMS management integration
 //! v0.3.0 - MemChain integration (MemPool, AofWriter, 1st-byte dispatch)
-//! v0.3.1 - Fixed Option<Arc<…>> type mismatch
+//! v0.3.1 - Fixed Option<Arc<...>> type mismatch
 //! v0.4.0 - Ed25519 verify, trust whitelist, SyncReq/SyncRes
 //! v1.3.0 - Command Pipeline: CommandHandler + channel wiring
 //! v2.1.0 - Dual-engine init (SQLite+Vector + legacy MemPool+AOF),
@@ -48,11 +48,20 @@
 //!   handle_memchain_message gains `sessions` + `chat_relay` parameters.
 //!   Added ChatRelay branch: online multi-device broadcast + offline store_pending.
 //!   Added DeviceRegister branch: sessions.register_device() via session.wallet_bytes().
+//! v1.0.0-Voice+SessionFix - Three targeted fixes:
+//!   A. start_combined_api: `_sessions` -> `sessions`; merged build_voice_router().
+//!      GET /api/peer-virtual-ip now live for UDP direct-connect voice calls.
+//!   B. spawn_udp_task ClientHello branch: session_created() now passes real
+//!      wallet_hex derived from result.session.client_public_key.to_bytes().
+//!   C. spawn_cleanup_task: cleanup_expired() now returns 5-tuple
+//!      (SessionId, Ipv4Addr, wallet_hex, bytes_rx, bytes_tx).
+//!      session_ended() receives real wallet + traffic data, fixing the
+//!      aeronyx.network 400 error: {"client_wallet":["This field is required."]}.
 //!
-//! ⚠️ Important Notes for Next Developer:
+//! ## ⚠️ Important Notes for Next Developer
 //! - record_key is derived from identity.to_bytes() (Ed25519 PRIVATE key)
 //! - rawlog_key uses derive_rawlog_key() — a DIFFERENT KDF from derive_record_key()
-//! - SuperNode init order: init_llm_router() → reset_stale_processing_tasks() → TaskWorker
+//! - SuperNode init order: init_llm_router() -> reset_stale_processing_tasks() -> TaskWorker
 //! - NerEngine MUST be loaded AFTER EmbedEngine (shared ORT runtime via Once)
 //! - RerankerEngine MUST be loaded AFTER EmbedEngine and NerEngine (shared ORT Once)
 //! - SaaS mode: MpiState.storage = None, MpiState.vector_index = None.
@@ -68,6 +77,8 @@
 //!   chat_relay = None means chat relay is disabled; ChatRelay messages are dropped.
 //! - DeviceRegister handler uses session.wallet_bytes() ([u8;32]) — NOT a separate
 //!   method — to extract the wallet pubkey from the authenticated session.
+//! - build_voice_router() injects Arc<SessionManager> as independent axum State;
+//!   it does NOT share MpiState. The two routers are fully isolated.
 //!
 //! ## Last Modified
 //! v2.5.2+SecAudit     - BroadcastRecord sig verification hardened.
@@ -75,6 +86,8 @@
 //! v2.5.3+Security     - Server::new() gains config_path; auto-generates secrets.
 //! v1.0.0-MultiTenant  - SaaS startup branch; MpiState::local() constructor.
 //! v1.2.0-MultiDevice  - ChatRelayService init; ChatRelay + DeviceRegister handlers.
+//! v1.0.0-Voice+SessionFix - Voice API mount; session_created wallet fix;
+//!   cleanup_expired 5-tuple; session_ended real wallet+traffic data.
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -112,6 +125,8 @@ use rusqlite::OptionalExtension;
 
 use crate::api::mpi::{build_mpi_router, MpiState, BaselineSnapshot, Mode};
 use crate::api::auth::{ensure_jwt_secret, generate_secret};
+// v1.0.0-Voice: Voice API router for GET /api/peer-virtual-ip
+use crate::api::voice::build_voice_router;
 use crate::config::{MemChainConfig, MemChainMode, ServerConfig, VectorQuantizationMode};
 use crate::error::{Result, ServerError};
 use crate::handlers::packet::DecryptedPayload;
@@ -299,7 +314,19 @@ impl Server {
             chat_relay.clone(),
         );
         tasks.push(("cleanup", cleanup_task));
-        
+
+        // v1.0.0-TrafficAccounting: periodic traffic snapshot task.
+        // Every 5 minutes, snapshot all active sessions and send cumulative
+        // bytes_in / bytes_out to aeronyx.network as SessionTrafficSnapshot
+        // events. Fills the gap where long-lived sessions had zero visibility
+        // until disconnect. Values are cumulative totals (not deltas) —
+        // backend must upsert, not accumulate.
+        let snapshot_task = self.spawn_traffic_snapshot_task(
+            Arc::clone(&sessions),
+            session_event_sender.clone(),
+        );
+        tasks.push(("traffic-snapshot", snapshot_task));
+
         // 🌟 v1.3.0-Sovereign: wallet route cache stale-entry cleanup task
         if let Some(ref relay) = chat_relay {
             let routes = Arc::clone(&relay.wallet_routes);
@@ -850,12 +877,12 @@ impl Server {
                     model = %model_path,
                     model_type = %engine.model_type(),
                     dim = engine.dim(),
-                    "[EMBED] ✅ Local embedding engine loaded"
+                    "[EMBED] Local embedding engine loaded"
                 );
                 Some(Arc::new(engine))
             }
             Err(e) => {
-                warn!(model = %model_path, error = %e, "[EMBED] ⚠️ Unavailable");
+                warn!(model = %model_path, error = %e, "[EMBED] Unavailable");
                 None
             }
         }
@@ -873,12 +900,12 @@ impl Server {
                 info!(
                     model = %model_path,
                     threshold,
-                    "[NER] ✅ Local NER engine loaded (GLiNER)"
+                    "[NER] Local NER engine loaded (GLiNER)"
                 );
                 Some(Arc::new(engine))
             }
             Err(e) => {
-                warn!(model = %model_path, error = %e, "[NER] ⚠️ Unavailable");
+                warn!(model = %model_path, error = %e, "[NER] Unavailable");
                 None
             }
         }
@@ -896,12 +923,12 @@ impl Server {
                 info!(
                     model = %model_path,
                     blend_weight = %RerankerEngine::blend_weight(),
-                    "[RERANKER] ✅ Cross-encoder loaded"
+                    "[RERANKER] Cross-encoder loaded"
                 );
                 Some(Arc::new(engine))
             }
             Err(e) => {
-                warn!(model = %model_path, error = %e, "[RERANKER] ⚠️ Unavailable");
+                warn!(model = %model_path, error = %e, "[RERANKER] Unavailable");
                 None
             }
         }
@@ -1027,7 +1054,7 @@ impl Server {
         info!(
             providers = supernode.providers.len(),
             fallback = ?supernode.routing.fallback,
-            "[SUPERNODE] ✅ LlmRouter initialized"
+            "[SUPERNODE] LlmRouter initialized"
         );
         Some(Arc::new(router))
     }
@@ -1118,7 +1145,7 @@ impl Server {
                 if let Some(data) = cal_data {
                     let ok = vector_index.restore_quantizer(&owner, model_name, &data);
                     if ok {
-                        info!(model = model_name, "[VECTOR] ✅ Quantizer restored");
+                        info!(model = model_name, "[VECTOR] Quantizer restored");
                     }
                     ok
                 } else {
@@ -1137,7 +1164,7 @@ impl Server {
                     drop(conn);
                     info!(
                         model = model_name,
-                        "[VECTOR] ✅ Quantizer calibrated and persisted"
+                        "[VECTOR] Quantizer calibrated and persisted"
                     );
                 }
             }
@@ -1177,19 +1204,35 @@ impl Server {
     // Combined API Server
     // ============================================
 
+    /// Start the combined HTTP API server.
+    ///
+    /// Mounts:
+    /// - MPI router (`build_mpi_router`) — all /api/mpi/* and /api/admin/* endpoints
+    /// - Voice router (`build_voice_router`) — GET /api/peer-virtual-ip
+    ///
+    /// ## v1.0.0-Voice
+    /// `sessions` parameter renamed from `_sessions` (unused) to `sessions`.
+    /// The Voice router is merged via `.merge(build_voice_router(sessions))`.
+    /// The two routers use independent axum State — MpiState and Arc<SessionManager>
+    /// respectively — and are fully isolated from each other.
     fn start_combined_api(
         &self,
         listen_addr: std::net::SocketAddr,
         mpi_state: Arc<MpiState>,
         _mempool: Arc<MemPool>,
         _aof_writer: Arc<TokioMutex<AofWriter>>,
-        _sessions: Arc<SessionManager>,
+        // v1.0.0-Voice: renamed from `_sessions` — now passed to build_voice_router().
+        sessions: Arc<SessionManager>,
         _udp: Arc<UdpTransport>,
     ) -> JoinHandle<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
-            let app = build_mpi_router(mpi_state);
+            // v1.0.0-Voice: merge Voice API router (GET /api/peer-virtual-ip).
+            // build_voice_router injects Arc<SessionManager> as independent axum State;
+            // it does NOT share MpiState. The two routers are fully isolated.
+            let app = build_mpi_router(mpi_state)
+                .merge(build_voice_router(sessions));
 
             let listener = match tokio::net::TcpListener::bind(listen_addr).await {
                 Ok(l) => {
@@ -1479,7 +1522,16 @@ impl Server {
                                                     let sid = BASE64.encode(
                                                         &result.response.session_id
                                                     );
-                                                    session_events.session_created(&sid, None);
+                                                    // v1.0.0-Voice+SessionFix:
+                                                    // Extract wallet hex from the handshake result's
+                                                    // session rather than passing None.
+                                                    // HandshakeResult { session: Arc<Session>, response: ServerHello }
+                                                    // Fixes aeronyx.network 400:
+                                                    //   {"client_wallet":["This field is required."]}
+                                                    let wallet_hex = hex::encode(
+                                                        result.session.client_public_key.to_bytes()
+                                                    );
+                                                    session_events.session_created(&sid, Some(wallet_hex));
                                                     let resp = encode_server_hello(&result.response);
                                                     let _ = udp.send(&resp, &source.addr).await;
                                                 }
@@ -1563,7 +1615,7 @@ impl Server {
     ) {
         match msg {
             // ── Legacy P2P sync variants (unchanged) ─────────────────────────
-    
+
             MemChainMessage::BroadcastFact(fact) => {
                 let origin_hex = hex::encode(fact.origin);
                 let sig_ok = match IdentityPublicKey::from_bytes(&fact.origin) {
@@ -1583,7 +1635,7 @@ impl Server {
                     let _ = w.append_fact(&fact).await;
                 }
             }
-    
+
             MemChainMessage::BroadcastRecord(record) => {
                 let owner_hex = record.owner_hex();
                 let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
@@ -1621,13 +1673,13 @@ impl Server {
                     }
                 }
             }
-    
+
             MemChainMessage::SyncRequest { last_known_hash } => {
                 let facts = mempool.get_facts_after(last_known_hash);
                 let resp = MemChainMessage::SyncResponse { facts };
                 Server::send_to_session(&resp, session, udp, crypto).await;
             }
-    
+
             MemChainMessage::SyncResponse { facts } => {
                 for fact in facts {
                     let origin_hex = hex::encode(fact.origin);
@@ -1644,7 +1696,7 @@ impl Server {
                     }
                 }
             }
-    
+
             MemChainMessage::SyncRecordRequest { owner, after_timestamp } => {
                 if let Some(ref st) = storage {
                     let records = st.query_by_owner_after(&owner, after_timestamp).await;
@@ -1652,7 +1704,7 @@ impl Server {
                     Server::send_to_session(&resp, session, udp, crypto).await;
                 }
             }
-    
+
             MemChainMessage::SyncRecordResponse { records } => {
                 if let Some(ref st) = storage {
                     for record in records {
@@ -1680,7 +1732,7 @@ impl Server {
                     }
                 }
             }
-    
+
             MemChainMessage::BlockAnnounce(header) => {
                 info!(
                     height = header.height,
@@ -1688,9 +1740,9 @@ impl Server {
                     "[MEMCHAIN] BlockAnnounce received"
                 );
             }
-    
+
             // ── v1.1.0-ChatRelay + v1.3.0-Sovereign: ChatRelay ───────────────
-    
+
             MemChainMessage::ChatRelay(envelope) => {
                 // Step 1: validate ChatEnvelope Ed25519 signature (unchanged)
                 if envelope.verify_signature().is_err() {
@@ -1700,7 +1752,7 @@ impl Server {
                     );
                     return;
                 }
-    
+
                 let Some(ref relay) = chat_relay else {
                     warn!(
                         receiver = %hex::encode(&envelope.receiver[..4]),
@@ -1708,7 +1760,7 @@ impl Server {
                     );
                     return;
                 };
-    
+
                 // Step 2: dedup check (online path)
                 if relay.is_online_duplicate(&envelope.message_id) {
                     debug!(
@@ -1717,24 +1769,24 @@ impl Server {
                     );
                     return;
                 }
-    
+
                 // Step 3: announce sender to route cache (refreshes last_active)
                 relay.wallet_routes.announce(
                     &envelope.sender,
                     session.id.clone(),
                     session.client_endpoint,
                 );
-    
+
                 let receiver = envelope.receiver;
-    
+
                 // Step 4: lookup receiver in route cache (sovereign routing)
                 let target_routes = relay.wallet_routes.lookup(&receiver);
-    
+
                 if !target_routes.is_empty() {
                     // ── Online path: deliver to all active sessions ───────────
                     let mut all_failed = true;
                     let device_count = target_routes.len();
-    
+
                     for (target_sid, _endpoint) in &target_routes {
                         // Look up the live Session object so we can encrypt correctly
                         if let Some(target_session) = sessions.get(target_sid) {
@@ -1754,7 +1806,7 @@ impl Server {
                             );
                         }
                     }
-    
+
                     if all_failed {
                         // All sessions were stale — fall back to offline store
                         if let Err(e) = relay.store_pending(&envelope) {
@@ -1793,21 +1845,21 @@ impl Server {
                     }
                 }
             }
-    
+
             // ── v1.1.0 + v1.3.0-Sovereign: ChatPull ──────────────────────────
-    
+
             MemChainMessage::ChatPull {
                 wallet, after_timestamp, cursor, limit,
                 request_timestamp, signature,
             } => {
                 let Some(ref relay) = chat_relay else { return; };
-    
+
                 // Signature input (per spec):
                 // wallet(32) || after_timestamp(8,LE) || cursor(16) || limit(4,LE) || request_timestamp(8,LE)
                 let at_bytes = after_timestamp.to_le_bytes();
                 let limit_bytes = limit.to_le_bytes();
                 let rts_bytes = request_timestamp.to_le_bytes();
-    
+
                 let verify_result = verify_signed_message(
                     DOMAIN_CHAT_PULL,
                     &[
@@ -1821,19 +1873,19 @@ impl Server {
                     &signature,
                     request_timestamp,
                 );
-    
+
                 if verify_result.is_err() {
                     // Silent drop — no feedback to attacker (anti-DoS)
                     return;
                 }
-    
+
                 // Announce to route cache: client is alive
                 relay.wallet_routes.announce(
                     &wallet,
                     session.id.clone(),
                     session.client_endpoint,
                 );
-    
+
                 // Query by wallet from the signed message (not session key)
                 match relay.pull_pending(&wallet, after_timestamp, &cursor, limit) {
                     Ok((messages, has_more)) => {
@@ -1850,26 +1902,26 @@ impl Server {
                     }
                 }
             }
-    
+
             // ── v1.1.0 + v1.3.0-Sovereign: ChatAck ───────────────────────────
-    
+
             MemChainMessage::ChatAck { message_ids, wallet, ack_timestamp, signature } => {
                 let Some(ref relay) = chat_relay else { return; };
-    
+
                 if message_ids.is_empty() {
                     return;
                 }
-    
+
                 // Build SHA-256 of concatenated message_ids (in list order)
-                // ids_hash = SHA256( id[0](16) || id[1](16) || … )
+                // ids_hash = SHA256( id[0](16) || id[1](16) || ... )
                 let mut id_hasher = Sha256::new();
                 for mid in &message_ids {
                     id_hasher.update(mid.as_ref());
                 }
                 let ids_hash: [u8; 32] = id_hasher.finalize().into();
-    
+
                 let ack_ts_bytes = ack_timestamp.to_le_bytes();
-    
+
                 let verify_result = verify_signed_message(
                     DOMAIN_CHAT_ACK,
                     &[
@@ -1881,7 +1933,7 @@ impl Server {
                     &signature,
                     ack_timestamp,
                 );
-    
+
                 if let Err(e) = verify_result {
                     warn!(
                         wallet = %hex::encode(&wallet[..4]),
@@ -1890,7 +1942,7 @@ impl Server {
                     );
                     return;
                 }
-    
+
                 // receiver = wallet — enforced by ack_messages SQL (AND receiver = ?)
                 match relay.ack_messages(&message_ids, &wallet) {
                     Ok(deleted) => {
@@ -1909,16 +1961,16 @@ impl Server {
                     }
                 }
             }
-    
+
             // ── v1.3.0-Sovereign: DeviceRegister (with signature) ────────────
-    
+
             MemChainMessage::DeviceRegister {
                 device_id, device_name, wallet_pubkey, timestamp, signature,
             } => {
                 // Signature input (per spec):
                 // session_id(16) || device_id(16) || wallet_pubkey(32) || timestamp(8,LE)
                 let ts_bytes = timestamp.to_le_bytes();
-    
+
                 let verify_result = verify_signed_message(
                     DOMAIN_DEVICE_REGISTER,
                     &[
@@ -1931,7 +1983,7 @@ impl Server {
                     &signature,
                     timestamp,
                 );
-    
+
                 if let Err(e) = verify_result {
                     warn!(
                         session = %session.id,
@@ -1941,7 +1993,7 @@ impl Server {
                     );
                     return;
                 }
-    
+
                 // Truncate device_name at a UTF-8 char boundary if > 64 bytes
                 let name_display = if device_name.len() > 64 {
                     let mut end = 64;
@@ -1950,18 +2002,18 @@ impl Server {
                 } else {
                     &device_name
                 };
-    
-                // Announce wallet → session in route cache
+
+                // Announce wallet -> session in route cache
                 let Some(ref relay) = chat_relay else { return; };
                 relay.wallet_routes.announce(
                     &wallet_pubkey,
                     session.id.clone(),
                     session.client_endpoint,
                 );
-    
+
                 // Register device in SessionManager
                 sessions.register_device(&wallet_pubkey, device_id, session.id.clone());
-    
+
                 info!(
                     session_id = %session.id,
                     wallet = %hex::encode(&wallet_pubkey[..4]),
@@ -1969,7 +2021,7 @@ impl Server {
                     device_name = %name_display,
                     "[CHAT_RELAY] Device registered (v1.3.0-Sovereign)"
                 );
-    
+
                 // Deliver pending offline messages immediately
                 match relay.pull_pending(&wallet_pubkey, 0, &[0u8; 16], 100) {
                     Ok((messages, _has_more)) if !messages.is_empty() => {
@@ -1998,16 +2050,16 @@ impl Server {
                     }
                 }
             }
-    
+
             // ── v1.3.0-Sovereign: WalletPresence heartbeat ───────────────────
-    
+
             MemChainMessage::WalletPresence { wallet_pubkey, timestamp, signature } => {
                 let Some(ref relay) = chat_relay else { return; };
-    
+
                 // Signature input:
                 // session_id(16) || wallet_pubkey(32) || timestamp(8,LE)
                 let ts_bytes = timestamp.to_le_bytes();
-    
+
                 let verify_result = verify_signed_message(
                     DOMAIN_WALLET_PRESENCE,
                     &[
@@ -2019,7 +2071,7 @@ impl Server {
                     &signature,
                     timestamp,
                 );
-    
+
                 if let Err(e) = verify_result {
                     // Debug level — this heartbeat fires frequently; warn would be noisy
                     debug!(
@@ -2029,20 +2081,20 @@ impl Server {
                     );
                     return;
                 }
-    
+
                 relay.wallet_routes.announce(
                     &wallet_pubkey,
                     session.id.clone(),
                     session.client_endpoint,
                 );
-    
+
                 debug!(
                     wallet = %hex::encode(&wallet_pubkey[..4]),
                     "[CHAT_RELAY] WalletPresence: route refreshed"
                 );
                 // No reply — presence is one-way
             }
-    
+
             _ => {
                 debug!("[MEMCHAIN] Unhandled message variant");
             }
@@ -2125,10 +2177,111 @@ impl Server {
     }
 
     // ============================================
+    // Traffic Snapshot Task (v1.0.0-TrafficAccounting)
+    // ============================================
+
+    /// Periodic traffic snapshot task — fires every 5 minutes.
+    ///
+    /// Iterates all active sessions and sends a `SessionTrafficSnapshot`
+    /// event for each one containing cumulative bytes_in / bytes_out since
+    /// session start. This gives aeronyx.network visibility into long-lived
+    /// sessions without waiting for disconnect.
+    ///
+    /// ## Design decisions
+    /// - Interval: 5 minutes (300 s). Short enough for reasonable billing
+    ///   granularity; long enough to avoid spamming the CMS API.
+    /// - Values: cumulative totals, not deltas. Makes reports idempotent
+    ///   if re-sent after a network error.
+    /// - Sessions with zero traffic (bytes_in == 0 && bytes_out == 0) are
+    ///   skipped — they have nothing meaningful to report yet.
+    /// - No wallet = session not yet registered via DeviceRegister. Still
+    ///   reported with wallet = None so the backend can match by session_id.
+    fn spawn_traffic_snapshot_task(
+        &self,
+        sessions: Arc<SessionManager>,
+        events: SessionEventSender,
+    ) -> JoinHandle<()> {
+        let shutdown = Arc::clone(&self.shutdown);
+        let mut rx = self.shutdown_tx.subscribe();
+
+        tokio::spawn(async move {
+            // Offset by 60 s so the first snapshot fires after sessions have
+            // had time to accumulate some traffic (avoids sending zero-byte
+            // snapshots immediately after server start).
+            tokio::time::sleep(Duration::from_secs(60)).await;
+
+            let mut timer = tokio::time::interval(Duration::from_secs(300));
+
+            loop {
+                tokio::select! {
+                    _ = rx.recv() => break,
+                    _ = timer.tick() => {
+                        if shutdown.load(Ordering::SeqCst) { break; }
+
+                        let all = sessions.all_sessions();
+                        let mut reported = 0usize;
+
+                        for session in all {
+                            let snap = session.stats.snapshot();
+
+                            // Skip sessions with no traffic yet.
+                            if snap.bytes_rx == 0 && snap.bytes_tx == 0 {
+                                continue;
+                            }
+
+                            let wallet_hex = hex::encode(
+                                session.client_public_key.to_bytes()
+                            );
+                            let sid = BASE64.encode(session.id.as_bytes());
+
+                            events.session_traffic_snapshot(
+                                &sid,
+                                Some(wallet_hex),
+                                snap.bytes_rx,
+                                snap.bytes_tx,
+                            );
+                            reported += 1;
+                        }
+
+                        if reported > 0 {
+                            debug!(
+                                sessions = reported,
+                                "[TRAFFIC_SNAPSHOT] Sent snapshots for {} active session(s)",
+                                reported
+                            );
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    // ============================================
     // Cleanup Task
     // ============================================
 
-    
+    /// Periodic session expiry sweep (every 60 seconds).
+    ///
+    /// ## v1.0.0-Voice+SessionFix
+    /// `cleanup_expired()` now returns a 5-tuple:
+    ///   `(SessionId, Ipv4Addr, wallet_hex, bytes_rx, bytes_tx)`
+    ///
+    /// The wallet and traffic fields are forwarded to `session_ended()` so
+    /// that aeronyx.network receives accurate billing data. Previously,
+    /// passing `None` and `0` caused a 400 Bad Request:
+    ///   `{"error":{"client_wallet":["This field is required."]}}`
+    ///
+    /// ## IP Cooldown (Security fix)
+    /// Virtual IPs are no longer returned to the IP pool immediately on
+    /// session expiry. Instead:
+    ///   1. `cleanup_expired()` stages each released IP into `sessions.cooldown_pool`.
+    ///   2. Each cleanup tick calls `sessions.drain_cooldown_pool()` to collect
+    ///      IPs whose 30-second cooldown has elapsed.
+    ///   3. Only those cooled-down IPs are returned to `ip_pool` via `release()`.
+    ///
+    /// This prevents stale voice packets (addressed to a just-expired virtual IP)
+    /// from being delivered to a new session that was immediately assigned the
+    /// same address.
     fn spawn_cleanup_task(
         &self,
         sessions: Arc<SessionManager>,
@@ -2147,21 +2300,34 @@ impl Server {
                     _ = rx.recv() => break,
                     _ = timer.tick() => {
                         if shutdown.load(Ordering::SeqCst) { break; }
-                        for (sid, vip) in sessions.cleanup_expired() {
+
+                        // ── Step 1: expire sessions, stage IPs into cooldown pool ──
+                        // cleanup_expired() calls sessions.cooldown_pool.insert(ip)
+                        // internally; we only handle routing + event reporting here.
+                        for (sid, vip, wallet, bytes_rx, bytes_tx) in sessions.cleanup_expired() {
+                            // Remove routing entry immediately — no new packets
+                            // should be forwarded to this session.
                             routing.remove_route(vip);
-                            ip_pool.release(vip);
-                            events.session_ended(&sid.to_string(), None, 0, 0);
+                            // Report session end with real wallet + traffic data.
+                            events.session_ended(&sid.to_string(), Some(wallet), bytes_rx, bytes_tx);
                             // 🌟 v1.3.0-Sovereign: prune stale wallet route entries
                             if let Some(ref relay) = chat_relay {
                                 relay.wallet_routes.remove_session(&sid);
                             }
+                        }
+
+                        // ── Step 2: return cooled-down IPs to the pool ─────────────
+                        // IPs that completed their 30-second cooldown window are now
+                        // safe for reassignment. IPs still within the window remain
+                        // in cooldown_pool and will be checked again next tick.
+                        for ip in sessions.drain_cooldown_pool() {
+                            ip_pool.release(ip);
                         }
                     }
                 }
             }
         })
     }
-
 
     // ============================================
     // Shutdown
