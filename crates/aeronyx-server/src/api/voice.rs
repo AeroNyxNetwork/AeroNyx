@@ -101,6 +101,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tower::limit::RateLimitLayer;
+use std::time::Duration as StdDuration;
 
 use crate::services::SessionManager;
 
@@ -270,7 +271,7 @@ pub fn build_voice_router(sessions: Arc<SessionManager>) -> Router {
         // this global limit is sufficient to block bulk enumeration.
         .layer(RateLimitLayer::new(
             RATE_LIMIT_REQUESTS,
-            std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS),
+            StdDuration::from_secs(RATE_LIMIT_WINDOW_SECS),
         ))
         .with_state(sessions)
 }
