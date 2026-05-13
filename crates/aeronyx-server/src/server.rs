@@ -98,7 +98,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, trace};
 
 use aeronyx_core::protocol::auth::{
     verify_signed_message,
@@ -293,6 +293,8 @@ impl Server {
             server_pubkey_hex.clone(),
             // 🌟 v1.2.0-MultiDevice
             chat_relay.clone(),
+            // v1.0.0-Voice: for voice packet routing
+            Arc::clone(&routing),
         );
         tasks.push(("udp", udp_task));
 
@@ -1595,6 +1597,8 @@ impl Server {
         server_pubkey_hex: String,
         // 🌟 v1.2.0-MultiDevice
         chat_relay: Option<Arc<ChatRelayService>>,
+        // v1.0.0-Voice: needed for voice packet routing by dst virtual IP
+        routing: Arc<RoutingService>,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
