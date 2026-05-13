@@ -1659,6 +1659,60 @@ impl Server {
                                                 #[cfg(target_os = "linux")]
                                                 { let _ = tun.write(&pkt).await; }
                                             }
+                                            Ok((session, DecryptedPayload::Voice { dst_ip, payload })) => {
+                                                // ── Voice relay ──────────────────────────────
+                                                // Look up the target session by virtual IP,
+                                                // re-encrypt the payload with the target's
+                                                // session key, and send to their UDP endpoint.
+                                                // The server never inspects the voice content —
+                                                // it is end-to-end encrypted between clients.
+                                                if let Some(target_sid) = routing.lookup(dst_ip) {
+                                                    if let Some(target) = sessions.get(&target_sid) {
+                                                        let counter = target.next_tx_counter();
+                                                        let mut encrypted =
+                                                            vec![0u8; payload.len() + aeronyx_core::crypto::transport::ENCRYPTION_OVERHEAD];
+                                                        match crypto.encrypt(
+                                                            &target.session_key,
+                                                            counter,
+                                                            target.id.as_bytes(),
+                                                            &payload,
+                                                            &mut encrypted,
+                                                        ) {
+                                                            Ok(len) => {
+                                                                encrypted.truncate(len);
+                                                                let pkt = aeronyx_core::protocol::DataPacket::new(
+                                                                    *target.id.as_bytes(),
+                                                                    counter,
+                                                                    encrypted,
+                                                                );
+                                                                let bytes = aeronyx_core::protocol::codec::encode_data_packet(&pkt).to_vec();
+                                                                let _ = udp_reply.send(&bytes, &target.client_endpoint).await;
+                                                                trace!(
+                                                                    src = %session.virtual_ip,
+                                                                    dst = %dst_ip,
+                                                                    "[VOICE] Relayed voice packet"
+                                                                );
+                                                            }
+                                                            Err(e) => {
+                                                                warn!(
+                                                                    dst_ip = %dst_ip,
+                                                                    "[VOICE] Re-encrypt failed: {}", e
+                                                                );
+                                                            }
+                                                        }
+                                                    } else {
+                                                        debug!(
+                                                            dst_ip = %dst_ip,
+                                                            "[VOICE] Target session not found (disconnected?)"
+                                                        );
+                                                    }
+                                                } else {
+                                                    debug!(
+                                                        dst_ip = %dst_ip,
+                                                        "[VOICE] No route to dst_ip (peer offline)"
+                                                    );
+                                                }
+                                            }
                                             Ok((session, DecryptedPayload::MemChain(msg))) => {
                                                 if let (Some(ref mp), Some(ref aw)) =
                                                     (&mempool, &aof_writer)
