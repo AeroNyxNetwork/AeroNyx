@@ -1663,6 +1663,27 @@ impl Server {
                                                 #[cfg(target_os = "linux")]
                                                 { let _ = tun.write(&pkt).await; }
                                             }
+                                            Err(ref e) if e.is_session_not_found() => {
+                                                // Client is using a stale session key
+                                                // (e.g. after server restart). Send a
+                                                // 1-byte RESET (0xFF) so the client
+                                                // re-handshakes immediately.
+                                                // ⚠️ This packet is NOT encrypted.
+                                                // Clients must validate the accompanying
+                                                // session_id once we add it (TODO: add
+                                                // session_id prefix to prevent spoofing).
+                                                let reset = [0xFFu8];
+                                                let _ = udp_reply.send(&reset, &source.addr).await;
+                                                debug!(
+                                                    src = %source.addr,
+                                                    "[SESSION] Sent RESET to stale client"
+                                                );
+                                            }
+                                            Err(_) => {
+                                                // Other errors (decryption failure, replay,
+                                                // IP spoofing logged at debug level, etc.)
+                                                // are silently dropped.
+                                            }
                                             Ok((session, DecryptedPayload::Voice { dst_ip, payload })) => {
                                                 // ── Voice relay ──────────────────────────────
                                                 // Look up the target session by virtual IP,
@@ -1717,8 +1738,7 @@ impl Server {
                                                     );
                                                 }
                                             }
-                                            Ok((session, DecryptedPayload::MemChain(msg))) => {
-                                                if let (Some(ref mp), Some(ref aw)) =
+                                            Ok((session, DecryptedPayload::MemChain(msg))) => {                                                if let (Some(ref mp), Some(ref aw)) =
                                                     (&mempool, &aof_writer)
                                                 {
                                                     Self::handle_memchain_message(
