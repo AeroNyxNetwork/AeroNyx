@@ -5,6 +5,10 @@
 //!
 //! ## Last Modified
 //! v0.1.2 - Fixed: InvalidPacket source field renamed to avoid thiserror issue
+//! v1.0.0-Voice+SessionFix - Added `is_session_not_found()` helper method.
+//!   Used by `server.rs::spawn_udp_task` to detect stale-session packets and
+//!   send a 0xFF RESET signal so clients re-handshake immediately instead of
+//!   silently retrying with an invalid session key.
 
 use std::net::SocketAddr;
 
@@ -137,6 +141,18 @@ impl ServerError {
         }
     }
 
+    /// Returns `true` if this error indicates the requested session does not
+    /// exist in the session manager.
+    ///
+    /// Used by `server.rs::spawn_udp_task` to detect packets from clients
+    /// that are using a stale session key (e.g. after a server restart).
+    /// When detected, the server sends a 0xFF RESET byte to the client so
+    /// it re-handshakes immediately instead of retrying indefinitely.
+    #[must_use]
+    pub fn is_session_not_found(&self) -> bool {
+        matches!(self, Self::SessionNotFound(_))
+    }
+
     #[must_use]
     pub const fn is_config_error(&self) -> bool {
         matches!(
@@ -202,5 +218,22 @@ mod tests {
         let config_err = ServerError::config_invalid("port", "must be > 0");
         assert!(config_err.is_config_error());
         assert!(config_err.is_fatal());
+    }
+
+    /// v1.0.0-Voice+SessionFix: verify is_session_not_found() works correctly.
+    #[test]
+    fn test_is_session_not_found() {
+        let sid = aeronyx_common::types::SessionId::generate();
+        let not_found = ServerError::SessionNotFound(sid);
+        assert!(not_found.is_session_not_found());
+
+        let other = ServerError::startup_failed("test");
+        assert!(!other.is_session_not_found());
+
+        let invalid_pkt = ServerError::invalid_packet(
+            "0.0.0.0:0".parse().unwrap(),
+            "test",
+        );
+        assert!(!invalid_pkt.is_session_not_found());
     }
 }
