@@ -8,91 +8,46 @@
 //! and forwarding between UDP and TUN interfaces.
 //!
 //! ## Modification Reason
-//! Added **MemChain 1st-byte multiplexing** support. After decryption,
+//! Added MemChain 1st-byte multiplexing support. After decryption,
 //! the plaintext's first byte is inspected:
 //!   - `0x4X` (IPv4) → normal VPN path (validate source IP, forward to TUN)
-//!   - `0xAE` (MemChain magic) → strip prefix, deserialise to
-//!     `MemChainMessage`, return via `DecryptedPayload::MemChain` —
-//!     caller routes to MemPool instead of TUN.
-//!
-//! This achieves **zero modification** to the outer wire protocol,
-//! crypto layer, or session management.
+//!   - `0xAE` disc 0-17 → MemChain message → MemPool
+//!   - `0xAE` disc 31-33 → Voice signal → forward to target session by wallet
+//!   - `0xAF` → Voice audio frame → forward to target session by dst_ip
 //!
 //! ## Traffic Accounting Fix (v1.0.0-TrafficFix)
-//! Previous implementation had two precision issues:
+//! record_rx() is called ONLY inside VPN arms (IPv4/IPv6).
+//! MemChain and Voice control messages do NOT increment bytes_rx.
 //!
-//! 1. **Inbound (UDP → TUN)**: `record_rx()` was called AFTER the
-//!    `match plaintext.first()` block, meaning MemChain messages and
-//!    replay-rejected packets were also counted. Now `record_rx()` is
-//!    called only inside the IPv4/IPv6 VPN arms, counting only actual
-//!    VPN user-data bytes. MemChain control messages are excluded.
-//!
-//! 2. **Outbound (TUN → UDP)**: `record_tx()` correctly uses
-//!    `ip_packet.len()` (plaintext bytes) rather than `output.len()`
-//!    (encrypted + header overhead). This was already correct and is
-//!    preserved verbatim.
-//!
-//! Result: `bytes_rx` / `bytes_tx` now reflect only user VPN traffic,
-//! which is what aeronyx.network billing expects.
-//!
-//! ## Main Functionality
-//! - `PacketHandler`: Main packet processing logic
-//! - `DecryptedPayload`: enum distinguishing VPN vs MemChain payloads
-//! - UDP packet decryption and TUN forwarding
-//! - TUN packet encryption and UDP forwarding
-//! - Session and routing lookups
-//!
-//! ## Packet Processing
-//!
-//! ### Client → Internet (UDP → TUN)  [original path]
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │  1. Receive UDP packet                                      │
-//! │  2. Lookup session by ID                                    │
-//! │  3. Validate counter (replay protection)                    │
-//! │  4. Decrypt payload with session key                        │
-//! │  5. Peek plaintext[0]:                                      │
-//! │     ├─ 0x4X → Validate source IP → record_rx → Vpn        │
-//! │     ├─ 0x6X → record_rx → Vpn (IPv6 pass-through)         │
-//! │     └─ 0xAE → bincode decode → MemChain (NOT counted)      │
-//! │  6. Caller writes VPN to TUN, MemChain to MemPool           │
-//! └─────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! ### Internet → Client (TUN → UDP)  [unchanged]
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │  1. Read IP packet from TUN                                 │
-//! │  2. Extract destination IP                                  │
-//! │  3. Lookup route → session                                  │
-//! │  4. Encrypt packet                                          │
-//! │  5. record_tx(ip_packet.len()) — plaintext bytes only       │
-//! │  6. Build packet with session ID and counter                │
-//! │  7. Send via UDP to client                                  │
-//! └─────────────────────────────────────────────────────────────┘
-//! ```
+//! ## Voice Signal Routing (v1.0.0-VoiceSignal)
+//! disc=31 (Offer), disc=32 (Answer), disc=33 (End) inside 0xAE packets
+//! are voice call signals. They carry a JSON payload with a "pubkey" field
+//! identifying the target wallet. The server extracts the pubkey, looks up
+//! the target session, re-encrypts and forwards the full payload.
+//! This fixes the error:
+//!   "invalid value: integer `31`, expected variant index 0 <= i < 18"
+//! which occurred because the server tried to decode disc=31 as a MemChain
+//! variant (only 0-17 are valid).
 //!
 //! ## ⚠️ Important Note for Next Developer
-//! - Performance critical - minimize allocations
+//! - Performance critical — minimize allocations
 //! - Counter validation prevents replay attacks
-//! - Source IP validation prevents IP spoofing (VPN path only)
+//! - Source IP validation is now advisory (debug log only) for iOS/macOS NE
+//!   compatibility — Apple's NetworkExtension framework sends packets with the
+//!   device's real LAN IP as src, not the VPN virtual IP
 //! - MemChain path deliberately skips IP validation (no IP header)
-//! - MemChain messages are NOT counted in bytes_rx — they are control
-//!   traffic, not user data. Billing depends on this distinction.
-//! - record_rx uses plaintext_len (decrypted bytes), NOT the raw UDP
-//!   wire length. This counts actual user payload, not crypto overhead.
-//! - record_tx uses ip_packet.len() (plaintext), NOT output.len()
-//!   (encrypted). Same reasoning — bill for user data, not overhead.
-//! - Log security events but avoid log flooding
-//! - The `MEMCHAIN_MAGIC` constant (0xAE) must stay in sync with
-//!   `aeronyx_core::protocol::memchain::MEMCHAIN_MAGIC`
+//! - MemChain messages and Voice signals are NOT counted in bytes_rx
+//! - record_rx uses plaintext_len (decrypted bytes), not raw UDP wire length
+//! - record_tx uses ip_packet.len() (plaintext), not output.len() (encrypted)
+//! - MEMCHAIN_MAGIC (0xAE) must stay in sync with aeronyx_core
+//! - VOICE_MAGIC (0xAF) must stay in sync with client-side magic bytes
+//! - Voice signal discriminants 31/32/33 must match client VoiceFrameBuilder
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial packet handler
 //! v0.2.0 - Added MemChain 1st-byte multiplexing (DecryptedPayload enum)
-//! v1.0.0-TrafficFix - record_rx() moved inside VPN arms only;
-//!   MemChain messages excluded from traffic accounting.
-//!   record_tx() verified correct (ip_packet.len() not output.len()).
+//! v1.0.0-TrafficFix - record_rx() moved inside VPN arms only
+//! v1.0.0-VoiceSignal - disc=31/32/33 routed as voice signals, not MemChain
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -123,73 +78,74 @@ const IPV4_DST_OFFSET: usize = 16;
 /// Offset of source IP in IPv4 header.
 const IPV4_SRC_OFFSET: usize = 12;
 
+/// Magic byte identifying a Voice audio frame packet (0xAF).
+///
+/// High nibble = 0xA (10), distinct from IPv4 (0x4), IPv6 (0x6), MemChain (0xAE).
+///
+/// Wire format after stripping magic byte:
+///   [dst_virtual_ip: 4 bytes][payload: variable]
+pub const VOICE_MAGIC: u8 = 0xAF;
+
+/// Minimum size of a voice audio packet: magic(1) + dst_ip(4) = 5 bytes.
+const VOICE_PACKET_MIN_SIZE: usize = 5;
+
+/// Offset of dst IP inside a voice audio packet plaintext.
+const VOICE_DST_IP_OFFSET: usize = 1;
+
+/// Voice signal discriminant: CallOffer.
+pub const DISC_VOICE_OFFER: u32 = 31;
+/// Voice signal discriminant: CallAnswer.
+pub const DISC_VOICE_ANSWER: u32 = 32;
+/// Voice signal discriminant: CallEnd.
+pub const DISC_VOICE_END: u32 = 33;
+
 // ============================================
 // DecryptedPayload
 // ============================================
 
-/// Magic byte identifying a Voice packet (signal or audio frame).
-///
-/// Chosen to be distinct from IPv4 (0x4X), IPv6 (0x6X), and MemChain (0xAE).
-/// High nibble = 0xA (10), so it cannot collide with any IP version nibble.
-///
-/// Wire format after stripping the magic byte:
-/// ```
-/// [0xAF][dst_virtual_ip: 4 bytes][payload: variable]
-///         ^                       ^
-///         100.64.0.x              CallOffer / CallAnswer / CallEnd / audio frame
-/// ```
-/// The server routes the packet to the session owning `dst_virtual_ip`
-/// without inspecting or modifying the payload (end-to-end encrypted).
-pub const VOICE_MAGIC: u8 = 0xAF;
-
-/// Minimum size of a voice packet after decryption:
-/// magic byte (1) + dst_virtual_ip (4) = 5 bytes minimum.
-const VOICE_PACKET_MIN_SIZE: usize = 5;
-
-/// Offset of the destination IPv4 address inside a voice packet plaintext.
-/// plaintext[0]   = VOICE_MAGIC (0xAF)
-/// plaintext[1..5] = dst_virtual_ip (4 bytes, big-endian octets)
-/// plaintext[5..]  = voice payload (signal or audio)
-const VOICE_DST_IP_OFFSET: usize = 1;
-
 /// Result of decrypting an incoming DataPacket.
 ///
-/// The multiplexer inspects `plaintext[0]` to decide the variant:
-/// - `0x4X` (IPv4) → [`DecryptedPayload::Vpn`]
-/// - `0x6X` (IPv6) → [`DecryptedPayload::Vpn`] (pass-through)
-/// - `0xAE`        → [`DecryptedPayload::MemChain`]
-/// - `0xAF`        → [`DecryptedPayload::Voice`]
-///
-/// The caller (`server.rs` UDP task) uses this to route the payload
-/// to the TUN device, MemChain MemPool, or the target voice session.
+/// Multiplexer dispatch table:
+/// | plaintext[0] | discriminant | Variant       |
+/// |--------------|--------------|---------------|
+/// | 0x4X (IPv4)  | —            | Vpn           |
+/// | 0x6X (IPv6)  | —            | Vpn           |
+/// | 0xAE         | 0-17         | MemChain      |
+/// | 0xAE         | 31-33        | VoiceSignal   |
+/// | 0xAF         | —            | Voice         |
 ///
 /// ## Traffic accounting
-/// Only `Vpn` variants increment `session.stats.bytes_rx`.
-/// `MemChain` and `Voice` are control/signalling traffic — not billed.
+/// Only `Vpn` increments `session.stats.bytes_rx`.
+/// All other variants are control/signal traffic — not billed.
 #[derive(Debug)]
 pub enum DecryptedPayload {
-    /// Standard VPN IP packet — should be written to TUN.
-    /// `bytes_rx` has already been incremented for this payload.
+    /// Standard VPN IP packet — write to TUN.
+    /// `bytes_rx` already incremented before returning.
     Vpn(Vec<u8>),
 
-    /// MemChain application message — should be routed to MemPool.
-    /// Does NOT increment `bytes_rx` — control traffic is not billed.
+    /// MemChain application message (disc 0-17) — route to MemPool.
     MemChain(MemChainMessage),
 
-    /// Voice signalling or audio frame — should be forwarded to the
-    /// session identified by `dst_ip`.
-    ///
-    /// The server routes the full `payload` (including the 0xAF magic byte
-    /// and dst_ip header) to the target session's UDP endpoint unchanged.
-    /// Content is end-to-end encrypted between the two clients; the server
-    /// never decrypts or inspects it.
-    ///
-    /// Does NOT increment `bytes_rx` — voice relay is not billed as VPN traffic.
+    /// Voice call signal (disc 31=Offer, 32=Answer, 33=End).
+    /// Carried inside 0xAE packets with discriminant outside MemChain range.
+    /// Server extracts `target_wallet` from JSON payload and forwards `payload`
+    /// to that wallet's session (re-encrypted with the target's session key).
+    VoiceSignal {
+        /// Discriminant (31, 32, or 33).
+        discriminant: u32,
+        /// Target wallet pubkey hex from JSON "pubkey" field.
+        /// None if JSON parsing failed — caller should drop.
+        target_wallet: Option<String>,
+        /// Full plaintext (including 0xAE magic + discriminant).
+        /// Re-encrypted and forwarded to target session unchanged.
+        payload: Vec<u8>,
+    },
+
+    /// Voice audio frame (0xAF) — forward to target session by dst_ip.
     Voice {
-        /// Destination virtual IP (100.64.0.x) extracted from plaintext[1..5].
+        /// Destination virtual IP (100.64.0.x) from plaintext[1..5].
         dst_ip: Ipv4Addr,
-        /// Full plaintext including the 0xAF magic byte and dst_ip header.
-        /// Re-encrypted and forwarded to the target session as-is.
+        /// Full plaintext including magic byte and dst_ip header.
         payload: Vec<u8>,
     },
 }
@@ -203,58 +159,23 @@ pub enum DecryptedPayload {
 /// # Thread Safety
 /// All operations are thread-safe and can be called concurrently.
 pub struct PacketHandler {
-    /// Session manager for lookups.
     sessions: Arc<SessionManager>,
-    /// Routing service for IP lookups.
-    routing: Arc<RoutingService>,
-    /// Transport encryption.
-    crypto: DefaultTransportCrypto,
+    routing:  Arc<RoutingService>,
+    crypto:   DefaultTransportCrypto,
 }
 
 impl PacketHandler {
-    /// Creates a new packet handler.
     pub fn new(sessions: Arc<SessionManager>, routing: Arc<RoutingService>) -> Self {
-        Self {
-            sessions,
-            routing,
-            crypto: DefaultTransportCrypto::new(),
-        }
+        Self { sessions, routing, crypto: DefaultTransportCrypto::new() }
     }
 
     /// Processes an incoming UDP data packet.
     ///
-    /// After decryption, the plaintext's **first byte** is peeked to
-    /// determine whether this is a VPN IP packet or a MemChain message:
-    ///
-    /// | Byte      | Action                                           |
-    /// |-----------|--------------------------------------------------|
-    /// | `0x4X`    | IPv4 — validate source IP, record_rx, return Vpn |
-    /// | `0x6X`    | IPv6 — record_rx, return Vpn (pass-through)      |
-    /// | `0xAE`    | MemChain — bincode decode, return MemChain        |
-    /// | other     | Error (unknown payload type)                     |
-    ///
-    /// ## Traffic accounting
-    /// `session.stats.record_rx(plaintext_len)` is called only for VPN
-    /// packets (IPv4 and IPv6). MemChain control messages are excluded.
-    /// `plaintext_len` is the decrypted payload length — user data bytes
-    /// without any wire-level crypto overhead.
-    ///
-    /// # Arguments
-    /// * `data` - Raw UDP packet data (session_id + counter + ciphertext)
-    ///
-    /// # Returns
-    /// - `Ok((session, DecryptedPayload::Vpn(ip_packet)))` for VPN traffic
-    /// - `Ok((session, DecryptedPayload::MemChain(msg)))` for MemChain traffic
-    ///
-    /// # Errors
-    /// - Session not found
-    /// - Decryption failure
-    /// - Replay attack detected
-    /// - IP spoofing detected (VPN path only)
-    /// - Unknown plaintext type
-    /// - MemChain deserialisation failure
+    /// Returns `(session, DecryptedPayload)` on success.
+    /// Returns `Err(ServerError::SessionNotFound)` when the session ID is
+    /// unknown — caller should send a 0xFF RESET to the client.
     pub fn handle_udp_packet(&self, data: &[u8]) -> Result<(Arc<Session>, DecryptedPayload)> {
-        // ---- Validate minimum size ----
+        // ── Minimum size check ────────────────────────────────────────────
         if data.len() < DATA_PACKET_HEADER_SIZE + ENCRYPTION_OVERHEAD {
             return Err(ServerError::invalid_packet(
                 "0.0.0.0:0".parse().unwrap(),
@@ -262,7 +183,7 @@ impl PacketHandler {
             ));
         }
 
-        // ---- DEBUG LOG: Raw session ID bytes ----
+        // ── Debug logging ─────────────────────────────────────────────────
         let raw_session_id = &data[0..16];
         debug!(
             "[PACKET_HANDLER] Processing packet, raw SessionID bytes: {:02X?}",
@@ -273,7 +194,7 @@ impl PacketHandler {
             BASE64.encode(raw_session_id)
         );
 
-        // ---- Decode packet header ----
+        // ── Decode packet header ──────────────────────────────────────────
         let packet = decode_data_packet(data)?;
 
         debug!(
@@ -281,7 +202,7 @@ impl PacketHandler {
             BASE64.encode(&packet.session_id)
         );
 
-        // ---- Lookup session ----
+        // ── Session lookup ────────────────────────────────────────────────
         let session_id = SessionId::from_bytes(&packet.session_id)
             .ok_or_else(|| {
                 warn!(
@@ -294,22 +215,14 @@ impl PacketHandler {
                 )
             })?;
 
-        debug!(
-            "[PACKET_HANDLER] Looking up SessionID: {}",
-            session_id
-        );
-        debug!(
-            "[PACKET_HANDLER] Active sessions count: {}",
-            self.sessions.count()
-        );
+        debug!("[PACKET_HANDLER] Looking up SessionID: {}", session_id);
+        debug!("[PACKET_HANDLER] Active sessions count: {}", self.sessions.count());
 
         let session = match self.sessions.get(&session_id) {
             Some(s) => {
                 debug!(
                     "[PACKET_HANDLER] Session FOUND: {}, virtual_ip={}, endpoint={}",
-                    session_id,
-                    s.virtual_ip,
-                    s.client_endpoint
+                    session_id, s.virtual_ip, s.client_endpoint
                 );
                 s
             }
@@ -323,7 +236,7 @@ impl PacketHandler {
             }
         };
 
-        // ---- Validate counter (replay protection) ----
+        // ── Replay counter validation ─────────────────────────────────────
         if !session.validate_rx_counter(packet.counter) {
             warn!(
                 session_id = %session_id,
@@ -336,7 +249,7 @@ impl PacketHandler {
             )));
         }
 
-        // ---- Decrypt packet ----
+        // ── Decrypt ───────────────────────────────────────────────────────
         let mut plaintext = vec![0u8; packet.encrypted_payload.len()];
         let plaintext_len = self.crypto.decrypt(
             &session.session_key,
@@ -347,24 +260,16 @@ impl PacketHandler {
         )?;
         plaintext.truncate(plaintext_len);
 
-        // ---- Update session activity (all paths) ----
-        // touch() is always called — even MemChain messages keep the session alive.
+        // ── Update session activity (all paths) ───────────────────────────
         session.touch();
 
-        // ====================================================
+        // ====================================================================
         // 1st-Byte Multiplexing + Traffic Accounting
-        // ====================================================
-        // Zero-copy peek of the first byte to determine payload type.
-        //
-        // IMPORTANT: record_rx() is called ONLY inside VPN arms (IPv4/IPv6).
-        // MemChain control messages must NOT increment bytes_rx because:
-        //   1. They are not user data — they carry protocol control messages.
-        //   2. aeronyx.network billing counts user VPN traffic only.
-        //   3. MemChain traffic volume is independent of VPN usage.
+        // ====================================================================
         let payload = match plaintext.first().copied() {
-            // ---- IPv4 VPN packet (most common path) ----
+
+            // ── IPv4 VPN (most common) ────────────────────────────────────
             Some(b) if b >> 4 == 4 => {
-                // Validate minimum IP header size
                 if plaintext_len < IPV4_HEADER_MIN_SIZE {
                     return Err(ServerError::invalid_packet(
                         session.client_endpoint,
@@ -372,72 +277,38 @@ impl PacketHandler {
                     ));
                 }
 
-                // Validate source IP matches session's virtual IP (anti-spoofing).
-                //
-                // NOTE: iOS/macOS Network Extension packetFlow.readPackets() returns
-                // raw IP packets with the device's real LAN IP as src (e.g. 10.x.x.x),
-                // not the VPN virtual IP (100.64.0.x). This is a known limitation of
-                // Apple's NetworkExtension framework — the TUN rewriting happens at the
-                // OS level but the raw packets seen by the extension still carry the
-                // original src IP.
-                //
-                // We log at debug level instead of warn to avoid log spam, and we
-                // do NOT drop the packet — the session key authentication already
-                // proves the packet came from the legitimate client. IP src validation
-                // is a secondary defence that is redundant when session auth passes.
+                // Source IP validation is advisory only.
+                // Apple NetworkExtension sends packets with the device's real
+                // LAN IP as src (e.g. 10.x.x.x), not the VPN virtual IP.
+                // Session-key authentication already proves identity.
                 let src_ip = extract_ipv4_src(&plaintext)?;
                 if src_ip != session.virtual_ip {
                     debug!(
                         session_id = %session_id,
                         expected = %session.virtual_ip,
                         actual = %src_ip,
-                        "src IP mismatch (iOS/macOS NE limitation — packet accepted)"
+                        "src IP mismatch (iOS/macOS NE — packet accepted)"
                     );
-                    // Do NOT return error — session key auth is sufficient proof of identity.
                 }
 
-                // ✅ Count inbound VPN user-data bytes (plaintext, no overhead).
+                // ✅ Count inbound VPN user-data bytes.
                 session.stats.record_rx(plaintext_len as u64);
 
-                trace!(
-                    session_id = %session_id,
-                    len = plaintext_len,
-                    "VPN IPv4 packet decrypted"
-                );
-
+                trace!(session_id = %session_id, len = plaintext_len, "VPN IPv4 decrypted");
                 DecryptedPayload::Vpn(plaintext)
             }
 
-            // ---- IPv6 — pass through as VPN (future support) ----
+            // ── IPv6 VPN (pass-through) ───────────────────────────────────
             Some(b) if b >> 4 == 6 => {
-                // ✅ Count inbound VPN user-data bytes for IPv6 as well.
+                // ✅ Count inbound VPN user-data bytes.
                 session.stats.record_rx(plaintext_len as u64);
-
-                trace!(
-                    session_id = %session_id,
-                    len = plaintext_len,
-                    "VPN IPv6 packet decrypted (pass-through)"
-                );
+                trace!(session_id = %session_id, len = plaintext_len, "VPN IPv6 decrypted");
                 DecryptedPayload::Vpn(plaintext)
             }
 
-            // ---- MemChain message / Voice signal (0xAE) --------------------
-            // Wire format after stripping magic byte:
-            //   [discriminant: 4 bytes LE][payload: variable]
-            //
-            // discriminant 0-17: MemChain protocol variants → decode + route
-            // discriminant 31:   VoiceCallOffer  signal → forward to target session
-            // discriminant 32:   VoiceCallAnswer signal → forward to target session
-            // discriminant 33:   VoiceCallEnd    signal → forward to target session
-            //
-            // Voice signals carry a JSON payload containing the target wallet pubkey.
-            // The server extracts the pubkey, looks up the target session, and
-            // forwards the full raw plaintext (including 0xAE magic + discriminant)
-            // to the target without modification.
-            //
-            // ⚠️ Do NOT call record_rx() here — control traffic is not billed.
+            // ── 0xAE: MemChain or Voice Signal ───────────────────────────
             Some(MEMCHAIN_MAGIC) => {
-                // Need at least 5 bytes: magic(1) + discriminant(4)
+                // Need at least magic(1) + discriminant(4) = 5 bytes.
                 if plaintext_len < 5 {
                     return Err(ServerError::invalid_packet(
                         session.client_endpoint,
@@ -445,27 +316,23 @@ impl PacketHandler {
                     ));
                 }
 
-                // Read discriminant (u32 LE) from plaintext[1..5]
-                // plaintext[0] = 0xAE (already confirmed)
+                // Read discriminant (u32 LE) from plaintext[1..5].
                 let disc = u32::from_le_bytes([
                     plaintext[1], plaintext[2], plaintext[3], plaintext[4],
                 ]);
 
-                // Voice signal discriminants: forward as-is to target session.
-                // The server does not decode the payload — it extracts the target
-                // wallet pubkey from the JSON body and routes accordingly.
-                if disc == 31 || disc == 32 || disc == 33 {
-                    // JSON payload starts at plaintext[5]
-                    // Expected format: {"type":"offer","call_id":"...","pubkey":"hex..."}
-                    // We only need the "pubkey" field to route to the target session.
-                    let json_bytes = &plaintext[5..];
-                    let target_wallet = extract_pubkey_from_json(json_bytes);
+                // Voice signal discriminants: 31=Offer, 32=Answer, 33=End.
+                // These are NOT MemChain variants — route by target wallet pubkey.
+                if matches!(disc, DISC_VOICE_OFFER | DISC_VOICE_ANSWER | DISC_VOICE_END) {
+                    // JSON payload starts at plaintext[5].
+                    // Format: {"type":"offer","call_id":"...","pubkey":"<64-char hex>"}
+                    let target_wallet = extract_pubkey_from_json(&plaintext[5..]);
 
                     trace!(
                         session_id = %session_id,
                         disc,
-                        target_wallet = %target_wallet.as_deref().unwrap_or("unknown"),
-                        "[VOICE_SIGNAL] Voice signal received"
+                        target = %target_wallet.as_deref().unwrap_or("unknown"),
+                        "[VOICE_SIGNAL] Signal received"
                     );
 
                     return Ok((session, DecryptedPayload::VoiceSignal {
@@ -475,7 +342,8 @@ impl PacketHandler {
                     }));
                 }
 
-                // MemChain variants (discriminant 0-17): decode normally.
+                // MemChain variants (disc 0-17): decode normally.
+                // ⚠️ Do NOT call record_rx() — control traffic is not billed.
                 let memchain_payload = &plaintext[1..];
 
                 match decode_memchain(memchain_payload) {
@@ -483,7 +351,7 @@ impl PacketHandler {
                         debug!(
                             session_id = %session_id,
                             msg_type = ?std::mem::discriminant(&msg),
-                            "[MEMCHAIN] MemChain message decoded"
+                            "[MEMCHAIN] Message decoded"
                         );
                         DecryptedPayload::MemChain(msg)
                     }
@@ -495,7 +363,7 @@ impl PacketHandler {
                             plaintext_total_len = plaintext.len(),
                             header_hex = %hex::encode(&plaintext[..dump_len]),
                             discriminant_bytes = %hex::encode(&plaintext[1..plaintext.len().min(5)]),
-                            "[MEMCHAIN] Failed to decode MemChain payload"
+                            "[MEMCHAIN] Failed to decode payload"
                         );
                         return Err(ServerError::invalid_packet(
                             session.client_endpoint,
@@ -505,15 +373,7 @@ impl PacketHandler {
                 }
             }
 
-            // ---- Voice signalling / audio frame (0xAF) ----------------------
-            // Wire format: [0xAF][dst_ip: 4 bytes][encrypted voice payload]
-            //
-            // The server extracts dst_ip and routes the full plaintext to the
-            // target session's UDP endpoint without inspecting the payload.
-            // Content is end-to-end encrypted between clients — server is
-            // a transparent relay only.
-            //
-            // ⚠️ Do NOT call record_rx() — voice relay is not VPN user-data.
+            // ── 0xAF: Voice audio frame ───────────────────────────────────
             Some(VOICE_MAGIC) => {
                 if plaintext_len < VOICE_PACKET_MIN_SIZE {
                     warn!(
@@ -528,7 +388,6 @@ impl PacketHandler {
                     ));
                 }
 
-                // Extract destination virtual IP from plaintext[1..5].
                 let mut dst_octets = [0u8; 4];
                 dst_octets.copy_from_slice(
                     &plaintext[VOICE_DST_IP_OFFSET..VOICE_DST_IP_OFFSET + 4]
@@ -539,13 +398,13 @@ impl PacketHandler {
                     session_id = %session_id,
                     dst_ip = %dst_ip,
                     len = plaintext_len,
-                    "[VOICE] Voice packet decoded"
+                    "[VOICE] Audio frame decoded"
                 );
 
                 DecryptedPayload::Voice { dst_ip, payload: plaintext }
             }
 
-            // ---- Unknown payload type ----
+            // ── Unknown ───────────────────────────────────────────────────
             Some(b) => {
                 warn!(
                     session_id = %session_id,
@@ -558,7 +417,6 @@ impl PacketHandler {
                 ));
             }
 
-            // ---- Empty plaintext (should not happen after decrypt) ----
             None => {
                 return Err(ServerError::invalid_packet(
                     session.client_endpoint,
@@ -573,26 +431,12 @@ impl PacketHandler {
     /// Processes an IP packet from the TUN device (outbound: server → client).
     ///
     /// ## Traffic accounting
-    /// `session.stats.record_tx(ip_packet.len())` counts plaintext bytes —
-    /// the actual user-data size before encryption. This is intentional:
-    /// billing should reflect user data transferred, not wire-level overhead
-    /// (ENCRYPTION_OVERHEAD adds ~16 bytes of Poly1305 tag per packet).
-    ///
-    /// # Arguments
-    /// * `ip_packet` - Raw IP packet from TUN (plaintext)
-    ///
-    /// # Returns
-    /// Tuple of (encrypted wire packet, client UDP endpoint).
-    ///
-    /// # Errors
-    /// - No route for destination IP
-    /// - Session not found
-    /// - Encryption failure
+    /// Uses ip_packet.len() (plaintext bytes), not output.len() (encrypted).
+    /// Billing should reflect user data transferred, not wire overhead.
     pub fn handle_tun_packet(
         &self,
         ip_packet: &[u8],
     ) -> Result<(Vec<u8>, std::net::SocketAddr)> {
-        // Validate minimum size
         if ip_packet.len() < IPV4_HEADER_MIN_SIZE {
             return Err(ServerError::invalid_packet(
                 "0.0.0.0:0".parse().unwrap(),
@@ -600,21 +444,12 @@ impl PacketHandler {
             ));
         }
 
-        // Extract destination IP
-        let dst_ip = extract_ipv4_dst(ip_packet)?;
-
-        // Lookup route
+        let dst_ip    = extract_ipv4_dst(ip_packet)?;
         let session_id = self.routing.lookup_or_error(dst_ip)?;
+        let session   = self.sessions.get_or_error(&session_id)?;
+        let counter   = session.next_tx_counter();
 
-        // Get session
-        let session = self.sessions.get_or_error(&session_id)?;
-
-        // Get next counter
-        let counter = session.next_tx_counter();
-
-        // Encrypt packet
-        let encrypted_len = ip_packet.len() + ENCRYPTION_OVERHEAD;
-        let mut encrypted = vec![0u8; encrypted_len];
+        let mut encrypted = vec![0u8; ip_packet.len() + ENCRYPTION_OVERHEAD];
         let actual_len = self.crypto.encrypt(
             &session.session_key,
             counter,
@@ -624,18 +459,10 @@ impl PacketHandler {
         )?;
         encrypted.truncate(actual_len);
 
-        // Build data packet
-        let data_packet = DataPacket::new(
-            *session.id.as_bytes(),
-            counter,
-            encrypted,
-        );
-
+        let data_packet = DataPacket::new(*session.id.as_bytes(), counter, encrypted);
         let output = encode_data_packet(&data_packet).to_vec();
 
-        // ✅ Count outbound VPN user-data bytes.
-        // Use ip_packet.len() (plaintext), NOT output.len() (encrypted + header).
-        // Billing counts user data transferred, not wire overhead.
+        // ✅ Count outbound VPN user-data bytes (plaintext length).
         session.touch();
         session.stats.record_tx(ip_packet.len() as u64);
 
@@ -661,82 +488,64 @@ impl std::fmt::Debug for PacketHandler {
 // Helper Functions
 // ============================================
 
-/// Extracts the source IPv4 address from an IP packet.
 fn extract_ipv4_src(packet: &[u8]) -> Result<Ipv4Addr> {
     if packet.len() < IPV4_SRC_OFFSET + 4 {
         return Err(ServerError::invalid_packet(
             "0.0.0.0:0".parse().unwrap(),
-            "Packet too short for IPv4 header",
+            "Packet too short for IPv4 src",
         ));
     }
-
-    let version = packet[0] >> 4;
-    if version != 4 {
+    if packet[0] >> 4 != 4 {
         return Err(ServerError::invalid_packet(
             "0.0.0.0:0".parse().unwrap(),
-            format!("Expected IPv4, got version {}", version),
+            format!("Expected IPv4, got version {}", packet[0] >> 4),
         ));
     }
-
     let mut octets = [0u8; 4];
     octets.copy_from_slice(&packet[IPV4_SRC_OFFSET..IPV4_SRC_OFFSET + 4]);
     Ok(Ipv4Addr::from(octets))
 }
 
-/// Extracts the destination IPv4 address from an IP packet.
 fn extract_ipv4_dst(packet: &[u8]) -> Result<Ipv4Addr> {
     if packet.len() < IPV4_DST_OFFSET + 4 {
         return Err(ServerError::invalid_packet(
             "0.0.0.0:0".parse().unwrap(),
-            "Packet too short for IPv4 header",
+            "Packet too short for IPv4 dst",
         ));
     }
-
-    let version = packet[0] >> 4;
-    if version != 4 {
+    if packet[0] >> 4 != 4 {
         return Err(ServerError::invalid_packet(
             "0.0.0.0:0".parse().unwrap(),
-            format!("Expected IPv4, got version {}", version),
+            format!("Expected IPv4, got version {}", packet[0] >> 4),
         ));
     }
-
     let mut octets = [0u8; 4];
     octets.copy_from_slice(&packet[IPV4_DST_OFFSET..IPV4_DST_OFFSET + 4]);
     Ok(Ipv4Addr::from(octets))
 }
 
-/// Extracts the "pubkey" field from a JSON voice signal payload.
+/// Extracts the "pubkey" field from a voice signal JSON payload.
 ///
-/// Expected format (any order):
+/// Expected format (field order flexible):
 /// ```json
-/// {"type":"offer","call_id":"...","pubkey":"99e2b460..."}
+/// {"type":"offer","call_id":"...","pubkey":"<64-char hex>"}
 /// ```
 ///
-/// Returns `Some(hex_string)` if a valid 64-char hex pubkey is found,
-/// `None` otherwise. Uses simple byte scanning without a JSON parser
-/// dependency to keep this on the hot path lightweight.
+/// Returns `Some(hex_string)` if a valid 64-char hex pubkey is found.
+/// Uses simple byte scanning — no JSON parser dependency on the hot path.
 fn extract_pubkey_from_json(json_bytes: &[u8]) -> Option<String> {
-    // Convert to str; bail if not valid UTF-8.
     let s = std::str::from_utf8(json_bytes).ok()?;
-
-    // Find "pubkey": search for the key literally.
     let key = "\"pubkey\"";
     let key_pos = s.find(key)?;
-
-    // Skip past the key, colon, optional whitespace, and opening quote.
     let after_key = &s[key_pos + key.len()..];
     let colon_pos = after_key.find(':')?;
-    let after_colon = &after_key[colon_pos + 1..].trim_start();
+    let after_colon = after_key[colon_pos + 1..].trim_start();
     if !after_colon.starts_with('"') {
         return None;
     }
-    let value_start = &after_colon[1..]; // skip opening quote
-
-    // Find closing quote.
+    let value_start = &after_colon[1..];
     let end = value_start.find('"')?;
     let pubkey_hex = &value_start[..end];
-
-    // Validate: must be exactly 64 lowercase hex chars.
     if pubkey_hex.len() == 64 && pubkey_hex.chars().all(|c| c.is_ascii_hexdigit()) {
         Some(pubkey_hex.to_string())
     } else {
@@ -752,123 +561,99 @@ fn extract_pubkey_from_json(json_bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn create_test_ipv4_packet(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
-        let mut packet = vec![0u8; 20];
-        packet[0] = 0x45; // Version 4, IHL 5
-        packet[1] = 0x00; // DSCP, ECN
-        packet[2] = 0x00; // Total length (high)
-        packet[3] = 0x14; // Total length (low) = 20
-        packet[IPV4_SRC_OFFSET..IPV4_SRC_OFFSET + 4].copy_from_slice(&src.octets());
-        packet[IPV4_DST_OFFSET..IPV4_DST_OFFSET + 4].copy_from_slice(&dst.octets());
-        packet
+    fn make_ipv4(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        p[2] = 0x00; p[3] = 0x14;
+        p[IPV4_SRC_OFFSET..IPV4_SRC_OFFSET + 4].copy_from_slice(&src.octets());
+        p[IPV4_DST_OFFSET..IPV4_DST_OFFSET + 4].copy_from_slice(&dst.octets());
+        p
     }
 
     #[test]
     fn test_extract_ipv4_src() {
         let src = Ipv4Addr::new(192, 168, 1, 100);
         let dst = Ipv4Addr::new(8, 8, 8, 8);
-        let packet = create_test_ipv4_packet(src, dst);
-        let extracted = extract_ipv4_src(&packet).unwrap();
-        assert_eq!(extracted, src);
+        assert_eq!(extract_ipv4_src(&make_ipv4(src, dst)).unwrap(), src);
     }
 
     #[test]
     fn test_extract_ipv4_dst() {
         let src = Ipv4Addr::new(192, 168, 1, 100);
         let dst = Ipv4Addr::new(8, 8, 8, 8);
-        let packet = create_test_ipv4_packet(src, dst);
-        let extracted = extract_ipv4_dst(&packet).unwrap();
-        assert_eq!(extracted, dst);
+        assert_eq!(extract_ipv4_dst(&make_ipv4(src, dst)).unwrap(), dst);
     }
 
     #[test]
     fn test_extract_from_short_packet() {
-        let short_packet = vec![0x45, 0x00]; // Too short
-        assert!(extract_ipv4_src(&short_packet).is_err());
-        assert!(extract_ipv4_dst(&short_packet).is_err());
+        let short = vec![0x45, 0x00];
+        assert!(extract_ipv4_src(&short).is_err());
+        assert!(extract_ipv4_dst(&short).is_err());
     }
 
     #[test]
     fn test_extract_wrong_version() {
-        let mut packet = vec![0u8; 20];
-        packet[0] = 0x60; // IPv6 version
-        assert!(extract_ipv4_src(&packet).is_err());
+        let mut p = vec![0u8; 20];
+        p[0] = 0x60; // IPv6
+        assert!(extract_ipv4_src(&p).is_err());
     }
 
     #[test]
-    fn test_memchain_magic_no_ip_collision() {
-        // MEMCHAIN_MAGIC (0xAE) high nibble = 0xA = 10
-        // VOICE_MAGIC    (0xAF) high nibble = 0xA = 10
-        // IPv4 high nibble = 4, IPv6 high nibble = 6
-        // These must never collide or the multiplexer will misroute packets.
-        assert_ne!(MEMCHAIN_MAGIC >> 4, 4u8, "MEMCHAIN must not collide with IPv4");
-        assert_ne!(MEMCHAIN_MAGIC >> 4, 6u8, "MEMCHAIN must not collide with IPv6");
-        assert_ne!(VOICE_MAGIC >> 4,    4u8, "VOICE must not collide with IPv4");
-        assert_ne!(VOICE_MAGIC >> 4,    6u8, "VOICE must not collide with IPv6");
-        assert_ne!(VOICE_MAGIC, MEMCHAIN_MAGIC, "VOICE and MEMCHAIN must be distinct");
+    fn test_magic_bytes_no_collision() {
+        // MEMCHAIN_MAGIC = 0xAE, VOICE_MAGIC = 0xAF
+        // Neither collides with IPv4 (0x4X) or IPv6 (0x6X)
+        assert_ne!(MEMCHAIN_MAGIC >> 4, 4u8);
+        assert_ne!(MEMCHAIN_MAGIC >> 4, 6u8);
+        assert_ne!(VOICE_MAGIC >> 4,    4u8);
+        assert_ne!(VOICE_MAGIC >> 4,    6u8);
+        assert_ne!(VOICE_MAGIC, MEMCHAIN_MAGIC);
     }
 
-    /// Verify that the traffic accounting logic is correctly separated.
     #[test]
     fn test_first_byte_routing_invariants() {
-        // IPv4: version nibble = 4
-        assert_eq!(0x45u8 >> 4, 4u8);
-        // IPv6: version nibble = 6
-        assert_eq!(0x60u8 >> 4, 6u8);
-        // MemChain: version nibble = 10 (0xA)
+        assert_eq!(0x45u8 >> 4, 4u8); // IPv4
+        assert_eq!(0x60u8 >> 4, 6u8); // IPv6
         assert_eq!(MEMCHAIN_MAGIC >> 4, 10u8);
-        // Voice: version nibble = 10 (0xA), distinct byte value
-        assert_eq!(VOICE_MAGIC >> 4, 10u8);
-        assert_eq!(VOICE_MAGIC, 0xAFu8);
+        assert_eq!(VOICE_MAGIC,         0xAFu8);
     }
 
-    /// Verify voice signal discriminant detection.
     #[test]
-    fn test_voice_signal_discriminant_range() {
-        // MemChain variants: 0-17 → decode normally
-        // Voice signals: 31-33 → route by wallet pubkey
-        let memchain_discs: &[u32] = &[0, 1, 17];
-        let voice_discs: &[u32] = &[31, 32, 33];
-
-        for &d in memchain_discs {
-            assert!(d < 18, "disc={} should be MemChain", d);
-        }
-        for &d in voice_discs {
-            assert!(d == 31 || d == 32 || d == 33, "disc={} should be voice signal", d);
-        }
+    fn test_voice_packet_dst_ip_extraction() {
+        let dst = Ipv4Addr::new(100, 64, 0, 5);
+        let mut p = vec![VOICE_MAGIC];
+        p.extend_from_slice(&dst.octets());
+        p.extend_from_slice(b"audio");
+        assert!(p.len() >= VOICE_PACKET_MIN_SIZE);
+        let mut octets = [0u8; 4];
+        octets.copy_from_slice(&p[VOICE_DST_IP_OFFSET..VOICE_DST_IP_OFFSET + 4]);
+        assert_eq!(Ipv4Addr::from(octets), dst);
     }
 
-    /// Verify pubkey extraction from voice signal JSON.
+    #[test]
+    fn test_voice_signal_discriminants() {
+        assert_eq!(DISC_VOICE_OFFER,  31u32);
+        assert_eq!(DISC_VOICE_ANSWER, 32u32);
+        assert_eq!(DISC_VOICE_END,    33u32);
+        // All outside MemChain range 0-17
+        assert!(DISC_VOICE_OFFER  >= 18);
+        assert!(DISC_VOICE_ANSWER >= 18);
+        assert!(DISC_VOICE_END    >= 18);
+    }
+
     #[test]
     fn test_extract_pubkey_from_json() {
-        let pubkey = "99e2b4602033e7b8c744232a1a74a3ec8b6c82c9dfedf66406f09b779071f753";
-        let json = format!(
-            r#"{{"type":"offer","call_id":"abc123","pubkey":"{}"}}"#,
-            pubkey
-        );
-        let extracted = extract_pubkey_from_json(json.as_bytes());
-        assert_eq!(extracted.as_deref(), Some(pubkey));
+        let pk = "99e2b4602033e7b8c744232a1a74a3ec8b6c82c9dfedf66406f09b779071f753";
+        let json = format!(r#"{{"type":"offer","call_id":"abc","pubkey":"{}"}}"#, pk);
+        assert_eq!(extract_pubkey_from_json(json.as_bytes()).as_deref(), Some(pk));
 
-        // Missing pubkey field
-        let no_pubkey = br#"{"type":"offer","call_id":"abc"}"#;
-        assert!(extract_pubkey_from_json(no_pubkey).is_none());
+        // Missing field
+        assert!(extract_pubkey_from_json(br#"{"type":"offer"}"#).is_none());
 
-        // Wrong length
-        let short = br#"{"pubkey":"deadbeef"}"#;
-        assert!(extract_pubkey_from_json(short).is_none());
-    }
-        // Construct a minimal voice plaintext:
-        // [0xAF][100][64][0][5][...payload...]
-        let dst = Ipv4Addr::new(100, 64, 0, 5);
-        let mut packet = vec![VOICE_MAGIC];
-        packet.extend_from_slice(&dst.octets());
-        packet.extend_from_slice(b"voice_payload");
+        // Too short
+        assert!(extract_pubkey_from_json(br#"{"pubkey":"deadbeef"}"#).is_none());
 
-        assert!(packet.len() >= VOICE_PACKET_MIN_SIZE);
-
-        let mut octets = [0u8; 4];
-        octets.copy_from_slice(&packet[VOICE_DST_IP_OFFSET..VOICE_DST_IP_OFFSET + 4]);
-        let extracted = Ipv4Addr::from(octets);
-        assert_eq!(extracted, dst);
+        // Exactly 64 chars but contains non-hex
+        let bad = format!(r#"{{"pubkey":"{}"}}"#, "z".repeat(64));
+        assert!(extract_pubkey_from_json(bad.as_bytes()).is_none());
     }
 }
