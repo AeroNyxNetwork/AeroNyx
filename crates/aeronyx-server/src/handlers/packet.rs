@@ -421,10 +421,61 @@ impl PacketHandler {
                 DecryptedPayload::Vpn(plaintext)
             }
 
-            // ---- MemChain message — NOT counted in bytes_rx ----
+            // ---- MemChain message / Voice signal (0xAE) --------------------
+            // Wire format after stripping magic byte:
+            //   [discriminant: 4 bytes LE][payload: variable]
+            //
+            // discriminant 0-17: MemChain protocol variants → decode + route
+            // discriminant 31:   VoiceCallOffer  signal → forward to target session
+            // discriminant 32:   VoiceCallAnswer signal → forward to target session
+            // discriminant 33:   VoiceCallEnd    signal → forward to target session
+            //
+            // Voice signals carry a JSON payload containing the target wallet pubkey.
+            // The server extracts the pubkey, looks up the target session, and
+            // forwards the full raw plaintext (including 0xAE magic + discriminant)
+            // to the target without modification.
+            //
+            // ⚠️ Do NOT call record_rx() here — control traffic is not billed.
             Some(MEMCHAIN_MAGIC) => {
-                // Strip the magic byte; remaining bytes are bincode payload.
-                // ⚠️ Do NOT call record_rx() here — MemChain is control traffic.
+                // Need at least 5 bytes: magic(1) + discriminant(4)
+                if plaintext_len < 5 {
+                    return Err(ServerError::invalid_packet(
+                        session.client_endpoint,
+                        "0xAE packet too short for discriminant",
+                    ));
+                }
+
+                // Read discriminant (u32 LE) from plaintext[1..5]
+                // plaintext[0] = 0xAE (already confirmed)
+                let disc = u32::from_le_bytes([
+                    plaintext[1], plaintext[2], plaintext[3], plaintext[4],
+                ]);
+
+                // Voice signal discriminants: forward as-is to target session.
+                // The server does not decode the payload — it extracts the target
+                // wallet pubkey from the JSON body and routes accordingly.
+                if disc == 31 || disc == 32 || disc == 33 {
+                    // JSON payload starts at plaintext[5]
+                    // Expected format: {"type":"offer","call_id":"...","pubkey":"hex..."}
+                    // We only need the "pubkey" field to route to the target session.
+                    let json_bytes = &plaintext[5..];
+                    let target_wallet = extract_pubkey_from_json(json_bytes);
+
+                    trace!(
+                        session_id = %session_id,
+                        disc,
+                        target_wallet = %target_wallet.as_deref().unwrap_or("unknown"),
+                        "[VOICE_SIGNAL] Voice signal received"
+                    );
+
+                    return Ok((session, DecryptedPayload::VoiceSignal {
+                        discriminant: disc,
+                        target_wallet,
+                        payload: plaintext,
+                    }));
+                }
+
+                // MemChain variants (discriminant 0-17): decode normally.
                 let memchain_payload = &plaintext[1..];
 
                 match decode_memchain(memchain_payload) {
@@ -654,6 +705,45 @@ fn extract_ipv4_dst(packet: &[u8]) -> Result<Ipv4Addr> {
     Ok(Ipv4Addr::from(octets))
 }
 
+/// Extracts the "pubkey" field from a JSON voice signal payload.
+///
+/// Expected format (any order):
+/// ```json
+/// {"type":"offer","call_id":"...","pubkey":"99e2b460..."}
+/// ```
+///
+/// Returns `Some(hex_string)` if a valid 64-char hex pubkey is found,
+/// `None` otherwise. Uses simple byte scanning without a JSON parser
+/// dependency to keep this on the hot path lightweight.
+fn extract_pubkey_from_json(json_bytes: &[u8]) -> Option<String> {
+    // Convert to str; bail if not valid UTF-8.
+    let s = std::str::from_utf8(json_bytes).ok()?;
+
+    // Find "pubkey": search for the key literally.
+    let key = "\"pubkey\"";
+    let key_pos = s.find(key)?;
+
+    // Skip past the key, colon, optional whitespace, and opening quote.
+    let after_key = &s[key_pos + key.len()..];
+    let colon_pos = after_key.find(':')?;
+    let after_colon = &after_key[colon_pos + 1..].trim_start();
+    if !after_colon.starts_with('"') {
+        return None;
+    }
+    let value_start = &after_colon[1..]; // skip opening quote
+
+    // Find closing quote.
+    let end = value_start.find('"')?;
+    let pubkey_hex = &value_start[..end];
+
+    // Validate: must be exactly 64 lowercase hex chars.
+    if pubkey_hex.len() == 64 && pubkey_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(pubkey_hex.to_string())
+    } else {
+        None
+    }
+}
+
 // ============================================
 // Tests
 // ============================================
@@ -732,9 +822,41 @@ mod tests {
         assert_eq!(VOICE_MAGIC, 0xAFu8);
     }
 
-    /// Verify voice packet dst_ip extraction.
+    /// Verify voice signal discriminant detection.
     #[test]
-    fn test_voice_packet_dst_ip_extraction() {
+    fn test_voice_signal_discriminant_range() {
+        // MemChain variants: 0-17 → decode normally
+        // Voice signals: 31-33 → route by wallet pubkey
+        let memchain_discs: &[u32] = &[0, 1, 17];
+        let voice_discs: &[u32] = &[31, 32, 33];
+
+        for &d in memchain_discs {
+            assert!(d < 18, "disc={} should be MemChain", d);
+        }
+        for &d in voice_discs {
+            assert!(d == 31 || d == 32 || d == 33, "disc={} should be voice signal", d);
+        }
+    }
+
+    /// Verify pubkey extraction from voice signal JSON.
+    #[test]
+    fn test_extract_pubkey_from_json() {
+        let pubkey = "99e2b4602033e7b8c744232a1a74a3ec8b6c82c9dfedf66406f09b779071f753";
+        let json = format!(
+            r#"{{"type":"offer","call_id":"abc123","pubkey":"{}"}}"#,
+            pubkey
+        );
+        let extracted = extract_pubkey_from_json(json.as_bytes());
+        assert_eq!(extracted.as_deref(), Some(pubkey));
+
+        // Missing pubkey field
+        let no_pubkey = br#"{"type":"offer","call_id":"abc"}"#;
+        assert!(extract_pubkey_from_json(no_pubkey).is_none());
+
+        // Wrong length
+        let short = br#"{"pubkey":"deadbeef"}"#;
+        assert!(extract_pubkey_from_json(short).is_none());
+    }
         // Construct a minimal voice plaintext:
         // [0xAF][100][64][0][5][...payload...]
         let dst = Ipv4Addr::new(100, 64, 0, 5);
