@@ -1684,6 +1684,109 @@ impl Server {
                                                 // IP spoofing logged at debug level, etc.)
                                                 // are silently dropped.
                                             }
+                                            Ok((session, DecryptedPayload::VoiceSignal { discriminant, target_wallet, payload })) => {
+                                                // Voice call signal (disc 31=Offer, 32=Answer, 33=End).
+                                                // Extract target wallet from JSON, look up session,
+                                                // re-encrypt and forward the full payload unchanged.
+                                                let signal_name = match discriminant {
+                                                    31 => "Offer",
+                                                    32 => "Answer",
+                                                    33 => "End",
+                                                    _  => "Unknown",
+                                                };
+                                                match target_wallet {
+                                                    None => {
+                                                        warn!(
+                                                            src = %session.virtual_ip,
+                                                            disc = discriminant,
+                                                            "[VOICE_SIGNAL] {} — could not extract target pubkey, dropped",
+                                                            signal_name
+                                                        );
+                                                    }
+                                                    Some(ref wallet_hex) => {
+                                                        // Decode hex pubkey → [u8; 32]
+                                                        let target_bytes = hex::decode(wallet_hex)
+                                                            .ok()
+                                                            .and_then(|b| {
+                                                                if b.len() == 32 {
+                                                                    let mut arr = [0u8; 32];
+                                                                    arr.copy_from_slice(&b);
+                                                                    Some(arr)
+                                                                } else {
+                                                                    None
+                                                                }
+                                                            });
+
+                                                        match target_bytes {
+                                                            None => {
+                                                                warn!(
+                                                                    wallet = %wallet_hex,
+                                                                    "[VOICE_SIGNAL] {} — invalid pubkey hex, dropped",
+                                                                    signal_name
+                                                                );
+                                                            }
+                                                            Some(pk) => {
+                                                                // Pass 1: wallet_index O(1)
+                                                                let target = sessions.get_by_wallet(&pk)
+                                                                    .or_else(|| {
+                                                                        // Pass 2: linear scan fallback
+                                                                        sessions.all_sessions()
+                                                                            .into_iter()
+                                                                            .find(|s| s.client_public_key.to_bytes() == pk)
+                                                                    });
+
+                                                                match target {
+                                                                    None => {
+                                                                        debug!(
+                                                                            wallet = %&wallet_hex[..8],
+                                                                            "[VOICE_SIGNAL] {} — target offline, dropped",
+                                                                            signal_name
+                                                                        );
+                                                                    }
+                                                                    Some(target_session) => {
+                                                                        // Re-encrypt with target session key and forward.
+                                                                        let counter = target_session.next_tx_counter();
+                                                                        let mut encrypted = vec![
+                                                                            0u8;
+                                                                            payload.len() + aeronyx_core::crypto::transport::ENCRYPTION_OVERHEAD
+                                                                        ];
+                                                                        match crypto.encrypt(
+                                                                            &target_session.session_key,
+                                                                            counter,
+                                                                            target_session.id.as_bytes(),
+                                                                            &payload,
+                                                                            &mut encrypted,
+                                                                        ) {
+                                                                            Ok(len) => {
+                                                                                encrypted.truncate(len);
+                                                                                let pkt = aeronyx_core::protocol::DataPacket::new(
+                                                                                    *target_session.id.as_bytes(),
+                                                                                    counter,
+                                                                                    encrypted,
+                                                                                );
+                                                                                let bytes = aeronyx_core::protocol::codec::encode_data_packet(&pkt).to_vec();
+                                                                                let _ = udp_reply.send(&bytes, &target_session.client_endpoint).await;
+                                                                                debug!(
+                                                                                    src = %session.virtual_ip,
+                                                                                    dst = %target_session.virtual_ip,
+                                                                                    signal = signal_name,
+                                                                                    "[VOICE_SIGNAL] Forwarded"
+                                                                                );
+                                                                            }
+                                                                            Err(e) => {
+                                                                                warn!(
+                                                                                    error = %e,
+                                                                                    "[VOICE_SIGNAL] Re-encrypt failed"
+                                                                                );
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             Ok((session, DecryptedPayload::Voice { dst_ip, payload })) => {
                                                 // ── Voice relay ──────────────────────────────
                                                 // Look up the target session by virtual IP,
