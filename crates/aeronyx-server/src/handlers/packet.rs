@@ -524,18 +524,35 @@ fn extract_ipv4_dst(packet: &[u8]) -> Result<Ipv4Addr> {
     Ok(Ipv4Addr::from(octets))
 }
 
-/// Extracts the "pubkey" field from a voice signal JSON payload.
+/// Extracts the routing target from a voice signal JSON payload.
 ///
-/// Expected format (field order flexible):
+/// Reads the `"to"` field (target wallet pubkey hex) for routing.
+/// The `"pubkey"` field identifies the sender — kept for the receiver
+/// to display caller identity, but NOT used for routing.
+///
+/// Expected format:
 /// ```json
-/// {"type":"offer","call_id":"...","pubkey":"<64-char hex>"}
+/// {
+///   "type":    "offer",
+///   "call_id": "<base64>",
+///   "pubkey":  "<sender 64-char hex>",
+///   "to":      "<target 64-char hex>"
+/// }
 /// ```
 ///
-/// Returns `Some(hex_string)` if a valid 64-char hex pubkey is found.
-/// Uses simple byte scanning — no JSON parser dependency on the hot path.
+/// Returns `Some(hex_string)` if a valid 64-char hex `"to"` value is found.
 fn extract_pubkey_from_json(json_bytes: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(json_bytes).ok()?;
-    let key = "\"pubkey\"";
+
+    // Look for the "to" field (routing target).
+    // Falls back to "pubkey" for backward compatibility during transition.
+    extract_json_hex_field(s, "\"to\"")
+        .or_else(|| extract_json_hex_field(s, "\"pubkey\""))
+}
+
+/// Extracts a 64-char hex string value for the given JSON key.
+/// Simple byte scanning — no JSON parser dependency on the hot path.
+fn extract_json_hex_field<'a>(s: &'a str, key: &str) -> Option<String> {
     let key_pos = s.find(key)?;
     let after_key = &s[key_pos + key.len()..];
     let colon_pos = after_key.find(':')?;
@@ -545,9 +562,9 @@ fn extract_pubkey_from_json(json_bytes: &[u8]) -> Option<String> {
     }
     let value_start = &after_colon[1..];
     let end = value_start.find('"')?;
-    let pubkey_hex = &value_start[..end];
-    if pubkey_hex.len() == 64 && pubkey_hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(pubkey_hex.to_string())
+    let hex = &value_start[..end];
+    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hex.to_string())
     } else {
         None
     }
@@ -642,18 +659,41 @@ mod tests {
 
     #[test]
     fn test_extract_pubkey_from_json() {
-        let pk = "99e2b4602033e7b8c744232a1a74a3ec8b6c82c9dfedf66406f09b779071f753";
-        let json = format!(r#"{{"type":"offer","call_id":"abc","pubkey":"{}"}}"#, pk);
-        assert_eq!(extract_pubkey_from_json(json.as_bytes()).as_deref(), Some(pk));
+        let sender = "437059fc0f5403365c69ef9ba6df93cdb0dc1f0058acee6af647f0b4152a7010";
+        let target = "99e2b4602033e7b8c744232a1a74a3ec8b6c82c9dfedf66406f09b779071f753";
 
-        // Missing field
+        // New format: "to" field is used for routing (target wallet)
+        let json_new = format!(
+            r#"{{"type":"offer","call_id":"abc","pubkey":"{}","to":"{}"}}"#,
+            sender, target
+        );
+        // "to" takes priority over "pubkey"
+        assert_eq!(
+            extract_pubkey_from_json(json_new.as_bytes()).as_deref(),
+            Some(target),
+            "should extract 'to' field for routing"
+        );
+
+        // Old format (no "to" field): fall back to "pubkey" for backward compat
+        let json_old = format!(
+            r#"{{"type":"offer","call_id":"abc","pubkey":"{}"}}"#,
+            target
+        );
+        assert_eq!(
+            extract_pubkey_from_json(json_old.as_bytes()).as_deref(),
+            Some(target),
+            "should fall back to 'pubkey' when 'to' is absent"
+        );
+
+        // Missing both fields
         assert!(extract_pubkey_from_json(br#"{"type":"offer"}"#).is_none());
 
-        // Too short
-        assert!(extract_pubkey_from_json(br#"{"pubkey":"deadbeef"}"#).is_none());
-
-        // Exactly 64 chars but contains non-hex
-        let bad = format!(r#"{{"pubkey":"{}"}}"#, "z".repeat(64));
-        assert!(extract_pubkey_from_json(bad.as_bytes()).is_none());
+        // "to" present but too short
+        let bad = format!(r#"{{"to":"deadbeef","pubkey":"{}"}}"#, target);
+        assert_eq!(
+            extract_pubkey_from_json(bad.as_bytes()).as_deref(),
+            Some(target),
+            "should fall back to valid 'pubkey' when 'to' is invalid"
+        );
     }
 }
