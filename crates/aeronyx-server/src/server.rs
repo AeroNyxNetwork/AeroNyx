@@ -1699,7 +1699,7 @@ impl Server {
                                                         warn!(
                                                             src = %session.virtual_ip,
                                                             disc = discriminant,
-                                                            "[VOICE_SIGNAL] {} — could not extract target pubkey, dropped",
+                                                            "[VOICE_SIGNAL] {} — missing 'to' field in payload, dropped",
                                                             signal_name
                                                         );
                                                     }
