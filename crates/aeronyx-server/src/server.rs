@@ -1,93 +1,40 @@
 // ============================================
 // File: crates/aeronyx-server/src/server.rs
 // ============================================
-//! # Server Orchestrator
-//!
-//! ## Modification History
-//! v0.1.0 - Initial server implementation
-//! v0.1.1 - Keepalive packet handling
-//! v0.2.0 - CMS management integration
-//! v0.3.0 - MemChain integration (MemPool, AofWriter, 1st-byte dispatch)
-//! v0.3.1 - Fixed Option<Arc<...>> type mismatch
-//! v0.4.0 - Ed25519 verify, trust whitelist, SyncReq/SyncRes
-//! v1.3.0 - Command Pipeline: CommandHandler + channel wiring
-//! v2.1.0 - Dual-engine init (SQLite+Vector + legacy MemPool+AOF),
-//!           MPI router merged, BroadcastRecord/SyncRecordRequest handling,
-//!           vector index rebuild on startup, new Miner 8-arg signature.
-//! v2.1.1 - Fixed duplicate LinuxTun import, removed unused `trace` import
-//! v2.1.0+MVF+Encryption - MemoryStorage.open() now receives record_key
-//!   derived from Ed25519 private key for transparent record content encryption.
-//!   MpiState now receives api_secret from config for Bearer token auth.
-//! v2.3.0+RemoteStorage - MpiState now receives allow_remote_storage and
-//!   max_remote_owners from config for Phase 1 remote MPI Gateway support.
-//! v2.4.0-GraphCognition - NerEngine initialization + MpiState extension.
-//! v2.4.0-GraphCognition Phase B - Scalar quantization integration.
-//! v2.4.0+Reranker - RerankerEngine initialization.
-//! v2.4.0+Conversation - derive_rawlog_key import and rawlog_key field in MpiState.
-//! v2.5.0+SuperNode - LlmRouter initialization + MpiState.llm_router field.
-//!   - init_llm_router() reads supernode config, constructs providers + router
-//!   - reset_stale_processing_tasks() called at startup before TaskWorker spawn
-//!   - TaskWorker spawned as background task when supernode.enabled=true
-//!   - ReflectionMiner receives .with_llm_router() for Steps 8/9/10 enqueue
-//!   - All SuperNode paths gated on is_supernode_enabled() — safe to disable
-//! v2.5.2+SecAudit - BroadcastRecord/SyncRecordResponse: signature now
-//!   verified against record content hash (record.content_hash_bytes()) rather
-//!   than record_id alone, preventing spoofed-content replay attacks.
-//!   public_ip resolution: metadata URLs restricted to HTTPS only + IP validation
-//!   tightened to reject private/loopback addresses as fallback detection.
-//! v2.5.3+Security - Server::new() gains config_path: Option<PathBuf> (3rd arg).
-//!   First SaaS startup auto-generates api_secret and jwt_secret and writes
-//!   them back to the config file via ensure_api_secret() + ensure_jwt_secret().
-//! v1.0.0-MultiTenant - SaaS mode startup branch in run():
-//!   init_saas_mode() initializes SystemDb, VolumeRouter, StoragePool,
-//!   VectorIndexPool, and jwt_secret. MpiState constructed via MpiState::local()
-//!   in Local mode (backward compatible). Pool eviction timer + MinerScheduler
-//!   spawned in SaaS mode. build_mpi_router() handles both modes transparently.
-//! v1.2.0-MultiDevice - ChatRelayService initialization in run().
-//!   spawn_udp_task gains `chat_relay` parameter.
-//!   handle_memchain_message gains `sessions` + `chat_relay` parameters.
-//!   Added ChatRelay branch: online multi-device broadcast + offline store_pending.
-//!   Added DeviceRegister branch: sessions.register_device() via session.wallet_bytes().
-//! v1.0.0-Voice+SessionFix - Three targeted fixes:
-//!   A. start_combined_api: `_sessions` -> `sessions`; merged build_voice_router().
-//!      GET /api/peer-virtual-ip now live for UDP direct-connect voice calls.
-//!   B. spawn_udp_task ClientHello branch: session_created() now passes real
-//!      wallet_hex derived from result.session.client_public_key.to_bytes().
-//!   C. spawn_cleanup_task: cleanup_expired() now returns 5-tuple
-//!      (SessionId, Ipv4Addr, wallet_hex, bytes_rx, bytes_tx).
-//!      session_ended() receives real wallet + traffic data, fixing the
-//!      aeronyx.network 400 error: {"client_wallet":["This field is required."]}.
-//!
-//! ## ⚠️ Important Notes for Next Developer
-//! - record_key is derived from identity.to_bytes() (Ed25519 PRIVATE key)
-//! - rawlog_key uses derive_rawlog_key() — a DIFFERENT KDF from derive_record_key()
-//! - SuperNode init order: init_llm_router() -> reset_stale_processing_tasks() -> TaskWorker
-//! - NerEngine MUST be loaded AFTER EmbedEngine (shared ORT runtime via Once)
-//! - RerankerEngine MUST be loaded AFTER EmbedEngine and NerEngine (shared ORT Once)
-//! - SaaS mode: MpiState.storage = None, MpiState.vector_index = None.
-//!   Handlers access per-user storage via Extension<Arc<MemoryStorage>> injected
-//!   by unified_auth_middleware from StoragePool. Never access state.storage in SaaS.
-//! - config_path must be passed to Server::new() so api_secret and jwt_secret
-//!   can be auto-generated and persisted on first startup.
-//! - Pool eviction timer fires every 5 minutes (300 seconds) in SaaS mode.
-//!   It evicts both StoragePool and VectorIndexPool idle connections.
-//! - MinerScheduler ticks every 60 seconds in SaaS mode (per-user Miner).
-//!   In Local mode, the original ReflectionMiner::run() is used unchanged.
-//! - ChatRelayService is initialized only when memchain.is_enabled().
-//!   chat_relay = None means chat relay is disabled; ChatRelay messages are dropped.
-//! - DeviceRegister handler uses session.wallet_bytes() ([u8;32]) — NOT a separate
-//!   method — to extract the wallet pubkey from the authenticated session.
-//! - build_voice_router() injects Arc<SessionManager> as independent axum State;
-//!   it does NOT share MpiState. The two routers are fully isolated.
-//!
-//! ## Last Modified
-//! v2.5.2+SecAudit     - BroadcastRecord sig verification hardened.
-//!   resolve_public_ip private-IP guard added.
-//! v2.5.3+Security     - Server::new() gains config_path; auto-generates secrets.
-//! v1.0.0-MultiTenant  - SaaS startup branch; MpiState::local() constructor.
-//! v1.2.0-MultiDevice  - ChatRelayService init; ChatRelay + DeviceRegister handlers.
-//! v1.0.0-Voice+SessionFix - Voice API mount; session_created wallet fix;
-//!   cleanup_expired 5-tuple; session_ended real wallet+traffic data.
+// Version: 1.0.0-Membership
+//
+// Modification Reason:
+//   Wired TrafficTracker into PacketHandler and HeartbeatReporter.
+//   spawn_cleanup_task() now accepts + calls traffic_tracker.remove_wallet().
+//   HeartbeatReporter receives sessions, traffic, udp via builder methods
+//   so it can collect connected_wallets, drain deltas, and enforce
+//   membership rules on heartbeat responses.
+//
+// What changed vs previous version:
+//   1. Added import: use crate::services::traffic_tracker::TrafficTracker;
+//   2. In run(): Arc::new(TrafficTracker::new()) created before PacketHandler
+//   3. PacketHandler::new() receives Arc::clone(&traffic_tracker)
+//   4. HeartbeatReporter gets .with_sessions/.with_traffic_tracker/.with_udp
+//   5. spawn_cleanup_task() signature + call site: added traffic_tracker param
+//   6. cleanup loop: calls traffic_tracker.remove_wallet(&wallet)
+//
+// ⚠️ Important Notes for Next Developer:
+//   - traffic_tracker is Arc-shared between packet_handler (writes) and
+//     heartbeat reporter (drains). Same instance, different usage patterns.
+//   - heartbeat is declared `mut` in run() so builder calls can be chained
+//     after init_management_reporter() returns.
+//   - remove_wallet() is called AFTER sessions.remove() (inside
+//     cleanup_expired). Order matters: session must be gone first.
+//   - All other logic (VPN, MemChain, ChatRelay, Voice, SuperNode,
+//     SaaS pool, Miner) is unchanged from the previous version.
+//
+// Last Modified:
+//   v2.5.3+Security    - Server::new() gains config_path
+//   v1.0.0-MultiTenant - SaaS startup branch
+//   v1.2.0-MultiDevice - ChatRelayService init
+//   v1.0.0-Voice+SessionFix - Voice API, session fixes
+//   v1.0.0-Membership  - TrafficTracker wiring
+// ============================================
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -125,7 +72,6 @@ use rusqlite::OptionalExtension;
 
 use crate::api::mpi::{build_mpi_router, MpiState, BaselineSnapshot, Mode};
 use crate::api::auth::{ensure_jwt_secret, generate_secret};
-// v1.0.0-Voice: Voice API router for GET /api/peer-virtual-ip
 use crate::api::voice::build_voice_router;
 use crate::config::{MemChainConfig, MemChainMode, ServerConfig, VectorQuantizationMode};
 use crate::error::{Result, ServerError};
@@ -144,58 +90,43 @@ use crate::services::memchain::EmbedEngine;
 use crate::services::memchain::NerEngine;
 use crate::services::memchain::RerankerEngine;
 use crate::services::memchain::{LlmRouter, TaskWorker};
-// v1.0.0-MultiTenant: SaaS mode infrastructure
 use crate::services::memchain::{
     SystemDb, VolumeRouter, StoragePool, VectorIndexPool,
     ensure_volumes_config,
 };
-// v1.2.0-MultiDevice: Chat relay service
 use crate::services::chat_relay::{ChatRelayService, derive_node_secret};
 use crate::services::{HandshakeService, IpPoolService, RoutingService, SessionManager};
+// v1.0.0-Membership
+use crate::services::traffic_tracker::TrafficTracker;
 
 // ============================================
 // Constants
 // ============================================
 
-const KEEPALIVE_PACKET_SIZE: usize = 17;
-
+const KEEPALIVE_PACKET_SIZE:       usize  = 17;
 #[allow(dead_code)]
-const DISCONNECT_PACKET_MIN_SIZE: usize = 18;
-
-const COMMAND_CHANNEL_BUFFER: usize = 100;
-const QUANTIZER_CAL_KEY_PREFIX: &str = "quantizer_cal";
-
-/// Pool eviction timer interval (SaaS mode).
-const POOL_EVICTION_INTERVAL_SECS: u64 = 300;
-
-/// MinerScheduler tick interval (SaaS mode).
-const MINER_SCHEDULER_TICK_SECS: u64 = 60;
+const DISCONNECT_PACKET_MIN_SIZE:  usize  = 18;
+const COMMAND_CHANNEL_BUFFER:      usize  = 100;
+const QUANTIZER_CAL_KEY_PREFIX:    &str   = "quantizer_cal";
+const POOL_EVICTION_INTERVAL_SECS: u64    = 300;
+const MINER_SCHEDULER_TICK_SECS:   u64    = 60;
 
 // ============================================
 // Server
 // ============================================
 
 pub struct Server {
-    config: ServerConfig,
-    identity: IdentityKeyPair,
-    /// Path to the config file on disk.
-    /// Used to persist auto-generated secrets (api_secret, jwt_secret) on first startup.
+    config:      ServerConfig,
+    identity:    IdentityKeyPair,
     config_path: Option<PathBuf>,
-    shutdown: Arc<AtomicBool>,
+    shutdown:    Arc<AtomicBool>,
     shutdown_tx: broadcast::Sender<()>,
 }
 
 impl Server {
-    /// Create a new Server instance.
-    ///
-    /// # Arguments
-    /// - `config`: loaded server configuration
-    /// - `identity`: Ed25519 keypair for this node
-    /// - `config_path`: path to the config file on disk (for secret auto-generation).
-    ///   Pass `None` only in tests; production callers always pass the real path.
     pub fn new(
-        config: ServerConfig,
-        identity: IdentityKeyPair,
+        config:      ServerConfig,
+        identity:    IdentityKeyPair,
         config_path: Option<PathBuf>,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -211,14 +142,11 @@ impl Server {
     pub async fn run(&self) -> Result<()> {
         info!("Starting AeroNyx server v{}", env!("CARGO_PKG_VERSION"));
 
-        // ── Ensure api_secret exists (v2.5.3+Security) ──────────────────
-        // Auto-generate and persist if missing. Only for memchain-enabled modes.
         if self.config.memchain.is_enabled() {
             self.ensure_api_secret_on_disk().await;
         }
 
         let (ip_pool, sessions, routing) = self.init_services()?;
-        let session_event_sender = self.init_management_reporter(&sessions).await;
 
         let handshake_service = Arc::new(HandshakeService::new(
             self.identity.clone(),
@@ -227,12 +155,6 @@ impl Server {
             Arc::clone(&routing),
         ));
 
-        let packet_handler = Arc::new(PacketHandler::new(
-            Arc::clone(&sessions),
-            Arc::clone(&routing),
-        ));
-
-        // ── MemChain initialization — branch on mode ─────────────────────
         let (storage, vector_index, mempool, aof_writer) = if self.config.memchain.is_enabled() {
             let (st, vi, mp, aw) = self.init_memchain().await?;
             (Some(st), Some(vi), Some(mp), Some(aw))
@@ -241,9 +163,6 @@ impl Server {
             (None, None, None, None)
         };
 
-        // ── v1.2.0-MultiDevice: ChatRelayService initialization ──────────
-        // Initialized only when memchain is enabled. `chat_relay = None` means
-        // chat relay is disabled; incoming ChatRelay messages will be dropped.
         let chat_relay: Option<Arc<ChatRelayService>> =
             if self.config.memchain.is_enabled() {
                 let node_secret = derive_node_secret(&self.identity.to_bytes());
@@ -277,6 +196,25 @@ impl Server {
         let server_pubkey_hex = hex::encode(self.identity.public_key_bytes());
         let mut tasks: Vec<(&str, JoinHandle<()>)> = Vec::new();
 
+        // v1.0.0-Membership: TrafficTracker must be created before
+        // PacketHandler AND before init_management_reporter so both
+        // can receive the same Arc.
+        let traffic_tracker = Arc::new(TrafficTracker::new());
+
+        let packet_handler = Arc::new(PacketHandler::new(
+            Arc::clone(&sessions),
+            Arc::clone(&routing),
+            Arc::clone(&traffic_tracker),
+        ));
+
+        // init_management_reporter needs udp + traffic_tracker,
+        // so it is called here after both are available.
+        let session_event_sender = self.init_management_reporter(
+            &sessions,
+            Arc::clone(&udp),
+            Arc::clone(&traffic_tracker),
+        ).await;
+
         let udp_task = self.spawn_udp_task(
             Arc::clone(&udp),
             #[cfg(target_os = "linux")]
@@ -291,9 +229,7 @@ impl Server {
             vector_index.clone(),
             self.config.memchain.clone(),
             server_pubkey_hex.clone(),
-            // 🌟 v1.2.0-MultiDevice
             chat_relay.clone(),
-            // v1.0.0-Voice: for voice packet routing
             Arc::clone(&routing),
         );
         tasks.push(("udp", udp_task));
@@ -314,37 +250,28 @@ impl Server {
             Arc::clone(&routing),
             session_event_sender.clone(),
             chat_relay.clone(),
+            Arc::clone(&traffic_tracker),   // v1.0.0-Membership
         );
         tasks.push(("cleanup", cleanup_task));
 
-        // v1.0.0-TrafficAccounting: periodic traffic snapshot task.
-        // Every 5 minutes, snapshot all active sessions and send cumulative
-        // bytes_in / bytes_out to aeronyx.network as SessionTrafficSnapshot
-        // events. Fills the gap where long-lived sessions had zero visibility
-        // until disconnect. Values are cumulative totals (not deltas) —
-        // backend must upsert, not accumulate.
         let snapshot_task = self.spawn_traffic_snapshot_task(
             Arc::clone(&sessions),
             session_event_sender.clone(),
         );
         tasks.push(("traffic-snapshot", snapshot_task));
 
-        // 🌟 v1.3.0-Sovereign: wallet route cache stale-entry cleanup task
         if let Some(ref relay) = chat_relay {
-            let routes = Arc::clone(&relay.wallet_routes);
-            let mut routes_rx = self.shutdown_tx.subscribe();
+            let routes     = Arc::clone(&relay.wallet_routes);
+            let mut rx     = self.shutdown_tx.subscribe();
             tasks.push(("wallet-routes-cleanup", tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(60));
                 loop {
                     tokio::select! {
-                        _ = routes_rx.recv() => break,
+                        _ = rx.recv() => break,
                         _ = interval.tick() => {
                             let evicted = routes.cleanup_stale(Duration::from_secs(300));
                             if evicted > 0 {
-                                debug!(
-                                    evicted,
-                                    "[CHAT_RELAY] Stale wallet routes evicted"
-                                );
+                                debug!(evicted, "[CHAT_RELAY] Stale wallet routes evicted");
                             }
                         }
                     }
@@ -356,20 +283,16 @@ impl Server {
         if let (Some(ref st), Some(ref vi), Some(ref mp), Some(ref aw)) =
             (&storage, &vector_index, &mempool, &aof_writer)
         {
-            // ── Determine operating mode ──────────────────────────────────
             let is_saas = self.config.memchain.mode == MemChainMode::Saas;
 
             let user_weights = Arc::new(parking_lot::RwLock::new(
                 std::collections::HashMap::new(),
             ));
 
-            // Load MVF user weights from SQLite (Local mode only — in SaaS mode
-            // each user has their own DB; weights are loaded per-user by the Miner).
             if !is_saas {
                 let owner = self.identity.public_key_bytes();
                 if let Some(blob) = st.load_user_weights(&owner).await {
-                    if let Some(w) = crate::services::memchain::mvf::WeightVector::from_bytes(&blob)
-                    {
+                    if let Some(w) = crate::services::memchain::mvf::WeightVector::from_bytes(&blob) {
                         let mut map = user_weights.write();
                         map.insert(hex::encode(owner), w);
                         info!("[MEMCHAIN] Loaded MVF user weights from SQLite");
@@ -391,26 +314,19 @@ impl Server {
                 raw.and_then(|bytes| {
                     serde_json::from_str::<BaselineSnapshot>(
                         &String::from_utf8_lossy(&bytes),
-                    )
-                    .ok()
+                    ).ok()
                 })
             } else {
                 None
             };
 
-            let owner_key = self.identity.public_key_bytes();
+            let owner_key  = self.identity.public_key_bytes();
             let api_secret = self.config.memchain.effective_api_secret().map(|s| s.to_string());
 
-            // ── Shared engine initialization (both modes) ─────────────────
-            let embed_engine = self.init_embed_engine();
-            let ner_engine = self.init_ner_engine();
+            let embed_engine    = self.init_embed_engine();
+            let ner_engine      = self.init_ner_engine();
             let reranker_engine = self.init_reranker_engine();
 
-            // ── v2.5.0+SuperNode: LlmRouter ──────────────────────────────
-            // ⚠️ Init order is MANDATORY:
-            //   1. init_llm_router()
-            //   2. reset_stale_processing_tasks()
-            //   3. TaskWorker::spawn()
             let llm_router: Option<Arc<LlmRouter>> = self.init_llm_router().await;
 
             if llm_router.is_some() {
@@ -418,15 +334,10 @@ impl Server {
                     self.config.memchain.supernode.worker.task_timeout_secs as i64;
                 let recovered = st.reset_stale_processing_tasks(timeout_secs).await;
                 if recovered > 0 {
-                    info!(
-                        recovered,
-                        timeout_secs,
-                        "[SUPERNODE] Recovered stale tasks from previous run"
-                    );
+                    info!(recovered, timeout_secs, "[SUPERNODE] Recovered stale tasks");
                 }
             }
 
-            // ── Build MpiState (mode-aware) ───────────────────────────────
             let mpi_state = if is_saas {
                 self.init_saas_mpi_state(
                     st,
@@ -437,10 +348,8 @@ impl Server {
                     ner_engine.clone(),
                     reranker_engine,
                     llm_router.clone(),
-                )
-                .await?
+                ).await?
             } else {
-                // Local mode: use MpiState::local() constructor.
                 let mpi = MpiState::local(
                     Arc::clone(st),
                     Arc::clone(vi),
@@ -461,49 +370,42 @@ impl Server {
                     self.config.memchain.graph_enabled,
                     self.config.memchain.entropy_filter_enabled,
                     reranker_engine,
-                    // ⚠️ Uses derive_rawlog_key(), NOT derive_record_key()
                     Some(derive_rawlog_key(&self.identity.to_bytes())),
                     llm_router.clone(),
                 );
                 Arc::new(mpi)
             };
 
-            // ── Local mode: pre-populate identity cache ───────────────────
             if !is_saas {
-                let owner_hex = hex::encode(owner_key);
+                let owner_hex      = hex::encode(owner_key);
                 let identity_records = st
                     .get_active_records(
                         &owner_key,
                         Some(aeronyx_core::ledger::MemoryLayer::Identity),
                         100,
-                    )
-                    .await;
+                    ).await;
                 if !identity_records.is_empty() {
                     let mut cache = mpi_state.identity_cache.write();
                     cache.insert(owner_hex, identity_records);
                 }
+                mpi_state.index_ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
-                mpi_state
-                    .index_ready
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-
-                // Freeze MVF baseline if needed (Local mode only).
                 if self.config.memchain.mvf_enabled
                     && mpi_state.mvf_baseline.read().is_none()
                 {
                     let feedback = st.get_recent_feedback(200).await;
                     if !feedback.is_empty() {
                         let positive = feedback.iter().filter(|(s, _)| *s == 1).count();
-                        let rate = positive as f32 / feedback.len() as f32;
-                        let now_ts = SystemTime::now()
+                        let rate     = positive as f32 / feedback.len() as f32;
+                        let now_ts   = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs() as i64;
 
                         let baseline = BaselineSnapshot {
                             positive_rate: rate,
-                            sample_size: feedback.len(),
-                            frozen_at: now_ts,
+                            sample_size:   feedback.len(),
+                            frozen_at:     now_ts,
                         };
 
                         if let Ok(json) = serde_json::to_string(&baseline) {
@@ -530,8 +432,6 @@ impl Server {
             );
             tasks.push(("memchain-api", api_task));
 
-            // ── v2.5.0+SuperNode: TaskWorker spawn ────────────────────────
-            // Spawned AFTER reset_stale_processing_tasks().
             if let Some(ref router) = llm_router {
                 let worker = TaskWorker::new(
                     Arc::clone(st),
@@ -543,19 +443,18 @@ impl Server {
                     worker.run(worker_shutdown).await;
                 })));
                 info!(
-                    poll_interval = self.config.memchain.supernode.worker.poll_interval_secs,
+                    poll_interval  = self.config.memchain.supernode.worker.poll_interval_secs,
                     max_concurrent = self.config.memchain.supernode.worker.max_concurrent,
                     "[SUPERNODE] TaskWorker spawned"
                 );
             }
 
-            // ── SaaS mode: pool eviction timer ────────────────────────────
             if is_saas {
                 if let (Some(ref sp), Some(ref vp)) =
                     (&mpi_state.storage_pool, &mpi_state.vector_pool)
                 {
-                    let sp_clone = Arc::clone(sp);
-                    let vp_clone = Arc::clone(vp);
+                    let sp_clone   = Arc::clone(sp);
+                    let vp_clone   = Arc::clone(vp);
                     let mut evict_rx = self.shutdown_tx.subscribe();
                     tasks.push(("pool-eviction", tokio::spawn(async move {
                         let mut interval = tokio::time::interval(
@@ -570,7 +469,7 @@ impl Server {
                                     if evicted_s + evicted_v > 0 {
                                         info!(
                                             storage = evicted_s,
-                                            vector = evicted_v,
+                                            vector  = evicted_v,
                                             "[POOL] Evicted idle connections"
                                         );
                                     }
@@ -578,17 +477,12 @@ impl Server {
                             }
                         }
                     })));
-                    info!(
-                        interval_secs = POOL_EVICTION_INTERVAL_SECS,
-                        "[POOL] Eviction timer started"
-                    );
+                    info!(interval_secs = POOL_EVICTION_INTERVAL_SECS, "[POOL] Eviction timer started");
                 }
             }
 
-            // ── Miner: Local = ReflectionMiner, SaaS = MinerScheduler ────
             if self.config.memchain.miner_interval_secs > 0 {
                 if is_saas {
-                    // SaaS mode: MinerScheduler polls all active users.
                     if let (Some(ref sp), Some(ref sys_db)) =
                         (&mpi_state.storage_pool, &mpi_state.system_db)
                     {
@@ -614,19 +508,13 @@ impl Server {
                             loop {
                                 tokio::select! {
                                     _ = sched_rx.recv() => break,
-                                    _ = interval.tick() => {
-                                        scheduler.tick().await;
-                                    }
+                                    _ = interval.tick() => { scheduler.tick().await; }
                                 }
                             }
                         })));
-                        info!(
-                            tick_secs = MINER_SCHEDULER_TICK_SECS,
-                            "[MINER] SaaS MinerScheduler started"
-                        );
+                        info!(tick_secs = MINER_SCHEDULER_TICK_SECS, "[MINER] SaaS MinerScheduler started");
                     }
                 } else {
-                    // Local mode: original ReflectionMiner (unchanged).
                     let miner = ReflectionMiner::new(
                         self.config.memchain.miner_interval_secs,
                         Arc::clone(st),
@@ -640,21 +528,9 @@ impl Server {
                     .with_compaction_threshold(self.config.memchain.compaction_threshold)
                     .with_mvf(self.config.memchain.mvf_enabled, Arc::clone(&user_weights));
 
-                    let miner = if let Some(ref ee) = embed_engine {
-                        miner.with_embed_engine(Arc::clone(ee))
-                    } else {
-                        miner
-                    };
-                    let miner = if let Some(ref ne) = ner_engine {
-                        miner.with_ner_engine(Arc::clone(ne))
-                    } else {
-                        miner
-                    };
-                    let miner = if let Some(ref lr) = llm_router {
-                        miner.with_llm_router(Arc::clone(lr))
-                    } else {
-                        miner
-                    };
+                    let miner = if let Some(ref ee) = embed_engine { miner.with_embed_engine(Arc::clone(ee)) } else { miner };
+                    let miner = if let Some(ref ne) = ner_engine   { miner.with_ner_engine(Arc::clone(ne))   } else { miner };
+                    let miner = if let Some(ref lr) = llm_router   { miner.with_llm_router(Arc::clone(lr))   } else { miner };
 
                     let miner_shutdown = self.shutdown_tx.subscribe();
                     tasks.push(("miner", tokio::spawn(async move {
@@ -677,7 +553,7 @@ impl Server {
             match tokio::time::timeout(Duration::from_secs(5), task).await {
                 Ok(Ok(())) => debug!("Task '{}' completed", name),
                 Ok(Err(e)) => warn!("Task '{}' failed: {}", name, e),
-                Err(_) => warn!("Task '{}' timed out", name),
+                Err(_)     => warn!("Task '{}' timed out", name),
             }
         }
 
@@ -689,9 +565,9 @@ impl Server {
             (&storage, &mempool, &aof_writer)
         {
             info!(
-                sqlite = st.count().await,
+                sqlite  = st.count().await,
                 mempool = mp.count(),
-                aof = aw.lock().await.write_count(),
+                aof     = aw.lock().await.write_count(),
                 "Shutdown complete (MemChain stats)"
             );
         } else {
@@ -702,61 +578,34 @@ impl Server {
     }
 
     // ============================================
-    // v2.5.3+Security: Auto-generate api_secret
+    // Auto-generate api_secret
     // ============================================
 
-    /// Ensure api_secret exists, auto-generating if missing.
-    ///
-    /// Only runs when memchain is enabled. The generated secret is written
-    /// back to the config file via a regex-safe line replacement.
-    /// Non-fatal: if write fails, logs a warning and continues.
     async fn ensure_api_secret_on_disk(&self) {
-        // Already configured — nothing to do.
-        if self.config.memchain.effective_api_secret().is_some() {
-            return;
-        }
-
+        if self.config.memchain.effective_api_secret().is_some() { return; }
         let Some(ref path) = self.config_path else { return };
-
         let secret = generate_secret();
         match crate::api::auth::write_secret_to_config_pub(path, "api_secret", &secret) {
-            Ok(()) => {
-                info!(
-                    path = %path.display(),
-                    "[SECURITY] Auto-generated api_secret and written to config"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "[SECURITY] Failed to persist api_secret — server is unprotected"
-                );
-            }
+            Ok(()) => info!(path = %path.display(), "[SECURITY] Auto-generated api_secret written to config"),
+            Err(e) => warn!(error = %e, "[SECURITY] Failed to persist api_secret"),
         }
     }
 
     // ============================================
-    // v1.0.0-MultiTenant: SaaS MpiState init
+    // SaaS MpiState init
     // ============================================
 
-    /// Initialize the SaaS-mode MpiState.
-    ///
-    /// Creates SystemDb, VolumeRouter, StoragePool, VectorIndexPool, and
-    /// ensures the JWT secret is generated/persisted.
-    ///
-    /// The single-user `storage` and `vector_index` are not used in SaaS mode —
-    /// they remain the server-level DB used only for p2p sync paths.
     #[allow(clippy::too_many_arguments)]
     async fn init_saas_mpi_state(
         &self,
-        _server_storage: &Arc<MemoryStorage>,
-        owner_key: [u8; 32],
-        api_secret: Option<String>,
-        user_weights: Arc<parking_lot::RwLock<std::collections::HashMap<String, crate::services::memchain::mvf::WeightVector>>>,
-        embed_engine: Option<Arc<EmbedEngine>>,
-        ner_engine: Option<Arc<NerEngine>>,
-        reranker_engine: Option<Arc<RerankerEngine>>,
-        llm_router: Option<Arc<LlmRouter>>,
+        _server_storage:  &Arc<MemoryStorage>,
+        owner_key:        [u8; 32],
+        api_secret:       Option<String>,
+        user_weights:     Arc<parking_lot::RwLock<std::collections::HashMap<String, crate::services::memchain::mvf::WeightVector>>>,
+        embed_engine:     Option<Arc<EmbedEngine>>,
+        ner_engine:       Option<Arc<NerEngine>>,
+        reranker_engine:  Option<Arc<RerankerEngine>>,
+        llm_router:       Option<Arc<LlmRouter>>,
     ) -> Result<Arc<MpiState>> {
         let saas_cfg = self.config.memchain.saas.as_ref()
             .ok_or_else(|| ServerError::startup_failed(
@@ -765,26 +614,21 @@ impl Server {
 
         let data_root = &saas_cfg.data_root;
 
-        // Ensure data_root exists.
         tokio::fs::create_dir_all(data_root).await.map_err(|e| {
             ServerError::startup_failed(format!("SaaS data_root '{}': {}", data_root.display(), e))
         })?;
 
-        // ── 1. SystemDb ───────────────────────────────────────────────
         let system_db = SystemDb::open(&data_root.join("system.db"))
             .await
             .map_err(|e| ServerError::startup_failed(format!("SystemDb: {}", e)))?;
 
-        // ── 2. volumes.toml (auto-generate if missing) ────────────────
         let volumes_config_path = ensure_volumes_config(data_root)
             .map_err(|e| ServerError::startup_failed(format!("volumes.toml: {}", e)))?;
 
-        // ── 3. VolumeRouter ───────────────────────────────────────────
         let volume_router = VolumeRouter::new(&volumes_config_path, Arc::clone(&system_db))
             .await
             .map_err(|e| ServerError::startup_failed(format!("VolumeRouter: {}", e)))?;
 
-        // ── 4. StoragePool ────────────────────────────────────────────
         let storage_pool = StoragePool::new(
             Arc::clone(&volume_router),
             Arc::clone(&system_db),
@@ -792,14 +636,9 @@ impl Server {
             Duration::from_secs(saas_cfg.pool_idle_timeout_secs),
         );
 
-        // ── 5. VectorIndexPool ────────────────────────────────────────
         let quantization_enabled =
             self.config.memchain.vector_quantization == VectorQuantizationMode::ScalarUint8;
-        let saturation_threshold = if self.config.memchain.vector_early_termination {
-            0.001_f32
-        } else {
-            0.0_f32
-        };
+        let saturation_threshold = if self.config.memchain.vector_early_termination { 0.001_f32 } else { 0.0_f32 };
 
         let vector_pool = VectorIndexPool::new(
             Arc::clone(&volume_router),
@@ -808,136 +647,91 @@ impl Server {
             saturation_threshold,
         );
 
-        // ── 6. JWT secret ─────────────────────────────────────────────
         let jwt_secret = ensure_jwt_secret(
             self.config.memchain.jwt_secret.as_deref(),
             self.config_path.as_deref(),
-        )
-        .map_err(|e| ServerError::startup_failed(format!("jwt_secret: {}", e)))?;
+        ).map_err(|e| ServerError::startup_failed(format!("jwt_secret: {}", e)))?;
 
         info!(
-            data_root = %data_root.display(),
-            pool_max = saas_cfg.pool_max_connections,
-            idle_timeout_secs = saas_cfg.pool_idle_timeout_secs,
+            data_root     = %data_root.display(),
+            pool_max      = saas_cfg.pool_max_connections,
+            idle_timeout  = saas_cfg.pool_idle_timeout_secs,
             "[SAAS] Infrastructure initialized"
         );
 
-        // ── 7. Build SaaS MpiState ────────────────────────────────────
         let mpi_state = Arc::new(MpiState {
             mode: Mode::Saas,
-            // Single-user storage fields: None in SaaS mode.
-            // Per-user storage is accessed via storage_pool in middleware.
-            storage: None,
+            storage:      None,
             vector_index: None,
-            identity: self.identity.clone(),
+            identity:     self.identity.clone(),
             identity_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            index_ready: std::sync::atomic::AtomicBool::new(true),
+            index_ready:  std::sync::atomic::AtomicBool::new(true),
             user_weights,
-            mvf_alpha: self.config.memchain.mvf_alpha,
-            mvf_enabled: self.config.memchain.mvf_enabled,
+            mvf_alpha:    self.config.memchain.mvf_alpha,
+            mvf_enabled:  self.config.memchain.mvf_enabled,
             session_embeddings: parking_lot::RwLock::new(std::collections::HashMap::new()),
             mvf_baseline: parking_lot::RwLock::new(None),
-            // SaaS: owner_key is placeholder — never used in request handling.
             owner_key,
             api_secret,
             embed_engine,
-            allow_remote_storage: false, // SaaS mode doesn't use Ed25519 remote auth.
-            max_remote_owners: 0,
+            allow_remote_storage: false,
+            max_remote_owners:    0,
             ner_engine,
-            graph_enabled: self.config.memchain.graph_enabled,
-            entropy_filter_enabled: self.config.memchain.entropy_filter_enabled,
+            graph_enabled:           self.config.memchain.graph_enabled,
+            entropy_filter_enabled:  self.config.memchain.entropy_filter_enabled,
             reranker_engine,
-            rawlog_key: Some(derive_rawlog_key(&self.identity.to_bytes())),
+            rawlog_key:  Some(derive_rawlog_key(&self.identity.to_bytes())),
             llm_router,
-            // SaaS-specific fields.
-            storage_pool: Some(storage_pool),
-            vector_pool: Some(vector_pool),
-            volume_router: Some(volume_router),
-            system_db: Some(system_db),
-            jwt_secret: Some(jwt_secret),
-            token_ttl_secs: self.config.memchain.token_ttl_secs,
-            pool_max_connections: saas_cfg.pool_max_connections,
-            pool_idle_timeout_secs: saas_cfg.pool_idle_timeout_secs,
+            storage_pool:    Some(storage_pool),
+            vector_pool:     Some(vector_pool),
+            volume_router:   Some(volume_router),
+            system_db:       Some(system_db),
+            jwt_secret:      Some(jwt_secret),
+            token_ttl_secs:          self.config.memchain.token_ttl_secs,
+            pool_max_connections:    saas_cfg.pool_max_connections,
+            pool_idle_timeout_secs:  saas_cfg.pool_idle_timeout_secs,
         });
 
         Ok(mpi_state)
     }
 
     // ============================================
-    // Shared Engine Initialization
+    // Engine initialization
     // ============================================
 
     fn init_embed_engine(&self) -> Option<Arc<EmbedEngine>> {
         let model_path = &self.config.memchain.embed_model_path;
-        match EmbedEngine::load(
-            model_path,
-            self.config.memchain.embed_max_tokens,
-            self.config.memchain.embed_output_dim,
-        ) {
+        match EmbedEngine::load(model_path, self.config.memchain.embed_max_tokens, self.config.memchain.embed_output_dim) {
             Ok(engine) => {
-                info!(
-                    model = %model_path,
-                    model_type = %engine.model_type(),
-                    dim = engine.dim(),
-                    "[EMBED] Local embedding engine loaded"
-                );
+                info!(model = %model_path, model_type = %engine.model_type(), dim = engine.dim(), "[EMBED] Local embedding engine loaded");
                 Some(Arc::new(engine))
             }
-            Err(e) => {
-                warn!(model = %model_path, error = %e, "[EMBED] Unavailable");
-                None
-            }
+            Err(e) => { warn!(model = %model_path, error = %e, "[EMBED] Unavailable"); None }
         }
     }
 
     fn init_ner_engine(&self) -> Option<Arc<NerEngine>> {
-        if !self.config.memchain.ner_enabled {
-            debug!("[NER] Disabled (ner_enabled=false)");
-            return None;
-        }
+        if !self.config.memchain.ner_enabled { debug!("[NER] Disabled"); return None; }
         let model_path = &self.config.memchain.ner_model_path;
-        let threshold = self.config.memchain.ner_confidence_threshold;
+        let threshold  = self.config.memchain.ner_confidence_threshold;
         match NerEngine::load(model_path, threshold, 0) {
-            Ok(engine) => {
-                info!(
-                    model = %model_path,
-                    threshold,
-                    "[NER] Local NER engine loaded (GLiNER)"
-                );
-                Some(Arc::new(engine))
-            }
-            Err(e) => {
-                warn!(model = %model_path, error = %e, "[NER] Unavailable");
-                None
-            }
+            Ok(engine) => { info!(model = %model_path, threshold, "[NER] Local NER engine loaded"); Some(Arc::new(engine)) }
+            Err(e)     => { warn!(model = %model_path, error = %e, "[NER] Unavailable"); None }
         }
     }
 
     fn init_reranker_engine(&self) -> Option<Arc<RerankerEngine>> {
-        if !self.config.memchain.reranker_enabled {
-            debug!("[RERANKER] Disabled (reranker_enabled=false)");
-            return None;
-        }
+        if !self.config.memchain.reranker_enabled { debug!("[RERANKER] Disabled"); return None; }
         let model_path = &self.config.memchain.reranker_model_path;
-        let max_seq = self.config.memchain.reranker_max_seq_length;
+        let max_seq    = self.config.memchain.reranker_max_seq_length;
         match RerankerEngine::load(model_path, max_seq) {
-            Ok(engine) => {
-                info!(
-                    model = %model_path,
-                    blend_weight = %RerankerEngine::blend_weight(),
-                    "[RERANKER] Cross-encoder loaded"
-                );
-                Some(Arc::new(engine))
-            }
-            Err(e) => {
-                warn!(model = %model_path, error = %e, "[RERANKER] Unavailable");
-                None
-            }
+            Ok(engine) => { info!(model = %model_path, blend_weight = %RerankerEngine::blend_weight(), "[RERANKER] Cross-encoder loaded"); Some(Arc::new(engine)) }
+            Err(e)     => { warn!(model = %model_path, error = %e, "[RERANKER] Unavailable"); None }
         }
     }
 
     // ============================================
-    // v2.5.0+SuperNode: LlmRouter Initialization
+    // LlmRouter initialization
     // ============================================
 
     async fn init_llm_router(&self) -> Option<Arc<LlmRouter>> {
@@ -945,13 +739,13 @@ impl Server {
         use crate::services::memchain::{LlmProvider, OpenAiCompatProvider, AnthropicProvider};
 
         if !self.config.memchain.is_supernode_enabled() {
-            debug!("[SUPERNODE] Disabled (supernode.enabled=false)");
+            debug!("[SUPERNODE] Disabled");
             return None;
         }
 
         let supernode = &self.config.memchain.supernode;
         if supernode.providers.is_empty() {
-            warn!("[SUPERNODE] enabled=true but no providers configured — SuperNode disabled");
+            warn!("[SUPERNODE] enabled=true but no providers — disabled");
             return None;
         }
 
@@ -959,23 +753,15 @@ impl Server {
 
         for provider_cfg in &supernode.providers {
             let api_key: Option<String> = provider_cfg.api_key.as_ref().map(|k| {
-                let k: &String = k;
                 if k.starts_with('$') {
                     std::env::var(&k[1..]).unwrap_or_else(|_| {
-                        warn!(
-                            key = %k, provider = %provider_cfg.name,
-                            "[SUPERNODE] ENV var not set for api_key"
-                        );
+                        warn!(key = %k, provider = %provider_cfg.name, "[SUPERNODE] ENV var not set for api_key");
                         String::new()
                     })
-                } else {
-                    k.clone()
-                }
+                } else { k.clone() }
             });
 
-            let api_base = if provider_cfg.api_base.is_empty()
-                && provider_cfg.provider_type == ProviderType::Anthropic
-            {
+            let api_base = if provider_cfg.api_base.is_empty() && provider_cfg.provider_type == ProviderType::Anthropic {
                 "https://api.anthropic.com".to_string()
             } else {
                 provider_cfg.api_base.clone()
@@ -984,85 +770,45 @@ impl Server {
             let provider: Arc<dyn LlmProvider> = match provider_cfg.provider_type {
                 ProviderType::OpenaiCompatible => {
                     match OpenAiCompatProvider::new(
-                        provider_cfg.name.clone(),
-                        api_base.clone(),
-                        api_key.unwrap_or_default(),
-                        provider_cfg.model.clone(),
-                        provider_cfg.max_tokens,
-                        provider_cfg.temperature,
+                        provider_cfg.name.clone(), api_base.clone(),
+                        api_key.unwrap_or_default(), provider_cfg.model.clone(),
+                        provider_cfg.max_tokens, provider_cfg.temperature,
                     ) {
-                        Ok(p) => Arc::new(p),
-                        Err(e) => {
-                            warn!(
-                                provider = %provider_cfg.name, error = %e,
-                                "[SUPERNODE] OpenAiCompatProvider failed — skipped"
-                            );
-                            continue;
-                        }
+                        Ok(p)  => Arc::new(p),
+                        Err(e) => { warn!(provider = %provider_cfg.name, error = %e, "[SUPERNODE] OpenAiCompatProvider failed"); continue; }
                     }
                 }
                 ProviderType::Anthropic => {
                     let key = match api_key {
                         Some(k) if !k.is_empty() => k,
-                        _ => {
-                            warn!(
-                                provider = %provider_cfg.name,
-                                "[SUPERNODE] Anthropic provider requires api_key — skipped"
-                            );
-                            continue;
-                        }
+                        _ => { warn!(provider = %provider_cfg.name, "[SUPERNODE] Anthropic requires api_key"); continue; }
                     };
                     match AnthropicProvider::new(
-                        provider_cfg.name.clone(),
-                        key,
-                        provider_cfg.model.clone(),
-                        provider_cfg.max_tokens,
-                        provider_cfg.temperature,
+                        provider_cfg.name.clone(), key, provider_cfg.model.clone(),
+                        provider_cfg.max_tokens, provider_cfg.temperature,
                     ) {
-                        Ok(p) => Arc::new(p),
-                        Err(e) => {
-                            warn!(
-                                provider = %provider_cfg.name, error = %e,
-                                "[SUPERNODE] AnthropicProvider failed — skipped"
-                            );
-                            continue;
-                        }
+                        Ok(p)  => Arc::new(p),
+                        Err(e) => { warn!(provider = %provider_cfg.name, error = %e, "[SUPERNODE] AnthropicProvider failed"); continue; }
                     }
                 }
             };
 
-            info!(
-                name = %provider_cfg.name,
-                type_ = ?provider_cfg.provider_type,
-                model = %provider_cfg.model,
-                api_base = %api_base,
-                "[SUPERNODE] Provider registered"
-            );
-
-            providers.push((
-                provider_cfg.name.clone(),
-                api_base,
-                provider_cfg.model.clone(),
-                provider,
-            ));
+            info!(name = %provider_cfg.name, type_ = ?provider_cfg.provider_type, model = %provider_cfg.model, api_base = %api_base, "[SUPERNODE] Provider registered");
+            providers.push((provider_cfg.name.clone(), api_base, provider_cfg.model.clone(), provider));
         }
 
         if providers.is_empty() {
-            warn!("[SUPERNODE] All providers failed — SuperNode disabled");
+            warn!("[SUPERNODE] All providers failed — disabled");
             return None;
         }
 
         let router = LlmRouter::new(providers, supernode.routing.clone());
-        info!(
-            providers = supernode.providers.len(),
-            fallback = ?supernode.routing.fallback,
-            "[SUPERNODE] LlmRouter initialized"
-        );
+        info!(providers = supernode.providers.len(), fallback = ?supernode.routing.fallback, "[SUPERNODE] LlmRouter initialized");
         Some(Arc::new(router))
     }
 
     // ============================================
-    // MemChain Initialization (dual-engine, Local mode)
+    // MemChain initialization
     // ============================================
 
     async fn init_memchain(&self) -> Result<(
@@ -1080,7 +826,6 @@ impl Server {
             }
         }
 
-        // ⚠️ SECURITY: identity.to_bytes() = PRIVATE key. Do NOT use public_key_bytes().
         let record_key = derive_record_key(&self.identity.to_bytes());
         info!("[MEMCHAIN] Record content encryption enabled");
 
@@ -1092,11 +837,7 @@ impl Server {
         let quantization_enabled =
             self.config.memchain.vector_quantization == VectorQuantizationMode::ScalarUint8;
         let vector_index = Arc::new(if quantization_enabled {
-            let sat = if self.config.memchain.vector_early_termination {
-                0.001_f32
-            } else {
-                0.0_f32
-            };
+            let sat = if self.config.memchain.vector_early_termination { 0.001_f32 } else { 0.0_f32 };
             info!(quantization = "scalar_uint8", "[MEMCHAIN] VectorIndex with scalar quantization");
             VectorIndex::with_config(true, sat)
         } else {
@@ -1105,33 +846,21 @@ impl Server {
 
         let owner = self.identity.public_key_bytes();
         let records_with_model = storage.get_records_with_embedding(&owner).await;
-        let rebuild_count = records_with_model.len();
+        let rebuild_count      = records_with_model.len();
         for (r, model) in records_with_model {
             if r.has_embedding() {
-                vector_index.upsert(
-                    r.record_id, r.embedding.clone(), r.layer,
-                    r.timestamp, &r.owner, &model,
-                );
+                vector_index.upsert(r.record_id, r.embedding.clone(), r.layer, r.timestamp, &r.owner, &model);
             }
         }
 
-        info!(
-            db = %db_path,
-            records = storage.count().await,
-            vectors = rebuild_count,
-            "[MEMCHAIN] SQLite + VectorIndex initialized"
-        );
+        info!(db = %db_path, records = storage.count().await, vectors = rebuild_count, "[MEMCHAIN] SQLite + VectorIndex initialized");
 
         if quantization_enabled && rebuild_count > 0 {
-            let owner_hex = hex::encode(owner);
+            let owner_hex  = hex::encode(owner);
             let model_name = std::path::Path::new(&self.config.memchain.embed_model_path)
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or("minilm-l6-v2");
+                .file_name().and_then(|f| f.to_str()).unwrap_or("minilm-l6-v2");
+            let cal_key    = format!("{}:{}:{}", QUANTIZER_CAL_KEY_PREFIX, owner_hex, model_name);
 
-            let cal_key = format!(
-                "{}:{}:{}", QUANTIZER_CAL_KEY_PREFIX, owner_hex, model_name
-            );
             let restored = {
                 let conn = storage.conn_lock().await;
                 let cal_data: Option<Vec<u8>> = conn
@@ -1139,20 +868,13 @@ impl Server {
                         "SELECT value FROM chain_state WHERE key = ?1",
                         rusqlite::params![cal_key],
                         |row| row.get::<_, Vec<u8>>(0),
-                    )
-                    .optional()
-                    .unwrap_or(None);
+                    ).optional().unwrap_or(None);
                 drop(conn);
-
                 if let Some(data) = cal_data {
                     let ok = vector_index.restore_quantizer(&owner, model_name, &data);
-                    if ok {
-                        info!(model = model_name, "[VECTOR] Quantizer restored");
-                    }
+                    if ok { info!(model = model_name, "[VECTOR] Quantizer restored"); }
                     ok
-                } else {
-                    false
-                }
+                } else { false }
             };
 
             if !restored {
@@ -1164,10 +886,7 @@ impl Server {
                         rusqlite::params![cal_key, cal_bytes.as_slice()],
                     );
                     drop(conn);
-                    info!(
-                        model = model_name,
-                        "[VECTOR] Quantizer calibrated and persisted"
-                    );
+                    info!(model = model_name, "[VECTOR] Quantizer calibrated and persisted");
                 }
             }
         }
@@ -1181,8 +900,7 @@ impl Server {
             }
         }
 
-        let (existing_facts, last_block) = AofWriter::replay(aof_path)
-            .await
+        let (existing_facts, last_block) = AofWriter::replay(aof_path).await
             .map_err(|e| ServerError::startup_failed(format!("AOF replay: {}", e)))?;
 
         let mempool = Arc::new(MemPool::new());
@@ -1191,14 +909,12 @@ impl Server {
             if mempool.add_fact(fact) { loaded += 1; }
         }
 
-        let aof_writer = AofWriter::open(aof_path)
-            .await
+        let aof_writer = AofWriter::open(aof_path).await
             .map_err(|e| ServerError::startup_failed(format!("AOF open: {}", e)))?;
         aof_writer.set_chain_state(last_block.as_ref());
         let aof_writer = Arc::new(TokioMutex::new(aof_writer));
 
         info!(facts = loaded, "[MEMCHAIN] Legacy MemPool + AOF initialized");
-
         Ok((storage, vector_index, mempool, aof_writer))
     }
 
@@ -1206,137 +922,60 @@ impl Server {
     // Combined API Server
     // ============================================
 
-    /// Start the combined HTTP API server.
-    ///
-    /// Mounts:
-    /// - MPI router (`build_mpi_router`) — all /api/mpi/* and /api/admin/* endpoints
-    /// - Voice router (`build_voice_router`) — GET /api/peer-virtual-ip
-    ///
-    /// ## Dual-listener design (v1.0.0-Voice)
-    /// Binds two TCP listeners simultaneously:
-    ///   1. `listen_addr` (config value, typically 127.0.0.1:8421) — local processes
-    ///   2. `100.64.0.1:8421` (VPN gateway virtual IP) — VPN-connected clients
-    ///
-    /// The VPN listener allows clients that have established a VPN session to call
-    /// GET /api/peer-virtual-ip for voice call UDP direct-connect routing.
-    /// The public internet cannot reach 100.64.0.1 — it is only reachable through
-    /// the WireGuard tunnel, so no additional auth is needed for this endpoint.
-    ///
-    /// If the VPN virtual interface is not yet up when the server starts
-    /// (e.g. TUN not initialized), the VPN listener bind will fail gracefully —
-    /// a warning is logged and the server continues on listen_addr only.
-    ///
-    /// ## v1.0.0-Voice
-    /// `sessions` parameter renamed from `_sessions` (unused) to `sessions`.
-    /// The Voice router is merged via `.merge(build_voice_router(sessions))`.
-    /// The two routers use independent axum State — MpiState and Arc<SessionManager>
-    /// respectively — and are fully isolated from each other.
     fn start_combined_api(
         &self,
         listen_addr: std::net::SocketAddr,
-        mpi_state: Arc<MpiState>,
-        _mempool: Arc<MemPool>,
+        mpi_state:   Arc<MpiState>,
+        _mempool:    Arc<MemPool>,
         _aof_writer: Arc<TokioMutex<AofWriter>>,
-        // v1.0.0-Voice: renamed from `_sessions` — now passed to build_voice_router().
-        sessions: Arc<SessionManager>,
-        _udp: Arc<UdpTransport>,
+        sessions:    Arc<SessionManager>,
+        _udp:        Arc<UdpTransport>,
     ) -> JoinHandle<()> {
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        // Secondary shutdown receiver for the VPN listener task.
+        let mut shutdown_rx     = self.shutdown_tx.subscribe();
         let mut shutdown_rx_vpn = self.shutdown_tx.subscribe();
-        // Gateway IP of the VPN virtual network (100.64.0.1).
-        // Clients connected to the VPN can reach this address through the tunnel.
-        // The port matches listen_addr so clients use a consistent port number.
         let vpn_listen_addr: std::net::SocketAddr = format!(
-            "100.64.0.1:{}",
-            listen_addr.port()
+            "100.64.0.1:{}", listen_addr.port()
         ).parse().unwrap_or_else(|_| "100.64.0.1:8421".parse().unwrap());
 
         tokio::spawn(async move {
-            // v1.0.0-Voice: merge Voice API router (GET /api/peer-virtual-ip).
-            // build_voice_router injects Arc<SessionManager> as independent axum State;
-            // it does NOT share MpiState. The two routers are fully isolated.
             let app = build_mpi_router(mpi_state)
                 .merge(build_voice_router(sessions));
 
-            // ── Listener 1: configured address (127.0.0.1:8421 by default) ──
             let listener = match tokio::net::TcpListener::bind(listen_addr).await {
-                Ok(l) => {
-                    info!("[API] MemChain API on http://{}", listen_addr);
-                    l
-                }
-                Err(e) => {
-                    error!("[API] Bind failed {}: {}", listen_addr, e);
-                    return;
-                }
+                Ok(l)  => { info!("[API] MemChain API on http://{}", listen_addr); l }
+                Err(e) => { error!("[API] Bind failed {}: {}", listen_addr, e); return; }
             };
 
-            // ── Listener 2: VPN gateway address (100.64.0.1:<port>) ──────────
-            // Allows VPN-connected clients to query peer virtual IPs for voice calls.
-            // Retries binding every 10 seconds if TUN interface is not yet up.
             match tokio::net::TcpListener::bind(vpn_listen_addr).await {
                 Ok(vpn_listener) => {
-                    info!(
-                        "[API] Voice API also available on http://{} (VPN clients only)",
-                        vpn_listen_addr
-                    );
+                    info!("[API] Voice API also available on http://{} (VPN clients only)", vpn_listen_addr);
                     let app_clone = app.clone();
                     tokio::spawn(async move {
                         let server = axum::serve(vpn_listener, app_clone)
-                            .with_graceful_shutdown(async move {
-                                let _ = shutdown_rx_vpn.recv().await;
-                            });
-                        if let Err(e) = server.await {
-                            error!("[API] VPN listener error: {}", e);
-                        }
+                            .with_graceful_shutdown(async move { let _ = shutdown_rx_vpn.recv().await; });
+                        if let Err(e) = server.await { error!("[API] VPN listener error: {}", e); }
                         info!("[API] VPN listener stopped");
                     });
                 }
                 Err(e) => {
-                    warn!(
-                        "[API] VPN listener on {} not ready yet ({}), \
-                         will retry every 10s in background",
-                        vpn_listen_addr, e
-                    );
-                    // Spawn a background task that keeps trying to bind the VPN
-                    // listener until it succeeds (TUN comes up) or shutdown fires.
+                    warn!("[API] VPN listener on {} not ready yet ({}), will retry every 10s", vpn_listen_addr, e);
                     let app_clone = app.clone();
                     tokio::spawn(async move {
-                        let mut interval = tokio::time::interval(
-                            std::time::Duration::from_secs(10)
-                        );
-                        // Skip the first immediate tick.
+                        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
                         interval.tick().await;
                         loop {
                             tokio::select! {
-                                _ = shutdown_rx_vpn.recv() => {
-                                    debug!("[API] VPN listener retry task shutting down");
-                                    break;
-                                }
+                                _ = shutdown_rx_vpn.recv() => { debug!("[API] VPN listener retry task shutting down"); break; }
                                 _ = interval.tick() => {
                                     match tokio::net::TcpListener::bind(vpn_listen_addr).await {
                                         Ok(vpn_listener) => {
-                                            info!(
-                                                "[API] VPN listener bound on {} (TUN is now up)",
-                                                vpn_listen_addr
-                                            );
+                                            info!("[API] VPN listener bound on {} (TUN is now up)", vpn_listen_addr);
                                             let server = axum::serve(vpn_listener, app_clone)
-                                                .with_graceful_shutdown(async {
-                                                    // No shutdown signal here — the task
-                                                    // runs until the process exits.
-                                                    std::future::pending::<()>().await
-                                                });
-                                            if let Err(e) = server.await {
-                                                error!("[API] VPN listener error: {}", e);
-                                            }
+                                                .with_graceful_shutdown(async { std::future::pending::<()>().await });
+                                            if let Err(e) = server.await { error!("[API] VPN listener error: {}", e); }
                                             break;
                                         }
-                                        Err(e) => {
-                                            debug!(
-                                                "[API] VPN listener retry failed ({}): {}",
-                                                vpn_listen_addr, e
-                                            );
-                                        }
+                                        Err(e) => { debug!("[API] VPN listener retry failed ({}): {}", vpn_listen_addr, e); }
                                     }
                                 }
                             }
@@ -1345,15 +984,11 @@ impl Server {
                 }
             }
 
-            // ── Primary server (blocking) ─────────────────────────────────────
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                 let _ = shutdown_rx.recv().await;
                 info!("[API] Shutdown signal received");
             });
-
-            if let Err(e) = server.await {
-                error!("[API] Server error: {}", e);
-            }
+            if let Err(e) = server.await { error!("[API] Server error: {}", e); }
             info!("[API] Stopped");
         })
     }
@@ -1364,7 +999,9 @@ impl Server {
 
     async fn init_management_reporter(
         &self,
-        sessions: &Arc<SessionManager>,
+        sessions:        &Arc<SessionManager>,
+        udp:             Arc<UdpTransport>,
+        traffic_tracker: Arc<TrafficTracker>,
     ) -> SessionEventSender {
         info!("Initializing management reporting...");
 
@@ -1382,8 +1019,8 @@ impl Server {
         agent_manager.detect_existing().await;
 
         {
-            let am = Arc::clone(&agent_manager);
-            let mut rx = self.shutdown_tx.subscribe();
+            let am      = Arc::clone(&agent_manager);
+            let mut rx  = self.shutdown_tx.subscribe();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(30));
                 loop {
@@ -1396,23 +1033,19 @@ impl Server {
         }
 
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_BUFFER);
-        let cmd_handler = CommandHandler::new(
-            cmd_rx,
-            Arc::clone(&mgmt_client),
-            Arc::clone(&agent_manager),
-        );
-        let cmd_shutdown = self.shutdown_tx.subscribe();
+        let cmd_handler      = CommandHandler::new(cmd_rx, Arc::clone(&mgmt_client), Arc::clone(&agent_manager));
+        let cmd_shutdown     = self.shutdown_tx.subscribe();
         tokio::spawn(async move { cmd_handler.run(cmd_shutdown).await; });
 
         let memchain_status_fn: Option<crate::management::reporter::MemChainStatusFn> =
             if self.config.memchain.is_enabled() {
                 let allow_remote = self.config.memchain.allow_remote_storage;
-                let max_owners = self.config.memchain.max_remote_owners;
+                let max_owners   = self.config.memchain.max_remote_owners;
                 Some(Box::new(move || {
                     Some(crate::management::client::MemChainHeartbeatStatus {
-                        enabled: true,
-                        allow_remote_storage: allow_remote,
-                        max_remote_owners: max_owners,
+                        enabled:               true,
+                        allow_remote_storage:  allow_remote,
+                        max_remote_owners:     max_owners,
                         current_remote_owners: 0,
                     })
                 }))
@@ -1420,16 +1053,21 @@ impl Server {
                 None
             };
 
+        // Note: .with_sessions / .with_traffic_tracker / .with_udp are
+        // injected here — all three are available at this call site.
         let mut heartbeat =
             HeartbeatReporter::new(Arc::clone(&mgmt_client), public_ip)
                 .with_command_sender(cmd_tx)
-                .with_agent_manager(Arc::clone(&agent_manager));
+                .with_agent_manager(Arc::clone(&agent_manager))
+                .with_sessions(Arc::clone(sessions))
+                .with_traffic_tracker(Arc::clone(&traffic_tracker))
+                .with_udp(Arc::clone(&udp));
 
         if let Some(f) = memchain_status_fn {
             heartbeat = heartbeat.with_memchain_status(f);
         }
 
-        let sess = Arc::clone(sessions);
+        let sess        = Arc::clone(sessions);
         let hb_shutdown = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             heartbeat
@@ -1437,8 +1075,7 @@ impl Server {
                 .await;
         });
 
-        let (session_reporter, event_tx) =
-            SessionReporter::new(Arc::clone(&mgmt_client));
+        let (session_reporter, event_tx) = SessionReporter::new(Arc::clone(&mgmt_client));
         let sr_shutdown = self.shutdown_tx.subscribe();
         tokio::spawn(async move { session_reporter.run(sr_shutdown).await; });
 
@@ -1448,12 +1085,8 @@ impl Server {
                 self.identity.clone(),
                 node_info.node_id.clone(),
                 Arc::clone(&agent_manager),
-            )
-            .with_mpi_api_secret(
-                self.config
-                    .memchain
-                    .effective_api_secret()
-                    .map(|s| s.to_string()),
+            ).with_mpi_api_secret(
+                self.config.memchain.effective_api_secret().map(|s| s.to_string()),
             );
             let ws_shutdown = self.shutdown_tx.subscribe();
             tokio::spawn(async move { ws.run(ws_shutdown).await; });
@@ -1475,8 +1108,6 @@ impl Server {
             return ip.to_string();
         }
 
-        // v2.5.2+SecAudit: these URLs are hardcoded — do NOT extend with
-        // user-controlled input (SSRF vector).
         let services = [
             "https://api.ipify.org",
             "https://ifconfig.me/ip",
@@ -1485,10 +1116,7 @@ impl Server {
             "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip",
         ];
 
-        if let Ok(client) = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-        {
+        if let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(5)).build() {
             for url in &services {
                 let mut req = client.get(*url);
                 if url.contains("metadata.google.internal") {
@@ -1501,23 +1129,14 @@ impl Server {
                             if ip_str.len() <= 45 {
                                 if let Ok(addr) = ip_str.parse::<std::net::IpAddr>() {
                                     let is_private = match addr {
-                                        std::net::IpAddr::V4(v4) => {
-                                            v4.is_loopback()
-                                                || v4.is_private()
-                                                || v4.is_unspecified()
-                                        }
-                                        std::net::IpAddr::V6(v6) => {
-                                            v6.is_loopback() || v6.is_unspecified()
-                                        }
+                                        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_unspecified(),
+                                        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
                                     };
                                     if !is_private {
                                         info!(ip = %addr, source = %url, "[NET] Public IP detected");
                                         return addr.to_string();
                                     }
-                                    warn!(
-                                        ip = %addr, source = %url,
-                                        "[NET] Ignoring private/loopback IP from metadata"
-                                    );
+                                    warn!(ip = %addr, source = %url, "[NET] Ignoring private/loopback IP");
                                 }
                             }
                         }
@@ -1535,24 +1154,15 @@ impl Server {
     // Core Services
     // ============================================
 
-    fn init_services(&self) -> Result<(
-        Arc<IpPoolService>,
-        Arc<SessionManager>,
-        Arc<RoutingService>,
-    )> {
+    fn init_services(&self) -> Result<(Arc<IpPoolService>, Arc<SessionManager>, Arc<RoutingService>)> {
         let (network, prefix) = self.config.parse_ip_range()?;
-        let ip_pool =
-            Arc::new(IpPoolService::new(network, prefix, self.config.gateway_ip())?);
+        let ip_pool  = Arc::new(IpPoolService::new(network, prefix, self.config.gateway_ip())?);
         let sessions = Arc::new(SessionManager::new(
             self.config.max_sessions(),
             Duration::from_secs(self.config.session_timeout_secs()),
         ));
-        let routing = Arc::new(RoutingService::new());
-        info!(
-            capacity = ip_pool.capacity(),
-            max_sessions = self.config.max_sessions(),
-            "Services initialized"
-        );
+        let routing  = Arc::new(RoutingService::new());
+        info!(capacity = ip_pool.capacity(), max_sessions = self.config.max_sessions(), "Services initialized");
         Ok((ip_pool, sessions, routing))
     }
 
@@ -1562,17 +1172,11 @@ impl Server {
             .with_address(self.config.gateway_ip())
             .with_netmask(Ipv4Addr::new(255, 255, 255, 0))
             .with_mtu(self.config.mtu());
-        let tun = LinuxTun::create(cfg)
-            .await
+        let tun = LinuxTun::create(cfg).await
             .map_err(|e| ServerError::startup_failed(format!("TUN: {}", e)))?;
-        tun.up()
-            .await
+        tun.up().await
             .map_err(|e| ServerError::startup_failed(format!("TUN up: {}", e)))?;
-        info!(
-            "TUN '{}' initialized @ {}",
-            tun.name(),
-            self.config.gateway_ip()
-        );
+        info!("TUN '{}' initialized @ {}", tun.name(), self.config.gateway_ip());
         Ok(Arc::new(tun))
     }
 
@@ -1583,30 +1187,28 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     fn spawn_udp_task(
         &self,
-        udp: Arc<UdpTransport>,
+        udp:              Arc<UdpTransport>,
         #[cfg(target_os = "linux")] tun: Arc<LinuxTun>,
-        handshake: Arc<HandshakeService>,
-        packet_handler: Arc<PacketHandler>,
-        sessions: Arc<SessionManager>,
-        session_events: SessionEventSender,
-        mempool: Option<Arc<MemPool>>,
-        aof_writer: Option<Arc<TokioMutex<AofWriter>>>,
-        storage: Option<Arc<MemoryStorage>>,
-        vector_index: Option<Arc<VectorIndex>>,
-        memchain_config: MemChainConfig,
+        handshake:        Arc<HandshakeService>,
+        packet_handler:   Arc<PacketHandler>,
+        sessions:         Arc<SessionManager>,
+        session_events:   SessionEventSender,
+        mempool:          Option<Arc<MemPool>>,
+        aof_writer:       Option<Arc<TokioMutex<AofWriter>>>,
+        storage:          Option<Arc<MemoryStorage>>,
+        vector_index:     Option<Arc<VectorIndex>>,
+        memchain_config:  MemChainConfig,
         server_pubkey_hex: String,
-        // 🌟 v1.2.0-MultiDevice
-        chat_relay: Option<Arc<ChatRelayService>>,
-        // v1.0.0-Voice: needed for voice packet routing by dst virtual IP
-        routing: Arc<RoutingService>,
+        chat_relay:       Option<Arc<ChatRelayService>>,
+        routing:          Arc<RoutingService>,
     ) -> JoinHandle<()> {
-        let shutdown = Arc::clone(&self.shutdown);
+        let shutdown    = Arc::clone(&self.shutdown);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let udp_reply = Arc::clone(&udp);
+        let udp_reply   = Arc::clone(&udp);
 
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            let crypto = DefaultTransportCrypto::new();
+            let mut buf    = vec![0u8; 65535];
+            let crypto     = DefaultTransportCrypto::new();
 
             loop {
                 tokio::select! {
@@ -1622,41 +1224,25 @@ impl Server {
                                         if let Ok(hello) = decode_client_hello(data) {
                                             match handshake.process(&hello, source.addr) {
                                                 Ok(result) => {
-                                                    let sid = BASE64.encode(
-                                                        &result.response.session_id
-                                                    );
-                                                    // v1.0.0-Voice+SessionFix:
-                                                    // Extract wallet hex from the handshake result's
-                                                    // session rather than passing None.
-                                                    // HandshakeResult { session: Arc<Session>, response: ServerHello }
-                                                    // Fixes aeronyx.network 400:
-                                                    //   {"client_wallet":["This field is required."]}
-                                                    let wallet_hex = hex::encode(
-                                                        result.session.client_public_key.to_bytes()
-                                                    );
+                                                    let sid        = BASE64.encode(&result.response.session_id);
+                                                    let wallet_hex = hex::encode(result.session.client_public_key.to_bytes());
                                                     session_events.session_created(&sid, Some(wallet_hex));
                                                     let resp = encode_server_hello(&result.response);
                                                     let _ = udp.send(&resp, &source.addr).await;
                                                 }
-                                                Err(e) => {
-                                                    warn!("[HANDSHAKE] Failed {}: {}", source.addr, e)
-                                                }
+                                                Err(e) => warn!("[HANDSHAKE] Failed {}: {}", source.addr, e),
                                             }
                                         }
                                     }
-
                                     Ok(MessageType::Keepalive) => {
                                         if len >= KEEPALIVE_PACKET_SIZE {
                                             let mut sid = [0u8; 16];
                                             sid.copy_from_slice(&data[1..17]);
                                             if let Some(id) = SessionId::from_bytes(&sid) {
-                                                if let Some(s) = sessions.get(&id) {
-                                                    s.touch();
-                                                }
+                                                if let Some(s) = sessions.get(&id) { s.touch(); }
                                             }
                                         }
                                     }
-
                                     Ok(MessageType::Data) | Err(_) => {
                                         match packet_handler.handle_udp_packet(data) {
                                             Ok((_sess, DecryptedPayload::Vpn(pkt))) => {
@@ -1664,121 +1250,39 @@ impl Server {
                                                 { let _ = tun.write(&pkt).await; }
                                             }
                                             Err(ref e) if e.is_session_not_found() => {
-                                                // Client is using a stale session key
-                                                // (e.g. after server restart). Send a
-                                                // 1-byte RESET (0xFF) so the client
-                                                // re-handshakes immediately.
-                                                // ⚠️ This packet is NOT encrypted.
-                                                // Clients must validate the accompanying
-                                                // session_id once we add it (TODO: add
-                                                // session_id prefix to prevent spoofing).
                                                 let reset = [0xFFu8];
                                                 let _ = udp_reply.send(&reset, &source.addr).await;
-                                                debug!(
-                                                    src = %source.addr,
-                                                    "[SESSION] Sent RESET to stale client"
-                                                );
+                                                debug!(src = %source.addr, "[SESSION] Sent RESET to stale client");
                                             }
-                                            Err(_) => {
-                                                // Other errors (decryption failure, replay,
-                                                // IP spoofing logged at debug level, etc.)
-                                                // are silently dropped.
-                                            }
+                                            Err(_) => {}
                                             Ok((session, DecryptedPayload::VoiceSignal { discriminant, target_wallet, payload })) => {
-                                                // Voice call signal (disc 31=Offer, 32=Answer, 33=End).
-                                                // Extract target wallet from JSON, look up session,
-                                                // re-encrypt and forward the full payload unchanged.
-                                                let signal_name = match discriminant {
-                                                    31 => "Offer",
-                                                    32 => "Answer",
-                                                    33 => "End",
-                                                    _  => "Unknown",
-                                                };
+                                                let signal_name = match discriminant { 31 => "Offer", 32 => "Answer", 33 => "End", _ => "Unknown" };
                                                 match target_wallet {
-                                                    None => {
-                                                        warn!(
-                                                            src = %session.virtual_ip,
-                                                            disc = discriminant,
-                                                            "[VOICE_SIGNAL] {} — missing 'to' field in payload, dropped",
-                                                            signal_name
-                                                        );
-                                                    }
+                                                    None => { warn!(src = %session.virtual_ip, disc = discriminant, "[VOICE_SIGNAL] {} — missing 'to' field, dropped", signal_name); }
                                                     Some(ref wallet_hex) => {
-                                                        // Decode hex pubkey → [u8; 32]
-                                                        let target_bytes = hex::decode(wallet_hex)
-                                                            .ok()
-                                                            .and_then(|b| {
-                                                                if b.len() == 32 {
-                                                                    let mut arr = [0u8; 32];
-                                                                    arr.copy_from_slice(&b);
-                                                                    Some(arr)
-                                                                } else {
-                                                                    None
-                                                                }
-                                                            });
-
+                                                        let target_bytes = hex::decode(wallet_hex).ok().and_then(|b| {
+                                                            if b.len() == 32 { let mut arr = [0u8; 32]; arr.copy_from_slice(&b); Some(arr) } else { None }
+                                                        });
                                                         match target_bytes {
-                                                            None => {
-                                                                warn!(
-                                                                    wallet = %wallet_hex,
-                                                                    "[VOICE_SIGNAL] {} — invalid pubkey hex, dropped",
-                                                                    signal_name
-                                                                );
-                                                            }
+                                                            None => { warn!(wallet = %wallet_hex, "[VOICE_SIGNAL] {} — invalid pubkey hex, dropped", signal_name); }
                                                             Some(pk) => {
-                                                                // Pass 1: wallet_index O(1)
-                                                                let target = sessions.get_by_wallet(&pk)
-                                                                    .or_else(|| {
-                                                                        // Pass 2: linear scan fallback
-                                                                        sessions.all_sessions()
-                                                                            .into_iter()
-                                                                            .find(|s| s.client_public_key.to_bytes() == pk)
-                                                                    });
-
+                                                                let target = sessions.get_by_wallet(&pk).or_else(|| {
+                                                                    sessions.all_sessions().into_iter().find(|s| s.client_public_key.to_bytes() == pk)
+                                                                });
                                                                 match target {
-                                                                    None => {
-                                                                        debug!(
-                                                                            wallet = %&wallet_hex[..8],
-                                                                            "[VOICE_SIGNAL] {} — target offline, dropped",
-                                                                            signal_name
-                                                                        );
-                                                                    }
+                                                                    None => { debug!(wallet = %&wallet_hex[..8], "[VOICE_SIGNAL] {} — target offline, dropped", signal_name); }
                                                                     Some(target_session) => {
-                                                                        // Re-encrypt with target session key and forward.
                                                                         let counter = target_session.next_tx_counter();
-                                                                        let mut encrypted = vec![
-                                                                            0u8;
-                                                                            payload.len() + aeronyx_core::crypto::transport::ENCRYPTION_OVERHEAD
-                                                                        ];
-                                                                        match crypto.encrypt(
-                                                                            &target_session.session_key,
-                                                                            counter,
-                                                                            target_session.id.as_bytes(),
-                                                                            &payload,
-                                                                            &mut encrypted,
-                                                                        ) {
+                                                                        let mut encrypted = vec![0u8; payload.len() + ENCRYPTION_OVERHEAD];
+                                                                        match crypto.encrypt(&target_session.session_key, counter, target_session.id.as_bytes(), &payload, &mut encrypted) {
                                                                             Ok(len) => {
                                                                                 encrypted.truncate(len);
-                                                                                let pkt = aeronyx_core::protocol::DataPacket::new(
-                                                                                    *target_session.id.as_bytes(),
-                                                                                    counter,
-                                                                                    encrypted,
-                                                                                );
+                                                                                let pkt   = aeronyx_core::protocol::DataPacket::new(*target_session.id.as_bytes(), counter, encrypted);
                                                                                 let bytes = aeronyx_core::protocol::codec::encode_data_packet(&pkt).to_vec();
                                                                                 let _ = udp_reply.send(&bytes, &target_session.client_endpoint).await;
-                                                                                debug!(
-                                                                                    src = %session.virtual_ip,
-                                                                                    dst = %target_session.virtual_ip,
-                                                                                    signal = signal_name,
-                                                                                    "[VOICE_SIGNAL] Forwarded"
-                                                                                );
+                                                                                debug!(src = %session.virtual_ip, dst = %target_session.virtual_ip, signal = signal_name, "[VOICE_SIGNAL] Forwarded");
                                                                             }
-                                                                            Err(e) => {
-                                                                                warn!(
-                                                                                    error = %e,
-                                                                                    "[VOICE_SIGNAL] Re-encrypt failed"
-                                                                                );
-                                                                            }
+                                                                            Err(e) => { warn!(error = %e, "[VOICE_SIGNAL] Re-encrypt failed"); }
                                                                         }
                                                                     }
                                                                 }
@@ -1788,72 +1292,35 @@ impl Server {
                                                 }
                                             }
                                             Ok((session, DecryptedPayload::Voice { dst_ip, payload })) => {
-                                                // ── Voice relay ──────────────────────────────
-                                                // Look up the target session by virtual IP,
-                                                // re-encrypt the payload with the target's
-                                                // session key, and send to their UDP endpoint.
-                                                // The server never inspects the voice content —
-                                                // it is end-to-end encrypted between clients.
                                                 if let Some(target_sid) = routing.lookup(dst_ip) {
                                                     if let Some(target) = sessions.get(&target_sid) {
                                                         let counter = target.next_tx_counter();
-                                                        let mut encrypted =
-                                                            vec![0u8; payload.len() + aeronyx_core::crypto::transport::ENCRYPTION_OVERHEAD];
-                                                        match crypto.encrypt(
-                                                            &target.session_key,
-                                                            counter,
-                                                            target.id.as_bytes(),
-                                                            &payload,
-                                                            &mut encrypted,
-                                                        ) {
+                                                        let mut encrypted = vec![0u8; payload.len() + ENCRYPTION_OVERHEAD];
+                                                        match crypto.encrypt(&target.session_key, counter, target.id.as_bytes(), &payload, &mut encrypted) {
                                                             Ok(len) => {
                                                                 encrypted.truncate(len);
-                                                                let pkt = aeronyx_core::protocol::DataPacket::new(
-                                                                    *target.id.as_bytes(),
-                                                                    counter,
-                                                                    encrypted,
-                                                                );
+                                                                let pkt   = aeronyx_core::protocol::DataPacket::new(*target.id.as_bytes(), counter, encrypted);
                                                                 let bytes = aeronyx_core::protocol::codec::encode_data_packet(&pkt).to_vec();
                                                                 let _ = udp_reply.send(&bytes, &target.client_endpoint).await;
-                                                                trace!(
-                                                                    src = %session.virtual_ip,
-                                                                    dst = %dst_ip,
-                                                                    "[VOICE] Relayed voice packet"
-                                                                );
+                                                                trace!(src = %session.virtual_ip, dst = %dst_ip, "[VOICE] Relayed voice packet");
                                                             }
-                                                            Err(e) => {
-                                                                warn!(
-                                                                    dst_ip = %dst_ip,
-                                                                    "[VOICE] Re-encrypt failed: {}", e
-                                                                );
-                                                            }
+                                                            Err(e) => { warn!(dst_ip = %dst_ip, "[VOICE] Re-encrypt failed: {}", e); }
                                                         }
                                                     } else {
-                                                        debug!(
-                                                            dst_ip = %dst_ip,
-                                                            "[VOICE] Target session not found (disconnected?)"
-                                                        );
+                                                        debug!(dst_ip = %dst_ip, "[VOICE] Target session not found (disconnected?)");
                                                     }
                                                 } else {
-                                                    debug!(
-                                                        dst_ip = %dst_ip,
-                                                        "[VOICE] No route to dst_ip (peer offline)"
-                                                    );
+                                                    debug!(dst_ip = %dst_ip, "[VOICE] No route to dst_ip (peer offline)");
                                                 }
                                             }
-                                            Ok((session, DecryptedPayload::MemChain(msg))) => {                                                if let (Some(ref mp), Some(ref aw)) =
-                                                    (&mempool, &aof_writer)
-                                                {
+                                            Ok((session, DecryptedPayload::MemChain(msg))) => {
+                                                if let (Some(ref mp), Some(ref aw)) = (&mempool, &aof_writer) {
                                                     Self::handle_memchain_message(
-                                                        msg, mp, aw,
-                                                        &storage, &vector_index,
-                                                        &memchain_config,
-                                                        &server_pubkey_hex,
+                                                        msg, mp, aw, &storage, &vector_index,
+                                                        &memchain_config, &server_pubkey_hex,
                                                         &session, &udp_reply, &crypto,
-                                                        &sessions,
-                                                        &chat_relay,
-                                                    )
-                                                    .await;
+                                                        &sessions, &chat_relay,
+                                                    ).await;
                                                 }
                                             }
                                             Err(_) => {}
@@ -1863,9 +1330,7 @@ impl Server {
                                 }
                             }
                             Err(e) => {
-                                if !shutdown.load(Ordering::SeqCst) {
-                                    error!("UDP recv error: {}", e);
-                                }
+                                if !shutdown.load(Ordering::SeqCst) { error!("UDP recv error: {}", e); }
                             }
                         }
                     }
@@ -1875,91 +1340,69 @@ impl Server {
     }
 
     // ============================================
-    // MemChain Message Handler
+    // MemChain Message Handler (unchanged)
     // ============================================
 
     #[allow(clippy::too_many_arguments)]
     async fn handle_memchain_message(
-        msg: MemChainMessage,
-        mempool: &Arc<MemPool>,
-        aof_writer: &Arc<TokioMutex<AofWriter>>,
-        storage: &Option<Arc<MemoryStorage>>,
-        vector_index: &Option<Arc<VectorIndex>>,
-        config: &MemChainConfig,
+        msg:              MemChainMessage,
+        mempool:          &Arc<MemPool>,
+        aof_writer:       &Arc<TokioMutex<AofWriter>>,
+        storage:          &Option<Arc<MemoryStorage>>,
+        vector_index:     &Option<Arc<VectorIndex>>,
+        config:           &MemChainConfig,
         server_pubkey_hex: &str,
-        session: &Arc<crate::services::Session>,
-        udp: &Arc<UdpTransport>,
-        crypto: &DefaultTransportCrypto,
-        sessions: &Arc<SessionManager>,
-        chat_relay: &Option<Arc<ChatRelayService>>,
+        session:          &Arc<crate::services::Session>,
+        udp:              &Arc<UdpTransport>,
+        crypto:           &DefaultTransportCrypto,
+        sessions:         &Arc<SessionManager>,
+        chat_relay:       &Option<Arc<ChatRelayService>>,
     ) {
         match msg {
-            // ── Legacy P2P sync variants (unchanged) ─────────────────────────
-
             MemChainMessage::BroadcastFact(fact) => {
                 let origin_hex = hex::encode(fact.origin);
                 let sig_ok = match IdentityPublicKey::from_bytes(&fact.origin) {
                     Ok(pk) => pk.verify(&fact.fact_id, &fact.signature).is_ok(),
                     Err(_) => false,
                 };
-                if !sig_ok {
-                    warn!("[MEMCHAIN] BroadcastFact sig failed");
-                    return;
-                }
+                if !sig_ok { warn!("[MEMCHAIN] BroadcastFact sig failed"); return; }
                 if !config.is_origin_trusted(&origin_hex, server_pubkey_hex) {
-                    warn!("[MEMCHAIN] BroadcastFact untrusted origin");
-                    return;
+                    warn!("[MEMCHAIN] BroadcastFact untrusted origin"); return;
                 }
                 if mempool.add_fact(fact.clone()) {
                     let mut w = aof_writer.lock().await;
                     let _ = w.append_fact(&fact).await;
                 }
             }
-
             MemChainMessage::BroadcastRecord(record) => {
                 let owner_hex = record.owner_hex();
                 let sig_ok = match IdentityPublicKey::from_bytes(&record.owner) {
                     Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                     Err(_) => false,
                 };
-                if !sig_ok {
-                    warn!(owner = %owner_hex, "[MEMCHAIN] BroadcastRecord sig failed");
-                    return;
-                }
+                if !sig_ok { warn!(owner = %owner_hex, "[MEMCHAIN] BroadcastRecord sig failed"); return; }
                 if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
-                    warn!(owner = %owner_hex, "[MEMCHAIN] BroadcastRecord untrusted owner");
-                    return;
+                    warn!(owner = %owner_hex, "[MEMCHAIN] BroadcastRecord untrusted"); return;
                 }
                 if !record.verify_id() {
-                    warn!(
-                        owner = %owner_hex,
-                        id = hex::encode(record.record_id),
-                        "[MEMCHAIN] BroadcastRecord record_id hash mismatch"
-                    );
-                    return;
+                    warn!(owner = %owner_hex, id = hex::encode(record.record_id), "[MEMCHAIN] record_id hash mismatch"); return;
                 }
                 if let Some(ref st) = storage {
                     if st.insert(&record, "p2p-remote").await {
                         info!(id = hex::encode(record.record_id), "[MEMCHAIN] BroadcastRecord stored");
                         if record.has_embedding() {
                             if let Some(ref vi) = vector_index {
-                                vi.upsert(
-                                    record.record_id, record.embedding.clone(),
-                                    record.layer, record.timestamp,
-                                    &record.owner, "p2p-remote",
-                                );
+                                vi.upsert(record.record_id, record.embedding.clone(), record.layer, record.timestamp, &record.owner, "p2p-remote");
                             }
                         }
                     }
                 }
             }
-
             MemChainMessage::SyncRequest { last_known_hash } => {
                 let facts = mempool.get_facts_after(last_known_hash);
-                let resp = MemChainMessage::SyncResponse { facts };
-                Server::send_to_session(&resp, session, udp, crypto).await;
+                let resp  = MemChainMessage::SyncResponse { facts };
+                Self::send_to_session(&resp, session, udp, crypto).await;
             }
-
             MemChainMessage::SyncResponse { facts } => {
                 for fact in facts {
                     let origin_hex = hex::encode(fact.origin);
@@ -1967,24 +1410,20 @@ impl Server {
                         Ok(pk) => pk.verify(&fact.fact_id, &fact.signature).is_ok(),
                         Err(_) => false,
                     };
-                    if !sig_ok || !config.is_origin_trusted(&origin_hex, server_pubkey_hex) {
-                        continue;
-                    }
+                    if !sig_ok || !config.is_origin_trusted(&origin_hex, server_pubkey_hex) { continue; }
                     if mempool.add_fact(fact.clone()) {
                         let mut w = aof_writer.lock().await;
                         let _ = w.append_fact(&fact).await;
                     }
                 }
             }
-
             MemChainMessage::SyncRecordRequest { owner, after_timestamp } => {
                 if let Some(ref st) = storage {
                     let records = st.query_by_owner_after(&owner, after_timestamp).await;
-                    let resp = MemChainMessage::SyncRecordResponse { records };
-                    Server::send_to_session(&resp, session, udp, crypto).await;
+                    let resp    = MemChainMessage::SyncRecordResponse { records };
+                    Self::send_to_session(&resp, session, udp, crypto).await;
                 }
             }
-
             MemChainMessage::SyncRecordResponse { records } => {
                 if let Some(ref st) = storage {
                     for record in records {
@@ -1993,427 +1432,169 @@ impl Server {
                             Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                             Err(_) => false,
                         };
-                        if !sig_ok {
-                            warn!(owner = %owner_hex, "[MEMCHAIN] SyncRecordResponse sig failed");
-                            continue;
-                        }
-                        if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
-                            continue;
-                        }
+                        if !sig_ok { warn!(owner = %owner_hex, "[MEMCHAIN] SyncRecordResponse sig failed"); continue; }
+                        if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) { continue; }
                         if !record.verify_id() {
-                            warn!(
-                                owner = %owner_hex,
-                                id = hex::encode(record.record_id),
-                                "[MEMCHAIN] SyncRecordResponse record_id hash mismatch"
-                            );
-                            continue;
+                            warn!(owner = %owner_hex, id = hex::encode(record.record_id), "[MEMCHAIN] SyncRecordResponse hash mismatch"); continue;
                         }
                         let _ = st.insert(&record, "p2p-sync").await;
                     }
                 }
             }
-
             MemChainMessage::BlockAnnounce(header) => {
-                info!(
-                    height = header.height,
-                    hash = hex::encode(header.hash()),
-                    "[MEMCHAIN] BlockAnnounce received"
-                );
+                info!(height = header.height, hash = hex::encode(header.hash()), "[MEMCHAIN] BlockAnnounce received");
             }
-
-            // ── v1.1.0-ChatRelay + v1.3.0-Sovereign: ChatRelay ───────────────
-
             MemChainMessage::ChatRelay(envelope) => {
-                // Step 1: validate ChatEnvelope Ed25519 signature (unchanged)
                 if envelope.verify_signature().is_err() {
-                    warn!(
-                        receiver = %hex::encode(&envelope.receiver[..4]),
-                        "[CHAT_RELAY] Envelope signature verification failed — dropped"
-                    );
-                    return;
+                    warn!(receiver = %hex::encode(&envelope.receiver[..4]), "[CHAT_RELAY] Envelope sig failed — dropped"); return;
                 }
-
                 let Some(ref relay) = chat_relay else {
-                    warn!(
-                        receiver = %hex::encode(&envelope.receiver[..4]),
-                        "[CHAT_RELAY] Relay service unavailable — dropped"
-                    );
-                    return;
+                    warn!(receiver = %hex::encode(&envelope.receiver[..4]), "[CHAT_RELAY] Relay unavailable — dropped"); return;
                 };
-
-                // Step 2: dedup check (online path)
                 if relay.is_online_duplicate(&envelope.message_id) {
-                    debug!(
-                        id = %hex::encode(envelope.message_id),
-                        "[CHAT_RELAY] Online duplicate — dropped"
-                    );
-                    return;
+                    debug!(id = %hex::encode(envelope.message_id), "[CHAT_RELAY] Online duplicate — dropped"); return;
                 }
-
-                // Step 3: announce sender to route cache (refreshes last_active)
-                relay.wallet_routes.announce(
-                    &envelope.sender,
-                    session.id.clone(),
-                    session.client_endpoint,
-                );
-
-                let receiver = envelope.receiver;
-
-                // Step 4: lookup receiver in route cache (sovereign routing)
+                relay.wallet_routes.announce(&envelope.sender, session.id.clone(), session.client_endpoint);
+                let receiver      = envelope.receiver;
                 let target_routes = relay.wallet_routes.lookup(&receiver);
 
                 if !target_routes.is_empty() {
-                    // ── Online path: deliver to all active sessions ───────────
-                    let mut all_failed = true;
-                    let device_count = target_routes.len();
-
+                    let mut all_failed  = true;
+                    let device_count    = target_routes.len();
                     for (target_sid, _endpoint) in &target_routes {
-                        // Look up the live Session object so we can encrypt correctly
                         if let Some(target_session) = sessions.get(target_sid) {
-                            Server::send_to_session(
-                                &MemChainMessage::ChatRelay(envelope.clone()),
-                                &target_session,
-                                udp,
-                                crypto,
-                            ).await;
+                            Self::send_to_session(&MemChainMessage::ChatRelay(envelope.clone()), &target_session, udp, crypto).await;
                             all_failed = false;
                         } else {
-                            // Session gone — prune the stale route entry
                             relay.wallet_routes.remove_session(target_sid);
-                            debug!(
-                                session = %target_sid,
-                                "[CHAT_RELAY] Pruned stale route entry during delivery"
-                            );
+                            debug!(session = %target_sid, "[CHAT_RELAY] Pruned stale route during delivery");
                         }
                     }
-
                     if all_failed {
-                        // All sessions were stale — fall back to offline store
                         if let Err(e) = relay.store_pending(&envelope) {
-                            warn!(
-                                error = %e,
-                                receiver = %hex::encode(&receiver[..4]),
-                                "[CHAT_RELAY] Fallback store_pending failed"
-                            );
+                            warn!(error = %e, receiver = %hex::encode(&receiver[..4]), "[CHAT_RELAY] Fallback store_pending failed");
                         } else {
-                            debug!(
-                                receiver = %hex::encode(&receiver[..4]),
-                                "[CHAT_RELAY] All routes stale — stored for offline delivery"
-                            );
+                            debug!(receiver = %hex::encode(&receiver[..4]), "[CHAT_RELAY] All routes stale — stored for offline delivery");
                         }
                     } else {
-                        debug!(
-                            receiver = %hex::encode(&receiver[..4]),
-                            devices = device_count,
-                            "[CHAT_RELAY] Online delivery to {} device(s)", device_count
-                        );
+                        debug!(receiver = %hex::encode(&receiver[..4]), devices = device_count, "[CHAT_RELAY] Online delivery to {} device(s)", device_count);
                     }
                 } else {
-                    // ── Offline path: store for later pull ────────────────────
                     if let Err(e) = relay.store_pending(&envelope) {
-                        warn!(
-                            error = %e,
-                            receiver = %hex::encode(&receiver[..4]),
-                            "[CHAT_RELAY] store_pending failed"
-                        );
+                        warn!(error = %e, receiver = %hex::encode(&receiver[..4]), "[CHAT_RELAY] store_pending failed");
                     } else {
-                        debug!(
-                            receiver = %hex::encode(&receiver[..4]),
-                            id = %hex::encode(envelope.message_id),
-                            "[CHAT_RELAY] Stored for offline delivery"
-                        );
+                        debug!(receiver = %hex::encode(&receiver[..4]), id = %hex::encode(envelope.message_id), "[CHAT_RELAY] Stored for offline delivery");
                     }
                 }
             }
-
-            // ── v1.1.0 + v1.3.0-Sovereign: ChatPull ──────────────────────────
-
-            MemChainMessage::ChatPull {
-                wallet, after_timestamp, cursor, limit,
-                request_timestamp, signature,
-            } => {
+            MemChainMessage::ChatPull { wallet, after_timestamp, cursor, limit, request_timestamp, signature } => {
                 let Some(ref relay) = chat_relay else { return; };
-
-                // Signature input (per spec):
-                // wallet(32) || after_timestamp(8,LE) || cursor(16) || limit(4,LE) || request_timestamp(8,LE)
-                let at_bytes = after_timestamp.to_le_bytes();
+                let at_bytes    = after_timestamp.to_le_bytes();
                 let limit_bytes = limit.to_le_bytes();
-                let rts_bytes = request_timestamp.to_le_bytes();
-
+                let rts_bytes   = request_timestamp.to_le_bytes();
                 let verify_result = verify_signed_message(
                     DOMAIN_CHAT_PULL,
-                    &[
-                        wallet.as_ref(),
-                        at_bytes.as_ref(),
-                        cursor.as_ref(),
-                        limit_bytes.as_ref(),
-                        rts_bytes.as_ref(),
-                    ],
-                    &wallet,
-                    &signature,
-                    request_timestamp,
+                    &[wallet.as_ref(), at_bytes.as_ref(), cursor.as_ref(), limit_bytes.as_ref(), rts_bytes.as_ref()],
+                    &wallet, &signature, request_timestamp,
                 );
-
-                if verify_result.is_err() {
-                    // Silent drop — no feedback to attacker (anti-DoS)
-                    return;
-                }
-
-                // Announce to route cache: client is alive
-                relay.wallet_routes.announce(
-                    &wallet,
-                    session.id.clone(),
-                    session.client_endpoint,
-                );
-
-                // Query by wallet from the signed message (not session key)
+                if verify_result.is_err() { return; }
+                relay.wallet_routes.announce(&wallet, session.id.clone(), session.client_endpoint);
                 match relay.pull_pending(&wallet, after_timestamp, &cursor, limit) {
                     Ok((messages, has_more)) => {
                         let envelopes: Vec<_> = messages.into_iter().map(|m| m.envelope).collect();
                         let resp = MemChainMessage::ChatPullResponse { envelopes, has_more };
-                        Server::send_to_session(&resp, session, udp, crypto).await;
+                        Self::send_to_session(&resp, session, udp, crypto).await;
                     }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            wallet = %hex::encode(&wallet[..4]),
-                            "[CHAT_RELAY] pull_pending failed"
-                        );
-                    }
+                    Err(e) => { warn!(error = %e, wallet = %hex::encode(&wallet[..4]), "[CHAT_RELAY] pull_pending failed"); }
                 }
             }
-
-            // ── v1.1.0 + v1.3.0-Sovereign: ChatAck ───────────────────────────
-
             MemChainMessage::ChatAck { message_ids, wallet, ack_timestamp, signature } => {
                 let Some(ref relay) = chat_relay else { return; };
-
-                if message_ids.is_empty() {
-                    return;
-                }
-
-                // Build SHA-256 of concatenated message_ids (in list order)
-                // ids_hash = SHA256( id[0](16) || id[1](16) || ... )
+                if message_ids.is_empty() { return; }
                 let mut id_hasher = Sha256::new();
-                for mid in &message_ids {
-                    id_hasher.update(mid.as_ref());
-                }
+                for mid in &message_ids { id_hasher.update(mid.as_ref()); }
                 let ids_hash: [u8; 32] = id_hasher.finalize().into();
-
                 let ack_ts_bytes = ack_timestamp.to_le_bytes();
-
                 let verify_result = verify_signed_message(
                     DOMAIN_CHAT_ACK,
-                    &[
-                        wallet.as_ref(),
-                        ack_ts_bytes.as_ref(),
-                        ids_hash.as_ref(),
-                    ],
-                    &wallet,
-                    &signature,
-                    ack_timestamp,
+                    &[wallet.as_ref(), ack_ts_bytes.as_ref(), ids_hash.as_ref()],
+                    &wallet, &signature, ack_timestamp,
                 );
-
                 if let Err(e) = verify_result {
-                    warn!(
-                        wallet = %hex::encode(&wallet[..4]),
-                        error = %e,
-                        "[CHAT_RELAY] ChatAck signature failed"
-                    );
-                    return;
+                    warn!(wallet = %hex::encode(&wallet[..4]), error = %e, "[CHAT_RELAY] ChatAck sig failed"); return;
                 }
-
-                // receiver = wallet — enforced by ack_messages SQL (AND receiver = ?)
                 match relay.ack_messages(&message_ids, &wallet) {
-                    Ok(deleted) => {
-                        debug!(
-                            deleted,
-                            wallet = %hex::encode(&wallet[..4]),
-                            "[CHAT_RELAY] ChatAck processed"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            wallet = %hex::encode(&wallet[..4]),
-                            "[CHAT_RELAY] ack_messages failed"
-                        );
-                    }
+                    Ok(deleted) => { debug!(deleted, wallet = %hex::encode(&wallet[..4]), "[CHAT_RELAY] ChatAck processed"); }
+                    Err(e)      => { warn!(error = %e, wallet = %hex::encode(&wallet[..4]), "[CHAT_RELAY] ack_messages failed"); }
                 }
             }
-
-            // ── v1.3.0-Sovereign: DeviceRegister (with signature) ────────────
-
-            MemChainMessage::DeviceRegister {
-                device_id, device_name, wallet_pubkey, timestamp, signature,
-            } => {
-                // Signature input (per spec):
-                // session_id(16) || device_id(16) || wallet_pubkey(32) || timestamp(8,LE)
+            MemChainMessage::DeviceRegister { device_id, device_name, wallet_pubkey, timestamp, signature } => {
                 let ts_bytes = timestamp.to_le_bytes();
-
                 let verify_result = verify_signed_message(
                     DOMAIN_DEVICE_REGISTER,
-                    &[
-                        session.id.as_bytes().as_ref(),
-                        device_id.as_ref(),
-                        wallet_pubkey.as_ref(),
-                        ts_bytes.as_ref(),
-                    ],
-                    &wallet_pubkey,
-                    &signature,
-                    timestamp,
+                    &[session.id.as_bytes().as_ref(), device_id.as_ref(), wallet_pubkey.as_ref(), ts_bytes.as_ref()],
+                    &wallet_pubkey, &signature, timestamp,
                 );
-
                 if let Err(e) = verify_result {
-                    warn!(
-                        session = %session.id,
-                        wallet = %hex::encode(&wallet_pubkey[..4]),
-                        error = %e,
-                        "[CHAT_RELAY] DeviceRegister signature failed"
-                    );
-                    return;
+                    warn!(session = %session.id, wallet = %hex::encode(&wallet_pubkey[..4]), error = %e, "[CHAT_RELAY] DeviceRegister sig failed"); return;
                 }
-
-                // Truncate device_name at a UTF-8 char boundary if > 64 bytes
                 let name_display = if device_name.len() > 64 {
                     let mut end = 64;
                     while !device_name.is_char_boundary(end) { end -= 1; }
                     &device_name[..end]
-                } else {
-                    &device_name
-                };
-
-                // Announce wallet -> session in route cache
+                } else { &device_name };
                 let Some(ref relay) = chat_relay else { return; };
-                relay.wallet_routes.announce(
-                    &wallet_pubkey,
-                    session.id.clone(),
-                    session.client_endpoint,
-                );
-
-                // Register device in SessionManager
+                relay.wallet_routes.announce(&wallet_pubkey, session.id.clone(), session.client_endpoint);
                 sessions.register_device(&wallet_pubkey, device_id, session.id.clone());
-
-                info!(
-                    session_id = %session.id,
-                    wallet = %hex::encode(&wallet_pubkey[..4]),
-                    device_id = %hex::encode(device_id),
-                    device_name = %name_display,
-                    "[CHAT_RELAY] Device registered (v1.3.0-Sovereign)"
-                );
-
-                // Deliver pending offline messages immediately
+                info!(session_id = %session.id, wallet = %hex::encode(&wallet_pubkey[..4]), device_id = %hex::encode(device_id), device_name = %name_display, "[CHAT_RELAY] Device registered");
                 match relay.pull_pending(&wallet_pubkey, 0, &[0u8; 16], 100) {
                     Ok((messages, _has_more)) if !messages.is_empty() => {
                         let count = messages.len();
                         for pm in messages {
-                            Server::send_to_session(
-                                &MemChainMessage::ChatRelay(pm.envelope),
-                                session,
-                                udp,
-                                crypto,
-                            ).await;
+                            Self::send_to_session(&MemChainMessage::ChatRelay(pm.envelope), session, udp, crypto).await;
                         }
-                        info!(
-                            count,
-                            wallet = %hex::encode(&wallet_pubkey[..4]),
-                            "[CHAT_RELAY] Delivered pending messages on register"
-                        );
+                        info!(count, wallet = %hex::encode(&wallet_pubkey[..4]), "[CHAT_RELAY] Delivered pending messages on register");
                     }
-                    Ok(_) => {} // no pending messages
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            wallet = %hex::encode(&wallet_pubkey[..4]),
-                            "[CHAT_RELAY] pull_pending on register failed"
-                        );
-                    }
+                    Ok(_)  => {}
+                    Err(e) => { warn!(error = %e, wallet = %hex::encode(&wallet_pubkey[..4]), "[CHAT_RELAY] pull_pending on register failed"); }
                 }
             }
-
-            // ── v1.3.0-Sovereign: WalletPresence heartbeat ───────────────────
-
             MemChainMessage::WalletPresence { wallet_pubkey, timestamp, signature } => {
                 let Some(ref relay) = chat_relay else { return; };
-
-                // Signature input:
-                // session_id(16) || wallet_pubkey(32) || timestamp(8,LE)
                 let ts_bytes = timestamp.to_le_bytes();
-
                 let verify_result = verify_signed_message(
                     DOMAIN_WALLET_PRESENCE,
-                    &[
-                        session.id.as_bytes().as_ref(),
-                        wallet_pubkey.as_ref(),
-                        ts_bytes.as_ref(),
-                    ],
-                    &wallet_pubkey,
-                    &signature,
-                    timestamp,
+                    &[session.id.as_bytes().as_ref(), wallet_pubkey.as_ref(), ts_bytes.as_ref()],
+                    &wallet_pubkey, &signature, timestamp,
                 );
-
                 if let Err(e) = verify_result {
-                    // Debug level — this heartbeat fires frequently; warn would be noisy
-                    debug!(
-                        wallet = %hex::encode(&wallet_pubkey[..4]),
-                        error = %e,
-                        "[CHAT_RELAY] WalletPresence signature failed"
-                    );
-                    return;
+                    debug!(wallet = %hex::encode(&wallet_pubkey[..4]), error = %e, "[CHAT_RELAY] WalletPresence sig failed"); return;
                 }
-
-                relay.wallet_routes.announce(
-                    &wallet_pubkey,
-                    session.id.clone(),
-                    session.client_endpoint,
-                );
-
-                debug!(
-                    wallet = %hex::encode(&wallet_pubkey[..4]),
-                    "[CHAT_RELAY] WalletPresence: route refreshed"
-                );
-                // No reply — presence is one-way
+                relay.wallet_routes.announce(&wallet_pubkey, session.id.clone(), session.client_endpoint);
+                debug!(wallet = %hex::encode(&wallet_pubkey[..4]), "[CHAT_RELAY] WalletPresence: route refreshed");
             }
-
-            _ => {
-                debug!("[MEMCHAIN] Unhandled message variant");
-            }
+            _ => { debug!("[MEMCHAIN] Unhandled message variant"); }
         }
     }
 
     async fn send_to_session(
-        msg: &MemChainMessage,
+        msg:     &MemChainMessage,
         session: &Arc<crate::services::Session>,
-        udp: &Arc<UdpTransport>,
-        crypto: &DefaultTransportCrypto,
+        udp:     &Arc<UdpTransport>,
+        crypto:  &DefaultTransportCrypto,
     ) {
         let plaintext = match encode_memchain(msg) {
-            Ok(p) => p,
-            Err(e) => {
-                error!("[MEMCHAIN_TX] Encode: {}", e);
-                return;
-            }
+            Ok(p)  => p,
+            Err(e) => { error!("[MEMCHAIN_TX] Encode: {}", e); return; }
         };
-
-        let counter = session.next_tx_counter();
+        let counter       = session.next_tx_counter();
         let mut encrypted = vec![0u8; plaintext.len() + ENCRYPTION_OVERHEAD];
-
-        let len = match crypto.encrypt(
-            &session.session_key,
-            counter,
-            session.id.as_bytes(),
-            &plaintext,
-            &mut encrypted,
-        ) {
-            Ok(l) => l,
-            Err(e) => {
-                error!("[MEMCHAIN_TX] Encrypt: {}", e);
-                return;
-            }
+        let len = match crypto.encrypt(&session.session_key, counter, session.id.as_bytes(), &plaintext, &mut encrypted) {
+            Ok(l)  => l,
+            Err(e) => { error!("[MEMCHAIN_TX] Encrypt: {}", e); return; }
         };
         encrypted.truncate(len);
-
-        let pkt = DataPacket::new(*session.id.as_bytes(), counter, encrypted);
+        let pkt   = DataPacket::new(*session.id.as_bytes(), counter, encrypted);
         let bytes = encode_data_packet(&pkt).to_vec();
         let _ = udp.send(&bytes, &session.client_endpoint).await;
     }
@@ -2425,12 +1606,12 @@ impl Server {
     #[cfg(target_os = "linux")]
     fn spawn_tun_task(
         &self,
-        tun: Arc<LinuxTun>,
-        udp: Arc<UdpTransport>,
+        tun:     Arc<LinuxTun>,
+        udp:     Arc<UdpTransport>,
         handler: Arc<PacketHandler>,
     ) -> JoinHandle<()> {
-        let shutdown = Arc::clone(&self.shutdown);
-        let mut rx = self.shutdown_tx.subscribe();
+        let shutdown    = Arc::clone(&self.shutdown);
+        let mut rx      = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             loop {
@@ -2444,11 +1625,7 @@ impl Server {
                                     let _ = udp.send(&enc, &ep).await;
                                 }
                             }
-                            Err(e) => {
-                                if !shutdown.load(Ordering::SeqCst) {
-                                    error!("TUN: {}", e);
-                                }
-                            }
+                            Err(e) => { if !shutdown.load(Ordering::SeqCst) { error!("TUN: {}", e); } }
                         }
                     }
                 }
@@ -2457,78 +1634,36 @@ impl Server {
     }
 
     // ============================================
-    // Traffic Snapshot Task (v1.0.0-TrafficAccounting)
+    // Traffic Snapshot Task
     // ============================================
 
-    /// Periodic traffic snapshot task — fires every 5 minutes.
-    ///
-    /// Iterates all active sessions and sends a `SessionTrafficSnapshot`
-    /// event for each one containing cumulative bytes_in / bytes_out since
-    /// session start. This gives aeronyx.network visibility into long-lived
-    /// sessions without waiting for disconnect.
-    ///
-    /// ## Design decisions
-    /// - Interval: 5 minutes (300 s). Short enough for reasonable billing
-    ///   granularity; long enough to avoid spamming the CMS API.
-    /// - Values: cumulative totals, not deltas. Makes reports idempotent
-    ///   if re-sent after a network error.
-    /// - Sessions with zero traffic (bytes_in == 0 && bytes_out == 0) are
-    ///   skipped — they have nothing meaningful to report yet.
-    /// - No wallet = session not yet registered via DeviceRegister. Still
-    ///   reported with wallet = None so the backend can match by session_id.
     fn spawn_traffic_snapshot_task(
         &self,
         sessions: Arc<SessionManager>,
-        events: SessionEventSender,
+        events:   SessionEventSender,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
-        let mut rx = self.shutdown_tx.subscribe();
-
+        let mut rx   = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
-            // Offset by 60 s so the first snapshot fires after sessions have
-            // had time to accumulate some traffic (avoids sending zero-byte
-            // snapshots immediately after server start).
             tokio::time::sleep(Duration::from_secs(60)).await;
-
             let mut timer = tokio::time::interval(Duration::from_secs(300));
-
             loop {
                 tokio::select! {
                     _ = rx.recv() => break,
                     _ = timer.tick() => {
                         if shutdown.load(Ordering::SeqCst) { break; }
-
-                        let all = sessions.all_sessions();
+                        let all      = sessions.all_sessions();
                         let mut reported = 0usize;
-
                         for session in all {
                             let snap = session.stats.snapshot();
-
-                            // Skip sessions with no traffic yet.
-                            if snap.bytes_rx == 0 && snap.bytes_tx == 0 {
-                                continue;
-                            }
-
-                            let wallet_hex = hex::encode(
-                                session.client_public_key.to_bytes()
-                            );
-                            let sid = BASE64.encode(session.id.as_bytes());
-
-                            events.session_traffic_snapshot(
-                                &sid,
-                                Some(wallet_hex),
-                                snap.bytes_rx,
-                                snap.bytes_tx,
-                            );
+                            if snap.bytes_rx == 0 && snap.bytes_tx == 0 { continue; }
+                            let wallet_hex = session.wallet_hex.clone();
+                            let sid        = BASE64.encode(session.id.as_bytes());
+                            events.session_traffic_snapshot(&sid, Some(wallet_hex), snap.bytes_rx, snap.bytes_tx);
                             reported += 1;
                         }
-
                         if reported > 0 {
-                            debug!(
-                                sessions = reported,
-                                "[TRAFFIC_SNAPSHOT] Sent snapshots for {} active session(s)",
-                                reported
-                            );
+                            debug!(sessions = reported, "[TRAFFIC_SNAPSHOT] Sent snapshots for {} active session(s)", reported);
                         }
                     }
                 }
@@ -2540,39 +1675,17 @@ impl Server {
     // Cleanup Task
     // ============================================
 
-    /// Periodic session expiry sweep (every 60 seconds).
-    ///
-    /// ## v1.0.0-Voice+SessionFix
-    /// `cleanup_expired()` now returns a 5-tuple:
-    ///   `(SessionId, Ipv4Addr, wallet_hex, bytes_rx, bytes_tx)`
-    ///
-    /// The wallet and traffic fields are forwarded to `session_ended()` so
-    /// that aeronyx.network receives accurate billing data. Previously,
-    /// passing `None` and `0` caused a 400 Bad Request:
-    ///   `{"error":{"client_wallet":["This field is required."]}}`
-    ///
-    /// ## IP Cooldown (Security fix)
-    /// Virtual IPs are no longer returned to the IP pool immediately on
-    /// session expiry. Instead:
-    ///   1. `cleanup_expired()` stages each released IP into `sessions.cooldown_pool`.
-    ///   2. Each cleanup tick calls `sessions.drain_cooldown_pool()` to collect
-    ///      IPs whose 30-second cooldown has elapsed.
-    ///   3. Only those cooled-down IPs are returned to `ip_pool` via `release()`.
-    ///
-    /// This prevents stale voice packets (addressed to a just-expired virtual IP)
-    /// from being delivered to a new session that was immediately assigned the
-    /// same address.
     fn spawn_cleanup_task(
         &self,
-        sessions: Arc<SessionManager>,
-        ip_pool: Arc<IpPoolService>,
-        routing: Arc<RoutingService>,
-        events: SessionEventSender,
-        // 🌟 v1.3.0-Sovereign: notify wallet route cache on session expiry
-        chat_relay: Option<Arc<ChatRelayService>>,
+        sessions:         Arc<SessionManager>,
+        ip_pool:          Arc<IpPoolService>,
+        routing:          Arc<RoutingService>,
+        events:           SessionEventSender,
+        chat_relay:       Option<Arc<ChatRelayService>>,
+        traffic_tracker:  Arc<TrafficTracker>,    // v1.0.0-Membership
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
-        let mut rx = self.shutdown_tx.subscribe();
+        let mut rx   = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(Duration::from_secs(60));
             loop {
@@ -2581,25 +1694,16 @@ impl Server {
                     _ = timer.tick() => {
                         if shutdown.load(Ordering::SeqCst) { break; }
 
-                        // ── Step 1: expire sessions, stage IPs into cooldown pool ──
-                        // cleanup_expired() calls sessions.cooldown_pool.insert(ip)
-                        // internally; we only handle routing + event reporting here.
                         for (sid, vip, wallet, bytes_rx, bytes_tx) in sessions.cleanup_expired() {
-                            // Remove routing entry immediately — no new packets
-                            // should be forwarded to this session.
                             routing.remove_route(vip);
-                            // Report session end with real wallet + traffic data.
-                            events.session_ended(&sid.to_string(), Some(wallet), bytes_rx, bytes_tx);
-                            // 🌟 v1.3.0-Sovereign: prune stale wallet route entries
+                            events.session_ended(&sid.to_string(), Some(wallet.clone()), bytes_rx, bytes_tx);
                             if let Some(ref relay) = chat_relay {
                                 relay.wallet_routes.remove_session(&sid);
                             }
+                            // v1.0.0-Membership: remove tracker entry for this wallet.
+                            traffic_tracker.remove_wallet(&wallet);
                         }
 
-                        // ── Step 2: return cooled-down IPs to the pool ─────────────
-                        // IPs that completed their 30-second cooldown window are now
-                        // safe for reassignment. IPs still within the window remain
-                        // in cooldown_pool and will be checked again next tick.
                         for ip in sessions.drain_cooldown_pool() {
                             ip_pool.release(ip);
                         }
@@ -2614,9 +1718,7 @@ impl Server {
     // ============================================
 
     async fn wait_for_shutdown(&self) {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Ctrl+C listener failed");
+        tokio::signal::ctrl_c().await.expect("Ctrl+C listener failed");
         info!("Shutdown signal received");
     }
 
@@ -2630,8 +1732,8 @@ impl std::fmt::Debug for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Server")
             .field("listen", &self.config.listen_addr())
-            .field("tun", &self.config.device_name())
-            .field("mode", &self.config.memchain.mode)
+            .field("tun",    &self.config.device_name())
+            .field("mode",   &self.config.memchain.mode)
             .finish()
     }
 }
