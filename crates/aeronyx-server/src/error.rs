@@ -1,14 +1,23 @@
 // ============================================
 // File: crates/aeronyx-server/src/error.rs
 // ============================================
-//! # Server Error Types
-//!
-//! ## Last Modified
-//! v0.1.2 - Fixed: InvalidPacket source field renamed to avoid thiserror issue
-//! v1.0.0-Voice+SessionFix - Added `is_session_not_found()` helper method.
-//!   Used by `server.rs::spawn_udp_task` to detect stale-session packets and
-//!   send a 0xFF RESET signal so clients re-handshake immediately instead of
-//!   silently retrying with an invalid session key.
+// Version: 1.0.0-Membership
+//
+// Modification Reason:
+//   Added WalletDenied variant for deny list rejection at handshake time.
+//   Called by HandshakeService::process() when a wallet is on the deny list.
+//   Caller (server.rs UDP task) treats this the same as any other handshake
+//   error — sends 0xFF RESET to the client.
+//
+// What changed:
+//   - Added WalletDenied { reason: String } variant
+//   - Added is_wallet_denied() helper method
+//
+// Last Modified:
+//   v0.1.2               - InvalidPacket source field rename
+//   v1.0.0-Voice+SessionFix - is_session_not_found() helper
+//   v1.0.0-Membership    - WalletDenied variant + is_wallet_denied()
+// ============================================
 
 use std::net::SocketAddr;
 
@@ -88,6 +97,19 @@ pub enum ServerError {
         message: String,
     },
 
+    // ── v1.0.0-Membership ────────────────────────────────────────────────
+    /// Wallet is on the deny list — handshake rejected immediately.
+    ///
+    /// Reasons:
+    ///   - "no_premium_access": tier cannot access this premium node
+    ///   - "quota_exceeded": Free tier monthly traffic quota exhausted
+    ///
+    /// Caller sends 0xFF RESET; client will back off and retry later.
+    #[error("Wallet denied: {reason}")]
+    WalletDenied {
+        reason: String,
+    },
+
     #[error(transparent)]
     Common(#[from] CommonError),
 
@@ -103,54 +125,46 @@ pub enum ServerError {
 
 impl ServerError {
     pub fn config_load(path: impl Into<String>, reason: impl Into<String>) -> Self {
-        Self::ConfigLoad {
-            path: path.into(),
-            reason: reason.into(),
-        }
+        Self::ConfigLoad { path: path.into(), reason: reason.into() }
     }
 
     pub fn config_invalid(field: impl Into<String>, reason: impl Into<String>) -> Self {
-        Self::ConfigInvalid {
-            field: field.into(),
-            reason: reason.into(),
-        }
+        Self::ConfigInvalid { field: field.into(), reason: reason.into() }
     }
 
     pub fn session_creation_failed(reason: impl Into<String>) -> Self {
-        Self::SessionCreationFailed {
-            reason: reason.into(),
-        }
+        Self::SessionCreationFailed { reason: reason.into() }
     }
 
     pub fn invalid_packet(source: SocketAddr, reason: impl Into<String>) -> Self {
-        Self::InvalidPacket {
-            from_addr: source.to_string(),
-            reason: reason.into(),
-        }
+        Self::InvalidPacket { from_addr: source.to_string(), reason: reason.into() }
     }
 
     pub fn startup_failed(reason: impl Into<String>) -> Self {
-        Self::StartupFailed {
-            reason: reason.into(),
-        }
+        Self::StartupFailed { reason: reason.into() }
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
-        Self::Internal {
-            message: message.into(),
-        }
+        Self::Internal { message: message.into() }
     }
 
-    /// Returns `true` if this error indicates the requested session does not
+    /// Returns true if this error indicates the requested session does not
     /// exist in the session manager.
     ///
-    /// Used by `server.rs::spawn_udp_task` to detect packets from clients
+    /// Used by server.rs::spawn_udp_task to detect packets from clients
     /// that are using a stale session key (e.g. after a server restart).
-    /// When detected, the server sends a 0xFF RESET byte to the client so
-    /// it re-handshakes immediately instead of retrying indefinitely.
     #[must_use]
     pub fn is_session_not_found(&self) -> bool {
         matches!(self, Self::SessionNotFound(_))
+    }
+
+    /// Returns true if this error indicates a wallet was rejected by the
+    /// deny list check in HandshakeService::process().
+    ///
+    /// Caller should send 0xFF RESET — same as other handshake errors.
+    #[must_use]
+    pub fn is_wallet_denied(&self) -> bool {
+        matches!(self, Self::WalletDenied { .. })
     }
 
     #[must_use]
@@ -195,8 +209,8 @@ impl ServerError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Transport(e) => e.is_retryable(),
-            Self::IpPoolExhausted => true,
+            Self::Transport(e)              => e.is_retryable(),
+            Self::IpPoolExhausted           => true,
             Self::SessionLimitReached { .. } => true,
             _ => false,
         }
@@ -220,7 +234,6 @@ mod tests {
         assert!(config_err.is_fatal());
     }
 
-    /// v1.0.0-Voice+SessionFix: verify is_session_not_found() works correctly.
     #[test]
     fn test_is_session_not_found() {
         let sid = aeronyx_common::types::SessionId::generate();
@@ -235,5 +248,15 @@ mod tests {
             "test",
         );
         assert!(!invalid_pkt.is_session_not_found());
+    }
+
+    #[test]
+    fn test_is_wallet_denied() {
+        let err = ServerError::WalletDenied { reason: "quota_exceeded".to_string() };
+        assert!(err.is_wallet_denied());
+        assert!(!err.is_session_not_found());
+
+        let other = ServerError::startup_failed("test");
+        assert!(!other.is_wallet_denied());
     }
 }
