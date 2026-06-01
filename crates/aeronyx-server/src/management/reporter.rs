@@ -49,6 +49,7 @@ use super::models::{Command, SessionEventReport, SessionEventType};
 use crate::services::AgentManager;
 use crate::services::SessionManager;
 use crate::services::traffic_tracker::TrafficTracker;
+use aeronyx_transport::traits::Transport;
 
 // ============================================
 // Constants
