@@ -184,6 +184,7 @@ impl HeartbeatReporter {
             sessions:           None,
             traffic:            None,
             udp:                None,
+            deny_list:          None,   // ← add this line
             node_tier:        Arc::new(RwLock::new("public".to_string())),
             user_permissions: Arc::new(RwLock::new(HashMap::new())),
         }
