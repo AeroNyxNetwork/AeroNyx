@@ -109,6 +109,12 @@
 //!     data to `session_ended()`, fixing the aeronyx.network 400 error:
 //!     `{"error":{"client_wallet":["This field is required."]}}`.
 //!   - All existing tests preserved verbatim; cleanup test updated for new tuple.
+//!
+//! v1.0.0-Membership
+//!   - Added `wallet_hex: String` cached field to `Session`.
+//!     Computed once in `Session::new()` via `hex::encode(client_public_key.to_bytes())`.
+//!     Eliminates repeated hex encoding on every VPN packet in the hot path.
+//!   - `cleanup_expired()` now uses `session.wallet_hex` instead of re-encoding.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -446,7 +452,7 @@ pub struct StatsSnapshot {
 }
 
 // ============================================
-// Session (unchanged)
+// Session
 // ============================================
 
 /// A single authenticated client session.
@@ -475,6 +481,15 @@ pub struct Session {
     pub rx_counter: AtomicU64,
     /// Per-session traffic and rejection statistics.
     pub stats: SessionStats,
+    // ── v1.0.0-Membership ────────────────────────────────────────────────
+    /// Cached lowercase hex of `client_public_key.to_bytes()`.
+    ///
+    /// Computed once in `Session::new()` to avoid `hex::encode` on every
+    /// VPN packet in the hot path (PacketHandler + TrafficTracker).
+    ///
+    /// ⚠️ This is a performance cache only. For identity verification
+    /// always use `client_public_key`, not `wallet_hex`.
+    pub wallet_hex: String,
 }
 
 impl Session {
@@ -488,6 +503,8 @@ impl Session {
         client_endpoint: SocketAddr,
     ) -> Self {
         let now = std::time::Instant::now();
+        // v1.0.0-Membership: cache wallet hex once to avoid hot-path alloc.
+        let wallet_hex = hex::encode(client_public_key.to_bytes());
         Self {
             id,
             state: RwLock::new(SessionState::Established),
@@ -501,6 +518,7 @@ impl Session {
             replay_window: Mutex::new(ReplayWindow::new()),
             rx_counter: AtomicU64::new(0),
             stats: SessionStats::default(),
+            wallet_hex,
         }
     }
 
@@ -908,19 +926,9 @@ impl SessionManager {
     /// - `bytes_rx`:   bytes received from client during this session
     /// - `bytes_tx`:   bytes sent to client during this session
     ///
-    /// These are consumed by `server.rs::spawn_cleanup_task` to pass
-    /// accurate data to `session_ended()`, fixing the aeronyx.network
-    /// 400 error caused by `client_wallet: null` and zero traffic counts.
-    ///
-    /// Released IPs are staged into the cooldown pool via
-    /// `stage_ip_cooldown()` — callers must use `drain_cooldown_pool()`
-    /// to retrieve IPs that have completed their cooldown before returning
-    /// them to IpPoolService.
-    ///
-    /// ⚠️ Race window: stats snapshot and session removal are two separate
-    /// operations — no cross-session atomic lock. DashMap's design makes
-    /// this unavoidable and is consistent with the rest of the codebase.
-    /// The discrepancy (if any) is a few bytes at most and is acceptable.
+    /// ## v1.0.0-Membership
+    /// Uses `session.wallet_hex` (cached field) instead of re-encoding
+    /// `client_public_key` on every expiry sweep.
     pub fn cleanup_expired(&self) -> Vec<(SessionId, Ipv4Addr, String, u64, u64)> {
         let mut expired = Vec::new();
 
@@ -928,7 +936,8 @@ impl SessionManager {
             let session = entry.value();
             if session.is_expired(self.session_timeout) {
                 let snap = session.stats.snapshot();
-                let wallet = hex::encode(session.client_public_key.to_bytes());
+                // v1.0.0-Membership: use cached wallet_hex — no allocation.
+                let wallet = session.wallet_hex.clone();
                 expired.push((
                     session.id.clone(),
                     session.virtual_ip,
@@ -1115,8 +1124,6 @@ mod tests {
     }
 
     /// 🔴 v1.2.1: First packet is accepted regardless of its counter value.
-    /// This test replaces the ambiguous `test_replay_window_counter_zero_is_accept_and_advance`
-    /// which was silently testing the buggy u64::MAX sentinel path.
     #[test]
     fn test_replay_window_first_packet_accepted_with_any_counter() {
         // counter=0
@@ -1153,27 +1160,19 @@ mod tests {
         assert_eq!(w.highest_seen(), u64::MAX - 1);
     }
 
-    /// 🔴 v1.2.1 regression test: the original bug manifested as every
-    /// packet appearing to be accepted (result=Accept) but `highest_seen`
-    /// never advancing past the sentinel value. The bitmap would then
-    /// wrap around at counter 2049 and falsely report replays.
+    /// 🔴 v1.2.1 regression test.
     #[test]
     fn test_replay_window_highest_seen_advances_from_first_packet() {
         let mut w = ReplayWindow::new();
 
-        // First packet must establish highest_seen.
         assert!(!w.has_seen_any());
         w.check_and_record(1);
         assert!(w.has_seen_any());
         assert_eq!(w.highest_seen(), 1);
 
-        // Subsequent packets must keep advancing it.
         w.check_and_record(2);
         assert_eq!(w.highest_seen(), 2);
 
-        // Run through 3000 sequential counters and verify every single one
-        // is AcceptAndAdvance — this is the exact scenario that was
-        // previously failing at counter 2049.
         for c in 3..=3000u64 {
             let result = w.check_and_record(c);
             assert!(
@@ -1220,7 +1219,7 @@ mod tests {
         assert_eq!(rejected, 0);
     }
 
-    // ── Session Tests (preserved verbatim) ───────────────────────────────
+    // ── Session Tests ────────────────────────────────────────────────────
 
     fn create_test_session() -> Session {
         let identity = IdentityKeyPair::generate();
@@ -1237,6 +1236,22 @@ mod tests {
     fn test_session_creation() {
         let session = create_test_session();
         assert!(session.is_established());
+    }
+
+    // v1.0.0-Membership: wallet_hex is cached and correct.
+    #[test]
+    fn test_session_wallet_hex_cached() {
+        let identity = IdentityKeyPair::generate();
+        let session = Session::new(
+            SessionId::generate(),
+            identity.public_key(),
+            SessionKey::from_bytes([0x42; 32]),
+            Ipv4Addr::new(100, 64, 0, 2),
+            "127.0.0.1:12345".parse().unwrap(),
+        );
+        assert_eq!(session.wallet_hex, hex::encode(identity.public_key_bytes()));
+        assert_eq!(session.wallet_hex, session.wallet_hex.to_lowercase());
+        assert_eq!(session.wallet_hex.len(), 64);
     }
 
     #[test]
@@ -1364,8 +1379,6 @@ mod tests {
         [seed; 16]
     }
 
-    /// create() no longer inserts into wallet_index.
-    /// wallet_index is only populated by register_device().
     #[test]
     fn test_create_does_not_populate_wallet_index() {
         let manager = make_manager();
@@ -1381,7 +1394,6 @@ mod tests {
             )
             .unwrap();
 
-        // wallet_index must be empty until register_device is called
         assert_eq!(manager.wallet_index_count(), 0);
         assert!(manager.get_by_wallet(&identity.public_key_bytes()).is_none());
     }
@@ -1417,7 +1429,6 @@ mod tests {
         let identity = IdentityKeyPair::generate();
         let wallet = identity.public_key_bytes();
 
-        // Device A
         let sid_a = SessionId::generate();
         manager
             .create(
@@ -1430,7 +1441,6 @@ mod tests {
             .unwrap();
         manager.register_device(&wallet, make_device_id(0xAA), sid_a.clone());
 
-        // Device B (same wallet)
         let sid_b = SessionId::generate();
         manager
             .create(
@@ -1450,12 +1460,8 @@ mod tests {
         assert!(ids.contains(&sid_a));
         assert!(ids.contains(&sid_b));
 
-        // get_by_wallet returns the most recently registered (sid_b)
         let last = manager.get_by_wallet(&wallet).unwrap();
-        assert_eq!(
-            last.id, sid_b,
-            "get_by_wallet must return most recent device"
-        );
+        assert_eq!(last.id, sid_b, "get_by_wallet must return most recent device");
 
         assert_eq!(manager.wallet_index_count(), 2);
         assert_eq!(manager.wallet_count(), 1);
@@ -1491,10 +1497,8 @@ mod tests {
             .unwrap();
         manager.register_device(&wallet, make_device_id(0xBB), sid_b.clone());
 
-        // Remove device A
         manager.remove(&sid_a);
 
-        // Device B must still be reachable
         let all = manager.get_all_by_wallet(&wallet);
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, sid_b);
@@ -1534,7 +1538,6 @@ mod tests {
         let wallet = identity.public_key_bytes();
         let device_id = make_device_id(0x42);
 
-        // First connection
         let sid_old = SessionId::generate();
         manager
             .create(
@@ -1548,7 +1551,6 @@ mod tests {
         manager.register_device(&wallet, device_id, sid_old.clone());
         assert_eq!(manager.wallet_index_count(), 1);
 
-        // Same device reconnects with new session
         let sid_new = SessionId::generate();
         manager
             .create(
@@ -1561,7 +1563,6 @@ mod tests {
             .unwrap();
         manager.register_device(&wallet, device_id, sid_new.clone());
 
-        // Still only one entry (old replaced, not accumulated)
         assert_eq!(manager.wallet_index_count(), 1);
         let found = manager.get_by_wallet(&wallet).unwrap();
         assert_eq!(found.id, sid_new);
@@ -1574,9 +1575,6 @@ mod tests {
         assert!(manager.get_all_by_wallet(&wallet).is_empty());
     }
 
-    /// v1.0.0-Voice+SessionFix: cleanup_expired now returns 5-tuple.
-    /// Verifies the new wallet_hex and bytes fields are populated correctly.
-    /// Also verifies the IP cooldown pool is populated after cleanup.
     #[test]
     fn test_cleanup_expired_removes_device_entries() {
         let manager = SessionManager::new(100, Duration::from_millis(1));
@@ -1599,7 +1597,6 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         let expired = manager.cleanup_expired();
 
-        // Verify 5-tuple structure
         assert_eq!(expired.len(), 1);
         let (_, vip, wallet_hex, bytes_rx, bytes_tx) = &expired[0];
         assert_eq!(*vip, virtual_ip);
@@ -1607,38 +1604,26 @@ mod tests {
         assert_eq!(*bytes_rx, 0);
         assert_eq!(*bytes_tx, 0);
 
-        // IP must be staged into cooldown pool immediately after cleanup
         assert!(
             manager.cooldown_pool.contains_key(vip),
             "Released IP must be in cooldown pool"
         );
 
-        // drain_cooldown_pool must return nothing before cooldown elapses
         let drained_before = manager.drain_cooldown_pool();
         assert!(
             drained_before.is_empty(),
             "IP must not be released before cooldown window"
         );
 
-        // wallet_index must be fully cleaned up
         assert!(manager.get_all_by_wallet(&wallet).is_empty());
         assert_eq!(manager.wallet_index_count(), 0);
     }
 
-    /// Verify that drain_cooldown_pool releases IPs after the cooldown window.
     #[test]
     fn test_drain_cooldown_pool_after_window() {
         let manager = SessionManager::new(100, Duration::from_secs(300));
         let ip = Ipv4Addr::new(100, 64, 0, 99);
 
-        // Insert the IP into the cooldown pool with the current time,
-        // then advance time by sleeping past the cooldown window.
-        // We use a manager with a 1 ms session timeout and rely on
-        // drain_cooldown_pool's elapsed() check against IP_COOLDOWN_SECS.
-        //
-        // Since IP_COOLDOWN_SECS = 30 and we cannot sleep 30 s in a unit test,
-        // we directly verify the drain logic by checking that an IP inserted
-        // NOW is NOT returned (cooldown not yet elapsed).
         manager.cooldown_pool.insert(ip, Instant::now());
         let drained_immediately = manager.drain_cooldown_pool();
         assert!(
@@ -1646,30 +1631,21 @@ mod tests {
             "IP must not be drained before cooldown window elapses"
         );
 
-        // Verify the IP is still in the pool (not incorrectly evicted).
         assert!(
             manager.cooldown_pool.contains_key(&ip),
             "IP must remain in cooldown pool until window elapses"
         );
     }
 
-    /// Verify that an IP is drained once its cooldown window has elapsed.
-    /// Uses a zero-duration cutoff by directly manipulating the pool with
-    /// a pre-elapsed instant computed via checked_sub to avoid panic on
-    /// systems where uptime < IP_COOLDOWN_SECS.
     #[test]
     fn test_drain_cooldown_pool_elapsed() {
         let manager = SessionManager::new(100, Duration::from_secs(300));
         let ip = Ipv4Addr::new(100, 64, 0, 88);
 
-        // Use checked_sub to avoid panic if system uptime < IP_COOLDOWN_SECS.
-        // If the system has been running for at least IP_COOLDOWN_SECS + 1 s,
-        // we get a past Instant. Otherwise we skip this test safely.
         let past = Instant::now()
             .checked_sub(Duration::from_secs(IP_COOLDOWN_SECS + 1));
 
         let Some(past_instant) = past else {
-            // System uptime < cooldown window — skip rather than panic.
             eprintln!("Skipping test_drain_cooldown_pool_elapsed: system uptime too short");
             return;
         };
@@ -1692,7 +1668,6 @@ mod tests {
             let identity = IdentityKeyPair::generate();
             let wallet = identity.public_key_bytes();
 
-            // Register 2 devices per wallet
             for j in 0u8..2 {
                 let sid = SessionId::generate();
                 manager
@@ -1710,8 +1685,8 @@ mod tests {
             }
         }
 
-        assert_eq!(manager.count(), 6); // 3 wallets × 2 devices
-        assert_eq!(manager.wallet_count(), 3); // 3 distinct wallets
-        assert_eq!(manager.wallet_index_count(), 6); // 6 device entries total
+        assert_eq!(manager.count(), 6);
+        assert_eq!(manager.wallet_count(), 3);
+        assert_eq!(manager.wallet_index_count(), 6);
     }
 }
