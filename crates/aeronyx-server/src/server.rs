@@ -98,6 +98,7 @@ use crate::services::chat_relay::{ChatRelayService, derive_node_secret};
 use crate::services::{HandshakeService, IpPoolService, RoutingService, SessionManager};
 // v1.0.0-Membership
 use crate::services::traffic_tracker::TrafficTracker;
+use crate::services::deny_list::DenyList;
 
 // ============================================
 // Constants
@@ -148,13 +149,6 @@ impl Server {
 
         let (ip_pool, sessions, routing) = self.init_services()?;
 
-        let handshake_service = Arc::new(HandshakeService::new(
-            self.identity.clone(),
-            Arc::clone(&ip_pool),
-            Arc::clone(&sessions),
-            Arc::clone(&routing),
-        ));
-
         let (storage, vector_index, mempool, aof_writer) = if self.config.memchain.is_enabled() {
             let (st, vi, mp, aw) = self.init_memchain().await?;
             (Some(st), Some(vi), Some(mp), Some(aw))
@@ -200,11 +194,22 @@ impl Server {
         // PacketHandler AND before init_management_reporter so both
         // can receive the same Arc.
         let traffic_tracker = Arc::new(TrafficTracker::new());
+        // v1.0.0-Membership: DenyList shared between HandshakeService
+        // (read: reject denied wallets) and HeartbeatReporter (write: add/remove entries).
+        let deny_list = Arc::new(DenyList::new());
 
         let packet_handler = Arc::new(PacketHandler::new(
             Arc::clone(&sessions),
             Arc::clone(&routing),
             Arc::clone(&traffic_tracker),
+        ));
+
+        let handshake_service = Arc::new(HandshakeService::new(
+            self.identity.clone(),
+            Arc::clone(&ip_pool),
+            Arc::clone(&sessions),
+            Arc::clone(&routing),
+            Arc::clone(&deny_list),
         ));
 
         // init_management_reporter needs udp + traffic_tracker,
@@ -213,6 +218,7 @@ impl Server {
             &sessions,
             Arc::clone(&udp),
             Arc::clone(&traffic_tracker),
+            Arc::clone(&deny_list),
         ).await;
 
         let udp_task = self.spawn_udp_task(
@@ -250,7 +256,8 @@ impl Server {
             Arc::clone(&routing),
             session_event_sender.clone(),
             chat_relay.clone(),
-            Arc::clone(&traffic_tracker),   // v1.0.0-Membership
+            Arc::clone(&traffic_tracker),
+            Arc::clone(&deny_list),
         );
         tasks.push(("cleanup", cleanup_task));
 
@@ -1002,6 +1009,7 @@ impl Server {
         sessions:        &Arc<SessionManager>,
         udp:             Arc<UdpTransport>,
         traffic_tracker: Arc<TrafficTracker>,
+        deny_list:       Arc<DenyList>,
     ) -> SessionEventSender {
         info!("Initializing management reporting...");
 
@@ -1061,7 +1069,8 @@ impl Server {
                 .with_agent_manager(Arc::clone(&agent_manager))
                 .with_sessions(Arc::clone(sessions))
                 .with_traffic_tracker(Arc::clone(&traffic_tracker))
-                .with_udp(Arc::clone(&udp));
+                .with_udp(Arc::clone(&udp))
+                .with_deny_list(Arc::clone(&deny_list));
 
         if let Some(f) = memchain_status_fn {
             heartbeat = heartbeat.with_memchain_status(f);
@@ -1682,7 +1691,8 @@ impl Server {
         routing:          Arc<RoutingService>,
         events:           SessionEventSender,
         chat_relay:       Option<Arc<ChatRelayService>>,
-        traffic_tracker:  Arc<TrafficTracker>,    // v1.0.0-Membership
+        traffic_tracker:  Arc<TrafficTracker>,
+        deny_list:        Arc<DenyList>,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut rx   = self.shutdown_tx.subscribe();
@@ -1700,13 +1710,17 @@ impl Server {
                             if let Some(ref relay) = chat_relay {
                                 relay.wallet_routes.remove_session(&sid);
                             }
-                            // v1.0.0-Membership: remove tracker entry for this wallet.
                             traffic_tracker.remove_wallet(&wallet);
                         }
 
                         for ip in sessions.drain_cooldown_pool() {
                             ip_pool.release(ip);
                         }
+
+                        // Evict expired deny list entries (QuotaExceeded whose
+                        // month has rolled over). NoPremiumAccess entries are
+                        // permanent and are only removed by handle_membership_response.
+                        deny_list.cleanup();
                     }
                 }
             }
