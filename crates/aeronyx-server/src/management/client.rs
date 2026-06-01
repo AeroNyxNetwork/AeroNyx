@@ -1,58 +1,41 @@
-/*
-============================================
-File: crates/aeronyx-server/src/management/client.rs
-Path: aeronyx-server/src/management/client.rs
-============================================
-Purpose: Management API Client for node registration, heartbeat, and session reporting
+// ============================================
+// File: crates/aeronyx-server/src/management/client.rs
+// ============================================
+// Version: 1.0.0-Membership
+//
+// Modification Reason:
+//   Added TrafficDelta and UserPermission types.
+//   Extended HeartbeatResponse with node_tier + user_permissions.
+//   send_heartbeat() now accepts connected_wallets + traffic_delta
+//   and injects them into the signed body.
+//
+// Main Logical Flow:
+//   1. create_signature() - Ed25519 over SHA256(node_id + timestamp + body)
+//   2. send_heartbeat()   - signed heartbeat with membership fields
+//   3. report_session_event() - session lifecycle events
+//   4. report_command_status() - command execution feedback to CMS
+//
+// ⚠️ Important Notes for Next Developer:
+//   - connected_wallets + traffic_delta are injected into the TOP-LEVEL
+//     signed body (not inside system_stats).
+//   - Both use skip_serializing_if — backward compatible with old CMS.
+//   - HeartbeatResponse new fields use #[serde(default)] — old CMS
+//     responses without these fields deserialize cleanly.
+//   - wallet_hex keys must be lowercase (hex::encode output).
+//   - The body used for signing MUST be the same as what is sent.
+//     Do NOT add fields after signing.
+//
+// Last Modified:
+//   v1.0.0         - Initial implementation
+//   v1.2.0         - Fixed JSON field ordering (json! macro)
+//   v1.3.0         - Added report_command_status(), fixed eprintln!
+//   v2.3.0         - Added memchain_status to heartbeat system_stats
+//   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
+// ============================================
 
-Key Fix v1.2.0:
-  - Use serde_json::json! macro with preserve_order feature to maintain field order
-  - Send the same JSON object used for signing (not a separate struct)
-  - This ensures signature verification passes on Python backend
-
-Modification Reason (v1.3.0):
-  - 🌟 Added `report_command_status()` for CommandHandler → CMS status feedback
-  - 🐛 Replaced `eprintln!` debug output with `tracing::trace!` to stop polluting
-    stderr in production (prints every 30 seconds)
-  - 🌟 Refactored duplicate `json!` body construction into helper to reduce
-    risk of signing/sending field mismatch
-
-Modification Reason (v2.3.0+RemoteStorage):
-  - 🌟 send_heartbeat() now accepts optional `memchain_status` parameter
-  - When present, injects `memchain_status` into `system_stats` with:
-    allow_remote_storage, max_remote_owners, current_remote_owners
-  - CMS heartbeat_service.py reads these fields to update Node model
-  - Pattern follows existing agent_status injection (conditional, backward compatible)
-
-Main Logical Flow:
-  1. create_signature() - Creates Ed25519 signature over message hash
-  2. send_heartbeat() - Sends node status with signature verification
-  3. report_session_event() - Reports session events to CMS
-  4. 🌟 report_command_status() - Reports command execution status to CMS
-
-⚠️ Important Note for Next Developer:
-  - JSON field order MUST match Python backend expectation
-  - The body_json used for signing MUST be the same as what's sent
-  - Do NOT use HeartbeatRequest struct for sending - use json! macro directly
-  - 🌟 `report_command_status()` uses the same signature scheme as heartbeat
-  - 🌟 memchain_status is injected into system_stats (not top-level body)
-    to match CMS heartbeat_service.py's _update_remote_storage_fields() logic
-
-Dependencies:
-  - super::config::ManagementConfig
-  - super::models::*
-  - super::integrity (for version and binary hash)
-  - aeronyx_core::crypto::IdentityKeyPair
-
-Last Modified:
-  v1.0.0 - Initial implementation
-  v1.2.0 - Fixed JSON field ordering issue by using json! macro
-  v1.3.0 - 🌟 Added report_command_status(), fixed eprintln!, refactored signing
-  v2.3.0+RemoteStorage - 🌟 Added memchain_status to heartbeat system_stats
-============================================
-*/
-
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, trace, warn};
@@ -62,39 +45,85 @@ use aeronyx_core::crypto::IdentityKeyPair;
 use super::config::ManagementConfig;
 use super::models::*;
 
-/// MemChain status data for heartbeat reporting (v2.3.0).
-///
-/// Sent as part of `system_stats.memchain_status` in the heartbeat body.
-/// CMS `heartbeat_service.py` reads these fields to update the Node model's
-/// `allow_remote_storage`, `max_remote_owners`, and `current_remote_owners`.
+// ============================================
+// MemChainHeartbeatStatus (v2.3.0)
+// ============================================
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MemChainHeartbeatStatus {
-    pub enabled: bool,
-    pub allow_remote_storage: bool,
-    pub max_remote_owners: usize,
+    pub enabled:               bool,
+    pub allow_remote_storage:  bool,
+    pub max_remote_owners:     usize,
     pub current_remote_owners: usize,
 }
 
-/// Management API client for communicating with the CMS backend.
+// ============================================
+// v1.0.0-Membership: TrafficDelta + UserPermission
+// ============================================
+
+/// Per-wallet traffic increment for a single heartbeat period.
 ///
-/// Handles:
-/// - Node registration with binding codes
-/// - Periodic heartbeat with system stats
-/// - Session event reporting
-/// - 🌟 Command execution status reporting
+/// bytes_in  = client → server (rx from server perspective)
+/// bytes_out = server → client (tx from server perspective)
+///
+/// Zero-traffic wallets are omitted from heartbeat payloads.
+/// CMS must use F() atomic update on UserTrafficQuota.used_bytes.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TrafficDelta {
+    pub bytes_in:  u64,
+    pub bytes_out: u64,
+}
+
+/// Permission snapshot for a single wallet, returned per heartbeat response.
+///
+/// CMS returns this only for wallets listed in connected_wallets.
+/// Rust enforces tier and quota constraints on active sessions using this.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct UserPermission {
+    /// Subscription tier: "free" | "premium" | "ultimate"
+    pub tier: String,
+    /// Whether the subscription is currently active (not expired/cancelled).
+    pub is_active: bool,
+    /// Whether this wallet may connect to premium-tier nodes.
+    pub can_access_premium_nodes: bool,
+    /// false = Free tier monthly quota exceeded — disconnect the session.
+    pub traffic_allowed: bool,
+}
+
+// ============================================
+// HeartbeatResponse
+// ============================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct HeartbeatResponse {
+    pub success:           bool,
+    pub next_heartbeat_in: Option<u64>,
+    pub commands:          Option<Vec<Command>>,
+
+    // v1.0.0-Membership
+    /// Node access tier: "public" | "premium".
+    /// None = CMS did not return a tier — keep current cached value.
+    #[serde(default)]
+    pub node_tier: Option<String>,
+
+    /// Per-wallet permission snapshot for all wallets in connected_wallets.
+    /// Empty map = CMS returned no permissions — keep current cached state.
+    #[serde(default)]
+    pub user_permissions: HashMap<String, UserPermission>,
+}
+
+// ============================================
+// ManagementClient
+// ============================================
+
 pub struct ManagementClient {
-    config: ManagementConfig,
-    http: Client,
-    identity: IdentityKeyPair,
+    config:      ManagementConfig,
+    http:        Client,
+    identity:    IdentityKeyPair,
     binary_hash: String,
 }
 
 impl ManagementClient {
-    /// Creates a new ManagementClient instance.
-    ///
-    /// # Arguments
-    /// * `config` - Management configuration containing CMS URL and timeouts
-    /// * `identity` - Ed25519 identity keypair for signing requests
     pub fn new(config: ManagementConfig, identity: IdentityKeyPair) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(config.request_timeout_secs))
@@ -104,91 +133,55 @@ impl ManagementClient {
         Self { config, http, identity, binary_hash }
     }
 
-    /// Returns the node ID (hex-encoded public key).
     pub fn node_id(&self) -> String {
         hex::encode(self.identity.public_key_bytes())
     }
 
-    /// Returns current Unix timestamp in seconds.
     fn current_timestamp() -> u64 {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
     }
 
-    /// Creates an Ed25519 signature over the message.
-    ///
-    /// Signature process:
-    /// 1. Concatenate: node_id + timestamp + body
-    /// 2. SHA256 hash the concatenated message
-    /// 3. Sign the hash with Ed25519
-    ///
-    /// # Arguments
-    /// * `timestamp` - Unix timestamp used in the message
-    /// * `body` - JSON body string to sign
-    ///
-    /// # Returns
-    /// Hex-encoded signature string
+    /// Creates an Ed25519 signature over SHA256(node_id + timestamp + body).
     fn create_signature(&self, timestamp: u64, body: &str) -> String {
         let node_id = self.node_id();
-
-        // Message format: node_id + timestamp + body (no separators)
         let message = format!("{}{}{}", node_id, timestamp, body);
 
-        // 🐛 v1.3.0: Replaced eprintln! with trace! to stop polluting stderr
         trace!(
-            node_id = %node_id,
-            timestamp = timestamp,
-            body_preview = %body.chars().take(200).collect::<String>(),
+            node_id       = %node_id,
+            timestamp     = timestamp,
+            body_preview  = %body.chars().take(200).collect::<String>(),
             "[SIGNATURE] Creating signature"
         );
 
-        // SHA256 hash of the message
         let mut hasher = Sha256::new();
         hasher.update(message.as_bytes());
         let message_hash = hasher.finalize();
 
-        trace!(
-            hash = %hex::encode(&message_hash),
-            "[SIGNATURE] Message hash computed"
-        );
+        trace!(hash = %hex::encode(&message_hash), "[SIGNATURE] Message hash computed");
 
-        // Ed25519 signature of the hash
         let signature = self.identity.sign(&message_hash);
-        let sig_hex = hex::encode(signature);
+        let sig_hex   = hex::encode(signature);
 
-        trace!(
-            signature = %sig_hex,
-            "[SIGNATURE] Signature created"
-        );
-
+        trace!(signature = %sig_hex, "[SIGNATURE] Signature created");
         sig_hex
     }
 
-    /// Helper: builds signed request headers.
-    ///
-    /// # Arguments
-    /// * `node_id` - Hex-encoded public key
-    /// * `timestamp` - Unix timestamp
-    /// * `signature` - Hex-encoded Ed25519 signature
-    fn signed_headers(node_id: &str, timestamp: u64, signature: &str) -> Vec<(&'static str, String)> {
+    fn signed_headers(node_id: &str, timestamp: u64, signature: &str)
+        -> Vec<(&'static str, String)>
+    {
         vec![
-            ("X-Node-ID", node_id.to_string()),
-            ("X-Timestamp", timestamp.to_string()),
-            ("X-Signature", signature.to_string()),
+            ("X-Node-ID",    node_id.to_string()),
+            ("X-Timestamp",  timestamp.to_string()),
+            ("X-Signature",  signature.to_string()),
         ]
     }
 
     /// Registers the node with the CMS using a binding code.
-    ///
-    /// # Arguments
-    /// * `code` - The binding code from the CMS dashboard
-    ///
-    /// # Returns
-    /// NodeInfo on success, error message on failure
     pub async fn register_node(&self, code: &str) -> Result<NodeInfo, String> {
-        let url = format!("{}/node/bind/", self.config.cms_url);
+        let url     = format!("{}/node/bind/", self.config.cms_url);
         let request = BindNodeRequest {
-            code: code.to_string(),
-            public_key: self.node_id(),
+            code:          code.to_string(),
+            public_key:    self.node_id(),
             hardware_info: HardwareInfo::collect(),
         };
 
@@ -212,51 +205,34 @@ impl ManagementClient {
 
     /// Sends a heartbeat to the CMS with current node status.
     ///
-    /// CRITICAL: Signature is computed over body WITHOUT the signature field.
-    /// Python backend will reconstruct the same body (without signature) to verify.
+    /// ## v1.0.0-Membership additions
+    /// - connected_wallets: hex list of currently connected wallet pubkeys.
+    ///   CMS uses this to know which wallets to include in user_permissions.
+    /// - traffic_delta: per-wallet byte increments since last heartbeat.
+    ///   CMS atomically adds these to UserTrafficQuota.used_bytes (F() update).
     ///
-    /// JSON field order for body (without signature):
-    /// 1. node_id
-    /// 2. timestamp
-    /// 3. public_ip
-    /// 4. version
-    /// 5. binary_hash
-    /// 6. system_stats (with cpu_usage, memory_mb, active_sessions,
-    ///    and optionally agent_status, memchain_status, net_rx_bytes, etc.)
-    ///
-    /// ## v2.3.0: memchain_status
-    /// When provided, injected into `system_stats` as `memchain_status` object.
-    /// CMS reads this to update Node's remote storage fields.
-    ///
-    /// # Arguments
-    /// * `public_ip` - Node's public IP address
-    /// * `active_sessions` - Number of active client sessions
-    /// * `agent_status` - Optional OpenClaw agent status
-    /// * `memchain_status` - Optional MemChain remote storage status (v2.3.0)
-    ///
-    /// # Returns
-    /// HeartbeatResponse on success, error message on failure
+    /// Both fields are part of the signed body — CMS can verify integrity.
+    /// Empty collections are omitted from the serialized body (skip_serializing_if).
     pub async fn send_heartbeat(
         &self,
-        public_ip: &str,
-        active_sessions: u32,
-        agent_status: Option<AgentStatusInfo>,
-        memchain_status: Option<MemChainHeartbeatStatus>,
+        public_ip:         &str,
+        active_sessions:   u32,
+        agent_status:      Option<AgentStatusInfo>,
+        memchain_status:   Option<MemChainHeartbeatStatus>,
+        // v1.0.0-Membership
+        connected_wallets: Vec<String>,
+        traffic_delta:     HashMap<String, TrafficDelta>,
     ) -> Result<HeartbeatResponse, String> {
-        let url = format!("{}/node/heartbeat/", self.config.cms_url);
+        let url       = format!("{}/node/heartbeat/", self.config.cms_url);
         let timestamp = Self::current_timestamp();
-        let node_id = self.node_id();
-        let stats = SystemStats::collect(active_sessions);
+        let node_id   = self.node_id();
+        let stats     = SystemStats::collect(active_sessions);
 
-        // CRITICAL: Build JSON WITHOUT signature field for signing.
-        // This is what Python will reconstruct to verify the signature.
-        //
-        // 🌟 v1.3.1: Optional fields (agent_status, net_rx_bytes, etc.)
-        // are conditionally injected so they don't break older CMS versions.
+        // Build system_stats (unchanged from v2.3.0).
         let mut system_stats_json = serde_json::json!({
-            "cpu_usage": stats.cpu_usage,
-            "memory_mb": stats.memory_mb,
-            "active_sessions": stats.active_sessions
+            "cpu_usage":       stats.cpu_usage,
+            "memory_mb":       stats.memory_mb,
+            "active_sessions": stats.active_sessions,
         });
 
         if let Some(obj) = system_stats_json.as_object_mut() {
@@ -266,15 +242,12 @@ impl ManagementClient {
                     serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
                 );
             }
-
-            // v2.3.0: Inject memchain_status for remote storage field updates
-            if let Some(ref mc_status) = memchain_status {
+            if let Some(ref mc) = memchain_status {
                 obj.insert(
                     "memchain_status".to_string(),
-                    serde_json::to_value(mc_status).unwrap_or(serde_json::Value::Null),
+                    serde_json::to_value(mc).unwrap_or(serde_json::Value::Null),
                 );
             }
-
             if let Some(rx) = stats.net_rx_bytes {
                 obj.insert("net_rx_bytes".to_string(), serde_json::json!(rx));
             }
@@ -289,31 +262,57 @@ impl ManagementClient {
             }
         }
 
-        let body_for_signing = json!({
-            "node_id": &node_id,
-            "timestamp": timestamp,
-            "public_ip": public_ip,
-            "version": super::integrity::get_version(),
-            "binary_hash": &self.binary_hash,
-            "system_stats": system_stats_json
+        // Build base body WITHOUT signature field (for signing).
+        let mut body_for_signing = json!({
+            "node_id":      &node_id,
+            "timestamp":    timestamp,
+            "public_ip":    public_ip,
+            "version":      super::integrity::get_version(),
+            "binary_hash":  &self.binary_hash,
+            "system_stats": system_stats_json,
         });
 
-        // Serialize to string for signing (NO signature field)
-        let body_str = serde_json::to_string(&body_for_signing).map_err(|e| e.to_string())?;
+        // v1.0.0-Membership: inject connected_wallets + traffic_delta
+        // into the signed body so CMS can verify their integrity.
+        if let Some(obj) = body_for_signing.as_object_mut() {
+            if !connected_wallets.is_empty() {
+                obj.insert(
+                    "connected_wallets".to_string(),
+                    serde_json::to_value(&connected_wallets)
+                        .unwrap_or(serde_json::Value::Array(vec![])),
+                );
+            }
+            if !traffic_delta.is_empty() {
+                obj.insert(
+                    "traffic_delta".to_string(),
+                    serde_json::to_value(&traffic_delta)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                );
+            }
+        }
 
-        // Create signature over the body
+        // Sign the body (no signature field present yet).
+        let body_str  = serde_json::to_string(&body_for_signing).map_err(|e| e.to_string())?;
         let signature = self.create_signature(timestamp, &body_str);
 
-        // Build final body by inserting signature into existing object
+        // Insert signature into body.
         let body_json = {
             let mut obj = body_for_signing;
             if let Some(map) = obj.as_object_mut() {
-                map.insert("signature".to_string(), serde_json::Value::String(signature.clone()));
+                map.insert(
+                    "signature".to_string(),
+                    serde_json::Value::String(signature.clone()),
+                );
             }
             obj
         };
 
-        debug!("Heartbeat: sessions={}", active_sessions);
+        debug!(
+            sessions  = active_sessions,
+            wallets   = connected_wallets.len(),
+            tx_deltas = traffic_delta.len(),
+            "[HEARTBEAT] Sending"
+        );
 
         let mut request = self.http.post(&url);
         for (header, value) in Self::signed_headers(&node_id, timestamp, &signature) {
@@ -326,7 +325,7 @@ impl ManagementClient {
             .map_err(|e| format!("Request failed: {}", e))?;
 
         if !response.status().is_success() {
-            let status = response.status();
+            let status    = response.status();
             let body_text = response.text().await.unwrap_or_default();
             error!("Heartbeat failed: status={}, body={}", status, body_text);
             return Err(format!("Status: {}, Body: {}", status, body_text));
@@ -336,61 +335,44 @@ impl ManagementClient {
     }
 
     /// Reports a session event (create/update/end) to the CMS.
-    ///
-    /// # Arguments
-    /// * `event` - The session event details
-    ///
-    /// # Returns
-    /// SessionReportResponse on success, error message on failure
     pub async fn report_session_event(&self, event: SessionEventReport) -> Result<(), String> {
-        let url = format!("{}/node/sessions/report/", self.config.cms_url);
+        let url       = format!("{}/node/sessions/report/", self.config.cms_url);
         let timestamp = Self::current_timestamp();
-        let node_id = self.node_id();
-        let body_str = serde_json::to_string(&event).map_err(|e| e.to_string())?;
+        let node_id   = self.node_id();
+        let body_str  = serde_json::to_string(&event).map_err(|e| e.to_string())?;
         let signature = self.create_signature(timestamp, &body_str);
-    
+
         let mut request = self.http.post(&url);
         for (header, value) in Self::signed_headers(&node_id, timestamp, &signature) {
             request = request.header(header, value);
         }
-    
+
         let response = request
             .json(&event)
             .send().await
             .map_err(|e| e.to_string())?;
-    
+
         if !response.status().is_success() {
-            let status = response.status();
+            let status    = response.status();
             let body_text = response.text().await.unwrap_or_default();
             return Err(format!("Status: {}, Body: {}", status, body_text));
         }
-    
+
         Ok(())
     }
-    /// 🌟 v1.3.0: Reports command execution status to CMS.
-    ///
-    /// Called by `CommandHandler` after executing (or attempting) a command.
-    /// Uses the same Ed25519 signature authentication as heartbeat requests.
-    ///
-    /// # Arguments
-    /// * `report` - Command status report with ID, status, progress, message
-    ///
-    /// # Returns
-    /// Ok(()) on success, Err(message) on failure
-    ///
-    /// # Endpoint
-    /// `POST {cms_url}/node/agent/status/`
+
+    /// Reports command execution status to CMS (v1.3.0).
     pub async fn report_command_status(&self, report: &CommandStatusReport) -> Result<(), String> {
-        let url = format!("{}/node/agent/status/", self.config.cms_url);
+        let url       = format!("{}/node/agent/status/", self.config.cms_url);
         let timestamp = Self::current_timestamp();
-        let node_id = self.node_id();
-        let body_str = serde_json::to_string(report).map_err(|e| e.to_string())?;
+        let node_id   = self.node_id();
+        let body_str  = serde_json::to_string(report).map_err(|e| e.to_string())?;
         let signature = self.create_signature(timestamp, &body_str);
 
         debug!(
             command_id = %report.command_id,
-            status = ?report.status,
-            "[CMS_CLIENT] 📤 Reporting command status"
+            status     = ?report.status,
+            "[CMS_CLIENT] Reporting command status"
         );
 
         let mut request = self.http.post(&url);
@@ -404,29 +386,22 @@ impl ManagementClient {
             .map_err(|e| format!("Request failed: {}", e))?;
 
         if !response.status().is_success() {
-            let status = response.status();
+            let status    = response.status();
             let body_text = response.text().await.unwrap_or_default();
             warn!(
-                command_id = %report.command_id,
+                command_id  = %report.command_id,
                 http_status = %status,
-                "[CMS_CLIENT] ⚠️ Command status report failed: {}",
+                "[CMS_CLIENT] Command status report failed: {}",
                 body_text
             );
             return Err(format!("Status: {}, Body: {}", status, body_text));
         }
 
-        debug!(
-            command_id = %report.command_id,
-            "[CMS_CLIENT] ✅ Command status reported"
-        );
-
+        debug!(command_id = %report.command_id, "[CMS_CLIENT] Command status reported");
         Ok(())
     }
 
-    /// Returns a reference to the management configuration.
-    pub fn config(&self) -> &ManagementConfig {
-        &self.config
-    }
+    pub fn config(&self) -> &ManagementConfig { &self.config }
 }
 
 impl std::fmt::Debug for ManagementClient {
