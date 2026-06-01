@@ -48,6 +48,7 @@ use super::client::{
 use super::models::{Command, SessionEventReport, SessionEventType};
 use crate::services::AgentManager;
 use crate::services::SessionManager;
+use crate::services::deny_list::{DenyList, DenyReason};
 use crate::services::traffic_tracker::TrafficTracker;
 use aeronyx_transport::traits::Transport;
 
@@ -162,6 +163,8 @@ pub struct HeartbeatReporter {
     sessions:         Option<Arc<SessionManager>>,
     traffic:          Option<Arc<TrafficTracker>>,
     udp:              Option<Arc<aeronyx_transport::UdpTransport>>,
+    /// v1.0.0-Membership: deny list for writing disconnection decisions.
+    deny_list:        Option<Arc<DenyList>>,
     /// Cached node tier from last CMS response. Default = "public".
     node_tier:        Arc<RwLock<String>>,
     /// Cached per-wallet permissions from last CMS response.
@@ -213,6 +216,11 @@ impl HeartbeatReporter {
 
     pub fn with_udp(mut self, udp: Arc<aeronyx_transport::UdpTransport>) -> Self {
         self.udp = Some(udp);
+        self
+    }
+
+    pub fn with_deny_list(mut self, deny_list: Arc<DenyList>) -> Self {
+        self.deny_list = Some(deny_list);
         self
     }
 
@@ -437,22 +445,42 @@ impl HeartbeatReporter {
 
         if permissions.is_empty() { return; }
 
-        // Collect sessions that violate membership rules.
+        // ── Restore access for wallets whose permissions improved ─────────
+        // If a wallet is on the deny list but CMS now says access is OK,
+        // remove it so the next reconnect attempt is allowed.
+        if let Some(ref dl) = self.deny_list {
+            for (wallet, perm) in &permissions {
+                let now_ok = perm.is_active
+                    && perm.traffic_allowed
+                    && (node_tier != "premium" || perm.can_access_premium_nodes);
+                if now_ok && dl.is_denied(wallet) {
+                    dl.remove(wallet);
+                }
+            }
+        }
+
+        // ── Collect sessions that violate membership rules ────────────────
+        //
+        // Rule 1: node is premium AND wallet cannot access premium nodes.
+        //   Covers both "free tier on premium node" and any future tier that
+        //   lacks premium access. can_access_premium_nodes is the single
+        //   authoritative field — no need to check tier separately.
+        //
+        // Rule 2: traffic quota exhausted (Free tier monthly limit).
         let to_disconnect: Vec<_> = sessions
             .all_sessions()
             .into_iter()
             .filter_map(|sess| {
                 let perm = permissions.get(&sess.wallet_hex)?;
 
-                let rule_tier    = node_tier == "premium" && perm.tier == "free";
-                let rule_quota   = !perm.traffic_allowed;
-                let rule_premium = !perm.can_access_premium_nodes && node_tier == "premium";
+                let rule1 = node_tier == "premium" && !perm.can_access_premium_nodes;
+                let rule2 = !perm.traffic_allowed;
 
-                if rule_tier || rule_quota || rule_premium {
-                    let reason = if rule_quota {
-                        "traffic_quota_exceeded"
+                if rule1 || rule2 {
+                    let reason = if rule2 {
+                        DenyReason::QuotaExceeded
                     } else {
-                        "tier_not_allowed"
+                        DenyReason::NoPremiumAccess
                     };
                     Some((sess, reason))
                 } else {
@@ -465,11 +493,21 @@ impl HeartbeatReporter {
             info!(
                 wallet     = %&sess.wallet_hex[..8],
                 session_id = %sess.id,
-                reason,
+                reason     = %reason,
                 "[MEMBERSHIP] Disconnecting session"
             );
-            // Send RESET (0xFF) — client re-handshakes immediately.
+
+            // Add to deny list BEFORE sending RESET so that if the client
+            // reconnects before we process the next heartbeat, the
+            // handshake rejects it immediately.
+            if let Some(ref dl) = self.deny_list {
+                dl.add(&sess.wallet_hex, reason.clone());
+            }
+
+            // Send RESET (0xFF) — client re-handshakes immediately,
+            // which will be rejected by the deny list check.
             let _ = udp.send(&[0xFFu8], &sess.client_endpoint).await;
+
             // Remove session — cleans up routing + wallet_index + cooldown.
             sessions.remove(&sess.id);
         }
