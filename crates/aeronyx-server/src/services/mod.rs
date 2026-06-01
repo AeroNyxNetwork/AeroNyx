@@ -114,6 +114,7 @@ pub mod memchain;
 pub mod routing;
 pub mod session;
 pub mod wallet_routes;
+pub mod traffic_tracker;
 
 // Re-export primary types
 pub use agent_manager::AgentManager;
