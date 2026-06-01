@@ -184,7 +184,7 @@ impl HeartbeatReporter {
             sessions:           None,
             traffic:            None,
             udp:                None,
-            deny_list:          None,   // ← add this line
+            deny_list:          None,
             node_tier:        Arc::new(RwLock::new("public".to_string())),
             user_permissions: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -447,15 +447,22 @@ impl HeartbeatReporter {
         if permissions.is_empty() { return; }
 
         // ── Restore access for wallets whose permissions improved ─────────
-        // If a wallet is on the deny list but CMS now says access is OK,
-        // remove it so the next reconnect attempt is allowed.
+        // Check deny reason independently:
+        //   NoPremiumAccess → remove if can_access_premium_nodes is now true
+        //   QuotaExceeded   → remove if traffic_allowed is now true
+        // Do NOT combine into a single now_ok flag — a wallet can have
+        // NoPremiumAccess cleared (tier upgrade) while still over quota,
+        // or vice versa. Each reason is independent.
         if let Some(ref dl) = self.deny_list {
             for (wallet, perm) in &permissions {
-                let now_ok = perm.is_active
-                    && perm.traffic_allowed
-                    && (node_tier != "premium" || perm.can_access_premium_nodes);
-                if now_ok && dl.is_denied(wallet) {
-                    dl.remove(wallet);
+                if let Some(reason) = dl.deny_reason(wallet) {
+                    let should_remove = match reason {
+                        DenyReason::NoPremiumAccess => perm.can_access_premium_nodes,
+                        DenyReason::QuotaExceeded   => perm.traffic_allowed,
+                    };
+                    if should_remove {
+                        dl.remove(wallet);
+                    }
                 }
             }
         }
