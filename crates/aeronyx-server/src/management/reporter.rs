@@ -319,14 +319,14 @@ impl HeartbeatReporter {
                             failures = 0;
 
                             // Forward commands (unchanged).
-                            if let Some(commands) = response.commands {
+                            if let Some(ref commands) = response.commands {
                                 if !commands.is_empty() {
                                     info!(
                                         count = commands.len(),
                                         "[HEARTBEAT] Received {} command(s) from CMS",
                                         commands.len()
                                     );
-                                    self.forward_commands(commands).await;
+                                    self.forward_commands(commands.clone()).await;
                                 }
                             }
 
