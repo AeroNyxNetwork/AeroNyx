@@ -62,6 +62,7 @@ use aeronyx_core::protocol::codec::{
 };
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
 use aeronyx_core::protocol::{DataPacket, MessageType};
+use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
 use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::UdpTransport;
 
@@ -99,6 +100,7 @@ use crate::services::{HandshakeService, IpPoolService, RoutingService, SessionMa
 // v1.0.0-Membership
 use crate::services::traffic_tracker::TrafficTracker;
 use crate::services::deny_list::DenyList;
+use crate::voucher_verifier::VoucherVerifier;
 
 // ============================================
 // Constants
@@ -212,6 +214,10 @@ impl Server {
             Arc::clone(&deny_list),
         ));
 
+        // [VOUCHER-P1] Observe-only verifier. It never rejects handshakes in
+        // this phase; it records valid/invalid/missing voucher rates first.
+        let voucher_verifier = Arc::new(VoucherVerifier::new());
+
         // init_management_reporter needs udp + traffic_tracker,
         // so it is called here after both are available.
         let session_event_sender = self.init_management_reporter(
@@ -227,6 +233,7 @@ impl Server {
             Arc::clone(&tun),
             Arc::clone(&handshake_service),
             Arc::clone(&packet_handler),
+            Arc::clone(&voucher_verifier),
             Arc::clone(&sessions),
             session_event_sender.clone(),
             mempool.clone(),
@@ -1200,6 +1207,7 @@ impl Server {
         #[cfg(target_os = "linux")] tun: Arc<LinuxTun>,
         handshake:        Arc<HandshakeService>,
         packet_handler:   Arc<PacketHandler>,
+        voucher_verifier: Arc<VoucherVerifier>,
         sessions:         Arc<SessionManager>,
         session_events:   SessionEventSender,
         mempool:          Option<Arc<MemPool>>,
@@ -1230,6 +1238,16 @@ impl Server {
 
                                 match ProtocolCodec::peek_message_type(data) {
                                     Ok(MessageType::ClientHello) => {
+                                        let extension = if data.len() > CLIENT_HELLO_SIZE {
+                                            data[CLIENT_HELLO_SIZE..].to_vec()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        let verifier = Arc::clone(&voucher_verifier);
+                                        tokio::spawn(async move {
+                                            verifier.observe_client_hello_extension(extension).await;
+                                        });
+
                                         if let Ok(hello) = decode_client_hello(data) {
                                             match handshake.process(&hello, source.addr) {
                                                 Ok(result) => {

@@ -50,6 +50,7 @@ pub mod management;
 pub mod miner;
 pub mod server;
 pub mod services;
+pub mod voucher_verifier;
 
 // Re-export primary types
 pub use config::ServerConfig;
