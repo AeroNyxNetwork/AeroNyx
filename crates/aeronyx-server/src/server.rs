@@ -74,6 +74,7 @@ use rusqlite::OptionalExtension;
 use crate::api::mpi::{build_mpi_router, MpiState, BaselineSnapshot, Mode};
 use crate::api::auth::{ensure_jwt_secret, generate_secret};
 use crate::api::voice::build_voice_router;
+use crate::api::vpn_health::build_vpn_health_router;
 use crate::config::{MemChainConfig, MemChainMode, ServerConfig, VectorQuantizationMode};
 use crate::error::{Result, ServerError};
 use crate::handlers::packet::DecryptedPayload;
@@ -950,10 +951,12 @@ impl Server {
         let vpn_listen_addr: std::net::SocketAddr = format!(
             "100.64.0.1:{}", listen_addr.port()
         ).parse().unwrap_or_else(|_| "100.64.0.1:8421".parse().unwrap());
+        let vpn_health_config = self.config.clone();
 
         tokio::spawn(async move {
             let app = build_mpi_router(mpi_state)
-                .merge(build_voice_router(sessions));
+                .merge(build_voice_router(Arc::clone(&sessions)))
+                .merge(build_vpn_health_router(vpn_health_config, sessions));
 
             let listener = match tokio::net::TcpListener::bind(listen_addr).await {
                 Ok(l)  => { info!("[API] MemChain API on http://{}", listen_addr); l }

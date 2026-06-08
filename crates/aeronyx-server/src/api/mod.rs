@@ -80,6 +80,7 @@ pub mod admin_handlers;
 pub mod local;
 // ── v1.0.0-Voice: Peer virtual IP resolution for UDP direct-connect routing ──
 pub mod voice;
+pub mod vpn_health;
 
 // ── Re-exports (unchanged from v2.3.0 — external callers unaffected) ──
 pub use mpi::{build_mpi_router, MpiState, BaselineSnapshot};
