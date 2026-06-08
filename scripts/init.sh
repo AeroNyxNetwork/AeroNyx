@@ -17,6 +17,7 @@
 #   ./scripts/init.sh --help       # Show help
 #
 # Last Modified:
+# v2.6.1 - Added AeroNyx VPN DNS stub setup for in-tunnel DNS
 # v2.6.0 - Added Step 4.5: IP forwarding + iptables NAT setup
 
 set -euo pipefail
@@ -584,6 +585,21 @@ elif command -v firewall-cmd &>/dev/null; then
 fi
 
 echo ""
+# ── 6. Configure in-tunnel DNS stub ─────────────────────────────
+# iOS/macOS clients use the VPN gateway as DNS server to avoid local-network
+# DNS leakage. The node must therefore listen on 100.64.0.1:53.
+if [ -x "${SCRIPT_DIR}/setup_vpn_dns.sh" ]; then
+    info "Configuring AeroNyx VPN DNS stub..."
+    if "${SCRIPT_DIR}/setup_vpn_dns.sh" --gateway "100.64.0.1"; then
+        ok "VPN DNS stub configured"
+    else
+        warn "VPN DNS stub setup failed. Clients may connect but DNS may not resolve."
+    fi
+else
+    warn "Missing ${SCRIPT_DIR}/setup_vpn_dns.sh. Clients may connect but DNS may not resolve."
+fi
+
+echo ""
 ok "Network setup complete"
 info "Note: On GCP/AWS/Azure, also open UDP 51820 in the cloud security group."
 
@@ -628,6 +644,14 @@ if [ "${BUILD_NOW}" = true ]; then
         if curl -s "http://${API_ADDR}/api/mpi/status" >/dev/null 2>&1; then
             ok "Server is running! (PID: ${SERVER_PID})"
             echo ""
+
+            if [ -x "${SCRIPT_DIR}/setup_vpn_dns.sh" ]; then
+                info "Activating AeroNyx VPN DNS stub after server start..."
+                if ! "${SCRIPT_DIR}/setup_vpn_dns.sh" --gateway "100.64.0.1"; then
+                    warn "VPN DNS stub activation failed; run scripts/setup_vpn_dns.sh after the TUN interface is up."
+                fi
+                echo ""
+            fi
 
             STATUS=$(curl -s "http://${API_ADDR}/api/mpi/status")
             EMBED_READY=$(echo "${STATUS}" | jq -r '.embed_ready // false')
