@@ -1,23 +1,23 @@
 // ============================================
 // File: crates/aeronyx-server/src/voucher_verifier.rs
 // ============================================
-//! Observe-only VPN voucher verifier.
+//! VPN voucher verifier.
 //!
-//! This is phase 1 of voucher rollout: the node verifies any voucher extension
-//! appended to ClientHello, records metrics, and never rejects the handshake.
-//! Later phases can reuse this module and switch policy from observe-only to
-//! enforcement after production metrics prove the valid/missing rates.
+//! Phase 2 rollout policy: missing vouchers are still allowed for compatibility,
+//! but malformed or cryptographically invalid vouchers are rejected before the
+//! handshake is accepted. Phase 3 can switch missing vouchers to reject once
+//! production metrics show old clients have drained out.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use blind_rsa_signatures::{
     MessageRandomizer, PublicKeySha384PSSRandomized, Signature,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -33,7 +33,9 @@ const DEFAULT_ISSUER_KEYS_URL: &str =
 #[derive(Debug, Clone, Deserialize)]
 struct VoucherWire {
     token: String,
+    #[serde(alias = "sig")]
     signature: String,
+    #[serde(alias = "rand")]
     msg_randomizer: String,
     epoch: String,
 }
@@ -56,12 +58,30 @@ struct IssuerKeyCache {
     fetched_at: Option<Instant>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct VoucherMetricsSnapshot {
+    pub mode: &'static str,
+    pub valid: u64,
+    pub invalid: u64,
+    pub missing: u64,
+    pub malformed: u64,
+    pub total: u64,
+    pub valid_ratio: f64,
+    pub invalid_ratio: f64,
+    pub missing_ratio: f64,
+    pub malformed_ratio: f64,
+    pub last_observation: Option<String>,
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Default)]
 struct VoucherMetrics {
     valid: AtomicU64,
     invalid: AtomicU64,
     missing: AtomicU64,
     malformed: AtomicU64,
+    last_observation: Mutex<Option<String>>,
+    last_error: Mutex<Option<String>>,
 }
 
 impl VoucherMetrics {
@@ -78,6 +98,25 @@ impl VoucherMetrics {
         let (valid, invalid, missing, malformed) = self.snapshot();
         valid + invalid + missing + malformed
     }
+
+    fn last(&self) -> (Option<String>, Option<String>) {
+        let observation = self
+            .last_observation
+            .lock()
+            .ok()
+            .and_then(|value| value.clone());
+        let error = self.last_error.lock().ok().and_then(|value| value.clone());
+        (observation, error)
+    }
+
+    fn set_last(&self, observation: String, error: Option<String>) {
+        if let Ok(mut value) = self.last_observation.lock() {
+            *value = Some(observation);
+        }
+        if let Ok(mut value) = self.last_error.lock() {
+            *value = error;
+        }
+    }
 }
 
 /// Voucher verification result for observation.
@@ -89,7 +128,7 @@ enum VoucherObservation {
     Malformed { reason: String },
 }
 
-/// Observe-only voucher verifier.
+/// VPN voucher verifier.
 #[derive(Clone)]
 pub struct VoucherVerifier {
     issuer_keys_url: String,
@@ -121,10 +160,50 @@ impl VoucherVerifier {
         }
     }
 
+    /// Verify a ClientHello trailing extension and return whether to accept it.
+    ///
+    /// Phase 2 policy keeps missing vouchers compatible, but rejects malformed
+    /// or invalid vouchers. Every path is still recorded in metrics.
+    pub async fn accept_client_hello_extension(&self, extension: Vec<u8>) -> bool {
+        let observation = self.verify_extension(&extension).await;
+        let accept = matches!(
+            observation,
+            VoucherObservation::Missing | VoucherObservation::Valid { .. }
+        );
+        self.record(observation);
+        accept
+    }
+
     /// Observe a ClientHello trailing extension without affecting handshake.
+    #[allow(dead_code)]
     pub async fn observe_client_hello_extension(&self, extension: Vec<u8>) {
         let observation = self.verify_extension(&extension).await;
         self.record(observation);
+    }
+
+    /// Returns current voucher counters for node health checks.
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> VoucherMetricsSnapshot {
+        let (valid, invalid, missing, malformed) = self.metrics.snapshot();
+        let (last_observation, last_error) = self.metrics.last();
+        let total = valid + invalid + missing + malformed;
+        let ratio = |count: u64| {
+            if total == 0 { 0.0 } else { count as f64 / total as f64 }
+        };
+        VoucherMetricsSnapshot {
+            mode: "reject_invalid",
+            valid,
+            invalid,
+            missing,
+            malformed,
+            total,
+            valid_ratio: ratio(valid),
+            invalid_ratio: ratio(invalid),
+            missing_ratio: ratio(missing),
+            malformed_ratio: ratio(malformed),
+            last_observation,
+            last_error,
+        }
     }
 
     async fn verify_extension(&self, extension: &[u8]) -> VoucherObservation {
@@ -232,24 +311,30 @@ impl VoucherVerifier {
         match observation {
             VoucherObservation::Missing => {
                 self.metrics.missing.fetch_add(1, Ordering::Relaxed);
+                self.metrics.set_last("missing".to_string(), None);
                 debug!("[VOUCHER] observe missing voucher");
             }
             VoucherObservation::Valid { epoch } => {
                 self.metrics.valid.fetch_add(1, Ordering::Relaxed);
+                self.metrics.set_last(format!("valid:{epoch}"), None);
                 debug!(epoch = %epoch, "[VOUCHER] observe valid voucher");
             }
             VoucherObservation::Invalid { epoch, reason } => {
                 self.metrics.invalid.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .set_last(format!("invalid:{epoch}"), Some(reason.clone()));
                 warn!(epoch = %epoch, reason = %reason, "[VOUCHER] observe invalid voucher");
             }
             VoucherObservation::Malformed { reason } => {
                 self.metrics.malformed.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .set_last("malformed".to_string(), Some(reason.clone()));
                 warn!(reason = %reason, "[VOUCHER] observe malformed voucher extension");
             }
         }
 
         let total = self.metrics.total();
-        if total > 0 && total % 100 == 0 {
+        if total <= 20 || total % 100 == 0 {
             let (valid, invalid, missing, malformed) = self.metrics.snapshot();
             info!(
                 valid,
@@ -257,6 +342,7 @@ impl VoucherVerifier {
                 missing,
                 malformed,
                 total,
+                mode = "reject_invalid",
                 "[VOUCHER] observe-only metrics"
             );
         }
@@ -274,21 +360,29 @@ fn extract_voucher_json(extension: &[u8]) -> Result<Option<String>, String> {
         return Ok(None);
     }
     if extension.len() < VOUCHER_EXTENSION_HEADER_SIZE {
-        return Err("extension_too_short".to_string());
+        return Err(format!("extension_too_short: len={}", extension.len()));
     }
     if &extension[..4] != VOUCHER_EXTENSION_MAGIC {
-        return Err("unknown_extension_magic".to_string());
+        return Err(format!(
+            "unknown_extension_magic: len={} prefix={}",
+            extension.len(),
+            hex::encode(&extension[..extension.len().min(8)])
+        ));
     }
 
     let len = u16::from_le_bytes([extension[4], extension[5]]) as usize;
     if len == 0 {
-        return Err("empty_voucher".to_string());
+        return Err(format!("empty_voucher: ext_len={}", extension.len()));
     }
     if len > VOUCHER_EXTENSION_MAX_SIZE {
-        return Err("voucher_too_large".to_string());
+        return Err(format!("voucher_too_large: len={}", len));
     }
     if extension.len() < VOUCHER_EXTENSION_HEADER_SIZE + len {
-        return Err("voucher_truncated".to_string());
+        return Err(format!(
+            "voucher_truncated: ext_len={} declared_len={}",
+            extension.len(),
+            len
+        ));
     }
 
     let raw = &extension[VOUCHER_EXTENSION_HEADER_SIZE..VOUCHER_EXTENSION_HEADER_SIZE + len];

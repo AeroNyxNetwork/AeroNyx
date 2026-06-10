@@ -194,7 +194,7 @@ pub struct LimitsConfig {
 }
 
 fn default_max_connections() -> usize { 1000 }
-fn default_session_timeout() -> u64 { 300 }
+fn default_session_timeout() -> u64 { 86400 }
 
 impl LimitsConfig {
     pub(crate) fn validate(&self) -> Result<()> {

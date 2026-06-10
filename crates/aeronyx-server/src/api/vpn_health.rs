@@ -20,6 +20,7 @@ use tokio::time::timeout;
 
 use crate::config::ServerConfig;
 use crate::services::SessionManager;
+use crate::voucher_verifier::{VoucherMetricsSnapshot, VoucherVerifier};
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_QUERY_NAME: &str = "api.aeronyx.network";
@@ -29,6 +30,7 @@ const EGRESS_CHECK_ADDR: &str = "1.1.1.1:443";
 pub struct VpnHealthState {
     config: ServerConfig,
     sessions: Arc<SessionManager>,
+    voucher_verifier: Arc<VoucherVerifier>,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,16 +50,18 @@ struct VpnHealthResponse {
     tun_device: String,
     active_sessions: usize,
     active_wallet_devices: usize,
+    voucher_metrics: VoucherMetricsSnapshot,
     checks: Vec<HealthCheck>,
 }
 
 pub fn build_vpn_health_router(
     config: ServerConfig,
     sessions: Arc<SessionManager>,
+    voucher_verifier: Arc<VoucherVerifier>,
 ) -> Router {
     Router::new()
         .route("/api/vpn/health", get(vpn_health_handler))
-        .with_state(VpnHealthState { config, sessions })
+        .with_state(VpnHealthState { config, sessions, voucher_verifier })
 }
 
 async fn vpn_health_handler(State(state): State<VpnHealthState>) -> impl IntoResponse {
@@ -94,6 +98,7 @@ async fn vpn_health_handler(State(state): State<VpnHealthState>) -> impl IntoRes
         tun_device,
         active_sessions: state.sessions.count(),
         active_wallet_devices: state.sessions.wallet_index_count(),
+        voucher_metrics: state.voucher_verifier.metrics_snapshot(),
         checks,
     })
 }

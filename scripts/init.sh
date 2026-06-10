@@ -390,7 +390,7 @@ mtu = 1420
 
 [limits]
 max_connections = 1000
-session_timeout = 300
+session_timeout = 86400
 
 [logging]
 level = "info"

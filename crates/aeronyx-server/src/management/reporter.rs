@@ -438,6 +438,24 @@ impl HeartbeatReporter {
             *self.user_permissions.write() = response.user_permissions.clone();
         }
 
+        // Voucher rollout note:
+        // Billing identity is now represented by blind-signed vouchers issued by
+        // the CMS. `Session::wallet_hex` is the VPN transport identity from the
+        // ClientHello; it is not the user's wallet and must not be used for
+        // membership/quota enforcement. Doing so disconnects valid voucher
+        // sessions a few seconds after handshake and leaves clients with an
+        // established tunnel whose packets hit "Session NOT FOUND".
+        //
+        // Keep heartbeat cache updates above, but skip legacy per-wallet session
+        // enforcement on the node. Voucher issuance/verifier is the authority.
+        let enforce_legacy_wallet_sessions = std::env::var("AERONYX_ENFORCE_LEGACY_WALLET_SESSIONS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !enforce_legacy_wallet_sessions {
+            debug!("[MEMBERSHIP] legacy wallet/session enforcement skipped; voucher auth is authoritative");
+            return;
+        }
+
         let Some(ref sessions) = self.sessions else { return; };
         let Some(ref udp)      = self.udp       else { return; };
 

@@ -444,6 +444,7 @@ impl Server {
                 Arc::clone(aw),
                 Arc::clone(&sessions),
                 Arc::clone(&udp),
+                Arc::clone(&voucher_verifier),
             );
             tasks.push(("memchain-api", api_task));
 
@@ -945,6 +946,7 @@ impl Server {
         _aof_writer: Arc<TokioMutex<AofWriter>>,
         sessions:    Arc<SessionManager>,
         _udp:        Arc<UdpTransport>,
+        voucher_verifier: Arc<VoucherVerifier>,
     ) -> JoinHandle<()> {
         let mut shutdown_rx     = self.shutdown_tx.subscribe();
         let mut shutdown_rx_vpn = self.shutdown_tx.subscribe();
@@ -956,7 +958,7 @@ impl Server {
         tokio::spawn(async move {
             let app = build_mpi_router(mpi_state)
                 .merge(build_voice_router(Arc::clone(&sessions)))
-                .merge(build_vpn_health_router(vpn_health_config, sessions));
+                .merge(build_vpn_health_router(vpn_health_config, sessions, voucher_verifier));
 
             let listener = match tokio::net::TcpListener::bind(listen_addr).await {
                 Ok(l)  => { info!("[API] MemChain API on http://{}", listen_addr); l }
@@ -1247,9 +1249,13 @@ impl Server {
                                             Vec::new()
                                         };
                                         let verifier = Arc::clone(&voucher_verifier);
-                                        tokio::spawn(async move {
-                                            verifier.observe_client_hello_extension(extension).await;
-                                        });
+                                        if !verifier.accept_client_hello_extension(extension).await {
+                                            warn!(
+                                                client = %source.addr,
+                                                "[VOUCHER] rejected ClientHello with invalid voucher"
+                                            );
+                                            continue;
+                                        }
 
                                         if let Ok(hello) = decode_client_hello(data) {
                                             match handshake.process(&hello, source.addr) {
