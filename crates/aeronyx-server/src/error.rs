@@ -97,6 +97,11 @@ pub enum ServerError {
         message: String,
     },
 
+    #[error("Node policy rejected request: {reason}")]
+    NodePolicyRejected {
+        reason: String,
+    },
+
     // ── v1.0.0-Membership ────────────────────────────────────────────────
     /// Wallet is on the deny list — handshake rejected immediately.
     ///
@@ -146,6 +151,10 @@ impl ServerError {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal { message: message.into() }
+    }
+
+    pub fn node_policy_rejected(reason: impl Into<String>) -> Self {
+        Self::NodePolicyRejected { reason: reason.into() }
     }
 
     /// Returns true if this error indicates the requested session does not

@@ -50,7 +50,7 @@ use aeronyx_core::protocol::messages::DATA_PACKET_HEADER_SIZE;
 use aeronyx_core::protocol::{DataPacket, MemChainMessage};
 
 use crate::error::{Result, ServerError};
-use crate::services::{RoutingService, Session, SessionManager};
+use crate::services::{NodePolicyRuntime, RoutingService, Session, SessionManager};
 use crate::services::traffic_tracker::TrafficTracker;
 
 // ============================================
@@ -113,6 +113,8 @@ pub struct PacketHandler {
     /// Per-wallet traffic delta tracker for membership quota enforcement.
     /// Drained by HeartbeatReporter every ~30s and sent to CMS.
     traffic:  Arc<TrafficTracker>,
+    /// Operator policy from nodeboard Settings.
+    policy:   Arc<NodePolicyRuntime>,
 }
 
 impl PacketHandler {
@@ -120,12 +122,14 @@ impl PacketHandler {
         sessions: Arc<SessionManager>,
         routing:  Arc<RoutingService>,
         traffic:  Arc<TrafficTracker>,
+        policy:   Arc<NodePolicyRuntime>,
     ) -> Self {
         Self {
             sessions,
             routing,
             crypto: DefaultTransportCrypto::new(),
             traffic,
+            policy,
         }
     }
 
@@ -238,6 +242,9 @@ impl PacketHandler {
                 }
 
                 // Session-level cumulative counter (billing audit).
+                if !self.policy.allow_traffic_bytes(plaintext_len) {
+                    return Err(ServerError::node_policy_rejected("bandwidth_limit_mbps"));
+                }
                 session.stats.record_rx(plaintext_len as u64);
                 // Wallet-level delta counter (heartbeat quota enforcement).
                 // Uses cached wallet_hex — no allocation on hot path.
@@ -250,6 +257,9 @@ impl PacketHandler {
             // ── IPv6 VPN ──────────────────────────────────────────────
             Some(b) if b >> 4 == 6 => {
                 // Session-level cumulative counter.
+                if !self.policy.allow_traffic_bytes(plaintext_len) {
+                    return Err(ServerError::node_policy_rejected("bandwidth_limit_mbps"));
+                }
                 session.stats.record_rx(plaintext_len as u64);
                 // Wallet-level delta counter.
                 self.traffic.record_rx(&session.wallet_hex, plaintext_len as u64);
@@ -384,6 +394,9 @@ impl PacketHandler {
         let dst_ip     = extract_ipv4_dst(ip_packet)?;
         let session_id = self.routing.lookup_or_error(dst_ip)?;
         let session    = self.sessions.get_or_error(&session_id)?;
+        if !self.policy.allow_traffic_bytes(ip_packet.len()) {
+            return Err(ServerError::node_policy_rejected("bandwidth_limit_mbps"));
+        }
         let counter    = session.next_tx_counter();
 
         let mut encrypted = vec![0u8; ip_packet.len() + ENCRYPTION_OVERHEAD];

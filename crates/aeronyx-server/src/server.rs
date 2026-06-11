@@ -97,7 +97,9 @@ use crate::services::memchain::{
     ensure_volumes_config,
 };
 use crate::services::chat_relay::{ChatRelayService, derive_node_secret};
-use crate::services::{HandshakeService, IpPoolService, RoutingService, SessionManager};
+use crate::services::{
+    HandshakeService, IpPoolService, NodePolicyRuntime, RoutingService, SessionManager,
+};
 // v1.0.0-Membership
 use crate::services::traffic_tracker::TrafficTracker;
 use crate::services::session::StatsSnapshot;
@@ -221,11 +223,13 @@ impl Server {
         // v1.0.0-Membership: DenyList shared between HandshakeService
         // (read: reject denied wallets) and HeartbeatReporter (write: add/remove entries).
         let deny_list = Arc::new(DenyList::new());
+        let node_policy = Arc::new(NodePolicyRuntime::default());
 
         let packet_handler = Arc::new(PacketHandler::new(
             Arc::clone(&sessions),
             Arc::clone(&routing),
             Arc::clone(&traffic_tracker),
+            Arc::clone(&node_policy),
         ));
 
         let handshake_service = Arc::new(HandshakeService::new(
@@ -234,6 +238,7 @@ impl Server {
             Arc::clone(&sessions),
             Arc::clone(&routing),
             Arc::clone(&deny_list),
+            Arc::clone(&node_policy),
         ));
 
         // [VOUCHER-P1] Observe-only verifier. It never rejects handshakes in
@@ -247,6 +252,7 @@ impl Server {
             Arc::clone(&udp),
             Arc::clone(&traffic_tracker),
             Arc::clone(&deny_list),
+            Arc::clone(&node_policy),
         ).await;
 
         let udp_task = self.spawn_udp_task(
@@ -1043,6 +1049,7 @@ impl Server {
         udp:             Arc<UdpTransport>,
         traffic_tracker: Arc<TrafficTracker>,
         deny_list:       Arc<DenyList>,
+        node_policy:     Arc<NodePolicyRuntime>,
     ) -> SessionEventSender {
         info!("Initializing management reporting...");
 
@@ -1108,7 +1115,8 @@ impl Server {
                 .with_sessions(Arc::clone(sessions))
                 .with_traffic_tracker(Arc::clone(&traffic_tracker))
                 .with_udp(Arc::clone(&udp))
-                .with_deny_list(Arc::clone(&deny_list));
+                .with_deny_list(Arc::clone(&deny_list))
+                .with_node_policy(Arc::clone(&node_policy));
 
         if let Some(f) = memchain_status_fn {
             heartbeat = heartbeat.with_memchain_status(f);

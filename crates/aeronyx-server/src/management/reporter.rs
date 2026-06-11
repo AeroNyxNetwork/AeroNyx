@@ -47,7 +47,7 @@ use super::client::{
 };
 use super::models::{Command, SessionEventReport, SessionEventType};
 use crate::services::AgentManager;
-use crate::services::SessionManager;
+use crate::services::{NodePolicyRuntime, NodePolicySnapshot, SessionManager};
 use crate::services::deny_list::{DenyList, DenyReason};
 use crate::services::traffic_tracker::TrafficTracker;
 use aeronyx_transport::traits::Transport;
@@ -214,6 +214,8 @@ pub struct HeartbeatReporter {
     udp:              Option<Arc<aeronyx_transport::UdpTransport>>,
     /// v1.0.0-Membership: deny list for writing disconnection decisions.
     deny_list:        Option<Arc<DenyList>>,
+    /// Runtime operator policy shared with handshake and packet handlers.
+    node_policy:      Option<Arc<NodePolicyRuntime>>,
     /// Cached node tier from last CMS response. Default = "public".
     node_tier:        Arc<RwLock<String>>,
     /// Cached per-wallet permissions from last CMS response.
@@ -234,6 +236,7 @@ impl HeartbeatReporter {
             traffic:            None,
             udp:                None,
             deny_list:          None,
+            node_policy:        None,
             node_tier:        Arc::new(RwLock::new("public".to_string())),
             user_permissions: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -271,6 +274,11 @@ impl HeartbeatReporter {
 
     pub fn with_deny_list(mut self, deny_list: Arc<DenyList>) -> Self {
         self.deny_list = Some(deny_list);
+        self
+    }
+
+    pub fn with_node_policy(mut self, node_policy: Arc<NodePolicyRuntime>) -> Self {
+        self.node_policy = Some(node_policy);
         self
     }
 
@@ -486,6 +494,16 @@ impl HeartbeatReporter {
         }
 
         if let Some(ref policy) = response.node_policy {
+            if let Some(ref runtime_policy) = self.node_policy {
+                runtime_policy.update(NodePolicySnapshot {
+                    node_tier: policy.node_tier.clone(),
+                    maintenance_mode: policy.maintenance_mode,
+                    max_sessions: policy.max_sessions,
+                    bandwidth_limit_mbps: policy.bandwidth_limit_mbps,
+                    heartbeat_interval_seconds: policy.heartbeat_interval_seconds,
+                    updated_at: policy.updated_at.clone(),
+                });
+            }
             info!(
                 node_tier = %policy.node_tier,
                 maintenance_mode = policy.maintenance_mode,

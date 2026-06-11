@@ -53,7 +53,7 @@ use aeronyx_core::protocol::{ClientHello, ServerHello};
 
 use crate::error::{Result, ServerError};
 use crate::services::deny_list::DenyList;
-use crate::services::{IpPoolService, RoutingService, Session, SessionManager};
+use crate::services::{IpPoolService, NodePolicyRuntime, RoutingService, Session, SessionManager};
 
 /// Result of a successful handshake.
 pub struct HandshakeResult {
@@ -69,6 +69,8 @@ pub struct HandshakeService {
     routing:   Arc<RoutingService>,
     /// v1.0.0-Membership: deny list checked before any resource allocation.
     deny_list: Arc<DenyList>,
+    /// Operator policy from nodeboard Settings.
+    policy:    Arc<NodePolicyRuntime>,
 }
 
 impl HandshakeService {
@@ -78,9 +80,10 @@ impl HandshakeService {
         sessions:        Arc<SessionManager>,
         routing:         Arc<RoutingService>,
         deny_list:       Arc<DenyList>,
+        policy:          Arc<NodePolicyRuntime>,
     ) -> Self {
         let crypto = DefaultHandshakeCrypto::new(server_identity);
-        Self { crypto, ip_pool, sessions, routing, deny_list }
+        Self { crypto, ip_pool, sessions, routing, deny_list, policy }
     }
 
     /// Processes a ClientHello and creates a session.
@@ -96,6 +99,15 @@ impl HandshakeService {
         client_addr:  SocketAddr,
     ) -> Result<HandshakeResult> {
         debug!(client = %client_addr, "Processing handshake");
+
+        if let Err(reason) = self.policy.validate_new_session(self.sessions.count()) {
+            warn!(
+                client = %client_addr,
+                reason = reason,
+                "[NODE_POLICY] Handshake rejected"
+            );
+            return Err(ServerError::node_policy_rejected(reason));
+        }
 
         // ── Step 0: Deny list check (v1.0.0-Membership) ──────────────────
         // Derive wallet hex from the public key in the ClientHello.
@@ -226,6 +238,7 @@ mod tests {
     use aeronyx_core::protocol::CURRENT_PROTOCOL_VERSION;
     use std::net::Ipv4Addr;
     use crate::services::deny_list::DenyReason;
+    use crate::services::NodePolicySnapshot;
 
     fn create_test_services() -> (
         Arc<IpPoolService>,
@@ -258,6 +271,7 @@ mod tests {
             sessions.clone(),
             routing.clone(),
             deny_list,
+            Arc::new(NodePolicyRuntime::default()),
         );
 
         let client_identity = IdentityKeyPair::generate();
@@ -294,6 +308,7 @@ mod tests {
             sessions.clone(),
             routing.clone(),
             deny_list,
+            Arc::new(NodePolicyRuntime::default()),
         );
 
         let client_identity = IdentityKeyPair::generate();
@@ -336,6 +351,7 @@ mod tests {
             sessions.clone(),
             routing.clone(),
             deny_list,
+            Arc::new(NodePolicyRuntime::default()),
         );
 
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
@@ -370,6 +386,7 @@ mod tests {
             sessions.clone(),
             routing.clone(),
             Arc::clone(&deny_list),
+            Arc::new(NodePolicyRuntime::default()),
         );
 
         // Denied.
@@ -382,6 +399,80 @@ mod tests {
         // Now allowed.
         let result = service.process(&client_hello, client_addr);
         assert!(result.is_ok(), "Wallet removed from deny list must be allowed");
+        assert_eq!(sessions.count(), 1);
+    }
+
+    #[test]
+    fn test_maintenance_policy_rejects_before_ip_alloc() {
+        let server_identity = IdentityKeyPair::generate();
+        let (ip_pool, sessions, routing, deny_list) = create_test_services();
+        let policy = Arc::new(NodePolicyRuntime::default());
+        policy.update(NodePolicySnapshot {
+            maintenance_mode: true,
+            ..NodePolicySnapshot::default()
+        });
+
+        let service = HandshakeService::new(
+            server_identity,
+            ip_pool.clone(),
+            sessions.clone(),
+            routing.clone(),
+            deny_list,
+            policy,
+        );
+
+        let client_identity = IdentityKeyPair::generate();
+        let client_ephemeral = EphemeralKeyPair::generate();
+        let client_hello = create_client_hello(
+            &client_identity,
+            client_ephemeral.public_key_bytes(),
+            CURRENT_PROTOCOL_VERSION,
+        );
+        let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        let result = service.process(&client_hello, client_addr);
+        assert!(matches!(result, Err(ServerError::NodePolicyRejected { .. })));
+        assert_eq!(ip_pool.allocated_count(), 0);
+        assert_eq!(sessions.count(), 0);
+        assert!(routing.is_empty());
+    }
+
+    #[test]
+    fn test_policy_max_sessions_rejects_before_local_limit() {
+        let server_identity = IdentityKeyPair::generate();
+        let (ip_pool, sessions, routing, deny_list) = create_test_services();
+        let policy = Arc::new(NodePolicyRuntime::default());
+        policy.update(NodePolicySnapshot {
+            max_sessions: 1,
+            ..NodePolicySnapshot::default()
+        });
+
+        let service = HandshakeService::new(
+            server_identity,
+            ip_pool.clone(),
+            sessions.clone(),
+            routing.clone(),
+            deny_list,
+            policy,
+        );
+
+        for index in 0..2 {
+            let client_identity = IdentityKeyPair::generate();
+            let client_ephemeral = EphemeralKeyPair::generate();
+            let client_hello = create_client_hello(
+                &client_identity,
+                client_ephemeral.public_key_bytes(),
+                CURRENT_PROTOCOL_VERSION,
+            );
+            let client_addr: SocketAddr = format!("127.0.0.1:{}", 12345 + index).parse().unwrap();
+            let result = service.process(&client_hello, client_addr);
+            if index == 0 {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(ServerError::NodePolicyRejected { .. })));
+            }
+        }
+
         assert_eq!(sessions.count(), 1);
     }
 }
