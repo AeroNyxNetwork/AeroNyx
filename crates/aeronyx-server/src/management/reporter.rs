@@ -34,7 +34,7 @@
 //   v1.0.0-Membership     - wallet collection, delta drain, permission enforcement
 // ============================================
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -487,6 +487,8 @@ impl HeartbeatReporter {
             *self.user_permissions.write() = response.user_permissions.clone();
         }
 
+        self.sync_operator_bans(response);
+
         // Voucher rollout note:
         // Billing identity is now represented by blind-signed vouchers issued by
         // the CMS. `Session::wallet_hex` is the VPN transport identity from the
@@ -596,6 +598,46 @@ impl HeartbeatReporter {
                 to_disconnect.len()
             );
         }
+    }
+
+    fn sync_operator_bans(&self, response: &super::client::HeartbeatResponse) {
+        let Some(ref operator_bans) = response.operator_bans else {
+            return;
+        };
+        let Some(ref deny_list) = self.deny_list else {
+            return;
+        };
+
+        let desired: HashSet<String> = operator_bans
+            .iter()
+            .filter_map(|wallet| normalize_wallet_hex(wallet))
+            .collect();
+
+        for wallet in &desired {
+            if deny_list.deny_reason(wallet) != Some(DenyReason::OperatorBan) {
+                deny_list.add(wallet, DenyReason::OperatorBan);
+            }
+        }
+
+        for wallet in deny_list.wallets_for_reason(DenyReason::OperatorBan) {
+            if !desired.contains(&wallet) {
+                deny_list.remove(&wallet);
+            }
+        }
+
+        debug!(
+            count = desired.len(),
+            "[OPERATOR_BAN] Synced operator wallet bans from CMS"
+        );
+    }
+}
+
+fn normalize_wallet_hex(value: &str) -> Option<String> {
+    let wallet = value.trim().to_ascii_lowercase();
+    if wallet.len() == 64 && wallet.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Some(wallet)
+    } else {
+        None
     }
 }
 

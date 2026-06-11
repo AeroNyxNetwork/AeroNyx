@@ -415,6 +415,9 @@ pub struct HeartbeatResponse {
     /// v1.3.0: Structured commands from CMS to execute on this node.
     #[serde(default)]
     pub commands: Option<Vec<Command>>,
+    /// Full operator wallet ban policy from CMS.
+    #[serde(default)]
+    pub operator_bans: Option<Vec<String>>,
     /// Error message (present on failure)
     pub error: Option<String>,
 }

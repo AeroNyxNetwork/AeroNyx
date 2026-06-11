@@ -183,6 +183,16 @@ impl DenyList {
             .map(|e| e.reason.clone())
     }
 
+    /// Returns all active wallets currently denied for a specific reason.
+    #[must_use]
+    pub fn wallets_for_reason(&self, reason: DenyReason) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.is_active() && entry.reason == reason)
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     /// Explicitly removes a wallet from the deny list.
     ///
     /// Called when CMS heartbeat response confirms the wallet's access

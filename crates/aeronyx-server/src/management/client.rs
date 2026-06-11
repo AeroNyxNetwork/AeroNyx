@@ -114,6 +114,12 @@ pub struct HeartbeatResponse {
     /// Empty map = CMS returned no permissions — keep current cached state.
     #[serde(default)]
     pub user_permissions: HashMap<String, UserPermission>,
+
+    /// Full operator-managed wallet deny policy for this node.
+    /// None = CMS did not include the field — keep current runtime state.
+    /// Some(empty) = CMS explicitly has no active operator bans.
+    #[serde(default)]
+    pub operator_bans: Option<Vec<String>>,
 }
 
 // ============================================
