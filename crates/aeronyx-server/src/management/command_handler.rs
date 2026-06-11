@@ -275,6 +275,9 @@ impl CommandHandler {
             "kick_session" => {
                 self.handle_kick_session(&command).await;
             }
+            "refresh_config" => {
+                self.handle_refresh_config(&command).await;
+            }
             "restart_service" => {
                 self.handle_restart_service(&command).await;
             }
@@ -602,6 +605,71 @@ impl CommandHandler {
         ).await;
     }
 
+    /// Handles `refresh_config` command.
+    ///
+    /// This is the safe first step toward centralized VPN policy refresh. The
+    /// node validates and summarizes the fixed management configuration it is
+    /// already running with, plus its node binding file, without accepting any
+    /// caller-provided path or shell parameter.
+    async fn handle_refresh_config(&self, command: &Command) {
+        info!(
+            command_id = %command.id,
+            "[CMD_HANDLER] 🔁 refresh_config"
+        );
+
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::InProgress,
+            25,
+            "Refreshing VPN management configuration",
+        ).await;
+
+        let config = self.client.config();
+        let validation = match config.validate() {
+            Ok(()) => "ok".to_string(),
+            Err(error) => {
+                self.report_status_for_agent_type(
+                    "vpn",
+                    &command.id,
+                    CommandExecutionStatus::Failed,
+                    0,
+                    &format!("management config validation failed: {}", error),
+                ).await;
+                return;
+            }
+        };
+
+        let node_info = read_node_info_summary(&config.node_info_path).await;
+        let message = sanitize_and_truncate(&format!(
+            "VPN management configuration refreshed\n\
+             config_validation: {}\n\
+             cms_url: {}\n\
+             heartbeat_interval_secs: {}\n\
+             session_report_interval_secs: {}\n\
+             request_timeout_secs: {}\n\
+             max_retries: {}\n\
+             node_info_path: {}\n\
+             node_info: {}",
+            validation,
+            config.cms_url,
+            config.heartbeat_interval_secs,
+            config.session_report_interval_secs,
+            config.request_timeout_secs,
+            config.max_retries,
+            config.node_info_path,
+            node_info
+        ));
+
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::Completed,
+            100,
+            &message,
+        ).await;
+    }
+
     /// Handles `restart_service` command.
     ///
     /// The node first reports that the restart has been scheduled, then asks
@@ -861,6 +929,38 @@ async fn schedule_service_restart(command_id: &str, service_name: &str) -> Resul
         Ok(Err(error)) => Err(format!("failed to schedule restart fallback: {}", error)),
         Err(_) => Err("restart fallback scheduling timed out".to_string()),
     }
+}
+
+async fn read_node_info_summary(path: &str) -> String {
+    let content = match tokio::fs::read_to_string(path).await {
+        Ok(value) => value,
+        Err(error) => return format!("missing_or_unreadable path={} error={}", path, error),
+    };
+
+    let value: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(value) => value,
+        Err(error) => return format!("invalid_json path={} error={}", path, error),
+    };
+
+    let field = |keys: &[&str]| -> String {
+        for key in keys {
+            if let Some(value) = value.get(key).and_then(|item| item.as_str()) {
+                return value.to_string();
+            }
+        }
+        "unknown".to_string()
+    };
+    let public_key = field(&["public_key"]);
+    let public_key_prefix: String = public_key.chars().take(12).collect();
+
+    format!(
+        "registered=true id={} name={} status={} key_prefix={} created_at={}",
+        field(&["id", "node_id"]),
+        field(&["name"]),
+        field(&["status"]),
+        public_key_prefix,
+        field(&["created_at", "registered_at"])
+    )
 }
 
 fn command_agent_type(action: &str) -> &'static str {
