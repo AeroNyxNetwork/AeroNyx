@@ -275,6 +275,9 @@ impl CommandHandler {
             "kick_session" => {
                 self.handle_kick_session(&command).await;
             }
+            "restart_service" => {
+                self.handle_restart_service(&command).await;
+            }
             unknown => {
                 warn!(
                     command_id = %cmd_id,
@@ -599,6 +602,77 @@ impl CommandHandler {
         ).await;
     }
 
+    /// Handles `restart_service` command.
+    ///
+    /// The node first reports that the restart has been scheduled, then asks
+    /// systemd to restart the fixed VPN service a few seconds later. This keeps
+    /// command audit from being stranded when the current process exits.
+    async fn handle_restart_service(&self, command: &Command) {
+        info!(
+            command_id = %command.id,
+            "[CMD_HANDLER] 🔄 restart_service"
+        );
+
+        let service_name = command.params
+            .get("service_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("aeronyx-server");
+        if service_name != "aeronyx-server" {
+            self.report_status_for_agent_type(
+                "vpn",
+                &command.id,
+                CommandExecutionStatus::Failed,
+                0,
+                "restart_service only supports aeronyx-server",
+            ).await;
+            return;
+        }
+
+        let confirm = command.params
+            .get("confirm")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if confirm != "restart" {
+            self.report_status_for_agent_type(
+                "vpn",
+                &command.id,
+                CommandExecutionStatus::Failed,
+                0,
+                "restart_service requires confirm=restart",
+            ).await;
+            return;
+        }
+
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::InProgress,
+            50,
+            "Scheduling VPN service restart",
+        ).await;
+
+        match schedule_service_restart(&command.id, service_name).await {
+            Ok(message) => {
+                self.report_status_for_agent_type(
+                    "vpn",
+                    &command.id,
+                    CommandExecutionStatus::Completed,
+                    100,
+                    &message,
+                ).await;
+            }
+            Err(message) => {
+                self.report_status_for_agent_type(
+                    "vpn",
+                    &command.id,
+                    CommandExecutionStatus::Failed,
+                    0,
+                    &message,
+                ).await;
+            }
+        }
+    }
+
     // ============================================
     // Status Reporting
     // ============================================
@@ -716,6 +790,76 @@ async fn run_readonly_command(program: &str, args: &[&str]) -> String {
         }
         Ok(Err(e)) => format!("{} failed: {}", program, e),
         Err(_) => format!("{} timed out", program),
+    }
+}
+
+async fn schedule_service_restart(command_id: &str, service_name: &str) -> Result<String, String> {
+    let suffix: String = command_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(12)
+        .collect();
+    let unit = format!("aeronyx-restart-{}", suffix);
+
+    let systemd_run = timeout(
+        VPN_COMMAND_TIMEOUT,
+        TokioCommand::new("systemd-run")
+            .args([
+                "--unit",
+                &unit,
+                "--on-active=3s",
+                "/bin/systemctl",
+                "restart",
+                service_name,
+            ])
+            .output(),
+    ).await;
+
+    match systemd_run {
+        Ok(Ok(output)) if output.status.success() => {
+            return Ok(format!(
+                "VPN service restart scheduled via systemd-run unit={} delay=3s",
+                unit
+            ));
+        }
+        Ok(Ok(output)) => {
+            warn!(
+                unit = %unit,
+                status = %output.status,
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "[CMD_HANDLER] systemd-run restart scheduling failed; falling back"
+            );
+        }
+        Ok(Err(error)) => {
+            warn!(
+                unit = %unit,
+                error = %error,
+                "[CMD_HANDLER] systemd-run unavailable; falling back"
+            );
+        }
+        Err(_) => {
+            warn!(
+                unit = %unit,
+                "[CMD_HANDLER] systemd-run restart scheduling timed out; falling back"
+            );
+        }
+    }
+
+    let fallback = timeout(
+        VPN_COMMAND_TIMEOUT,
+        TokioCommand::new("sh")
+            .arg("-c")
+            .arg("nohup sh -c 'sleep 3; /bin/systemctl restart aeronyx-server' >/dev/null 2>&1 &")
+            .status(),
+    ).await;
+
+    match fallback {
+        Ok(Ok(status)) if status.success() => Ok(
+            "VPN service restart scheduled via detached fallback delay=3s".to_string()
+        ),
+        Ok(Ok(status)) => Err(format!("failed to schedule restart fallback: exit={}", status)),
+        Ok(Err(error)) => Err(format!("failed to schedule restart fallback: {}", error)),
+        Err(_) => Err("restart fallback scheduling timed out".to_string()),
     }
 }
 
