@@ -1073,8 +1073,12 @@ impl Server {
             });
         }
 
+        let (session_reporter, event_tx) = SessionReporter::new(Arc::clone(&mgmt_client));
+        let session_event_sender = SessionEventSender::new(event_tx);
+
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_BUFFER);
-        let cmd_handler      = CommandHandler::new(cmd_rx, Arc::clone(&mgmt_client), Arc::clone(&agent_manager));
+        let cmd_handler      = CommandHandler::new(cmd_rx, Arc::clone(&mgmt_client), Arc::clone(&agent_manager))
+            .with_session_control(Arc::clone(sessions), session_event_sender.clone());
         let cmd_shutdown     = self.shutdown_tx.subscribe();
         tokio::spawn(async move { cmd_handler.run(cmd_shutdown).await; });
 
@@ -1117,7 +1121,6 @@ impl Server {
                 .await;
         });
 
-        let (session_reporter, event_tx) = SessionReporter::new(Arc::clone(&mgmt_client));
         let sr_shutdown = self.shutdown_tx.subscribe();
         tokio::spawn(async move { session_reporter.run(sr_shutdown).await; });
 
@@ -1138,7 +1141,7 @@ impl Server {
         }
 
         info!("[MANAGEMENT] Reporting started");
-        SessionEventSender::new(event_tx)
+        session_event_sender
     }
 
     // ============================================

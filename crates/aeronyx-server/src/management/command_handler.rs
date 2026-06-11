@@ -52,6 +52,7 @@
 //! ============================================
 
 use std::collections::HashSet;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -61,8 +62,10 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use super::client::ManagementClient;
+use super::reporter::{SessionEventSender, SessionQuality};
 use super::models::{Command, CommandExecutionStatus, CommandStatusReport};
-use crate::services::AgentManager;
+use aeronyx_common::types::SessionId;
+use crate::services::{AgentManager, SessionManager};
 
 // ============================================
 // Constants
@@ -73,6 +76,26 @@ use crate::services::AgentManager;
 const MAX_PROCESSED_IDS: usize = 1000;
 const VPN_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DIAGNOSTIC_MESSAGE: usize = 3800;
+
+fn session_quality_from_stats(snap: &crate::services::session::StatsSnapshot) -> SessionQuality {
+    let rejects = snap.replays_rejected + snap.too_old_rejected;
+    let accepted = snap.packets_rx + snap.packets_tx;
+    let packet_loss = if accepted + rejects > 0 {
+        Some((rejects as f64 / (accepted + rejects) as f64) * 100.0)
+    } else {
+        None
+    };
+
+    SessionQuality {
+        last_rx_at: (snap.last_rx_at > 0).then_some(snap.last_rx_at),
+        last_tx_at: (snap.last_tx_at > 0).then_some(snap.last_tx_at),
+        packet_loss,
+        replay_rejections: Some(snap.replays_rejected),
+        too_old_rejections: Some(snap.too_old_rejected),
+        packets_rx: Some(snap.packets_rx),
+        packets_tx: Some(snap.packets_tx),
+    }
+}
 
 // ============================================
 // CommandHandler
@@ -108,6 +131,12 @@ pub struct CommandHandler {
     /// 🌟 v1.3.0 Phase 2: OpenClaw agent lifecycle manager.
     agent_manager: Arc<AgentManager>,
 
+    /// VPN session manager used by nodeboard operations commands.
+    sessions: Option<Arc<SessionManager>>,
+
+    /// Session event sender used to notify CMS after control-plane kicks.
+    session_events: SessionEventSender,
+
     /// Set of already-processed command IDs for deduplication.
     /// CMS may resend commands in consecutive heartbeats until
     /// it receives an acknowledgement.
@@ -137,9 +166,21 @@ impl CommandHandler {
             command_rx,
             client,
             agent_manager,
+            sessions: None,
+            session_events: SessionEventSender::disabled(),
             processed_ids: HashSet::with_capacity(128),
             processed_ids_order: Vec::with_capacity(128),
         }
+    }
+
+    pub fn with_session_control(
+        mut self,
+        sessions: Arc<SessionManager>,
+        session_events: SessionEventSender,
+    ) -> Self {
+        self.sessions = Some(sessions);
+        self.session_events = session_events;
+        self
     }
 
     /// Runs the command handler loop until shutdown signal received.
@@ -230,6 +271,9 @@ impl CommandHandler {
             }
             "collect_logs" => {
                 self.handle_collect_logs(&command).await;
+            }
+            "kick_session" => {
+                self.handle_kick_session(&command).await;
             }
             unknown => {
                 warn!(
@@ -456,6 +500,102 @@ impl CommandHandler {
             CommandExecutionStatus::Completed,
             100,
             &message,
+        ).await;
+    }
+
+    /// Handles `kick_session` command.
+    ///
+    /// This is a bounded control-plane operation: the CMS passes exactly one
+    /// base64 `session_id`; the node removes that in-memory VPN session and
+    /// reports a final cumulative `session_ended` event.
+    async fn handle_kick_session(&self, command: &Command) {
+        info!(
+            command_id = %command.id,
+            "[CMD_HANDLER] 🧹 kick_session"
+        );
+
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::InProgress,
+            30,
+            "Kicking VPN session",
+        ).await;
+
+        let Some(ref sessions) = self.sessions else {
+            self.report_status_for_agent_type(
+                "vpn",
+                &command.id,
+                CommandExecutionStatus::Failed,
+                0,
+                "VPN session manager is not available",
+            ).await;
+            return;
+        };
+
+        let Some(session_id_raw) = command.params
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            self.report_status_for_agent_type(
+                "vpn",
+                &command.id,
+                CommandExecutionStatus::Failed,
+                0,
+                "session_id is required",
+            ).await;
+            return;
+        };
+
+        let session_id = match SessionId::from_str(session_id_raw) {
+            Ok(value) => value,
+            Err(error) => {
+                self.report_status_for_agent_type(
+                    "vpn",
+                    &command.id,
+                    CommandExecutionStatus::Failed,
+                    0,
+                    &format!("invalid session_id: {}", error),
+                ).await;
+                return;
+            }
+        };
+
+        let Some(session) = sessions.remove(&session_id) else {
+            self.report_status_for_agent_type(
+                "vpn",
+                &command.id,
+                CommandExecutionStatus::Failed,
+                0,
+                "session not found on node",
+            ).await;
+            return;
+        };
+
+        let stats = session.stats.snapshot();
+        let quality = session_quality_from_stats(&stats);
+        self.session_events.session_ended(
+            session_id_raw,
+            Some(session.wallet_hex.clone()),
+            stats.bytes_rx,
+            stats.bytes_tx,
+            quality,
+        );
+
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::Completed,
+            100,
+            &format!(
+                "VPN session kicked: session_id={}, virtual_ip={}, bytes_in={}, bytes_out={}",
+                session_id_raw,
+                session.virtual_ip,
+                stats.bytes_rx,
+                stats.bytes_tx
+            ),
         ).await;
     }
 
