@@ -4,16 +4,14 @@
 //! ============================================
 //!
 //! ## Creation Reason
-//! Phase 1 of the OpenClaw integration: Command Pipeline.
-//! Receives structured `Command` objects from the heartbeat response
-//! (via an internal `mpsc` channel) and dispatches them to the
-//! appropriate handler based on `command.action`.
+//! VPN operations command pipeline. Receives structured `Command` objects from
+//! the heartbeat response and dispatches safe node operations by
+//! `command.action`.
 //!
-//! ## Modification Reason (v1.3.0 Phase 2)
-//! - 🌟 Replaced all stub handlers with real `AgentManager` delegation.
-//! - 🌟 Added `agent_manager: Arc<AgentManager>` field, injected from server.rs.
-//! - 🌟 Each action handler now calls the corresponding AgentManager method
-//!   and reports success/failure based on the result.
+//! ## Modification Reason
+//! - v1.5.0: removed legacy non-VPN agent lifecycle command dispatch. The node
+//!   now accepts only VPN operations commands from the centralized control
+//!   plane.
 //!
 //! ## Main Functionality
 //! - `CommandHandler`: Background async task that consumes commands
@@ -21,20 +19,19 @@
 //! - Maintains an internal log of received command IDs to avoid
 //!   re-executing duplicate commands (CMS may resend until acknowledged).
 //! - Reports execution status back to CMS via `ManagementClient`.
-//! - 🌟 Delegates agent lifecycle ops to `AgentManager`.
 //!
 //! ## Main Logical Flow
 //! 1. `HeartbeatReporter` receives `HeartbeatResponse` with `commands`
 //! 2. Commands are sent to `CommandHandler` via `mpsc::Sender<Command>`
 //! 3. `CommandHandler::run()` loop receives each `Command`
 //! 4. Deduplication check (skip if `command.id` already processed)
-//! 5. Match on `command.action` → dispatch to AgentManager
+//! 5. Match on `command.action` → dispatch to bounded VPN operation handlers
 //! 6. Report `CommandStatusReport` back to CMS
 //!
 //! ## Dependencies
 //! - `super::client::ManagementClient` — for status reporting to CMS
 //! - `super::models::*` — Command, CommandStatusReport, CommandExecutionStatus
-//! - `crate::services::AgentManager` — OpenClaw lifecycle management
+//! - `crate::services::*` — VPN sessions, deny list, and retained runtime state
 //!
 //! ## ⚠️ Important Note for Next Developer
 //! - The deduplication set (`processed_ids`) is in-memory only.
@@ -43,12 +40,12 @@
 //! - The set is capped at `MAX_PROCESSED_IDS` (1000) to prevent
 //!   unbounded memory growth. When full, the oldest half is evicted.
 //! - Unknown actions are logged and reported as `failed` — never panic.
-//! - AgentManager methods handle their own progress reporting to CMS,
-//!   so CommandHandler only needs to report "received" and handle errors.
+//! - Legacy non-VPN lifecycle commands are not dispatched. They fall through to
+//!   the unknown-action failure path so the CMS audit trail shows rejection.
 //!
 //! ## Last Modified
-//! v1.3.0 - 🌟 Initial creation (Phase 1: stubs)
-//! v1.3.0 - 🌟 Phase 2: Replaced stubs with AgentManager delegation
+//! v1.3.0 - Initial command pipeline
+//! v1.5.0 - VPN-only operations dispatch
 //! ============================================
 
 use std::collections::HashSet;
@@ -59,7 +56,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use super::client::ManagementClient;
 use super::reporter::{SessionEventSender, SessionQuality};
@@ -113,12 +110,14 @@ fn session_quality_from_stats(snap: &crate::services::session::StatsSnapshot) ->
 ///       │
 ///       ├── deduplicate (skip seen command.id)
 ///       ├── match command.action
-///       │     ├── "install_openclaw"  → AgentManager::install_agent()
-///       │     ├── "start_openclaw"    → AgentManager::start_agent()
-///       │     ├── "stop_openclaw"     → AgentManager::stop_agent()
-///       │     ├── "uninstall_openclaw"→ AgentManager::uninstall_agent()
-///       │     ├── "update_openclaw"   → AgentManager::update_agent()
-///       │     └── unknown            → report failed
+///       │     ├── "system_info"     → collect read-only diagnostics
+///       │     ├── "collect_logs"    → collect bounded service logs
+///       │     ├── "refresh_config"  → validate management config
+///       │     ├── "kick_session"    → disconnect one active tunnel
+///       │     ├── "ban_wallet"      → block a wallet on this node
+///       │     ├── "unban_wallet"    → remove a wallet block
+///       │     ├── "restart_service" → restart the fixed VPN service
+///       │     └── unknown           → report failed
 ///       │
 ///       └── report_command_status() → CMS
 /// ```
@@ -129,7 +128,8 @@ pub struct CommandHandler {
     /// Shared management client for reporting status to CMS.
     client: Arc<ManagementClient>,
 
-    /// 🌟 v1.3.0 Phase 2: OpenClaw agent lifecycle manager.
+    /// Retained runtime manager used by the management websocket path. Command
+    /// handling no longer dispatches non-VPN lifecycle actions through it.
     agent_manager: Arc<AgentManager>,
 
     /// VPN session manager used by nodeboard operations commands.
@@ -157,7 +157,7 @@ impl CommandHandler {
     /// # Arguments
     /// * `command_rx` - Receiver end of the command channel
     /// * `client` - Shared ManagementClient for CMS communication
-    /// * `agent_manager` - Shared AgentManager for OpenClaw lifecycle ops
+    /// * `agent_manager` - Retained runtime manager shared with management services
     ///
     /// # Returns
     /// A new `CommandHandler` ready to be spawned with `.run()`.
@@ -248,11 +248,9 @@ impl CommandHandler {
         // Mark as processed (before execution to prevent re-entry)
         self.mark_processed(cmd_id.clone());
 
-        let report_agent_type = command_agent_type(action);
-
         // Report "received" status to CMS
         self.report_status_for_agent_type(
-            report_agent_type,
+            "vpn",
             cmd_id,
             CommandExecutionStatus::Received,
             0,
@@ -261,21 +259,6 @@ impl CommandHandler {
 
         // ===== Dispatch by action =====
         match action.as_str() {
-            "install_openclaw" => {
-                self.handle_install_openclaw(&command).await;
-            }
-            "start_openclaw" => {
-                self.handle_start_openclaw(&command).await;
-            }
-            "stop_openclaw" => {
-                self.handle_stop_openclaw(&command).await;
-            }
-            "uninstall_openclaw" => {
-                self.handle_uninstall_openclaw(&command).await;
-            }
-            "update_openclaw" => {
-                self.handle_update_openclaw(&command).await;
-            }
             "system_info" => {
                 self.handle_system_info(&command).await;
             }
@@ -304,109 +287,13 @@ impl CommandHandler {
                     "[CMD_HANDLER] ❓ Unknown action — reporting failed"
                 );
                 self.report_status_for_agent_type(
-                    report_agent_type,
+                    "vpn",
                     cmd_id,
                     CommandExecutionStatus::Failed,
                     0,
                     &format!("Unknown action: {}", unknown),
                 ).await;
             }
-        }
-    }
-
-    // ============================================
-    // Action Handlers (delegating to AgentManager)
-    // ============================================
-
-    /// Handles `install_openclaw` command.
-    ///
-    /// Delegates to `AgentManager::install_agent()` which handles:
-    /// 1. Create system user
-    /// 2. Install Node.js 22+
-    /// 3. Install OpenClaw via npm
-    /// 4. Run onboarding with --install-daemon
-    /// 5. Start gateway
-    /// 6. Verify health
-    ///
-    /// AgentManager handles its own progress reporting.
-    async fn handle_install_openclaw(&self, command: &Command) {
-        info!(
-            command_id = %command.id,
-            params = %command.params,
-            "[CMD_HANDLER] 🔧 install_openclaw"
-        );
-
-        if let Err(e) = self.agent_manager.install_agent(&command.id, &command.params).await {
-            error!(
-                command_id = %command.id,
-                error = %e,
-                "[CMD_HANDLER] ❌ install_openclaw failed"
-            );
-            // AgentManager already reported failure, but log it here too
-        }
-    }
-
-    /// Handles `start_openclaw` command.
-    async fn handle_start_openclaw(&self, command: &Command) {
-        info!(
-            command_id = %command.id,
-            "[CMD_HANDLER] ▶️ start_openclaw"
-        );
-
-        if let Err(e) = self.agent_manager.start_agent(&command.id).await {
-            error!(
-                command_id = %command.id,
-                error = %e,
-                "[CMD_HANDLER] ❌ start_openclaw failed"
-            );
-        }
-    }
-
-    /// Handles `stop_openclaw` command.
-    async fn handle_stop_openclaw(&self, command: &Command) {
-        info!(
-            command_id = %command.id,
-            "[CMD_HANDLER] ⏹️ stop_openclaw"
-        );
-
-        if let Err(e) = self.agent_manager.stop_agent(&command.id).await {
-            error!(
-                command_id = %command.id,
-                error = %e,
-                "[CMD_HANDLER] ❌ stop_openclaw failed"
-            );
-        }
-    }
-
-    /// Handles `uninstall_openclaw` command.
-    async fn handle_uninstall_openclaw(&self, command: &Command) {
-        info!(
-            command_id = %command.id,
-            "[CMD_HANDLER] 🗑️ uninstall_openclaw"
-        );
-
-        if let Err(e) = self.agent_manager.uninstall_agent(&command.id).await {
-            error!(
-                command_id = %command.id,
-                error = %e,
-                "[CMD_HANDLER] ❌ uninstall_openclaw failed"
-            );
-        }
-    }
-
-    /// Handles `update_openclaw` command.
-    async fn handle_update_openclaw(&self, command: &Command) {
-        info!(
-            command_id = %command.id,
-            "[CMD_HANDLER] 🔄 update_openclaw"
-        );
-
-        if let Err(e) = self.agent_manager.update_agent(&command.id, &command.params).await {
-            error!(
-                command_id = %command.id,
-                error = %e,
-                "[CMD_HANDLER] ❌ update_openclaw failed"
-            );
         }
     }
 
@@ -908,7 +795,7 @@ impl CommandHandler {
         message: &str,
     ) {
         self.report_status_for_agent_type(
-            "openclaw",
+            "vpn",
             command_id,
             status,
             progress,
@@ -1128,17 +1015,6 @@ fn wallet_hex_to_bytes(wallet_hex: &str) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);
     Some(out)
-}
-
-fn command_agent_type(action: &str) -> &'static str {
-    match action {
-        "install_openclaw"
-        | "start_openclaw"
-        | "stop_openclaw"
-        | "uninstall_openclaw"
-        | "update_openclaw" => "openclaw",
-        _ => "vpn",
-    }
 }
 
 async fn read_trimmed_file(path: &str) -> String {

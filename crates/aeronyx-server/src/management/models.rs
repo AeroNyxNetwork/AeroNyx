@@ -448,11 +448,12 @@ pub struct NodePolicy {
 /// A structured command dispatched from CMS to a Rust node.
 ///
 /// ## Known Actions
-/// - `"install_openclaw"` — Download and install OpenClaw agent
-/// - `"start_openclaw"`   — Start the OpenClaw process
-/// - `"stop_openclaw"`    — Stop the OpenClaw process
-/// - `"uninstall_openclaw"` — Remove OpenClaw from the system
-/// - `"update_openclaw"`  — Update OpenClaw to a new version
+/// - `"system_info"` — Collect read-only VPN node diagnostics
+/// - `"collect_logs"` — Return a bounded, redacted service log tail
+/// - `"refresh_config"` — Re-read and validate management config
+/// - `"kick_session"` — Disconnect one active VPN session
+/// - `"ban_wallet"` / `"unban_wallet"` — Update the operator deny list
+/// - `"restart_service"` — Restart the fixed VPN service after audit reporting
 ///
 /// ⚠️ `id` MUST be included in all status reports back to CMS.
 /// Unknown actions should be logged and reported as `failed`, never panic.
@@ -484,7 +485,7 @@ fn default_priority() -> u8 { 10 }
 pub struct CommandStatusReport {
     /// The command ID this report refers to (from `Command.id`).
     pub command_id: String,
-    /// Agent type identifier. Default: "openclaw".
+    /// Command reporter type identifier. Default: "vpn".
     #[serde(default = "default_agent_type")]
     pub agent_type: String,
     /// Execution status.
@@ -499,7 +500,7 @@ pub struct CommandStatusReport {
     pub timestamp: u64,
 }
 
-fn default_agent_type() -> String { "openclaw".to_string() }
+fn default_agent_type() -> String { "vpn".to_string() }
 
 /// Execution status for a CMS command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
