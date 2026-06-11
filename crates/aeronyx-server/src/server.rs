@@ -74,7 +74,7 @@ use rusqlite::OptionalExtension;
 use crate::api::mpi::{build_mpi_router, MpiState, BaselineSnapshot, Mode};
 use crate::api::auth::{ensure_jwt_secret, generate_secret};
 use crate::api::voice::build_voice_router;
-use crate::api::vpn_health::build_vpn_health_router;
+use crate::api::vpn_health::{build_vpn_health_router, collect_vpn_health_value};
 use crate::config::{MemChainConfig, MemChainMode, ServerConfig, VectorQuantizationMode};
 use crate::error::{Result, ServerError};
 use crate::handlers::packet::DecryptedPayload;
@@ -253,6 +253,7 @@ impl Server {
             Arc::clone(&traffic_tracker),
             Arc::clone(&deny_list),
             Arc::clone(&node_policy),
+            Arc::clone(&voucher_verifier),
         ).await;
 
         let udp_task = self.spawn_udp_task(
@@ -1050,6 +1051,7 @@ impl Server {
         traffic_tracker: Arc<TrafficTracker>,
         deny_list:       Arc<DenyList>,
         node_policy:     Arc<NodePolicyRuntime>,
+        voucher_verifier: Arc<VoucherVerifier>,
     ) -> SessionEventSender {
         info!("Initializing management reporting...");
 
@@ -1121,6 +1123,18 @@ impl Server {
         if let Some(f) = memchain_status_fn {
             heartbeat = heartbeat.with_memchain_status(f);
         }
+
+        let vpn_health_config = self.config.clone();
+        let vpn_health_sessions = Arc::clone(sessions);
+        let vpn_health_verifier = Arc::clone(&voucher_verifier);
+        heartbeat = heartbeat.with_vpn_health_status(Box::new(move || {
+            let config = vpn_health_config.clone();
+            let sessions = Arc::clone(&vpn_health_sessions);
+            let verifier = Arc::clone(&vpn_health_verifier);
+            Box::pin(async move {
+                Some(collect_vpn_health_value(config, sessions, verifier).await)
+            })
+        }));
 
         let sess        = Arc::clone(sessions);
         let hb_shutdown = self.shutdown_tx.subscribe();

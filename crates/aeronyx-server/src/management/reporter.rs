@@ -35,6 +35,8 @@
 // ============================================
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,6 +68,16 @@ const COLD_START_TIMEOUT_SECS:     u64 = 30;
 // ============================================
 
 pub type MemChainStatusFn = Box<dyn Fn() -> Option<MemChainHeartbeatStatus> + Send + Sync>;
+
+/// Async VPN health probe injected by server startup.
+///
+/// Source path:
+///   /root/a/AeroNyx/crates/aeronyx-server/src/management/reporter.rs
+///
+/// The probe returns privacy-safe node diagnostics for heartbeat
+/// `system_stats.vpn_health`.
+pub type VpnHealthStatusFn =
+    Box<dyn Fn() -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>> + Send + Sync>;
 
 // ============================================
 // Session Events
@@ -207,6 +219,7 @@ pub struct HeartbeatReporter {
     command_tx:         Option<mpsc::Sender<Command>>,
     agent_manager:      Option<Arc<AgentManager>>,
     memchain_status_fn: Option<MemChainStatusFn>,
+    vpn_health_status_fn: Option<VpnHealthStatusFn>,
 
     // v1.0.0-Membership
     sessions:         Option<Arc<SessionManager>>,
@@ -232,6 +245,7 @@ impl HeartbeatReporter {
             command_tx:         None,
             agent_manager:      None,
             memchain_status_fn: None,
+            vpn_health_status_fn: None,
             sessions:           None,
             traffic:            None,
             udp:                None,
@@ -254,6 +268,11 @@ impl HeartbeatReporter {
 
     pub fn with_memchain_status(mut self, f: MemChainStatusFn) -> Self {
         self.memchain_status_fn = Some(f);
+        self
+    }
+
+    pub fn with_vpn_health_status(mut self, f: VpnHealthStatusFn) -> Self {
+        self.vpn_health_status_fn = Some(f);
         self
     }
 
@@ -323,6 +342,12 @@ impl HeartbeatReporter {
                     let memchain_status = self.memchain_status_fn.as_ref()
                         .and_then(|f| f());
 
+                    let vpn_health_status = if let Some(ref f) = self.vpn_health_status_fn {
+                        f().await
+                    } else {
+                        None
+                    };
+
                     // v1.0.0-Membership: collect connected wallets (deduplicated).
                     let connected_wallets: Vec<String> =
                         if let Some(ref sm) = self.sessions {
@@ -360,6 +385,7 @@ impl HeartbeatReporter {
                             memchain_status,
                             connected_wallets,
                             traffic_delta,
+                            vpn_health_status,
                         ),
                     ).await;
 

@@ -268,6 +268,7 @@ impl ManagementClient {
         // v1.0.0-Membership
         connected_wallets: Vec<String>,
         traffic_delta:     HashMap<String, TrafficDelta>,
+        vpn_health:        Option<serde_json::Value>,
     ) -> Result<HeartbeatResponse, String> {
         let url       = format!("{}/node/heartbeat/", self.config.cms_url);
         let timestamp = Self::current_timestamp();
@@ -309,6 +310,9 @@ impl ManagementClient {
             }
             if let Some(count) = stats.cpu_count {
                 obj.insert("cpu_count".to_string(), serde_json::json!(count));
+            }
+            if let Some(health) = vpn_health {
+                obj.insert("vpn_health".to_string(), health);
             }
         }
 

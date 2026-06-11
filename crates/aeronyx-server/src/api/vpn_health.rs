@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 use serde::Serialize;
+use serde_json::Value;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
@@ -65,6 +66,37 @@ pub fn build_vpn_health_router(
 }
 
 async fn vpn_health_handler(State(state): State<VpnHealthState>) -> impl IntoResponse {
+    Json(collect_vpn_health_response(state).await)
+}
+
+/// Collect privacy-safe VPN node health as JSON for the CMS heartbeat.
+///
+/// Source path:
+///   /root/a/AeroNyx/crates/aeronyx-server/src/api/vpn_health.rs
+///
+/// The payload contains only local node diagnostics such as UDP listener, TUN,
+/// NAT, DNS stub/query, egress reachability, and aggregate counters. It never
+/// includes user destinations, DNS query contents, packet payloads, or browsing
+/// history.
+pub async fn collect_vpn_health_value(
+    config: ServerConfig,
+    sessions: Arc<SessionManager>,
+    voucher_verifier: Arc<VoucherVerifier>,
+) -> Value {
+    let state = VpnHealthState { config, sessions, voucher_verifier };
+    serde_json::to_value(collect_vpn_health_response(state).await)
+        .unwrap_or_else(|e| serde_json::json!({
+            "status": "failed",
+            "checked_at": unix_now_secs(),
+            "checks": [{
+                "name": "vpn_health_serialization",
+                "ok": false,
+                "detail": format!("serialization failed: {}", e),
+            }],
+        }))
+}
+
+async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse {
     let config = state.config;
     let gateway_ip = config.gateway_ip();
     let listen_addr = config.listen_addr();
@@ -89,7 +121,7 @@ async fn vpn_health_handler(State(state): State<VpnHealthState>) -> impl IntoRes
         "failed"
     };
 
-    Json(VpnHealthResponse {
+    VpnHealthResponse {
         status,
         checked_at: unix_now_secs(),
         listen_addr: listen_addr.to_string(),
@@ -100,7 +132,7 @@ async fn vpn_health_handler(State(state): State<VpnHealthState>) -> impl IntoRes
         active_wallet_devices: state.sessions.wallet_index_count(),
         voucher_metrics: state.voucher_verifier.metrics_snapshot(),
         checks,
-    })
+    }
 }
 
 async fn check_udp_listener(listen_addr: SocketAddr) -> HealthCheck {
