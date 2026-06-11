@@ -119,7 +119,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
@@ -395,6 +395,10 @@ pub struct SessionStats {
     pub replays_rejected: AtomicU64,
     /// Packets rejected because the counter was below the window base.
     pub too_old_rejected: AtomicU64,
+    /// Unix timestamp of the last successful VPN receive.
+    pub last_rx_at: AtomicU64,
+    /// Unix timestamp of the last successful VPN transmit.
+    pub last_tx_at: AtomicU64,
 }
 
 impl SessionStats {
@@ -402,12 +406,14 @@ impl SessionStats {
     pub fn record_rx(&self, bytes: u64) {
         self.bytes_rx.fetch_add(bytes, Ordering::Relaxed);
         self.packets_rx.fetch_add(1, Ordering::Relaxed);
+        self.last_rx_at.store(unix_now_secs(), Ordering::Relaxed);
     }
 
     /// Records a successful transmit of `bytes` bytes.
     pub fn record_tx(&self, bytes: u64) {
         self.bytes_tx.fetch_add(bytes, Ordering::Relaxed);
         self.packets_tx.fetch_add(1, Ordering::Relaxed);
+        self.last_tx_at.store(unix_now_secs(), Ordering::Relaxed);
     }
 
     /// Increments the replay-rejection counter.
@@ -430,6 +436,8 @@ impl SessionStats {
             packets_tx: self.packets_tx.load(Ordering::Relaxed),
             replays_rejected: self.replays_rejected.load(Ordering::Relaxed),
             too_old_rejected: self.too_old_rejected.load(Ordering::Relaxed),
+            last_rx_at: self.last_rx_at.load(Ordering::Relaxed),
+            last_tx_at: self.last_tx_at.load(Ordering::Relaxed),
         }
     }
 }
@@ -449,6 +457,17 @@ pub struct StatsSnapshot {
     pub replays_rejected: u64,
     /// Packets rejected as too old.
     pub too_old_rejected: u64,
+    /// Unix timestamp of the last successful VPN receive. Zero means none.
+    pub last_rx_at: u64,
+    /// Unix timestamp of the last successful VPN transmit. Zero means none.
+    pub last_tx_at: u64,
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 // ============================================
@@ -919,7 +938,7 @@ impl SessionManager {
     ///
     /// ## v1.0.0-Voice+SessionFix
     /// Return type extended from `Vec<(SessionId, Ipv4Addr)>` to
-    /// `Vec<(SessionId, Ipv4Addr, String, u64, u64)>`.
+    /// `Vec<(SessionId, Ipv4Addr, String, u64, u64, StatsSnapshot)>`.
     ///
     /// The three new fields:
     /// - `wallet_hex`: hex-encoded Ed25519 public key (client identity)
@@ -929,7 +948,7 @@ impl SessionManager {
     /// ## v1.0.0-Membership
     /// Uses `session.wallet_hex` (cached field) instead of re-encoding
     /// `client_public_key` on every expiry sweep.
-    pub fn cleanup_expired(&self) -> Vec<(SessionId, Ipv4Addr, String, u64, u64)> {
+    pub fn cleanup_expired(&self) -> Vec<(SessionId, Ipv4Addr, String, u64, u64, StatsSnapshot)> {
         let mut expired = Vec::new();
 
         for entry in self.sessions.iter() {
@@ -944,11 +963,12 @@ impl SessionManager {
                     wallet,
                     snap.bytes_rx,
                     snap.bytes_tx,
+                    snap,
                 ));
             }
         }
 
-        for (id, ip, _, _, _) in &expired {
+        for (id, ip, _, _, _, _) in &expired {
             debug!(session_id = %id, virtual_ip = %ip, "Session expired");
             self.remove(id);
             // Stage the released IP into the cooldown pool.

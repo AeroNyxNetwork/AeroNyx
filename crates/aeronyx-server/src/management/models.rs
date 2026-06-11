@@ -623,6 +623,30 @@ pub struct SessionEventReport {
     /// true  → SessionEnded, backend closes billing period.
     /// false → SessionTrafficSnapshot, backend upserts live totals.
     pub is_final: bool,
+    /// Unix timestamp for the last accepted client -> node VPN packet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_rx_at: Option<u64>,
+    /// Unix timestamp for the last node -> client VPN packet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tx_at: Option<u64>,
+    /// Keepalive/ACK round-trip time in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f64>,
+    /// Estimated packet loss percentage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub packet_loss: Option<f64>,
+    /// Packets rejected by the replay window as duplicates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_rejections: Option<u64>,
+    /// Packets rejected by the replay window as too old.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub too_old_rejections: Option<u64>,
+    /// Accepted VPN packets received from the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub packets_rx: Option<u64>,
+    /// VPN packets sent to the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub packets_tx: Option<u64>,
 }
 
 /// Response from session event report.

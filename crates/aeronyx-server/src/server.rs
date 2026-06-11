@@ -81,7 +81,7 @@ use crate::handlers::packet::DecryptedPayload;
 use crate::handlers::PacketHandler;
 use crate::management::{
     CommandHandler, HeartbeatReporter, ManagementClient, SessionReporter,
-    reporter::SessionEventSender,
+    reporter::{SessionEventSender, SessionQuality},
 };
 use crate::miner::ReflectionMiner;
 #[allow(deprecated)]
@@ -100,6 +100,7 @@ use crate::services::chat_relay::{ChatRelayService, derive_node_secret};
 use crate::services::{HandshakeService, IpPoolService, RoutingService, SessionManager};
 // v1.0.0-Membership
 use crate::services::traffic_tracker::TrafficTracker;
+use crate::services::session::StatsSnapshot;
 use crate::services::deny_list::DenyList;
 use crate::voucher_verifier::VoucherVerifier;
 
@@ -118,6 +119,26 @@ const MINER_SCHEDULER_TICK_SECS:   u64    = 60;
 // ============================================
 // Server
 // ============================================
+
+fn quality_from_stats(snap: StatsSnapshot) -> SessionQuality {
+    let rejects = snap.replays_rejected + snap.too_old_rejected;
+    let accepted = snap.packets_rx + snap.packets_tx;
+    let packet_loss = if accepted + rejects > 0 {
+        Some((rejects as f64 / (accepted + rejects) as f64) * 100.0)
+    } else {
+        None
+    };
+
+    SessionQuality {
+        last_rx_at: (snap.last_rx_at > 0).then_some(snap.last_rx_at),
+        last_tx_at: (snap.last_tx_at > 0).then_some(snap.last_tx_at),
+        packet_loss,
+        replay_rejections: Some(snap.replays_rejected),
+        too_old_rejections: Some(snap.too_old_rejected),
+        packets_rx: Some(snap.packets_rx),
+        packets_tx: Some(snap.packets_tx),
+    }
+}
 
 pub struct Server {
     config:      ServerConfig,
@@ -1695,7 +1716,13 @@ impl Server {
                             if snap.bytes_rx == 0 && snap.bytes_tx == 0 { continue; }
                             let wallet_hex = session.wallet_hex.clone();
                             let sid        = BASE64.encode(session.id.as_bytes());
-                            events.session_traffic_snapshot(&sid, Some(wallet_hex), snap.bytes_rx, snap.bytes_tx);
+                            events.session_traffic_snapshot(
+                                &sid,
+                                Some(wallet_hex),
+                                snap.bytes_rx,
+                                snap.bytes_tx,
+                                quality_from_stats(snap),
+                            );
                             reported += 1;
                         }
                         if reported > 0 {
@@ -1731,9 +1758,15 @@ impl Server {
                     _ = timer.tick() => {
                         if shutdown.load(Ordering::SeqCst) { break; }
 
-                        for (sid, vip, wallet, bytes_rx, bytes_tx) in sessions.cleanup_expired() {
+                        for (sid, vip, wallet, bytes_rx, bytes_tx, snap) in sessions.cleanup_expired() {
                             routing.remove_route(vip);
-                            events.session_ended(&sid.to_string(), Some(wallet.clone()), bytes_rx, bytes_tx);
+                            events.session_ended(
+                                &sid.to_string(),
+                                Some(wallet.clone()),
+                                bytes_rx,
+                                bytes_tx,
+                                quality_from_stats(snap),
+                            );
                             if let Some(ref relay) = chat_relay {
                                 relay.wallet_routes.remove_session(&sid);
                             }

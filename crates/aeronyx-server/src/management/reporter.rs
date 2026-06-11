@@ -79,6 +79,13 @@ pub struct SessionEvent {
     pub bytes_in:      u64,
     pub bytes_out:     u64,
     pub timestamp:     u64,
+    pub last_rx_at:    Option<u64>,
+    pub last_tx_at:    Option<u64>,
+    pub packet_loss:   Option<f64>,
+    pub replay_rejections: Option<u64>,
+    pub too_old_rejections: Option<u64>,
+    pub packets_rx:    Option<u64>,
+    pub packets_tx:    Option<u64>,
 }
 
 impl SessionEvent {
@@ -90,6 +97,13 @@ impl SessionEvent {
             bytes_in:  0,
             bytes_out: 0,
             timestamp: now_unix(),
+            last_rx_at: None,
+            last_tx_at: None,
+            packet_loss: None,
+            replay_rejections: None,
+            too_old_rejections: None,
+            packets_rx: None,
+            packets_tx: None,
         }
     }
 
@@ -98,6 +112,7 @@ impl SessionEvent {
         client_wallet: Option<String>,
         bytes_in:      u64,
         bytes_out:     u64,
+        quality:        SessionQuality,
     ) -> Self {
         Self {
             event_type: SessionEventType::SessionEnded,
@@ -106,6 +121,13 @@ impl SessionEvent {
             bytes_in,
             bytes_out,
             timestamp: now_unix(),
+            last_rx_at: quality.last_rx_at,
+            last_tx_at: quality.last_tx_at,
+            packet_loss: quality.packet_loss,
+            replay_rejections: quality.replay_rejections,
+            too_old_rejections: quality.too_old_rejections,
+            packets_rx: quality.packets_rx,
+            packets_tx: quality.packets_tx,
         }
     }
 
@@ -114,6 +136,7 @@ impl SessionEvent {
         client_wallet: Option<String>,
         bytes_in:      u64,
         bytes_out:     u64,
+        quality:        SessionQuality,
     ) -> Self {
         Self {
             event_type: SessionEventType::SessionTrafficSnapshot,
@@ -122,6 +145,13 @@ impl SessionEvent {
             bytes_in,
             bytes_out,
             timestamp: now_unix(),
+            last_rx_at: quality.last_rx_at,
+            last_tx_at: quality.last_tx_at,
+            packet_loss: quality.packet_loss,
+            replay_rejections: quality.replay_rejections,
+            too_old_rejections: quality.too_old_rejections,
+            packets_rx: quality.packets_rx,
+            packets_tx: quality.packets_tx,
         }
     }
 
@@ -135,8 +165,27 @@ impl SessionEvent {
             bytes_out:     self.bytes_out,
             timestamp:     self.timestamp,
             is_final:      matches!(self.event_type, SessionEventType::SessionEnded),
+            last_rx_at:    self.last_rx_at,
+            last_tx_at:    self.last_tx_at,
+            rtt_ms:        None,
+            packet_loss:   self.packet_loss,
+            replay_rejections: self.replay_rejections,
+            too_old_rejections: self.too_old_rejections,
+            packets_rx:    self.packets_rx,
+            packets_tx:    self.packets_tx,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionQuality {
+    pub last_rx_at: Option<u64>,
+    pub last_tx_at: Option<u64>,
+    pub packet_loss: Option<f64>,
+    pub replay_rejections: Option<u64>,
+    pub too_old_rejections: Option<u64>,
+    pub packets_rx: Option<u64>,
+    pub packets_tx: Option<u64>,
 }
 
 #[inline]
@@ -619,12 +668,14 @@ impl SessionEventSender {
         client_wallet: Option<String>,
         bytes_in:      u64,
         bytes_out:     u64,
+        quality:        SessionQuality,
     ) {
         self.try_send(SessionEvent::ended(
             session_id.to_string(),
             client_wallet,
             bytes_in,
             bytes_out,
+            quality,
         ));
     }
 
@@ -634,12 +685,14 @@ impl SessionEventSender {
         client_wallet: Option<String>,
         bytes_in:      u64,
         bytes_out:     u64,
+        quality:        SessionQuality,
     ) {
         self.try_send(SessionEvent::snapshot(
             session_id.to_string(),
             client_wallet,
             bytes_in,
             bytes_out,
+            quality,
         ));
     }
 
