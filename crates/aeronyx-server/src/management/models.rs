@@ -418,8 +418,27 @@ pub struct HeartbeatResponse {
     /// Full operator wallet ban policy from CMS.
     #[serde(default)]
     pub operator_bans: Option<Vec<String>>,
+    /// Operator VPN policy from nodeboard Settings.
+    #[serde(default)]
+    pub node_policy: Option<NodePolicy>,
     /// Error message (present on failure)
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodePolicy {
+    #[serde(default)]
+    pub node_tier: String,
+    #[serde(default)]
+    pub maintenance_mode: bool,
+    #[serde(default)]
+    pub max_sessions: u32,
+    #[serde(default)]
+    pub bandwidth_limit_mbps: u32,
+    #[serde(default)]
+    pub heartbeat_interval_seconds: u64,
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 // ============================================

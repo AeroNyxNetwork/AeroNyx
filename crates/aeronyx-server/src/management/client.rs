@@ -94,6 +94,22 @@ pub struct UserPermission {
     pub traffic_allowed: bool,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NodePolicy {
+    #[serde(default)]
+    pub node_tier: String,
+    #[serde(default)]
+    pub maintenance_mode: bool,
+    #[serde(default)]
+    pub max_sessions: u32,
+    #[serde(default)]
+    pub bandwidth_limit_mbps: u32,
+    #[serde(default)]
+    pub heartbeat_interval_seconds: u64,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
 // ============================================
 // HeartbeatResponse
 // ============================================
@@ -120,6 +136,11 @@ pub struct HeartbeatResponse {
     /// Some(empty) = CMS explicitly has no active operator bans.
     #[serde(default)]
     pub operator_bans: Option<Vec<String>>,
+
+    /// Operator VPN policy from nodeboard Settings.
+    /// Older CMS versions omit this field; Rust must keep local defaults then.
+    #[serde(default)]
+    pub node_policy: Option<NodePolicy>,
 }
 
 // ============================================

@@ -291,7 +291,8 @@ impl HeartbeatReporter {
             "[HEARTBEAT] Reporter started"
         );
 
-        let mut interval    = tokio::time::interval(self.interval);
+        let mut active_interval_secs = self.interval.as_secs();
+        let mut interval = tokio::time::interval(Duration::from_secs(active_interval_secs));
         let mut failures    = 0u32;
         let mut total_beats = 0u32;
 
@@ -388,18 +389,20 @@ impl HeartbeatReporter {
                                 }
                             }
 
-                            // Adjust interval (unchanged).
+                            // Adjust interval from nodeboard Settings.
                             if let Some(next_in) = response.next_heartbeat_in {
                                 let clamped = next_in
                                     .max(MIN_HEARTBEAT_INTERVAL_SECS)
                                     .min(MAX_HEARTBEAT_INTERVAL_SECS);
-                                if clamped != self.interval.as_secs() {
-                                    debug!(
-                                        current   = self.interval.as_secs(),
+                                if clamped != active_interval_secs {
+                                    info!(
+                                        current   = active_interval_secs,
                                         requested = next_in,
                                         applied   = clamped,
                                         "[HEARTBEAT] CMS requested interval change"
                                     );
+                                    active_interval_secs = clamped;
+                                    interval = tokio::time::interval(Duration::from_secs(clamped));
                                 }
                             }
 
@@ -480,6 +483,21 @@ impl HeartbeatReporter {
         if let Some(ref tier) = response.node_tier {
             *self.node_tier.write() = tier.clone();
             info!(tier = %tier, "[MEMBERSHIP] node_tier updated");
+        }
+
+        if let Some(ref policy) = response.node_policy {
+            info!(
+                node_tier = %policy.node_tier,
+                maintenance_mode = policy.maintenance_mode,
+                max_sessions = policy.max_sessions,
+                bandwidth_limit_mbps = policy.bandwidth_limit_mbps,
+                heartbeat_interval_seconds = policy.heartbeat_interval_seconds,
+                updated_at = ?policy.updated_at,
+                "[NODE_POLICY] CMS operator policy updated"
+            );
+            if !policy.node_tier.is_empty() {
+                *self.node_tier.write() = policy.node_tier.clone();
+            }
         }
 
         // Update user_permissions cache (only when non-empty).
