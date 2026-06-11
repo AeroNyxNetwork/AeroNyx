@@ -34,6 +34,7 @@
 // ============================================
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
@@ -44,6 +45,9 @@ use serde_json::json;
 use aeronyx_core::crypto::IdentityKeyPair;
 use super::config::ManagementConfig;
 use super::models::*;
+
+static RUNTIME_STARTED_AT: OnceLock<u64> = OnceLock::new();
+static RUNTIME_ID: OnceLock<String> = OnceLock::new();
 
 // ============================================
 // MemChainHeartbeatStatus (v2.3.0)
@@ -141,6 +145,21 @@ impl ManagementClient {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
     }
 
+    fn runtime_started_at() -> u64 {
+        *RUNTIME_STARTED_AT.get_or_init(Self::current_timestamp)
+    }
+
+    fn runtime_id(&self, node_id: &str) -> String {
+        RUNTIME_ID.get_or_init(|| {
+            let mut hasher = Sha256::new();
+            hasher.update(node_id.as_bytes());
+            hasher.update(self.binary_hash.as_bytes());
+            hasher.update(Self::runtime_started_at().to_string().as_bytes());
+            hasher.update(std::process::id().to_string().as_bytes());
+            hex::encode(hasher.finalize())
+        }).clone()
+    }
+
     /// Creates an Ed25519 signature over SHA256(node_id + timestamp + body).
     fn create_signature(&self, timestamp: u64, body: &str) -> String {
         let node_id = self.node_id();
@@ -227,12 +246,16 @@ impl ManagementClient {
         let timestamp = Self::current_timestamp();
         let node_id   = self.node_id();
         let stats     = SystemStats::collect(active_sessions);
+        let runtime_id = self.runtime_id(&node_id);
+        let runtime_started_at = Self::runtime_started_at();
 
         // Build system_stats (unchanged from v2.3.0).
         let mut system_stats_json = serde_json::json!({
             "cpu_usage":       stats.cpu_usage,
             "memory_mb":       stats.memory_mb,
             "active_sessions": stats.active_sessions,
+            "runtime_id":      runtime_id,
+            "runtime_started_at": runtime_started_at,
         });
 
         if let Some(obj) = system_stats_json.as_object_mut() {

@@ -252,6 +252,14 @@ pub struct SystemStats {
     /// v1.3.1: Number of CPU cores (vCPU count).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_count: Option<u32>,
+
+    /// M2: Per-process runtime identifier for server reset detection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+
+    /// M2: Unix timestamp for when this Rust process started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_started_at: Option<u64>,
 }
 
 impl SystemStats {
@@ -270,6 +278,8 @@ impl SystemStats {
             cpu_count: std::thread::available_parallelism()
                 .map(|p| Some(p.get() as u32))
                 .unwrap_or(None),
+            runtime_id: None,
+            runtime_started_at: None,
         }
     }
 
