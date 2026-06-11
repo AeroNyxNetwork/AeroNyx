@@ -783,7 +783,7 @@ impl CommandHandler {
     /// Reports command execution status to CMS.
     ///
     /// Uses `ManagementClient::report_command_status()` which sends
-    /// a signed `POST /node/agent/status` request.
+    /// a signed `POST /node/vpn/status` request.
     ///
     /// Failures are logged but do not block command processing —
     /// CMS can always re-query via the next heartbeat.

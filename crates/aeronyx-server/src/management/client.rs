@@ -417,7 +417,7 @@ impl ManagementClient {
 
     /// Reports command execution status to CMS (v1.3.0).
     pub async fn report_command_status(&self, report: &CommandStatusReport) -> Result<(), String> {
-        let url       = format!("{}/node/agent/status/", self.config.cms_url);
+        let url       = format!("{}/node/vpn/status/", self.config.cms_url);
         let timestamp = Self::current_timestamp();
         let node_id   = self.node_id();
         let body_str  = serde_json::to_string(report).map_err(|e| e.to_string())?;
