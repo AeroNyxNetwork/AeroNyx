@@ -134,6 +134,7 @@ fn quality_from_stats(snap: StatsSnapshot) -> SessionQuality {
     SessionQuality {
         last_rx_at: (snap.last_rx_at > 0).then_some(snap.last_rx_at),
         last_tx_at: (snap.last_tx_at > 0).then_some(snap.last_tx_at),
+        rtt_ms: (snap.rtt_us > 0).then_some(snap.rtt_us as f64 / 1000.0),
         packet_loss,
         replay_rejections: Some(snap.replays_rejected),
         too_old_rejections: Some(snap.too_old_rejected),
@@ -302,6 +303,14 @@ impl Server {
             session_event_sender.clone(),
         );
         tasks.push(("traffic-snapshot", snapshot_task));
+
+        let keepalive_task = self.spawn_keepalive_probe_task(
+            Arc::clone(&sessions),
+            Arc::clone(&udp),
+            Arc::clone(&packet_handler),
+            self.config.gateway_ip(),
+        );
+        tasks.push(("vpn-keepalive", keepalive_task));
 
         if let Some(ref relay) = chat_relay {
             let routes     = Arc::clone(&relay.wallet_routes);
@@ -1332,6 +1341,13 @@ impl Server {
                                                 #[cfg(target_os = "linux")]
                                                 { let _ = tun.write(&pkt).await; }
                                             }
+                                            Ok((session, DecryptedPayload::KeepaliveAck { rtt_ms })) => {
+                                                trace!(
+                                                    session_id = %session.id,
+                                                    rtt_ms,
+                                                    "[KEEPALIVE] ACK consumed"
+                                                );
+                                            }
                                             Err(ref e) if e.is_session_not_found() => {
                                                 let reset = [0xFFu8];
                                                 let _ = udp_reply.send(&reset, &source.addr).await;
@@ -1753,6 +1769,54 @@ impl Server {
                         }
                         if reported > 0 {
                             debug!(sessions = reported, "[TRAFFIC_SNAPSHOT] Sent snapshots for {} active session(s)", reported);
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    // ============================================
+    // VPN Keepalive / RTT Probe Task
+    // ============================================
+
+    fn spawn_keepalive_probe_task(
+        &self,
+        sessions:       Arc<SessionManager>,
+        udp:            Arc<UdpTransport>,
+        packet_handler: Arc<PacketHandler>,
+        gateway_ip:     Ipv4Addr,
+    ) -> JoinHandle<()> {
+        let shutdown = Arc::clone(&self.shutdown);
+        let mut rx   = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let mut timer = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = rx.recv() => break,
+                    _ = timer.tick() => {
+                        if shutdown.load(Ordering::SeqCst) { break; }
+                        let mut sent = 0usize;
+                        for session in sessions.all_sessions() {
+                            if !session.is_established() { continue; }
+                            match packet_handler.build_keepalive_probe(&session, gateway_ip) {
+                                Ok((bytes, endpoint)) => {
+                                    if udp.send(&bytes, &endpoint).await.is_ok() {
+                                        sent += 1;
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        session_id = %session.id,
+                                        error = %e,
+                                        "[KEEPALIVE] Probe build failed"
+                                    );
+                                }
+                            }
+                        }
+                        if sent > 0 {
+                            trace!(sessions = sent, "[KEEPALIVE] ICMP probes sent");
                         }
                     }
                 }

@@ -60,6 +60,11 @@ use crate::services::traffic_tracker::TrafficTracker;
 const IPV4_HEADER_MIN_SIZE: usize = 20;
 const IPV4_DST_OFFSET:      usize = 16;
 const IPV4_SRC_OFFSET:      usize = 12;
+const IPV4_PROTOCOL_OFFSET: usize = 9;
+const ICMP_PROTOCOL:        u8 = 1;
+const ICMP_ECHO_REPLY:      u8 = 0;
+const ICMP_ECHO_REQUEST:    u8 = 8;
+const ICMP_HEADER_SIZE:     usize = 8;
 
 /// Magic byte identifying a Voice audio frame packet (0xAF).
 pub const VOICE_MAGIC: u8 = 0xAF;
@@ -90,6 +95,7 @@ pub const DISC_VOICE_END:    u32 = 33;
 #[derive(Debug)]
 pub enum DecryptedPayload {
     Vpn(Vec<u8>),
+    KeepaliveAck { rtt_ms: f64 },
     MemChain(MemChainMessage),
     VoiceSignal {
         discriminant:  u32,
@@ -239,6 +245,15 @@ impl PacketHandler {
                         actual     = %src_ip,
                         "src IP mismatch (iOS/macOS NE — packet accepted)"
                     );
+                }
+
+                if let Some(rtt_ms) = record_keepalive_echo_reply(&session, &plaintext) {
+                    trace!(
+                        session_id = %session_id,
+                        rtt_ms,
+                        "[KEEPALIVE] ICMP echo reply received"
+                    );
+                    return Ok((session, DecryptedPayload::KeepaliveAck { rtt_ms }));
                 }
 
                 // Session-level cumulative counter (billing audit).
@@ -429,6 +444,45 @@ impl PacketHandler {
 
         Ok((output, session.client_endpoint))
     }
+
+    /// Builds an encrypted in-tunnel ICMP Echo Request for RTT measurement.
+    ///
+    /// Source path:
+    ///   /root/a/AeroNyx/crates/aeronyx-server/src/handlers/packet.rs
+    ///
+    /// This is an operational keepalive probe, not user traffic. It is sent only
+    /// to the session's assigned virtual IP and therefore does not reveal user
+    /// destinations, DNS contents, packet payloads, or browsing history.
+    pub fn build_keepalive_probe(
+        &self,
+        session: &Arc<Session>,
+        gateway_ip: Ipv4Addr,
+    ) -> Result<(Vec<u8>, std::net::SocketAddr)> {
+        let (identifier, sequence) = session.begin_keepalive_probe();
+        let ip_packet = build_icmp_echo_request(
+            gateway_ip,
+            session.virtual_ip,
+            identifier,
+            sequence,
+        );
+        let counter = session.next_tx_counter();
+
+        let mut encrypted = vec![0u8; ip_packet.len() + ENCRYPTION_OVERHEAD];
+        let actual_len = self.crypto.encrypt(
+            &session.session_key,
+            counter,
+            session.id.as_bytes(),
+            &ip_packet,
+            &mut encrypted,
+        )?;
+        encrypted.truncate(actual_len);
+
+        let data_packet = DataPacket::new(*session.id.as_bytes(), counter, encrypted);
+        let output = encode_data_packet(&data_packet).to_vec();
+        session.stats.record_control_tx();
+
+        Ok((output, session.client_endpoint))
+    }
 }
 
 impl std::fmt::Debug for PacketHandler {
@@ -457,6 +511,78 @@ fn extract_ipv4_src(packet: &[u8]) -> Result<Ipv4Addr> {
     let mut octets = [0u8; 4];
     octets.copy_from_slice(&packet[IPV4_SRC_OFFSET..IPV4_SRC_OFFSET + 4]);
     Ok(Ipv4Addr::from(octets))
+}
+
+fn record_keepalive_echo_reply(session: &Arc<Session>, packet: &[u8]) -> Option<f64> {
+    if packet.len() < IPV4_HEADER_MIN_SIZE {
+        return None;
+    }
+    if packet[0] >> 4 != 4 || packet[IPV4_PROTOCOL_OFFSET] != ICMP_PROTOCOL {
+        return None;
+    }
+
+    let ihl = ((packet[0] & 0x0f) as usize) * 4;
+    if ihl < IPV4_HEADER_MIN_SIZE || packet.len() < ihl + ICMP_HEADER_SIZE {
+        return None;
+    }
+
+    let icmp = &packet[ihl..];
+    if icmp[0] != ICMP_ECHO_REPLY || icmp[1] != 0 {
+        return None;
+    }
+
+    let identifier = u16::from_be_bytes([icmp[4], icmp[5]]);
+    let sequence = u16::from_be_bytes([icmp[6], icmp[7]]);
+    session.complete_keepalive_probe(identifier, sequence)
+}
+
+fn build_icmp_echo_request(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    identifier: u16,
+    sequence: u16,
+) -> Vec<u8> {
+    let payload = b"AERONYX-KEEPALIVE";
+    let total_len = IPV4_HEADER_MIN_SIZE + ICMP_HEADER_SIZE + payload.len();
+    let mut packet = vec![0u8; total_len];
+
+    packet[0] = 0x45;
+    packet[1] = 0;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[4..6].copy_from_slice(&sequence.to_be_bytes());
+    packet[6..8].copy_from_slice(&0u16.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = ICMP_PROTOCOL;
+    packet[12..16].copy_from_slice(&src.octets());
+    packet[16..20].copy_from_slice(&dst.octets());
+    let ip_sum = internet_checksum(&packet[..IPV4_HEADER_MIN_SIZE]);
+    packet[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+
+    let icmp_start = IPV4_HEADER_MIN_SIZE;
+    packet[icmp_start] = ICMP_ECHO_REQUEST;
+    packet[icmp_start + 1] = 0;
+    packet[icmp_start + 4..icmp_start + 6].copy_from_slice(&identifier.to_be_bytes());
+    packet[icmp_start + 6..icmp_start + 8].copy_from_slice(&sequence.to_be_bytes());
+    packet[icmp_start + ICMP_HEADER_SIZE..].copy_from_slice(payload);
+    let icmp_sum = internet_checksum(&packet[icmp_start..]);
+    packet[icmp_start + 2..icmp_start + 4].copy_from_slice(&icmp_sum.to_be_bytes());
+
+    packet
+}
+
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let Some(&last) = chunks.remainder().first() {
+        sum += (last as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 fn extract_ipv4_dst(packet: &[u8]) -> Result<Ipv4Addr> {

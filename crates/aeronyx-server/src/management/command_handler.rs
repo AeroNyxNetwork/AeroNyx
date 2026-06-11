@@ -89,6 +89,7 @@ fn session_quality_from_stats(snap: &crate::services::session::StatsSnapshot) ->
     SessionQuality {
         last_rx_at: (snap.last_rx_at > 0).then_some(snap.last_rx_at),
         last_tx_at: (snap.last_tx_at > 0).then_some(snap.last_tx_at),
+        rtt_ms: (snap.rtt_us > 0).then_some(snap.rtt_us as f64 / 1000.0),
         packet_loss,
         replay_rejections: Some(snap.replays_rejected),
         too_old_rejections: Some(snap.too_old_rejected),

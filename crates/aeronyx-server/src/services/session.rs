@@ -117,6 +117,7 @@
 //!   - `cleanup_expired()` now uses `session.wallet_hex` instead of re-encoding.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -399,6 +400,8 @@ pub struct SessionStats {
     pub last_rx_at: AtomicU64,
     /// Unix timestamp of the last successful VPN transmit.
     pub last_tx_at: AtomicU64,
+    /// Last measured tunnel keepalive RTT in microseconds. Zero means unknown.
+    pub rtt_us: AtomicU64,
 }
 
 impl SessionStats {
@@ -413,6 +416,11 @@ impl SessionStats {
     pub fn record_tx(&self, bytes: u64) {
         self.bytes_tx.fetch_add(bytes, Ordering::Relaxed);
         self.packets_tx.fetch_add(1, Ordering::Relaxed);
+        self.last_tx_at.store(unix_now_secs(), Ordering::Relaxed);
+    }
+
+    /// Records an operational control-plane transmit without billing bytes.
+    pub fn record_control_tx(&self) {
         self.last_tx_at.store(unix_now_secs(), Ordering::Relaxed);
     }
 
@@ -438,8 +446,24 @@ impl SessionStats {
             too_old_rejected: self.too_old_rejected.load(Ordering::Relaxed),
             last_rx_at: self.last_rx_at.load(Ordering::Relaxed),
             last_tx_at: self.last_tx_at.load(Ordering::Relaxed),
+            rtt_us: self.rtt_us.load(Ordering::Relaxed),
         }
     }
+}
+
+/// Pending tunnel keepalive probes for one session.
+///
+/// Source path:
+///   /root/a/AeroNyx/crates/aeronyx-server/src/services/session.rs
+///
+/// Rust sends privacy-safe ICMP Echo probes inside the VPN tunnel and records
+/// Echo Reply latency here. The probes target only the assigned virtual IP and
+/// do not reveal user destinations, DNS contents, packet payloads, or browsing
+/// history.
+#[derive(Debug, Default)]
+struct KeepaliveState {
+    next_sequence: u16,
+    pending: HashMap<u16, Instant>,
 }
 
 /// Point-in-time snapshot of [`SessionStats`].
@@ -461,6 +485,8 @@ pub struct StatsSnapshot {
     pub last_rx_at: u64,
     /// Unix timestamp of the last successful VPN transmit. Zero means none.
     pub last_tx_at: u64,
+    /// Last measured keepalive round-trip time in microseconds. Zero means none.
+    pub rtt_us: u64,
 }
 
 fn unix_now_secs() -> u64 {
@@ -500,6 +526,8 @@ pub struct Session {
     pub rx_counter: AtomicU64,
     /// Per-session traffic and rejection statistics.
     pub stats: SessionStats,
+    /// In-tunnel ICMP keepalive state for RTT measurement.
+    keepalive: Mutex<KeepaliveState>,
     // ── v1.0.0-Membership ────────────────────────────────────────────────
     /// Cached lowercase hex of `client_public_key.to_bytes()`.
     ///
@@ -537,6 +565,7 @@ impl Session {
             replay_window: Mutex::new(ReplayWindow::new()),
             rx_counter: AtomicU64::new(0),
             stats: SessionStats::default(),
+            keepalive: Mutex::new(KeepaliveState::default()),
             wallet_hex,
         }
     }
@@ -637,6 +666,51 @@ impl Session {
     #[must_use]
     pub fn wallet_bytes(&self) -> [u8; 32] {
         self.client_public_key.to_bytes()
+    }
+
+    /// Registers an outbound ICMP keepalive probe and returns its identifier
+    /// and sequence number.
+    pub fn begin_keepalive_probe(&self) -> (u16, u16) {
+        let mut state = self.keepalive.lock();
+        state.next_sequence = state.next_sequence.wrapping_add(1);
+        let sequence = state.next_sequence;
+        state.pending.insert(sequence, Instant::now());
+
+        // Bound memory if a client stops replying. One session should never
+        // have many pending probes; keeping the newest 8 is enough for
+        // diagnostics and avoids unbounded growth during bad networks.
+        if state.pending.len() > 8 {
+            let oldest = state
+                .pending
+                .iter()
+                .min_by_key(|(_, sent_at)| **sent_at)
+                .map(|(seq, _)| *seq);
+            if let Some(seq) = oldest {
+                state.pending.remove(&seq);
+            }
+        }
+
+        (self.keepalive_identifier(), sequence)
+    }
+
+    /// Records a matching ICMP Echo Reply. Returns RTT in milliseconds.
+    pub fn complete_keepalive_probe(&self, identifier: u16, sequence: u16) -> Option<f64> {
+        if identifier != self.keepalive_identifier() {
+            return None;
+        }
+
+        let sent_at = self.keepalive.lock().pending.remove(&sequence)?;
+        let rtt = sent_at.elapsed();
+        let rtt_us = rtt.as_micros().min(u64::MAX as u128) as u64;
+        self.stats.rtt_us.store(rtt_us, Ordering::Relaxed);
+        Some(rtt_us as f64 / 1000.0)
+    }
+
+    /// Stable ICMP identifier for this session's keepalive probes.
+    #[must_use]
+    pub fn keepalive_identifier(&self) -> u16 {
+        let bytes = self.id.as_bytes();
+        u16::from_be_bytes([bytes[0], bytes[1]])
     }
 }
 
