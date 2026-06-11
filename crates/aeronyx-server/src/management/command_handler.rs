@@ -65,7 +65,7 @@ use super::client::ManagementClient;
 use super::reporter::{SessionEventSender, SessionQuality};
 use super::models::{Command, CommandExecutionStatus, CommandStatusReport};
 use aeronyx_common::types::SessionId;
-use crate::services::{AgentManager, SessionManager};
+use crate::services::{AgentManager, DenyList, DenyReason, SessionManager};
 
 // ============================================
 // Constants
@@ -137,6 +137,9 @@ pub struct CommandHandler {
     /// Session event sender used to notify CMS after control-plane kicks.
     session_events: SessionEventSender,
 
+    /// Shared VPN deny list used by handshake and nodeboard wallet bans.
+    deny_list: Option<Arc<DenyList>>,
+
     /// Set of already-processed command IDs for deduplication.
     /// CMS may resend commands in consecutive heartbeats until
     /// it receives an acknowledgement.
@@ -168,6 +171,7 @@ impl CommandHandler {
             agent_manager,
             sessions: None,
             session_events: SessionEventSender::disabled(),
+            deny_list: None,
             processed_ids: HashSet::with_capacity(128),
             processed_ids_order: Vec::with_capacity(128),
         }
@@ -180,6 +184,11 @@ impl CommandHandler {
     ) -> Self {
         self.sessions = Some(sessions);
         self.session_events = session_events;
+        self
+    }
+
+    pub fn with_deny_list(mut self, deny_list: Arc<DenyList>) -> Self {
+        self.deny_list = Some(deny_list);
         self
     }
 
@@ -277,6 +286,12 @@ impl CommandHandler {
             }
             "refresh_config" => {
                 self.handle_refresh_config(&command).await;
+            }
+            "ban_wallet" => {
+                self.handle_ban_wallet(&command).await;
+            }
+            "unban_wallet" => {
+                self.handle_unban_wallet(&command).await;
             }
             "restart_service" => {
                 self.handle_restart_service(&command).await;
@@ -670,6 +685,136 @@ impl CommandHandler {
         ).await;
     }
 
+    /// Handles `ban_wallet` command.
+    ///
+    /// Adds the wallet to the shared deny list used by handshake processing,
+    /// then disconnects all currently active sessions for that wallet. The CMS
+    /// passes the wallet as lowercase hex only; this handler validates again
+    /// before touching the runtime control plane.
+    async fn handle_ban_wallet(&self, command: &Command) {
+        info!(
+            command_id = %command.id,
+            "[CMD_HANDLER] 🚫 ban_wallet"
+        );
+
+        let Some(wallet_hex) = normalize_wallet_hex(command.params.get("wallet_hex")) else {
+            self.report_status_for_agent_type(
+                "vpn",
+                &command.id,
+                CommandExecutionStatus::Failed,
+                0,
+                "wallet_hex must be 64 lowercase hex characters",
+            ).await;
+            return;
+        };
+        let Some(wallet_bytes) = wallet_hex_to_bytes(&wallet_hex) else {
+            self.report_status_for_agent_type(
+                "vpn",
+                &command.id,
+                CommandExecutionStatus::Failed,
+                0,
+                "wallet_hex could not be decoded",
+            ).await;
+            return;
+        };
+        let reason = command.params
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or("operator_ban");
+
+        let Some(ref deny_list) = self.deny_list else {
+            self.report_status_for_agent_type(
+                "vpn",
+                &command.id,
+                CommandExecutionStatus::Failed,
+                0,
+                "VPN deny list is not available",
+            ).await;
+            return;
+        };
+
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::InProgress,
+            35,
+            "Adding wallet to VPN deny list",
+        ).await;
+
+        deny_list.add(&wallet_hex, DenyReason::OperatorBan);
+
+        let mut disconnected = 0usize;
+        if let Some(ref sessions) = self.sessions {
+            let active = sessions.get_all_by_wallet(&wallet_bytes);
+            for session in active {
+                if let Some(removed) = sessions.remove(&session.id) {
+                    let stats = removed.stats.snapshot();
+                    let quality = session_quality_from_stats(&stats);
+                    self.session_events.session_ended(
+                        &removed.id.to_string(),
+                        Some(removed.wallet_hex.clone()),
+                        stats.bytes_rx,
+                        stats.bytes_tx,
+                        quality,
+                    );
+                    disconnected += 1;
+                }
+            }
+        }
+
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::Completed,
+            100,
+            &format!(
+                "Wallet banned: wallet_prefix={}, reason={}, disconnected_sessions={}",
+                &wallet_hex[..12],
+                sanitize_inline(reason, 80),
+                disconnected
+            ),
+        ).await;
+    }
+
+    /// Handles `unban_wallet` command.
+    async fn handle_unban_wallet(&self, command: &Command) {
+        info!(
+            command_id = %command.id,
+            "[CMD_HANDLER] ✅ unban_wallet"
+        );
+
+        let Some(wallet_hex) = normalize_wallet_hex(command.params.get("wallet_hex")) else {
+            self.report_status_for_agent_type(
+                "vpn",
+                &command.id,
+                CommandExecutionStatus::Failed,
+                0,
+                "wallet_hex must be 64 lowercase hex characters",
+            ).await;
+            return;
+        };
+
+        let Some(ref deny_list) = self.deny_list else {
+            self.report_status_for_agent_type(
+                "vpn",
+                &command.id,
+                CommandExecutionStatus::Failed,
+                0,
+                "VPN deny list is not available",
+            ).await;
+            return;
+        };
+
+        deny_list.remove(&wallet_hex);
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::Completed,
+            100,
+            &format!("Wallet unbanned: wallet_prefix={}", &wallet_hex[..12]),
+        ).await;
+    }
+
     /// Handles `restart_service` command.
     ///
     /// The node first reports that the restart has been scheduled, then asks
@@ -963,6 +1108,25 @@ async fn read_node_info_summary(path: &str) -> String {
     )
 }
 
+fn normalize_wallet_hex(value: Option<&serde_json::Value>) -> Option<String> {
+    let wallet = value?.as_str()?.trim().to_ascii_lowercase();
+    if wallet.len() == 64 && wallet.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Some(wallet)
+    } else {
+        None
+    }
+}
+
+fn wallet_hex_to_bytes(wallet_hex: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(wallet_hex).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Some(out)
+}
+
 fn command_agent_type(action: &str) -> &'static str {
     match action {
         "install_openclaw"
@@ -989,6 +1153,14 @@ fn collapse_lines(text: &str, max_lines: usize) -> String {
     } else {
         lines.join("\n")
     }
+}
+
+fn sanitize_inline(input: &str, max_chars: usize) -> String {
+    input
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+        .take(max_chars)
+        .collect::<String>()
 }
 
 fn sanitize_and_truncate(input: &str) -> String {

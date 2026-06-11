@@ -76,6 +76,9 @@ pub enum DenyReason {
     /// Free tier monthly traffic quota exhausted.
     /// Expires automatically at the start of the next calendar month (UTC).
     QuotaExceeded,
+    /// Operator-blocked wallet from nodeboard.
+    /// Permanent until an explicit operator unban command removes it.
+    OperatorBan,
 }
 
 impl std::fmt::Display for DenyReason {
@@ -83,6 +86,7 @@ impl std::fmt::Display for DenyReason {
         match self {
             Self::NoPremiumAccess => write!(f, "no_premium_access"),
             Self::QuotaExceeded  => write!(f, "quota_exceeded"),
+            Self::OperatorBan    => write!(f, "operator_ban"),
         }
     }
 }
@@ -135,10 +139,12 @@ impl DenyList {
     ///
     /// - `NoPremiumAccess`: permanent entry (TTL = u64::MAX).
     /// - `QuotaExceeded`:   expires at start of next UTC calendar month.
+    /// - `OperatorBan`:     permanent entry until operator unban.
     pub fn add(&self, wallet_hex: &str, reason: DenyReason) {
         let expires_at_unix = match reason {
             DenyReason::NoPremiumAccess => u64::MAX,
             DenyReason::QuotaExceeded   => next_month_unix(),
+            DenyReason::OperatorBan     => u64::MAX,
         };
 
         info!(

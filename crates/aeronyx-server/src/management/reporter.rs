@@ -526,6 +526,7 @@ impl HeartbeatReporter {
                     let should_remove = match reason {
                         DenyReason::NoPremiumAccess => perm.can_access_premium_nodes,
                         DenyReason::QuotaExceeded   => perm.traffic_allowed,
+                        DenyReason::OperatorBan     => false,
                     };
                     if should_remove {
                         dl.remove(wallet);
