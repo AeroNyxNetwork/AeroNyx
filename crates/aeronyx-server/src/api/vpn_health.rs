@@ -5,8 +5,8 @@
 //!
 //! This endpoint is intentionally read-only. It verifies the Linux node pieces
 //! that commonly make a tunnel appear "connected but offline": UDP listener,
-//! TUN device, IPv4 forwarding, NAT masquerade, VPN DNS stub, DNS resolution,
-//! and basic Internet egress.
+//! TUN device and MTU, IPv4 forwarding, NAT masquerade, VPN DNS stub, DNS
+//! resolution, and basic Internet egress.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -49,6 +49,7 @@ struct VpnHealthResponse {
     gateway_ip: String,
     virtual_ip_range: String,
     tun_device: String,
+    configured_mtu: u16,
     active_sessions: usize,
     active_wallet_devices: usize,
     voucher_metrics: VoucherMetricsSnapshot,
@@ -75,9 +76,9 @@ async fn vpn_health_handler(State(state): State<VpnHealthState>) -> impl IntoRes
 ///   /root/a/AeroNyx/crates/aeronyx-server/src/api/vpn_health.rs
 ///
 /// The payload contains only local node diagnostics such as UDP listener, TUN,
-/// NAT, DNS stub/query, egress reachability, and aggregate counters. It never
-/// includes user destinations, DNS query contents, packet payloads, or browsing
-/// history.
+/// MTU, NAT, DNS stub/query, egress reachability, and aggregate counters. It
+/// never includes user destinations, DNS query contents, packet payloads, or
+/// browsing history.
 pub async fn collect_vpn_health_value(
     config: ServerConfig,
     sessions: Arc<SessionManager>,
@@ -101,11 +102,13 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     let gateway_ip = config.gateway_ip();
     let listen_addr = config.listen_addr();
     let tun_device = config.device_name().to_string();
+    let configured_mtu = config.mtu();
     let ip_range = config.ip_range().to_string();
 
     let mut checks = Vec::new();
     checks.push(check_udp_listener(listen_addr).await);
     checks.push(check_tun_device(&tun_device).await);
+    checks.push(check_mtu_config(&tun_device, configured_mtu).await);
     checks.push(check_ip_forwarding().await);
     checks.push(check_nat_masquerade(&ip_range).await);
     checks.push(check_dns_socket(gateway_ip).await);
@@ -128,6 +131,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         gateway_ip: gateway_ip.to_string(),
         virtual_ip_range: ip_range,
         tun_device,
+        configured_mtu,
         active_sessions: state.sessions.count(),
         active_wallet_devices: state.sessions.wallet_index_count(),
         voucher_metrics: state.voucher_verifier.metrics_snapshot(),
@@ -177,6 +181,39 @@ async fn check_tun_device(device: &str) -> HealthCheck {
             name: "tun_device",
             ok: false,
             detail: format!("{} not found or ip command failed: {}", device, e),
+        },
+    }
+}
+
+async fn check_mtu_config(device: &str, configured_mtu: u16) -> HealthCheck {
+    let path = format!("/sys/class/net/{}/mtu", device);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(value) => {
+            let actual = value.trim().parse::<u16>().unwrap_or(0);
+            let range_ok = (1280..=1500).contains(&actual);
+            let matches_config = actual == configured_mtu;
+            HealthCheck {
+                name: "mtu_config",
+                ok: range_ok && matches_config,
+                detail: if range_ok && matches_config {
+                    format!("{} MTU {} matches config", device, actual)
+                } else if !matches_config {
+                    format!(
+                        "{} MTU {} does not match configured MTU {}",
+                        device, actual, configured_mtu
+                    )
+                } else {
+                    format!(
+                        "{} MTU {} is outside the recommended Internet VPN range 1280-1500",
+                        device, actual
+                    )
+                },
+            }
+        }
+        Err(e) => HealthCheck {
+            name: "mtu_config",
+            ok: false,
+            detail: format!("read {} failed: {}", path, e),
         },
     }
 }
