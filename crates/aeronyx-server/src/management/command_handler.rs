@@ -601,6 +601,7 @@ impl CommandHandler {
         self.session_events.session_ended(
             session_id_raw,
             Some(session.wallet_hex.clone()),
+            Some(session.virtual_ip.to_string()),
             stats.bytes_rx,
             stats.bytes_tx,
             quality,
@@ -754,6 +755,7 @@ impl CommandHandler {
                     self.session_events.session_ended(
                         &removed.id.to_string(),
                         Some(removed.wallet_hex.clone()),
+                        Some(removed.virtual_ip.to_string()),
                         stats.bytes_rx,
                         stats.bytes_tx,
                         quality,

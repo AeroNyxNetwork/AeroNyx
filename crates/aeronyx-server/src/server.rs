@@ -1318,7 +1318,11 @@ impl Server {
                                                 Ok(result) => {
                                                     let sid        = BASE64.encode(&result.response.session_id);
                                                     let wallet_hex = hex::encode(result.session.client_public_key.to_bytes());
-                                                    session_events.session_created(&sid, Some(wallet_hex));
+                                                    session_events.session_created(
+                                                        &sid,
+                                                        Some(wallet_hex),
+                                                        Some(result.session.virtual_ip.to_string()),
+                                                    );
                                                     let resp = encode_server_hello(&result.response);
                                                     let _ = udp.send(&resp, &source.addr).await;
                                                 }
@@ -1761,6 +1765,7 @@ impl Server {
                             events.session_traffic_snapshot(
                                 &sid,
                                 Some(wallet_hex),
+                                Some(session.virtual_ip.to_string()),
                                 snap.bytes_rx,
                                 snap.bytes_tx,
                                 quality_from_stats(snap),
@@ -1853,6 +1858,7 @@ impl Server {
                             events.session_ended(
                                 &sid.to_string(),
                                 Some(wallet.clone()),
+                                Some(vip.to_string()),
                                 bytes_rx,
                                 bytes_tx,
                                 quality_from_stats(snap),

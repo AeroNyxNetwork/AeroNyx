@@ -88,6 +88,7 @@ pub struct SessionEvent {
     pub event_type:    SessionEventType,
     pub session_id:    String,
     pub client_wallet: Option<String>,
+    pub virtual_ip:    Option<String>,
     pub bytes_in:      u64,
     pub bytes_out:     u64,
     pub timestamp:     u64,
@@ -102,11 +103,16 @@ pub struct SessionEvent {
 }
 
 impl SessionEvent {
-    pub fn created(session_id: String, client_wallet: Option<String>) -> Self {
+    pub fn created(
+        session_id: String,
+        client_wallet: Option<String>,
+        virtual_ip: Option<String>,
+    ) -> Self {
         Self {
             event_type:    SessionEventType::SessionCreated,
             session_id,
             client_wallet,
+            virtual_ip,
             bytes_in:  0,
             bytes_out: 0,
             timestamp: now_unix(),
@@ -124,6 +130,7 @@ impl SessionEvent {
     pub fn ended(
         session_id:    String,
         client_wallet: Option<String>,
+        virtual_ip:    Option<String>,
         bytes_in:      u64,
         bytes_out:     u64,
         quality:        SessionQuality,
@@ -132,6 +139,7 @@ impl SessionEvent {
             event_type: SessionEventType::SessionEnded,
             session_id,
             client_wallet,
+            virtual_ip,
             bytes_in,
             bytes_out,
             timestamp: now_unix(),
@@ -149,6 +157,7 @@ impl SessionEvent {
     pub fn snapshot(
         session_id:    String,
         client_wallet: Option<String>,
+        virtual_ip:    Option<String>,
         bytes_in:      u64,
         bytes_out:     u64,
         quality:        SessionQuality,
@@ -157,6 +166,7 @@ impl SessionEvent {
             event_type: SessionEventType::SessionTrafficSnapshot,
             session_id,
             client_wallet,
+            virtual_ip,
             bytes_in,
             bytes_out,
             timestamp: now_unix(),
@@ -177,6 +187,7 @@ impl SessionEvent {
             session_id:    self.session_id.clone(),
             client_wallet: self.client_wallet.clone(),
             client_ip:     None,
+            virtual_ip:    self.virtual_ip.clone(),
             bytes_in:      self.bytes_in,
             bytes_out:     self.bytes_out,
             timestamp:     self.timestamp,
@@ -768,14 +779,24 @@ impl SessionEventSender {
         Self { tx: None }
     }
 
-    pub fn session_created(&self, session_id: &str, client_wallet: Option<String>) {
-        self.try_send(SessionEvent::created(session_id.to_string(), client_wallet));
+    pub fn session_created(
+        &self,
+        session_id: &str,
+        client_wallet: Option<String>,
+        virtual_ip: Option<String>,
+    ) {
+        self.try_send(SessionEvent::created(
+            session_id.to_string(),
+            client_wallet,
+            virtual_ip,
+        ));
     }
 
     pub fn session_ended(
         &self,
         session_id:    &str,
         client_wallet: Option<String>,
+        virtual_ip:    Option<String>,
         bytes_in:      u64,
         bytes_out:     u64,
         quality:        SessionQuality,
@@ -783,6 +804,7 @@ impl SessionEventSender {
         self.try_send(SessionEvent::ended(
             session_id.to_string(),
             client_wallet,
+            virtual_ip,
             bytes_in,
             bytes_out,
             quality,
@@ -793,6 +815,7 @@ impl SessionEventSender {
         &self,
         session_id:    &str,
         client_wallet: Option<String>,
+        virtual_ip:    Option<String>,
         bytes_in:      u64,
         bytes_out:     u64,
         quality:        SessionQuality,
@@ -800,6 +823,7 @@ impl SessionEventSender {
         self.try_send(SessionEvent::snapshot(
             session_id.to_string(),
             client_wallet,
+            virtual_ip,
             bytes_in,
             bytes_out,
             quality,

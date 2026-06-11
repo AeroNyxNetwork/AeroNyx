@@ -645,6 +645,12 @@ pub struct SessionEventReport {
     /// Client's IP address (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,
+    /// Tunnel-local virtual IP assigned to this session.
+    ///
+    /// This is operational metadata for nodeboard. It is not a public client IP,
+    /// destination IP, DNS query, packet payload, or browsing history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub virtual_ip: Option<String>,
     /// Cumulative bytes received from client since session start.
     pub bytes_in: u64,
     /// Cumulative bytes sent to client since session start.
