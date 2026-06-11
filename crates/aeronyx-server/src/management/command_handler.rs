@@ -53,9 +53,11 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
+use tokio::process::Command as TokioCommand;
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use super::client::ManagementClient;
@@ -69,6 +71,8 @@ use crate::services::AgentManager;
 /// Maximum number of command IDs to retain for deduplication.
 /// When this limit is reached, the oldest half is evicted.
 const MAX_PROCESSED_IDS: usize = 1000;
+const VPN_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_DIAGNOSTIC_MESSAGE: usize = 3800;
 
 // ============================================
 // CommandHandler
@@ -193,8 +197,11 @@ impl CommandHandler {
         // Mark as processed (before execution to prevent re-entry)
         self.mark_processed(cmd_id.clone());
 
+        let report_agent_type = command_agent_type(action);
+
         // Report "received" status to CMS
-        self.report_status(
+        self.report_status_for_agent_type(
+            report_agent_type,
             cmd_id,
             CommandExecutionStatus::Received,
             0,
@@ -218,13 +225,20 @@ impl CommandHandler {
             "update_openclaw" => {
                 self.handle_update_openclaw(&command).await;
             }
+            "system_info" => {
+                self.handle_system_info(&command).await;
+            }
+            "collect_logs" => {
+                self.handle_collect_logs(&command).await;
+            }
             unknown => {
                 warn!(
                     command_id = %cmd_id,
                     action = %unknown,
                     "[CMD_HANDLER] ❓ Unknown action — reporting failed"
                 );
-                self.report_status(
+                self.report_status_for_agent_type(
+                    report_agent_type,
                     cmd_id,
                     CommandExecutionStatus::Failed,
                     0,
@@ -330,6 +344,121 @@ impl CommandHandler {
         }
     }
 
+    /// Handles `system_info` command.
+    ///
+    /// This is a read-only VPN operations command used by nodeboard to collect
+    /// enough node context for remote diagnosis without SSH access.
+    async fn handle_system_info(&self, command: &Command) {
+        info!(
+            command_id = %command.id,
+            "[CMD_HANDLER] 🩺 system_info"
+        );
+
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::InProgress,
+            20,
+            "Collecting VPN node diagnostics",
+        ).await;
+
+        let service_name = command.params
+            .get("service_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("aeronyx-server");
+        let tun_device = command.params
+            .get("tun_device")
+            .and_then(|value| value.as_str())
+            .unwrap_or("aeronyx0");
+
+        let mut parts = Vec::new();
+        parts.push(format!("uptime: {}", run_readonly_command("uptime", &[]).await));
+        parts.push(format!("kernel: {}", run_readonly_command("uname", &["-a"]).await));
+        parts.push(format!(
+            "service({}): {}",
+            service_name,
+            run_readonly_command("systemctl", &["is-active", service_name]).await
+        ));
+        parts.push(format!(
+            "tun({}): {}",
+            tun_device,
+            run_readonly_command("ip", &["addr", "show", "dev", tun_device]).await
+        ));
+        parts.push(format!(
+            "udp_listeners: {}",
+            run_readonly_command("ss", &["-lun"]).await
+        ));
+        parts.push(format!(
+            "ip_forward: {}",
+            read_trimmed_file("/proc/sys/net/ipv4/ip_forward").await
+        ));
+
+        let message = sanitize_and_truncate(&parts.join("\n"));
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::Completed,
+            100,
+            &message,
+        ).await;
+    }
+
+    /// Handles `collect_logs` command.
+    ///
+    /// The command intentionally returns a short, redacted journal tail only.
+    /// It is for operational diagnosis, not unrestricted remote shell access.
+    async fn handle_collect_logs(&self, command: &Command) {
+        info!(
+            command_id = %command.id,
+            "[CMD_HANDLER] 📄 collect_logs"
+        );
+
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::InProgress,
+            20,
+            "Collecting recent VPN service logs",
+        ).await;
+
+        let service_name = command.params
+            .get("service_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("aeronyx-server");
+        let lines = command.params
+            .get("lines")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(60)
+            .clamp(10, 120)
+            .to_string();
+
+        let output = run_readonly_command(
+            "journalctl",
+            &[
+                "-u",
+                service_name,
+                "--no-pager",
+                "--since",
+                "30 minutes ago",
+                "-n",
+                &lines,
+            ],
+        ).await;
+
+        let message = sanitize_and_truncate(&format!(
+            "recent_logs({}; last {} lines):\n{}",
+            service_name, lines, output
+        ));
+
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::Completed,
+            100,
+            &message,
+        ).await;
+    }
+
     // ============================================
     // Status Reporting
     // ============================================
@@ -348,9 +477,26 @@ impl CommandHandler {
         progress: u8,
         message: &str,
     ) {
+        self.report_status_for_agent_type(
+            "openclaw",
+            command_id,
+            status,
+            progress,
+            message,
+        ).await;
+    }
+
+    async fn report_status_for_agent_type(
+        &self,
+        agent_type: &str,
+        command_id: &str,
+        status: CommandExecutionStatus,
+        progress: u8,
+        message: &str,
+    ) {
         let report = CommandStatusReport {
             command_id: command_id.to_string(),
-            agent_type: "openclaw".to_string(),
+            agent_type: agent_type.to_string(),
             status,
             progress,
             message: message.to_string(),
@@ -402,4 +548,88 @@ impl CommandHandler {
         self.processed_ids.insert(id.clone());
         self.processed_ids_order.push(id);
     }
+}
+
+async fn run_readonly_command(program: &str, args: &[&str]) -> String {
+    let output = timeout(
+        VPN_COMMAND_TIMEOUT,
+        TokioCommand::new(program).args(args).output(),
+    ).await;
+
+    match output {
+        Ok(Ok(result)) => {
+            let mut text = String::new();
+            if !result.stdout.is_empty() {
+                text.push_str(&String::from_utf8_lossy(&result.stdout));
+            }
+            if !result.stderr.is_empty() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&String::from_utf8_lossy(&result.stderr));
+            }
+            if text.trim().is_empty() {
+                format!("exit={}", result.status)
+            } else {
+                collapse_lines(text.trim(), 18)
+            }
+        }
+        Ok(Err(e)) => format!("{} failed: {}", program, e),
+        Err(_) => format!("{} timed out", program),
+    }
+}
+
+fn command_agent_type(action: &str) -> &'static str {
+    match action {
+        "install_openclaw"
+        | "start_openclaw"
+        | "stop_openclaw"
+        | "uninstall_openclaw"
+        | "update_openclaw" => "openclaw",
+        _ => "vpn",
+    }
+}
+
+async fn read_trimmed_file(path: &str) -> String {
+    match tokio::fs::read_to_string(path).await {
+        Ok(value) => value.trim().to_string(),
+        Err(e) => format!("read failed: {}", e),
+    }
+}
+
+fn collapse_lines(text: &str, max_lines: usize) -> String {
+    let mut lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        format!("{}\n...truncated", lines.join("\n"))
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn sanitize_and_truncate(input: &str) -> String {
+    let mut output = Vec::new();
+
+    for line in input.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("authorization")
+            || lower.contains("signature")
+            || lower.contains("private_key")
+            || lower.contains("secret")
+            || lower.contains("voucher")
+            || lower.contains("token")
+            || lower.contains("api_key")
+        {
+            output.push("[redacted sensitive log line]".to_string());
+        } else {
+            output.push(line.to_string());
+        }
+    }
+
+    let mut text = output.join("\n");
+    if text.len() > MAX_DIAGNOSTIC_MESSAGE {
+        text.truncate(MAX_DIAGNOSTIC_MESSAGE);
+        text.push_str("\n...truncated");
+    }
+    text
 }
