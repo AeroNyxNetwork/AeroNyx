@@ -20,7 +20,9 @@ use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
 use crate::config::ServerConfig;
-use crate::services::{NodePolicyEnforcementSnapshot, NodePolicyRuntime, NodePolicySnapshot, SessionManager};
+use crate::services::{
+    NodePolicyEnforcementSnapshot, NodePolicyRuntime, NodePolicySnapshot, SessionManager,
+};
 use crate::voucher_verifier::{VoucherMetricsSnapshot, VoucherVerifier};
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -51,6 +53,7 @@ struct VpnHealthResponse {
     virtual_ip_range: String,
     tun_device: String,
     configured_mtu: u16,
+    running_mtu: Option<u16>,
     active_sessions: usize,
     active_wallet_devices: usize,
     node_policy: NodePolicySnapshot,
@@ -67,7 +70,12 @@ pub fn build_vpn_health_router(
 ) -> Router {
     Router::new()
         .route("/api/vpn/health", get(vpn_health_handler))
-        .with_state(VpnHealthState { config, sessions, node_policy, voucher_verifier })
+        .with_state(VpnHealthState {
+            config,
+            sessions,
+            node_policy,
+            voucher_verifier,
+        })
 }
 
 async fn vpn_health_handler(State(state): State<VpnHealthState>) -> impl IntoResponse {
@@ -89,9 +97,14 @@ pub async fn collect_vpn_health_value(
     node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
 ) -> Value {
-    let state = VpnHealthState { config, sessions, node_policy, voucher_verifier };
-    serde_json::to_value(collect_vpn_health_response(state).await)
-        .unwrap_or_else(|e| serde_json::json!({
+    let state = VpnHealthState {
+        config,
+        sessions,
+        node_policy,
+        voucher_verifier,
+    };
+    serde_json::to_value(collect_vpn_health_response(state).await).unwrap_or_else(|e| {
+        serde_json::json!({
             "status": "failed",
             "checked_at": unix_now_secs(),
             "checks": [{
@@ -99,7 +112,8 @@ pub async fn collect_vpn_health_value(
                 "ok": false,
                 "detail": format!("serialization failed: {}", e),
             }],
-        }))
+        })
+    })
 }
 
 async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse {
@@ -108,12 +122,13 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     let listen_addr = config.listen_addr();
     let tun_device = config.device_name().to_string();
     let configured_mtu = config.mtu();
+    let running_mtu = read_tun_mtu(&tun_device).await.ok();
     let ip_range = config.ip_range().to_string();
 
     let mut checks = Vec::new();
     checks.push(check_udp_listener(listen_addr).await);
     checks.push(check_tun_device(&tun_device).await);
-    checks.push(check_mtu_config(&tun_device, configured_mtu).await);
+    checks.push(check_mtu_config(&tun_device, configured_mtu, running_mtu).await);
     checks.push(check_ip_forwarding().await);
     checks.push(check_nat_masquerade(&ip_range).await);
     checks.push(check_dns_socket(gateway_ip).await);
@@ -137,6 +152,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         virtual_ip_range: ip_range,
         tun_device,
         configured_mtu,
+        running_mtu,
         active_sessions: state.sessions.count(),
         active_wallet_devices: state.sessions.wallet_index_count(),
         node_policy: state.node_policy.snapshot(),
@@ -192,11 +208,24 @@ async fn check_tun_device(device: &str) -> HealthCheck {
     }
 }
 
-async fn check_mtu_config(device: &str, configured_mtu: u16) -> HealthCheck {
+async fn read_tun_mtu(device: &str) -> Result<u16, String> {
     let path = format!("/sys/class/net/{}/mtu", device);
-    match tokio::fs::read_to_string(&path).await {
-        Ok(value) => {
-            let actual = value.trim().parse::<u16>().unwrap_or(0);
+    let value = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("read {} failed: {}", path, e))?;
+    value
+        .trim()
+        .parse::<u16>()
+        .map_err(|e| format!("parse {} failed: {}", path, e))
+}
+
+async fn check_mtu_config(
+    device: &str,
+    configured_mtu: u16,
+    running_mtu: Option<u16>,
+) -> HealthCheck {
+    match running_mtu {
+        Some(actual) => {
             let range_ok = (1280..=1500).contains(&actual);
             let matches_config = actual == configured_mtu;
             HealthCheck {
@@ -217,10 +246,13 @@ async fn check_mtu_config(device: &str, configured_mtu: u16) -> HealthCheck {
                 },
             }
         }
-        Err(e) => HealthCheck {
+        None => HealthCheck {
             name: "mtu_config",
             ok: false,
-            detail: format!("read {} failed: {}", path, e),
+            detail: format!(
+                "{} MTU is unavailable from /sys/class/net/{}/mtu",
+                device, device
+            ),
         },
     }
 }
@@ -244,7 +276,13 @@ async fn check_ip_forwarding() -> HealthCheck {
 }
 
 async fn check_nat_masquerade(ip_range: &str) -> HealthCheck {
-    match run_command("iptables", &["-t", "nat", "-S", "POSTROUTING"], CHECK_TIMEOUT).await {
+    match run_command(
+        "iptables",
+        &["-t", "nat", "-S", "POSTROUTING"],
+        CHECK_TIMEOUT,
+    )
+    .await
+    {
         Ok(out) => {
             let ok = out.lines().any(|line| {
                 line.contains(ip_range)
@@ -299,7 +337,10 @@ async fn check_dns_query(gateway_ip: Ipv4Addr) -> HealthCheck {
         Ok(answers) => HealthCheck {
             name: "dns_query",
             ok: answers > 0,
-            detail: format!("{} A answers via {}:53 = {}", DNS_QUERY_NAME, gateway_ip, answers),
+            detail: format!(
+                "{} A answers via {}:53 = {}",
+                DNS_QUERY_NAME, gateway_ip, answers
+            ),
         },
         Err(e) => HealthCheck {
             name: "dns_query",
@@ -359,10 +400,10 @@ fn build_dns_query(name: &str) -> std::result::Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(64);
     out.extend_from_slice(&0xAE90u16.to_be_bytes()); // transaction id
     out.extend_from_slice(&0x0100u16.to_be_bytes()); // recursion desired
-    out.extend_from_slice(&1u16.to_be_bytes());      // qdcount
-    out.extend_from_slice(&0u16.to_be_bytes());      // ancount
-    out.extend_from_slice(&0u16.to_be_bytes());      // nscount
-    out.extend_from_slice(&0u16.to_be_bytes());      // arcount
+    out.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+    out.extend_from_slice(&0u16.to_be_bytes()); // ancount
+    out.extend_from_slice(&0u16.to_be_bytes()); // nscount
+    out.extend_from_slice(&0u16.to_be_bytes()); // arcount
     for label in name.split('.') {
         if label.is_empty() || label.len() > 63 {
             return Err(format!("invalid DNS label in {}", name));
