@@ -33,7 +33,7 @@ fn default_cms_url() -> String {
 }
 
 fn default_heartbeat_interval() -> u64 { 30 }
-fn default_session_report_interval() -> u64 { 60 }
+fn default_session_report_interval() -> u64 { 30 }
 fn default_request_timeout() -> u64 { 10 }
 fn default_max_retries() -> u32 { 3 }
 

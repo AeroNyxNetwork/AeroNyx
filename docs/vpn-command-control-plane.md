@@ -47,7 +47,7 @@ Source paths:
 
 The Rust node drives active VPN session quality snapshots from
 `management.session_report_interval_secs` instead of a hard-coded five-minute
-timer. The default is 60 seconds, and runtime scheduling clamps the interval to
+timer. The default is 30 seconds, and runtime scheduling clamps the interval to
 10-300 seconds.
 
 Snapshots are emitted for every established session, even when the current
