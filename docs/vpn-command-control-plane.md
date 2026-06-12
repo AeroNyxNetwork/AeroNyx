@@ -38,11 +38,30 @@ maintenance rejections, max-session rejections, bandwidth drops, and the last
 rejection reason/time. The backend turns these counters into
 `node_policy_enforced` events for nodeboard Alerts / Events.
 
+## Session Quality Snapshot Cadence
+
+Source paths:
+
+- `crates/aeronyx-server/src/server.rs`
+- `crates/aeronyx-server/src/management/config.rs`
+
+The Rust node drives active VPN session quality snapshots from
+`management.session_report_interval_secs` instead of a hard-coded five-minute
+timer. The default is 60 seconds, and runtime scheduling clamps the interval to
+10-300 seconds.
+
+Snapshots are emitted for every established session, even when the current
+traffic counters are still zero. This keeps low-traffic commercial VPN tunnels
+visible in nodeboard with fresh `last_tx_at`, keepalive RTT, replay-window
+counters, and packet-loss metadata.
+
 ## Privacy Boundary
 
 Command results are operational diagnostics only. They must not include traffic
 destinations, DNS query contents, packet payloads, browsing history, or full
 client-identifying data. Policy enforcement telemetry is aggregate-only and
 does not include destinations, DNS contents, packet payloads, or browsing
-history. `collect_logs` returns a bounded and redacted service tail intended for
-VPN stability diagnosis.
+history. Session quality snapshots contain only operational tunnel metadata and
+never include destination IP addresses, DNS contents, packet payloads, domains,
+URLs, or browsing history. `collect_logs` returns a bounded and redacted service
+tail intended for VPN stability diagnosis.

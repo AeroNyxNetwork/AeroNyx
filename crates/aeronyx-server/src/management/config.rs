@@ -62,6 +62,9 @@ impl ManagementConfig {
         if self.heartbeat_interval_secs == 0 {
             return Err("heartbeat_interval_secs must be > 0".to_string());
         }
+        if self.session_report_interval_secs == 0 {
+            return Err("session_report_interval_secs must be > 0".to_string());
+        }
         if self.request_timeout_secs == 0 {
             return Err("request_timeout_secs must be > 0".to_string());
         }

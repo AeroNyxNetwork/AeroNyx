@@ -301,6 +301,7 @@ impl Server {
         let snapshot_task = self.spawn_traffic_snapshot_task(
             Arc::clone(&sessions),
             session_event_sender.clone(),
+            self.config.management.session_report_interval_secs,
         );
         tasks.push(("traffic-snapshot", snapshot_task));
 
@@ -1717,12 +1718,14 @@ impl Server {
         &self,
         sessions: Arc<SessionManager>,
         events:   SessionEventSender,
+        interval_secs: u64,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut rx   = self.shutdown_tx.subscribe();
+        let interval_secs = interval_secs.clamp(10, 300);
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            let mut timer = tokio::time::interval(Duration::from_secs(300));
+            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+            let mut timer = tokio::time::interval(Duration::from_secs(interval_secs));
             loop {
                 tokio::select! {
                     _ = rx.recv() => break,
@@ -1731,8 +1734,8 @@ impl Server {
                         let all      = sessions.all_sessions();
                         let mut reported = 0usize;
                         for session in all {
+                            if !session.is_established() { continue; }
                             let snap = session.stats.snapshot();
-                            if snap.bytes_rx == 0 && snap.bytes_tx == 0 { continue; }
                             let wallet_hex = session.wallet_hex.clone();
                             let sid        = BASE64.encode(session.id.as_bytes());
                             events.session_traffic_snapshot(
@@ -1746,7 +1749,12 @@ impl Server {
                             reported += 1;
                         }
                         if reported > 0 {
-                            debug!(sessions = reported, "[TRAFFIC_SNAPSHOT] Sent snapshots for {} active session(s)", reported);
+                            debug!(
+                                sessions = reported,
+                                interval_secs,
+                                "[TRAFFIC_SNAPSHOT] Sent quality snapshots for {} active session(s)",
+                                reported
+                            );
                         }
                     }
                 }
