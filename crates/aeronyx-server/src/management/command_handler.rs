@@ -92,6 +92,10 @@ fn session_quality_from_stats(snap: &crate::services::session::StatsSnapshot) ->
         too_old_rejections: Some(snap.too_old_rejected),
         packets_rx: Some(snap.packets_rx),
         packets_tx: Some(snap.packets_tx),
+        keepalive_probes_sent: Some(snap.keepalive_probes_sent),
+        keepalive_acks: Some(snap.keepalive_acks),
+        keepalive_missed: Some(snap.keepalive_missed),
+        keepalive_pending: Some(snap.keepalive_pending),
     }
 }
 
@@ -475,7 +479,7 @@ impl CommandHandler {
             return;
         };
 
-        let stats = session.stats.snapshot();
+        let stats = session.stats_snapshot();
         let quality = session_quality_from_stats(&stats);
         self.session_events.session_ended(
             session_id_raw,
@@ -629,7 +633,7 @@ impl CommandHandler {
             let active = sessions.get_all_by_wallet(&wallet_bytes);
             for session in active {
                 if let Some(removed) = sessions.remove(&session.id) {
-                    let stats = removed.stats.snapshot();
+                    let stats = removed.stats_snapshot();
                     let quality = session_quality_from_stats(&stats);
                     self.session_events.session_ended(
                         &removed.id.to_string(),

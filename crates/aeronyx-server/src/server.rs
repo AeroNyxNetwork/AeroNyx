@@ -117,6 +117,8 @@ const COMMAND_CHANNEL_BUFFER:      usize  = 100;
 const QUANTIZER_CAL_KEY_PREFIX:    &str   = "quantizer_cal";
 const POOL_EVICTION_INTERVAL_SECS: u64    = 300;
 const MINER_SCHEDULER_TICK_SECS:   u64    = 60;
+const KEEPALIVE_PROBE_INTERVAL_SECS: u64    = 60;
+const KEEPALIVE_ACK_TIMEOUT_SECS:    u64    = 90;
 
 // ============================================
 // Server
@@ -140,6 +142,10 @@ fn quality_from_stats(snap: StatsSnapshot) -> SessionQuality {
         too_old_rejections: Some(snap.too_old_rejected),
         packets_rx: Some(snap.packets_rx),
         packets_tx: Some(snap.packets_tx),
+        keepalive_probes_sent: Some(snap.keepalive_probes_sent),
+        keepalive_acks: Some(snap.keepalive_acks),
+        keepalive_missed: Some(snap.keepalive_missed),
+        keepalive_pending: Some(snap.keepalive_pending),
     }
 }
 
@@ -1735,7 +1741,7 @@ impl Server {
                         let mut reported = 0usize;
                         for session in all {
                             if !session.is_established() { continue; }
-                            let snap = session.stats.snapshot();
+                            let snap = session.stats_snapshot();
                             let wallet_hex = session.wallet_hex.clone();
                             let sid        = BASE64.encode(session.id.as_bytes());
                             events.session_traffic_snapshot(
@@ -1777,7 +1783,7 @@ impl Server {
         let mut rx   = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            let mut timer = tokio::time::interval(Duration::from_secs(60));
+            let mut timer = tokio::time::interval(Duration::from_secs(KEEPALIVE_PROBE_INTERVAL_SECS));
             loop {
                 tokio::select! {
                     _ = rx.recv() => break,
@@ -1786,7 +1792,11 @@ impl Server {
                         let mut sent = 0usize;
                         for session in sessions.all_sessions() {
                             if !session.is_established() { continue; }
-                            match packet_handler.build_keepalive_probe(&session, gateway_ip) {
+                            match packet_handler.build_keepalive_probe(
+                                &session,
+                                gateway_ip,
+                                Duration::from_secs(KEEPALIVE_ACK_TIMEOUT_SECS),
+                            ) {
                                 Ok((bytes, endpoint)) => {
                                     if udp.send(&bytes, &endpoint).await.is_ok() {
                                         sent += 1;

@@ -38,6 +38,7 @@
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tracing::{debug, trace, warn};
@@ -457,8 +458,9 @@ impl PacketHandler {
         &self,
         session: &Arc<Session>,
         gateway_ip: Ipv4Addr,
+        ack_timeout: Duration,
     ) -> Result<(Vec<u8>, std::net::SocketAddr)> {
-        let (identifier, sequence) = session.begin_keepalive_probe();
+        let (identifier, sequence) = session.begin_keepalive_probe(ack_timeout);
         let ip_packet = build_icmp_echo_request(
             gateway_ip,
             session.virtual_ip,

@@ -591,6 +591,18 @@ pub struct SessionEventReport {
     /// VPN packets sent to the client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packets_tx: Option<u64>,
+    /// Total in-tunnel keepalive probes queued for this session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keepalive_probes_sent: Option<u64>,
+    /// Keepalive probes that received a matching ACK.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keepalive_acks: Option<u64>,
+    /// Keepalive probes that timed out without an ACK.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keepalive_missed: Option<u64>,
+    /// Keepalive probes currently waiting for an ACK.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keepalive_pending: Option<u64>,
 }
 
 /// Response from session event report.

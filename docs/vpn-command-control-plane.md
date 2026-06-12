@@ -55,6 +55,27 @@ traffic counters are still zero. This keeps low-traffic commercial VPN tunnels
 visible in nodeboard with fresh `last_tx_at`, keepalive RTT, replay-window
 counters, and packet-loss metadata.
 
+## Keepalive ACK Counters
+
+Source paths:
+
+- `crates/aeronyx-server/src/services/session.rs`
+- `crates/aeronyx-server/src/handlers/packet.rs`
+- `crates/aeronyx-server/src/server.rs`
+- `crates/aeronyx-server/src/management/reporter.rs`
+- `crates/aeronyx-server/src/management/models.rs`
+
+The Rust node now records in-tunnel keepalive ACK health per session:
+
+- `keepalive_probes_sent`: probes queued for the assigned virtual IP.
+- `keepalive_acks`: probes that received a matching ACK.
+- `keepalive_missed`: probes that expired without an ACK.
+- `keepalive_pending`: probes still waiting for an ACK.
+
+The keepalive task sends probes every 60 seconds and treats an ACK as missed
+after 90 seconds. These counters make "connected but unstable" tunnels visible
+to the CMS and nodeboard without requiring SSH.
+
 ## Privacy Boundary
 
 Command results are operational diagnostics only. They must not include traffic

@@ -402,6 +402,12 @@ pub struct SessionStats {
     pub last_tx_at: AtomicU64,
     /// Last measured tunnel keepalive RTT in microseconds. Zero means unknown.
     pub rtt_us: AtomicU64,
+    /// Total in-tunnel keepalive probes sent to this session.
+    pub keepalive_probes_sent: AtomicU64,
+    /// Total keepalive ACKs matched for this session.
+    pub keepalive_acks: AtomicU64,
+    /// Total keepalive probes that expired without an ACK.
+    pub keepalive_missed: AtomicU64,
 }
 
 impl SessionStats {
@@ -422,6 +428,23 @@ impl SessionStats {
     /// Records an operational control-plane transmit without billing bytes.
     pub fn record_control_tx(&self) {
         self.last_tx_at.store(unix_now_secs(), Ordering::Relaxed);
+    }
+
+    /// Records an outbound keepalive probe.
+    pub fn record_keepalive_probe_sent(&self) {
+        self.keepalive_probes_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a matched keepalive ACK.
+    pub fn record_keepalive_ack(&self) {
+        self.keepalive_acks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records keepalive probes that expired without an ACK.
+    pub fn record_keepalive_missed(&self, missed: u64) {
+        if missed > 0 {
+            self.keepalive_missed.fetch_add(missed, Ordering::Relaxed);
+        }
     }
 
     /// Increments the replay-rejection counter.
@@ -447,6 +470,10 @@ impl SessionStats {
             last_rx_at: self.last_rx_at.load(Ordering::Relaxed),
             last_tx_at: self.last_tx_at.load(Ordering::Relaxed),
             rtt_us: self.rtt_us.load(Ordering::Relaxed),
+            keepalive_probes_sent: self.keepalive_probes_sent.load(Ordering::Relaxed),
+            keepalive_acks: self.keepalive_acks.load(Ordering::Relaxed),
+            keepalive_missed: self.keepalive_missed.load(Ordering::Relaxed),
+            keepalive_pending: 0,
         }
     }
 }
@@ -487,6 +514,14 @@ pub struct StatsSnapshot {
     pub last_tx_at: u64,
     /// Last measured keepalive round-trip time in microseconds. Zero means none.
     pub rtt_us: u64,
+    /// Total in-tunnel keepalive probes sent to this session.
+    pub keepalive_probes_sent: u64,
+    /// Total keepalive ACKs matched for this session.
+    pub keepalive_acks: u64,
+    /// Total keepalive probes that expired without an ACK.
+    pub keepalive_missed: u64,
+    /// Keepalive probes currently waiting for an ACK.
+    pub keepalive_pending: u64,
 }
 
 fn unix_now_secs() -> u64 {
@@ -598,6 +633,15 @@ impl Session {
         self.last_activity.elapsed()
     }
 
+    /// Returns traffic and keepalive counters with the current pending ACK
+    /// queue length included for management-plane telemetry.
+    #[must_use]
+    pub fn stats_snapshot(&self) -> StatsSnapshot {
+        let mut snap = self.stats.snapshot();
+        snap.keepalive_pending = self.keepalive.lock().pending.len() as u64;
+        snap
+    }
+
     /// Returns true if the session has been idle longer than `timeout`.
     #[must_use]
     pub fn is_expired(&self, timeout: Duration) -> bool {
@@ -670,11 +714,20 @@ impl Session {
 
     /// Registers an outbound ICMP keepalive probe and returns its identifier
     /// and sequence number.
-    pub fn begin_keepalive_probe(&self) -> (u16, u16) {
+    pub fn begin_keepalive_probe(&self, ack_timeout: Duration) -> (u16, u16) {
         let mut state = self.keepalive.lock();
+        let now = Instant::now();
+        let before_prune = state.pending.len();
+        state
+            .pending
+            .retain(|_, sent_at| now.duration_since(*sent_at) <= ack_timeout);
+        self.stats
+            .record_keepalive_missed((before_prune - state.pending.len()) as u64);
+
         state.next_sequence = state.next_sequence.wrapping_add(1);
         let sequence = state.next_sequence;
-        state.pending.insert(sequence, Instant::now());
+        state.pending.insert(sequence, now);
+        self.stats.record_keepalive_probe_sent();
 
         // Bound memory if a client stops replying. One session should never
         // have many pending probes; keeping the newest 8 is enough for
@@ -687,6 +740,7 @@ impl Session {
                 .map(|(seq, _)| *seq);
             if let Some(seq) = oldest {
                 state.pending.remove(&seq);
+                self.stats.record_keepalive_missed(1);
             }
         }
 
@@ -703,6 +757,7 @@ impl Session {
         let rtt = sent_at.elapsed();
         let rtt_us = rtt.as_micros().min(u64::MAX as u128) as u64;
         self.stats.rtt_us.store(rtt_us, Ordering::Relaxed);
+        self.stats.record_keepalive_ack();
         Some(rtt_us as f64 / 1000.0)
     }
 
@@ -940,7 +995,7 @@ impl SessionManager {
             session.set_state(SessionState::Closed);
             self.remove_device_by_session(id, &session.wallet_bytes());
 
-            let stats = session.stats.snapshot();
+            let stats = session.stats_snapshot();
             info!(
                 session_id = %id,
                 virtual_ip = %session.virtual_ip,
@@ -1028,7 +1083,7 @@ impl SessionManager {
         for entry in self.sessions.iter() {
             let session = entry.value();
             if session.is_expired(self.session_timeout) {
-                let snap = session.stats.snapshot();
+                let snap = session.stats_snapshot();
                 // v1.0.0-Membership: use cached wallet_hex — no allocation.
                 let wallet = session.wallet_hex.clone();
                 expired.push((

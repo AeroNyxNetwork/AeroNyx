@@ -99,6 +99,10 @@ pub struct SessionEvent {
     pub too_old_rejections: Option<u64>,
     pub packets_rx:    Option<u64>,
     pub packets_tx:    Option<u64>,
+    pub keepalive_probes_sent: Option<u64>,
+    pub keepalive_acks: Option<u64>,
+    pub keepalive_missed: Option<u64>,
+    pub keepalive_pending: Option<u64>,
 }
 
 impl SessionEvent {
@@ -123,6 +127,10 @@ impl SessionEvent {
             too_old_rejections: None,
             packets_rx: None,
             packets_tx: None,
+            keepalive_probes_sent: None,
+            keepalive_acks: None,
+            keepalive_missed: None,
+            keepalive_pending: None,
         }
     }
 
@@ -150,6 +158,10 @@ impl SessionEvent {
             too_old_rejections: quality.too_old_rejections,
             packets_rx: quality.packets_rx,
             packets_tx: quality.packets_tx,
+            keepalive_probes_sent: quality.keepalive_probes_sent,
+            keepalive_acks: quality.keepalive_acks,
+            keepalive_missed: quality.keepalive_missed,
+            keepalive_pending: quality.keepalive_pending,
         }
     }
 
@@ -177,6 +189,10 @@ impl SessionEvent {
             too_old_rejections: quality.too_old_rejections,
             packets_rx: quality.packets_rx,
             packets_tx: quality.packets_tx,
+            keepalive_probes_sent: quality.keepalive_probes_sent,
+            keepalive_acks: quality.keepalive_acks,
+            keepalive_missed: quality.keepalive_missed,
+            keepalive_pending: quality.keepalive_pending,
         }
     }
 
@@ -199,6 +215,10 @@ impl SessionEvent {
             too_old_rejections: self.too_old_rejections,
             packets_rx:    self.packets_rx,
             packets_tx:    self.packets_tx,
+            keepalive_probes_sent: self.keepalive_probes_sent,
+            keepalive_acks: self.keepalive_acks,
+            keepalive_missed: self.keepalive_missed,
+            keepalive_pending: self.keepalive_pending,
         }
     }
 }
@@ -213,6 +233,10 @@ pub struct SessionQuality {
     pub too_old_rejections: Option<u64>,
     pub packets_rx: Option<u64>,
     pub packets_tx: Option<u64>,
+    pub keepalive_probes_sent: Option<u64>,
+    pub keepalive_acks: Option<u64>,
+    pub keepalive_missed: Option<u64>,
+    pub keepalive_pending: Option<u64>,
 }
 
 #[inline]
