@@ -28,6 +28,7 @@ use crate::voucher_verifier::{VoucherMetricsSnapshot, VoucherVerifier};
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_QUERY_NAME: &str = "api.aeronyx.network";
 const EGRESS_CHECK_ADDR: &str = "1.1.1.1:443";
+const VPN_SERVICE_NAME: &str = "aeronyx-server";
 
 #[derive(Clone)]
 pub struct VpnHealthState {
@@ -45,6 +46,15 @@ struct HealthCheck {
 }
 
 #[derive(Debug, Serialize)]
+struct ServiceManagerStatus {
+    manager: &'static str,
+    service_name: &'static str,
+    load_state: String,
+    restart_supported: bool,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
 struct VpnHealthResponse {
     status: &'static str,
     checked_at: u64,
@@ -56,6 +66,7 @@ struct VpnHealthResponse {
     running_mtu: Option<u16>,
     active_sessions: usize,
     active_wallet_devices: usize,
+    service_manager: ServiceManagerStatus,
     node_policy: NodePolicySnapshot,
     policy_enforcement: NodePolicyEnforcementSnapshot,
     voucher_metrics: VoucherMetricsSnapshot,
@@ -124,6 +135,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     let configured_mtu = config.mtu();
     let running_mtu = read_tun_mtu(&tun_device).await.ok();
     let ip_range = config.ip_range().to_string();
+    let service_manager = collect_service_manager_status(VPN_SERVICE_NAME).await;
 
     let mut checks = Vec::new();
     checks.push(check_udp_listener(listen_addr).await);
@@ -155,10 +167,72 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         running_mtu,
         active_sessions: state.sessions.count(),
         active_wallet_devices: state.sessions.wallet_index_count(),
+        service_manager,
         node_policy: state.node_policy.snapshot(),
         policy_enforcement: state.node_policy.enforcement_snapshot(),
         voucher_metrics: state.voucher_verifier.metrics_snapshot(),
         checks,
+    }
+}
+
+async fn collect_service_manager_status(service_name: &'static str) -> ServiceManagerStatus {
+    let result = timeout(
+        CHECK_TIMEOUT,
+        TokioCommand::new("systemctl")
+            .args(["show", service_name, "--property=LoadState", "--value"])
+            .output(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) if output.status.success() => {
+            let load_state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let load_state = if load_state.is_empty() {
+                "unknown".to_string()
+            } else {
+                load_state
+            };
+            let restart_supported = load_state == "loaded";
+            ServiceManagerStatus {
+                manager: "systemd",
+                service_name,
+                load_state: load_state.clone(),
+                restart_supported,
+                detail: if restart_supported {
+                    format!("{} systemd service is loaded", service_name)
+                } else {
+                    format!(
+                        "{} systemd service is not restartable from nodeboard (LoadState={})",
+                        service_name, load_state
+                    )
+                },
+            }
+        }
+        Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.trim().chars().take(240).collect::<String>();
+            ServiceManagerStatus {
+                manager: "systemd",
+                service_name,
+                load_state: "unknown".to_string(),
+                restart_supported: false,
+                detail: format!("systemctl show failed: {}", detail),
+            }
+        }
+        Ok(Err(error)) => ServiceManagerStatus {
+            manager: "systemd",
+            service_name,
+            load_state: "unavailable".to_string(),
+            restart_supported: false,
+            detail: format!("systemctl unavailable: {}", error),
+        },
+        Err(_) => ServiceManagerStatus {
+            manager: "systemd",
+            service_name,
+            load_state: "timeout".to_string(),
+            restart_supported: false,
+            detail: "systemctl show timed out".to_string(),
+        },
     }
 }
 
