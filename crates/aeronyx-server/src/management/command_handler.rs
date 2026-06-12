@@ -393,6 +393,7 @@ impl CommandHandler {
             .unwrap_or(60)
             .clamp(10, 120)
             .to_string();
+        let service_state = service_load_state_summary(service_name).await;
 
         let output = run_readonly_command(
             "journalctl",
@@ -409,7 +410,7 @@ impl CommandHandler {
 
         let message = sanitize_and_truncate(&format!(
             "recent_logs({}; last {} lines):\n{}",
-            service_name, lines, output
+            service_name, lines, format!("service_manager: {}\n{}", service_state, output)
         ));
 
         self.report_status_for_agent_type(
@@ -1059,6 +1060,44 @@ async fn ensure_systemd_service_loaded(service_name: &str) -> Result<(), String>
         }
         Ok(Err(error)) => Err(format!("systemctl unavailable for restart_service: {}", error)),
         Err(_) => Err("systemctl service preflight timed out".to_string()),
+    }
+}
+
+async fn service_load_state_summary(service_name: &str) -> String {
+    let show = timeout(
+        VPN_COMMAND_TIMEOUT,
+        TokioCommand::new("systemctl")
+            .args(["show", service_name, "--property=LoadState", "--value"])
+            .output(),
+    ).await;
+
+    match show {
+        Ok(Ok(output)) if output.status.success() => {
+            let load_state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let load_state = if load_state.is_empty() { "unknown" } else { &load_state };
+            if load_state == "loaded" {
+                format!(
+                    "systemd LoadState=loaded; restart and journal collection are supported for {}",
+                    service_name
+                )
+            } else {
+                format!(
+                    "systemd LoadState={}; {} is not managed as a loaded service, so nodeboard restart may be unavailable for this foreground deployment",
+                    load_state,
+                    service_name
+                )
+            }
+        }
+        Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            format!(
+                "systemctl show failed for {}: {}",
+                service_name,
+                collapse_lines(stderr.trim(), 4)
+            )
+        }
+        Ok(Err(error)) => format!("systemctl unavailable for {}: {}", service_name, error),
+        Err(_) => format!("systemctl show timed out for {}", service_name),
     }
 }
 
