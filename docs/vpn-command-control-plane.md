@@ -107,6 +107,27 @@ CMS command history so operators can confirm policy delivery without SSH.
 The command does not accept arbitrary policy values, file paths, shell
 arguments, or traffic inspection parameters.
 
+## Legacy Non-VPN Cleanup
+
+Source paths:
+
+- `privacy_network/consumers.py` on the CMS backend
+- `crates/aeronyx-server/Cargo.toml`
+- `crates/aeronyx-server/src/lib.rs`
+- `crates/aeronyx-core/src/ledger/block.rs`
+- `crates/aeronyx-core/src/protocol/memchain.rs`
+- `scripts/download_models.sh`
+
+Nodeboard no longer exposes legacy non-VPN pages, navigation, or API calls.
+The CMS WebSocket keeps VPN/E2E node operations available, but plaintext legacy
+frontend request/stream/response traffic is no longer forwarded between the
+browser and Rust node. Internal MPI compatibility traffic remains bounded to the
+CMS-to-node bridge and is not exposed as a nodeboard product surface.
+
+Rust comments and test fixtures use neutral AeroNyx memory/runtime names, keeping
+the commercial VPN operator experience focused on VPN health, policy, sessions,
+billing, commands, and events.
+
 ## Privacy Boundary
 
 Command results are operational diagnostics only. They must not include traffic

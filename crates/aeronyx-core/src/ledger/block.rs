@@ -384,9 +384,9 @@ mod tests {
             1_700_000_000,
             MemoryLayer::Knowledge,
             vec!["health".to_string()],
-            "openclaw-v1".to_string(),
+            "aeronyx-memory-v1".to_string(),
             b"secret_content".to_vec(),
-            b"embedding_data".to_vec(),
+            vec![0.1, 0.2, 0.3],
         );
 
         let block = RecordBlock::new(make_memory_header(5), vec![record.clone()]);

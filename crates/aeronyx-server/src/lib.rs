@@ -5,7 +5,7 @@
 //!
 //! ## Modification Reason
 //! - Added management module for CMS integration.
-//! - Added api module for MemChain Agent HTTP API.
+//! - Added api module for legacy MemChain local HTTP API.
 //! - v0.5.0: Added miner module for ReflectionMiner block packing.
 //! - v2.5.0: Added config_supernode module for SuperNode LLM config.
 //! - v1.0.0-MultiTenant: miner module now exports MinerScheduler in addition
@@ -17,7 +17,7 @@
 //! ## Last Modified
 //! v0.1.0 - Initial server library
 //! v0.2.0 - Added management module for CMS integration
-//! v0.3.0 - Added api module for MemChain Agent HTTP API
+//! v0.3.0 - Added api module for legacy MemChain local HTTP API
 //! v0.5.0 - Added miner module for ReflectionMiner
 //! v2.5.0 - Added config_supernode module
 //! v1.0.0-MultiTenant - MinerScheduler added to miner module;

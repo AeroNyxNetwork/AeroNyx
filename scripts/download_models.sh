@@ -35,7 +35,7 @@
 #   - Server starts normally (both engines are optional)
 #   - /api/mpi/embed returns 503
 #   - NER engine disabled, cognitive graph pipeline inactive
-#   - Miner falls back to OpenClaw Gateway for embeddings
+#   - Miner disables local embedding fallback until models are installed
 #
 # Model sources:
 #   EmbeddingGemma: https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX
