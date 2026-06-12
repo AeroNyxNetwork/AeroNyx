@@ -11,7 +11,6 @@
 //   v1.1.0-ChatRelay - Added chat_relay submodule
 //   v1.0.0-Membership - Added deny_list submodule + traffic_tracker
 
-pub mod agent_manager;
 pub mod chat_relay;
 pub mod deny_list;
 pub mod handshake;
@@ -24,7 +23,6 @@ pub mod traffic_tracker;
 pub mod wallet_routes;
 
 // Re-export primary types
-pub use agent_manager::AgentManager;
 pub use chat_relay::{ChatRelayService, derive_node_secret};
 pub use deny_list::{DenyList, DenyReason};
 pub use handshake::HandshakeService;

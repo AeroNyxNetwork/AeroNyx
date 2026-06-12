@@ -25,7 +25,7 @@
 The nodeboard backend only queues bounded VPN operations commands. The Rust node
 executes those commands without exposing arbitrary shell, file path, or process
 control. Command results are reported to the CMS through the signed
-`/node/agent/status` compatibility endpoint with `agent_type = "vpn"`.
+`/node/vpn/status/` endpoint with `agent_type = "vpn"`.
 
 ## Privacy Boundary
 

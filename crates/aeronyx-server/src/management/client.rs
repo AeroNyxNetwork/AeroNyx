@@ -263,7 +263,6 @@ impl ManagementClient {
         &self,
         public_ip:         &str,
         active_sessions:   u32,
-        agent_status:      Option<AgentStatusInfo>,
         memchain_status:   Option<MemChainHeartbeatStatus>,
         // v1.0.0-Membership
         connected_wallets: Vec<String>,
@@ -287,12 +286,6 @@ impl ManagementClient {
         });
 
         if let Some(obj) = system_stats_json.as_object_mut() {
-            if let Some(ref status) = agent_status {
-                obj.insert(
-                    "agent_status".to_string(),
-                    serde_json::to_value(status).unwrap_or(serde_json::Value::Null),
-                );
-            }
             if let Some(ref mc) = memchain_status {
                 obj.insert(
                     "memchain_status".to_string(),

@@ -48,7 +48,6 @@ use super::client::{
     ManagementClient, MemChainHeartbeatStatus, TrafficDelta, UserPermission,
 };
 use super::models::{Command, SessionEventReport, SessionEventType};
-use crate::services::AgentManager;
 use crate::services::{NodePolicyRuntime, NodePolicySnapshot, SessionManager};
 use crate::services::deny_list::{DenyList, DenyReason};
 use crate::services::traffic_tracker::TrafficTracker;
@@ -233,7 +232,6 @@ pub struct HeartbeatReporter {
     interval:           Duration,
     public_ip:          String,
     command_tx:         Option<mpsc::Sender<Command>>,
-    agent_manager:      Option<Arc<AgentManager>>,
     memchain_status_fn: Option<MemChainStatusFn>,
     vpn_health_status_fn: Option<VpnHealthStatusFn>,
 
@@ -259,7 +257,6 @@ impl HeartbeatReporter {
             interval,
             public_ip,
             command_tx:         None,
-            agent_manager:      None,
             memchain_status_fn: None,
             vpn_health_status_fn: None,
             sessions:           None,
@@ -274,11 +271,6 @@ impl HeartbeatReporter {
 
     pub fn with_command_sender(mut self, tx: mpsc::Sender<Command>) -> Self {
         self.command_tx = Some(tx);
-        self
-    }
-
-    pub fn with_agent_manager(mut self, am: Arc<AgentManager>) -> Self {
-        self.agent_manager = Some(am);
         self
     }
 
@@ -349,12 +341,6 @@ impl HeartbeatReporter {
                     total_beats += 1;
                     let in_cold_start = total_beats <= COLD_START_GRACE_BEATS;
 
-                    let agent_status = if let Some(ref am) = self.agent_manager {
-                        Some(am.status().await)
-                    } else {
-                        None
-                    };
-
                     let memchain_status = self.memchain_status_fn.as_ref()
                         .and_then(|f| f());
 
@@ -397,7 +383,6 @@ impl HeartbeatReporter {
                         self.client.send_heartbeat(
                             &self.public_ip,
                             session_count_fn(),
-                            agent_status,
                             memchain_status,
                             connected_wallets,
                             traffic_delta,

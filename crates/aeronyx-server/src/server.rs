@@ -1072,30 +1072,11 @@ impl Server {
 
         let public_ip = self.resolve_public_ip().await;
 
-        let agent_manager = Arc::new(
-            crate::services::AgentManager::new(Arc::clone(&mgmt_client))
-        );
-        agent_manager.detect_existing().await;
-
-        {
-            let am      = Arc::clone(&agent_manager);
-            let mut rx  = self.shutdown_tx.subscribe();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(30));
-                loop {
-                    tokio::select! {
-                        _ = rx.recv() => break,
-                        _ = interval.tick() => am.periodic_health_check().await,
-                    }
-                }
-            });
-        }
-
         let (session_reporter, event_tx) = SessionReporter::new(Arc::clone(&mgmt_client));
         let session_event_sender = SessionEventSender::new(event_tx);
 
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_BUFFER);
-        let cmd_handler      = CommandHandler::new(cmd_rx, Arc::clone(&mgmt_client), Arc::clone(&agent_manager))
+        let cmd_handler      = CommandHandler::new(cmd_rx, Arc::clone(&mgmt_client))
             .with_session_control(Arc::clone(sessions), session_event_sender.clone())
             .with_deny_list(Arc::clone(&deny_list));
         let cmd_shutdown     = self.shutdown_tx.subscribe();
@@ -1122,7 +1103,6 @@ impl Server {
         let mut heartbeat =
             HeartbeatReporter::new(Arc::clone(&mgmt_client), public_ip)
                 .with_command_sender(cmd_tx)
-                .with_agent_manager(Arc::clone(&agent_manager))
                 .with_sessions(Arc::clone(sessions))
                 .with_traffic_tracker(Arc::clone(&traffic_tracker))
                 .with_udp(Arc::clone(&udp))
@@ -1155,22 +1135,6 @@ impl Server {
 
         let sr_shutdown = self.shutdown_tx.subscribe();
         tokio::spawn(async move { session_reporter.run(sr_shutdown).await; });
-
-        let node_info_path = &self.config.management.node_info_path;
-        if let Ok(node_info) = crate::management::models::StoredNodeInfo::load(node_info_path) {
-            let ws = crate::management::WsTunnel::new(
-                self.identity.clone(),
-                node_info.node_id.clone(),
-                Arc::clone(&agent_manager),
-            ).with_mpi_api_secret(
-                self.config.memchain.effective_api_secret().map(|s| s.to_string()),
-            );
-            let ws_shutdown = self.shutdown_tx.subscribe();
-            tokio::spawn(async move { ws.run(ws_shutdown).await; });
-            info!(node_id = %node_info.node_id, "[WS_TUNNEL] Spawned");
-        } else {
-            warn!("[WS_TUNNEL] Node not registered — disabled");
-        }
 
         info!("[MANAGEMENT] Reporting started");
         session_event_sender

@@ -72,11 +72,9 @@ pub mod config;
 pub mod integrity;
 pub mod models;
 pub mod reporter;
-pub mod ws_client;
 
 pub use client::ManagementClient;
 pub use command_handler::CommandHandler;
 pub use config::ManagementConfig;
 pub use models::Command;
 pub use reporter::{HeartbeatReporter, SessionReporter, SessionEvent};
-pub use ws_client::WsTunnel;

@@ -62,7 +62,7 @@ use super::client::ManagementClient;
 use super::reporter::{SessionEventSender, SessionQuality};
 use super::models::{Command, CommandExecutionStatus, CommandStatusReport};
 use aeronyx_common::types::SessionId;
-use crate::services::{AgentManager, DenyList, DenyReason, SessionManager};
+use crate::services::{DenyList, DenyReason, SessionManager};
 
 // ============================================
 // Constants
@@ -128,10 +128,6 @@ pub struct CommandHandler {
     /// Shared management client for reporting status to CMS.
     client: Arc<ManagementClient>,
 
-    /// Retained runtime manager used by the management websocket path. Command
-    /// handling no longer dispatches non-VPN lifecycle actions through it.
-    agent_manager: Arc<AgentManager>,
-
     /// VPN session manager used by nodeboard operations commands.
     sessions: Option<Arc<SessionManager>>,
 
@@ -157,19 +153,15 @@ impl CommandHandler {
     /// # Arguments
     /// * `command_rx` - Receiver end of the command channel
     /// * `client` - Shared ManagementClient for CMS communication
-    /// * `agent_manager` - Retained runtime manager shared with management services
-    ///
     /// # Returns
     /// A new `CommandHandler` ready to be spawned with `.run()`.
     pub fn new(
         command_rx: mpsc::Receiver<Command>,
         client: Arc<ManagementClient>,
-        agent_manager: Arc<AgentManager>,
     ) -> Self {
         Self {
             command_rx,
             client,
-            agent_manager,
             sessions: None,
             session_events: SessionEventSender::disabled(),
             deny_list: None,

@@ -13,9 +13,7 @@
 //!   - Added `Command` struct for CMS command dispatch (Phase 1: Command Pipeline)
 //!   - Upgraded `HeartbeatResponse.commands` from `Option<Vec<String>>`
 //!     to `Option<Vec<Command>>` to support structured commands with params
-//!   - Added `AgentStatus` enum and `AgentStatusInfo` for OpenClaw lifecycle tracking
 //!   - Added `CommandStatusReport` for Rust -> CMS command execution feedback
-//!   - Added `agent_status` to `SystemStats` for heartbeat-based status reporting
 //!
 //! Modification Reason (v1.0.0-TrafficAccounting):
 //!   - Added `SessionTrafficSnapshot` to `SessionEventType` for periodic
@@ -34,7 +32,6 @@
 //!   - HardwareInfo: System hardware information
 //!   - SystemStats: Runtime system statistics
 //!   - Command: CMS -> Rust structured command with params
-//!   - AgentStatus / AgentStatusInfo: OpenClaw agent lifecycle state
 //!   - CommandStatusReport: Rust -> CMS command execution result
 //!
 //! ⚠️ Important Note for Next Developer:
@@ -44,8 +41,6 @@
 //!   - `Command.id` is used by CMS to track command lifecycle — always include
 //!     it in status reports
 //!   - `Command.params` is `serde_json::Value` for maximum flexibility
-//!   - `AgentStatus` default is `NotInstalled` — do NOT rename variants,
-//!     CMS relies on snake_case serialisation
 //!   - `SessionTrafficSnapshot` bytes_in/bytes_out are CUMULATIVE since session
 //!     start, NOT deltas. Backend must upsert, not accumulate.
 //!   - `is_final=true` only on SessionEnded — backend uses this to close billing.
@@ -58,7 +53,7 @@
 //! Last Modified:
 //!   v1.0.0 - Initial models
 //!   v1.2.0 - Clarified HeartbeatRequest is documentation only
-//!   v1.3.0 - Added Command, AgentStatus, AgentStatusInfo, CommandStatusReport
+//!   v1.3.0 - Added Command and CommandStatusReport
 //!   v1.0.0-TrafficAccounting - Added SessionTrafficSnapshot event type,
 //!     is_final field to SessionEventReport
 
@@ -233,10 +228,6 @@ pub struct SystemStats {
     /// Number of active VPN sessions.
     pub active_sessions: u32,
 
-    /// v1.3.0: OpenClaw agent status for CMS dashboard display.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_status: Option<AgentStatusInfo>,
-
     /// v1.3.1: Total network bytes received since boot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub net_rx_bytes: Option<u64>,
@@ -271,7 +262,6 @@ impl SystemStats {
             cpu_usage: Self::get_cpu_usage(),
             memory_mb,
             active_sessions,
-            agent_status: None,
             net_rx_bytes: net_rx,
             net_tx_bytes: net_tx,
             memory_total_mb,
@@ -281,13 +271,6 @@ impl SystemStats {
             runtime_id: None,
             runtime_started_at: None,
         }
-    }
-
-    /// Collects current system statistics with agent status.
-    pub fn collect_with_agent(active_sessions: u32, agent_status: AgentStatusInfo) -> Self {
-        let mut stats = Self::collect(active_sessions);
-        stats.agent_status = Some(agent_status);
-        stats
     }
 
     /// Gets CPU usage percentage from /proc/loadavg.
@@ -511,84 +494,6 @@ pub enum CommandExecutionStatus {
     Completed,
     Failed,
     Cancelled,
-}
-
-// ============================================
-// Agent Status Models (v1.3.0)
-// ============================================
-
-/// OpenClaw agent lifecycle state.
-///
-/// ⚠️ Do NOT rename variants — CMS relies on snake_case serialisation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentStatus {
-    NotInstalled,
-    Installing,
-    Stopped,
-    Running,
-    Error,
-    Updating,
-}
-
-impl Default for AgentStatus {
-    fn default() -> Self { Self::NotInstalled }
-}
-
-/// Detailed agent status information for heartbeat reporting.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentStatusInfo {
-    pub status: AgentStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pid: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub local_port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_usage: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_mb: Option<u64>,
-}
-
-impl AgentStatusInfo {
-    pub fn not_installed() -> Self {
-        Self {
-            status: AgentStatus::NotInstalled,
-            version: None, message: None, pid: None,
-            local_port: None, cpu_usage: None, memory_mb: None,
-        }
-    }
-
-    pub fn running(version: String, pid: u32) -> Self {
-        Self {
-            status: AgentStatus::Running,
-            version: Some(version),
-            message: Some("Healthy".to_string()),
-            pid: Some(pid),
-            local_port: Some(18789),
-            cpu_usage: None,
-            memory_mb: None,
-        }
-    }
-
-    pub fn installing(message: String) -> Self {
-        Self {
-            status: AgentStatus::Installing,
-            version: None, message: Some(message), pid: None,
-            local_port: None, cpu_usage: None, memory_mb: None,
-        }
-    }
-
-    pub fn error(message: String) -> Self {
-        Self {
-            status: AgentStatus::Error,
-            version: None, message: Some(message), pid: None,
-            local_port: None, cpu_usage: None, memory_mb: None,
-        }
-    }
 }
 
 // ============================================
