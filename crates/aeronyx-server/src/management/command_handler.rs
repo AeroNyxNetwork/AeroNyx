@@ -765,9 +765,11 @@ impl CommandHandler {
 
     /// Handles `restart_service` command.
     ///
-    /// The node first reports that the restart has been scheduled, then asks
-    /// systemd to restart the fixed VPN service a few seconds later. This keeps
-    /// command audit from being stranded when the current process exits.
+    /// The node first verifies that the fixed systemd service is loaded, then
+    /// reports that the restart has been scheduled and asks systemd to restart
+    /// it a few seconds later. This keeps command audit from being stranded
+    /// when the current process exits and avoids false success on foreground
+    /// deployments without an installed service unit.
     async fn handle_restart_service(&self, command: &Command) {
         info!(
             command_id = %command.id,
@@ -955,6 +957,8 @@ async fn run_readonly_command(program: &str, args: &[&str]) -> String {
 }
 
 async fn schedule_service_restart(command_id: &str, service_name: &str) -> Result<String, String> {
+    ensure_systemd_service_loaded(service_name).await?;
+
     let suffix: String = command_id
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
@@ -1021,6 +1025,40 @@ async fn schedule_service_restart(command_id: &str, service_name: &str) -> Resul
         Ok(Ok(status)) => Err(format!("failed to schedule restart fallback: exit={}", status)),
         Ok(Err(error)) => Err(format!("failed to schedule restart fallback: {}", error)),
         Err(_) => Err("restart fallback scheduling timed out".to_string()),
+    }
+}
+
+async fn ensure_systemd_service_loaded(service_name: &str) -> Result<(), String> {
+    let show = timeout(
+        VPN_COMMAND_TIMEOUT,
+        TokioCommand::new("systemctl")
+            .args(["show", service_name, "--property=LoadState", "--value"])
+            .output(),
+    ).await;
+
+    match show {
+        Ok(Ok(output)) if output.status.success() => {
+            let load_state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if load_state == "loaded" {
+                Ok(())
+            } else {
+                Err(format!(
+                    "systemd service {} is not loaded (LoadState={}); install an aeronyx-server service unit or restart this foreground deployment outside nodeboard",
+                    service_name,
+                    if load_state.is_empty() { "unknown" } else { &load_state }
+                ))
+            }
+        }
+        Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!(
+                "systemctl show {} failed: {}",
+                service_name,
+                collapse_lines(stderr.trim(), 4)
+            ))
+        }
+        Ok(Err(error)) => Err(format!("systemctl unavailable for restart_service: {}", error)),
+        Err(_) => Err("systemctl service preflight timed out".to_string()),
     }
 }
 
