@@ -62,7 +62,7 @@ use super::client::ManagementClient;
 use super::reporter::{SessionEventSender, SessionQuality};
 use super::models::{Command, CommandExecutionStatus, CommandStatusReport};
 use aeronyx_common::types::SessionId;
-use crate::services::{DenyList, DenyReason, SessionManager};
+use crate::services::{DenyList, DenyReason, NodePolicyRuntime, SessionManager};
 
 // ============================================
 // Constants
@@ -121,6 +121,7 @@ fn session_quality_from_stats(snap: &crate::services::session::StatsSnapshot) ->
 ///       │     ├── "ban_wallet"      → block a wallet on this node
 ///       │     ├── "unban_wallet"    → remove a wallet block
 ///       │     ├── "restart_service" → restart the fixed VPN service
+///       │     ├── "apply_policy"    → report current runtime policy snapshot
 ///       │     └── unknown           → report failed
 ///       │
 ///       └── report_command_status() → CMS
@@ -140,6 +141,9 @@ pub struct CommandHandler {
 
     /// Shared VPN deny list used by handshake and nodeboard wallet bans.
     deny_list: Option<Arc<DenyList>>,
+
+    /// Runtime operator policy used by handshake and bandwidth hot paths.
+    node_policy: Option<Arc<NodePolicyRuntime>>,
 
     /// Set of already-processed command IDs for deduplication.
     /// CMS may resend commands in consecutive heartbeats until
@@ -169,6 +173,7 @@ impl CommandHandler {
             sessions: None,
             session_events: SessionEventSender::disabled(),
             deny_list: None,
+            node_policy: None,
             processed_ids: HashSet::with_capacity(128),
             processed_ids_order: Vec::with_capacity(128),
         }
@@ -186,6 +191,11 @@ impl CommandHandler {
 
     pub fn with_deny_list(mut self, deny_list: Arc<DenyList>) -> Self {
         self.deny_list = Some(deny_list);
+        self
+    }
+
+    pub fn with_node_policy(mut self, node_policy: Arc<NodePolicyRuntime>) -> Self {
+        self.node_policy = Some(node_policy);
         self
     }
 
@@ -275,6 +285,9 @@ impl CommandHandler {
             }
             "restart_service" => {
                 self.handle_restart_service(&command).await;
+            }
+            "apply_policy" => {
+                self.handle_apply_policy(&command).await;
             }
             unknown => {
                 warn!(
@@ -559,6 +572,55 @@ impl CommandHandler {
             config.max_retries,
             config.node_info_path,
             node_info
+        ));
+
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::Completed,
+            100,
+            &message,
+        ).await;
+    }
+
+    /// Handles `apply_policy` command.
+    ///
+    /// The CMS sends policy values in the heartbeat response; the runtime
+    /// policy cache is updated before commands from that heartbeat are handled.
+    /// This command is therefore a safe acknowledgement point: it reports the
+    /// node's current runtime policy snapshot back to nodeboard without
+    /// accepting caller-provided policy values or shell parameters.
+    async fn handle_apply_policy(&self, command: &Command) {
+        info!(
+            command_id = %command.id,
+            "[CMD_HANDLER] 📋 apply_policy"
+        );
+
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::InProgress,
+            40,
+            "Confirming runtime VPN policy snapshot",
+        ).await;
+
+        let Some(ref node_policy) = self.node_policy else {
+            self.report_status_for_agent_type(
+                "vpn",
+                &command.id,
+                CommandExecutionStatus::Failed,
+                0,
+                "runtime node policy is not available",
+            ).await;
+            return;
+        };
+
+        let snapshot = node_policy.snapshot();
+        let snapshot_json = serde_json::to_string(&snapshot)
+            .unwrap_or_else(|_| "{}".to_string());
+        let message = sanitize_and_truncate(&format!(
+            "Runtime VPN policy acknowledged\npolicy: {}\nsource: heartbeat_node_policy",
+            snapshot_json
         ));
 
         self.report_status_for_agent_type(

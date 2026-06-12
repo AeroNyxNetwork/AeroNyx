@@ -1092,7 +1092,8 @@ impl Server {
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_BUFFER);
         let cmd_handler      = CommandHandler::new(cmd_rx, Arc::clone(&mgmt_client))
             .with_session_control(Arc::clone(sessions), session_event_sender.clone())
-            .with_deny_list(Arc::clone(&deny_list));
+            .with_deny_list(Arc::clone(&deny_list))
+            .with_node_policy(Arc::clone(&node_policy));
         let cmd_shutdown     = self.shutdown_tx.subscribe();
         tokio::spawn(async move { cmd_handler.run(cmd_shutdown).await; });
 

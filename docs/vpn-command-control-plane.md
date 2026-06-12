@@ -91,6 +91,22 @@ bandwidth cap, and heartbeat interval have reached the node.
 This is operational control-plane metadata only. It does not include user
 destinations, DNS contents, packet payloads, domains, URLs, or browsing history.
 
+## Apply Policy Command
+
+Source paths:
+
+- `crates/aeronyx-server/src/management/command_handler.rs`
+- `crates/aeronyx-server/src/server.rs`
+
+`apply_policy` is a safe acknowledgement command for nodeboard Settings. The
+CMS still sends authoritative policy values in the heartbeat response; Rust
+updates `NodePolicyRuntime` before dispatching heartbeat commands. When
+`apply_policy` runs, it reports the current runtime policy snapshot back to the
+CMS command history so operators can confirm policy delivery without SSH.
+
+The command does not accept arbitrary policy values, file paths, shell
+arguments, or traffic inspection parameters.
+
 ## Privacy Boundary
 
 Command results are operational diagnostics only. They must not include traffic
