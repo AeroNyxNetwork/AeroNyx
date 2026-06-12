@@ -6,9 +6,9 @@
 //! ## Processing Pipeline (runs on timer or rawlog threshold)
 //! ```text
 //! Step 0:   Positive feedback batch detection (from raw_logs)
-//! Step 0.5: Backfill missing embeddings (via OpenClaw HTTP)
+//! Step 0.5: Backfill missing embeddings (local EmbedEngine only)
 //! Step 0.6: Correction chaining (_correction tag → supersede)
-//! Step 1-5: Legacy compaction (Episode → Archive via OpenClaw summary)
+//! Step 1-5: Legacy compaction (Episode → Archive)
 //! ```
 //!
 //! ## v2.4.0-GraphCognition: Cognitive Graph Steps (Phase B — IMPLEMENTED)
@@ -40,7 +40,7 @@
 //! - ner_engine is Option<Arc<NerEngine>> — when None, Steps 7-11 are skipped
 //! - llm_router is Option<Arc<LlmRouter>> — when None, SuperNode enqueue is skipped
 //! - infer_filename() is best-effort. When code block has no filename comment,
-//!   falls back to snippet_{hash[:8]}.{ext}. AI agents should prefix code blocks
+//!   falls back to snippet_{hash[:8]}.{ext}. Producers may prefix code blocks
 //!   with `// filename.rs` to improve accuracy.
 //! - get_latest_artifact_version() takes a write lock on the DB — called once
 //!   per code block in the loop. For sessions with many code blocks this can
@@ -49,7 +49,7 @@
 //!
 //! ## Modification History
 //! v0.5.0                   - Initial timer-based block packer
-//! v1.0.0                   - Smart compaction via OpenClaw
+//! v1.0.0                   - Smart compaction
 //! v2.1.0                   - MVF feedback pipeline (Step 0, 0.5, 0.6) + SGD
 //! v2.1.0+MVF+Encryption    - 🌟 Fixed rawlog key derivation in Step 0
 //! v2.4.0-GraphCognition    - 🌟 ner_engine field + cognitive graph Steps 6-11
@@ -99,9 +99,6 @@ use crate::services::SessionManager;
 
 const DEFAULT_COMPACTION_THRESHOLD: u64 = 500;
 const MAX_COMPACTION_BATCH: usize = 200;
-const OPENCLAW_GATEWAY_CHAT: &str = "http://127.0.0.1:18789/v1/chat/completions";
-const OPENCLAW_GATEWAY_EMBED: &str = "http://127.0.0.1:18789/v1/embeddings";
-const OPENCLAW_TIMEOUT_SECS: u64 = 120;
 const EMBEDDING_BACKFILL_BATCH: usize = 50;
 
 const DEFAULT_ENTITY_LABELS: &[&str] = &[
@@ -323,7 +320,7 @@ impl ReflectionMiner {
                 }
 
                 let top_entries: Vec<&serde_json::Value> = entries.iter().take(2).collect();
-                let query_embedding = self.call_openclaw_embed(&content).await;
+                let query_embedding = self.local_embedding(&content).await;
 
                 for entry in top_entries {
                     let mem_id_hex = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -405,7 +402,7 @@ impl ReflectionMiner {
             let content = String::from_utf8_lossy(&record.encrypted_content).to_string();
             if content.is_empty() { continue; }
 
-            if let Some(embedding) = self.call_openclaw_embed(&content).await {
+            if let Some(embedding) = self.local_embedding(&content).await {
                 let dim = embedding.len();
                 let embedding_blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
 
@@ -479,10 +476,12 @@ impl ReflectionMiner {
 
         info!(count = episodes.len(), "[MINER] Compacting episodes");
 
-        let prompt = self.build_summary_prompt(&episodes);
-        let summary = match self.call_openclaw_chat(&prompt).await {
+        let summary = match self.local_compaction_summary(&episodes).await {
             Some(s) => s,
-            None => { warn!("[MINER] OpenClaw summary failed"); return; }
+            None => {
+                warn!("[MINER] Compaction summary skipped: no local compaction LLM configured");
+                return;
+            }
         };
 
         let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -629,7 +628,7 @@ impl ReflectionMiner {
                     format!("ent_{}", &hex::encode(hasher.finalize())[..16])
                 };
 
-                let embedding = self.call_openclaw_embed(&entity.text).await;
+                let embedding = self.local_embedding(&entity.text).await;
                 let description = if entity.confidence > 0.8 {
                     Some(format!("{} ({})", entity.text, entity.label))
                 } else { None };
@@ -1358,7 +1357,7 @@ impl ReflectionMiner {
     }
 
     // ============================================
-    // OpenClaw HTTP Helpers
+    // Local ML Helpers
     // ============================================
 
     fn build_summary_prompt(&self, episodes: &[MemoryRecord]) -> String {
@@ -1374,40 +1373,19 @@ impl ReflectionMiner {
         prompt
     }
 
-    async fn call_openclaw_chat(&self, prompt: &str) -> Option<String> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(OPENCLAW_TIMEOUT_SECS))
-            .build().ok()?;
-        let body = serde_json::json!({
-            "model": "default",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 2000, "temperature": 0.3
-        });
-        let resp = client.post(OPENCLAW_GATEWAY_CHAT).json(&body).send().await.ok()?;
-        if !resp.status().is_success() { return None; }
-        let json: serde_json::Value = resp.json().await.ok()?;
-        json.get("choices")?.get(0)?.get("message")?.get("content")?.as_str().map(|s| s.to_string())
+    async fn local_compaction_summary(&self, episodes: &[MemoryRecord]) -> Option<String> {
+        let _prompt = self.build_summary_prompt(episodes);
+        None
     }
 
-    async fn call_openclaw_embed(&self, text: &str) -> Option<Vec<f32>> {
+    async fn local_embedding(&self, text: &str) -> Option<Vec<f32>> {
         if let Some(ref engine) = self.embed_engine {
             match engine.embed_single(text) {
                 Ok(embedding) => { debug!(dim = embedding.len(), "[MINER] Local embed succeeded"); return Some(embedding); }
-                Err(e) => { warn!(error = %e, "[MINER] Local embed failed, falling back to OpenClaw"); }
+                Err(e) => { warn!(error = %e, "[MINER] Local embed failed"); }
             }
         }
-        self.call_openclaw_embed_remote(text).await
-    }
-
-    async fn call_openclaw_embed_remote(&self, text: &str) -> Option<Vec<f32>> {
-        let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().ok()?;
-        let body = serde_json::json!({ "model": "minilm-l6-v2", "input": text });
-        let resp = client.post(OPENCLAW_GATEWAY_EMBED).json(&body).send().await.ok()?;
-        if !resp.status().is_success() { warn!("[MINER] OpenClaw embed failed: {}", resp.status()); return None; }
-        let json: serde_json::Value = resp.json().await.ok()?;
-        json.get("data")?.get(0)?.get("embedding")?
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect())
+        None
     }
 
     // ============================================
@@ -1501,7 +1479,7 @@ fn is_stopword_entity(name_normalized: &str, original_text: &str, entity_label: 
 /// 3. Fallback: `snippet_{hash[:8]}.{ext}`
 ///
 /// ## Usage
-/// AI agents can improve accuracy by prefixing code blocks with a filename comment:
+/// Producers can improve accuracy by prefixing code blocks with a filename comment:
 /// ```
 /// // auth.rs
 /// ```rust

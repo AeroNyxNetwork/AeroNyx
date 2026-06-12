@@ -28,7 +28,7 @@ pub use deny_list::{DenyList, DenyReason};
 pub use handshake::HandshakeService;
 pub use ip_pool::IpPoolService;
 pub use memchain::{AofWriter, MemPool};
-pub use node_policy::{NodePolicyRuntime, NodePolicySnapshot};
+pub use node_policy::{NodePolicyEnforcementSnapshot, NodePolicyRuntime, NodePolicySnapshot};
 pub use routing::RoutingService;
 pub use session::{Session, SessionManager, SessionState};
 pub use wallet_routes::WalletRouteCache;

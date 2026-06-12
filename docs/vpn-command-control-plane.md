@@ -27,9 +27,22 @@ executes those commands without exposing arbitrary shell, file path, or process
 control. Command results are reported to the CMS through the signed
 `/node/vpn/status/` endpoint with `agent_type = "vpn"`.
 
+## Policy Enforcement Telemetry
+
+The Rust node enforces nodeboard policy locally in the VPN hot paths:
+`maintenance_mode` and `max_sessions` are checked before new session allocation,
+and `bandwidth_limit_mbps` is checked before VPN packet counters are recorded.
+
+`system_stats.vpn_health.policy_enforcement` reports aggregate counters for
+maintenance rejections, max-session rejections, bandwidth drops, and the last
+rejection reason/time. The backend turns these counters into
+`node_policy_enforced` events for nodeboard Alerts / Events.
+
 ## Privacy Boundary
 
 Command results are operational diagnostics only. They must not include traffic
 destinations, DNS query contents, packet payloads, browsing history, or full
-client-identifying data. `collect_logs` returns a bounded and redacted service
-tail intended for VPN stability diagnosis.
+client-identifying data. Policy enforcement telemetry is aggregate-only and
+does not include destinations, DNS contents, packet payloads, or browsing
+history. `collect_logs` returns a bounded and redacted service tail intended for
+VPN stability diagnosis.

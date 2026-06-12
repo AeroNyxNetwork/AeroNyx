@@ -287,7 +287,7 @@ mod tests {
             1_700_000_000,
             MemoryLayer::Episode,
             vec!["test".into(), "memory".into()],
-            "openclaw-v1".into(),
+            "local-ml-v1".into(),
             b"encrypted_content".to_vec(),
             b"encrypted_embedding".to_vec(),
         );
@@ -301,7 +301,7 @@ mod tests {
             MemChainMessage::BroadcastRecord(r) => {
                 assert_eq!(r.record_id, record.record_id);
                 assert_eq!(r.layer, MemoryLayer::Episode);
-                assert_eq!(r.source_ai, "openclaw-v1");
+                assert_eq!(r.source_ai, "local-ml-v1");
                 assert_eq!(r.topic_tags, vec!["test", "memory"]);
             }
             other => panic!("Expected BroadcastRecord, got {:?}", other),

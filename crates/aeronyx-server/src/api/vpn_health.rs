@@ -20,7 +20,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
 use crate::config::ServerConfig;
-use crate::services::SessionManager;
+use crate::services::{NodePolicyEnforcementSnapshot, NodePolicyRuntime, SessionManager};
 use crate::voucher_verifier::{VoucherMetricsSnapshot, VoucherVerifier};
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -31,6 +31,7 @@ const EGRESS_CHECK_ADDR: &str = "1.1.1.1:443";
 pub struct VpnHealthState {
     config: ServerConfig,
     sessions: Arc<SessionManager>,
+    node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
 }
 
@@ -52,6 +53,7 @@ struct VpnHealthResponse {
     configured_mtu: u16,
     active_sessions: usize,
     active_wallet_devices: usize,
+    policy_enforcement: NodePolicyEnforcementSnapshot,
     voucher_metrics: VoucherMetricsSnapshot,
     checks: Vec<HealthCheck>,
 }
@@ -59,11 +61,12 @@ struct VpnHealthResponse {
 pub fn build_vpn_health_router(
     config: ServerConfig,
     sessions: Arc<SessionManager>,
+    node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
 ) -> Router {
     Router::new()
         .route("/api/vpn/health", get(vpn_health_handler))
-        .with_state(VpnHealthState { config, sessions, voucher_verifier })
+        .with_state(VpnHealthState { config, sessions, node_policy, voucher_verifier })
 }
 
 async fn vpn_health_handler(State(state): State<VpnHealthState>) -> impl IntoResponse {
@@ -82,9 +85,10 @@ async fn vpn_health_handler(State(state): State<VpnHealthState>) -> impl IntoRes
 pub async fn collect_vpn_health_value(
     config: ServerConfig,
     sessions: Arc<SessionManager>,
+    node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
 ) -> Value {
-    let state = VpnHealthState { config, sessions, voucher_verifier };
+    let state = VpnHealthState { config, sessions, node_policy, voucher_verifier };
     serde_json::to_value(collect_vpn_health_response(state).await)
         .unwrap_or_else(|e| serde_json::json!({
             "status": "failed",
@@ -134,6 +138,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         configured_mtu,
         active_sessions: state.sessions.count(),
         active_wallet_devices: state.sessions.wallet_index_count(),
+        policy_enforcement: state.node_policy.enforcement_snapshot(),
         voucher_metrics: state.voucher_verifier.metrics_snapshot(),
         checks,
     }

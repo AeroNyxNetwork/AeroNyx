@@ -481,6 +481,7 @@ impl Server {
                 Arc::clone(aw),
                 Arc::clone(&sessions),
                 Arc::clone(&udp),
+                Arc::clone(&node_policy),
                 Arc::clone(&voucher_verifier),
             );
             tasks.push(("memchain-api", api_task));
@@ -983,6 +984,7 @@ impl Server {
         _aof_writer: Arc<TokioMutex<AofWriter>>,
         sessions:    Arc<SessionManager>,
         _udp:        Arc<UdpTransport>,
+        node_policy: Arc<NodePolicyRuntime>,
         voucher_verifier: Arc<VoucherVerifier>,
     ) -> JoinHandle<()> {
         let mut shutdown_rx     = self.shutdown_tx.subscribe();
@@ -995,7 +997,12 @@ impl Server {
         tokio::spawn(async move {
             let app = build_mpi_router(mpi_state)
                 .merge(build_voice_router(Arc::clone(&sessions)))
-                .merge(build_vpn_health_router(vpn_health_config, sessions, voucher_verifier));
+                .merge(build_vpn_health_router(
+                    vpn_health_config,
+                    sessions,
+                    node_policy,
+                    voucher_verifier,
+                ));
 
             let listener = match tokio::net::TcpListener::bind(listen_addr).await {
                 Ok(l)  => { info!("[API] MemChain API on http://{}", listen_addr); l }
@@ -1115,13 +1122,15 @@ impl Server {
 
         let vpn_health_config = self.config.clone();
         let vpn_health_sessions = Arc::clone(sessions);
+        let vpn_health_policy = Arc::clone(&node_policy);
         let vpn_health_verifier = Arc::clone(&voucher_verifier);
         heartbeat = heartbeat.with_vpn_health_status(Box::new(move || {
             let config = vpn_health_config.clone();
             let sessions = Arc::clone(&vpn_health_sessions);
+            let node_policy = Arc::clone(&vpn_health_policy);
             let verifier = Arc::clone(&vpn_health_verifier);
             Box::pin(async move {
-                Some(collect_vpn_health_value(config, sessions, verifier).await)
+                Some(collect_vpn_health_value(config, sessions, node_policy, verifier).await)
             })
         }));
 

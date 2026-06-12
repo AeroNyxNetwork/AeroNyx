@@ -5,7 +5,7 @@
 //!
 //! ## Creation Reason
 //! Provides low-latency (< 5ms) semantic retrieval for MPI `/api/mpi/recall`.
-//! Partitioned by `(owner, embedding_model)` to handle multiple AI agents
+//! Partitioned by `(owner, embedding_model)` to handle multiple local clients
 //! using different embedding models (with different dimensions).
 //!
 //! ## Partition Design

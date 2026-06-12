@@ -5,7 +5,7 @@
 //!
 //! ## Creation Reason
 //! Provides local embedding generation for MemChain, eliminating the dependency
-//! on OpenClaw Gateway being online. This makes MemChain a self-contained
+//! on an external gateway being online. This makes MemChain a self-contained
 //! cognitive engine where recall, remember, and Miner operations all work
 //! independently of external services.
 //!
@@ -88,8 +88,8 @@
 //! - `EmbedEngine::load()` returns `Err` → server starts without embed
 //! - `/api/mpi/embed` returns 503 Service Unavailable
 //! - `/api/mpi/status` reports `embed_ready: false`
-//! - Miner falls back to OpenClaw Gateway HTTP API
-//! - Plugin falls back to OpenClaw Gateway `/v1/embeddings`
+//! - Miner uses the local embedding engine when the model is available
+//! - Plugin callers should use the local MemChain API for embeddings
 //!
 //! ## Dependencies
 //! - `ort` 2.0.0-rc.11 — ONNX Runtime Rust bindings (load-dynamic mode)

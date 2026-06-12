@@ -1,11 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/api/local.rs
 // ============================================
-//! # Local Agent API — Axum HTTP Server (MPI + Legacy)
+//! # Local MemChain API — Axum HTTP Server (MPI + Legacy)
 //!
 //! ## Creation Reason
-//! Provides HTTP endpoints for local AI Agents to interact with the
-//! MemChain ledger. This is the "front door" for OpenClaw and other
+//! Provides HTTP endpoints for trusted local clients to interact with the
+//! MemChain ledger. This is the loopback entry point for trusted local
 //! tools to write and read memory.
 //!
 //! ## Modification Reason
@@ -29,7 +29,7 @@
 //!   "content": "User prefers dark mode and Rust programming",
 //!   "layer": "identity",          // "identity" | "knowledge" | "episode"
 //!   "topic_tags": ["preference", "programming"],
-//!   "source_ai": "openclaw-v1",
+//!   "source_ai": "local-ml-v1",
 //!   "embedding": [0.1, 0.2, ...]  // optional f32 vector
 //! }
 //! // Response (201 Created)
@@ -59,7 +59,7 @@
 //!       "score": 0.92,
 //!       "content": "User prefers dark mode and Rust programming",
 //!       "topic_tags": ["preference"],
-//!       "source_ai": "openclaw-v1",
+//!       "source_ai": "local-ml-v1",
 //!       "timestamp": 1700000000
 //!     }
 //!   ],
@@ -89,7 +89,7 @@
 //! - Legacy endpoints still use `MemPool` + `AofWriter`.
 //! - The `owner` field for MPI operations uses the server's identity
 //!   public key. In future phases, clients will provide their own wallet key.
-//! - `embedding` in remember/recall is provided by the AI agent (e.g. OpenClaw).
+//! - `embedding` in remember/recall is provided by a trusted local client.
 //!   The server does NOT generate embeddings itself.
 //! - P2P broadcast of MemoryRecords uses `BroadcastRecord` message type.
 //!
@@ -136,7 +136,7 @@ use crate::services::SessionManager;
 /// The legacy API is deprecated — new integrations should use the MPI
 /// endpoints in `api/mpi.rs`. This struct is preserved to keep
 /// `/api/fact`, `/api/facts`, `/api/status`, `/api/sync` working
-/// for backward compatibility with older AI agents.
+/// for backward compatibility with older local clients.
 #[deprecated(since = "2.1.0", note = "Use MPI endpoints (/api/mpi/*) via api::mpi::MpiState")]
 pub struct ApiState {
     // Legacy state (Fact-based)
@@ -440,7 +440,7 @@ fn build_legacy_router(state: Arc<ApiState>) -> Router {
 /// Starts the legacy MemChain Agent API HTTP server.
 ///
 /// **Deprecated**: New code should use `api::mpi::build_mpi_router` instead.
-/// This function is preserved for backward compatibility with older AI agents
+/// This function is preserved for backward compatibility with older local clients
 /// that still use `/api/fact` and `/api/facts`.
 #[allow(deprecated)]
 pub fn start_legacy_api_server(

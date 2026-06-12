@@ -1,13 +1,12 @@
 // ============================================
 // File: crates/aeronyx-server/src/api/mod.rs
 // ============================================
-//! # MemChain Agent API
+//! # MemChain Local API
 //!
 //! ## Creation Reason
-//! Provides a local HTTP API for AI Agents (e.g. OpenClaw) to read and
-//! write memory Facts into the MemChain ledger. The API binds to
-//! loopback by default (`127.0.0.1:8421`) and is NOT exposed to the
-//! public network.
+//! Provides a local HTTP API for trusted node-local clients to read and write
+//! memory Facts into the MemChain ledger. The API binds to loopback by default
+//! (`127.0.0.1:8421`) and is NOT exposed to the public network.
 //!
 //! ## v2.4.0 File Split
 //! mpi.rs was split into 3 files for maintainability:

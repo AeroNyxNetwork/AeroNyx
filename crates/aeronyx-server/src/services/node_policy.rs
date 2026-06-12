@@ -7,9 +7,10 @@
 //! local copy for the hot VPN paths so handshake and packet handling can enforce
 //! nodeboard Settings without SSH or process restart.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
+use serde::Serialize;
 
 #[derive(Debug, Clone)]
 /// Snapshot of operator-controlled VPN node policy from the CMS heartbeat.
@@ -56,11 +57,36 @@ impl Default for BandwidthWindow {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+/// Privacy-safe aggregate counters for operator policy enforcement.
+pub struct NodePolicyEnforcementSnapshot {
+    /// New handshakes rejected while maintenance mode was enabled.
+    pub maintenance_rejections: u64,
+    /// New handshakes rejected because active sessions reached max_sessions.
+    pub max_sessions_rejections: u64,
+    /// VPN packets rejected by the node-wide bandwidth limiter.
+    pub bandwidth_drops: u64,
+    /// Last policy reason that rejected a handshake or packet.
+    pub last_rejection_reason: Option<String>,
+    /// Unix timestamp of the last policy rejection.
+    pub last_rejection_at: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct PolicyEnforcementStats {
+    maintenance_rejections: u64,
+    max_sessions_rejections: u64,
+    bandwidth_drops: u64,
+    last_rejection_reason: Option<&'static str>,
+    last_rejection_at: Option<u64>,
+}
+
 #[derive(Debug, Default)]
 /// Thread-safe runtime policy cache used by handshake and packet hot paths.
 pub struct NodePolicyRuntime {
     policy: RwLock<NodePolicySnapshot>,
     bandwidth: Mutex<BandwidthWindow>,
+    enforcement: Mutex<PolicyEnforcementStats>,
 }
 
 impl NodePolicyRuntime {
@@ -75,15 +101,37 @@ impl NodePolicyRuntime {
         self.policy.read().clone()
     }
 
+    #[must_use]
+    /// Return privacy-safe aggregate policy enforcement counters.
+    pub fn enforcement_snapshot(&self) -> NodePolicyEnforcementSnapshot {
+        let stats = self.enforcement.lock();
+        NodePolicyEnforcementSnapshot {
+            maintenance_rejections: stats.maintenance_rejections,
+            max_sessions_rejections: stats.max_sessions_rejections,
+            bandwidth_drops: stats.bandwidth_drops,
+            last_rejection_reason: stats.last_rejection_reason.map(str::to_string),
+            last_rejection_at: stats.last_rejection_at,
+        }
+    }
+
     /// Check whether a new VPN session may be admitted under operator policy.
     pub fn validate_new_session(&self, active_sessions: usize) -> Result<(), &'static str> {
-        let policy = self.policy.read();
-        if policy.maintenance_mode {
-            return Err("maintenance_mode");
+        let rejection = {
+            let policy = self.policy.read();
+            if policy.maintenance_mode {
+                Some("maintenance_mode")
+            } else if policy.max_sessions > 0 && active_sessions >= policy.max_sessions as usize {
+                Some("max_sessions")
+            } else {
+                None
+            }
+        };
+
+        if let Some(reason) = rejection {
+            self.record_rejection(reason);
+            return Err(reason);
         }
-        if policy.max_sessions > 0 && active_sessions >= policy.max_sessions as usize {
-            return Err("max_sessions");
-        }
+
         Ok(())
     }
 
@@ -96,6 +144,7 @@ impl NodePolicyRuntime {
 
         let limit_bytes_per_sec = (limit_mbps as u64).saturating_mul(1_000_000) / 8;
         if limit_bytes_per_sec == 0 {
+            self.record_rejection("bandwidth_limit_mbps");
             return false;
         }
 
@@ -107,10 +156,36 @@ impl NodePolicyRuntime {
 
         let next = window.bytes.saturating_add(bytes as u64);
         if next > limit_bytes_per_sec {
+            self.record_rejection("bandwidth_limit_mbps");
             return false;
         }
 
         window.bytes = next;
         true
     }
+
+    fn record_rejection(&self, reason: &'static str) {
+        let mut stats = self.enforcement.lock();
+        match reason {
+            "maintenance_mode" => {
+                stats.maintenance_rejections = stats.maintenance_rejections.saturating_add(1);
+            }
+            "max_sessions" => {
+                stats.max_sessions_rejections = stats.max_sessions_rejections.saturating_add(1);
+            }
+            "bandwidth_limit_mbps" => {
+                stats.bandwidth_drops = stats.bandwidth_drops.saturating_add(1);
+            }
+            _ => {}
+        }
+        stats.last_rejection_reason = Some(reason);
+        stats.last_rejection_at = Some(unix_now_secs());
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
