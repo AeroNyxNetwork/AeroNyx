@@ -76,6 +76,21 @@ The keepalive task sends probes every 60 seconds and treats an ACK as missed
 after 90 seconds. These counters make "connected but unstable" tunnels visible
 to the CMS and nodeboard without requiring SSH.
 
+## Node Policy Sync Snapshot
+
+Source paths:
+
+- `crates/aeronyx-server/src/api/vpn_health.rs`
+- `crates/aeronyx-server/src/services/node_policy.rs`
+
+Rust includes the current runtime `node_policy` snapshot in
+`system_stats.vpn_health` on heartbeat. The CMS can compare this snapshot with
+nodeboard Settings to show whether tier, maintenance mode, max sessions,
+bandwidth cap, and heartbeat interval have reached the node.
+
+This is operational control-plane metadata only. It does not include user
+destinations, DNS contents, packet payloads, domains, URLs, or browsing history.
+
 ## Privacy Boundary
 
 Command results are operational diagnostics only. They must not include traffic

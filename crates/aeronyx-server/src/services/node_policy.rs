@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 /// Snapshot of operator-controlled VPN node policy from the CMS heartbeat.
 pub struct NodePolicySnapshot {
     /// Operator tier label used by nodeboard and the CMS.

@@ -20,7 +20,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
 use crate::config::ServerConfig;
-use crate::services::{NodePolicyEnforcementSnapshot, NodePolicyRuntime, SessionManager};
+use crate::services::{NodePolicyEnforcementSnapshot, NodePolicyRuntime, NodePolicySnapshot, SessionManager};
 use crate::voucher_verifier::{VoucherMetricsSnapshot, VoucherVerifier};
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -53,6 +53,7 @@ struct VpnHealthResponse {
     configured_mtu: u16,
     active_sessions: usize,
     active_wallet_devices: usize,
+    node_policy: NodePolicySnapshot,
     policy_enforcement: NodePolicyEnforcementSnapshot,
     voucher_metrics: VoucherMetricsSnapshot,
     checks: Vec<HealthCheck>,
@@ -138,6 +139,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         configured_mtu,
         active_sessions: state.sessions.count(),
         active_wallet_devices: state.sessions.wallet_index_count(),
+        node_policy: state.node_policy.snapshot(),
         policy_enforcement: state.node_policy.enforcement_snapshot(),
         voucher_metrics: state.voucher_verifier.metrics_snapshot(),
         checks,
