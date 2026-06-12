@@ -9,6 +9,7 @@
 //   HeartbeatReporter receives sessions, traffic, udp via builder methods
 //   so it can collect connected_wallets, drain deltas, and enforce
 //   membership rules on heartbeat responses.
+//   Adds a shared aggregate encrypted VPN message counter for public stats.
 //
 // What changed vs previous version:
 //   1. Added import: use crate::services::traffic_tracker::TrafficTracker;
@@ -17,6 +18,7 @@
 //   4. HeartbeatReporter gets .with_sessions/.with_traffic_tracker/.with_udp
 //   5. spawn_cleanup_task() signature + call site: added traffic_tracker param
 //   6. cleanup loop: calls traffic_tracker.remove_wallet(&wallet)
+//   7. encrypted_message_counter shared by PacketHandler and VPN health
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -27,6 +29,8 @@
 //     cleanup_expired). Order matters: session must be gone first.
 //   - All other logic (VPN, MemChain, ChatRelay, Voice, SuperNode,
 //     SaaS pool, Miner) is unchanged from the previous version.
+//   - encrypted_message_counter is aggregate only and never stores payload,
+//     destination, DNS, URL, voucher, wallet, or client public IP details.
 //
 // Last Modified:
 //   v2.5.3+Security    - Server::new() gains config_path
@@ -34,11 +38,12 @@
 //   v1.2.0-MultiDevice - ChatRelayService init
 //   v1.0.0-Voice+SessionFix - Voice API, session fixes
 //   v1.0.0-Membership  - TrafficTracker wiring
+//   v1.0.1-VpnMessageStats - encrypted message counter wiring
 // ============================================
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -227,6 +232,7 @@ impl Server {
         // PacketHandler AND before init_management_reporter so both
         // can receive the same Arc.
         let traffic_tracker = Arc::new(TrafficTracker::new());
+        let encrypted_message_counter = Arc::new(AtomicU64::new(0));
         // v1.0.0-Membership: DenyList shared between HandshakeService
         // (read: reject denied wallets) and HeartbeatReporter (write: add/remove entries).
         let deny_list = Arc::new(DenyList::new());
@@ -236,6 +242,7 @@ impl Server {
             Arc::clone(&sessions),
             Arc::clone(&routing),
             Arc::clone(&traffic_tracker),
+            Arc::clone(&encrypted_message_counter),
             Arc::clone(&node_policy),
         ));
 
@@ -261,6 +268,7 @@ impl Server {
             Arc::clone(&deny_list),
             Arc::clone(&node_policy),
             Arc::clone(&voucher_verifier),
+            Arc::clone(&encrypted_message_counter),
         ).await;
 
         let udp_task = self.spawn_udp_task(
@@ -490,6 +498,7 @@ impl Server {
                 Arc::clone(&udp),
                 Arc::clone(&node_policy),
                 Arc::clone(&voucher_verifier),
+                Arc::clone(&encrypted_message_counter),
             );
             tasks.push(("memchain-api", api_task));
 
@@ -993,6 +1002,7 @@ impl Server {
         _udp:        Arc<UdpTransport>,
         node_policy: Arc<NodePolicyRuntime>,
         voucher_verifier: Arc<VoucherVerifier>,
+        encrypted_message_counter: Arc<AtomicU64>,
     ) -> JoinHandle<()> {
         let mut shutdown_rx     = self.shutdown_tx.subscribe();
         let mut shutdown_rx_vpn = self.shutdown_tx.subscribe();
@@ -1009,6 +1019,7 @@ impl Server {
                     sessions,
                     node_policy,
                     voucher_verifier,
+                    encrypted_message_counter,
                 ));
 
             let listener = match tokio::net::TcpListener::bind(listen_addr).await {
@@ -1075,6 +1086,7 @@ impl Server {
         deny_list:       Arc<DenyList>,
         node_policy:     Arc<NodePolicyRuntime>,
         voucher_verifier: Arc<VoucherVerifier>,
+        encrypted_message_counter: Arc<AtomicU64>,
     ) -> SessionEventSender {
         info!("Initializing management reporting...");
 
@@ -1132,13 +1144,21 @@ impl Server {
         let vpn_health_sessions = Arc::clone(sessions);
         let vpn_health_policy = Arc::clone(&node_policy);
         let vpn_health_verifier = Arc::clone(&voucher_verifier);
+        let vpn_health_message_counter = Arc::clone(&encrypted_message_counter);
         heartbeat = heartbeat.with_vpn_health_status(Box::new(move || {
             let config = vpn_health_config.clone();
             let sessions = Arc::clone(&vpn_health_sessions);
             let node_policy = Arc::clone(&vpn_health_policy);
             let verifier = Arc::clone(&vpn_health_verifier);
+            let message_counter = Arc::clone(&vpn_health_message_counter);
             Box::pin(async move {
-                Some(collect_vpn_health_value(config, sessions, node_policy, verifier).await)
+                Some(collect_vpn_health_value(
+                    config,
+                    sessions,
+                    node_policy,
+                    verifier,
+                    message_counter,
+                ).await)
             })
         }));
 

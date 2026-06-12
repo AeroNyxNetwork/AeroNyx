@@ -6,9 +6,11 @@
 //! This endpoint is intentionally read-only. It verifies the Linux node pieces
 //! that commonly make a tunnel appear "connected but offline": UDP listener,
 //! TUN device and MTU, IPv4 forwarding, NAT masquerade, VPN DNS stub, DNS
-//! resolution, and basic Internet egress.
+//! resolution, basic Internet egress, and aggregate encrypted VPN message
+//! forwarding counters.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +38,7 @@ pub struct VpnHealthState {
     sessions: Arc<SessionManager>,
     node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
+    encrypted_message_counter: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -55,6 +58,13 @@ struct ServiceManagerStatus {
 }
 
 #[derive(Debug, Serialize)]
+struct EncryptedMessageForwardingStatus {
+    count: u64,
+    source: &'static str,
+    privacy_boundary: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct VpnHealthResponse {
     status: &'static str,
     checked_at: u64,
@@ -70,6 +80,7 @@ struct VpnHealthResponse {
     node_policy: NodePolicySnapshot,
     policy_enforcement: NodePolicyEnforcementSnapshot,
     voucher_metrics: VoucherMetricsSnapshot,
+    encrypted_message_forwarding: EncryptedMessageForwardingStatus,
     checks: Vec<HealthCheck>,
 }
 
@@ -78,6 +89,7 @@ pub fn build_vpn_health_router(
     sessions: Arc<SessionManager>,
     node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
+    encrypted_message_counter: Arc<AtomicU64>,
 ) -> Router {
     Router::new()
         .route("/api/vpn/health", get(vpn_health_handler))
@@ -86,6 +98,7 @@ pub fn build_vpn_health_router(
             sessions,
             node_policy,
             voucher_verifier,
+            encrypted_message_counter,
         })
 }
 
@@ -107,12 +120,14 @@ pub async fn collect_vpn_health_value(
     sessions: Arc<SessionManager>,
     node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
+    encrypted_message_counter: Arc<AtomicU64>,
 ) -> Value {
     let state = VpnHealthState {
         config,
         sessions,
         node_policy,
         voucher_verifier,
+        encrypted_message_counter,
     };
     serde_json::to_value(collect_vpn_health_response(state).await).unwrap_or_else(|e| {
         serde_json::json!({
@@ -171,6 +186,15 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         node_policy: state.node_policy.snapshot(),
         policy_enforcement: state.node_policy.enforcement_snapshot(),
         voucher_metrics: state.voucher_verifier.metrics_snapshot(),
+        encrypted_message_forwarding: EncryptedMessageForwardingStatus {
+            count: state.encrypted_message_counter.load(Ordering::Relaxed),
+            source: "packet_handler_successful_vpn_data_packets",
+            privacy_boundary: concat!(
+                "aggregate count only; no destinations, DNS contents, packet ",
+                "payloads, domains, URLs, browsing history, voucher secrets, ",
+                "client public IPs, or wallet-level traffic"
+            ),
+        },
         checks,
     }
 }

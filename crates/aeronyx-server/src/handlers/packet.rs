@@ -8,6 +8,7 @@
 //   VPN hot path (IPv4/IPv6) now dual-writes bytes to both
 //   SessionStats (per-session cumulative) and TrafficTracker
 //   (per-wallet delta, drained each heartbeat).
+//   Adds an aggregate encrypted VPN message counter for public stats.
 //   Uses session.wallet_hex cache — no allocation per packet.
 //
 // Main Functionality:
@@ -22,8 +23,8 @@
 //   - aeronyx-core: crypto, protocol
 //
 // ⚠️ Important Notes for Next Developer:
-//   - Only VPN arms (0x4X / 0x6X) write to TrafficTracker.
-//     MemChain / Voice signals / Voice audio do NOT — not billed.
+//   - Only VPN arms (0x4X / 0x6X) write to TrafficTracker and the aggregate
+//     encrypted message counter. MemChain / Voice / keepalive are excluded.
 //   - wallet_hex is read from session.wallet_hex (cached at Session::new).
 //     Never call hex::encode in this hot path.
 //   - MEMCHAIN_MAGIC (0xAE) and VOICE_MAGIC (0xAF) must stay in sync
@@ -34,9 +35,11 @@
 //   v1.0.0-TrafficFix     — record_rx() moved inside VPN arms only
 //   v1.0.0-VoiceSignal    — disc=31/32/33 routed as voice signals
 //   v1.0.0-Membership     — TrafficTracker dual-write on VPN path
+//   v1.0.1-VpnMessageStats — aggregate encrypted VPN message counter
 // ============================================
 
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -120,6 +123,9 @@ pub struct PacketHandler {
     /// Per-wallet traffic delta tracker for membership quota enforcement.
     /// Drained by HeartbeatReporter every ~30s and sent to CMS.
     traffic:  Arc<TrafficTracker>,
+    /// Aggregate encrypted VPN message counter for public network stats.
+    /// Counts successful VPN data packets only; excludes control/voice/memory.
+    encrypted_message_counter: Arc<AtomicU64>,
     /// Operator policy from nodeboard Settings.
     policy:   Arc<NodePolicyRuntime>,
 }
@@ -129,6 +135,7 @@ impl PacketHandler {
         sessions: Arc<SessionManager>,
         routing:  Arc<RoutingService>,
         traffic:  Arc<TrafficTracker>,
+        encrypted_message_counter: Arc<AtomicU64>,
         policy:   Arc<NodePolicyRuntime>,
     ) -> Self {
         Self {
@@ -136,6 +143,7 @@ impl PacketHandler {
             routing,
             crypto: DefaultTransportCrypto::new(),
             traffic,
+            encrypted_message_counter,
             policy,
         }
     }
@@ -265,6 +273,7 @@ impl PacketHandler {
                 // Wallet-level delta counter (heartbeat quota enforcement).
                 // Uses cached wallet_hex — no allocation on hot path.
                 self.traffic.record_rx(&session.wallet_hex, plaintext_len as u64);
+                self.record_encrypted_vpn_message();
 
                 trace!(session_id = %session_id, len = plaintext_len, "VPN IPv4 decrypted");
                 DecryptedPayload::Vpn(plaintext)
@@ -279,6 +288,7 @@ impl PacketHandler {
                 session.stats.record_rx(plaintext_len as u64);
                 // Wallet-level delta counter.
                 self.traffic.record_rx(&session.wallet_hex, plaintext_len as u64);
+                self.record_encrypted_vpn_message();
 
                 trace!(session_id = %session_id, len = plaintext_len, "VPN IPv6 decrypted");
                 DecryptedPayload::Vpn(plaintext)
@@ -434,6 +444,7 @@ impl PacketHandler {
         session.stats.record_tx(ip_packet.len() as u64);
         // Wallet-level delta counter (heartbeat quota enforcement).
         self.traffic.record_tx(&session.wallet_hex, ip_packet.len() as u64);
+        self.record_encrypted_vpn_message();
 
         trace!(
             session_id    = %session_id,
@@ -444,6 +455,11 @@ impl PacketHandler {
         );
 
         Ok((output, session.client_endpoint))
+    }
+
+    #[inline]
+    fn record_encrypted_vpn_message(&self) {
+        self.encrypted_message_counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Builds an encrypted in-tunnel ICMP Echo Request for RTT measurement.
