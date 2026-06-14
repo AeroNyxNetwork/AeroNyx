@@ -1,0 +1,35 @@
+# /etc/systemd/system/aeronyx-server.service
+#
+# AeroNyx Rust node systemd unit for production node operations.
+#
+# Nodeboard/backend contracts:
+# - Rust health source:
+#   /root/open/AeroNyx/crates/aeronyx-server/src/api/vpn_health.rs
+# - Backend overview:
+#   /root/aeronyx/privacy_network/api/vpn_observability.py
+# - Nodeboard Services:
+#   /root/open/nodeboard/app/dashboard/services/page.tsx
+#
+# Privacy boundary:
+# This unit manages the Rust process only. It does not collect traffic
+# destinations, DNS contents, packet payloads, domains, URLs, browsing history,
+# voucher secrets, client public IPs, or wallet-level traffic.
+
+[Unit]
+Description=AeroNyx Rust privacy node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/open/AeroNyx
+ExecStart=/root/open/AeroNyx/target/release/aeronyx-server start -c /etc/aeronyx/server.toml
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
