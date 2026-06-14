@@ -19,6 +19,8 @@
 //   5. spawn_cleanup_task() signature + call site: added traffic_tracker param
 //   6. cleanup loop: calls traffic_tracker.remove_wallet(&wallet)
 //   7. encrypted_message_counter shared by PacketHandler and VPN health
+//   8. Starts a privacy-safe VPN DNS proxy on gateway_ip:53 so commercial
+//      clients can resolve domains through the tunnel.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -31,8 +33,11 @@
 //     SaaS pool, Miner) is unchanged from the previous version.
 //   - encrypted_message_counter is aggregate only and never stores payload,
 //     destination, DNS, URL, voucher, wallet, or client public IP details.
+//   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
+//     log, store, or report queried domains.
 //
 // Last Modified:
+//   v1.0.2-DNSProxy - VPN gateway DNS proxy wiring
 //   v2.5.3+Security    - Server::new() gains config_path
 //   v1.0.0-MultiTenant - SaaS startup branch
 //   v1.2.0-MultiDevice - ChatRelayService init
@@ -105,7 +110,8 @@ use crate::services::memchain::{
 };
 use crate::services::chat_relay::{ChatRelayService, derive_node_secret};
 use crate::services::{
-    HandshakeService, IpPoolService, NodePolicyRuntime, RoutingService, SessionManager,
+    spawn_dns_proxy, HandshakeService, IpPoolService, NodePolicyRuntime, RoutingService,
+    SessionManager,
 };
 // v1.0.0-Membership
 use crate::services::traffic_tracker::TrafficTracker;
@@ -229,6 +235,12 @@ impl Server {
 
         let server_pubkey_hex = hex::encode(self.identity.public_key_bytes());
         let mut tasks: Vec<(&str, JoinHandle<()>)> = Vec::new();
+
+        // Commercial VPN readiness requires DNS to be available at the tunnel
+        // gateway. This proxy forwards opaque UDP DNS bytes only and never
+        // records queried domains, DNS contents, destinations, or client IPs.
+        let dns_task = spawn_dns_proxy(self.config.gateway_ip(), self.shutdown_tx.subscribe());
+        tasks.push(("dns-proxy", dns_task));
 
         // v1.0.0-Membership: TrafficTracker must be created before
         // PacketHandler AND before init_management_reporter so both
