@@ -104,10 +104,21 @@ struct OperatorRisk {
     remediation: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeRolloutStatus {
+    executable_path: Option<String>,
+    executable_replaced: bool,
+    restart_required: bool,
+    detail: String,
+    source: &'static str,
+    privacy_boundary: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 struct NodeOperatorStatusResponse {
     status: &'static str,
     generated_at: u64,
+    runtime_rollout: RuntimeRolloutStatus,
     services: Vec<OperatorServiceStatus>,
     risks: Vec<OperatorRisk>,
     privacy_boundary: &'static str,
@@ -279,6 +290,7 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
     let supernode_enabled = config.memchain.is_supernode_enabled();
     let api_secret_configured = config.memchain.effective_api_secret().is_some();
     let encrypted_messages = state.encrypted_message_counter.load(Ordering::Relaxed);
+    let runtime_rollout = collect_runtime_rollout_status().await;
     let mut services = Vec::new();
     let mut risks = Vec::new();
 
@@ -305,6 +317,7 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
             "service_manager": vpn_health.service_manager,
             "encrypted_message_forwarding": vpn_health.encrypted_message_forwarding,
             "failed_checks": vpn_health.checks.iter().filter(|check| !check.ok).count(),
+            "runtime_rollout": runtime_rollout.clone(),
         }),
     });
 
@@ -409,6 +422,15 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
         });
     }
 
+    if runtime_rollout.restart_required {
+        risks.push(OperatorRisk {
+            severity: "warning",
+            code: "runtime_restart_required",
+            message: "Rust process is running an executable that has been replaced on disk".to_string(),
+            remediation: "Drain active sessions, enter maintenance mode, then restart the AeroNyx Rust node so the staged binary takes effect".to_string(),
+        });
+    }
+
     if !api_secret_configured {
         risks.push(OperatorRisk {
             severity: if remote_storage_enabled { "critical" } else { "warning" },
@@ -460,6 +482,7 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
     NodeOperatorStatusResponse {
         status,
         generated_at,
+        runtime_rollout,
         services,
         risks,
         privacy_boundary: concat!(
@@ -467,6 +490,55 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
             "only; no user plaintext, social graph plaintext, destinations, DNS ",
             "contents, packet payloads, domains, URLs, browsing history, voucher ",
             "secrets, or wallet-level traffic"
+        ),
+    }
+}
+
+async fn collect_runtime_rollout_status() -> RuntimeRolloutStatus {
+    // Return a privacy-safe rollout signal for nodeboard.
+    //
+    // Source path:
+    //   /root/open/AeroNyx/crates/aeronyx-server/src/api/vpn_health.rs
+    //
+    // Linux keeps a running process alive even after its executable file is
+    // replaced on disk. `/proc/self/exe` then points to a path suffixed with
+    // `(deleted)`. That is a strong operator signal that a new binary may be
+    // staged but the node still needs a controlled maintenance drain/restart.
+    //
+    // This reports process metadata only: executable path state and whether a
+    // restart is required. It never includes user destinations, DNS contents,
+    // packet payloads, browsing history, voucher secrets, or wallet traffic.
+    let proc_exe = tokio::fs::read_link("/proc/self/exe").await.ok();
+    let fallback_exe = if proc_exe.is_none() {
+        std::env::current_exe().ok()
+    } else {
+        None
+    };
+    let executable_path = proc_exe.or(fallback_exe).map(|path| {
+        path.to_string_lossy()
+            .chars()
+            .take(512)
+            .collect::<String>()
+    });
+    let executable_replaced = executable_path
+        .as_deref()
+        .map(|path| path.contains(" (deleted)") || path.ends_with("(deleted)"))
+        .unwrap_or(false);
+
+    RuntimeRolloutStatus {
+        executable_path,
+        executable_replaced,
+        restart_required: executable_replaced,
+        detail: if executable_replaced {
+            "Running process executable has been replaced on disk; restart after draining active sessions".to_string()
+        } else {
+            "Running process executable is active; no rollout restart signal detected".to_string()
+        },
+        source: "/proc/self/exe",
+        privacy_boundary: concat!(
+            "runtime process executable metadata only; no destinations, DNS ",
+            "contents, packet payloads, domains, URLs, browsing history, ",
+            "voucher secrets, client public IPs, or wallet-level traffic"
         ),
     }
 }
