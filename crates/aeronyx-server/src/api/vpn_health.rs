@@ -7,7 +7,9 @@
 //! that commonly make a tunnel appear "connected but offline": UDP listener,
 //! TUN device and MTU, IPv4 forwarding, NAT masquerade, VPN DNS stub, DNS
 //! resolution, basic Internet egress, and aggregate encrypted VPN message
-//! forwarding counters.
+//! forwarding counters. The same router also exposes a node-operator status
+//! snapshot for nodeboard so operators can see which AeroNyx services this
+//! Rust node is currently ready to provide.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -84,6 +86,33 @@ struct VpnHealthResponse {
     checks: Vec<HealthCheck>,
 }
 
+#[derive(Debug, Serialize)]
+struct OperatorServiceStatus {
+    key: &'static str,
+    label: &'static str,
+    enabled: bool,
+    status: &'static str,
+    summary: String,
+    metrics: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct OperatorRisk {
+    severity: &'static str,
+    code: &'static str,
+    message: String,
+    remediation: String,
+}
+
+#[derive(Debug, Serialize)]
+struct NodeOperatorStatusResponse {
+    status: &'static str,
+    generated_at: u64,
+    services: Vec<OperatorServiceStatus>,
+    risks: Vec<OperatorRisk>,
+    privacy_boundary: &'static str,
+}
+
 pub fn build_vpn_health_router(
     config: ServerConfig,
     sessions: Arc<SessionManager>,
@@ -93,6 +122,8 @@ pub fn build_vpn_health_router(
 ) -> Router {
     Router::new()
         .route("/api/vpn/health", get(vpn_health_handler))
+        .route("/api/node/operator/status", get(node_operator_status_handler))
+        .route("/api/operator/status", get(node_operator_status_handler))
         .with_state(VpnHealthState {
             config,
             sessions,
@@ -104,6 +135,10 @@ pub fn build_vpn_health_router(
 
 async fn vpn_health_handler(State(state): State<VpnHealthState>) -> impl IntoResponse {
     Json(collect_vpn_health_response(state).await)
+}
+
+async fn node_operator_status_handler(State(state): State<VpnHealthState>) -> impl IntoResponse {
+    Json(collect_node_operator_status_response(state).await)
 }
 
 /// Collect privacy-safe VPN node health as JSON for the CMS heartbeat.
@@ -137,6 +172,41 @@ pub async fn collect_vpn_health_value(
                 "name": "vpn_health_serialization",
                 "ok": false,
                 "detail": format!("serialization failed: {}", e),
+            }],
+        })
+    })
+}
+
+/// Collect the nodeboard-facing operator service snapshot as privacy-safe JSON.
+///
+/// Source path:
+///   /root/open/AeroNyx/crates/aeronyx-server/src/api/vpn_health.rs
+///
+/// This is reported in heartbeat `system_stats.operator_status` and exposed as
+/// `/api/node/operator/status`. It contains aggregate service/config state only.
+pub async fn collect_node_operator_status_value(
+    config: ServerConfig,
+    sessions: Arc<SessionManager>,
+    node_policy: Arc<NodePolicyRuntime>,
+    voucher_verifier: Arc<VoucherVerifier>,
+    encrypted_message_counter: Arc<AtomicU64>,
+) -> Value {
+    let state = VpnHealthState {
+        config,
+        sessions,
+        node_policy,
+        voucher_verifier,
+        encrypted_message_counter,
+    };
+    serde_json::to_value(collect_node_operator_status_response(state).await).unwrap_or_else(|e| {
+        serde_json::json!({
+            "status": "failed",
+            "generated_at": unix_now_secs(),
+            "risks": [{
+                "severity": "critical",
+                "code": "operator_status_serialization",
+                "message": format!("operator status serialization failed: {}", e),
+                "remediation": "Check Rust node operator status response serialization",
             }],
         })
     })
@@ -196,6 +266,208 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
             ),
         },
         checks,
+    }
+}
+
+async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOperatorStatusResponse {
+    let generated_at = unix_now_secs();
+    let vpn_health = collect_vpn_health_response(state.clone()).await;
+    let config = state.config.clone();
+    let memchain_enabled = config.memchain.is_enabled();
+    let remote_storage_enabled = config.memchain.is_remote_storage_enabled();
+    let chat_relay_enabled = config.memchain.is_chat_relay_enabled();
+    let supernode_enabled = config.memchain.is_supernode_enabled();
+    let api_secret_configured = config.memchain.effective_api_secret().is_some();
+    let encrypted_messages = state.encrypted_message_counter.load(Ordering::Relaxed);
+    let mut services = Vec::new();
+    let mut risks = Vec::new();
+
+    services.push(OperatorServiceStatus {
+        key: "privacy_protocol",
+        label: "AeroNyx Privacy Protocol",
+        enabled: true,
+        status: vpn_health.status,
+        summary: format!(
+            "{} active sessions, {} wallet devices, {} encrypted packets forwarded",
+            vpn_health.active_sessions,
+            vpn_health.active_wallet_devices,
+            encrypted_messages
+        ),
+        metrics: serde_json::json!({
+            "listen_addr": vpn_health.listen_addr,
+            "gateway_ip": vpn_health.gateway_ip,
+            "virtual_ip_range": vpn_health.virtual_ip_range,
+            "tun_device": vpn_health.tun_device,
+            "configured_mtu": vpn_health.configured_mtu,
+            "running_mtu": vpn_health.running_mtu,
+            "active_sessions": vpn_health.active_sessions,
+            "active_wallet_devices": vpn_health.active_wallet_devices,
+            "service_manager": vpn_health.service_manager,
+            "encrypted_message_forwarding": vpn_health.encrypted_message_forwarding,
+            "failed_checks": vpn_health.checks.iter().filter(|check| !check.ok).count(),
+        }),
+    });
+
+    services.push(OperatorServiceStatus {
+        key: "memchain",
+        label: "MemChain / MPI",
+        enabled: memchain_enabled,
+        status: if memchain_enabled { "ok" } else { "disabled" },
+        summary: if memchain_enabled {
+            format!("mode={:?}, API bound at {}", config.memchain.mode, config.memchain.api_listen_addr)
+        } else {
+            "MemChain is disabled in this node config".to_string()
+        },
+        metrics: serde_json::json!({
+            "mode": format!("{:?}", config.memchain.mode),
+            "api_listen_addr": config.memchain.api_listen_addr.to_string(),
+            "db_path": config.memchain.db_path,
+            "aof_path": config.memchain.aof_path,
+            "api_secret_configured": api_secret_configured,
+            "ner_enabled": config.memchain.ner_enabled,
+            "graph_enabled": config.memchain.graph_enabled,
+            "reranker_enabled": config.memchain.reranker_enabled,
+            "remote_storage_enabled": remote_storage_enabled,
+            "max_remote_owners": config.memchain.max_remote_owners,
+        }),
+    });
+
+    services.push(OperatorServiceStatus {
+        key: "chat_relay",
+        label: "Zero-Knowledge Chat Relay",
+        enabled: chat_relay_enabled,
+        status: if chat_relay_enabled { "ok" } else { "disabled" },
+        summary: if chat_relay_enabled {
+            format!(
+                "offline TTL {}s, {} pending messages per wallet, max blob {} bytes",
+                config.memchain.chat_relay.offline_ttl_secs,
+                config.memchain.chat_relay.max_pending_per_wallet,
+                config.memchain.chat_relay.max_blob_size
+            )
+        } else {
+            "Chat relay is disabled; encrypted messages are not stored for offline delivery".to_string()
+        },
+        metrics: serde_json::json!({
+            "offline_ttl_secs": config.memchain.chat_relay.offline_ttl_secs,
+            "max_pending_per_wallet": config.memchain.chat_relay.max_pending_per_wallet,
+            "db_path": config.memchain.chat_relay.db_path,
+            "max_message_size": config.memchain.chat_relay.max_message_size,
+            "max_blob_size": config.memchain.chat_relay.max_blob_size,
+            "max_blobs_per_receiver": config.memchain.chat_relay.max_blobs_per_receiver,
+            "cleanup_interval_secs": config.memchain.chat_relay.cleanup_interval_secs,
+        }),
+    });
+
+    services.push(OperatorServiceStatus {
+        key: "sovereign_data_layer",
+        label: "Sovereign Data Layer",
+        enabled: remote_storage_enabled,
+        status: if remote_storage_enabled { "ready" } else { "planned" },
+        summary: if remote_storage_enabled {
+            format!("remote encrypted owner storage enabled for up to {} owners", config.memchain.max_remote_owners)
+        } else {
+            "Encrypted user-owned record RPC is not enabled on this node yet".to_string()
+        },
+        metrics: serde_json::json!({
+            "remote_storage_enabled": remote_storage_enabled,
+            "max_remote_owners": config.memchain.max_remote_owners,
+            "current_protocol_basis": [
+                "MemoryRecord.owner",
+                "MemoryRecord.encrypted_content",
+                "MemoryRecord.signature",
+                "MemChainMessage::SyncRecordRequest",
+                "MemChainMessage::SyncRecordResponse"
+            ],
+            "settlement_layer": "ethereum",
+            "private_data_on_ethereum": false,
+        }),
+    });
+
+    services.push(OperatorServiceStatus {
+        key: "supernode",
+        label: "SuperNode Cognitive Worker",
+        enabled: supernode_enabled,
+        status: if supernode_enabled { "ready" } else { "disabled" },
+        summary: if supernode_enabled {
+            format!("{} configured provider(s)", config.memchain.supernode.providers.len())
+        } else {
+            "SuperNode LLM worker is disabled".to_string()
+        },
+        metrics: serde_json::json!({
+            "providers": config.memchain.supernode.providers.len(),
+            "worker_poll_interval_secs": config.memchain.supernode.worker.poll_interval_secs,
+            "worker_max_concurrent": config.memchain.supernode.worker.max_concurrent,
+        }),
+    });
+
+    if vpn_health.status != "ok" {
+        risks.push(OperatorRisk {
+            severity: if vpn_health.status == "failed" { "critical" } else { "warning" },
+            code: "privacy_protocol_health",
+            message: format!("AeroNyx privacy protocol health is {}", vpn_health.status),
+            remediation: "Open /api/vpn/health and resolve failed checks before advertising this node as healthy".to_string(),
+        });
+    }
+
+    if !api_secret_configured {
+        risks.push(OperatorRisk {
+            severity: if remote_storage_enabled { "critical" } else { "warning" },
+            code: "mpi_api_secret_missing",
+            message: "MemChain API secret is not configured".to_string(),
+            remediation: "Set memchain.api_secret before enabling remote RPC or remote encrypted storage".to_string(),
+        });
+    }
+
+    if !chat_relay_enabled {
+        risks.push(OperatorRisk {
+            severity: "info",
+            code: "chat_relay_disabled",
+            message: "Zero-knowledge chat relay is disabled".to_string(),
+            remediation: "Enable [memchain.chat_relay] when this node should store encrypted offline messages and blobs".to_string(),
+        });
+    }
+
+    if !remote_storage_enabled {
+        risks.push(OperatorRisk {
+            severity: "info",
+            code: "sovereign_data_layer_not_enabled",
+            message: "Sovereign Data Layer remote storage is not enabled".to_string(),
+            remediation: "Enable memchain.allow_remote_storage after encrypted record limits and API authentication are ready".to_string(),
+        });
+    }
+
+    if remote_storage_enabled && config.memchain.max_remote_owners == 0 {
+        risks.push(OperatorRisk {
+            severity: "warning",
+            code: "remote_owner_capacity_unbounded",
+            message: "Remote encrypted storage owner capacity is unlimited".to_string(),
+            remediation: "Set memchain.max_remote_owners for commercial node capacity planning".to_string(),
+        });
+    }
+
+    let has_critical = risks.iter().any(|risk| risk.severity == "critical");
+    let has_warning = risks.iter().any(|risk| risk.severity == "warning");
+    let status = if has_critical {
+        "critical"
+    } else if vpn_health.status == "failed" {
+        "failed"
+    } else if has_warning || vpn_health.status == "degraded" {
+        "attention"
+    } else {
+        "ok"
+    };
+
+    NodeOperatorStatusResponse {
+        status,
+        generated_at,
+        services,
+        risks,
+        privacy_boundary: concat!(
+            "operator status contains aggregate service health and configuration ",
+            "only; no user plaintext, social graph plaintext, destinations, DNS ",
+            "contents, packet payloads, domains, URLs, browsing history, voucher ",
+            "secrets, or wallet-level traffic"
+        ),
     }
 }
 

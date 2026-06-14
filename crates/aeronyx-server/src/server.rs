@@ -79,7 +79,9 @@ use rusqlite::OptionalExtension;
 use crate::api::mpi::{build_mpi_router, MpiState, BaselineSnapshot, Mode};
 use crate::api::auth::{ensure_jwt_secret, generate_secret};
 use crate::api::voice::build_voice_router;
-use crate::api::vpn_health::{build_vpn_health_router, collect_vpn_health_value};
+use crate::api::vpn_health::{
+    build_vpn_health_router, collect_node_operator_status_value, collect_vpn_health_value,
+};
 use crate::config::{MemChainConfig, MemChainMode, ServerConfig, VectorQuantizationMode};
 use crate::error::{Result, ServerError};
 use crate::handlers::packet::DecryptedPayload;
@@ -1153,6 +1155,28 @@ impl Server {
             let message_counter = Arc::clone(&vpn_health_message_counter);
             Box::pin(async move {
                 Some(collect_vpn_health_value(
+                    config,
+                    sessions,
+                    node_policy,
+                    verifier,
+                    message_counter,
+                ).await)
+            })
+        }));
+
+        let operator_status_config = self.config.clone();
+        let operator_status_sessions = Arc::clone(sessions);
+        let operator_status_policy = Arc::clone(&node_policy);
+        let operator_status_verifier = Arc::clone(&voucher_verifier);
+        let operator_status_message_counter = Arc::clone(&encrypted_message_counter);
+        heartbeat = heartbeat.with_operator_status(Box::new(move || {
+            let config = operator_status_config.clone();
+            let sessions = Arc::clone(&operator_status_sessions);
+            let node_policy = Arc::clone(&operator_status_policy);
+            let verifier = Arc::clone(&operator_status_verifier);
+            let message_counter = Arc::clone(&operator_status_message_counter);
+            Box::pin(async move {
+                Some(collect_node_operator_status_value(
                     config,
                     sessions,
                     node_policy,

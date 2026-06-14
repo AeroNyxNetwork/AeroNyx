@@ -78,6 +78,13 @@ pub type MemChainStatusFn = Box<dyn Fn() -> Option<MemChainHeartbeatStatus> + Se
 pub type VpnHealthStatusFn =
     Box<dyn Fn() -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>> + Send + Sync>;
 
+/// Async node-operator service snapshot injected by server startup.
+///
+/// The probe returns privacy-safe aggregate service readiness for heartbeat
+/// `system_stats.operator_status`.
+pub type OperatorStatusFn =
+    Box<dyn Fn() -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>> + Send + Sync>;
+
 // ============================================
 // Session Events
 // ============================================
@@ -258,6 +265,7 @@ pub struct HeartbeatReporter {
     command_tx:         Option<mpsc::Sender<Command>>,
     memchain_status_fn: Option<MemChainStatusFn>,
     vpn_health_status_fn: Option<VpnHealthStatusFn>,
+    operator_status_fn: Option<OperatorStatusFn>,
 
     // v1.0.0-Membership
     sessions:         Option<Arc<SessionManager>>,
@@ -283,6 +291,7 @@ impl HeartbeatReporter {
             command_tx:         None,
             memchain_status_fn: None,
             vpn_health_status_fn: None,
+            operator_status_fn: None,
             sessions:           None,
             traffic:            None,
             udp:                None,
@@ -305,6 +314,11 @@ impl HeartbeatReporter {
 
     pub fn with_vpn_health_status(mut self, f: VpnHealthStatusFn) -> Self {
         self.vpn_health_status_fn = Some(f);
+        self
+    }
+
+    pub fn with_operator_status(mut self, f: OperatorStatusFn) -> Self {
+        self.operator_status_fn = Some(f);
         self
     }
 
@@ -374,6 +388,12 @@ impl HeartbeatReporter {
                         None
                     };
 
+                    let operator_status = if let Some(ref f) = self.operator_status_fn {
+                        f().await
+                    } else {
+                        None
+                    };
+
                     // v1.0.0-Membership: collect connected wallets (deduplicated).
                     let connected_wallets: Vec<String> =
                         if let Some(ref sm) = self.sessions {
@@ -411,6 +431,7 @@ impl HeartbeatReporter {
                             connected_wallets,
                             traffic_delta,
                             vpn_health_status,
+                            operator_status,
                         ),
                     ).await;
 

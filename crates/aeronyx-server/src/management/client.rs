@@ -268,6 +268,7 @@ impl ManagementClient {
         connected_wallets: Vec<String>,
         traffic_delta:     HashMap<String, TrafficDelta>,
         vpn_health:        Option<serde_json::Value>,
+        operator_status:   Option<serde_json::Value>,
     ) -> Result<HeartbeatResponse, String> {
         let url       = format!("{}/node/heartbeat/", self.config.cms_url);
         let timestamp = Self::current_timestamp();
@@ -306,6 +307,9 @@ impl ManagementClient {
             }
             if let Some(health) = vpn_health {
                 obj.insert("vpn_health".to_string(), health);
+            }
+            if let Some(status) = operator_status {
+                obj.insert("operator_status".to_string(), status);
             }
         }
 
