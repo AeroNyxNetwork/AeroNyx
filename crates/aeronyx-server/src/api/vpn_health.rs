@@ -56,6 +56,8 @@ struct ServiceManagerStatus {
     manager: &'static str,
     service_name: &'static str,
     load_state: String,
+    active_state: String,
+    unit_file_state: String,
     restart_supported: bool,
     detail: String,
 }
@@ -563,34 +565,68 @@ async fn collect_runtime_rollout_status() -> RuntimeRolloutStatus {
 }
 
 async fn collect_service_manager_status(service_name: &'static str) -> ServiceManagerStatus {
+    // Source path:
+    //   /root/open/AeroNyx/crates/aeronyx-server/src/api/vpn_health.rs
+    //
+    // Nodeboard/backend consumers:
+    //   /root/aeronyx/privacy_network/api/vpn_observability.py
+    //   /root/open/nodeboard/app/dashboard/services/page.tsx
+    //
+    // This command returns local process manager metadata only. It does not
+    // inspect destinations, DNS contents, packet payloads, domains, URLs,
+    // browsing history, voucher secrets, client public IPs, or wallet traffic.
     let result = timeout(
         CHECK_TIMEOUT,
         TokioCommand::new("systemctl")
-            .args(["show", service_name, "--property=LoadState", "--value"])
+            .args([
+                "show",
+                service_name,
+                "--property=LoadState,ActiveState,UnitFileState",
+                "--value",
+            ])
             .output(),
     )
     .await;
 
     match result {
         Ok(Ok(output)) if output.status.success() => {
-            let load_state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut lines = stdout.lines().map(str::trim);
+            let load_state = lines.next().unwrap_or("").to_string();
+            let active_state = lines.next().unwrap_or("").to_string();
+            let unit_file_state = lines.next().unwrap_or("").to_string();
             let load_state = if load_state.is_empty() {
                 "unknown".to_string()
             } else {
                 load_state
+            };
+            let active_state = if active_state.is_empty() {
+                "unknown".to_string()
+            } else {
+                active_state
+            };
+            let unit_file_state = if unit_file_state.is_empty() {
+                "unknown".to_string()
+            } else {
+                unit_file_state
             };
             let restart_supported = load_state == "loaded";
             ServiceManagerStatus {
                 manager: "systemd",
                 service_name,
                 load_state: load_state.clone(),
+                active_state: active_state.clone(),
+                unit_file_state: unit_file_state.clone(),
                 restart_supported,
                 detail: if restart_supported {
-                    format!("{} systemd service is loaded", service_name)
+                    format!(
+                        "{} systemd service is loaded (ActiveState={}, UnitFileState={})",
+                        service_name, active_state, unit_file_state
+                    )
                 } else {
                     format!(
-                        "{} systemd service is not restartable from nodeboard (LoadState={})",
-                        service_name, load_state
+                        "{} systemd service is not restartable from nodeboard (LoadState={}, ActiveState={}, UnitFileState={})",
+                        service_name, load_state, active_state, unit_file_state
                     )
                 },
             }
@@ -602,6 +638,8 @@ async fn collect_service_manager_status(service_name: &'static str) -> ServiceMa
                 manager: "systemd",
                 service_name,
                 load_state: "unknown".to_string(),
+                active_state: "unknown".to_string(),
+                unit_file_state: "unknown".to_string(),
                 restart_supported: false,
                 detail: format!("systemctl show failed: {}", detail),
             }
@@ -610,6 +648,8 @@ async fn collect_service_manager_status(service_name: &'static str) -> ServiceMa
             manager: "systemd",
             service_name,
             load_state: "unavailable".to_string(),
+            active_state: "unavailable".to_string(),
+            unit_file_state: "unavailable".to_string(),
             restart_supported: false,
             detail: format!("systemctl unavailable: {}", error),
         },
@@ -617,6 +657,8 @@ async fn collect_service_manager_status(service_name: &'static str) -> ServiceMa
             manager: "systemd",
             service_name,
             load_state: "timeout".to_string(),
+            active_state: "timeout".to_string(),
+            unit_file_state: "timeout".to_string(),
             restart_supported: false,
             detail: "systemctl show timed out".to_string(),
         },
