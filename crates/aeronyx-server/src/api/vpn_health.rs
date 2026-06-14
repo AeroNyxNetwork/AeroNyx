@@ -27,6 +27,7 @@ use crate::config::ServerConfig;
 use crate::services::{
     NodePolicyEnforcementSnapshot, NodePolicyRuntime, NodePolicySnapshot, SessionManager,
 };
+use crate::services::session::CLIENT_LIVENESS_TIMEOUT_SECS;
 use crate::voucher_verifier::{VoucherMetricsSnapshot, VoucherVerifier};
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -66,6 +67,13 @@ struct EncryptedMessageForwardingStatus {
     privacy_boundary: &'static str,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct SessionCleanupStatus {
+    client_liveness_timeout_seconds: u64,
+    source: &'static str,
+    privacy_boundary: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 struct VpnHealthResponse {
     status: &'static str,
@@ -83,6 +91,7 @@ struct VpnHealthResponse {
     policy_enforcement: NodePolicyEnforcementSnapshot,
     voucher_metrics: VoucherMetricsSnapshot,
     encrypted_message_forwarding: EncryptedMessageForwardingStatus,
+    session_cleanup: SessionCleanupStatus,
     checks: Vec<HealthCheck>,
 }
 
@@ -276,6 +285,15 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
                 "client public IPs, or wallet-level traffic"
             ),
         },
+        session_cleanup: SessionCleanupStatus {
+            client_liveness_timeout_seconds: CLIENT_LIVENESS_TIMEOUT_SECS,
+            source: "session_client_activity_timeout",
+            privacy_boundary: concat!(
+                "local monotonic timeout metadata only; no destinations, DNS ",
+                "contents, packet payloads, domains, URLs, browsing history, ",
+                "voucher secrets, client public IPs, or wallet-level traffic"
+            ),
+        },
         checks,
     }
 }
@@ -316,6 +334,7 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
             "active_wallet_devices": vpn_health.active_wallet_devices,
             "service_manager": vpn_health.service_manager,
             "encrypted_message_forwarding": vpn_health.encrypted_message_forwarding,
+            "session_cleanup": vpn_health.session_cleanup,
             "failed_checks": vpn_health.checks.iter().filter(|check| !check.ok).count(),
             "runtime_rollout": runtime_rollout.clone(),
         }),

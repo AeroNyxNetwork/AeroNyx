@@ -159,7 +159,7 @@ const BITMAP_WORDS: usize = (REPLAY_WINDOW_SIZE / 64) as usize;
 ///   This uses only local monotonic timestamps. It does not inspect packet
 ///   payloads, DNS contents, destinations, domains, URLs, browsing history,
 ///   voucher secrets, client public IPs, or wallet-level traffic.
-const CLIENT_LIVENESS_TIMEOUT_SECS: u64 = 300;
+pub const CLIENT_LIVENESS_TIMEOUT_SECS: u64 = 300;
 
 // ============================================
 // 🌟 v1.2.0-MultiDevice: DeviceId type + DeviceEntry
