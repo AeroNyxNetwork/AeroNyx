@@ -234,6 +234,20 @@ impl PacketHandler {
         plaintext.truncate(plaintext_len);
 
         session.touch();
+        // Maintenance drain must be based on authenticated client liveness.
+        //
+        // Source path:
+        //   /root/a/AeroNyx/crates/aeronyx-server/src/handlers/packet.rs
+        //
+        // Backend / nodeboard consumers:
+        //   POST /api/privacy_network/node/sessions/report/
+        //   /root/aeronyx/privacy_network/api/sessions.py
+        //   /root/open/nodeboard/app/dashboard/nodes/[id]/page.tsx
+        //
+        // This is metadata only: it never reads DNS contents, destinations,
+        // packet payloads, domains, URLs, browsing history, client public IPs,
+        // voucher secrets, or wallet-level traffic.
+        session.mark_client_activity();
 
         let payload = match plaintext.first().copied() {
 

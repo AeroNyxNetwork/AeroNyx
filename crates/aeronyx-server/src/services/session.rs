@@ -74,6 +74,9 @@
 //! - The two-map update (sessions + wallet_index) is not strictly atomic.
 //!   Chat routing tolerates a brief gap between them.
 //! - Window size of 2048 allows ~100ms of reordering at 20k pps.
+//! - Commercial maintenance drain depends on client liveness, not just local
+//!   server activity. Do not let server→client traffic or keepalive probes keep
+//!   an otherwise disconnected session alive forever.
 //! - 🔴 DO NOT revert `has_seen_any` back to a u64 sentinel. The sentinel
 //!   approach is fundamentally incompatible with the `counter > highest_seen`
 //!   comparison because any real counter value can be a valid "first packet".
@@ -138,6 +141,25 @@ use crate::error::{Result, ServerError};
 
 const REPLAY_WINDOW_SIZE: u64 = 2048;
 const BITMAP_WORDS: usize = (REPLAY_WINDOW_SIZE / 64) as usize;
+/// Maximum time a session may remain without any authenticated client packet
+/// or encrypted tunnel keepalive ACK before cleanup considers it stale.
+///
+/// Product requirement:
+///   nodeboard Maintenance Drain must eventually reach zero active tunnels so
+///   operators can safely restart a Rust node after staged binary rollout.
+///
+/// Backend / nodeboard consumers:
+///   - POST /api/privacy_network/node/sessions/report/
+///     /root/aeronyx/privacy_network/api/sessions.py
+///   - ClientSessionSerializer
+///     /root/aeronyx/privacy_network/serializers.py
+///   - /root/open/nodeboard/app/dashboard/nodes/[id]/page.tsx
+///
+/// Privacy boundary:
+///   This uses only local monotonic timestamps. It does not inspect packet
+///   payloads, DNS contents, destinations, domains, URLs, browsing history,
+///   voucher secrets, client public IPs, or wallet-level traffic.
+const CLIENT_LIVENESS_TIMEOUT_SECS: u64 = 300;
 
 // ============================================
 // 🌟 v1.2.0-MultiDevice: DeviceId type + DeviceEntry
@@ -553,6 +575,15 @@ pub struct Session {
     pub created_at: std::time::Instant,
     /// Time of the most recent activity, used for idle-timeout cleanup.
     pub last_activity: AtomicInstant,
+    /// Time of the most recent authenticated client-originated packet or
+    /// encrypted tunnel keepalive ACK.
+    ///
+    /// `last_activity` includes server-originated sends, so it is useful for
+    /// general idle diagnostics but not sufficient for commercial maintenance
+    /// drain. A disconnected client may stop replying while the server keeps
+    /// sending keepalive probes; this field lets cleanup remove that stale
+    /// session and report `session_ended` to the backend.
+    pub client_activity: AtomicInstant,
     /// Monotonic counter used for outbound (server → client) packets.
     pub tx_counter: AtomicU64,
     /// Replay window guarding inbound (client → server) packets.
@@ -596,6 +627,7 @@ impl Session {
             client_endpoint,
             created_at: now,
             last_activity: AtomicInstant::from_instant(now),
+            client_activity: AtomicInstant::from_instant(now),
             tx_counter: AtomicU64::new(0),
             replay_window: Mutex::new(ReplayWindow::new()),
             rx_counter: AtomicU64::new(0),
@@ -627,10 +659,23 @@ impl Session {
         self.last_activity.store(std::time::Instant::now());
     }
 
+    /// Updates client liveness after an authenticated client-originated packet
+    /// or encrypted tunnel keepalive ACK.
+    pub fn mark_client_activity(&self) {
+        self.client_activity.store(std::time::Instant::now());
+    }
+
     /// Returns the time elapsed since the most recent activity.
     #[must_use]
     pub fn idle_time(&self) -> Duration {
         self.last_activity.elapsed()
+    }
+
+    /// Returns the time elapsed since the most recent client-originated
+    /// authenticated activity.
+    #[must_use]
+    pub fn client_inactive_time(&self) -> Duration {
+        self.client_activity.elapsed()
     }
 
     /// Returns traffic and keepalive counters with the current pending ACK
@@ -642,10 +687,13 @@ impl Session {
         snap
     }
 
-    /// Returns true if the session has been idle longer than `timeout`.
+    /// Returns true if the session has exceeded either the configured idle
+    /// timeout or the commercial drain client-liveness timeout.
     #[must_use]
     pub fn is_expired(&self, timeout: Duration) -> bool {
-        self.idle_time() > timeout
+        let liveness_timeout =
+            timeout.min(Duration::from_secs(CLIENT_LIVENESS_TIMEOUT_SECS));
+        self.idle_time() > timeout || self.client_inactive_time() > liveness_timeout
     }
 
     /// Atomically returns the next outbound counter value.
@@ -758,6 +806,7 @@ impl Session {
         let rtt_us = rtt.as_micros().min(u64::MAX as u128) as u64;
         self.stats.rtt_us.store(rtt_us, Ordering::Relaxed);
         self.stats.record_keepalive_ack();
+        self.mark_client_activity();
         Some(rtt_us as f64 / 1000.0)
     }
 
@@ -778,6 +827,7 @@ impl std::fmt::Debug for Session {
             .field("virtual_ip", &self.virtual_ip)
             .field("client_endpoint", &self.client_endpoint)
             .field("idle_time", &self.idle_time())
+            .field("client_inactive_time", &self.client_inactive_time())
             .field(
                 "replay_window",
                 &format!("[{}..{}]", window_base, highest_seen),
@@ -1747,7 +1797,7 @@ mod tests {
         let expired = manager.cleanup_expired();
 
         assert_eq!(expired.len(), 1);
-        let (_, vip, wallet_hex, bytes_rx, bytes_tx) = &expired[0];
+        let (_, vip, wallet_hex, bytes_rx, bytes_tx, _snap) = &expired[0];
         assert_eq!(*vip, virtual_ip);
         assert_eq!(*wallet_hex, hex::encode(wallet));
         assert_eq!(*bytes_rx, 0);
@@ -1766,6 +1816,36 @@ mod tests {
 
         assert!(manager.get_all_by_wallet(&wallet).is_empty());
         assert_eq!(manager.wallet_index_count(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_expired_uses_client_liveness_not_server_touch() {
+        let manager = SessionManager::new(100, Duration::from_millis(20));
+        let identity = IdentityKeyPair::generate();
+        let wallet = identity.public_key_bytes();
+        let sid = SessionId::generate();
+
+        manager
+            .create(
+                sid.clone(),
+                identity.public_key(),
+                SessionKey::from_bytes([0x24; 32]),
+                Ipv4Addr::new(100, 64, 0, 4),
+                "127.0.0.1:12346".parse().unwrap(),
+            )
+            .unwrap();
+        manager.register_device(&wallet, make_device_id(0x02), sid.clone());
+
+        std::thread::sleep(Duration::from_millis(30));
+        manager.touch(&sid);
+
+        let expired = manager.cleanup_expired();
+        assert_eq!(
+            expired.len(),
+            1,
+            "server-side touch must not keep a client-unresponsive session alive"
+        );
+        assert!(manager.get(&sid).is_none());
     }
 
     #[test]
