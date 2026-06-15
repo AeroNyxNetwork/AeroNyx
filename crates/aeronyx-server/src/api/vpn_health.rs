@@ -25,7 +25,8 @@ use tokio::time::timeout;
 
 use crate::config::ServerConfig;
 use crate::services::{
-    NodePolicyEnforcementSnapshot, NodePolicyRuntime, NodePolicySnapshot, SessionManager,
+    NodePolicyEnforcementSnapshot, NodePolicyPlacementSnapshot, NodePolicyRuntime,
+    NodePolicySnapshot, SessionManager,
 };
 use crate::services::session::CLIENT_LIVENESS_TIMEOUT_SECS;
 use crate::voucher_verifier::{VoucherMetricsSnapshot, VoucherVerifier};
@@ -91,6 +92,7 @@ struct VpnHealthResponse {
     service_manager: ServiceManagerStatus,
     node_policy: NodePolicySnapshot,
     policy_enforcement: NodePolicyEnforcementSnapshot,
+    placement_readiness: NodePolicyPlacementSnapshot,
     voucher_metrics: VoucherMetricsSnapshot,
     encrypted_message_forwarding: EncryptedMessageForwardingStatus,
     session_cleanup: SessionCleanupStatus,
@@ -263,6 +265,9 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         "failed"
     };
 
+    let active_sessions = state.sessions.count();
+    let active_wallet_devices = state.sessions.wallet_index_count();
+
     VpnHealthResponse {
         status,
         checked_at: unix_now_secs(),
@@ -272,11 +277,12 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         tun_device,
         configured_mtu,
         running_mtu,
-        active_sessions: state.sessions.count(),
-        active_wallet_devices: state.sessions.wallet_index_count(),
+        active_sessions,
+        active_wallet_devices,
         service_manager,
         node_policy: state.node_policy.snapshot(),
         policy_enforcement: state.node_policy.enforcement_snapshot(),
+        placement_readiness: state.node_policy.placement_snapshot(active_sessions),
         voucher_metrics: state.voucher_verifier.metrics_snapshot(),
         encrypted_message_forwarding: EncryptedMessageForwardingStatus {
             count: state.encrypted_message_counter.load(Ordering::Relaxed),
@@ -337,6 +343,7 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
             "service_manager": vpn_health.service_manager,
             "encrypted_message_forwarding": vpn_health.encrypted_message_forwarding,
             "session_cleanup": vpn_health.session_cleanup,
+            "placement_readiness": vpn_health.placement_readiness,
             "failed_checks": vpn_health.checks.iter().filter(|check| !check.ok).count(),
             "runtime_rollout": runtime_rollout.clone(),
         }),

@@ -6,6 +6,11 @@
 //! The CMS sends `node_policy` in every heartbeat response. This module keeps a
 //! local copy for the hot VPN paths so handshake and packet handling can enforce
 //! nodeboard Settings without SSH or process restart.
+//!
+//! Commercial placement readiness is also computed here because the Rust node
+//! is the authoritative runtime for maintenance mode, max_sessions, and the
+//! node-wide bandwidth limiter. Nodeboard and the CMS should render this
+//! aggregate decision instead of re-implementing admission policy.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -80,6 +85,43 @@ pub struct NodePolicyEnforcementSnapshot {
     pub last_rejection_at: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+/// Privacy-safe runtime admission summary for commercial placement.
+pub struct NodePolicyPlacementSnapshot {
+    /// True when this node can accept a new VPN session under local policy.
+    pub accepting_new_sessions: bool,
+    /// Compact machine status for backend and nodeboard placement triage.
+    pub status: String,
+    /// Primary admission reason: accepting, maintenance_mode, or max_sessions.
+    pub reason: String,
+    /// Operator-facing detail safe for heartbeat and nodeboard.
+    pub detail: String,
+    /// Current active VPN sessions on this Rust process.
+    pub active_sessions: usize,
+    /// Operator configured max sessions; zero means unlimited.
+    pub max_sessions: u32,
+    /// Remaining bounded session slots; null means unlimited.
+    pub session_capacity_remaining: Option<u32>,
+    /// Bounded session usage percent; null means unlimited.
+    pub session_capacity_used_percent: Option<f64>,
+    /// Whether nodeboard maintenance mode is active locally.
+    pub maintenance_mode: bool,
+    /// Operator configured bandwidth cap; zero means unlimited.
+    pub bandwidth_limit_mbps: u32,
+    /// Current bandwidth cap in bytes per second; zero means unlimited.
+    pub bandwidth_limit_bytes_per_second: u64,
+    /// Bytes already admitted in the active one-second limiter window.
+    pub bandwidth_window_bytes: u64,
+    /// Current one-second limiter usage percent; null means unlimited.
+    pub bandwidth_window_used_percent: Option<f64>,
+    /// Compact traffic-capacity status for backend commercial placement UI.
+    pub traffic_capacity_status: String,
+    /// Source path for backend/nodeboard contract tracing.
+    pub source: &'static str,
+    /// Explicit privacy boundary for heartbeat consumers.
+    pub privacy_boundary: &'static str,
+}
+
 #[derive(Debug)]
 struct PolicyEnforcementStats {
     counters_started_at: u64,
@@ -149,6 +191,94 @@ impl NodePolicyRuntime {
             bandwidth_window_bytes: window_bytes,
             last_rejection_reason: stats.last_rejection_reason.map(str::to_string),
             last_rejection_at: stats.last_rejection_at,
+        }
+    }
+
+    #[must_use]
+    /// Return the local runtime decision for admitting new commercial traffic.
+    pub fn placement_snapshot(&self, active_sessions: usize) -> NodePolicyPlacementSnapshot {
+        let policy = self.policy.read().clone();
+        let limit_bytes_per_second = bandwidth_limit_bytes_per_second(policy.bandwidth_limit_mbps);
+        let bandwidth_window_bytes = {
+            let window = self.bandwidth.lock();
+            if window.started_at.elapsed() < Duration::from_secs(1) {
+                window.bytes
+            } else {
+                0
+            }
+        };
+        let session_capacity_remaining = if policy.max_sessions > 0 {
+            Some((policy.max_sessions as usize).saturating_sub(active_sessions) as u32)
+        } else {
+            None
+        };
+        let session_capacity_used_percent = if policy.max_sessions > 0 {
+            Some(round_percent((active_sessions as f64 / policy.max_sessions as f64) * 100.0))
+        } else {
+            None
+        };
+        let bandwidth_window_used_percent = if limit_bytes_per_second > 0 {
+            Some(round_percent((bandwidth_window_bytes as f64 / limit_bytes_per_second as f64) * 100.0))
+        } else {
+            None
+        };
+        let traffic_capacity_status = if limit_bytes_per_second == 0 {
+            "unlimited"
+        } else if bandwidth_window_bytes >= limit_bytes_per_second {
+            "saturated"
+        } else if bandwidth_window_used_percent.unwrap_or(0.0) >= 80.0 {
+            "near_limit"
+        } else {
+            "available"
+        };
+        let (accepting_new_sessions, status, reason, detail) = if policy.maintenance_mode {
+            (
+                false,
+                "blocked",
+                "maintenance_mode",
+                "Maintenance mode is enabled; new VPN handshakes are rejected while existing sessions can drain.".to_string(),
+            )
+        } else if policy.max_sessions > 0 && active_sessions >= policy.max_sessions as usize {
+            (
+                false,
+                "blocked",
+                "max_sessions",
+                format!(
+                    "Active sessions ({}) reached max_sessions ({}); new handshakes are rejected.",
+                    active_sessions, policy.max_sessions
+                ),
+            )
+        } else {
+            (
+                true,
+                if traffic_capacity_status == "near_limit" { "watch" } else { "accepting" },
+                "accepting",
+                "Node policy allows new VPN handshakes under the current maintenance and session limits.".to_string(),
+            )
+        };
+
+        NodePolicyPlacementSnapshot {
+            accepting_new_sessions,
+            status: status.to_string(),
+            reason: reason.to_string(),
+            detail,
+            active_sessions,
+            max_sessions: policy.max_sessions,
+            session_capacity_remaining,
+            session_capacity_used_percent,
+            maintenance_mode: policy.maintenance_mode,
+            bandwidth_limit_mbps: policy.bandwidth_limit_mbps,
+            bandwidth_limit_bytes_per_second: limit_bytes_per_second,
+            bandwidth_window_bytes,
+            bandwidth_window_used_percent,
+            traffic_capacity_status: traffic_capacity_status.to_string(),
+            source: "/root/open/AeroNyx/crates/aeronyx-server/src/services/node_policy.rs",
+            privacy_boundary: concat!(
+                "aggregate node policy and capacity state only; no client ",
+                "public IPs, destinations, DNS contents, packet payloads, ",
+                "domains, URLs, browsing history, voucher secrets, or ",
+                "wallet-level traffic"
+            ),
         }
     }
 
@@ -227,9 +357,67 @@ fn bandwidth_limit_bytes_per_second(limit_mbps: u32) -> u64 {
     (limit_mbps as u64).saturating_mul(1_000_000) / 8
 }
 
+fn round_percent(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
 fn unix_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NodePolicyRuntime, NodePolicySnapshot};
+
+    #[test]
+    fn placement_snapshot_blocks_maintenance_mode() {
+        let runtime = NodePolicyRuntime::default();
+        runtime.update(NodePolicySnapshot {
+            maintenance_mode: true,
+            max_sessions: 10,
+            bandwidth_limit_mbps: 0,
+            ..NodePolicySnapshot::default()
+        });
+
+        let snapshot = runtime.placement_snapshot(1);
+
+        assert!(!snapshot.accepting_new_sessions);
+        assert_eq!(snapshot.status, "blocked");
+        assert_eq!(snapshot.reason, "maintenance_mode");
+        assert_eq!(snapshot.session_capacity_remaining, Some(9));
+    }
+
+    #[test]
+    fn placement_snapshot_blocks_full_max_sessions() {
+        let runtime = NodePolicyRuntime::default();
+        runtime.update(NodePolicySnapshot {
+            max_sessions: 2,
+            bandwidth_limit_mbps: 100,
+            ..NodePolicySnapshot::default()
+        });
+
+        let snapshot = runtime.placement_snapshot(2);
+
+        assert!(!snapshot.accepting_new_sessions);
+        assert_eq!(snapshot.status, "blocked");
+        assert_eq!(snapshot.reason, "max_sessions");
+        assert_eq!(snapshot.session_capacity_remaining, Some(0));
+        assert_eq!(snapshot.session_capacity_used_percent, Some(100.0));
+    }
+
+    #[test]
+    fn placement_snapshot_accepts_unlimited_sessions() {
+        let runtime = NodePolicyRuntime::default();
+
+        let snapshot = runtime.placement_snapshot(128);
+
+        assert!(snapshot.accepting_new_sessions);
+        assert_eq!(snapshot.status, "accepting");
+        assert_eq!(snapshot.reason, "accepting");
+        assert_eq!(snapshot.session_capacity_remaining, None);
+        assert_eq!(snapshot.session_capacity_used_percent, None);
+    }
 }
