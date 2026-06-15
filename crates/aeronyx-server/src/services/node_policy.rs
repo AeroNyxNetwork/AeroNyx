@@ -60,6 +60,8 @@ impl Default for BandwidthWindow {
 #[derive(Debug, Clone, Default, Serialize)]
 /// Privacy-safe aggregate counters for operator policy enforcement.
 pub struct NodePolicyEnforcementSnapshot {
+    /// Unix timestamp when these in-process enforcement counters started.
+    pub counters_started_at: u64,
     /// New handshakes rejected while maintenance mode was enabled.
     pub maintenance_rejections: u64,
     /// New handshakes rejected because active sessions reached max_sessions.
@@ -78,14 +80,29 @@ pub struct NodePolicyEnforcementSnapshot {
     pub last_rejection_at: Option<u64>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PolicyEnforcementStats {
+    counters_started_at: u64,
     maintenance_rejections: u64,
     max_sessions_rejections: u64,
     bandwidth_drops: u64,
     bandwidth_drop_bytes: u64,
     last_rejection_reason: Option<&'static str>,
     last_rejection_at: Option<u64>,
+}
+
+impl Default for PolicyEnforcementStats {
+    fn default() -> Self {
+        Self {
+            counters_started_at: unix_now_secs(),
+            maintenance_rejections: 0,
+            max_sessions_rejections: 0,
+            bandwidth_drops: 0,
+            bandwidth_drop_bytes: 0,
+            last_rejection_reason: None,
+            last_rejection_at: None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -123,6 +140,7 @@ impl NodePolicyRuntime {
         };
         let stats = self.enforcement.lock();
         NodePolicyEnforcementSnapshot {
+            counters_started_at: stats.counters_started_at,
             maintenance_rejections: stats.maintenance_rejections,
             max_sessions_rejections: stats.max_sessions_rejections,
             bandwidth_drops: stats.bandwidth_drops,
