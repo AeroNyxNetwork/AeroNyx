@@ -503,7 +503,7 @@ impl SessionStats {
 /// Pending tunnel keepalive probes for one session.
 ///
 /// Source path:
-///   /root/a/AeroNyx/crates/aeronyx-server/src/services/session.rs
+///   /root/open/AeroNyx/crates/aeronyx-server/src/services/session.rs
 ///
 /// Rust sends privacy-safe ICMP Echo probes inside the VPN tunnel and records
 /// Echo Reply latency here. The probes target only the assigned virtual IP and

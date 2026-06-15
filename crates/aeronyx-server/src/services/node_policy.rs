@@ -1,7 +1,7 @@
 //! Runtime node operator policy.
 //!
 //! Source path:
-//!   /root/a/AeroNyx/crates/aeronyx-server/src/services/node_policy.rs
+//!   /root/open/AeroNyx/crates/aeronyx-server/src/services/node_policy.rs
 //!
 //! The CMS sends `node_policy` in every heartbeat response. This module keeps a
 //! local copy for the hot VPN paths so handshake and packet handling can enforce
@@ -66,6 +66,12 @@ pub struct NodePolicyEnforcementSnapshot {
     pub max_sessions_rejections: u64,
     /// VPN packets rejected by the node-wide bandwidth limiter.
     pub bandwidth_drops: u64,
+    /// Total plaintext VPN bytes rejected by the node-wide bandwidth limiter.
+    pub bandwidth_drop_bytes: u64,
+    /// Current node-wide limiter in bytes per second; zero means unlimited.
+    pub bandwidth_limit_bytes_per_second: u64,
+    /// Bytes already admitted in the active one-second limiter window.
+    pub bandwidth_window_bytes: u64,
     /// Last policy reason that rejected a handshake or packet.
     pub last_rejection_reason: Option<String>,
     /// Unix timestamp of the last policy rejection.
@@ -77,6 +83,7 @@ struct PolicyEnforcementStats {
     maintenance_rejections: u64,
     max_sessions_rejections: u64,
     bandwidth_drops: u64,
+    bandwidth_drop_bytes: u64,
     last_rejection_reason: Option<&'static str>,
     last_rejection_at: Option<u64>,
 }
@@ -104,11 +111,24 @@ impl NodePolicyRuntime {
     #[must_use]
     /// Return privacy-safe aggregate policy enforcement counters.
     pub fn enforcement_snapshot(&self) -> NodePolicyEnforcementSnapshot {
+        let limit_mbps = self.policy.read().bandwidth_limit_mbps;
+        let limit_bytes_per_second = bandwidth_limit_bytes_per_second(limit_mbps);
+        let window_bytes = {
+            let window = self.bandwidth.lock();
+            if window.started_at.elapsed() < Duration::from_secs(1) {
+                window.bytes
+            } else {
+                0
+            }
+        };
         let stats = self.enforcement.lock();
         NodePolicyEnforcementSnapshot {
             maintenance_rejections: stats.maintenance_rejections,
             max_sessions_rejections: stats.max_sessions_rejections,
             bandwidth_drops: stats.bandwidth_drops,
+            bandwidth_drop_bytes: stats.bandwidth_drop_bytes,
+            bandwidth_limit_bytes_per_second: limit_bytes_per_second,
+            bandwidth_window_bytes: window_bytes,
             last_rejection_reason: stats.last_rejection_reason.map(str::to_string),
             last_rejection_at: stats.last_rejection_at,
         }
@@ -128,7 +148,7 @@ impl NodePolicyRuntime {
         };
 
         if let Some(reason) = rejection {
-            self.record_rejection(reason);
+            self.record_rejection(reason, 0);
             return Err(reason);
         }
 
@@ -142,9 +162,10 @@ impl NodePolicyRuntime {
             return true;
         }
 
-        let limit_bytes_per_sec = (limit_mbps as u64).saturating_mul(1_000_000) / 8;
+        let rejected_bytes = bytes as u64;
+        let limit_bytes_per_sec = bandwidth_limit_bytes_per_second(limit_mbps);
         if limit_bytes_per_sec == 0 {
-            self.record_rejection("bandwidth_limit_mbps");
+            self.record_rejection("bandwidth_limit_mbps", rejected_bytes);
             return false;
         }
 
@@ -156,7 +177,7 @@ impl NodePolicyRuntime {
 
         let next = window.bytes.saturating_add(bytes as u64);
         if next > limit_bytes_per_sec {
-            self.record_rejection("bandwidth_limit_mbps");
+            self.record_rejection("bandwidth_limit_mbps", rejected_bytes);
             return false;
         }
 
@@ -164,7 +185,7 @@ impl NodePolicyRuntime {
         true
     }
 
-    fn record_rejection(&self, reason: &'static str) {
+    fn record_rejection(&self, reason: &'static str, rejected_bytes: u64) {
         let mut stats = self.enforcement.lock();
         match reason {
             "maintenance_mode" => {
@@ -175,12 +196,17 @@ impl NodePolicyRuntime {
             }
             "bandwidth_limit_mbps" => {
                 stats.bandwidth_drops = stats.bandwidth_drops.saturating_add(1);
+                stats.bandwidth_drop_bytes = stats.bandwidth_drop_bytes.saturating_add(rejected_bytes);
             }
             _ => {}
         }
         stats.last_rejection_reason = Some(reason);
         stats.last_rejection_at = Some(unix_now_secs());
     }
+}
+
+fn bandwidth_limit_bytes_per_second(limit_mbps: u32) -> u64 {
+    (limit_mbps as u64).saturating_mul(1_000_000) / 8
 }
 
 fn unix_now_secs() -> u64 {

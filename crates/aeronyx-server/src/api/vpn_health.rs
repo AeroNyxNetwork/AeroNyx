@@ -166,7 +166,7 @@ async fn node_operator_status_handler(State(state): State<VpnHealthState>) -> im
 /// Collect privacy-safe VPN node health as JSON for the CMS heartbeat.
 ///
 /// Source path:
-///   /root/a/AeroNyx/crates/aeronyx-server/src/api/vpn_health.rs
+///   /root/open/AeroNyx/crates/aeronyx-server/src/api/vpn_health.rs
 ///
 /// The payload contains only local node diagnostics such as UDP listener, TUN,
 /// MTU, NAT, DNS stub/query, egress reachability, and aggregate counters. It

@@ -71,7 +71,7 @@ pub type MemChainStatusFn = Box<dyn Fn() -> Option<MemChainHeartbeatStatus> + Se
 /// Async VPN health probe injected by server startup.
 ///
 /// Source path:
-///   /root/a/AeroNyx/crates/aeronyx-server/src/management/reporter.rs
+///   /root/open/AeroNyx/crates/aeronyx-server/src/management/reporter.rs
 ///
 /// The probe returns privacy-safe node diagnostics for heartbeat
 /// `system_stats.vpn_health`.

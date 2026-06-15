@@ -237,7 +237,7 @@ impl PacketHandler {
         // Maintenance drain must be based on authenticated client liveness.
         //
         // Source path:
-        //   /root/a/AeroNyx/crates/aeronyx-server/src/handlers/packet.rs
+        //   /root/open/AeroNyx/crates/aeronyx-server/src/handlers/packet.rs
         //
         // Backend / nodeboard consumers:
         //   POST /api/privacy_network/node/sessions/report/
@@ -479,7 +479,7 @@ impl PacketHandler {
     /// Builds an encrypted in-tunnel ICMP Echo Request for RTT measurement.
     ///
     /// Source path:
-    ///   /root/a/AeroNyx/crates/aeronyx-server/src/handlers/packet.rs
+    ///   /root/open/AeroNyx/crates/aeronyx-server/src/handlers/packet.rs
     ///
     /// This is an operational keepalive probe, not user traffic. It is sent only
     /// to the session's assigned virtual IP and therefore does not reveal user
