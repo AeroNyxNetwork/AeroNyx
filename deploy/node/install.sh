@@ -41,6 +41,7 @@
 #   development/client platforms, not production node hosts for this script.
 #
 # Last Modified:
+# v1.3.0-node-deploy - Added --preflight-only for install readiness checks.
 # v1.2.0-node-deploy - Added production preflight checks for host readiness.
 # v1.1.1-node-deploy - Only checks/installs Rust when release build is enabled.
 # v1.1.0-node-deploy - Added --skip-package-install and made --config-only avoid
@@ -73,6 +74,7 @@ INSTALL_RUST=1
 INSTALL_PACKAGES=1
 DRY_RUN=0
 CONFIG_ONLY=0
+PREFLIGHT_ONLY=0
 
 log() { printf '[INFO] %s\n' "$*"; }
 ok() { printf '[OK] %s\n' "$*"; }
@@ -96,6 +98,7 @@ Options:
   --skip-package-install  Do not install OS packages automatically.
   --skip-rust-install     Do not install Rust automatically if cargo is missing.
   --config-only           Only create config/env directories and server.toml if missing.
+  --preflight-only        Run production readiness checks and exit.
   --dry-run               Print actions without changing the host.
   -h, --help              Show this help.
 
@@ -118,6 +121,7 @@ while [ "$#" -gt 0 ]; do
         --skip-package-install) INSTALL_PACKAGES=0; shift ;;
         --skip-rust-install) INSTALL_RUST=0; shift ;;
         --config-only) CONFIG_ONLY=1; DO_BUILD=0; DO_NETWORK=0; DO_START=0; DO_ENABLE=0; INSTALL_PACKAGES=0; INSTALL_RUST=0; shift ;;
+        --preflight-only) PREFLIGHT_ONLY=1; DO_BUILD=0; DO_NETWORK=0; DO_START=0; DO_ENABLE=0; INSTALL_PACKAGES=0; INSTALL_RUST=0; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "Unknown option: $1" ;;
@@ -398,6 +402,10 @@ main() {
     require_root
     require_linux_systemd
     preflight_checks
+    if [ "${PREFLIGHT_ONLY}" -eq 1 ]; then
+        ok "Preflight-only checks complete."
+        exit 0
+    fi
     install_packages
     if [ "${DO_BUILD}" -eq 1 ]; then
         install_rust_if_needed

@@ -84,6 +84,12 @@ checks for:
 - disk space
 - common AeroNyx ports `51820` and `8421`
 
+Run preflight only:
+
+```bash
+sudo ./deploy/node/install.sh --repo-dir /opt/aeronyx/AeroNyx --preflight-only
+```
+
 ## Upgrade
 
 ```bash
@@ -107,6 +113,12 @@ fails, `upgrade.sh` restores the previous release binary from
 
 ```bash
 ./deploy/node/healthcheck.sh --repo-dir /opt/aeronyx/AeroNyx
+```
+
+Machine-readable output for nodeboard or automation:
+
+```bash
+./deploy/node/healthcheck.sh --repo-dir /opt/aeronyx/AeroNyx --json-only
 ```
 
 The healthcheck prints:

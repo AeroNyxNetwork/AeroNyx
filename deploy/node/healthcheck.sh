@@ -13,6 +13,7 @@
 # - Checks repository, binary, config, registration state, systemd status,
 #   host capacity, IP forwarding, NAT hints, local VPN health endpoint, and
 #   capacity telemetry.
+# - Emits machine-readable JSON for nodeboard or support automation.
 #
 # Dependencies:
 # - /etc/aeronyx/server.toml
@@ -32,6 +33,7 @@
 # - This script should never modify host state.
 #
 # Last Modified:
+# v1.2.0-node-deploy - Added full checks[] JSON output and --json-only mode.
 # v1.1.0-node-deploy - Added host capacity, TUN, route, disk, and port checks.
 # v1.0.0-node-deploy - Added production node healthcheck.
 # ============================================
@@ -42,6 +44,9 @@ REPO_DIR="/opt/aeronyx/AeroNyx"
 CONFIG_FILE="/etc/aeronyx/server.toml"
 SERVICE_NAME="aeronyx-server"
 JSON=0
+JSON_ONLY=0
+CHECK_LOG="$(mktemp)"
+trap 'rm -f "${CHECK_LOG}"' EXIT
 
 usage() {
     cat <<'USAGE'
@@ -52,7 +57,8 @@ Options:
   --repo-dir PATH   Repository path. Default: /opt/aeronyx/AeroNyx
   --config PATH     Config path. Default: /etc/aeronyx/server.toml
   --service NAME    systemd service name. Default: aeronyx-server
-  --json            Emit compact JSON summary when python3 is available.
+  --json            Emit JSON summary as the final output line.
+  --json-only       Emit only JSON, suitable for nodeboard automation.
   -h, --help        Show this help.
 USAGE
 }
@@ -63,6 +69,7 @@ while [ "$#" -gt 0 ]; do
         --config) CONFIG_FILE="${2:?missing value}"; shift 2 ;;
         --service) SERVICE_NAME="${2:?missing value}"; shift 2 ;;
         --json) JSON=1; shift ;;
+        --json-only) JSON=1; JSON_ONLY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) printf '[ERROR] Unknown option: %s\n' "$1" >&2; exit 1 ;;
     esac
@@ -72,9 +79,29 @@ PASS=0
 WARN=0
 FAIL=0
 
-pass() { PASS=$((PASS + 1)); printf '[PASS] %s\n' "$*"; }
-warn() { WARN=$((WARN + 1)); printf '[WARN] %s\n' "$*" >&2; }
-fail() { FAIL=$((FAIL + 1)); printf '[FAIL] %s\n' "$*" >&2; }
+record_check() {
+    local status="$1"
+    shift
+    printf '%s\t%s\n' "${status}" "$*" >> "${CHECK_LOG}"
+}
+
+pass() {
+    PASS=$((PASS + 1))
+    record_check "pass" "$*"
+    [ "${JSON_ONLY}" -eq 1 ] || printf '[PASS] %s\n' "$*"
+}
+
+warn() {
+    WARN=$((WARN + 1))
+    record_check "warn" "$*"
+    [ "${JSON_ONLY}" -eq 1 ] || printf '[WARN] %s\n' "$*" >&2
+}
+
+fail() {
+    FAIL=$((FAIL + 1))
+    record_check "fail" "$*"
+    [ "${JSON_ONLY}" -eq 1 ] || printf '[FAIL] %s\n' "$*" >&2
+}
 
 check_file() {
     local path="$1" label="$2"
@@ -240,7 +267,7 @@ check_health_endpoint() {
     tmp="$(mktemp)"
     if curl -fsS --max-time 5 http://127.0.0.1:8421/api/vpn/health >"${tmp}" 2>/dev/null; then
         pass "local VPN health endpoint"
-        if command -v python3 >/dev/null 2>&1; then
+        if [ "${JSON_ONLY}" -eq 0 ] && command -v python3 >/dev/null 2>&1; then
             python3 - "${tmp}" <<'PY'
 import json
 import sys
@@ -285,9 +312,30 @@ emit_json_summary() {
         return 0
     fi
     if command -v python3 >/dev/null 2>&1; then
-        python3 - <<PY
+        python3 - "${CHECK_LOG}" <<PY
 import json
-print(json.dumps({"pass": ${PASS}, "warn": ${WARN}, "fail": ${FAIL}}, separators=(",", ":")))
+import sys
+from datetime import datetime, timezone
+
+checks = []
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    for line in handle:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        status, _, message = line.partition("\t")
+        checks.append({"status": status, "message": message})
+
+print(json.dumps({
+    "success": ${FAIL} == 0,
+    "summary": {"pass": ${PASS}, "warn": ${WARN}, "fail": ${FAIL}},
+    "repo_dir": "${REPO_DIR}",
+    "config": "${CONFIG_FILE}",
+    "service": "${SERVICE_NAME}",
+    "checks": checks,
+    "privacy_boundary": "diagnostics only; no private keys, registration secrets, client public IPs, destinations, DNS contents, packet payloads, or wallet-level traffic",
+    "generated_at": datetime.now(timezone.utc).isoformat(),
+}, separators=(",", ":")))
 PY
     fi
 }
@@ -301,7 +349,7 @@ main() {
     check_network
     check_health_endpoint
 
-    printf '[SUMMARY] pass=%s warn=%s fail=%s\n' "${PASS}" "${WARN}" "${FAIL}"
+    [ "${JSON_ONLY}" -eq 1 ] || printf '[SUMMARY] pass=%s warn=%s fail=%s\n' "${PASS}" "${WARN}" "${FAIL}"
     emit_json_summary
     [ "${FAIL}" -eq 0 ]
 }
