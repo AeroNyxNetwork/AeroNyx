@@ -13,7 +13,7 @@ Modification Reason:
   shared node-local deployment locking, and install-time systemd unit
   verification, purge path safety, service-name validation, and release-backup
   retention/diagnostics, plus network restore command-path portability and unit
-  verification.
+  verification/synchronization.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -39,6 +39,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.12.0-node-deploy - Documented upgrade-time network restore synchronization.
 v1.11.0-node-deploy - Documented network restore unit verification.
 v1.10.0-node-deploy - Documented structured network restore command diagnostics.
 v1.9.0-node-deploy - Documented portable network restore command paths.
@@ -137,10 +138,11 @@ Only one install or upgrade can run on the same node at a time. The script takes
 the shared node-local deployment lock before pulling, building, replacing the
 systemd unit, or restarting the service.
 
-During restart upgrades, the script also renders
-`deploy/node/aeronyx-server.service` into the installed systemd unit and
-verifies it with `systemd-analyze verify` before restarting. This keeps live
-nodes aligned with the production hardening profile shipped in Git.
+During upgrades, the script also renders `deploy/node/aeronyx-server.service`
+into the installed systemd unit and verifies it with `systemd-analyze verify`
+before restarting. When persisted iptables rules exist, it also regenerates and
+verifies `aeronyx-network-restore.service` so existing nodes receive reboot
+recovery improvements without a full reinstall.
 
 Build and validate without restarting:
 
@@ -154,13 +156,19 @@ Keep the currently installed systemd unit while upgrading the binary:
 sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --skip-unit-update
 ```
 
+Keep the currently installed network restore unit:
+
+```bash
+sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --skip-network-restore-update
+```
+
 Post-restart health is polled automatically. If restart or health verification
 fails, `upgrade.sh` restores both the previous systemd unit and previous release
 binary from `/var/lib/aeronyx/releases`, then restarts the service again.
 
 After a successful upgrade, old backups in `/var/lib/aeronyx/releases` are
-pruned per backup type. The default keeps the latest 10 binary backups and the
-latest 10 systemd unit backups:
+pruned per backup type. The default keeps the latest 10 binary backups, latest
+10 main systemd unit backups, and latest 10 network restore unit backups:
 
 ```bash
 sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --keep-releases 20

@@ -12,6 +12,8 @@
 #   validating operator-provided service names.
 # - Add release-backup retention so long-running production nodes do not keep
 #   unlimited binary/unit backups.
+# - Sync the generated network restore unit on upgrade so existing nodes receive
+#   reboot-recovery improvements without a full reinstall.
 #
 # Main Functionality:
 # - Pulls the configured branch.
@@ -19,6 +21,7 @@
 # - Builds aeronyx-server release binary.
 # - Validates /etc/aeronyx/server.toml.
 # - Syncs the repository systemd unit template before restart.
+# - Syncs the generated network restore unit when persisted NAT rules exist.
 # - Checks active VPN sessions before restart.
 # - Restarts systemd service and verifies post-upgrade health.
 # - Restores the previous systemd unit and binary if restart or health
@@ -35,8 +38,8 @@
 # 2. Update repo from Git.
 # 3. Build and validate the release binary.
 # 4. Restart only when no active sessions are present, unless --force is used.
-# 5. Sync and verify the systemd unit template.
-# 6. Verify local health and roll back the unit/binary if restart health fails.
+# 5. Sync and verify the systemd unit template and network restore unit.
+# 6. Verify local health and roll back the units/binary if restart health fails.
 # 7. Prune old release backups after success.
 #
 # Important Note for Next Developer:
@@ -47,8 +50,12 @@
 # - Reject service names that look like paths or command-line options.
 # - Do not prune release backups until the upgrade path has completed
 #   successfully.
+# - Do not create the network restore unit unless persisted iptables rules
+#   already exist.
 #
 # Last Modified:
+# v1.7.0-node-deploy - Syncs the generated network restore systemd unit during
+#                      upgrades when persisted NAT rules are present.
 # v1.6.0-node-deploy - Added configurable release-backup retention pruning
 #                      after successful upgrades.
 # v1.5.0-node-deploy - Validates --service names before systemd, lock, or unit
@@ -74,16 +81,22 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"
 LOCK_DIR=""
 RELEASE_DIR="/var/lib/aeronyx/releases"
+NETWORK_RESTORE_SERVICE="aeronyx-network-restore.service"
+NETWORK_RESTORE_FILE="/etc/systemd/system/${NETWORK_RESTORE_SERVICE}"
+SYSCTL_FILE="/etc/sysctl.d/99-aeronyx.conf"
+IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
 FORCE=0
 DRY_RUN=0
 SKIP_PULL=0
 SKIP_UNIT_UPDATE=0
+SKIP_NETWORK_RESTORE_UPDATE=0
 NO_RESTART=0
 KEEP_RELEASES=10
 HEALTH_RETRIES=10
 HEALTH_DELAY=2
 BACKUP_BINARY=""
 BACKUP_SERVICE_FILE=""
+BACKUP_NETWORK_RESTORE_FILE=""
 
 log() { printf '[INFO] %s\n' "$*"; }
 ok() { printf '[OK] %s\n' "$*"; }
@@ -104,6 +117,8 @@ Options:
   --no-restart        Build and validate only; do not restart the service.
   --skip-pull         Build the currently checked out source.
   --skip-unit-update  Do not render/install deploy/node/aeronyx-server.service.
+  --skip-network-restore-update
+                      Do not render/install aeronyx-network-restore.service.
   --keep-releases N   Keep latest N binary/unit backups after success. Default: 10
   --health-retries N  Health polling attempts after restart. Default: 10
   --health-delay N    Seconds between health polling attempts. Default: 2
@@ -122,6 +137,7 @@ while [ "$#" -gt 0 ]; do
         --no-restart) NO_RESTART=1; shift ;;
         --skip-pull) SKIP_PULL=1; shift ;;
         --skip-unit-update) SKIP_UNIT_UPDATE=1; shift ;;
+        --skip-network-restore-update) SKIP_NETWORK_RESTORE_UPDATE=1; shift ;;
         --keep-releases) KEEP_RELEASES="${2:?missing value}"; shift 2 ;;
         --health-retries) HEALTH_RETRIES="${2:?missing value}"; shift 2 ;;
         --health-delay) HEALTH_DELAY="${2:?missing value}"; shift 2 ;;
@@ -157,6 +173,14 @@ validate_service_name() {
 validate_keep_releases() {
     printf '%s' "${KEEP_RELEASES}" | grep -Eq '^[1-9][0-9]*$' \
         || die "--keep-releases must be a positive integer."
+}
+
+resolve_command_path() {
+    local cmd="$1"
+    local path
+    path="$(command -v "${cmd}" 2>/dev/null || true)"
+    [ -n "${path}" ] || die "Required command not found: ${cmd}"
+    printf '%s\n' "${path}"
 }
 
 release_lock() {
@@ -308,6 +332,104 @@ rollback_service_unit() {
     run systemctl daemon-reload
 }
 
+backup_current_network_restore_unit() {
+    local stamp
+    [ -f "${NETWORK_RESTORE_FILE}" ] || return
+
+    stamp="$(date -u +%Y%m%d_%H%M%S)"
+    BACKUP_NETWORK_RESTORE_FILE="${RELEASE_DIR}/${NETWORK_RESTORE_SERVICE}.${stamp}"
+    run mkdir -p "${RELEASE_DIR}"
+    run cp "${NETWORK_RESTORE_FILE}" "${BACKUP_NETWORK_RESTORE_FILE}"
+    ok "Current network restore unit backed up to ${BACKUP_NETWORK_RESTORE_FILE}"
+}
+
+render_network_restore_unit_file() {
+    local output_file="$1"
+    local sysctl_path="$2"
+    local iptables_restore_path="$3"
+
+    cat > "${output_file}" <<SERVICE
+# ============================================
+# File: /etc/systemd/system/${NETWORK_RESTORE_SERVICE}
+# ============================================
+# Creation Reason:
+# - Restore AeroNyx VPN forwarding/NAT rules on host boot.
+#
+# Main Functionality:
+# - Applies sysctl forwarding from ${SYSCTL_FILE}.
+# - Restores iptables rules from ${IPTABLES_RULES_FILE}.
+#
+# Important Note for Next Developer:
+# - This service is generated by deploy/node/upgrade.sh.
+# - It does not inspect or log client traffic, DNS contents, destinations, or
+#   packet payloads.
+# ============================================
+
+[Unit]
+Description=AeroNyx VPN network restore
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+ConditionPathExists=${IPTABLES_RULES_FILE}
+
+[Service]
+Type=oneshot
+ExecStart=${sysctl_path} -w net.ipv4.ip_forward=1
+ExecStart=${iptables_restore_path} ${IPTABLES_RULES_FILE}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+}
+
+sync_network_restore_unit() {
+    local sysctl_path iptables_restore_path rendered
+    [ "${SKIP_NETWORK_RESTORE_UPDATE}" -eq 0 ] || { ok "Network restore unit update skipped"; return; }
+
+    if [ ! -f "${IPTABLES_RULES_FILE}" ]; then
+        ok "Network restore unit update skipped; persisted iptables rules absent: ${IPTABLES_RULES_FILE}"
+        return
+    fi
+
+    sysctl_path="$(resolve_command_path sysctl)"
+    iptables_restore_path="$(resolve_command_path iptables-restore)"
+    rendered="/tmp/aeronyx-network-restore.upgrade.service"
+
+    log "Rendering network restore unit to ${NETWORK_RESTORE_FILE}"
+    backup_current_network_restore_unit
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] network restore commands: sysctl=%s iptables-restore=%s\n' "${sysctl_path}" "${iptables_restore_path}"
+        printf '[DRY-RUN] render network restore unit to %s\n' "${NETWORK_RESTORE_FILE}"
+        printf '[DRY-RUN] systemd-analyze verify %s\n' "${rendered}"
+        printf '[DRY-RUN] systemctl enable %s\n' "${NETWORK_RESTORE_SERVICE}"
+        return
+    fi
+
+    render_network_restore_unit_file "${rendered}" "${sysctl_path}" "${iptables_restore_path}"
+    systemd-analyze verify "${rendered}"
+    cp "${rendered}" "${NETWORK_RESTORE_FILE}"
+    chmod 644 "${NETWORK_RESTORE_FILE}"
+    systemctl daemon-reload
+    systemctl enable "${NETWORK_RESTORE_SERVICE}"
+}
+
+rollback_network_restore_unit() {
+    if [ -z "${BACKUP_NETWORK_RESTORE_FILE}" ]; then
+        warn "Network restore unit rollback skipped; no backup unit path recorded."
+        return 0
+    fi
+    if [ "${DRY_RUN}" -eq 0 ] && [ ! -f "${BACKUP_NETWORK_RESTORE_FILE}" ]; then
+        warn "Network restore unit rollback skipped; backup missing: ${BACKUP_NETWORK_RESTORE_FILE}"
+        return 1
+    fi
+
+    warn "Rolling back network restore unit: ${BACKUP_NETWORK_RESTORE_FILE}"
+    run cp "${BACKUP_NETWORK_RESTORE_FILE}" "${NETWORK_RESTORE_FILE}"
+    run systemctl daemon-reload
+}
+
 health_endpoint_ok() {
     command -v curl >/dev/null 2>&1 || return 1
     curl -fsS --max-time 5 http://127.0.0.1:8421/api/vpn/health 2>/dev/null \
@@ -351,6 +473,7 @@ rollback_binary() {
 
     warn "Rolling back to previous binary: ${BACKUP_BINARY}"
     rollback_service_unit
+    rollback_network_restore_unit
     run cp "${BACKUP_BINARY}" "${binary}"
     run systemctl daemon-reload
     run systemctl restart "${SERVICE_NAME}"
@@ -438,6 +561,7 @@ prune_release_backups() {
     log "Pruning release backups; keeping latest ${KEEP_RELEASES} per backup type"
     prune_backup_pattern "aeronyx-server.*" "binary"
     prune_backup_pattern "${SERVICE_NAME}.service.*" "systemd unit"
+    prune_backup_pattern "${NETWORK_RESTORE_SERVICE}.*" "network restore unit"
 }
 
 main() {
@@ -452,6 +576,10 @@ main() {
     build_release
     validate_config
     render_service_unit
+    if ! sync_network_restore_unit; then
+        rollback_network_restore_unit
+        die "Upgrade failed while syncing network restore unit."
+    fi
     restart_service
     if [ "${NO_RESTART}" -eq 0 ]; then
         run_healthcheck
