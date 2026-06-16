@@ -39,6 +39,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.15.0-node-deploy - Documented systemd restart-policy diagnostics.
 v1.14.0-node-deploy - Documented network restore backup count diagnostics.
 v1.13.0-node-deploy - Documented --network-restore-only maintenance mode.
 v1.12.0-node-deploy - Documented upgrade-time network restore synchronization.
@@ -206,6 +207,7 @@ The healthcheck prints:
 - config validation result
 - node registration files
 - systemd status
+- systemd restart policy: restart mode, restart delay, start limits, timeouts
 - systemd hardening status
 - IPv4 forwarding, NAT, and reboot persistence hints
 - network restore command path checks
@@ -267,6 +269,8 @@ The systemd template applies production-safe hardening:
 - restricted `CapabilityBoundingSet`
 - explicit `ReadWritePaths` for `/etc/aeronyx`, `/var/lib/aeronyx`, and
   `/var/log/aeronyx`
+- explicit restart limits: `Restart=on-failure`, `RestartSec=5`,
+  `StartLimitIntervalSec=300`, `StartLimitBurst=10`
 
 It intentionally does not enable `PrivateDevices` or `ProtectHome` because VPN
 nodes need `/dev/net/tun`, and existing deployments may keep the repository

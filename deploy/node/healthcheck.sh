@@ -13,6 +13,7 @@
 # - Validate generated network restore command paths for reboot reliability.
 # - Expose network restore command paths in JSON for nodeboard automation.
 # - Include network restore unit backups in retention diagnostics.
+# - Add systemd restart-policy diagnostics for production self-healing.
 #
 # Main Functionality:
 # - Checks repository, binary, config, registration state, systemd status,
@@ -42,6 +43,7 @@
 # - Reject service names that look like paths or command-line options.
 #
 # Last Modified:
+# v1.11.0-node-deploy - Added systemd restart-policy diagnostics.
 # v1.10.0-node-deploy - Added network restore unit backup counts to release
 #                       retention diagnostics.
 # v1.9.0-node-deploy - Added structured network restore command diagnostics to
@@ -324,6 +326,8 @@ check_config_validation() {
 }
 
 check_systemd() {
+    local restart restart_sec start_limit_burst start_limit_interval timeout_start
+
     if ! command -v systemctl >/dev/null 2>&1; then
         warn "systemd checks skipped"
         return
@@ -340,6 +344,33 @@ check_systemd() {
     else
         warn "systemd service not active: ${SERVICE_NAME}"
     fi
+
+    restart="$(systemd_property Restart)"
+    [ "${restart}" = "on-failure" ] \
+        && pass "systemd restart policy Restart=on-failure" \
+        || warn "systemd restart policy Restart is not on-failure: ${restart:-unknown}"
+
+    restart_sec="$(systemd_property RestartUSec)"
+    [ "${restart_sec}" = "5s" ] \
+        && pass "systemd restart policy RestartSec=5s" \
+        || warn "systemd restart policy RestartSec is not 5s: ${restart_sec:-unknown}"
+
+    start_limit_burst="$(systemd_property StartLimitBurst)"
+    if [ "${start_limit_burst:-0}" -ge 10 ] 2>/dev/null; then
+        pass "systemd restart policy StartLimitBurst=${start_limit_burst}"
+    else
+        warn "systemd restart policy StartLimitBurst is low: ${start_limit_burst:-unknown}"
+    fi
+
+    start_limit_interval="$(systemd_property StartLimitIntervalUSec)"
+    [ "${start_limit_interval}" = "5min" ] \
+        && pass "systemd restart policy StartLimitIntervalSec=300" \
+        || warn "systemd restart policy StartLimitIntervalSec is not 300s: ${start_limit_interval:-unknown}"
+
+    timeout_start="$(systemd_property TimeoutStartUSec)"
+    [ "${timeout_start}" = "1min" ] \
+        && pass "systemd restart policy TimeoutStartSec=60" \
+        || warn "systemd restart policy TimeoutStartSec is not 60s: ${timeout_start:-unknown}"
 }
 
 systemd_property() {
@@ -573,6 +604,16 @@ def network_restore_commands(unit_name):
         commands.append({"path": command, "executable": os.access(command, os.X_OK)})
     return commands
 
+def systemd_restart_policy(service_name):
+    return {
+        "restart": run(["systemctl", "show", service_name, "-p", "Restart", "--value"]),
+        "restart_usec": run(["systemctl", "show", service_name, "-p", "RestartUSec", "--value"]),
+        "start_limit_burst": run(["systemctl", "show", service_name, "-p", "StartLimitBurst", "--value"]),
+        "start_limit_interval": run(["systemctl", "show", service_name, "-p", "StartLimitIntervalUSec", "--value"]),
+        "timeout_start": run(["systemctl", "show", service_name, "-p", "TimeoutStartUSec", "--value"]),
+        "timeout_stop": run(["systemctl", "show", service_name, "-p", "TimeoutStopUSec", "--value"]),
+    }
+
 checks = []
 with open(checks_path, "r", encoding="utf-8") as handle:
     for line in handle:
@@ -600,6 +641,7 @@ runtime = {
     "config_mtime": file_mtime(config_path),
     "service_active": run(["systemctl", "is-active", service_name]),
     "service_enabled": run(["systemctl", "is-enabled", service_name]),
+    "systemd_restart_policy": systemd_restart_policy(service_name),
     "network_restore_active": run(["systemctl", "is-active", network_restore_service]),
     "network_restore_enabled": run(["systemctl", "is-enabled", network_restore_service]),
     "network_restore_commands": network_restore_commands(network_restore_service),
