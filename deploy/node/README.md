@@ -11,7 +11,7 @@ Creation Reason:
 Modification Reason:
 - Document production upgrade unit-template synchronization, rollback behavior,
   shared node-local deployment locking, and install-time systemd unit
-  verification.
+  verification, plus purge path safety.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -37,6 +37,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.5.0-node-deploy - Documented uninstall purge path allow-list protection.
 v1.4.0-node-deploy - Documented install-time systemd unit verification.
 v1.3.0-node-deploy - Documented shared install/upgrade deployment locking.
 v1.2.0-node-deploy - Documented node-local upgrade locking.
@@ -197,6 +198,15 @@ Full purge requires explicit confirmation:
 ```bash
 sudo ./deploy/node/uninstall.sh --purge
 ```
+
+Even with `--purge --yes`, `uninstall.sh` only deletes paths on the AeroNyx
+purge allow-list:
+
+- `/etc/aeronyx`
+- `/var/lib/aeronyx`
+- `/var/log/aeronyx`
+- `/etc/sysctl.d/99-aeronyx.conf`
+- `/etc/iptables/rules.v4`
 
 ## Important Configuration Items
 

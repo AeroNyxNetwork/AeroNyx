@@ -8,7 +8,8 @@
 #   registration state.
 #
 # Modification Reason:
-# - Initial production node uninstall script for commercial operations.
+# - Add explicit purge path safety checks while preserving the production node
+#   uninstall workflow for commercial operations.
 #
 # Main Functionality:
 # - Stops and disables the systemd service.
@@ -16,7 +17,7 @@
 # - Stops/disables/removes the generated network restore unit by default.
 # - Preserves /etc/aeronyx, /var/lib/aeronyx, /var/log/aeronyx, and network
 #   persistence files by default.
-# - Supports explicit purge with typed confirmation.
+# - Supports explicit purge with typed confirmation and path allow-list checks.
 #
 # Dependencies:
 # - systemd service installed by deploy/node/install.sh.
@@ -28,15 +29,19 @@
 # 1. Parse flags and require root.
 # 2. Stop/disable the systemd service.
 # 3. Stop/disable/remove generated network restore unit.
-# 4. Optionally remove service units and, only with confirmation, purge state.
+# 4. Optionally remove service units and, only with confirmation plus path
+#    safety checks, purge state.
 #
 # Important Note for Next Developer:
 # - Default behavior must preserve node identity and registration data.
 # - Do not delete config/state/log/network persistence files unless --purge is
-#   used and the operator types the exact confirmation string.
+#   used, the operator types the exact confirmation string, and the target path
+#   passes the AeroNyx purge allow-list.
 # - This script is Linux/systemd only; mobile/desktop clients are unaffected.
 #
 # Last Modified:
+# v1.2.0-node-deploy - Added purge path allow-list checks before destructive
+#                      state deletion.
 # v1.1.0-node-deploy - Added network restore unit removal and full purge cleanup.
 # v1.0.0-node-deploy - Added safe production node uninstall script.
 # ============================================
@@ -179,10 +184,41 @@ confirm_purge() {
     [ "${answer}" = "DELETE-AERONYX-NODE" ]
 }
 
+assert_safe_purge_path() {
+    local path="$1"
+
+    [ -n "${path}" ] || die "Refusing purge of empty path."
+
+    case "${path}" in
+        /etc/aeronyx|/var/lib/aeronyx|/var/log/aeronyx|/etc/sysctl.d/99-aeronyx.conf|/etc/iptables/rules.v4)
+            return 0
+            ;;
+        *)
+            die "Refusing purge of unexpected path: ${path}"
+            ;;
+    esac
+}
+
+purge_path() {
+    local path="$1"
+    assert_safe_purge_path "${path}"
+
+    if [ -e "${path}" ] || [ -L "${path}" ]; then
+        log "Purging ${path}"
+        run rm -rf "${path}"
+    else
+        ok "Purge target already absent: ${path}"
+    fi
+}
+
 purge_state() {
     if confirm_purge; then
         log "Purging node state"
-        run rm -rf "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${SYSCTL_FILE}" "${IPTABLES_RULES_FILE}"
+        purge_path "${CONFIG_DIR}"
+        purge_path "${STATE_DIR}"
+        purge_path "${LOG_DIR}"
+        purge_path "${SYSCTL_FILE}"
+        purge_path "${IPTABLES_RULES_FILE}"
     elif [ "${PURGE}" -eq 1 ]; then
         die "Purge confirmation failed; node state preserved."
     else
