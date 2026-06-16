@@ -39,6 +39,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.18.0-node-deploy - Documented live systemd unit binding diagnostics.
 v1.17.0-node-deploy - Documented mutually exclusive maintenance flags.
 v1.16.0-node-deploy - Documented --service-unit-only maintenance mode.
 v1.15.0-node-deploy - Documented systemd restart-policy diagnostics.
@@ -213,6 +214,7 @@ The healthcheck prints:
 - system commands and OS support
 - host capacity: TUN, default route, memory, disk, and ports
 - runtime metadata: git commit, branch, binary/config timestamps, service state
+- live systemd unit binding: WorkingDirectory, ExecStart binary, config path
 - tracked worktree and current-start journal warning checks
 - release-backup counts for binary, main unit, and network restore unit
 - release binary presence

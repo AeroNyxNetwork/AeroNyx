@@ -14,6 +14,7 @@
 # - Expose network restore command paths in JSON for nodeboard automation.
 # - Include network restore unit backups in retention diagnostics.
 # - Add systemd restart-policy diagnostics for production self-healing.
+# - Verify the live systemd unit points at the requested repository and config.
 #
 # Main Functionality:
 # - Checks repository, binary, config, registration state, systemd status,
@@ -43,6 +44,8 @@
 # - Reject service names that look like paths or command-line options.
 #
 # Last Modified:
+# v1.12.0-node-deploy - Added live systemd ExecStart/WorkingDirectory binding
+#                       diagnostics.
 # v1.11.0-node-deploy - Added systemd restart-policy diagnostics.
 # v1.10.0-node-deploy - Added network restore unit backup counts to release
 #                       retention diagnostics.
@@ -326,7 +329,7 @@ check_config_validation() {
 }
 
 check_systemd() {
-    local restart restart_sec start_limit_burst start_limit_interval timeout_start
+    local expected_binary exec_start restart restart_sec start_limit_burst start_limit_interval timeout_start working_directory
 
     if ! command -v systemctl >/dev/null 2>&1; then
         warn "systemd checks skipped"
@@ -343,6 +346,22 @@ check_systemd() {
         pass "systemd service active: ${SERVICE_NAME}"
     else
         warn "systemd service not active: ${SERVICE_NAME}"
+    fi
+
+    working_directory="$(systemd_property WorkingDirectory)"
+    if [ "${working_directory}" = "${REPO_DIR}" ]; then
+        pass "systemd unit WorkingDirectory matches repo: ${working_directory}"
+    else
+        warn "systemd unit WorkingDirectory mismatch: live=${working_directory:-unknown} expected=${REPO_DIR}"
+    fi
+
+    expected_binary="${REPO_DIR}/target/release/aeronyx-server"
+    exec_start="$(systemd_property ExecStart)"
+    if printf '%s\n' "${exec_start}" | grep -Fq "${expected_binary}" \
+        && printf '%s\n' "${exec_start}" | grep -Fq " -c ${CONFIG_FILE}"; then
+        pass "systemd unit ExecStart matches repo binary and config"
+    else
+        warn "systemd unit ExecStart mismatch: expected binary=${expected_binary} config=${CONFIG_FILE}"
     fi
 
     restart="$(systemd_property Restart)"
@@ -614,6 +633,19 @@ def systemd_restart_policy(service_name):
         "timeout_stop": run(["systemctl", "show", service_name, "-p", "TimeoutStopUSec", "--value"]),
     }
 
+def systemd_unit_binding(service_name, repo_dir, config_path, binary_path):
+    exec_start = run(["systemctl", "show", service_name, "-p", "ExecStart", "--value"])
+    working_directory = run(["systemctl", "show", service_name, "-p", "WorkingDirectory", "--value"])
+    return {
+        "working_directory": working_directory,
+        "expected_working_directory": repo_dir,
+        "exec_start": exec_start,
+        "expected_binary": binary_path,
+        "expected_config": config_path,
+        "working_directory_matches": working_directory == repo_dir,
+        "exec_start_matches": bool(exec_start and binary_path in exec_start and f" -c {config_path}" in exec_start),
+    }
+
 checks = []
 with open(checks_path, "r", encoding="utf-8") as handle:
     for line in handle:
@@ -642,6 +674,7 @@ runtime = {
     "service_active": run(["systemctl", "is-active", service_name]),
     "service_enabled": run(["systemctl", "is-enabled", service_name]),
     "systemd_restart_policy": systemd_restart_policy(service_name),
+    "systemd_unit_binding": systemd_unit_binding(service_name, repo_dir, config_path, binary_path),
     "network_restore_active": run(["systemctl", "is-active", network_restore_service]),
     "network_restore_enabled": run(["systemctl", "is-enabled", network_restore_service]),
     "network_restore_commands": network_restore_commands(network_restore_service),
