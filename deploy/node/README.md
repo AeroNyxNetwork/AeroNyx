@@ -1,0 +1,146 @@
+# AeroNyx Production Node Deployment
+
+<!--
+============================================
+File Creation/Modification Notes
+============================================
+Creation Reason:
+- Provide operator-facing documentation for the production Rust privacy node
+  deployment scripts.
+
+Modification Reason:
+- Initial documentation for the deploy/node one-command install, upgrade, and
+  healthcheck workflow.
+
+Main Functionality:
+- Explains first install, registration, upgrade, healthcheck, configuration
+  ownership, compatibility scope, and next-developer guidance.
+
+Dependencies:
+- deploy/node/install.sh
+- deploy/node/upgrade.sh
+- deploy/node/healthcheck.sh
+- deploy/node/server.example.toml
+- deploy/node/aeronyx-server.service
+- crates/aeronyx-server/src/main.rs
+
+Main Logical Flow:
+1. Operator installs the node with install.sh.
+2. Operator registers with a nodeboard registration code.
+3. systemd runs aeronyx-server and healthcheck.sh verifies runtime status.
+
+Important Note for Next Developer:
+- Do not document workflows that require exposing private keys or user traffic.
+- Keep the commands compatible with Linux/systemd production nodes.
+- macOS, iOS, Android, and Windows are client/development platforms for this
+  deployment package, not production node targets.
+
+Last Modified:
+v1.0.0-node-deploy - Added production deployment documentation.
+============================================
+-->
+
+## File Purpose
+
+This directory is the production deployment package for AeroNyx Rust privacy
+nodes. It gives node operators a predictable path for first install, upgrade,
+healthcheck, and systemd service management.
+
+## Files
+
+- `install.sh`: one-command production installer.
+- `upgrade.sh`: safe source update, release build, config validation, and
+  restart workflow.
+- `healthcheck.sh`: read-only node diagnostics and capacity telemetry summary.
+- `server.example.toml`: public, safe default config template.
+- `aeronyx-server.service`: systemd unit template rendered by `install.sh`.
+
+## First Install
+
+```bash
+sudo ./deploy/node/install.sh --registration-code <NODEBOARD_CODE> --start
+```
+
+For an existing checkout in a custom path:
+
+```bash
+sudo ./deploy/node/install.sh --repo-dir /root/open/AeroNyx --no-build --no-network
+```
+
+The installer never overwrites these files when they already exist:
+
+- `/etc/aeronyx/server.toml`
+- `/etc/aeronyx/server_key.json`
+- `/etc/aeronyx/node_info.json`
+- `/etc/aeronyx/aeronyx.env`
+
+## Upgrade
+
+```bash
+sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx
+```
+
+`upgrade.sh` checks active VPN sessions before restart. If users are connected,
+the script stops unless the operator explicitly passes `--force`.
+
+## Healthcheck
+
+```bash
+./deploy/node/healthcheck.sh --repo-dir /opt/aeronyx/AeroNyx
+```
+
+The healthcheck prints:
+
+- system commands and OS support
+- release binary presence
+- config validation result
+- node registration files
+- systemd status
+- IPv4 forwarding and NAT hints
+- local VPN health endpoint status
+- capacity telemetry: IP pool, conntrack, file descriptors, drops, pps, bps
+
+It does not print private keys, user traffic destinations, DNS contents,
+payloads, wallet-level traffic, or client public IPs.
+
+## Important Configuration Items
+
+`server.example.toml` defaults to a commercial VPN node profile:
+
+- VPN listen address: `0.0.0.0:51820`
+- virtual IP pool: `100.64.0.0/24`
+- TUN device: `aeronyx0`
+- max connections: `1000`
+- management API: `https://api.aeronyx.network/api/privacy_network`
+- MemChain: `off`
+
+MemChain and local AI model setup remain available through the existing
+`scripts/init.sh` and `scripts/download_models.sh` workflows. They are not part
+of the minimal commercial VPN node install path.
+
+## Compatibility
+
+Production node host:
+
+- Linux with systemd
+- Ubuntu/Debian preferred
+- Fedora/RHEL/CentOS supported on a best-effort package-install basis
+
+Client/development platforms:
+
+- macOS, iOS, Android, and Windows are not production node targets for these
+  scripts.
+- These scripts do not change mobile or desktop client APIs.
+
+## Next Developer Guide
+
+- Keep install and upgrade idempotent.
+- Preserve existing CLI compatibility:
+  - `aeronyx-server register`
+  - `aeronyx-server start`
+  - `aeronyx-server validate`
+  - `aeronyx-server status`
+- Never overwrite private node state unless a future migration explicitly asks
+  the operator for confirmation.
+- Keep nodeboard compatibility by preserving systemd service name
+  `aeronyx-server` unless backend and nodeboard are updated together.

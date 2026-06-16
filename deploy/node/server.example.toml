@@ -1,0 +1,74 @@
+# ============================================
+# File: deploy/node/server.example.toml
+# ============================================
+# Creation Reason:
+# - Provide a production-safe, version-controlled configuration template for
+#   commercial AeroNyx privacy nodes.
+#
+# Modification Reason:
+# - Initial production node deployment profile. This template separates public
+#   defaults from node-private runtime state in /etc/aeronyx.
+#
+# Main Functionality:
+# - Defines VPN listener, virtual IP pool, TUN device, node limits, logging,
+#   management heartbeat, and optional MemChain defaults.
+#
+# Dependencies:
+# - Loaded by aeronyx-server via:
+#   aeronyx-server start -c /etc/aeronyx/server.toml
+# - Installed by deploy/node/install.sh.
+# - Validated by deploy/node/healthcheck.sh and aeronyx-server validate.
+#
+# Main Logical Flow:
+# 1. install.sh copies this file to /etc/aeronyx/server.toml if it does not
+#    already exist.
+# 2. Operators register the node with aeronyx-server register --code <CODE>.
+# 3. systemd starts aeronyx-server with the installed config path.
+#
+# Important Note for Next Developer:
+# - Do not put node private keys, registration data, wallet secrets, or user
+#   traffic data in this template.
+# - Keep this file backward compatible with crates/aeronyx-server/src/config.rs.
+# - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
+#
+# Last Modified:
+# v1.0.0-node-deploy - Added production node example config.
+# ============================================
+
+[network]
+listen_addr = "0.0.0.0:51820"
+
+[vpn]
+virtual_ip_range = "100.64.0.0/24"
+gateway_ip = "100.64.0.1"
+
+[tun]
+device_name = "aeronyx0"
+mtu = 1420
+
+[server_key]
+key_file = "/etc/aeronyx/server_key.json"
+
+[limits]
+max_connections = 1000
+session_timeout = 86400
+
+[logging]
+level = "info"
+
+[management]
+cms_url = "https://api.aeronyx.network/api/privacy_network"
+heartbeat_interval_secs = 30
+session_report_interval_secs = 30
+request_timeout_secs = 10
+max_retries = 3
+node_info_path = "/etc/aeronyx/node_info.json"
+
+# Commercial VPN nodes should start with MemChain disabled unless the operator
+# explicitly wants local memory-chain services on the same machine.
+[memchain]
+mode = "off"
+api_listen_addr = "127.0.0.1:8421"
+db_path = "/var/lib/aeronyx/memchain.db"
+aof_path = "/var/lib/aeronyx/.memchain"
+miner_interval_secs = 60

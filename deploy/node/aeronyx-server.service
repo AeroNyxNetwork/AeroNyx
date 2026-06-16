@@ -1,0 +1,53 @@
+# ============================================
+# File: deploy/node/aeronyx-server.service
+# ============================================
+# Creation Reason:
+# - Provide a repository-owned systemd unit template for production AeroNyx
+#   privacy nodes.
+#
+# Modification Reason:
+# - Initial production node deployment profile for install.sh and upgrade.sh.
+#
+# Main Functionality:
+# - Runs the Rust aeronyx-server binary under systemd.
+# - Loads optional environment overrides from /etc/aeronyx/aeronyx.env.
+# - Uses /etc/aeronyx/server.toml as the stable config path.
+#
+# Dependencies:
+# - Installed by deploy/node/install.sh into /etc/systemd/system.
+# - Reloaded/restarted by deploy/node/upgrade.sh.
+# - Observed by deploy/node/healthcheck.sh and nodeboard restart controls.
+#
+# Main Logical Flow:
+# 1. systemd waits for network-online.target.
+# 2. aeronyx-server starts from @REPO_DIR@/target/release.
+# 3. systemd restarts the service on process failure.
+#
+# Important Note for Next Developer:
+# - Keep ExecStart compatible with crates/aeronyx-server/src/main.rs.
+# - Do not add user traffic logging or destination inspection here.
+# - install.sh replaces @REPO_DIR@ and @CONFIG_FILE@ before installation.
+#
+# Last Modified:
+# v1.0.0-node-deploy - Added production systemd unit template.
+# ============================================
+
+[Unit]
+Description=AeroNyx Rust privacy node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@REPO_DIR@
+EnvironmentFile=-/etc/aeronyx/aeronyx.env
+ExecStart=@REPO_DIR@/target/release/aeronyx-server start -c @CONFIG_FILE@
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
