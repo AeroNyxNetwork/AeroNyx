@@ -185,6 +185,7 @@ blind-rsa-signatures = "0.17.2"
 tempfile = "3.12"
 tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+serde_urlencoded = "0.7"
 
 [lints]
 workspace = true

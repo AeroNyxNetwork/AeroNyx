@@ -686,7 +686,7 @@ mod tests {
         s.mark_session_summary_generated("sess_001").await;
         s.update_session_ended_at("sess_001", now + 3600).await;
 
-        let sess = s.get_session("sess_001").await.unwrap();
+        let sess = s.get_session("sess_001", &owner).await.unwrap();
         assert!(sess.entities_extracted);
         assert!(sess.summary_generated);
         assert_eq!(sess.ended_at, Some(now + 3600));

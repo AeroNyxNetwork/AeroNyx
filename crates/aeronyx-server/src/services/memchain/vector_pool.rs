@@ -336,7 +336,7 @@ mod tests {
 
         // Assign to a volume first (simulating what StoragePool does).
         db.assign_volume(&owner, "vol-001").await.unwrap();
-        router.assignments.insert(owner, "vol-001".into());
+        router.cache_assignment_for_test(owner, "vol-001");
 
         let index = pool.get_or_create(&owner).unwrap();
         assert_eq!(pool.active_count(), 1);
@@ -365,7 +365,7 @@ mod tests {
 
         let owner = make_owner(0xAA);
         db.assign_volume(&owner, "vol-001").await.unwrap();
-        router.assignments.insert(owner, "vol-001".into());
+        router.cache_assignment_for_test(owner, "vol-001");
 
         let i1 = pool.get_or_create(&owner).unwrap();
         let i2 = pool.get_or_create(&owner).unwrap();
@@ -382,7 +382,7 @@ mod tests {
         for seed in [0xAAu8, 0xBB] {
             let owner = make_owner(seed);
             db.assign_volume(&owner, "vol-001").await.unwrap();
-            router.assignments.insert(owner, "vol-001".into());
+            router.cache_assignment_for_test(owner, "vol-001");
         }
 
         let i_a = pool.get_or_create(&make_owner(0xAA)).unwrap();
@@ -401,7 +401,7 @@ mod tests {
 
         let owner = make_owner(0xAA);
         db.assign_volume(&owner, "vol-001").await.unwrap();
-        router.assignments.insert(owner, "vol-001".into());
+        router.cache_assignment_for_test(owner, "vol-001");
 
         let index = pool.get_or_create(&owner).unwrap();
 
@@ -442,7 +442,7 @@ mod tests {
         for seed in [0xAAu8, 0xBB, 0xCC] {
             let owner = make_owner(seed);
             db.assign_volume(&owner, "vol-001").await.unwrap();
-            router.assignments.insert(owner, "vol-001".into());
+            router.cache_assignment_for_test(owner, "vol-001");
             pool.get_or_create(&owner).unwrap();
         }
 
@@ -476,8 +476,8 @@ mod tests {
 
         db.assign_volume(&owner_old, "vol-001").await.unwrap();
         db.assign_volume(&owner_new, "vol-001").await.unwrap();
-        router.assignments.insert(owner_old, "vol-001".into());
-        router.assignments.insert(owner_new, "vol-001".into());
+        router.cache_assignment_for_test(owner_old, "vol-001");
+        router.cache_assignment_for_test(owner_new, "vol-001");
 
         pool.get_or_create(&owner_old).unwrap();
 
@@ -515,11 +515,11 @@ mod tests {
 
         let owner = make_owner(0xAA);
         db.assign_volume(&owner, "vol-001").await.unwrap();
-        router.assignments.insert(owner, "vol-001".into());
+        router.cache_assignment_for_test(owner, "vol-001");
 
         let index = pool.get_or_create(&owner).unwrap();
         // The index should have quantization enabled.
-        assert!(index.quantization_enabled);
+        assert!(index.quantization_enabled_for_test());
     }
 
     // ── active_count and cached_owners ───────────────────────────────
@@ -534,7 +534,7 @@ mod tests {
         for seed in 0u8..5 {
             let owner = make_owner(seed);
             db.assign_volume(&owner, "vol-001").await.unwrap();
-            router.assignments.insert(owner, "vol-001".into());
+            router.cache_assignment_for_test(owner, "vol-001");
             pool.get_or_create(&owner).unwrap();
         }
 
@@ -551,7 +551,7 @@ mod tests {
 
         let owner = make_owner(0xAA);
         db.assign_volume(&owner, "vol-001").await.unwrap();
-        router.assignments.insert(owner, "vol-001".into());
+        router.cache_assignment_for_test(owner, "vol-001");
 
         // 8 concurrent tasks for the same owner.
         let handles: Vec<_> = (0..8)

@@ -952,15 +952,15 @@ mod tests {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
         s.upsert_session("sess_001", &owner, None, "code", now, 15).await.unwrap();
         // Title should be None initially
-        let sess = s.get_session("sess_001").await.unwrap();
+        let sess = s.get_session("sess_001", &owner).await.unwrap();
         assert!(sess.title.is_none());
         // Set title via update_session_summary
         s.update_session_summary("sess_001", "Topics: JWT", None, Some("Project Alpha: JWT")).await;
-        let sess2 = s.get_session("sess_001").await.unwrap();
+        let sess2 = s.get_session("sess_001", &owner).await.unwrap();
         assert_eq!(sess2.title, Some("Project Alpha: JWT".into()));
         // Passing None preserves the existing title
         s.update_session_summary("sess_001", "Topics: JWT, RS256", None, None).await;
-        let sess3 = s.get_session("sess_001").await.unwrap();
+        let sess3 = s.get_session("sess_001", &owner).await.unwrap();
         assert_eq!(sess3.title, Some("Project Alpha: JWT".into()));
     }
 
@@ -973,7 +973,7 @@ mod tests {
         let pending = s.get_pending_sessions(&owner, 10).await;
         assert_eq!(pending.len(), 1);
         s.mark_session_entities_extracted("sess_001").await;
-        let sess = s.get_session("sess_001").await.unwrap();
+        let sess = s.get_session("sess_001", &owner).await.unwrap();
         assert!(sess.entities_extracted);
     }
 

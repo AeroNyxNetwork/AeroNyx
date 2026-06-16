@@ -244,6 +244,11 @@ impl VectorIndex {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn quantization_enabled_for_test(&self) -> bool {
+        self.quantization_enabled
+    }
+
     /// Insert or update a vector.
     ///
     /// v2.4.0: If quantization is enabled AND the partition has a calibrated

@@ -1904,7 +1904,7 @@ mod tests {
                         sid.clone(),
                         identity.public_key(),
                         SessionKey::from_bytes([i * 10 + j; 32]),
-                        Ipv4Addr::new(100, 64, 0, (i * 10 + j + 2) as u32),
+                        Ipv4Addr::new(100, 64, 0, i * 10 + j + 2),
                         format!("127.0.0.1:{}", 10000u16 + (i as u16) * 10 + j as u16)
                             .parse()
                             .unwrap(),

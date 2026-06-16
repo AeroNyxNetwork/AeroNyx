@@ -2240,7 +2240,7 @@ mod tests {
         let r = make_rec_owner(100, owner, MemoryLayer::Episode);
         let id = r.record_id;
         s.insert(&r, "m").await;
-        s.set_record_session_id(&id, "sess_xyz").await;
+        s.set_record_session_id(&id, &owner, "sess_xyz").await;
 
         let records = s.get_records_for_session("sess_xyz", &owner).await;
         assert_eq!(records.len(), 1);

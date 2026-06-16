@@ -923,7 +923,7 @@ mod tests {
         let owner = [0xAA; 32];
 
         // Create a session in the DB so metadata resolution works
-        s.upsert_session("sess_meta", &owner, "test-source", 5).await;
+        s.upsert_session("sess_meta", &owner, None, "test-source", 5, 1).await.unwrap();
         s.update_session_summary("sess_meta", "Test summary", None, Some("Test Title")).await;
 
         let hits = vec![

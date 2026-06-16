@@ -239,6 +239,11 @@ impl VolumeRouter {
         self.assignments.get(owner).map(|v| v.clone())
     }
 
+    #[cfg(test)]
+    pub(crate) fn cache_assignment_for_test(&self, owner: [u8; 32], volume_id: &str) {
+        self.assignments.insert(owner, volume_id.to_string());
+    }
+
     /// Assign a new user to the least-loaded writable volume.
     ///
     /// ## Algorithm
@@ -627,7 +632,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
         let missing = dir.path().join("nonexistent.toml");
-        let err = VolumeRouter::new(&missing, Arc::clone(&db)).await.unwrap_err();
+        let err = match VolumeRouter::new(&missing, Arc::clone(&db)).await {
+            Ok(_) => panic!("missing config should fail"),
+            Err(err) => err,
+        };
         assert!(matches!(err, VolumeRouterError::ConfigNotFound(_)));
     }
 
@@ -649,7 +657,10 @@ mod tests {
         )
         .unwrap();
         let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
-        let err = VolumeRouter::new(&path, Arc::clone(&db)).await.unwrap_err();
+        let err = match VolumeRouter::new(&path, Arc::clone(&db)).await {
+            Ok(_) => panic!("duplicate volume ids should fail"),
+            Err(err) => err,
+        };
         assert!(matches!(err, VolumeRouterError::DuplicateId(_)));
     }
 
