@@ -52,6 +52,7 @@ healthcheck, and systemd service management.
 - `upgrade.sh`: safe source update, release build, config validation, and
   restart workflow.
 - `healthcheck.sh`: read-only node diagnostics and capacity telemetry summary.
+- `uninstall.sh`: safe service removal while preserving node identity by default.
 - `server.example.toml`: public, safe default config template.
 - `aeronyx-server.service`: systemd unit template rendered by `install.sh`.
 
@@ -103,6 +104,26 @@ The healthcheck prints:
 It does not print private keys, user traffic destinations, DNS contents,
 payloads, wallet-level traffic, or client public IPs.
 
+## Safe Uninstall
+
+```bash
+sudo ./deploy/node/uninstall.sh
+```
+
+Default uninstall behavior stops/disables the service and removes the systemd
+unit, but preserves:
+
+- `/etc/aeronyx/server.toml`
+- `/etc/aeronyx/server_key.json`
+- `/etc/aeronyx/node_info.json`
+- `/var/lib/aeronyx`
+
+Full purge requires explicit confirmation:
+
+```bash
+sudo ./deploy/node/uninstall.sh --purge
+```
+
 ## Important Configuration Items
 
 `server.example.toml` defaults to a commercial VPN node profile:
@@ -139,7 +160,9 @@ Client/development platforms:
   - `aeronyx-server register`
   - `aeronyx-server start`
   - `aeronyx-server validate`
-  - `aeronyx-server status`
+- `aeronyx-server status`
+- Keep uninstall safe by default. Node identity must not be deleted unless the
+  operator explicitly asks for purge.
 - Never overwrite private node state unless a future migration explicitly asks
   the operator for confirmation.
 - Keep nodeboard compatibility by preserving systemd service name

@@ -39,6 +39,9 @@
 #   development/client platforms, not production node hosts for this script.
 #
 # Last Modified:
+# v1.1.1-node-deploy - Only checks/installs Rust when release build is enabled.
+# v1.1.0-node-deploy - Added --skip-package-install and made --config-only avoid
+#                      package/Rust installation by default.
 # v1.0.0-node-deploy - Added production node installer.
 # ============================================
 
@@ -64,6 +67,7 @@ DO_NETWORK=1
 DO_START=0
 DO_ENABLE=1
 INSTALL_RUST=1
+INSTALL_PACKAGES=1
 DRY_RUN=0
 CONFIG_ONLY=0
 
@@ -86,6 +90,7 @@ Options:
   --no-build              Skip cargo release build.
   --no-network            Skip sysctl and NAT setup.
   --no-enable             Do not enable systemd service.
+  --skip-package-install  Do not install OS packages automatically.
   --skip-rust-install     Do not install Rust automatically if cargo is missing.
   --config-only           Only create config/env directories and server.toml if missing.
   --dry-run               Print actions without changing the host.
@@ -107,8 +112,9 @@ while [ "$#" -gt 0 ]; do
         --no-build) DO_BUILD=0; shift ;;
         --no-network) DO_NETWORK=0; shift ;;
         --no-enable) DO_ENABLE=0; shift ;;
+        --skip-package-install) INSTALL_PACKAGES=0; shift ;;
         --skip-rust-install) INSTALL_RUST=0; shift ;;
-        --config-only) CONFIG_ONLY=1; DO_BUILD=0; DO_NETWORK=0; DO_START=0; DO_ENABLE=0; shift ;;
+        --config-only) CONFIG_ONLY=1; DO_BUILD=0; DO_NETWORK=0; DO_START=0; DO_ENABLE=0; INSTALL_PACKAGES=0; INSTALL_RUST=0; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "Unknown option: $1" ;;
@@ -141,6 +147,8 @@ require_linux_systemd() {
 }
 
 install_packages() {
+    [ "${INSTALL_PACKAGES}" -eq 1 ] || { ok "Package installation skipped"; return; }
+
     if command -v apt-get >/dev/null 2>&1; then
         log "Installing Debian/Ubuntu host dependencies"
         run apt-get update
@@ -322,7 +330,11 @@ main() {
     require_root
     require_linux_systemd
     install_packages
-    install_rust_if_needed
+    if [ "${DO_BUILD}" -eq 1 ]; then
+        install_rust_if_needed
+    else
+        ok "Rust toolchain check skipped"
+    fi
     prepare_repo
     prepare_directories
     install_config
