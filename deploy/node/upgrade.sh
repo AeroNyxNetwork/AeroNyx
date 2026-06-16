@@ -7,7 +7,8 @@
 #   nodes without requiring manual git/build/systemd commands.
 #
 # Modification Reason:
-# - Initial production node upgrade script with active-session protection.
+# - Add production rollback/no-restart/health polling controls while preserving
+#   active-session protection.
 #
 # Main Functionality:
 # - Pulls the configured branch.
@@ -15,6 +16,7 @@
 # - Validates /etc/aeronyx/server.toml.
 # - Checks active VPN sessions before restart.
 # - Restarts systemd service and verifies post-upgrade health.
+# - Restores the previous binary if restart or health verification fails.
 #
 # Dependencies:
 # - deploy/node/healthcheck.sh
@@ -25,6 +27,7 @@
 # 1. Update repo from Git.
 # 2. Build and validate the release binary.
 # 3. Restart only when no active sessions are present, unless --force is used.
+# 4. Verify local health and roll back the binary if restart health fails.
 #
 # Important Note for Next Developer:
 # - Do not remove active-session protection. Commercial VPN users should not be
@@ -33,6 +36,8 @@
 # - Keep this script compatible with current and older installed service units.
 #
 # Last Modified:
+# v1.1.0-node-deploy - Added --no-restart, health polling, and binary rollback
+#                      on restart/health failure.
 # v1.0.0-node-deploy - Added production node upgrade script.
 # ============================================
 
@@ -45,6 +50,10 @@ SERVICE_NAME="aeronyx-server"
 FORCE=0
 DRY_RUN=0
 SKIP_PULL=0
+NO_RESTART=0
+HEALTH_RETRIES=10
+HEALTH_DELAY=2
+BACKUP_BINARY=""
 
 log() { printf '[INFO] %s\n' "$*"; }
 ok() { printf '[OK] %s\n' "$*"; }
@@ -62,7 +71,10 @@ Options:
   --config PATH       Config path. Default: /etc/aeronyx/server.toml
   --service NAME      systemd service name. Default: aeronyx-server
   --force             Restart even when active VPN sessions exist.
+  --no-restart        Build and validate only; do not restart the service.
   --skip-pull         Build the currently checked out source.
+  --health-retries N  Health polling attempts after restart. Default: 10
+  --health-delay N    Seconds between health polling attempts. Default: 2
   --dry-run           Print actions without changing the host.
   -h, --help          Show this help.
 USAGE
@@ -75,7 +87,10 @@ while [ "$#" -gt 0 ]; do
         --config) CONFIG_FILE="${2:?missing value}"; shift 2 ;;
         --service) SERVICE_NAME="${2:?missing value}"; shift 2 ;;
         --force) FORCE=1; shift ;;
+        --no-restart) NO_RESTART=1; shift ;;
         --skip-pull) SKIP_PULL=1; shift ;;
+        --health-retries) HEALTH_RETRIES="${2:?missing value}"; shift 2 ;;
+        --health-delay) HEALTH_DELAY="${2:?missing value}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "Unknown option: $1" ;;
@@ -125,9 +140,10 @@ backup_current_binary() {
 
     backup_dir="/var/lib/aeronyx/releases"
     stamp="$(date -u +%Y%m%d_%H%M%S)"
+    BACKUP_BINARY="${backup_dir}/aeronyx-server.${stamp}"
     run mkdir -p "${backup_dir}"
-    run cp "${binary}" "${backup_dir}/aeronyx-server.${stamp}"
-    ok "Current binary backed up to ${backup_dir}/aeronyx-server.${stamp}"
+    run cp "${binary}" "${BACKUP_BINARY}"
+    ok "Current binary backed up to ${BACKUP_BINARY}"
 }
 
 update_source() {
@@ -160,8 +176,58 @@ validate_config() {
     run "${binary}" validate -c "${CONFIG_FILE}"
 }
 
+health_endpoint_ok() {
+    command -v curl >/dev/null 2>&1 || return 1
+    curl -fsS --max-time 5 http://127.0.0.1:8421/api/vpn/health 2>/dev/null \
+        | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("status") == "ok" else 1)' 2>/dev/null
+}
+
+wait_for_health() {
+    local attempt
+
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] poll http://127.0.0.1:8421/api/vpn/health up to %s times\n' "${HEALTH_RETRIES}"
+        return 0
+    fi
+
+    attempt=1
+    while [ "${attempt}" -le "${HEALTH_RETRIES}" ]; do
+        if health_endpoint_ok; then
+            ok "Post-restart VPN health endpoint is ok"
+            return 0
+        fi
+        warn "Post-restart health not ready (${attempt}/${HEALTH_RETRIES})"
+        sleep "${HEALTH_DELAY}"
+        attempt=$((attempt + 1))
+    done
+
+    return 1
+}
+
+rollback_binary() {
+    local binary
+    binary="${REPO_DIR}/target/release/aeronyx-server"
+
+    if [ -z "${BACKUP_BINARY}" ]; then
+        warn "Rollback skipped; no backup binary path recorded."
+        return 1
+    fi
+    if [ "${DRY_RUN}" -eq 0 ] && [ ! -f "${BACKUP_BINARY}" ]; then
+        warn "Rollback skipped; backup binary missing: ${BACKUP_BINARY}"
+        return 1
+    fi
+
+    warn "Rolling back to previous binary: ${BACKUP_BINARY}"
+    run cp "${BACKUP_BINARY}" "${binary}"
+    run systemctl daemon-reload
+    run systemctl restart "${SERVICE_NAME}"
+    run systemctl is-active "${SERVICE_NAME}"
+}
+
 restart_service() {
     local sessions
+    [ "${NO_RESTART}" -eq 0 ] || { ok "Restart skipped by --no-restart"; return; }
+
     sessions="$(active_sessions)"
 
     if [ "${sessions}" != "unknown" ] && [ "${sessions}" -gt 0 ] 2>/dev/null && [ "${FORCE}" -ne 1 ]; then
@@ -176,8 +242,21 @@ restart_service() {
 
     log "Restarting ${SERVICE_NAME}"
     run systemctl daemon-reload
-    run systemctl restart "${SERVICE_NAME}"
-    run systemctl is-active "${SERVICE_NAME}"
+    if ! run systemctl restart "${SERVICE_NAME}"; then
+        warn "Restart failed; attempting rollback."
+        rollback_binary
+        die "Upgrade failed during restart and rollback was attempted."
+    fi
+    if ! run systemctl is-active "${SERVICE_NAME}"; then
+        warn "Service is not active after restart; attempting rollback."
+        rollback_binary
+        die "Upgrade failed because service did not become active."
+    fi
+    if ! wait_for_health; then
+        warn "Health endpoint failed after restart; attempting rollback."
+        rollback_binary
+        die "Upgrade failed because post-restart health check did not pass."
+    fi
 }
 
 run_healthcheck() {
@@ -198,7 +277,11 @@ main() {
     build_release
     validate_config
     restart_service
-    run_healthcheck
+    if [ "${NO_RESTART}" -eq 0 ]; then
+        run_healthcheck
+    else
+        ok "Build and validation complete. Service was not restarted."
+    fi
 }
 
 main "$@"

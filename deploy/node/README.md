@@ -84,6 +84,16 @@ sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx
 `upgrade.sh` checks active VPN sessions before restart. If users are connected,
 the script stops unless the operator explicitly passes `--force`.
 
+Build and validate without restarting:
+
+```bash
+sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --no-restart
+```
+
+Post-restart health is polled automatically. If restart or health verification
+fails, `upgrade.sh` restores the previous release binary from
+`/var/lib/aeronyx/releases` and restarts the service again.
+
 ## Healthcheck
 
 ```bash
@@ -160,7 +170,7 @@ Client/development platforms:
   - `aeronyx-server register`
   - `aeronyx-server start`
   - `aeronyx-server validate`
-- `aeronyx-server status`
+  - `aeronyx-server status`
 - Keep uninstall safe by default. Node identity must not be deleted unless the
   operator explicitly asks for purge.
 - Never overwrite private node state unless a future migration explicitly asks
