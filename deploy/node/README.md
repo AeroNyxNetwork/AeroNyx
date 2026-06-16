@@ -39,6 +39,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.17.0-node-deploy - Documented mutually exclusive maintenance flags.
 v1.16.0-node-deploy - Documented --service-unit-only maintenance mode.
 v1.15.0-node-deploy - Documented systemd restart-policy diagnostics.
 v1.14.0-node-deploy - Documented network restore backup count diagnostics.
@@ -166,6 +167,9 @@ Rust node service:
 ```bash
 sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --service-unit-only
 ```
+
+The unit-only maintenance modes are intentionally mutually exclusive and cannot
+be combined with their matching `--skip-*-update` flags.
 
 Keep the currently installed network restore unit:
 

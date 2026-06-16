@@ -59,8 +59,11 @@
 #   successfully.
 # - Do not create the network restore unit unless persisted iptables rules
 #   already exist.
+# - Reject contradictory maintenance flags instead of reporting a no-op as
+#   success.
 #
 # Last Modified:
+# v1.10.0-node-deploy - Rejects contradictory unit-only maintenance options.
 # v1.9.0-node-deploy - Added --service-unit-only for low-risk main systemd
 #                      unit maintenance.
 # v1.8.0-node-deploy - Added --network-restore-only for low-risk reboot
@@ -192,6 +195,18 @@ validate_service_name() {
 validate_keep_releases() {
     printf '%s' "${KEEP_RELEASES}" | grep -Eq '^[1-9][0-9]*$' \
         || die "--keep-releases must be a positive integer."
+}
+
+validate_option_combinations() {
+    if [ "${SERVICE_UNIT_ONLY}" -eq 1 ] && [ "${NETWORK_RESTORE_ONLY}" -eq 1 ]; then
+        die "--service-unit-only and --network-restore-only are mutually exclusive."
+    fi
+    if [ "${SERVICE_UNIT_ONLY}" -eq 1 ] && [ "${SKIP_UNIT_UPDATE}" -eq 1 ]; then
+        die "--service-unit-only cannot be combined with --skip-unit-update."
+    fi
+    if [ "${NETWORK_RESTORE_ONLY}" -eq 1 ] && [ "${SKIP_NETWORK_RESTORE_UPDATE}" -eq 1 ]; then
+        die "--network-restore-only cannot be combined with --skip-network-restore-update."
+    fi
 }
 
 resolve_command_path() {
@@ -586,6 +601,7 @@ prune_release_backups() {
 main() {
     validate_service_name
     validate_keep_releases
+    validate_option_combinations
     require_root
     acquire_lock
     if [ "${SERVICE_UNIT_ONLY}" -eq 1 ]; then
