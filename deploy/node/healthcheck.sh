@@ -9,11 +9,12 @@
 # Modification Reason:
 # - Add service-name validation while preserving the production healthcheck for
 #   node deployment workflows.
+# - Add release-backup diagnostics for node upgrade retention observability.
 #
 # Main Functionality:
 # - Checks repository, binary, config, registration state, systemd status,
 #   host capacity, IP forwarding, NAT runtime/persistence, local VPN health
-#   endpoint, and capacity telemetry.
+#   endpoint, release-backup retention, and capacity telemetry.
 # - Emits machine-readable JSON for nodeboard or support automation.
 # - Warns when installed systemd hardening is weaker than the production
 #   template.
@@ -27,7 +28,7 @@
 # Main Logical Flow:
 # 1. Perform static checks on files and systemd.
 # 2. Validate config with aeronyx-server when binary exists.
-# 3. Query local health endpoint and summarize capacity if available.
+# 3. Check release-backup retention and query local health endpoint.
 #
 # Important Note for Next Developer:
 # - Do not print private keys, registration secrets, API secrets, wallet-level
@@ -37,6 +38,8 @@
 # - Reject service names that look like paths or command-line options.
 #
 # Last Modified:
+# v1.7.0-node-deploy - Added release-backup count diagnostics for upgrade
+#                      retention observability.
 # v1.6.0-node-deploy - Validates --service names before systemd and journal
 #                      diagnostics.
 # v1.5.0-node-deploy - Added runtime metadata, tracked worktree, and current
@@ -60,6 +63,8 @@ CHECK_LOG="$(mktemp)"
 SYSCTL_FILE="/etc/sysctl.d/99-aeronyx.conf"
 IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
 NETWORK_RESTORE_SERVICE="aeronyx-network-restore"
+RELEASE_DIR="/var/lib/aeronyx/releases"
+RELEASE_BACKUP_KEEP_TARGET=10
 trap 'rm -f "${CHECK_LOG}"' EXIT
 
 usage() {
@@ -266,6 +271,29 @@ check_runtime_metadata() {
         fi
     else
         warn "journal warning check skipped"
+    fi
+}
+
+count_release_backups() {
+    local pattern="$1"
+    find "${RELEASE_DIR}" -maxdepth 1 -type f -name "${pattern}" 2>/dev/null | wc -l | tr -d ' '
+}
+
+check_release_backups() {
+    local binary_count unit_count
+
+    if [ ! -d "${RELEASE_DIR}" ]; then
+        pass "release backup directory absent; no retained upgrade backups"
+        return
+    fi
+
+    binary_count="$(count_release_backups "aeronyx-server.*")"
+    unit_count="$(count_release_backups "${SERVICE_NAME}.service.*")"
+
+    if [ "${binary_count:-0}" -le "${RELEASE_BACKUP_KEEP_TARGET}" ] && [ "${unit_count:-0}" -le "${RELEASE_BACKUP_KEEP_TARGET}" ]; then
+        pass "release backups within retention target: binary=${binary_count:-0} systemd_unit=${unit_count:-0} keep_target=${RELEASE_BACKUP_KEEP_TARGET}"
+    else
+        warn "release backups exceed retention target: binary=${binary_count:-0} systemd_unit=${unit_count:-0} keep_target=${RELEASE_BACKUP_KEEP_TARGET}; run a successful upgrade or prune manually"
     fi
 }
 
@@ -479,6 +507,7 @@ emit_json_summary() {
     if command -v python3 >/dev/null 2>&1; then
         python3 - "${CHECK_LOG}" "${REPO_DIR}" "${CONFIG_FILE}" "${SERVICE_NAME}" "${NETWORK_RESTORE_SERVICE}" "${PASS}" "${WARN}" "${FAIL}" <<'PY'
 import json
+import glob
 import os
 import subprocess
 import sys
@@ -509,6 +538,13 @@ with open(checks_path, "r", encoding="utf-8") as handle:
         checks.append({"status": status, "message": message})
 
 binary_path = os.path.join(repo_dir, "target/release/aeronyx-server")
+release_dir = "/var/lib/aeronyx/releases"
+release_backups = {
+    "dir": release_dir,
+    "binary_count": len(glob.glob(os.path.join(release_dir, "aeronyx-server.*"))),
+    "systemd_unit_count": len(glob.glob(os.path.join(release_dir, f"{service_name}.service.*"))),
+    "keep_target": 10,
+}
 runtime = {
     "git_commit": run(["git", "-C", repo_dir, "rev-parse", "--short", "HEAD"]),
     "git_branch": run(["git", "-C", repo_dir, "rev-parse", "--abbrev-ref", "HEAD"]),
@@ -520,6 +556,7 @@ runtime = {
     "service_enabled": run(["systemctl", "is-enabled", service_name]),
     "network_restore_active": run(["systemctl", "is-active", network_restore_service]),
     "network_restore_enabled": run(["systemctl", "is-enabled", network_restore_service]),
+    "release_backups": release_backups,
 }
 
 print(json.dumps({
@@ -543,6 +580,7 @@ main() {
     check_host_capacity
     check_repo_and_binary
     check_runtime_metadata
+    check_release_backups
     check_config_validation
     check_systemd
     check_systemd_hardening

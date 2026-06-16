@@ -12,7 +12,7 @@ Modification Reason:
 - Document production upgrade unit-template synchronization, rollback behavior,
   shared node-local deployment locking, and install-time systemd unit
   verification, purge path safety, service-name validation, and release-backup
-  retention.
+  retention/diagnostics.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -38,6 +38,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.8.0-node-deploy - Documented healthcheck release-backup diagnostics.
 v1.7.0-node-deploy - Documented upgrade release-backup retention.
 v1.6.0-node-deploy - Documented --service name validation.
 v1.5.0-node-deploy - Documented uninstall purge path allow-list protection.
@@ -174,6 +175,7 @@ The healthcheck prints:
 - host capacity: TUN, default route, memory, disk, and ports
 - runtime metadata: git commit, branch, binary/config timestamps, service state
 - tracked worktree and current-start journal warning checks
+- release-backup counts for upgrade retention observability
 - release binary presence
 - config validation result
 - node registration files
