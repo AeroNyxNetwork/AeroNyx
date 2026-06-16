@@ -12,7 +12,7 @@ Modification Reason:
 - Document production upgrade unit-template synchronization, rollback behavior,
   shared node-local deployment locking, and install-time systemd unit
   verification, purge path safety, service-name validation, and release-backup
-  retention/diagnostics.
+  retention/diagnostics, plus network restore command-path portability.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -38,6 +38,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.9.0-node-deploy - Documented portable network restore command paths.
 v1.8.0-node-deploy - Documented healthcheck release-backup diagnostics.
 v1.7.0-node-deploy - Documented upgrade release-backup retention.
 v1.6.0-node-deploy - Documented --service name validation.
@@ -104,6 +105,10 @@ When network setup is enabled, `install.sh` persists forwarding/NAT with:
 - `/etc/sysctl.d/99-aeronyx.conf`
 - `/etc/iptables/rules.v4`
 - `aeronyx-network-restore.service`
+
+The generated network restore service uses detected absolute paths for
+`sysctl` and `iptables-restore` so reboot recovery works across Linux
+distributions that place these commands under `/usr/sbin` instead of `/sbin`.
 
 Before installing the main service, `install.sh` renders the systemd template
 and verifies it with `systemd-analyze verify`. A malformed service unit fails
@@ -182,6 +187,7 @@ The healthcheck prints:
 - systemd status
 - systemd hardening status
 - IPv4 forwarding, NAT, and reboot persistence hints
+- network restore command path checks
 - local VPN health endpoint status
 - capacity telemetry: IP pool, conntrack, file descriptors, drops, pps, bps
 

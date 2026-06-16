@@ -10,6 +10,8 @@
 # Modification Reason:
 # - Add install-time systemd unit verification while preserving the production
 #   deployment entrypoint for commercial VPN node operators.
+# - Render the generated network restore unit with detected system command
+#   paths instead of assuming /sbin.
 #
 # Main Functionality:
 # - Detects Linux/systemd environment.
@@ -24,6 +26,7 @@
 # - Verifies, installs, and enables the systemd service.
 # - Optionally configures IP forwarding/NAT and registers/starts the node.
 # - Persists VPN forwarding/NAT across host reboots.
+# - Renders reboot network restore with distro-specific sysctl/iptables paths.
 #
 # Dependencies:
 # - deploy/node/server.example.toml
@@ -46,6 +49,8 @@
 #   development/client platforms, not production node hosts for this script.
 #
 # Last Modified:
+# v1.7.0-node-deploy - Uses detected sysctl and iptables-restore paths in the
+#                      generated network restore service.
 # v1.6.0-node-deploy - Verifies the rendered systemd service unit before
 #                      installing it.
 # v1.5.0-node-deploy - Added shared deployment locking with upgrade.sh.
@@ -166,6 +171,14 @@ require_root() {
 require_linux_systemd() {
     [ "$(uname -s)" = "Linux" ] || die "install.sh supports Linux production nodes only."
     command -v systemctl >/dev/null 2>&1 || die "systemctl is required for production node service management."
+}
+
+resolve_command_path() {
+    local cmd="$1"
+    local path
+    path="$(command -v "${cmd}" 2>/dev/null || true)"
+    [ -n "${path}" ] || die "Required command not found: ${cmd}"
+    printf '%s\n' "${path}"
 }
 
 release_lock() {
@@ -393,9 +406,14 @@ persist_network_rules() {
 }
 
 install_network_restore_service() {
+    local sysctl_path iptables_restore_path
+    sysctl_path="$(resolve_command_path sysctl)"
+    iptables_restore_path="$(resolve_command_path iptables-restore)"
+
     log "Installing network restore service: ${NETWORK_RESTORE_FILE}"
     if [ "${DRY_RUN}" -eq 1 ]; then
         printf '[DRY-RUN] create %s\n' "${NETWORK_RESTORE_FILE}"
+        printf '[DRY-RUN] network restore commands: sysctl=%s iptables-restore=%s\n' "${sysctl_path}" "${iptables_restore_path}"
     else
         cat > "${NETWORK_RESTORE_FILE}" <<SERVICE
 # ============================================
@@ -424,8 +442,8 @@ ConditionPathExists=${IPTABLES_RULES_FILE}
 
 [Service]
 Type=oneshot
-ExecStart=/sbin/sysctl -w net.ipv4.ip_forward=1
-ExecStart=/sbin/iptables-restore ${IPTABLES_RULES_FILE}
+ExecStart=${sysctl_path} -w net.ipv4.ip_forward=1
+ExecStart=${iptables_restore_path} ${IPTABLES_RULES_FILE}
 RemainAfterExit=yes
 
 [Install]

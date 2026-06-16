@@ -10,11 +10,13 @@
 # - Add service-name validation while preserving the production healthcheck for
 #   node deployment workflows.
 # - Add release-backup diagnostics for node upgrade retention observability.
+# - Validate generated network restore command paths for reboot reliability.
 #
 # Main Functionality:
 # - Checks repository, binary, config, registration state, systemd status,
 #   host capacity, IP forwarding, NAT runtime/persistence, local VPN health
 #   endpoint, release-backup retention, and capacity telemetry.
+# - Checks that generated network restore ExecStart command paths exist.
 # - Emits machine-readable JSON for nodeboard or support automation.
 # - Warns when installed systemd hardening is weaker than the production
 #   template.
@@ -38,6 +40,7 @@
 # - Reject service names that look like paths or command-line options.
 #
 # Last Modified:
+# v1.8.0-node-deploy - Added network restore ExecStart command path checks.
 # v1.7.0-node-deploy - Added release-backup count diagnostics for upgrade
 #                      retention observability.
 # v1.6.0-node-deploy - Validates --service names before systemd and journal
@@ -408,7 +411,7 @@ check_systemd_hardening() {
 }
 
 check_network() {
-    local forwarding
+    local forwarding restore_cmd restore_paths
     forwarding="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || printf 'unknown')"
     if [ "${forwarding}" = "1" ]; then
         pass "IPv4 forwarding enabled"
@@ -446,6 +449,23 @@ check_network() {
             pass "network restore service enabled: ${NETWORK_RESTORE_SERVICE}"
         else
             warn "network restore service not enabled: ${NETWORK_RESTORE_SERVICE}"
+        fi
+        restore_paths="$(systemctl cat "${NETWORK_RESTORE_SERVICE}.service" 2>/dev/null \
+            | awk -F= '/^ExecStart=/ {print $2}' \
+            | awk '{print $1}')"
+        if [ -n "${restore_paths}" ]; then
+            while IFS= read -r restore_cmd; do
+                [ -n "${restore_cmd}" ] || continue
+                if [ -x "${restore_cmd}" ]; then
+                    pass "network restore command path executable: ${restore_cmd}"
+                else
+                    warn "network restore command path missing or not executable: ${restore_cmd}"
+                fi
+            done <<EOF
+${restore_paths}
+EOF
+        else
+            warn "network restore ExecStart commands not readable"
         fi
     fi
 }
