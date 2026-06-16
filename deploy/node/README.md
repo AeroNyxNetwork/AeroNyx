@@ -14,8 +14,8 @@ Modification Reason:
   verification, purge path safety, service-name validation, and release-backup
   retention/diagnostics, plus network restore command-path portability and unit
   verification/synchronization, low-risk maintenance, and tracked dirty
-  worktree protection, config-driven VPN network rules, and network-only
-  maintenance.
+  worktree protection, config-driven VPN network rules, network-only
+  maintenance, and install-time commercial capacity plan checks.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -41,6 +41,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.22.0-node-deploy - Documented installer capacity plan preflight for IP pool,
+                     max connections, fd limit, and conntrack headroom.
 v1.21.0-node-deploy - Documented --network-only maintenance for config-driven
                      NAT/FORWARD refresh.
 v1.20.0-node-deploy - Documented config-driven VPN subnet/TUN network rules
@@ -122,6 +124,22 @@ checks for:
 - memory
 - disk space
 - common AeroNyx ports `51820` and `8421`
+- commercial capacity plan:
+  - configured VPN pool and estimated usable client IPs
+  - configured `limits.max_connections`
+  - systemd `LimitNOFILE` plus shell file-descriptor soft/hard limit
+  - current and maximum Linux conntrack entries
+
+Capacity-plan warnings are non-blocking, but they should be resolved before a
+node is placed into paid commercial routing. In particular,
+`limits.max_connections` should not exceed usable client IPs in
+`vpn.virtual_ip_range`, and the host should keep enough file-descriptor and
+conntrack headroom for the configured session target.
+
+The file-descriptor check prefers the installed or template systemd
+`LimitNOFILE` value because that is the limit used by the production
+`aeronyx-server` service. The shell `ulimit` is still printed as context for
+manual debugging.
 
 When network setup is enabled, `install.sh` persists forwarding/NAT with:
 
@@ -318,6 +336,12 @@ purge allow-list:
 application settings. `install.sh` uses them when writing host NAT/FORWARD
 rules, and `healthcheck.sh` verifies runtime and persisted rules against the
 same values.
+
+`limits.max_connections` is the node-local session ceiling used during install
+capacity planning and by the Rust runtime as the default maximum session limit.
+Remote nodeboard policy may apply a stricter commercial `max_sessions` value at
+runtime; capacity planning should use the lower of the local limit, the remote
+policy limit, and available client IPs.
 
 The systemd template applies production-safe hardening:
 

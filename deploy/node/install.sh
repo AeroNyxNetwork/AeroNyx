@@ -24,11 +24,16 @@
 #   hard-coded deployment defaults.
 # - Add a network-only maintenance mode for refreshing forwarding/NAT after
 #   VPN subnet or TUN-device changes.
+# - Add an install-time commercial capacity plan summary so operators can see
+#   IP-pool, max_connections, file-descriptor, and conntrack risk before the
+#   first build or service restart.
 #
 # Main Functionality:
 # - Detects Linux/systemd environment.
 # - Runs production preflight checks for TUN, default route, memory, disk, and
 #   common AeroNyx ports.
+# - Prints a read-only commercial capacity plan from server.toml/defaults and
+#   host kernel limits.
 # - Prevents concurrent install/upgrade runs on the same node.
 # - Installs host dependencies on supported Linux distributions.
 # - Clones or uses the AeroNyx repository.
@@ -68,6 +73,8 @@
 #   side effects.
 #
 # Last Modified:
+# v1.14.0-node-deploy - Added capacity plan preflight for IP pool, configured
+#                       max connections, fd limit, and conntrack headroom.
 # v1.13.0-node-deploy - Added --network-only for config-driven forwarding/NAT
 #                       maintenance.
 # v1.12.0-node-deploy - Reads VPN subnet and TUN device from server.toml for
@@ -342,6 +349,110 @@ config_tun_device() {
     fi
 }
 
+config_uint() {
+    local section="$1" key="$2" default_value="$3" raw
+    raw="$(config_value "${section}" "${key}" "${default_value}")"
+    if printf '%s' "${raw}" | grep -Eq '^[0-9]+$'; then
+        printf '%s\n' "${raw}"
+    else
+        warn "Invalid ${section}.${key} in ${CONFIG_FILE}: ${raw}; using ${default_value}"
+        printf '%s\n' "${default_value}"
+    fi
+}
+
+cidr_usable_client_ips() {
+    local cidr="$1"
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf 'unknown\n'
+        return
+    fi
+
+    python3 - "${cidr}" <<'PY'
+import ipaddress
+import sys
+
+try:
+    network = ipaddress.ip_network(sys.argv[1], strict=False)
+    hosts = sum(1 for _ in network.hosts())
+    # AeroNyx reserves one usable host address for the gateway inside the pool.
+    print(max(hosts - 1, 0))
+except Exception:
+    print("unknown")
+PY
+}
+
+read_uint_file() {
+    local path="$1" fallback="$2" value
+    if [ -r "${path}" ]; then
+        value="$(cat "${path}" 2>/dev/null || true)"
+        if printf '%s' "${value}" | grep -Eq '^[0-9]+$'; then
+            printf '%s\n' "${value}"
+            return
+        fi
+    fi
+    printf '%s\n' "${fallback}"
+}
+
+capacity_warn() {
+    printf '[WARN] %s\n' "$*"
+}
+
+service_limit_nofile() {
+    local candidate value
+    for candidate in \
+        "${SERVICE_FILE}" \
+        "${SCRIPT_DIR}/aeronyx-server.service" \
+        "${REPO_DIR}/deploy/node/aeronyx-server.service"
+    do
+        if [ -r "${candidate}" ]; then
+            value="$(grep -E '^[[:space:]]*LimitNOFILE=' "${candidate}" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '[:space:]' || true)"
+            if printf '%s' "${value}" | grep -Eq '^[0-9]+$'; then
+                printf '%s\n' "${value}"
+                return
+            fi
+        fi
+    done
+    printf 'unknown\n'
+}
+
+capacity_plan_checks() {
+    local vpn_subnet tun_device max_connections ip_capacity shell_fd_soft
+    local shell_fd_hard service_fd_limit effective_fd_limit conntrack_max
+    local conntrack_used recommended_fd recommended_conntrack
+
+    vpn_subnet="$(config_cidr "100.64.0.0/24")"
+    tun_device="$(config_tun_device "aeronyx0")"
+    max_connections="$(config_uint limits max_connections 1000)"
+    ip_capacity="$(cidr_usable_client_ips "${vpn_subnet}")"
+    shell_fd_soft="$(ulimit -Sn 2>/dev/null || printf 'unknown')"
+    shell_fd_hard="$(ulimit -Hn 2>/dev/null || printf 'unknown')"
+    service_fd_limit="$(service_limit_nofile)"
+    effective_fd_limit="${service_fd_limit}"
+    if ! printf '%s' "${effective_fd_limit}" | grep -Eq '^[0-9]+$'; then
+        effective_fd_limit="${shell_fd_soft}"
+    fi
+    conntrack_max="$(read_uint_file /proc/sys/net/netfilter/nf_conntrack_max unknown)"
+    conntrack_used="$(read_uint_file /proc/sys/net/netfilter/nf_conntrack_count 0)"
+    recommended_fd=$((max_connections * 4 + 1024))
+    recommended_conntrack=$((max_connections * 8))
+
+    log "Commercial capacity plan"
+    ok "VPN pool ${vpn_subnet} on ${tun_device}; usable client IPs: ${ip_capacity}; configured max_connections: ${max_connections}"
+    ok "Host limits: service LimitNOFILE=${service_fd_limit}; shell fd soft=${shell_fd_soft} hard=${shell_fd_hard}; conntrack used=${conntrack_used} max=${conntrack_max}"
+
+    if [ "${ip_capacity}" != "unknown" ] && [ "${max_connections}" -gt "${ip_capacity}" ]; then
+        capacity_warn "max_connections (${max_connections}) exceeds usable client IPs (${ip_capacity}). Expand vpn.virtual_ip_range or lower limits.max_connections before commercial placement."
+    fi
+
+    if printf '%s' "${effective_fd_limit}" | grep -Eq '^[0-9]+$' && [ "${effective_fd_limit}" -lt "${recommended_fd}" ]; then
+        capacity_warn "Effective file descriptor limit (${effective_fd_limit}) is below recommended headroom (${recommended_fd}) for ${max_connections} configured sessions."
+    fi
+
+    if printf '%s' "${conntrack_max}" | grep -Eq '^[0-9]+$' && [ "${conntrack_max}" -lt "${recommended_conntrack}" ]; then
+        capacity_warn "nf_conntrack_max (${conntrack_max}) is below recommended headroom (${recommended_conntrack}) for ${max_connections} configured sessions."
+    fi
+}
+
 port_in_use() {
     local port="$1"
     if command -v ss >/dev/null 2>&1; then
@@ -397,6 +508,8 @@ preflight_checks() {
     else
         ok "Port 8421 appears available"
     fi
+
+    capacity_plan_checks
 }
 
 install_packages() {
