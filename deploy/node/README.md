@@ -129,6 +129,7 @@ The healthcheck prints:
 - config validation result
 - node registration files
 - systemd status
+- systemd hardening status
 - IPv4 forwarding and NAT hints
 - local VPN health endpoint status
 - capacity telemetry: IP pool, conntrack, file descriptors, drops, pps, bps
@@ -166,6 +167,18 @@ sudo ./deploy/node/uninstall.sh --purge
 - max connections: `1000`
 - management API: `https://api.aeronyx.network/api/privacy_network`
 - MemChain: `off`
+
+The systemd template applies production-safe hardening:
+
+- `NoNewPrivileges=true`
+- `ProtectSystem=full`
+- restricted `CapabilityBoundingSet`
+- explicit `ReadWritePaths` for `/etc/aeronyx`, `/var/lib/aeronyx`, and
+  `/var/log/aeronyx`
+
+It intentionally does not enable `PrivateDevices` or `ProtectHome` because VPN
+nodes need `/dev/net/tun`, and existing deployments may keep the repository
+under `/root`.
 
 MemChain and local AI model setup remain available through the existing
 `scripts/init.sh` and `scripts/download_models.sh` workflows. They are not part

@@ -6,12 +6,15 @@
 #   privacy nodes.
 #
 # Modification Reason:
-# - Initial production node deployment profile for install.sh and upgrade.sh.
+# - Add production systemd hardening while preserving TUN/VPN runtime access.
 #
 # Main Functionality:
 # - Runs the Rust aeronyx-server binary under systemd.
 # - Loads optional environment overrides from /etc/aeronyx/aeronyx.env.
 # - Uses /etc/aeronyx/server.toml as the stable config path.
+# - Restricts process privileges with capability and filesystem boundaries.
+# - Lets systemd create the state/config/log directories before namespace
+#   hardening is applied.
 #
 # Dependencies:
 # - Installed by deploy/node/install.sh into /etc/systemd/system.
@@ -21,14 +24,20 @@
 # Main Logical Flow:
 # 1. systemd waits for network-online.target.
 # 2. aeronyx-server starts from @REPO_DIR@/target/release.
-# 3. systemd restarts the service on process failure.
+# 3. systemd applies runtime hardening that still permits TUN/VPN networking.
+# 4. systemd restarts the service on process failure.
 #
 # Important Note for Next Developer:
 # - Keep ExecStart compatible with crates/aeronyx-server/src/main.rs.
 # - Do not add user traffic logging or destination inspection here.
 # - install.sh replaces @REPO_DIR@ and @CONFIG_FILE@ before installation.
+# - Do not enable PrivateDevices or ProtectHome here; production nodes need
+#   /dev/net/tun and many current deployments place the repository under /root.
 #
 # Last Modified:
+# v1.1.1-node-deploy - Added systemd-managed state/config/log directories so
+#                      ReadWritePaths cannot fail on missing paths.
+# v1.1.0-node-deploy - Added production-safe systemd hardening.
 # v1.0.0-node-deploy - Added production systemd unit template.
 # ============================================
 
@@ -48,6 +57,28 @@ RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=30
 LimitNOFILE=1048576
+ConfigurationDirectory=aeronyx
+StateDirectory=aeronyx
+LogsDirectory=aeronyx
+
+# Runtime hardening:
+# - Keep CAP_NET_ADMIN/CAP_NET_RAW for TUN and VPN packet handling.
+# - Keep CAP_NET_BIND_SERVICE for future privileged bind compatibility.
+# - Keep /etc/aeronyx writable because first startup may persist generated
+#   secrets and registration-related runtime state.
+# - Do not use PrivateDevices=true; it would hide /dev/net/tun.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/etc/aeronyx /var/lib/aeronyx /var/log/aeronyx
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

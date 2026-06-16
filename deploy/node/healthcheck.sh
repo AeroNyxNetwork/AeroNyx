@@ -14,6 +14,8 @@
 #   host capacity, IP forwarding, NAT hints, local VPN health endpoint, and
 #   capacity telemetry.
 # - Emits machine-readable JSON for nodeboard or support automation.
+# - Warns when installed systemd hardening is weaker than the production
+#   template.
 #
 # Dependencies:
 # - /etc/aeronyx/server.toml
@@ -33,6 +35,8 @@
 # - This script should never modify host state.
 #
 # Last Modified:
+# v1.3.1-node-deploy - Checks systemd-managed AeroNyx directories.
+# v1.3.0-node-deploy - Added systemd hardening diagnostics.
 # v1.2.0-node-deploy - Added full checks[] JSON output and --json-only mode.
 # v1.1.0-node-deploy - Added host capacity, TUN, route, disk, and port checks.
 # v1.0.0-node-deploy - Added production node healthcheck.
@@ -204,6 +208,8 @@ check_repo_and_binary() {
     check_file "${CONFIG_FILE}" "config"
     check_file "/etc/aeronyx/node_info.json" "node registration"
     check_file "/etc/aeronyx/server_key.json" "node server key"
+    check_file "/var/lib/aeronyx" "state directory"
+    check_file "/var/log/aeronyx" "log directory"
 }
 
 check_config_validation() {
@@ -236,6 +242,83 @@ check_systemd() {
         pass "systemd service active: ${SERVICE_NAME}"
     else
         warn "systemd service not active: ${SERVICE_NAME}"
+    fi
+}
+
+systemd_property() {
+    local property="$1"
+    systemctl show "${SERVICE_NAME}" -p "${property}" --value 2>/dev/null || true
+}
+
+check_systemd_hardening() {
+    local capability_bounding ambient_capabilities protect_system read_write_paths
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "systemd hardening checks skipped"
+        return
+    fi
+    if ! systemctl list-unit-files "${SERVICE_NAME}.service" --no-legend 2>/dev/null | grep -q "${SERVICE_NAME}.service"; then
+        warn "systemd hardening checks skipped; service unit missing"
+        return
+    fi
+
+    [ "$(systemd_property NoNewPrivileges)" = "yes" ] \
+        && pass "systemd hardening NoNewPrivileges=yes" \
+        || warn "systemd hardening NoNewPrivileges is not enabled"
+
+    [ "$(systemd_property PrivateTmp)" = "yes" ] \
+        && pass "systemd hardening PrivateTmp=yes" \
+        || warn "systemd hardening PrivateTmp is not enabled"
+
+    protect_system="$(systemd_property ProtectSystem)"
+    [ "${protect_system}" = "full" ] || [ "${protect_system}" = "strict" ] \
+        && pass "systemd hardening ProtectSystem=${protect_system}" \
+        || warn "systemd hardening ProtectSystem is not full/strict"
+
+    [ "$(systemd_property ProtectControlGroups)" = "yes" ] \
+        && pass "systemd hardening ProtectControlGroups=yes" \
+        || warn "systemd hardening ProtectControlGroups is not enabled"
+
+    [ "$(systemd_property ProtectKernelTunables)" = "yes" ] \
+        && pass "systemd hardening ProtectKernelTunables=yes" \
+        || warn "systemd hardening ProtectKernelTunables is not enabled"
+
+    [ "$(systemd_property ProtectKernelModules)" = "yes" ] \
+        && pass "systemd hardening ProtectKernelModules=yes" \
+        || warn "systemd hardening ProtectKernelModules is not enabled"
+
+    [ "$(systemd_property RestrictSUIDSGID)" = "yes" ] \
+        && pass "systemd hardening RestrictSUIDSGID=yes" \
+        || warn "systemd hardening RestrictSUIDSGID is not enabled"
+
+    [ "$(systemd_property LockPersonality)" = "yes" ] \
+        && pass "systemd hardening LockPersonality=yes" \
+        || warn "systemd hardening LockPersonality is not enabled"
+
+    capability_bounding="$(systemd_property CapabilityBoundingSet)"
+    if printf '%s\n' "${capability_bounding}" | grep -q 'cap_sys_admin'; then
+        warn "systemd hardening CapabilityBoundingSet still includes cap_sys_admin"
+    elif printf '%s\n' "${capability_bounding}" | grep -q 'cap_net_admin' \
+        && printf '%s\n' "${capability_bounding}" | grep -q 'cap_net_raw'; then
+        pass "systemd hardening CapabilityBoundingSet is restricted for VPN networking"
+    else
+        warn "systemd hardening CapabilityBoundingSet may not include required VPN capabilities"
+    fi
+
+    ambient_capabilities="$(systemd_property AmbientCapabilities)"
+    if printf '%s\n' "${ambient_capabilities}" | grep -q 'cap_net_admin' \
+        && printf '%s\n' "${ambient_capabilities}" | grep -q 'cap_net_raw'; then
+        pass "systemd hardening AmbientCapabilities includes VPN capabilities"
+    else
+        warn "systemd hardening AmbientCapabilities missing expected VPN capabilities"
+    fi
+
+    read_write_paths="$(systemd_property ReadWritePaths)"
+    if printf '%s\n' "${read_write_paths}" | grep -q '/etc/aeronyx' \
+        && printf '%s\n' "${read_write_paths}" | grep -q '/var/lib/aeronyx'; then
+        pass "systemd hardening ReadWritePaths include AeroNyx state directories"
+    else
+        warn "systemd hardening ReadWritePaths missing AeroNyx state directories"
     fi
 }
 
@@ -346,6 +429,7 @@ main() {
     check_repo_and_binary
     check_config_validation
     check_systemd
+    check_systemd_hardening
     check_network
     check_health_endpoint
 
