@@ -22,6 +22,8 @@
 #   inheriting a false shell test status.
 # - Derive VPN NAT subnet and TUN interface from server.toml instead of using
 #   hard-coded deployment defaults.
+# - Add a network-only maintenance mode for refreshing forwarding/NAT after
+#   VPN subnet or TUN-device changes.
 #
 # Main Functionality:
 # - Detects Linux/systemd environment.
@@ -62,8 +64,12 @@
 #   data and build artifacts do not block reinstall flows.
 # - Keep network setup aligned with /etc/aeronyx/server.toml when operators
 #   expand the VPN IP pool or customize the TUN device.
+# - Keep --network-only free of binary build, registration, and service restart
+#   side effects.
 #
 # Last Modified:
+# v1.13.0-node-deploy - Added --network-only for config-driven forwarding/NAT
+#                       maintenance.
 # v1.12.0-node-deploy - Reads VPN subnet and TUN device from server.toml for
 #                       forwarding/NAT setup.
 # v1.11.0-node-deploy - Made registration-skipped installs return
@@ -121,6 +127,7 @@ DRY_RUN=0
 CONFIG_ONLY=0
 PREFLIGHT_ONLY=0
 ALLOW_DIRTY=0
+NETWORK_ONLY=0
 
 log() { printf '[INFO] %s\n' "$*"; }
 ok() { printf '[OK] %s\n' "$*"; }
@@ -145,6 +152,7 @@ Options:
   --skip-rust-install     Do not install Rust automatically if cargo is missing.
   --config-only           Only create config/env directories and server.toml if missing.
   --preflight-only        Run production readiness checks and exit.
+  --network-only          Only refresh sysctl, iptables, and network restore service.
   --allow-dirty           Allow install to update an existing repo with tracked Git changes.
   --dry-run               Print actions without changing the host.
   -h, --help              Show this help.
@@ -169,6 +177,7 @@ while [ "$#" -gt 0 ]; do
         --skip-rust-install) INSTALL_RUST=0; shift ;;
         --config-only) CONFIG_ONLY=1; DO_BUILD=0; DO_NETWORK=0; DO_START=0; DO_ENABLE=0; INSTALL_PACKAGES=0; INSTALL_RUST=0; shift ;;
         --preflight-only) PREFLIGHT_ONLY=1; DO_BUILD=0; DO_NETWORK=0; DO_START=0; DO_ENABLE=0; INSTALL_PACKAGES=0; INSTALL_RUST=0; shift ;;
+        --network-only) NETWORK_ONLY=1; DO_BUILD=0; DO_NETWORK=1; DO_START=0; DO_ENABLE=0; INSTALL_PACKAGES=0; INSTALL_RUST=0; shift ;;
         --allow-dirty) ALLOW_DIRTY=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -199,6 +208,18 @@ require_root() {
 require_linux_systemd() {
     [ "$(uname -s)" = "Linux" ] || die "install.sh supports Linux production nodes only."
     command -v systemctl >/dev/null 2>&1 || die "systemctl is required for production node service management."
+}
+
+validate_option_combinations() {
+    if [ "${NETWORK_ONLY}" -eq 1 ] && [ "${CONFIG_ONLY}" -eq 1 ]; then
+        die "--network-only cannot be combined with --config-only."
+    fi
+    if [ "${NETWORK_ONLY}" -eq 1 ] && [ "${PREFLIGHT_ONLY}" -eq 1 ]; then
+        die "--network-only cannot be combined with --preflight-only."
+    fi
+    if [ "${NETWORK_ONLY}" -eq 1 ] && [ "${DRY_RUN}" -eq 0 ] && [ ! -f "${CONFIG_FILE}" ]; then
+        die "--network-only requires existing config: ${CONFIG_FILE}"
+    fi
 }
 
 resolve_command_path() {
@@ -655,12 +676,19 @@ start_service() {
 main() {
     require_root
     require_linux_systemd
+    validate_option_combinations
     preflight_checks
     if [ "${PREFLIGHT_ONLY}" -eq 1 ]; then
         ok "Preflight-only checks complete."
         exit 0
     fi
     acquire_deploy_lock
+    if [ "${NETWORK_ONLY}" -eq 1 ]; then
+        configure_network
+        ok "Network-only maintenance complete."
+        exit 0
+    fi
+
     install_packages
     if [ "${DO_BUILD}" -eq 1 ]; then
         install_rust_if_needed

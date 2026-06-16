@@ -14,7 +14,8 @@ Modification Reason:
   verification, purge path safety, service-name validation, and release-backup
   retention/diagnostics, plus network restore command-path portability and unit
   verification/synchronization, low-risk maintenance, and tracked dirty
-  worktree protection, plus config-driven VPN network rules.
+  worktree protection, config-driven VPN network rules, and network-only
+  maintenance.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -40,6 +41,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.21.0-node-deploy - Documented --network-only maintenance for config-driven
+                     NAT/FORWARD refresh.
 v1.20.0-node-deploy - Documented config-driven VPN subnet/TUN network rules
                      and health diagnostics.
 v1.19.0-node-deploy - Documented tracked dirty-worktree protection for install
@@ -134,6 +137,16 @@ The VPN source subnet and TUN interface are read from the installed
 
 This keeps NAT and forwarding rules aligned when operators expand the IP pool
 or customize the TUN device for higher-capacity nodes.
+
+Refresh only host forwarding/NAT and reboot recovery after changing
+`vpn.virtual_ip_range` or `tun.device_name`:
+
+```bash
+sudo ./deploy/node/install.sh --network-only
+```
+
+This mode does not pull source, build the Rust binary, register the node,
+install the main systemd unit, or restart `aeronyx-server`.
 
 The generated network restore service uses detected absolute paths for
 `sysctl` and `iptables-restore` so reboot recovery works across Linux
