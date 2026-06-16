@@ -151,13 +151,17 @@ payloads, wallet-level traffic, or client public IPs.
 sudo ./deploy/node/uninstall.sh
 ```
 
-Default uninstall behavior stops/disables the service and removes the systemd
-unit, but preserves:
+Default uninstall behavior stops/disables the main service, removes the main
+systemd unit, and also stops/disables/removes `aeronyx-network-restore.service`.
+It preserves:
 
 - `/etc/aeronyx/server.toml`
 - `/etc/aeronyx/server_key.json`
 - `/etc/aeronyx/node_info.json`
 - `/var/lib/aeronyx`
+- `/var/log/aeronyx`
+- `/etc/sysctl.d/99-aeronyx.conf`
+- `/etc/iptables/rules.v4`
 
 Full purge requires explicit confirmation:
 
