@@ -16,7 +16,8 @@ Modification Reason:
   verification/synchronization, low-risk maintenance, and tracked dirty
   worktree protection, config-driven VPN network rules, network-only
   maintenance, install-time commercial capacity plan checks, and healthcheck
-  capacity-risk JSON export.
+  capacity-risk JSON export. Document the /22 default VPN pool that matches the
+  commercial 1000-session profile.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -42,6 +43,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.24.0-node-deploy - Documented /22 default VPN pool for 1000-session
+                     commercial capacity.
 v1.23.0-node-deploy - Documented healthcheck capacity telemetry warnings and
                      JSON export for nodeboard automation.
 v1.22.0-node-deploy - Documented installer capacity plan preflight for IP pool,
@@ -337,7 +340,7 @@ purge allow-list:
 `server.example.toml` defaults to a commercial VPN node profile:
 
 - VPN listen address: `0.0.0.0:51820`
-- virtual IP pool: `100.64.0.0/24`
+- virtual IP pool: `100.64.0.0/22`
 - TUN device: `aeronyx0`
 - max connections: `1000`
 - management API: `https://api.aeronyx.network/api/privacy_network`
@@ -347,6 +350,13 @@ purge allow-list:
 application settings. `install.sh` uses them when writing host NAT/FORWARD
 rules, and `healthcheck.sh` verifies runtime and persisted rules against the
 same values.
+
+The default `100.64.0.0/22` pool gives roughly 1021 usable client addresses
+after the gateway reservation, which matches the default `max_connections =
+1000` commercial profile. Existing nodes are not rewritten automatically:
+expand a live pool only during an operator-approved maintenance window, then
+run `install.sh --network-only` to refresh NAT/FORWARD rules and restart the
+Rust service only after active sessions are safely drained.
 
 `limits.max_connections` is the node-local session ceiling used during install
 capacity planning and by the Rust runtime as the default maximum session limit.

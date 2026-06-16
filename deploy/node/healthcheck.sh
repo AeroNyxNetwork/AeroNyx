@@ -20,6 +20,7 @@
 # - Promote Rust VPN capacity telemetry from informational output into
 #   healthcheck warnings and JSON so commercial placement tooling can detect
 #   IP-pool, session-ceiling, fd, conntrack, and packet-drop risk.
+# - Align default/fallback VPN pool with the commercial 1000-session profile.
 #
 # Main Functionality:
 # - Checks repository, binary, config, registration state, systemd status,
@@ -52,6 +53,8 @@
 #   tun.device_name from the installed config.
 #
 # Last Modified:
+# v1.15.0-node-deploy - Expanded default VPN pool fallback to /22 for
+#                       1000-session commercial capacity.
 # v1.14.0-node-deploy - Added capacity telemetry checks and JSON export for
 #                       commercial placement risk.
 # v1.13.0-node-deploy - Reads VPN subnet and TUN device from server.toml for
@@ -561,7 +564,7 @@ check_systemd_hardening() {
 
 check_network() {
     local forwarding restore_cmd restore_paths tun_device vpn_subnet
-    vpn_subnet="$(config_cidr "100.64.0.0/24")"
+    vpn_subnet="$(config_cidr "100.64.0.0/22")"
     tun_device="$(config_tun_device "aeronyx0")"
 
     forwarding="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || printf 'unknown')"
@@ -797,11 +800,11 @@ def vpn_config(path):
             parsed = tomllib.loads(raw.decode("utf-8"))
             vpn = parsed.get("vpn", {})
             tun = parsed.get("tun", {})
-            data["virtual_ip_range"] = str(vpn.get("virtual_ip_range", "100.64.0.0/24"))
+            data["virtual_ip_range"] = str(vpn.get("virtual_ip_range", "100.64.0.0/22"))
             data["tun_device"] = str(tun.get("device_name", "aeronyx0"))
         except Exception:
             current = None
-            values = {"virtual_ip_range": "100.64.0.0/24", "tun_device": "aeronyx0"}
+            values = {"virtual_ip_range": "100.64.0.0/22", "tun_device": "aeronyx0"}
             for raw_line in raw.decode("utf-8", "replace").splitlines():
                 line = raw_line.split("#", 1)[0].strip()
                 if not line:
@@ -820,7 +823,7 @@ def vpn_config(path):
                     values["tun_device"] = value
             data.update(values)
     except Exception:
-        data = {"virtual_ip_range": "100.64.0.0/24", "tun_device": "aeronyx0"}
+        data = {"virtual_ip_range": "100.64.0.0/22", "tun_device": "aeronyx0"}
 
     try:
         import ipaddress

@@ -6,6 +6,8 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - Align the default commercial VPN IP pool with the default 1000-session
+#   ceiling so new nodes do not start with an IP-pool capacity warning.
 # - Initial production node deployment profile. This template separates public
 #   defaults from node-private runtime state in /etc/aeronyx.
 #
@@ -32,6 +34,8 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.1.0-node-deploy - Expanded default VPN pool to /22 for 1000-session
+#                      commercial capacity.
 # v1.0.0-node-deploy - Added production node example config.
 # ============================================
 
@@ -39,7 +43,7 @@
 listen_addr = "0.0.0.0:51820"
 
 [vpn]
-virtual_ip_range = "100.64.0.0/24"
+virtual_ip_range = "100.64.0.0/22"
 gateway_ip = "100.64.0.1"
 
 [tun]

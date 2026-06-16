@@ -27,6 +27,7 @@
 # - Add an install-time commercial capacity plan summary so operators can see
 #   IP-pool, max_connections, file-descriptor, and conntrack risk before the
 #   first build or service restart.
+# - Align default/fallback VPN pool with the commercial 1000-session profile.
 #
 # Main Functionality:
 # - Detects Linux/systemd environment.
@@ -73,6 +74,8 @@
 #   side effects.
 #
 # Last Modified:
+# v1.15.0-node-deploy - Expanded default VPN pool fallback to /22 for
+#                       1000-session commercial capacity.
 # v1.14.0-node-deploy - Added capacity plan preflight for IP pool, configured
 #                       max connections, fd limit, and conntrack headroom.
 # v1.13.0-node-deploy - Added --network-only for config-driven forwarding/NAT
@@ -420,7 +423,7 @@ capacity_plan_checks() {
     local shell_fd_hard service_fd_limit effective_fd_limit conntrack_max
     local conntrack_used recommended_fd recommended_conntrack
 
-    vpn_subnet="$(config_cidr "100.64.0.0/24")"
+    vpn_subnet="$(config_cidr "100.64.0.0/22")"
     tun_device="$(config_tun_device "aeronyx0")"
     max_connections="$(config_uint limits max_connections 1000)"
     ip_capacity="$(cidr_usable_client_ips "${vpn_subnet}")"
@@ -628,7 +631,7 @@ configure_network() {
     [ "${DO_NETWORK}" -eq 1 ] || { ok "Network setup skipped"; return; }
 
     local vpn_subnet tun_device default_iface
-    vpn_subnet="$(config_cidr "100.64.0.0/24")"
+    vpn_subnet="$(config_cidr "100.64.0.0/22")"
     tun_device="$(config_tun_device "aeronyx0")"
     default_iface="$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')"
     [ -n "${default_iface}" ] || default_iface="eth0"

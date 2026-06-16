@@ -93,7 +93,7 @@ pub struct VpnConfig {
     pub gateway_ip: Ipv4Addr,
 }
 
-fn default_ip_range() -> String { "100.64.0.0/24".into() }
+fn default_ip_range() -> String { "100.64.0.0/22".into() }
 fn default_gateway_ip() -> Ipv4Addr { Ipv4Addr::new(100, 64, 0, 1) }
 
 impl VpnConfig {

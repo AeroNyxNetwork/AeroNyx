@@ -243,7 +243,7 @@ impl AsRef<[u8]> for SessionId {
 /// between physical and virtual IP addresses.
 ///
 /// # Default Range
-/// The default virtual IP range is `100.64.0.0/24` (Carrier-grade NAT range).
+/// The default virtual IP range is `100.64.0.0/22` (Carrier-grade NAT range).
 ///
 /// # Example
 /// ```
