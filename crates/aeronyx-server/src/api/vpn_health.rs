@@ -9,7 +9,9 @@
 //! resolution, basic Internet egress, and aggregate encrypted VPN message
 //! forwarding counters. The same router also exposes a node-operator status
 //! snapshot for nodeboard so operators can see which AeroNyx services this
-//! Rust node is currently ready to provide.
+//! Rust node is currently ready to provide. The capacity block includes
+//! structured placement risks so nodeboard, CLI healthchecks, and backend
+//! automation can share the same commercial readiness decisions.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -122,6 +124,14 @@ struct FileDescriptorCapacityStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct CapacityRiskStatus {
+    severity: &'static str,
+    code: &'static str,
+    message: String,
+    remediation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct VpnCapacityStatus {
     virtual_ip_range: String,
     ip_pool_capacity: usize,
@@ -135,6 +145,7 @@ struct VpnCapacityStatus {
     file_descriptors: FileDescriptorCapacityStatus,
     interface: InterfaceCapacityStatus,
     packet_drops_total: Option<u64>,
+    risks: Vec<CapacityRiskStatus>,
     source: &'static str,
     privacy_boundary: &'static str,
 }
@@ -978,20 +989,39 @@ async fn collect_capacity_status(
         None if policy_drops > 0 => Some(policy_drops),
         None => None,
     };
+    let virtual_ip_range = config.ip_range().to_string();
+    let ip_pool_capacity = ip_pool.capacity();
+    let ip_pool_used = ip_pool.allocated_count();
+    let ip_pool_free = ip_pool.available_count();
+    let max_connections = config.max_sessions();
+    let policy_max_sessions = node_policy.max_sessions;
+    let conntrack = collect_conntrack_capacity();
+    let file_descriptors = collect_fd_capacity();
+    let risks = collect_capacity_risks(
+        &virtual_ip_range,
+        ip_pool_capacity,
+        ip_pool_free,
+        max_connections,
+        policy_max_sessions,
+        conntrack.used_percent,
+        file_descriptors.used_percent,
+        packet_drops_total,
+    );
 
     VpnCapacityStatus {
-        virtual_ip_range: config.ip_range().to_string(),
-        ip_pool_capacity: ip_pool.capacity(),
-        ip_pool_used: ip_pool.allocated_count(),
-        ip_pool_free: ip_pool.available_count(),
-        max_connections: config.max_sessions(),
-        policy_max_sessions: node_policy.max_sessions,
+        virtual_ip_range,
+        ip_pool_capacity,
+        ip_pool_used,
+        ip_pool_free,
+        max_connections,
+        policy_max_sessions,
         active_sessions,
         session_capacity_remaining: placement_readiness.session_capacity_remaining,
-        conntrack: collect_conntrack_capacity(),
-        file_descriptors: collect_fd_capacity(),
+        conntrack,
+        file_descriptors,
         interface,
         packet_drops_total,
+        risks,
         source: "rust_vpn_health_capacity_snapshot",
         privacy_boundary: concat!(
             "aggregate node capacity only; no client public IPs, destinations, ",
@@ -999,6 +1029,125 @@ async fn collect_capacity_status(
             "voucher secrets, or wallet-level traffic"
         ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_capacity_risks(
+    virtual_ip_range: &str,
+    ip_pool_capacity: usize,
+    ip_pool_free: usize,
+    max_connections: usize,
+    policy_max_sessions: u32,
+    conntrack_used_percent: Option<f64>,
+    fd_used_percent: Option<f64>,
+    packet_drops_total: Option<u64>,
+) -> Vec<CapacityRiskStatus> {
+    let mut risks = Vec::new();
+
+    if max_connections > ip_pool_capacity {
+        let required = max_connections;
+        let recommended = recommended_ipv4_cidr(virtual_ip_range, required)
+            .unwrap_or_else(|| "a larger vpn.virtual_ip_range".to_string());
+        risks.push(CapacityRiskStatus {
+            severity: "warning",
+            code: "vpn_ip_pool_below_max_connections",
+            message: format!(
+                "Configured max_connections {} exceeds usable VPN IP pool {}.",
+                max_connections, ip_pool_capacity
+            ),
+            remediation: format!(
+                "During a maintenance window, expand vpn.virtual_ip_range to at least {} or lower limits.max_connections to {} or below, then run deploy/node/install.sh --network-only.",
+                recommended, ip_pool_capacity
+            ),
+        });
+    }
+
+    if policy_max_sessions > 0 && policy_max_sessions as usize > ip_pool_capacity {
+        let required = policy_max_sessions as usize;
+        let recommended = recommended_ipv4_cidr(virtual_ip_range, required)
+            .unwrap_or_else(|| "a larger vpn.virtual_ip_range".to_string());
+        risks.push(CapacityRiskStatus {
+            severity: "warning",
+            code: "vpn_ip_pool_below_policy_max_sessions",
+            message: format!(
+                "Nodeboard policy max_sessions {} exceeds usable VPN IP pool {}.",
+                policy_max_sessions, ip_pool_capacity
+            ),
+            remediation: format!(
+                "Expand vpn.virtual_ip_range to at least {} or lower the nodeboard policy max_sessions before commercial placement.",
+                recommended
+            ),
+        });
+    }
+
+    if ip_pool_free == 0 {
+        risks.push(CapacityRiskStatus {
+            severity: "critical",
+            code: "vpn_ip_pool_exhausted",
+            message: "No free VPN virtual IP addresses remain for new sessions.".to_string(),
+            remediation: "Drain traffic or expand vpn.virtual_ip_range before admitting additional clients.".to_string(),
+        });
+    }
+
+    if let Some(percent) = conntrack_used_percent {
+        if percent >= 80.0 {
+            risks.push(CapacityRiskStatus {
+                severity: if percent >= 90.0 { "critical" } else { "warning" },
+                code: "conntrack_pressure",
+                message: format!("Linux conntrack usage is {:.2}%.", percent),
+                remediation: "Raise nf_conntrack_max and keep conntrack headroom above 20% before scaling traffic.".to_string(),
+            });
+        }
+    }
+
+    if let Some(percent) = fd_used_percent {
+        if percent >= 80.0 {
+            risks.push(CapacityRiskStatus {
+                severity: if percent >= 90.0 { "critical" } else { "warning" },
+                code: "file_descriptor_pressure",
+                message: format!("Process file descriptor usage is {:.2}%.", percent),
+                remediation: "Raise the systemd LimitNOFILE value or reduce active load before adding clients.".to_string(),
+            });
+        }
+    }
+
+    if let Some(drops) = packet_drops_total {
+        if drops > 0 {
+            risks.push(CapacityRiskStatus {
+                severity: "warning",
+                code: "packet_drops_detected",
+                message: format!("{} packet drops were reported by the VPN interface or policy layer.", drops),
+                remediation: "Inspect host NIC/TUN queues, CPU pressure, and policy bandwidth drops before increasing placement weight.".to_string(),
+            });
+        }
+    }
+
+    risks
+}
+
+fn recommended_ipv4_cidr(current_cidr: &str, required_usable_ips: usize) -> Option<String> {
+    let (raw_ip, _) = current_cidr.split_once('/')?;
+    let ip: Ipv4Addr = raw_ip.parse().ok()?;
+    let ip_u32 = u32::from(ip);
+
+    for prefix in (0..=30).rev() {
+        if usable_ipv4_clients_for_prefix(prefix) < required_usable_ips {
+            continue;
+        }
+        let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+        let network = Ipv4Addr::from(ip_u32 & mask);
+        return Some(format!("{}/{}", network, prefix));
+    }
+
+    None
+}
+
+fn usable_ipv4_clients_for_prefix(prefix: u32) -> usize {
+    if prefix >= 31 {
+        return 0;
+    }
+    let total = 1usize << (32 - prefix);
+    total.saturating_sub(3)
 }
 
 async fn collect_interface_capacity(name: &str) -> InterfaceCapacityStatus {
@@ -1195,6 +1344,38 @@ fn build_dns_query(name: &str) -> std::result::Result<Vec<u8>, String> {
     out.extend_from_slice(&1u16.to_be_bytes()); // A
     out.extend_from_slice(&1u16.to_be_bytes()); // IN
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recommended_ipv4_cidr_matches_thousand_session_profile() {
+        assert_eq!(
+            recommended_ipv4_cidr("100.64.0.0/24", 1_000),
+            Some("100.64.0.0/22".to_string())
+        );
+    }
+
+    #[test]
+    fn capacity_risks_include_actionable_ip_pool_remediation() {
+        let risks = collect_capacity_risks(
+            "100.64.0.0/24",
+            253,
+            253,
+            1_000,
+            0,
+            Some(0.05),
+            Some(0.0),
+            Some(0),
+        );
+
+        assert_eq!(risks.len(), 1);
+        assert_eq!(risks[0].code, "vpn_ip_pool_below_max_connections");
+        assert!(risks[0].remediation.contains("100.64.0.0/22"));
+        assert!(risks[0].remediation.contains("install.sh --network-only"));
+    }
 }
 
 async fn run_command(
