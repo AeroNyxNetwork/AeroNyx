@@ -11,8 +11,8 @@
 #
 # Main Functionality:
 # - Checks repository, binary, config, registration state, systemd status,
-#   host capacity, IP forwarding, NAT hints, local VPN health endpoint, and
-#   capacity telemetry.
+#   host capacity, IP forwarding, NAT runtime/persistence, local VPN health
+#   endpoint, and capacity telemetry.
 # - Emits machine-readable JSON for nodeboard or support automation.
 # - Warns when installed systemd hardening is weaker than the production
 #   template.
@@ -35,6 +35,7 @@
 # - This script should never modify host state.
 #
 # Last Modified:
+# v1.4.0-node-deploy - Added sysctl/iptables persistence diagnostics.
 # v1.3.1-node-deploy - Checks systemd-managed AeroNyx directories.
 # v1.3.0-node-deploy - Added systemd hardening diagnostics.
 # v1.2.0-node-deploy - Added full checks[] JSON output and --json-only mode.
@@ -50,6 +51,9 @@ SERVICE_NAME="aeronyx-server"
 JSON=0
 JSON_ONLY=0
 CHECK_LOG="$(mktemp)"
+SYSCTL_FILE="/etc/sysctl.d/99-aeronyx.conf"
+IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
+NETWORK_RESTORE_SERVICE="aeronyx-network-restore"
 trap 'rm -f "${CHECK_LOG}"' EXIT
 
 usage() {
@@ -336,6 +340,31 @@ check_network() {
             pass "iptables NAT rule present for 100.64.0.0/24"
         else
             warn "iptables NAT rule for 100.64.0.0/24 not found"
+        fi
+    fi
+
+    if [ -f "${SYSCTL_FILE}" ] && grep -q '^net.ipv4.ip_forward=1' "${SYSCTL_FILE}" 2>/dev/null; then
+        pass "IPv4 forwarding persisted in ${SYSCTL_FILE}"
+    else
+        warn "IPv4 forwarding persistence file missing or incomplete: ${SYSCTL_FILE}"
+    fi
+
+    if [ -f "${IPTABLES_RULES_FILE}" ] && grep -q '100\.64\.0\.0/24.*MASQUERADE' "${IPTABLES_RULES_FILE}" 2>/dev/null; then
+        pass "iptables NAT rules persisted in ${IPTABLES_RULES_FILE}"
+    else
+        warn "iptables NAT persistence file missing or incomplete: ${IPTABLES_RULES_FILE}"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-unit-files "${NETWORK_RESTORE_SERVICE}.service" --no-legend 2>/dev/null | grep -q "${NETWORK_RESTORE_SERVICE}.service"; then
+            pass "network restore service installed: ${NETWORK_RESTORE_SERVICE}"
+        else
+            warn "network restore service not installed: ${NETWORK_RESTORE_SERVICE}"
+        fi
+        if systemctl is-enabled --quiet "${NETWORK_RESTORE_SERVICE}.service" 2>/dev/null; then
+            pass "network restore service enabled: ${NETWORK_RESTORE_SERVICE}"
+        else
+            warn "network restore service not enabled: ${NETWORK_RESTORE_SERVICE}"
         fi
     fi
 }

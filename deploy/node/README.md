@@ -84,6 +84,12 @@ checks for:
 - disk space
 - common AeroNyx ports `51820` and `8421`
 
+When network setup is enabled, `install.sh` persists forwarding/NAT with:
+
+- `/etc/sysctl.d/99-aeronyx.conf`
+- `/etc/iptables/rules.v4`
+- `aeronyx-network-restore.service`
+
 Run preflight only:
 
 ```bash
@@ -130,7 +136,7 @@ The healthcheck prints:
 - node registration files
 - systemd status
 - systemd hardening status
-- IPv4 forwarding and NAT hints
+- IPv4 forwarding, NAT, and reboot persistence hints
 - local VPN health endpoint status
 - capacity telemetry: IP pool, conntrack, file descriptors, drops, pps, bps
 
