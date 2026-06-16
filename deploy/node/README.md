@@ -13,7 +13,8 @@ Modification Reason:
   shared node-local deployment locking, and install-time systemd unit
   verification, purge path safety, service-name validation, and release-backup
   retention/diagnostics, plus network restore command-path portability and unit
-  verification/synchronization and low-risk maintenance.
+  verification/synchronization, low-risk maintenance, and tracked dirty
+  worktree protection.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -39,6 +40,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.19.0-node-deploy - Documented tracked dirty-worktree protection for install
+                     and upgrade.
 v1.18.0-node-deploy - Documented live systemd unit binding diagnostics.
 v1.17.0-node-deploy - Documented mutually exclusive maintenance flags.
 v1.16.0-node-deploy - Documented --service-unit-only maintenance mode.
@@ -101,6 +104,11 @@ Installation and upgrade share a node-local deployment lock, so an operator or
 automation system cannot run a second install/upgrade process while one is
 already replacing the repository, service unit, binary, or network rules.
 
+When using an existing repository checkout, `install.sh` refuses to pull if
+tracked Git files have local staged or unstaged changes. Untracked runtime and
+build paths, such as `target/`, `data/`, and local model files, do not block the
+check. For emergency maintenance only, an operator can pass `--allow-dirty`.
+
 Before installation, `install.sh` performs non-blocking production preflight
 checks for:
 
@@ -143,6 +151,11 @@ the script stops unless the operator explicitly passes `--force`.
 Only one install or upgrade can run on the same node at a time. The script takes
 the shared node-local deployment lock before pulling, building, replacing the
 systemd unit, or restarting the service.
+
+Before a source upgrade, `upgrade.sh` verifies that tracked Git files are clean.
+This prevents a production node from mixing local edits with a pulled release.
+Untracked runtime/build data is ignored. For emergency maintenance only, pass
+`--allow-dirty`.
 
 During upgrades, the script also renders `deploy/node/aeronyx-server.service`
 into the installed systemd unit and verifies it with `systemd-analyze verify`
@@ -309,6 +322,9 @@ Client/development platforms:
 - These scripts do not change mobile or desktop client APIs.
 - Scripts that accept `--service` reject names containing `/`, names beginning
   with `-`, and names outside `[A-Za-z0-9_.@-]`.
+- Install and upgrade dirty-worktree protection only checks tracked Git files,
+  preserving compatibility with untracked runtime/build directories on Linux
+  production nodes.
 
 ## Next Developer Guide
 

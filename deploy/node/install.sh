@@ -14,6 +14,12 @@
 #   paths instead of assuming /sbin.
 # - Verify the generated network restore unit before replacing the installed
 #   reboot recovery service.
+# - Refuse to pull an existing tracked-dirty repository unless the operator
+#   explicitly opts in.
+# - Make --no-enable complete cleanly after service rendering instead of
+#   inheriting a false shell test status.
+# - Make installs without a registration code complete cleanly instead of
+#   inheriting a false shell test status.
 #
 # Main Functionality:
 # - Detects Linux/systemd environment.
@@ -50,8 +56,16 @@
 # - Keep all operations idempotent so operators can safely rerun the installer.
 # - This script is Linux/systemd only; macOS, iOS, Android, and Windows are
 #   development/client platforms, not production node hosts for this script.
+# - Keep the dirty-worktree check limited to tracked files so untracked runtime
+#   data and build artifacts do not block reinstall flows.
 #
 # Last Modified:
+# v1.11.0-node-deploy - Made registration-skipped installs return
+#                       successfully.
+# v1.10.0-node-deploy - Made --no-enable service installation return
+#                       successfully after rendering the unit.
+# v1.9.0-node-deploy - Added tracked dirty-worktree protection before updating
+#                      an existing repository.
 # v1.8.0-node-deploy - Verifies the generated network restore systemd unit
 #                      before installing it.
 # v1.7.0-node-deploy - Uses detected sysctl and iptables-restore paths in the
@@ -100,6 +114,7 @@ INSTALL_PACKAGES=1
 DRY_RUN=0
 CONFIG_ONLY=0
 PREFLIGHT_ONLY=0
+ALLOW_DIRTY=0
 
 log() { printf '[INFO] %s\n' "$*"; }
 ok() { printf '[OK] %s\n' "$*"; }
@@ -124,6 +139,7 @@ Options:
   --skip-rust-install     Do not install Rust automatically if cargo is missing.
   --config-only           Only create config/env directories and server.toml if missing.
   --preflight-only        Run production readiness checks and exit.
+  --allow-dirty           Allow install to update an existing repo with tracked Git changes.
   --dry-run               Print actions without changing the host.
   -h, --help              Show this help.
 
@@ -147,6 +163,7 @@ while [ "$#" -gt 0 ]; do
         --skip-rust-install) INSTALL_RUST=0; shift ;;
         --config-only) CONFIG_ONLY=1; DO_BUILD=0; DO_NETWORK=0; DO_START=0; DO_ENABLE=0; INSTALL_PACKAGES=0; INSTALL_RUST=0; shift ;;
         --preflight-only) PREFLIGHT_ONLY=1; DO_BUILD=0; DO_NETWORK=0; DO_START=0; DO_ENABLE=0; INSTALL_PACKAGES=0; INSTALL_RUST=0; shift ;;
+        --allow-dirty) ALLOW_DIRTY=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "Unknown option: $1" ;;
@@ -320,9 +337,25 @@ install_rust_if_needed() {
     fi
 }
 
+ensure_tracked_worktree_clean() {
+    [ "${ALLOW_DIRTY}" -eq 0 ] || { warn "Tracked worktree check skipped by --allow-dirty"; return; }
+
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] verify tracked Git worktree is clean in %s\n' "${REPO_DIR}"
+        return
+    fi
+
+    git -C "${REPO_DIR}" diff --quiet --ignore-submodules -- \
+        || die "Tracked Git worktree has unstaged changes. Commit/stash them or re-run with --allow-dirty."
+    git -C "${REPO_DIR}" diff --cached --quiet --ignore-submodules -- \
+        || die "Tracked Git worktree has staged changes. Commit/stash them or re-run with --allow-dirty."
+    ok "Tracked Git worktree clean"
+}
+
 prepare_repo() {
     if [ -d "${REPO_DIR}/.git" ]; then
         log "Using existing repository: ${REPO_DIR}"
+        ensure_tracked_worktree_clean
         run git -C "${REPO_DIR}" fetch origin "${BRANCH}"
         run git -C "${REPO_DIR}" checkout "${BRANCH}"
         run git -C "${REPO_DIR}" pull --ff-only origin "${BRANCH}"
@@ -508,11 +541,13 @@ install_service() {
 
     if [ "${DO_ENABLE}" -eq 1 ]; then
         run systemctl enable "${SERVICE_NAME}"
+    else
+        ok "Systemd enable skipped"
     fi
 }
 
 register_node() {
-    [ -n "${REGISTRATION_CODE}" ] || return
+    [ -n "${REGISTRATION_CODE}" ] || { ok "Node registration skipped"; return 0; }
 
     log "Registering node with provided registration code"
     if [ "${DRY_RUN}" -eq 1 ]; then

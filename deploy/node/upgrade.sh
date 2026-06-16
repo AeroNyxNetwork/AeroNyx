@@ -18,6 +18,8 @@
 #   recovery repairs.
 # - Provide a service-unit-only maintenance mode for low-risk systemd template
 #   repairs.
+# - Refuse source upgrades from a tracked-dirty Git worktree unless the
+#   operator explicitly opts in.
 #
 # Main Functionality:
 # - Pulls the configured branch.
@@ -61,8 +63,12 @@
 #   already exist.
 # - Reject contradictory maintenance flags instead of reporting a no-op as
 #   success.
+# - Keep the dirty-worktree check limited to tracked files so runtime/build
+#   directories can remain untracked on production nodes.
 #
 # Last Modified:
+# v1.11.0-node-deploy - Added tracked dirty-worktree protection before source
+#                       upgrades.
 # v1.10.0-node-deploy - Rejects contradictory unit-only maintenance options.
 # v1.9.0-node-deploy - Added --service-unit-only for low-risk main systemd
 #                      unit maintenance.
@@ -106,6 +112,7 @@ SKIP_UNIT_UPDATE=0
 SKIP_NETWORK_RESTORE_UPDATE=0
 NETWORK_RESTORE_ONLY=0
 SERVICE_UNIT_ONLY=0
+ALLOW_DIRTY=0
 NO_RESTART=0
 KEEP_RELEASES=10
 HEALTH_RETRIES=10
@@ -139,6 +146,7 @@ Options:
                       Only sync aeronyx-server.service; no pull/build/restart.
   --network-restore-only
                       Only sync aeronyx-network-restore.service; no pull/build/restart.
+  --allow-dirty      Allow source upgrade when tracked Git files are modified.
   --keep-releases N   Keep latest N binary/unit backups after success. Default: 10
   --health-retries N  Health polling attempts after restart. Default: 10
   --health-delay N    Seconds between health polling attempts. Default: 2
@@ -160,6 +168,7 @@ while [ "$#" -gt 0 ]; do
         --skip-network-restore-update) SKIP_NETWORK_RESTORE_UPDATE=1; shift ;;
         --service-unit-only) SERVICE_UNIT_ONLY=1; NO_RESTART=1; SKIP_PULL=1; shift ;;
         --network-restore-only) NETWORK_RESTORE_ONLY=1; NO_RESTART=1; SKIP_PULL=1; shift ;;
+        --allow-dirty) ALLOW_DIRTY=1; shift ;;
         --keep-releases) KEEP_RELEASES="${2:?missing value}"; shift 2 ;;
         --health-retries) HEALTH_RETRIES="${2:?missing value}"; shift 2 ;;
         --health-delay) HEALTH_DELAY="${2:?missing value}"; shift 2 ;;
@@ -265,6 +274,22 @@ active_sessions() {
     curl -fsS --max-time 3 http://127.0.0.1:8421/api/vpn/health 2>/dev/null \
         | python3 -c 'import json,sys; print(json.load(sys.stdin).get("active_sessions", "unknown"))' 2>/dev/null \
         || printf 'unknown'
+}
+
+ensure_tracked_worktree_clean() {
+    [ "${SKIP_PULL}" -eq 0 ] || { ok "Tracked worktree check skipped with --skip-pull"; return; }
+    [ "${ALLOW_DIRTY}" -eq 0 ] || { warn "Tracked worktree check skipped by --allow-dirty"; return; }
+
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] verify tracked Git worktree is clean in %s\n' "${REPO_DIR}"
+        return
+    fi
+
+    git -C "${REPO_DIR}" diff --quiet --ignore-submodules -- \
+        || die "Tracked Git worktree has unstaged changes. Commit/stash them or re-run with --allow-dirty."
+    git -C "${REPO_DIR}" diff --cached --quiet --ignore-submodules -- \
+        || die "Tracked Git worktree has staged changes. Commit/stash them or re-run with --allow-dirty."
+    ok "Tracked Git worktree clean"
 }
 
 backup_current_binary() {
@@ -626,6 +651,7 @@ main() {
     fi
     ensure_cargo_path
     [ -d "${REPO_DIR}/.git" ] || die "Repository not found: ${REPO_DIR}"
+    ensure_tracked_worktree_clean
     backup_current_binary
     update_source
     build_release
