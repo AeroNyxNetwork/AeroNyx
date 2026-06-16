@@ -11,6 +11,7 @@
 #   node deployment workflows.
 # - Add release-backup diagnostics for node upgrade retention observability.
 # - Validate generated network restore command paths for reboot reliability.
+# - Expose network restore command paths in JSON for nodeboard automation.
 #
 # Main Functionality:
 # - Checks repository, binary, config, registration state, systemd status,
@@ -40,6 +41,8 @@
 # - Reject service names that look like paths or command-line options.
 #
 # Last Modified:
+# v1.9.0-node-deploy - Added structured network restore command diagnostics to
+#                      JSON output.
 # v1.8.0-node-deploy - Added network restore ExecStart command path checks.
 # v1.7.0-node-deploy - Added release-backup count diagnostics for upgrade
 #                      retention observability.
@@ -548,6 +551,22 @@ def file_mtime(path):
     except Exception:
         return None
 
+def network_restore_commands(unit_name):
+    try:
+        unit_text = subprocess.check_output(["systemctl", "cat", f"{unit_name}.service"], stderr=subprocess.DEVNULL, text=True)
+    except Exception:
+        return []
+
+    commands = []
+    for line in unit_text.splitlines():
+        if not line.startswith("ExecStart="):
+            continue
+        command = line.split("=", 1)[1].strip().split(" ", 1)[0]
+        if not command:
+            continue
+        commands.append({"path": command, "executable": os.access(command, os.X_OK)})
+    return commands
+
 checks = []
 with open(checks_path, "r", encoding="utf-8") as handle:
     for line in handle:
@@ -576,6 +595,7 @@ runtime = {
     "service_enabled": run(["systemctl", "is-enabled", service_name]),
     "network_restore_active": run(["systemctl", "is-active", network_restore_service]),
     "network_restore_enabled": run(["systemctl", "is-enabled", network_restore_service]),
+    "network_restore_commands": network_restore_commands(network_restore_service),
     "release_backups": release_backups,
 }
 

@@ -38,6 +38,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.10.0-node-deploy - Documented structured network restore command diagnostics.
 v1.9.0-node-deploy - Documented portable network restore command paths.
 v1.8.0-node-deploy - Documented healthcheck release-backup diagnostics.
 v1.7.0-node-deploy - Documented upgrade release-backup retention.
@@ -188,6 +189,7 @@ The healthcheck prints:
 - systemd hardening status
 - IPv4 forwarding, NAT, and reboot persistence hints
 - network restore command path checks
+- structured JSON runtime fields for release backups and network restore commands
 - local VPN health endpoint status
 - capacity telemetry: IP pool, conntrack, file descriptors, drops, pps, bps
 
