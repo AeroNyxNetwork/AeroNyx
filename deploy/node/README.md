@@ -13,7 +13,7 @@ Modification Reason:
   shared node-local deployment locking, and install-time systemd unit
   verification, purge path safety, service-name validation, and release-backup
   retention/diagnostics, plus network restore command-path portability and unit
-  verification/synchronization.
+  verification/synchronization and low-risk maintenance.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -39,6 +39,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.13.0-node-deploy - Documented --network-restore-only maintenance mode.
 v1.12.0-node-deploy - Documented upgrade-time network restore synchronization.
 v1.11.0-node-deploy - Documented network restore unit verification.
 v1.10.0-node-deploy - Documented structured network restore command diagnostics.
@@ -160,6 +161,13 @@ Keep the currently installed network restore unit:
 
 ```bash
 sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --skip-network-restore-update
+```
+
+Repair only the reboot network restore unit without pulling, building, or
+restarting the Rust node service:
+
+```bash
+sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --network-restore-only
 ```
 
 Post-restart health is polled automatically. If restart or health verification
