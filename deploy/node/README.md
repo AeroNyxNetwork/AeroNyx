@@ -75,6 +75,15 @@ The installer never overwrites these files when they already exist:
 - `/etc/aeronyx/node_info.json`
 - `/etc/aeronyx/aeronyx.env`
 
+Before installation, `install.sh` performs non-blocking production preflight
+checks for:
+
+- `/dev/net/tun`
+- default route interface
+- memory
+- disk space
+- common AeroNyx ports `51820` and `8421`
+
 ## Upgrade
 
 ```bash
@@ -103,6 +112,7 @@ fails, `upgrade.sh` restores the previous release binary from
 The healthcheck prints:
 
 - system commands and OS support
+- host capacity: TUN, default route, memory, disk, and ports
 - release binary presence
 - config validation result
 - node registration files

@@ -12,6 +12,8 @@
 #
 # Main Functionality:
 # - Detects Linux/systemd environment.
+# - Runs production preflight checks for TUN, default route, memory, disk, and
+#   common AeroNyx ports.
 # - Installs host dependencies on supported Linux distributions.
 # - Clones or uses the AeroNyx repository.
 # - Creates /etc/aeronyx and /var/lib/aeronyx state directories.
@@ -39,6 +41,7 @@
 #   development/client platforms, not production node hosts for this script.
 #
 # Last Modified:
+# v1.2.0-node-deploy - Added production preflight checks for host readiness.
 # v1.1.1-node-deploy - Only checks/installs Rust when release build is enabled.
 # v1.1.0-node-deploy - Added --skip-package-install and made --config-only avoid
 #                      package/Rust installation by default.
@@ -144,6 +147,71 @@ require_root() {
 require_linux_systemd() {
     [ "$(uname -s)" = "Linux" ] || die "install.sh supports Linux production nodes only."
     command -v systemctl >/dev/null 2>&1 || die "systemctl is required for production node service management."
+}
+
+existing_path_for_df() {
+    local path="$1"
+    while [ ! -e "${path}" ] && [ "${path}" != "/" ]; do
+        path="$(dirname "${path}")"
+    done
+    printf '%s\n' "${path}"
+}
+
+port_in_use() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${port}$"
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -lntu 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
+    else
+        return 2
+    fi
+}
+
+preflight_checks() {
+    local default_iface disk_path disk_free_mb mem_mb
+
+    log "Running production preflight checks"
+
+    if [ -e /dev/net/tun ]; then
+        ok "TUN device available: /dev/net/tun"
+    else
+        warn "TUN device missing: /dev/net/tun. Enable the tun kernel module before starting the VPN node."
+    fi
+
+    default_iface="$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')"
+    if [ -n "${default_iface}" ]; then
+        ok "Default route interface detected: ${default_iface}"
+    else
+        warn "No default route detected. VPN client internet forwarding may fail."
+    fi
+
+    mem_mb="$(awk '/MemTotal:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || printf '0')"
+    if [ "${mem_mb}" -ge 2048 ]; then
+        ok "Memory check: ${mem_mb} MB"
+    else
+        warn "Memory check: ${mem_mb} MB. 2GB+ is recommended for a production VPN node; MemChain models require more."
+    fi
+
+    disk_path="$(existing_path_for_df "${REPO_DIR}")"
+    disk_free_mb="$(df -Pm "${disk_path}" 2>/dev/null | awk 'NR==2 {print $4}' || printf '0')"
+    if [ "${disk_free_mb:-0}" -ge 4096 ]; then
+        ok "Disk check: ${disk_free_mb} MB free near ${disk_path}"
+    else
+        warn "Disk check: ${disk_free_mb:-0} MB free near ${disk_path}. 4GB+ is recommended for build artifacts and backups."
+    fi
+
+    if port_in_use 51820; then
+        warn "Port 51820 already appears to be listening. If this is an existing AeroNyx node, this is expected during reinstall."
+    else
+        ok "Port 51820 appears available"
+    fi
+
+    if port_in_use 8421; then
+        warn "Port 8421 already appears to be listening. Existing AeroNyx API service may already be running."
+    else
+        ok "Port 8421 appears available"
+    fi
 }
 
 install_packages() {
@@ -329,6 +397,7 @@ start_service() {
 main() {
     require_root
     require_linux_systemd
+    preflight_checks
     install_packages
     if [ "${DO_BUILD}" -eq 1 ]; then
         install_rust_if_needed

@@ -11,7 +11,8 @@
 #
 # Main Functionality:
 # - Checks repository, binary, config, registration state, systemd status,
-#   IP forwarding, NAT hints, local VPN health endpoint, and capacity telemetry.
+#   host capacity, IP forwarding, NAT hints, local VPN health endpoint, and
+#   capacity telemetry.
 #
 # Dependencies:
 # - /etc/aeronyx/server.toml
@@ -31,6 +32,7 @@
 # - This script should never modify host state.
 #
 # Last Modified:
+# v1.1.0-node-deploy - Added host capacity, TUN, route, disk, and port checks.
 # v1.0.0-node-deploy - Added production node healthcheck.
 # ============================================
 
@@ -92,6 +94,25 @@ check_command() {
     fi
 }
 
+existing_path_for_df() {
+    local path="$1"
+    while [ ! -e "${path}" ] && [ "${path}" != "/" ]; do
+        path="$(dirname "${path}")"
+    done
+    printf '%s\n' "${path}"
+}
+
+port_in_use() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${port}$"
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -lntu 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
+    else
+        return 2
+    fi
+}
+
 check_system() {
     if [ "$(uname -s)" = "Linux" ]; then
         pass "host OS: Linux"
@@ -104,6 +125,50 @@ check_system() {
     check_command ip
     check_command iptables
     check_command python3
+}
+
+check_host_capacity() {
+    local default_iface disk_path disk_free_mb mem_mb
+
+    if [ -e /dev/net/tun ]; then
+        pass "TUN device available"
+    else
+        fail "TUN device missing: /dev/net/tun"
+    fi
+
+    default_iface="$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')"
+    if [ -n "${default_iface}" ]; then
+        pass "default route interface: ${default_iface}"
+    else
+        warn "default route not detected"
+    fi
+
+    mem_mb="$(awk '/MemTotal:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || printf '0')"
+    if [ "${mem_mb}" -ge 2048 ]; then
+        pass "memory available: ${mem_mb} MB"
+    else
+        warn "memory low: ${mem_mb} MB; 2GB+ recommended for production VPN nodes"
+    fi
+
+    disk_path="$(existing_path_for_df "${REPO_DIR}")"
+    disk_free_mb="$(df -Pm "${disk_path}" 2>/dev/null | awk 'NR==2 {print $4}' || printf '0')"
+    if [ "${disk_free_mb:-0}" -ge 4096 ]; then
+        pass "disk free near ${disk_path}: ${disk_free_mb} MB"
+    else
+        warn "disk free near ${disk_path}: ${disk_free_mb:-0} MB; 4GB+ recommended"
+    fi
+
+    if port_in_use 51820; then
+        pass "port 51820 is listening"
+    else
+        warn "port 51820 is not listening"
+    fi
+
+    if port_in_use 8421; then
+        pass "port 8421 is listening"
+    else
+        warn "port 8421 is not listening"
+    fi
 }
 
 check_repo_and_binary() {
@@ -229,6 +294,7 @@ PY
 
 main() {
     check_system
+    check_host_capacity
     check_repo_and_binary
     check_config_validation
     check_systemd
