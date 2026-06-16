@@ -15,6 +15,8 @@
 # - Include network restore unit backups in retention diagnostics.
 # - Add systemd restart-policy diagnostics for production self-healing.
 # - Verify the live systemd unit points at the requested repository and config.
+# - Check NAT and forwarding rules against server.toml instead of hard-coded
+#   deployment defaults.
 #
 # Main Functionality:
 # - Checks repository, binary, config, registration state, systemd status,
@@ -42,8 +44,12 @@
 # - Keep output stable; nodeboard or support tooling may parse these lines later.
 # - This script should never modify host state.
 # - Reject service names that look like paths or command-line options.
+# - Keep VPN network diagnostics aligned with vpn.virtual_ip_range and
+#   tun.device_name from the installed config.
 #
 # Last Modified:
+# v1.13.0-node-deploy - Reads VPN subnet and TUN device from server.toml for
+#                       NAT and forwarding diagnostics.
 # v1.12.0-node-deploy - Added live systemd ExecStart/WorkingDirectory binding
 #                       diagnostics.
 # v1.11.0-node-deploy - Added systemd restart-policy diagnostics.
@@ -174,6 +180,83 @@ existing_path_for_df() {
         path="$(dirname "${path}")"
     done
     printf '%s\n' "${path}"
+}
+
+config_value() {
+    local section="$1" key="$2" default_value="$3"
+    if ! command -v python3 >/dev/null 2>&1 || [ ! -f "${CONFIG_FILE}" ]; then
+        printf '%s\n' "${default_value}"
+        return
+    fi
+
+    python3 - "${CONFIG_FILE}" "${section}" "${key}" "${default_value}" <<'PY'
+import sys
+
+path, section, key, default = sys.argv[1:5]
+
+def fallback_parse(text):
+    current = None
+    values = {}
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1].strip()
+            continue
+        if current == section and "=" in line:
+            name, value = line.split("=", 1)
+            name = name.strip()
+            value = value.strip().strip('"').strip("'")
+            values[name] = value
+    return values.get(key, default)
+
+try:
+    raw = open(path, "rb").read()
+    try:
+        import tomllib
+        data = tomllib.loads(raw.decode("utf-8"))
+        value = data.get(section, {}).get(key, default)
+    except Exception:
+        value = fallback_parse(raw.decode("utf-8", "replace"))
+    print(value if value is not None else default)
+except Exception:
+    print(default)
+PY
+}
+
+config_cidr() {
+    local raw default_value="$1"
+    raw="$(config_value vpn virtual_ip_range "${default_value}")"
+    if ! command -v python3 >/dev/null 2>&1; then
+        if printf '%s' "${raw}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$'; then
+            printf '%s\n' "${raw}"
+        else
+            printf '%s\n' "${default_value}"
+        fi
+        return
+    fi
+
+    python3 - "${raw}" "${default_value}" <<'PY'
+import ipaddress
+import sys
+
+raw, default = sys.argv[1:3]
+try:
+    print(ipaddress.ip_network(raw, strict=False).with_prefixlen)
+except Exception:
+    print(default)
+PY
+}
+
+config_tun_device() {
+    local raw default_value="$1"
+    raw="$(config_value tun device_name "${default_value}")"
+    if printf '%s' "${raw}" | grep -Eq '^[A-Za-z0-9_.-]{1,15}$'; then
+        printf '%s\n' "${raw}"
+    else
+        printf '%s\n' "${default_value}"
+    fi
 }
 
 port_in_use() {
@@ -470,7 +553,10 @@ check_systemd_hardening() {
 }
 
 check_network() {
-    local forwarding restore_cmd restore_paths
+    local forwarding restore_cmd restore_paths tun_device vpn_subnet
+    vpn_subnet="$(config_cidr "100.64.0.0/24")"
+    tun_device="$(config_tun_device "aeronyx0")"
+
     forwarding="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || printf 'unknown')"
     if [ "${forwarding}" = "1" ]; then
         pass "IPv4 forwarding enabled"
@@ -479,10 +565,22 @@ check_network() {
     fi
 
     if command -v iptables >/dev/null 2>&1; then
-        if iptables -t nat -S POSTROUTING 2>/dev/null | grep -q '100\.64\.0\.0/24.*MASQUERADE'; then
-            pass "iptables NAT rule present for 100.64.0.0/24"
+        if iptables -t nat -S POSTROUTING 2>/dev/null | grep -F "${vpn_subnet}" | grep -q -- '-j MASQUERADE'; then
+            pass "iptables NAT rule present for ${vpn_subnet}"
         else
-            warn "iptables NAT rule for 100.64.0.0/24 not found"
+            warn "iptables NAT rule for ${vpn_subnet} not found"
+        fi
+
+        if iptables -S FORWARD 2>/dev/null | grep -F -- "-i ${tun_device}" | grep -q -- '-j ACCEPT'; then
+            pass "iptables FORWARD input rule present for ${tun_device}"
+        else
+            warn "iptables FORWARD input rule for ${tun_device} not found"
+        fi
+
+        if iptables -S FORWARD 2>/dev/null | grep -F -- "-o ${tun_device}" | grep -q -- '-j ACCEPT'; then
+            pass "iptables FORWARD output rule present for ${tun_device}"
+        else
+            warn "iptables FORWARD output rule for ${tun_device} not found"
         fi
     fi
 
@@ -492,10 +590,11 @@ check_network() {
         warn "IPv4 forwarding persistence file missing or incomplete: ${SYSCTL_FILE}"
     fi
 
-    if [ -f "${IPTABLES_RULES_FILE}" ] && grep -q '100\.64\.0\.0/24.*MASQUERADE' "${IPTABLES_RULES_FILE}" 2>/dev/null; then
+    if [ -f "${IPTABLES_RULES_FILE}" ] \
+        && grep -F "${vpn_subnet}" "${IPTABLES_RULES_FILE}" 2>/dev/null | grep -q -- '-j MASQUERADE'; then
         pass "iptables NAT rules persisted in ${IPTABLES_RULES_FILE}"
     else
-        warn "iptables NAT persistence file missing or incomplete: ${IPTABLES_RULES_FILE}"
+        warn "iptables NAT persistence file missing or incomplete for ${vpn_subnet}: ${IPTABLES_RULES_FILE}"
     fi
 
     if command -v systemctl >/dev/null 2>&1; then
@@ -623,6 +722,48 @@ def network_restore_commands(unit_name):
         commands.append({"path": command, "executable": os.access(command, os.X_OK)})
     return commands
 
+def vpn_config(path):
+    data = {}
+    try:
+        raw = open(path, "rb").read()
+        try:
+            import tomllib
+            parsed = tomllib.loads(raw.decode("utf-8"))
+            vpn = parsed.get("vpn", {})
+            tun = parsed.get("tun", {})
+            data["virtual_ip_range"] = str(vpn.get("virtual_ip_range", "100.64.0.0/24"))
+            data["tun_device"] = str(tun.get("device_name", "aeronyx0"))
+        except Exception:
+            current = None
+            values = {"virtual_ip_range": "100.64.0.0/24", "tun_device": "aeronyx0"}
+            for raw_line in raw.decode("utf-8", "replace").splitlines():
+                line = raw_line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    current = line[1:-1].strip()
+                    continue
+                if "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                name = name.strip()
+                value = value.strip().strip('"').strip("'")
+                if current == "vpn" and name == "virtual_ip_range":
+                    values["virtual_ip_range"] = value
+                if current == "tun" and name == "device_name":
+                    values["tun_device"] = value
+            data.update(values)
+    except Exception:
+        data = {"virtual_ip_range": "100.64.0.0/24", "tun_device": "aeronyx0"}
+
+    try:
+        import ipaddress
+        data["virtual_ip_range"] = ipaddress.ip_network(data["virtual_ip_range"], strict=False).with_prefixlen
+    except Exception:
+        pass
+
+    return data
+
 def systemd_restart_policy(service_name):
     return {
         "restart": run(["systemctl", "show", service_name, "-p", "Restart", "--value"]),
@@ -675,6 +816,7 @@ runtime = {
     "service_enabled": run(["systemctl", "is-enabled", service_name]),
     "systemd_restart_policy": systemd_restart_policy(service_name),
     "systemd_unit_binding": systemd_unit_binding(service_name, repo_dir, config_path, binary_path),
+    "vpn_config": vpn_config(config_path),
     "network_restore_active": run(["systemctl", "is-active", network_restore_service]),
     "network_restore_enabled": run(["systemctl", "is-enabled", network_restore_service]),
     "network_restore_commands": network_restore_commands(network_restore_service),

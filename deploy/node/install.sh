@@ -20,6 +20,8 @@
 #   inheriting a false shell test status.
 # - Make installs without a registration code complete cleanly instead of
 #   inheriting a false shell test status.
+# - Derive VPN NAT subnet and TUN interface from server.toml instead of using
+#   hard-coded deployment defaults.
 #
 # Main Functionality:
 # - Detects Linux/systemd environment.
@@ -58,8 +60,12 @@
 #   development/client platforms, not production node hosts for this script.
 # - Keep the dirty-worktree check limited to tracked files so untracked runtime
 #   data and build artifacts do not block reinstall flows.
+# - Keep network setup aligned with /etc/aeronyx/server.toml when operators
+#   expand the VPN IP pool or customize the TUN device.
 #
 # Last Modified:
+# v1.12.0-node-deploy - Reads VPN subnet and TUN device from server.toml for
+#                       forwarding/NAT setup.
 # v1.11.0-node-deploy - Made registration-skipped installs return
 #                       successfully.
 # v1.10.0-node-deploy - Made --no-enable service installation return
@@ -237,6 +243,84 @@ existing_path_for_df() {
     printf '%s\n' "${path}"
 }
 
+config_value() {
+    local section="$1" key="$2" default_value="$3"
+    if ! command -v python3 >/dev/null 2>&1 || [ ! -f "${CONFIG_FILE}" ]; then
+        printf '%s\n' "${default_value}"
+        return
+    fi
+
+    python3 - "${CONFIG_FILE}" "${section}" "${key}" "${default_value}" <<'PY'
+import sys
+
+path, section, key, default = sys.argv[1:5]
+
+def fallback_parse(text):
+    current = None
+    values = {}
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1].strip()
+            continue
+        if current == section and "=" in line:
+            name, value = line.split("=", 1)
+            name = name.strip()
+            value = value.strip().strip('"').strip("'")
+            values[name] = value
+    return values.get(key, default)
+
+try:
+    raw = open(path, "rb").read()
+    try:
+        import tomllib
+        data = tomllib.loads(raw.decode("utf-8"))
+        value = data.get(section, {}).get(key, default)
+    except Exception:
+        value = fallback_parse(raw.decode("utf-8", "replace"))
+    print(value if value is not None else default)
+except Exception:
+    print(default)
+PY
+}
+
+config_cidr() {
+    local raw default_value="$1"
+    raw="$(config_value vpn virtual_ip_range "${default_value}")"
+    if ! command -v python3 >/dev/null 2>&1; then
+        if printf '%s' "${raw}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$'; then
+            printf '%s\n' "${raw}"
+        else
+            printf '%s\n' "${default_value}"
+        fi
+        return
+    fi
+
+    python3 - "${raw}" "${default_value}" <<'PY'
+import ipaddress
+import sys
+
+raw, default = sys.argv[1:3]
+try:
+    print(ipaddress.ip_network(raw, strict=False).with_prefixlen)
+except Exception:
+    print(default)
+PY
+}
+
+config_tun_device() {
+    local raw default_value="$1"
+    raw="$(config_value tun device_name "${default_value}")"
+    if printf '%s' "${raw}" | grep -Eq '^[A-Za-z0-9_.-]{1,15}$'; then
+        printf '%s\n' "${raw}"
+    else
+        warn "Invalid tun.device_name in ${CONFIG_FILE}: ${raw}; using ${default_value}"
+        printf '%s\n' "${default_value}"
+    fi
+}
+
 port_in_use() {
     local port="$1"
     if command -v ss >/dev/null 2>&1; then
@@ -410,8 +494,8 @@ configure_network() {
     [ "${DO_NETWORK}" -eq 1 ] || { ok "Network setup skipped"; return; }
 
     local vpn_subnet tun_device default_iface
-    vpn_subnet="100.64.0.0/24"
-    tun_device="aeronyx0"
+    vpn_subnet="$(config_cidr "100.64.0.0/24")"
+    tun_device="$(config_tun_device "aeronyx0")"
     default_iface="$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')"
     [ -n "${default_iface}" ] || default_iface="eth0"
 
@@ -421,7 +505,7 @@ configure_network() {
     run sysctl -w net.ipv4.ip_forward=1
 
     if command -v iptables >/dev/null 2>&1; then
-        log "Applying idempotent iptables NAT rules on ${default_iface}"
+        log "Applying idempotent iptables NAT rules for ${vpn_subnet} on ${default_iface} via ${tun_device}"
         run_shell "iptables -t nat -C POSTROUTING -s '${vpn_subnet}' -o '${default_iface}' -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s '${vpn_subnet}' -o '${default_iface}' -j MASQUERADE"
         run_shell "iptables -C FORWARD -i '${tun_device}' -j ACCEPT 2>/dev/null || iptables -A FORWARD -i '${tun_device}' -j ACCEPT"
         run_shell "iptables -C FORWARD -o '${tun_device}' -j ACCEPT 2>/dev/null || iptables -A FORWARD -o '${tun_device}' -j ACCEPT"

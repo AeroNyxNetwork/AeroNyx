@@ -14,7 +14,7 @@ Modification Reason:
   verification, purge path safety, service-name validation, and release-backup
   retention/diagnostics, plus network restore command-path portability and unit
   verification/synchronization, low-risk maintenance, and tracked dirty
-  worktree protection.
+  worktree protection, plus config-driven VPN network rules.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -40,6 +40,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.20.0-node-deploy - Documented config-driven VPN subnet/TUN network rules
+                     and health diagnostics.
 v1.19.0-node-deploy - Documented tracked dirty-worktree protection for install
                      and upgrade.
 v1.18.0-node-deploy - Documented live systemd unit binding diagnostics.
@@ -123,6 +125,15 @@ When network setup is enabled, `install.sh` persists forwarding/NAT with:
 - `/etc/sysctl.d/99-aeronyx.conf`
 - `/etc/iptables/rules.v4`
 - `aeronyx-network-restore.service`
+
+The VPN source subnet and TUN interface are read from the installed
+`server.toml` values:
+
+- `vpn.virtual_ip_range`
+- `tun.device_name`
+
+This keeps NAT and forwarding rules aligned when operators expand the IP pool
+or customize the TUN device for higher-capacity nodes.
 
 The generated network restore service uses detected absolute paths for
 `sysctl` and `iptables-restore` so reboot recovery works across Linux
@@ -228,6 +239,7 @@ The healthcheck prints:
 - host capacity: TUN, default route, memory, disk, and ports
 - runtime metadata: git commit, branch, binary/config timestamps, service state
 - live systemd unit binding: WorkingDirectory, ExecStart binary, config path
+- config-driven VPN subnet/TUN diagnostics for NAT and FORWARD rules
 - tracked worktree and current-start journal warning checks
 - release-backup counts for binary, main unit, and network restore unit
 - release binary presence
@@ -288,6 +300,11 @@ purge allow-list:
 - max connections: `1000`
 - management API: `https://api.aeronyx.network/api/privacy_network`
 - MemChain: `off`
+
+`vpn.virtual_ip_range` and `tun.device_name` are operational inputs, not only
+application settings. `install.sh` uses them when writing host NAT/FORWARD
+rules, and `healthcheck.sh` verifies runtime and persisted rules against the
+same values.
 
 The systemd template applies production-safe hardening:
 
