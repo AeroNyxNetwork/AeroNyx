@@ -210,6 +210,7 @@ impl ServerError {
         matches!(
             self,
             Self::ConfigLoad { .. }
+                | Self::ConfigInvalid { .. }
                 | Self::ConfigMissing { .. }
                 | Self::StartupFailed { .. }
         )

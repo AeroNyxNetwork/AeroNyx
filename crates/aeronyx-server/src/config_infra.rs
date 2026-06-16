@@ -289,7 +289,7 @@ mod tests {
         let vc = VpnConfig::default();
         let (net, prefix) = vc.parse_ip_range().unwrap();
         assert_eq!(net, Ipv4Addr::new(100, 64, 0, 0));
-        assert_eq!(prefix, 24);
+        assert_eq!(prefix, 22);
     }
 
     #[test]

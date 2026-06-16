@@ -2170,6 +2170,9 @@ mod tests {
             params![source_id.as_slice(), target_id.as_slice(), now],
         ).unwrap();
 
+        // Match MemoryStorage::open() upgrade order: create any missing modern
+        // tables first, then run incremental migrations against the old data.
+        MemoryStorage::create_schema(&conn).unwrap();
         MemoryStorage::maybe_migrate(&conn).unwrap();
 
         // Verify the migrated edge has the correct owner (owner_bytes), not source_id

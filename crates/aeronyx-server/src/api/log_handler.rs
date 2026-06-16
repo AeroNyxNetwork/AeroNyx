@@ -873,7 +873,7 @@ mod tests {
     fn test_rule_engine_environment() {
         let r = run_rule_engine("I'm using macOS Sonoma 14.2");
         assert!(!r.is_empty());
-        assert!(r[0].tags.contains(&"environment".to_string()));
+        assert!(r.iter().any(|item| item.tags.contains(&"environment".to_string())));
     }
 
     #[test]

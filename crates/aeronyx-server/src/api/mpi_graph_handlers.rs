@@ -815,6 +815,13 @@ mod tests {
     #[tokio::test]
     async fn test_session_conversation_no_rawlogs() {
         let s = make_state().await;
+        let owner = s.owner_key;
+        s.storage
+            .as_ref()
+            .unwrap()
+            .upsert_session("s1", &owner, None, "chat", 1, 0)
+            .await
+            .unwrap();
         let app = build_mpi_router(s);
         let req = Request::builder()
             .uri("/api/mpi/sessions/s1/conversation").body(Body::empty()).unwrap();
@@ -829,6 +836,10 @@ mod tests {
     #[tokio::test]
     async fn test_session_conversation_plaintext_turns() {
         let state = make_state().await;
+        let owner = state.owner_key;
+        state.storage.as_ref().unwrap().upsert_session(
+            "sess_test", &owner, None, "chat", 1, 2,
+        ).await.unwrap();
         state.storage.as_ref().unwrap().insert_raw_log(
             "sess_test", 0, "user", "Hello auth discussion", "test", None, 1, None, None,
         ).await.unwrap();

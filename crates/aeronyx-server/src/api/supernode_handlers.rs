@@ -609,7 +609,7 @@ mod tests {
         assert_eq!(unix_days_for_date(1970, 2, 1), 31);
         assert_eq!(unix_days_for_date(1972, 1, 1), 730);
         assert_eq!(unix_days_for_date(1972, 3, 1), 790);
-        assert_eq!(unix_days_for_date(2026, 1, 1), 20089);
+        assert_eq!(unix_days_for_date(2026, 1, 1), 20454);
         let y2100 = unix_days_for_date(2100, 1, 1);
         let y2099 = unix_days_for_date(2099, 1, 1);
         assert_eq!(y2100 - y2099, 365);
