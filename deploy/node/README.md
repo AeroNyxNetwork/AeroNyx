@@ -15,7 +15,8 @@ Modification Reason:
   retention/diagnostics, plus network restore command-path portability and unit
   verification/synchronization, low-risk maintenance, and tracked dirty
   worktree protection, config-driven VPN network rules, network-only
-  maintenance, and install-time commercial capacity plan checks.
+  maintenance, install-time commercial capacity plan checks, and healthcheck
+  capacity-risk JSON export.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -41,6 +42,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.23.0-node-deploy - Documented healthcheck capacity telemetry warnings and
+                     JSON export for nodeboard automation.
 v1.22.0-node-deploy - Documented installer capacity plan preflight for IP pool,
                      max connections, fd limit, and conntrack headroom.
 v1.21.0-node-deploy - Documented --network-only maintenance for config-driven
@@ -284,9 +287,17 @@ The healthcheck prints:
 - structured JSON runtime fields for release backups and network restore commands
 - local VPN health endpoint status
 - capacity telemetry: IP pool, conntrack, file descriptors, drops, pps, bps
+- capacity risk checks: `max_connections` / policy `max_sessions` versus
+  usable VPN IP pool, IP-pool exhaustion, fd usage, conntrack usage, and packet
+  drops
 
 It does not print private keys, user traffic destinations, DNS contents,
 payloads, wallet-level traffic, or client public IPs.
+
+`--json-only` includes a top-level `capacity` object copied from the local Rust
+VPN health endpoint and a `local_vpn_health` summary for nodeboard automation.
+These fields remain aggregate-only and preserve the same privacy boundary as
+the Rust `/api/vpn/health` response.
 
 ## Safe Uninstall
 

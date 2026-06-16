@@ -17,11 +17,15 @@
 # - Verify the live systemd unit points at the requested repository and config.
 # - Check NAT and forwarding rules against server.toml instead of hard-coded
 #   deployment defaults.
+# - Promote Rust VPN capacity telemetry from informational output into
+#   healthcheck warnings and JSON so commercial placement tooling can detect
+#   IP-pool, session-ceiling, fd, conntrack, and packet-drop risk.
 #
 # Main Functionality:
 # - Checks repository, binary, config, registration state, systemd status,
 #   host capacity, IP forwarding, NAT runtime/persistence, local VPN health
 #   endpoint, release-backup retention, and capacity telemetry.
+# - Records commercial capacity risk as structured checks and JSON.
 # - Checks that generated network restore ExecStart command paths exist.
 # - Emits machine-readable JSON for nodeboard or support automation.
 # - Warns when installed systemd hardening is weaker than the production
@@ -48,6 +52,8 @@
 #   tun.device_name from the installed config.
 #
 # Last Modified:
+# v1.14.0-node-deploy - Added capacity telemetry checks and JSON export for
+#                       commercial placement risk.
 # v1.13.0-node-deploy - Reads VPN subnet and TUN device from server.toml for
 #                       NAT and forwarding diagnostics.
 # v1.12.0-node-deploy - Added live systemd ExecStart/WorkingDirectory binding
@@ -80,12 +86,13 @@ SERVICE_NAME="aeronyx-server"
 JSON=0
 JSON_ONLY=0
 CHECK_LOG="$(mktemp)"
+HEALTH_JSON_FILE="$(mktemp)"
 SYSCTL_FILE="/etc/sysctl.d/99-aeronyx.conf"
 IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
 NETWORK_RESTORE_SERVICE="aeronyx-network-restore"
 RELEASE_DIR="/var/lib/aeronyx/releases"
 RELEASE_BACKUP_KEEP_TARGET=10
-trap 'rm -f "${CHECK_LOG}"' EXIT
+trap 'rm -f "${CHECK_LOG}" "${HEALTH_JSON_FILE}"' EXIT
 
 usage() {
     cat <<'USAGE'
@@ -634,12 +641,19 @@ check_health_endpoint() {
         return
     fi
 
-    local tmp
-    tmp="$(mktemp)"
-    if curl -fsS --max-time 5 http://127.0.0.1:8421/api/vpn/health >"${tmp}" 2>/dev/null; then
+    : >"${HEALTH_JSON_FILE}"
+    if curl -fsS --max-time 5 http://127.0.0.1:8421/api/vpn/health >"${HEALTH_JSON_FILE}" 2>/dev/null; then
         pass "local VPN health endpoint"
-        if [ "${JSON_ONLY}" -eq 0 ] && command -v python3 >/dev/null 2>&1; then
-            python3 - "${tmp}" <<'PY'
+        if command -v python3 >/dev/null 2>&1; then
+            while IFS="$(printf '\t')" read -r status message; do
+                [ -n "${status}" ] || continue
+                case "${status}" in
+                    pass) pass "${message}" ;;
+                    warn) warn "${message}" ;;
+                    info) [ "${JSON_ONLY}" -eq 1 ] || printf '[INFO] %s\n' "${message}" ;;
+                esac
+            done <<EOF
+$(python3 - "${HEALTH_JSON_FILE}" <<'PY'
 import json
 import sys
 
@@ -647,35 +661,78 @@ path = sys.argv[1]
 data = json.load(open(path, "r", encoding="utf-8"))
 capacity = data.get("capacity") or {}
 interface = capacity.get("interface") or {}
-print("[INFO] status=%s active_sessions=%s active_wallet_devices=%s" % (
+print("info\tstatus=%s active_sessions=%s active_wallet_devices=%s" % (
     data.get("status"),
     data.get("active_sessions"),
     data.get("active_wallet_devices"),
 ))
 if capacity:
-    print("[INFO] capacity ip_pool=%s used=%s free=%s max_connections=%s policy_max_sessions=%s" % (
-        capacity.get("ip_pool_capacity"),
+    ip_pool_capacity = capacity.get("ip_pool_capacity")
+    ip_pool_free = capacity.get("ip_pool_free")
+    max_connections = capacity.get("max_connections") or 0
+    policy_max_sessions = capacity.get("policy_max_sessions") or 0
+    conntrack = capacity.get("conntrack") or {}
+    fd = capacity.get("file_descriptors") or {}
+    packet_drops = capacity.get("packet_drops_total") or 0
+    conntrack_used_percent = conntrack.get("used_percent")
+    fd_used_percent = fd.get("used_percent")
+
+    print("info\tcapacity ip_pool=%s used=%s free=%s max_connections=%s policy_max_sessions=%s" % (
+        ip_pool_capacity,
         capacity.get("ip_pool_used"),
-        capacity.get("ip_pool_free"),
-        capacity.get("max_connections"),
-        capacity.get("policy_max_sessions"),
+        ip_pool_free,
+        max_connections,
+        policy_max_sessions,
     ))
-    print("[INFO] capacity conntrack=%s fd=%s drops=%s pps=%s bps=%s interface=%s" % (
-        (capacity.get("conntrack") or {}).get("used"),
-        (capacity.get("file_descriptors") or {}).get("used"),
-        capacity.get("packet_drops_total"),
+    print("info\tcapacity conntrack=%s/%s fd=%s/%s drops=%s pps=%s bps=%s interface=%s" % (
+        conntrack.get("used"),
+        conntrack.get("max"),
+        fd.get("used"),
+        fd.get("soft_limit"),
+        packet_drops,
         interface.get("total_pps"),
         interface.get("total_bps"),
         interface.get("interface"),
     ))
+
+    if isinstance(ip_pool_capacity, int) and isinstance(max_connections, int) and max_connections > ip_pool_capacity:
+        print("warn\tcapacity max_connections %s exceeds usable VPN IP pool %s" % (max_connections, ip_pool_capacity))
+    else:
+        print("pass\tcapacity max_connections fits usable VPN IP pool")
+
+    if isinstance(ip_pool_capacity, int) and isinstance(policy_max_sessions, int) and policy_max_sessions > 0 and policy_max_sessions > ip_pool_capacity:
+        print("warn\tcapacity policy max_sessions %s exceeds usable VPN IP pool %s" % (policy_max_sessions, ip_pool_capacity))
+    elif isinstance(policy_max_sessions, int) and policy_max_sessions > 0:
+        print("pass\tcapacity policy max_sessions fits usable VPN IP pool")
+
+    if isinstance(ip_pool_free, int) and ip_pool_free <= 0:
+        print("warn\tcapacity VPN IP pool exhausted")
+    elif isinstance(ip_pool_free, int):
+        print("pass\tcapacity VPN IP pool has %s free address(es)" % ip_pool_free)
+
+    if isinstance(conntrack_used_percent, (int, float)) and conntrack_used_percent >= 80:
+        print("warn\tcapacity conntrack usage high at %.2f%%" % conntrack_used_percent)
+    elif isinstance(conntrack_used_percent, (int, float)):
+        print("pass\tcapacity conntrack usage %.2f%%" % conntrack_used_percent)
+
+    if isinstance(fd_used_percent, (int, float)) and fd_used_percent >= 80:
+        print("warn\tcapacity file descriptor usage high at %.2f%%" % fd_used_percent)
+    elif isinstance(fd_used_percent, (int, float)):
+        print("pass\tcapacity file descriptor usage %.2f%%" % fd_used_percent)
+
+    if isinstance(packet_drops, int) and packet_drops > 0:
+        print("warn\tcapacity packet drops detected: %s" % packet_drops)
+    else:
+        print("pass\tcapacity packet drops clean")
 else:
-    print("[WARN] capacity telemetry missing; upgrade Rust node binary if this is unexpected")
+    print("warn\tcapacity telemetry missing; upgrade Rust node binary if this is unexpected")
 PY
+)
+EOF
         fi
     else
         warn "local VPN health endpoint unavailable"
     fi
-    rm -f "${tmp}"
 }
 
 emit_json_summary() {
@@ -683,7 +740,7 @@ emit_json_summary() {
         return 0
     fi
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "${CHECK_LOG}" "${REPO_DIR}" "${CONFIG_FILE}" "${SERVICE_NAME}" "${NETWORK_RESTORE_SERVICE}" "${PASS}" "${WARN}" "${FAIL}" <<'PY'
+        python3 - "${CHECK_LOG}" "${REPO_DIR}" "${CONFIG_FILE}" "${SERVICE_NAME}" "${NETWORK_RESTORE_SERVICE}" "${HEALTH_JSON_FILE}" "${PASS}" "${WARN}" "${FAIL}" <<'PY'
 import json
 import glob
 import os
@@ -691,8 +748,8 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-checks_path, repo_dir, config_path, service_name, network_restore_service = sys.argv[1:6]
-pass_count, warn_count, fail_count = [int(value) for value in sys.argv[6:9]]
+checks_path, repo_dir, config_path, service_name, network_restore_service, health_json_path = sys.argv[1:7]
+pass_count, warn_count, fail_count = [int(value) for value in sys.argv[7:10]]
 
 def run(args):
     try:
@@ -721,6 +778,15 @@ def network_restore_commands(unit_name):
             continue
         commands.append({"path": command, "executable": os.access(command, os.X_OK)})
     return commands
+
+def local_health_payload(path):
+    try:
+        if not os.path.getsize(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return {}
 
 def vpn_config(path):
     data = {}
@@ -822,6 +888,7 @@ runtime = {
     "network_restore_commands": network_restore_commands(network_restore_service),
     "release_backups": release_backups,
 }
+local_health = local_health_payload(health_json_path)
 
 print(json.dumps({
     "success": fail_count == 0,
@@ -829,6 +896,16 @@ print(json.dumps({
     "repo_dir": repo_dir,
     "config": config_path,
     "service": service_name,
+    "capacity": local_health.get("capacity"),
+    "local_vpn_health": {
+        "status": local_health.get("status"),
+        "checked_at": local_health.get("checked_at"),
+        "active_sessions": local_health.get("active_sessions"),
+        "active_wallet_devices": local_health.get("active_wallet_devices"),
+        "placement_readiness": local_health.get("placement_readiness"),
+        "encrypted_message_forwarding": local_health.get("encrypted_message_forwarding"),
+        "privacy_boundary": "aggregate local VPN health only; no client public IPs, destinations, DNS contents, packet payloads, domains, URLs, browsing history, voucher secrets, or wallet-level traffic",
+    },
     "runtime": runtime,
     "checks": checks,
     "privacy_boundary": "diagnostics only; no private keys, registration secrets, client public IPs, destinations, DNS contents, packet payloads, or wallet-level traffic",
