@@ -12,7 +12,8 @@ Modification Reason:
 - Document production upgrade unit-template synchronization, rollback behavior,
   shared node-local deployment locking, and install-time systemd unit
   verification, purge path safety, service-name validation, and release-backup
-  retention/diagnostics, plus network restore command-path portability.
+  retention/diagnostics, plus network restore command-path portability and unit
+  verification.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -38,6 +39,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.11.0-node-deploy - Documented network restore unit verification.
 v1.10.0-node-deploy - Documented structured network restore command diagnostics.
 v1.9.0-node-deploy - Documented portable network restore command paths.
 v1.8.0-node-deploy - Documented healthcheck release-backup diagnostics.
@@ -111,9 +113,10 @@ The generated network restore service uses detected absolute paths for
 `sysctl` and `iptables-restore` so reboot recovery works across Linux
 distributions that place these commands under `/usr/sbin` instead of `/sbin`.
 
-Before installing the main service, `install.sh` renders the systemd template
-and verifies it with `systemd-analyze verify`. A malformed service unit fails
-before it can replace the installed unit.
+Before installing the main service or generated network restore service,
+`install.sh` renders the systemd unit to `/tmp` and verifies it with
+`systemd-analyze verify`. A malformed service unit fails before it can replace
+the installed unit.
 
 Run preflight only:
 

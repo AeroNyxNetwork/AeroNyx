@@ -12,6 +12,8 @@
 #   deployment entrypoint for commercial VPN node operators.
 # - Render the generated network restore unit with detected system command
 #   paths instead of assuming /sbin.
+# - Verify the generated network restore unit before replacing the installed
+#   reboot recovery service.
 #
 # Main Functionality:
 # - Detects Linux/systemd environment.
@@ -26,7 +28,8 @@
 # - Verifies, installs, and enables the systemd service.
 # - Optionally configures IP forwarding/NAT and registers/starts the node.
 # - Persists VPN forwarding/NAT across host reboots.
-# - Renders reboot network restore with distro-specific sysctl/iptables paths.
+# - Renders and verifies reboot network restore with distro-specific
+#   sysctl/iptables paths.
 #
 # Dependencies:
 # - deploy/node/server.example.toml
@@ -49,6 +52,8 @@
 #   development/client platforms, not production node hosts for this script.
 #
 # Last Modified:
+# v1.8.0-node-deploy - Verifies the generated network restore systemd unit
+#                      before installing it.
 # v1.7.0-node-deploy - Uses detected sysctl and iptables-restore paths in the
 #                      generated network restore service.
 # v1.6.0-node-deploy - Verifies the rendered systemd service unit before
@@ -405,17 +410,12 @@ persist_network_rules() {
     install_network_restore_service
 }
 
-install_network_restore_service() {
-    local sysctl_path iptables_restore_path
-    sysctl_path="$(resolve_command_path sysctl)"
-    iptables_restore_path="$(resolve_command_path iptables-restore)"
+render_network_restore_unit() {
+    local output_file="$1"
+    local sysctl_path="$2"
+    local iptables_restore_path="$3"
 
-    log "Installing network restore service: ${NETWORK_RESTORE_FILE}"
-    if [ "${DRY_RUN}" -eq 1 ]; then
-        printf '[DRY-RUN] create %s\n' "${NETWORK_RESTORE_FILE}"
-        printf '[DRY-RUN] network restore commands: sysctl=%s iptables-restore=%s\n' "${sysctl_path}" "${iptables_restore_path}"
-    else
-        cat > "${NETWORK_RESTORE_FILE}" <<SERVICE
+    cat > "${output_file}" <<SERVICE
 # ============================================
 # File: /etc/systemd/system/${NETWORK_RESTORE_SERVICE}
 # ============================================
@@ -449,6 +449,23 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 SERVICE
+}
+
+install_network_restore_service() {
+    local sysctl_path iptables_restore_path rendered
+    sysctl_path="$(resolve_command_path sysctl)"
+    iptables_restore_path="$(resolve_command_path iptables-restore)"
+    rendered="/tmp/aeronyx-network-restore.install.service"
+
+    log "Installing network restore service: ${NETWORK_RESTORE_FILE}"
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] create %s\n' "${NETWORK_RESTORE_FILE}"
+        printf '[DRY-RUN] network restore commands: sysctl=%s iptables-restore=%s\n' "${sysctl_path}" "${iptables_restore_path}"
+        printf '[DRY-RUN] systemd-analyze verify %s\n' "${rendered}"
+    else
+        render_network_restore_unit "${rendered}" "${sysctl_path}" "${iptables_restore_path}"
+        systemd-analyze verify "${rendered}"
+        cp "${rendered}" "${NETWORK_RESTORE_FILE}"
         chmod 644 "${NETWORK_RESTORE_FILE}"
         systemctl daemon-reload
     fi
