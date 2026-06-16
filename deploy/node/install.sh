@@ -8,7 +8,8 @@
 #   sysctl, iptables, and build commands.
 #
 # Modification Reason:
-# - Initial production deployment entrypoint for commercial VPN node operators.
+# - Add install-time systemd unit verification while preserving the production
+#   deployment entrypoint for commercial VPN node operators.
 #
 # Main Functionality:
 # - Detects Linux/systemd environment.
@@ -20,7 +21,7 @@
 # - Creates /etc/aeronyx and /var/lib/aeronyx state directories.
 # - Installs a safe default server.toml without overwriting existing config.
 # - Builds aeronyx-server release binary.
-# - Installs and enables systemd service.
+# - Verifies, installs, and enables the systemd service.
 # - Optionally configures IP forwarding/NAT and registers/starts the node.
 # - Persists VPN forwarding/NAT across host reboots.
 #
@@ -45,6 +46,8 @@
 #   development/client platforms, not production node hosts for this script.
 #
 # Last Modified:
+# v1.6.0-node-deploy - Verifies the rendered systemd service unit before
+#                      installing it.
 # v1.5.0-node-deploy - Added shared deployment locking with upgrade.sh.
 # v1.4.0-node-deploy - Persisted sysctl and iptables NAT with a restore unit.
 # v1.3.0-node-deploy - Added --preflight-only for install readiness checks.
@@ -450,16 +453,20 @@ build_binary() {
 
 install_service() {
     local template="${REPO_DIR}/deploy/node/aeronyx-server.service"
+    local rendered="/tmp/${SERVICE_NAME}.install.service"
     [ "${DRY_RUN}" -eq 1 ] || [ -f "${template}" ] || die "Missing service template: ${template}"
 
     log "Installing systemd service: ${SERVICE_FILE}"
     if [ "${DRY_RUN}" -eq 1 ]; then
         printf '[DRY-RUN] render %s to %s\n' "${template}" "${SERVICE_FILE}"
+        printf '[DRY-RUN] systemd-analyze verify %s\n' "${rendered}"
     else
         sed \
             -e "s|@REPO_DIR@|${REPO_DIR}|g" \
             -e "s|@CONFIG_FILE@|${CONFIG_FILE}|g" \
-            "${template}" > "${SERVICE_FILE}"
+            "${template}" > "${rendered}"
+        systemd-analyze verify "${rendered}"
+        cp "${rendered}" "${SERVICE_FILE}"
         chmod 644 "${SERVICE_FILE}"
         systemctl daemon-reload
     fi

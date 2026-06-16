@@ -10,7 +10,8 @@ Creation Reason:
 
 Modification Reason:
 - Document production upgrade unit-template synchronization, rollback behavior,
-  and shared node-local deployment locking.
+  shared node-local deployment locking, and install-time systemd unit
+  verification.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -36,6 +37,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.4.0-node-deploy - Documented install-time systemd unit verification.
 v1.3.0-node-deploy - Documented shared install/upgrade deployment locking.
 v1.2.0-node-deploy - Documented node-local upgrade locking.
 v1.1.0-node-deploy - Documented upgrade-time systemd unit synchronization and
@@ -97,6 +99,10 @@ When network setup is enabled, `install.sh` persists forwarding/NAT with:
 - `/etc/sysctl.d/99-aeronyx.conf`
 - `/etc/iptables/rules.v4`
 - `aeronyx-network-restore.service`
+
+Before installing the main service, `install.sh` renders the systemd template
+and verifies it with `systemd-analyze verify`. A malformed service unit fails
+before it can replace the installed unit.
 
 Run preflight only:
 
