@@ -10,6 +10,8 @@
 # - Add production systemd unit synchronization, rollback, no-restart, and
 #   health polling controls while preserving active-session protection and
 #   validating operator-provided service names.
+# - Add release-backup retention so long-running production nodes do not keep
+#   unlimited binary/unit backups.
 #
 # Main Functionality:
 # - Pulls the configured branch.
@@ -21,6 +23,7 @@
 # - Restarts systemd service and verifies post-upgrade health.
 # - Restores the previous systemd unit and binary if restart or health
 #   verification fails.
+# - Prunes old release backups after a successful upgrade.
 #
 # Dependencies:
 # - deploy/node/healthcheck.sh
@@ -34,6 +37,7 @@
 # 4. Restart only when no active sessions are present, unless --force is used.
 # 5. Sync and verify the systemd unit template.
 # 6. Verify local health and roll back the unit/binary if restart health fails.
+# 7. Prune old release backups after success.
 #
 # Important Note for Next Developer:
 # - Do not remove active-session protection. Commercial VPN users should not be
@@ -41,8 +45,12 @@
 # - Do not overwrite /etc/aeronyx/server.toml during upgrades.
 # - Keep this script compatible with current and older installed service units.
 # - Reject service names that look like paths or command-line options.
+# - Do not prune release backups until the upgrade path has completed
+#   successfully.
 #
 # Last Modified:
+# v1.6.0-node-deploy - Added configurable release-backup retention pruning
+#                      after successful upgrades.
 # v1.5.0-node-deploy - Validates --service names before systemd, lock, or unit
 #                      path operations.
 # v1.4.0-node-deploy - Uses the shared node deployment lock across install and
@@ -65,11 +73,13 @@ SERVICE_NAME="aeronyx-server"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"
 LOCK_DIR=""
+RELEASE_DIR="/var/lib/aeronyx/releases"
 FORCE=0
 DRY_RUN=0
 SKIP_PULL=0
 SKIP_UNIT_UPDATE=0
 NO_RESTART=0
+KEEP_RELEASES=10
 HEALTH_RETRIES=10
 HEALTH_DELAY=2
 BACKUP_BINARY=""
@@ -94,6 +104,7 @@ Options:
   --no-restart        Build and validate only; do not restart the service.
   --skip-pull         Build the currently checked out source.
   --skip-unit-update  Do not render/install deploy/node/aeronyx-server.service.
+  --keep-releases N   Keep latest N binary/unit backups after success. Default: 10
   --health-retries N  Health polling attempts after restart. Default: 10
   --health-delay N    Seconds between health polling attempts. Default: 2
   --dry-run           Print actions without changing the host.
@@ -111,6 +122,7 @@ while [ "$#" -gt 0 ]; do
         --no-restart) NO_RESTART=1; shift ;;
         --skip-pull) SKIP_PULL=1; shift ;;
         --skip-unit-update) SKIP_UNIT_UPDATE=1; shift ;;
+        --keep-releases) KEEP_RELEASES="${2:?missing value}"; shift 2 ;;
         --health-retries) HEALTH_RETRIES="${2:?missing value}"; shift 2 ;;
         --health-delay) HEALTH_DELAY="${2:?missing value}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -140,6 +152,11 @@ validate_service_name() {
 
     printf '%s' "${SERVICE_NAME}" | grep -Eq '^[A-Za-z0-9_.@-]+$' \
         || die "Invalid service name: ${SERVICE_NAME}"
+}
+
+validate_keep_releases() {
+    printf '%s' "${KEEP_RELEASES}" | grep -Eq '^[1-9][0-9]*$' \
+        || die "--keep-releases must be a positive integer."
 }
 
 release_lock() {
@@ -193,14 +210,13 @@ active_sessions() {
 }
 
 backup_current_binary() {
-    local binary backup_dir stamp
+    local binary stamp
     binary="${REPO_DIR}/target/release/aeronyx-server"
     [ -f "${binary}" ] || return
 
-    backup_dir="/var/lib/aeronyx/releases"
     stamp="$(date -u +%Y%m%d_%H%M%S)"
-    BACKUP_BINARY="${backup_dir}/aeronyx-server.${stamp}"
-    run mkdir -p "${backup_dir}"
+    BACKUP_BINARY="${RELEASE_DIR}/aeronyx-server.${stamp}"
+    run mkdir -p "${RELEASE_DIR}"
     run cp "${binary}" "${BACKUP_BINARY}"
     ok "Current binary backed up to ${BACKUP_BINARY}"
 }
@@ -236,13 +252,12 @@ validate_config() {
 }
 
 backup_current_service_unit() {
-    local backup_dir stamp
+    local stamp
     [ -f "${SERVICE_FILE}" ] || return
 
-    backup_dir="/var/lib/aeronyx/releases"
     stamp="$(date -u +%Y%m%d_%H%M%S)"
-    BACKUP_SERVICE_FILE="${backup_dir}/${SERVICE_NAME}.service.${stamp}"
-    run mkdir -p "${backup_dir}"
+    BACKUP_SERVICE_FILE="${RELEASE_DIR}/${SERVICE_NAME}.service.${stamp}"
+    run mkdir -p "${RELEASE_DIR}"
     run cp "${SERVICE_FILE}" "${BACKUP_SERVICE_FILE}"
     ok "Current systemd unit backed up to ${BACKUP_SERVICE_FILE}"
 }
@@ -386,8 +401,48 @@ run_healthcheck() {
     fi
 }
 
+prune_backup_pattern() {
+    local pattern="$1"
+    local label="$2"
+    local file
+    local files=()
+
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] prune %s backups in %s matching %s, keep latest %s\n' \
+            "${label}" "${RELEASE_DIR}" "${pattern}" "${KEEP_RELEASES}"
+        return
+    fi
+
+    [ -d "${RELEASE_DIR}" ] || { ok "Release backup directory absent: ${RELEASE_DIR}"; return; }
+
+    while IFS= read -r file; do
+        files+=("${file}")
+    done < <(
+        find "${RELEASE_DIR}" -maxdepth 1 -type f -name "${pattern}" -printf '%T@ %p\n' 2>/dev/null \
+            | sort -rn \
+            | awk -v keep="${KEEP_RELEASES}" 'NR > keep { $1=""; sub(/^ /, ""); print }'
+    )
+
+    if [ "${#files[@]}" -eq 0 ]; then
+        ok "No old ${label} backups to prune"
+        return
+    fi
+
+    for file in "${files[@]}"; do
+        log "Pruning old ${label} backup: ${file}"
+        run rm -f "${file}"
+    done
+}
+
+prune_release_backups() {
+    log "Pruning release backups; keeping latest ${KEEP_RELEASES} per backup type"
+    prune_backup_pattern "aeronyx-server.*" "binary"
+    prune_backup_pattern "${SERVICE_NAME}.service.*" "systemd unit"
+}
+
 main() {
     validate_service_name
+    validate_keep_releases
     require_root
     acquire_lock
     ensure_cargo_path
@@ -403,6 +458,7 @@ main() {
     else
         ok "Build and validation complete. Service was not restarted."
     fi
+    prune_release_backups
 }
 
 main "$@"

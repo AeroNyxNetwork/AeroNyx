@@ -11,7 +11,8 @@ Creation Reason:
 Modification Reason:
 - Document production upgrade unit-template synchronization, rollback behavior,
   shared node-local deployment locking, and install-time systemd unit
-  verification, purge path safety, and service-name validation.
+  verification, purge path safety, service-name validation, and release-backup
+  retention.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -37,6 +38,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.7.0-node-deploy - Documented upgrade release-backup retention.
 v1.6.0-node-deploy - Documented --service name validation.
 v1.5.0-node-deploy - Documented uninstall purge path allow-list protection.
 v1.4.0-node-deploy - Documented install-time systemd unit verification.
@@ -145,6 +147,14 @@ sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --skip-unit-update
 Post-restart health is polled automatically. If restart or health verification
 fails, `upgrade.sh` restores both the previous systemd unit and previous release
 binary from `/var/lib/aeronyx/releases`, then restarts the service again.
+
+After a successful upgrade, old backups in `/var/lib/aeronyx/releases` are
+pruned per backup type. The default keeps the latest 10 binary backups and the
+latest 10 systemd unit backups:
+
+```bash
+sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --keep-releases 20
+```
 
 ## Healthcheck
 
