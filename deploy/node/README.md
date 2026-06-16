@@ -17,7 +17,8 @@ Modification Reason:
   worktree protection, config-driven VPN network rules, network-only
   maintenance, install-time commercial capacity plan checks, and healthcheck
   capacity-risk JSON export. Document the /22 default VPN pool that matches the
-  commercial 1000-session profile.
+  commercial 1000-session profile, and document healthcheck repo path
+  auto-detection for non-standard node checkouts.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -43,6 +44,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.25.0-node-deploy - Documented healthcheck systemd repo path auto-detection.
 v1.24.0-node-deploy - Documented /22 default VPN pool for 1000-session
                      commercial capacity.
 v1.23.0-node-deploy - Documented healthcheck capacity telemetry warnings and
@@ -263,6 +265,11 @@ sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --keep-releases 20
 ```bash
 ./deploy/node/healthcheck.sh --repo-dir /opt/aeronyx/AeroNyx
 ```
+
+When `--repo-dir` is omitted, `healthcheck.sh` reads the live systemd
+`WorkingDirectory` first and then the `ExecStart` binary path before falling
+back to `/opt/aeronyx/AeroNyx`. Pass `--repo-dir` explicitly when auditing a
+different checkout than the currently running service.
 
 Machine-readable output for nodeboard or automation:
 

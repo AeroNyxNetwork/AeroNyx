@@ -21,6 +21,8 @@
 #   healthcheck warnings and JSON so commercial placement tooling can detect
 #   IP-pool, session-ceiling, fd, conntrack, and packet-drop risk.
 # - Align default/fallback VPN pool with the commercial 1000-session profile.
+# - Auto-detect the live systemd repository path when operators run the script
+#   from a non-standard checkout without passing --repo-dir.
 #
 # Main Functionality:
 # - Checks repository, binary, config, registration state, systemd status,
@@ -49,10 +51,13 @@
 # - Keep output stable; nodeboard or support tooling may parse these lines later.
 # - This script should never modify host state.
 # - Reject service names that look like paths or command-line options.
+# - Explicit --repo-dir must always override systemd auto-detection.
 # - Keep VPN network diagnostics aligned with vpn.virtual_ip_range and
 #   tun.device_name from the installed config.
 #
 # Last Modified:
+# v1.16.0-node-deploy - Auto-detect live systemd repo path when --repo-dir is
+#                       not provided.
 # v1.15.0-node-deploy - Expanded default VPN pool fallback to /22 for
 #                       1000-session commercial capacity.
 # v1.14.0-node-deploy - Added capacity telemetry checks and JSON export for
@@ -83,7 +88,9 @@
 
 set -euo pipefail
 
-REPO_DIR="/opt/aeronyx/AeroNyx"
+DEFAULT_REPO_DIR="/opt/aeronyx/AeroNyx"
+REPO_DIR="${DEFAULT_REPO_DIR}"
+REPO_DIR_EXPLICIT=0
 CONFIG_FILE="/etc/aeronyx/server.toml"
 SERVICE_NAME="aeronyx-server"
 JSON=0
@@ -103,7 +110,7 @@ Usage:
   ./deploy/node/healthcheck.sh [OPTIONS]
 
 Options:
-  --repo-dir PATH   Repository path. Default: /opt/aeronyx/AeroNyx
+  --repo-dir PATH   Repository path. Default: systemd WorkingDirectory, then /opt/aeronyx/AeroNyx
   --config PATH     Config path. Default: /etc/aeronyx/server.toml
   --service NAME    systemd service name. Default: aeronyx-server
   --json            Emit JSON summary as the final output line.
@@ -114,7 +121,7 @@ USAGE
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --repo-dir) REPO_DIR="${2:?missing value}"; shift 2 ;;
+        --repo-dir) REPO_DIR="${2:?missing value}"; REPO_DIR_EXPLICIT=1; shift 2 ;;
         --config) CONFIG_FILE="${2:?missing value}"; shift 2 ;;
         --service) SERVICE_NAME="${2:?missing value}"; shift 2 ;;
         --json) JSON=1; shift ;;
@@ -140,6 +147,40 @@ validate_service_name() {
         printf '[ERROR] Invalid service name: %s\n' "${SERVICE_NAME}" >&2
         exit 1
     }
+}
+
+resolve_repo_dir() {
+    local exec_binary exec_dir exec_start working_directory
+
+    if [ "${REPO_DIR_EXPLICIT}" -eq 1 ]; then
+        return
+    fi
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return
+    fi
+
+    working_directory="$(systemctl show "${SERVICE_NAME}" -p WorkingDirectory --value 2>/dev/null || true)"
+    if [ -n "${working_directory}" ] \
+        && [ "${working_directory}" != "/" ] \
+        && [ -f "${working_directory}/Cargo.toml" ]; then
+        REPO_DIR="${working_directory}"
+        return
+    fi
+
+    exec_start="$(systemctl show "${SERVICE_NAME}" -p ExecStart --value 2>/dev/null || true)"
+    exec_binary="$(printf '%s\n' "${exec_start}" | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -n 1)"
+    if [ -z "${exec_binary}" ]; then
+        exec_binary="$(printf '%s\n' "${exec_start}" | tr ' ' '\n' | grep '/target/release/aeronyx-server$' | head -n 1 || true)"
+    fi
+    if [ -z "${exec_binary}" ]; then
+        return
+    fi
+
+    exec_dir="${exec_binary%/target/release/aeronyx-server}"
+    if [ "${exec_dir}" != "${exec_binary}" ] && [ -f "${exec_dir}/Cargo.toml" ]; then
+        REPO_DIR="${exec_dir}"
+    fi
 }
 
 record_check() {
@@ -920,6 +961,7 @@ PY
 
 main() {
     validate_service_name
+    resolve_repo_dir
     check_system
     check_host_capacity
     check_repo_and_binary
