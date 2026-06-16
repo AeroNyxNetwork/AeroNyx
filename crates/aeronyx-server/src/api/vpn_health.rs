@@ -11,9 +11,10 @@
 //! snapshot for nodeboard so operators can see which AeroNyx services this
 //! Rust node is currently ready to provide.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
@@ -25,8 +26,8 @@ use tokio::time::timeout;
 
 use crate::config::ServerConfig;
 use crate::services::{
-    NodePolicyEnforcementSnapshot, NodePolicyPlacementSnapshot, NodePolicyRuntime,
-    NodePolicySnapshot, SessionManager,
+    IpPoolService, NodePolicyEnforcementSnapshot, NodePolicyPlacementSnapshot,
+    NodePolicyRuntime, NodePolicySnapshot, SessionManager,
 };
 use crate::services::session::CLIENT_LIVENESS_TIMEOUT_SECS;
 use crate::voucher_verifier::{VoucherMetricsSnapshot, VoucherVerifier};
@@ -39,6 +40,7 @@ const VPN_SERVICE_NAME: &str = "aeronyx-server";
 #[derive(Clone)]
 pub struct VpnHealthState {
     config: ServerConfig,
+    ip_pool: Arc<IpPoolService>,
     sessions: Arc<SessionManager>,
     node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
@@ -77,6 +79,66 @@ struct SessionCleanupStatus {
     privacy_boundary: &'static str,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct InterfaceCounterSnapshot {
+    timestamp: u64,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    rx_packets: u64,
+    tx_packets: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InterfaceCapacityStatus {
+    interface: String,
+    rx_bytes: Option<u64>,
+    tx_bytes: Option<u64>,
+    rx_packets: Option<u64>,
+    tx_packets: Option<u64>,
+    rx_dropped: Option<u64>,
+    tx_dropped: Option<u64>,
+    packet_drops: Option<u64>,
+    rx_pps: Option<f64>,
+    tx_pps: Option<f64>,
+    total_pps: Option<f64>,
+    rx_bps: Option<f64>,
+    tx_bps: Option<f64>,
+    total_bps: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConntrackCapacityStatus {
+    used: Option<u64>,
+    max: Option<u64>,
+    used_percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FileDescriptorCapacityStatus {
+    used: Option<u64>,
+    soft_limit: Option<u64>,
+    hard_limit: Option<u64>,
+    used_percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VpnCapacityStatus {
+    virtual_ip_range: String,
+    ip_pool_capacity: usize,
+    ip_pool_used: usize,
+    ip_pool_free: usize,
+    max_connections: usize,
+    policy_max_sessions: u32,
+    active_sessions: usize,
+    session_capacity_remaining: Option<u32>,
+    conntrack: ConntrackCapacityStatus,
+    file_descriptors: FileDescriptorCapacityStatus,
+    interface: InterfaceCapacityStatus,
+    packet_drops_total: Option<u64>,
+    source: &'static str,
+    privacy_boundary: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 struct VpnHealthResponse {
     status: &'static str,
@@ -93,6 +155,7 @@ struct VpnHealthResponse {
     node_policy: NodePolicySnapshot,
     policy_enforcement: NodePolicyEnforcementSnapshot,
     placement_readiness: NodePolicyPlacementSnapshot,
+    capacity: VpnCapacityStatus,
     voucher_metrics: VoucherMetricsSnapshot,
     encrypted_message_forwarding: EncryptedMessageForwardingStatus,
     session_cleanup: SessionCleanupStatus,
@@ -139,6 +202,7 @@ struct NodeOperatorStatusResponse {
 
 pub fn build_vpn_health_router(
     config: ServerConfig,
+    ip_pool: Arc<IpPoolService>,
     sessions: Arc<SessionManager>,
     node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
@@ -150,6 +214,7 @@ pub fn build_vpn_health_router(
         .route("/api/operator/status", get(node_operator_status_handler))
         .with_state(VpnHealthState {
             config,
+            ip_pool,
             sessions,
             node_policy,
             voucher_verifier,
@@ -176,6 +241,7 @@ async fn node_operator_status_handler(State(state): State<VpnHealthState>) -> im
 /// browsing history.
 pub async fn collect_vpn_health_value(
     config: ServerConfig,
+    ip_pool: Arc<IpPoolService>,
     sessions: Arc<SessionManager>,
     node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
@@ -183,6 +249,7 @@ pub async fn collect_vpn_health_value(
 ) -> Value {
     let state = VpnHealthState {
         config,
+        ip_pool,
         sessions,
         node_policy,
         voucher_verifier,
@@ -210,6 +277,7 @@ pub async fn collect_vpn_health_value(
 /// `/api/node/operator/status`. It contains aggregate service/config state only.
 pub async fn collect_node_operator_status_value(
     config: ServerConfig,
+    ip_pool: Arc<IpPoolService>,
     sessions: Arc<SessionManager>,
     node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
@@ -217,6 +285,7 @@ pub async fn collect_node_operator_status_value(
 ) -> Value {
     let state = VpnHealthState {
         config,
+        ip_pool,
         sessions,
         node_policy,
         voucher_verifier,
@@ -267,6 +336,17 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
 
     let active_sessions = state.sessions.count();
     let active_wallet_devices = state.sessions.wallet_index_count();
+    let node_policy = state.node_policy.snapshot();
+    let policy_enforcement = state.node_policy.enforcement_snapshot();
+    let placement_readiness = state.node_policy.placement_snapshot(active_sessions);
+    let capacity = collect_capacity_status(
+        &config,
+        &state.ip_pool,
+        &node_policy,
+        &policy_enforcement,
+        &placement_readiness,
+        active_sessions,
+    ).await;
 
     VpnHealthResponse {
         status,
@@ -280,9 +360,10 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         active_sessions,
         active_wallet_devices,
         service_manager,
-        node_policy: state.node_policy.snapshot(),
-        policy_enforcement: state.node_policy.enforcement_snapshot(),
-        placement_readiness: state.node_policy.placement_snapshot(active_sessions),
+        node_policy,
+        policy_enforcement,
+        placement_readiness,
+        capacity,
         voucher_metrics: state.voucher_verifier.metrics_snapshot(),
         encrypted_message_forwarding: EncryptedMessageForwardingStatus {
             count: state.encrypted_message_counter.load(Ordering::Relaxed),
@@ -344,6 +425,7 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
             "encrypted_message_forwarding": vpn_health.encrypted_message_forwarding,
             "session_cleanup": vpn_health.session_cleanup,
             "placement_readiness": vpn_health.placement_readiness,
+            "capacity": vpn_health.capacity,
             "failed_checks": vpn_health.checks.iter().filter(|check| !check.ok).count(),
             "runtime_rollout": runtime_rollout.clone(),
         }),
@@ -878,6 +960,194 @@ async fn check_internet_egress() -> HealthCheck {
             detail: format!("TCP connect to {} timed out", EGRESS_CHECK_ADDR),
         },
     }
+}
+
+async fn collect_capacity_status(
+    config: &ServerConfig,
+    ip_pool: &IpPoolService,
+    node_policy: &NodePolicySnapshot,
+    policy_enforcement: &NodePolicyEnforcementSnapshot,
+    placement_readiness: &NodePolicyPlacementSnapshot,
+    active_sessions: usize,
+) -> VpnCapacityStatus {
+    let interface = collect_interface_capacity(config.device_name()).await;
+    let interface_drops = interface.packet_drops;
+    let policy_drops = policy_enforcement.bandwidth_drops;
+    let packet_drops_total = match interface_drops {
+        Some(drops) => Some(drops.saturating_add(policy_drops)),
+        None if policy_drops > 0 => Some(policy_drops),
+        None => None,
+    };
+
+    VpnCapacityStatus {
+        virtual_ip_range: config.ip_range().to_string(),
+        ip_pool_capacity: ip_pool.capacity(),
+        ip_pool_used: ip_pool.allocated_count(),
+        ip_pool_free: ip_pool.available_count(),
+        max_connections: config.max_sessions(),
+        policy_max_sessions: node_policy.max_sessions,
+        active_sessions,
+        session_capacity_remaining: placement_readiness.session_capacity_remaining,
+        conntrack: collect_conntrack_capacity(),
+        file_descriptors: collect_fd_capacity(),
+        interface,
+        packet_drops_total,
+        source: "rust_vpn_health_capacity_snapshot",
+        privacy_boundary: concat!(
+            "aggregate node capacity only; no client public IPs, destinations, ",
+            "DNS contents, packet payloads, domains, URLs, browsing history, ",
+            "voucher secrets, or wallet-level traffic"
+        ),
+    }
+}
+
+async fn collect_interface_capacity(name: &str) -> InterfaceCapacityStatus {
+    let rx_bytes = read_sysfs_counter(name, "rx_bytes");
+    let tx_bytes = read_sysfs_counter(name, "tx_bytes");
+    let rx_packets = read_sysfs_counter(name, "rx_packets");
+    let tx_packets = read_sysfs_counter(name, "tx_packets");
+    let rx_dropped = read_sysfs_counter(name, "rx_dropped");
+    let tx_dropped = read_sysfs_counter(name, "tx_dropped");
+    let packet_drops = match (rx_dropped, tx_dropped) {
+        (Some(rx), Some(tx)) => Some(rx.saturating_add(tx)),
+        (Some(rx), None) => Some(rx),
+        (None, Some(tx)) => Some(tx),
+        (None, None) => None,
+    };
+
+    let rates = match (rx_bytes, tx_bytes, rx_packets, tx_packets) {
+        (Some(rx_b), Some(tx_b), Some(rx_p), Some(tx_p)) => {
+            interface_rates(name, InterfaceCounterSnapshot {
+                timestamp: unix_now_secs(),
+                rx_bytes: rx_b,
+                tx_bytes: tx_b,
+                rx_packets: rx_p,
+                tx_packets: tx_p,
+            })
+        }
+        _ => None,
+    };
+
+    let (rx_pps, tx_pps, total_pps, rx_bps, tx_bps, total_bps) = rates
+        .map(|r| (r.0, r.1, r.2, r.3, r.4, r.5))
+        .unwrap_or((None, None, None, None, None, None));
+
+    InterfaceCapacityStatus {
+        interface: name.to_string(),
+        rx_bytes,
+        tx_bytes,
+        rx_packets,
+        tx_packets,
+        rx_dropped,
+        tx_dropped,
+        packet_drops,
+        rx_pps,
+        tx_pps,
+        total_pps,
+        rx_bps,
+        tx_bps,
+        total_bps,
+    }
+}
+
+fn read_sysfs_counter(interface: &str, name: &str) -> Option<u64> {
+    let path = format!("/sys/class/net/{}/statistics/{}", interface, name);
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn interface_rates(
+    interface: &str,
+    current: InterfaceCounterSnapshot,
+) -> Option<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>)> {
+    static PREVIOUS: OnceLock<Mutex<HashMap<String, InterfaceCounterSnapshot>>> = OnceLock::new();
+    let samples = PREVIOUS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = samples.lock().ok()?;
+    let previous = guard.insert(interface.to_string(), current)?;
+    let elapsed = current.timestamp.saturating_sub(previous.timestamp);
+    if elapsed == 0 {
+        return None;
+    }
+
+    let seconds = elapsed as f64;
+    let rx_packets = current.rx_packets.saturating_sub(previous.rx_packets) as f64 / seconds;
+    let tx_packets = current.tx_packets.saturating_sub(previous.tx_packets) as f64 / seconds;
+    let rx_bps = current.rx_bytes.saturating_sub(previous.rx_bytes) as f64 * 8.0 / seconds;
+    let tx_bps = current.tx_bytes.saturating_sub(previous.tx_bytes) as f64 * 8.0 / seconds;
+    Some((
+        Some(round_two(rx_packets)),
+        Some(round_two(tx_packets)),
+        Some(round_two(rx_packets + tx_packets)),
+        Some(round_two(rx_bps)),
+        Some(round_two(tx_bps)),
+        Some(round_two(rx_bps + tx_bps)),
+    ))
+}
+
+fn collect_conntrack_capacity() -> ConntrackCapacityStatus {
+    let used = read_u64_file("/proc/sys/net/netfilter/nf_conntrack_count");
+    let max = read_u64_file("/proc/sys/net/netfilter/nf_conntrack_max");
+    ConntrackCapacityStatus {
+        used,
+        max,
+        used_percent: percent(used, max),
+    }
+}
+
+fn collect_fd_capacity() -> FileDescriptorCapacityStatus {
+    let used = std::fs::read_dir("/proc/self/fd")
+        .ok()
+        .map(|entries| entries.filter_map(std::result::Result::ok).count() as u64);
+    let (soft_limit, hard_limit) = read_open_file_limits();
+    FileDescriptorCapacityStatus {
+        used,
+        soft_limit,
+        hard_limit,
+        used_percent: percent(used, soft_limit),
+    }
+}
+
+fn read_u64_file(path: &str) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn read_open_file_limits() -> (Option<u64>, Option<u64>) {
+    let content = match std::fs::read_to_string("/proc/self/limits") {
+        Ok(content) => content,
+        Err(_) => return (None, None),
+    };
+    for line in content.lines() {
+        if !line.starts_with("Max open files") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 {
+            return (None, None);
+        }
+        return (parse_limit(parts[3]), parse_limit(parts[4]));
+    }
+    (None, None)
+}
+
+fn parse_limit(value: &str) -> Option<u64> {
+    if value.eq_ignore_ascii_case("unlimited") {
+        None
+    } else {
+        value.parse().ok()
+    }
+}
+
+fn percent(used: Option<u64>, max: Option<u64>) -> Option<f64> {
+    let used = used?;
+    let max = max?;
+    if max == 0 {
+        None
+    } else {
+        Some(round_two((used as f64 / max as f64) * 100.0))
+    }
+}
+
+fn round_two(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
 }
 
 async fn dns_query_a(server_ip: Ipv4Addr, name: &str) -> std::result::Result<u16, String> {

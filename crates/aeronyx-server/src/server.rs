@@ -277,6 +277,7 @@ impl Server {
         // so it is called here after both are available.
         let session_event_sender = self.init_management_reporter(
             &sessions,
+            Arc::clone(&ip_pool),
             Arc::clone(&udp),
             Arc::clone(&traffic_tracker),
             Arc::clone(&deny_list),
@@ -508,6 +509,7 @@ impl Server {
                 Arc::clone(&mpi_state),
                 Arc::clone(mp),
                 Arc::clone(aw),
+                Arc::clone(&ip_pool),
                 Arc::clone(&sessions),
                 Arc::clone(&udp),
                 Arc::clone(&node_policy),
@@ -1012,6 +1014,7 @@ impl Server {
         mpi_state:   Arc<MpiState>,
         _mempool:    Arc<MemPool>,
         _aof_writer: Arc<TokioMutex<AofWriter>>,
+        ip_pool:     Arc<IpPoolService>,
         sessions:    Arc<SessionManager>,
         _udp:        Arc<UdpTransport>,
         node_policy: Arc<NodePolicyRuntime>,
@@ -1030,6 +1033,7 @@ impl Server {
                 .merge(build_voice_router(Arc::clone(&sessions)))
                 .merge(build_vpn_health_router(
                     vpn_health_config,
+                    Arc::clone(&ip_pool),
                     sessions,
                     node_policy,
                     voucher_verifier,
@@ -1095,6 +1099,7 @@ impl Server {
     async fn init_management_reporter(
         &self,
         sessions:        &Arc<SessionManager>,
+        ip_pool:         Arc<IpPoolService>,
         udp:             Arc<UdpTransport>,
         traffic_tracker: Arc<TrafficTracker>,
         deny_list:       Arc<DenyList>,
@@ -1155,12 +1160,14 @@ impl Server {
         }
 
         let vpn_health_config = self.config.clone();
+        let vpn_health_ip_pool = Arc::clone(&ip_pool);
         let vpn_health_sessions = Arc::clone(sessions);
         let vpn_health_policy = Arc::clone(&node_policy);
         let vpn_health_verifier = Arc::clone(&voucher_verifier);
         let vpn_health_message_counter = Arc::clone(&encrypted_message_counter);
         heartbeat = heartbeat.with_vpn_health_status(Box::new(move || {
             let config = vpn_health_config.clone();
+            let ip_pool = Arc::clone(&vpn_health_ip_pool);
             let sessions = Arc::clone(&vpn_health_sessions);
             let node_policy = Arc::clone(&vpn_health_policy);
             let verifier = Arc::clone(&vpn_health_verifier);
@@ -1168,6 +1175,7 @@ impl Server {
             Box::pin(async move {
                 Some(collect_vpn_health_value(
                     config,
+                    ip_pool,
                     sessions,
                     node_policy,
                     verifier,
@@ -1177,12 +1185,14 @@ impl Server {
         }));
 
         let operator_status_config = self.config.clone();
+        let operator_status_ip_pool = Arc::clone(&ip_pool);
         let operator_status_sessions = Arc::clone(sessions);
         let operator_status_policy = Arc::clone(&node_policy);
         let operator_status_verifier = Arc::clone(&voucher_verifier);
         let operator_status_message_counter = Arc::clone(&encrypted_message_counter);
         heartbeat = heartbeat.with_operator_status(Box::new(move || {
             let config = operator_status_config.clone();
+            let ip_pool = Arc::clone(&operator_status_ip_pool);
             let sessions = Arc::clone(&operator_status_sessions);
             let node_policy = Arc::clone(&operator_status_policy);
             let verifier = Arc::clone(&operator_status_verifier);
@@ -1190,6 +1200,7 @@ impl Server {
             Box::pin(async move {
                 Some(collect_node_operator_status_value(
                     config,
+                    ip_pool,
                     sessions,
                     node_policy,
                     verifier,
