@@ -9,8 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
-- Initial documentation for the deploy/node one-command install, upgrade, and
-  healthcheck workflow.
+- Document production upgrade unit-template synchronization and rollback
+  behavior.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -36,6 +36,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.1.0-node-deploy - Documented upgrade-time systemd unit synchronization and
+                     rollback behavior.
 v1.0.0-node-deploy - Added production deployment documentation.
 ============================================
 -->
@@ -105,15 +107,26 @@ sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx
 `upgrade.sh` checks active VPN sessions before restart. If users are connected,
 the script stops unless the operator explicitly passes `--force`.
 
+During restart upgrades, the script also renders
+`deploy/node/aeronyx-server.service` into the installed systemd unit and
+verifies it with `systemd-analyze verify` before restarting. This keeps live
+nodes aligned with the production hardening profile shipped in Git.
+
 Build and validate without restarting:
 
 ```bash
 sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --no-restart
 ```
 
+Keep the currently installed systemd unit while upgrading the binary:
+
+```bash
+sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --skip-unit-update
+```
+
 Post-restart health is polled automatically. If restart or health verification
-fails, `upgrade.sh` restores the previous release binary from
-`/var/lib/aeronyx/releases` and restarts the service again.
+fails, `upgrade.sh` restores both the previous systemd unit and previous release
+binary from `/var/lib/aeronyx/releases`, then restarts the service again.
 
 ## Healthcheck
 

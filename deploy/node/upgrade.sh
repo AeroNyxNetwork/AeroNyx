@@ -7,16 +7,18 @@
 #   nodes without requiring manual git/build/systemd commands.
 #
 # Modification Reason:
-# - Add production rollback/no-restart/health polling controls while preserving
-#   active-session protection.
+# - Add production systemd unit synchronization, rollback, no-restart, and
+#   health polling controls while preserving active-session protection.
 #
 # Main Functionality:
 # - Pulls the configured branch.
 # - Builds aeronyx-server release binary.
 # - Validates /etc/aeronyx/server.toml.
+# - Syncs the repository systemd unit template before restart.
 # - Checks active VPN sessions before restart.
 # - Restarts systemd service and verifies post-upgrade health.
-# - Restores the previous binary if restart or health verification fails.
+# - Restores the previous systemd unit and binary if restart or health
+#   verification fails.
 #
 # Dependencies:
 # - deploy/node/healthcheck.sh
@@ -27,7 +29,8 @@
 # 1. Update repo from Git.
 # 2. Build and validate the release binary.
 # 3. Restart only when no active sessions are present, unless --force is used.
-# 4. Verify local health and roll back the binary if restart health fails.
+# 4. Sync and verify the systemd unit template.
+# 5. Verify local health and roll back the unit/binary if restart health fails.
 #
 # Important Note for Next Developer:
 # - Do not remove active-session protection. Commercial VPN users should not be
@@ -36,6 +39,8 @@
 # - Keep this script compatible with current and older installed service units.
 #
 # Last Modified:
+# v1.2.0-node-deploy - Syncs systemd unit template during restart upgrades and
+#                      rolls back the unit together with the binary.
 # v1.1.0-node-deploy - Added --no-restart, health polling, and binary rollback
 #                      on restart/health failure.
 # v1.0.0-node-deploy - Added production node upgrade script.
@@ -47,13 +52,16 @@ REPO_DIR="/opt/aeronyx/AeroNyx"
 BRANCH="main"
 CONFIG_FILE="/etc/aeronyx/server.toml"
 SERVICE_NAME="aeronyx-server"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 FORCE=0
 DRY_RUN=0
 SKIP_PULL=0
+SKIP_UNIT_UPDATE=0
 NO_RESTART=0
 HEALTH_RETRIES=10
 HEALTH_DELAY=2
 BACKUP_BINARY=""
+BACKUP_SERVICE_FILE=""
 
 log() { printf '[INFO] %s\n' "$*"; }
 ok() { printf '[OK] %s\n' "$*"; }
@@ -73,6 +81,7 @@ Options:
   --force             Restart even when active VPN sessions exist.
   --no-restart        Build and validate only; do not restart the service.
   --skip-pull         Build the currently checked out source.
+  --skip-unit-update  Do not render/install deploy/node/aeronyx-server.service.
   --health-retries N  Health polling attempts after restart. Default: 10
   --health-delay N    Seconds between health polling attempts. Default: 2
   --dry-run           Print actions without changing the host.
@@ -85,10 +94,11 @@ while [ "$#" -gt 0 ]; do
         --repo-dir) REPO_DIR="${2:?missing value}"; shift 2 ;;
         --branch) BRANCH="${2:?missing value}"; shift 2 ;;
         --config) CONFIG_FILE="${2:?missing value}"; shift 2 ;;
-        --service) SERVICE_NAME="${2:?missing value}"; shift 2 ;;
+        --service) SERVICE_NAME="${2:?missing value}"; SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"; shift 2 ;;
         --force) FORCE=1; shift ;;
         --no-restart) NO_RESTART=1; shift ;;
         --skip-pull) SKIP_PULL=1; shift ;;
+        --skip-unit-update) SKIP_UNIT_UPDATE=1; shift ;;
         --health-retries) HEALTH_RETRIES="${2:?missing value}"; shift 2 ;;
         --health-delay) HEALTH_DELAY="${2:?missing value}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -176,6 +186,64 @@ validate_config() {
     run "${binary}" validate -c "${CONFIG_FILE}"
 }
 
+backup_current_service_unit() {
+    local backup_dir stamp
+    [ -f "${SERVICE_FILE}" ] || return
+
+    backup_dir="/var/lib/aeronyx/releases"
+    stamp="$(date -u +%Y%m%d_%H%M%S)"
+    BACKUP_SERVICE_FILE="${backup_dir}/${SERVICE_NAME}.service.${stamp}"
+    run mkdir -p "${backup_dir}"
+    run cp "${SERVICE_FILE}" "${BACKUP_SERVICE_FILE}"
+    ok "Current systemd unit backed up to ${BACKUP_SERVICE_FILE}"
+}
+
+render_service_unit() {
+    local template rendered
+    [ "${SKIP_UNIT_UPDATE}" -eq 0 ] || { ok "Systemd unit update skipped"; return; }
+    [ "${NO_RESTART}" -eq 0 ] || { ok "Systemd unit update skipped by --no-restart"; return; }
+
+    template="${REPO_DIR}/deploy/node/aeronyx-server.service"
+    rendered="/tmp/${SERVICE_NAME}.upgrade.service"
+
+    if [ ! -f "${template}" ]; then
+        warn "Systemd unit template missing; leaving installed unit unchanged: ${template}"
+        return
+    fi
+
+    log "Rendering systemd unit template to ${SERVICE_FILE}"
+    backup_current_service_unit
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] render %s to %s\n' "${template}" "${SERVICE_FILE}"
+        printf '[DRY-RUN] systemd-analyze verify %s\n' "${SERVICE_FILE}"
+        return
+    fi
+
+    sed \
+        -e "s|@REPO_DIR@|${REPO_DIR}|g" \
+        -e "s|@CONFIG_FILE@|${CONFIG_FILE}|g" \
+        "${template}" > "${rendered}"
+    systemd-analyze verify "${rendered}"
+    cp "${rendered}" "${SERVICE_FILE}"
+    chmod 644 "${SERVICE_FILE}"
+    systemctl daemon-reload
+}
+
+rollback_service_unit() {
+    if [ -z "${BACKUP_SERVICE_FILE}" ]; then
+        warn "Systemd unit rollback skipped; no backup unit path recorded."
+        return 0
+    fi
+    if [ "${DRY_RUN}" -eq 0 ] && [ ! -f "${BACKUP_SERVICE_FILE}" ]; then
+        warn "Systemd unit rollback skipped; backup missing: ${BACKUP_SERVICE_FILE}"
+        return 1
+    fi
+
+    warn "Rolling back systemd unit: ${BACKUP_SERVICE_FILE}"
+    run cp "${BACKUP_SERVICE_FILE}" "${SERVICE_FILE}"
+    run systemctl daemon-reload
+}
+
 health_endpoint_ok() {
     command -v curl >/dev/null 2>&1 || return 1
     curl -fsS --max-time 5 http://127.0.0.1:8421/api/vpn/health 2>/dev/null \
@@ -218,6 +286,7 @@ rollback_binary() {
     fi
 
     warn "Rolling back to previous binary: ${BACKUP_BINARY}"
+    rollback_service_unit
     run cp "${BACKUP_BINARY}" "${binary}"
     run systemctl daemon-reload
     run systemctl restart "${SERVICE_NAME}"
@@ -276,6 +345,7 @@ main() {
     update_source
     build_release
     validate_config
+    render_service_unit
     restart_service
     if [ "${NO_RESTART}" -eq 0 ]; then
         run_healthcheck
