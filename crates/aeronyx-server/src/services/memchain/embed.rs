@@ -298,13 +298,16 @@ pub enum EmbedPromptMode {
 /// Session::run() returns SessionOutputs that borrows &mut Session, so we
 /// cannot call session.outputs() while SessionOutputs is alive.
 fn detect_model_type(session: &Session) -> (EmbedModelType, Option<usize>) {
-    let output_names: Vec<String> = session.outputs().iter()
+    let output_names: Vec<String> = session
+        .outputs()
+        .iter()
         .map(|o| o.name().to_string())
         .collect();
 
     debug!(outputs = ?output_names, "[EMBED] ONNX model output tensor names");
 
-    let se_idx = output_names.iter()
+    let se_idx = output_names
+        .iter()
         .position(|name| name == "sentence_embedding");
 
     if se_idx.is_some() {
@@ -514,7 +517,11 @@ impl EmbedEngine {
         };
 
         // Resolve output_dim: 0 → EMBED_DIM (384)
-        let output_dim = if output_dim == 0 { EMBED_DIM } else { output_dim };
+        let output_dim = if output_dim == 0 {
+            EMBED_DIM
+        } else {
+            output_dim
+        };
 
         // Validate output_dim for MiniLM (native 384, cannot upscale)
         if model_type == EmbedModelType::MiniLM && output_dim > 384 {
@@ -549,15 +556,21 @@ impl EmbedEngine {
 
     /// Returns the output embedding dimension (default 384).
     #[must_use]
-    pub fn dim(&self) -> usize { self.output_dim }
+    pub fn dim(&self) -> usize {
+        self.output_dim
+    }
 
     /// Returns the configured max sequence length.
     #[must_use]
-    pub fn max_seq_length(&self) -> usize { self.max_seq_length }
+    pub fn max_seq_length(&self) -> usize {
+        self.max_seq_length
+    }
 
     /// Returns the detected model type.
     #[must_use]
-    pub fn model_type(&self) -> EmbedModelType { self.model_type }
+    pub fn model_type(&self) -> EmbedModelType {
+        self.model_type
+    }
 
     /// Returns the model name string for storage metadata.
     /// Used by vector index and records table to track which model produced embeddings.
@@ -597,7 +610,10 @@ impl EmbedEngine {
         mode: EmbedPromptMode,
     ) -> Result<Vec<f32>, String> {
         let results = self.embed_with_mode(&[text], mode)?;
-        results.into_iter().next().ok_or_else(|| "Empty result from embed_batch".into())
+        results
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Empty result from embed_batch".into())
     }
 
     /// Generate embeddings for a batch of texts with default prompt mode (Document).
@@ -626,7 +642,11 @@ impl EmbedEngine {
         }
 
         if texts.len() > MAX_BATCH_SIZE {
-            return Err(format!("Batch size {} exceeds max {}", texts.len(), MAX_BATCH_SIZE));
+            return Err(format!(
+                "Batch size {} exceeds max {}",
+                texts.len(),
+                MAX_BATCH_SIZE
+            ));
         }
 
         match self.model_type {
@@ -684,22 +704,24 @@ impl EmbedEngine {
 
         let ids_tensor = Tensor::from_array((shape, input_ids.into_boxed_slice()))
             .map_err(|e| format!("input_ids tensor: {}", e))?;
-        let mask_tensor = Tensor::from_array((shape, attention_mask_raw.clone().into_boxed_slice()))
-            .map_err(|e| format!("attention_mask tensor: {}", e))?;
+        let mask_tensor =
+            Tensor::from_array((shape, attention_mask_raw.clone().into_boxed_slice()))
+                .map_err(|e| format!("attention_mask tensor: {}", e))?;
         let types_tensor = Tensor::from_array((shape, token_type_ids.into_boxed_slice()))
             .map_err(|e| format!("token_type_ids tensor: {}", e))?;
 
         // ── ONNX inference ──
-        let mut session = self.session.lock()
+        let mut session = self
+            .session
+            .lock()
             .map_err(|e| format!("Session lock poisoned: {}", e))?;
-        let outputs = session.run(
-            ort::inputs![
+        let outputs = session
+            .run(ort::inputs![
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
                 "token_type_ids" => types_tensor,
-            ]
-        )
-        .map_err(|e| format!("ONNX inference: {}", e))?;
+            ])
+            .map_err(|e| format!("ONNX inference: {}", e))?;
 
         // Output[0] = last_hidden_state: [batch_size, seq_len, hidden_dim]
         let hidden = outputs[0]
@@ -708,7 +730,10 @@ impl EmbedEngine {
 
         let hidden_shape = hidden.shape();
         if hidden_shape.len() != 3 {
-            return Err(format!("Expected 3D output [batch, seq, dim], got {}D", hidden_shape.len()));
+            return Err(format!(
+                "Expected 3D output [batch, seq, dim], got {}D",
+                hidden_shape.len()
+            ));
         }
         let hidden_dim = hidden_shape[2];
 
@@ -749,7 +774,13 @@ impl EmbedEngine {
             results.push(pooled);
         }
 
-        debug!(batch = batch_size, seq_len = seq_len, dim = self.output_dim, model = "minilm", "[EMBED] Inference done");
+        debug!(
+            batch = batch_size,
+            seq_len = seq_len,
+            dim = self.output_dim,
+            model = "minilm",
+            "[EMBED] Inference done"
+        );
         Ok(results)
     }
 
@@ -761,22 +792,19 @@ impl EmbedEngine {
     /// apply task prefix → tokenize → input_ids + attention_mask
     /// → ONNX run → sentence_embedding [batch, 768]
     /// → Matryoshka truncate to output_dim → L2 re-normalize
-    fn embed_gemma(
-        &self,
-        texts: &[&str],
-        mode: EmbedPromptMode,
-    ) -> Result<Vec<Vec<f32>>, String> {
+    fn embed_gemma(&self, texts: &[&str], mode: EmbedPromptMode) -> Result<Vec<Vec<f32>>, String> {
         let batch_size = texts.len();
 
         // ── Apply task-specific prompt prefix ──
-        let prefixed_texts: Vec<String> = texts.iter().map(|text| {
-            match mode {
+        let prefixed_texts: Vec<String> = texts
+            .iter()
+            .map(|text| match mode {
                 EmbedPromptMode::Query => format!("{}{}", GEMMA_QUERY_PREFIX, text),
                 EmbedPromptMode::Document => format!("{}{}", GEMMA_DOCUMENT_PREFIX, text),
                 EmbedPromptMode::Similarity => format!("{}{}", GEMMA_SIMILARITY_PREFIX, text),
                 EmbedPromptMode::Raw => text.to_string(),
-            }
-        }).collect();
+            })
+            .collect();
 
         let text_refs: Vec<&str> = prefixed_texts.iter().map(|s| s.as_str()).collect();
 
@@ -824,19 +852,21 @@ impl EmbedEngine {
 
         // ── ONNX inference ──
         // EmbeddingGemma only takes input_ids + attention_mask
-        let mut session = self.session.lock()
+        let mut session = self
+            .session
+            .lock()
             .map_err(|e| format!("Session lock poisoned: {}", e))?;
-        let outputs = session.run(
-            ort::inputs![
+        let outputs = session
+            .run(ort::inputs![
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
-            ]
-        )
-        .map_err(|e| format!("ONNX inference: {}", e))?;
+            ])
+            .map_err(|e| format!("ONNX inference: {}", e))?;
 
         // Use pre-resolved output index (computed at load time to avoid borrow conflict).
-        let se_idx = self.se_output_idx
-            .ok_or_else(|| "EmbeddingGemma ONNX missing 'sentence_embedding' output index".to_string())?;
+        let se_idx = self.se_output_idx.ok_or_else(|| {
+            "EmbeddingGemma ONNX missing 'sentence_embedding' output index".to_string()
+        })?;
 
         let embeddings = outputs[se_idx]
             .try_extract_array::<f32>()
@@ -846,7 +876,8 @@ impl EmbedEngine {
         if emb_shape.len() != 2 {
             return Err(format!(
                 "Expected 2D sentence_embedding [batch, dim], got {}D {:?}",
-                emb_shape.len(), emb_shape
+                emb_shape.len(),
+                emb_shape
             ));
         }
         let native_dim = emb_shape[1]; // 768 for EmbeddingGemma
@@ -860,9 +891,7 @@ impl EmbedEngine {
 
         for b in 0..batch_size {
             // Extract and truncate
-            let mut vec: Vec<f32> = (0..truncate_dim)
-                .map(|d| embeddings[[b, d]])
-                .collect();
+            let mut vec: Vec<f32> = (0..truncate_dim).map(|d| embeddings[[b, d]]).collect();
 
             // L2 re-normalize after truncation
             let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -927,8 +956,16 @@ mod tests {
         let result = EmbedEngine::load("/nonexistent/path/to/model", 128, 0);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("not found"), "Error should mention 'not found': {}", err);
-        assert!(err.contains("download_models.sh"), "Error should hint at download script: {}", err);
+        assert!(
+            err.contains("not found"),
+            "Error should mention 'not found': {}",
+            err
+        );
+        assert!(
+            err.contains("download_models.sh"),
+            "Error should hint at download script: {}",
+            err
+        );
     }
 
     #[test]
@@ -992,7 +1029,8 @@ mod tests {
             assert!(
                 (norm - 1.0).abs() < 0.01,
                 "Vector {} norm={}, expected ~1.0",
-                i, norm
+                i,
+                norm
             );
         }
     }
@@ -1008,7 +1046,11 @@ mod tests {
         let v2 = engine.embed_single("hello world").unwrap();
 
         let diff: f32 = v1.iter().zip(v2.iter()).map(|(a, b)| (a - b).abs()).sum();
-        assert!(diff < 1e-6, "Same input must produce same output, diff={}", diff);
+        assert!(
+            diff < 1e-6,
+            "Same input must produce same output, diff={}",
+            diff
+        );
     }
 
     #[test]
@@ -1090,8 +1132,12 @@ mod tests {
         }
 
         let text = "What is the capital of France?";
-        let v_query = engine.embed_single_with_mode(text, EmbedPromptMode::Query).unwrap();
-        let v_doc = engine.embed_single_with_mode(text, EmbedPromptMode::Document).unwrap();
+        let v_query = engine
+            .embed_single_with_mode(text, EmbedPromptMode::Query)
+            .unwrap();
+        let v_doc = engine
+            .embed_single_with_mode(text, EmbedPromptMode::Document)
+            .unwrap();
 
         let sim: f32 = v_query.iter().zip(v_doc.iter()).map(|(a, b)| a * b).sum();
         // Same text with different prefixes should produce somewhat different vectors

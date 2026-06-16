@@ -44,13 +44,11 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use super::client::{
-    ManagementClient, MemChainHeartbeatStatus, TrafficDelta, UserPermission,
-};
+use super::client::{ManagementClient, MemChainHeartbeatStatus, TrafficDelta, UserPermission};
 use super::models::{Command, SessionEventReport, SessionEventType};
-use crate::services::{NodePolicyRuntime, NodePolicySnapshot, SessionManager};
 use crate::services::deny_list::{DenyList, DenyReason};
 use crate::services::traffic_tracker::TrafficTracker;
+use crate::services::{NodePolicyRuntime, NodePolicySnapshot, SessionManager};
 use aeronyx_transport::traits::Transport;
 
 // ============================================
@@ -59,8 +57,8 @@ use aeronyx_transport::traits::Transport;
 
 const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const MAX_HEARTBEAT_INTERVAL_SECS: u64 = 300;
-const COLD_START_GRACE_BEATS:      u32 = 5;
-const COLD_START_TIMEOUT_SECS:     u64 = 30;
+const COLD_START_GRACE_BEATS: u32 = 5;
+const COLD_START_TIMEOUT_SECS: u64 = 30;
 
 // ============================================
 // MemChainStatusFn
@@ -91,21 +89,21 @@ pub type OperatorStatusFn =
 
 #[derive(Debug, Clone)]
 pub struct SessionEvent {
-    pub event_type:    SessionEventType,
-    pub session_id:    String,
+    pub event_type: SessionEventType,
+    pub session_id: String,
     pub client_wallet: Option<String>,
-    pub virtual_ip:    Option<String>,
-    pub bytes_in:      u64,
-    pub bytes_out:     u64,
-    pub timestamp:     u64,
-    pub last_rx_at:    Option<u64>,
-    pub last_tx_at:    Option<u64>,
-    pub rtt_ms:        Option<f64>,
-    pub packet_loss:   Option<f64>,
+    pub virtual_ip: Option<String>,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub timestamp: u64,
+    pub last_rx_at: Option<u64>,
+    pub last_tx_at: Option<u64>,
+    pub rtt_ms: Option<f64>,
+    pub packet_loss: Option<f64>,
     pub replay_rejections: Option<u64>,
     pub too_old_rejections: Option<u64>,
-    pub packets_rx:    Option<u64>,
-    pub packets_tx:    Option<u64>,
+    pub packets_rx: Option<u64>,
+    pub packets_tx: Option<u64>,
     pub keepalive_probes_sent: Option<u64>,
     pub keepalive_acks: Option<u64>,
     pub keepalive_missed: Option<u64>,
@@ -119,11 +117,11 @@ impl SessionEvent {
         virtual_ip: Option<String>,
     ) -> Self {
         Self {
-            event_type:    SessionEventType::SessionCreated,
+            event_type: SessionEventType::SessionCreated,
             session_id,
             client_wallet,
             virtual_ip,
-            bytes_in:  0,
+            bytes_in: 0,
             bytes_out: 0,
             timestamp: now_unix(),
             last_rx_at: None,
@@ -142,12 +140,12 @@ impl SessionEvent {
     }
 
     pub fn ended(
-        session_id:    String,
+        session_id: String,
         client_wallet: Option<String>,
-        virtual_ip:    Option<String>,
-        bytes_in:      u64,
-        bytes_out:     u64,
-        quality:        SessionQuality,
+        virtual_ip: Option<String>,
+        bytes_in: u64,
+        bytes_out: u64,
+        quality: SessionQuality,
     ) -> Self {
         Self {
             event_type: SessionEventType::SessionEnded,
@@ -173,12 +171,12 @@ impl SessionEvent {
     }
 
     pub fn snapshot(
-        session_id:    String,
+        session_id: String,
         client_wallet: Option<String>,
-        virtual_ip:    Option<String>,
-        bytes_in:      u64,
-        bytes_out:     u64,
-        quality:        SessionQuality,
+        virtual_ip: Option<String>,
+        bytes_in: u64,
+        bytes_out: u64,
+        quality: SessionQuality,
     ) -> Self {
         Self {
             event_type: SessionEventType::SessionTrafficSnapshot,
@@ -205,23 +203,23 @@ impl SessionEvent {
 
     fn to_report(&self) -> SessionEventReport {
         SessionEventReport {
-            event_type:    self.event_type,
-            session_id:    self.session_id.clone(),
+            event_type: self.event_type,
+            session_id: self.session_id.clone(),
             client_wallet: self.client_wallet.clone(),
-            client_ip:     None,
-            virtual_ip:    self.virtual_ip.clone(),
-            bytes_in:      self.bytes_in,
-            bytes_out:     self.bytes_out,
-            timestamp:     self.timestamp,
-            is_final:      matches!(self.event_type, SessionEventType::SessionEnded),
-            last_rx_at:    self.last_rx_at,
-            last_tx_at:    self.last_tx_at,
-            rtt_ms:        self.rtt_ms,
-            packet_loss:   self.packet_loss,
+            client_ip: None,
+            virtual_ip: self.virtual_ip.clone(),
+            bytes_in: self.bytes_in,
+            bytes_out: self.bytes_out,
+            timestamp: self.timestamp,
+            is_final: matches!(self.event_type, SessionEventType::SessionEnded),
+            last_rx_at: self.last_rx_at,
+            last_tx_at: self.last_tx_at,
+            rtt_ms: self.rtt_ms,
+            packet_loss: self.packet_loss,
             replay_rejections: self.replay_rejections,
             too_old_rejections: self.too_old_rejections,
-            packets_rx:    self.packets_rx,
-            packets_tx:    self.packets_tx,
+            packets_rx: self.packets_rx,
+            packets_tx: self.packets_tx,
             keepalive_probes_sent: self.keepalive_probes_sent,
             keepalive_acks: self.keepalive_acks,
             keepalive_missed: self.keepalive_missed,
@@ -259,24 +257,24 @@ fn now_unix() -> u64 {
 // ============================================
 
 pub struct HeartbeatReporter {
-    client:             Arc<ManagementClient>,
-    interval:           Duration,
-    public_ip:          String,
-    command_tx:         Option<mpsc::Sender<Command>>,
+    client: Arc<ManagementClient>,
+    interval: Duration,
+    public_ip: String,
+    command_tx: Option<mpsc::Sender<Command>>,
     memchain_status_fn: Option<MemChainStatusFn>,
     vpn_health_status_fn: Option<VpnHealthStatusFn>,
     operator_status_fn: Option<OperatorStatusFn>,
 
     // v1.0.0-Membership
-    sessions:         Option<Arc<SessionManager>>,
-    traffic:          Option<Arc<TrafficTracker>>,
-    udp:              Option<Arc<aeronyx_transport::UdpTransport>>,
+    sessions: Option<Arc<SessionManager>>,
+    traffic: Option<Arc<TrafficTracker>>,
+    udp: Option<Arc<aeronyx_transport::UdpTransport>>,
     /// v1.0.0-Membership: deny list for writing disconnection decisions.
-    deny_list:        Option<Arc<DenyList>>,
+    deny_list: Option<Arc<DenyList>>,
     /// Runtime operator policy shared with handshake and packet handlers.
-    node_policy:      Option<Arc<NodePolicyRuntime>>,
+    node_policy: Option<Arc<NodePolicyRuntime>>,
     /// Cached node tier from last CMS response. Default = "public".
-    node_tier:        Arc<RwLock<String>>,
+    node_tier: Arc<RwLock<String>>,
     /// Cached per-wallet permissions from last CMS response.
     user_permissions: Arc<RwLock<HashMap<String, UserPermission>>>,
 }
@@ -288,16 +286,16 @@ impl HeartbeatReporter {
             client,
             interval,
             public_ip,
-            command_tx:         None,
+            command_tx: None,
             memchain_status_fn: None,
             vpn_health_status_fn: None,
             operator_status_fn: None,
-            sessions:           None,
-            traffic:            None,
-            udp:                None,
-            deny_list:          None,
-            node_policy:        None,
-            node_tier:        Arc::new(RwLock::new("public".to_string())),
+            sessions: None,
+            traffic: None,
+            udp: None,
+            deny_list: None,
+            node_policy: None,
+            node_tier: Arc::new(RwLock::new("public".to_string())),
             user_permissions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -352,21 +350,20 @@ impl HeartbeatReporter {
         self,
         session_count_fn: F,
         mut shutdown: tokio::sync::broadcast::Receiver<()>,
-    )
-    where
+    ) where
         F: Fn() -> u32 + Send + 'static,
     {
         info!(
-            interval_secs       = self.interval.as_secs(),
+            interval_secs = self.interval.as_secs(),
             has_command_channel = self.command_tx.is_some(),
             has_memchain_status = self.memchain_status_fn.is_some(),
-            has_membership      = self.sessions.is_some(),
+            has_membership = self.sessions.is_some(),
             "[HEARTBEAT] Reporter started"
         );
 
         let mut active_interval_secs = self.interval.as_secs();
         let mut interval = tokio::time::interval(Duration::from_secs(active_interval_secs));
-        let mut failures    = 0u32;
+        let mut failures = 0u32;
         let mut total_beats = 0u32;
 
         loop {
@@ -555,10 +552,7 @@ impl HeartbeatReporter {
     ///   - !can_access_premium_nodes && node_tier == "premium"
     ///
     /// Fail-open: no-op if sessions or udp are not injected.
-    async fn handle_membership_response(
-        &self,
-        response: &super::client::HeartbeatResponse,
-    ) {
+    async fn handle_membership_response(&self, response: &super::client::HeartbeatResponse) {
         // Update node_tier cache.
         if let Some(ref tier) = response.node_tier {
             *self.node_tier.write() = tier.clone();
@@ -607,21 +601,28 @@ impl HeartbeatReporter {
         //
         // Keep heartbeat cache updates above, but skip legacy per-wallet session
         // enforcement on the node. Voucher issuance/verifier is the authority.
-        let enforce_legacy_wallet_sessions = std::env::var("AERONYX_ENFORCE_LEGACY_WALLET_SESSIONS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let enforce_legacy_wallet_sessions =
+            std::env::var("AERONYX_ENFORCE_LEGACY_WALLET_SESSIONS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
         if !enforce_legacy_wallet_sessions {
             debug!("[MEMBERSHIP] legacy wallet/session enforcement skipped; voucher auth is authoritative");
             return;
         }
 
-        let Some(ref sessions) = self.sessions else { return; };
-        let Some(ref udp)      = self.udp       else { return; };
+        let Some(ref sessions) = self.sessions else {
+            return;
+        };
+        let Some(ref udp) = self.udp else {
+            return;
+        };
 
-        let node_tier   = self.node_tier.read().clone();
+        let node_tier = self.node_tier.read().clone();
         let permissions = self.user_permissions.read().clone();
 
-        if permissions.is_empty() { return; }
+        if permissions.is_empty() {
+            return;
+        }
 
         // ── Restore access for wallets whose permissions improved ─────────
         // Check deny reason independently:
@@ -635,8 +636,8 @@ impl HeartbeatReporter {
                 if let Some(reason) = dl.deny_reason(wallet) {
                     let should_remove = match reason {
                         DenyReason::NoPremiumAccess => perm.can_access_premium_nodes,
-                        DenyReason::QuotaExceeded   => perm.traffic_allowed,
-                        DenyReason::OperatorBan     => false,
+                        DenyReason::QuotaExceeded => perm.traffic_allowed,
+                        DenyReason::OperatorBan => false,
                     };
                     if should_remove {
                         dl.remove(wallet);
@@ -754,14 +755,20 @@ fn normalize_wallet_hex(value: &str) -> Option<String> {
 // ============================================
 
 pub struct SessionReporter {
-    client:   Arc<ManagementClient>,
+    client: Arc<ManagementClient>,
     event_rx: mpsc::Receiver<SessionEvent>,
 }
 
 impl SessionReporter {
     pub fn new(client: Arc<ManagementClient>) -> (Self, mpsc::Sender<SessionEvent>) {
         let (tx, rx) = mpsc::channel(1000);
-        (Self { client, event_rx: rx }, tx)
+        (
+            Self {
+                client,
+                event_rx: rx,
+            },
+            tx,
+        )
     }
 
     pub async fn run(mut self, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
@@ -824,12 +831,12 @@ impl SessionEventSender {
 
     pub fn session_ended(
         &self,
-        session_id:    &str,
+        session_id: &str,
         client_wallet: Option<String>,
-        virtual_ip:    Option<String>,
-        bytes_in:      u64,
-        bytes_out:     u64,
-        quality:        SessionQuality,
+        virtual_ip: Option<String>,
+        bytes_in: u64,
+        bytes_out: u64,
+        quality: SessionQuality,
     ) {
         self.try_send(SessionEvent::ended(
             session_id.to_string(),
@@ -843,12 +850,12 @@ impl SessionEventSender {
 
     pub fn session_traffic_snapshot(
         &self,
-        session_id:    &str,
+        session_id: &str,
         client_wallet: Option<String>,
-        virtual_ip:    Option<String>,
-        bytes_in:      u64,
-        bytes_out:     u64,
-        quality:        SessionQuality,
+        virtual_ip: Option<String>,
+        bytes_in: u64,
+        bytes_out: u64,
+        quality: SessionQuality,
     ) {
         self.try_send(SessionEvent::snapshot(
             session_id.to_string(),

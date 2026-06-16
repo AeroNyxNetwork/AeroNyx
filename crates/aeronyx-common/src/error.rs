@@ -66,7 +66,6 @@ pub enum CommonError {
     // ========================================
     // Validation Errors
     // ========================================
-    
     /// Invalid input data provided.
     #[error("Invalid input for '{field}': {reason}")]
     InvalidInput {
@@ -99,7 +98,6 @@ pub enum CommonError {
     // ========================================
     // Resource Errors
     // ========================================
-
     /// Requested resource was not found.
     #[error("Resource not found: {resource_type} with id '{id}'")]
     NotFound {
@@ -130,7 +128,6 @@ pub enum CommonError {
     // ========================================
     // IO Errors
     // ========================================
-
     /// System I/O error occurred.
     #[error("I/O error: {context}")]
     Io {
@@ -144,7 +141,6 @@ pub enum CommonError {
     // ========================================
     // Encoding Errors
     // ========================================
-
     /// Failed to encode/serialize data.
     #[error("Encoding error: {context}")]
     Encoding {
@@ -166,7 +162,6 @@ pub enum CommonError {
     // ========================================
     // State Errors
     // ========================================
-
     /// Operation not valid in current state.
     #[error("Invalid state: expected {expected}, found {current}")]
     InvalidState {
@@ -188,7 +183,6 @@ pub enum CommonError {
     // ========================================
     // Internal Errors
     // ========================================
-
     /// Internal error (bug or unexpected condition).
     #[error("Internal error: {message}")]
     Internal {
@@ -239,10 +233,7 @@ impl CommonError {
     }
 
     /// Creates a `ResourceExhausted` error.
-    pub fn resource_exhausted(
-        resource: impl Into<String>,
-        limit: impl fmt::Display,
-    ) -> Self {
+    pub fn resource_exhausted(resource: impl Into<String>, limit: impl fmt::Display) -> Self {
         Self::ResourceExhausted {
             resource: resource.into(),
             limit: limit.to_string(),
@@ -350,10 +341,7 @@ mod tests {
 
     #[test]
     fn test_io_error_conversion() {
-        let io_err = std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "file not found",
-        );
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let common_err: CommonError = io_err.into();
         assert!(matches!(common_err, CommonError::Io { .. }));
     }

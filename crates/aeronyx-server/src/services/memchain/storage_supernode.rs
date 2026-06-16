@@ -198,17 +198,19 @@ impl MemoryStorage {
         // Only guard when both target_table and target_id are provided.
         // Tasks without a target (e.g. one-off recall_synthesis) always insert.
         if let (Some(tbl), Some(tid)) = (target_table, target_id) {
-            let exists: bool = conn.query_row(
-                "SELECT EXISTS(
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
                     SELECT 1 FROM cognitive_tasks
                     WHERE target_table = ?1
                       AND target_id   = ?2
                       AND task_type   = ?3
                       AND status IN ('pending', 'processing')
                 )",
-                params![tbl, tid, task_type],
-                |row| row.get(0),
-            ).unwrap_or(false);
+                    params![tbl, tid, task_type],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
 
             if exists {
                 debug!(
@@ -227,10 +229,18 @@ impl MemoryStorage {
                  target_table, target_id, privacy_level, max_retries, created_at)
              VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                task_type, priority, payload, prompt_messages,
-                target_table, target_id, privacy_level, max_retries, now,
+                task_type,
+                priority,
+                payload,
+                prompt_messages,
+                target_table,
+                target_id,
+                privacy_level,
+                max_retries,
+                now,
             ],
-        ).map_err(|e| format!("Insert cognitive_task: {}", e))?;
+        )
+        .map_err(|e| format!("Insert cognitive_task: {}", e))?;
 
         let id = conn.last_insert_rowid();
         debug!(id = id, task_type = task_type, "[STORAGE_SN] Task enqueued");
@@ -303,7 +313,7 @@ impl MemoryStorage {
              FROM cognitive_tasks
              WHERE status = 'pending' AND retry_count < max_retries
              ORDER BY priority DESC, created_at ASC
-             LIMIT ?1"
+             LIMIT ?1",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -349,14 +359,23 @@ impl MemoryStorage {
     ) -> Result<(), String> {
         let now = now_ts();
         let conn = self.conn.lock().await;
-        let affected = conn.execute(
-            "UPDATE cognitive_tasks SET
+        let affected = conn
+            .execute(
+                "UPDATE cognitive_tasks SET
                 status = 'completed', result = ?1,
                 provider_used = ?2, model_used = ?3,
                 token_usage = ?4, completed_at = ?5
              WHERE id = ?6 AND status = 'processing'",
-            params![result, provider_used, model_used, token_usage_json, now, task_id],
-        ).map_err(|e| format!("complete_task {}: {}", task_id, e))?;
+                params![
+                    result,
+                    provider_used,
+                    model_used,
+                    token_usage_json,
+                    now,
+                    task_id
+                ],
+            )
+            .map_err(|e| format!("complete_task {}: {}", task_id, e))?;
 
         if affected == 0 {
             return Err(format!(
@@ -372,14 +391,20 @@ impl MemoryStorage {
     /// Record a task failure. Resets to 'pending' if retries remain, else 'failed'.
     pub async fn fail_task(&self, task_id: i64, error_message: &str) -> Result<(), String> {
         let conn = self.conn.lock().await;
-        let (retry_count, max_retries): (i64, i64) = conn.query_row(
-            "SELECT retry_count, max_retries FROM cognitive_tasks WHERE id = ?1",
-            params![task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).map_err(|e| format!("fail_task fetch {}: {}", task_id, e))?;
+        let (retry_count, max_retries): (i64, i64) = conn
+            .query_row(
+                "SELECT retry_count, max_retries FROM cognitive_tasks WHERE id = ?1",
+                params![task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| format!("fail_task fetch {}: {}", task_id, e))?;
 
         let new_count = retry_count + 1;
-        let new_status = if new_count >= max_retries { "failed" } else { "pending" };
+        let new_status = if new_count >= max_retries {
+            "failed"
+        } else {
+            "pending"
+        };
 
         conn.execute(
             "UPDATE cognitive_tasks SET
@@ -387,9 +412,15 @@ impl MemoryStorage {
                 error_message = ?3, started_at = NULL
              WHERE id = ?4",
             params![new_status, new_count, error_message, task_id],
-        ).map_err(|e| format!("fail_task update {}: {}", task_id, e))?;
+        )
+        .map_err(|e| format!("fail_task update {}: {}", task_id, e))?;
 
-        debug!(id = task_id, retries = new_count, status = new_status, "[STORAGE_SN] Task failed");
+        debug!(
+            id = task_id,
+            retries = new_count,
+            status = new_status,
+            "[STORAGE_SN] Task failed"
+        );
         Ok(())
     }
 
@@ -402,11 +433,13 @@ impl MemoryStorage {
     pub async fn retry_task(&self, task_id: i64) -> Result<(), String> {
         let conn = self.conn.lock().await;
 
-        let (status, retry_count): (String, i64) = conn.query_row(
-            "SELECT status, retry_count FROM cognitive_tasks WHERE id = ?1",
-            params![task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).map_err(|_| format!("retry_task: task {} not found", task_id))?;
+        let (status, retry_count): (String, i64) = conn
+            .query_row(
+                "SELECT status, retry_count FROM cognitive_tasks WHERE id = ?1",
+                params![task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| format!("retry_task: task {} not found", task_id))?;
 
         if status != "failed" && status != "cancelled" {
             return Err(format!(
@@ -421,9 +454,14 @@ impl MemoryStorage {
                 error_message = NULL, started_at = NULL
              WHERE id = ?2",
             params![retry_count + 1, task_id],
-        ).map_err(|e| format!("retry_task update {}: {}", task_id, e))?;
+        )
+        .map_err(|e| format!("retry_task update {}: {}", task_id, e))?;
 
-        debug!(id = task_id, new_retry_count = retry_count + 1, "[STORAGE_SN] Task queued for retry");
+        debug!(
+            id = task_id,
+            new_retry_count = retry_count + 1,
+            "[STORAGE_SN] Task queued for retry"
+        );
         Ok(())
     }
 
@@ -434,12 +472,18 @@ impl MemoryStorage {
     /// claimed between the status check and this UPDATE) and return 409 Conflict.
     pub async fn cancel_task(&self, task_id: i64) -> Result<usize, String> {
         let conn = self.conn.lock().await;
-        let affected = conn.execute(
-            "UPDATE cognitive_tasks SET status = 'cancelled'
+        let affected = conn
+            .execute(
+                "UPDATE cognitive_tasks SET status = 'cancelled'
              WHERE id = ?1 AND status = 'pending'",
-            params![task_id],
-        ).map_err(|e| format!("cancel_task {}: {}", task_id, e))?;
-        debug!(id = task_id, affected = affected, "[STORAGE_SN] Task cancel attempted");
+                params![task_id],
+            )
+            .map_err(|e| format!("cancel_task {}: {}", task_id, e))?;
+        debug!(
+            id = task_id,
+            affected = affected,
+            "[STORAGE_SN] Task cancel attempted"
+        );
         Ok(affected)
     }
 
@@ -454,7 +498,9 @@ impl MemoryStorage {
              FROM cognitive_tasks WHERE id = ?1",
             params![task_id],
             |row| task_row(row),
-        ).optional().unwrap_or(None)
+        )
+        .optional()
+        .unwrap_or(None)
     }
 
     /// List tasks filtered by status, newest first.
@@ -468,8 +514,11 @@ impl MemoryStorage {
              FROM cognitive_tasks
              WHERE status = ?1
              ORDER BY created_at DESC
-             LIMIT ?2"
-        ) { Ok(s) => s, Err(_) => return Vec::new() };
+             LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
 
         stmt.query_map(params![status, limit as i64], |row| task_row(row))
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -505,8 +554,11 @@ impl MemoryStorage {
                             retry_count, max_retries, error_message
                      FROM cognitive_tasks
                      WHERE status = ?1 AND task_type = ?2
-                     ORDER BY priority DESC, created_at ASC LIMIT ?3 OFFSET ?4"
-                ) { Ok(s) => s, Err(_) => return Vec::new() };
+                     ORDER BY priority DESC, created_at ASC LIMIT ?3 OFFSET ?4",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
                 stmt.query_map(params![s, t, limit_i, offset_i], |row| task_row(row))
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
                     .unwrap_or_default()
@@ -519,8 +571,11 @@ impl MemoryStorage {
                             retry_count, max_retries, error_message
                      FROM cognitive_tasks
                      WHERE status = ?1
-                     ORDER BY priority DESC, created_at ASC LIMIT ?2 OFFSET ?3"
-                ) { Ok(s) => s, Err(_) => return Vec::new() };
+                     ORDER BY priority DESC, created_at ASC LIMIT ?2 OFFSET ?3",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
                 stmt.query_map(params![s, limit_i, offset_i], |row| task_row(row))
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
                     .unwrap_or_default()
@@ -533,8 +588,11 @@ impl MemoryStorage {
                             retry_count, max_retries, error_message
                      FROM cognitive_tasks
                      WHERE task_type = ?1
-                     ORDER BY priority DESC, created_at ASC LIMIT ?2 OFFSET ?3"
-                ) { Ok(s) => s, Err(_) => return Vec::new() };
+                     ORDER BY priority DESC, created_at ASC LIMIT ?2 OFFSET ?3",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
                 stmt.query_map(params![t, limit_i, offset_i], |row| task_row(row))
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
                     .unwrap_or_default()
@@ -546,8 +604,11 @@ impl MemoryStorage {
                             token_usage, created_at, started_at, completed_at,
                             retry_count, max_retries, error_message
                      FROM cognitive_tasks
-                     ORDER BY priority DESC, created_at ASC LIMIT ?1 OFFSET ?2"
-                ) { Ok(s) => s, Err(_) => return Vec::new() };
+                     ORDER BY priority DESC, created_at ASC LIMIT ?1 OFFSET ?2",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
                 stmt.query_map(params![limit_i, offset_i], |row| task_row(row))
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
                     .unwrap_or_default()
@@ -573,8 +634,11 @@ impl MemoryStorage {
                             retry_count, max_retries, error_message
                      FROM cognitive_tasks
                      WHERE target_table = ?1 AND target_id = ?2 AND status = ?3
-                     ORDER BY created_at DESC"
-                ) { Ok(s) => s, Err(_) => return Vec::new() };
+                     ORDER BY created_at DESC",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
                 stmt.query_map(params![target_table, target_id, s], |row| task_row(row))
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
                     .unwrap_or_default()
@@ -587,8 +651,11 @@ impl MemoryStorage {
                             retry_count, max_retries, error_message
                      FROM cognitive_tasks
                      WHERE target_table = ?1 AND target_id = ?2
-                     ORDER BY created_at DESC"
-                ) { Ok(s) => s, Err(_) => return Vec::new() };
+                     ORDER BY created_at DESC",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
                 stmt.query_map(params![target_table, target_id], |row| task_row(row))
                     .map(|rows| rows.filter_map(|r| r.ok()).collect())
                     .unwrap_or_default()
@@ -602,15 +669,16 @@ impl MemoryStorage {
     /// Used by /status and /supernode/health for queue summary.
     pub async fn count_tasks_by_status(&self) -> HashMap<String, i64> {
         let conn = self.conn.lock().await;
-        let mut stmt = match conn.prepare(
-            "SELECT status, COUNT(*) FROM cognitive_tasks GROUP BY status"
-        ) {
-            Ok(s) => s,
-            Err(_) => return HashMap::new(),
-        };
+        let mut stmt =
+            match conn.prepare("SELECT status, COUNT(*) FROM cognitive_tasks GROUP BY status") {
+                Ok(s) => s,
+                Err(_) => return HashMap::new(),
+            };
 
         let raw: HashMap<String, i64> = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default();
 
@@ -646,9 +714,18 @@ impl MemoryStorage {
                 (task_id, provider, model, input_tokens, output_tokens,
                  cached_tokens, latency_ms, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![task_id, provider, model, input_tokens, output_tokens,
-                    cached_tokens, latency_ms, now],
-        ).map_err(|e| format!("insert_usage_log: {}", e))?;
+            params![
+                task_id,
+                provider,
+                model,
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                latency_ms,
+                now
+            ],
+        )
+        .map_err(|e| format!("insert_usage_log: {}", e))?;
         Ok(())
     }
 
@@ -662,25 +739,35 @@ impl MemoryStorage {
 
         let conn = self.conn.lock().await;
 
-        let (total_calls, total_input, total_output, total_cached, avg_latency):
-            (i64, i64, i64, i64, f64) = conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+        let (total_calls, total_input, total_output, total_cached, avg_latency): (
+            i64,
+            i64,
+            i64,
+            i64,
+            f64,
+        ) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                     COALESCE(SUM(cached_tokens),0), COALESCE(AVG(latency_ms),0.0)
              FROM llm_usage_log
              WHERE created_at >= ?1 AND created_at <= ?2",
-            params![since, until],
-            |row| Ok((
-                row.get(0).unwrap_or(0),
-                row.get(1).unwrap_or(0),
-                row.get(2).unwrap_or(0),
-                row.get(3).unwrap_or(0),
-                row.get(4).unwrap_or(0.0),
-            )),
-        ).unwrap_or((0, 0, 0, 0, 0.0));
+                params![since, until],
+                |row| {
+                    Ok((
+                        row.get(0).unwrap_or(0),
+                        row.get(1).unwrap_or(0),
+                        row.get(2).unwrap_or(0),
+                        row.get(3).unwrap_or(0),
+                        row.get(4).unwrap_or(0.0),
+                    ))
+                },
+            )
+            .unwrap_or((0, 0, 0, 0, 0.0));
 
         // By-provider breakdown — isolated stmt scope to avoid borrow conflict
-        let by_provider: Vec<ProviderUsage> = {
-            let mut stmt = match conn.prepare(
+        let by_provider: Vec<ProviderUsage> =
+            {
+                let mut stmt = match conn.prepare(
                 "SELECT provider, COUNT(*), SUM(input_tokens), SUM(output_tokens), AVG(latency_ms)
                  FROM llm_usage_log
                  WHERE created_at >= ?1 AND created_at <= ?2
@@ -698,24 +785,28 @@ impl MemoryStorage {
                     };
                 }
             };
-            stmt.query_map(params![since, until], |row| {
-                Ok(ProviderUsage {
-                    provider: row.get(0)?,
-                    calls: row.get(1)?,
-                    input_tokens: row.get(2)?,
-                    output_tokens: row.get(3)?,
-                    avg_latency_ms: row.get(4).unwrap_or(0.0),
+                stmt.query_map(params![since, until], |row| {
+                    Ok(ProviderUsage {
+                        provider: row.get(0)?,
+                        calls: row.get(1)?,
+                        input_tokens: row.get(2)?,
+                        output_tokens: row.get(3)?,
+                        avg_latency_ms: row.get(4).unwrap_or(0.0),
+                    })
                 })
-            })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        };
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+            };
 
         LlmUsageStats {
-            window_start: since, window_end: until,
-            total_calls, total_input_tokens: total_input,
-            total_output_tokens: total_output, total_cached_tokens: total_cached,
-            avg_latency_ms: avg_latency, by_provider,
+            window_start: since,
+            window_end: until,
+            total_calls,
+            total_input_tokens: total_input,
+            total_output_tokens: total_output,
+            total_cached_tokens: total_cached,
+            avg_latency_ms: avg_latency,
+            by_provider,
         }
     }
 
@@ -723,9 +814,7 @@ impl MemoryStorage {
     ///
     /// Two-dimensional breakdown for the management UI.
     /// Tasks without a task_id in llm_usage_log are excluded (JOIN filters them).
-    pub async fn get_usage_stats_by_task_type(
-        &self, since: i64, until: i64,
-    ) -> Vec<TaskTypeUsage> {
+    pub async fn get_usage_stats_by_task_type(&self, since: i64, until: i64) -> Vec<TaskTypeUsage> {
         let now = now_ts();
         let since = since.max(0);
         let until = if until == 0 { now } else { until };
@@ -739,11 +828,14 @@ impl MemoryStorage {
              JOIN cognitive_tasks ct ON ct.id = ul.task_id
              WHERE ul.created_at >= ?1 AND ul.created_at <= ?2
              GROUP BY ct.task_type, ul.provider
-             ORDER BY COUNT(*) DESC"
+             ORDER BY COUNT(*) DESC",
         ) {
             Ok(s) => s,
             Err(e) => {
-                warn!("[STORAGE_SN] get_usage_stats_by_task_type prepare failed: {}", e);
+                warn!(
+                    "[STORAGE_SN] get_usage_stats_by_task_type prepare failed: {}",
+                    e
+                );
                 return Vec::new();
             }
         };
@@ -810,10 +902,20 @@ mod tests {
     #[tokio::test]
     async fn test_insert_and_claim_task() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        let id = s.insert_cognitive_task(
-            "session_title", 5, r#"{"session_id":"sess_001"}"#,
-            None, Some("sessions"), Some("sess_001"), "structured", 3,
-        ).await.unwrap().expect("Should insert first task");
+        let id = s
+            .insert_cognitive_task(
+                "session_title",
+                5,
+                r#"{"session_id":"sess_001"}"#,
+                None,
+                Some("sessions"),
+                Some("sess_001"),
+                "structured",
+                3,
+            )
+            .await
+            .unwrap()
+            .expect("Should insert first task");
         assert!(id > 0);
 
         let claimed = s.claim_pending_tasks(10).await;
@@ -831,38 +933,87 @@ mod tests {
     async fn test_insert_cognitive_task_dedup() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
 
-        let id1 = s.insert_cognitive_task(
-            "session_title", 5, r#"{"session_id":"sess_001"}"#,
-            None, Some("sessions"), Some("sess_001"), "structured", 3,
-        ).await.unwrap();
+        let id1 = s
+            .insert_cognitive_task(
+                "session_title",
+                5,
+                r#"{"session_id":"sess_001"}"#,
+                None,
+                Some("sessions"),
+                Some("sess_001"),
+                "structured",
+                3,
+            )
+            .await
+            .unwrap();
         assert!(id1.is_some(), "First insert must succeed");
 
         // Same triple, status=pending → must be skipped
-        let id2 = s.insert_cognitive_task(
-            "session_title", 5, r#"{"session_id":"sess_001"}"#,
-            None, Some("sessions"), Some("sess_001"), "structured", 3,
-        ).await.unwrap();
+        let id2 = s
+            .insert_cognitive_task(
+                "session_title",
+                5,
+                r#"{"session_id":"sess_001"}"#,
+                None,
+                Some("sessions"),
+                Some("sess_001"),
+                "structured",
+                3,
+            )
+            .await
+            .unwrap();
         assert!(id2.is_none(), "Duplicate pending task must be skipped");
 
-        let tasks = s.get_tasks_filtered(None, Some("session_title"), 10, 0).await;
+        let tasks = s
+            .get_tasks_filtered(None, Some("session_title"), 10, 0)
+            .await;
         assert_eq!(tasks.len(), 1);
 
         // Different task_type on same target → allowed
-        let id3 = s.insert_cognitive_task(
-            "code_analysis", 5, r#"{}"#,
-            None, Some("sessions"), Some("sess_001"), "structured", 3,
-        ).await.unwrap();
-        assert!(id3.is_some(), "Different task_type on same target must be allowed");
+        let id3 = s
+            .insert_cognitive_task(
+                "code_analysis",
+                5,
+                r#"{}"#,
+                None,
+                Some("sessions"),
+                Some("sess_001"),
+                "structured",
+                3,
+            )
+            .await
+            .unwrap();
+        assert!(
+            id3.is_some(),
+            "Different task_type on same target must be allowed"
+        );
 
         // After completion, same type may be re-inserted
         let id1_unwrapped = id1.unwrap();
         s.claim_pending_tasks(10).await;
-        s.complete_task(id1_unwrapped, r#"{"title":"Done"}"#, "openai", "gpt-4o-mini", "{}").await.unwrap();
+        s.complete_task(
+            id1_unwrapped,
+            r#"{"title":"Done"}"#,
+            "openai",
+            "gpt-4o-mini",
+            "{}",
+        )
+        .await
+        .unwrap();
 
-        let id4 = s.insert_cognitive_task(
-            "session_title", 5, r#"{"session_id":"sess_001"}"#,
-            None, Some("sessions"), Some("sess_001"), "structured", 3,
-        ).await.unwrap();
+        let id4 = s
+            .insert_cognitive_task(
+                "session_title",
+                5,
+                r#"{"session_id":"sess_001"}"#,
+                None,
+                Some("sessions"),
+                Some("sess_001"),
+                "structured",
+                3,
+            )
+            .await
+            .unwrap();
         assert!(id4.is_some(), "Re-insert after completion must succeed");
     }
 
@@ -871,14 +1022,32 @@ mod tests {
     async fn test_insert_no_target_always_inserts() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
 
-        let id1 = s.insert_cognitive_task(
-            "recall_synthesis", 5, r#"{}"#,
-            None, None, None, "structured", 3,
-        ).await.unwrap();
-        let id2 = s.insert_cognitive_task(
-            "recall_synthesis", 5, r#"{}"#,
-            None, None, None, "structured", 3,
-        ).await.unwrap();
+        let id1 = s
+            .insert_cognitive_task(
+                "recall_synthesis",
+                5,
+                r#"{}"#,
+                None,
+                None,
+                None,
+                "structured",
+                3,
+            )
+            .await
+            .unwrap();
+        let id2 = s
+            .insert_cognitive_task(
+                "recall_synthesis",
+                5,
+                r#"{}"#,
+                None,
+                None,
+                None,
+                "structured",
+                3,
+            )
+            .await
+            .unwrap();
 
         assert!(id1.is_some());
         assert!(id2.is_some());
@@ -890,10 +1059,20 @@ mod tests {
     async fn test_reset_stale_processing_tasks() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
 
-        let id = s.insert_cognitive_task(
-            "session_title", 5, r#"{}"#,
-            None, Some("sessions"), Some("s1"), "structured", 3,
-        ).await.unwrap().unwrap();
+        let id = s
+            .insert_cognitive_task(
+                "session_title",
+                5,
+                r#"{}"#,
+                None,
+                Some("sessions"),
+                Some("s1"),
+                "structured",
+                3,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         s.claim_pending_tasks(1).await;
 
         // Manually back-date started_at to simulate a stale task
@@ -902,7 +1081,8 @@ mod tests {
             conn.execute(
                 "UPDATE cognitive_tasks SET started_at = started_at - 1000 WHERE id = ?1",
                 params![id],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         let recovered = s.reset_stale_processing_tasks(60).await;
@@ -910,7 +1090,10 @@ mod tests {
 
         let task = s.get_task(id).await.unwrap();
         assert_eq!(task.status, "pending");
-        assert_eq!(task.retry_count, 0, "retry_count must NOT be incremented by recovery");
+        assert_eq!(
+            task.retry_count, 0,
+            "retry_count must NOT be incremented by recovery"
+        );
         assert!(task.error_message.unwrap_or_default().contains("Recovered"));
     }
 
@@ -919,9 +1102,17 @@ mod tests {
     async fn test_reset_stale_skips_fresh_processing() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         s.insert_cognitive_task(
-            "session_title", 5, r#"{}"#,
-            None, Some("sessions"), Some("s1"), "structured", 3,
-        ).await.unwrap();
+            "session_title",
+            5,
+            r#"{}"#,
+            None,
+            Some("sessions"),
+            Some("s1"),
+            "structured",
+            3,
+        )
+        .await
+        .unwrap();
         s.claim_pending_tasks(1).await;
 
         let recovered = s.reset_stale_processing_tasks(120).await;
@@ -931,33 +1122,68 @@ mod tests {
     #[tokio::test]
     async fn test_complete_task_rejects_non_processing() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        let id = s.insert_cognitive_task(
-            "session_title", 5, r#"{"session_id":"s1"}"#,
-            None, Some("sessions"), Some("s1"), "structured", 3,
-        ).await.unwrap().unwrap();
+        let id = s
+            .insert_cognitive_task(
+                "session_title",
+                5,
+                r#"{"session_id":"s1"}"#,
+                None,
+                Some("sessions"),
+                Some("s1"),
+                "structured",
+                3,
+            )
+            .await
+            .unwrap()
+            .unwrap();
 
         // Task is still pending — complete should fail (not processing)
-        let result = s.complete_task(id, "{}", "openai", "gpt-4o-mini", "{}").await;
-        assert!(result.is_err(), "complete_task on pending task must return Err");
+        let result = s
+            .complete_task(id, "{}", "openai", "gpt-4o-mini", "{}")
+            .await;
+        assert!(
+            result.is_err(),
+            "complete_task on pending task must return Err"
+        );
 
         // Cancel it — complete should still fail
         s.cancel_task(id).await.unwrap();
-        let result2 = s.complete_task(id, "{}", "openai", "gpt-4o-mini", "{}").await;
-        assert!(result2.is_err(), "complete_task on cancelled task must return Err");
+        let result2 = s
+            .complete_task(id, "{}", "openai", "gpt-4o-mini", "{}")
+            .await;
+        assert!(
+            result2.is_err(),
+            "complete_task on cancelled task must return Err"
+        );
     }
 
     #[tokio::test]
     async fn test_complete_task() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        let id = s.insert_cognitive_task(
-            "session_title", 5, r#"{"session_id":"s1"}"#,
-            None, Some("sessions"), Some("s1"), "structured", 3,
-        ).await.unwrap().unwrap();
+        let id = s
+            .insert_cognitive_task(
+                "session_title",
+                5,
+                r#"{"session_id":"s1"}"#,
+                None,
+                Some("sessions"),
+                Some("s1"),
+                "structured",
+                3,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         s.claim_pending_tasks(1).await;
-        s.complete_task(id, r#"{"title":"Project Alpha: JWT"}"#,
-            "openai", "gpt-4o-mini",
-            r#"{"input":50,"output":10,"cached":0}"#
-        ).await.unwrap();
+        s.complete_task(
+            id,
+            r#"{"title":"Project Alpha: JWT"}"#,
+            "openai",
+            "gpt-4o-mini",
+            r#"{"input":50,"output":10,"cached":0}"#,
+        )
+        .await
+        .unwrap();
         let t = s.get_task(id).await.unwrap();
         assert_eq!(t.status, "completed");
         assert!(t.result.is_some());
@@ -966,10 +1192,20 @@ mod tests {
     #[tokio::test]
     async fn test_fail_task_retries() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        let id = s.insert_cognitive_task(
-            "community_summary", 3, r#"{}"#,
-            None, None, None, "structured", 2,
-        ).await.unwrap().unwrap();
+        let id = s
+            .insert_cognitive_task(
+                "community_summary",
+                3,
+                r#"{}"#,
+                None,
+                None,
+                None,
+                "structured",
+                2,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         s.claim_pending_tasks(1).await;
 
         // First fail → back to pending
@@ -988,10 +1224,20 @@ mod tests {
     #[tokio::test]
     async fn test_retry_task_resets_to_pending() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        let id = s.insert_cognitive_task(
-            "session_title", 5, r#"{}"#,
-            None, None, None, "structured", 1,
-        ).await.unwrap().unwrap();
+        let id = s
+            .insert_cognitive_task(
+                "session_title",
+                5,
+                r#"{}"#,
+                None,
+                None,
+                None,
+                "structured",
+                1,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         s.claim_pending_tasks(1).await;
         s.fail_task(id, "error").await.unwrap();
         let t = s.get_task(id).await.unwrap();
@@ -1007,10 +1253,20 @@ mod tests {
     #[tokio::test]
     async fn test_retry_task_rejects_non_failed() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        let id = s.insert_cognitive_task(
-            "session_title", 5, r#"{}"#,
-            None, None, None, "structured", 3,
-        ).await.unwrap().unwrap();
+        let id = s
+            .insert_cognitive_task(
+                "session_title",
+                5,
+                r#"{}"#,
+                None,
+                None,
+                None,
+                "structured",
+                3,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         let result = s.retry_task(id).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("pending"));
@@ -1027,10 +1283,20 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_task() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        let id = s.insert_cognitive_task(
-            "entity_description", 5, r#"{}"#,
-            None, None, None, "structured", 3,
-        ).await.unwrap().unwrap();
+        let id = s
+            .insert_cognitive_task(
+                "entity_description",
+                5,
+                r#"{}"#,
+                None,
+                None,
+                None,
+                "structured",
+                3,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         let affected = s.cancel_task(id).await.unwrap();
         assert_eq!(affected, 1);
         let t = s.get_task(id).await.unwrap();
@@ -1044,22 +1310,41 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_task_already_claimed_returns_zero() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        let id = s.insert_cognitive_task(
-            "session_title", 5, r#"{}"#,
-            None, None, None, "structured", 3,
-        ).await.unwrap().unwrap();
+        let id = s
+            .insert_cognitive_task(
+                "session_title",
+                5,
+                r#"{}"#,
+                None,
+                None,
+                None,
+                "structured",
+                3,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         s.claim_pending_tasks(1).await; // moves to processing
 
         let affected = s.cancel_task(id).await.unwrap();
-        assert_eq!(affected, 0, "Should return 0 when task is no longer pending");
+        assert_eq!(
+            affected, 0,
+            "Should return 0 when task is no longer pending"
+        );
     }
 
     #[tokio::test]
     async fn test_priority_ordering() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        s.insert_cognitive_task("t", 2, "{}", None, None, None, "structured", 3).await.unwrap();
-        s.insert_cognitive_task("t", 9, "{}", None, None, None, "structured", 3).await.unwrap();
-        s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3).await.unwrap();
+        s.insert_cognitive_task("t", 2, "{}", None, None, None, "structured", 3)
+            .await
+            .unwrap();
+        s.insert_cognitive_task("t", 9, "{}", None, None, None, "structured", 3)
+            .await
+            .unwrap();
+        s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3)
+            .await
+            .unwrap();
 
         let claimed = s.claim_pending_tasks(3).await;
         assert_eq!(claimed.len(), 3);
@@ -1071,17 +1356,36 @@ mod tests {
     #[tokio::test]
     async fn test_get_tasks_filtered() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        s.insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3).await.unwrap();
-        s.insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3).await.unwrap();
-        s.insert_cognitive_task("community_summary", 3, "{}", None, None, None, "structured", 3).await.unwrap();
+        s.insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3)
+            .await
+            .unwrap();
+        s.insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3)
+            .await
+            .unwrap();
+        s.insert_cognitive_task(
+            "community_summary",
+            3,
+            "{}",
+            None,
+            None,
+            None,
+            "structured",
+            3,
+        )
+        .await
+        .unwrap();
 
-        let title_tasks = s.get_tasks_filtered(None, Some("session_title"), 10, 0).await;
+        let title_tasks = s
+            .get_tasks_filtered(None, Some("session_title"), 10, 0)
+            .await;
         assert_eq!(title_tasks.len(), 2);
 
         let pending = s.get_tasks_filtered(Some("pending"), None, 10, 0).await;
         assert_eq!(pending.len(), 3);
 
-        let both = s.get_tasks_filtered(Some("pending"), Some("community_summary"), 10, 0).await;
+        let both = s
+            .get_tasks_filtered(Some("pending"), Some("community_summary"), 10, 0)
+            .await;
         assert_eq!(both.len(), 1);
 
         let all = s.get_tasks_filtered(None, None, 10, 0).await;
@@ -1093,7 +1397,9 @@ mod tests {
     async fn test_get_tasks_filtered_pagination() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         for _ in 0..5 {
-            s.insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3).await.unwrap();
+            s.insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3)
+                .await
+                .unwrap();
         }
 
         let page0 = s.get_tasks_filtered(None, None, 3, 0).await;
@@ -1111,16 +1417,26 @@ mod tests {
         assert!(page2.is_empty());
 
         // Filter + offset: 2 session_title tasks, offset=1 → 1 result
-        let filtered_page1 = s.get_tasks_filtered(None, Some("session_title"), 10, 1).await;
+        let filtered_page1 = s
+            .get_tasks_filtered(None, Some("session_title"), 10, 1)
+            .await;
         assert_eq!(filtered_page1.len(), 4); // 5 total - 1 offset
     }
 
     #[tokio::test]
     async fn test_count_tasks_by_status() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3).await.unwrap();
-        s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3).await.unwrap();
-        let id3 = s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3).await.unwrap().unwrap();
+        s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3)
+            .await
+            .unwrap();
+        s.insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3)
+            .await
+            .unwrap();
+        let id3 = s
+            .insert_cognitive_task("t", 5, "{}", None, None, None, "structured", 3)
+            .await
+            .unwrap()
+            .unwrap();
         s.cancel_task(id3).await.unwrap();
 
         let counts = s.count_tasks_by_status().await;
@@ -1132,9 +1448,15 @@ mod tests {
     #[tokio::test]
     async fn test_insert_usage_log_and_stats() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        s.insert_usage_log(Some(1), "openai", "gpt-4o-mini", 100, 50, 0, 850).await.unwrap();
-        s.insert_usage_log(Some(2), "openai", "gpt-4o-mini", 200, 80, 20, 1200).await.unwrap();
-        s.insert_usage_log(Some(3), "anthropic", "claude-haiku", 150, 60, 0, 950).await.unwrap();
+        s.insert_usage_log(Some(1), "openai", "gpt-4o-mini", 100, 50, 0, 850)
+            .await
+            .unwrap();
+        s.insert_usage_log(Some(2), "openai", "gpt-4o-mini", 200, 80, 20, 1200)
+            .await
+            .unwrap();
+        s.insert_usage_log(Some(3), "anthropic", "claude-haiku", 150, 60, 0, 950)
+            .await
+            .unwrap();
 
         let stats = s.get_usage_stats(0, 0).await;
         assert_eq!(stats.total_calls, 3);
@@ -1150,26 +1472,59 @@ mod tests {
     async fn test_get_usage_stats_by_task_type() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
 
-        let t1 = s.insert_cognitive_task(
-            "session_title", 5, "{}", None, None, None, "structured", 3,
-        ).await.unwrap().unwrap();
-        let t2 = s.insert_cognitive_task(
-            "community_narrative", 5, "{}", None, None, None, "structured", 3,
-        ).await.unwrap().unwrap();
+        let t1 = s
+            .insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3)
+            .await
+            .unwrap()
+            .unwrap();
+        let t2 = s
+            .insert_cognitive_task(
+                "community_narrative",
+                5,
+                "{}",
+                None,
+                None,
+                None,
+                "structured",
+                3,
+            )
+            .await
+            .unwrap()
+            .unwrap();
 
-        s.insert_usage_log(Some(t1), "deepseek", "deepseek-reasoner", 100, 40, 0, 800).await.unwrap();
-        s.insert_usage_log(Some(t1), "deepseek", "deepseek-reasoner", 120, 50, 0, 900).await.unwrap();
-        s.insert_usage_log(Some(t2), "claude", "claude-sonnet-4-20250514", 200, 80, 30, 1100).await.unwrap();
+        s.insert_usage_log(Some(t1), "deepseek", "deepseek-reasoner", 100, 40, 0, 800)
+            .await
+            .unwrap();
+        s.insert_usage_log(Some(t1), "deepseek", "deepseek-reasoner", 120, 50, 0, 900)
+            .await
+            .unwrap();
+        s.insert_usage_log(
+            Some(t2),
+            "claude",
+            "claude-sonnet-4-20250514",
+            200,
+            80,
+            30,
+            1100,
+        )
+        .await
+        .unwrap();
 
         let stats = s.get_usage_stats_by_task_type(0, 0).await;
         assert_eq!(stats.len(), 2);
 
-        let st = stats.iter().find(|r| r.task_type == "session_title").unwrap();
+        let st = stats
+            .iter()
+            .find(|r| r.task_type == "session_title")
+            .unwrap();
         assert_eq!(st.provider, "deepseek");
         assert_eq!(st.calls, 2);
         assert_eq!(st.input_tokens, 220);
 
-        let cn = stats.iter().find(|r| r.task_type == "community_narrative").unwrap();
+        let cn = stats
+            .iter()
+            .find(|r| r.task_type == "community_narrative")
+            .unwrap();
         assert_eq!(cn.provider, "claude");
         assert_eq!(cn.calls, 1);
         assert_eq!(cn.cached_tokens, 30);
@@ -1179,14 +1534,24 @@ mod tests {
     async fn test_get_tasks_for_target() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         s.insert_cognitive_task(
-            "session_title", 5, "{}", None,
-            Some("sessions"), Some("sess_001"), "structured", 3,
-        ).await.unwrap();
+            "session_title",
+            5,
+            "{}",
+            None,
+            Some("sessions"),
+            Some("sess_001"),
+            "structured",
+            3,
+        )
+        .await
+        .unwrap();
 
         let tasks = s.get_tasks_for_target("sessions", "sess_001", None).await;
         assert_eq!(tasks.len(), 1);
 
-        let pending = s.get_tasks_for_target("sessions", "sess_001", Some("pending")).await;
+        let pending = s
+            .get_tasks_for_target("sessions", "sess_001", Some("pending"))
+            .await;
         assert_eq!(pending.len(), 1);
 
         let none = s.get_tasks_for_target("sessions", "sess_999", None).await;

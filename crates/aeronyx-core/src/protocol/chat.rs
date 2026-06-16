@@ -59,9 +59,9 @@
 //! ## Last Modified
 //! v1.0.0-ChatRelay — Initial implementation
 
+use bincode::Options;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
-use bincode::Options;
 
 use crate::crypto::keys::IdentityPublicKey;
 use crate::error::CoreError;
@@ -413,7 +413,11 @@ mod tests {
 
     #[test]
     fn test_content_type_serde_roundtrip() {
-        for ct in [ChatContentType::Text, ChatContentType::Media, ChatContentType::System] {
+        for ct in [
+            ChatContentType::Text,
+            ChatContentType::Media,
+            ChatContentType::System,
+        ] {
             let bytes = bincode::serialize(&ct).expect("serialize");
             let decoded: ChatContentType = bincode::deserialize(&bytes).expect("deserialize");
             assert_eq!(ct, decoded);
@@ -441,7 +445,10 @@ mod tests {
     fn test_envelope_verify_signature_ok() {
         let kp = IdentityKeyPair::generate();
         let env = make_signed_envelope(&kp);
-        assert!(env.verify_signature().is_ok(), "Valid signature must verify");
+        assert!(
+            env.verify_signature().is_ok(),
+            "Valid signature must verify"
+        );
     }
 
     #[test]
@@ -461,7 +468,10 @@ mod tests {
         let kp = IdentityKeyPair::generate();
         let mut env = make_signed_envelope(&kp);
         env.receiver[0] ^= 0xFF;
-        assert!(env.verify_signature().is_err(), "Tampered receiver must fail");
+        assert!(
+            env.verify_signature().is_err(),
+            "Tampered receiver must fail"
+        );
     }
 
     #[test]
@@ -469,7 +479,10 @@ mod tests {
         let kp = IdentityKeyPair::generate();
         let mut env = make_signed_envelope(&kp);
         env.ciphertext[0] ^= 0xFF;
-        assert!(env.verify_signature().is_err(), "Tampered ciphertext must fail");
+        assert!(
+            env.verify_signature().is_err(),
+            "Tampered ciphertext must fail"
+        );
     }
 
     #[test]
@@ -477,7 +490,10 @@ mod tests {
         let kp = IdentityKeyPair::generate();
         let mut env = make_signed_envelope(&kp);
         env.timestamp += 1;
-        assert!(env.verify_signature().is_err(), "Tampered timestamp must fail");
+        assert!(
+            env.verify_signature().is_err(),
+            "Tampered timestamp must fail"
+        );
     }
 
     #[test]
@@ -486,7 +502,10 @@ mod tests {
         let mut env = make_signed_envelope(&kp);
         // Flip Text → Media
         env.content_type = ChatContentType::Media;
-        assert!(env.verify_signature().is_err(), "Tampered content_type must fail");
+        assert!(
+            env.verify_signature().is_err(),
+            "Tampered content_type must fail"
+        );
     }
 
     #[test]

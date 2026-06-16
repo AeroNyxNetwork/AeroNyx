@@ -41,8 +41,8 @@
 //! v2.1.0+MVF+Encryption - Extracted from storage.rs
 //! v2.2.0 - 🌟 Split into dedicated file for maintainability
 
-use sha2::Sha256;
 use hkdf::Hkdf;
+use sha2::Sha256;
 use tracing::warn;
 
 // ============================================
@@ -61,7 +61,8 @@ use tracing::warn;
 pub fn derive_record_key(owner_private: &[u8; 32]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(Some(b"memchain-records"), owner_private);
     let mut key = [0u8; 32];
-    hk.expand(b"v1", &mut key).expect("HKDF expand should not fail for 32 bytes");
+    hk.expand(b"v1", &mut key)
+        .expect("HKDF expand should not fail for 32 bytes");
     key
 }
 
@@ -76,7 +77,8 @@ pub fn derive_record_key(owner_private: &[u8; 32]) -> [u8; 32] {
 pub fn derive_rawlog_key(owner_private: &[u8; 32]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(Some(b"memchain-rawlog"), owner_private);
     let mut key = [0u8; 32];
-    hk.expand(b"v1", &mut key).expect("HKDF expand should not fail for 32 bytes");
+    hk.expand(b"v1", &mut key)
+        .expect("HKDF expand should not fail for 32 bytes");
     key
 }
 
@@ -96,14 +98,13 @@ pub fn derive_rawlog_key(owner_private: &[u8; 32]) -> [u8; 32] {
 /// Record content dedup (`has_active_content`) and `record_id` hashing both
 /// depend on `encrypted_content` being consistent for the same plaintext.
 pub fn encrypt_record_content(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
     use chacha20poly1305::aead::{Aead, NewAead};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
     use hmac::{Hmac, Mac};
 
     // Deterministic nonce: HMAC-SHA256(key, plaintext)[0..12]
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key)
-        .map_err(|e| format!("HMAC init: {}", e))?;
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|e| format!("HMAC init: {}", e))?;
     mac.update(plaintext);
     let hmac_result = mac.finalize().into_bytes();
     let mut nonce_bytes = [0u8; 12];
@@ -113,7 +114,8 @@ pub fn encrypt_record_content(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8
     let cipher = ChaCha20Poly1305::new(cipher_key);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher.encrypt(nonce, plaintext)
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext)
         .map_err(|e| format!("ChaCha20 encrypt: {}", e))?;
 
     let mut result = Vec::with_capacity(12 + ciphertext.len());
@@ -125,8 +127,8 @@ pub fn encrypt_record_content(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8
 /// Decrypt record content.
 /// Input format: nonce(12) || ciphertext(len + 16 tag)
 pub fn decrypt_record_content(key: &[u8; 32], stored: &[u8]) -> Result<Vec<u8>, String> {
-    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
     use chacha20poly1305::aead::{Aead, NewAead};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
     if stored.len() < 12 + 16 {
         return Err("Record ciphertext too short".into());
@@ -137,7 +139,8 @@ pub fn decrypt_record_content(key: &[u8; 32], stored: &[u8]) -> Result<Vec<u8>, 
     let nonce = Nonce::from_slice(&stored[..12]);
     let ciphertext = &stored[12..];
 
-    cipher.decrypt(nonce, ciphertext)
+    cipher
+        .decrypt(nonce, ciphertext)
         .map_err(|e| format!("ChaCha20 decrypt: {}", e))
 }
 
@@ -149,8 +152,8 @@ pub fn decrypt_record_content(key: &[u8; 32], stored: &[u8]) -> Result<Vec<u8>, 
 /// Uses random nonce (NOT deterministic — rawlogs don't need dedup).
 /// Format: nonce(12) || ciphertext(len + 16 tag)
 pub(crate) fn encrypt_rawlog_content(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
     use chacha20poly1305::aead::{Aead, NewAead};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
     let cipher_key = Key::from_slice(key);
     let cipher = ChaCha20Poly1305::new(cipher_key);
@@ -160,7 +163,8 @@ pub(crate) fn encrypt_rawlog_content(key: &[u8; 32], plaintext: &[u8]) -> Result
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher.encrypt(nonce, plaintext)
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext)
         .map_err(|e| format!("ChaCha20 encrypt: {}", e))?;
 
     let mut result = Vec::with_capacity(12 + ciphertext.len());
@@ -172,8 +176,8 @@ pub(crate) fn encrypt_rawlog_content(key: &[u8; 32], plaintext: &[u8]) -> Result
 /// Decrypt content bytes from rawlog storage.
 /// Input format: nonce(12) || ciphertext(len + 16 tag)
 pub(crate) fn decrypt_rawlog_content(key: &[u8; 32], stored: &[u8]) -> Result<Vec<u8>, String> {
-    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
     use chacha20poly1305::aead::{Aead, NewAead};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
     if stored.len() < 12 + 16 {
         return Err("Ciphertext too short".into());
@@ -184,7 +188,8 @@ pub(crate) fn decrypt_rawlog_content(key: &[u8; 32], stored: &[u8]) -> Result<Ve
     let nonce = Nonce::from_slice(&stored[..12]);
     let ciphertext = &stored[12..];
 
-    cipher.decrypt(nonce, ciphertext)
+    cipher
+        .decrypt(nonce, ciphertext)
         .map_err(|e| format!("ChaCha20 decrypt: {}", e))
 }
 

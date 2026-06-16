@@ -97,7 +97,9 @@ struct RateLimiter {
 
 impl RateLimiter {
     fn new() -> Self {
-        Self { state: Arc::new(DashMap::new()) }
+        Self {
+            state: Arc::new(DashMap::new()),
+        }
     }
 
     /// Returns `true` if the request is allowed, `false` if limit exceeded.
@@ -176,7 +178,11 @@ pub struct PeerVirtualIpResponse {
 impl PeerVirtualIpResponse {
     #[inline]
     fn offline() -> Self {
-        Self { online: false, virtual_ip: None, last_seen: None }
+        Self {
+            online: false,
+            virtual_ip: None,
+            last_seen: None,
+        }
     }
 }
 
@@ -225,7 +231,9 @@ pub async fn peer_virtual_ip_handler(
     if !state.rate_limiter.check() {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
-            Json(ErrorResponse { error: "rate limit exceeded" }),
+            Json(ErrorResponse {
+                error: "rate limit exceeded",
+            }),
         ));
     }
 
@@ -250,7 +258,8 @@ pub async fn peer_virtual_ip_handler(
         s
     } else {
         // ── Step 4: Pass 2 — full session scan O(n) ──────────────────────
-        match state.sessions
+        match state
+            .sessions
             .all_sessions()
             .into_iter()
             .find(|s| s.client_public_key.to_bytes() == pubkey_bytes)

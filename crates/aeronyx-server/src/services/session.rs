@@ -119,8 +119,8 @@
 //!     Eliminates repeated hex encoding on every VPN packet in the hot path.
 //!   - `cleanup_expired()` now uses `session.wallet_hex` instead of re-encoding.
 
-use std::net::{Ipv4Addr, SocketAddr};
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -691,8 +691,7 @@ impl Session {
     /// timeout or the commercial drain client-liveness timeout.
     #[must_use]
     pub fn is_expired(&self, timeout: Duration) -> bool {
-        let liveness_timeout =
-            timeout.min(Duration::from_secs(CLIENT_LIVENESS_TIMEOUT_SECS));
+        let liveness_timeout = timeout.min(Duration::from_secs(CLIENT_LIVENESS_TIMEOUT_SECS));
         self.idle_time() > timeout || self.client_inactive_time() > liveness_timeout
     }
 
@@ -935,7 +934,8 @@ impl SessionManager {
             client_endpoint,
         ));
 
-        self.sessions.insert(session_id.clone(), Arc::clone(&session));
+        self.sessions
+            .insert(session_id.clone(), Arc::clone(&session));
 
         info!(
             session_id = %session_id,
@@ -959,12 +959,7 @@ impl SessionManager {
     /// * `wallet` - The wallet public key bytes (from verified session)
     /// * `device_id` - Stable device identifier from the client
     /// * `session_id` - The current active session for this device
-    pub fn register_device(
-        &self,
-        wallet: &[u8; 32],
-        device_id: DeviceId,
-        session_id: SessionId,
-    ) {
+    pub fn register_device(&self, wallet: &[u8; 32], device_id: DeviceId, session_id: SessionId) {
         let mut entry = self.wallet_index.entry(*wallet).or_default();
 
         // Remove stale entry for the same device_id (reconnect case).
@@ -1194,12 +1189,15 @@ impl SessionManager {
                 ready.push(*ip);
                 false // remove from pool
             } else {
-                true  // keep in pool
+                true // keep in pool
             }
         });
 
         if !ready.is_empty() {
-            debug!(count = ready.len(), "Virtual IPs released from cooldown pool");
+            debug!(
+                count = ready.len(),
+                "Virtual IPs released from cooldown pool"
+            );
         }
 
         ready
@@ -1594,7 +1592,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(manager.wallet_index_count(), 0);
-        assert!(manager.get_by_wallet(&identity.public_key_bytes()).is_none());
+        assert!(manager
+            .get_by_wallet(&identity.public_key_bytes())
+            .is_none());
     }
 
     #[test]
@@ -1660,7 +1660,10 @@ mod tests {
         assert!(ids.contains(&sid_b));
 
         let last = manager.get_by_wallet(&wallet).unwrap();
-        assert_eq!(last.id, sid_b, "get_by_wallet must return most recent device");
+        assert_eq!(
+            last.id, sid_b,
+            "get_by_wallet must return most recent device"
+        );
 
         assert_eq!(manager.wallet_index_count(), 2);
         assert_eq!(manager.wallet_count(), 1);
@@ -1871,8 +1874,7 @@ mod tests {
         let manager = SessionManager::new(100, Duration::from_secs(300));
         let ip = Ipv4Addr::new(100, 64, 0, 88);
 
-        let past = Instant::now()
-            .checked_sub(Duration::from_secs(IP_COOLDOWN_SECS + 1));
+        let past = Instant::now().checked_sub(Duration::from_secs(IP_COOLDOWN_SECS + 1));
 
         let Some(past_instant) = past else {
             eprintln!("Skipping test_drain_cooldown_pool_elapsed: system uptime too short");
@@ -1882,7 +1884,11 @@ mod tests {
         manager.cooldown_pool.insert(ip, past_instant);
 
         let drained = manager.drain_cooldown_pool();
-        assert_eq!(drained, vec![ip], "IP must be returned after cooldown window");
+        assert_eq!(
+            drained,
+            vec![ip],
+            "IP must be returned after cooldown window"
+        );
         assert!(
             !manager.cooldown_pool.contains_key(&ip),
             "IP must be removed from cooldown pool after drain"

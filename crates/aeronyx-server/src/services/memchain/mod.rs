@@ -77,9 +77,9 @@ pub mod storage_supernode;
 pub mod storage_fts;
 
 // ── Cognitive engine ──
-pub mod vector;
-pub mod mvf;
 pub mod graph;
+pub mod mvf;
+pub mod vector;
 
 // ── Local inference engines ──
 pub mod embed;
@@ -93,9 +93,9 @@ pub mod quantize;
 pub mod reranker;
 
 // ── v2.5.0+SuperNode: LLM provider infrastructure ──
-pub mod llm_provider;
-pub mod llm_openai;
 pub mod llm_anthropic;
+pub mod llm_openai;
+pub mod llm_provider;
 pub mod llm_router;
 pub mod task_worker;
 // v2.5.0+SuperNode Phase B: Prompt template engine
@@ -122,19 +122,13 @@ pub mod mempool;
 // ============================================
 
 // ── Storage core ──
-pub use storage::{MemoryStorage, StorageStats, LayerCounts, RawLogRow};
-pub use storage_crypto::{derive_record_key, derive_rawlog_key, decrypt_rawlog_content_pub};
-pub use storage_ops::{OverviewRecord, OverviewData};
+pub use storage::{LayerCounts, MemoryStorage, RawLogRow, StorageStats};
+pub use storage_crypto::{decrypt_rawlog_content_pub, derive_rawlog_key, derive_record_key};
+pub use storage_ops::{OverviewData, OverviewRecord};
 
 // ── Storage graph types (v2.4.0+Search) ──
 pub use storage_graph::{
-    EntityRow,
-    KnowledgeEdgeRow,
-    SessionRow,
-    CommunityRow,
-    ProjectRow,
-    ArtifactRow,
-    GraphStats,
+    ArtifactRow, CommunityRow, EntityRow, GraphStats, KnowledgeEdgeRow, ProjectRow, SessionRow,
 };
 
 // ── Storage miner types (v2.4.0+Search) ──
@@ -149,19 +143,18 @@ pub use storage_supernode::{CognitiveTaskRow, LlmUsageStats, ProviderUsage, Task
 
 // ── Vector ──
 pub use vector::{
-    VectorIndex, SearchResult, DedupResult,
-    cosine_similarity, compute_recall_score,
-    dedup_threshold_for_layer, EPISODE_DEDUP_WINDOW_SECS,
+    compute_recall_score, cosine_similarity, dedup_threshold_for_layer, DedupResult, SearchResult,
+    VectorIndex, EPISODE_DEDUP_WINDOW_SECS,
 };
 
 // ── Embedding engine ──
 pub use embed::EmbedEngine;
 
 // ── NER engine (v2.4.0) ──
-pub use ner::{NerEngine, DetectedEntity};
+pub use ner::{DetectedEntity, NerEngine};
 
 // ── Query analyzer (v2.4.0) ──
-pub use query_analyzer::{analyze_query, QueryAnalysis, QueryType, MatchedEntity};
+pub use query_analyzer::{analyze_query, MatchedEntity, QueryAnalysis, QueryType};
 
 // ── Scalar quantization (v2.4.0) ──
 pub use quantize::ScalarQuantizer;
@@ -172,33 +165,30 @@ pub use reranker::RerankerEngine;
 // ── LLM provider infrastructure (v2.5.0+SuperNode) ──
 // v2.5.0+Unify: CognitiveTaskType is re-exported from llm_provider, which itself
 // re-exports from config_supernode.rs (the single source of truth).
-pub use llm_provider::{
-    LlmProvider, ChatRequest, ChatResponse, ChatMessage,
-    TokenUsage, CognitiveTaskType, LlmError,
-};
-pub use llm_openai::OpenAiCompatProvider;
 pub use llm_anthropic::AnthropicProvider;
+pub use llm_openai::OpenAiCompatProvider;
+pub use llm_provider::{
+    ChatMessage, ChatRequest, ChatResponse, CognitiveTaskType, LlmError, LlmProvider, TokenUsage,
+};
 pub use llm_router::LlmRouter;
 pub use task_worker::TaskWorker;
 
 // ── Prompt template engine (v2.5.0+SuperNode Phase B) ──
 // v2.5.0+Unify: PrivacyLevel is re-exported from prompts, which itself
 // re-exports from config_supernode.rs (the single source of truth).
-pub use prompts::{PrivacyLevel, EntityDescriptionInput};
+pub use prompts::{EntityDescriptionInput, PrivacyLevel};
 
 // ── Multi-tenant infrastructure (v1.0.0-MultiTenant) ──
 // SystemDb::open() returns Arc<SystemDb> — do not re-wrap.
 // VolumeRouter::new() returns Arc<VolumeRouter> — do not re-wrap.
 // StoragePool::new() returns Arc<StoragePool> — do not re-wrap.
 // VectorIndexPool::new() returns Arc<VectorIndexPool> — do not re-wrap.
-pub use system_db::{SystemDb, SystemDbError, ActiveOwner, OwnerUsageStats};
-pub use volume_router::{
-    VolumeRouter, VolumeRouterError,
-    VolumeConfig, VolumeStatus, VolumeStats,
-    ensure_volumes_config,
-};
-pub use storage_pool::{StoragePool, StoragePoolError, derive_record_key_from_pubkey};
+pub use storage_pool::{derive_record_key_from_pubkey, StoragePool, StoragePoolError};
+pub use system_db::{ActiveOwner, OwnerUsageStats, SystemDb, SystemDbError};
 pub use vector_pool::{VectorIndexPool, VectorPoolError};
+pub use volume_router::{
+    ensure_volumes_config, VolumeConfig, VolumeRouter, VolumeRouterError, VolumeStats, VolumeStatus,
+};
 
 // ── Legacy ──
 pub use aof::AofWriter;

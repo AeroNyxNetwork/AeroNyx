@@ -69,10 +69,9 @@ use tracing::{debug, error, info, warn};
 
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord, RecordStatus};
 
-use super::storage::{MemoryStorage, StorageStats, LayerCounts, RawLogRow, embedding_to_bytes};
+use super::storage::{embedding_to_bytes, LayerCounts, MemoryStorage, RawLogRow, StorageStats};
 use super::storage_crypto::{
-    encrypt_rawlog_content, decrypt_rawlog_content,
-    encrypt_record_content, decrypt_record_content,
+    decrypt_rawlog_content, decrypt_record_content, encrypt_rawlog_content, encrypt_record_content,
 };
 
 // ============================================
@@ -121,15 +120,16 @@ impl MemoryStorage {
             .as_secs() as i64;
 
         let (stored_content, encrypted_flag): (Vec<u8>, i64) = match rawlog_key {
-            Some(key) => {
-                match encrypt_rawlog_content(key, content.as_bytes()) {
-                    Ok(ciphertext) => (ciphertext, 1),
-                    Err(e) => {
-                        warn!("[STORAGE] RawLog encryption failed, storing plaintext: {}", e);
-                        (content.as_bytes().to_vec(), 0)
-                    }
+            Some(key) => match encrypt_rawlog_content(key, content.as_bytes()) {
+                Ok(ciphertext) => (ciphertext, 1),
+                Err(e) => {
+                    warn!(
+                        "[STORAGE] RawLog encryption failed, storing plaintext: {}",
+                        e
+                    );
+                    (content.as_bytes().to_vec(), 0)
                 }
-            }
+            },
             None => (content.as_bytes().to_vec(), 0),
         };
 
@@ -139,11 +139,19 @@ impl MemoryStorage {
                 recall_context, extractable, feedback_signal, encrypted, created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
-                session_id, turn_index, role, stored_content,
-                source_ai, recall_context, extractable,
-                feedback_signal, encrypted_flag, now,
+                session_id,
+                turn_index,
+                role,
+                stored_content,
+                source_ai,
+                recall_context,
+                extractable,
+                feedback_signal,
+                encrypted_flag,
+                now,
             ],
-        ).map_err(|e| format!("RawLog insert: {}", e))?;
+        )
+        .map_err(|e| format!("RawLog insert: {}", e))?;
 
         let log_id = conn.last_insert_rowid();
         Ok(log_id)
@@ -155,18 +163,22 @@ impl MemoryStorage {
         rawlog_key: Option<&[u8; 32]>,
     ) -> Option<String> {
         let conn = self.conn.lock().await;
-        let row: Option<(Vec<u8>, i64)> = conn.query_row(
-            "SELECT content, encrypted FROM raw_logs WHERE log_id = ?1",
-            params![log_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional().ok()?;
+        let row: Option<(Vec<u8>, i64)> = conn
+            .query_row(
+                "SELECT content, encrypted FROM raw_logs WHERE log_id = ?1",
+                params![log_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .ok()?;
 
         let (content_bytes, encrypted) = row?;
 
         if encrypted == 0 {
             String::from_utf8(content_bytes).ok()
         } else if let Some(key) = rawlog_key {
-            decrypt_rawlog_content(key, &content_bytes).ok()
+            decrypt_rawlog_content(key, &content_bytes)
+                .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
         } else {
             warn!("[STORAGE] Encrypted rawlog but no key provided");
@@ -190,7 +202,7 @@ impl MemoryStorage {
              FROM raw_logs
              WHERE feedback_signal IS NULL
              ORDER BY session_id, turn_index
-             LIMIT ?1"
+             LIMIT ?1",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -226,11 +238,17 @@ impl MemoryStorage {
             params![record_id.as_slice()],
         ) {
             Ok(n) if n > 0 => {
-                debug!(record_id = hex::encode(record_id), "[STORAGE] positive_feedback incremented");
+                debug!(
+                    record_id = hex::encode(record_id),
+                    "[STORAGE] positive_feedback incremented"
+                );
                 self.cache.write().invalidate(record_id);
             }
             Ok(_) => {
-                warn!(record_id = hex::encode(record_id), "[STORAGE] positive_feedback: record not found");
+                warn!(
+                    record_id = hex::encode(record_id),
+                    "[STORAGE] positive_feedback: record not found"
+                );
             }
             Err(e) => {
                 error!(
@@ -248,11 +266,17 @@ impl MemoryStorage {
             params![record_id.as_slice()],
         ) {
             Ok(n) if n > 0 => {
-                debug!(record_id = hex::encode(record_id), "[STORAGE] negative_feedback incremented");
+                debug!(
+                    record_id = hex::encode(record_id),
+                    "[STORAGE] negative_feedback incremented"
+                );
                 self.cache.write().invalidate(record_id);
             }
             Ok(_) => {
-                warn!(record_id = hex::encode(record_id), "[STORAGE] negative_feedback: record not found");
+                warn!(
+                    record_id = hex::encode(record_id),
+                    "[STORAGE] negative_feedback: record not found"
+                );
             }
             Err(e) => {
                 error!(
@@ -270,29 +294,58 @@ impl MemoryStorage {
             params![conflict_id.as_slice(), record_id.as_slice()],
         ) {
             Ok(n) if n > 0 => {
-                debug!(record_id = hex::encode(record_id), conflict = hex::encode(conflict_id), "[STORAGE] conflict_with set");
+                debug!(
+                    record_id = hex::encode(record_id),
+                    conflict = hex::encode(conflict_id),
+                    "[STORAGE] conflict_with set"
+                );
                 self.cache.write().invalidate(record_id);
                 true
             }
-            Ok(_) => { warn!(record_id = hex::encode(record_id), "[STORAGE] conflict_with: record not found"); false }
-            Err(e) => { error!(error = %e, "[STORAGE] ❌ set_conflict_with failed"); false }
+            Ok(_) => {
+                warn!(
+                    record_id = hex::encode(record_id),
+                    "[STORAGE] conflict_with: record not found"
+                );
+                false
+            }
+            Err(e) => {
+                error!(error = %e, "[STORAGE] ❌ set_conflict_with failed");
+                false
+            }
         }
     }
 
     pub async fn insert_feedback(
-        &self, owner: &[u8; 32], memory_id: &[u8; 32], session_id: &str,
-        turn_index: i64, signal: i64, features: Option<&[f32; 9]>, prediction: Option<f32>,
+        &self,
+        owner: &[u8; 32],
+        memory_id: &[u8; 32],
+        session_id: &str,
+        turn_index: i64,
+        signal: i64,
+        features: Option<&[f32; 9]>,
+        prediction: Option<f32>,
     ) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-        let features_blob: Option<Vec<u8>> = features.map(|f| f.iter().flat_map(|v| v.to_le_bytes()).collect());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let features_blob: Option<Vec<u8>> =
+            features.map(|f| f.iter().flat_map(|v| v.to_le_bytes()).collect());
         let conn = self.conn.lock().await;
         let _ = conn.execute(
             "INSERT INTO memory_feedback (owner, memory_id, session_id, turn_index,
                 signal, features, prediction, created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
-                owner.as_slice(), memory_id.as_slice(), session_id,
-                turn_index, signal, features_blob.as_deref(), prediction, now,
+                owner.as_slice(),
+                memory_id.as_slice(),
+                session_id,
+                turn_index,
+                signal,
+                features_blob.as_deref(),
+                prediction,
+                now,
             ],
         );
     }
@@ -300,14 +353,16 @@ impl MemoryStorage {
     pub async fn get_recent_feedback(&self, limit: usize) -> Vec<(i64, f32)> {
         let conn = self.conn.lock().await;
         let mut stmt = match conn.prepare(
-            "SELECT signal, prediction FROM memory_feedback ORDER BY created_at DESC LIMIT ?1"
+            "SELECT signal, prediction FROM memory_feedback ORDER BY created_at DESC LIMIT ?1",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
         stmt.query_map(params![limit as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1).unwrap_or(0.0)))
-        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     }
 }
 
@@ -332,28 +387,36 @@ impl MemoryStorage {
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT value FROM chain_state WHERE key='last_block_hash'",
-            [], |row| {
+            [],
+            |row| {
                 let blob: Vec<u8> = row.get(0)?;
                 let mut h = [0u8; 32];
-                if blob.len() == 32 { h.copy_from_slice(&blob); }
+                if blob.len() == 32 {
+                    h.copy_from_slice(&blob);
+                }
                 Ok(h)
             },
-        ).unwrap_or([0u8; 32])
+        )
+        .unwrap_or([0u8; 32])
     }
 
     pub async fn last_block_height(&self) -> u64 {
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT value FROM chain_state WHERE key='last_block_height'",
-            [], |row| {
+            [],
+            |row| {
                 let blob: Vec<u8> = row.get(0)?;
                 if blob.len() == 8 {
                     let mut b = [0u8; 8];
                     b.copy_from_slice(&blob);
                     Ok(u64::from_le_bytes(b))
-                } else { Ok(0u64) }
+                } else {
+                    Ok(0u64)
+                }
             },
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 }
 
@@ -370,15 +433,34 @@ impl MemoryStorage {
         let total = q("SELECT COUNT(*) FROM records", &[]);
         let active = q("SELECT COUNT(*) FROM records WHERE status=0", &[]);
         StorageStats {
-            total_records: total, active_records: active,
+            total_records: total,
+            active_records: active,
             by_layer: LayerCounts {
-                identity:  q("SELECT COUNT(*) FROM records WHERE status=0 AND layer=0", &[]),
-                knowledge: q("SELECT COUNT(*) FROM records WHERE status=0 AND layer=1", &[]),
-                episode:   q("SELECT COUNT(*) FROM records WHERE status=0 AND layer=2", &[]),
-                archive:   q("SELECT COUNT(*) FROM records WHERE status=0 AND layer=3", &[]),
+                identity: q(
+                    "SELECT COUNT(*) FROM records WHERE status=0 AND layer=0",
+                    &[],
+                ),
+                knowledge: q(
+                    "SELECT COUNT(*) FROM records WHERE status=0 AND layer=1",
+                    &[],
+                ),
+                episode: q(
+                    "SELECT COUNT(*) FROM records WHERE status=0 AND layer=2",
+                    &[],
+                ),
+                archive: q(
+                    "SELECT COUNT(*) FROM records WHERE status=0 AND layer=3",
+                    &[],
+                ),
             },
-            content_bytes: q("SELECT COALESCE(SUM(LENGTH(encrypted_content)),0) FROM records WHERE status=0", &[]),
-            records_with_embedding: q("SELECT COUNT(*) FROM records WHERE status=0 AND embedding IS NOT NULL", &[]),
+            content_bytes: q(
+                "SELECT COALESCE(SUM(LENGTH(encrypted_content)),0) FROM records WHERE status=0",
+                &[],
+            ),
+            records_with_embedding: q(
+                "SELECT COUNT(*) FROM records WHERE status=0 AND embedding IS NOT NULL",
+                &[],
+            ),
             session_inserts: self.total_inserted(),
             session_rejects: self.total_rejected(),
         }
@@ -386,7 +468,8 @@ impl MemoryStorage {
 
     pub async fn count(&self) -> usize {
         let conn = self.conn.lock().await;
-        conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get::<_, i64>(0)).unwrap_or(0) as usize
+        conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get::<_, i64>(0))
+            .unwrap_or(0) as usize
     }
 }
 
@@ -399,40 +482,68 @@ impl MemoryStorage {
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT COUNT(*) FROM records WHERE status=0 AND layer=?1",
-            params![layer as u8 as i64], |row| row.get::<_, i64>(0),
-        ).unwrap_or(0) as u64
+            params![layer as u8 as i64],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as u64
     }
 
-    pub async fn compact_episodes_to_archive(&self, owner: &[u8; 32], limit: usize) -> Vec<MemoryRecord> {
+    pub async fn compact_episodes_to_archive(
+        &self,
+        owner: &[u8; 32],
+        limit: usize,
+    ) -> Vec<MemoryRecord> {
         let conn = self.conn.lock().await;
-        let records = self.query_rows(&conn,
+        let records = self.query_rows(
+            &conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,signature,access_count,
                     positive_feedback,negative_feedback,conflict_with
              FROM records WHERE owner=?1 AND status=0 AND layer=?2 ORDER BY timestamp ASC LIMIT ?3",
-            params![owner.as_slice(), MemoryLayer::Episode as u8 as i64, limit as i64],
+            params![
+                owner.as_slice(),
+                MemoryLayer::Episode as u8 as i64,
+                limit as i64
+            ],
         );
-        if records.is_empty() { return records; }
-        if conn.execute_batch("BEGIN TRANSACTION").is_err() { return Vec::new(); }
+        if records.is_empty() {
+            return records;
+        }
+        if conn.execute_batch("BEGIN TRANSACTION").is_err() {
+            return Vec::new();
+        }
         for r in &records {
-            let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+            let now_ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
             if let Err(e) = conn.execute(
                 "UPDATE records SET layer=?1, archived_at=?2 WHERE record_id=?3",
-                params![MemoryLayer::Archive as u8 as i64, now_ts, r.record_id.as_slice()],
+                params![
+                    MemoryLayer::Archive as u8 as i64,
+                    now_ts,
+                    r.record_id.as_slice()
+                ],
             ) {
                 error!(error=%e, "[STORAGE] ❌ Compact update failed, rolling back");
                 let _ = conn.execute_batch("ROLLBACK");
                 return Vec::new();
             }
         }
-        if conn.execute_batch("COMMIT").is_err() { return Vec::new(); }
-        info!(count = records.len(), "[STORAGE] ⛏️ Episodes compacted to Archive layer");
+        if conn.execute_batch("COMMIT").is_err() {
+            return Vec::new();
+        }
+        info!(
+            count = records.len(),
+            "[STORAGE] ⛏️ Episodes compacted to Archive layer"
+        );
         records
     }
 
     pub async fn get_records_needing_embedding(&self, limit: usize) -> Vec<MemoryRecord> {
         let conn = self.conn.lock().await;
-        self.query_rows(&conn,
+        self.query_rows(
+            &conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,signature,access_count,
                     positive_feedback,negative_feedback,conflict_with
@@ -443,11 +554,13 @@ impl MemoryStorage {
 
     pub async fn get_correction_records(&self) -> Vec<MemoryRecord> {
         let conn = self.conn.lock().await;
-        self.query_rows(&conn,
+        self.query_rows(
+            &conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,signature,access_count,
                     positive_feedback,negative_feedback,conflict_with
-             FROM records WHERE topic_tags LIKE '%_correction%' AND status = 0", [],
+             FROM records WHERE topic_tags LIKE '%_correction%' AND status = 0",
+            [],
         )
     }
 
@@ -479,11 +592,16 @@ impl MemoryStorage {
             "SELECT weights FROM user_weights WHERE owner = ?1",
             params![owner.as_slice()],
             |row| row.get::<_, Vec<u8>>(0),
-        ).optional().ok()?
+        )
+        .optional()
+        .ok()?
     }
 
     pub async fn save_user_weights(&self, owner: &[u8; 32], weights_blob: &[u8], version: u64) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
         let conn = self.conn.lock().await;
         let _ = conn.execute(
             "INSERT INTO user_weights (owner, weights, version, created_at, updated_at)
@@ -501,8 +619,9 @@ impl MemoryStorage {
 impl MemoryStorage {
     pub async fn has_active_content(&self, owner: &[u8; 32], content: &[u8]) -> bool {
         let compare_content: Vec<u8> = if let Some(ref key) = self.record_key {
-            if content.is_empty() { content.to_vec() }
-            else {
+            if content.is_empty() {
+                content.to_vec()
+            } else {
                 match encrypt_record_content(key, content) {
                     Ok(ct) => ct,
                     Err(e) => {
@@ -511,7 +630,9 @@ impl MemoryStorage {
                     }
                 }
             }
-        } else { content.to_vec() };
+        } else {
+            content.to_vec()
+        };
         let conn = self.conn.lock().await;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM records WHERE owner = ?1 AND encrypted_content = ?2 AND status = 0 LIMIT 1",
@@ -533,20 +654,29 @@ impl MemoryStorage {
             "SELECT embedding_model FROM records WHERE record_id = ?1",
             params![record_id.as_slice()],
             |row| row.get::<_, String>(0),
-        ).optional().unwrap_or(None)
+        )
+        .optional()
+        .unwrap_or(None)
     }
 
     pub async fn get_overview(&self, owner: &[u8; 32], per_layer_limit: usize) -> OverviewData {
         let conn = self.conn.lock().await;
         let limit = per_layer_limit.min(50).max(1);
         let mut by_layer = HashMap::new();
-        let layer_names = [(0i64, "identity"), (1, "knowledge"), (2, "episode"), (3, "archive")];
+        let layer_names = [
+            (0i64, "identity"),
+            (1, "knowledge"),
+            (2, "episode"),
+            (3, "archive"),
+        ];
         for (layer_val, layer_name) in &layer_names {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM records WHERE owner = ?1 AND status = 0 AND layer = ?2",
-                params![owner.as_slice(), layer_val],
-                |row| row.get(0),
-            ).unwrap_or(0);
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM records WHERE owner = ?1 AND status = 0 AND layer = ?2",
+                    params![owner.as_slice(), layer_val],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
             by_layer.insert(layer_name.to_string(), count as u64);
         }
         let mut recent_by_layer = HashMap::new();
@@ -556,11 +686,13 @@ impl MemoryStorage {
                 "SELECT record_id, encrypted_content, topic_tags, timestamp,
                         access_count, positive_feedback, negative_feedback, source_ai
                  FROM records WHERE owner = ?1 AND layer = ?2 AND status = 0
-                 ORDER BY timestamp DESC LIMIT ?3"
-            ) { Ok(s) => s, Err(_) => continue };
-            let records: Vec<OverviewRecord> = stmt.query_map(
-                params![owner.as_slice(), layer_val, limit as i64],
-                |row| {
+                 ORDER BY timestamp DESC LIMIT ?3",
+            ) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let records: Vec<OverviewRecord> = stmt
+                .query_map(params![owner.as_slice(), layer_val, limit as i64], |row| {
                     let rid_blob: Vec<u8> = row.get(0)?;
                     let raw_content: Vec<u8> = row.get(1)?;
                     let tags_json: String = row.get(2)?;
@@ -575,25 +707,40 @@ impl MemoryStorage {
                                 Ok(plain) => String::from_utf8_lossy(&plain).to_string(),
                                 Err(_) => String::from_utf8_lossy(&raw_content).to_string(),
                             }
-                        } else { String::from_utf8_lossy(&raw_content).to_string() }
-                    } else { String::from_utf8_lossy(&raw_content).to_string() };
+                        } else {
+                            String::from_utf8_lossy(&raw_content).to_string()
+                        }
+                    } else {
+                        String::from_utf8_lossy(&raw_content).to_string()
+                    };
                     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
                     Ok(OverviewRecord {
-                        record_id: hex::encode(&rid_blob), content, topic_tags: tags,
-                        timestamp: timestamp as u64, access_count: access_count as u32,
-                        positive_feedback: pos_fb as u32, negative_feedback: neg_fb as u32,
+                        record_id: hex::encode(&rid_blob),
+                        content,
+                        topic_tags: tags,
+                        timestamp: timestamp as u64,
+                        access_count: access_count as u32,
+                        positive_feedback: pos_fb as u32,
+                        negative_feedback: neg_fb as u32,
                         source_ai,
                     })
-                },
-            ).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default();
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default();
             recent_by_layer.insert(layer_name.to_string(), records);
         }
-        let last_memory_at: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(timestamp), 0) FROM records WHERE owner = ?1 AND status = 0",
-            params![owner.as_slice()],
-            |row| row.get(0),
-        ).unwrap_or(0);
-        OverviewData { by_layer, recent_by_layer, last_memory_at: last_memory_at as u64 }
+        let last_memory_at: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(timestamp), 0) FROM records WHERE owner = ?1 AND status = 0",
+                params![owner.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        OverviewData {
+            by_layer,
+            recent_by_layer,
+            last_memory_at: last_memory_at as u64,
+        }
     }
 }
 
@@ -604,11 +751,10 @@ impl MemoryStorage {
 impl MemoryStorage {
     pub async fn count_distinct_owners(&self) -> usize {
         let conn = self.conn.lock().await;
-        conn.query_row(
-            "SELECT COUNT(DISTINCT owner) FROM records",
-            [],
-            |row| row.get::<_, i64>(0),
-        ).unwrap_or(0) as usize
+        conn.query_row("SELECT COUNT(DISTINCT owner) FROM records", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(0) as usize
     }
 
     pub async fn owner_exists(&self, owner: &[u8; 32]) -> bool {
@@ -617,7 +763,8 @@ impl MemoryStorage {
             "SELECT EXISTS(SELECT 1 FROM records WHERE owner = ?1 LIMIT 1)",
             params![owner.as_slice()],
             |row| row.get::<_, bool>(0),
-        ).unwrap_or(false)
+        )
+        .unwrap_or(false)
     }
 }
 
@@ -658,7 +805,8 @@ impl MemoryStorage {
         let conn = self.conn.lock().await;
 
         if let Some(l) = layer {
-            self.query_rows(&conn,
+            self.query_rows(
+                &conn,
                 "SELECT r.record_id, r.owner, r.timestamp, r.layer, r.topic_tags, r.source_ai,
                         r.status, r.supersedes, r.encrypted_content, r.embedding, r.signature,
                         r.access_count, r.positive_feedback, r.negative_feedback, r.conflict_with
@@ -673,7 +821,8 @@ impl MemoryStorage {
                 params![owner.as_slice(), l as u8 as i64, project_id, limit as i64],
             )
         } else {
-            self.query_rows(&conn,
+            self.query_rows(
+                &conn,
                 "SELECT r.record_id, r.owner, r.timestamp, r.layer, r.topic_tags, r.source_ai,
                         r.status, r.supersedes, r.encrypted_content, r.embedding, r.signature,
                         r.access_count, r.positive_feedback, r.negative_feedback, r.conflict_with
@@ -702,8 +851,15 @@ mod tests {
     use aeronyx_core::ledger::MemoryRecord;
 
     fn make_rec_owner(ts: u64, owner: [u8; 32], layer: MemoryLayer) -> MemoryRecord {
-        MemoryRecord::new(owner, ts, layer, vec!["test".into()], "ai".into(),
-            format!("content_{}", ts).into_bytes(), vec![0.5; 4])
+        MemoryRecord::new(
+            owner,
+            ts,
+            layer,
+            vec!["test".into()],
+            "ai".into(),
+            format!("content_{}", ts).into_bytes(),
+            vec![0.5; 4],
+        )
     }
 
     #[tokio::test]
@@ -714,13 +870,19 @@ mod tests {
         s.insert(&r, "m").await;
         assert!(s.has_active_content(&owner, &r.encrypted_content).await);
         assert!(!s.has_active_content(&owner, b"nonexistent").await);
-        assert!(!s.has_active_content(&[0xCC; 32], &r.encrypted_content).await);
+        assert!(
+            !s.has_active_content(&[0xCC; 32], &r.encrypted_content)
+                .await
+        );
     }
 
     #[tokio::test]
     async fn test_insert_raw_log_plaintext() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        let log_id = s.insert_raw_log("s1", 0, "user", "hello", "test", None, 1, None, None).await.unwrap();
+        let log_id = s
+            .insert_raw_log("s1", 0, "user", "hello", "test", None, 1, None, None)
+            .await
+            .unwrap();
         assert!(log_id > 0);
         let content = s.read_rawlog_content(log_id, None).await.unwrap();
         assert_eq!(content, "hello");
@@ -731,7 +893,10 @@ mod tests {
         use super::super::storage_crypto::derive_rawlog_key;
         let rlk = derive_rawlog_key(&[0x42; 32]);
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        let log_id = s.insert_raw_log("s1", 0, "user", "secret", "test", None, 1, None, Some(&rlk)).await.unwrap();
+        let log_id = s
+            .insert_raw_log("s1", 0, "user", "secret", "test", None, 1, None, Some(&rlk))
+            .await
+            .unwrap();
         let content = s.read_rawlog_content(log_id, Some(&rlk)).await.unwrap();
         assert_eq!(content, "secret");
         assert!(s.read_rawlog_content(log_id, None).await.is_none());
@@ -756,8 +921,10 @@ mod tests {
     async fn test_stats() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
-        s.insert(&make_rec_owner(100, owner, MemoryLayer::Episode), "m").await;
-        s.insert(&make_rec_owner(200, owner, MemoryLayer::Identity), "m").await;
+        s.insert(&make_rec_owner(100, owner, MemoryLayer::Episode), "m")
+            .await;
+        s.insert(&make_rec_owner(200, owner, MemoryLayer::Identity), "m")
+            .await;
         let stats = s.stats().await;
         assert_eq!(stats.total_records, 2);
         assert_eq!(stats.active_records, 2);
@@ -771,16 +938,22 @@ mod tests {
         let r = make_rec_owner(100, [0xAA; 32], MemoryLayer::Episode);
         let rid = r.record_id;
         s.insert(&r, "minilm-l6-v2").await;
-        assert_eq!(s.get_embedding_model(&rid).await, Some("minilm-l6-v2".into()));
+        assert_eq!(
+            s.get_embedding_model(&rid).await,
+            Some("minilm-l6-v2".into())
+        );
     }
 
     #[tokio::test]
     async fn test_get_overview() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
-        s.insert(&make_rec_owner(100, owner, MemoryLayer::Episode), "m").await;
-        s.insert(&make_rec_owner(200, owner, MemoryLayer::Identity), "m").await;
-        s.insert(&make_rec_owner(300, owner, MemoryLayer::Knowledge), "m").await;
+        s.insert(&make_rec_owner(100, owner, MemoryLayer::Episode), "m")
+            .await;
+        s.insert(&make_rec_owner(200, owner, MemoryLayer::Identity), "m")
+            .await;
+        s.insert(&make_rec_owner(300, owner, MemoryLayer::Knowledge), "m")
+            .await;
         let ov = s.get_overview(&owner, 20).await;
         assert_eq!(*ov.by_layer.get("episode").unwrap(), 1);
         assert_eq!(*ov.by_layer.get("identity").unwrap(), 1);
@@ -797,10 +970,14 @@ mod tests {
     #[tokio::test]
     async fn test_count_distinct_owners_multiple() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        s.insert(&make_rec_owner(100, [0xAA; 32], MemoryLayer::Episode), "m").await;
-        s.insert(&make_rec_owner(200, [0xBB; 32], MemoryLayer::Episode), "m").await;
-        s.insert(&make_rec_owner(300, [0xCC; 32], MemoryLayer::Episode), "m").await;
-        s.insert(&make_rec_owner(400, [0xAA; 32], MemoryLayer::Identity), "m").await;
+        s.insert(&make_rec_owner(100, [0xAA; 32], MemoryLayer::Episode), "m")
+            .await;
+        s.insert(&make_rec_owner(200, [0xBB; 32], MemoryLayer::Episode), "m")
+            .await;
+        s.insert(&make_rec_owner(300, [0xCC; 32], MemoryLayer::Episode), "m")
+            .await;
+        s.insert(&make_rec_owner(400, [0xAA; 32], MemoryLayer::Identity), "m")
+            .await;
         assert_eq!(s.count_distinct_owners().await, 3);
     }
 
@@ -808,7 +985,8 @@ mod tests {
     async fn test_owner_exists_after_insert() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
-        s.insert(&make_rec_owner(100, owner, MemoryLayer::Episode), "m").await;
+        s.insert(&make_rec_owner(100, owner, MemoryLayer::Episode), "m")
+            .await;
         assert!(s.owner_exists(&owner).await);
         assert!(!s.owner_exists(&[0xBB; 32]).await);
     }
@@ -820,10 +998,14 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
 
         // Register a session with project_id = "work"
-        s.upsert_session("sess_work", &owner, Some("work"), "chat", now, 2).await.unwrap();
+        s.upsert_session("sess_work", &owner, Some("work"), "chat", now, 2)
+            .await
+            .unwrap();
 
         // Insert two records linked to the work session
         let mut r1 = make_rec_owner(100, owner, MemoryLayer::Episode);
@@ -842,12 +1024,20 @@ mod tests {
         s.insert(&r2, "m").await;
 
         // Query context = "work" should return only r1
-        let results = s.get_active_records_by_context(&owner, "work", None, 100).await;
-        assert_eq!(results.len(), 1, "Only the work-tagged record should be returned");
+        let results = s
+            .get_active_records_by_context(&owner, "work", None, 100)
+            .await;
+        assert_eq!(
+            results.len(),
+            1,
+            "Only the work-tagged record should be returned"
+        );
         assert_eq!(results[0].record_id, r1.record_id);
 
         // Query context = "personal" should return nothing (no records tagged personal)
-        let personal = s.get_active_records_by_context(&owner, "personal", None, 100).await;
+        let personal = s
+            .get_active_records_by_context(&owner, "personal", None, 100)
+            .await;
         assert!(personal.is_empty(), "No personal records exist");
     }
 
@@ -857,9 +1047,13 @@ mod tests {
         let owner_a = [0xAA; 32];
         let owner_b = [0xBB; 32];
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
 
-        s.upsert_session("sess_a", &owner_a, Some("work"), "chat", now, 1).await.unwrap();
+        s.upsert_session("sess_a", &owner_a, Some("work"), "chat", now, 1)
+            .await
+            .unwrap();
 
         let r = make_rec_owner(100, owner_a, MemoryLayer::Episode);
         s.insert(&r, "m").await;
@@ -872,7 +1066,9 @@ mod tests {
         }
 
         // owner_b querying "work" must see nothing (different owner)
-        let results = s.get_active_records_by_context(&owner_b, "work", None, 100).await;
+        let results = s
+            .get_active_records_by_context(&owner_b, "work", None, 100)
+            .await;
         assert!(results.is_empty(), "Cross-owner isolation must be enforced");
     }
 }

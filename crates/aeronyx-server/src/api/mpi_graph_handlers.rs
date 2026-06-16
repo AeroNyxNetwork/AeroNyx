@@ -54,16 +54,21 @@
 
 use std::sync::Arc;
 
-use axum::{extract::{State, Path, Query}, http::StatusCode, response::IntoResponse, Json};
 use axum::http::Request;
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::services::memchain::{MemoryStorage, VectorIndex};
 use crate::services::memchain::graph;
 use crate::services::memchain::storage_crypto::decrypt_rawlog_content_pub;
+use crate::services::memchain::{MemoryStorage, VectorIndex};
 
-use super::mpi::{MpiState, Mode, extract_owner, default_list_limit};
+use super::mpi::{default_list_limit, extract_owner, Mode, MpiState};
 
 // ============================================
 // Shared Query Params
@@ -101,15 +106,21 @@ pub async fn mpi_projects(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let owner = extract_owner(&req).owner_bytes();
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
-    let projects = storage.get_projects(
-        &owner, params.status.as_deref(), params.limit.min(100),
-    ).await;
+    let projects = storage
+        .get_projects(&owner, params.status.as_deref(), params.limit.min(100))
+        .await;
 
     debug!(count = projects.len(), "[MPI] GET /projects");
-    (StatusCode::OK, Json(serde_json::json!({"projects": projects})))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"projects": projects})),
+    )
 }
 
 pub async fn mpi_project_detail(
@@ -118,13 +129,19 @@ pub async fn mpi_project_detail(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let owner = extract_owner(&req).owner_bytes();
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     match storage.get_project(&project_id, &owner).await {
         Some(p) => (StatusCode::OK, Json(serde_json::json!(p))).into_response(),
-        None => (StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error":"project not found"}))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"project not found"})),
+        )
+            .into_response(),
     }
 }
 
@@ -135,22 +152,28 @@ pub async fn mpi_project_timeline(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let owner = extract_owner(&req).owner_bytes();
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     let limit = params.limit.min(100);
     let offset = params.offset;
 
-    let sessions = storage.get_sessions_for_project(
-        &project_id, limit, offset, &owner,
-    ).await;
+    let sessions = storage
+        .get_sessions_for_project(&project_id, limit, offset, &owner)
+        .await;
 
     debug!(project = %project_id, sessions = sessions.len(), offset, "[MPI] GET /projects/:id/timeline");
-    (StatusCode::OK, Json(serde_json::json!({
-        "project_id": project_id,
-        "sessions": sessions,
-        "pagination": { "limit": limit, "offset": offset, "has_more": sessions.len() == limit }
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "project_id": project_id,
+            "sessions": sessions,
+            "pagination": { "limit": limit, "offset": offset, "has_more": sessions.len() == limit }
+        })),
+    )
 }
 
 // ============================================
@@ -163,13 +186,19 @@ pub async fn mpi_session_detail(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let owner = extract_owner(&req).owner_bytes();
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     match storage.get_session(&session_id, &owner).await {
         Some(s) => (StatusCode::OK, Json(serde_json::json!(s))).into_response(),
-        None => (StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error":"session not found"}))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"session not found"})),
+        )
+            .into_response(),
     }
 }
 
@@ -182,14 +211,20 @@ pub async fn mpi_session_conversation(
     let owner = auth.owner_bytes();
     let is_remote = auth.is_remote();
 
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     // Verify ownership — return 404 (not 403) to avoid leaking session existence.
     let session_meta = storage.get_session(&session_id, &owner).await;
     if session_meta.is_none() {
-        return (StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error":"session not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"session not found"})),
+        )
+            .into_response();
     }
 
     let raw_logs = storage.get_rawlogs_for_session(&session_id).await;
@@ -198,17 +233,25 @@ pub async fn mpi_session_conversation(
         let episodes = storage.get_episodes_for_session(&session_id).await;
         debug!(session = %session_id, episodes = episodes.len(),
             "[MPI] GET /sessions/:id/conversation (no raw_logs, fallback)");
-        return (StatusCode::OK, Json(serde_json::json!({
-            "session_id": session_id,
-            "session": session_meta,
-            "turns": serde_json::Value::Null,
-            "episodes": episodes,
-            "turn_count": 0,
-            "note": "No raw conversation logs available. Showing episode metadata only."
-        }))).into_response();
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "session_id": session_id,
+                "session": session_meta,
+                "turns": serde_json::Value::Null,
+                "episodes": episodes,
+                "turn_count": 0,
+                "note": "No raw conversation logs available. Showing episode metadata only."
+            })),
+        )
+            .into_response();
     }
 
-    let rawlog_key = if !is_remote { state.rawlog_key.as_ref() } else { None };
+    let rawlog_key = if !is_remote {
+        state.rawlog_key.as_ref()
+    } else {
+        None
+    };
 
     let mut turns: Vec<ConversationTurn> = Vec::with_capacity(raw_logs.len());
     let mut decrypt_failures = 0u32;
@@ -219,7 +262,10 @@ pub async fn mpi_session_conversation(
                 match decrypt_rawlog_content_pub(key, &log.content) {
                     Ok(bytes) => match String::from_utf8(bytes) {
                         Ok(text) => (Some(text), false),
-                        Err(_) => { decrypt_failures += 1; (None, true) }
+                        Err(_) => {
+                            decrypt_failures += 1;
+                            (None, true)
+                        }
                     },
                     Err(e) => {
                         warn!(session = %session_id, turn = log.turn_index,
@@ -253,12 +299,16 @@ pub async fn mpi_session_conversation(
     debug!(session = %session_id, turns = turns.len(), remote = is_remote,
         "[MPI] GET /sessions/:id/conversation");
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "session_id": session_id,
-        "session": session_meta,
-        "turns": turns,
-        "turn_count": turns.len(),
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "session_id": session_id,
+            "session": session_meta,
+            "turns": turns,
+            "turn_count": turns.len(),
+        })),
+    )
+        .into_response()
 }
 
 pub async fn mpi_session_artifacts(
@@ -267,14 +317,20 @@ pub async fn mpi_session_artifacts(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let owner = extract_owner(&req).owner_bytes();
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     let artifacts = storage.get_artifacts_for_session(&session_id, &owner).await;
     debug!(session = %session_id, artifacts = artifacts.len(), "[MPI] GET /sessions/:id/artifacts");
-    (StatusCode::OK, Json(serde_json::json!({
-        "session_id": session_id, "artifacts": artifacts,
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "session_id": session_id, "artifacts": artifacts,
+        })),
+    )
 }
 
 // ============================================
@@ -302,8 +358,11 @@ pub async fn mpi_artifacts_search(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let owner = extract_owner(&req).owner_bytes();
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     let limit = params.limit.min(100).max(1);
     let offset = params.offset;
@@ -312,13 +371,14 @@ pub async fn mpi_artifacts_search(
     // session_id and language filters are applied post-query.
     let pattern = params.q.as_deref().unwrap_or("");
 
-    let mut artifacts: Vec<crate::services::memchain::ArtifactRow> =
-        storage.search_artifacts_by_filename(
+    let mut artifacts: Vec<crate::services::memchain::ArtifactRow> = storage
+        .search_artifacts_by_filename(
             &owner,
             pattern,
             limit * 4, // fetch extra to account for post-filters
             offset,
-        ).await;
+        )
+        .await;
 
     // Post-filter: session_id
     if let Some(ref sid) = params.session_id {
@@ -340,14 +400,17 @@ pub async fn mpi_artifacts_search(
         "[MPI] GET /artifacts/search"
     );
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "artifacts": artifacts,
-        "pagination": {
-            "limit": limit,
-            "offset": offset,
-            "has_more": artifacts.len() == limit,
-        }
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "artifacts": artifacts,
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "has_more": artifacts.len() == limit,
+            }
+        })),
+    )
 }
 /// `GET /api/mpi/artifacts/:id` — Artifact detail. (stub, Phase D)
 pub async fn mpi_artifact_detail(
@@ -357,10 +420,13 @@ pub async fn mpi_artifact_detail(
 ) -> impl IntoResponse {
     let _owner = extract_owner(&req).owner_bytes();
     debug!(artifact = %artifact_id, "[MPI] GET /artifacts/:id (stub)");
-    (StatusCode::OK, Json(serde_json::json!({
-        "artifact_id": artifact_id,
-        "status": "stub - full content retrieval in Phase D",
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "artifact_id": artifact_id,
+            "status": "stub - full content retrieval in Phase D",
+        })),
+    )
 }
 
 /// `GET /api/mpi/artifacts/:id/versions` — Artifact version history. (stub, Phase D)
@@ -372,9 +438,12 @@ pub async fn mpi_artifact_versions(
     let _owner = extract_owner(&req).owner_bytes();
     debug!(artifact = %artifact_id, "[MPI] GET /artifacts/:id/versions (stub)");
     let versions: Vec<crate::services::memchain::ArtifactRow> = Vec::new();
-    (StatusCode::OK, Json(serde_json::json!({
-        "artifact_id": artifact_id, "versions": versions,
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "artifact_id": artifact_id, "versions": versions,
+        })),
+    )
 }
 
 // ============================================
@@ -387,20 +456,30 @@ pub async fn mpi_entity_detail(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let owner = extract_owner(&req).owner_bytes();
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     match storage.get_entity(&entity_id).await {
         Some(entity) => {
             let edges = storage.get_edges_for_entity(&entity_id, &owner).await;
             let provenance = storage.get_episodes_for_entity(&entity_id).await;
             debug!(entity = %entity_id, edges = edges.len(), "[MPI] GET /entities/:id");
-            (StatusCode::OK, Json(serde_json::json!({
-                "entity": entity, "edges": edges, "provenance": provenance,
-            }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "entity": entity, "edges": edges, "provenance": provenance,
+                })),
+            )
+                .into_response()
         }
-        None => (StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error":"entity not found"}))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"entity not found"})),
+        )
+            .into_response(),
     }
 }
 
@@ -417,31 +496,39 @@ pub async fn mpi_entity_graph(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let owner = extract_owner(&req).owner_bytes();
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     let node_json: Vec<serde_json::Value> = if state.mode == Mode::Local {
         let conn = storage.conn_lock().await;
-        let nodes = graph::bfs_traverse(
-            &conn, &owner, &[entity_id.clone()],
-            2, 20, 0.3,
-        );
+        let nodes = graph::bfs_traverse(&conn, &owner, &[entity_id.clone()], 2, 20, 0.3);
         drop(conn);
-        nodes.iter().map(|n| serde_json::json!({
-            "entity_id": n.entity_id,
-            "depth": n.depth,
-            "weight": n.weight,
-            "via_relation": n.via_relation,
-        })).collect()
+        nodes
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "entity_id": n.entity_id,
+                    "depth": n.depth,
+                    "weight": n.weight,
+                    "via_relation": n.via_relation,
+                })
+            })
+            .collect()
     } else {
         // SaaS: full async graph BFS not yet implemented. Return empty.
         Vec::new()
     };
 
     debug!(root = %entity_id, nodes = node_json.len(), "[MPI] GET /entities/:id/graph");
-    (StatusCode::OK, Json(serde_json::json!({
-        "root": entity_id, "nodes": node_json,
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "root": entity_id, "nodes": node_json,
+        })),
+    )
 }
 
 pub async fn mpi_entities_list(
@@ -450,19 +537,25 @@ pub async fn mpi_entities_list(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let owner = extract_owner(&req).owner_bytes();
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     let limit = params.limit.min(200).max(1);
     let offset = params.offset;
 
     let entities = storage.get_entities_by_owner(&owner, None, limit).await;
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "entities": entities,
-        "total": entities.len(),
-        "pagination": { "limit": limit, "offset": offset, "has_more": entities.len() == limit }
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "entities": entities,
+            "total": entities.len(),
+            "pagination": { "limit": limit, "offset": offset, "has_more": entities.len() == limit }
+        })),
+    )
 }
 
 // ============================================
@@ -486,15 +579,22 @@ pub async fn mpi_search(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let owner = extract_owner(&req).owner_bytes();
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     let limit = params.limit.min(100).max(1);
 
     if params.q.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "query parameter 'q' is required and cannot be empty"
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "query parameter 'q' is required and cannot be empty"
+            })),
+        )
+            .into_response();
     }
 
     let hits = storage.search_with_snippets(&params.q, &owner, limit).await;
@@ -502,11 +602,15 @@ pub async fn mpi_search(
     let total_results: usize = groups.iter().map(|g| g.hits.len()).sum();
 
     debug!(query = %params.q, groups = groups.len(), total = total_results, "[MPI] GET /search");
-    (StatusCode::OK, Json(serde_json::json!({
-        "query": params.q,
-        "results": groups,
-        "total_results": total_results,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "query": params.q,
+            "results": groups,
+            "total_results": total_results,
+        })),
+    )
+        .into_response()
 }
 
 // ============================================
@@ -520,32 +624,46 @@ pub async fn mpi_entity_timeline(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let owner = extract_owner(&req).owner_bytes();
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     let limit = params.limit.min(200).max(1);
     let offset = params.offset;
 
     let entity = match storage.get_entity(&entity_id).await {
         Some(e) => e,
-        None => return (StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error":"entity not found"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error":"entity not found"})),
+            )
+                .into_response()
+        }
     };
 
-    let timeline = storage.get_entity_timeline(&entity_id, &owner, limit, offset).await;
+    let timeline = storage
+        .get_entity_timeline(&entity_id, &owner, limit, offset)
+        .await;
 
     debug!(entity = %entity_id, events = timeline.len(), offset, "[MPI] GET /entities/:id/timeline");
-    (StatusCode::OK, Json(serde_json::json!({
-        "entity": {
-            "entity_id": entity.entity_id,
-            "name": entity.name,
-            "entity_type": entity.entity_type,
-            "description": entity.description,
-            "mention_count": entity.mention_count,
-        },
-        "timeline": timeline,
-        "pagination": { "limit": limit, "offset": offset, "has_more": timeline.len() == limit }
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "entity": {
+                "entity_id": entity.entity_id,
+                "name": entity.name,
+                "entity_type": entity.entity_type,
+                "description": entity.description,
+                "mention_count": entity.mention_count,
+            },
+            "timeline": timeline,
+            "pagination": { "limit": limit, "offset": offset, "has_more": timeline.len() == limit }
+        })),
+    )
+        .into_response()
 }
 
 // ============================================
@@ -561,8 +679,12 @@ pub struct ContextInjectParams {
     pub recent_sessions: usize,
 }
 
-fn default_context_max_tokens() -> usize { 500 }
-fn default_context_sessions()   -> usize { 3 }
+fn default_context_max_tokens() -> usize {
+    500
+}
+fn default_context_sessions() -> usize {
+    3
+}
 
 pub async fn mpi_context_inject(
     State(_state): State<Arc<MpiState>>,
@@ -570,10 +692,13 @@ pub async fn mpi_context_inject(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let owner = extract_owner(&req).owner_bytes();
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
-    let max_tokens  = params.max_tokens.min(2000).max(100);
+    let max_tokens = params.max_tokens.min(2000).max(100);
     let recent_count = params.recent_sessions.min(10).max(1);
 
     let project = if let Some(ref pid) = params.project_id {
@@ -584,10 +709,12 @@ pub async fn mpi_context_inject(
     };
 
     let project_name = project.as_ref().map(|p| p.name.clone());
-    let project_id   = project.as_ref().map(|p| p.project_id.clone());
+    let project_id = project.as_ref().map(|p| p.project_id.clone());
 
     let recent_sessions = if let Some(ref pid) = project_id {
-        storage.get_sessions_for_project(pid, recent_count, 0, &owner).await
+        storage
+            .get_sessions_for_project(pid, recent_count, 0, &owner)
+            .await
     } else {
         storage.get_pending_sessions(&owner, recent_count).await
     };
@@ -610,8 +737,12 @@ pub async fn mpi_context_inject(
         ctx.push_str("## Recent Sessions\n");
         token_est += 5;
         for sess in &recent_sessions {
-            if token_est >= max_tokens { break; }
-            let title = sess.title.as_deref()
+            if token_est >= max_tokens {
+                break;
+            }
+            let title = sess
+                .title
+                .as_deref()
                 .or(sess.summary.as_deref())
                 .unwrap_or(&sess.session_id);
             let line = format!("- **{}** (ts:{})\n", title, sess.started_at);
@@ -620,7 +751,9 @@ pub async fn mpi_context_inject(
             if let Some(ref summary) = sess.summary {
                 let sl = format!("  {}\n", summary);
                 token_est += sl.len() / 4;
-                if token_est < max_tokens { ctx.push_str(&sl); }
+                if token_est < max_tokens {
+                    ctx.push_str(&sl);
+                }
             }
         }
         ctx.push('\n');
@@ -629,8 +762,13 @@ pub async fn mpi_context_inject(
     if !key_entities.is_empty() && token_est < max_tokens {
         ctx.push_str("## Key Concepts\n");
         token_est += 5;
-        let names: Vec<String> = key_entities.iter().take(10)
-            .filter(|e| { token_est += e.name.len() / 4 + 5; token_est < max_tokens })
+        let names: Vec<String> = key_entities
+            .iter()
+            .take(10)
+            .filter(|e| {
+                token_est += e.name.len() / 4 + 5;
+                token_est < max_tokens
+            })
             .map(|e| format!("{} ({})", e.name, e.entity_type))
             .collect();
         if !names.is_empty() {
@@ -639,35 +777,48 @@ pub async fn mpi_context_inject(
         }
     }
 
-    let sessions_json: Vec<serde_json::Value> = recent_sessions.iter()
-        .map(|s| serde_json::json!({
-            "session_id": s.session_id, "title": s.title,
-            "started_at": s.started_at, "summary": s.summary,
-            "turn_count": s.turn_count,
-        }))
+    let sessions_json: Vec<serde_json::Value> = recent_sessions
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "session_id": s.session_id, "title": s.title,
+                "started_at": s.started_at, "summary": s.summary,
+                "turn_count": s.turn_count,
+            })
+        })
         .collect();
 
-    let entities_json: Vec<serde_json::Value> = key_entities.iter().take(10)
-        .map(|e| serde_json::json!({
-            "name": e.name, "type": e.entity_type, "mentions": e.mention_count,
-        }))
+    let entities_json: Vec<serde_json::Value> = key_entities
+        .iter()
+        .take(10)
+        .map(|e| {
+            serde_json::json!({
+                "name": e.name, "type": e.entity_type, "mentions": e.mention_count,
+            })
+        })
         .collect();
 
     debug!(
         project = project_name.as_deref().unwrap_or("none"),
-        sessions = sessions_json.len(), entities = entities_json.len(),
-        tokens = token_est, "[MPI] GET /context/inject"
+        sessions = sessions_json.len(),
+        entities = entities_json.len(),
+        tokens = token_est,
+        "[MPI] GET /context/inject"
     );
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "project": project.as_ref().map(|p| serde_json::json!({
-            "project_id": p.project_id, "name": p.name, "status": p.status,
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "project": project.as_ref().map(|p| serde_json::json!({
+                "project_id": p.project_id, "name": p.name, "status": p.status,
+            })),
+            "recent_sessions": sessions_json,
+            "key_entities": entities_json,
+            "formatted_context": ctx.trim(),
+            "token_estimate": token_est,
         })),
-        "recent_sessions": sessions_json,
-        "key_entities": entities_json,
-        "formatted_context": ctx.trim(),
-        "token_estimate": token_est,
-    }))).into_response()
+    )
+        .into_response()
 }
 
 // ============================================
@@ -679,12 +830,18 @@ pub async fn mpi_communities(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let owner = extract_owner(&req).owner_bytes();
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     let communities = storage.get_communities(&owner).await;
     debug!(count = communities.len(), "[MPI] GET /communities");
-    (StatusCode::OK, Json(serde_json::json!({"communities": communities})))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"communities": communities})),
+    )
 }
 
 // ============================================
@@ -694,15 +851,15 @@ pub async fn mpi_communities(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::mpi::{build_mpi_router, MpiState, Mode};
-    use crate::services::memchain::{MemoryStorage, VectorIndex};
+    use crate::api::mpi::{build_mpi_router, Mode, MpiState};
     use crate::services::memchain::storage_crypto::derive_rawlog_key;
+    use crate::services::memchain::{MemoryStorage, VectorIndex};
     use aeronyx_core::crypto::IdentityKeyPair;
-    use std::collections::{HashMap, VecDeque};
-    use std::sync::atomic::AtomicBool;
-    use parking_lot::RwLock;
     use axum::body::Body;
     use axum::http::Request;
+    use parking_lot::RwLock;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::AtomicBool;
     use tower::ServiceExt;
 
     /// Build a minimal Local-mode MpiState for testing.
@@ -757,10 +914,15 @@ mod tests {
     async fn test_projects_empty() {
         let s = make_state().await;
         let app = build_mpi_router(s);
-        let req = Request::builder().uri("/api/mpi/projects").body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .uri("/api/mpi/projects")
+            .body(Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["projects"].as_array().unwrap().is_empty());
     }
@@ -769,7 +931,10 @@ mod tests {
     async fn test_communities_empty() {
         let s = make_state().await;
         let app = build_mpi_router(s);
-        let req = Request::builder().uri("/api/mpi/communities").body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .uri("/api/mpi/communities")
+            .body(Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -778,24 +943,42 @@ mod tests {
     async fn test_entity_not_found() {
         let s = make_state().await;
         let app = build_mpi_router(s);
-        let req = Request::builder().uri("/api/mpi/entities/nonexistent").body(Body::empty()).unwrap();
-        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
+        let req = Request::builder()
+            .uri("/api/mpi/entities/nonexistent")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
     async fn test_session_not_found() {
         let s = make_state().await;
         let app = build_mpi_router(s);
-        let req = Request::builder().uri("/api/mpi/sessions/nonexistent").body(Body::empty()).unwrap();
-        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
+        let req = Request::builder()
+            .uri("/api/mpi/sessions/nonexistent")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
     async fn test_project_not_found() {
         let s = make_state().await;
         let app = build_mpi_router(s);
-        let req = Request::builder().uri("/api/mpi/projects/nonexistent").body(Body::empty()).unwrap();
-        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
+        let req = Request::builder()
+            .uri("/api/mpi/projects/nonexistent")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
@@ -803,10 +986,14 @@ mod tests {
         let s = make_state().await;
         let app = build_mpi_router(s);
         let req = Request::builder()
-            .uri("/api/mpi/entities/some_entity/graph").body(Body::empty()).unwrap();
+            .uri("/api/mpi/entities/some_entity/graph")
+            .body(Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["root"], "some_entity");
         assert!(json["nodes"].as_array().is_some());
@@ -824,10 +1011,14 @@ mod tests {
             .unwrap();
         let app = build_mpi_router(s);
         let req = Request::builder()
-            .uri("/api/mpi/sessions/s1/conversation").body(Body::empty()).unwrap();
+            .uri("/api/mpi/sessions/s1/conversation")
+            .body(Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["session_id"], "s1");
         assert_eq!(json["turn_count"], 0);
@@ -837,22 +1028,58 @@ mod tests {
     async fn test_session_conversation_plaintext_turns() {
         let state = make_state().await;
         let owner = state.owner_key;
-        state.storage.as_ref().unwrap().upsert_session(
-            "sess_test", &owner, None, "chat", 1, 2,
-        ).await.unwrap();
-        state.storage.as_ref().unwrap().insert_raw_log(
-            "sess_test", 0, "user", "Hello auth discussion", "test", None, 1, None, None,
-        ).await.unwrap();
-        state.storage.as_ref().unwrap().insert_raw_log(
-            "sess_test", 1, "assistant", "What auth method?", "test", None, 0, None, None,
-        ).await.unwrap();
+        state
+            .storage
+            .as_ref()
+            .unwrap()
+            .upsert_session("sess_test", &owner, None, "chat", 1, 2)
+            .await
+            .unwrap();
+        state
+            .storage
+            .as_ref()
+            .unwrap()
+            .insert_raw_log(
+                "sess_test",
+                0,
+                "user",
+                "Hello auth discussion",
+                "test",
+                None,
+                1,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .as_ref()
+            .unwrap()
+            .insert_raw_log(
+                "sess_test",
+                1,
+                "assistant",
+                "What auth method?",
+                "test",
+                None,
+                0,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
 
         let app = build_mpi_router(state);
         let req = Request::builder()
-            .uri("/api/mpi/sessions/sess_test/conversation").body(Body::empty()).unwrap();
+            .uri("/api/mpi/sessions/sess_test/conversation")
+            .body(Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["turn_count"], 2);
         let turns = json["turns"].as_array().unwrap();
@@ -866,10 +1093,13 @@ mod tests {
         let app = build_mpi_router(s);
         let req = Request::builder()
             .uri("/api/mpi/projects/proj1/timeline?limit=5&offset=10")
-            .body(Body::empty()).unwrap();
+            .body(Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["pagination"]["limit"], 5);
         assert_eq!(json["pagination"]["offset"], 10);
@@ -880,8 +1110,13 @@ mod tests {
         let s = make_state().await;
         let app = build_mpi_router(s);
         let req = Request::builder()
-            .uri("/api/mpi/search?q=").body(Body::empty()).unwrap();
-        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+            .uri("/api/mpi/search?q=")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]
@@ -889,10 +1124,14 @@ mod tests {
         let s = make_state().await;
         let app = build_mpi_router(s);
         let req = Request::builder()
-            .uri("/api/mpi/search?q=nonexistent_xyz").body(Body::empty()).unwrap();
+            .uri("/api/mpi/search?q=nonexistent_xyz")
+            .body(Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["total_results"], 0);
     }
@@ -903,10 +1142,13 @@ mod tests {
         let app = build_mpi_router(s);
         let req = Request::builder()
             .uri("/api/mpi/artifacts/search?q=fn+main")
-            .body(Body::empty()).unwrap();
+            .body(Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["artifacts"].as_array().unwrap().is_empty());
         assert!(json["pagination"].is_object());
@@ -917,7 +1159,9 @@ mod tests {
         let s = make_state().await;
         let app = build_mpi_router(s);
         let req = Request::builder()
-            .uri("/api/mpi/artifacts/art1").body(Body::empty()).unwrap();
+            .uri("/api/mpi/artifacts/art1")
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
@@ -926,7 +1170,9 @@ mod tests {
         let s = make_state().await;
         let app = build_mpi_router(s);
         let req = Request::builder()
-            .uri("/api/mpi/artifacts/art1/versions").body(Body::empty()).unwrap();
+            .uri("/api/mpi/artifacts/art1/versions")
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
@@ -935,24 +1181,45 @@ mod tests {
         let s = make_state().await;
         let app = build_mpi_router(s);
         let req = Request::builder()
-            .uri("/api/mpi/entities/nonexistent/timeline").body(Body::empty()).unwrap();
-        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
+            .uri("/api/mpi/entities/nonexistent/timeline")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
     async fn test_entity_timeline_empty_events() {
         let state = make_state().await;
         let owner = state.owner_key;
-        state.storage.as_ref().unwrap().upsert_entity(
-            "ent_test", &owner, "TestEntity", "testentity", "concept", None, None,
-        ).await.unwrap();
+        state
+            .storage
+            .as_ref()
+            .unwrap()
+            .upsert_entity(
+                "ent_test",
+                &owner,
+                "TestEntity",
+                "testentity",
+                "concept",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
 
         let app = build_mpi_router(state);
         let req = Request::builder()
-            .uri("/api/mpi/entities/ent_test/timeline").body(Body::empty()).unwrap();
+            .uri("/api/mpi/entities/ent_test/timeline")
+            .body(Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["entity"]["name"], "TestEntity");
         assert!(json["timeline"].as_array().unwrap().is_empty());
@@ -964,20 +1231,36 @@ mod tests {
         let state = make_state().await;
         let owner = state.owner_key;
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-        state.storage.as_ref().unwrap()
-            .upsert_session("sess_a", &owner, None, "code", now, 5).await.unwrap();
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        state
+            .storage
+            .as_ref()
+            .unwrap()
+            .upsert_session("sess_a", &owner, None, "code", now, 5)
+            .await
+            .unwrap();
 
         // owner matches — should succeed
         let app_a = build_mpi_router(state.clone());
-        let req = Request::builder().uri("/api/mpi/sessions/sess_a").body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .uri("/api/mpi/sessions/sess_a")
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(app_a.oneshot(req).await.unwrap().status(), StatusCode::OK);
 
         // Different identity — no sess_a in their DB -> 404
         let state_b = make_state().await;
         let app_b = build_mpi_router(state_b);
-        let req2 = Request::builder().uri("/api/mpi/sessions/sess_a").body(Body::empty()).unwrap();
-        assert_eq!(app_b.oneshot(req2).await.unwrap().status(), StatusCode::NOT_FOUND);
+        let req2 = Request::builder()
+            .uri("/api/mpi/sessions/sess_a")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app_b.oneshot(req2).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
@@ -985,15 +1268,26 @@ mod tests {
         let state_a = make_state().await;
         let owner_a = state_a.owner_key;
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-        state_a.storage.as_ref().unwrap()
-            .upsert_session("sess_private", &owner_a, None, "code", now, 2).await.unwrap();
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        state_a
+            .storage
+            .as_ref()
+            .unwrap()
+            .upsert_session("sess_private", &owner_a, None, "code", now, 2)
+            .await
+            .unwrap();
 
         let state_b = make_state().await;
         let app_b = build_mpi_router(state_b);
         let req = Request::builder()
             .uri("/api/mpi/sessions/sess_private/conversation")
-            .body(Body::empty()).unwrap();
-        assert_eq!(app_b.oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app_b.oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }

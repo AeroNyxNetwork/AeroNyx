@@ -55,7 +55,7 @@ use crate::traits::{PacketSource, Transport};
 /// use aeronyx_transport::UdpTransport;
 ///
 /// let transport = UdpTransport::bind("0.0.0.0:51820").await?;
-/// 
+///
 /// // Receive packets
 /// let mut buf = [0u8; 1500];
 /// let (len, source) = transport.recv(&mut buf).await?;
@@ -87,11 +87,12 @@ impl UdpTransport {
     /// - `AddressInUse`: If address is already in use
     pub async fn bind(addr: impl AsRef<str>) -> Result<Self> {
         let addr_str = addr.as_ref();
-        let socket_addr: SocketAddr = addr_str.parse().map_err(|_| {
-            TransportError::InvalidAddress {
-                addr: addr_str.to_string(),
-            }
-        })?;
+        let socket_addr: SocketAddr =
+            addr_str
+                .parse()
+                .map_err(|_| TransportError::InvalidAddress {
+                    addr: addr_str.to_string(),
+                })?;
 
         Self::bind_addr(socket_addr).await
     }
@@ -126,15 +127,13 @@ impl UdpTransport {
             .map_err(|e| TransportError::io("setting non-blocking", e))?;
 
         // Bind to address
-        socket
-            .bind(&addr.into())
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AddrInUse {
-                    TransportError::AddressInUse { addr }
-                } else {
-                    TransportError::bind_failed(addr, e.to_string())
-                }
-            })?;
+        socket.bind(&addr.into()).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                TransportError::AddressInUse { addr }
+            } else {
+                TransportError::bind_failed(addr, e.to_string())
+            }
+        })?;
 
         // Convert to Tokio socket
         let std_socket: std::net::UdpSocket = socket.into();
@@ -177,13 +176,13 @@ impl Transport for UdpTransport {
             return Err(TransportError::ShuttingDown);
         }
 
-        let (len, addr) = self
-            .socket
-            .recv_from(buf)
-            .await
-            .map_err(|e| TransportError::ReceiveFailed {
-                reason: e.to_string(),
-            })?;
+        let (len, addr) =
+            self.socket
+                .recv_from(buf)
+                .await
+                .map_err(|e| TransportError::ReceiveFailed {
+                    reason: e.to_string(),
+                })?;
 
         trace!("Received {} bytes from {}", len, addr);
 
@@ -252,7 +251,7 @@ mod tests {
     async fn test_bind_and_local_addr() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let addr = transport.local_addr().unwrap();
-        
+
         assert_eq!(addr.ip(), std::net::Ipv4Addr::LOCALHOST);
         assert!(addr.port() > 0);
     }
@@ -281,11 +280,11 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
-        
+
         assert!(transport.is_active());
-        
+
         transport.shutdown().await.unwrap();
-        
+
         assert!(!transport.is_active());
         assert!(transport.is_shutdown());
 
@@ -306,7 +305,7 @@ mod tests {
         // Bind to a specific port
         let transport1 = UdpTransport::bind("127.0.0.1:0").await.unwrap();
         let addr = transport1.local_addr().unwrap();
-        
+
         // Drop the first transport
         drop(transport1);
 

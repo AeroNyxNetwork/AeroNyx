@@ -64,8 +64,8 @@
 // ── Core MPI module (state, auth, router) ──
 pub mod mpi;
 // ── Handler modules ──
-pub mod mpi_handlers;
 pub mod mpi_graph_handlers;
+pub mod mpi_handlers;
 pub mod recall_handler;
 // ── /log endpoint ──
 pub mod log_handler;
@@ -82,8 +82,8 @@ pub mod voice;
 pub mod vpn_health;
 
 // ── Re-exports (unchanged from v2.3.0 — external callers unaffected) ──
-pub use mpi::{build_mpi_router, MpiState, BaselineSnapshot};
+pub use mpi::{build_mpi_router, BaselineSnapshot, MpiState};
 // v1.0.0-MultiTenant: export Mode for server.rs SaaS init branch
-pub use mpi::Mode;
 #[allow(deprecated)]
 pub use local::start_legacy_api_server;
+pub use mpi::Mode;

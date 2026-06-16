@@ -174,7 +174,10 @@ impl OpenAiCompatProvider {
         let api_key = if api_key_raw.starts_with('$') {
             let var_name = &api_key_raw[1..];
             std::env::var(var_name).unwrap_or_else(|_| {
-                warn!("[LLM_OPENAI] Env var '{}' not set, using empty api_key", var_name);
+                warn!(
+                    "[LLM_OPENAI] Env var '{}' not set, using empty api_key",
+                    var_name
+                );
                 String::new()
             })
         } else {
@@ -214,8 +217,13 @@ impl LlmProvider for OpenAiCompatProvider {
         let max_tokens = req.max_tokens.or(self.max_tokens);
         let temperature = req.temperature.or(self.temperature);
 
-        let messages: Vec<OpenAiMessage> = req.messages.iter()
-            .map(|m| OpenAiMessage { role: &m.role, content: &m.content })
+        let messages: Vec<OpenAiMessage> = req
+            .messages
+            .iter()
+            .map(|m| OpenAiMessage {
+                role: &m.role,
+                content: &m.content,
+            })
             .collect();
 
         let body = OpenAiRequest {
@@ -228,14 +236,15 @@ impl LlmProvider for OpenAiCompatProvider {
 
         let url = format!("{}/v1/chat/completions", self.api_base);
 
-        let mut request_builder = self.client
+        let mut request_builder = self
+            .client
             .post(&url)
             .header("Content-Type", "application/json");
 
         // Only add Authorization if api_key is non-empty
         if !self.api_key.is_empty() {
-            request_builder = request_builder
-                .header("Authorization", format!("Bearer {}", self.api_key));
+            request_builder =
+                request_builder.header("Authorization", format!("Bearer {}", self.api_key));
         }
 
         let resp = request_builder
@@ -249,13 +258,16 @@ impl LlmProvider for OpenAiCompatProvider {
 
         if status == 429 {
             // Rate limit — extract Retry-After header if present
-            let retry_after = resp.headers()
+            let retry_after = resp
+                .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
             self.healthy.store(false, Ordering::Relaxed);
             warn!(provider = %self.name, retry_after = ?retry_after, "[LLM_OPENAI] Rate limited");
-            return Err(LlmError::RateLimit { retry_after_secs: retry_after });
+            return Err(LlmError::RateLimit {
+                retry_after_secs: retry_after,
+            });
         }
 
         if !resp.status().is_success() {
@@ -267,10 +279,13 @@ impl LlmProvider for OpenAiCompatProvider {
             return Err(LlmError::ApiError { status, body: msg });
         }
 
-        let resp_json: OpenAiResponse = resp.json().await
+        let resp_json: OpenAiResponse = resp
+            .json()
+            .await
             .map_err(|e| LlmError::ParseError(e.to_string()))?;
 
-        let content = resp_json.choices
+        let content = resp_json
+            .choices
             .into_iter()
             .next()
             .map(|c| c.message.content.trim().to_string())
@@ -281,7 +296,8 @@ impl LlmProvider for OpenAiCompatProvider {
         }
 
         let usage = resp_json.usage.unwrap_or_default();
-        let cached = usage.prompt_tokens_details
+        let cached = usage
+            .prompt_tokens_details
             .map(|d| d.cached_tokens)
             .unwrap_or(0);
 

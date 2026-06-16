@@ -78,13 +78,11 @@ pub struct TraversedNode {
 ///
 /// Takes the top `max_pairs` (default 5) memory IDs and creates/updates
 /// bidirectional edges between all pairs.
-pub fn update_cooccurrence(
-    conn: &Connection,
-    memory_ids: &[[u8; 32]],
-    now: i64,
-) {
+pub fn update_cooccurrence(conn: &Connection, memory_ids: &[[u8; 32]], now: i64) {
     let ids: Vec<&[u8; 32]> = memory_ids.iter().take(5).collect();
-    if ids.len() < 2 { return; }
+    if ids.len() < 2 {
+        return;
+    }
 
     for i in 0..ids.len() {
         for j in (i + 1)..ids.len() {
@@ -106,33 +104,49 @@ pub fn update_cooccurrence(
             );
         }
     }
-    debug!(pairs = ids.len() * (ids.len() - 1) / 2, "[GRAPH] Co-occurrence edges updated");
+    debug!(
+        pairs = ids.len() * (ids.len() - 1) / 2,
+        "[GRAPH] Co-occurrence edges updated"
+    );
 }
 
 /// Get neighbors of a memory node, sorted by edge weight descending.
-pub fn get_neighbors(conn: &Connection, memory_id: &[u8; 32], limit: usize) -> Vec<([u8; 32], f32)> {
+pub fn get_neighbors(
+    conn: &Connection,
+    memory_id: &[u8; 32],
+    limit: usize,
+) -> Vec<([u8; 32], f32)> {
     let mut stmt = match conn.prepare(
         "SELECT target_id, weight FROM memory_edges
-         WHERE source_id = ?1 ORDER BY weight DESC LIMIT ?2"
+         WHERE source_id = ?1 ORDER BY weight DESC LIMIT ?2",
     ) {
         Ok(s) => s,
-        Err(e) => { error!(error = %e, "[GRAPH] get_neighbors prepare failed"); return Vec::new(); }
+        Err(e) => {
+            error!(error = %e, "[GRAPH] get_neighbors prepare failed");
+            return Vec::new();
+        }
     };
     stmt.query_map(params![memory_id.as_slice(), limit as i64], |row| {
         let blob: Vec<u8> = row.get(0)?;
         let weight: f32 = row.get(1)?;
         let mut id = [0u8; 32];
-        if blob.len() == 32 { id.copy_from_slice(&blob); }
+        if blob.len() == 32 {
+            id.copy_from_slice(&blob);
+        }
         Ok((id, weight))
-    }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
 }
 
 /// Get the degree (number of edges) for a memory node.
 pub fn get_degree(conn: &Connection, memory_id: &[u8; 32]) -> u32 {
     conn.query_row(
         "SELECT COUNT(*) FROM memory_edges WHERE source_id = ?1",
-        params![memory_id.as_slice()], |row| row.get::<_, i64>(0),
-    ).unwrap_or(0) as u32
+        params![memory_id.as_slice()],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0) as u32
 }
 
 /// Get the maximum degree among all memories for a given owner.
@@ -143,8 +157,10 @@ pub fn get_max_degree(conn: &Connection, owner: &[u8; 32]) -> u32 {
             JOIN records r ON e.source_id = r.record_id
             WHERE r.owner = ?1 GROUP BY e.source_id
         )",
-        params![owner.as_slice()], |row| row.get::<_, i64>(0),
-    ).unwrap_or(0) as u32
+        params![owner.as_slice()],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0) as u32
 }
 
 // ============================================
@@ -180,7 +196,9 @@ pub fn bfs_traverse(
     max_nodes_per_hop: usize,
     min_edge_weight: f64,
 ) -> Vec<TraversedNode> {
-    if seed_entity_ids.is_empty() { return Vec::new(); }
+    if seed_entity_ids.is_empty() {
+        return Vec::new();
+    }
 
     let mut visited: HashSet<String> = HashSet::new();
     let mut result: Vec<TraversedNode> = Vec::new();
@@ -201,19 +219,24 @@ pub fn bfs_traverse(
 
     // BFS loop
     while let Some((current_id, current_depth)) = frontier.pop_front() {
-        if current_depth >= max_depth { continue; }
-        if result.len() >= BFS_MAX_TOTAL_NODES { break; }
+        if current_depth >= max_depth {
+            continue;
+        }
+        if result.len() >= BFS_MAX_TOTAL_NODES {
+            break;
+        }
 
         // Get adjacent entities via currently valid knowledge edges
-        let neighbors = get_knowledge_neighbors(
-            conn, owner, &current_id, min_edge_weight, max_nodes_per_hop,
-        );
+        let neighbors =
+            get_knowledge_neighbors(conn, owner, &current_id, min_edge_weight, max_nodes_per_hop);
 
         let next_depth = current_depth + 1;
         let next_weight = HOP_DECAY_FACTOR.powi(next_depth as i32);
 
         for (neighbor_id, relation_type, _edge_weight) in neighbors {
-            if result.len() >= BFS_MAX_TOTAL_NODES { break; }
+            if result.len() >= BFS_MAX_TOTAL_NODES {
+                break;
+            }
 
             if visited.insert(neighbor_id.clone()) {
                 result.push(TraversedNode {
@@ -257,20 +280,27 @@ fn get_knowledge_neighbors(
            AND valid_until IS NULL
            AND weight >= ?3
          ORDER BY score DESC
-         LIMIT ?4"
+         LIMIT ?4",
     ) {
         Ok(s) => s,
-        Err(e) => { error!(error = %e, "[GRAPH_BFS] Neighbor query failed"); return Vec::new(); }
+        Err(e) => {
+            error!(error = %e, "[GRAPH_BFS] Neighbor query failed");
+            return Vec::new();
+        }
     };
 
     stmt.query_map(
         params![owner.as_slice(), entity_id, min_weight, limit as i64],
-        |row| Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, f64>(2)?,
-        ))
-    ).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        },
+    )
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
 }
 
 // ============================================
@@ -306,14 +336,21 @@ pub fn label_propagation(
     max_iterations: Option<usize>,
     incremental: bool,
 ) -> HashMap<String, String> {
-    let max_iter = if incremental { 1 } else { max_iterations.unwrap_or(LP_MAX_ITERATIONS) };
+    let max_iter = if incremental {
+        1
+    } else {
+        max_iterations.unwrap_or(LP_MAX_ITERATIONS)
+    };
 
     // Step 1: Load all entities
     let entities = load_entity_ids(conn, owner);
-    if entities.is_empty() { return HashMap::new(); }
+    if entities.is_empty() {
+        return HashMap::new();
+    }
 
     // Initialize: each entity is its own community
-    let mut labels: HashMap<String, String> = entities.iter()
+    let mut labels: HashMap<String, String> = entities
+        .iter()
         .map(|eid| {
             // Use existing community_id if available, otherwise self
             let existing = get_entity_community(conn, eid);
@@ -342,13 +379,15 @@ pub fn label_propagation(
                 }
             }
 
-            if label_counts.is_empty() { continue; }
+            if label_counts.is_empty() {
+                continue;
+            }
 
             // Find most frequent label (ties → lexicographic smallest)
-            let (best_label, _) = label_counts.iter()
+            let (best_label, _) = label_counts
+                .iter()
                 .max_by(|(a_label, a_count), (b_label, b_count)| {
-                    a_count.cmp(b_count)
-                        .then_with(|| b_label.cmp(a_label)) // lexicographic smallest on tie
+                    a_count.cmp(b_count).then_with(|| b_label.cmp(a_label)) // lexicographic smallest on tie
                 })
                 .unwrap(); // safe: label_counts is non-empty
 
@@ -380,9 +419,10 @@ pub fn label_propagation(
 
 /// Load all entity IDs for an owner.
 fn load_entity_ids(conn: &Connection, owner: &[u8; 32]) -> Vec<String> {
-    let mut stmt = match conn.prepare(
-        "SELECT entity_id FROM entities WHERE owner = ?1"
-    ) { Ok(s) => s, Err(_) => return Vec::new() };
+    let mut stmt = match conn.prepare("SELECT entity_id FROM entities WHERE owner = ?1") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
 
     stmt.query_map(params![owner.as_slice()], |row| row.get::<_, String>(0))
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -395,7 +435,9 @@ fn get_entity_community(conn: &Connection, entity_id: &str) -> Option<String> {
         "SELECT community_id FROM entities WHERE entity_id = ?1",
         params![entity_id],
         |row| row.get::<_, Option<String>>(0),
-    ).ok().flatten()
+    )
+    .ok()
+    .flatten()
 }
 
 /// Load adjacency list from currently valid knowledge_edges.
@@ -405,13 +447,18 @@ fn load_adjacency(conn: &Connection, owner: &[u8; 32]) -> HashMap<String, Vec<St
 
     let mut stmt = match conn.prepare(
         "SELECT source_id, target_id FROM knowledge_edges
-         WHERE owner = ?1 AND valid_until IS NULL"
-    ) { Ok(s) => s, Err(_) => return adj };
+         WHERE owner = ?1 AND valid_until IS NULL",
+    ) {
+        Ok(s) => s,
+        Err(_) => return adj,
+    };
 
-    let edges: Vec<(String, String)> = stmt.query_map(
-        params![owner.as_slice()],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    ).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default();
+    let edges: Vec<(String, String)> = stmt
+        .query_map(params![owner.as_slice()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
 
     for (src, tgt) in edges {
         adj.entry(src.clone()).or_default().push(tgt.clone());
@@ -451,20 +498,27 @@ pub fn find_conflicting_edges(
     let mut stmt = match conn.prepare(
         "SELECT edge_id, relation_type, fact_text FROM knowledge_edges
          WHERE owner = ?1 AND source_id = ?2 AND target_id = ?3
-           AND relation_type = ?4 AND valid_until IS NULL"
+           AND relation_type = ?4 AND valid_until IS NULL",
     ) {
         Ok(s) => s,
-        Err(e) => { error!(error = %e, "[GRAPH] Conflict query failed"); return Vec::new(); }
+        Err(e) => {
+            error!(error = %e, "[GRAPH] Conflict query failed");
+            return Vec::new();
+        }
     };
 
     stmt.query_map(
         params![owner.as_slice(), source_id, target_id, relation_type],
-        |row| Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-        ))
-    ).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
 }
 
 /// Find edges where the same source uses a contradictory relation.
@@ -485,21 +539,28 @@ pub fn find_superseded_edges(
     let mut stmt = match conn.prepare(
         "SELECT edge_id, target_id, relation_type, fact_text FROM knowledge_edges
          WHERE owner = ?1 AND source_id = ?2 AND relation_type = ?3
-           AND target_id != ?4 AND valid_until IS NULL"
+           AND target_id != ?4 AND valid_until IS NULL",
     ) {
         Ok(s) => s,
-        Err(e) => { error!(error = %e, "[GRAPH] Superseded query failed"); return Vec::new(); }
+        Err(e) => {
+            error!(error = %e, "[GRAPH] Superseded query failed");
+            return Vec::new();
+        }
     };
 
     stmt.query_map(
         params![owner.as_slice(), source_id, relation_type, exclude_target],
-        |row| Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Option<String>>(3)?,
-        ))
-    ).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        },
+    )
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
 }
 
 // ============================================
@@ -542,12 +603,15 @@ mod tests {
                  valid_from INTEGER NOT NULL, valid_until INTEGER,
                  episode_id TEXT,
                  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-             );"
-        ).unwrap();
+             );",
+        )
+        .unwrap();
         conn
     }
 
-    fn owner() -> [u8; 32] { [0xAAu8; 32] }
+    fn owner() -> [u8; 32] {
+        [0xAAu8; 32]
+    }
 
     fn insert_entity(conn: &Connection, id: &str, etype: &str) {
         conn.execute(
@@ -570,29 +634,39 @@ mod tests {
     #[test]
     fn test_cooccurrence_basic() {
         let conn = setup_db();
-        let a = [1u8; 32]; let b = [2u8; 32]; let c = [3u8; 32];
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
         update_cooccurrence(&conn, &[a, b, c], 1000);
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM memory_edges", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_edges", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 6);
     }
 
     #[test]
     fn test_weight_accumulation() {
         let conn = setup_db();
-        let a = [1u8; 32]; let b = [2u8; 32];
+        let a = [1u8; 32];
+        let b = [2u8; 32];
         update_cooccurrence(&conn, &[a, b], 1000);
         update_cooccurrence(&conn, &[a, b], 2000);
-        let w: f32 = conn.query_row(
-            "SELECT weight FROM memory_edges WHERE source_id = ?1 AND target_id = ?2",
-            params![a.as_slice(), b.as_slice()], |r| r.get(0),
-        ).unwrap();
+        let w: f32 = conn
+            .query_row(
+                "SELECT weight FROM memory_edges WHERE source_id = ?1 AND target_id = ?2",
+                params![a.as_slice(), b.as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert!((w - 2.0).abs() < 0.01);
     }
 
     #[test]
     fn test_degree() {
         let conn = setup_db();
-        let a = [1u8; 32]; let b = [2u8; 32]; let c = [3u8; 32];
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
         update_cooccurrence(&conn, &[a, b, c], 1000);
         assert_eq!(get_degree(&conn, &a), 2);
     }
@@ -600,7 +674,9 @@ mod tests {
     #[test]
     fn test_neighbors() {
         let conn = setup_db();
-        let a = [1u8; 32]; let b = [2u8; 32]; let c = [3u8; 32];
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
         update_cooccurrence(&conn, &[a, b, c], 1000);
         update_cooccurrence(&conn, &[a, b], 2000);
         let neighbors = get_neighbors(&conn, &a, 5);
@@ -614,7 +690,9 @@ mod tests {
         let conn = setup_db();
         let ids: Vec<[u8; 32]> = (0..10u8).map(|i| [i; 32]).collect();
         update_cooccurrence(&conn, &ids, 1000);
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM memory_edges", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_edges", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 20); // C(5,2) × 2
     }
 
@@ -790,9 +868,7 @@ mod tests {
         let conn = setup_db();
         insert_kedge(&conn, "ent_auth", "ent_jwt", "USES", 1.0);
 
-        let conflicts = find_conflicting_edges(
-            &conn, &owner(), "ent_auth", "ent_jwt", "USES"
-        );
+        let conflicts = find_conflicting_edges(&conn, &owner(), "ent_auth", "ent_jwt", "USES");
         assert_eq!(conflicts.len(), 1);
     }
 
@@ -802,7 +878,11 @@ mod tests {
         insert_kedge(&conn, "ent_auth", "ent_jwt", "USES", 1.0);
 
         let conflicts = find_conflicting_edges(
-            &conn, &owner(), "ent_auth", "ent_jwt", "DEPENDS_ON" // different relation
+            &conn,
+            &owner(),
+            "ent_auth",
+            "ent_jwt",
+            "DEPENDS_ON", // different relation
         );
         assert!(conflicts.is_empty());
     }
@@ -814,9 +894,7 @@ mod tests {
         insert_kedge(&conn, "ent_auth", "ent_basic", "USES", 0.8);
 
         // New edge: auth USES oauth → should find jwt and basic as superseded
-        let superseded = find_superseded_edges(
-            &conn, &owner(), "ent_auth", "USES", "ent_oauth"
-        );
+        let superseded = find_superseded_edges(&conn, &owner(), "ent_auth", "USES", "ent_oauth");
         assert_eq!(superseded.len(), 2);
     }
 }

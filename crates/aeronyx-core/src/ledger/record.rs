@@ -54,9 +54,9 @@ mod serde_bytes_64 {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
         let slice: Vec<u8> = serde_bytes::deserialize(d)?;
-        slice.try_into().map_err(|v: Vec<u8>| {
-            serde::de::Error::invalid_length(v.len(), &"64 bytes")
-        })
+        slice
+            .try_into()
+            .map_err(|v: Vec<u8>| serde::de::Error::invalid_length(v.len(), &"64 bytes"))
     }
 }
 
@@ -91,10 +91,10 @@ impl MemoryLayer {
     #[must_use]
     pub fn recall_weight(self) -> f64 {
         match self {
-            Self::Identity  => 0.30,
+            Self::Identity => 0.30,
             Self::Knowledge => 0.20,
-            Self::Episode   => 0.10,
-            Self::Archive   => 0.05,
+            Self::Episode => 0.10,
+            Self::Archive => 0.05,
         }
     }
 
@@ -103,10 +103,10 @@ impl MemoryLayer {
     #[must_use]
     pub fn stability_hours(self) -> f64 {
         match self {
-            Self::Identity  => 8760.0,
+            Self::Identity => 8760.0,
             Self::Knowledge => 2160.0,
-            Self::Episode   => 168.0,
-            Self::Archive   => 720.0,
+            Self::Episode => 168.0,
+            Self::Archive => 720.0,
         }
     }
 
@@ -126,10 +126,10 @@ impl MemoryLayer {
 impl std::fmt::Display for MemoryLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Identity  => write!(f, "identity"),
+            Self::Identity => write!(f, "identity"),
             Self::Knowledge => write!(f, "knowledge"),
-            Self::Episode   => write!(f, "episode"),
-            Self::Archive   => write!(f, "archive"),
+            Self::Episode => write!(f, "episode"),
+            Self::Archive => write!(f, "archive"),
         }
     }
 }
@@ -153,7 +153,9 @@ pub enum RecordStatus {
 
 impl RecordStatus {
     #[must_use]
-    pub fn is_active(self) -> bool { self == Self::Active }
+    pub fn is_active(self) -> bool {
+        self == Self::Active
+    }
 
     #[must_use]
     pub fn from_u8(value: u8) -> Option<Self> {
@@ -169,9 +171,9 @@ impl RecordStatus {
 impl std::fmt::Display for RecordStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Active     => write!(f, "active"),
+            Self::Active => write!(f, "active"),
             Self::Superseded => write!(f, "superseded"),
-            Self::Revoked    => write!(f, "revoked"),
+            Self::Revoked => write!(f, "revoked"),
         }
     }
 }
@@ -233,7 +235,6 @@ pub struct MemoryRecord {
     // ========================================
     // v2.1.0+MVF (Schema v4) — Feedback & Conflict Fields
     // ========================================
-
     /// Positive feedback count from users (MVF φ₄ numerator component).
     ///
     /// Incremented by Miner Step 0 when detecting positive signals
@@ -311,8 +312,12 @@ impl MemoryRecord {
     #[must_use]
     pub fn verify_id(&self) -> bool {
         let expected = Self::compute_record_id(
-            &self.owner, self.timestamp, self.layer,
-            &self.topic_tags, &self.source_ai, &self.encrypted_content,
+            &self.owner,
+            self.timestamp,
+            self.layer,
+            &self.topic_tags,
+            &self.source_ai,
+            &self.encrypted_content,
         );
         self.record_id == expected
     }
@@ -332,11 +337,22 @@ impl MemoryRecord {
         embedding: Vec<f32>,
     ) -> Self {
         let record_id = Self::compute_record_id(
-            &owner, timestamp, layer, &topic_tags, &source_ai, &encrypted_content,
+            &owner,
+            timestamp,
+            layer,
+            &topic_tags,
+            &source_ai,
+            &encrypted_content,
         );
         Self {
-            record_id, owner, timestamp, layer, topic_tags, source_ai,
-            encrypted_content, embedding,
+            record_id,
+            owner,
+            timestamp,
+            layer,
+            topic_tags,
+            source_ai,
+            encrypted_content,
+            embedding,
             status: RecordStatus::Active,
             supersedes: None,
             signature: [0u8; 64],
@@ -351,16 +367,36 @@ impl MemoryRecord {
     // Convenience accessors
     // ========================================
 
-    #[must_use] pub fn id_hex(&self) -> String { hex::encode(self.record_id) }
-    #[must_use] pub fn owner_hex(&self) -> String { hex::encode(self.owner) }
-    #[must_use] pub fn is_active(&self) -> bool { self.status.is_active() }
-    #[must_use] pub fn content_size(&self) -> usize { self.encrypted_content.len() }
-    #[must_use] pub fn embedding_dim(&self) -> usize { self.embedding.len() }
-    #[must_use] pub fn has_embedding(&self) -> bool { !self.embedding.is_empty() }
+    #[must_use]
+    pub fn id_hex(&self) -> String {
+        hex::encode(self.record_id)
+    }
+    #[must_use]
+    pub fn owner_hex(&self) -> String {
+        hex::encode(self.owner)
+    }
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.status.is_active()
+    }
+    #[must_use]
+    pub fn content_size(&self) -> usize {
+        self.encrypted_content.len()
+    }
+    #[must_use]
+    pub fn embedding_dim(&self) -> usize {
+        self.embedding.len()
+    }
+    #[must_use]
+    pub fn has_embedding(&self) -> bool {
+        !self.embedding.is_empty()
+    }
 
     /// Whether this memory has a conflict marker (for MVF φ₈ feature).
     #[must_use]
-    pub fn has_conflict(&self) -> bool { self.conflict_with.is_some() }
+    pub fn has_conflict(&self) -> bool {
+        self.conflict_with.is_some()
+    }
 
     /// Compute MVF φ₄ feedback score: (pos - neg) / (pos + neg + 1).
     /// Range: (-1.0, 1.0). Neutral (no feedback) = 0.0.
@@ -373,19 +409,30 @@ impl MemoryRecord {
 }
 
 impl PartialEq for MemoryRecord {
-    fn eq(&self, other: &Self) -> bool { self.record_id == other.record_id }
+    fn eq(&self, other: &Self) -> bool {
+        self.record_id == other.record_id
+    }
 }
 impl Eq for MemoryRecord {}
 
 impl std::hash::Hash for MemoryRecord {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) { self.record_id.hash(state); }
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.record_id.hash(state);
+    }
 }
 
 impl std::fmt::Display for MemoryRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MemoryRecord({}: layer={}, status={}, emb={}, fb={}/{})",
-            &self.id_hex()[..8], self.layer, self.status,
-            self.embedding_dim(), self.positive_feedback, self.negative_feedback)
+        write!(
+            f,
+            "MemoryRecord({}: layer={}, status={}, emb={}, fb={}/{})",
+            &self.id_hex()[..8],
+            self.layer,
+            self.status,
+            self.embedding_dim(),
+            self.positive_feedback,
+            self.negative_feedback
+        )
     }
 }
 
@@ -398,18 +445,31 @@ mod tests {
     use super::*;
 
     fn make(ts: u64, layer: MemoryLayer) -> MemoryRecord {
-        MemoryRecord::new([0xAA; 32], ts, layer, vec!["t".into()], "ai".into(),
-            b"content".to_vec(), vec![0.1, 0.2, 0.3])
+        MemoryRecord::new(
+            [0xAA; 32],
+            ts,
+            layer,
+            vec!["t".into()],
+            "ai".into(),
+            b"content".to_vec(),
+            vec![0.1, 0.2, 0.3],
+        )
     }
 
     #[test]
     fn test_hash_deterministic() {
-        assert_eq!(make(100, MemoryLayer::Episode).record_id, make(100, MemoryLayer::Episode).record_id);
+        assert_eq!(
+            make(100, MemoryLayer::Episode).record_id,
+            make(100, MemoryLayer::Episode).record_id
+        );
     }
 
     #[test]
     fn test_hash_differs_layer() {
-        assert_ne!(make(100, MemoryLayer::Episode).record_id, make(100, MemoryLayer::Archive).record_id);
+        assert_ne!(
+            make(100, MemoryLayer::Episode).record_id,
+            make(100, MemoryLayer::Archive).record_id
+        );
     }
 
     #[test]
@@ -477,7 +537,15 @@ mod tests {
     #[test]
     fn test_has_embedding() {
         assert!(make(0, MemoryLayer::Episode).has_embedding());
-        let r = MemoryRecord::new([0;32],0,MemoryLayer::Episode,vec![],"".into(),vec![],vec![]);
+        let r = MemoryRecord::new(
+            [0; 32],
+            0,
+            MemoryLayer::Episode,
+            vec![],
+            "".into(),
+            vec![],
+            vec![],
+        );
         assert!(!r.has_embedding());
     }
 

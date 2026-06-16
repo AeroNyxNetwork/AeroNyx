@@ -195,15 +195,33 @@ pub struct ChatRelayConfig {
 
 // ── Default functions ──
 
-fn default_chat_ttl() -> u64 { 259_200 }                // 72 hours
-fn default_max_pending_per_wallet() -> usize { 500 }
-fn default_chat_db_path() -> String { "data/chat_pending.db".into() }
-fn default_max_message_size() -> usize { 65_536 }        // 64 KB
-fn default_max_blob_size() -> usize { 10_485_760 }       // 10 MB
-fn default_max_blobs_per_receiver() -> usize { 50 }
-fn default_cleanup_interval() -> u64 { 60 }
-fn default_dedup_lru_capacity() -> usize { 10_000 }
-fn default_expired_notification_ttl() -> u64 { 604_800 } // 7 days
+fn default_chat_ttl() -> u64 {
+    259_200
+} // 72 hours
+fn default_max_pending_per_wallet() -> usize {
+    500
+}
+fn default_chat_db_path() -> String {
+    "data/chat_pending.db".into()
+}
+fn default_max_message_size() -> usize {
+    65_536
+} // 64 KB
+fn default_max_blob_size() -> usize {
+    10_485_760
+} // 10 MB
+fn default_max_blobs_per_receiver() -> usize {
+    50
+}
+fn default_cleanup_interval() -> u64 {
+    60
+}
+fn default_dedup_lru_capacity() -> usize {
+    10_000
+}
+fn default_expired_notification_ttl() -> u64 {
+    604_800
+} // 7 days
 
 impl Default for ChatRelayConfig {
     fn default() -> Self {
@@ -370,25 +388,40 @@ mod tests {
 
     #[test]
     fn test_chat_relay_enabled_default_valid() {
-        let cr = ChatRelayConfig { enabled: true, ..Default::default() };
+        let cr = ChatRelayConfig {
+            enabled: true,
+            ..Default::default()
+        };
         assert!(cr.validate().is_ok());
     }
 
     #[test]
     fn test_chat_relay_ttl_zero_rejected() {
-        let cr = ChatRelayConfig { enabled: true, offline_ttl_secs: 0, ..Default::default() };
+        let cr = ChatRelayConfig {
+            enabled: true,
+            offline_ttl_secs: 0,
+            ..Default::default()
+        };
         assert!(cr.validate().is_err());
     }
 
     #[test]
     fn test_chat_relay_empty_db_path_rejected() {
-        let cr = ChatRelayConfig { enabled: true, db_path: String::new(), ..Default::default() };
+        let cr = ChatRelayConfig {
+            enabled: true,
+            db_path: String::new(),
+            ..Default::default()
+        };
         assert!(cr.validate().is_err());
     }
 
     #[test]
     fn test_chat_relay_zero_message_size_rejected() {
-        let cr = ChatRelayConfig { enabled: true, max_message_size: 0, ..Default::default() };
+        let cr = ChatRelayConfig {
+            enabled: true,
+            max_message_size: 0,
+            ..Default::default()
+        };
         assert!(cr.validate().is_err());
     }
 
@@ -414,25 +447,41 @@ mod tests {
 
     #[test]
     fn test_chat_relay_zero_blob_size_rejected() {
-        let cr = ChatRelayConfig { enabled: true, max_blob_size: 0, ..Default::default() };
+        let cr = ChatRelayConfig {
+            enabled: true,
+            max_blob_size: 0,
+            ..Default::default()
+        };
         assert!(cr.validate().is_err());
     }
 
     #[test]
     fn test_chat_relay_zero_blobs_per_receiver_rejected() {
-        let cr = ChatRelayConfig { enabled: true, max_blobs_per_receiver: 0, ..Default::default() };
+        let cr = ChatRelayConfig {
+            enabled: true,
+            max_blobs_per_receiver: 0,
+            ..Default::default()
+        };
         assert!(cr.validate().is_err());
     }
 
     #[test]
     fn test_chat_relay_zero_cleanup_interval_rejected() {
-        let cr = ChatRelayConfig { enabled: true, cleanup_interval_secs: 0, ..Default::default() };
+        let cr = ChatRelayConfig {
+            enabled: true,
+            cleanup_interval_secs: 0,
+            ..Default::default()
+        };
         assert!(cr.validate().is_err());
     }
 
     #[test]
     fn test_chat_relay_zero_lru_capacity_rejected() {
-        let cr = ChatRelayConfig { enabled: true, dedup_lru_capacity: 0, ..Default::default() };
+        let cr = ChatRelayConfig {
+            enabled: true,
+            dedup_lru_capacity: 0,
+            ..Default::default()
+        };
         assert!(cr.validate().is_err());
     }
 

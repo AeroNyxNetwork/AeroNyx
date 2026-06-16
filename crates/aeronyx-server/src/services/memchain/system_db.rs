@@ -158,13 +158,14 @@ impl SystemDb {
                 "PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = NORMAL;
                  PRAGMA busy_timeout = 5000;
-                 PRAGMA foreign_keys = ON;"
+                 PRAGMA foreign_keys = ON;",
             )?;
 
             Self::create_schema_sync(&conn)?;
 
             Ok(conn)
-        }).await??;
+        })
+        .await??;
 
         info!(
             path = %path.display(),
@@ -236,10 +237,7 @@ impl SystemDb {
     /// Look up which volume a given owner has been assigned to.
     ///
     /// Returns `None` for new users who have not been assigned yet.
-    pub async fn get_assignment(
-        &self,
-        owner: &[u8; 32],
-    ) -> Result<Option<String>, SystemDbError> {
+    pub async fn get_assignment(&self, owner: &[u8; 32]) -> Result<Option<String>, SystemDbError> {
         let owner = *owner;
         let conn = Arc::clone(&self.conn);
 
@@ -249,8 +247,10 @@ impl SystemDb {
                 "SELECT volume_id FROM volume_assignments WHERE owner_pubkey = ?1",
                 params![owner.as_slice()],
                 |row| row.get::<_, String>(0),
-            ).optional()
-        }).await?
+            )
+            .optional()
+        })
+        .await?
         .map_err(SystemDbError::Db)
     }
 
@@ -296,16 +296,15 @@ impl SystemDb {
             }
 
             Ok(())
-        }).await?
+        })
+        .await?
     }
 
     /// Count how many users are assigned to each volume.
     ///
     /// Returns `Vec<(volume_id, user_count)>` sorted by volume_id.
     /// Used by VolumeRouter to select the least-loaded writable volume.
-    pub async fn count_users_per_volume(
-        &self,
-    ) -> Result<Vec<(String, usize)>, SystemDbError> {
+    pub async fn count_users_per_volume(&self) -> Result<Vec<(String, usize)>, SystemDbError> {
         let conn = Arc::clone(&self.conn);
 
         task::spawn_blocking(move || -> Result<Vec<(String, usize)>, rusqlite::Error> {
@@ -314,7 +313,7 @@ impl SystemDb {
                 "SELECT volume_id, COUNT(*) as cnt
                  FROM volume_assignments
                  GROUP BY volume_id
-                 ORDER BY volume_id"
+                 ORDER BY volume_id",
             )?;
 
             let rows = stmt.query_map([], |row| {
@@ -322,7 +321,8 @@ impl SystemDb {
             })?;
 
             rows.collect::<Result<Vec<_>, _>>()
-        }).await?
+        })
+        .await?
         .map_err(SystemDbError::Db)
     }
 
@@ -336,10 +336,7 @@ impl SystemDb {
     /// High-frequency write. Uses a direct UPDATE (not INSERT OR REPLACE)
     /// to avoid re-writing the full row on every call. WAL mode ensures
     /// this does not block concurrent readers.
-    pub async fn update_last_active(
-        &self,
-        owner: &[u8; 32],
-    ) -> Result<(), SystemDbError> {
+    pub async fn update_last_active(&self, owner: &[u8; 32]) -> Result<(), SystemDbError> {
         let owner = *owner;
         let conn = Arc::clone(&self.conn);
 
@@ -353,7 +350,8 @@ impl SystemDb {
                 params![now, owner.as_slice()],
             )?;
             Ok(())
-        }).await?
+        })
+        .await?
         .map_err(SystemDbError::Db)
     }
 
@@ -361,10 +359,7 @@ impl SystemDb {
     ///
     /// Used by MinerScheduler to select which users to process each tick.
     /// `limit` controls how many owners are returned.
-    pub async fn get_active_owners(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<ActiveOwner>, SystemDbError> {
+    pub async fn get_active_owners(&self, limit: usize) -> Result<Vec<ActiveOwner>, SystemDbError> {
         let conn = Arc::clone(&self.conn);
 
         task::spawn_blocking(move || -> Result<Vec<ActiveOwner>, rusqlite::Error> {
@@ -373,7 +368,7 @@ impl SystemDb {
                 "SELECT owner_pubkey, volume_id, last_active_at
                  FROM volume_assignments
                  ORDER BY last_active_at DESC
-                 LIMIT ?1"
+                 LIMIT ?1",
             )?;
 
             let rows = stmt.query_map(params![limit as i64], |row| {
@@ -392,7 +387,11 @@ impl SystemDb {
 
                 let mut pubkey = [0u8; 32];
                 pubkey.copy_from_slice(&blob);
-                Ok(ActiveOwner { pubkey, volume_id, last_active_at })
+                Ok(ActiveOwner {
+                    pubkey,
+                    volume_id,
+                    last_active_at,
+                })
             })?;
 
             // Filter out any rows that failed to parse (corrupt data).
@@ -407,7 +406,8 @@ impl SystemDb {
                 .collect();
 
             Ok(owners)
-        }).await?
+        })
+        .await?
         .map_err(SystemDbError::Db)
     }
 
@@ -415,43 +415,43 @@ impl SystemDb {
     ///
     /// Called once during VolumeRouter initialization to populate the
     /// in-memory DashMap cache from persistent state.
-    pub async fn load_all_assignments(
-        &self,
-    ) -> Result<Vec<([u8; 32], String)>, SystemDbError> {
+    pub async fn load_all_assignments(&self) -> Result<Vec<([u8; 32], String)>, SystemDbError> {
         let conn = Arc::clone(&self.conn);
 
-        task::spawn_blocking(move || -> Result<Vec<([u8; 32], String)>, rusqlite::Error> {
-            let conn = conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT owner_pubkey, volume_id FROM volume_assignments"
-            )?;
+        task::spawn_blocking(
+            move || -> Result<Vec<([u8; 32], String)>, rusqlite::Error> {
+                let conn = conn.lock().unwrap();
+                let mut stmt =
+                    conn.prepare("SELECT owner_pubkey, volume_id FROM volume_assignments")?;
 
-            let rows = stmt.query_map([], |row| {
-                let blob: Vec<u8> = row.get(0)?;
-                let volume_id: String = row.get(1)?;
+                let rows = stmt.query_map([], |row| {
+                    let blob: Vec<u8> = row.get(0)?;
+                    let volume_id: String = row.get(1)?;
 
-                if blob.len() != 32 {
-                    return Err(rusqlite::Error::InvalidColumnType(
-                        0,
-                        "owner_pubkey".into(),
-                        rusqlite::types::Type::Blob,
-                    ));
-                }
+                    if blob.len() != 32 {
+                        return Err(rusqlite::Error::InvalidColumnType(
+                            0,
+                            "owner_pubkey".into(),
+                            rusqlite::types::Type::Blob,
+                        ));
+                    }
 
-                let mut pubkey = [0u8; 32];
-                pubkey.copy_from_slice(&blob);
-                Ok((pubkey, volume_id))
-            })?;
+                    let mut pubkey = [0u8; 32];
+                    pubkey.copy_from_slice(&blob);
+                    Ok((pubkey, volume_id))
+                })?;
 
-            rows.filter_map(|r| match r {
-                Ok(pair) => Some(Ok(pair)),
-                Err(e) => {
-                    warn!("[SYSTEM_DB] Skipping corrupt assignment row: {}", e);
-                    None
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()
-        }).await?
+                rows.filter_map(|r| match r {
+                    Ok(pair) => Some(Ok(pair)),
+                    Err(e) => {
+                        warn!("[SYSTEM_DB] Skipping corrupt assignment row: {}", e);
+                        None
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+            },
+        )
+        .await?
         .map_err(SystemDbError::Db)
     }
 
@@ -494,7 +494,8 @@ impl SystemDb {
                 ],
             )?;
             Ok(())
-        }).await?
+        })
+        .await?
         .map_err(SystemDbError::Db)
     }
 
@@ -521,7 +522,7 @@ impl SystemDb {
                  FROM global_llm_usage
                  WHERE created_at >= ?1 AND created_at <= ?2
                  GROUP BY owner_pubkey
-                 ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC"
+                 ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC",
             )?;
 
             let rows = stmt.query_map(params![since, until], |row| {
@@ -557,7 +558,8 @@ impl SystemDb {
                 }
             })
             .collect::<Result<Vec<_>, _>>()
-        }).await?
+        })
+        .await?
         .map_err(SystemDbError::Db)
     }
 
@@ -594,15 +596,11 @@ impl SystemDb {
                 "INSERT INTO auth_events
                     (owner_pubkey, event_type, ip_address, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    owner.as_slice(),
-                    event_type,
-                    ip_address,
-                    now,
-                ],
+                params![owner.as_slice(), event_type, ip_address, now,],
             )?;
             Ok(())
-        }).await?
+        })
+        .await?
         .map_err(SystemDbError::Db)
     }
 }
@@ -651,9 +649,7 @@ mod tests {
         let tables = task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let mut stmt = conn
-                .prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
-                )
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap();
             stmt.query_map([], |row| row.get::<_, String>(0))
                 .unwrap()
@@ -788,10 +784,16 @@ mod tests {
         let now = now_unix();
 
         // owner_a: 2 calls
-        db.log_llm_usage(&owner_a, "gpt-4o", 100, 50, "session_title").await.unwrap();
-        db.log_llm_usage(&owner_a, "gpt-4o", 200, 80, "community_narrative").await.unwrap();
+        db.log_llm_usage(&owner_a, "gpt-4o", 100, 50, "session_title")
+            .await
+            .unwrap();
+        db.log_llm_usage(&owner_a, "gpt-4o", 200, 80, "community_narrative")
+            .await
+            .unwrap();
         // owner_b: 1 call
-        db.log_llm_usage(&owner_b, "claude-3", 150, 60, "session_title").await.unwrap();
+        db.log_llm_usage(&owner_b, "claude-3", 150, 60, "session_title")
+            .await
+            .unwrap();
 
         let stats = db.get_usage_stats(now - 10, now + 10).await.unwrap();
         assert_eq!(stats.len(), 2);
@@ -812,7 +814,9 @@ mod tests {
         let (_dir, db) = open_temp_db().await;
         let owner = make_owner(0xAA);
 
-        db.log_llm_usage(&owner, "gpt-4o", 100, 50, "session_title").await.unwrap();
+        db.log_llm_usage(&owner, "gpt-4o", 100, 50, "session_title")
+            .await
+            .unwrap();
 
         // Query a window far in the future.
         let future = now_unix() + 100_000;
@@ -828,7 +832,9 @@ mod tests {
         let owner = make_owner(0xAA);
 
         // Both event types with and without IP.
-        db.log_auth_event(&owner, "token_issued", Some("192.168.1.1")).await.unwrap();
+        db.log_auth_event(&owner, "token_issued", Some("192.168.1.1"))
+            .await
+            .unwrap();
         db.log_auth_event(&owner, "auth_fail", None).await.unwrap();
 
         // Verify rows were inserted.
@@ -870,7 +876,9 @@ mod tests {
         let db_path = dir.path().join("system.db");
 
         let db1 = SystemDb::open(&db_path).await.unwrap();
-        db1.assign_volume(&make_owner(0xAA), "vol-001").await.unwrap();
+        db1.assign_volume(&make_owner(0xAA), "vol-001")
+            .await
+            .unwrap();
         drop(db1);
 
         // Re-open same file — should not lose data.

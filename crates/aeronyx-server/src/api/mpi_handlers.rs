@@ -59,22 +59,20 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use axum::extract::Path;
 use axum::http::Request;
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 
-use crate::services::memchain::{MemoryStorage, VectorIndex};
 use crate::services::memchain::LlmRouter;
+use crate::services::memchain::{MemoryStorage, VectorIndex};
 
 use super::mpi::{
-    MpiState, AuthenticatedOwner, Mode,
-    extract_owner, parse_layer, now_secs,
-    default_layer, default_source, default_model, default_top_k,
-    default_token_budget, default_include_graph,
+    default_include_graph, default_layer, default_model, default_source, default_token_budget,
+    default_top_k, extract_owner, now_secs, parse_layer, AuthenticatedOwner, Mode, MpiState,
 };
 
 /// Max identity/allergy records kept in the hot cache per owner (fix #11).
@@ -115,30 +113,54 @@ pub async fn mpi_remember(
     let owner_hex = auth.owner_hex();
 
     // SaaS fix: extract storage and vector_index from Extensions.
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
-    let vi = req.extensions().get::<Arc<VectorIndex>>()
-        .expect("[BUG] VectorIndex extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
+    let vi = req
+        .extensions()
+        .get::<Arc<VectorIndex>>()
+        .expect("[BUG] VectorIndex extension not set")
+        .clone();
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"failed to read body"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"failed to read body"})),
+            )
+                .into_response()
+        }
     };
     let rb: RememberRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("invalid JSON: {}", e)}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid JSON: {}", e)})),
+            )
+                .into_response()
+        }
     };
 
     if rb.content.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"content empty"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"content empty"})),
+        )
+            .into_response();
     }
     let layer = match parse_layer(&rb.layer) {
         Some(l) => l,
-        None => return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"invalid layer"}))).into_response(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"invalid layer"})),
+            )
+                .into_response()
+        }
     };
 
     let ts = now_secs();
@@ -147,32 +169,54 @@ pub async fn mpi_remember(
         let dedup = vi.check_duplicate(&rb.embedding, &owner, &rb.embedding_model, layer, ts);
         if dedup.is_duplicate {
             let dup_hex = hex::encode(dedup.existing_id.unwrap_or([0; 32]));
-            return (StatusCode::OK, Json(serde_json::json!(RememberResponse {
-                record_id: dup_hex.clone(), status: "duplicate".into(),
-                duplicate_of: Some(dup_hex),
-            }))).into_response();
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!(RememberResponse {
+                    record_id: dup_hex.clone(),
+                    status: "duplicate".into(),
+                    duplicate_of: Some(dup_hex),
+                })),
+            )
+                .into_response();
         }
     }
 
     let encrypted_content = rb.content.as_bytes().to_vec();
     let mut record = MemoryRecord::new(
-        owner, ts, layer, rb.topic_tags.clone(), rb.source_ai.clone(),
-        encrypted_content, rb.embedding.clone(),
+        owner,
+        ts,
+        layer,
+        rb.topic_tags.clone(),
+        rb.source_ai.clone(),
+        encrypted_content,
+        rb.embedding.clone(),
     );
     record.signature = state.identity.sign(&record.record_id);
     let rid_hex = record.id_hex();
 
     if !storage.insert(&record, &rb.embedding_model).await {
-        return (StatusCode::CONFLICT,
-            Json(serde_json::json!({"error":"exists","record_id":rid_hex}))).into_response();
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"exists","record_id":rid_hex})),
+        )
+            .into_response();
     }
 
     if !rb.embedding.is_empty() {
-        vi.upsert(record.record_id, rb.embedding, layer, ts, &owner, &rb.embedding_model);
+        vi.upsert(
+            record.record_id,
+            rb.embedding,
+            layer,
+            ts,
+            &owner,
+            &rb.embedding_model,
+        );
     }
 
     let tags_str = serde_json::to_string(&rb.topic_tags).unwrap_or_default();
-    storage.fts_index_record(&record.record_id, &owner, &rb.content, &tags_str).await;
+    storage
+        .fts_index_record(&record.record_id, &owner, &rb.content, &tags_str)
+        .await;
 
     // Fix #11: cap identity cache size per owner.
     if layer == MemoryLayer::Identity {
@@ -185,9 +229,15 @@ pub async fn mpi_remember(
     }
 
     info!(id = %rid_hex, layer = %layer, owner = %&owner_hex[..8], "[MPI_REMEMBER] Stored");
-    (StatusCode::CREATED, Json(serde_json::json!(RememberResponse {
-        record_id: rid_hex, status: "created".into(), duplicate_of: None,
-    }))).into_response()
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!(RememberResponse {
+            record_id: rid_hex,
+            status: "created".into(),
+            duplicate_of: None,
+        })),
+    )
+        .into_response()
 }
 
 // ============================================
@@ -224,13 +274,21 @@ pub struct RecallRequest {
     pub context: Option<String>,
 }
 
-pub(crate) fn default_recall_mode() -> String { "full".into() }
+pub(crate) fn default_recall_mode() -> String {
+    "full".into()
+}
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct TimeHint { pub start: i64, pub end: i64 }
+pub struct TimeHint {
+    pub start: i64,
+    pub end: i64,
+}
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct TimeRangeParam { pub start: i64, pub end: i64 }
+pub struct TimeRangeParam {
+    pub start: i64,
+    pub end: i64,
+}
 
 #[derive(Debug, Serialize)]
 pub struct RecalledMemory {
@@ -260,10 +318,15 @@ pub struct RecallResponse {
 // ============================================
 
 #[derive(Debug, Deserialize)]
-pub struct ForgetRequest { pub record_id: String }
+pub struct ForgetRequest {
+    pub record_id: String,
+}
 
 #[derive(Debug, Serialize)]
-pub struct ForgetResponse { pub status: String, pub record_id: String }
+pub struct ForgetResponse {
+    pub status: String,
+    pub record_id: String,
+}
 
 pub async fn mpi_forget(
     State(state): State<Arc<MpiState>>,
@@ -273,44 +336,82 @@ pub async fn mpi_forget(
     let owner = auth.owner_bytes();
 
     // SaaS fix: extract storage and vi from Extensions.
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
-    let vi = req.extensions().get::<Arc<VectorIndex>>()
-        .expect("[BUG] VectorIndex extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
+    let vi = req
+        .extensions()
+        .get::<Arc<VectorIndex>>()
+        .expect("[BUG] VectorIndex extension not set")
+        .clone();
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"failed to read body"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"failed to read body"})),
+            )
+                .into_response()
+        }
     };
     let rb: ForgetRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("invalid JSON: {}", e)}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid JSON: {}", e)})),
+            )
+                .into_response()
+        }
     };
 
     let rid = match hex::decode(&rb.record_id) {
-        Ok(b) if b.len() == 32 => { let mut a = [0u8;32]; a.copy_from_slice(&b); a }
-        _ => return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"bad record_id"}))).into_response(),
+        Ok(b) if b.len() == 32 => {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&b);
+            a
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"bad record_id"})),
+            )
+                .into_response()
+        }
     };
 
     // Fix #4: check ownership before revoke to avoid TOCTOU.
     if let Some(record) = storage.get(&rid).await {
         if record.owner != owner {
-            return (StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error":"access denied"}))).into_response();
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error":"access denied"})),
+            )
+                .into_response();
         }
     } else {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!(ForgetResponse {
-            status:"not_found".into(), record_id: rb.record_id
-        }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ForgetResponse {
+                status: "not_found".into(),
+                record_id: rb.record_id
+            })),
+        )
+            .into_response();
     }
 
     if !storage.revoke(&rid).await {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!(ForgetResponse {
-            status:"not_found".into(), record_id: rb.record_id
-        }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!(ForgetResponse {
+                status: "not_found".into(),
+                record_id: rb.record_id
+            })),
+        )
+            .into_response();
     }
 
     vi.remove(&rid);
@@ -319,12 +420,19 @@ pub async fn mpi_forget(
     {
         let oh = auth.owner_hex();
         let mut c = state.identity_cache.write();
-        if let Some(e) = c.get_mut(&oh) { e.retain(|r| r.record_id != rid); }
+        if let Some(e) = c.get_mut(&oh) {
+            e.retain(|r| r.record_id != rid);
+        }
     }
 
-    (StatusCode::OK, Json(serde_json::json!(ForgetResponse {
-        status:"revoked".into(), record_id: rb.record_id
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(ForgetResponse {
+            status: "revoked".into(),
+            record_id: rb.record_id
+        })),
+    )
+        .into_response()
 }
 
 // ============================================
@@ -376,11 +484,16 @@ pub struct MpiStatusResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MvfMetrics {
-    pub enabled: bool, pub alpha: f32,
-    pub total_positive_feedback: u64, pub total_negative_feedback: u64,
-    pub baseline_positive_rate: Option<f32>, pub baseline_sample_size: Option<usize>,
-    pub mvf_positive_rate: Option<f32>, pub mvf_sample_size: Option<usize>,
-    pub lift: Option<f32>, pub weights_version: u64,
+    pub enabled: bool,
+    pub alpha: f32,
+    pub total_positive_feedback: u64,
+    pub total_negative_feedback: u64,
+    pub baseline_positive_rate: Option<f32>,
+    pub baseline_sample_size: Option<usize>,
+    pub mvf_positive_rate: Option<f32>,
+    pub mvf_sample_size: Option<usize>,
+    pub lift: Option<f32>,
+    pub weights_version: u64,
 }
 
 pub async fn mpi_status(
@@ -392,29 +505,49 @@ pub async fn mpi_status(
     let owner_hex = auth.owner_hex();
 
     // SaaS fix: use Extension storage for all per-user queries.
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
-    let vi = req.extensions().get::<Arc<VectorIndex>>()
-        .expect("[BUG] VectorIndex extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
+    let vi = req
+        .extensions()
+        .get::<Arc<VectorIndex>>()
+        .expect("[BUG] VectorIndex extension not set")
+        .clone();
 
-    let stats  = storage.stats().await;
+    let stats = storage.stats().await;
     let height = storage.last_block_height().await;
-    let wv     = { state.user_weights.read().get(&owner_hex).map(|w| w.version).unwrap_or(0) };
-    let fb     = storage.get_recent_feedback(500).await;
-    let tp     = fb.iter().filter(|(s,_)| *s == 1).count() as u64;
-    let tn     = fb.iter().filter(|(s,_)| *s == -1).count() as u64;
-    let mr     = if !fb.is_empty() { Some(tp as f32 / fb.len() as f32) } else { None };
-    let ms     = if !fb.is_empty() { Some(fb.len()) } else { None };
-    let bl     = state.mvf_baseline.read().clone();
-    let lift   = match (&bl, mr) {
-        (Some(b), Some(m)) if b.positive_rate > 0.0 =>
-            Some((m - b.positive_rate) / b.positive_rate),
+    let wv = {
+        state
+            .user_weights
+            .read()
+            .get(&owner_hex)
+            .map(|w| w.version)
+            .unwrap_or(0)
+    };
+    let fb = storage.get_recent_feedback(500).await;
+    let tp = fb.iter().filter(|(s, _)| *s == 1).count() as u64;
+    let tn = fb.iter().filter(|(s, _)| *s == -1).count() as u64;
+    let mr = if !fb.is_empty() {
+        Some(tp as f32 / fb.len() as f32)
+    } else {
+        None
+    };
+    let ms = if !fb.is_empty() { Some(fb.len()) } else { None };
+    let bl = state.mvf_baseline.read().clone();
+    let lift = match (&bl, mr) {
+        (Some(b), Some(m)) if b.positive_rate > 0.0 => {
+            Some((m - b.positive_rate) / b.positive_rate)
+        }
         _ => None,
     };
 
     let gs = if state.graph_enabled || state.ner_engine.is_some() {
         Some(storage.graph_stats(&owner).await)
-    } else { None };
+    } else {
+        None
+    };
 
     let supernode_status = {
         let now = now_secs() as i64;
@@ -422,17 +555,24 @@ pub async fn mpi_status(
 
         let counts = storage.count_tasks_by_status().await;
         let queue = QueueStatus {
-            pending:    *counts.get("pending").unwrap_or(&0),
+            pending: *counts.get("pending").unwrap_or(&0),
             processing: *counts.get("processing").unwrap_or(&0),
-            failed:     *counts.get("failed").unwrap_or(&0),
+            failed: *counts.get("failed").unwrap_or(&0),
         };
 
         let today_stats = storage.get_usage_stats(today_start, now).await;
-        let cost_today: f64 = today_stats.by_provider.iter().map(|p| {
-            LlmRouter::estimate_cost(
-                &p.provider, p.input_tokens as u32, p.output_tokens as u32, 0,
-            )
-        }).sum();
+        let cost_today: f64 = today_stats
+            .by_provider
+            .iter()
+            .map(|p| {
+                LlmRouter::estimate_cost(
+                    &p.provider,
+                    p.input_tokens as u32,
+                    p.output_tokens as u32,
+                    0,
+                )
+            })
+            .sum();
 
         // tasks_completed today: only run conn_lock in Local mode to avoid
         // blocking the async runtime on a per-request conn in SaaS mode.
@@ -444,13 +584,21 @@ pub async fn mpi_status(
                  WHERE status='completed' AND completed_at >= ?1",
                 rusqlite::params![today_start],
                 |r| r.get::<_, i64>(0),
-            ).unwrap_or(0)
+            )
+            .unwrap_or(0)
         } else {
             0
         };
 
-        let provider_names = state.llm_router.as_ref()
-            .map(|r| r.provider_names().into_iter().map(String::from).collect::<Vec<_>>())
+        let provider_names = state
+            .llm_router
+            .as_ref()
+            .map(|r| {
+                r.provider_names()
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
 
         SuperNodeStatus {
@@ -469,33 +617,40 @@ pub async fn mpi_status(
 
     let mode_str = match state.mode {
         Mode::Local => "local",
-        Mode::Saas  => "saas",
+        Mode::Saas => "saas",
     };
 
-    (StatusCode::OK, Json(serde_json::json!(MpiStatusResponse {
-        memchain_enabled: true,
-        mode: mode_str.into(),
-        stats,
-        vector_index_total: vi.total_vectors(),
-        vector_partitions: vi.partition_count(),
-        last_block_height: height,
-        index_ready: state.index_ready.load(std::sync::atomic::Ordering::Relaxed),
-        embed_ready: state.embed_engine.is_some(),
-        embed_dim: state.embed_engine.as_ref().map(|e| e.dim()),
-        mvf: MvfMetrics {
-            enabled: state.mvf_enabled, alpha: state.mvf_alpha,
-            total_positive_feedback: tp, total_negative_feedback: tn,
-            baseline_positive_rate: bl.as_ref().map(|b| b.positive_rate),
-            baseline_sample_size: bl.as_ref().map(|b| b.sample_size),
-            mvf_positive_rate: mr, mvf_sample_size: ms, lift,
-            weights_version: wv,
-        },
-        remote_storage_enabled: state.allow_remote_storage,
-        ner_ready: state.ner_engine.is_some(),
-        graph_enabled: state.graph_enabled,
-        graph_stats: gs,
-        supernode: supernode_status,
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(MpiStatusResponse {
+            memchain_enabled: true,
+            mode: mode_str.into(),
+            stats,
+            vector_index_total: vi.total_vectors(),
+            vector_partitions: vi.partition_count(),
+            last_block_height: height,
+            index_ready: state.index_ready.load(std::sync::atomic::Ordering::Relaxed),
+            embed_ready: state.embed_engine.is_some(),
+            embed_dim: state.embed_engine.as_ref().map(|e| e.dim()),
+            mvf: MvfMetrics {
+                enabled: state.mvf_enabled,
+                alpha: state.mvf_alpha,
+                total_positive_feedback: tp,
+                total_negative_feedback: tn,
+                baseline_positive_rate: bl.as_ref().map(|b| b.positive_rate),
+                baseline_sample_size: bl.as_ref().map(|b| b.sample_size),
+                mvf_positive_rate: mr,
+                mvf_sample_size: ms,
+                lift,
+                weights_version: wv,
+            },
+            remote_storage_enabled: state.allow_remote_storage,
+            ner_ready: state.ner_engine.is_some(),
+            graph_enabled: state.graph_enabled,
+            graph_stats: gs,
+            supernode: supernode_status,
+        })),
+    )
 }
 
 // ============================================
@@ -504,10 +659,18 @@ pub async fn mpi_status(
 
 #[derive(Debug, Serialize)]
 pub struct RecordDetailResponse {
-    pub record_id: String, pub layer: String, pub content: String,
-    pub topic_tags: Vec<String>, pub source_ai: String, pub timestamp: u64,
-    pub access_count: u32, pub positive_feedback: u32, pub negative_feedback: u32,
-    pub has_conflict: bool, pub embedding_model: String, pub has_embedding: bool,
+    pub record_id: String,
+    pub layer: String,
+    pub content: String,
+    pub topic_tags: Vec<String>,
+    pub source_ai: String,
+    pub timestamp: u64,
+    pub access_count: u32,
+    pub positive_feedback: u32,
+    pub negative_feedback: u32,
+    pub has_conflict: bool,
+    pub embedding_model: String,
+    pub has_embedding: bool,
     pub status: String,
 }
 
@@ -519,39 +682,72 @@ pub async fn mpi_get_record(
     let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
 
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     let rid = match hex::decode(&record_id_hex) {
-        Ok(b) if b.len() == 32 => { let mut a = [0u8; 32]; a.copy_from_slice(&b); a }
-        _ => return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"invalid record_id"}))).into_response(),
+        Ok(b) if b.len() == 32 => {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&b);
+            a
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"invalid record_id"})),
+            )
+                .into_response()
+        }
     };
 
     let record = match storage.get(&rid).await {
         Some(r) => r,
-        None => return (StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error":"record not found"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error":"record not found"})),
+            )
+                .into_response()
+        }
     };
     if record.owner != owner {
-        return (StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error":"access denied"}))).into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"access denied"})),
+        )
+            .into_response();
     }
 
     let em = storage.get_embedding_model(&rid).await.unwrap_or_default();
     let content = String::from_utf8_lossy(&record.encrypted_content).to_string();
 
-    (StatusCode::OK, Json(serde_json::json!(RecordDetailResponse {
-        record_id: record_id_hex, layer: record.layer.to_string(), content,
-        topic_tags: record.topic_tags.clone(), source_ai: record.source_ai.clone(),
-        timestamp: record.timestamp, access_count: record.access_count,
-        positive_feedback: record.positive_feedback,
-        negative_feedback: record.negative_feedback,
-        has_conflict: record.has_conflict(),
-        embedding_model: em,
-        has_embedding: record.has_embedding(),
-        status: if record.is_active() { "active" } else { "revoked" }.into(),
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(RecordDetailResponse {
+            record_id: record_id_hex,
+            layer: record.layer.to_string(),
+            content,
+            topic_tags: record.topic_tags.clone(),
+            source_ai: record.source_ai.clone(),
+            timestamp: record.timestamp,
+            access_count: record.access_count,
+            positive_feedback: record.positive_feedback,
+            negative_feedback: record.negative_feedback,
+            has_conflict: record.has_conflict(),
+            embedding_model: em,
+            has_embedding: record.has_embedding(),
+            status: if record.is_active() {
+                "active"
+            } else {
+                "revoked"
+            }
+            .into(),
+        })),
+    )
+        .into_response()
 }
 
 // ============================================
@@ -565,20 +761,26 @@ pub async fn mpi_records_overview(
     let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
 
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     let ov = storage.get_overview(&owner, 20).await;
     let total: u64 = ov.by_layer.values().sum();
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "total": total,
-        "by_layer": ov.by_layer,
-        "recent_by_layer": ov.recent_by_layer,
-        "last_memory_at": ov.last_memory_at,
-        "embed_ready": state.embed_engine.is_some(),
-        "embed_dim": state.embed_engine.as_ref().map(|e| e.dim()),
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "total": total,
+            "by_layer": ov.by_layer,
+            "recent_by_layer": ov.recent_by_layer,
+            "last_memory_at": ov.last_memory_at,
+            "embed_ready": state.embed_engine.is_some(),
+            "embed_dim": state.embed_engine.as_ref().map(|e| e.dim()),
+        })),
+    )
 }
 
 // ============================================
@@ -599,26 +801,47 @@ pub async fn mpi_embed(
     let _auth = extract_owner(&req);
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"failed to read body"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"failed to read body"})),
+            )
+                .into_response()
+        }
     };
     let rb: EmbedRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("invalid JSON: {}", e)}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid JSON: {}", e)})),
+            )
+                .into_response()
+        }
     };
     let engine = match &state.embed_engine {
         Some(e) => e,
-        None => return (StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error":"local embed engine not available"}))).into_response(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":"local embed engine not available"})),
+            )
+                .into_response()
+        }
     };
     if rb.texts.is_empty() {
-        return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"texts array is empty"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"texts array is empty"})),
+        )
+            .into_response();
     }
     if rb.texts.len() > 100 {
-        return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"batch too large","max":100}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"batch too large","max":100})),
+        )
+            .into_response();
     }
 
     let refs: Vec<&str> = rb.texts.iter().map(|s| s.as_str()).collect();
@@ -626,14 +849,21 @@ pub async fn mpi_embed(
         Ok(embs) => {
             let dim = embs.first().map(|v| v.len()).unwrap_or(0);
             debug!(batch = embs.len(), dim = dim, "[MPI_EMBED] Generated");
-            (StatusCode::OK, Json(serde_json::json!({
-                "embeddings": embs, "model": "minilm-l6-v2", "dim": dim
-            }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "embeddings": embs, "model": "minilm-l6-v2", "dim": dim
+                })),
+            )
+                .into_response()
         }
         Err(e) => {
             warn!(error = %e, "[MPI_EMBED] Inference failed");
-            (StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("embed failed: {}", e)}))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("embed failed: {}", e)})),
+            )
+                .into_response()
         }
     }
 }
@@ -675,30 +905,57 @@ pub async fn mpi_patch_record(
     let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
 
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
-    let vi = req.extensions().get::<Arc<VectorIndex>>()
-        .expect("[BUG] VectorIndex extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
+    let vi = req
+        .extensions()
+        .get::<Arc<VectorIndex>>()
+        .expect("[BUG] VectorIndex extension not set")
+        .clone();
 
     let rid: [u8; 32] = match hex::decode(&record_id_hex) {
-        Ok(b) if b.len() == 32 => { let mut a = [0u8; 32]; a.copy_from_slice(&b); a }
-        _ => return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"invalid record_id format"}))).into_response(),
+        Ok(b) if b.len() == 32 => {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&b);
+            a
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"invalid record_id format"})),
+            )
+                .into_response()
+        }
     };
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), 512 * 1024).await {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"failed to read body"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"failed to read body"})),
+            )
+                .into_response()
+        }
     };
     let patch: PatchRecordRequest = match serde_json::from_slice(&body_bytes) {
         Ok(p) => p,
-        Err(e) => return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("invalid JSON: {}", e)}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid JSON: {}", e)})),
+            )
+                .into_response()
+        }
     };
 
-    if patch.content.is_none() && patch.topic_tags.is_none()
-        && patch.layer.is_none() && patch.source_ai.is_none()
+    if patch.content.is_none()
+        && patch.topic_tags.is_none()
+        && patch.layer.is_none()
+        && patch.source_ai.is_none()
     {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": "at least one field must be provided: content, topic_tags, layer, source_ai"
@@ -715,11 +972,17 @@ pub async fn mpi_patch_record(
         None => None,
     };
 
-    match storage.update_record_content(
-        &rid, &owner,
-        patch.content.as_deref(), patch.topic_tags.as_deref(),
-        new_layer, patch.source_ai.as_deref(),
-    ).await {
+    match storage
+        .update_record_content(
+            &rid,
+            &owner,
+            patch.content.as_deref(),
+            patch.topic_tags.as_deref(),
+            new_layer,
+            patch.source_ai.as_deref(),
+        )
+        .await
+    {
         Ok(true) => {
             let content_changed = patch.content.is_some();
             let needs_fts = content_changed || patch.topic_tags.is_some();
@@ -728,12 +991,16 @@ pub async fn mpi_patch_record(
                 let index_content: Option<String> = if let Some(ref c) = patch.content {
                     Some(c.clone())
                 } else {
-                    storage.get(&rid).await
+                    storage
+                        .get(&rid)
+                        .await
                         .map(|r| String::from_utf8_lossy(&r.encrypted_content).into_owned())
                 };
 
                 if let Some(ref cs) = index_content {
-                    let tags_str = patch.topic_tags.as_ref()
+                    let tags_str = patch
+                        .topic_tags
+                        .as_ref()
                         .and_then(|t| serde_json::to_string(t).ok())
                         .unwrap_or_default();
                     storage.fts_remove_record(&rid).await;
@@ -741,7 +1008,9 @@ pub async fn mpi_patch_record(
                 }
             }
 
-            if content_changed { vi.remove(&rid); }
+            if content_changed {
+                vi.remove(&rid);
+            }
 
             {
                 let oh = auth.owner_hex();
@@ -751,22 +1020,34 @@ pub async fn mpi_patch_record(
                 }
             }
 
-            (StatusCode::OK, Json(serde_json::json!({
-                "record_id": record_id_hex,
-                "status": "updated",
-                "embedding_invalidated": content_changed,
-                "fts_updated": needs_fts,
-                "note": if content_changed {
-                    "Embedding cleared. Miner will re-embed on next cycle (~60s)."
-                } else { "Update applied." }
-            }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "record_id": record_id_hex,
+                    "status": "updated",
+                    "embedding_invalidated": content_changed,
+                    "fts_updated": needs_fts,
+                    "note": if content_changed {
+                        "Embedding cleared. Miner will re-embed on next cycle (~60s)."
+                    } else { "Update applied." }
+                })),
+            )
+                .into_response()
         }
-        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": "record not found, not active, or access denied"
-        }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("update failed: {}", e)
-        }))).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "record not found, not active, or access denied"
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("update failed: {}", e)
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -782,19 +1063,34 @@ pub async fn mpi_record_provenance(
     let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
 
-    let storage = req.extensions().get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set").clone();
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
 
     let rid: [u8; 32] = match hex::decode(&record_id_hex) {
-        Ok(b) if b.len() == 32 => { let mut a = [0u8; 32]; a.copy_from_slice(&b); a }
-        _ => return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"invalid record_id format"}))).into_response(),
+        Ok(b) if b.len() == 32 => {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&b);
+            a
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"invalid record_id format"})),
+            )
+                .into_response()
+        }
     };
 
     match storage.get_record_provenance(&rid, &owner).await {
         Some(prov) => (StatusCode::OK, Json(serde_json::json!(prov))).into_response(),
-        None => (StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error":"record not found or access denied"}))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"record not found or access denied"})),
+        )
+            .into_response(),
     }
 }
 
@@ -810,8 +1106,10 @@ mod tests {
     fn test_provenance_null_fields_serialize_as_null() {
         let prov = RecordProvenance {
             record_id: "aabbcc".into(),
-            session_id: None, session_title: None,
-            session_started_at: None, turn_index: None,
+            session_id: None,
+            session_title: None,
+            session_started_at: None,
+            turn_index: None,
             layer: "episode".into(),
             topic_tags: vec!["identity".into()],
             extracted_at: 1_700_000_000,
@@ -844,16 +1142,27 @@ mod tests {
 
     #[test]
     fn test_patch_all_none_should_be_rejected() {
-        let p = PatchRecordRequest { content: None, topic_tags: None, layer: None, source_ai: None };
-        assert!(p.content.is_none() && p.topic_tags.is_none()
-            && p.layer.is_none() && p.source_ai.is_none());
+        let p = PatchRecordRequest {
+            content: None,
+            topic_tags: None,
+            layer: None,
+            source_ai: None,
+        };
+        assert!(
+            p.content.is_none()
+                && p.topic_tags.is_none()
+                && p.layer.is_none()
+                && p.source_ai.is_none()
+        );
     }
 
     #[test]
     fn test_patch_content_only_is_valid() {
         let p = PatchRecordRequest {
             content: Some("corrected".into()),
-            topic_tags: None, layer: None, source_ai: None,
+            topic_tags: None,
+            layer: None,
+            source_ai: None,
         };
         assert!(p.content.is_some());
     }

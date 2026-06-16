@@ -27,11 +27,11 @@ use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
 use crate::config::ServerConfig;
-use crate::services::{
-    IpPoolService, NodePolicyEnforcementSnapshot, NodePolicyPlacementSnapshot,
-    NodePolicyRuntime, NodePolicySnapshot, SessionManager,
-};
 use crate::services::session::CLIENT_LIVENESS_TIMEOUT_SECS;
+use crate::services::{
+    IpPoolService, NodePolicyEnforcementSnapshot, NodePolicyPlacementSnapshot, NodePolicyRuntime,
+    NodePolicySnapshot, SessionManager,
+};
 use crate::voucher_verifier::{VoucherMetricsSnapshot, VoucherVerifier};
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -221,7 +221,10 @@ pub fn build_vpn_health_router(
 ) -> Router {
     Router::new()
         .route("/api/vpn/health", get(vpn_health_handler))
-        .route("/api/node/operator/status", get(node_operator_status_handler))
+        .route(
+            "/api/node/operator/status",
+            get(node_operator_status_handler),
+        )
         .route("/api/operator/status", get(node_operator_status_handler))
         .with_state(VpnHealthState {
             config,
@@ -357,7 +360,8 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         &policy_enforcement,
         &placement_readiness,
         active_sessions,
-    ).await;
+    )
+    .await;
 
     VpnHealthResponse {
         status,
@@ -398,7 +402,9 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     }
 }
 
-async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOperatorStatusResponse {
+async fn collect_node_operator_status_response(
+    state: VpnHealthState,
+) -> NodeOperatorStatusResponse {
     let generated_at = unix_now_secs();
     let vpn_health = collect_vpn_health_response(state.clone()).await;
     let config = state.config.clone();
@@ -419,9 +425,7 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
         status: vpn_health.status,
         summary: format!(
             "{} active sessions, {} wallet devices, {} encrypted packets forwarded",
-            vpn_health.active_sessions,
-            vpn_health.active_wallet_devices,
-            encrypted_messages
+            vpn_health.active_sessions, vpn_health.active_wallet_devices, encrypted_messages
         ),
         metrics: serde_json::json!({
             "listen_addr": vpn_health.listen_addr,
@@ -448,7 +452,10 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
         enabled: memchain_enabled,
         status: if memchain_enabled { "ok" } else { "disabled" },
         summary: if memchain_enabled {
-            format!("mode={:?}, API bound at {}", config.memchain.mode, config.memchain.api_listen_addr)
+            format!(
+                "mode={:?}, API bound at {}",
+                config.memchain.mode, config.memchain.api_listen_addr
+            )
         } else {
             "MemChain is disabled in this node config".to_string()
         },
@@ -479,7 +486,8 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
                 config.memchain.chat_relay.max_blob_size
             )
         } else {
-            "Chat relay is disabled; encrypted messages are not stored for offline delivery".to_string()
+            "Chat relay is disabled; encrypted messages are not stored for offline delivery"
+                .to_string()
         },
         metrics: serde_json::json!({
             "offline_ttl_secs": config.memchain.chat_relay.offline_ttl_secs,
@@ -496,9 +504,16 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
         key: "sovereign_data_layer",
         label: "Sovereign Data Layer",
         enabled: remote_storage_enabled,
-        status: if remote_storage_enabled { "ready" } else { "planned" },
+        status: if remote_storage_enabled {
+            "ready"
+        } else {
+            "planned"
+        },
         summary: if remote_storage_enabled {
-            format!("remote encrypted owner storage enabled for up to {} owners", config.memchain.max_remote_owners)
+            format!(
+                "remote encrypted owner storage enabled for up to {} owners",
+                config.memchain.max_remote_owners
+            )
         } else {
             "Encrypted user-owned record RPC is not enabled on this node yet".to_string()
         },
@@ -521,9 +536,16 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
         key: "supernode",
         label: "SuperNode Cognitive Worker",
         enabled: supernode_enabled,
-        status: if supernode_enabled { "ready" } else { "disabled" },
+        status: if supernode_enabled {
+            "ready"
+        } else {
+            "disabled"
+        },
         summary: if supernode_enabled {
-            format!("{} configured provider(s)", config.memchain.supernode.providers.len())
+            format!(
+                "{} configured provider(s)",
+                config.memchain.supernode.providers.len()
+            )
         } else {
             "SuperNode LLM worker is disabled".to_string()
         },
@@ -554,10 +576,16 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
 
     if !api_secret_configured {
         risks.push(OperatorRisk {
-            severity: if remote_storage_enabled { "critical" } else { "warning" },
+            severity: if remote_storage_enabled {
+                "critical"
+            } else {
+                "warning"
+            },
             code: "mpi_api_secret_missing",
             message: "MemChain API secret is not configured".to_string(),
-            remediation: "Set memchain.api_secret before enabling remote RPC or remote encrypted storage".to_string(),
+            remediation:
+                "Set memchain.api_secret before enabling remote RPC or remote encrypted storage"
+                    .to_string(),
         });
     }
 
@@ -584,7 +612,8 @@ async fn collect_node_operator_status_response(state: VpnHealthState) -> NodeOpe
             severity: "warning",
             code: "remote_owner_capacity_unbounded",
             message: "Remote encrypted storage owner capacity is unlimited".to_string(),
-            remediation: "Set memchain.max_remote_owners for commercial node capacity planning".to_string(),
+            remediation: "Set memchain.max_remote_owners for commercial node capacity planning"
+                .to_string(),
         });
     }
 
@@ -635,12 +664,9 @@ async fn collect_runtime_rollout_status() -> RuntimeRolloutStatus {
     } else {
         None
     };
-    let executable_path = proc_exe.or(fallback_exe).map(|path| {
-        path.to_string_lossy()
-            .chars()
-            .take(512)
-            .collect::<String>()
-    });
+    let executable_path = proc_exe
+        .or(fallback_exe)
+        .map(|path| path.to_string_lossy().chars().take(512).collect::<String>());
     let executable_replaced = executable_path
         .as_deref()
         .map(|path| path.contains(" (deleted)") || path.ends_with("(deleted)"))
@@ -1085,7 +1111,9 @@ fn collect_capacity_risks(
             severity: "critical",
             code: "vpn_ip_pool_exhausted",
             message: "No free VPN virtual IP addresses remain for new sessions.".to_string(),
-            remediation: "Drain traffic or expand vpn.virtual_ip_range before admitting additional clients.".to_string(),
+            remediation:
+                "Drain traffic or expand vpn.virtual_ip_range before admitting additional clients."
+                    .to_string(),
         });
     }
 
@@ -1134,7 +1162,11 @@ fn recommended_ipv4_cidr(current_cidr: &str, required_usable_ips: usize) -> Opti
         if usable_ipv4_clients_for_prefix(prefix) < required_usable_ips {
             continue;
         }
-        let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+        let mask = if prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix)
+        };
         let network = Ipv4Addr::from(ip_u32 & mask);
         return Some(format!("{}/{}", network, prefix));
     }
@@ -1165,15 +1197,16 @@ async fn collect_interface_capacity(name: &str) -> InterfaceCapacityStatus {
     };
 
     let rates = match (rx_bytes, tx_bytes, rx_packets, tx_packets) {
-        (Some(rx_b), Some(tx_b), Some(rx_p), Some(tx_p)) => {
-            interface_rates(name, InterfaceCounterSnapshot {
+        (Some(rx_b), Some(tx_b), Some(rx_p), Some(tx_p)) => interface_rates(
+            name,
+            InterfaceCounterSnapshot {
                 timestamp: unix_now_secs(),
                 rx_bytes: rx_b,
                 tx_bytes: tx_b,
                 rx_packets: rx_p,
                 tx_packets: tx_p,
-            })
-        }
+            },
+        ),
         _ => None,
     };
 
@@ -1207,7 +1240,14 @@ fn read_sysfs_counter(interface: &str, name: &str) -> Option<u64> {
 fn interface_rates(
     interface: &str,
     current: InterfaceCounterSnapshot,
-) -> Option<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>)> {
+) -> Option<(
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+)> {
     static PREVIOUS: OnceLock<Mutex<HashMap<String, InterfaceCounterSnapshot>>> = OnceLock::new();
     let samples = PREVIOUS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = samples.lock().ok()?;

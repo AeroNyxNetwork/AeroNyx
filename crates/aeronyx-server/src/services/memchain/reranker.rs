@@ -167,12 +167,13 @@ impl RerankerEngine {
     /// ## Arguments
     /// * `model_dir` - Directory containing model.onnx and tokenizer.json
     /// * `max_seq_length` - Max combined query+document token length (pass 0 for default 512)
-    pub fn load(
-        model_dir: impl AsRef<Path>,
-        max_seq_length: usize,
-    ) -> Result<Self, String> {
+    pub fn load(model_dir: impl AsRef<Path>, max_seq_length: usize) -> Result<Self, String> {
         let model_dir = model_dir.as_ref();
-        let max_seq_length = if max_seq_length == 0 { DEFAULT_MAX_SEQ_LENGTH } else { max_seq_length };
+        let max_seq_length = if max_seq_length == 0 {
+            DEFAULT_MAX_SEQ_LENGTH
+        } else {
+            max_seq_length
+        };
 
         let model_path = model_dir.join(MODEL_FILENAME);
         let tokenizer_path = model_dir.join(TOKENIZER_FILENAME);
@@ -234,7 +235,8 @@ impl RerankerEngine {
         if documents.len() > MAX_BATCH_SIZE {
             return Err(format!(
                 "Rerank batch size {} exceeds max {}",
-                documents.len(), MAX_BATCH_SIZE
+                documents.len(),
+                MAX_BATCH_SIZE
             ));
         }
 
@@ -259,7 +261,8 @@ impl RerankerEngine {
         // tokenizers encode_batch with add_special_tokens=true produces:
         //   [CLS] query tokens [SEP] doc tokens [SEP]
         // token_type_ids: 0 for query side, 1 for doc side.
-        let pairs: Vec<(String, String)> = documents.iter()
+        let pairs: Vec<(String, String)> = documents
+            .iter()
             .map(|doc| (query.to_string(), doc.to_string()))
             .collect();
 
@@ -280,8 +283,8 @@ impl RerankerEngine {
         let mut token_type_ids = Vec::with_capacity(total);
 
         for enc in &encodings {
-            let ids   = enc.get_ids();
-            let mask  = enc.get_attention_mask();
+            let ids = enc.get_ids();
+            let mask = enc.get_attention_mask();
             let types = enc.get_type_ids();
             for i in 0..seq_len {
                 input_ids.push(ids.get(i).copied().unwrap_or(0) as i64);
@@ -300,16 +303,18 @@ impl RerankerEngine {
             .map_err(|e| format!("Reranker token_type_ids tensor: {}", e))?;
 
         // ── ONNX inference ──
-        let mut session = self.session.lock()
+        let mut session = self
+            .session
+            .lock()
             .map_err(|e| format!("Reranker session lock poisoned: {}", e))?;
 
-        let outputs = session.run(
-            ort::inputs![
+        let outputs = session
+            .run(ort::inputs![
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
                 "token_type_ids" => types_tensor,
-            ]
-        ).map_err(|e| format!("Reranker ONNX inference: {}", e))?;
+            ])
+            .map_err(|e| format!("Reranker ONNX inference: {}", e))?;
 
         // Output: logits shaped [batch_size, 1] or [batch_size]
         let logits = outputs[0]
@@ -322,9 +327,13 @@ impl RerankerEngine {
         let mut raw_scores: Vec<f32> = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
             let score = match logits_shape.len() {
-                2 => logits[[i, 0]],  // [batch, 1] — most common
-                1 => logits[[i]],     // [batch] — some exports
-                _ => logits.as_slice().and_then(|s| s.get(i)).copied().unwrap_or(0.0),
+                2 => logits[[i, 0]], // [batch, 1] — most common
+                1 => logits[[i]],    // [batch] — some exports
+                _ => logits
+                    .as_slice()
+                    .and_then(|s| s.get(i))
+                    .copied()
+                    .unwrap_or(0.0),
             };
             raw_scores.push(score);
         }
@@ -338,7 +347,8 @@ impl RerankerEngine {
 
         let normalized_scores: Vec<f64> = if score_range > NORM_EPSILON {
             // Standard min-max: maps [min, max] → [0, 1]
-            raw_scores.iter()
+            raw_scores
+                .iter()
                 .map(|&s| ((s - score_min) / score_range) as f64)
                 .collect()
         } else {
@@ -349,13 +359,16 @@ impl RerankerEngine {
                 score = score_min,
                 "[RERANKER] All CE scores identical — using sigmoid normalization fallback"
             );
-            raw_scores.iter()
+            raw_scores
+                .iter()
                 .map(|&s| 1.0 / (1.0 + (-s as f64).exp()))
                 .collect()
         };
 
         // ── Build candidates and sort by raw CE score descending ──
-        let mut candidates: Vec<RerankedCandidate> = raw_scores.iter().zip(normalized_scores.iter())
+        let mut candidates: Vec<RerankedCandidate> = raw_scores
+            .iter()
+            .zip(normalized_scores.iter())
             .enumerate()
             .map(|(i, (&ce, &norm))| RerankedCandidate {
                 original_index: i,
@@ -366,14 +379,25 @@ impl RerankerEngine {
 
         // Sort by raw CE score descending (raw logit is the true relevance signal)
         candidates.sort_by(|a, b| {
-            b.ce_score.partial_cmp(&a.ce_score).unwrap_or(std::cmp::Ordering::Equal)
+            b.ce_score
+                .partial_cmp(&a.ce_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         debug!(
             batch = batch_size,
             seq_len = seq_len,
-            top_ce = format!("{:.3}", candidates.first().map(|c| c.ce_score).unwrap_or(0.0)),
-            top_norm = format!("{:.3}", candidates.first().map(|c| c.ce_score_normalized).unwrap_or(0.0)),
+            top_ce = format!(
+                "{:.3}",
+                candidates.first().map(|c| c.ce_score).unwrap_or(0.0)
+            ),
+            top_norm = format!(
+                "{:.3}",
+                candidates
+                    .first()
+                    .map(|c| c.ce_score_normalized)
+                    .unwrap_or(0.0)
+            ),
             score_range = format!("{:.3}", score_range),
             "[RERANKER] Batch rerank complete"
         );
@@ -389,12 +413,16 @@ impl RerankerEngine {
 
     /// Returns the configured max sequence length.
     #[must_use]
-    pub fn max_seq_length(&self) -> usize { self.max_seq_length }
+    pub fn max_seq_length(&self) -> usize {
+        self.max_seq_length
+    }
 
     /// Returns the CE blend weight used in recall_handler Step 3.5.
     /// Exposed for testing and transparency.
     #[must_use]
-    pub fn blend_weight() -> f64 { CE_BLEND_WEIGHT }
+    pub fn blend_weight() -> f64 {
+        CE_BLEND_WEIGHT
+    }
 }
 
 impl std::fmt::Debug for RerankerEngine {
@@ -433,8 +461,16 @@ mod tests {
         let result = RerankerEngine::load("/nonexistent/path", 512);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("not found"), "Error should mention 'not found': {}", err);
-        assert!(err.contains("download_models.sh"), "Error should hint at download script: {}", err);
+        assert!(
+            err.contains("not found"),
+            "Error should mention 'not found': {}",
+            err
+        );
+        assert!(
+            err.contains("download_models.sh"),
+            "Error should hint at download script: {}",
+            err
+        );
     }
 
     #[test]
@@ -466,14 +502,16 @@ mod tests {
             None => return,
         };
 
-        let candidates = engine.rerank_batch(
-            "What signing algorithm does the auth module use?",
-            &[
-                "The auth module uses RS256 signing with the ring crate for RSA operations",
-                "User likes spicy food and is allergic to shellfish",
-                "Project Alpha was started last month by the engineering team",
-            ],
-        ).unwrap();
+        let candidates = engine
+            .rerank_batch(
+                "What signing algorithm does the auth module use?",
+                &[
+                    "The auth module uses RS256 signing with the ring crate for RSA operations",
+                    "User likes spicy food and is allergic to shellfish",
+                    "Project Alpha was started last month by the engineering team",
+                ],
+            )
+            .unwrap();
 
         assert_eq!(candidates.len(), 3);
         // Most relevant doc (index 0) should be ranked first
@@ -494,13 +532,19 @@ mod tests {
             None => return,
         };
 
-        let score = engine.rerank_single(
-            "rate limiting",
-            "Token bucket rate limiting at 100 requests per minute using tower middleware",
-        ).unwrap();
+        let score = engine
+            .rerank_single(
+                "rate limiting",
+                "Token bucket rate limiting at 100 requests per minute using tower middleware",
+            )
+            .unwrap();
 
         // Highly relevant pair should have a positive raw logit
-        assert!(score > 0.0, "Relevant pair should have positive score, got {}", score);
+        assert!(
+            score > 0.0,
+            "Relevant pair should have positive score, got {}",
+            score
+        );
     }
 
     #[test]
@@ -510,20 +554,23 @@ mod tests {
             None => return,
         };
 
-        let candidates = engine.rerank_batch(
-            "JWT authentication",
-            &[
-                "JWT uses RS256 for token signing",
-                "PostgreSQL database connection pool settings",
-                "React component lifecycle hooks",
-            ],
-        ).unwrap();
+        let candidates = engine
+            .rerank_batch(
+                "JWT authentication",
+                &[
+                    "JWT uses RS256 for token signing",
+                    "PostgreSQL database connection pool settings",
+                    "React component lifecycle hooks",
+                ],
+            )
+            .unwrap();
 
         for c in &candidates {
             assert!(
                 c.ce_score_normalized >= 0.0 && c.ce_score_normalized <= 1.0,
                 "Normalized score out of [0,1]: {} (raw={})",
-                c.ce_score_normalized, c.ce_score
+                c.ce_score_normalized,
+                c.ce_score
             );
         }
     }
@@ -532,7 +579,11 @@ mod tests {
     fn test_blend_weight_constant() {
         // Ensure the blend weight is in a sensible range
         let w = RerankerEngine::blend_weight();
-        assert!(w > 0.0 && w < 1.0, "CE_BLEND_WEIGHT should be in (0, 1), got {}", w);
+        assert!(
+            w > 0.0 && w < 1.0,
+            "CE_BLEND_WEIGHT should be in (0, 1), got {}",
+            w
+        );
     }
 
     #[test]

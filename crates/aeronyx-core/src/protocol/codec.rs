@@ -33,8 +33,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::{CoreError, Result};
 use crate::protocol::messages::{
-    ClientHello, DataPacket, MessageType, ServerHello,
-    CLIENT_HELLO_SIZE, DATA_PACKET_HEADER_SIZE, SERVER_HELLO_SIZE,
+    ClientHello, DataPacket, MessageType, ServerHello, CLIENT_HELLO_SIZE, DATA_PACKET_HEADER_SIZE,
+    SERVER_HELLO_SIZE,
 };
 
 // ============================================
@@ -89,8 +89,7 @@ impl ProtocolCodec {
         if buf.is_empty() {
             return Err(CoreError::too_short(1, 0));
         }
-        MessageType::from_byte(buf[0])
-            .ok_or(CoreError::UnknownMessageType(buf[0]))
+        MessageType::from_byte(buf[0]).ok_or(CoreError::UnknownMessageType(buf[0]))
     }
 
     /// Checks if the buffer contains a complete message.
@@ -108,7 +107,7 @@ impl ProtocolCodec {
         }
 
         let msg_type = Self::peek_message_type(buf)?;
-        
+
         let required = match msg_type {
             MessageType::ClientHello => CLIENT_HELLO_SIZE,
             MessageType::ServerHello => SERVER_HELLO_SIZE,
@@ -442,9 +441,12 @@ mod tests {
         };
 
         let encoded = encode_client_hello(&hello);
-        
+
         // Timestamp is at offset 1 + 1 + 32 + 32 = 66
         let timestamp_bytes = &encoded[66..74];
-        assert_eq!(timestamp_bytes, &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(
+            timestamp_bytes,
+            &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+        );
     }
 }

@@ -57,33 +57,40 @@ use crate::services::{IpPoolService, NodePolicyRuntime, RoutingService, Session,
 
 /// Result of a successful handshake.
 pub struct HandshakeResult {
-    pub session:  Arc<Session>,
+    pub session: Arc<Session>,
     pub response: ServerHello,
 }
 
 /// High-level handshake orchestration service.
 pub struct HandshakeService {
-    crypto:    DefaultHandshakeCrypto,
-    ip_pool:   Arc<IpPoolService>,
-    sessions:  Arc<SessionManager>,
-    routing:   Arc<RoutingService>,
+    crypto: DefaultHandshakeCrypto,
+    ip_pool: Arc<IpPoolService>,
+    sessions: Arc<SessionManager>,
+    routing: Arc<RoutingService>,
     /// v1.0.0-Membership: deny list checked before any resource allocation.
     deny_list: Arc<DenyList>,
     /// Operator policy from nodeboard Settings.
-    policy:    Arc<NodePolicyRuntime>,
+    policy: Arc<NodePolicyRuntime>,
 }
 
 impl HandshakeService {
     pub fn new(
         server_identity: IdentityKeyPair,
-        ip_pool:         Arc<IpPoolService>,
-        sessions:        Arc<SessionManager>,
-        routing:         Arc<RoutingService>,
-        deny_list:       Arc<DenyList>,
-        policy:          Arc<NodePolicyRuntime>,
+        ip_pool: Arc<IpPoolService>,
+        sessions: Arc<SessionManager>,
+        routing: Arc<RoutingService>,
+        deny_list: Arc<DenyList>,
+        policy: Arc<NodePolicyRuntime>,
     ) -> Self {
         let crypto = DefaultHandshakeCrypto::new(server_identity);
-        Self { crypto, ip_pool, sessions, routing, deny_list, policy }
+        Self {
+            crypto,
+            ip_pool,
+            sessions,
+            routing,
+            deny_list,
+            policy,
+        }
     }
 
     /// Processes a ClientHello and creates a session.
@@ -96,7 +103,7 @@ impl HandshakeService {
     pub fn process(
         &self,
         client_hello: &ClientHello,
-        client_addr:  SocketAddr,
+        client_addr: SocketAddr,
     ) -> Result<HandshakeResult> {
         debug!(client = %client_addr, "Processing handshake");
 
@@ -114,7 +121,8 @@ impl HandshakeService {
         // O(1) DashMap lookup — cheaper than Ed25519 verify below.
         let wallet_hex = hex::encode(&client_hello.client_public_key);
         if self.deny_list.is_denied(&wallet_hex) {
-            let reason = self.deny_list
+            let reason = self
+                .deny_list
                 .deny_reason(&wallet_hex)
                 .map(|r| r.to_string())
                 .unwrap_or_else(|| "denied".to_string());
@@ -196,15 +204,14 @@ impl HandshakeService {
             "Handshake completed successfully"
         );
 
-        Ok(HandshakeResult { session, response: server_hello })
+        Ok(HandshakeResult {
+            session,
+            response: server_hello,
+        })
     }
 
     /// Cleans up resources for a failed or closed session.
-    pub fn cleanup(
-        &self,
-        session_id: &aeronyx_common::SessionId,
-        virtual_ip: std::net::Ipv4Addr,
-    ) {
+    pub fn cleanup(&self, session_id: &aeronyx_common::SessionId, virtual_ip: std::net::Ipv4Addr) {
         debug!(session_id = %session_id, virtual_ip = %virtual_ip, "Cleaning up session resources");
         self.routing.remove_route(virtual_ip);
         self.ip_pool.release(virtual_ip);
@@ -232,13 +239,13 @@ impl std::fmt::Debug for HandshakeService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use crate::services::deny_list::DenyReason;
+    use crate::services::NodePolicySnapshot;
     use aeronyx_core::crypto::handshake::create_client_hello;
     use aeronyx_core::crypto::EphemeralKeyPair;
     use aeronyx_core::protocol::CURRENT_PROTOCOL_VERSION;
     use std::net::Ipv4Addr;
-    use crate::services::deny_list::DenyReason;
-    use crate::services::NodePolicySnapshot;
+    use std::time::Duration;
 
     fn create_test_services() -> (
         Arc<IpPoolService>,
@@ -254,15 +261,15 @@ mod tests {
             )
             .unwrap(),
         );
-        let sessions  = Arc::new(SessionManager::new(100, Duration::from_secs(300)));
-        let routing   = Arc::new(RoutingService::new());
+        let sessions = Arc::new(SessionManager::new(100, Duration::from_secs(300)));
+        let routing = Arc::new(RoutingService::new());
         let deny_list = Arc::new(DenyList::new());
         (ip_pool, sessions, routing, deny_list)
     }
 
     #[test]
     fn test_successful_handshake() {
-        let server_identity             = IdentityKeyPair::generate();
+        let server_identity = IdentityKeyPair::generate();
         let (ip_pool, sessions, routing, deny_list) = create_test_services();
 
         let service = HandshakeService::new(
@@ -333,9 +340,9 @@ mod tests {
         let server_identity = IdentityKeyPair::generate();
         let (ip_pool, sessions, routing, deny_list) = create_test_services();
 
-        let client_identity  = IdentityKeyPair::generate();
+        let client_identity = IdentityKeyPair::generate();
         let client_ephemeral = EphemeralKeyPair::generate();
-        let client_hello     = create_client_hello(
+        let client_hello = create_client_hello(
             &client_identity,
             client_ephemeral.public_key_bytes(),
             CURRENT_PROTOCOL_VERSION,
@@ -359,9 +366,20 @@ mod tests {
 
         assert!(result.is_err(), "Denied wallet must be rejected");
         // No resources consumed.
-        assert_eq!(ip_pool.allocated_count(), 0, "IP must not be allocated for denied wallet");
-        assert_eq!(sessions.count(), 0,          "Session must not be created for denied wallet");
-        assert!(routing.is_empty(),               "Route must not be registered for denied wallet");
+        assert_eq!(
+            ip_pool.allocated_count(),
+            0,
+            "IP must not be allocated for denied wallet"
+        );
+        assert_eq!(
+            sessions.count(),
+            0,
+            "Session must not be created for denied wallet"
+        );
+        assert!(
+            routing.is_empty(),
+            "Route must not be registered for denied wallet"
+        );
     }
 
     #[test]
@@ -369,9 +387,9 @@ mod tests {
         let server_identity = IdentityKeyPair::generate();
         let (ip_pool, sessions, routing, deny_list) = create_test_services();
 
-        let client_identity  = IdentityKeyPair::generate();
+        let client_identity = IdentityKeyPair::generate();
         let client_ephemeral = EphemeralKeyPair::generate();
-        let client_hello     = create_client_hello(
+        let client_hello = create_client_hello(
             &client_identity,
             client_ephemeral.public_key_bytes(),
             CURRENT_PROTOCOL_VERSION,
@@ -398,7 +416,10 @@ mod tests {
 
         // Now allowed.
         let result = service.process(&client_hello, client_addr);
-        assert!(result.is_ok(), "Wallet removed from deny list must be allowed");
+        assert!(
+            result.is_ok(),
+            "Wallet removed from deny list must be allowed"
+        );
         assert_eq!(sessions.count(), 1);
     }
 
@@ -431,7 +452,10 @@ mod tests {
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
         let result = service.process(&client_hello, client_addr);
-        assert!(matches!(result, Err(ServerError::NodePolicyRejected { .. })));
+        assert!(matches!(
+            result,
+            Err(ServerError::NodePolicyRejected { .. })
+        ));
         assert_eq!(ip_pool.allocated_count(), 0);
         assert_eq!(sessions.count(), 0);
         assert!(routing.is_empty());
@@ -469,7 +493,10 @@ mod tests {
             if index == 0 {
                 assert!(result.is_ok());
             } else {
-                assert!(matches!(result, Err(ServerError::NodePolicyRejected { .. })));
+                assert!(matches!(
+                    result,
+                    Err(ServerError::NodePolicyRejected { .. })
+                ));
             }
         }
 

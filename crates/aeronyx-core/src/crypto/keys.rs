@@ -59,19 +59,16 @@ use std::fmt;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{
-    Keypair,
-    PublicKey as Ed25519PublicKey,
-    SecretKey,
-    Signature,
-    Signer,
-    Verifier
+    Keypair, PublicKey as Ed25519PublicKey, SecretKey, Signature, Signer, Verifier,
 };
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, SharedSecret, StaticSecret};
 use zeroize::Zeroize;
 
-use super::{ED25519_PUBLIC_KEY_SIZE, ED25519_SIGNATURE_SIZE, X25519_PUBLIC_KEY_SIZE, CHACHA20_KEY_SIZE};
+use super::{
+    CHACHA20_KEY_SIZE, ED25519_PUBLIC_KEY_SIZE, ED25519_SIGNATURE_SIZE, X25519_PUBLIC_KEY_SIZE,
+};
 use crate::error::{CoreError, Result};
 
 // ============================================
@@ -100,9 +97,10 @@ impl IdentityKeyPair {
     /// Creates an identity key pair from raw private key bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != 32 {
-            return Err(CoreError::key_generation(
-                format!("Invalid Ed25519 key size: expected 32, got {}", bytes.len())
-            ));
+            return Err(CoreError::key_generation(format!(
+                "Invalid Ed25519 key size: expected 32, got {}",
+                bytes.len()
+            )));
         }
         let secret = SecretKey::from_bytes(bytes)
             .map_err(|_| CoreError::key_generation("Invalid Ed25519 secret key"))?;
@@ -167,7 +165,7 @@ impl IdentityKeyPair {
     /// The `StaticSecret` is used to compute the shared secret with the frontend's
     /// ephemeral public key.
     pub fn to_x25519(&self) -> (StaticSecret, X25519PublicKey) {
-        use sha2::{Sha512, Digest};
+        use sha2::{Digest, Sha512};
 
         let ed_sk_bytes = self.keypair.secret.to_bytes();
         let mut hasher = Sha512::new();
@@ -219,7 +217,9 @@ impl Clone for IdentityKeyPair {
         let secret = SecretKey::from_bytes(&self.keypair.secret.to_bytes())
             .expect("Cloning existing valid key should not fail");
         let public = Ed25519PublicKey::from(&secret);
-        Self { keypair: Keypair { secret, public } }
+        Self {
+            keypair: Keypair { secret, public },
+        }
     }
 }
 
@@ -262,17 +262,21 @@ impl IdentityPublicKey {
     }
 
     pub fn verify(&self, message: &[u8], signature: &[u8; ED25519_SIGNATURE_SIZE]) -> Result<()> {
-        let sig = Signature::from_bytes(signature)
-            .map_err(|_| CoreError::SignatureVerification)?;
-        self.0.verify(message, &sig).map_err(|_| CoreError::SignatureVerification)
+        let sig = Signature::from_bytes(signature).map_err(|_| CoreError::SignatureVerification)?;
+        self.0
+            .verify(message, &sig)
+            .map_err(|_| CoreError::SignatureVerification)
     }
 }
 
 impl fmt::Debug for IdentityPublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let bytes = self.0.as_bytes();
-        write!(f, "IdentityPublicKey({:02x}{:02x}{:02x}{:02x}...)",
-            bytes[0], bytes[1], bytes[2], bytes[3])
+        write!(
+            f,
+            "IdentityPublicKey({:02x}{:02x}{:02x}{:02x}...)",
+            bytes[0], bytes[1], bytes[2], bytes[3]
+        )
     }
 }
 
@@ -284,7 +288,9 @@ impl fmt::Display for IdentityPublicKey {
 
 impl Serialize for IdentityPublicKey {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where S: serde::Serializer {
+    where
+        S: serde::Serializer,
+    {
         if serializer.is_human_readable() {
             serializer.serialize_str(&BASE64.encode(self.0.as_bytes()))
         } else {
@@ -295,7 +301,9 @@ impl Serialize for IdentityPublicKey {
 
 impl<'de> Deserialize<'de> for IdentityPublicKey {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where D: serde::Deserializer<'de> {
+    where
+        D: serde::Deserializer<'de>,
+    {
         if deserializer.is_human_readable() {
             let s = String::deserialize(deserializer)?;
             let bytes = BASE64.decode(&s).map_err(serde::de::Error::custom)?;
@@ -332,7 +340,10 @@ impl EphemeralKeyPair {
     pub fn generate() -> Self {
         let secret = EphemeralSecret::new(OsRng);
         let public = X25519PublicKey::from(&secret);
-        Self { secret: Some(secret), public }
+        Self {
+            secret: Some(secret),
+            public,
+        }
     }
 
     #[must_use]
@@ -358,8 +369,13 @@ impl fmt::Debug for EphemeralKeyPair {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let bytes = self.public.as_bytes();
         f.debug_struct("EphemeralKeyPair")
-            .field("public", &format_args!("{:02x}{:02x}{:02x}{:02x}...",
-                bytes[0], bytes[1], bytes[2], bytes[3]))
+            .field(
+                "public",
+                &format_args!(
+                    "{:02x}{:02x}{:02x}{:02x}...",
+                    bytes[0], bytes[1], bytes[2], bytes[3]
+                ),
+            )
             .field("consumed", &self.is_consumed())
             .finish()
     }
@@ -374,15 +390,21 @@ impl fmt::Debug for EphemeralKeyPair {
 pub struct SessionKey([u8; CHACHA20_KEY_SIZE]);
 
 impl Drop for SessionKey {
-    fn drop(&mut self) { self.0.zeroize(); }
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 impl SessionKey {
     #[must_use]
-    pub fn from_bytes(bytes: [u8; CHACHA20_KEY_SIZE]) -> Self { Self(bytes) }
+    pub fn from_bytes(bytes: [u8; CHACHA20_KEY_SIZE]) -> Self {
+        Self(bytes)
+    }
 
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8; CHACHA20_KEY_SIZE] { &self.0 }
+    pub fn as_bytes(&self) -> &[u8; CHACHA20_KEY_SIZE] {
+        &self.0
+    }
 }
 
 impl fmt::Debug for SessionKey {
@@ -392,7 +414,9 @@ impl fmt::Debug for SessionKey {
 }
 
 impl PartialEq for SessionKey {
-    fn eq(&self, other: &Self) -> bool { self.0 == other.0 }
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
 }
 
 impl Eq for SessionKey {}
@@ -443,7 +467,10 @@ impl E2eSession {
     /// let session = E2eSession::new(*shared.as_bytes(), frontend_pk_bytes);
     /// ```
     pub fn new(shared_secret: [u8; 32], peer_public_key: [u8; 32]) -> Self {
-        Self { shared_secret, peer_public_key }
+        Self {
+            shared_secret,
+            peer_public_key,
+        }
     }
 
     /// Encrypt plaintext for sending to the frontend.
@@ -469,15 +496,16 @@ impl E2eSession {
     ///
     /// Accepts `(nonce_hex, ciphertext_hex)` from the JSON message.
     pub fn decrypt(&self, nonce_hex: &str, ciphertext_hex: &str) -> Result<Vec<u8>> {
-        let nonce_bytes = hex::decode(nonce_hex)
-            .map_err(|_| CoreError::key_generation("Invalid nonce hex"))?;
+        let nonce_bytes =
+            hex::decode(nonce_hex).map_err(|_| CoreError::key_generation("Invalid nonce hex"))?;
         let ciphertext = hex::decode(ciphertext_hex)
             .map_err(|_| CoreError::key_generation("Invalid ciphertext hex"))?;
 
         if nonce_bytes.len() != 24 {
-            return Err(CoreError::key_generation(
-                format!("Nonce must be 24 bytes, got {}", nonce_bytes.len())
-            ));
+            return Err(CoreError::key_generation(format!(
+                "Nonce must be 24 bytes, got {}",
+                nonce_bytes.len()
+            )));
         }
 
         let mut nonce = [0u8; 24];
@@ -488,28 +516,30 @@ impl E2eSession {
 
     /// Low-level encrypt with explicit nonce (for testing).
     pub fn encrypt_raw(&self, plaintext: &[u8], nonce: &[u8; 24]) -> Result<Vec<u8>> {
-        use chacha20poly1305::{XChaCha20Poly1305, Key, XNonce};
         use chacha20poly1305::aead::{Aead, NewAead};
+        use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 
         let key = Key::from_slice(&self.shared_secret);
         let cipher = XChaCha20Poly1305::new(key);
         let xnonce = XNonce::from_slice(nonce);
 
-        cipher.encrypt(xnonce, plaintext)
+        cipher
+            .encrypt(xnonce, plaintext)
             .map_err(|_| CoreError::key_generation("E2E encryption failed"))
     }
 
     /// Low-level decrypt with explicit nonce (for testing).
     pub fn decrypt_raw(&self, ciphertext: &[u8], nonce: &[u8; 24]) -> Result<Vec<u8>> {
-        use chacha20poly1305::{XChaCha20Poly1305, Key, XNonce};
         use chacha20poly1305::aead::{Aead, NewAead};
+        use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 
         let key = Key::from_slice(&self.shared_secret);
         let cipher = XChaCha20Poly1305::new(key);
         let xnonce = XNonce::from_slice(nonce);
 
-        cipher.decrypt(xnonce, ciphertext)
-            .map_err(|_| CoreError::key_generation("E2E decryption failed (wrong key or tampered data)"))
+        cipher.decrypt(xnonce, ciphertext).map_err(|_| {
+            CoreError::key_generation("E2E decryption failed (wrong key or tampered data)")
+        })
     }
 
     /// Get the peer's ephemeral public key (for logging).
@@ -528,8 +558,13 @@ impl Drop for E2eSession {
 impl fmt::Debug for E2eSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("E2eSession")
-            .field("peer_pk", &format_args!("{:02x}{:02x}...",
-                self.peer_public_key[0], self.peer_public_key[1]))
+            .field(
+                "peer_pk",
+                &format_args!(
+                    "{:02x}{:02x}...",
+                    self.peer_public_key[0], self.peer_public_key[1]
+                ),
+            )
             .field("shared_secret", &"[REDACTED]")
             .finish()
     }
@@ -621,7 +656,11 @@ mod tests {
         let kp = IdentityKeyPair::generate();
         let (_, pk1) = kp.to_x25519();
         let (_, pk2) = kp.to_x25519();
-        assert_eq!(pk1.to_bytes(), pk2.to_bytes(), "Same Ed25519 key must produce same X25519 key");
+        assert_eq!(
+            pk1.to_bytes(),
+            pk2.to_bytes(),
+            "Same Ed25519 key must produce same X25519 key"
+        );
     }
 
     #[test]
@@ -653,12 +692,16 @@ mod tests {
         // Both sides compute shared secret
         let node_shared = node_x25519_sk.diffie_hellman(&frontend_pk);
         let frontend_shared = frontend_sk.diffie_hellman(&node_x25519_pk);
-        assert_eq!(node_shared.as_bytes(), frontend_shared.as_bytes(),
-            "DH shared secrets must match");
+        assert_eq!(
+            node_shared.as_bytes(),
+            frontend_shared.as_bytes(),
+            "DH shared secrets must match"
+        );
 
         // Create E2E sessions
         let node_session = E2eSession::new(*node_shared.as_bytes(), frontend_pk.to_bytes());
-        let frontend_session = E2eSession::new(*frontend_shared.as_bytes(), node_x25519_pk.to_bytes());
+        let frontend_session =
+            E2eSession::new(*frontend_shared.as_bytes(), node_x25519_pk.to_bytes());
 
         // Node encrypts → Frontend decrypts
         let plaintext = b"Hello from node!";
@@ -713,7 +756,13 @@ mod tests {
     fn test_e2e_session_debug_redacts_secret() {
         let session = E2eSession::new([0x42; 32], [0xAA; 32]);
         let debug_str = format!("{:?}", session);
-        assert!(debug_str.contains("REDACTED"), "Debug output must not reveal shared secret");
-        assert!(!debug_str.contains("42"), "Debug output must not reveal key bytes");
+        assert!(
+            debug_str.contains("REDACTED"),
+            "Debug output must not reveal shared secret"
+        );
+        assert!(
+            !debug_str.contains("42"),
+            "Debug output must not reveal key bytes"
+        );
     }
 }

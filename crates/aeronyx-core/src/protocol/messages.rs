@@ -373,20 +373,15 @@ mod tests {
         assert!(MessageType::ClientHello.is_handshake());
         assert!(MessageType::ServerHello.is_handshake());
         assert!(!MessageType::Data.is_handshake());
-        
+
         assert!(MessageType::Data.is_data());
         assert!(!MessageType::ClientHello.is_data());
     }
 
     #[test]
     fn test_client_hello_size() {
-        let hello = ClientHello::new(
-            1,
-            [0u8; 32],
-            [0u8; 32],
-            12345,
-        );
-        
+        let hello = ClientHello::new(1, [0u8; 32], [0u8; 32], 12345);
+
         // 1 + 1 + 32 + 32 + 8 + 64 = 138
         assert_eq!(ClientHello::wire_size(), CLIENT_HELLO_SIZE);
         assert_eq!(hello.message_type, MessageType::ClientHello.as_byte());
@@ -394,14 +389,8 @@ mod tests {
 
     #[test]
     fn test_server_hello_size() {
-        let hello = ServerHello::new(
-            1,
-            [0u8; 32],
-            [0u8; 32],
-            [100, 64, 0, 2],
-            [0u8; 16],
-        );
-        
+        let hello = ServerHello::new(1, [0u8; 32], [0u8; 32], [100, 64, 0, 2], [0u8; 16]);
+
         // 1 + 1 + 32 + 32 + 4 + 16 + 64 = 150
         assert_eq!(ServerHello::wire_size(), SERVER_HELLO_SIZE);
         assert_eq!(hello.message_type, MessageType::ServerHello.as_byte());
@@ -409,12 +398,8 @@ mod tests {
 
     #[test]
     fn test_data_packet_size() {
-        let packet = DataPacket::new(
-            [0u8; 16],
-            1,
-            vec![0u8; 100],
-        );
-        
+        let packet = DataPacket::new([0u8; 16], 1, vec![0u8; 100]);
+
         // 16 + 8 = 24 header + 100 payload
         assert_eq!(DataPacket::header_size(), DATA_PACKET_HEADER_SIZE);
         assert_eq!(packet.wire_size(), 124);

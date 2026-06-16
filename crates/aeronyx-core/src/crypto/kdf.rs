@@ -36,8 +36,8 @@
 
 use hkdf::Hkdf;
 use sha2::Sha256;
-use zeroize::Zeroize;
 use tracing::{debug, info};
+use zeroize::Zeroize;
 
 use super::{CHACHA20_KEY_SIZE, ED25519_PUBLIC_KEY_SIZE, HKDF_INFO_PREFIX, HKDF_SALT};
 use crate::crypto::SessionKey;
@@ -93,7 +93,7 @@ pub fn derive_session_key(
     server_public: &[u8; ED25519_PUBLIC_KEY_SIZE],
 ) -> Result<SessionKey> {
     info!("[CRYPTO-DEBUG] ========== derive_session_key START ==========");
-    
+
     // Log all inputs
     info!(
         "[CRYPTO-DEBUG] Input - Shared Secret: {}",
@@ -107,7 +107,7 @@ pub fn derive_session_key(
         "[CRYPTO-DEBUG] Input - Server Public Key: {}",
         to_hex(server_public)
     );
-    
+
     // Log HKDF parameters
     debug!(
         "[CRYPTO-DEBUG] HKDF Salt: {} (\"{}\")",
@@ -121,21 +121,17 @@ pub fn derive_session_key(
     );
 
     // Build info parameter: prefix || client_public || server_public
-    let mut info = Vec::with_capacity(
-        HKDF_INFO_PREFIX.len() + ED25519_PUBLIC_KEY_SIZE * 2
-    );
+    let mut info = Vec::with_capacity(HKDF_INFO_PREFIX.len() + ED25519_PUBLIC_KEY_SIZE * 2);
     info.extend_from_slice(HKDF_INFO_PREFIX);
     info.extend_from_slice(client_public);
     info.extend_from_slice(server_public);
-    
+
     debug!(
         "[CRYPTO-DEBUG] HKDF Info (full): {} ({} bytes)",
         to_hex(&info),
         info.len()
     );
-    debug!(
-        "[CRYPTO-DEBUG] HKDF Info breakdown:"
-    );
+    debug!("[CRYPTO-DEBUG] HKDF Info breakdown:");
     debug!(
         "[CRYPTO-DEBUG]   - Prefix ({} bytes): {}",
         HKDF_INFO_PREFIX.len(),
@@ -155,7 +151,7 @@ pub fn derive_session_key(
     // Perform HKDF-SHA256
     debug!("[CRYPTO-DEBUG] Performing HKDF-SHA256...");
     let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret);
-    
+
     let mut key_bytes = [0u8; CHACHA20_KEY_SIZE];
     match hk.expand(&info, &mut key_bytes) {
         Ok(()) => {
@@ -180,7 +176,7 @@ pub fn derive_session_key(
     debug!("[CRYPTO-DEBUG] Cleared intermediate info buffer");
 
     info!("[CRYPTO-DEBUG] ========== derive_session_key SUCCESS ==========");
-    
+
     // Summary for easy comparison
     info!("[CRYPTO-DEBUG] ====== KEY DERIVATION SUMMARY ======");
     info!(
@@ -195,10 +191,7 @@ pub fn derive_session_key(
         "[CRYPTO-DEBUG]   Server Public:     {}",
         to_hex(server_public)
     );
-    info!(
-        "[CRYPTO-DEBUG]   Derived Key:       {}",
-        to_hex(&key_bytes)
-    );
+    info!("[CRYPTO-DEBUG]   Derived Key:       {}", to_hex(&key_bytes));
     info!("[CRYPTO-DEBUG] ====================================");
 
     Ok(SessionKey::from_bytes(key_bytes))
@@ -242,7 +235,7 @@ pub fn hkdf_expand(
     debug!("[CRYPTO-DEBUG] Input - output_len: {} bytes", output_len);
 
     let hk = Hkdf::<Sha256>::new(Some(salt), shared_secret);
-    
+
     let mut output = vec![0u8; output_len];
     match hk.expand(info, &mut output) {
         Ok(()) => {
@@ -277,15 +270,11 @@ mod tests {
         let client_public = [0x01u8; ED25519_PUBLIC_KEY_SIZE];
         let server_public = [0x02u8; ED25519_PUBLIC_KEY_SIZE];
 
-        let key = derive_session_key(
-            &shared_secret,
-            &client_public,
-            &server_public,
-        ).unwrap();
+        let key = derive_session_key(&shared_secret, &client_public, &server_public).unwrap();
 
         // Key should be 32 bytes
         assert_eq!(key.as_bytes().len(), 32);
-        
+
         // Key should not be all zeros (would indicate failure)
         assert_ne!(key.as_bytes(), &[0u8; 32]);
     }
@@ -296,17 +285,9 @@ mod tests {
         let client_public = [0x01u8; ED25519_PUBLIC_KEY_SIZE];
         let server_public = [0x02u8; ED25519_PUBLIC_KEY_SIZE];
 
-        let key1 = derive_session_key(
-            &shared_secret,
-            &client_public,
-            &server_public,
-        ).unwrap();
+        let key1 = derive_session_key(&shared_secret, &client_public, &server_public).unwrap();
 
-        let key2 = derive_session_key(
-            &shared_secret,
-            &client_public,
-            &server_public,
-        ).unwrap();
+        let key2 = derive_session_key(&shared_secret, &client_public, &server_public).unwrap();
 
         // Same inputs should produce same key
         assert_eq!(key1.as_bytes(), key2.as_bytes());
@@ -319,17 +300,9 @@ mod tests {
         let server_public = [0x02u8; ED25519_PUBLIC_KEY_SIZE];
         let other_public = [0x03u8; ED25519_PUBLIC_KEY_SIZE];
 
-        let key1 = derive_session_key(
-            &shared_secret,
-            &client_public,
-            &server_public,
-        ).unwrap();
+        let key1 = derive_session_key(&shared_secret, &client_public, &server_public).unwrap();
 
-        let key2 = derive_session_key(
-            &shared_secret,
-            &client_public,
-            &other_public,
-        ).unwrap();
+        let key2 = derive_session_key(&shared_secret, &client_public, &other_public).unwrap();
 
         // Different server public should produce different key
         assert_ne!(key1.as_bytes(), key2.as_bytes());
@@ -343,15 +316,17 @@ mod tests {
 
         let key1 = derive_session_key(
             &shared_secret,
-            &key_a,  // client
-            &key_b,  // server
-        ).unwrap();
+            &key_a, // client
+            &key_b, // server
+        )
+        .unwrap();
 
         let key2 = derive_session_key(
             &shared_secret,
-            &key_b,  // client (swapped)
-            &key_a,  // server (swapped)
-        ).unwrap();
+            &key_b, // client (swapped)
+            &key_a, // server (swapped)
+        )
+        .unwrap();
 
         // Order of public keys matters
         assert_ne!(key1.as_bytes(), key2.as_bytes());
@@ -364,7 +339,7 @@ mod tests {
         let info = b"test-info";
 
         let output = hkdf_expand(&ikm, salt, info, 64).unwrap();
-        
+
         assert_eq!(output.len(), 64);
         assert_ne!(&output[..32], &[0u8; 32]);
     }

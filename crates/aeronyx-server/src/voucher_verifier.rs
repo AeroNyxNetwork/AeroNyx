@@ -14,9 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use blind_rsa_signatures::{
-    MessageRandomizer, PublicKeySha384PSSRandomized, Signature,
-};
+use blind_rsa_signatures::{MessageRandomizer, PublicKeySha384PSSRandomized, Signature};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -27,8 +25,7 @@ pub const VOUCHER_EXTENSION_MAGIC: &[u8; 4] = b"AVCH";
 const VOUCHER_EXTENSION_HEADER_SIZE: usize = 6;
 const VOUCHER_EXTENSION_MAX_SIZE: usize = 2048;
 const ISSUER_KEY_CACHE_TTL: Duration = Duration::from_secs(3600);
-const DEFAULT_ISSUER_KEYS_URL: &str =
-    "https://api.aeronyx.network/api/voucher/issuer/keys/";
+const DEFAULT_ISSUER_KEYS_URL: &str = "https://api.aeronyx.network/api/voucher/issuer/keys/";
 
 #[derive(Debug, Clone, Deserialize)]
 struct VoucherWire {
@@ -188,7 +185,11 @@ impl VoucherVerifier {
         let (last_observation, last_error) = self.metrics.last();
         let total = valid + invalid + missing + malformed;
         let ratio = |count: u64| {
-            if total == 0 { 0.0 } else { count as f64 / total as f64 }
+            if total == 0 {
+                0.0
+            } else {
+                count as f64 / total as f64
+            }
         };
         VoucherMetricsSnapshot {
             mode: "reject_invalid",
@@ -386,7 +387,9 @@ fn extract_voucher_json(extension: &[u8]) -> Result<Option<String>, String> {
     }
 
     let raw = &extension[VOUCHER_EXTENSION_HEADER_SIZE..VOUCHER_EXTENSION_HEADER_SIZE + len];
-    String::from_utf8(raw.to_vec()).map(Some).map_err(|e| format!("utf8: {e}"))
+    String::from_utf8(raw.to_vec())
+        .map(Some)
+        .map_err(|e| format!("utf8: {e}"))
 }
 
 fn b64d(s: &str) -> Result<Vec<u8>, String> {

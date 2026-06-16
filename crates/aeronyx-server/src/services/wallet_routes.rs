@@ -125,12 +125,13 @@ impl WalletRouteCache {
     /// subsequent calls just update `last_active` and `endpoint`.
     pub fn announce(&self, wallet: &[u8; 32], session_id: SessionId, endpoint: SocketAddr) {
         let mut map = self.inner.write();
-        map.entry(*wallet)
-            .or_insert_with(HashMap::new)
-            .insert(session_id, RouteEntry {
+        map.entry(*wallet).or_insert_with(HashMap::new).insert(
+            session_id,
+            RouteEntry {
                 endpoint,
                 last_active: Instant::now(),
-            });
+            },
+        );
     }
 
     // ============================================
@@ -195,9 +196,7 @@ impl WalletRouteCache {
 
         map.retain(|_wallet, sessions| {
             let before = sessions.len();
-            sessions.retain(|_sid, entry| {
-                now.duration_since(entry.last_active) <= ttl
-            });
+            sessions.retain(|_sid, entry| now.duration_since(entry.last_active) <= ttl);
             evicted += before - sessions.len();
             !sessions.is_empty()
         });
@@ -319,7 +318,11 @@ mod tests {
         assert_eq!(cache.lookup(&wallet_a).len(), 1);
         assert_eq!(cache.lookup(&wallet_b).len(), 1);
         // wallet_a's session must not appear in wallet_b's lookup
-        let b_sids: Vec<SessionId> = cache.lookup(&wallet_b).into_iter().map(|(s, _)| s).collect();
+        let b_sids: Vec<SessionId> = cache
+            .lookup(&wallet_b)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
         assert!(!b_sids.contains(&sid_a));
     }
 

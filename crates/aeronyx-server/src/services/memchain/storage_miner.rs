@@ -137,7 +137,7 @@ impl MemoryStorage {
                     recall_context, extractable, feedback_signal
              FROM raw_logs
              WHERE session_id = ?1
-             ORDER BY turn_index ASC"
+             ORDER BY turn_index ASC",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -201,7 +201,9 @@ impl MemoryStorage {
     /// Get entities with embeddings for pairwise cosine merge.
     /// Used by Miner Step 9. Returns (entity_id, name, type, embedding).
     pub async fn get_entities_with_embedding(
-        &self, owner: &[u8; 32], limit: usize,
+        &self,
+        owner: &[u8; 32],
+        limit: usize,
     ) -> Vec<(String, String, String, Vec<f32>)> {
         let conn = self.conn.lock().await;
         let mut stmt = match conn.prepare(
@@ -209,7 +211,7 @@ impl MemoryStorage {
              FROM entities
              WHERE owner = ?1 AND embedding IS NOT NULL
              ORDER BY mention_count DESC
-             LIMIT ?2"
+             LIMIT ?2",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -238,7 +240,10 @@ impl MemoryStorage {
     /// 6. Delete orphaned source episode_edges
     /// 7. Delete the source entity
     pub async fn merge_entities(
-        &self, owner: &[u8; 32], source_id: &str, target_id: &str,
+        &self,
+        owner: &[u8; 32],
+        source_id: &str,
+        target_id: &str,
     ) -> Result<(), String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -247,11 +252,14 @@ impl MemoryStorage {
 
         let conn = self.conn.lock().await;
 
-        let source_info: Option<(i64, Option<String>)> = conn.query_row(
-            "SELECT mention_count, description FROM entities WHERE entity_id = ?1",
-            params![source_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional().unwrap_or(None);
+        let source_info: Option<(i64, Option<String>)> = conn
+            .query_row(
+                "SELECT mention_count, description FROM entities WHERE entity_id = ?1",
+                params![source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap_or(None);
 
         let (src_mentions, src_desc) = match source_info {
             Some(info) => info,
@@ -270,13 +278,15 @@ impl MemoryStorage {
                     updated_at = ?3
                  WHERE entity_id = ?4",
                 params![src_mentions, desc, now, target_id],
-            ).map_err(|e| format!("Merge entity counts: {}", e))?;
+            )
+            .map_err(|e| format!("Merge entity counts: {}", e))?;
         } else {
             conn.execute(
                 "UPDATE entities SET mention_count = mention_count + ?1, updated_at = ?2
                  WHERE entity_id = ?3",
                 params![src_mentions, now, target_id],
-            ).map_err(|e| format!("Merge entity counts: {}", e))?;
+            )
+            .map_err(|e| format!("Merge entity counts: {}", e))?;
         }
 
         let _ = conn.execute(
@@ -291,14 +301,19 @@ impl MemoryStorage {
         );
 
         // Invalidate self-loops created by the merge (source↔target → target↔target)
-        let self_loop_count = conn.execute(
-            "UPDATE knowledge_edges SET valid_until = ?1, updated_at = ?1
+        let self_loop_count = conn
+            .execute(
+                "UPDATE knowledge_edges SET valid_until = ?1, updated_at = ?1
              WHERE owner = ?2 AND source_id = ?3 AND target_id = ?3 AND valid_until IS NULL",
-            params![now, owner.as_slice(), target_id],
-        ).unwrap_or(0);
+                params![now, owner.as_slice(), target_id],
+            )
+            .unwrap_or(0);
         if self_loop_count > 0 {
-            debug!(count = self_loop_count, target = target_id,
-                "[STORAGE] Self-loop edges invalidated after merge");
+            debug!(
+                count = self_loop_count,
+                target = target_id,
+                "[STORAGE] Self-loop edges invalidated after merge"
+            );
         }
 
         let _ = conn.execute(
@@ -315,8 +330,12 @@ impl MemoryStorage {
             params![source_id],
         );
 
-        info!(source = source_id, target = target_id,
-            merged_mentions = src_mentions, "[STORAGE] Entities merged");
+        info!(
+            source = source_id,
+            target = target_id,
+            merged_mentions = src_mentions,
+            "[STORAGE] Entities merged"
+        );
 
         Ok(())
     }
@@ -361,7 +380,7 @@ impl MemoryStorage {
                  JOIN sessions s ON s.session_id = e.session_id
                  WHERE ee.entity_id = ?1 AND ee.owner = ?2
                  ORDER BY s.started_at ASC
-                 LIMIT ?3 OFFSET ?4"
+                 LIMIT ?3 OFFSET ?4",
             ) {
                 Ok(s) => s,
                 Err(_) => return events,
@@ -370,7 +389,15 @@ impl MemoryStorage {
             let rows: Vec<(String, Option<String>, i64, Option<String>, String)> = stmt
                 .query_map(
                     params![entity_id, owner.as_slice(), limit as i64, offset as i64],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )
                 .map(|r| r.filter_map(|x| x.ok()).collect())
                 .unwrap_or_default();
@@ -379,8 +406,10 @@ impl MemoryStorage {
                 let project_name: Option<String> = project_id.and_then(|pid| {
                     conn.query_row(
                         "SELECT name FROM projects WHERE project_id = ?1",
-                        params![pid], |row| row.get(0),
-                    ).ok()
+                        params![pid],
+                        |row| row.get(0),
+                    )
+                    .ok()
                 });
 
                 events.push(EntityTimelineEntry {
@@ -408,23 +437,47 @@ impl MemoryStorage {
                  LEFT JOIN entities et ON et.entity_id = ke.target_id
                  WHERE ke.owner = ?1 AND (ke.source_id = ?2 OR ke.target_id = ?2)
                  ORDER BY ke.valid_from ASC
-                 LIMIT ?3"
+                 LIMIT ?3",
             ) {
                 Ok(s) => s,
                 Err(_) => return events,
             };
 
-            let rows: Vec<(String, Option<String>, i64, Option<i64>, String, String, String, String)> = stmt
-                .query_map(
-                    params![owner.as_slice(), entity_id, limit as i64],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                              row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))
-                )
+            let rows: Vec<(
+                String,
+                Option<String>,
+                i64,
+                Option<i64>,
+                String,
+                String,
+                String,
+                String,
+            )> = stmt
+                .query_map(params![owner.as_slice(), entity_id, limit as i64], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                })
                 .map(|r| r.filter_map(|x| x.ok()).collect())
                 .unwrap_or_default();
 
-            for (rel_type, fact_text, valid_from, valid_until,
-                 src_id, _tgt_id, src_name, tgt_name) in rows
+            for (
+                rel_type,
+                fact_text,
+                valid_from,
+                valid_until,
+                src_id,
+                _tgt_id,
+                src_name,
+                tgt_name,
+            ) in rows
             {
                 let (other_name, direction) = if src_id == entity_id {
                     (tgt_name, format!("→ {}", rel_type))
@@ -438,9 +491,7 @@ impl MemoryStorage {
                     "relation_created"
                 };
 
-                let detail = fact_text.unwrap_or_else(|| {
-                    format!("{} {}", direction, other_name)
-                });
+                let detail = fact_text.unwrap_or_else(|| format!("{} {}", direction, other_name));
 
                 events.push(EntityTimelineEntry {
                     session_id: String::new(),
@@ -480,14 +531,17 @@ impl MemoryStorage {
         filename: &str,
     ) -> (i64, Option<String>) {
         let conn = self.conn.lock().await;
-        let result: Option<(i64, String)> = conn.query_row(
-            "SELECT version, artifact_id FROM artifacts
+        let result: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT version, artifact_id FROM artifacts
              WHERE owner = ?1 AND filename = ?2
              ORDER BY version DESC
              LIMIT 1",
-            params![owner.as_slice(), filename],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional().unwrap_or(None);
+                params![owner.as_slice(), filename],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap_or(None);
 
         match result {
             Some((v, id)) => (v, Some(id)),
@@ -539,7 +593,9 @@ impl MemoryStorage {
                     created_at: row.get(11)?,
                 })
             },
-        ).optional().unwrap_or(None)
+        )
+        .optional()
+        .unwrap_or(None)
     }
 
     /// Search artifacts by filename pattern (LIKE %pattern%) for an owner.
@@ -578,30 +634,35 @@ impl MemoryStorage {
              FROM artifacts
              WHERE owner = ?1 AND lower(COALESCE(filename, '')) LIKE ?2 ESCAPE '\\'
              ORDER BY filename ASC, version DESC
-             LIMIT ?3 OFFSET ?4"
+             LIMIT ?3 OFFSET ?4",
         ) {
             Ok(s) => s,
             Err(e) => {
-                warn!("[STORAGE] search_artifacts_by_filename prepare failed: {}", e);
+                warn!(
+                    "[STORAGE] search_artifacts_by_filename prepare failed: {}",
+                    e
+                );
                 return Vec::new();
             }
         };
 
         stmt.query_map(
             params![owner.as_slice(), pattern, limit as i64, offset as i64],
-            |row| Ok(crate::services::memchain::ArtifactRow {
-                artifact_id: row.get(0)?,
-                session_id: row.get(1)?,
-                project_id: row.get(2)?,
-                artifact_type: row.get(3)?,
-                filename: row.get(4)?,
-                language: row.get(5)?,
-                version: row.get(6)?,
-                parent_id: row.get(7)?,
-                content_hash: row.get(8)?,
-                line_count: row.get(9)?,
-                created_at: row.get(10)?,
-            }),
+            |row| {
+                Ok(crate::services::memchain::ArtifactRow {
+                    artifact_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    project_id: row.get(2)?,
+                    artifact_type: row.get(3)?,
+                    filename: row.get(4)?,
+                    language: row.get(5)?,
+                    version: row.get(6)?,
+                    parent_id: row.get(7)?,
+                    content_hash: row.get(8)?,
+                    line_count: row.get(9)?,
+                    created_at: row.get(10)?,
+                })
+            },
         )
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
@@ -620,9 +681,35 @@ mod tests {
     #[tokio::test]
     async fn test_get_rawlogs_for_session() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
-        s.insert_raw_log("sess_a", 0, "user", "hello", "test", None, 1, None, None).await.unwrap();
-        s.insert_raw_log("sess_a", 1, "assistant", "hi there", "test", None, 0, None, None).await.unwrap();
-        s.insert_raw_log("sess_b", 0, "user", "other session", "test", None, 1, None, None).await.unwrap();
+        s.insert_raw_log("sess_a", 0, "user", "hello", "test", None, 1, None, None)
+            .await
+            .unwrap();
+        s.insert_raw_log(
+            "sess_a",
+            1,
+            "assistant",
+            "hi there",
+            "test",
+            None,
+            0,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        s.insert_raw_log(
+            "sess_b",
+            0,
+            "user",
+            "other session",
+            "test",
+            None,
+            1,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let logs = s.get_rawlogs_for_session("sess_a").await;
         assert_eq!(logs.len(), 2);
@@ -637,15 +724,54 @@ mod tests {
     async fn test_merge_entities() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
 
-        s.upsert_entity("ent_jwt", &owner, "JWT", "jwt", "technology", Some("Token format"), None).await.unwrap();
-        s.upsert_entity("ent_jwt2", &owner, "JSON Web Token", "json web token", "technology", Some("Auth token"), None).await.unwrap();
-        s.upsert_entity("ent_jwt2", &owner, "JSON Web Token", "json web token", "technology", None, None).await.unwrap();
+        s.upsert_entity(
+            "ent_jwt",
+            &owner,
+            "JWT",
+            "jwt",
+            "technology",
+            Some("Token format"),
+            None,
+        )
+        .await
+        .unwrap();
+        s.upsert_entity(
+            "ent_jwt2",
+            &owner,
+            "JSON Web Token",
+            "json web token",
+            "technology",
+            Some("Auth token"),
+            None,
+        )
+        .await
+        .unwrap();
+        s.upsert_entity(
+            "ent_jwt2",
+            &owner,
+            "JSON Web Token",
+            "json web token",
+            "technology",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
-        s.insert_knowledge_edge(&owner, "ent_jwt2", "ent_auth", "USED_BY", None, 1.0, 0.9, None, now, None).await.unwrap();
+        s.insert_knowledge_edge(
+            &owner, "ent_jwt2", "ent_auth", "USED_BY", None, 1.0, 0.9, None, now, None,
+        )
+        .await
+        .unwrap();
 
-        s.merge_entities(&owner, "ent_jwt2", "ent_jwt").await.unwrap();
+        s.merge_entities(&owner, "ent_jwt2", "ent_jwt")
+            .await
+            .unwrap();
 
         assert!(s.get_entity("ent_jwt2").await.is_none());
 
@@ -661,26 +787,54 @@ mod tests {
     async fn test_merge_entities_self_loop_cleanup() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
 
-        s.upsert_entity("ent_a", &owner, "A", "a", "concept", None, None).await.unwrap();
-        s.upsert_entity("ent_b", &owner, "B", "b", "concept", None, None).await.unwrap();
+        s.upsert_entity("ent_a", &owner, "A", "a", "concept", None, None)
+            .await
+            .unwrap();
+        s.upsert_entity("ent_b", &owner, "B", "b", "concept", None, None)
+            .await
+            .unwrap();
 
-        s.insert_knowledge_edge(&owner, "ent_a", "ent_b", "RELATED_TO", None, 1.0, 0.9, None, now, None).await.unwrap();
+        s.insert_knowledge_edge(
+            &owner,
+            "ent_a",
+            "ent_b",
+            "RELATED_TO",
+            None,
+            1.0,
+            0.9,
+            None,
+            now,
+            None,
+        )
+        .await
+        .unwrap();
 
         s.merge_entities(&owner, "ent_b", "ent_a").await.unwrap();
 
         let edges = s.get_edges_for_entity("ent_a", &owner).await;
-        assert!(edges.is_empty(), "Self-loop edges should be invalidated after merge");
+        assert!(
+            edges.is_empty(),
+            "Self-loop edges should be invalidated after merge"
+        );
     }
 
     #[tokio::test]
     async fn test_session_lifecycle_methods() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
 
-        s.upsert_session("sess_001", &owner, None, "code", now, 10).await.unwrap();
+        s.upsert_session("sess_001", &owner, None, "code", now, 10)
+            .await
+            .unwrap();
 
         s.mark_session_entities_extracted("sess_001").await;
         s.mark_session_summary_generated("sess_001").await;
@@ -713,20 +867,44 @@ mod tests {
         let owner = [0xAA; 32];
 
         s.insert_artifact(
-            "art_v1", &owner, "sess_001", None, "code",
-            Some("auth.rs"), Some("rust"), 1, None,
-            b"fn auth() {}", "hash1", None, Some(1),
-        ).await.unwrap();
+            "art_v1",
+            &owner,
+            "sess_001",
+            None,
+            "code",
+            Some("auth.rs"),
+            Some("rust"),
+            1,
+            None,
+            b"fn auth() {}",
+            "hash1",
+            None,
+            Some(1),
+        )
+        .await
+        .unwrap();
 
         let (v, id) = s.get_latest_artifact_version(&owner, "auth.rs").await;
         assert_eq!(v, 1);
         assert_eq!(id, Some("art_v1".to_string()));
 
         s.insert_artifact(
-            "art_v2", &owner, "sess_002", None, "code",
-            Some("auth.rs"), Some("rust"), 2, Some("art_v1"),
-            b"fn auth() { jwt() }", "hash2", None, Some(1),
-        ).await.unwrap();
+            "art_v2",
+            &owner,
+            "sess_002",
+            None,
+            "code",
+            Some("auth.rs"),
+            Some("rust"),
+            2,
+            Some("art_v1"),
+            b"fn auth() { jwt() }",
+            "hash2",
+            None,
+            Some(1),
+        )
+        .await
+        .unwrap();
 
         let (v2, id2) = s.get_latest_artifact_version(&owner, "auth.rs").await;
         assert_eq!(v2, 2);
@@ -739,11 +917,22 @@ mod tests {
         let owner = [0xAA; 32];
 
         s.insert_artifact(
-            "art_001", &owner, "sess_001", None, "code",
-            Some("main.rs"), Some("rust"), 1, None,
-            b"fn main() { println!(\"hello\"); }", "abc123",
-            None, Some(1),
-        ).await.unwrap();
+            "art_001",
+            &owner,
+            "sess_001",
+            None,
+            "code",
+            Some("main.rs"),
+            Some("rust"),
+            1,
+            None,
+            b"fn main() { println!(\"hello\"); }",
+            "abc123",
+            None,
+            Some(1),
+        )
+        .await
+        .unwrap();
 
         let result = s.get_artifact_with_content("art_001", &owner).await;
         assert!(result.is_some());
@@ -754,7 +943,10 @@ mod tests {
 
         // Other owner must not access
         let other_owner = [0xBB; 32];
-        assert!(s.get_artifact_with_content("art_001", &other_owner).await.is_none());
+        assert!(s
+            .get_artifact_with_content("art_001", &other_owner)
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -762,12 +954,57 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
 
-        s.insert_artifact("art_1", &owner, "s1", None, "code",
-            Some("auth.rs"), Some("rust"), 1, None, b"v1", "h1", None, None).await.unwrap();
-        s.insert_artifact("art_2", &owner, "s2", None, "code",
-            Some("auth.rs"), Some("rust"), 2, Some("art_1"), b"v2", "h2", None, None).await.unwrap();
-        s.insert_artifact("art_3", &owner, "s3", None, "code",
-            Some("main.rs"), Some("rust"), 1, None, b"main", "h3", None, None).await.unwrap();
+        s.insert_artifact(
+            "art_1",
+            &owner,
+            "s1",
+            None,
+            "code",
+            Some("auth.rs"),
+            Some("rust"),
+            1,
+            None,
+            b"v1",
+            "h1",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        s.insert_artifact(
+            "art_2",
+            &owner,
+            "s2",
+            None,
+            "code",
+            Some("auth.rs"),
+            Some("rust"),
+            2,
+            Some("art_1"),
+            b"v2",
+            "h2",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        s.insert_artifact(
+            "art_3",
+            &owner,
+            "s3",
+            None,
+            "code",
+            Some("main.rs"),
+            Some("rust"),
+            1,
+            None,
+            b"main",
+            "h3",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         // "auth" matches auth.rs (both versions)
         let results = s.search_artifacts_by_filename(&owner, "auth", 10, 0).await;

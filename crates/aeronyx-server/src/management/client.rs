@@ -38,13 +38,13 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, trace, warn};
-use serde_json::json;
 
-use aeronyx_core::crypto::IdentityKeyPair;
 use super::config::ManagementConfig;
 use super::models::*;
+use aeronyx_core::crypto::IdentityKeyPair;
 
 static RUNTIME_STARTED_AT: OnceLock<u64> = OnceLock::new();
 static RUNTIME_ID: OnceLock<String> = OnceLock::new();
@@ -55,9 +55,9 @@ static RUNTIME_ID: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MemChainHeartbeatStatus {
-    pub enabled:               bool,
-    pub allow_remote_storage:  bool,
-    pub max_remote_owners:     usize,
+    pub enabled: bool,
+    pub allow_remote_storage: bool,
+    pub max_remote_owners: usize,
     pub current_remote_owners: usize,
 }
 
@@ -74,7 +74,7 @@ pub struct MemChainHeartbeatStatus {
 /// CMS must use F() atomic update on UserTrafficQuota.used_bytes.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TrafficDelta {
-    pub bytes_in:  u64,
+    pub bytes_in: u64,
     pub bytes_out: u64,
 }
 
@@ -116,9 +116,9 @@ pub struct NodePolicy {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct HeartbeatResponse {
-    pub success:           bool,
+    pub success: bool,
     pub next_heartbeat_in: Option<u64>,
-    pub commands:          Option<Vec<Command>>,
+    pub commands: Option<Vec<Command>>,
 
     // v1.0.0-Membership
     /// Node access tier: "public" | "premium".
@@ -148,9 +148,9 @@ pub struct HeartbeatResponse {
 // ============================================
 
 pub struct ManagementClient {
-    config:      ManagementConfig,
-    http:        Client,
-    identity:    IdentityKeyPair,
+    config: ManagementConfig,
+    http: Client,
+    identity: IdentityKeyPair,
     binary_hash: String,
 }
 
@@ -161,7 +161,12 @@ impl ManagementClient {
             .build()
             .expect("Failed to create HTTP client");
         let binary_hash = super::integrity::compute_binary_hash();
-        Self { config, http, identity, binary_hash }
+        Self {
+            config,
+            http,
+            identity,
+            binary_hash,
+        }
     }
 
     pub fn node_id(&self) -> String {
@@ -169,7 +174,10 @@ impl ManagementClient {
     }
 
     fn current_timestamp() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     fn runtime_started_at() -> u64 {
@@ -177,14 +185,16 @@ impl ManagementClient {
     }
 
     fn runtime_id(&self, node_id: &str) -> String {
-        RUNTIME_ID.get_or_init(|| {
-            let mut hasher = Sha256::new();
-            hasher.update(node_id.as_bytes());
-            hasher.update(self.binary_hash.as_bytes());
-            hasher.update(Self::runtime_started_at().to_string().as_bytes());
-            hasher.update(std::process::id().to_string().as_bytes());
-            hex::encode(hasher.finalize())
-        }).clone()
+        RUNTIME_ID
+            .get_or_init(|| {
+                let mut hasher = Sha256::new();
+                hasher.update(node_id.as_bytes());
+                hasher.update(self.binary_hash.as_bytes());
+                hasher.update(Self::runtime_started_at().to_string().as_bytes());
+                hasher.update(std::process::id().to_string().as_bytes());
+                hex::encode(hasher.finalize())
+            })
+            .clone()
     }
 
     /// Creates an Ed25519 signature over SHA256(node_id + timestamp + body).
@@ -206,37 +216,46 @@ impl ManagementClient {
         trace!(hash = %hex::encode(&message_hash), "[SIGNATURE] Message hash computed");
 
         let signature = self.identity.sign(&message_hash);
-        let sig_hex   = hex::encode(signature);
+        let sig_hex = hex::encode(signature);
 
         trace!(signature = %sig_hex, "[SIGNATURE] Signature created");
         sig_hex
     }
 
-    fn signed_headers(node_id: &str, timestamp: u64, signature: &str)
-        -> Vec<(&'static str, String)>
-    {
+    fn signed_headers(
+        node_id: &str,
+        timestamp: u64,
+        signature: &str,
+    ) -> Vec<(&'static str, String)> {
         vec![
-            ("X-Node-ID",    node_id.to_string()),
-            ("X-Timestamp",  timestamp.to_string()),
-            ("X-Signature",  signature.to_string()),
+            ("X-Node-ID", node_id.to_string()),
+            ("X-Timestamp", timestamp.to_string()),
+            ("X-Signature", signature.to_string()),
         ]
     }
 
     /// Registers the node with the CMS using a binding code.
     pub async fn register_node(&self, code: &str) -> Result<NodeInfo, String> {
-        let url     = format!("{}/node/bind/", self.config.cms_url);
+        let url = format!("{}/node/bind/", self.config.cms_url);
         let request = BindNodeRequest {
-            code:          code.to_string(),
-            public_key:    self.node_id(),
+            code: code.to_string(),
+            public_key: self.node_id(),
             hardware_info: HardwareInfo::collect(),
         };
 
         info!("Registering node...");
 
-        let response = self.http.post(&url).json(&request).send().await
+        let response = self
+            .http
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
             .map_err(|e| format!("Request failed: {}", e))?;
 
-        let body: BindNodeResponse = response.json().await
+        let body: BindNodeResponse = response
+            .json()
+            .await
             .map_err(|e| format!("Parse failed: {}", e))?;
 
         if body.success {
@@ -246,7 +265,10 @@ impl ManagementClient {
             }
         }
 
-        Err(body.error.or(body.message).unwrap_or_else(|| "Unknown error".to_string()))
+        Err(body
+            .error
+            .or(body.message)
+            .unwrap_or_else(|| "Unknown error".to_string()))
     }
 
     /// Sends a heartbeat to the CMS with current node status.
@@ -261,19 +283,19 @@ impl ManagementClient {
     /// Empty collections are omitted from the serialized body (skip_serializing_if).
     pub async fn send_heartbeat(
         &self,
-        public_ip:         &str,
-        active_sessions:   u32,
-        memchain_status:   Option<MemChainHeartbeatStatus>,
+        public_ip: &str,
+        active_sessions: u32,
+        memchain_status: Option<MemChainHeartbeatStatus>,
         // v1.0.0-Membership
         connected_wallets: Vec<String>,
-        traffic_delta:     HashMap<String, TrafficDelta>,
-        vpn_health:        Option<serde_json::Value>,
-        operator_status:   Option<serde_json::Value>,
+        traffic_delta: HashMap<String, TrafficDelta>,
+        vpn_health: Option<serde_json::Value>,
+        operator_status: Option<serde_json::Value>,
     ) -> Result<HeartbeatResponse, String> {
-        let url       = format!("{}/node/heartbeat/", self.config.cms_url);
+        let url = format!("{}/node/heartbeat/", self.config.cms_url);
         let timestamp = Self::current_timestamp();
-        let node_id   = self.node_id();
-        let stats     = SystemStats::collect(active_sessions);
+        let node_id = self.node_id();
+        let stats = SystemStats::collect(active_sessions);
         let runtime_id = self.runtime_id(&node_id);
         let runtime_started_at = Self::runtime_started_at();
 
@@ -343,7 +365,7 @@ impl ManagementClient {
         }
 
         // Sign the body (no signature field present yet).
-        let body_str  = serde_json::to_string(&body_for_signing).map_err(|e| e.to_string())?;
+        let body_str = serde_json::to_string(&body_for_signing).map_err(|e| e.to_string())?;
         let signature = self.create_signature(timestamp, &body_str);
 
         // Insert signature into body.
@@ -359,8 +381,8 @@ impl ManagementClient {
         };
 
         debug!(
-            sessions  = active_sessions,
-            wallets   = connected_wallets.len(),
+            sessions = active_sessions,
+            wallets = connected_wallets.len(),
             tx_deltas = traffic_delta.len(),
             "[HEARTBEAT] Sending"
         );
@@ -372,11 +394,12 @@ impl ManagementClient {
 
         let response = request
             .json(&body_json)
-            .send().await
+            .send()
+            .await
             .map_err(|e| format!("Request failed: {}", e))?;
 
         if !response.status().is_success() {
-            let status    = response.status();
+            let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
             error!("Heartbeat failed: status={}, body={}", status, body_text);
             return Err(format!("Status: {}, Body: {}", status, body_text));
@@ -387,10 +410,10 @@ impl ManagementClient {
 
     /// Reports a session event (create/update/end) to the CMS.
     pub async fn report_session_event(&self, event: SessionEventReport) -> Result<(), String> {
-        let url       = format!("{}/node/sessions/report/", self.config.cms_url);
+        let url = format!("{}/node/sessions/report/", self.config.cms_url);
         let timestamp = Self::current_timestamp();
-        let node_id   = self.node_id();
-        let body_str  = serde_json::to_string(&event).map_err(|e| e.to_string())?;
+        let node_id = self.node_id();
+        let body_str = serde_json::to_string(&event).map_err(|e| e.to_string())?;
         let signature = self.create_signature(timestamp, &body_str);
 
         let mut request = self.http.post(&url);
@@ -400,11 +423,12 @@ impl ManagementClient {
 
         let response = request
             .json(&event)
-            .send().await
+            .send()
+            .await
             .map_err(|e| e.to_string())?;
 
         if !response.status().is_success() {
-            let status    = response.status();
+            let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
             return Err(format!("Status: {}, Body: {}", status, body_text));
         }
@@ -414,10 +438,10 @@ impl ManagementClient {
 
     /// Reports command execution status to CMS (v1.3.0).
     pub async fn report_command_status(&self, report: &CommandStatusReport) -> Result<(), String> {
-        let url       = format!("{}/node/vpn/status/", self.config.cms_url);
+        let url = format!("{}/node/vpn/status/", self.config.cms_url);
         let timestamp = Self::current_timestamp();
-        let node_id   = self.node_id();
-        let body_str  = serde_json::to_string(report).map_err(|e| e.to_string())?;
+        let node_id = self.node_id();
+        let body_str = serde_json::to_string(report).map_err(|e| e.to_string())?;
         let signature = self.create_signature(timestamp, &body_str);
 
         debug!(
@@ -433,11 +457,12 @@ impl ManagementClient {
 
         let response = request
             .json(report)
-            .send().await
+            .send()
+            .await
             .map_err(|e| format!("Request failed: {}", e))?;
 
         if !response.status().is_success() {
-            let status    = response.status();
+            let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
             warn!(
                 command_id  = %report.command_id,
@@ -452,7 +477,9 @@ impl ManagementClient {
         Ok(())
     }
 
-    pub fn config(&self) -> &ManagementConfig { &self.config }
+    pub fn config(&self) -> &ManagementConfig {
+        &self.config
+    }
 }
 
 impl std::fmt::Debug for ManagementClient {

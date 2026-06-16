@@ -205,7 +205,8 @@ impl LlmProvider for AnthropicProvider {
         let start = Instant::now();
 
         let model = req.model_override.as_deref().unwrap_or(&self.model);
-        let max_tokens = req.max_tokens
+        let max_tokens = req
+            .max_tokens
             .or(self.max_tokens)
             .unwrap_or(DEFAULT_MAX_TOKENS);
         let temperature = req.temperature.or(self.temperature);
@@ -218,13 +219,18 @@ impl LlmProvider for AnthropicProvider {
         // Now all system messages are concatenated with "\n\n" and a warning is
         // emitted so callers know the input was unusual.
         let mut system_parts: Vec<&str> = Vec::new();
-        let user_messages: Vec<AnthropicMessage> = req.messages.iter()
+        let user_messages: Vec<AnthropicMessage> = req
+            .messages
+            .iter()
             .filter_map(|m| {
                 if m.role == "system" {
                     system_parts.push(&m.content);
                     None // system role is NOT included in the messages array
                 } else {
-                    Some(AnthropicMessage { role: &m.role, content: &m.content })
+                    Some(AnthropicMessage {
+                        role: &m.role,
+                        content: &m.content,
+                    })
                 }
             })
             .collect();
@@ -260,7 +266,8 @@ impl LlmProvider for AnthropicProvider {
 
         let url = format!("{}/v1/messages", ANTHROPIC_API_BASE);
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_API_VERSION)
@@ -278,13 +285,16 @@ impl LlmProvider for AnthropicProvider {
         let latency_ms = start.elapsed().as_millis() as u64;
 
         if status == 429 {
-            let retry_after = resp.headers()
+            let retry_after = resp
+                .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
             self.healthy.store(false, Ordering::Relaxed);
             warn!(provider = %self.name, "[LLM_ANTHROPIC] Rate limited");
-            return Err(LlmError::RateLimit { retry_after_secs: retry_after });
+            return Err(LlmError::RateLimit {
+                retry_after_secs: retry_after,
+            });
         }
 
         if status == 400 {
@@ -301,7 +311,10 @@ impl LlmProvider for AnthropicProvider {
                 return Err(LlmError::ContextTooLong);
             }
             self.healthy.store(false, Ordering::Relaxed);
-            return Err(LlmError::ApiError { status, body: body_text });
+            return Err(LlmError::ApiError {
+                status,
+                body: body_text,
+            });
         }
 
         if !resp.status().is_success() {
@@ -316,14 +329,14 @@ impl LlmProvider for AnthropicProvider {
             return Err(LlmError::ApiError { status, body: msg });
         }
 
-        let resp_json: AnthropicResponse = resp.json().await
-            .map_err(|e| {
-                self.healthy.store(false, Ordering::Relaxed);
-                LlmError::ParseError(e.to_string())
-            })?;
+        let resp_json: AnthropicResponse = resp.json().await.map_err(|e| {
+            self.healthy.store(false, Ordering::Relaxed);
+            LlmError::ParseError(e.to_string())
+        })?;
 
         // Extract text from first text block
-        let content = resp_json.content
+        let content = resp_json
+            .content
             .into_iter()
             .find(|b| b.block_type == "text")
             .map(|b| b.text.trim().to_string())

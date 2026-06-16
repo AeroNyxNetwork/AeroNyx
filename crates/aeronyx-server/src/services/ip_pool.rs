@@ -183,7 +183,7 @@ impl IpPoolService {
     pub fn release(&self, ip: Ipv4Addr) -> bool {
         let mut allocated = self.allocated.lock();
         let removed = allocated.remove(&ip);
-        
+
         if removed {
             debug!("Released IP: {} ({} in use)", ip, allocated.len());
         } else {
@@ -245,7 +245,7 @@ impl IpPoolService {
         let network_u32 = u32::from(self.network);
         let ip_u32 = u32::from(ip);
         let offset = ip_u32.wrapping_sub(network_u32);
-        
+
         offset >= self.first_usable && offset <= self.last_usable && ip != self.gateway
     }
 
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn test_pool_creation() {
         let pool = create_test_pool();
-        
+
         assert_eq!(pool.network(), Ipv4Addr::new(100, 64, 0, 0));
         assert_eq!(pool.prefix_len(), 24);
         assert_eq!(pool.gateway(), Ipv4Addr::new(100, 64, 0, 1));
@@ -300,9 +300,9 @@ mod tests {
     #[test]
     fn test_allocate_first() {
         let pool = create_test_pool();
-        
+
         let ip = pool.allocate().unwrap();
-        
+
         // First allocation should be .2 (skip .0 network and .1 gateway)
         assert_eq!(ip, Ipv4Addr::new(100, 64, 0, 2));
         assert_eq!(pool.allocated_count(), 1);
@@ -312,11 +312,11 @@ mod tests {
     #[test]
     fn test_allocate_multiple() {
         let pool = create_test_pool();
-        
+
         let ip1 = pool.allocate().unwrap();
         let ip2 = pool.allocate().unwrap();
         let ip3 = pool.allocate().unwrap();
-        
+
         assert_eq!(ip1, Ipv4Addr::new(100, 64, 0, 2));
         assert_eq!(ip2, Ipv4Addr::new(100, 64, 0, 3));
         assert_eq!(ip3, Ipv4Addr::new(100, 64, 0, 4));
@@ -326,10 +326,10 @@ mod tests {
     #[test]
     fn test_release() {
         let pool = create_test_pool();
-        
+
         let ip = pool.allocate().unwrap();
         assert!(pool.is_allocated(ip));
-        
+
         let released = pool.release(ip);
         assert!(released);
         assert!(!pool.is_allocated(ip));
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn test_release_unallocated() {
         let pool = create_test_pool();
-        
+
         let released = pool.release(Ipv4Addr::new(100, 64, 0, 100));
         assert!(!released);
     }
@@ -347,12 +347,12 @@ mod tests {
     #[test]
     fn test_reallocation_after_release() {
         let pool = create_test_pool();
-        
+
         let ip1 = pool.allocate().unwrap();
         let ip2 = pool.allocate().unwrap();
-        
+
         pool.release(ip1);
-        
+
         // Next allocation should reuse ip1
         let ip3 = pool.allocate().unwrap();
         assert_eq!(ip3, ip1);
@@ -361,12 +361,8 @@ mod tests {
     #[test]
     fn test_pool_exhaustion() {
         // Use a /30 network (4 addresses: 1 network, 1 broadcast, 1 gateway, 1 usable)
-        let pool = IpPoolService::new(
-            Ipv4Addr::new(10, 0, 0, 0),
-            30,
-            Ipv4Addr::new(10, 0, 0, 1),
-        )
-        .unwrap();
+        let pool =
+            IpPoolService::new(Ipv4Addr::new(10, 0, 0, 0), 30, Ipv4Addr::new(10, 0, 0, 1)).unwrap();
 
         // Should be able to allocate 1 address (.2)
         let ip = pool.allocate().unwrap();
@@ -380,14 +376,14 @@ mod tests {
     #[test]
     fn test_contains() {
         let pool = create_test_pool();
-        
+
         // Valid addresses
         assert!(pool.contains(Ipv4Addr::new(100, 64, 0, 2)));
         assert!(pool.contains(Ipv4Addr::new(100, 64, 0, 254)));
-        
+
         // Gateway is not allocatable
         assert!(!pool.contains(Ipv4Addr::new(100, 64, 0, 1)));
-        
+
         // Outside range
         assert!(!pool.contains(Ipv4Addr::new(100, 64, 1, 1)));
         assert!(!pool.contains(Ipv4Addr::new(192, 168, 0, 1)));

@@ -77,4 +77,4 @@ pub use client::ManagementClient;
 pub use command_handler::CommandHandler;
 pub use config::ManagementConfig;
 pub use models::Command;
-pub use reporter::{HeartbeatReporter, SessionReporter, SessionEvent};
+pub use reporter::{HeartbeatReporter, SessionEvent, SessionReporter};

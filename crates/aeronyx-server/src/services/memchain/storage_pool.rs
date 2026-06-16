@@ -61,8 +61,8 @@ use tokio::task;
 use tracing::{info, warn};
 
 use super::storage::MemoryStorage;
-use super::volume_router::{VolumeRouter, VolumeRouterError};
 use super::system_db::SystemDb;
+use super::volume_router::{VolumeRouter, VolumeRouterError};
 
 // ============================================
 // Public Types
@@ -202,14 +202,13 @@ impl StoragePool {
 
         // Open MemoryStorage via spawn_blocking (synchronous SQLite call).
         let db_path_clone = db_path.clone();
-        let storage = task::spawn_blocking(move || {
-            MemoryStorage::open(&db_path_clone, Some(record_key))
-        })
-        .await?
-        .map_err(|reason| StoragePoolError::DbOpen {
-            path: db_path.to_string_lossy().into_owned(),
-            reason,
-        })?;
+        let storage =
+            task::spawn_blocking(move || MemoryStorage::open(&db_path_clone, Some(record_key)))
+                .await?
+                .map_err(|reason| StoragePoolError::DbOpen {
+                    path: db_path.to_string_lossy().into_owned(),
+                    reason,
+                })?;
 
         let storage = Arc::new(storage);
 
@@ -387,7 +386,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
         let config_path = write_volumes_toml(dir.path());
-        let router = VolumeRouter::new(&config_path, Arc::clone(&db)).await.unwrap();
+        let router = VolumeRouter::new(&config_path, Arc::clone(&db))
+            .await
+            .unwrap();
 
         let pool = StoragePool::new(
             Arc::clone(&router),
@@ -444,7 +445,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
         let config_path = write_volumes_toml(dir.path());
-        let router = VolumeRouter::new(&config_path, Arc::clone(&db)).await.unwrap();
+        let router = VolumeRouter::new(&config_path, Arc::clone(&db))
+            .await
+            .unwrap();
 
         // Use a very short idle timeout so we can test eviction quickly.
         let pool = StoragePool::new(
@@ -471,7 +474,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
         let config_path = write_volumes_toml(dir.path());
-        let router = VolumeRouter::new(&config_path, Arc::clone(&db)).await.unwrap();
+        let router = VolumeRouter::new(&config_path, Arc::clone(&db))
+            .await
+            .unwrap();
 
         // Pool capped at 2 connections.
         let pool = StoragePool::new(
@@ -567,7 +572,10 @@ mod tests {
         // All results should be the same Arc instance.
         let first = &results[0];
         for r in &results[1..] {
-            assert!(Arc::ptr_eq(first, r), "All concurrent calls must return the same Arc");
+            assert!(
+                Arc::ptr_eq(first, r),
+                "All concurrent calls must return the same Arc"
+            );
         }
 
         // Only one connection should be in the pool.

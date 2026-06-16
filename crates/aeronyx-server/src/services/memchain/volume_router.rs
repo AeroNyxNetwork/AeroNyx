@@ -93,9 +93,15 @@ pub struct VolumeConfig {
     pub max_bytes: u64,
 }
 
-fn default_status() -> VolumeStatus { VolumeStatus::ReadWrite }
-fn default_max_users() -> usize { 10_000 }
-fn default_max_bytes() -> u64 { 500_000_000_000 } // 500 GB
+fn default_status() -> VolumeStatus {
+    VolumeStatus::ReadWrite
+}
+fn default_max_users() -> usize {
+    10_000
+}
+fn default_max_bytes() -> u64 {
+    500_000_000_000
+} // 500 GB
 
 /// Top-level structure of volumes.toml.
 #[derive(serde::Deserialize)]
@@ -320,11 +326,7 @@ impl VolumeRouter {
     ///
     /// # Errors
     /// Returns `VolumeNotFound` if volume_id is not in the current config.
-    pub fn db_path(
-        &self,
-        volume_id: &str,
-        owner: &[u8; 32],
-    ) -> Result<PathBuf, VolumeRouterError> {
+    pub fn db_path(&self, volume_id: &str, owner: &[u8; 32]) -> Result<PathBuf, VolumeRouterError> {
         let vol_path = self.volume_path(volume_id)?;
         let filename = format!("{}.db", owner_to_filename(owner));
         Ok(vol_path.join(filename))
@@ -390,11 +392,7 @@ impl VolumeRouter {
         let old_count = vols.len();
         *vols = new_volumes;
 
-        info!(
-            old_count,
-            new_count,
-            "[VOLUME_ROUTER] ✅ Config reloaded"
-        );
+        info!(old_count, new_count, "[VOLUME_ROUTER] ✅ Config reloaded");
 
         Ok(())
     }
@@ -452,8 +450,8 @@ fn load_volumes_config(path: &Path) -> Result<Vec<VolumeConfig>, VolumeRouterErr
     let content = std::fs::read_to_string(path)
         .map_err(|_| VolumeRouterError::ConfigNotFound(path.to_path_buf()))?;
 
-    let file: VolumesFile = toml::from_str(&content)
-        .map_err(|e| VolumeRouterError::ConfigParse(e.to_string()))?;
+    let file: VolumesFile =
+        toml::from_str(&content).map_err(|e| VolumeRouterError::ConfigParse(e.to_string()))?;
 
     if file.volumes.is_empty() {
         return Err(VolumeRouterError::ConfigParse(
@@ -488,7 +486,10 @@ fn load_volumes_config(path: &Path) -> Result<Vec<VolumeConfig>, VolumeRouterErr
     }
 
     // Warn if no writable volume configured.
-    let has_writable = file.volumes.iter().any(|v| v.status == VolumeStatus::ReadWrite);
+    let has_writable = file
+        .volumes
+        .iter()
+        .any(|v| v.status == VolumeStatus::ReadWrite);
     if !has_writable {
         warn!(
             "[VOLUME_ROUTER] No ReadWrite volume configured — \
@@ -610,7 +611,9 @@ mod tests {
     ) -> (Arc<SystemDb>, Arc<VolumeRouter>) {
         let db = SystemDb::open(&dir.join("system.db")).await.unwrap();
         let config_path = write_volumes_toml(dir, volumes);
-        let router = VolumeRouter::new(&config_path, Arc::clone(&db)).await.unwrap();
+        let router = VolumeRouter::new(&config_path, Arc::clone(&db))
+            .await
+            .unwrap();
         (db, router)
     }
 
@@ -708,11 +711,7 @@ mod tests {
     #[tokio::test]
     async fn test_assign_no_writable_volume() {
         let dir = TempDir::new().unwrap();
-        let (_db, router) = make_router(
-            dir.path(),
-            &[("vol-001", VolumeStatus::ReadOnly)],
-        )
-        .await;
+        let (_db, router) = make_router(dir.path(), &[("vol-001", VolumeStatus::ReadOnly)]).await;
 
         let err = router.assign(&make_owner(0xAA)).await.unwrap_err();
         assert!(matches!(err, VolumeRouterError::NoWritableVolume));
@@ -750,7 +749,8 @@ mod tests {
 
         let expected_prefix = hex::encode(owner)[..16].to_string();
         assert!(
-            path.to_string_lossy().ends_with(&format!("{}.db", expected_prefix)),
+            path.to_string_lossy()
+                .ends_with(&format!("{}.db", expected_prefix)),
             "Expected path ending in {}.db, got: {}",
             expected_prefix,
             path.display()
@@ -767,7 +767,8 @@ mod tests {
 
         let expected_prefix = hex::encode(owner)[..16].to_string();
         assert!(
-            path.to_string_lossy().ends_with(&format!("{}.vec", expected_prefix)),
+            path.to_string_lossy()
+                .ends_with(&format!("{}.vec", expected_prefix)),
             "Expected path ending in {}.vec, got: {}",
             expected_prefix,
             path.display()
@@ -779,7 +780,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (_db, router) = make_router(dir.path(), &[("vol-001", VolumeStatus::ReadWrite)]).await;
 
-        let err = router.db_path("vol-nonexistent", &make_owner(0xAA)).unwrap_err();
+        let err = router
+            .db_path("vol-nonexistent", &make_owner(0xAA))
+            .unwrap_err();
         assert!(matches!(err, VolumeRouterError::VolumeNotFound(_)));
     }
 

@@ -56,9 +56,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::record::MemoryRecord;
 #[allow(deprecated)]
 use super::Fact;
-use super::record::MemoryRecord;
 
 // ============================================
 // Constants
@@ -168,7 +168,10 @@ impl std::fmt::Display for BlockHeader {
 /// A block with 100 facts can be 15–20 KB. **Never** broadcast a
 /// full `Block` over UDP. Only the `BlockHeader` (~100 bytes) is
 /// safe for UDP announcement. Use `SyncRequest` for full retrieval.
-#[deprecated(since = "2.1.0", note = "Use RecordBlock instead of Block for new code")]
+#[deprecated(
+    since = "2.1.0",
+    note = "Use RecordBlock instead of Block for new code"
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
     /// Block header (lightweight summary).

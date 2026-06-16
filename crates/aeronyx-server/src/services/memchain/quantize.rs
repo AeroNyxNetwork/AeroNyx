@@ -134,11 +134,15 @@ impl ScalarQuantizer {
 
     /// Returns the embedding dimension.
     #[must_use]
-    pub fn dim(&self) -> usize { self.dim }
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
 
     /// Returns whether calibration has been performed.
     #[must_use]
-    pub fn is_calibrated(&self) -> bool { self.calibrated }
+    pub fn is_calibrated(&self) -> bool {
+        self.calibrated
+    }
 
     /// Calibrate the quantizer from a representative sample of vectors.
     ///
@@ -198,8 +202,12 @@ impl ScalarQuantizer {
         for v in vectors.iter().skip(1) {
             assert_eq!(v.len(), self.dim, "Vector dimension mismatch");
             for i in 0..self.dim {
-                if v[i] < self.min_vals[i] { self.min_vals[i] = v[i]; }
-                if v[i] > self.max_vals[i] { self.max_vals[i] = v[i]; }
+                if v[i] < self.min_vals[i] {
+                    self.min_vals[i] = v[i];
+                }
+                if v[i] > self.max_vals[i] {
+                    self.max_vals[i] = v[i];
+                }
             }
         }
 
@@ -227,7 +235,8 @@ impl ScalarQuantizer {
                 assert_eq!(v.len(), self.dim, "Vector dimension mismatch");
                 dim_values.push(v[i]);
             }
-            dim_values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            dim_values
+                .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
             self.min_vals[i] = dim_values[lo_idx];
             self.max_vals[i] = dim_values[hi_idx];
@@ -247,7 +256,13 @@ impl ScalarQuantizer {
     /// ## Returns
     /// Vec<u8> of length self.dim.
     pub fn quantize(&self, vector: &[f32]) -> Vec<u8> {
-        assert_eq!(vector.len(), self.dim, "Vector dimension mismatch: expected {}, got {}", self.dim, vector.len());
+        assert_eq!(
+            vector.len(),
+            self.dim,
+            "Vector dimension mismatch: expected {}, got {}",
+            self.dim,
+            vector.len()
+        );
 
         let mut result = Vec::with_capacity(self.dim);
         for i in 0..self.dim {
@@ -262,7 +277,11 @@ impl ScalarQuantizer {
     /// ## Returns
     /// Vec<f32> of length self.dim.
     pub fn dequantize(&self, quantized: &[u8]) -> Vec<f32> {
-        assert_eq!(quantized.len(), self.dim, "Quantized vector dimension mismatch");
+        assert_eq!(
+            quantized.len(),
+            self.dim,
+            "Quantized vector dimension mismatch"
+        );
 
         let mut result = Vec::with_capacity(self.dim);
         for i in 0..self.dim {
@@ -322,37 +341,65 @@ impl ScalarQuantizer {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(4 + self.dim * 8);
         buf.extend_from_slice(&(self.dim as u32).to_le_bytes());
-        for &v in &self.min_vals { buf.extend_from_slice(&v.to_le_bytes()); }
-        for &v in &self.max_vals { buf.extend_from_slice(&v.to_le_bytes()); }
+        for &v in &self.min_vals {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for &v in &self.max_vals {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
         buf
     }
 
     /// Deserialize calibration parameters from bytes.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 4 { return None; }
+        if data.len() < 4 {
+            return None;
+        }
         let dim = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         let expected = 4 + dim * 8;
-        if data.len() < expected { return None; }
+        if data.len() < expected {
+            return None;
+        }
 
         let mut min_vals = Vec::with_capacity(dim);
         let mut max_vals = Vec::with_capacity(dim);
 
         for i in 0..dim {
             let off = 4 + i * 4;
-            min_vals.push(f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]));
+            min_vals.push(f32::from_le_bytes([
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+            ]));
         }
         for i in 0..dim {
             let off = 4 + dim * 4 + i * 4;
-            max_vals.push(f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]));
+            max_vals.push(f32::from_le_bytes([
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+            ]));
         }
 
         let mut scales = Vec::with_capacity(dim);
         for i in 0..dim {
             let range = max_vals[i] - min_vals[i];
-            scales.push(if range > MIN_RANGE { Q_LEVELS / range } else { 0.0 });
+            scales.push(if range > MIN_RANGE {
+                Q_LEVELS / range
+            } else {
+                0.0
+            });
         }
 
-        Some(Self { dim, min_vals, max_vals, scales, calibrated: true })
+        Some(Self {
+            dim,
+            min_vals,
+            max_vals,
+            scales,
+            calibrated: true,
+        })
     }
 }
 
@@ -367,12 +414,16 @@ mod tests {
     fn make_normalized_vectors(n: usize, dim: usize) -> Vec<Vec<f32>> {
         let mut vecs = Vec::with_capacity(n);
         for i in 0..n {
-            let mut v: Vec<f32> = (0..dim).map(|d| {
-                ((i * dim + d) as f32 * 0.01).sin() * 0.3
-            }).collect();
+            let mut v: Vec<f32> = (0..dim)
+                .map(|d| ((i * dim + d) as f32 * 0.01).sin() * 0.3)
+                .collect();
             // L2 normalize
-            let norm: f32 = v.iter().map(|x| x*x).sum::<f32>().sqrt();
-            if norm > 1e-6 { for x in v.iter_mut() { *x /= norm; } }
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 1e-6 {
+                for x in v.iter_mut() {
+                    *x /= norm;
+                }
+            }
             vecs.push(v);
         }
         vecs
@@ -431,7 +482,9 @@ mod tests {
             assert_eq!(dequantized.len(), 384);
 
             // Check per-dimension error is small
-            let max_error: f32 = v.iter().zip(dequantized.iter())
+            let max_error: f32 = v
+                .iter()
+                .zip(dequantized.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
 
@@ -451,7 +504,7 @@ mod tests {
         // Values outside [min, max] should be clamped
         let out_of_range = vec![-10.0, 5.0, 0.5, 0.5];
         let quantized = q.quantize(&out_of_range);
-        assert_eq!(quantized[0], 0);   // clamped to min
+        assert_eq!(quantized[0], 0); // clamped to min
         assert_eq!(quantized[1], 255); // clamped to max
     }
 
@@ -475,7 +528,9 @@ mod tests {
         assert!(
             error < 0.05,
             "Quantized dot product error {:.4} exceeds 0.05 (f32={:.4}, quant={:.4})",
-            error, f32_dot, q_dot
+            error,
+            f32_dot,
+            q_dot
         );
     }
 
@@ -512,7 +567,9 @@ mod tests {
         assert!(
             overlap >= 2,
             "Top-3 overlap should be >= 2, got {} (f32={:?}, fast={:?})",
-            overlap, f32_top3, fast_top3
+            overlap,
+            f32_top3,
+            fast_top3
         );
     }
 
@@ -549,11 +606,15 @@ mod tests {
         let n = 100_000;
 
         let f32_bytes = n * dim * 4; // 147,456,000 bytes ≈ 147 MB
-        let u8_bytes = n * dim * 1;  //  38,400,000 bytes ≈ 37 MB
+        let u8_bytes = n * dim * 1; //  38,400,000 bytes ≈ 37 MB
         let calibration_overhead = 4 + dim * 8; // 3,076 bytes
 
         let savings = 1.0 - (u8_bytes + calibration_overhead) as f64 / f32_bytes as f64;
-        assert!(savings > 0.73, "Expected > 73% savings, got {:.1}%", savings * 100.0);
+        assert!(
+            savings > 0.73,
+            "Expected > 73% savings, got {:.1}%",
+            savings * 100.0
+        );
     }
 
     #[test]
@@ -566,11 +627,7 @@ mod tests {
     #[test]
     fn test_constant_dimension_handled() {
         // If all values in a dimension are the same, scale = 0 → maps to 128
-        let vecs = vec![
-            vec![0.5, 0.1],
-            vec![0.5, 0.2],
-            vec![0.5, 0.3],
-        ];
+        let vecs = vec![vec![0.5, 0.1], vec![0.5, 0.2], vec![0.5, 0.3]];
         let mut q = ScalarQuantizer::new(2);
         q.calibrate(&vecs);
 

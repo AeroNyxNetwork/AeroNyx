@@ -62,7 +62,12 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::{extract::{Query, State}, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -161,9 +166,7 @@ struct UsageResponse {
 /// `GET /api/admin/volumes`
 ///
 /// Returns per-volume status including user counts and capacity.
-pub async fn admin_volumes(
-    State(state): State<Arc<MpiState>>,
-) -> impl IntoResponse {
+pub async fn admin_volumes(State(state): State<Arc<MpiState>>) -> impl IntoResponse {
     let router = match &state.volume_router {
         Some(r) => r,
         None => {
@@ -211,7 +214,14 @@ pub async fn admin_volumes(
         })
         .collect();
 
-    Json(serde_json::to_value(VolumesResponse { volumes, total_users }).unwrap()).into_response()
+    Json(
+        serde_json::to_value(VolumesResponse {
+            volumes,
+            total_users,
+        })
+        .unwrap(),
+    )
+    .into_response()
 }
 
 /// `POST /api/admin/volumes/reload`
@@ -219,9 +229,7 @@ pub async fn admin_volumes(
 /// Hot-reloads volumes.toml. New volumes become available immediately.
 /// Status changes take effect for new assignments only.
 /// Returns 422 if the config file has a parse error; existing config preserved.
-pub async fn admin_volumes_reload(
-    State(state): State<Arc<MpiState>>,
-) -> impl IntoResponse {
+pub async fn admin_volumes_reload(State(state): State<Arc<MpiState>>) -> impl IntoResponse {
     let router = match &state.volume_router {
         Some(r) => r,
         None => {
@@ -240,21 +248,28 @@ pub async fn admin_volumes_reload(
                 Err(_) => 0,
             };
             info!(volumes_count, "[ADMIN] volumes.toml reloaded");
-            Json(serde_json::to_value(ReloadResponse {
-                status: "ok",
-                message: None,
-                volumes_count,
-            }).unwrap()).into_response()
+            Json(
+                serde_json::to_value(ReloadResponse {
+                    status: "ok",
+                    message: None,
+                    volumes_count,
+                })
+                .unwrap(),
+            )
+            .into_response()
         }
         Err(e) => {
             tracing::warn!(error = %e, "[ADMIN] volumes.toml reload failed");
             (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::to_value(ReloadResponse {
-                    status: "error",
-                    message: Some(e.to_string()),
-                    volumes_count: 0,
-                }).unwrap()),
+                Json(
+                    serde_json::to_value(ReloadResponse {
+                        status: "error",
+                        message: Some(e.to_string()),
+                        volumes_count: 0,
+                    })
+                    .unwrap(),
+                ),
             )
                 .into_response()
         }
@@ -266,9 +281,7 @@ pub async fn admin_volumes_reload(
 /// Returns live connection counts for StoragePool and VectorIndexPool.
 /// Also returns max_connections and idle_timeout_secs from MpiState config
 /// (fixes MT2: these were previously always 0).
-pub async fn admin_pool_stats(
-    State(state): State<Arc<MpiState>>,
-) -> impl IntoResponse {
+pub async fn admin_pool_stats(State(state): State<Arc<MpiState>>) -> impl IntoResponse {
     let (storage_active, vector_active) = match (&state.storage_pool, &state.vector_pool) {
         (Some(sp), Some(vp)) => (sp.active_count(), vp.active_count()),
         _ => {
@@ -341,9 +354,9 @@ pub async fn admin_usage(
         }
     };
 
-    let total_input: u64  = stats.iter().map(|s| s.total_input_tokens).sum();
+    let total_input: u64 = stats.iter().map(|s| s.total_input_tokens).sum();
     let total_output: u64 = stats.iter().map(|s| s.total_output_tokens).sum();
-    let total_calls: u64  = stats.iter().map(|s| s.call_count).sum();
+    let total_calls: u64 = stats.iter().map(|s| s.call_count).sum();
 
     let by_owner: Vec<UsageEntry> = stats
         .into_iter()
@@ -355,14 +368,19 @@ pub async fn admin_usage(
         })
         .collect();
 
-    Json(serde_json::to_value(UsageResponse {
-        period: period_label,
-        since, until,
-        total_input_tokens: total_input,
-        total_output_tokens: total_output,
-        total_calls,
-        by_owner,
-    }).unwrap()).into_response()
+    Json(
+        serde_json::to_value(UsageResponse {
+            period: period_label,
+            since,
+            until,
+            total_input_tokens: total_input,
+            total_output_tokens: total_output,
+            total_calls,
+            by_owner,
+        })
+        .unwrap(),
+    )
+    .into_response()
 }
 
 // ============================================
@@ -400,13 +418,25 @@ fn parse_period(period: &str) -> Result<(i64, i64, String), &'static str> {
     if parts.len() != 2 {
         return Err("period must be in YYYY-MM format");
     }
-    let year: i32  = parts[0].parse().map_err(|_| "period year is not a valid integer")?;
-    let month: u32 = parts[1].parse().map_err(|_| "period month is not a valid integer")?;
-    if !(1..=12).contains(&month)     { return Err("period month must be between 01 and 12"); }
-    if !(1970..=9999).contains(&year) { return Err("period year out of range"); }
+    let year: i32 = parts[0]
+        .parse()
+        .map_err(|_| "period year is not a valid integer")?;
+    let month: u32 = parts[1]
+        .parse()
+        .map_err(|_| "period month is not a valid integer")?;
+    if !(1..=12).contains(&month) {
+        return Err("period month must be between 01 and 12");
+    }
+    if !(1970..=9999).contains(&year) {
+        return Err("period year out of range");
+    }
 
     let since = month_start_unix(year, month);
-    let (next_year, next_month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
     let until = month_start_unix(next_year, next_month) - 1;
     Ok((since, until, period.to_string()))
 }
@@ -417,7 +447,11 @@ fn current_month_bounds(now_unix: i64) -> (i64, i64) {
     let days_since_epoch = now_unix / 86400;
     let (year, month, _) = days_to_ymd(days_since_epoch);
     let since = month_start_unix(year, month);
-    let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let (ny, nm) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
     let until = month_start_unix(ny, nm) - 1;
     (since, until)
 }
@@ -449,18 +483,22 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
     // doe is always non-negative after this subtraction by construction of era.
     let doe = (z - era * 146097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y   = yoe as i64 + era * 400;
+    let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp  = (5 * doy + 2) / 153;
-    let d   = doy - (153 * mp + 2) / 5 + 1;
-    let m   = if mp < 10 { mp + 3 } else { mp - 9 };
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if m <= 2 { y + 1 } else { y };
     (year as i32, m as u32, d as u32)
 }
 
 /// Convert (year, month, day) to days-since-epoch (1970-01-01 = 0).
 fn ymd_to_days(year: i32, month: u32, day: u32) -> i64 {
-    let y = if month <= 2 { year as i64 - 1 } else { year as i64 };
+    let y = if month <= 2 {
+        year as i64 - 1
+    } else {
+        year as i64
+    };
     let m = month as i64;
     let d = day as i64;
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -515,7 +553,11 @@ mod tests {
 
     #[test]
     fn test_explicit_since_until() {
-        let params = UsageQuery { period: None, since: Some(1_700_000_000), until: Some(1_700_100_000) };
+        let params = UsageQuery {
+            period: None,
+            since: Some(1_700_000_000),
+            until: Some(1_700_100_000),
+        };
         let (since, until, _) = resolve_time_range(&params).unwrap();
         assert_eq!(since, 1_700_000_000);
         assert_eq!(until, 1_700_100_000);
@@ -523,13 +565,21 @@ mod tests {
 
     #[test]
     fn test_since_after_until_rejected() {
-        let params = UsageQuery { period: None, since: Some(2_000_000_000), until: Some(1_000_000_000) };
+        let params = UsageQuery {
+            period: None,
+            since: Some(2_000_000_000),
+            until: Some(1_000_000_000),
+        };
         assert!(resolve_time_range(&params).is_err());
     }
 
     #[test]
     fn test_default_is_current_month() {
-        let params = UsageQuery { period: None, since: None, until: None };
+        let params = UsageQuery {
+            period: None,
+            since: None,
+            until: None,
+        };
         let (since, until, label) = resolve_time_range(&params).unwrap();
         assert!(since > 0);
         assert!(until >= since);

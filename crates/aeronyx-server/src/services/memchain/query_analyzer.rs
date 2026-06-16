@@ -64,7 +64,7 @@ use std::collections::HashMap;
 
 use tracing::debug;
 
-use super::ner::{NerEngine, DetectedEntity};
+use super::ner::{DetectedEntity, NerEngine};
 
 // ============================================
 // Constants
@@ -73,17 +73,19 @@ use super::ner::{NerEngine, DetectedEntity};
 /// Entity labels used for query analysis.
 /// These match the labels used in Stage 2 entity extraction (consistency).
 const QUERY_ENTITY_LABELS: &[&str] = &[
-    "project", "module", "technology", "file", "person",
-    "decision", "problem", "solution",
+    "project",
+    "module",
+    "technology",
+    "file",
+    "person",
+    "decision",
+    "problem",
+    "solution",
 ];
 
 /// Keywords that indicate a PROJECT-type query (progress/status/overview).
-const PROJECT_KEYWORDS_CN: &[&str] = &[
-    "进展", "进度", "状态", "概览", "概况", "总结", "综合",
-];
-const PROJECT_KEYWORDS_EN: &[&str] = &[
-    "progress", "status", "overview", "summary",
-];
+const PROJECT_KEYWORDS_CN: &[&str] = &["进展", "进度", "状态", "概览", "概况", "总结", "综合"];
+const PROJECT_KEYWORDS_EN: &[&str] = &["progress", "status", "overview", "summary"];
 
 // ============================================
 // Types
@@ -245,7 +247,8 @@ fn match_entities(
 
         // Try partial match if exact fails (e.g., "项目B" matches "项目b")
         let entity_id = entity_id.or_else(|| {
-            known.iter()
+            known
+                .iter()
                 .find(|(k, _)| k.contains(&normalized) || normalized.contains(k.as_str()))
                 .map(|(_, v)| v.clone())
         });
@@ -255,7 +258,11 @@ fn match_entities(
             label: det.label.clone(),
             confidence: det.confidence,
             entity_id: entity_id.clone(),
-            entity_type: if entity_id.is_some() { Some(det.label.clone()) } else { None },
+            entity_type: if entity_id.is_some() {
+                Some(det.label.clone())
+            } else {
+                None
+            },
         });
     }
 
@@ -280,13 +287,12 @@ fn classify_query(
     }
 
     // Check for project-type keywords + project entity match
-    let has_project_keywords =
-        PROJECT_KEYWORDS_CN.iter().any(|kw| lower.contains(kw))
+    let has_project_keywords = PROJECT_KEYWORDS_CN.iter().any(|kw| lower.contains(kw))
         || PROJECT_KEYWORDS_EN.iter().any(|kw| lower.contains(kw));
 
-    let has_project_entity = matched_entities.iter().any(|e| {
-        e.entity_id.is_some() && e.label == "project"
-    });
+    let has_project_entity = matched_entities
+        .iter()
+        .any(|e| e.entity_id.is_some() && e.label == "project");
 
     if has_project_keywords || has_project_entity {
         // If we have a matched project entity, it's definitely PROJECT
@@ -332,7 +338,11 @@ fn extract_time_reference(query: &str, now_ts: i64) -> Option<TimeRange> {
         return Some(TimeRange {
             start: day_start,
             end: day_start + 86400,
-            source_text: if lower.contains("昨天") { "昨天".into() } else { "yesterday".into() },
+            source_text: if lower.contains("昨天") {
+                "昨天".into()
+            } else {
+                "yesterday".into()
+            },
         });
     }
 
@@ -342,7 +352,11 @@ fn extract_time_reference(query: &str, now_ts: i64) -> Option<TimeRange> {
         return Some(TimeRange {
             start: day_start,
             end: now_ts,
-            source_text: if lower.contains("今天") { "今天".into() } else { "today".into() },
+            source_text: if lower.contains("今天") {
+                "今天".into()
+            } else {
+                "today".into()
+            },
         });
     }
 
@@ -353,7 +367,11 @@ fn extract_time_reference(query: &str, now_ts: i64) -> Option<TimeRange> {
         return Some(TimeRange {
             start: week_start,
             end: week_end,
-            source_text: if lower.contains("上周") { "上周".into() } else { "last week".into() },
+            source_text: if lower.contains("上周") {
+                "上周".into()
+            } else {
+                "last week".into()
+            },
         });
     }
 
@@ -364,7 +382,11 @@ fn extract_time_reference(query: &str, now_ts: i64) -> Option<TimeRange> {
         return Some(TimeRange {
             start: week_start,
             end: now_ts,
-            source_text: if lower.contains("这周") { "这周".into() } else { "this week".into() },
+            source_text: if lower.contains("这周") {
+                "这周".into()
+            } else {
+                "this week".into()
+            },
         });
     }
 
@@ -375,7 +397,11 @@ fn extract_time_reference(query: &str, now_ts: i64) -> Option<TimeRange> {
         return Some(TimeRange {
             start: month_start,
             end: month_end,
-            source_text: if lower.contains("上个月") { "上个月".into() } else { "last month".into() },
+            source_text: if lower.contains("上个月") {
+                "上个月".into()
+            } else {
+                "last month".into()
+            },
         });
     }
 
@@ -400,12 +426,29 @@ fn extract_time_reference(query: &str, now_ts: i64) -> Option<TimeRange> {
 
     // ── Absolute date patterns (EN): "Month Day" ──
     let months = [
-        ("january", 1), ("february", 2), ("march", 3), ("april", 4),
-        ("may", 5), ("june", 6), ("july", 7), ("august", 8),
-        ("september", 9), ("october", 10), ("november", 11), ("december", 12),
-        ("jan", 1), ("feb", 2), ("mar", 3), ("apr", 4),
-        ("jun", 6), ("jul", 7), ("aug", 8), ("sep", 9),
-        ("oct", 10), ("nov", 11), ("dec", 12),
+        ("january", 1),
+        ("february", 2),
+        ("march", 3),
+        ("april", 4),
+        ("may", 5),
+        ("june", 6),
+        ("july", 7),
+        ("august", 8),
+        ("september", 9),
+        ("october", 10),
+        ("november", 11),
+        ("december", 12),
+        ("jan", 1),
+        ("feb", 2),
+        ("mar", 3),
+        ("apr", 4),
+        ("jun", 6),
+        ("jul", 7),
+        ("aug", 8),
+        ("sep", 9),
+        ("oct", 10),
+        ("nov", 11),
+        ("dec", 12),
     ];
 
     for (name, month_num) in &months {
@@ -436,7 +479,11 @@ fn regex_match(text: &str, pattern: &str) -> Option<Vec<String>> {
     let groups: Vec<String> = (1..caps.len())
         .filter_map(|i| caps.get(i).map(|m| m.as_str().to_string()))
         .collect();
-    if groups.is_empty() { None } else { Some(groups) }
+    if groups.is_empty() {
+        None
+    } else {
+        Some(groups)
+    }
 }
 
 /// Approximate a (month, day) date to a Unix timestamp.
@@ -619,7 +666,11 @@ mod tests {
             entity_id: Some("ent_jwt".into()),
             entity_type: Some("technology".into()),
         }];
-        let tr = Some(TimeRange { start: 100, end: 200, source_text: "yesterday".into() });
+        let tr = Some(TimeRange {
+            start: 100,
+            end: 200,
+            source_text: "yesterday".into(),
+        });
         let qt = classify_query("yesterday's JWT changes", &matched, &tr);
         assert_eq!(qt, QueryType::Temporal);
     }
@@ -628,9 +679,13 @@ mod tests {
     fn test_match_entities_exact() {
         let known = sample_known();
         let detected = vec![DetectedEntity {
-            text: "JWT".into(), label: "technology".into(),
-            confidence: 0.9, char_start: 0, char_end: 3,
-            word_start: 0, word_end: 0,
+            text: "JWT".into(),
+            label: "technology".into(),
+            confidence: 0.9,
+            char_start: 0,
+            char_end: 3,
+            word_start: 0,
+            word_end: 0,
         }];
         let matched = match_entities(&detected, &known);
         assert_eq!(matched.len(), 1);
@@ -641,9 +696,13 @@ mod tests {
     fn test_match_entities_partial() {
         let known = sample_known();
         let detected = vec![DetectedEntity {
-            text: "auth".into(), label: "module".into(),
-            confidence: 0.8, char_start: 0, char_end: 4,
-            word_start: 0, word_end: 0,
+            text: "auth".into(),
+            label: "module".into(),
+            confidence: 0.8,
+            char_start: 0,
+            char_end: 4,
+            word_start: 0,
+            word_end: 0,
         }];
         let matched = match_entities(&detected, &known);
         assert_eq!(matched.len(), 1);
@@ -655,9 +714,13 @@ mod tests {
     fn test_match_entities_no_match() {
         let known = sample_known();
         let detected = vec![DetectedEntity {
-            text: "React".into(), label: "technology".into(),
-            confidence: 0.8, char_start: 0, char_end: 5,
-            word_start: 0, word_end: 0,
+            text: "React".into(),
+            label: "technology".into(),
+            confidence: 0.8,
+            char_start: 0,
+            char_end: 5,
+            word_start: 0,
+            word_end: 0,
         }];
         let matched = match_entities(&detected, &known);
         assert_eq!(matched.len(), 1);

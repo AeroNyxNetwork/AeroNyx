@@ -212,7 +212,10 @@ impl LinuxTun {
         if config.persist {
             let persist_result = unsafe { libc::ioctl(fd, TUNSETPERSIST as libc::c_ulong, 1) };
             if persist_result < 0 {
-                warn!("Failed to set TUN persistence: {}", std::io::Error::last_os_error());
+                warn!(
+                    "Failed to set TUN persistence: {}",
+                    std::io::Error::last_os_error()
+                );
             }
         }
 
@@ -235,7 +238,10 @@ impl LinuxTun {
 
         // Create async fd wrapper
         let async_fd = AsyncFd::new(file).map_err(|e| {
-            TransportError::tun_create_failed(&config.name, format!("AsyncFd creation failed: {}", e))
+            TransportError::tun_create_failed(
+                &config.name,
+                format!("AsyncFd creation failed: {}", e),
+            )
         })?;
 
         // Update config with actual name
@@ -260,11 +266,9 @@ impl LinuxTun {
         let output = Command::new("ip")
             .args(["addr", "add", &addr, "dev", &self.config.name])
             .output()
-            .map_err(|e| {
-                TransportError::TunConfigFailed {
-                    name: self.config.name.clone(),
-                    reason: format!("Failed to run ip command: {}", e),
-                }
+            .map_err(|e| TransportError::TunConfigFailed {
+                name: self.config.name.clone(),
+                reason: format!("Failed to run ip command: {}", e),
             })?;
 
         if !output.status.success() {
@@ -295,11 +299,9 @@ impl LinuxTun {
                 &self.config.mtu.to_string(),
             ])
             .output()
-            .map_err(|e| {
-                TransportError::TunConfigFailed {
-                    name: self.config.name.clone(),
-                    reason: format!("Failed to set MTU: {}", e),
-                }
+            .map_err(|e| TransportError::TunConfigFailed {
+                name: self.config.name.clone(),
+                reason: format!("Failed to set MTU: {}", e),
             })?;
 
         if !output.status.success() {
@@ -325,19 +327,16 @@ impl LinuxTun {
 impl TunDevice for LinuxTun {
     async fn read(&self, buf: &mut [u8]) -> Result<usize> {
         loop {
-            let mut guard = self
-                .async_fd
-                .ready(Interest::READABLE)
-                .await
-                .map_err(|e| TransportError::TunReadFailed {
+            let mut guard = self.async_fd.ready(Interest::READABLE).await.map_err(|e| {
+                TransportError::TunReadFailed {
                     reason: e.to_string(),
-                })?;
+                }
+            })?;
 
             match guard.try_io(|inner| {
                 let fd = inner.get_ref().as_raw_fd();
-                let result = unsafe {
-                    libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-                };
+                let result =
+                    unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
 
                 if result < 0 {
                     Err(std::io::Error::last_os_error())
@@ -358,19 +357,16 @@ impl TunDevice for LinuxTun {
 
     async fn write(&self, buf: &[u8]) -> Result<usize> {
         loop {
-            let mut guard = self
-                .async_fd
-                .ready(Interest::WRITABLE)
-                .await
-                .map_err(|e| TransportError::TunWriteFailed {
+            let mut guard = self.async_fd.ready(Interest::WRITABLE).await.map_err(|e| {
+                TransportError::TunWriteFailed {
                     reason: e.to_string(),
-                })?;
+                }
+            })?;
 
             match guard.try_io(|inner| {
                 let fd = inner.get_ref().as_raw_fd();
-                let result = unsafe {
-                    libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
-                };
+                let result =
+                    unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
 
                 if result < 0 {
                     Err(std::io::Error::last_os_error())
@@ -418,11 +414,9 @@ impl TunDevice for LinuxTun {
         let output = Command::new("ip")
             .args(["link", "set", "dev", &self.config.name, "up"])
             .output()
-            .map_err(|e| {
-                TransportError::TunConfigFailed {
-                    name: self.config.name.clone(),
-                    reason: format!("Failed to bring up interface: {}", e),
-                }
+            .map_err(|e| TransportError::TunConfigFailed {
+                name: self.config.name.clone(),
+                reason: format!("Failed to bring up interface: {}", e),
             })?;
 
         if !output.status.success() {
@@ -434,7 +428,10 @@ impl TunDevice for LinuxTun {
         }
 
         self.is_up.store(true, Ordering::Release);
-        info!("TUN device {} is up with IP {}", self.config.name, self.config.address);
+        info!(
+            "TUN device {} is up with IP {}",
+            self.config.name, self.config.address
+        );
 
         Ok(())
     }
@@ -445,11 +442,9 @@ impl TunDevice for LinuxTun {
         let output = Command::new("ip")
             .args(["link", "set", "dev", &self.config.name, "down"])
             .output()
-            .map_err(|e| {
-                TransportError::TunConfigFailed {
-                    name: self.config.name.clone(),
-                    reason: format!("Failed to bring down interface: {}", e),
-                }
+            .map_err(|e| TransportError::TunConfigFailed {
+                name: self.config.name.clone(),
+                reason: format!("Failed to bring down interface: {}", e),
             })?;
 
         if !output.status.success() {
@@ -501,7 +496,7 @@ mod tests {
     #[test]
     fn test_ifreq_creation() {
         let ifr = IfReq::new("test0").with_flags(IFF_TUN | IFF_NO_PI);
-        
+
         assert_eq!(ifr.name(), "test0");
         assert_eq!(ifr.ifr_flags, IFF_TUN | IFF_NO_PI);
     }
@@ -510,7 +505,7 @@ mod tests {
     fn test_ifreq_name_truncation() {
         let long_name = "a".repeat(20);
         let ifr = IfReq::new(&long_name);
-        
+
         // Name should be truncated to IFNAMSIZ - 1
         assert!(ifr.name().len() < libc::IFNAMSIZ);
     }

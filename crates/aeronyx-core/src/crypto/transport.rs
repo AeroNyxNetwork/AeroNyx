@@ -53,11 +53,11 @@
 // chacha20poly1305 0.9 API (different from 0.10)
 // - 0.9: NewAead trait, Payload struct
 // - 0.10: KeyInit trait, different API
+use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::{
     aead::{Aead, NewAead, Payload},
     ChaCha20Poly1305, Nonce,
 };
-use chacha20poly1305::aead::generic_array::GenericArray;
 
 use crate::crypto::keys::SessionKey;
 use crate::error::{CoreError, Result};
@@ -191,7 +191,8 @@ impl TransportCrypto for DefaultTransportCrypto {
             return Err(CoreError::Encryption {
                 context: format!(
                     "Output buffer too small: need {}, have {}",
-                    required_len, output.len()
+                    required_len,
+                    output.len()
                 ),
             });
         }
@@ -200,17 +201,20 @@ impl TransportCrypto for DefaultTransportCrypto {
         // Note: 0.9 uses NewAead::new(), 0.10 uses KeyInit::new_from_slice()
         let cipher_key = GenericArray::from_slice(key.as_bytes());
         let cipher = ChaCha20Poly1305::new(cipher_key);
-        
+
         let nonce = Self::make_nonce(counter);
 
         // Encrypt with session_id as associated data (AAD)
         // The AAD is authenticated but not encrypted, binding the
         // ciphertext to this specific session
         let ciphertext = cipher
-            .encrypt(&nonce, Payload {
-                msg: plaintext,
-                aad: session_id,
-            })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: session_id,
+                },
+            )
             .map_err(|_| CoreError::Encryption {
                 context: "ChaCha20-Poly1305 encryption failed".into(),
             })?;
@@ -243,17 +247,20 @@ impl TransportCrypto for DefaultTransportCrypto {
         // Create cipher using chacha20poly1305 0.9 API
         let cipher_key = GenericArray::from_slice(key.as_bytes());
         let cipher = ChaCha20Poly1305::new(cipher_key);
-        
+
         let nonce = Self::make_nonce(counter);
 
         // Decrypt with session_id as associated data (AAD)
         // If AAD doesn't match what was used during encryption,
         // authentication will fail
         let plaintext = cipher
-            .decrypt(&nonce, Payload {
-                msg: ciphertext,
-                aad: session_id,
-            })
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: session_id,
+                },
+            )
             .map_err(|_| CoreError::Decryption)?;
 
         // Copy to output buffer
@@ -337,12 +344,12 @@ mod tests {
         let plaintext = b"Hello, AeroNyx!";
 
         let ciphertext = encrypt_packet(&key, counter, &session_id, plaintext).unwrap();
-        
+
         // Ciphertext should be larger due to auth tag
         assert_eq!(ciphertext.len(), plaintext.len() + POLY1305_TAG_SIZE);
 
         let decrypted = decrypt_packet(&key, counter, &session_id, &ciphertext).unwrap();
-        
+
         assert_eq!(decrypted, plaintext);
     }
 
@@ -367,7 +374,7 @@ mod tests {
         let plaintext = b"Hello, AeroNyx!";
 
         let ciphertext = encrypt_packet(&key1, counter, &session_id, plaintext).unwrap();
-        
+
         // Decryption with wrong key should fail
         let result = decrypt_packet(&key2, counter, &session_id, &ciphertext);
         assert!(matches!(result, Err(CoreError::Decryption)));
@@ -380,7 +387,7 @@ mod tests {
         let plaintext = b"Hello, AeroNyx!";
 
         let ciphertext = encrypt_packet(&key, 1, &session_id, plaintext).unwrap();
-        
+
         // Decryption with wrong counter should fail
         let result = decrypt_packet(&key, 2, &session_id, &ciphertext);
         assert!(matches!(result, Err(CoreError::Decryption)));
@@ -395,7 +402,7 @@ mod tests {
         let plaintext = b"Hello, AeroNyx!";
 
         let ciphertext = encrypt_packet(&key, counter, &session_id1, plaintext).unwrap();
-        
+
         // Decryption with wrong session_id should fail (AAD mismatch)
         let result = decrypt_packet(&key, counter, &session_id2, &ciphertext);
         assert!(matches!(result, Err(CoreError::Decryption)));
@@ -409,10 +416,10 @@ mod tests {
         let plaintext = b"Hello, AeroNyx!";
 
         let mut ciphertext = encrypt_packet(&key, counter, &session_id, plaintext).unwrap();
-        
+
         // Tamper with ciphertext
         ciphertext[0] ^= 0xFF;
-        
+
         // Decryption should fail
         let result = decrypt_packet(&key, counter, &session_id, &ciphertext);
         assert!(matches!(result, Err(CoreError::Decryption)));
@@ -426,7 +433,7 @@ mod tests {
         let plaintext = b"";
 
         let ciphertext = encrypt_packet(&key, counter, &session_id, plaintext).unwrap();
-        
+
         // Should just be the auth tag
         assert_eq!(ciphertext.len(), POLY1305_TAG_SIZE);
 
@@ -443,7 +450,7 @@ mod tests {
 
         let ciphertext = encrypt_packet(&key, counter, &session_id, &plaintext).unwrap();
         let decrypted = decrypt_packet(&key, counter, &session_id, &ciphertext).unwrap();
-        
+
         assert_eq!(decrypted, plaintext);
     }
 
@@ -451,10 +458,10 @@ mod tests {
     fn test_nonce_construction() {
         let nonce1 = DefaultTransportCrypto::make_nonce(1);
         let nonce2 = DefaultTransportCrypto::make_nonce(2);
-        
+
         // Different counters should produce different nonces
         assert_ne!(nonce1.as_slice(), nonce2.as_slice());
-        
+
         // Counter 1 should be at start of nonce (little-endian)
         let expected: [u8; 12] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(nonce1.as_slice(), &expected);
@@ -475,15 +482,19 @@ mod tests {
         let session_id = [0x01u8; 16];
         let counter = 1u64;
         let plaintext = b"Test message";
-        
+
         let mut ciphertext = vec![0u8; plaintext.len() + crypto.overhead()];
-        let ct_len = crypto.encrypt(&key, counter, &session_id, plaintext, &mut ciphertext).unwrap();
+        let ct_len = crypto
+            .encrypt(&key, counter, &session_id, plaintext, &mut ciphertext)
+            .unwrap();
         ciphertext.truncate(ct_len);
-        
+
         let mut decrypted = vec![0u8; ciphertext.len()];
-        let pt_len = crypto.decrypt(&key, counter, &session_id, &ciphertext, &mut decrypted).unwrap();
+        let pt_len = crypto
+            .decrypt(&key, counter, &session_id, &ciphertext, &mut decrypted)
+            .unwrap();
         decrypted.truncate(pt_len);
-        
+
         assert_eq!(decrypted, plaintext);
     }
 }

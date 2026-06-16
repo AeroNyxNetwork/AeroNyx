@@ -344,7 +344,7 @@ mod tests {
     fn test_atomic_instant_basic() {
         let atomic = AtomicInstant::now();
         let loaded = atomic.load();
-        
+
         // Should be very close to now
         assert!(loaded.elapsed() < Duration::from_millis(100));
     }
@@ -353,11 +353,11 @@ mod tests {
     fn test_atomic_instant_store() {
         let atomic = AtomicInstant::now();
         thread::sleep(Duration::from_millis(10));
-        
+
         let before = atomic.load();
         atomic.store(Instant::now());
         let after = atomic.load();
-        
+
         assert!(after > before);
     }
 
@@ -365,7 +365,7 @@ mod tests {
     fn test_atomic_instant_elapsed() {
         let atomic = AtomicInstant::now();
         thread::sleep(Duration::from_millis(10));
-        
+
         assert!(atomic.elapsed() >= Duration::from_millis(10));
         assert!(atomic.has_elapsed(Duration::from_millis(5)));
     }

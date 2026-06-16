@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn test_version_features() {
         let v1 = ProtocolVersion::new(1);
-        
+
         assert!(v1.has_feature(VersionFeature::Handshake));
         assert!(v1.has_feature(VersionFeature::ChaCha20Transport));
         assert!(v1.has_feature(VersionFeature::Ed25519Signatures));

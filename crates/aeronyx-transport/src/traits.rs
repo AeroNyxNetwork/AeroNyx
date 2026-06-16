@@ -352,7 +352,7 @@ mod tests {
     fn test_packet_source() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let source = PacketSource::new(addr);
-        
+
         assert_eq!(source.addr, addr);
         assert!(source.age() < std::time::Duration::from_secs(1));
     }
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn test_tun_config_defaults() {
         let config = TunConfig::new("tun0");
-        
+
         assert_eq!(config.name, "tun0");
         assert_eq!(config.address, std::net::Ipv4Addr::new(100, 64, 0, 1));
         assert_eq!(config.mtu, 1420);

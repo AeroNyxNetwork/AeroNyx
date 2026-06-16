@@ -41,8 +41,8 @@
 //                        DeviceRegister, ChatPull, ChatAck; added WalletPresence (17)
 // ============================================================================
 
-use serde::{Deserialize, Serialize};
 use bincode::Options;
+use serde::{Deserialize, Serialize};
 
 #[allow(deprecated)]
 use crate::ledger::Fact;
@@ -134,40 +134,27 @@ pub enum MemChainMessage {
     BroadcastFact(Fact),
 
     /// Request synchronisation: "send me all facts after this hash" (legacy).
-    SyncRequest {
-        last_known_hash: [u8; 32],
-    },
+    SyncRequest { last_known_hash: [u8; 32] },
 
     /// Response to a sync request with a batch of facts (legacy).
-    SyncResponse {
-        facts: Vec<Fact>,
-    },
+    SyncResponse { facts: Vec<Fact> },
 
     /// Query: ask a peer whether it has a specific fact.
-    QueryRequest {
-        fact_id: [u8; 32],
-    },
+    QueryRequest { fact_id: [u8; 32] },
 
     /// Query response.
-    QueryResponse {
-        fact: Option<Fact>,
-    },
+    QueryResponse { fact: Option<Fact> },
 
     /// Lightweight ping to verify MemChain layer is alive.
-    Ping {
-        nonce: u64,
-    },
+    Ping { nonce: u64 },
 
     /// Response to a `Ping`.
-    Pong {
-        nonce: u64,
-    },
+    Pong { nonce: u64 },
 
     /// Announce a newly mined block (header only, <100 bytes).
     BlockAnnounce(BlockHeader),
 
     // ── v1.0.0: MemoryRecord-based messages ─────────────────────────────
-
     /// Broadcast a newly created MemoryRecord to peers.
     BroadcastRecord(MemoryRecord),
 
@@ -178,12 +165,9 @@ pub enum MemChainMessage {
     },
 
     /// Response to a record sync request.
-    SyncRecordResponse {
-        records: Vec<MemoryRecord>,
-    },
+    SyncRecordResponse { records: Vec<MemoryRecord> },
 
     // ── v1.1.0-ChatRelay: Zero-knowledge P2P chat (indices 11-15) ────────
-
     /// [index 11] Deliver an E2E-encrypted chat message to the target wallet.
     ///
     /// The node validates the Ed25519 signature in the envelope, then either
@@ -259,7 +243,6 @@ pub enum MemChainMessage {
     },
 
     // ── v1.2.0-MultiDevice: Device registration (index 16) ───────────────
-
     /// [index 16] Register a device under the authenticated wallet.
     ///
     /// ## v1.3.0-Sovereign Breaking Change
@@ -287,7 +270,6 @@ pub enum MemChainMessage {
     },
 
     // ── v1.3.0-Sovereign: Wallet presence heartbeat (index 17) ───────────
-
     /// [index 17] Lightweight heartbeat proving wallet ownership.
     ///
     /// Sent by the client periodically (recommended: every 60–120 s) to keep
@@ -346,10 +328,10 @@ pub fn decode_memchain(payload: &[u8]) -> std::result::Result<MemChainMessage, b
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[allow(deprecated)]
-    use crate::ledger::{BLOCK_TYPE_NORMAL, GENESIS_PREV_HASH, MemoryLayer};
     use crate::crypto::IdentityKeyPair;
-    use crate::protocol::chat::{ChatContentType, encode_envelope};
+    #[allow(deprecated)]
+    use crate::ledger::{MemoryLayer, BLOCK_TYPE_NORMAL, GENESIS_PREV_HASH};
+    use crate::protocol::chat::{encode_envelope, ChatContentType};
 
     // ── Existing tests (preserved verbatim) ─────────────────────────────
 
@@ -374,7 +356,9 @@ mod tests {
 
     #[test]
     fn test_sync_request_roundtrip() {
-        let msg = MemChainMessage::SyncRequest { last_known_hash: [0xAB; 32] };
+        let msg = MemChainMessage::SyncRequest {
+            last_known_hash: [0xAB; 32],
+        };
         let encoded = encode_memchain(&msg).expect("encode");
         let decoded = decode_memchain(&encoded[1..]).expect("decode");
         match decoded {
@@ -407,7 +391,11 @@ mod tests {
         };
         let msg = MemChainMessage::BlockAnnounce(header.clone());
         let encoded = encode_memchain(&msg).expect("encode");
-        assert!(encoded.len() < 200, "BlockAnnounce must be <200 bytes, got {}", encoded.len());
+        assert!(
+            encoded.len() < 200,
+            "BlockAnnounce must be <200 bytes, got {}",
+            encoded.len()
+        );
         let decoded = decode_memchain(&encoded[1..]).expect("decode");
         match decoded {
             MemChainMessage::BlockAnnounce(h) => {
@@ -421,9 +409,13 @@ mod tests {
     #[test]
     fn test_broadcast_record_roundtrip() {
         let record = MemoryRecord::new(
-            [0xAA; 32], 1_700_000_000, MemoryLayer::Episode,
-            vec!["test".into(), "memory".into()], "aeronyx-memory-v1".into(),
-            b"encrypted_content".to_vec(), vec![0.1, 0.2, 0.3],
+            [0xAA; 32],
+            1_700_000_000,
+            MemoryLayer::Episode,
+            vec!["test".into(), "memory".into()],
+            "aeronyx-memory-v1".into(),
+            b"encrypted_content".to_vec(),
+            vec![0.1, 0.2, 0.3],
         );
         let msg = MemChainMessage::BroadcastRecord(record.clone());
         let encoded = encode_memchain(&msg).expect("encode");
@@ -449,7 +441,10 @@ mod tests {
         let encoded = encode_memchain(&msg).expect("encode");
         let decoded = decode_memchain(&encoded[1..]).expect("decode");
         match decoded {
-            MemChainMessage::SyncRecordRequest { owner, after_timestamp } => {
+            MemChainMessage::SyncRecordRequest {
+                owner,
+                after_timestamp,
+            } => {
                 assert_eq!(owner, [0xCC; 32]);
                 assert_eq!(after_timestamp, 1_700_000_000);
             }
@@ -460,10 +455,17 @@ mod tests {
     #[test]
     fn test_sync_record_response_roundtrip() {
         let record = MemoryRecord::new(
-            [0xAA; 32], 1_700_000_000, MemoryLayer::Knowledge,
-            vec![], "test".into(), b"data".to_vec(), vec![],
+            [0xAA; 32],
+            1_700_000_000,
+            MemoryLayer::Knowledge,
+            vec![],
+            "test".into(),
+            b"data".to_vec(),
+            vec![],
         );
-        let msg = MemChainMessage::SyncRecordResponse { records: vec![record.clone()] };
+        let msg = MemChainMessage::SyncRecordResponse {
+            records: vec![record.clone()],
+        };
         let encoded = encode_memchain(&msg).expect("encode");
         let decoded = decode_memchain(&encoded[1..]).expect("decode");
         match decoded {
@@ -487,23 +489,37 @@ mod tests {
         }
 
         // BroadcastFact = 0
-        let b = bincode::serialize(&MemChainMessage::BroadcastFact(
-            Fact::new(0, "s".into(), "p".into(), "o".into()),
-        )).unwrap();
+        let b = bincode::serialize(&MemChainMessage::BroadcastFact(Fact::new(
+            0,
+            "s".into(),
+            "p".into(),
+            "o".into(),
+        )))
+        .unwrap();
         assert_eq!(disc(&b), 0, "BroadcastFact must be discriminant 0");
 
         // BlockAnnounce = 7
         let b = bincode::serialize(&MemChainMessage::BlockAnnounce(BlockHeader {
-            height: 0, timestamp: 0,
-            prev_block_hash: [0; 32], merkle_root: [0; 32],
+            height: 0,
+            timestamp: 0,
+            prev_block_hash: [0; 32],
+            merkle_root: [0; 32],
             block_type: 0x01,
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(disc(&b), 7, "BlockAnnounce must be discriminant 7");
 
         // BroadcastRecord = 8
-        let b = bincode::serialize(&MemChainMessage::BroadcastRecord(
-            MemoryRecord::new([0; 32], 0, MemoryLayer::Episode, vec![], "".into(), vec![], vec![]),
-        )).unwrap();
+        let b = bincode::serialize(&MemChainMessage::BroadcastRecord(MemoryRecord::new(
+            [0; 32],
+            0,
+            MemoryLayer::Episode,
+            vec![],
+            "".into(),
+            vec![],
+            vec![],
+        )))
+        .unwrap();
         assert_eq!(disc(&b), 8, "BroadcastRecord must be discriminant 8");
 
         // ChatRelay = 11
@@ -531,13 +547,16 @@ mod tests {
             limit: 50,
             request_timestamp: 1_700_000_000,
             signature: [0u8; 64],
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(disc(&b), 12, "ChatPull must be discriminant 12");
 
         // ChatPullResponse = 13
         let b = bincode::serialize(&MemChainMessage::ChatPullResponse {
-            envelopes: vec![], has_more: false,
-        }).unwrap();
+            envelopes: vec![],
+            has_more: false,
+        })
+        .unwrap();
         assert_eq!(disc(&b), 13, "ChatPullResponse must be discriminant 13");
 
         // ChatAck = 14
@@ -546,14 +565,16 @@ mod tests {
             wallet: [0xAA; 32],
             ack_timestamp: 1_700_000_000,
             signature: [0u8; 64],
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(disc(&b), 14, "ChatAck must be discriminant 14");
 
         // ChatExpired = 15
         let b = bincode::serialize(&MemChainMessage::ChatExpired {
             message_ids: vec![[0u8; 16]],
             receiver: [0xCC; 32],
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(disc(&b), 15, "ChatExpired must be discriminant 15");
 
         // DeviceRegister = 16
@@ -563,7 +584,8 @@ mod tests {
             wallet_pubkey: [0xAA; 32],
             timestamp: 1_700_000_000,
             signature: [0u8; 64],
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(disc(&b), 16, "DeviceRegister must be discriminant 16");
 
         // WalletPresence = 17
@@ -571,7 +593,8 @@ mod tests {
             wallet_pubkey: [0xBB; 32],
             timestamp: 1_700_000_000,
             signature: [0u8; 64],
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(disc(&b), 17, "WalletPresence must be discriminant 17");
     }
 
@@ -604,7 +627,10 @@ mod tests {
                 assert_eq!(e.sender, env.sender);
                 assert_eq!(e.receiver, env.receiver);
                 assert_eq!(e.ciphertext, env.ciphertext);
-                assert!(e.verify_signature().is_ok(), "Signature must survive roundtrip");
+                assert!(
+                    e.verify_signature().is_ok(),
+                    "Signature must survive roundtrip"
+                );
             }
             other => panic!("Expected ChatRelay, got {:?}", other),
         }
@@ -624,8 +650,12 @@ mod tests {
         let decoded = decode_memchain(&encoded[1..]).expect("decode");
         match decoded {
             MemChainMessage::ChatPull {
-                wallet, after_timestamp, cursor, limit,
-                request_timestamp, signature,
+                wallet,
+                after_timestamp,
+                cursor,
+                limit,
+                request_timestamp,
+                signature,
             } => {
                 assert_eq!(wallet, [0xAA; 32]);
                 assert_eq!(after_timestamp, 1_700_000_000);
@@ -640,11 +670,17 @@ mod tests {
 
     #[test]
     fn test_chat_pull_response_roundtrip() {
-        let msg = MemChainMessage::ChatPullResponse { envelopes: vec![], has_more: true };
+        let msg = MemChainMessage::ChatPullResponse {
+            envelopes: vec![],
+            has_more: true,
+        };
         let encoded = encode_memchain(&msg).expect("encode");
         let decoded = decode_memchain(&encoded[1..]).expect("decode");
         match decoded {
-            MemChainMessage::ChatPullResponse { envelopes, has_more } => {
+            MemChainMessage::ChatPullResponse {
+                envelopes,
+                has_more,
+            } => {
                 assert!(envelopes.is_empty());
                 assert!(has_more);
             }
@@ -664,7 +700,12 @@ mod tests {
         let encoded = encode_memchain(&msg).expect("encode");
         let decoded = decode_memchain(&encoded[1..]).expect("decode");
         match decoded {
-            MemChainMessage::ChatAck { message_ids, wallet, ack_timestamp, signature } => {
+            MemChainMessage::ChatAck {
+                message_ids,
+                wallet,
+                ack_timestamp,
+                signature,
+            } => {
                 assert_eq!(message_ids, ids);
                 assert_eq!(wallet, [0xCC; 32]);
                 assert_eq!(ack_timestamp, 1_700_000_000);
@@ -678,11 +719,17 @@ mod tests {
     fn test_chat_expired_roundtrip() {
         let ids: Vec<[u8; 16]> = vec![[0xCC; 16]];
         let receiver = [0xDD; 32];
-        let msg = MemChainMessage::ChatExpired { message_ids: ids.clone(), receiver };
+        let msg = MemChainMessage::ChatExpired {
+            message_ids: ids.clone(),
+            receiver,
+        };
         let encoded = encode_memchain(&msg).expect("encode");
         let decoded = decode_memchain(&encoded[1..]).expect("decode");
         match decoded {
-            MemChainMessage::ChatExpired { message_ids, receiver: r } => {
+            MemChainMessage::ChatExpired {
+                message_ids,
+                receiver: r,
+            } => {
                 assert_eq!(message_ids, ids);
                 assert_eq!(r, receiver);
             }
@@ -708,17 +755,18 @@ mod tests {
         let decoded = decode_memchain(&encoded[1..]).expect("decode");
         match decoded {
             MemChainMessage::DeviceRegister {
-                device_id, device_name, wallet_pubkey, timestamp, signature,
+                device_id,
+                device_name,
+                wallet_pubkey,
+                timestamp,
+                signature,
             } => {
                 assert_eq!(device_id, [0xABu8; 16]);
                 assert_eq!(device_name, "iPhone 14 Pro");
                 assert_eq!(wallet_pubkey, kp.public_key_bytes());
                 assert_eq!(timestamp, 1_700_000_000);
                 // Signature bytes must survive roundtrip intact
-                assert_eq!(
-                    signature,
-                    kp.sign(b"dummy_sign_data_for_roundtrip")
-                );
+                assert_eq!(signature, kp.sign(b"dummy_sign_data_for_roundtrip"));
             }
             other => panic!("Expected DeviceRegister, got {:?}", other),
         }
@@ -740,7 +788,11 @@ mod tests {
 
         let decoded = decode_memchain(&encoded[1..]).expect("decode");
         match decoded {
-            MemChainMessage::WalletPresence { wallet_pubkey, timestamp, signature } => {
+            MemChainMessage::WalletPresence {
+                wallet_pubkey,
+                timestamp,
+                signature,
+            } => {
                 assert_eq!(wallet_pubkey, kp.public_key_bytes());
                 assert_eq!(timestamp, ts);
                 assert_eq!(signature, sig);
@@ -779,7 +831,10 @@ mod tests {
 
         let decoded: MemChainMessage = bincode::deserialize(&bytes).expect("deserialize");
         match decoded {
-            MemChainMessage::SyncRecordRequest { owner, after_timestamp } => {
+            MemChainMessage::SyncRecordRequest {
+                owner,
+                after_timestamp,
+            } => {
                 assert_eq!(owner, [0xEE; 32]);
                 assert_eq!(after_timestamp, 9_999_999);
             }

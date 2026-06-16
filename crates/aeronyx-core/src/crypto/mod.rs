@@ -90,8 +90,8 @@ pub mod transport;
 
 // Re-export primary types at module level
 pub use handshake::HandshakeCrypto;
-pub use keys::{EphemeralKeyPair, IdentityKeyPair, IdentityPublicKey, SessionKey};
 pub use keys::E2eSession;
+pub use keys::{EphemeralKeyPair, IdentityKeyPair, IdentityPublicKey, SessionKey};
 pub use transport::TransportCrypto;
 
 // ============================================

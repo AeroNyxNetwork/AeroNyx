@@ -61,14 +61,70 @@ struct CostRate {
 
 fn cost_table() -> HashMap<&'static str, CostRate> {
     let mut m = HashMap::new();
-    m.insert("gpt-4o-mini",               CostRate { input_per_m: 0.15,  output_per_m: 0.60,  cached_input_per_m: 0.075 });
-    m.insert("gpt-4o",                    CostRate { input_per_m: 2.50,  output_per_m: 10.0,  cached_input_per_m: 1.25  });
-    m.insert("deepseek-chat",             CostRate { input_per_m: 0.07,  output_per_m: 1.10,  cached_input_per_m: 0.014 });
-    m.insert("deepseek-reasoner",         CostRate { input_per_m: 0.55,  output_per_m: 2.19,  cached_input_per_m: 0.14  });
-    m.insert("claude-haiku-4-5-20251001", CostRate { input_per_m: 0.80,  output_per_m: 4.00,  cached_input_per_m: 0.08  });
-    m.insert("claude-sonnet-4-6",         CostRate { input_per_m: 3.00,  output_per_m: 15.0,  cached_input_per_m: 0.30  });
-    m.insert("llama-3.3-70b-versatile",   CostRate { input_per_m: 0.59,  output_per_m: 0.79,  cached_input_per_m: 0.0   });
-    m.insert("llama3.2",                  CostRate { input_per_m: 0.0,   output_per_m: 0.0,   cached_input_per_m: 0.0   });
+    m.insert(
+        "gpt-4o-mini",
+        CostRate {
+            input_per_m: 0.15,
+            output_per_m: 0.60,
+            cached_input_per_m: 0.075,
+        },
+    );
+    m.insert(
+        "gpt-4o",
+        CostRate {
+            input_per_m: 2.50,
+            output_per_m: 10.0,
+            cached_input_per_m: 1.25,
+        },
+    );
+    m.insert(
+        "deepseek-chat",
+        CostRate {
+            input_per_m: 0.07,
+            output_per_m: 1.10,
+            cached_input_per_m: 0.014,
+        },
+    );
+    m.insert(
+        "deepseek-reasoner",
+        CostRate {
+            input_per_m: 0.55,
+            output_per_m: 2.19,
+            cached_input_per_m: 0.14,
+        },
+    );
+    m.insert(
+        "claude-haiku-4-5-20251001",
+        CostRate {
+            input_per_m: 0.80,
+            output_per_m: 4.00,
+            cached_input_per_m: 0.08,
+        },
+    );
+    m.insert(
+        "claude-sonnet-4-6",
+        CostRate {
+            input_per_m: 3.00,
+            output_per_m: 15.0,
+            cached_input_per_m: 0.30,
+        },
+    );
+    m.insert(
+        "llama-3.3-70b-versatile",
+        CostRate {
+            input_per_m: 0.59,
+            output_per_m: 0.79,
+            cached_input_per_m: 0.0,
+        },
+    );
+    m.insert(
+        "llama3.2",
+        CostRate {
+            input_per_m: 0.0,
+            output_per_m: 0.0,
+            cached_input_per_m: 0.0,
+        },
+    );
     m
 }
 
@@ -162,13 +218,16 @@ impl LlmRouter {
         let task_str = task_type.as_str();
 
         // Determine primary provider name from routing table
-        let primary_name = self.routing.get(task_str)
+        let primary_name = self
+            .routing
+            .get(task_str)
             .or_else(|| self.provider_order.first());
 
         let Some(primary_name) = primary_name else {
-            return Err(LlmError::NotConfigured(
-                format!("no provider configured for task_type={}", task_str)
-            ));
+            return Err(LlmError::NotConfigured(format!(
+                "no provider configured for task_type={}",
+                task_str
+            )));
         };
 
         // Try primary provider first
@@ -195,13 +254,16 @@ impl LlmRouter {
         }
 
         // Fallback: try remaining providers in declaration order
-        let mut last_error = LlmError::NotConfigured(
-            format!("all providers failed for task_type={}", task_str)
-        );
+        let mut last_error =
+            LlmError::NotConfigured(format!("all providers failed for task_type={}", task_str));
         for name in &self.provider_order {
-            if name == primary_name { continue; }
+            if name == primary_name {
+                continue;
+            }
             if let Some(provider) = self.providers.get(name) {
-                if !provider.is_healthy() { continue; }
+                if !provider.is_healthy() {
+                    continue;
+                }
                 match provider.chat(req).await {
                     Ok(resp) => {
                         info!(
@@ -222,14 +284,19 @@ impl LlmRouter {
     }
 
     /// Estimate cost in USD for a given model + token counts.
-    pub fn estimate_cost(model: &str, input_tokens: u32, output_tokens: u32, cached_tokens: u32) -> f64 {
+    pub fn estimate_cost(
+        model: &str,
+        input_tokens: u32,
+        output_tokens: u32,
+        cached_tokens: u32,
+    ) -> f64 {
         let table = cost_table();
-        let rate = table.get(model)
-            .or_else(|| {
-                table.iter()
-                    .find(|(k, _)| model.starts_with(*k))
-                    .map(|(_, v)| v)
-            });
+        let rate = table.get(model).or_else(|| {
+            table
+                .iter()
+                .find(|(k, _)| model.starts_with(*k))
+                .map(|(_, v)| v)
+        });
 
         match rate {
             Some(r) => {
@@ -238,7 +305,8 @@ impl LlmRouter {
                 let output = output_tokens as f64;
                 (billable_input * r.input_per_m
                     + cached * r.cached_input_per_m
-                    + output * r.output_per_m) / 1_000_000.0
+                    + output * r.output_per_m)
+                    / 1_000_000.0
             }
             None => 0.0,
         }
@@ -257,11 +325,12 @@ impl LlmRouter {
     /// Provider configs for health check pings.
     /// Returns `(name, api_base, model)` tuples.
     pub fn provider_configs(&self) -> Vec<(String, String, String)> {
-        self.provider_order.iter()
+        self.provider_order
+            .iter()
             .filter_map(|name| {
-                self.provider_meta.get(name).map(|meta| {
-                    (name.clone(), meta.api_base.clone(), meta.model.clone())
-                })
+                self.provider_meta
+                    .get(name)
+                    .map(|meta| (name.clone(), meta.api_base.clone(), meta.model.clone()))
             })
             .collect()
     }
@@ -294,7 +363,12 @@ mod tests {
     fn test_estimate_cost_known_model() {
         let cost = LlmRouter::estimate_cost("deepseek-chat", 1_000_000, 1_000_000, 0);
         let expected = (0.07 + 1.10) / 1.0;
-        assert!((cost - expected).abs() < 0.001, "cost={} expected={}", cost, expected);
+        assert!(
+            (cost - expected).abs() < 0.001,
+            "cost={} expected={}",
+            cost,
+            expected
+        );
     }
 
     #[test]
@@ -328,9 +402,15 @@ mod tests {
         struct StubProvider;
         #[async_trait::async_trait]
         impl LlmProvider for StubProvider {
-            fn name(&self) -> &str { "stub" }
-            fn default_model(&self) -> &str { "test-model" }
-            fn is_healthy(&self) -> bool { true }
+            fn name(&self) -> &str {
+                "stub"
+            }
+            fn default_model(&self) -> &str {
+                "test-model"
+            }
+            fn is_healthy(&self) -> bool {
+                true
+            }
             async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
                 Err(LlmError::NotConfigured("stub".into()))
             }
@@ -347,14 +427,28 @@ mod tests {
         };
 
         let router = LlmRouter::new(
-            vec![("stub".into(), "http://localhost".into(), "test-model".into(), Arc::new(StubProvider))],
+            vec![(
+                "stub".into(),
+                "http://localhost".into(),
+                "test-model".into(),
+                Arc::new(StubProvider),
+            )],
             routing,
         );
 
         assert_eq!(router.provider_count(), 1);
-        assert_eq!(router.routing.get("session_title").map(|s| s.as_str()), Some("stub"));
+        assert_eq!(
+            router.routing.get("session_title").map(|s| s.as_str()),
+            Some("stub")
+        );
         // conflict_resolution has no explicit route but fallback is "stub"
-        assert_eq!(router.routing.get("conflict_resolution").map(|s| s.as_str()), Some("stub"));
+        assert_eq!(
+            router
+                .routing
+                .get("conflict_resolution")
+                .map(|s| s.as_str()),
+            Some("stub")
+        );
     }
 
     #[test]
@@ -362,9 +456,15 @@ mod tests {
         struct StubProvider;
         #[async_trait::async_trait]
         impl LlmProvider for StubProvider {
-            fn name(&self) -> &str { "stub" }
-            fn default_model(&self) -> &str { "test-model" }
-            fn is_healthy(&self) -> bool { true }
+            fn name(&self) -> &str {
+                "stub"
+            }
+            fn default_model(&self) -> &str {
+                "test-model"
+            }
+            fn is_healthy(&self) -> bool {
+                true
+            }
             async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
                 Err(LlmError::NotConfigured("stub".into()))
             }
@@ -372,8 +472,18 @@ mod tests {
 
         let router = LlmRouter::new(
             vec![
-                ("deepseek".into(), "https://api.deepseek.com/v1".into(), "deepseek-chat".into(), Arc::new(StubProvider)),
-                ("ollama".into(), "http://localhost:11434/v1".into(), "llama3.2".into(), Arc::new(StubProvider)),
+                (
+                    "deepseek".into(),
+                    "https://api.deepseek.com/v1".into(),
+                    "deepseek-chat".into(),
+                    Arc::new(StubProvider),
+                ),
+                (
+                    "ollama".into(),
+                    "http://localhost:11434/v1".into(),
+                    "llama3.2".into(),
+                    Arc::new(StubProvider),
+                ),
             ],
             TaskRoutingConfig::default(),
         );

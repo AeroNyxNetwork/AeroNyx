@@ -53,14 +53,14 @@ use crate::management::client::TrafficDelta;
 // ============================================
 
 struct WalletCounters {
-    bytes_in:  AtomicU64,
+    bytes_in: AtomicU64,
     bytes_out: AtomicU64,
 }
 
 impl WalletCounters {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            bytes_in:  AtomicU64::new(0),
+            bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
         })
     }
@@ -80,7 +80,9 @@ pub struct TrafficTracker {
 
 impl TrafficTracker {
     pub fn new() -> Self {
-        Self { wallets: DashMap::new() }
+        Self {
+            wallets: DashMap::new(),
+        }
     }
 
     /// Records inbound bytes for a wallet (client → server).
@@ -107,13 +109,16 @@ impl TrafficTracker {
     pub fn drain(&self) -> HashMap<String, TrafficDelta> {
         let mut result = HashMap::new();
         for entry in self.wallets.iter() {
-            let counters  = entry.value();
-            let bytes_in  = counters.bytes_in.swap(0,  Ordering::Relaxed);
+            let counters = entry.value();
+            let bytes_in = counters.bytes_in.swap(0, Ordering::Relaxed);
             let bytes_out = counters.bytes_out.swap(0, Ordering::Relaxed);
             if bytes_in > 0 || bytes_out > 0 {
                 result.insert(
                     entry.key().clone(),
-                    TrafficDelta { bytes_in, bytes_out },
+                    TrafficDelta {
+                        bytes_in,
+                        bytes_out,
+                    },
                 );
             }
         }
@@ -123,11 +128,14 @@ impl TrafficTracker {
     /// Removes the tracker entry for a wallet if its counters are zero.
     /// Called from server.rs spawn_cleanup_task after a session expires.
     pub fn remove_wallet(&self, wallet_hex: &str) {
-        let should_remove = self.wallets.get(wallet_hex).map(|entry| {
-            let c = entry.value();
-            c.bytes_in.load(Ordering::Relaxed) == 0
-                && c.bytes_out.load(Ordering::Relaxed) == 0
-        }).unwrap_or(false);
+        let should_remove = self
+            .wallets
+            .get(wallet_hex)
+            .map(|entry| {
+                let c = entry.value();
+                c.bytes_in.load(Ordering::Relaxed) == 0 && c.bytes_out.load(Ordering::Relaxed) == 0
+            })
+            .unwrap_or(false);
 
         if should_remove {
             self.wallets.remove(wallet_hex);
@@ -149,7 +157,9 @@ impl TrafficTracker {
 }
 
 impl Default for TrafficTracker {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl std::fmt::Debug for TrafficTracker {
@@ -178,9 +188,9 @@ mod tests {
 
         let d = t.drain();
         assert_eq!(d.len(), 2);
-        assert_eq!(d["aabb"].bytes_in,  300);
+        assert_eq!(d["aabb"].bytes_in, 300);
         assert_eq!(d["aabb"].bytes_out, 50);
-        assert_eq!(d["ccdd"].bytes_in,  400);
+        assert_eq!(d["ccdd"].bytes_in, 400);
         assert_eq!(d["ccdd"].bytes_out, 0);
     }
 
@@ -226,9 +236,9 @@ mod tests {
         t.record_rx("wallet1", 1000);
         t.record_tx("wallet2", 2000);
         let d = t.drain();
-        assert_eq!(d["wallet1"].bytes_in,  1000);
+        assert_eq!(d["wallet1"].bytes_in, 1000);
         assert_eq!(d["wallet1"].bytes_out, 0);
-        assert_eq!(d["wallet2"].bytes_in,  0);
+        assert_eq!(d["wallet2"].bytes_in, 0);
         assert_eq!(d["wallet2"].bytes_out, 2000);
     }
 }

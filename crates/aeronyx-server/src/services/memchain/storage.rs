@@ -121,10 +121,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, error, info, warn};
 
-use zeroize::Zeroizing;
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord, RecordStatus};
+use zeroize::Zeroizing;
 
-use super::storage_crypto::{encrypt_record_content, decrypt_record_content};
+use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 
 // ============================================
 // Constants
@@ -152,11 +152,14 @@ pub(crate) fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
 }
 
 pub(crate) fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4).map(|chunk| {
-        let mut buf = [0u8; 4];
-        buf.copy_from_slice(chunk);
-        f32::from_le_bytes(buf)
-    }).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| {
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(chunk);
+            f32::from_le_bytes(buf)
+        })
+        .collect()
 }
 
 // ============================================
@@ -237,7 +240,11 @@ pub(crate) struct LruCache {
 
 impl LruCache {
     pub fn new(capacity: usize) -> Self {
-        Self { map: HashMap::with_capacity(capacity), order_counter: 0, capacity }
+        Self {
+            map: HashMap::with_capacity(capacity),
+            order_counter: 0,
+            capacity,
+        }
     }
 
     pub fn get(&mut self, id: &[u8; 32]) -> Option<&MemoryRecord> {
@@ -295,7 +302,11 @@ impl MemoryStorage {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() && !parent.exists() {
                     std::fs::create_dir_all(parent).map_err(|e| {
-                        format!("Failed to create DB directory '{}': {}", parent.display(), e)
+                        format!(
+                            "Failed to create DB directory '{}': {}",
+                            parent.display(),
+                            e
+                        )
                     })?;
                 }
             }
@@ -308,13 +319,18 @@ impl MemoryStorage {
              PRAGMA synchronous = NORMAL;
              PRAGMA cache_size = -8000;
              PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;"
-        ).map_err(|e| format!("Failed to set pragmas: {}", e))?;
+             PRAGMA busy_timeout = 5000;",
+        )
+        .map_err(|e| format!("Failed to set pragmas: {}", e))?;
 
         Self::create_schema(&conn)?;
         Self::maybe_migrate(&conn)?;
 
-        let mode = if record_key.is_some() { "encrypted" } else { "plaintext" };
+        let mode = if record_key.is_some() {
+            "encrypted"
+        } else {
+            "plaintext"
+        };
         info!(path = %path.display(), mode = mode, "[STORAGE] ✅ SQLite opened (schema v{})", SCHEMA_VERSION);
 
         Ok(Self {
@@ -400,8 +416,9 @@ impl MemoryStorage {
             CREATE INDEX IF NOT EXISTS idx_feedback_memory ON memory_feedback(memory_id);
 
             CREATE TABLE IF NOT EXISTS chain_state (key TEXT PRIMARY KEY, value BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);"
-        ).map_err(|e| format!("Schema creation failed (base tables): {}", e))?;
+            CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);",
+        )
+        .map_err(|e| format!("Schema creation failed (base tables): {}", e))?;
 
         // ── v5 (v2.4.0): Three-layer cognitive graph tables ──
         conn.execute_batch(
@@ -571,7 +588,7 @@ impl MemoryStorage {
                 content,
                 tags,
                 tokenize='porter unicode61'
-            );"
+            );",
         ) {
             Ok(_) => info!("[STORAGE] ✅ FTS5 index ready"),
             Err(e) => warn!("[STORAGE] ⚠️ FTS5 creation failed (BM25 disabled): {}", e),
@@ -633,13 +650,18 @@ impl MemoryStorage {
 
         // Insert schema version if not present
         let existing: Option<u32> = conn
-            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .optional()
             .map_err(|e| format!("Read schema version: {}", e))?;
 
         if existing.is_none() {
-            conn.execute("INSERT INTO schema_version (version) VALUES (?1)", params![SCHEMA_VERSION])
-                .map_err(|e| format!("Insert schema version: {}", e))?;
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                params![SCHEMA_VERSION],
+            )
+            .map_err(|e| format!("Insert schema version: {}", e))?;
         }
 
         Ok(())
@@ -647,13 +669,17 @@ impl MemoryStorage {
 
     fn maybe_migrate(conn: &Connection) -> Result<(), String> {
         let current: u32 = conn
-            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap_or(1);
 
         // v1 → v2: embedding column
         if current < 2 {
             info!("[STORAGE] Migrating schema v{} → v2", current);
-            let has_embedding = conn.prepare("SELECT embedding FROM records LIMIT 0").is_ok();
+            let has_embedding = conn
+                .prepare("SELECT embedding FROM records LIMIT 0")
+                .is_ok();
             if !has_embedding {
                 let _ = conn.execute_batch("ALTER TABLE records ADD COLUMN embedding BLOB;");
                 info!("[STORAGE] Added `embedding` column");
@@ -666,21 +692,36 @@ impl MemoryStorage {
 
         // v2 → v4: MVF feedback + conflict
         let current: u32 = conn
-            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap_or(2);
 
         if current < 4 {
             info!("[STORAGE] Migrating schema v{} → v4", current);
 
-            if conn.prepare("SELECT positive_feedback FROM records LIMIT 0").is_err() {
-                conn.execute_batch("ALTER TABLE records ADD COLUMN positive_feedback INTEGER NOT NULL DEFAULT 0;")
-                    .map_err(|e| format!("Add positive_feedback: {}", e))?;
+            if conn
+                .prepare("SELECT positive_feedback FROM records LIMIT 0")
+                .is_err()
+            {
+                conn.execute_batch(
+                    "ALTER TABLE records ADD COLUMN positive_feedback INTEGER NOT NULL DEFAULT 0;",
+                )
+                .map_err(|e| format!("Add positive_feedback: {}", e))?;
             }
-            if conn.prepare("SELECT negative_feedback FROM records LIMIT 0").is_err() {
-                conn.execute_batch("ALTER TABLE records ADD COLUMN negative_feedback INTEGER NOT NULL DEFAULT 0;")
-                    .map_err(|e| format!("Add negative_feedback: {}", e))?;
+            if conn
+                .prepare("SELECT negative_feedback FROM records LIMIT 0")
+                .is_err()
+            {
+                conn.execute_batch(
+                    "ALTER TABLE records ADD COLUMN negative_feedback INTEGER NOT NULL DEFAULT 0;",
+                )
+                .map_err(|e| format!("Add negative_feedback: {}", e))?;
             }
-            if conn.prepare("SELECT conflict_with FROM records LIMIT 0").is_err() {
+            if conn
+                .prepare("SELECT conflict_with FROM records LIMIT 0")
+                .is_err()
+            {
                 conn.execute_batch("ALTER TABLE records ADD COLUMN conflict_with BLOB;")
                     .map_err(|e| format!("Add conflict_with: {}", e))?;
             }
@@ -693,24 +734,38 @@ impl MemoryStorage {
 
         // v4 → v5 (v2.4.0-GraphCognition): Three-layer cognitive graph
         let current: u32 = conn
-            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap_or(4);
 
         if current < 5 {
-            info!("[STORAGE] Migrating schema v{} → v5 (cognitive graph)", current);
+            info!(
+                "[STORAGE] Migrating schema v{} → v5 (cognitive graph)",
+                current
+            );
 
             // 5a: ALTER records — add project_id, session_id, episode_id
-            if conn.prepare("SELECT project_id FROM records LIMIT 0").is_err() {
+            if conn
+                .prepare("SELECT project_id FROM records LIMIT 0")
+                .is_err()
+            {
                 conn.execute_batch("ALTER TABLE records ADD COLUMN project_id TEXT;")
                     .map_err(|e| format!("Add project_id to records: {}", e))?;
                 info!("[STORAGE] Added records.project_id");
             }
-            if conn.prepare("SELECT session_id FROM records LIMIT 0").is_err() {
+            if conn
+                .prepare("SELECT session_id FROM records LIMIT 0")
+                .is_err()
+            {
                 conn.execute_batch("ALTER TABLE records ADD COLUMN session_id TEXT;")
                     .map_err(|e| format!("Add session_id to records: {}", e))?;
                 info!("[STORAGE] Added records.session_id");
             }
-            if conn.prepare("SELECT episode_id FROM records LIMIT 0").is_err() {
+            if conn
+                .prepare("SELECT episode_id FROM records LIMIT 0")
+                .is_err()
+            {
                 conn.execute_batch("ALTER TABLE records ADD COLUMN episode_id TEXT;")
                     .map_err(|e| format!("Add episode_id to records: {}", e))?;
                 info!("[STORAGE] Added records.episode_id");
@@ -725,15 +780,24 @@ impl MemoryStorage {
 
             // 5c: Create v5 tables (IF NOT EXISTS — safe if create_schema already ran)
             let v5_tables = [
-                "episodes", "entities", "knowledge_edges", "episode_edges",
-                "communities", "projects", "sessions", "artifacts",
+                "episodes",
+                "entities",
+                "knowledge_edges",
+                "episode_edges",
+                "communities",
+                "projects",
+                "sessions",
+                "artifacts",
             ];
             for table in &v5_tables {
-                let exists: bool = conn.query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    params![table],
-                    |row| row.get::<_, i64>(0),
-                ).unwrap_or(0) > 0;
+                let exists: bool = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                        params![table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    > 0;
 
                 if !exists {
                     warn!(
@@ -755,15 +819,21 @@ impl MemoryStorage {
             // Fix: join records on source_id to look up the actual owner.
             // Edges whose source_id has no matching record are skipped.
             {
-                let migrated: bool = conn.query_row(
-                    "SELECT value FROM chain_state WHERE key = 'memory_edges_migrated_v5'",
-                    [], |row| { let v: Vec<u8> = row.get(0)?; Ok(v == b"1") },
-                ).unwrap_or(false);
+                let migrated: bool = conn
+                    .query_row(
+                        "SELECT value FROM chain_state WHERE key = 'memory_edges_migrated_v5'",
+                        [],
+                        |row| {
+                            let v: Vec<u8> = row.get(0)?;
+                            Ok(v == b"1")
+                        },
+                    )
+                    .unwrap_or(false);
 
                 if !migrated {
-                    let edge_count: i64 = conn.query_row(
-                        "SELECT COUNT(*) FROM memory_edges", [], |row| row.get(0),
-                    ).unwrap_or(0);
+                    let edge_count: i64 = conn
+                        .query_row("SELECT COUNT(*) FROM memory_edges", [], |row| row.get(0))
+                        .unwrap_or(0);
 
                     if edge_count > 0 {
                         let now = SystemTime::now()
@@ -833,10 +903,16 @@ impl MemoryStorage {
 
             // 5f: Backfill FTS5 index from existing records
             {
-                let fts_populated: bool = conn.query_row(
-                    "SELECT value FROM chain_state WHERE key = 'fts_index_populated'",
-                    [], |row| { let v: Vec<u8> = row.get(0)?; Ok(v == b"1") },
-                ).unwrap_or(false);
+                let fts_populated: bool = conn
+                    .query_row(
+                        "SELECT value FROM chain_state WHERE key = 'fts_index_populated'",
+                        [],
+                        |row| {
+                            let v: Vec<u8> = row.get(0)?;
+                            Ok(v == b"1")
+                        },
+                    )
+                    .unwrap_or(false);
 
                 if !fts_populated {
                     // P1 SecAudit: skip FTS backfill when record_key is set.
@@ -872,7 +948,9 @@ impl MemoryStorage {
 
         // v5 → v6 (v2.5.0-SuperNode): Cognitive task queue + LLM usage log + sessions.title
         let current: u32 = conn
-            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap_or(5);
 
         if current < 6 {
@@ -1005,38 +1083,43 @@ impl MemoryStorage {
             None
         };
 
-        let tags_json: Option<String> = new_tags
-            .map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".to_string()));
+        let tags_json: Option<String> =
+            new_tags.map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".to_string()));
 
         // P0 SecAudit: single lock — ownership check + all UPDATEs in one critical section.
         // Each UPDATE carries AND owner = ?owner (+ AND status = 0 for content) so a
         // concurrent revoke cannot produce an inconsistent write.
         let conn = self.conn.lock().await;
 
-        let exists: bool = conn.query_row(
-            "SELECT COUNT(*) FROM records WHERE record_id = ?1 AND owner = ?2 AND status = 0",
-            params![record_id.as_slice(), owner.as_slice()],
-            |r| r.get::<_, i64>(0),
-        ).unwrap_or(0) > 0;
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM records WHERE record_id = ?1 AND owner = ?2 AND status = 0",
+                params![record_id.as_slice(), owner.as_slice()],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
 
         if !exists {
             return Ok(false);
         }
 
         if stored_content.is_some() {
-            let affected = conn.execute(
-                "UPDATE records SET
+            let affected = conn
+                .execute(
+                    "UPDATE records SET
                     encrypted_content = ?1,
                     embedding = NULL,
                     embedding_model = '',
                     embedding_dim = 0
                  WHERE record_id = ?2 AND owner = ?3 AND status = 0",
-                params![
-                    stored_content.as_deref(),
-                    record_id.as_slice(),
-                    owner.as_slice(),
-                ],
-            ).map_err(|e| format!("update content: {}", e))?;
+                    params![
+                        stored_content.as_deref(),
+                        record_id.as_slice(),
+                        owner.as_slice(),
+                    ],
+                )
+                .map_err(|e| format!("update content: {}", e))?;
             if affected == 0 {
                 return Ok(false);
             }
@@ -1046,21 +1129,24 @@ impl MemoryStorage {
             conn.execute(
                 "UPDATE records SET topic_tags = ?1 WHERE record_id = ?2 AND owner = ?3",
                 params![tj, record_id.as_slice(), owner.as_slice()],
-            ).map_err(|e| format!("update tags: {}", e))?;
+            )
+            .map_err(|e| format!("update tags: {}", e))?;
         }
 
         if let Some(l) = new_layer {
             conn.execute(
                 "UPDATE records SET layer = ?1 WHERE record_id = ?2 AND owner = ?3",
                 params![l as u8 as i64, record_id.as_slice(), owner.as_slice()],
-            ).map_err(|e| format!("update layer: {}", e))?;
+            )
+            .map_err(|e| format!("update layer: {}", e))?;
         }
 
         if let Some(src) = new_source_ai {
             conn.execute(
                 "UPDATE records SET source_ai = ?1 WHERE record_id = ?2 AND owner = ?3",
                 params![src, record_id.as_slice(), owner.as_slice()],
-            ).map_err(|e| format!("update source_ai: {}", e))?;
+            )
+            .map_err(|e| format!("update source_ai: {}", e))?;
         }
 
         drop(conn); // release lock before cache write
@@ -1173,7 +1259,8 @@ impl MemoryStorage {
         if content_substring.trim().is_empty() {
             return Vec::new();
         }
-        let all = self.get_active_records(owner, None, limit * 10).await;        let needle = content_substring.to_lowercase();
+        let all = self.get_active_records(owner, None, limit * 10).await;
+        let needle = content_substring.to_lowercase();
 
         all.into_iter()
             .filter(|r| {
@@ -1210,24 +1297,31 @@ impl MemoryStorage {
         owner: &[u8; 32],
     ) -> Option<RecordProvenance> {
         let record = self.get(record_id).await?;
-        if record.owner != *owner { return None; }
+        if record.owner != *owner {
+            return None;
+        }
 
         let conn = self.conn.lock().await;
 
         // Get session_id from the records table (provenance field)
-        let session_id: Option<String> = conn.query_row(
-            "SELECT session_id FROM records WHERE record_id = ?1",
-            params![record_id.as_slice()],
-            |r| r.get(0),
-        ).ok().flatten();
+        let session_id: Option<String> = conn
+            .query_row(
+                "SELECT session_id FROM records WHERE record_id = ?1",
+                params![record_id.as_slice()],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
 
         // Get session metadata if session_id is known
         let (session_title, session_started_at) = if let Some(ref sid) = session_id {
-            let meta: Option<(Option<String>, i64)> = conn.query_row(
-                "SELECT title, started_at FROM sessions WHERE session_id = ?1",
-                params![sid],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            ).ok();
+            let meta: Option<(Option<String>, i64)> = conn
+                .query_row(
+                    "SELECT title, started_at FROM sessions WHERE session_id = ?1",
+                    params![sid],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
             match meta {
                 Some((title, started_at)) => (title, Some(started_at)),
                 None => (None, None),
@@ -1248,7 +1342,8 @@ impl MemoryStorage {
                  LIMIT 1",
                 params![sid, content_len],
                 |r| r.get(0),
-            ).ok()
+            )
+            .ok()
         } else {
             None
         };
@@ -1272,16 +1367,25 @@ impl MemoryStorage {
 
     pub async fn insert(&self, record: &MemoryRecord, embedding_model: &str) -> bool {
         if !record.verify_id() {
-            warn!(record_id = hex::encode(record.record_id), "[STORAGE] ❌ Rejected: hash mismatch");
+            warn!(
+                record_id = hex::encode(record.record_id),
+                "[STORAGE] ❌ Rejected: hash mismatch"
+            );
             self.total_rejected.fetch_add(1, Ordering::Relaxed);
             return false;
         }
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-        let tags_json = serde_json::to_string(&record.topic_tags).unwrap_or_else(|_| "[]".to_string());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let tags_json =
+            serde_json::to_string(&record.topic_tags).unwrap_or_else(|_| "[]".to_string());
         let embedding_blob: Option<Vec<u8>> = if record.has_embedding() {
             Some(embedding_to_bytes(&record.embedding))
-        } else { None };
+        } else {
+            None
+        };
         let embedding_dim = record.embedding_dim() as i64;
         let conflict_with_blob: Option<Vec<u8>> = record.conflict_with.map(|c| c.to_vec());
 
@@ -1318,15 +1422,23 @@ impl MemoryStorage {
                 positive_feedback, negative_feedback, conflict_with
             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
-                record.record_id.as_slice(), record.owner.as_slice(),
-                record.timestamp as i64, record.layer as u8 as i64,
-                tags_json, record.source_ai,
+                record.record_id.as_slice(),
+                record.owner.as_slice(),
+                record.timestamp as i64,
+                record.layer as u8 as i64,
+                tags_json,
+                record.source_ai,
                 record.status as u8 as i64,
                 record.supersedes.as_ref().map(|s| s.as_slice()),
-                stored_content.as_slice(), embedding_blob.as_deref(),
-                embedding_model, embedding_dim,
-                record.signature.as_slice(), record.access_count as i64, now,
-                record.positive_feedback as i64, record.negative_feedback as i64,
+                stored_content.as_slice(),
+                embedding_blob.as_deref(),
+                embedding_model,
+                embedding_dim,
+                record.signature.as_slice(),
+                record.access_count as i64,
+                now,
+                record.positive_feedback as i64,
+                record.negative_feedback as i64,
                 conflict_with_blob.as_deref(),
             ],
         );
@@ -1338,7 +1450,13 @@ impl MemoryStorage {
                 debug!(record_id = hex::encode(record.record_id), layer = %record.layer, "[STORAGE] ✅ Inserted");
                 true
             }
-            Ok(_) => { debug!(record_id = hex::encode(record.record_id), "[STORAGE] Duplicate, skipped"); false }
+            Ok(_) => {
+                debug!(
+                    record_id = hex::encode(record.record_id),
+                    "[STORAGE] Duplicate, skipped"
+                );
+                false
+            }
             Err(e) => {
                 error!(record_id = hex::encode(record.record_id), error = %e, "[STORAGE] ❌ Insert failed");
                 self.total_rejected.fetch_add(1, Ordering::Relaxed);
@@ -1360,11 +1478,17 @@ impl MemoryStorage {
         }
         let conn = self.conn.lock().await;
         let rk = self.record_key.as_ref().map(|v| &**v);
-        let result = conn.query_row(
-            Self::SELECT_RECORD_COLS,
-            params![record_id.as_slice()],
-            |row| Self::row_to_record(row, rk),
-        ).optional().unwrap_or_else(|e| { error!(error=%e, "[STORAGE] Query failed"); None });
+        let result = conn
+            .query_row(
+                Self::SELECT_RECORD_COLS,
+                params![record_id.as_slice()],
+                |row| Self::row_to_record(row, rk),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                error!(error=%e, "[STORAGE] Query failed");
+                None
+            });
 
         if let Some(ref record) = result {
             self.cache.write().put(record.clone());
@@ -1373,58 +1497,83 @@ impl MemoryStorage {
     }
 
     pub async fn get_active_records(
-        &self, owner: &[u8; 32], layer: Option<MemoryLayer>, limit: usize,
+        &self,
+        owner: &[u8; 32],
+        layer: Option<MemoryLayer>,
+        limit: usize,
     ) -> Vec<MemoryRecord> {
         let limit = limit.min(1000).max(1);
         let conn = self.conn.lock().await;
         if let Some(l) = layer {
-            self.query_rows(&conn,
+            self.query_rows(
+                &conn,
                 "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                         status,supersedes,encrypted_content,embedding,signature,access_count,
                         positive_feedback,negative_feedback,conflict_with
                  FROM records WHERE owner=?1 AND status=0 AND layer=?2
                  ORDER BY timestamp DESC LIMIT ?3",
-                params![owner.as_slice(), l as u8 as i64, limit as i64])
+                params![owner.as_slice(), l as u8 as i64, limit as i64],
+            )
         } else {
-            self.query_rows(&conn,
+            self.query_rows(
+                &conn,
                 "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                         status,supersedes,encrypted_content,embedding,signature,access_count,
                         positive_feedback,negative_feedback,conflict_with
                  FROM records WHERE owner=?1 AND status=0
                  ORDER BY timestamp DESC LIMIT ?2",
-                params![owner.as_slice(), limit as i64])
+                params![owner.as_slice(), limit as i64],
+            )
         }
     }
 
-    pub async fn query_by_owner_after(&self, owner: &[u8; 32], after_timestamp: u64) -> Vec<MemoryRecord> {
+    pub async fn query_by_owner_after(
+        &self,
+        owner: &[u8; 32],
+        after_timestamp: u64,
+    ) -> Vec<MemoryRecord> {
         let conn = self.conn.lock().await;
-        self.query_rows(&conn,
+        self.query_rows(
+            &conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,signature,access_count,
                     positive_feedback,negative_feedback,conflict_with
              FROM records WHERE owner=?1 AND timestamp>?2
              ORDER BY timestamp ASC LIMIT ?3",
-            params![owner.as_slice(), after_timestamp as i64, DEFAULT_PAGE_SIZE as i64])
+            params![
+                owner.as_slice(),
+                after_timestamp as i64,
+                DEFAULT_PAGE_SIZE as i64
+            ],
+        )
     }
 
-    pub async fn get_records_with_embedding(&self, owner: &[u8; 32]) -> Vec<(MemoryRecord, String)> {
+    pub async fn get_records_with_embedding(
+        &self,
+        owner: &[u8; 32],
+    ) -> Vec<(MemoryRecord, String)> {
         let conn = self.conn.lock().await;
         let mut stmt = match conn.prepare(
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,signature,access_count,
                     positive_feedback,negative_feedback,conflict_with,embedding_model
              FROM records WHERE owner=?1 AND status=0 AND embedding IS NOT NULL
-             ORDER BY timestamp DESC"
+             ORDER BY timestamp DESC",
         ) {
             Ok(s) => s,
-            Err(e) => { error!(error=%e, "[STORAGE] Prepare failed"); return Vec::new(); }
+            Err(e) => {
+                error!(error=%e, "[STORAGE] Prepare failed");
+                return Vec::new();
+            }
         };
         let rk = self.record_key.as_ref().map(|v| &**v);
         stmt.query_map(params![owner.as_slice()], |row| {
             let record = Self::row_to_record(row, rk)?;
             let model: String = row.get(15)?;
             Ok((record, model))
-        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     }
 
     // ========================================
@@ -1433,11 +1582,25 @@ impl MemoryStorage {
 
     pub async fn update_status(&self, record_id: &[u8; 32], new_status: RecordStatus) -> bool {
         let conn = self.conn.lock().await;
-        match conn.execute("UPDATE records SET status=?1 WHERE record_id=?2",
-            params![new_status as u8 as i64, record_id.as_slice()]) {
-            Ok(n) if n > 0 => { debug!(record_id=hex::encode(record_id), %new_status, "[STORAGE] ✅ Status updated"); true }
-            Ok(_) => { warn!(record_id=hex::encode(record_id), "[STORAGE] Not found for status update"); false }
-            Err(e) => { error!(error=%e, "[STORAGE] Status update failed"); false }
+        match conn.execute(
+            "UPDATE records SET status=?1 WHERE record_id=?2",
+            params![new_status as u8 as i64, record_id.as_slice()],
+        ) {
+            Ok(n) if n > 0 => {
+                debug!(record_id=hex::encode(record_id), %new_status, "[STORAGE] ✅ Status updated");
+                true
+            }
+            Ok(_) => {
+                warn!(
+                    record_id = hex::encode(record_id),
+                    "[STORAGE] Not found for status update"
+                );
+                false
+            }
+            Err(e) => {
+                error!(error=%e, "[STORAGE] Status update failed");
+                false
+            }
         }
     }
 
@@ -1459,7 +1622,8 @@ impl MemoryStorage {
         let conn = self.conn.lock().await;
         let _ = conn.execute(
             "UPDATE records SET access_count=access_count+1 WHERE record_id=?1",
-            params![record_id.as_slice()]);
+            params![record_id.as_slice()],
+        );
     }
 
     /// Acquire the inner SQLite connection lock.
@@ -1471,8 +1635,12 @@ impl MemoryStorage {
         self.conn.lock().await
     }
 
-    pub fn total_inserted(&self) -> u64 { self.total_inserted.load(Ordering::Relaxed) }
-    pub fn total_rejected(&self) -> u64 { self.total_rejected.load(Ordering::Relaxed) }
+    pub fn total_inserted(&self) -> u64 {
+        self.total_inserted.load(Ordering::Relaxed)
+    }
+    pub fn total_rejected(&self) -> u64 {
+        self.total_rejected.load(Ordering::Relaxed)
+    }
 
     // ========================================
     // Private helpers
@@ -1484,10 +1652,18 @@ impl MemoryStorage {
                 positive_feedback,negative_feedback,conflict_with
          FROM records WHERE record_id = ?1";
 
-    pub(crate) fn query_rows(&self, conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Vec<MemoryRecord> {
+    pub(crate) fn query_rows(
+        &self,
+        conn: &Connection,
+        sql: &str,
+        p: impl rusqlite::Params,
+    ) -> Vec<MemoryRecord> {
         let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
-            Err(e) => { error!(error=%e, "[STORAGE] Prepare failed"); return Vec::new(); }
+            Err(e) => {
+                error!(error=%e, "[STORAGE] Prepare failed");
+                return Vec::new();
+            }
         };
         let rk = self.record_key.as_ref().map(|v| &**v);
         stmt.query_map(p, |row| Self::row_to_record(row, rk))
@@ -1495,7 +1671,10 @@ impl MemoryStorage {
             .unwrap_or_default()
     }
 
-    pub(crate) fn row_to_record(row: &rusqlite::Row<'_>, record_key: Option<&[u8; 32]>) -> rusqlite::Result<MemoryRecord> {
+    pub(crate) fn row_to_record(
+        row: &rusqlite::Row<'_>,
+        record_key: Option<&[u8; 32]>,
+    ) -> rusqlite::Result<MemoryRecord> {
         let record_id_blob: Vec<u8> = row.get(0)?;
         let owner_blob: Vec<u8> = row.get(1)?;
         let timestamp: i64 = row.get(2)?;
@@ -1513,8 +1692,12 @@ impl MemoryStorage {
                     Ok(plain) => plain,
                     Err(_) => encrypted_content,
                 }
-            } else { encrypted_content }
-        } else { encrypted_content };
+            } else {
+                encrypted_content
+            }
+        } else {
+            encrypted_content
+        };
 
         let signature_blob: Vec<u8> = row.get(10)?;
         let access_count: i64 = row.get(11)?;
@@ -1557,20 +1740,39 @@ impl MemoryStorage {
         }
 
         let supersedes = supersedes_blob.and_then(|b| {
-            if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None }
+            if b.len() == 32 {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                Some(a)
+            } else {
+                None
+            }
         });
         let conflict_with = conflict_with_blob.and_then(|b| {
-            if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None }
+            if b.len() == 32 {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                Some(a)
+            } else {
+                None
+            }
         });
-        let embedding = embedding_blob.map(|b| bytes_to_embedding(&b)).unwrap_or_default();
+        let embedding = embedding_blob
+            .map(|b| bytes_to_embedding(&b))
+            .unwrap_or_default();
 
         Ok(MemoryRecord {
-            record_id, owner, timestamp: timestamp as u64,
+            record_id,
+            owner,
+            timestamp: timestamp as u64,
             layer: MemoryLayer::from_u8(layer_val as u8).unwrap_or(MemoryLayer::Episode),
             topic_tags: serde_json::from_str(&tags_json).unwrap_or_default(),
             source_ai,
             status: RecordStatus::from_u8(status_val as u8).unwrap_or(RecordStatus::Active),
-            supersedes, encrypted_content: decrypted_content, embedding, signature,
+            supersedes,
+            encrypted_content: decrypted_content,
+            embedding,
+            signature,
             access_count: access_count as u32,
             positive_feedback: positive_feedback as u32,
             negative_feedback: negative_feedback as u32,
@@ -1598,13 +1800,27 @@ mod tests {
     use super::*;
 
     fn make_rec(ts: u64, layer: MemoryLayer, src: &str) -> MemoryRecord {
-        MemoryRecord::new([0xAA; 32], ts, layer, vec!["test".into()], src.into(),
-            b"encrypted_data".to_vec(), vec![0.1, 0.2, 0.3])
+        MemoryRecord::new(
+            [0xAA; 32],
+            ts,
+            layer,
+            vec!["test".into()],
+            src.into(),
+            b"encrypted_data".to_vec(),
+            vec![0.1, 0.2, 0.3],
+        )
     }
 
     fn make_rec_owner(ts: u64, owner: [u8; 32], layer: MemoryLayer) -> MemoryRecord {
-        MemoryRecord::new(owner, ts, layer, vec!["test".into()], "ai".into(),
-            format!("content_{}", ts).into_bytes(), vec![0.5; 4])
+        MemoryRecord::new(
+            owner,
+            ts,
+            layer,
+            vec!["test".into()],
+            "ai".into(),
+            format!("content_{}", ts).into_bytes(),
+            vec![0.5; 4],
+        )
     }
 
     // ========================================
@@ -1643,11 +1859,19 @@ mod tests {
     async fn test_get_active_records() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let o = [0xAA; 32];
-        s.insert(&make_rec_owner(100, o, MemoryLayer::Episode), "m").await;
-        s.insert(&make_rec_owner(200, o, MemoryLayer::Knowledge), "m").await;
-        s.insert(&make_rec_owner(300, o, MemoryLayer::Archive), "m").await;
+        s.insert(&make_rec_owner(100, o, MemoryLayer::Episode), "m")
+            .await;
+        s.insert(&make_rec_owner(200, o, MemoryLayer::Knowledge), "m")
+            .await;
+        s.insert(&make_rec_owner(300, o, MemoryLayer::Archive), "m")
+            .await;
         assert_eq!(s.get_active_records(&o, None, 100).await.len(), 3);
-        assert_eq!(s.get_active_records(&o, Some(MemoryLayer::Episode), 100).await.len(), 1);
+        assert_eq!(
+            s.get_active_records(&o, Some(MemoryLayer::Episode), 100)
+                .await
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1681,10 +1905,16 @@ mod tests {
     async fn test_schema_version_is_current() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
-        let v: u32 = conn.query_row(
-            "SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0)
-        ).unwrap();
-        assert_eq!(v, SCHEMA_VERSION, "Schema version should be {}", SCHEMA_VERSION);
+        let v: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            v, SCHEMA_VERSION,
+            "Schema version should be {}",
+            SCHEMA_VERSION
+        );
     }
 
     #[tokio::test]
@@ -1693,16 +1923,25 @@ mod tests {
         let conn = s.conn.lock().await;
 
         let expected_tables = [
-            "episodes", "entities", "knowledge_edges", "episode_edges",
-            "communities", "projects", "sessions", "artifacts",
+            "episodes",
+            "entities",
+            "knowledge_edges",
+            "episode_edges",
+            "communities",
+            "projects",
+            "sessions",
+            "artifacts",
         ];
 
         for table in &expected_tables {
-            let exists: bool = conn.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                params![table],
-                |row| row.get::<_, i64>(0),
-            ).unwrap() > 0;
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                > 0;
             assert!(exists, "Table '{}' should exist in schema v5", table);
         }
     }
@@ -1714,11 +1953,14 @@ mod tests {
 
         let expected_tables = ["cognitive_tasks", "llm_usage_log"];
         for table in &expected_tables {
-            let exists: bool = conn.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                params![table],
-                |row| row.get::<_, i64>(0),
-            ).unwrap() > 0;
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                > 0;
             assert!(exists, "Table '{}' should exist in schema v6", table);
         }
 
@@ -1742,29 +1984,44 @@ mod tests {
                  privacy_level, created_at, max_retries)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                "session_title", 5i64, "pending",
+                "session_title",
+                5i64,
+                "pending",
                 r#"{"session_id":"sess_001","summary":"JWT auth discussion"}"#,
-                "sessions", "sess_001", "structured", now, 3i64,
+                "sessions",
+                "sess_001",
+                "structured",
+                now,
+                3i64,
             ],
         );
-        assert!(result.is_ok(), "cognitive_tasks insert should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "cognitive_tasks insert should succeed: {:?}",
+            result.err()
+        );
 
-        let claimed = conn.execute(
-            "UPDATE cognitive_tasks SET status='processing', started_at=?1
+        let claimed = conn
+            .execute(
+                "UPDATE cognitive_tasks SET status='processing', started_at=?1
              WHERE id = (
                  SELECT id FROM cognitive_tasks
                  WHERE status='pending'
                  ORDER BY priority DESC, created_at ASC
                  LIMIT 1
              )",
-            params![now],
-        ).unwrap();
+                params![now],
+            )
+            .unwrap();
         assert_eq!(claimed, 1);
 
-        let status: String = conn.query_row(
-            "SELECT status FROM cognitive_tasks WHERE id = 1",
-            [], |row| row.get(0),
-        ).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM cognitive_tasks WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(status, "processing");
     }
 
@@ -1783,8 +2040,18 @@ mod tests {
                 (task_id, provider, model, input_tokens, output_tokens,
                  cached_tokens, latency_ms, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![1i64, "deepseek", "deepseek-reasoner", 512i64, 128i64, 64i64, 1200i64, now],
-        ).unwrap();
+            params![
+                1i64,
+                "deepseek",
+                "deepseek-reasoner",
+                512i64,
+                128i64,
+                64i64,
+                1200i64,
+                now
+            ],
+        )
+        .unwrap();
 
         let (input_sum, output_sum): (i64, i64) = conn.query_row(
             "SELECT SUM(input_tokens), SUM(output_tokens) FROM llm_usage_log WHERE provider = 'deepseek'",
@@ -1808,24 +2075,35 @@ mod tests {
             "INSERT INTO sessions (session_id, owner, session_type, started_at, turn_count)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params!["sess_001", [0xAAu8; 32].as_slice(), "chat", now, 5i64],
-        ).unwrap();
+        )
+        .unwrap();
 
-        let title: Option<String> = conn.query_row(
-            "SELECT title FROM sessions WHERE session_id = 'sess_001'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let title: Option<String> = conn
+            .query_row(
+                "SELECT title FROM sessions WHERE session_id = 'sess_001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(title.is_none());
 
         conn.execute(
             "UPDATE sessions SET title = ?1 WHERE session_id = ?2",
             params!["JWT Auth Implementation Discussion", "sess_001"],
-        ).unwrap();
+        )
+        .unwrap();
 
-        let title: Option<String> = conn.query_row(
-            "SELECT title FROM sessions WHERE session_id = 'sess_001'",
-            [], |row| row.get(0),
-        ).unwrap();
-        assert_eq!(title, Some("JWT Auth Implementation Discussion".to_string()));
+        let title: Option<String> = conn
+            .query_row(
+                "SELECT title FROM sessions WHERE session_id = 'sess_001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            title,
+            Some("JWT Auth Implementation Discussion".to_string())
+        );
     }
 
     // ========================================
@@ -1836,9 +2114,7 @@ mod tests {
     async fn test_v5_records_has_new_columns() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
-        let result = conn.prepare(
-            "SELECT project_id, session_id, episode_id FROM records LIMIT 0"
-        );
+        let result = conn.prepare("SELECT project_id, session_id, episode_id FROM records LIMIT 0");
         assert!(result.is_ok());
     }
 
@@ -1847,7 +2123,10 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
 
         let result = conn.execute(
             "INSERT INTO episodes (episode_id, owner, episode_type, source,
@@ -1855,17 +2134,31 @@ mod tests {
                 created_at, ingested_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
-                "ep_001", [0xAAu8; 32].as_slice(), "conversation", "test",
-                "session_001", b"encrypted".as_slice(), "hash123", 100i64,
-                now, now,
+                "ep_001",
+                [0xAAu8; 32].as_slice(),
+                "conversation",
+                "test",
+                "session_001",
+                b"encrypted".as_slice(),
+                "hash123",
+                100i64,
+                now,
+                now,
             ],
         );
-        assert!(result.is_ok(), "Episode insert should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Episode insert should succeed: {:?}",
+            result.err()
+        );
 
-        let ep_type: String = conn.query_row(
-            "SELECT episode_type FROM episodes WHERE episode_id = 'ep_001'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let ep_type: String = conn
+            .query_row(
+                "SELECT episode_type FROM episodes WHERE episode_id = 'ep_001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(ep_type, "conversation");
     }
 
@@ -1874,24 +2167,41 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
 
         let result = conn.execute(
             "INSERT INTO entities (entity_id, owner, name, name_normalized,
                 entity_type, description, community_id, created_at, updated_at, mention_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
-                "ent_jwt", [0xAAu8; 32].as_slice(), "JWT", "jwt",
-                "technology", "JSON Web Token", Option::<String>::None,
-                now, now, 3i64,
+                "ent_jwt",
+                [0xAAu8; 32].as_slice(),
+                "JWT",
+                "jwt",
+                "technology",
+                "JSON Web Token",
+                Option::<String>::None,
+                now,
+                now,
+                3i64,
             ],
         );
-        assert!(result.is_ok(), "Entity insert should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Entity insert should succeed: {:?}",
+            result.err()
+        );
 
-        let mention_count: i64 = conn.query_row(
-            "SELECT mention_count FROM entities WHERE entity_id = 'ent_jwt'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let mention_count: i64 = conn
+            .query_row(
+                "SELECT mention_count FROM entities WHERE entity_id = 'ent_jwt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(mention_count, 3);
     }
 
@@ -1900,39 +2210,62 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
 
         conn.execute(
             "INSERT INTO knowledge_edges (owner, source_id, target_id, relation_type,
                 fact_text, weight, confidence, valid_from, valid_until, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)",
             params![
-                [0xAAu8; 32].as_slice(), "ent_auth", "ent_jwt", "USES",
-                "auth module uses JWT", 1.0f64, 0.95f64, now, now, now,
+                [0xAAu8; 32].as_slice(),
+                "ent_auth",
+                "ent_jwt",
+                "USES",
+                "auth module uses JWT",
+                1.0f64,
+                0.95f64,
+                now,
+                now,
+                now,
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute(
             "INSERT INTO knowledge_edges (owner, source_id, target_id, relation_type,
                 fact_text, weight, confidence, valid_from, valid_until, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
-                [0xAAu8; 32].as_slice(), "ent_auth", "ent_basic", "USES",
-                "auth module uses Basic Auth", 1.0f64, 0.9f64,
-                now - 86400, now, now - 86400, now,
+                [0xAAu8; 32].as_slice(),
+                "ent_auth",
+                "ent_basic",
+                "USES",
+                "auth module uses Basic Auth",
+                1.0f64,
+                0.9f64,
+                now - 86400,
+                now,
+                now - 86400,
+                now,
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
-        let valid_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM knowledge_edges WHERE valid_until IS NULL",
-            [], |row| row.get(0),
-        ).unwrap();
+        let valid_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM knowledge_edges WHERE valid_until IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(valid_count, 1);
 
-        let total_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM knowledge_edges",
-            [], |row| row.get(0),
-        ).unwrap();
+        let total_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM knowledge_edges", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(total_count, 2);
     }
 
@@ -1941,24 +2274,40 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
 
         conn.execute(
             "INSERT INTO episode_edges (owner, episode_id, entity_id, role, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![[0xAAu8; 32].as_slice(), "ep_001", "ent_jwt", "mentioned", now],
-        ).unwrap();
+            params![
+                [0xAAu8; 32].as_slice(),
+                "ep_001",
+                "ent_jwt",
+                "mentioned",
+                now
+            ],
+        )
+        .unwrap();
 
-        let entity_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM episode_edges WHERE episode_id = 'ep_001'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let entity_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM episode_edges WHERE episode_id = 'ep_001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(entity_count, 1);
 
-        let episode_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM episode_edges WHERE entity_id = 'ent_jwt'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let episode_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM episode_edges WHERE entity_id = 'ent_jwt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(episode_count, 1);
     }
 
@@ -1967,7 +2316,10 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
 
         conn.execute(
             "INSERT INTO communities (community_id, owner, name, summary, entity_count, created_at, updated_at)
@@ -1979,29 +2331,52 @@ mod tests {
             "INSERT INTO projects (project_id, owner, name, status, community_id, summary,
                 created_at, updated_at, last_active_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params!["comm_1", [0xAAu8; 32].as_slice(), "Project B", "active", "comm_1",
-                "Auth system project", now, now, now],
-        ).unwrap();
+            params![
+                "comm_1",
+                [0xAAu8; 32].as_slice(),
+                "Project B",
+                "active",
+                "comm_1",
+                "Auth system project",
+                now,
+                now,
+                now
+            ],
+        )
+        .unwrap();
 
         conn.execute(
             "INSERT INTO sessions (session_id, owner, project_id, session_type,
                 started_at, turn_count, summary)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params!["sess_001", [0xAAu8; 32].as_slice(), "comm_1", "code",
-                now, 15i64, "Implemented JWT auth"],
-        ).unwrap();
+            params![
+                "sess_001",
+                [0xAAu8; 32].as_slice(),
+                "comm_1",
+                "code",
+                now,
+                15i64,
+                "Implemented JWT auth"
+            ],
+        )
+        .unwrap();
 
-        let session_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sessions WHERE project_id = 'comm_1'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let session_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE project_id = 'comm_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(session_count, 1);
 
-        let project_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM projects WHERE owner = ?1 AND status = 'active'",
-            params![[0xAAu8; 32].as_slice()],
-            |row| row.get(0),
-        ).unwrap();
+        let project_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE owner = ?1 AND status = 'active'",
+                params![[0xAAu8; 32].as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(project_count, 1);
     }
 
@@ -2010,41 +2385,66 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let conn = s.conn.lock().await;
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
 
         conn.execute(
             "INSERT INTO artifacts (artifact_id, owner, session_id, artifact_type,
                 filename, language, version, parent_id, encrypted_content, content_hash, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10)",
             params![
-                "art_v1", [0xAAu8; 32].as_slice(), "sess_001", "code",
-                "auth.rs", "rust", 1i64,
-                b"fn auth() {}".as_slice(), "hash_v1", now,
+                "art_v1",
+                [0xAAu8; 32].as_slice(),
+                "sess_001",
+                "code",
+                "auth.rs",
+                "rust",
+                1i64,
+                b"fn auth() {}".as_slice(),
+                "hash_v1",
+                now,
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute(
             "INSERT INTO artifacts (artifact_id, owner, session_id, artifact_type,
                 filename, language, version, parent_id, encrypted_content, content_hash, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
-                "art_v2", [0xAAu8; 32].as_slice(), "sess_002", "code",
-                "auth.rs", "rust", 2i64, "art_v1",
-                b"fn auth() { jwt() }".as_slice(), "hash_v2", now + 100,
+                "art_v2",
+                [0xAAu8; 32].as_slice(),
+                "sess_002",
+                "code",
+                "auth.rs",
+                "rust",
+                2i64,
+                "art_v1",
+                b"fn auth() { jwt() }".as_slice(),
+                "hash_v2",
+                now + 100,
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
-        let latest_version: i64 = conn.query_row(
-            "SELECT MAX(version) FROM artifacts WHERE owner = ?1 AND filename = 'auth.rs'",
-            params![[0xAAu8; 32].as_slice()],
-            |row| row.get(0),
-        ).unwrap();
+        let latest_version: i64 = conn
+            .query_row(
+                "SELECT MAX(version) FROM artifacts WHERE owner = ?1 AND filename = 'auth.rs'",
+                params![[0xAAu8; 32].as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(latest_version, 2);
 
-        let parent: Option<String> = conn.query_row(
-            "SELECT parent_id FROM artifacts WHERE artifact_id = 'art_v2'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_id FROM artifacts WHERE artifact_id = 'art_v2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(parent, Some("art_v1".to_string()));
     }
 
@@ -2055,11 +2455,13 @@ mod tests {
         assert!(s.insert(&r, "minilm").await);
 
         let conn = s.conn.lock().await;
-        let (pid, sid, eid): (Option<String>, Option<String>, Option<String>) = conn.query_row(
-            "SELECT project_id, session_id, episode_id FROM records WHERE record_id = ?1",
-            params![r.record_id.as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).unwrap();
+        let (pid, sid, eid): (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT project_id, session_id, episode_id FROM records WHERE record_id = ?1",
+                params![r.record_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
         assert!(pid.is_none());
         assert!(sid.is_none());
         assert!(eid.is_none());
@@ -2079,29 +2481,40 @@ mod tests {
                  owner BLOB NOT NULL,
                  started_at INTEGER NOT NULL
              );
-             CREATE TABLE chain_state (key TEXT PRIMARY KEY, value BLOB NOT NULL);"
-        ).unwrap();
+             CREATE TABLE chain_state (key TEXT PRIMARY KEY, value BLOB NOT NULL);",
+        )
+        .unwrap();
 
         MemoryStorage::maybe_migrate(&conn).unwrap();
 
-        let ct_exists: bool = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cognitive_tasks'",
-            [], |r| r.get::<_, i64>(0),
-        ).unwrap() > 0;
+        let ct_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cognitive_tasks'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0;
         assert!(ct_exists);
 
-        let ul_exists: bool = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='llm_usage_log'",
-            [], |r| r.get::<_, i64>(0),
-        ).unwrap() > 0;
+        let ul_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='llm_usage_log'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0;
         assert!(ul_exists);
 
         let title_ok = conn.prepare("SELECT title FROM sessions LIMIT 0").is_ok();
         assert!(title_ok);
 
-        let v: u32 = conn.query_row(
-            "SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0)
-        ).unwrap();
+        let v: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(v, 6);
     }
 
@@ -2149,8 +2562,9 @@ mod tests {
                  weight REAL DEFAULT 1.0,
                  created_at INTEGER NOT NULL,
                  PRIMARY KEY (source_id, target_id)
-             );"
-        ).unwrap();
+             );",
+        )
+        .unwrap();
 
         let owner_bytes = [0xBBu8; 32];
         let source_id = [0x01u8; 32];
@@ -2168,7 +2582,8 @@ mod tests {
             "INSERT INTO memory_edges (source_id, target_id, weight, created_at)
              VALUES (?1, ?2, 1.0, ?3)",
             params![source_id.as_slice(), target_id.as_slice(), now],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Match MemoryStorage::open() upgrade order: create any missing modern
         // tables first, then run incremental migrations against the old data.
@@ -2176,14 +2591,18 @@ mod tests {
         MemoryStorage::maybe_migrate(&conn).unwrap();
 
         // Verify the migrated edge has the correct owner (owner_bytes), not source_id
-        let migrated_owner: Vec<u8> = conn.query_row(
-            "SELECT owner FROM knowledge_edges LIMIT 1",
-            [], |r| r.get(0),
-        ).unwrap();
+        let migrated_owner: Vec<u8> = conn
+            .query_row("SELECT owner FROM knowledge_edges LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
 
         assert_eq!(migrated_owner.len(), 32);
-        assert_eq!(migrated_owner.as_slice(), owner_bytes.as_slice(),
-            "Migrated edge owner should be record.owner ([0xBB;32]), not source_id ([0x01;32])");
+        assert_eq!(
+            migrated_owner.as_slice(),
+            owner_bytes.as_slice(),
+            "Migrated edge owner should be record.owner ([0xBB;32]), not source_id ([0x01;32])"
+        );
     }
 
     /// Verify update_record_content clears embedding on content change.
@@ -2206,7 +2625,10 @@ mod tests {
         s.cache.write().clear();
 
         // Patch content
-        let patched = s.update_record_content(&id, &owner, Some("new content"), None, None, None).await.unwrap();
+        let patched = s
+            .update_record_content(&id, &owner, Some("new content"), None, None, None)
+            .await
+            .unwrap();
         assert!(patched);
 
         // Verify embedding was cleared
@@ -2231,7 +2653,10 @@ mod tests {
         let id = r.record_id;
         s.insert(&r, "minilm").await;
 
-        let result = s.update_record_content(&id, &other, Some("hacked"), None, None, None).await.unwrap();
+        let result = s
+            .update_record_content(&id, &other, Some("hacked"), None, None, None)
+            .await
+            .unwrap();
         assert!(!result, "Wrong owner should be rejected");
     }
 

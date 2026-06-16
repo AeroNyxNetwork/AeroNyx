@@ -72,7 +72,10 @@ pub use fact::Fact;
 #[deprecated(since = "2.1.0", note = "Use RecordBlock instead of Block")]
 pub use block::Block;
 
-pub use block::{BlockHeader, RecordBlock, BLOCK_TYPE_CHECKPOINT, BLOCK_TYPE_MEMORY, BLOCK_TYPE_NORMAL, GENESIS_PREV_HASH};
+pub use block::{
+    BlockHeader, RecordBlock, BLOCK_TYPE_CHECKPOINT, BLOCK_TYPE_MEMORY, BLOCK_TYPE_NORMAL,
+    GENESIS_PREV_HASH,
+};
 pub use merkle::merkle_root;
 
 // Re-export primary types — new (MRS-1)

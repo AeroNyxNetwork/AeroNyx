@@ -113,8 +113,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, error, info, warn};
 
+use aeronyx_core::crypto::transport::{
+    DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD,
+};
 use aeronyx_core::crypto::IdentityKeyPair;
-use aeronyx_core::crypto::transport::{DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD};
 #[allow(deprecated)]
 use aeronyx_core::ledger::Fact;
 use aeronyx_core::protocol::codec::encode_data_packet;
@@ -137,7 +139,10 @@ use crate::services::SessionManager;
 /// endpoints in `api/mpi.rs`. This struct is preserved to keep
 /// `/api/fact`, `/api/facts`, `/api/status`, `/api/sync` working
 /// for backward compatibility with older local clients.
-#[deprecated(since = "2.1.0", note = "Use MPI endpoints (/api/mpi/*) via api::mpi::MpiState")]
+#[deprecated(
+    since = "2.1.0",
+    note = "Use MPI endpoints (/api/mpi/*) via api::mpi::MpiState"
+)]
 pub struct ApiState {
     // Legacy state (Fact-based)
     pub mempool: Arc<MemPool>,
@@ -235,7 +240,10 @@ async fn broadcast_to_all_sessions(
     let plaintext = match encode_memchain(&msg) {
         Ok(p) => p,
         Err(e) => {
-            error!("[API_BROADCAST] ❌ Failed to encode MemChain message: {}", e);
+            error!(
+                "[API_BROADCAST] ❌ Failed to encode MemChain message: {}",
+                e
+            );
             return 0;
         }
     };
@@ -271,11 +279,7 @@ async fn broadcast_to_all_sessions(
         };
         encrypted.truncate(actual_len);
 
-        let data_packet = DataPacket::new(
-            *session.id.as_bytes(),
-            counter,
-            encrypted,
-        );
+        let data_packet = DataPacket::new(*session.id.as_bytes(), counter, encrypted);
         let packet_bytes = encode_data_packet(&data_packet).to_vec();
 
         if let Err(e) = udp.send(&packet_bytes, &session.client_endpoint).await {
@@ -363,37 +367,43 @@ async fn list_facts(
     let facts = state.mempool.recent(limit);
     let responses: Vec<FactResponse> = facts.iter().map(FactResponse::from).collect();
 
-    (StatusCode::OK, Json(FactsListResponse {
-        count: responses.len(),
-        facts: responses,
-    }))
+    (
+        StatusCode::OK,
+        Json(FactsListResponse {
+            count: responses.len(),
+            facts: responses,
+        }),
+    )
 }
 
 /// `GET /api/status` — Legacy health check.
-async fn status(
-    State(state): State<Arc<ApiState>>,
-) -> impl IntoResponse {
+async fn status(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     let aof_writes = {
         let writer = state.aof_writer.lock().await;
         writer.write_count()
     };
 
-    let mode_str = if state.memchain_config.is_p2p() { "p2p" } else { "local" };
+    let mode_str = if state.memchain_config.is_p2p() {
+        "p2p"
+    } else {
+        "local"
+    };
 
-    (StatusCode::OK, Json(StatusResponse {
-        memchain_enabled: true,
-        mode: mode_str.to_string(),
-        mempool_count: state.mempool.count(),
-        mempool_total_accepted: state.mempool.total_accepted(),
-        mempool_total_rejected: state.mempool.total_rejected(),
-        aof_writes,
-    }))
+    (
+        StatusCode::OK,
+        Json(StatusResponse {
+            memchain_enabled: true,
+            mode: mode_str.to_string(),
+            mempool_count: state.mempool.count(),
+            mempool_total_accepted: state.mempool.total_accepted(),
+            mempool_total_rejected: state.mempool.total_rejected(),
+            aof_writes,
+        }),
+    )
 }
 
 /// `POST /api/sync` — Trigger P2P catch-up (legacy).
-async fn trigger_sync(
-    State(state): State<Arc<ApiState>>,
-) -> impl IntoResponse {
+async fn trigger_sync(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     if !state.memchain_config.is_p2p() {
         return (
             StatusCode::BAD_REQUEST,
@@ -404,21 +414,31 @@ async fn trigger_sync(
     }
 
     let last_hash = state.mempool.last_fact_id().unwrap_or([0u8; 32]);
-    let last_hash_hex = if last_hash == [0u8; 32] { None } else { Some(hex::encode(last_hash)) };
+    let last_hash_hex = if last_hash == [0u8; 32] {
+        None
+    } else {
+        Some(hex::encode(last_hash))
+    };
 
-    let msg = MemChainMessage::SyncRequest { last_known_hash: last_hash };
+    let msg = MemChainMessage::SyncRequest {
+        last_known_hash: last_hash,
+    };
     let peers_contacted = broadcast_to_all_sessions(
         msg,
         Arc::clone(&state.sessions),
         Arc::clone(&state.udp),
         state.crypto.clone(),
-    ).await;
+    )
+    .await;
 
-    (StatusCode::OK, Json(serde_json::json!(SyncResponse {
-        status: "sync_requested".to_string(),
-        last_known_hash: last_hash_hex,
-        peers_contacted,
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(SyncResponse {
+            status: "sync_requested".to_string(),
+            last_known_hash: last_hash_hex,
+            peers_contacted,
+        })),
+    )
 }
 
 // ============================================
@@ -477,10 +497,9 @@ pub fn start_legacy_api_server(
             }
         };
 
-        let server = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.recv().await;
-            });
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = shutdown_rx.recv().await;
+        });
 
         if let Err(e) = server.await {
             error!("[LEGACY_API] Error: {}", e);
@@ -506,14 +525,17 @@ mod tests {
         let udp = Arc::new(
             UdpTransport::bind_addr("127.0.0.1:0".parse().unwrap())
                 .await
-                .unwrap()
+                .unwrap(),
         );
 
         Arc::new(ApiState {
             mempool: Arc::new(MemPool::new()),
             aof_writer: Arc::new(TokioMutex::new(aof)),
             identity: IdentityKeyPair::generate(),
-            sessions: Arc::new(SessionManager::new(100, std::time::Duration::from_secs(300))),
+            sessions: Arc::new(SessionManager::new(
+                100,
+                std::time::Duration::from_secs(300),
+            )),
             udp,
             crypto: DefaultTransportCrypto::new(),
             memchain_config: MemChainConfig::default(),
@@ -551,7 +573,9 @@ mod tests {
             .method("POST")
             .uri("/api/fact")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"subject":"user","predicate":"likes","object":"Rust"}"#))
+            .body(Body::from(
+                r#"{"subject":"user","predicate":"likes","object":"Rust"}"#,
+            ))
             .unwrap();
 
         let resp = app.clone().oneshot(req).await.unwrap();

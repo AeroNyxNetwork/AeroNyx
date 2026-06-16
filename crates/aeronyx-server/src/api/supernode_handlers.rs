@@ -37,10 +37,7 @@ use crate::services::memchain::{LlmRouter, MemoryStorage};
 // Helper: extract storage from Extensions (v1.0.1-SaaSFix)
 // ============================================
 
-fn get_storage(
-    req: &Request<axum::body::Body>,
-    state: &MpiState,
-) -> Option<Arc<MemoryStorage>> {
+fn get_storage(req: &Request<axum::body::Body>, state: &MpiState) -> Option<Arc<MemoryStorage>> {
     req.extensions()
         .get::<Arc<MemoryStorage>>()
         .cloned()
@@ -63,7 +60,9 @@ pub struct TaskListParams {
     pub offset: usize,
 }
 
-fn default_limit() -> usize { 20 }
+fn default_limit() -> usize {
+    20
+}
 
 #[derive(Debug, Deserialize)]
 pub struct UsageParams {
@@ -131,22 +130,31 @@ struct QueueSummary {
 // ============================================
 
 fn supernode_disabled() -> impl IntoResponse {
-    (StatusCode::NOT_FOUND, Json(serde_json::json!({
-        "error": "supernode not enabled",
-        "hint": "Set [memchain.supernode] enabled = true and configure at least one provider"
-    })))
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "supernode not enabled",
+            "hint": "Set [memchain.supernode] enabled = true and configure at least one provider"
+        })),
+    )
 }
 
 fn local_only() -> impl IntoResponse {
-    (StatusCode::FORBIDDEN, Json(serde_json::json!({
-        "error": "/supernode endpoints are local-only"
-    })))
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "/supernode endpoints are local-only"
+        })),
+    )
 }
 
 fn storage_unavailable() -> impl IntoResponse {
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-        "error": "storage unavailable"
-    })))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "storage unavailable"
+        })),
+    )
 }
 
 fn parse_period(params: &UsageParams) -> (i64, i64) {
@@ -165,7 +173,7 @@ fn parse_period(params: &UsageParams) -> (i64, i64) {
             let start = now - (now % 86400);
             (start, now)
         }
-        Some("7d")  => (now - 7 * 86400, now),
+        Some("7d") => (now - 7 * 86400, now),
         Some("30d") => (now - 30 * 86400, now),
         Some(s) if s.len() == 7 => parse_year_month(s, now),
         Some(_) => (0, now),
@@ -174,11 +182,15 @@ fn parse_period(params: &UsageParams) -> (i64, i64) {
 
 fn parse_year_month(s: &str, now: i64) -> (i64, i64) {
     let parts: Vec<&str> = s.splitn(2, '-').collect();
-    if parts.len() != 2 { return (0, now); }
+    if parts.len() != 2 {
+        return (0, now);
+    }
     let (Ok(year), Ok(month)) = (parts[0].parse::<i32>(), parts[1].parse::<u32>()) else {
         return (0, now);
     };
-    if !(1..=12).contains(&month) { return (0, now); }
+    if !(1..=12).contains(&month) {
+        return (0, now);
+    }
 
     let month_start_days = unix_days_for_date(year, month, 1);
     let month_end_days = if month == 12 {
@@ -201,10 +213,8 @@ fn unix_days_for_date(year: i32, month: u32, day: u32) -> i64 {
     let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
     let leap_correction = if month > 2 && is_leap { 1 } else { 0 };
     let epoch_days = days_from_year1(1970);
-    let target_days = days_from_year1(year)
-        + MONTH_DAYS[month as usize]
-        + leap_correction
-        + (day as i64 - 1);
+    let target_days =
+        days_from_year1(year) + MONTH_DAYS[month as usize] + leap_correction + (day as i64 - 1);
     (target_days - epoch_days).max(0)
 }
 
@@ -238,8 +248,12 @@ pub async fn supernode_list_tasks(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let auth = extract_owner(&req).clone();
-    if auth.is_remote() { return local_only().into_response(); }
-    if state.llm_router.is_none() { return supernode_disabled().into_response(); }
+    if auth.is_remote() {
+        return local_only().into_response();
+    }
+    if state.llm_router.is_none() {
+        return supernode_disabled().into_response();
+    }
 
     let storage = match get_storage(&req, &state) {
         Some(s) => s,
@@ -249,27 +263,33 @@ pub async fn supernode_list_tasks(
     let limit = params.limit.min(100).max(1);
     let offset = params.offset;
 
-    let tasks: Vec<crate::services::memchain::CognitiveTaskRow> = storage.get_tasks_filtered(
-        params.status.as_deref(),
-        params.task_type.as_deref(),
-        limit,
-        offset,
-    ).await;
+    let tasks: Vec<crate::services::memchain::CognitiveTaskRow> = storage
+        .get_tasks_filtered(
+            params.status.as_deref(),
+            params.task_type.as_deref(),
+            limit,
+            offset,
+        )
+        .await;
 
     let summaries: Vec<TaskSummary> = tasks.iter().map(row_to_summary).collect();
     let has_more = summaries.len() == limit;
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "filters": {
-            "status": params.status,
-            "type": params.task_type,
-            "limit": limit,
-            "offset": offset,
-        },
-        "count": summaries.len(),
-        "has_more": has_more,
-        "tasks": summaries,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "filters": {
+                "status": params.status,
+                "type": params.task_type,
+                "limit": limit,
+                "offset": offset,
+            },
+            "count": summaries.len(),
+            "has_more": has_more,
+            "tasks": summaries,
+        })),
+    )
+        .into_response()
 }
 
 // ============================================
@@ -282,8 +302,12 @@ pub async fn supernode_task_detail(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let auth = extract_owner(&req).clone();
-    if auth.is_remote() { return local_only().into_response(); }
-    if state.llm_router.is_none() { return supernode_disabled().into_response(); }
+    if auth.is_remote() {
+        return local_only().into_response();
+    }
+    if state.llm_router.is_none() {
+        return supernode_disabled().into_response();
+    }
 
     let storage = match get_storage(&req, &state) {
         Some(s) => s,
@@ -292,9 +316,15 @@ pub async fn supernode_task_detail(
 
     let task = match storage.get_task(task_id).await {
         Some(t) => t,
-        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": format!("task {} not found", task_id)
-        }))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("task {} not found", task_id)
+                })),
+            )
+                .into_response()
+        }
     };
 
     let payload_val: serde_json::Value = serde_json::from_str(&task.payload)
@@ -302,7 +332,9 @@ pub async fn supernode_task_detail(
     let result_val: Option<serde_json::Value> = task.result.as_deref().map(|r| {
         serde_json::from_str(r).unwrap_or_else(|_| serde_json::Value::String(r.to_string()))
     });
-    let token_usage_val: Option<serde_json::Value> = task.token_usage.as_deref()
+    let token_usage_val: Option<serde_json::Value> = task
+        .token_usage
+        .as_deref()
         .and_then(|s| serde_json::from_str(s).ok());
 
     let detail = TaskDetail {
@@ -325,8 +357,12 @@ pub async fn supernode_retry_task(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let auth = extract_owner(&req).clone();
-    if auth.is_remote() { return local_only().into_response(); }
-    if state.llm_router.is_none() { return supernode_disabled().into_response(); }
+    if auth.is_remote() {
+        return local_only().into_response();
+    }
+    if state.llm_router.is_none() {
+        return supernode_disabled().into_response();
+    }
 
     let storage = match get_storage(&req, &state) {
         Some(s) => s,
@@ -336,32 +372,51 @@ pub async fn supernode_retry_task(
     match storage.retry_task(task_id).await {
         Ok(()) => {
             info!(id = task_id, "[SUPERNODE] Task queued for retry");
-            (StatusCode::OK, Json(serde_json::json!({
-                "task_id": task_id,
-                "status": "pending",
-                "message": "Task reset to pending"
-            }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "task_id": task_id,
+                    "status": "pending",
+                    "message": "Task reset to pending"
+                })),
+            )
+                .into_response()
         }
-        Err(e) if e.contains("not found") => {
-            (StatusCode::NOT_FOUND, Json(serde_json::json!({
+        Err(e) if e.contains("not found") => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
                 "error": format!("task {} not found", task_id)
-            }))).into_response()
-        }
-        Err(e) if e.contains("can only retry") => {
-            (StatusCode::CONFLICT, Json(serde_json::json!({ "error": e }))).into_response()
-        }
+            })),
+        )
+            .into_response(),
+        Err(e) if e.contains("can only retry") => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
         Err(e) if e.contains("absolute retry ceiling") => {
-            warn!(id = task_id, "[SUPERNODE] Retry blocked by absolute ceiling");
-            (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({
-                "error": e,
-                "hint": "Investigate the provider error before retrying."
-            }))).into_response()
+            warn!(
+                id = task_id,
+                "[SUPERNODE] Retry blocked by absolute ceiling"
+            );
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": e,
+                    "hint": "Investigate the provider error before retrying."
+                })),
+            )
+                .into_response()
         }
         Err(e) => {
             warn!(id = task_id, error = %e, "[SUPERNODE] retry_task failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "internal error — task retry failed"
-            }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "internal error — task retry failed"
+                })),
+            )
+                .into_response()
         }
     }
 }
@@ -376,8 +431,12 @@ pub async fn supernode_cancel_task(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let auth = extract_owner(&req).clone();
-    if auth.is_remote() { return local_only().into_response(); }
-    if state.llm_router.is_none() { return supernode_disabled().into_response(); }
+    if auth.is_remote() {
+        return local_only().into_response();
+    }
+    if state.llm_router.is_none() {
+        return supernode_disabled().into_response();
+    }
 
     let storage = match get_storage(&req, &state) {
         Some(s) => s,
@@ -386,43 +445,71 @@ pub async fn supernode_cancel_task(
 
     let task = match storage.get_task(task_id).await {
         Some(t) => t,
-        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": format!("task {} not found", task_id)
-        }))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("task {} not found", task_id)
+                })),
+            )
+                .into_response()
+        }
     };
 
     if task.status != "pending" {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "error": format!(
-                "task {} is '{}', can only cancel 'pending' tasks",
-                task_id, task.status
-            )
-        }))).into_response();
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "task {} is '{}', can only cancel 'pending' tasks",
+                    task_id, task.status
+                )
+            })),
+        )
+            .into_response();
     }
 
     match storage.cancel_task(task_id).await {
         Ok(1) => {
             info!(id = task_id, "[SUPERNODE] Task cancelled");
-            (StatusCode::OK, Json(serde_json::json!({
-                "task_id": task_id,
-                "status": "cancelled"
-            }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "task_id": task_id,
+                    "status": "cancelled"
+                })),
+            )
+                .into_response()
         }
-        Ok(0) => {
-            (StatusCode::CONFLICT, Json(serde_json::json!({
+        Ok(0) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
                 "error": format!(
                     "task {} could not be cancelled — it may have been claimed by the worker",
                     task_id
                 )
-            }))).into_response()
-        }
+            })),
+        )
+            .into_response(),
         Ok(n) => {
-            warn!(id = task_id, rows = n, "[SUPERNODE] cancel_task affected unexpected row count");
-            (StatusCode::OK, Json(serde_json::json!({ "task_id": task_id, "status": "cancelled" }))).into_response()
+            warn!(
+                id = task_id,
+                rows = n,
+                "[SUPERNODE] cancel_task affected unexpected row count"
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "task_id": task_id, "status": "cancelled" })),
+            )
+                .into_response()
         }
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "internal error — task cancel failed"
-        }))).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "internal error — task cancel failed"
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -436,8 +523,12 @@ pub async fn supernode_usage(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let auth = extract_owner(&req).clone();
-    if auth.is_remote() { return local_only().into_response(); }
-    if state.llm_router.is_none() { return supernode_disabled().into_response(); }
+    if auth.is_remote() {
+        return local_only().into_response();
+    }
+    if state.llm_router.is_none() {
+        return supernode_disabled().into_response();
+    }
 
     let storage = match get_storage(&req, &state) {
         Some(s) => s,
@@ -449,58 +540,84 @@ pub async fn supernode_usage(
     let by_task_type: Vec<crate::services::memchain::TaskTypeUsage> =
         storage.get_usage_stats_by_task_type(since, until).await;
 
-    let by_provider_with_cost: Vec<serde_json::Value> = stats.by_provider.iter().map(|p| {
-        let cost = LlmRouter::estimate_cost(
-            &p.provider, p.input_tokens as u32, p.output_tokens as u32, 0,
-        );
-        serde_json::json!({
-            "provider": p.provider,
-            "calls": p.calls,
-            "input_tokens": p.input_tokens,
-            "output_tokens": p.output_tokens,
-            "avg_latency_ms": p.avg_latency_ms.round() as i64,
-            "estimated_cost_usd": cost,
+    let by_provider_with_cost: Vec<serde_json::Value> = stats
+        .by_provider
+        .iter()
+        .map(|p| {
+            let cost = LlmRouter::estimate_cost(
+                &p.provider,
+                p.input_tokens as u32,
+                p.output_tokens as u32,
+                0,
+            );
+            serde_json::json!({
+                "provider": p.provider,
+                "calls": p.calls,
+                "input_tokens": p.input_tokens,
+                "output_tokens": p.output_tokens,
+                "avg_latency_ms": p.avg_latency_ms.round() as i64,
+                "estimated_cost_usd": cost,
+            })
         })
-    }).collect();
+        .collect();
 
-    let by_task_type_json: Vec<serde_json::Value> = by_task_type.iter().map(|t| {
-        let cost = LlmRouter::estimate_cost(
-            &t.provider, t.input_tokens as u32, t.output_tokens as u32, t.cached_tokens as u32,
-        );
-        serde_json::json!({
-            "task_type": t.task_type,
-            "provider": t.provider,
-            "calls": t.calls,
-            "input_tokens": t.input_tokens,
-            "output_tokens": t.output_tokens,
-            "cached_tokens": t.cached_tokens,
-            "avg_latency_ms": t.avg_latency_ms.round() as i64,
-            "estimated_cost_usd": cost,
+    let by_task_type_json: Vec<serde_json::Value> = by_task_type
+        .iter()
+        .map(|t| {
+            let cost = LlmRouter::estimate_cost(
+                &t.provider,
+                t.input_tokens as u32,
+                t.output_tokens as u32,
+                t.cached_tokens as u32,
+            );
+            serde_json::json!({
+                "task_type": t.task_type,
+                "provider": t.provider,
+                "calls": t.calls,
+                "input_tokens": t.input_tokens,
+                "output_tokens": t.output_tokens,
+                "cached_tokens": t.cached_tokens,
+                "avg_latency_ms": t.avg_latency_ms.round() as i64,
+                "estimated_cost_usd": cost,
+            })
         })
-    }).collect();
+        .collect();
 
-    let total_cost: f64 = stats.by_provider.iter().map(|p| {
-        LlmRouter::estimate_cost(&p.provider, p.input_tokens as u32, p.output_tokens as u32, 0)
-    }).sum();
+    let total_cost: f64 = stats
+        .by_provider
+        .iter()
+        .map(|p| {
+            LlmRouter::estimate_cost(
+                &p.provider,
+                p.input_tokens as u32,
+                p.output_tokens as u32,
+                0,
+            )
+        })
+        .sum();
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "window": {
-            "since": since,
-            "until": until,
-            "period": params.period,
-            "timezone": "UTC",
-        },
-        "totals": {
-            "calls": stats.total_calls,
-            "input_tokens": stats.total_input_tokens,
-            "output_tokens": stats.total_output_tokens,
-            "cached_tokens": stats.total_cached_tokens,
-            "avg_latency_ms": stats.avg_latency_ms.round() as i64,
-            "estimated_cost_usd": total_cost,
-        },
-        "by_provider": by_provider_with_cost,
-        "by_task_type": by_task_type_json,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "window": {
+                "since": since,
+                "until": until,
+                "period": params.period,
+                "timezone": "UTC",
+            },
+            "totals": {
+                "calls": stats.total_calls,
+                "input_tokens": stats.total_input_tokens,
+                "output_tokens": stats.total_output_tokens,
+                "cached_tokens": stats.total_cached_tokens,
+                "avg_latency_ms": stats.avg_latency_ms.round() as i64,
+                "estimated_cost_usd": total_cost,
+            },
+            "by_provider": by_provider_with_cost,
+            "by_task_type": by_task_type_json,
+        })),
+    )
+        .into_response()
 }
 
 // ============================================
@@ -512,14 +629,22 @@ pub async fn supernode_health(
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let auth = extract_owner(&req).clone();
-    if auth.is_remote() { return local_only().into_response(); }
+    if auth.is_remote() {
+        return local_only().into_response();
+    }
 
     let router = match &state.llm_router {
         Some(r) => r,
-        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "status": "disabled",
-            "error": "supernode not enabled"
-        }))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "status": "disabled",
+                    "error": "supernode not enabled"
+                })),
+            )
+                .into_response()
+        }
     };
 
     let storage = match get_storage(&req, &state) {
@@ -529,11 +654,11 @@ pub async fn supernode_health(
 
     let counts: std::collections::HashMap<String, i64> = storage.count_tasks_by_status().await;
     let queue = QueueSummary {
-        pending:    *counts.get("pending").unwrap_or(&0),
+        pending: *counts.get("pending").unwrap_or(&0),
         processing: *counts.get("processing").unwrap_or(&0),
-        completed:  *counts.get("completed").unwrap_or(&0),
-        failed:     *counts.get("failed").unwrap_or(&0),
-        cancelled:  *counts.get("cancelled").unwrap_or(&0),
+        completed: *counts.get("completed").unwrap_or(&0),
+        failed: *counts.get("failed").unwrap_or(&0),
+        cancelled: *counts.get("cancelled").unwrap_or(&0),
     };
 
     let provider_configs = router.provider_configs();
@@ -578,20 +703,33 @@ pub async fn supernode_health(
         }
     }).collect();
 
-    let provider_health: Vec<ProviderHealthInfo> =
-        futures::future::join_all(ping_futures).await;
+    let provider_health: Vec<ProviderHealthInfo> = futures::future::join_all(ping_futures).await;
 
     let all_healthy = provider_health.iter().all(|p| p.healthy);
     let any_healthy = provider_health.iter().any(|p| p.healthy);
-    let overall = if all_healthy { "healthy" } else if any_healthy { "degraded" } else { "unhealthy" };
-    let code = if any_healthy { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let overall = if all_healthy {
+        "healthy"
+    } else if any_healthy {
+        "degraded"
+    } else {
+        "unhealthy"
+    };
+    let code = if any_healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
 
-    (code, Json(serde_json::json!({
-        "status": overall,
-        "note": "Provider health checks connectivity only (HTTP HEAD).",
-        "providers": provider_health,
-        "queue": queue,
-    }))).into_response()
+    (
+        code,
+        Json(serde_json::json!({
+            "status": overall,
+            "note": "Provider health checks connectivity only (HTTP HEAD).",
+            "providers": provider_health,
+            "queue": queue,
+        })),
+    )
+        .into_response()
 }
 
 // ============================================
@@ -620,7 +758,11 @@ mod tests {
 
     #[test]
     fn test_parse_year_month_2026_03() {
-        let params = UsageParams { period: Some("2026-03".into()), since: None, until: None };
+        let params = UsageParams {
+            period: Some("2026-03".into()),
+            since: None,
+            until: None,
+        };
         let (since, until) = parse_period(&params);
         let expected_start = unix_days_for_date(2026, 3, 1) * 86400;
         let expected_end = unix_days_for_date(2026, 4, 1) * 86400;
@@ -630,16 +772,27 @@ mod tests {
 
     #[test]
     fn test_parse_period_today() {
-        let params = UsageParams { period: Some("today".into()), since: None, until: None };
+        let params = UsageParams {
+            period: Some("today".into()),
+            since: None,
+            until: None,
+        };
         let (since, _) = parse_period(&params);
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         assert_eq!(since % 86400, 0);
         assert!(since <= now);
     }
 
     #[test]
     fn test_parse_period_explicit_override() {
-        let params = UsageParams { period: Some("2026-03".into()), since: Some(1000), until: Some(2000) };
+        let params = UsageParams {
+            period: Some("2026-03".into()),
+            since: Some(1000),
+            until: Some(2000),
+        };
         let (since, until) = parse_period(&params);
         assert_eq!(since, 1000);
         assert_eq!(until, 2000);
@@ -647,7 +800,11 @@ mod tests {
 
     #[test]
     fn test_parse_period_7d() {
-        let params = UsageParams { period: Some("7d".into()), since: None, until: None };
+        let params = UsageParams {
+            period: Some("7d".into()),
+            since: None,
+            until: None,
+        };
         let (since, until) = parse_period(&params);
         assert!(until - since >= 7 * 86400 - 1);
         assert!(until - since <= 7 * 86400 + 1);

@@ -340,7 +340,9 @@ impl PrivacyLevel {
 }
 
 impl Default for PrivacyLevel {
-    fn default() -> Self { Self::Structured }
+    fn default() -> Self {
+        Self::Structured
+    }
 }
 
 impl std::fmt::Display for PrivacyLevel {
@@ -410,10 +412,18 @@ pub struct WorkerConfig {
     pub task_timeout_secs: u64,
 }
 
-fn default_poll_interval() -> u64 { 5 }
-fn default_max_concurrent() -> usize { 3 }
-fn default_max_retries() -> u32 { 3 }
-fn default_task_timeout() -> u64 { 120 }
+fn default_poll_interval() -> u64 {
+    5
+}
+fn default_max_concurrent() -> usize {
+    3
+}
+fn default_max_retries() -> u32 {
+    3
+}
+fn default_task_timeout() -> u64 {
+    120
+}
 
 impl Default for WorkerConfig {
     fn default() -> Self {
@@ -518,9 +528,8 @@ impl SuperNodeConfig {
             }
         }
 
-        let provider_names: HashSet<&str> = self.providers.iter()
-            .map(|p| p.name.as_str())
-            .collect();
+        let provider_names: HashSet<&str> =
+            self.providers.iter().map(|p| p.name.as_str()).collect();
 
         for referenced in self.routing.all_referenced_providers() {
             if !provider_names.contains(referenced) {
@@ -567,11 +576,15 @@ impl SuperNodeConfig {
     }
 
     #[must_use]
-    pub fn is_enabled(&self) -> bool { self.enabled }
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
 
     #[must_use]
     pub fn effective_fallback(&self) -> Option<&str> {
-        self.routing.fallback.as_deref()
+        self.routing
+            .fallback
+            .as_deref()
             .or_else(|| self.providers.first().map(|p| p.name.as_str()))
     }
 
@@ -582,7 +595,9 @@ impl SuperNodeConfig {
 
     #[must_use]
     pub fn provider_for_task(&self, task_type: CognitiveTaskType) -> Option<&ProviderConfig> {
-        let provider_name = self.routing.provider_for(task_type)
+        let provider_name = self
+            .routing
+            .provider_for(task_type)
             .or_else(|| self.effective_fallback())?;
         self.get_provider(provider_name)
     }
@@ -619,13 +634,21 @@ mod tests {
 
     #[test]
     fn test_disabled_skips_all_validation() {
-        let cfg = SuperNodeConfig { enabled: false, providers: Vec::new(), ..Default::default() };
+        let cfg = SuperNodeConfig {
+            enabled: false,
+            providers: Vec::new(),
+            ..Default::default()
+        };
         assert!(cfg.validate().is_ok());
     }
 
     #[test]
     fn test_enabled_requires_providers() {
-        let cfg = SuperNodeConfig { enabled: true, providers: Vec::new(), ..Default::default() };
+        let cfg = SuperNodeConfig {
+            enabled: true,
+            providers: Vec::new(),
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
@@ -637,7 +660,10 @@ mod tests {
                 name: String::new(),
                 provider_type: ProviderType::OpenaiCompatible,
                 api_base: "http://localhost:11434/v1".into(),
-                api_key: None, model: "test".into(), max_tokens: None, temperature: None,
+                api_key: None,
+                model: "test".into(),
+                max_tokens: None,
+                temperature: None,
             }],
             ..Default::default()
         };
@@ -647,12 +673,18 @@ mod tests {
     #[test]
     fn test_provider_duplicate_name_rejected() {
         let provider = ProviderConfig {
-            name: "deepseek".into(), provider_type: ProviderType::OpenaiCompatible,
-            api_base: "http://api.deepseek.com/v1".into(), api_key: None,
-            model: "deepseek-reasoner".into(), max_tokens: None, temperature: None,
+            name: "deepseek".into(),
+            provider_type: ProviderType::OpenaiCompatible,
+            api_base: "http://api.deepseek.com/v1".into(),
+            api_key: None,
+            model: "deepseek-reasoner".into(),
+            max_tokens: None,
+            temperature: None,
         };
         let cfg = SuperNodeConfig {
-            enabled: true, providers: vec![provider.clone(), provider], ..Default::default()
+            enabled: true,
+            providers: vec![provider.clone(), provider],
+            ..Default::default()
         };
         assert!(cfg.validate().is_err());
     }
@@ -662,9 +694,13 @@ mod tests {
         let cfg = SuperNodeConfig {
             enabled: true,
             providers: vec![ProviderConfig {
-                name: "test".into(), provider_type: ProviderType::OpenaiCompatible,
-                api_base: String::new(), api_key: None, model: "test-model".into(),
-                max_tokens: None, temperature: None,
+                name: "test".into(),
+                provider_type: ProviderType::OpenaiCompatible,
+                api_base: String::new(),
+                api_key: None,
+                model: "test-model".into(),
+                max_tokens: None,
+                temperature: None,
             }],
             ..Default::default()
         };
@@ -676,9 +712,13 @@ mod tests {
         let cfg = SuperNodeConfig {
             enabled: true,
             providers: vec![ProviderConfig {
-                name: "claude".into(), provider_type: ProviderType::Anthropic,
-                api_base: String::new(), api_key: Some("$ANTHROPIC_API_KEY".into()),
-                model: "claude-sonnet-4-20250514".into(), max_tokens: None, temperature: None,
+                name: "claude".into(),
+                provider_type: ProviderType::Anthropic,
+                api_base: String::new(),
+                api_key: Some("$ANTHROPIC_API_KEY".into()),
+                model: "claude-sonnet-4-20250514".into(),
+                max_tokens: None,
+                temperature: None,
             }],
             ..Default::default()
         };
@@ -690,9 +730,13 @@ mod tests {
         let cfg = SuperNodeConfig {
             enabled: true,
             providers: vec![ProviderConfig {
-                name: "test".into(), provider_type: ProviderType::Anthropic,
-                api_base: String::new(), api_key: None, model: "test".into(),
-                max_tokens: None, temperature: Some(2.5),
+                name: "test".into(),
+                provider_type: ProviderType::Anthropic,
+                api_base: String::new(),
+                api_key: None,
+                model: "test".into(),
+                max_tokens: None,
+                temperature: Some(2.5),
             }],
             ..Default::default()
         };
@@ -705,13 +749,21 @@ mod tests {
             let cfg = SuperNodeConfig {
                 enabled: true,
                 providers: vec![ProviderConfig {
-                    name: "test".into(), provider_type: ProviderType::Anthropic,
-                    api_base: String::new(), api_key: None, model: "test".into(),
-                    max_tokens: None, temperature: Some(temp),
+                    name: "test".into(),
+                    provider_type: ProviderType::Anthropic,
+                    api_base: String::new(),
+                    api_key: None,
+                    model: "test".into(),
+                    max_tokens: None,
+                    temperature: Some(temp),
                 }],
                 ..Default::default()
             };
-            assert!(cfg.validate().is_ok(), "temperature {} should be valid", temp);
+            assert!(
+                cfg.validate().is_ok(),
+                "temperature {} should be valid",
+                temp
+            );
         }
     }
 
@@ -720,9 +772,13 @@ mod tests {
         let cfg = SuperNodeConfig {
             enabled: true,
             providers: vec![ProviderConfig {
-                name: "test".into(), provider_type: ProviderType::Anthropic,
-                api_base: String::new(), api_key: None, model: "test".into(),
-                max_tokens: Some(0), temperature: None,
+                name: "test".into(),
+                provider_type: ProviderType::Anthropic,
+                api_base: String::new(),
+                api_key: None,
+                model: "test".into(),
+                max_tokens: Some(0),
+                temperature: None,
             }],
             ..Default::default()
         };
@@ -734,12 +790,17 @@ mod tests {
         let cfg = SuperNodeConfig {
             enabled: true,
             providers: vec![ProviderConfig {
-                name: "deepseek".into(), provider_type: ProviderType::OpenaiCompatible,
-                api_base: "http://api.deepseek.com/v1".into(), api_key: None,
-                model: "deepseek-reasoner".into(), max_tokens: None, temperature: None,
+                name: "deepseek".into(),
+                provider_type: ProviderType::OpenaiCompatible,
+                api_base: "http://api.deepseek.com/v1".into(),
+                api_key: None,
+                model: "deepseek-reasoner".into(),
+                max_tokens: None,
+                temperature: None,
             }],
             routing: TaskRoutingConfig {
-                session_title: Some("nonexistent_provider".into()), ..Default::default()
+                session_title: Some("nonexistent_provider".into()),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -752,14 +813,22 @@ mod tests {
             enabled: true,
             providers: vec![
                 ProviderConfig {
-                    name: "deepseek".into(), provider_type: ProviderType::OpenaiCompatible,
-                    api_base: "http://api.deepseek.com/v1".into(), api_key: None,
-                    model: "deepseek-reasoner".into(), max_tokens: None, temperature: None,
+                    name: "deepseek".into(),
+                    provider_type: ProviderType::OpenaiCompatible,
+                    api_base: "http://api.deepseek.com/v1".into(),
+                    api_key: None,
+                    model: "deepseek-reasoner".into(),
+                    max_tokens: None,
+                    temperature: None,
                 },
                 ProviderConfig {
-                    name: "claude".into(), provider_type: ProviderType::Anthropic,
-                    api_base: String::new(), api_key: Some("$ANTHROPIC_API_KEY".into()),
-                    model: "claude-sonnet-4-20250514".into(), max_tokens: None, temperature: None,
+                    name: "claude".into(),
+                    provider_type: ProviderType::Anthropic,
+                    api_base: String::new(),
+                    api_key: Some("$ANTHROPIC_API_KEY".into()),
+                    model: "claude-sonnet-4-20250514".into(),
+                    max_tokens: None,
+                    temperature: None,
                 },
             ],
             routing: TaskRoutingConfig {
@@ -778,11 +847,18 @@ mod tests {
         let cfg = SuperNodeConfig {
             enabled: true,
             providers: vec![ProviderConfig {
-                name: "test".into(), provider_type: ProviderType::Anthropic,
-                api_base: String::new(), api_key: None, model: "test".into(),
-                max_tokens: None, temperature: None,
+                name: "test".into(),
+                provider_type: ProviderType::Anthropic,
+                api_base: String::new(),
+                api_key: None,
+                model: "test".into(),
+                max_tokens: None,
+                temperature: None,
             }],
-            worker: WorkerConfig { poll_interval_secs: 0, ..Default::default() },
+            worker: WorkerConfig {
+                poll_interval_secs: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
@@ -803,9 +879,18 @@ mod tests {
             default_level: PrivacyLevel::Structured,
             allow_full_for: vec!["session_title".into(), "code_analysis".into()],
         };
-        assert_eq!(privacy.level_for(CognitiveTaskType::SessionTitle), PrivacyLevel::Full);
-        assert_eq!(privacy.level_for(CognitiveTaskType::CodeAnalysis), PrivacyLevel::Full);
-        assert_eq!(privacy.level_for(CognitiveTaskType::CommunityNarrative), PrivacyLevel::Structured);
+        assert_eq!(
+            privacy.level_for(CognitiveTaskType::SessionTitle),
+            PrivacyLevel::Full
+        );
+        assert_eq!(
+            privacy.level_for(CognitiveTaskType::CodeAnalysis),
+            PrivacyLevel::Full
+        );
+        assert_eq!(
+            privacy.level_for(CognitiveTaskType::CommunityNarrative),
+            PrivacyLevel::Structured
+        );
     }
 
     #[test]
@@ -820,7 +905,10 @@ mod tests {
 
     #[test]
     fn test_privacy_full_default_overrides_all() {
-        let privacy = PrivacyConfig { default_level: PrivacyLevel::Full, allow_full_for: Vec::new() };
+        let privacy = PrivacyConfig {
+            default_level: PrivacyLevel::Full,
+            allow_full_for: Vec::new(),
+        };
         for task in CognitiveTaskType::ALL {
             assert!(privacy.is_full_allowed(*task));
         }
@@ -829,9 +917,18 @@ mod tests {
     #[test]
     fn test_task_type_parse() {
         // v2.5.0+Unify: all tests use parse(), not from_str
-        assert_eq!(CognitiveTaskType::parse("session_title"), Some(CognitiveTaskType::SessionTitle));
-        assert_eq!(CognitiveTaskType::parse("entity_description"), Some(CognitiveTaskType::EntityDescription));
-        assert_eq!(CognitiveTaskType::parse("community_narrative"), Some(CognitiveTaskType::CommunityNarrative));
+        assert_eq!(
+            CognitiveTaskType::parse("session_title"),
+            Some(CognitiveTaskType::SessionTitle)
+        );
+        assert_eq!(
+            CognitiveTaskType::parse("entity_description"),
+            Some(CognitiveTaskType::EntityDescription)
+        );
+        assert_eq!(
+            CognitiveTaskType::parse("community_narrative"),
+            Some(CognitiveTaskType::CommunityNarrative)
+        );
         assert_eq!(CognitiveTaskType::parse("unknown"), None);
         assert_eq!(CognitiveTaskType::parse(""), None);
     }
@@ -848,8 +945,14 @@ mod tests {
 
     #[test]
     fn test_task_type_entity_description() {
-        assert_eq!(CognitiveTaskType::parse("entity_description"), Some(CognitiveTaskType::EntityDescription));
-        assert_eq!(CognitiveTaskType::EntityDescription.as_str(), "entity_description");
+        assert_eq!(
+            CognitiveTaskType::parse("entity_description"),
+            Some(CognitiveTaskType::EntityDescription)
+        );
+        assert_eq!(
+            CognitiveTaskType::EntityDescription.as_str(),
+            "entity_description"
+        );
     }
 
     #[test]
@@ -863,7 +966,10 @@ mod tests {
         // v2.5.0+Unify: PrivacyLevel now has from_str/as_str methods
         assert_eq!(PrivacyLevel::from_str("full"), PrivacyLevel::Full);
         assert_eq!(PrivacyLevel::from_str("summary"), PrivacyLevel::Summary);
-        assert_eq!(PrivacyLevel::from_str("structured"), PrivacyLevel::Structured);
+        assert_eq!(
+            PrivacyLevel::from_str("structured"),
+            PrivacyLevel::Structured
+        );
         assert_eq!(PrivacyLevel::from_str("unknown"), PrivacyLevel::Structured);
         assert_eq!(PrivacyLevel::Full.as_str(), "full");
         assert_eq!(PrivacyLevel::Summary.as_str(), "summary");
@@ -874,19 +980,43 @@ mod tests {
     fn test_effective_fallback() {
         let cfg = SuperNodeConfig {
             providers: vec![
-                ProviderConfig { name: "a".into(), provider_type: ProviderType::Anthropic,
-                    api_base: String::new(), api_key: None, model: "m".into(), max_tokens: None, temperature: None },
-                ProviderConfig { name: "b".into(), provider_type: ProviderType::Anthropic,
-                    api_base: String::new(), api_key: None, model: "m".into(), max_tokens: None, temperature: None },
+                ProviderConfig {
+                    name: "a".into(),
+                    provider_type: ProviderType::Anthropic,
+                    api_base: String::new(),
+                    api_key: None,
+                    model: "m".into(),
+                    max_tokens: None,
+                    temperature: None,
+                },
+                ProviderConfig {
+                    name: "b".into(),
+                    provider_type: ProviderType::Anthropic,
+                    api_base: String::new(),
+                    api_key: None,
+                    model: "m".into(),
+                    max_tokens: None,
+                    temperature: None,
+                },
             ],
-            routing: TaskRoutingConfig { fallback: Some("b".into()), ..Default::default() },
+            routing: TaskRoutingConfig {
+                fallback: Some("b".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(cfg.effective_fallback(), Some("b"));
 
         let cfg2 = SuperNodeConfig {
-            providers: vec![ProviderConfig { name: "first".into(), provider_type: ProviderType::Anthropic,
-                api_base: String::new(), api_key: None, model: "m".into(), max_tokens: None, temperature: None }],
+            providers: vec![ProviderConfig {
+                name: "first".into(),
+                provider_type: ProviderType::Anthropic,
+                api_base: String::new(),
+                api_key: None,
+                model: "m".into(),
+                max_tokens: None,
+                temperature: None,
+            }],
             ..Default::default()
         };
         assert_eq!(cfg2.effective_fallback(), Some("first"));

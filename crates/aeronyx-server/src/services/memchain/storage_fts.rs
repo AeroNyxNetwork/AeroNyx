@@ -202,30 +202,30 @@ impl MemoryStorage {
              FROM fts_index
              WHERE fts_index MATCH ?1 AND owner_hex = ?2
              ORDER BY score DESC
-             LIMIT ?3"
+             LIMIT ?3",
         ) {
             Ok(s) => s,
             Err(e) => {
-                debug!("[BM25] Query prepare failed (FTS5 may not be available): {}", e);
+                debug!(
+                    "[BM25] Query prepare failed (FTS5 may not be available): {}",
+                    e
+                );
                 return Vec::new();
             }
         };
 
-        let results: Vec<(String, String, f64)> = stmt.query_map(
-            params![sanitized, owner_hex, limit as i64],
-            |row| Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, f64>(2)?,
-            ))
-        )
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
+        let results: Vec<(String, String, f64)> = stmt
+            .query_map(params![sanitized, owner_hex, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
 
-        debug!(
-            result_count = results.len(),
-            "[BM25] Search complete"
-        );
+        debug!(result_count = results.len(), "[BM25] Search complete");
 
         results
     }
@@ -280,7 +280,7 @@ impl MemoryStorage {
              FROM fts_index
              WHERE fts_index MATCH ?1 AND owner_hex = ?2
              ORDER BY score DESC
-             LIMIT ?3"
+             LIMIT ?3",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -290,15 +290,14 @@ impl MemoryStorage {
         };
 
         let raw_hits: Vec<(String, String, String, f64)> = stmt
-            .query_map(
-                params![sanitized, owner_hex, limit as i64],
-                |row| Ok((
+            .query_map(params![sanitized, owner_hex, limit as i64], |row| {
+                Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, f64>(3)?,
-                )),
-            )
+                ))
+            })
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default();
 
@@ -365,7 +364,10 @@ impl MemoryStorage {
         let mut groups: HashMap<String, Vec<SearchHit>> = HashMap::new();
 
         for hit in hits {
-            let key = hit.session_id.clone().unwrap_or_else(|| "(ungrouped)".to_string());
+            let key = hit
+                .session_id
+                .clone()
+                .unwrap_or_else(|| "(ungrouped)".to_string());
             groups.entry(key).or_default().push(hit.clone());
         }
 
@@ -374,10 +376,7 @@ impl MemoryStorage {
         let mut result: Vec<SessionSearchGroup> = Vec::with_capacity(groups.len());
 
         for (session_id, group_hits) in &groups {
-            let best_score = group_hits
-                .iter()
-                .map(|h| h.score)
-                .fold(0.0_f64, f64::max);
+            let best_score = group_hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
 
             // Look up session metadata from sessions + projects tables
             let (title, project_name, started_at) = if session_id != "(ungrouped)" {
@@ -445,7 +444,9 @@ impl MemoryStorage {
         content: &str,
         tags: &str,
     ) {
-        if content.trim().is_empty() { return; }
+        if content.trim().is_empty() {
+            return;
+        }
 
         let rid_hex = hex::encode(record_id);
         let owner_hex = hex::encode(owner);
@@ -491,13 +492,10 @@ impl MemoryStorage {
     /// Index a session summary into FTS5.
     ///
     /// Called by Miner Step 10 after update_session_summary().
-    pub async fn fts_index_session(
-        &self,
-        session_id: &str,
-        owner: &[u8; 32],
-        summary: &str,
-    ) {
-        if summary.trim().is_empty() { return; }
+    pub async fn fts_index_session(&self, session_id: &str, owner: &[u8; 32], summary: &str) {
+        if summary.trim().is_empty() {
+            return;
+        }
 
         let owner_hex = hex::encode(owner);
         let conn = self.conn.lock().await;
@@ -548,7 +546,7 @@ impl MemoryStorage {
             let mut stmt = match conn.prepare(
                 "SELECT record_id, encrypted_content, topic_tags
                  FROM records
-                 WHERE owner = ?1 AND status = 0 AND encrypted_content != x''"
+                 WHERE owner = ?1 AND status = 0 AND encrypted_content != x''",
             ) {
                 Ok(s) => s,
                 Err(e) => {
@@ -571,8 +569,7 @@ impl MemoryStorage {
                 // (ChaCha20-Poly1305: 12-byte nonce + 16-byte tag = 28 byte overhead minimum)
                 let plaintext = if let Some(key) = rk.as_ref() {
                     if encrypted.len() >= 28 {
-                        decrypt_record_content(key, encrypted)
-                            .unwrap_or_else(|_| encrypted.clone())
+                        decrypt_record_content(key, encrypted).unwrap_or_else(|_| encrypted.clone())
                     } else {
                         encrypted.clone()
                     }
@@ -581,7 +578,9 @@ impl MemoryStorage {
                 };
 
                 let text = String::from_utf8_lossy(&plaintext);
-                if text.trim().is_empty() { continue; }
+                if text.trim().is_empty() {
+                    continue;
+                }
 
                 let _ = conn.execute(
                     "INSERT INTO fts_index (source_type, source_id, owner_hex, content, tags)
@@ -594,24 +593,28 @@ impl MemoryStorage {
         };
 
         // ── Index entities (plaintext, bulk is fine) ──
-        let entities_indexed = conn.execute(
-            "INSERT INTO fts_index (source_type, source_id, owner_hex, content, tags)
+        let entities_indexed = conn
+            .execute(
+                "INSERT INTO fts_index (source_type, source_id, owner_hex, content, tags)
              SELECT 'entity', entity_id, ?1,
                     CASE WHEN description IS NOT NULL THEN name || ' ' || description ELSE name END,
                     entity_type
              FROM entities
              WHERE owner = ?2",
-            params![owner_hex, owner.as_slice()],
-        ).unwrap_or(0);
+                params![owner_hex, owner.as_slice()],
+            )
+            .unwrap_or(0);
 
         // ── Index sessions (plaintext summaries, bulk is fine) ──
-        let sessions_indexed = conn.execute(
-            "INSERT INTO fts_index (source_type, source_id, owner_hex, content, tags)
+        let sessions_indexed = conn
+            .execute(
+                "INSERT INTO fts_index (source_type, source_id, owner_hex, content, tags)
              SELECT 'session', session_id, ?1, summary, 'session_summary'
              FROM sessions
              WHERE owner = ?2 AND summary IS NOT NULL AND summary != ''",
-            params![owner_hex, owner.as_slice()],
-        ).unwrap_or(0);
+                params![owner_hex, owner.as_slice()],
+            )
+            .unwrap_or(0);
 
         info!(
             records = records_indexed,
@@ -636,7 +639,8 @@ impl MemoryStorage {
 /// FTS5 with `porter unicode61` tokenizer: space between words = implicit AND
 /// (requires all terms present).
 fn sanitize_fts_query(query: &str) -> String {
-    let cleaned: String = query.chars()
+    let cleaned: String = query
+        .chars()
         .map(|c| {
             if c.is_alphanumeric() || c.is_whitespace() || c == '-' || c == '_' {
                 c
@@ -647,7 +651,8 @@ fn sanitize_fts_query(query: &str) -> String {
         .collect();
 
     // Split into words and rejoin — this normalizes whitespace
-    let words: Vec<&str> = cleaned.split_whitespace()
+    let words: Vec<&str> = cleaned
+        .split_whitespace()
         .filter(|w| w.len() >= 2) // skip single-char noise
         .collect();
 
@@ -709,7 +714,10 @@ mod tests {
 
     #[test]
     fn test_sanitize_fts_query_hyphenated() {
-        assert_eq!(sanitize_fts_query("rate-limiting approach"), "rate-limiting approach");
+        assert_eq!(
+            sanitize_fts_query("rate-limiting approach"),
+            "rate-limiting approach"
+        );
     }
 
     // ── BM25 search tests ──
@@ -728,7 +736,13 @@ mod tests {
         let rid = [0xBB; 32];
 
         // Index a record
-        s.fts_index_record(&rid, &owner, "JWT authentication using RS256 algorithm", "technology").await;
+        s.fts_index_record(
+            &rid,
+            &owner,
+            "JWT authentication using RS256 algorithm",
+            "technology",
+        )
+        .await;
 
         // Search for it
         let results = s.bm25_search("RS256", &owner, 10).await;
@@ -750,8 +764,16 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
 
-        s.fts_index_entity("ent_001", &owner, "Project Alpha", Some("Authentication system"), "project").await;
-        s.fts_index_entity("ent_002", &owner, "PostgreSQL", None, "technology").await;
+        s.fts_index_entity(
+            "ent_001",
+            &owner,
+            "Project Alpha",
+            Some("Authentication system"),
+            "project",
+        )
+        .await;
+        s.fts_index_entity("ent_002", &owner, "PostgreSQL", None, "technology")
+            .await;
 
         let results = s.bm25_search("Alpha", &owner, 10).await;
         assert_eq!(results.len(), 1);
@@ -764,7 +786,12 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
 
-        s.fts_index_session("sess_001", &owner, "Implemented JWT auth with RS256 for Project Alpha").await;
+        s.fts_index_session(
+            "sess_001",
+            &owner,
+            "Implemented JWT auth with RS256 for Project Alpha",
+        )
+        .await;
 
         let results = s.bm25_search("RS256", &owner, 10).await;
         assert_eq!(results.len(), 1);
@@ -777,8 +804,10 @@ mod tests {
         let owner_a = [0xAA; 32];
         let owner_b = [0xBB; 32];
 
-        s.fts_index_record(&[0x01; 32], &owner_a, "secret data for Alice", "").await;
-        s.fts_index_record(&[0x02; 32], &owner_b, "secret data for Bob", "").await;
+        s.fts_index_record(&[0x01; 32], &owner_a, "secret data for Alice", "")
+            .await;
+        s.fts_index_record(&[0x02; 32], &owner_b, "secret data for Bob", "")
+            .await;
 
         let results_a = s.bm25_search("secret", &owner_a, 10).await;
         assert_eq!(results_a.len(), 1);
@@ -795,7 +824,8 @@ mod tests {
         let owner = [0xAA; 32];
         let rid = [0xCC; 32];
 
-        s.fts_index_record(&rid, &owner, "temporary content", "").await;
+        s.fts_index_record(&rid, &owner, "temporary content", "")
+            .await;
         assert!(!s.bm25_search("temporary", &owner, 10).await.is_empty());
 
         s.fts_remove_record(&rid).await;
@@ -807,9 +837,22 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
 
-        s.fts_index_record(&[0x01; 32], &owner, "rate limiting with token bucket", "").await;
-        s.fts_index_entity("ent_rl", &owner, "rate limiting", Some("Token bucket algorithm"), "technology").await;
-        s.fts_index_session("sess_rl", &owner, "Discussed rate limiting approach using token bucket").await;
+        s.fts_index_record(&[0x01; 32], &owner, "rate limiting with token bucket", "")
+            .await;
+        s.fts_index_entity(
+            "ent_rl",
+            &owner,
+            "rate limiting",
+            Some("Token bucket algorithm"),
+            "technology",
+        )
+        .await;
+        s.fts_index_session(
+            "sess_rl",
+            &owner,
+            "Discussed rate limiting approach using token bucket",
+        )
+        .await;
 
         // Space = implicit AND in FTS5, matches all three sources
         let results = s.bm25_search("rate limiting", &owner, 10).await;
@@ -835,22 +878,36 @@ mod tests {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
         s.fts_index_record(
-            &[0x01; 32], &owner,
-            "JWT authentication using RS256 algorithm for secure token verification", "auth",
-        ).await;
+            &[0x01; 32],
+            &owner,
+            "JWT authentication using RS256 algorithm for secure token verification",
+            "auth",
+        )
+        .await;
 
         let hits = s.search_with_snippets("JWT", &owner, 10).await;
         assert!(!hits.is_empty(), "Should find JWT in indexed content");
         assert_eq!(hits[0].source_type, "record");
-        assert!(hits[0].snippet.contains("<mark>"), "Snippet should contain <mark> highlight tags");
-        assert!(hits[0].score > 0.0, "Score should be positive (negated BM25)");
+        assert!(
+            hits[0].snippet.contains("<mark>"),
+            "Snippet should contain <mark> highlight tags"
+        );
+        assert!(
+            hits[0].score > 0.0,
+            "Score should be positive (negated BM25)"
+        );
     }
 
     #[tokio::test]
     async fn test_search_with_snippets_session_resolves_session_id() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let owner = [0xAA; 32];
-        s.fts_index_session("sess_test_001", &owner, "Implementing rate limiting with token bucket").await;
+        s.fts_index_session(
+            "sess_test_001",
+            &owner,
+            "Implementing rate limiting with token bucket",
+        )
+        .await;
 
         let hits = s.search_with_snippets("token bucket", &owner, 10).await;
         assert_eq!(hits.len(), 1);
@@ -865,8 +922,10 @@ mod tests {
         let owner_a = [0xAA; 32];
         let owner_b = [0xBB; 32];
 
-        s.fts_index_record(&[0x01; 32], &owner_a, "secret project for Alice", "").await;
-        s.fts_index_record(&[0x02; 32], &owner_b, "secret project for Bob", "").await;
+        s.fts_index_record(&[0x01; 32], &owner_a, "secret project for Alice", "")
+            .await;
+        s.fts_index_record(&[0x02; 32], &owner_b, "secret project for Bob", "")
+            .await;
 
         let hits_a = s.search_with_snippets("secret", &owner_a, 10).await;
         assert_eq!(hits_a.len(), 1, "Owner A should only see their own results");
@@ -890,21 +949,34 @@ mod tests {
 
         let hits = vec![
             SearchHit {
-                source_type: "session".into(), source_id: "sess_a".into(),
-                snippet: "hit 1".into(), score: 2.5, session_id: Some("sess_a".into()),
+                source_type: "session".into(),
+                source_id: "sess_a".into(),
+                snippet: "hit 1".into(),
+                score: 2.5,
+                session_id: Some("sess_a".into()),
             },
             SearchHit {
-                source_type: "session".into(), source_id: "sess_a".into(),
-                snippet: "hit 2".into(), score: 1.5, session_id: Some("sess_a".into()),
+                source_type: "session".into(),
+                source_id: "sess_a".into(),
+                snippet: "hit 2".into(),
+                score: 1.5,
+                session_id: Some("sess_a".into()),
             },
             SearchHit {
-                source_type: "record".into(), source_id: "rec_x".into(),
-                snippet: "hit 3".into(), score: 3.0, session_id: None,
+                source_type: "record".into(),
+                source_id: "rec_x".into(),
+                snippet: "hit 3".into(),
+                score: 3.0,
+                session_id: None,
             },
         ];
 
         let groups = s.group_hits_by_session(&hits).await;
-        assert_eq!(groups.len(), 2, "Should have 2 groups: sess_a and (ungrouped)");
+        assert_eq!(
+            groups.len(),
+            2,
+            "Should have 2 groups: sess_a and (ungrouped)"
+        );
 
         // Groups sorted by best_score descending
         // (ungrouped) has score 3.0, sess_a has score 2.5
@@ -923,15 +995,19 @@ mod tests {
         let owner = [0xAA; 32];
 
         // Create a session in the DB so metadata resolution works
-        s.upsert_session("sess_meta", &owner, None, "test-source", 5, 1).await.unwrap();
-        s.update_session_summary("sess_meta", "Test summary", None, Some("Test Title")).await;
+        s.upsert_session("sess_meta", &owner, None, "test-source", 5, 1)
+            .await
+            .unwrap();
+        s.update_session_summary("sess_meta", "Test summary", None, Some("Test Title"))
+            .await;
 
-        let hits = vec![
-            SearchHit {
-                source_type: "session".into(), source_id: "sess_meta".into(),
-                snippet: "matched".into(), score: 1.0, session_id: Some("sess_meta".into()),
-            },
-        ];
+        let hits = vec![SearchHit {
+            source_type: "session".into(),
+            source_id: "sess_meta".into(),
+            snippet: "matched".into(),
+            score: 1.0,
+            session_id: Some("sess_meta".into()),
+        }];
 
         let groups = s.group_hits_by_session(&hits).await;
         assert_eq!(groups.len(), 1);

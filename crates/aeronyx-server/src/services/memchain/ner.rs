@@ -252,7 +252,11 @@ impl NerEngine {
         } else {
             confidence_threshold
         };
-        let max_width = if max_width == 0 { DEFAULT_MAX_WIDTH } else { max_width };
+        let max_width = if max_width == 0 {
+            DEFAULT_MAX_WIDTH
+        } else {
+            max_width
+        };
 
         let model_path = model_dir.join(MODEL_FILENAME);
         let tokenizer_path = model_dir.join(TOKENIZER_FILENAME);
@@ -283,8 +287,13 @@ impl NerEngine {
         info!(model = %model_path.display(), "[NER] GLiNER ONNX model loaded");
 
         // Load tokenizer
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| format!("GLiNER tokenizer load ({}): {}", tokenizer_path.display(), e))?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+            format!(
+                "GLiNER tokenizer load ({}): {}",
+                tokenizer_path.display(),
+                e
+            )
+        })?;
 
         // Resolve special token IDs — these MUST exist in the tokenizer
         let ent_token_id = Self::resolve_token_id(&tokenizer, ENT_TOKEN)?;
@@ -335,7 +344,11 @@ impl NerEngine {
             return Ok(Vec::new());
         }
         if labels.len() > MAX_LABELS {
-            return Err(format!("Too many labels: {} (max {})", labels.len(), MAX_LABELS));
+            return Err(format!(
+                "Too many labels: {} (max {})",
+                labels.len(),
+                MAX_LABELS
+            ));
         }
 
         // Step 1: Word-split the text
@@ -353,8 +366,7 @@ impl NerEngine {
         let seq_len = input_ids.len();
 
         // Step 4: Build span indices (fixed-size grid: num_words × max_width)
-        let (span_idx_flat, span_mask_flat, num_spans) =
-            self.build_span_indices(num_text_words);
+        let (span_idx_flat, span_mask_flat, num_spans) = self.build_span_indices(num_text_words);
 
         if num_spans == 0 {
             return Ok(Vec::new());
@@ -367,46 +379,45 @@ impl NerEngine {
         let shape_span_idx = [batch_size, num_spans, 2usize];
         let shape_span_mask = [batch_size, num_spans];
 
-        let ids_tensor = Tensor::from_array(
-            (shape_2d, input_ids.into_boxed_slice())
-        ).map_err(|e| format!("input_ids tensor: {}", e))?;
+        let ids_tensor = Tensor::from_array((shape_2d, input_ids.into_boxed_slice()))
+            .map_err(|e| format!("input_ids tensor: {}", e))?;
 
-        let mask_tensor = Tensor::from_array(
-            (shape_2d, attention_mask.into_boxed_slice())
-        ).map_err(|e| format!("attention_mask tensor: {}", e))?;
+        let mask_tensor = Tensor::from_array((shape_2d, attention_mask.into_boxed_slice()))
+            .map_err(|e| format!("attention_mask tensor: {}", e))?;
 
-        let words_mask_tensor = Tensor::from_array(
-            (shape_2d, words_mask.into_boxed_slice())
-        ).map_err(|e| format!("words_mask tensor: {}", e))?;
+        let words_mask_tensor = Tensor::from_array((shape_2d, words_mask.into_boxed_slice()))
+            .map_err(|e| format!("words_mask tensor: {}", e))?;
 
-        let text_lengths_tensor = Tensor::from_array(
-            (shape_tl, vec![text_length as i64].into_boxed_slice())
-        ).map_err(|e| format!("text_lengths tensor: {}", e))?;
+        let text_lengths_tensor =
+            Tensor::from_array((shape_tl, vec![text_length as i64].into_boxed_slice()))
+                .map_err(|e| format!("text_lengths tensor: {}", e))?;
 
-        let span_idx_tensor = Tensor::from_array(
-            (shape_span_idx, span_idx_flat.into_boxed_slice())
-        ).map_err(|e| format!("span_idx tensor: {}", e))?;
+        let span_idx_tensor =
+            Tensor::from_array((shape_span_idx, span_idx_flat.into_boxed_slice()))
+                .map_err(|e| format!("span_idx tensor: {}", e))?;
 
         // v2.4.0+BugFix: span_mask is bool — ort 2.0.0-rc.11 supports bool directly.
         // Previously used u8, which caused: "expected: (tensor(bool)), actual: (tensor(uint8))"
-        let span_mask_tensor = Tensor::from_array(
-            (shape_span_mask, span_mask_flat.into_boxed_slice())
-        ).map_err(|e| format!("span_mask tensor: {}", e))?;
+        let span_mask_tensor =
+            Tensor::from_array((shape_span_mask, span_mask_flat.into_boxed_slice()))
+                .map_err(|e| format!("span_mask tensor: {}", e))?;
 
         // Step 6: ONNX inference
-        let mut session = self.session.lock()
+        let mut session = self
+            .session
+            .lock()
             .map_err(|e| format!("NER session lock poisoned: {}", e))?;
 
-        let outputs = session.run(
-            ort::inputs![
+        let outputs = session
+            .run(ort::inputs![
                 "input_ids" => ids_tensor,
                 "attention_mask" => mask_tensor,
                 "words_mask" => words_mask_tensor,
                 "text_lengths" => text_lengths_tensor,
                 "span_idx" => span_idx_tensor,
                 "span_mask" => span_mask_tensor,
-            ]
-        ).map_err(|e| format!("GLiNER ONNX inference: {}", e))?;
+            ])
+            .map_err(|e| format!("GLiNER ONNX inference: {}", e))?;
 
         // Output: logits [batch_size, num_spans, num_labels]
         let logits = outputs[0]
@@ -564,10 +575,12 @@ impl NerEngine {
         let mut all_words_mask: Vec<i64> = Vec::new();
 
         // [CLS] token
-        let cls_id = self.get_special_token_id("[CLS]")
+        let cls_id = self
+            .get_special_token_id("[CLS]")
             .or_else(|| self.get_special_token_id("<s>"))
             .unwrap_or(0);
-        let sep_end_id = self.get_special_token_id("[SEP]")
+        let sep_end_id = self
+            .get_special_token_id("[SEP]")
             .or_else(|| self.get_special_token_id("</s>"))
             .unwrap_or(0);
 
@@ -582,9 +595,10 @@ impl NerEngine {
             all_words_mask.push(0);
 
             // Tokenize label text (may produce multiple subwords)
-            let label_encoding = self.tokenizer.encode(
-                label.to_string(), false
-            ).map_err(|e| format!("Label tokenization failed: {}", e))?;
+            let label_encoding = self
+                .tokenizer
+                .encode(label.to_string(), false)
+                .map_err(|e| format!("Label tokenization failed: {}", e))?;
 
             for &id in label_encoding.get_ids() {
                 all_token_ids.push(id);
@@ -601,9 +615,10 @@ impl NerEngine {
         // Add text words — each word may produce multiple subword tokens.
         // words_mask maps each subword token to its word index (1-based for GLiNER).
         for (word_idx, word) in words.iter().enumerate() {
-            let word_encoding = self.tokenizer.encode(
-                word.text.clone(), false
-            ).map_err(|e| format!("Word tokenization failed: {}", e))?;
+            let word_encoding = self
+                .tokenizer
+                .encode(word.text.clone(), false)
+                .map_err(|e| format!("Word tokenization failed: {}", e))?;
 
             let ids = word_encoding.get_ids();
             if ids.is_empty() {
@@ -630,7 +645,13 @@ impl NerEngine {
         let input_ids: Vec<i64> = all_token_ids.iter().map(|&id| id as i64).collect();
         let attention_mask: Vec<i64> = vec![1i64; seq_len];
 
-        Ok((input_ids, attention_mask, all_words_mask, text_length, num_prompt_tokens))
+        Ok((
+            input_ids,
+            attention_mask,
+            all_words_mask,
+            text_length,
+            num_prompt_tokens,
+        ))
     }
 
     // ========================================
@@ -653,10 +674,7 @@ impl NerEngine {
     ///
     /// Returns: (span_idx_flat [num_spans * 2], span_mask_flat [num_spans], num_spans)
     /// where num_spans = num_text_words * max_width (FIXED size).
-    fn build_span_indices(
-        &self,
-        num_text_words: usize,
-    ) -> (Vec<i64>, Vec<bool>, usize) {
+    fn build_span_indices(&self, num_text_words: usize) -> (Vec<i64>, Vec<bool>, usize) {
         let num_spans = num_text_words * self.max_width;
         let mut span_idx: Vec<i64> = Vec::with_capacity(num_spans * 2);
         let mut span_mask: Vec<bool> = Vec::with_capacity(num_spans);
@@ -748,7 +766,11 @@ fn greedy_dedup(mut detections: Vec<DetectedEntity>) -> Vec<DetectedEntity> {
     }
 
     // Sort by confidence descending
-    detections.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    detections.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut claimed: Vec<bool> = Vec::new();
     // Find max word index to size the claimed array
@@ -758,9 +780,7 @@ fn greedy_dedup(mut detections: Vec<DetectedEntity>) -> Vec<DetectedEntity> {
     let mut results = Vec::new();
 
     for det in detections {
-        let overlaps = (det.word_start..=det.word_end).any(|w| {
-            w < claimed.len() && claimed[w]
-        });
+        let overlaps = (det.word_start..=det.word_end).any(|w| w < claimed.len() && claimed[w]);
 
         if !overlaps {
             for w in det.word_start..=det.word_end {
@@ -798,14 +818,22 @@ mod tests {
     fn test_greedy_dedup_no_overlap() {
         let detections = vec![
             DetectedEntity {
-                text: "JWT".into(), label: "technology".into(),
-                confidence: 0.9, char_start: 0, char_end: 3,
-                word_start: 0, word_end: 0,
+                text: "JWT".into(),
+                label: "technology".into(),
+                confidence: 0.9,
+                char_start: 0,
+                char_end: 3,
+                word_start: 0,
+                word_end: 0,
             },
             DetectedEntity {
-                text: "auth module".into(), label: "module".into(),
-                confidence: 0.85, char_start: 10, char_end: 21,
-                word_start: 2, word_end: 3,
+                text: "auth module".into(),
+                label: "module".into(),
+                confidence: 0.85,
+                char_start: 10,
+                char_end: 21,
+                word_start: 2,
+                word_end: 3,
             },
         ];
 
@@ -817,14 +845,22 @@ mod tests {
     fn test_greedy_dedup_overlap_keeps_highest() {
         let detections = vec![
             DetectedEntity {
-                text: "auth".into(), label: "module".into(),
-                confidence: 0.7, char_start: 0, char_end: 4,
-                word_start: 0, word_end: 0,
+                text: "auth".into(),
+                label: "module".into(),
+                confidence: 0.7,
+                char_start: 0,
+                char_end: 4,
+                word_start: 0,
+                word_end: 0,
             },
             DetectedEntity {
-                text: "auth module".into(), label: "module".into(),
-                confidence: 0.9, char_start: 0, char_end: 11,
-                word_start: 0, word_end: 1,
+                text: "auth module".into(),
+                label: "module".into(),
+                confidence: 0.9,
+                char_start: 0,
+                char_end: 11,
+                word_start: 0,
+                word_end: 1,
             },
         ];
 
@@ -842,13 +878,15 @@ mod tests {
 
     #[test]
     fn test_greedy_dedup_single() {
-        let detections = vec![
-            DetectedEntity {
-                text: "JWT".into(), label: "tech".into(),
-                confidence: 0.95, char_start: 0, char_end: 3,
-                word_start: 0, word_end: 0,
-            },
-        ];
+        let detections = vec![DetectedEntity {
+            text: "JWT".into(),
+            label: "tech".into(),
+            confidence: 0.95,
+            char_start: 0,
+            char_end: 3,
+            word_start: 0,
+            word_end: 0,
+        }];
         let result = greedy_dedup(detections);
         assert_eq!(result.len(), 1);
     }
@@ -914,11 +952,14 @@ mod tests {
         }
 
         assert_eq!(span_mask.len(), 6); // 3 × 2 = 6
-        assert_eq!(span_idx, vec![
-            0, 0,  0, 1,   // start=0
-            1, 1,  1, 2,   // start=1
-            2, 2,  0, 0,   // start=2 (second is padding)
-        ]);
+        assert_eq!(
+            span_idx,
+            vec![
+                0, 0, 0, 1, // start=0
+                1, 1, 1, 2, // start=1
+                2, 2, 0, 0, // start=2 (second is padding)
+            ]
+        );
         assert_eq!(span_mask, vec![true, true, true, true, true, false]);
     }
 
@@ -952,7 +993,11 @@ mod tests {
         let result = NerEngine::load("/nonexistent/path", 0.5, 12);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("not found"), "Error should mention 'not found': {}", err);
+        assert!(
+            err.contains("not found"),
+            "Error should mention 'not found': {}",
+            err
+        );
     }
 
     /// Standalone word_split for testing without NerEngine instance.
@@ -993,8 +1038,7 @@ mod tests {
 
     /// Resolve model directory from env or default.
     fn ner_model_dir() -> String {
-        std::env::var("MEMCHAIN_NER_MODEL_PATH")
-            .unwrap_or_else(|_| "models/gliner".to_string())
+        std::env::var("MEMCHAIN_NER_MODEL_PATH").unwrap_or_else(|_| "models/gliner".to_string())
     }
 
     /// Helper: skip test if model files are not downloaded.
@@ -1016,10 +1060,12 @@ mod tests {
             None => return,
         };
 
-        let entities = engine.detect_entities(
-            "auth module uses JWT for authentication",
-            &["module", "technology"],
-        ).unwrap();
+        let entities = engine
+            .detect_entities(
+                "auth module uses JWT for authentication",
+                &["module", "technology"],
+            )
+            .unwrap();
 
         // We expect at least one entity to be detected
         // Exact results depend on model quality

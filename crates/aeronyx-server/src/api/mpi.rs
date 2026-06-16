@@ -58,36 +58,36 @@
 //! v1.0.0-MultiTenant - MpiState SaaS fields; SaaS auth branch; auth + admin routes
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use axum::http::Request;
 use axum::middleware::{self, Next};
 use axum::routing::{get, post};
 use axum::Router;
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 
-use crate::services::memchain::{MemoryStorage, VectorIndex};
 use crate::services::memchain::mvf::WeightVector;
 use crate::services::memchain::EmbedEngine;
+use crate::services::memchain::LlmRouter;
 use crate::services::memchain::NerEngine;
 use crate::services::memchain::RerankerEngine;
-use crate::services::memchain::LlmRouter;
+use crate::services::memchain::{MemoryStorage, VectorIndex};
 // v1.0.0-MultiTenant: SaaS mode pools and infrastructure
-use crate::services::memchain::{StoragePool, VectorIndexPool, VolumeRouter, SystemDb};
+use crate::services::memchain::{StoragePool, SystemDb, VectorIndexPool, VolumeRouter};
 
-use super::mpi_handlers;
+use super::auth::{issue_token, parse_pubkey_hex, verify_jwt, AuthState};
 use super::mpi_graph_handlers;
+use super::mpi_handlers;
 use super::supernode_handlers;
-use super::auth::{AuthState, verify_jwt, parse_pubkey_hex, issue_token};
 
 // ============================================
 // Constants
@@ -116,28 +116,36 @@ pub enum Mode {
 
 #[derive(Debug, Clone)]
 pub enum AuthenticatedOwner {
-    Local  { owner: [u8; 32] },
-    Remote { owner: [u8; 32], owner_hex: String },
+    Local {
+        owner: [u8; 32],
+    },
+    Remote {
+        owner: [u8; 32],
+        owner_hex: String,
+    },
     /// v1.0.0-MultiTenant: SaaS JWT-authenticated user.
-    Saas   { owner: [u8; 32], owner_hex: String },
+    Saas {
+        owner: [u8; 32],
+        owner_hex: String,
+    },
 }
 
 impl AuthenticatedOwner {
     #[must_use]
     pub fn owner_bytes(&self) -> [u8; 32] {
         match self {
-            Self::Local  { owner }      => *owner,
-            Self::Remote { owner, .. }  => *owner,
-            Self::Saas   { owner, .. }  => *owner,
+            Self::Local { owner } => *owner,
+            Self::Remote { owner, .. } => *owner,
+            Self::Saas { owner, .. } => *owner,
         }
     }
 
     #[must_use]
     pub fn owner_hex(&self) -> String {
         match self {
-            Self::Local  { owner }          => hex::encode(owner),
-            Self::Remote { owner_hex, .. }  => owner_hex.clone(),
-            Self::Saas   { owner_hex, .. }  => owner_hex.clone(),
+            Self::Local { owner } => hex::encode(owner),
+            Self::Remote { owner_hex, .. } => owner_hex.clone(),
+            Self::Saas { owner_hex, .. } => owner_hex.clone(),
         }
     }
 
@@ -295,34 +303,59 @@ pub(crate) fn extract_owner<B>(req: &Request<B>) -> &AuthenticatedOwner {
 
 pub(crate) fn parse_layer(s: &str) -> Option<MemoryLayer> {
     match s.to_lowercase().as_str() {
-        "identity"  => Some(MemoryLayer::Identity),
+        "identity" => Some(MemoryLayer::Identity),
         "knowledge" => Some(MemoryLayer::Knowledge),
-        "episode"   => Some(MemoryLayer::Episode),
-        "archive"   => Some(MemoryLayer::Archive),
+        "episode" => Some(MemoryLayer::Episode),
+        "archive" => Some(MemoryLayer::Archive),
         _ => None,
     }
 }
 
 pub(crate) fn estimate_tokens(text: &str) -> usize {
     let len = text.len();
-    if len == 0 { return 0; }
+    if len == 0 {
+        return 0;
+    }
     let sample_len = len.min(100);
-    let ascii = text.as_bytes()[..sample_len].iter().filter(|b| b.is_ascii()).count();
-    if (ascii as f64 / sample_len as f64) > 0.80 { (len + 3) / 4 }
-    else { (len * 2 / 3).max(1) }
+    let ascii = text.as_bytes()[..sample_len]
+        .iter()
+        .filter(|b| b.is_ascii())
+        .count();
+    if (ascii as f64 / sample_len as f64) > 0.80 {
+        (len + 3) / 4
+    } else {
+        (len * 2 / 3).max(1)
+    }
 }
 
 pub(crate) fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
-pub(crate) fn default_layer()         -> String { "episode".into() }
-pub(crate) fn default_source()        -> String { "unknown".into() }
-pub(crate) fn default_model()         -> String { "default".into() }
-pub(crate) fn default_top_k()         -> usize  { 10 }
-pub(crate) fn default_token_budget()  -> usize  { 4000 }
-pub(crate) fn default_include_graph() -> bool   { true }
-pub(crate) fn default_list_limit()    -> usize  { 20 }
+pub(crate) fn default_layer() -> String {
+    "episode".into()
+}
+pub(crate) fn default_source() -> String {
+    "unknown".into()
+}
+pub(crate) fn default_model() -> String {
+    "default".into()
+}
+pub(crate) fn default_top_k() -> usize {
+    10
+}
+pub(crate) fn default_token_budget() -> usize {
+    4000
+}
+pub(crate) fn default_include_graph() -> bool {
+    true
+}
+pub(crate) fn default_list_limit() -> usize {
+    20
+}
 
 // ============================================
 // Unified Auth Middleware
@@ -341,9 +374,7 @@ async fn unified_auth_middleware(
             }
             handle_local_auth(state, req, next).await
         }
-        Mode::Saas => {
-            handle_saas_jwt_auth(state, req, next).await
-        }
+        Mode::Saas => handle_saas_jwt_auth(state, req, next).await,
     }
 }
 
@@ -400,7 +431,10 @@ async fn handle_saas_jwt_auth(
     let owner = match parse_pubkey_hex(&claims.sub) {
         Ok(b) => b,
         Err(e) => {
-            warn!(sub = &claims.sub[..8.min(claims.sub.len())], "[MPI_AUTH_SAAS] Invalid sub claim");
+            warn!(
+                sub = &claims.sub[..8.min(claims.sub.len())],
+                "[MPI_AUTH_SAAS] Invalid sub claim"
+            );
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({ "error": format!("invalid token claims: {}", e) })),
@@ -477,10 +511,7 @@ async fn handle_saas_jwt_auth(
     req.extensions_mut().insert(storage);
     req.extensions_mut().insert(vector_index);
 
-    debug!(
-        owner = &claims.sub[..8],
-        "[MPI_AUTH_SAAS] Authenticated"
-    );
+    debug!(owner = &claims.sub[..8], "[MPI_AUTH_SAAS] Authenticated");
 
     next.run(req).await.into_response()
 }
@@ -492,73 +523,141 @@ async fn handle_remote_auth(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> axum::response::Response {
-    let pubkey_hex = match req.headers()
-        .get("x-memchain-publickey").and_then(|v| v.to_str().ok())
+    let pubkey_hex = match req
+        .headers()
+        .get("x-memchain-publickey")
+        .and_then(|v| v.to_str().ok())
     {
         Some(v) => v.to_string(),
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
-            {"error":"missing X-MemChain-PublicKey header"}
-        ))).into_response(),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!(
+                    {"error":"missing X-MemChain-PublicKey header"}
+                )),
+            )
+                .into_response()
+        }
     };
-    let timestamp_str = match req.headers()
-        .get("x-memchain-timestamp").and_then(|v| v.to_str().ok())
+    let timestamp_str = match req
+        .headers()
+        .get("x-memchain-timestamp")
+        .and_then(|v| v.to_str().ok())
     {
         Some(v) => v.to_string(),
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
-            {"error":"missing X-MemChain-Timestamp header"}
-        ))).into_response(),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!(
+                    {"error":"missing X-MemChain-Timestamp header"}
+                )),
+            )
+                .into_response()
+        }
     };
-    let signature_hex = match req.headers()
-        .get("x-memchain-signature").and_then(|v| v.to_str().ok())
+    let signature_hex = match req
+        .headers()
+        .get("x-memchain-signature")
+        .and_then(|v| v.to_str().ok())
     {
         Some(v) => v.to_string(),
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
-            {"error":"missing X-MemChain-Signature header"}
-        ))).into_response(),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!(
+                    {"error":"missing X-MemChain-Signature header"}
+                )),
+            )
+                .into_response()
+        }
     };
 
     let pubkey_bytes = match hex::decode(&pubkey_hex) {
-        Ok(b) if b.len() == 32 => { let mut a = [0u8;32]; a.copy_from_slice(&b); a }
-        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
-            {"error":"invalid X-MemChain-PublicKey"}
-        ))).into_response(),
+        Ok(b) if b.len() == 32 => {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&b);
+            a
+        }
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!(
+                    {"error":"invalid X-MemChain-PublicKey"}
+                )),
+            )
+                .into_response()
+        }
     };
 
     let identity_pubkey = match IdentityPublicKey::from_bytes(&pubkey_bytes) {
         Ok(pk) => pk,
-        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
-            {"error":"invalid Ed25519 public key"}
-        ))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!(
+                    {"error":"invalid Ed25519 public key"}
+                )),
+            )
+                .into_response()
+        }
     };
 
     let timestamp: u64 = match timestamp_str.parse() {
         Ok(ts) => ts,
-        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
-            {"error":"invalid X-MemChain-Timestamp"}
-        ))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!(
+                    {"error":"invalid X-MemChain-Timestamp"}
+                )),
+            )
+                .into_response()
+        }
     };
 
     let now = now_secs();
-    let drift = if now > timestamp { now - timestamp } else { timestamp - now };
+    let drift = if now > timestamp {
+        now - timestamp
+    } else {
+        timestamp - now
+    };
     if drift > AUTH_TIMESTAMP_TOLERANCE_SECS {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "timestamp expired or clock drift too large",
-            "server_time": now, "request_time": timestamp,
-            "tolerance_secs": AUTH_TIMESTAMP_TOLERANCE_SECS,
-        }))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "timestamp expired or clock drift too large",
+                "server_time": now, "request_time": timestamp,
+                "tolerance_secs": AUTH_TIMESTAMP_TOLERANCE_SECS,
+            })),
+        )
+            .into_response();
     }
 
     if !state.allow_remote_storage {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!(
-            {"error":"this node does not accept remote storage requests"}
-        ))).into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!(
+                {"error":"this node does not accept remote storage requests"}
+            )),
+        )
+            .into_response();
     }
 
     let sig_bytes = match hex::decode(&signature_hex) {
-        Ok(b) if b.len() == 64 => { let mut a = [0u8;64]; a.copy_from_slice(&b); a }
-        _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
-            {"error":"invalid X-MemChain-Signature"}
-        ))).into_response(),
+        Ok(b) if b.len() == 64 => {
+            let mut a = [0u8; 64];
+            a.copy_from_slice(&b);
+            a
+        }
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!(
+                    {"error":"invalid X-MemChain-Signature"}
+                )),
+            )
+                .into_response()
+        }
     };
 
     let method = req.method().as_str().to_string();
@@ -566,9 +665,15 @@ async fn handle_remote_auth(
     let (parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!(
-            {"error":"failed to read request body"}
-        ))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!(
+                    {"error":"failed to read request body"}
+                )),
+            )
+                .into_response()
+        }
     };
 
     let body_hash = Sha256::digest(&body_bytes);
@@ -580,10 +685,17 @@ async fn handle_remote_auth(
     let signed_msg = msg_hasher.finalize();
 
     if identity_pubkey.verify(&signed_msg, &sig_bytes).is_err() {
-        warn!("[MPI_AUTH] Ed25519 sig verification failed for {}", pubkey_hex);
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
-            {"error":"signature verification failed"}
-        ))).into_response();
+        warn!(
+            "[MPI_AUTH] Ed25519 sig verification failed for {}",
+            pubkey_hex
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!(
+                {"error":"signature verification failed"}
+            )),
+        )
+            .into_response();
     }
 
     // Check remote capacity against the single-user storage.
@@ -593,18 +705,33 @@ async fn handle_remote_auth(
             let remote = current.saturating_sub(1);
             let exists = storage.owner_exists(&pubkey_bytes).await;
             if !exists && remote >= state.max_remote_owners {
-                warn!("[MPI_AUTH] Remote capacity reached: {}/{}", remote, state.max_remote_owners);
-                return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-                    "error": "this node has reached maximum remote user capacity",
-                    "max_remote_owners": state.max_remote_owners,
-                }))).into_response();
+                warn!(
+                    "[MPI_AUTH] Remote capacity reached: {}/{}",
+                    remote, state.max_remote_owners
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "this node has reached maximum remote user capacity",
+                        "max_remote_owners": state.max_remote_owners,
+                    })),
+                )
+                    .into_response();
             }
         }
     }
 
-    debug!("[MPI_AUTH] Remote OK: {} ({} {})", &pubkey_hex[..8], method, path);
+    debug!(
+        "[MPI_AUTH] Remote OK: {} ({} {})",
+        &pubkey_hex[..8],
+        method,
+        path
+    );
 
-    let auth = AuthenticatedOwner::Remote { owner: pubkey_bytes, owner_hex: pubkey_hex };
+    let auth = AuthenticatedOwner::Remote {
+        owner: pubkey_bytes,
+        owner_hex: pubkey_hex,
+    };
     let mut req = Request::from_parts(parts, axum::body::Body::from(body_bytes));
     req.extensions_mut().insert(auth);
 
@@ -631,31 +758,48 @@ async fn handle_local_auth(
     };
 
     if let Some(expected) = expected {
-        let auth_header = req.headers()
+        let auth_header = req
+            .headers()
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok());
 
         let token = match auth_header {
             Some(h) if h.starts_with("Bearer ") => &h[7..],
             Some(h) if h.starts_with("bearer ") => &h[7..],
-            _ => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
-                {"error":"missing Authorization: Bearer <token>"}
-            ))).into_response(),
+            _ => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!(
+                        {"error":"missing Authorization: Bearer <token>"}
+                    )),
+                )
+                    .into_response()
+            }
         };
 
         let valid = token.len() == expected.len()
-            && token.as_bytes().iter().zip(expected.as_bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+            && token
+                .as_bytes()
+                .iter()
+                .zip(expected.as_bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
 
         if !valid {
             warn!("[MPI_AUTH] Invalid Bearer token");
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!(
-                {"error":"invalid token"}
-            ))).into_response();
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!(
+                    {"error":"invalid token"}
+                )),
+            )
+                .into_response();
         }
     }
 
-    let auth = AuthenticatedOwner::Local { owner: state.owner_key };
+    let auth = AuthenticatedOwner::Local {
+        owner: state.owner_key,
+    };
 
     // Local mode: inject storage + vector_index as extensions for handler
     // consistency (handlers use Extension<> in both Local and SaaS modes).
@@ -670,9 +814,7 @@ async fn handle_local_auth(
 
 // ── Helper: extract Bearer token from Authorization header ───────────
 
-fn extract_bearer_token(
-    headers: &axum::http::HeaderMap,
-) -> Option<&str> {
+fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
     let header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())?;
@@ -714,15 +856,21 @@ async fn admin_auth_middleware(
         None => {
             return (
                 StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({ "error": "missing Authorization: Bearer <admin_secret>" })),
+                Json(
+                    serde_json::json!({ "error": "missing Authorization: Bearer <admin_secret>" }),
+                ),
             )
                 .into_response();
         }
     };
 
     let valid = token.len() == expected.len()
-        && token.as_bytes().iter().zip(expected.as_bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+        && token
+            .as_bytes()
+            .iter()
+            .zip(expected.as_bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
 
     if !valid {
         warn!("[ADMIN_AUTH] Invalid admin token");
@@ -755,50 +903,122 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
     // ── Core MPI routes (under unified_auth_middleware) ───────────────
     let mpi_routes = Router::new()
         // Core endpoints (mpi_handlers.rs)
-        .route("/api/mpi/remember",          post(mpi_handlers::mpi_remember))
-        .route("/api/mpi/recall",            post(super::recall_handler::mpi_recall))
-        .route("/api/mpi/recall/detail",     post(super::recall_handler::mpi_recall_detail))
-        .route("/api/mpi/forget",            post(mpi_handlers::mpi_forget))
-        .route("/api/mpi/status",            get(mpi_handlers::mpi_status))
-        .route("/api/mpi/embed",             post(mpi_handlers::mpi_embed))
+        .route("/api/mpi/remember", post(mpi_handlers::mpi_remember))
+        .route("/api/mpi/recall", post(super::recall_handler::mpi_recall))
+        .route(
+            "/api/mpi/recall/detail",
+            post(super::recall_handler::mpi_recall_detail),
+        )
+        .route("/api/mpi/forget", post(mpi_handlers::mpi_forget))
+        .route("/api/mpi/status", get(mpi_handlers::mpi_status))
+        .route("/api/mpi/embed", post(mpi_handlers::mpi_embed))
         // v2.5.2+Provenance: GET + PATCH; provenance AFTER plain :record_id
         // ⚠️ /record/:id/provenance MUST be registered after /record/:id
-        .route("/api/mpi/record/:record_id",
-            get(mpi_handlers::mpi_get_record)
-                .patch(mpi_handlers::mpi_patch_record))
-        .route("/api/mpi/record/:record_id/provenance",
-            get(mpi_handlers::mpi_record_provenance))
-        .route("/api/mpi/records/overview",  get(mpi_handlers::mpi_records_overview))
+        .route(
+            "/api/mpi/record/:record_id",
+            get(mpi_handlers::mpi_get_record).patch(mpi_handlers::mpi_patch_record),
+        )
+        .route(
+            "/api/mpi/record/:record_id/provenance",
+            get(mpi_handlers::mpi_record_provenance),
+        )
+        .route(
+            "/api/mpi/records/overview",
+            get(mpi_handlers::mpi_records_overview),
+        )
         // /log (log_handler.rs)
-        .route("/api/mpi/log",               post(crate::api::log_handler::mpi_log))
+        .route("/api/mpi/log", post(crate::api::log_handler::mpi_log))
         // v2.4.0: Cognitive graph (mpi_graph_handlers.rs)
-        .route("/api/mpi/projects",                    get(mpi_graph_handlers::mpi_projects))
-        .route("/api/mpi/projects/:id",                get(mpi_graph_handlers::mpi_project_detail))
-        .route("/api/mpi/projects/:id/timeline",       get(mpi_graph_handlers::mpi_project_timeline))
-        .route("/api/mpi/sessions/:id",                get(mpi_graph_handlers::mpi_session_detail))
-        .route("/api/mpi/sessions/:id/conversation",   get(mpi_graph_handlers::mpi_session_conversation))
-        .route("/api/mpi/sessions/:id/artifacts",      get(mpi_graph_handlers::mpi_session_artifacts))
+        .route("/api/mpi/projects", get(mpi_graph_handlers::mpi_projects))
+        .route(
+            "/api/mpi/projects/:id",
+            get(mpi_graph_handlers::mpi_project_detail),
+        )
+        .route(
+            "/api/mpi/projects/:id/timeline",
+            get(mpi_graph_handlers::mpi_project_timeline),
+        )
+        .route(
+            "/api/mpi/sessions/:id",
+            get(mpi_graph_handlers::mpi_session_detail),
+        )
+        .route(
+            "/api/mpi/sessions/:id/conversation",
+            get(mpi_graph_handlers::mpi_session_conversation),
+        )
+        .route(
+            "/api/mpi/sessions/:id/artifacts",
+            get(mpi_graph_handlers::mpi_session_artifacts),
+        )
         // ⚠️ v2.5.3+ArtifactChain: /artifacts/search MUST be before /artifacts/:id
         //    to prevent "search" being captured as the :id path parameter.
-        .route("/api/mpi/artifacts/search",            get(mpi_graph_handlers::mpi_artifacts_search))
-        .route("/api/mpi/artifacts/:id",               get(mpi_graph_handlers::mpi_artifact_detail))
-        .route("/api/mpi/artifacts/:id/versions",      get(mpi_graph_handlers::mpi_artifact_versions))
-        .route("/api/mpi/entities/:id",                get(mpi_graph_handlers::mpi_entity_detail))
-        .route("/api/mpi/entities",                    get(mpi_graph_handlers::mpi_entities_list))
-        .route("/api/mpi/entities/:id/graph",          get(mpi_graph_handlers::mpi_entity_graph))
-        .route("/api/mpi/communities",                 get(mpi_graph_handlers::mpi_communities))
-        .route("/api/mpi/search",                      get(mpi_graph_handlers::mpi_search))
-        .route("/api/mpi/entities/:id/timeline",       get(mpi_graph_handlers::mpi_entity_timeline))
-        .route("/api/mpi/context/inject",              get(mpi_graph_handlers::mpi_context_inject))
+        .route(
+            "/api/mpi/artifacts/search",
+            get(mpi_graph_handlers::mpi_artifacts_search),
+        )
+        .route(
+            "/api/mpi/artifacts/:id",
+            get(mpi_graph_handlers::mpi_artifact_detail),
+        )
+        .route(
+            "/api/mpi/artifacts/:id/versions",
+            get(mpi_graph_handlers::mpi_artifact_versions),
+        )
+        .route(
+            "/api/mpi/entities/:id",
+            get(mpi_graph_handlers::mpi_entity_detail),
+        )
+        .route(
+            "/api/mpi/entities",
+            get(mpi_graph_handlers::mpi_entities_list),
+        )
+        .route(
+            "/api/mpi/entities/:id/graph",
+            get(mpi_graph_handlers::mpi_entity_graph),
+        )
+        .route(
+            "/api/mpi/communities",
+            get(mpi_graph_handlers::mpi_communities),
+        )
+        .route("/api/mpi/search", get(mpi_graph_handlers::mpi_search))
+        .route(
+            "/api/mpi/entities/:id/timeline",
+            get(mpi_graph_handlers::mpi_entity_timeline),
+        )
+        .route(
+            "/api/mpi/context/inject",
+            get(mpi_graph_handlers::mpi_context_inject),
+        )
         // v2.5.0+SuperNode: Task queue management (supernode_handlers.rs)
-        .route("/api/mpi/supernode/tasks",             get(supernode_handlers::supernode_list_tasks))
-        .route("/api/mpi/supernode/tasks/:id",         get(supernode_handlers::supernode_task_detail))
-        .route("/api/mpi/supernode/tasks/:id/retry",   post(supernode_handlers::supernode_retry_task))
-        .route("/api/mpi/supernode/tasks/:id/cancel",  post(supernode_handlers::supernode_cancel_task))
-        .route("/api/mpi/supernode/usage",             get(supernode_handlers::supernode_usage))
-        .route("/api/mpi/supernode/health",            get(supernode_handlers::supernode_health))
+        .route(
+            "/api/mpi/supernode/tasks",
+            get(supernode_handlers::supernode_list_tasks),
+        )
+        .route(
+            "/api/mpi/supernode/tasks/:id",
+            get(supernode_handlers::supernode_task_detail),
+        )
+        .route(
+            "/api/mpi/supernode/tasks/:id/retry",
+            post(supernode_handlers::supernode_retry_task),
+        )
+        .route(
+            "/api/mpi/supernode/tasks/:id/cancel",
+            post(supernode_handlers::supernode_cancel_task),
+        )
+        .route(
+            "/api/mpi/supernode/usage",
+            get(supernode_handlers::supernode_usage),
+        )
+        .route(
+            "/api/mpi/supernode/health",
+            get(supernode_handlers::supernode_health),
+        )
         // Apply unified auth middleware to all MPI routes.
-        .route_layer(middleware::from_fn_with_state(state.clone(), unified_auth_middleware))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            unified_auth_middleware,
+        ))
         .with_state(Arc::clone(&state));
 
     let router = Router::new().merge(mpi_routes);
@@ -809,7 +1029,10 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
         let auth_state = {
             let jwt_secret = state.jwt_secret.clone().unwrap_or_default();
             let ttl = state.token_ttl_secs;
-            AuthState { jwt_secret, token_ttl_secs: ttl }
+            AuthState {
+                jwt_secret,
+                token_ttl_secs: ttl,
+            }
         };
 
         let auth_routes = Router::new()
@@ -818,11 +1041,23 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
 
         // Admin routes: separate admin_auth_middleware (api_secret, not JWT).
         let admin_routes = Router::new()
-            .route("/api/admin/volumes",         get(super::admin_handlers::admin_volumes))
-            .route("/api/admin/volumes/reload",  post(super::admin_handlers::admin_volumes_reload))
-            .route("/api/admin/pool/stats",      get(super::admin_handlers::admin_pool_stats))
-            .route("/api/admin/usage",           get(super::admin_handlers::admin_usage))
-            .route_layer(middleware::from_fn_with_state(state.clone(), admin_auth_middleware))
+            .route(
+                "/api/admin/volumes",
+                get(super::admin_handlers::admin_volumes),
+            )
+            .route(
+                "/api/admin/volumes/reload",
+                post(super::admin_handlers::admin_volumes_reload),
+            )
+            .route(
+                "/api/admin/pool/stats",
+                get(super::admin_handlers::admin_pool_stats),
+            )
+            .route("/api/admin/usage", get(super::admin_handlers::admin_usage))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                admin_auth_middleware,
+            ))
             .with_state(Arc::clone(&state));
 
         router.merge(auth_routes).merge(admin_routes)

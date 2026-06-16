@@ -107,7 +107,8 @@ impl ServerConfig {
     pub async fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         info!("Loading configuration from: {}", path.display());
-        let content = tokio::fs::read_to_string(path).await
+        let content = tokio::fs::read_to_string(path)
+            .await
             .map_err(|e| ServerError::config_load(&path.display().to_string(), e.to_string()))?;
         let config: Self = toml::from_str(&content)
             .map_err(|e| ServerError::config_load(&path.display().to_string(), e.to_string()))?;
@@ -130,7 +131,9 @@ impl ServerConfig {
         self.vpn.validate()?;
         self.tun.validate()?;
         self.limits.validate()?;
-        self.management.validate().map_err(|e| ServerError::config_invalid("management", e))?;
+        self.management
+            .validate()
+            .map_err(|e| ServerError::config_invalid("management", e))?;
         self.memchain.validate()?;
         Ok(())
     }
@@ -138,30 +141,48 @@ impl ServerConfig {
     // ── Convenience accessors ──────────────────────────────────────────
 
     #[must_use]
-    pub fn to_toml(&self) -> String { toml::to_string_pretty(self).unwrap_or_default() }
+    pub fn to_toml(&self) -> String {
+        toml::to_string_pretty(self).unwrap_or_default()
+    }
 
     #[must_use]
-    pub fn listen_addr(&self) -> SocketAddr { self.network.listen_addr }
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.network.listen_addr
+    }
 
     #[must_use]
-    pub fn device_name(&self) -> &str { &self.tun.device_name }
+    pub fn device_name(&self) -> &str {
+        &self.tun.device_name
+    }
 
     #[must_use]
-    pub fn ip_range(&self) -> &str { &self.vpn.virtual_ip_range }
+    pub fn ip_range(&self) -> &str {
+        &self.vpn.virtual_ip_range
+    }
 
     #[must_use]
-    pub fn gateway_ip(&self) -> Ipv4Addr { self.vpn.gateway_ip }
+    pub fn gateway_ip(&self) -> Ipv4Addr {
+        self.vpn.gateway_ip
+    }
 
     #[must_use]
-    pub fn mtu(&self) -> u16 { self.tun.mtu }
+    pub fn mtu(&self) -> u16 {
+        self.tun.mtu
+    }
 
     #[must_use]
-    pub fn max_sessions(&self) -> usize { self.limits.max_connections }
+    pub fn max_sessions(&self) -> usize {
+        self.limits.max_connections
+    }
 
     #[must_use]
-    pub fn session_timeout_secs(&self) -> u64 { self.limits.session_timeout }
+    pub fn session_timeout_secs(&self) -> u64 {
+        self.limits.session_timeout
+    }
 
-    pub fn parse_ip_range(&self) -> Result<(Ipv4Addr, u8)> { self.vpn.parse_ip_range() }
+    pub fn parse_ip_range(&self) -> Result<(Ipv4Addr, u8)> {
+        self.vpn.parse_ip_range()
+    }
 }
 
 impl Default for ServerConfig {

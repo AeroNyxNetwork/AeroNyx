@@ -25,8 +25,8 @@ use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use aeronyx_core::crypto::IdentityKeyPair;
-use aeronyx_server::{Server, ServerConfig, ManagementClient};
 use aeronyx_server::management::models::StoredNodeInfo;
+use aeronyx_server::{ManagementClient, Server, ServerConfig};
 
 // ============================================
 // CLI Definition
@@ -102,9 +102,11 @@ async fn main() {
     init_logging("info");
 
     let result = match cli.command {
-        Commands::Register { code, config, cms_url } => {
-            cmd_register(code, config, cms_url).await
-        }
+        Commands::Register {
+            code,
+            config,
+            cms_url,
+        } => cmd_register(code, config, cms_url).await,
         Commands::Start { config } => cmd_start(config).await,
         Commands::Status { config } => cmd_status(config).await,
         Commands::Validate { config } => cmd_validate(config).await,
@@ -356,9 +358,7 @@ async fn cmd_status(config_path: PathBuf) -> anyhow::Result<()> {
                 }
             }
         } else {
-            println!(
-                "   AOF File:      (not yet created — will be created on first write)"
-            );
+            println!("   AOF File:      (not yet created — will be created on first write)");
         }
     } else {
         println!("   Status:        Disabled");
@@ -374,10 +374,7 @@ async fn cmd_status(config_path: PathBuf) -> anyhow::Result<()> {
 /// Validates configuration file + shows MemChain config.
 async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
     if !config_path.exists() {
-        println!(
-            "⚠️  Config file not found: {}",
-            config_path.display()
-        );
+        println!("⚠️  Config file not found: {}", config_path.display());
         println!("   Server will use default values.");
         return Ok(());
     }
@@ -441,8 +438,7 @@ async fn cmd_pubkey(config_path: PathBuf, format: String) -> anyhow::Result<()> 
 // ============================================
 
 fn init_logging(level: &str) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
     tracing_subscriber::registry()
         .with(fmt::layer().with_target(true))
@@ -482,10 +478,8 @@ async fn save_key(identity: &IdentityKeyPair, path: &PathBuf) -> anyhow::Result<
     let key_data = KeyFile {
         version: "1.0".to_string(),
         key_type: "ed25519".to_string(),
-        public_key: base64::engine::general_purpose::STANDARD
-            .encode(identity.public_key_bytes()),
-        private_key: base64::engine::general_purpose::STANDARD
-            .encode(identity.to_bytes()),
+        public_key: base64::engine::general_purpose::STANDARD.encode(identity.public_key_bytes()),
+        private_key: base64::engine::general_purpose::STANDARD.encode(identity.to_bytes()),
         created_at: chrono_lite_timestamp(),
     };
 

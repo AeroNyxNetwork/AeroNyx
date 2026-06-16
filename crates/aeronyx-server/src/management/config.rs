@@ -32,10 +32,18 @@ fn default_cms_url() -> String {
     "https://api.aeronyx.network/api/privacy_network".to_string()
 }
 
-fn default_heartbeat_interval() -> u64 { 30 }
-fn default_session_report_interval() -> u64 { 30 }
-fn default_request_timeout() -> u64 { 10 }
-fn default_max_retries() -> u32 { 3 }
+fn default_heartbeat_interval() -> u64 {
+    30
+}
+fn default_session_report_interval() -> u64 {
+    30
+}
+fn default_request_timeout() -> u64 {
+    10
+}
+fn default_max_retries() -> u32 {
+    3
+}
 
 fn default_node_info_path() -> String {
     "/etc/aeronyx/node_info.json".to_string()

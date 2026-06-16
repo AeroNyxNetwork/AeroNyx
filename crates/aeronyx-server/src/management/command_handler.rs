@@ -53,16 +53,16 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::mpsc;
 use tokio::process::Command as TokioCommand;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use super::client::ManagementClient;
-use super::reporter::{SessionEventSender, SessionQuality};
 use super::models::{Command, CommandExecutionStatus, CommandStatusReport};
-use aeronyx_common::types::SessionId;
+use super::reporter::{SessionEventSender, SessionQuality};
 use crate::services::{DenyList, DenyReason, NodePolicyRuntime, SessionManager};
+use aeronyx_common::types::SessionId;
 
 // ============================================
 // Constants
@@ -163,10 +163,7 @@ impl CommandHandler {
     /// * `client` - Shared ManagementClient for CMS communication
     /// # Returns
     /// A new `CommandHandler` ready to be spawned with `.run()`.
-    pub fn new(
-        command_rx: mpsc::Receiver<Command>,
-        client: Arc<ManagementClient>,
-    ) -> Self {
+    pub fn new(command_rx: mpsc::Receiver<Command>, client: Arc<ManagementClient>) -> Self {
         Self {
             command_rx,
             client,
@@ -205,10 +202,7 @@ impl CommandHandler {
     ///
     /// # Arguments
     /// * `shutdown` - Broadcast receiver for graceful shutdown
-    pub async fn run(
-        mut self,
-        mut shutdown: tokio::sync::broadcast::Receiver<()>,
-    ) {
+    pub async fn run(mut self, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
         info!("[CMD_HANDLER] Command handler started");
 
         loop {
@@ -261,7 +255,8 @@ impl CommandHandler {
             CommandExecutionStatus::Received,
             0,
             "Command received by node",
-        ).await;
+        )
+        .await;
 
         // ===== Dispatch by action =====
         match action.as_str() {
@@ -301,7 +296,8 @@ impl CommandHandler {
                     CommandExecutionStatus::Failed,
                     0,
                     &format!("Unknown action: {}", unknown),
-                ).await;
+                )
+                .await;
             }
         }
     }
@@ -322,20 +318,29 @@ impl CommandHandler {
             CommandExecutionStatus::InProgress,
             20,
             "Collecting VPN node diagnostics",
-        ).await;
+        )
+        .await;
 
-        let service_name = command.params
+        let service_name = command
+            .params
             .get("service_name")
             .and_then(|value| value.as_str())
             .unwrap_or("aeronyx-server");
-        let tun_device = command.params
+        let tun_device = command
+            .params
             .get("tun_device")
             .and_then(|value| value.as_str())
             .unwrap_or("aeronyx0");
 
         let mut parts = Vec::new();
-        parts.push(format!("uptime: {}", run_readonly_command("uptime", &[]).await));
-        parts.push(format!("kernel: {}", run_readonly_command("uname", &["-a"]).await));
+        parts.push(format!(
+            "uptime: {}",
+            run_readonly_command("uptime", &[]).await
+        ));
+        parts.push(format!(
+            "kernel: {}",
+            run_readonly_command("uname", &["-a"]).await
+        ));
         parts.push(format!(
             "service({}): {}",
             service_name,
@@ -362,7 +367,8 @@ impl CommandHandler {
             CommandExecutionStatus::Completed,
             100,
             &message,
-        ).await;
+        )
+        .await;
     }
 
     /// Handles `collect_logs` command.
@@ -381,13 +387,16 @@ impl CommandHandler {
             CommandExecutionStatus::InProgress,
             20,
             "Collecting recent VPN service logs",
-        ).await;
+        )
+        .await;
 
-        let service_name = command.params
+        let service_name = command
+            .params
             .get("service_name")
             .and_then(|value| value.as_str())
             .unwrap_or("aeronyx-server");
-        let lines = command.params
+        let lines = command
+            .params
             .get("lines")
             .and_then(|value| value.as_u64())
             .unwrap_or(60)
@@ -406,11 +415,14 @@ impl CommandHandler {
                 "-n",
                 &lines,
             ],
-        ).await;
+        )
+        .await;
 
         let message = sanitize_and_truncate(&format!(
             "recent_logs({}; last {} lines):\n{}",
-            service_name, lines, format!("service_manager: {}\n{}", service_state, output)
+            service_name,
+            lines,
+            format!("service_manager: {}\n{}", service_state, output)
         ));
 
         self.report_status_for_agent_type(
@@ -419,7 +431,8 @@ impl CommandHandler {
             CommandExecutionStatus::Completed,
             100,
             &message,
-        ).await;
+        )
+        .await;
     }
 
     /// Handles `kick_session` command.
@@ -439,7 +452,8 @@ impl CommandHandler {
             CommandExecutionStatus::InProgress,
             30,
             "Kicking VPN session",
-        ).await;
+        )
+        .await;
 
         let Some(ref sessions) = self.sessions else {
             self.report_status_for_agent_type(
@@ -448,11 +462,13 @@ impl CommandHandler {
                 CommandExecutionStatus::Failed,
                 0,
                 "VPN session manager is not available",
-            ).await;
+            )
+            .await;
             return;
         };
 
-        let Some(session_id_raw) = command.params
+        let Some(session_id_raw) = command
+            .params
             .get("session_id")
             .and_then(|value| value.as_str())
             .map(str::trim)
@@ -464,7 +480,8 @@ impl CommandHandler {
                 CommandExecutionStatus::Failed,
                 0,
                 "session_id is required",
-            ).await;
+            )
+            .await;
             return;
         };
 
@@ -477,7 +494,8 @@ impl CommandHandler {
                     CommandExecutionStatus::Failed,
                     0,
                     &format!("invalid session_id: {}", error),
-                ).await;
+                )
+                .await;
                 return;
             }
         };
@@ -489,7 +507,8 @@ impl CommandHandler {
                 CommandExecutionStatus::Failed,
                 0,
                 "session not found on node",
-            ).await;
+            )
+            .await;
             return;
         };
 
@@ -511,12 +530,10 @@ impl CommandHandler {
             100,
             &format!(
                 "VPN session kicked: session_id={}, virtual_ip={}, bytes_in={}, bytes_out={}",
-                session_id_raw,
-                session.virtual_ip,
-                stats.bytes_rx,
-                stats.bytes_tx
+                session_id_raw, session.virtual_ip, stats.bytes_rx, stats.bytes_tx
             ),
-        ).await;
+        )
+        .await;
     }
 
     /// Handles `refresh_config` command.
@@ -537,7 +554,8 @@ impl CommandHandler {
             CommandExecutionStatus::InProgress,
             25,
             "Refreshing VPN management configuration",
-        ).await;
+        )
+        .await;
 
         let config = self.client.config();
         let validation = match config.validate() {
@@ -549,7 +567,8 @@ impl CommandHandler {
                     CommandExecutionStatus::Failed,
                     0,
                     &format!("management config validation failed: {}", error),
-                ).await;
+                )
+                .await;
                 return;
             }
         };
@@ -581,7 +600,8 @@ impl CommandHandler {
             CommandExecutionStatus::Completed,
             100,
             &message,
-        ).await;
+        )
+        .await;
     }
 
     /// Handles `apply_policy` command.
@@ -603,7 +623,8 @@ impl CommandHandler {
             CommandExecutionStatus::InProgress,
             40,
             "Confirming runtime VPN policy snapshot",
-        ).await;
+        )
+        .await;
 
         let Some(ref node_policy) = self.node_policy else {
             self.report_status_for_agent_type(
@@ -612,13 +633,13 @@ impl CommandHandler {
                 CommandExecutionStatus::Failed,
                 0,
                 "runtime node policy is not available",
-            ).await;
+            )
+            .await;
             return;
         };
 
         let snapshot = node_policy.snapshot();
-        let snapshot_json = serde_json::to_string(&snapshot)
-            .unwrap_or_else(|_| "{}".to_string());
+        let snapshot_json = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
         let message = sanitize_and_truncate(&format!(
             "Runtime VPN policy acknowledged\npolicy: {}\nsource: heartbeat_node_policy",
             snapshot_json
@@ -630,7 +651,8 @@ impl CommandHandler {
             CommandExecutionStatus::Completed,
             100,
             &message,
-        ).await;
+        )
+        .await;
     }
 
     /// Handles `ban_wallet` command.
@@ -652,7 +674,8 @@ impl CommandHandler {
                 CommandExecutionStatus::Failed,
                 0,
                 "wallet_hex must be 64 lowercase hex characters",
-            ).await;
+            )
+            .await;
             return;
         };
         let Some(wallet_bytes) = wallet_hex_to_bytes(&wallet_hex) else {
@@ -662,10 +685,12 @@ impl CommandHandler {
                 CommandExecutionStatus::Failed,
                 0,
                 "wallet_hex could not be decoded",
-            ).await;
+            )
+            .await;
             return;
         };
-        let reason = command.params
+        let reason = command
+            .params
             .get("reason")
             .and_then(|value| value.as_str())
             .unwrap_or("operator_ban");
@@ -677,7 +702,8 @@ impl CommandHandler {
                 CommandExecutionStatus::Failed,
                 0,
                 "VPN deny list is not available",
-            ).await;
+            )
+            .await;
             return;
         };
 
@@ -687,7 +713,8 @@ impl CommandHandler {
             CommandExecutionStatus::InProgress,
             35,
             "Adding wallet to VPN deny list",
-        ).await;
+        )
+        .await;
 
         deny_list.add(&wallet_hex, DenyReason::OperatorBan);
 
@@ -722,7 +749,8 @@ impl CommandHandler {
                 sanitize_inline(reason, 80),
                 disconnected
             ),
-        ).await;
+        )
+        .await;
     }
 
     /// Handles `unban_wallet` command.
@@ -739,7 +767,8 @@ impl CommandHandler {
                 CommandExecutionStatus::Failed,
                 0,
                 "wallet_hex must be 64 lowercase hex characters",
-            ).await;
+            )
+            .await;
             return;
         };
 
@@ -750,7 +779,8 @@ impl CommandHandler {
                 CommandExecutionStatus::Failed,
                 0,
                 "VPN deny list is not available",
-            ).await;
+            )
+            .await;
             return;
         };
 
@@ -761,7 +791,8 @@ impl CommandHandler {
             CommandExecutionStatus::Completed,
             100,
             &format!("Wallet unbanned: wallet_prefix={}", &wallet_hex[..12]),
-        ).await;
+        )
+        .await;
     }
 
     /// Handles `restart_service` command.
@@ -777,7 +808,8 @@ impl CommandHandler {
             "[CMD_HANDLER] 🔄 restart_service"
         );
 
-        let service_name = command.params
+        let service_name = command
+            .params
             .get("service_name")
             .and_then(|value| value.as_str())
             .unwrap_or("aeronyx-server");
@@ -788,11 +820,13 @@ impl CommandHandler {
                 CommandExecutionStatus::Failed,
                 0,
                 "restart_service only supports aeronyx-server",
-            ).await;
+            )
+            .await;
             return;
         }
 
-        let confirm = command.params
+        let confirm = command
+            .params
             .get("confirm")
             .and_then(|value| value.as_str())
             .unwrap_or("");
@@ -803,7 +837,8 @@ impl CommandHandler {
                 CommandExecutionStatus::Failed,
                 0,
                 "restart_service requires confirm=restart",
-            ).await;
+            )
+            .await;
             return;
         }
 
@@ -813,7 +848,8 @@ impl CommandHandler {
             CommandExecutionStatus::InProgress,
             50,
             "Scheduling VPN service restart",
-        ).await;
+        )
+        .await;
 
         match schedule_service_restart(&command.id, service_name).await {
             Ok(message) => {
@@ -823,7 +859,8 @@ impl CommandHandler {
                     CommandExecutionStatus::Completed,
                     100,
                     &message,
-                ).await;
+                )
+                .await;
             }
             Err(message) => {
                 self.report_status_for_agent_type(
@@ -832,7 +869,8 @@ impl CommandHandler {
                     CommandExecutionStatus::Failed,
                     0,
                     &message,
-                ).await;
+                )
+                .await;
             }
         }
     }
@@ -855,13 +893,8 @@ impl CommandHandler {
         progress: u8,
         message: &str,
     ) {
-        self.report_status_for_agent_type(
-            "vpn",
-            command_id,
-            status,
-            progress,
-            message,
-        ).await;
+        self.report_status_for_agent_type("vpn", command_id, status, progress, message)
+            .await;
     }
 
     async fn report_status_for_agent_type(
@@ -910,9 +943,7 @@ impl CommandHandler {
         // Evict oldest half if at capacity
         if self.processed_ids.len() >= MAX_PROCESSED_IDS {
             let evict_count = MAX_PROCESSED_IDS / 2;
-            let to_evict: Vec<String> = self.processed_ids_order
-                .drain(..evict_count)
-                .collect();
+            let to_evict: Vec<String> = self.processed_ids_order.drain(..evict_count).collect();
             for old_id in &to_evict {
                 self.processed_ids.remove(old_id);
             }
@@ -932,7 +963,8 @@ async fn run_readonly_command(program: &str, args: &[&str]) -> String {
     let output = timeout(
         VPN_COMMAND_TIMEOUT,
         TokioCommand::new(program).args(args).output(),
-    ).await;
+    )
+    .await;
 
     match output {
         Ok(Ok(result)) => {
@@ -979,7 +1011,8 @@ async fn schedule_service_restart(command_id: &str, service_name: &str) -> Resul
                 service_name,
             ])
             .output(),
-    ).await;
+    )
+    .await;
 
     match systemd_run {
         Ok(Ok(output)) if output.status.success() => {
@@ -1017,13 +1050,17 @@ async fn schedule_service_restart(command_id: &str, service_name: &str) -> Resul
             .arg("-c")
             .arg("nohup sh -c 'sleep 3; /bin/systemctl restart aeronyx-server' >/dev/null 2>&1 &")
             .status(),
-    ).await;
+    )
+    .await;
 
     match fallback {
-        Ok(Ok(status)) if status.success() => Ok(
-            "VPN service restart scheduled via detached fallback delay=3s".to_string()
-        ),
-        Ok(Ok(status)) => Err(format!("failed to schedule restart fallback: exit={}", status)),
+        Ok(Ok(status)) if status.success() => {
+            Ok("VPN service restart scheduled via detached fallback delay=3s".to_string())
+        }
+        Ok(Ok(status)) => Err(format!(
+            "failed to schedule restart fallback: exit={}",
+            status
+        )),
         Ok(Err(error)) => Err(format!("failed to schedule restart fallback: {}", error)),
         Err(_) => Err("restart fallback scheduling timed out".to_string()),
     }
@@ -1035,7 +1072,8 @@ async fn ensure_systemd_service_loaded(service_name: &str) -> Result<(), String>
         TokioCommand::new("systemctl")
             .args(["show", service_name, "--property=LoadState", "--value"])
             .output(),
-    ).await;
+    )
+    .await;
 
     match show {
         Ok(Ok(output)) if output.status.success() => {
@@ -1058,7 +1096,10 @@ async fn ensure_systemd_service_loaded(service_name: &str) -> Result<(), String>
                 collapse_lines(stderr.trim(), 4)
             ))
         }
-        Ok(Err(error)) => Err(format!("systemctl unavailable for restart_service: {}", error)),
+        Ok(Err(error)) => Err(format!(
+            "systemctl unavailable for restart_service: {}",
+            error
+        )),
         Err(_) => Err("systemctl service preflight timed out".to_string()),
     }
 }
@@ -1069,12 +1110,17 @@ async fn service_load_state_summary(service_name: &str) -> String {
         TokioCommand::new("systemctl")
             .args(["show", service_name, "--property=LoadState", "--value"])
             .output(),
-    ).await;
+    )
+    .await;
 
     match show {
         Ok(Ok(output)) if output.status.success() => {
             let load_state = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let load_state = if load_state.is_empty() { "unknown" } else { &load_state };
+            let load_state = if load_state.is_empty() {
+                "unknown"
+            } else {
+                &load_state
+            };
             if load_state == "loaded" {
                 format!(
                     "systemd LoadState=loaded; restart and journal collection are supported for {}",
@@ -1160,7 +1206,10 @@ async fn read_trimmed_file(path: &str) -> String {
 }
 
 fn collapse_lines(text: &str, max_lines: usize) -> String {
-    let mut lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+    let mut lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
     if lines.len() > max_lines {
         lines.truncate(max_lines);
         format!("{}\n...truncated", lines.join("\n"))

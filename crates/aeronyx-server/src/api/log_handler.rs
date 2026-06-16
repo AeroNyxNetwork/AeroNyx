@@ -71,8 +71,8 @@ const MAX_EXTRACTION_BYTES: usize = 4 * 1024;
 /// Max chars fed into the Rule Engine regex pipeline (fix #6).
 const MAX_RULE_ENGINE_INPUT: usize = 2_000;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use axum::http::Request;
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -80,8 +80,8 @@ use tracing::{debug, info, warn};
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 
 use crate::api::mpi::{AuthenticatedOwner, MpiState};
-use crate::services::memchain::{MemoryStorage, VectorIndex};
 use crate::services::memchain::derive_rawlog_key;
+use crate::services::memchain::{MemoryStorage, VectorIndex};
 
 // ============================================
 // Request / Response Types
@@ -124,10 +124,14 @@ static RE_PRIVACY_TAG: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Strip <no-mem> and <private> tags. Returns Cow::Borrowed when no tags present.
 fn strip_privacy_tags(content: &str) -> Cow<'_, str> {
-    let has_tag = content.as_bytes().windows(8)
+    let has_tag = content
+        .as_bytes()
+        .windows(8)
         .any(|w| w.eq_ignore_ascii_case(b"<no-mem>"))
-        || content.as_bytes().windows(9)
-        .any(|w| w.eq_ignore_ascii_case(b"<private>"));
+        || content
+            .as_bytes()
+            .windows(9)
+            .any(|w| w.eq_ignore_ascii_case(b"<private>"));
 
     if !has_tag {
         return Cow::Borrowed(content);
@@ -154,14 +158,19 @@ fn run_entropy_filter(
     known_entity_names: &std::collections::HashSet<String>,
     threshold: f32,
 ) -> EntropyResult {
-    let window_text: String = turns.iter()
+    let window_text: String = turns
+        .iter()
         .filter(|t| t.role == "user")
         .map(|t| t.content.as_str())
         .collect::<Vec<_>>()
         .join(" ");
 
     if window_text.trim().is_empty() {
-        return EntropyResult { score: 0.0, passes: false, detected_entities: Vec::new() };
+        return EntropyResult {
+            score: 0.0,
+            passes: false,
+            detected_entities: Vec::new(),
+        };
     }
 
     let mut entity_novelty: f32 = 0.5;
@@ -170,14 +179,21 @@ fn run_entropy_filter(
 
     if let Some(ref ner_engine) = state.ner_engine {
         let labels = &[
-            "project", "module", "technology", "file", "person",
-            "decision", "problem", "solution",
+            "project",
+            "module",
+            "technology",
+            "file",
+            "person",
+            "decision",
+            "problem",
+            "solution",
         ];
         match ner_engine.detect_entities(&window_text, labels) {
             Ok(entities) => {
                 let total = entities.len();
                 if total > 0 {
-                    let new_count = entities.iter()
+                    let new_count = entities
+                        .iter()
                         .filter(|e| !known_entity_names.contains(&e.text.to_lowercase()))
                         .count();
                     entity_novelty = new_count as f32 / total as f32;
@@ -218,7 +234,11 @@ fn run_entropy_filter(
         "[ENTROPY] Filter result"
     );
 
-    EntropyResult { score, passes, detected_entities }
+    EntropyResult {
+        score,
+        passes,
+        detected_entities,
+    }
 }
 
 // ============================================
@@ -229,15 +249,68 @@ const CN_FIRST_PERSON: &[&str] = &["我", "我的", "我们", "咱"];
 const EN_FIRST_PERSON: &[&str] = &["i ", "i'", "my ", "mine ", "i've ", "we ", "our "];
 
 const CN_TASK_VERBS: &[&str] = &[
-    "翻译", "总结", "写", "改", "列出", "转换", "生成", "计算", "解释", "比较",
-    "分析", "搜索", "查找", "创建", "修改", "优化", "整理", "格式化", "提取", "合并",
-    "画", "设计", "检查", "排序", "过滤", "统计", "导出", "压缩", "解压", "运行",
+    "翻译",
+    "总结",
+    "写",
+    "改",
+    "列出",
+    "转换",
+    "生成",
+    "计算",
+    "解释",
+    "比较",
+    "分析",
+    "搜索",
+    "查找",
+    "创建",
+    "修改",
+    "优化",
+    "整理",
+    "格式化",
+    "提取",
+    "合并",
+    "画",
+    "设计",
+    "检查",
+    "排序",
+    "过滤",
+    "统计",
+    "导出",
+    "压缩",
+    "解压",
+    "运行",
 ];
 const EN_TASK_VERBS: &[&str] = &[
-    "translate", "summarize", "write", "fix", "list", "convert", "generate",
-    "calculate", "explain", "compare", "analyze", "search", "create", "edit",
-    "optimize", "format", "extract", "merge", "draw", "design", "check", "run",
-    "sort", "filter", "export", "compress", "deploy", "execute", "debug", "build",
+    "translate",
+    "summarize",
+    "write",
+    "fix",
+    "list",
+    "convert",
+    "generate",
+    "calculate",
+    "explain",
+    "compare",
+    "analyze",
+    "search",
+    "create",
+    "edit",
+    "optimize",
+    "format",
+    "extract",
+    "merge",
+    "draw",
+    "design",
+    "check",
+    "run",
+    "sort",
+    "filter",
+    "export",
+    "compress",
+    "deploy",
+    "execute",
+    "debug",
+    "build",
 ];
 
 fn has_persistent_info(content: &str) -> bool {
@@ -245,15 +318,19 @@ fn has_persistent_info(content: &str) -> bool {
     let trimmed = lower.trim();
 
     let has_first_person = CN_FIRST_PERSON.iter().any(|p| trimmed.contains(p))
-        || EN_FIRST_PERSON.iter().any(|p| {
-            trimmed.starts_with(p) || trimmed.contains(&format!(" {}", p.trim()))
-        })
+        || EN_FIRST_PERSON
+            .iter()
+            .any(|p| trimmed.starts_with(p) || trimmed.contains(&format!(" {}", p.trim())))
         || trimmed == "i";
-    if has_first_person { return true; }
+    if has_first_person {
+        return true;
+    }
 
     let starts_with_task = CN_TASK_VERBS.iter().any(|v| trimmed.starts_with(v))
         || EN_TASK_VERBS.iter().any(|v| trimmed.starts_with(v));
-    if starts_with_task { return false; }
+    if starts_with_task {
+        return false;
+    }
 
     trimmed.len() > 20
 }
@@ -263,13 +340,28 @@ fn has_persistent_info(content: &str) -> bool {
 // ============================================
 
 const CN_NEGATIVE: &[&str] = &[
-    "不对", "不是", "错了", "我改主意", "搞错了", "纠正一下",
-    "其实不是", "不是这样", "这不是我要的", "重新来", "再试一次",
+    "不对",
+    "不是",
+    "错了",
+    "我改主意",
+    "搞错了",
+    "纠正一下",
+    "其实不是",
+    "不是这样",
+    "这不是我要的",
+    "重新来",
+    "再试一次",
 ];
 const EN_NEGATIVE: &[&str] = &[
-    "wrong", "not correct", "that's not right", "changed my mind",
-    "actually no", "let me correct", "not what i asked",
-    "try again", "that's not what i meant",
+    "wrong",
+    "not correct",
+    "that's not right",
+    "changed my mind",
+    "actually no",
+    "let me correct",
+    "not what i asked",
+    "try again",
+    "that's not what i meant",
 ];
 
 fn contains_negative_feedback(content: &str) -> bool {
@@ -286,46 +378,73 @@ fn compile_patterns(patterns: &[&str]) -> Vec<Regex> {
     patterns.iter().filter_map(|p| Regex::new(p).ok()).collect()
 }
 
-static RE_IDENTITY_CN: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
-    r"我(?:是|叫|的职业是|住在|来自|在.{1,15}工作|的名字是)(.{1,30})",
-    r"我.{0,2}(?:岁|年纪)",
-    r"我有(?:一个|两个|三个)?(.{1,10})(?:儿子|女儿|孩子|老婆|丈夫|男友|女友)",
-]));
-static RE_IDENTITY_EN: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
-    r"(?i)(?:I am|I'm|I work (?:at|as|in)|my name is|I live in|I'm from)(.{1,50})",
-    r"(?i)I'm (\d+) years old",
-    r"(?i)I have (?:a |an )?(\w+ (?:son|daughter|child|wife|husband|partner))",
-]));
-static RE_CORRECTION_CN: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
-    r"不是.{1,15}[，,]是", r"其实是", r"我说错了", r"更正一下", r"我之前说的不对",
-]));
-static RE_CORRECTION_EN: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
-    r"(?i)actually", r"(?i)I was wrong", r"(?i)let me correct", r"(?i)not .{1,20}, it's",
-]));
-static RE_PREF_LANG: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
-    r"用(?:中文|英文|英语|日文|日语|法语|韩语).{0,5}(?:回答|说|写)",
-    r"(?i)(?:reply|respond|answer|write) in (?:English|Chinese|Japanese|French)",
-]));
-static RE_PREF_FMT: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
-    r"(?:简短一点|详细一点|简洁|不要用.{1,8}术语|口语化|正式一点|用列表|用表格)",
-    r"(?i)(?:keep it short|more detail|avoid jargon|be casual|be formal|use bullet)",
-]));
-static RE_PREF_ROLE: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
-    r"你(?:扮演|是|充当)(.{1,20})",
-    r"(?i)(?:act as|you are|pretend to be|play the role of)(.{1,30})",
-]));
-static RE_ALLERGY: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
-    r"我?对(.{1,10})过敏",
-    r"(?i)(?:I'm |I am )?allergic to (.{1,20})",
-]));
-static RE_AVOID: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
-    r"(?:不要|别|没有|不含|不加|避开|避免|我不[吃喝用看听做])(.{1,15})",
-    r"(?i)(?:no|without|avoid|skip|don't want|don't like)\s+(.{1,20})",
-]));
-static RE_ENV: LazyLock<Vec<Regex>> = LazyLock::new(|| compile_patterns(&[
-    r"我(?:用的是|在用|用)(.{1,20})",
-    r"(?i)(?:I use|I'm on|I'm using|I'm running|my .{1,15} version is)(.{1,30})",
-]));
+static RE_IDENTITY_CN: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    compile_patterns(&[
+        r"我(?:是|叫|的职业是|住在|来自|在.{1,15}工作|的名字是)(.{1,30})",
+        r"我.{0,2}(?:岁|年纪)",
+        r"我有(?:一个|两个|三个)?(.{1,10})(?:儿子|女儿|孩子|老婆|丈夫|男友|女友)",
+    ])
+});
+static RE_IDENTITY_EN: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    compile_patterns(&[
+        r"(?i)(?:I am|I'm|I work (?:at|as|in)|my name is|I live in|I'm from)(.{1,50})",
+        r"(?i)I'm (\d+) years old",
+        r"(?i)I have (?:a |an )?(\w+ (?:son|daughter|child|wife|husband|partner))",
+    ])
+});
+static RE_CORRECTION_CN: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    compile_patterns(&[
+        r"不是.{1,15}[，,]是",
+        r"其实是",
+        r"我说错了",
+        r"更正一下",
+        r"我之前说的不对",
+    ])
+});
+static RE_CORRECTION_EN: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    compile_patterns(&[
+        r"(?i)actually",
+        r"(?i)I was wrong",
+        r"(?i)let me correct",
+        r"(?i)not .{1,20}, it's",
+    ])
+});
+static RE_PREF_LANG: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    compile_patterns(&[
+        r"用(?:中文|英文|英语|日文|日语|法语|韩语).{0,5}(?:回答|说|写)",
+        r"(?i)(?:reply|respond|answer|write) in (?:English|Chinese|Japanese|French)",
+    ])
+});
+static RE_PREF_FMT: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    compile_patterns(&[
+        r"(?:简短一点|详细一点|简洁|不要用.{1,8}术语|口语化|正式一点|用列表|用表格)",
+        r"(?i)(?:keep it short|more detail|avoid jargon|be casual|be formal|use bullet)",
+    ])
+});
+static RE_PREF_ROLE: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    compile_patterns(&[
+        r"你(?:扮演|是|充当)(.{1,20})",
+        r"(?i)(?:act as|you are|pretend to be|play the role of)(.{1,30})",
+    ])
+});
+static RE_ALLERGY: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    compile_patterns(&[
+        r"我?对(.{1,10})过敏",
+        r"(?i)(?:I'm |I am )?allergic to (.{1,20})",
+    ])
+});
+static RE_AVOID: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    compile_patterns(&[
+        r"(?:不要|别|没有|不含|不加|避开|避免|我不[吃喝用看听做])(.{1,15})",
+        r"(?i)(?:no|without|avoid|skip|don't want|don't like)\s+(.{1,20})",
+    ])
+});
+static RE_ENV: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    compile_patterns(&[
+        r"我(?:用的是|在用|用)(.{1,20})",
+        r"(?i)(?:I use|I'm on|I'm using|I'm running|my .{1,15} version is)(.{1,30})",
+    ])
+});
 
 struct Extraction {
     content: String,
@@ -336,12 +455,18 @@ struct Extraction {
 
 fn run_rule_engine(content: &str) -> Vec<Extraction> {
     let mut results = Vec::new();
-    if let Some(ext) = check_explicit_remember(content) { results.push(ext); }
+    if let Some(ext) = check_explicit_remember(content) {
+        results.push(ext);
+    }
     results.extend(check_identity_declarations(content));
-    if let Some(ext) = check_corrections(content) { results.push(ext); }
+    if let Some(ext) = check_corrections(content) {
+        results.push(ext);
+    }
     results.extend(check_preferences(content));
     results.extend(check_avoidance(content));
-    if let Some(ext) = check_environment(content) { results.push(ext); }
+    if let Some(ext) = check_environment(content) {
+        results.push(ext);
+    }
     results
 }
 
@@ -350,8 +475,13 @@ fn run_rule_engine(content: &str) -> Vec<Extraction> {
 /// makes the offset from `lower` invalid when applied to `content`.
 fn check_explicit_remember(content: &str) -> Option<Extraction> {
     const PATTERNS: &[&str] = &[
-        "remember ", "keep in mind", "don't forget",
-        "记住", "帮我记下", "帮我记住", "请记住",
+        "remember ",
+        "keep in mind",
+        "don't forget",
+        "记住",
+        "帮我记下",
+        "帮我记住",
+        "请记住",
     ];
     let lower = content.to_lowercase();
     for pat in PATTERNS {
@@ -539,17 +669,23 @@ pub async fn mpi_log(
     // Parse body.
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "failed to read body"})),
-        ).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "failed to read body"})),
+            )
+                .into_response()
+        }
     };
     let log_req: LogRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
-        Err(e) => return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("invalid JSON: {}", e)})),
-        ).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid JSON: {}", e)})),
+            )
+                .into_response()
+        }
     };
 
     // Step 0.5: Stage 1 Entropy Filter.
@@ -586,8 +722,7 @@ pub async fn mpi_log(
 
     let mut logged = 0usize;
     let request_recall_ctx = log_req.recall_context.as_deref();
-    let mut last_assistant_recall_ctx: Option<String> =
-        request_recall_ctx.map(|s| s.to_string());
+    let mut last_assistant_recall_ctx: Option<String> = request_recall_ctx.map(|s| s.to_string());
     let mut extracted_this_request: Vec<Vec<u8>> = Vec::new();
 
     for (idx, turn) in log_req.turns.iter().enumerate() {
@@ -609,7 +744,11 @@ pub async fn mpi_log(
             if !entropy_passes {
                 extractable = 0;
             } else {
-                extractable = if has_persistent_info(&turn_content) { 1 } else { 0 };
+                extractable = if has_persistent_info(&turn_content) {
+                    1
+                } else {
+                    0
+                };
             }
 
             if extractable == 1 {
@@ -623,7 +762,8 @@ pub async fn mpi_log(
 
                 let mut extractions = run_rule_engine(&rule_input);
                 extractions.sort_unstable_by(|a, b| {
-                    b.confidence.partial_cmp(&a.confidence)
+                    b.confidence
+                        .partial_cmp(&a.confidence)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
 
@@ -633,7 +773,9 @@ pub async fn mpi_log(
                     let stored_content: String = if ext.content.len() > MAX_EXTRACTION_BYTES {
                         let mut s = ext.content.clone();
                         s.truncate(MAX_EXTRACTION_BYTES);
-                        while !s.is_char_boundary(s.len()) { s.pop(); }
+                        while !s.is_char_boundary(s.len()) {
+                            s.pop();
+                        }
                         s
                     } else {
                         ext.content
@@ -656,13 +798,17 @@ pub async fn mpi_log(
                         continue;
                     }
 
-                    let is_identity_or_allergy = ext.tags.iter()
-                        .any(|t| t == "identity" || t == "allergy");
+                    let is_identity_or_allergy =
+                        ext.tags.iter().any(|t| t == "identity" || t == "allergy");
 
                     let mut record = MemoryRecord::new(
-                        owner, now_ts, ext.layer, ext.tags,
+                        owner,
+                        now_ts,
+                        ext.layer,
+                        ext.tags,
                         log_req.source_ai.clone(),
-                        encrypted_content.clone(), vec![],
+                        encrypted_content.clone(),
+                        vec![],
                     );
                     record.signature = state.identity.sign(&record.record_id);
 
@@ -670,11 +816,9 @@ pub async fn mpi_log(
 
                     // v2.5.2+Provenance: write session_id after insert.
                     // Fix #1: returns () — no Result to handle.
-                    storage.set_record_session_id(
-                        &record.record_id,
-                        &owner,
-                        &log_req.session_id,
-                    ).await;
+                    storage
+                        .set_record_session_id(&record.record_id, &owner, &log_req.session_id)
+                        .await;
 
                     extracted_this_request.push(encrypted_content);
 
@@ -691,8 +835,7 @@ pub async fn mpi_log(
 
             // Negative feedback detection.
             if contains_negative_feedback(&turn_content) {
-                let ctx_str = last_assistant_recall_ctx.as_deref()
-                    .or(request_recall_ctx);
+                let ctx_str = last_assistant_recall_ctx.as_deref().or(request_recall_ctx);
                 if let Some(ctx) = ctx_str {
                     let entries = parse_recall_context(ctx);
                     if let Some(top) = entries.first() {
@@ -703,18 +846,25 @@ pub async fn mpi_log(
 
                                 storage.increment_negative_feedback(&record_id).await;
 
-                                let features_arr: Option<[f32; 9]> =
-                                    if top.features.len() == 9 {
-                                        let mut arr = [0.0f32; 9];
-                                        arr.copy_from_slice(&top.features);
-                                        Some(arr)
-                                    } else { None };
+                                let features_arr: Option<[f32; 9]> = if top.features.len() == 9 {
+                                    let mut arr = [0.0f32; 9];
+                                    arr.copy_from_slice(&top.features);
+                                    Some(arr)
+                                } else {
+                                    None
+                                };
 
-                                storage.insert_feedback(
-                                    &owner, &record_id, &log_req.session_id,
-                                    turn_index, -1, features_arr.as_ref(),
-                                    Some(top.score as f32),
-                                ).await;
+                                storage
+                                    .insert_feedback(
+                                        &owner,
+                                        &record_id,
+                                        &log_req.session_id,
+                                        turn_index,
+                                        -1,
+                                        features_arr.as_ref(),
+                                        Some(top.score as f32),
+                                    )
+                                    .await;
 
                                 feedback_signal = Some(-1);
                                 info!(memory = top.id, session = %log_req.session_id,
@@ -727,13 +877,25 @@ pub async fn mpi_log(
         }
 
         // Write to raw_logs (stripped content).
-        let recall_ctx_for_row = if turn.role == "assistant" { per_turn_recall_ctx } else { None };
+        let recall_ctx_for_row = if turn.role == "assistant" {
+            per_turn_recall_ctx
+        } else {
+            None
+        };
 
-        let result = storage.insert_raw_log(
-            &log_req.session_id, turn_index, &turn.role, &turn_content,
-            &log_req.source_ai, recall_ctx_for_row, extractable,
-            feedback_signal, Some(&rawlog_key),
-        ).await;
+        let result = storage
+            .insert_raw_log(
+                &log_req.session_id,
+                turn_index,
+                &turn.role,
+                &turn_content,
+                &log_req.source_ai,
+                recall_ctx_for_row,
+                extractable,
+                feedback_signal,
+                Some(&rawlog_key),
+            )
+            .await;
 
         if result.is_ok() {
             logged += 1;
@@ -751,10 +913,14 @@ pub async fn mpi_log(
                     rid.copy_from_slice(&hash);
                     rid
                 };
-                storage.fts_index_record(
-                    &turn_rid, &owner, &turn_content,
-                    &format!("turn:{}:{}", log_req.session_id, turn.role),
-                ).await;
+                storage
+                    .fts_index_record(
+                        &turn_rid,
+                        &owner,
+                        &turn_content,
+                        &format!("turn:{}:{}", log_req.session_id, turn.role),
+                    )
+                    .await;
             }
         }
     }
@@ -769,10 +935,17 @@ pub async fn mpi_log(
             Some(ctx) => Some(ctx),
         };
 
-        if let Err(e) = storage.upsert_session(
-            &log_req.session_id, &owner, context_project_id,
-            "chat", now_ts as i64, turn_count,
-        ).await {
+        if let Err(e) = storage
+            .upsert_session(
+                &log_req.session_id,
+                &owner,
+                context_project_id,
+                "chat",
+                now_ts as i64,
+                turn_count,
+            )
+            .await
+        {
             warn!(session = %log_req.session_id, error = %e,
                 "[MPI_LOG] Failed to register session (non-fatal)");
         }
@@ -786,7 +959,8 @@ pub async fn mpi_log(
             logged,
             session_id: log_req.session_id,
         })),
-    ).into_response()
+    )
+        .into_response()
 }
 
 // ============================================
@@ -873,7 +1047,9 @@ mod tests {
     fn test_rule_engine_environment() {
         let r = run_rule_engine("I'm using macOS Sonoma 14.2");
         assert!(!r.is_empty());
-        assert!(r.iter().any(|item| item.tags.contains(&"environment".to_string())));
+        assert!(r
+            .iter()
+            .any(|item| item.tags.contains(&"environment".to_string())));
     }
 
     #[test]
@@ -942,7 +1118,9 @@ mod tests {
         let base = "I am a software engineer. ".repeat(200);
         assert!(base.len() > MAX_EXTRACTION_BYTES);
         let mut s = base[..MAX_EXTRACTION_BYTES].to_string();
-        while !s.is_char_boundary(s.len()) { s.pop(); }
+        while !s.is_char_boundary(s.len()) {
+            s.pop();
+        }
         assert!(s.len() <= MAX_EXTRACTION_BYTES);
         assert!(std::str::from_utf8(s.as_bytes()).is_ok());
     }

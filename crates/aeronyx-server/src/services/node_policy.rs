@@ -213,12 +213,16 @@ impl NodePolicyRuntime {
             None
         };
         let session_capacity_used_percent = if policy.max_sessions > 0 {
-            Some(round_percent((active_sessions as f64 / policy.max_sessions as f64) * 100.0))
+            Some(round_percent(
+                (active_sessions as f64 / policy.max_sessions as f64) * 100.0,
+            ))
         } else {
             None
         };
         let bandwidth_window_used_percent = if limit_bytes_per_second > 0 {
-            Some(round_percent((bandwidth_window_bytes as f64 / limit_bytes_per_second as f64) * 100.0))
+            Some(round_percent(
+                (bandwidth_window_bytes as f64 / limit_bytes_per_second as f64) * 100.0,
+            ))
         } else {
             None
         };
@@ -344,7 +348,8 @@ impl NodePolicyRuntime {
             }
             "bandwidth_limit_mbps" => {
                 stats.bandwidth_drops = stats.bandwidth_drops.saturating_add(1);
-                stats.bandwidth_drop_bytes = stats.bandwidth_drop_bytes.saturating_add(rejected_bytes);
+                stats.bandwidth_drop_bytes =
+                    stats.bandwidth_drop_bytes.saturating_add(rejected_bytes);
             }
             _ => {}
         }

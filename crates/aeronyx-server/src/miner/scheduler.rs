@@ -68,11 +68,11 @@ use tracing::{error, info, warn};
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_transport::UdpTransport;
 
+use crate::miner::ReflectionMiner;
 use crate::services::memchain::{
     AofWriter, EmbedEngine, LlmRouter, MemPool, NerEngine, StoragePool, SystemDb, VectorIndex,
 };
 use crate::services::SessionManager;
-use crate::miner::ReflectionMiner;
 
 // ============================================
 // Per-Owner Quota Tracking
@@ -133,7 +133,6 @@ pub struct MinerScheduler {
     quotas: TokioMutex<HashMap<[u8; 32], OwnerQuota>>,
 
     // ── Stub components (required by ReflectionMiner::new, unused in SaaS) ──
-
     /// Empty MemPool — drain_for_block() always returns Vec::new().
     stub_mempool: Arc<MemPool>,
 
@@ -177,10 +176,8 @@ impl MinerScheduler {
         // Write to a process-unique temp file. The SaaS Miner never calls
         // legacy_mine() (stub_mempool is always empty), so this file stays
         // empty. It is cleaned up when the process exits.
-        let stub_aof_path = std::env::temp_dir().join(format!(
-            "memchain_saas_miner_{}.aof",
-            std::process::id()
-        ));
+        let stub_aof_path =
+            std::env::temp_dir().join(format!("memchain_saas_miner_{}.aof", std::process::id()));
         let stub_aof = AofWriter::open(&stub_aof_path)
             .await
             .expect("[MINER_SCHED] Failed to open stub AofWriter — check /tmp permissions");
@@ -196,10 +193,7 @@ impl MinerScheduler {
 
         // ── Stub SessionManager ────────────────────────────────────────
         // 0 capacity — all_sessions() returns Vec::new().
-        let stub_sessions = Arc::new(SessionManager::new(
-            0,
-            Duration::from_secs(60),
-        ));
+        let stub_sessions = Arc::new(SessionManager::new(0, Duration::from_secs(60)));
 
         Arc::new(Self {
             storage_pool,
@@ -231,7 +225,8 @@ impl MinerScheduler {
     pub async fn tick(&self) {
         // ── 1. Get candidate owners ────────────────────────────────────
         // Fetch 4× more candidates than needed so quota filtering has headroom.
-        let candidates = match self.system_db
+        let candidates = match self
+            .system_db
             .get_active_owners(self.max_owners_per_tick * 4)
             .await
         {
@@ -251,7 +246,9 @@ impl MinerScheduler {
             let mut quotas = self.quotas.lock().await;
             let mut out = Vec::with_capacity(self.max_owners_per_tick);
             for c in &candidates {
-                if out.len() >= self.max_owners_per_tick { break; }
+                if out.len() >= self.max_owners_per_tick {
+                    break;
+                }
                 let q = quotas.entry(c.pubkey).or_insert_with(OwnerQuota::new);
                 if q.has_quota(self.max_rounds_per_hour) {
                     out.push(c.pubkey);
@@ -369,15 +366,15 @@ impl MinerScheduler {
 
         let miner = match &self.embed_engine {
             Some(ee) => miner.with_embed_engine(Arc::clone(ee)),
-            None     => miner,
+            None => miner,
         };
         let miner = match &self.ner_engine {
             Some(ne) => miner.with_ner_engine(Arc::clone(ne)),
-            None     => miner,
+            None => miner,
         };
         let miner = match &self.llm_router {
             Some(lr) => miner.with_llm_router(Arc::clone(lr)),
-            None     => miner,
+            None => miner,
         };
 
         miner
@@ -400,11 +397,13 @@ impl MinerScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::memchain::{SystemDb, VolumeRouter};
     use crate::services::memchain::storage_pool::StoragePool;
+    use crate::services::memchain::{SystemDb, VolumeRouter};
     use tempfile::TempDir;
 
-    fn make_owner(seed: u8) -> [u8; 32] { [seed; 32] }
+    fn make_owner(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
 
     fn write_volumes_toml(dir: &std::path::Path) -> std::path::PathBuf {
         let vol_dir = dir.join("volumes").join("vol-001");
@@ -416,14 +415,17 @@ mod tests {
                 "[[volumes]]\nid = \"vol-001\"\npath = \"{}\"\nstatus = \"read-write\"\n",
                 vol_dir.to_string_lossy().replace('\\', "/")
             ),
-        ).unwrap();
+        )
+        .unwrap();
         config_path
     }
 
     async fn make_scheduler(dir: &std::path::Path) -> Arc<MinerScheduler> {
         let db = SystemDb::open(&dir.join("system.db")).await.unwrap();
         let config_path = write_volumes_toml(dir);
-        let router = VolumeRouter::new(&config_path, Arc::clone(&db)).await.unwrap();
+        let router = VolumeRouter::new(&config_path, Arc::clone(&db))
+            .await
+            .unwrap();
         let pool = StoragePool::new(
             Arc::clone(&router),
             Arc::clone(&db),
@@ -489,16 +491,28 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
         let config_path = write_volumes_toml(dir.path());
-        let router = VolumeRouter::new(&config_path, Arc::clone(&db)).await.unwrap();
-        let pool = StoragePool::new(Arc::clone(&router), Arc::clone(&db), 10, Duration::from_secs(3600));
+        let router = VolumeRouter::new(&config_path, Arc::clone(&db))
+            .await
+            .unwrap();
+        let pool = StoragePool::new(
+            Arc::clone(&router),
+            Arc::clone(&db),
+            10,
+            Duration::from_secs(3600),
+        );
         let identity = aeronyx_core::crypto::IdentityKeyPair::generate();
 
         // max_rounds_per_hour = 1 → each owner can only be processed once per hour.
-        let sched = MinerScheduler::new(pool, Arc::clone(&db), 10, 1, identity, None, None, None).await;
+        let sched =
+            MinerScheduler::new(pool, Arc::clone(&db), 10, 1, identity, None, None, None).await;
 
         // Assign 2 owners so they appear in active_owners.
-        db.assign_volume(&make_owner(0xAA), "vol-001").await.unwrap();
-        db.assign_volume(&make_owner(0xBB), "vol-001").await.unwrap();
+        db.assign_volume(&make_owner(0xAA), "vol-001")
+            .await
+            .unwrap();
+        db.assign_volume(&make_owner(0xBB), "vol-001")
+            .await
+            .unwrap();
         db.update_last_active(&make_owner(0xAA)).await.unwrap();
         db.update_last_active(&make_owner(0xBB)).await.unwrap();
 
@@ -527,8 +541,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
         let config_path = write_volumes_toml(dir.path());
-        let router = VolumeRouter::new(&config_path, Arc::clone(&db)).await.unwrap();
-        let pool = StoragePool::new(Arc::clone(&router), Arc::clone(&db), 10, Duration::from_secs(3600));
+        let router = VolumeRouter::new(&config_path, Arc::clone(&db))
+            .await
+            .unwrap();
+        let pool = StoragePool::new(
+            Arc::clone(&router),
+            Arc::clone(&db),
+            10,
+            Duration::from_secs(3600),
+        );
         let identity = aeronyx_core::crypto::IdentityKeyPair::generate();
         let sched = MinerScheduler::new(pool, db, 1, 100, identity, None, None, None).await;
 
@@ -542,8 +563,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
         let config_path = write_volumes_toml(dir.path());
-        let router = VolumeRouter::new(&config_path, Arc::clone(&db)).await.unwrap();
-        let pool = StoragePool::new(Arc::clone(&router), Arc::clone(&db), 10, Duration::from_secs(3600));
+        let router = VolumeRouter::new(&config_path, Arc::clone(&db))
+            .await
+            .unwrap();
+        let pool = StoragePool::new(
+            Arc::clone(&router),
+            Arc::clone(&db),
+            10,
+            Duration::from_secs(3600),
+        );
         let identity = aeronyx_core::crypto::IdentityKeyPair::generate();
         // Pass 0 — should be clamped to 1.
         let sched = MinerScheduler::new(pool, db, 0, 6, identity, None, None, None).await;

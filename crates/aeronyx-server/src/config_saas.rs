@@ -117,11 +117,21 @@ pub struct SaasConfig {
 
 // ── Default functions ──
 
-fn default_saas_data_root() -> PathBuf { PathBuf::from("data") }
-fn default_pool_max_connections() -> usize { 100 }
-fn default_pool_idle_timeout_secs() -> u64 { 1800 }
-fn default_miner_max_owners_per_tick() -> usize { 10 }
-fn default_miner_max_rounds_per_hour() -> usize { 6 }
+fn default_saas_data_root() -> PathBuf {
+    PathBuf::from("data")
+}
+fn default_pool_max_connections() -> usize {
+    100
+}
+fn default_pool_idle_timeout_secs() -> u64 {
+    1800
+}
+fn default_miner_max_owners_per_tick() -> usize {
+    10
+}
+fn default_miner_max_rounds_per_hour() -> usize {
+    6
+}
 
 impl Default for SaasConfig {
     fn default() -> Self {
@@ -194,25 +204,37 @@ mod tests {
 
     #[test]
     fn test_saas_pool_max_zero_rejected() {
-        let sc = SaasConfig { pool_max_connections: 0, ..Default::default() };
+        let sc = SaasConfig {
+            pool_max_connections: 0,
+            ..Default::default()
+        };
         assert!(sc.validate().is_err());
     }
 
     #[test]
     fn test_saas_pool_idle_timeout_zero_rejected() {
-        let sc = SaasConfig { pool_idle_timeout_secs: 0, ..Default::default() };
+        let sc = SaasConfig {
+            pool_idle_timeout_secs: 0,
+            ..Default::default()
+        };
         assert!(sc.validate().is_err());
     }
 
     #[test]
     fn test_saas_owners_per_tick_zero_rejected() {
-        let sc = SaasConfig { miner_max_owners_per_tick: 0, ..Default::default() };
+        let sc = SaasConfig {
+            miner_max_owners_per_tick: 0,
+            ..Default::default()
+        };
         assert!(sc.validate().is_err());
     }
 
     #[test]
     fn test_saas_rounds_per_hour_zero_rejected() {
-        let sc = SaasConfig { miner_max_rounds_per_hour: 0, ..Default::default() };
+        let sc = SaasConfig {
+            miner_max_rounds_per_hour: 0,
+            ..Default::default()
+        };
         assert!(sc.validate().is_err());
     }
 
@@ -221,7 +243,10 @@ mod tests {
         let a = SaasConfig::default();
         let b = SaasConfig::default();
         assert_eq!(a, b);
-        let c = SaasConfig { pool_max_connections: 50, ..Default::default() };
+        let c = SaasConfig {
+            pool_max_connections: 50,
+            ..Default::default()
+        };
         assert_ne!(a, c);
     }
 }

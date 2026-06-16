@@ -48,9 +48,7 @@
 //! v0.1.0 - Initial handshake crypto implementation
 
 use crate::crypto::kdf::derive_session_key;
-use crate::crypto::keys::{
-    EphemeralKeyPair, IdentityKeyPair, IdentityPublicKey, SessionKey,
-};
+use crate::crypto::keys::{EphemeralKeyPair, IdentityKeyPair, IdentityPublicKey, SessionKey};
 use crate::error::{CoreError, Result};
 use crate::protocol::{ClientHello, ServerHello};
 
@@ -87,10 +85,10 @@ fn to_hex(bytes: &[u8]) -> String {
 /// # Example
 /// ```ignore
 /// let crypto = DefaultHandshakeCrypto::new(identity);
-/// 
+///
 /// // Process ClientHello
 /// crypto.verify_client_hello(&client_hello)?;
-/// 
+///
 /// // Create ServerHello
 /// let (server_hello, session_key) = crypto.process_handshake(
 ///     &client_hello,
@@ -162,7 +160,10 @@ impl DefaultHandshakeCrypto {
     /// * `seconds` - Maximum clock difference in seconds
     #[must_use]
     pub fn with_timestamp_skew(mut self, seconds: u64) -> Self {
-        debug!("[CRYPTO-DEBUG] Setting max_timestamp_skew to {} seconds", seconds);
+        debug!(
+            "[CRYPTO-DEBUG] Setting max_timestamp_skew to {} seconds",
+            seconds
+        );
         self.max_timestamp_skew = seconds;
         self
     }
@@ -184,12 +185,12 @@ impl DefaultHandshakeCrypto {
         data.extend_from_slice(&msg.client_public_key);
         data.extend_from_slice(&msg.client_ephemeral_key);
         data.extend_from_slice(&msg.timestamp.to_le_bytes());
-        
+
         trace!(
             "[CRYPTO-DEBUG] client_hello_sign_data constructed: {} bytes",
             data.len()
         );
-        
+
         data
     }
 
@@ -214,12 +215,12 @@ impl DefaultHandshakeCrypto {
         data.extend_from_slice(&msg.assigned_ip);
         data.extend_from_slice(&msg.session_id);
         data.extend_from_slice(client_public);
-        
+
         trace!(
             "[CRYPTO-DEBUG] server_hello_sign_data constructed: {} bytes",
             data.len()
         );
-        
+
         data
     }
 }
@@ -231,7 +232,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
 
     fn verify_client_hello(&self, msg: &ClientHello) -> Result<()> {
         info!("[CRYPTO-DEBUG] ========== verify_client_hello START ==========");
-        
+
         debug!("[CRYPTO-DEBUG] ClientHello contents:");
         debug!("[CRYPTO-DEBUG]   message_type: {}", msg.message_type);
         debug!("[CRYPTO-DEBUG]   version: {}", msg.version);
@@ -244,10 +245,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
             to_hex(&msg.client_ephemeral_key)
         );
         debug!("[CRYPTO-DEBUG]   timestamp: {}", msg.timestamp);
-        debug!(
-            "[CRYPTO-DEBUG]   signature: {}",
-            to_hex(&msg.signature)
-        );
+        debug!("[CRYPTO-DEBUG]   signature: {}", to_hex(&msg.signature));
 
         // 1. Validate timestamp
         let timestamp = Timestamp::from_secs(msg.timestamp);
@@ -259,7 +257,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
             current_time.abs_diff(msg.timestamp),
             self.max_timestamp_skew
         );
-        
+
         if !timestamp.is_recent(self.max_timestamp_skew) {
             info!("[CRYPTO-DEBUG] FAILED: Timestamp validation failed");
             return Err(CoreError::invalid_timestamp(format!(
@@ -275,14 +273,11 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
             "[CRYPTO-DEBUG] Sign data for verification: {} bytes",
             sign_data.len()
         );
-        debug!(
-            "[CRYPTO-DEBUG] Sign data hex: {}",
-            to_hex(&sign_data)
-        );
-        
+        debug!("[CRYPTO-DEBUG] Sign data hex: {}", to_hex(&sign_data));
+
         let client_public = IdentityPublicKey::from_bytes(&msg.client_public_key)?;
         debug!("[CRYPTO-DEBUG] Verifying signature with client public key...");
-        
+
         match client_public.verify(&sign_data, &msg.signature) {
             Ok(()) => {
                 info!("[CRYPTO-DEBUG] Signature verification: PASSED");
@@ -304,15 +299,12 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         session_id: [u8; 16],
     ) -> Result<(ServerHello, SessionKey)> {
         info!("[CRYPTO-DEBUG] ========== process_handshake START ==========");
-        
+
         debug!(
             "[CRYPTO-DEBUG] Input - assigned_ip: {}.{}.{}.{}",
             assigned_ip[0], assigned_ip[1], assigned_ip[2], assigned_ip[3]
         );
-        debug!(
-            "[CRYPTO-DEBUG] Input - session_id: {}",
-            to_hex(&session_id)
-        );
+        debug!("[CRYPTO-DEBUG] Input - session_id: {}", to_hex(&session_id));
         debug!(
             "[CRYPTO-DEBUG] Input - client_public_key: {}",
             to_hex(&client_hello.client_public_key)
@@ -349,13 +341,13 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
             "[CRYPTO-DEBUG] *** Server Identity Public Key (for KDF): {} ***",
             to_hex(&self.identity.public_key_bytes())
         );
-        
+
         let session_key = derive_session_key(
             &shared_secret,
             &client_hello.client_public_key,
             &self.identity.public_key_bytes(),
         )?;
-        
+
         info!(
             "[CRYPTO-DEBUG] *** Derived Session Key: {} ***",
             to_hex(session_key.as_bytes())
@@ -372,9 +364,12 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
             session_id,
             signature: [0u8; 64],
         };
-        
+
         debug!("[CRYPTO-DEBUG] ServerHello (before signing):");
-        debug!("[CRYPTO-DEBUG]   message_type: {}", server_hello.message_type);
+        debug!(
+            "[CRYPTO-DEBUG]   message_type: {}",
+            server_hello.message_type
+        );
         debug!("[CRYPTO-DEBUG]   version: {}", server_hello.version);
         debug!(
             "[CRYPTO-DEBUG]   server_public_key: {}",
@@ -398,10 +393,8 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
 
         // 5. Sign ServerHello
         info!("[CRYPTO-DEBUG] Step 5: Signing ServerHello...");
-        let sign_data = Self::server_hello_sign_data(
-            &server_hello,
-            &client_hello.client_public_key,
-        );
+        let sign_data =
+            Self::server_hello_sign_data(&server_hello, &client_hello.client_public_key);
         debug!(
             "[CRYPTO-DEBUG] ServerHello sign_data: {} bytes",
             sign_data.len()
@@ -410,7 +403,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
             "[CRYPTO-DEBUG] ServerHello sign_data hex: {}",
             to_hex(&sign_data)
         );
-        
+
         server_hello.signature = self.identity.sign(&sign_data);
         debug!(
             "[CRYPTO-DEBUG] ServerHello signature: {}",
@@ -419,10 +412,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
 
         info!("[CRYPTO-DEBUG] ========== process_handshake SUCCESS ==========");
         info!("[CRYPTO-DEBUG] Summary:");
-        info!(
-            "[CRYPTO-DEBUG]   Shared Secret: {}",
-            to_hex(&shared_secret)
-        );
+        info!("[CRYPTO-DEBUG]   Shared Secret: {}", to_hex(&shared_secret));
         info!(
             "[CRYPTO-DEBUG]   Client Identity Public: {}",
             to_hex(&client_hello.client_public_key)
@@ -452,14 +442,14 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
 ///
 /// # Errors
 /// Returns `SignatureVerification` error if signature is invalid.
-pub fn verify_server_hello(
-    server_hello: &ServerHello,
-    client_public: &[u8; 32],
-) -> Result<()> {
+pub fn verify_server_hello(server_hello: &ServerHello, client_public: &[u8; 32]) -> Result<()> {
     info!("[CRYPTO-DEBUG] ========== verify_server_hello START ==========");
-    
+
     debug!("[CRYPTO-DEBUG] ServerHello contents:");
-    debug!("[CRYPTO-DEBUG]   message_type: {}", server_hello.message_type);
+    debug!(
+        "[CRYPTO-DEBUG]   message_type: {}",
+        server_hello.message_type
+    );
     debug!("[CRYPTO-DEBUG]   version: {}", server_hello.version);
     debug!(
         "[CRYPTO-DEBUG]   server_public_key: {}",
@@ -489,22 +479,16 @@ pub fn verify_server_hello(
         to_hex(client_public)
     );
 
-    let sign_data = DefaultHandshakeCrypto::server_hello_sign_data(
-        server_hello,
-        client_public,
-    );
-    
+    let sign_data = DefaultHandshakeCrypto::server_hello_sign_data(server_hello, client_public);
+
     debug!(
         "[CRYPTO-DEBUG] Sign data for verification: {} bytes",
         sign_data.len()
     );
-    debug!(
-        "[CRYPTO-DEBUG] Sign data hex: {}",
-        to_hex(&sign_data)
-    );
-    
+    debug!("[CRYPTO-DEBUG] Sign data hex: {}", to_hex(&sign_data));
+
     let server_public = IdentityPublicKey::from_bytes(&server_hello.server_public_key)?;
-    
+
     match server_public.verify(&sign_data, &server_hello.signature) {
         Ok(()) => {
             info!("[CRYPTO-DEBUG] ServerHello signature verification: PASSED");
@@ -512,7 +496,10 @@ pub fn verify_server_hello(
             Ok(())
         }
         Err(e) => {
-            info!("[CRYPTO-DEBUG] ServerHello signature verification: FAILED - {:?}", e);
+            info!(
+                "[CRYPTO-DEBUG] ServerHello signature verification: FAILED - {:?}",
+                e
+            );
             info!("[CRYPTO-DEBUG] ========== verify_server_hello FAILED ==========");
             Err(e)
         }
@@ -534,9 +521,9 @@ pub fn create_client_hello(
     version: u8,
 ) -> ClientHello {
     info!("[CRYPTO-DEBUG] ========== create_client_hello START ==========");
-    
+
     let timestamp = Timestamp::now().as_secs();
-    
+
     debug!(
         "[CRYPTO-DEBUG] Client Identity Public Key: {}",
         to_hex(&identity.public_key_bytes())
@@ -547,7 +534,7 @@ pub fn create_client_hello(
     );
     debug!("[CRYPTO-DEBUG] Timestamp: {}", timestamp);
     debug!("[CRYPTO-DEBUG] Version: {}", version);
-    
+
     let mut msg = ClientHello {
         message_type: crate::protocol::MessageType::ClientHello as u8,
         version,
@@ -567,7 +554,7 @@ pub fn create_client_hello(
         "[CRYPTO-DEBUG] ClientHello sign_data hex: {}",
         to_hex(&sign_data)
     );
-    
+
     msg.signature = identity.sign(&sign_data);
     debug!(
         "[CRYPTO-DEBUG] ClientHello signature: {}",
@@ -575,7 +562,7 @@ pub fn create_client_hello(
     );
 
     info!("[CRYPTO-DEBUG] ========== create_client_hello SUCCESS ==========");
-    
+
     msg
 }
 
@@ -612,16 +599,13 @@ mod tests {
         // Server processes handshake
         let assigned_ip = [100, 64, 0, 2];
         let session_id = [0x42u8; 16];
-        
+
         let (server_hello, server_session_key) = server_crypto
             .process_handshake(&client_hello, assigned_ip, session_id)
             .unwrap();
 
         // Client verifies ServerHello
-        assert!(verify_server_hello(
-            &server_hello,
-            &client_identity.public_key_bytes(),
-        ).is_ok());
+        assert!(verify_server_hello(&server_hello, &client_identity.public_key_bytes(),).is_ok());
 
         // Client derives session key
         let shared_secret = client_ephemeral.exchange(&server_hello.server_ephemeral_key);
@@ -629,13 +613,11 @@ mod tests {
             &shared_secret,
             &client_identity.public_key_bytes(),
             &server_hello.server_public_key,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Both sides should have the same session key
-        assert_eq!(
-            server_session_key.as_bytes(),
-            client_session_key.as_bytes()
-        );
+        assert_eq!(server_session_key.as_bytes(), client_session_key.as_bytes());
     }
 
     #[test]
@@ -662,15 +644,14 @@ mod tests {
     #[test]
     fn test_old_timestamp_rejected() {
         let server_identity = IdentityKeyPair::generate();
-        let server_crypto = DefaultHandshakeCrypto::new(server_identity)
-            .with_timestamp_skew(30);
+        let server_crypto = DefaultHandshakeCrypto::new(server_identity).with_timestamp_skew(30);
 
         let client_identity = IdentityKeyPair::generate();
         let client_ephemeral = EphemeralKeyPair::generate();
 
         // Create a ClientHello with old timestamp
         let old_timestamp = Timestamp::now().as_secs() - 60; // 60 seconds old
-        
+
         let mut client_hello = ClientHello {
             message_type: crate::protocol::MessageType::ClientHello as u8,
             version: CURRENT_PROTOCOL_VERSION,

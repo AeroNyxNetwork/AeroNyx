@@ -176,10 +176,7 @@ impl VectorIndexPool {
     /// # SECURITY
     /// Assumes `owner` has already been authenticated. Never call with
     /// an unverified owner pubkey.
-    pub fn get_or_create(
-        &self,
-        owner: &[u8; 32],
-    ) -> Result<Arc<VectorIndex>, VectorPoolError> {
+    pub fn get_or_create(&self, owner: &[u8; 32]) -> Result<Arc<VectorIndex>, VectorPoolError> {
         // ── Fast path ──────────────────────────────────────────────────
         if let Some(mut entry) = self.indexes.get_mut(owner) {
             entry.last_accessed = Instant::now();
@@ -312,16 +309,15 @@ mod tests {
     }
 
     /// Create a VectorIndexPool backed by a real VolumeRouter.
-    async fn setup(dir: &std::path::Path) -> (Arc<SystemDb>, Arc<VolumeRouter>, Arc<VectorIndexPool>) {
+    async fn setup(
+        dir: &std::path::Path,
+    ) -> (Arc<SystemDb>, Arc<VolumeRouter>, Arc<VectorIndexPool>) {
         let db = SystemDb::open(&dir.join("system.db")).await.unwrap();
         let config_path = write_volumes_toml(dir);
-        let router = VolumeRouter::new(&config_path, Arc::clone(&db)).await.unwrap();
-        let pool = VectorIndexPool::new(
-            Arc::clone(&router),
-            Duration::from_secs(3600),
-            false,
-            0.0,
-        );
+        let router = VolumeRouter::new(&config_path, Arc::clone(&db))
+            .await
+            .unwrap();
+        let pool = VectorIndexPool::new(Arc::clone(&router), Duration::from_secs(3600), false, 0.0);
         (db, router, pool)
     }
 
@@ -429,15 +425,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
         let config_path = write_volumes_toml(dir.path());
-        let router = VolumeRouter::new(&config_path, Arc::clone(&db)).await.unwrap();
+        let router = VolumeRouter::new(&config_path, Arc::clone(&db))
+            .await
+            .unwrap();
 
         // Very short idle timeout for testing.
-        let pool = VectorIndexPool::new(
-            Arc::clone(&router),
-            Duration::from_millis(50),
-            false,
-            0.0,
-        );
+        let pool = VectorIndexPool::new(Arc::clone(&router), Duration::from_millis(50), false, 0.0);
 
         for seed in [0xAAu8, 0xBB, 0xCC] {
             let owner = make_owner(seed);
@@ -461,15 +454,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
         let config_path = write_volumes_toml(dir.path());
-        let router = VolumeRouter::new(&config_path, Arc::clone(&db)).await.unwrap();
+        let router = VolumeRouter::new(&config_path, Arc::clone(&db))
+            .await
+            .unwrap();
 
         // 200ms timeout.
-        let pool = VectorIndexPool::new(
-            Arc::clone(&router),
-            Duration::from_millis(200),
-            false,
-            0.0,
-        );
+        let pool =
+            VectorIndexPool::new(Arc::clone(&router), Duration::from_millis(200), false, 0.0);
 
         let owner_old = make_owner(0xAA);
         let owner_new = make_owner(0xBB);
@@ -504,7 +495,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
         let config_path = write_volumes_toml(dir.path());
-        let router = VolumeRouter::new(&config_path, Arc::clone(&db)).await.unwrap();
+        let router = VolumeRouter::new(&config_path, Arc::clone(&db))
+            .await
+            .unwrap();
 
         let pool = VectorIndexPool::new(
             Arc::clone(&router),

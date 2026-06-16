@@ -79,7 +79,7 @@ pub fn build_session_title(input: &SessionTitleInput<'_>) -> Vec<ChatMessage> {
         "You generate short, human-readable titles for AI conversation sessions. \
          Rules: 5-10 words max, plain text, no quotes, no trailing punctuation. \
          If a project is provided, start with it followed by ': '. \
-         Be specific and technical. Output ONLY the title, nothing else."
+         Be specific and technical. Output ONLY the title, nothing else.",
     );
 
     let user_content = match input.privacy_level {
@@ -103,11 +103,17 @@ pub fn build_session_title(input: &SessionTitleInput<'_>) -> Vec<ChatMessage> {
             if !input.entity_names.is_empty() {
                 let topics = input.entity_names.join(", ");
                 match input.project_name {
-                    Some(proj) => format!("Project: {}\nKey topics: {}\nGenerate the session title.", proj, topics),
+                    Some(proj) => format!(
+                        "Project: {}\nKey topics: {}\nGenerate the session title.",
+                        proj, topics
+                    ),
                     None => format!("Key topics: {}\nGenerate the session title.", topics),
                 }
             } else if let Some(proj) = input.project_name {
-                format!("Project: {}\nNo specific topics detected.\nGenerate a short session title.", proj)
+                format!(
+                    "Project: {}\nNo specific topics detected.\nGenerate a short session title.",
+                    proj
+                )
             } else if let Some(msg) = input.first_user_message {
                 let preview = truncate_chars(msg, 120);
                 format!("First message: {}\nGenerate a session title.", preview)
@@ -143,17 +149,20 @@ pub fn build_community_narrative(input: &CommunityNarrativeInput<'_>) -> Vec<Cha
         "You write concise narratives for knowledge graph communities. \
          A community is a cluster of related code entities. \
          Output 2-3 sentences: what this community is, its purpose, key relationships. \
-         Be technical and specific. No bullet points. Plain prose only."
+         Be technical and specific. No bullet points. Plain prose only.",
     );
 
     let mut sorted_members: Vec<_> = input.members.to_vec();
     sorted_members.sort_by(|a, b| b.2.cmp(&a.2));
-    let top_members: Vec<String> = sorted_members.iter()
+    let top_members: Vec<String> = sorted_members
+        .iter()
         .take(12)
         .map(|(name, typ, count)| format!("{} ({}, ×{})", name, typ, count))
         .collect();
 
-    let top_edges: Vec<String> = input.key_edges.iter()
+    let top_edges: Vec<String> = input
+        .key_edges
+        .iter()
         .take(8)
         .map(|(src, rel, tgt)| format!("{} {} {}", src, rel, tgt))
         .collect();
@@ -162,7 +171,11 @@ pub fn build_community_narrative(input: &CommunityNarrativeInput<'_>) -> Vec<Cha
         "Community: {}\nMembers: {}\nKey relations: {}\n\nWrite the 2-3 sentence narrative.",
         input.community_name,
         top_members.join("; "),
-        if top_edges.is_empty() { "none detected".to_string() } else { top_edges.join("; ") }
+        if top_edges.is_empty() {
+            "none detected".to_string()
+        } else {
+            top_edges.join("; ")
+        }
     );
 
     vec![system, ChatMessage::user(user_content)]
@@ -204,20 +217,24 @@ pub fn build_conflict_resolution(input: &ConflictResolutionInput<'_>) -> Vec<Cha
          Prefer: newer facts (higher timestamp) > higher confidence > more specific fact_text.\n\
          Respond with ONLY this format — the JSON must be inside <r> tags:\n\
          <r>{\"keep_edge_id\": <id>, \"reason\": \"<brief reason>\"}</r>\n\
-         No other text before or after the <r> tags."
+         No other text before or after the <r> tags.",
     );
 
-    let edges_desc: Vec<String> = input.edges.iter().map(|e| {
-        let fact = e.fact_text.as_deref().unwrap_or("(no supporting text)");
-        let conf_str = e.confidence
-            .map(|c| format!("{:.2}", c))
-            .unwrap_or_else(|| "?".to_string());
-        format!(
-            "Edge ID {}: {} {} {} | fact: {} | confidence: {} | created: timestamp {}",
-            e.edge_id, e.source, e.relation, e.target,
-            fact, conf_str, e.valid_from
-        )
-    }).collect();
+    let edges_desc: Vec<String> = input
+        .edges
+        .iter()
+        .map(|e| {
+            let fact = e.fact_text.as_deref().unwrap_or("(no supporting text)");
+            let conf_str = e
+                .confidence
+                .map(|c| format!("{:.2}", c))
+                .unwrap_or_else(|| "?".to_string());
+            format!(
+                "Edge ID {}: {} {} {} | fact: {} | confidence: {} | created: timestamp {}",
+                e.edge_id, e.source, e.relation, e.target, fact, conf_str, e.valid_from
+            )
+        })
+        .collect();
 
     let user_content = format!(
         "Conflicting edges for the same relationship type:\n{}\n\n\
@@ -253,7 +270,7 @@ pub fn build_recall_synthesis(input: &RecallSynthesisInput<'_>) -> Vec<ChatMessa
          Output ONLY a JSON object with two fields: \
          'summary' (2-3 sentences, present tense, what was discussed and decided) and \
          'key_decisions' (bullet list of specific decisions/conclusions, or null if none). \
-         Be specific and technical. No markdown outside the JSON values."
+         Be specific and technical. No markdown outside the JSON values.",
     );
 
     let user_content = match input.privacy_level {
@@ -263,11 +280,16 @@ pub fn build_recall_synthesis(input: &RecallSynthesisInput<'_>) -> Vec<ChatMessa
             const MAX_CONV_CHARS: usize = 3000;
 
             for (role, content) in input.turns {
-                if total_chars >= MAX_CONV_CHARS { break; }
+                if total_chars >= MAX_CONV_CHARS {
+                    break;
+                }
                 let remaining = MAX_CONV_CHARS - total_chars;
                 let snippet = if content.len() > remaining {
-                    let end = content.char_indices().nth(remaining)
-                        .map(|(i, _)| i).unwrap_or(content.len());
+                    let end = content
+                        .char_indices()
+                        .nth(remaining)
+                        .map(|(i, _)| i)
+                        .unwrap_or(content.len());
                     format!("[{}] {}...", role, &content[..end])
                 } else {
                     format!("[{}] {}", role, content)
@@ -278,7 +300,8 @@ pub fn build_recall_synthesis(input: &RecallSynthesisInput<'_>) -> Vec<ChatMessa
 
             format!(
                 "Session ID: {}\nTurns: {}\n\nConversation:\n{}\n\nGenerate the summary JSON.",
-                input.session_id, input.turn_count,
+                input.session_id,
+                input.turn_count,
                 conv_parts.join("\n")
             )
         }
@@ -287,7 +310,9 @@ pub fn build_recall_synthesis(input: &RecallSynthesisInput<'_>) -> Vec<ChatMessa
             format!(
                 "Session ID: {}\nTurns: {}\nExisting summary: {}\nKey topics: {}\n\n\
                  Upgrade this into a natural summary JSON.",
-                input.session_id, input.turn_count, existing,
+                input.session_id,
+                input.turn_count,
+                existing,
                 input.entity_names.join(", ")
             )
         }
@@ -296,9 +321,13 @@ pub fn build_recall_synthesis(input: &RecallSynthesisInput<'_>) -> Vec<ChatMessa
             format!(
                 "Session ID: {}\nTurns: {}\nKey topics discussed: {}\n\n\
                  Generate the summary JSON based on these topics.",
-                input.session_id, input.turn_count,
-                if input.entity_names.is_empty() { "(none detected)".to_string() }
-                else { input.entity_names.join(", ") }
+                input.session_id,
+                input.turn_count,
+                if input.entity_names.is_empty() {
+                    "(none detected)".to_string()
+                } else {
+                    input.entity_names.join(", ")
+                }
             )
         }
     };
@@ -332,7 +361,7 @@ pub fn build_code_analysis(input: &CodeAnalysisInput<'_>) -> Vec<ChatMessage> {
          'description' (one sentence: what this code does), \
          'complexity' ('low', 'medium', or 'high'), \
          'suggested_tags' (array of 2-4 lowercase tag strings). \
-         No markdown, no explanation, just the JSON."
+         No markdown, no explanation, just the JSON.",
     );
 
     let user_content = match input.privacy_level {
@@ -357,9 +386,15 @@ pub fn build_code_analysis(input: &CodeAnalysisInput<'_>) -> Vec<ChatMessage> {
                  Analyze this code artifact metadata and respond with JSON.",
                 input.artifact_id,
                 input.language,
-                input.line_count.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
-                if input.existing_tags.is_empty() { "none".to_string() }
-                else { input.existing_tags.join(", ") }
+                input
+                    .line_count
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                if input.existing_tags.is_empty() {
+                    "none".to_string()
+                } else {
+                    input.existing_tags.join(", ")
+                }
             )
         }
     };
@@ -389,10 +424,12 @@ pub fn build_entity_description(input: &EntityDescriptionInput<'_>) -> Vec<ChatM
         "You write concise technical descriptions for code knowledge graph entities. \
          Output 1-2 sentences: what this entity is and its role in the codebase. \
          Be specific and technical. No preamble phrases like 'This entity is...'. \
-         Plain prose only. No bullet points."
+         Plain prose only. No bullet points.",
     );
 
-    let rel_desc: Vec<String> = input.relations.iter()
+    let rel_desc: Vec<String> = input
+        .relations
+        .iter()
         .take(8)
         .map(|(rel, other)| format!("{} {}", rel, other))
         .collect();
@@ -401,7 +438,11 @@ pub fn build_entity_description(input: &EntityDescriptionInput<'_>) -> Vec<ChatM
         "Entity: {} (type: {})\nRelationships: {}\n\nWrite the 1-2 sentence description.",
         input.entity_name,
         input.entity_type,
-        if rel_desc.is_empty() { "none".to_string() } else { rel_desc.join("; ") }
+        if rel_desc.is_empty() {
+            "none".to_string()
+        } else {
+            rel_desc.join("; ")
+        }
     );
 
     vec![system, ChatMessage::user(user_content)]
@@ -416,7 +457,8 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     if char_count <= max_chars {
         return s.to_string();
     }
-    let end = s.char_indices()
+    let end = s
+        .char_indices()
         .nth(max_chars)
         .map(|(i, _)| i)
         .unwrap_or(s.len());
@@ -491,21 +533,32 @@ mod tests {
         let user = &msgs[1].content;
         let pos_auth = user.find("auth module").unwrap_or(usize::MAX);
         let pos_jwt = user.find("jwt").unwrap_or(usize::MAX);
-        assert!(pos_auth < pos_jwt, "Higher mention_count should appear first");
+        assert!(
+            pos_auth < pos_jwt,
+            "Higher mention_count should appear first"
+        );
     }
 
     #[test]
     fn test_conflict_resolution_uses_r_tags() {
         let edges = vec![
             ConflictingEdge {
-                edge_id: 1, source: "auth".into(), relation: "USES".into(),
-                target: "JWT".into(), fact_text: Some("auth uses JWT".into()),
-                valid_from: 1000, confidence: Some(0.9),
+                edge_id: 1,
+                source: "auth".into(),
+                relation: "USES".into(),
+                target: "JWT".into(),
+                fact_text: Some("auth uses JWT".into()),
+                valid_from: 1000,
+                confidence: Some(0.9),
             },
             ConflictingEdge {
-                edge_id: 2, source: "auth".into(), relation: "USES".into(),
-                target: "OAuth".into(), fact_text: Some("switched to OAuth".into()),
-                valid_from: 2000, confidence: Some(0.95),
+                edge_id: 2,
+                source: "auth".into(),
+                relation: "USES".into(),
+                target: "OAuth".into(),
+                fact_text: Some("switched to OAuth".into()),
+                valid_from: 2000,
+                confidence: Some(0.95),
             },
         ];
         let input = ConflictResolutionInput {
@@ -526,13 +579,15 @@ mod tests {
 
     #[test]
     fn test_conflict_resolution_no_confidence_handled() {
-        let edges = vec![
-            ConflictingEdge {
-                edge_id: 5, source: "mod_a".into(), relation: "DEPENDS_ON".into(),
-                target: "mod_b".into(), fact_text: None,
-                valid_from: 500, confidence: None,
-            },
-        ];
+        let edges = vec![ConflictingEdge {
+            edge_id: 5,
+            source: "mod_a".into(),
+            relation: "DEPENDS_ON".into(),
+            target: "mod_b".into(),
+            fact_text: None,
+            valid_from: 500,
+            confidence: None,
+        }];
         let input = ConflictResolutionInput {
             conflict_edge_ids: &[5],
             edges: &edges,
@@ -628,7 +683,10 @@ mod tests {
         let msgs = build_code_analysis(&input);
         let user = &msgs[1].content;
         assert!(user.contains("rust"));
-        assert!(!user.contains("fn auth()"), "Code content must not appear in structured mode");
+        assert!(
+            !user.contains("fn auth()"),
+            "Code content must not appear in structured mode"
+        );
     }
 
     #[test]
@@ -636,10 +694,7 @@ mod tests {
         let input = EntityDescriptionInput {
             entity_name: "JWT",
             entity_type: "technology",
-            relations: &[
-                ("USED_BY", "auth module"),
-                ("RELATED_TO", "OAuth"),
-            ],
+            relations: &[("USED_BY", "auth module"), ("RELATED_TO", "OAuth")],
             privacy_level: PrivacyLevel::Structured,
         };
         let msgs = build_entity_description(&input);
@@ -672,7 +727,10 @@ mod tests {
         // v2.5.0+Unify: PrivacyLevel from_str/as_str defined in config_supernode
         assert_eq!(PrivacyLevel::from_str("full"), PrivacyLevel::Full);
         assert_eq!(PrivacyLevel::from_str("summary"), PrivacyLevel::Summary);
-        assert_eq!(PrivacyLevel::from_str("structured"), PrivacyLevel::Structured);
+        assert_eq!(
+            PrivacyLevel::from_str("structured"),
+            PrivacyLevel::Structured
+        );
         assert_eq!(PrivacyLevel::from_str("unknown"), PrivacyLevel::Structured);
         assert_eq!(PrivacyLevel::Full.as_str(), "full");
         assert_eq!(PrivacyLevel::Summary.as_str(), "summary");
@@ -682,38 +740,53 @@ mod tests {
     #[test]
     fn test_all_builders_system_first() {
         let title = build_session_title(&SessionTitleInput {
-            entity_names: &["JWT"], project_name: None,
-            first_user_message: None, privacy_level: PrivacyLevel::Structured,
+            entity_names: &["JWT"],
+            project_name: None,
+            first_user_message: None,
+            privacy_level: PrivacyLevel::Structured,
         });
         assert_eq!(title[0].role, "system");
 
         let narr = build_community_narrative(&CommunityNarrativeInput {
-            community_name: "Auth", members: &[], key_edges: &[],
+            community_name: "Auth",
+            members: &[],
+            key_edges: &[],
             privacy_level: PrivacyLevel::Structured,
         });
         assert_eq!(narr[0].role, "system");
 
         let conflict = build_conflict_resolution(&ConflictResolutionInput {
-            conflict_edge_ids: &[], edges: &[],
+            conflict_edge_ids: &[],
+            edges: &[],
             privacy_level: PrivacyLevel::Structured,
         });
         assert_eq!(conflict[0].role, "system");
 
         let synth = build_recall_synthesis(&RecallSynthesisInput {
-            session_id: "s", existing_summary: None, entity_names: &[],
-            turn_count: 0, turns: &[], privacy_level: PrivacyLevel::Structured,
+            session_id: "s",
+            existing_summary: None,
+            entity_names: &[],
+            turn_count: 0,
+            turns: &[],
+            privacy_level: PrivacyLevel::Structured,
         });
         assert_eq!(synth[0].role, "system");
 
         let code = build_code_analysis(&CodeAnalysisInput {
-            artifact_id: "a", language: "rust", line_count: None,
-            code_content: "", existing_tags: &[], privacy_level: PrivacyLevel::Structured,
+            artifact_id: "a",
+            language: "rust",
+            line_count: None,
+            code_content: "",
+            existing_tags: &[],
+            privacy_level: PrivacyLevel::Structured,
         });
         assert_eq!(code[0].role, "system");
 
         let entity = build_entity_description(&EntityDescriptionInput {
-            entity_name: "e", entity_type: "technology",
-            relations: &[], privacy_level: PrivacyLevel::Structured,
+            entity_name: "e",
+            entity_type: "technology",
+            relations: &[],
+            privacy_level: PrivacyLevel::Structured,
         });
         assert_eq!(entity[0].role, "system");
     }

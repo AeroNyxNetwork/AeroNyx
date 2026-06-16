@@ -57,27 +57,35 @@ pub struct NetworkConfig {
     pub public_endpoint: Option<String>,
 }
 
-fn default_listen_addr() -> SocketAddr { "0.0.0.0:51820".parse().unwrap() }
+fn default_listen_addr() -> SocketAddr {
+    "0.0.0.0:51820".parse().unwrap()
+}
 
 impl NetworkConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.listen_addr.port() == 0 {
-            return Err(ServerError::config_invalid("network.listen_addr", "port cannot be 0"));
+            return Err(ServerError::config_invalid(
+                "network.listen_addr",
+                "port cannot be 0",
+            ));
         }
         Ok(())
     }
 
     /// Parses the host portion of `public_endpoint` as an `Ipv4Addr`.
     pub fn public_ip(&self) -> Option<Ipv4Addr> {
-        self.public_endpoint.as_ref().and_then(|ep| {
-            ep.split(':').next().and_then(|ip| ip.parse().ok())
-        })
+        self.public_endpoint
+            .as_ref()
+            .and_then(|ep| ep.split(':').next().and_then(|ip| ip.parse().ok()))
     }
 }
 
 impl Default for NetworkConfig {
     fn default() -> Self {
-        Self { listen_addr: default_listen_addr(), public_endpoint: None }
+        Self {
+            listen_addr: default_listen_addr(),
+            public_endpoint: None,
+        }
     }
 }
 
@@ -93,13 +101,20 @@ pub struct VpnConfig {
     pub gateway_ip: Ipv4Addr,
 }
 
-fn default_ip_range() -> String { "100.64.0.0/22".into() }
-fn default_gateway_ip() -> Ipv4Addr { Ipv4Addr::new(100, 64, 0, 1) }
+fn default_ip_range() -> String {
+    "100.64.0.0/22".into()
+}
+fn default_gateway_ip() -> Ipv4Addr {
+    Ipv4Addr::new(100, 64, 0, 1)
+}
 
 impl VpnConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         if !self.virtual_ip_range.contains('/') {
-            return Err(ServerError::config_invalid("vpn.virtual_ip_range", "must be CIDR"));
+            return Err(ServerError::config_invalid(
+                "vpn.virtual_ip_range",
+                "must be CIDR",
+            ));
         }
         Ok(())
     }
@@ -108,14 +123,22 @@ impl VpnConfig {
     pub fn parse_ip_range(&self) -> Result<(Ipv4Addr, u8)> {
         let parts: Vec<&str> = self.virtual_ip_range.split('/').collect();
         if parts.len() != 2 {
-            return Err(ServerError::config_invalid("vpn.virtual_ip_range", "invalid CIDR"));
+            return Err(ServerError::config_invalid(
+                "vpn.virtual_ip_range",
+                "invalid CIDR",
+            ));
         }
-        let network: Ipv4Addr = parts[0].parse()
+        let network: Ipv4Addr = parts[0]
+            .parse()
             .map_err(|_| ServerError::config_invalid("vpn.virtual_ip_range", "invalid address"))?;
-        let prefix: u8 = parts[1].parse()
+        let prefix: u8 = parts[1]
+            .parse()
             .map_err(|_| ServerError::config_invalid("vpn.virtual_ip_range", "invalid prefix"))?;
         if prefix > 32 {
-            return Err(ServerError::config_invalid("vpn.virtual_ip_range", "prefix > 32"));
+            return Err(ServerError::config_invalid(
+                "vpn.virtual_ip_range",
+                "prefix > 32",
+            ));
         }
         Ok((network, prefix))
     }
@@ -123,7 +146,10 @@ impl VpnConfig {
 
 impl Default for VpnConfig {
     fn default() -> Self {
-        Self { virtual_ip_range: default_ip_range(), gateway_ip: default_gateway_ip() }
+        Self {
+            virtual_ip_range: default_ip_range(),
+            gateway_ip: default_gateway_ip(),
+        }
     }
 }
 
@@ -139,8 +165,12 @@ pub struct TunConfig {
     pub mtu: u16,
 }
 
-fn default_device_name() -> String { "aeronyx0".into() }
-fn default_mtu() -> u16 { 1420 }
+fn default_device_name() -> String {
+    "aeronyx0".into()
+}
+fn default_mtu() -> u16 {
+    1420
+}
 
 impl TunConfig {
     pub(crate) fn validate(&self) -> Result<()> {
@@ -162,7 +192,12 @@ impl TunConfig {
 }
 
 impl Default for TunConfig {
-    fn default() -> Self { Self { device_name: default_device_name(), mtu: default_mtu() } }
+    fn default() -> Self {
+        Self {
+            device_name: default_device_name(),
+            mtu: default_mtu(),
+        }
+    }
 }
 
 // ============================================
@@ -175,10 +210,16 @@ pub struct ServerKeyConfig {
     pub key_file: String,
 }
 
-fn default_key_file() -> String { "/etc/aeronyx/server_key.json".into() }
+fn default_key_file() -> String {
+    "/etc/aeronyx/server_key.json".into()
+}
 
 impl Default for ServerKeyConfig {
-    fn default() -> Self { Self { key_file: default_key_file() } }
+    fn default() -> Self {
+        Self {
+            key_file: default_key_file(),
+        }
+    }
 }
 
 // ============================================
@@ -193,8 +234,12 @@ pub struct LimitsConfig {
     pub session_timeout: u64,
 }
 
-fn default_max_connections() -> usize { 1000 }
-fn default_session_timeout() -> u64 { 86400 }
+fn default_max_connections() -> usize {
+    1000
+}
+fn default_session_timeout() -> u64 {
+    86400
+}
 
 impl LimitsConfig {
     pub(crate) fn validate(&self) -> Result<()> {
@@ -227,10 +272,16 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
-fn default_log_level() -> String { "info".into() }
+fn default_log_level() -> String {
+    "info".into()
+}
 
 impl Default for LoggingConfig {
-    fn default() -> Self { Self { level: default_log_level() } }
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+        }
+    }
 }
 
 // ============================================
@@ -280,7 +331,10 @@ mod tests {
 
     #[test]
     fn test_vpn_missing_cidr_rejected() {
-        let vc = VpnConfig { virtual_ip_range: "10.0.0.0".into(), ..Default::default() };
+        let vc = VpnConfig {
+            virtual_ip_range: "10.0.0.0".into(),
+            ..Default::default()
+        };
         assert!(vc.validate().is_err());
     }
 
@@ -294,7 +348,10 @@ mod tests {
 
     #[test]
     fn test_vpn_prefix_over_32_rejected() {
-        let vc = VpnConfig { virtual_ip_range: "10.0.0.0/33".into(), ..Default::default() };
+        let vc = VpnConfig {
+            virtual_ip_range: "10.0.0.0/33".into(),
+            ..Default::default()
+        };
         assert!(vc.parse_ip_range().is_err());
     }
 
@@ -307,25 +364,37 @@ mod tests {
 
     #[test]
     fn test_tun_empty_name_rejected() {
-        let tc = TunConfig { device_name: String::new(), ..Default::default() };
+        let tc = TunConfig {
+            device_name: String::new(),
+            ..Default::default()
+        };
         assert!(tc.validate().is_err());
     }
 
     #[test]
     fn test_tun_name_too_long_rejected() {
-        let tc = TunConfig { device_name: "a".repeat(16), ..Default::default() };
+        let tc = TunConfig {
+            device_name: "a".repeat(16),
+            ..Default::default()
+        };
         assert!(tc.validate().is_err());
     }
 
     #[test]
     fn test_tun_mtu_too_small_rejected() {
-        let tc = TunConfig { mtu: 575, ..Default::default() };
+        let tc = TunConfig {
+            mtu: 575,
+            ..Default::default()
+        };
         assert!(tc.validate().is_err());
     }
 
     #[test]
     fn test_tun_mtu_too_large_rejected() {
-        let tc = TunConfig { mtu: 9001, ..Default::default() };
+        let tc = TunConfig {
+            mtu: 9001,
+            ..Default::default()
+        };
         assert!(tc.validate().is_err());
     }
 
@@ -338,13 +407,19 @@ mod tests {
 
     #[test]
     fn test_limits_zero_connections_rejected() {
-        let lc = LimitsConfig { max_connections: 0, ..Default::default() };
+        let lc = LimitsConfig {
+            max_connections: 0,
+            ..Default::default()
+        };
         assert!(lc.validate().is_err());
     }
 
     #[test]
     fn test_limits_zero_timeout_rejected() {
-        let lc = LimitsConfig { session_timeout: 0, ..Default::default() };
+        let lc = LimitsConfig {
+            session_timeout: 0,
+            ..Default::default()
+        };
         assert!(lc.validate().is_err());
     }
 }

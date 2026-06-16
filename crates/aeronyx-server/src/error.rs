@@ -35,34 +35,22 @@ pub type Result<T> = std::result::Result<T, ServerError>;
 #[derive(Error, Debug)]
 pub enum ServerError {
     #[error("Failed to load configuration from '{path}': {reason}")]
-    ConfigLoad {
-        path: String,
-        reason: String,
-    },
+    ConfigLoad { path: String, reason: String },
 
     #[error("Invalid configuration: {field} - {reason}")]
-    ConfigInvalid {
-        field: String,
-        reason: String,
-    },
+    ConfigInvalid { field: String, reason: String },
 
     #[error("Missing required configuration: {field}")]
-    ConfigMissing {
-        field: String,
-    },
+    ConfigMissing { field: String },
 
     #[error("Session not found: {0}")]
     SessionNotFound(SessionId),
 
     #[error("Failed to create session: {reason}")]
-    SessionCreationFailed {
-        reason: String,
-    },
+    SessionCreationFailed { reason: String },
 
     #[error("Session limit reached: max {limit} sessions")]
-    SessionLimitReached {
-        limit: usize,
-    },
+    SessionLimitReached { limit: usize },
 
     #[error("Session already exists for client")]
     SessionExists,
@@ -74,33 +62,22 @@ pub enum ServerError {
     IpAlreadyAssigned(std::net::Ipv4Addr),
 
     #[error("No route found for {destination}")]
-    NoRoute {
-        destination: std::net::Ipv4Addr,
-    },
+    NoRoute { destination: std::net::Ipv4Addr },
 
     #[error("Invalid packet from {from_addr}: {reason}")]
-    InvalidPacket {
-        from_addr: String,
-        reason: String,
-    },
+    InvalidPacket { from_addr: String, reason: String },
 
     #[error("Server failed to start: {reason}")]
-    StartupFailed {
-        reason: String,
-    },
+    StartupFailed { reason: String },
 
     #[error("Server is shutting down")]
     ShuttingDown,
 
     #[error("Internal error: {message}")]
-    Internal {
-        message: String,
-    },
+    Internal { message: String },
 
     #[error("Node policy rejected request: {reason}")]
-    NodePolicyRejected {
-        reason: String,
-    },
+    NodePolicyRejected { reason: String },
 
     // ── v1.0.0-Membership ────────────────────────────────────────────────
     /// Wallet is on the deny list — handshake rejected immediately.
@@ -111,9 +88,7 @@ pub enum ServerError {
     ///
     /// Caller sends 0xFF RESET; client will back off and retry later.
     #[error("Wallet denied: {reason}")]
-    WalletDenied {
-        reason: String,
-    },
+    WalletDenied { reason: String },
 
     #[error(transparent)]
     Common(#[from] CommonError),
@@ -130,31 +105,48 @@ pub enum ServerError {
 
 impl ServerError {
     pub fn config_load(path: impl Into<String>, reason: impl Into<String>) -> Self {
-        Self::ConfigLoad { path: path.into(), reason: reason.into() }
+        Self::ConfigLoad {
+            path: path.into(),
+            reason: reason.into(),
+        }
     }
 
     pub fn config_invalid(field: impl Into<String>, reason: impl Into<String>) -> Self {
-        Self::ConfigInvalid { field: field.into(), reason: reason.into() }
+        Self::ConfigInvalid {
+            field: field.into(),
+            reason: reason.into(),
+        }
     }
 
     pub fn session_creation_failed(reason: impl Into<String>) -> Self {
-        Self::SessionCreationFailed { reason: reason.into() }
+        Self::SessionCreationFailed {
+            reason: reason.into(),
+        }
     }
 
     pub fn invalid_packet(source: SocketAddr, reason: impl Into<String>) -> Self {
-        Self::InvalidPacket { from_addr: source.to_string(), reason: reason.into() }
+        Self::InvalidPacket {
+            from_addr: source.to_string(),
+            reason: reason.into(),
+        }
     }
 
     pub fn startup_failed(reason: impl Into<String>) -> Self {
-        Self::StartupFailed { reason: reason.into() }
+        Self::StartupFailed {
+            reason: reason.into(),
+        }
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
-        Self::Internal { message: message.into() }
+        Self::Internal {
+            message: message.into(),
+        }
     }
 
     pub fn node_policy_rejected(reason: impl Into<String>) -> Self {
-        Self::NodePolicyRejected { reason: reason.into() }
+        Self::NodePolicyRejected {
+            reason: reason.into(),
+        }
     }
 
     /// Returns true if this error indicates the requested session does not
@@ -219,8 +211,8 @@ impl ServerError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Transport(e)              => e.is_retryable(),
-            Self::IpPoolExhausted           => true,
+            Self::Transport(e) => e.is_retryable(),
+            Self::IpPoolExhausted => true,
             Self::SessionLimitReached { .. } => true,
             _ => false,
         }
@@ -253,16 +245,15 @@ mod tests {
         let other = ServerError::startup_failed("test");
         assert!(!other.is_session_not_found());
 
-        let invalid_pkt = ServerError::invalid_packet(
-            "0.0.0.0:0".parse().unwrap(),
-            "test",
-        );
+        let invalid_pkt = ServerError::invalid_packet("0.0.0.0:0".parse().unwrap(), "test");
         assert!(!invalid_pkt.is_session_not_found());
     }
 
     #[test]
     fn test_is_wallet_denied() {
-        let err = ServerError::WalletDenied { reason: "quota_exceeded".to_string() };
+        let err = ServerError::WalletDenied {
+            reason: "quota_exceeded".to_string(),
+        };
         assert!(err.is_wallet_denied());
         assert!(!err.is_session_not_found());
 

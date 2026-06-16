@@ -43,42 +43,44 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use tracing::{debug, trace, warn};
 
 use aeronyx_common::types::SessionId;
-use aeronyx_core::crypto::transport::{DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD};
+use aeronyx_core::crypto::transport::{
+    DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD,
+};
 use aeronyx_core::protocol::codec::{decode_data_packet, encode_data_packet};
 use aeronyx_core::protocol::memchain::{decode_memchain, MEMCHAIN_MAGIC};
 use aeronyx_core::protocol::messages::DATA_PACKET_HEADER_SIZE;
 use aeronyx_core::protocol::{DataPacket, MemChainMessage};
 
 use crate::error::{Result, ServerError};
-use crate::services::{NodePolicyRuntime, RoutingService, Session, SessionManager};
 use crate::services::traffic_tracker::TrafficTracker;
+use crate::services::{NodePolicyRuntime, RoutingService, Session, SessionManager};
 
 // ============================================
 // Constants
 // ============================================
 
 const IPV4_HEADER_MIN_SIZE: usize = 20;
-const IPV4_DST_OFFSET:      usize = 16;
-const IPV4_SRC_OFFSET:      usize = 12;
+const IPV4_DST_OFFSET: usize = 16;
+const IPV4_SRC_OFFSET: usize = 12;
 const IPV4_PROTOCOL_OFFSET: usize = 9;
-const ICMP_PROTOCOL:        u8 = 1;
-const ICMP_ECHO_REPLY:      u8 = 0;
-const ICMP_ECHO_REQUEST:    u8 = 8;
-const ICMP_HEADER_SIZE:     usize = 8;
+const ICMP_PROTOCOL: u8 = 1;
+const ICMP_ECHO_REPLY: u8 = 0;
+const ICMP_ECHO_REQUEST: u8 = 8;
+const ICMP_HEADER_SIZE: usize = 8;
 
 /// Magic byte identifying a Voice audio frame packet (0xAF).
 pub const VOICE_MAGIC: u8 = 0xAF;
 
 const VOICE_PACKET_MIN_SIZE: usize = 5;
-const VOICE_DST_IP_OFFSET:   usize = 1;
+const VOICE_DST_IP_OFFSET: usize = 1;
 
-pub const DISC_VOICE_OFFER:  u32 = 31;
+pub const DISC_VOICE_OFFER: u32 = 31;
 pub const DISC_VOICE_ANSWER: u32 = 32;
-pub const DISC_VOICE_END:    u32 = 33;
+pub const DISC_VOICE_END: u32 = 33;
 
 // ============================================
 // DecryptedPayload
@@ -99,15 +101,17 @@ pub const DISC_VOICE_END:    u32 = 33;
 #[derive(Debug)]
 pub enum DecryptedPayload {
     Vpn(Vec<u8>),
-    KeepaliveAck { rtt_ms: f64 },
+    KeepaliveAck {
+        rtt_ms: f64,
+    },
     MemChain(MemChainMessage),
     VoiceSignal {
-        discriminant:  u32,
+        discriminant: u32,
         target_wallet: Option<String>,
-        payload:       Vec<u8>,
+        payload: Vec<u8>,
     },
     Voice {
-        dst_ip:  Ipv4Addr,
+        dst_ip: Ipv4Addr,
         payload: Vec<u8>,
     },
 }
@@ -118,25 +122,25 @@ pub enum DecryptedPayload {
 
 pub struct PacketHandler {
     sessions: Arc<SessionManager>,
-    routing:  Arc<RoutingService>,
-    crypto:   DefaultTransportCrypto,
+    routing: Arc<RoutingService>,
+    crypto: DefaultTransportCrypto,
     /// Per-wallet traffic delta tracker for membership quota enforcement.
     /// Drained by HeartbeatReporter every ~30s and sent to CMS.
-    traffic:  Arc<TrafficTracker>,
+    traffic: Arc<TrafficTracker>,
     /// Aggregate encrypted VPN message counter for public network stats.
     /// Counts successful VPN data packets only; excludes control/voice/memory.
     encrypted_message_counter: Arc<AtomicU64>,
     /// Operator policy from nodeboard Settings.
-    policy:   Arc<NodePolicyRuntime>,
+    policy: Arc<NodePolicyRuntime>,
 }
 
 impl PacketHandler {
     pub fn new(
         sessions: Arc<SessionManager>,
-        routing:  Arc<RoutingService>,
-        traffic:  Arc<TrafficTracker>,
+        routing: Arc<RoutingService>,
+        traffic: Arc<TrafficTracker>,
         encrypted_message_counter: Arc<AtomicU64>,
-        policy:   Arc<NodePolicyRuntime>,
+        policy: Arc<NodePolicyRuntime>,
     ) -> Self {
         Self {
             sessions,
@@ -178,20 +182,19 @@ impl PacketHandler {
             BASE64.encode(&packet.session_id)
         );
 
-        let session_id = SessionId::from_bytes(&packet.session_id)
-            .ok_or_else(|| {
-                warn!(
-                    "[PACKET_HANDLER] Invalid session ID format: {:02X?}",
-                    &packet.session_id
-                );
-                ServerError::invalid_packet(
-                    "0.0.0.0:0".parse().unwrap(),
-                    "Invalid session ID",
-                )
-            })?;
+        let session_id = SessionId::from_bytes(&packet.session_id).ok_or_else(|| {
+            warn!(
+                "[PACKET_HANDLER] Invalid session ID format: {:02X?}",
+                &packet.session_id
+            );
+            ServerError::invalid_packet("0.0.0.0:0".parse().unwrap(), "Invalid session ID")
+        })?;
 
         debug!("[PACKET_HANDLER] Looking up SessionID: {}", session_id);
-        debug!("[PACKET_HANDLER] Active sessions count: {}", self.sessions.count());
+        debug!(
+            "[PACKET_HANDLER] Active sessions count: {}",
+            self.sessions.count()
+        );
 
         let session = match self.sessions.get(&session_id) {
             Some(s) => {
@@ -250,7 +253,6 @@ impl PacketHandler {
         session.mark_client_activity();
 
         let payload = match plaintext.first().copied() {
-
             // ── IPv4 VPN ──────────────────────────────────────────────
             Some(b) if b >> 4 == 4 => {
                 if plaintext_len < IPV4_HEADER_MIN_SIZE {
@@ -286,7 +288,8 @@ impl PacketHandler {
                 session.stats.record_rx(plaintext_len as u64);
                 // Wallet-level delta counter (heartbeat quota enforcement).
                 // Uses cached wallet_hex — no allocation on hot path.
-                self.traffic.record_rx(&session.wallet_hex, plaintext_len as u64);
+                self.traffic
+                    .record_rx(&session.wallet_hex, plaintext_len as u64);
                 self.record_encrypted_vpn_message();
 
                 trace!(session_id = %session_id, len = plaintext_len, "VPN IPv4 decrypted");
@@ -301,7 +304,8 @@ impl PacketHandler {
                 }
                 session.stats.record_rx(plaintext_len as u64);
                 // Wallet-level delta counter.
-                self.traffic.record_rx(&session.wallet_hex, plaintext_len as u64);
+                self.traffic
+                    .record_rx(&session.wallet_hex, plaintext_len as u64);
                 self.record_encrypted_vpn_message();
 
                 trace!(session_id = %session_id, len = plaintext_len, "VPN IPv6 decrypted");
@@ -317,9 +321,8 @@ impl PacketHandler {
                     ));
                 }
 
-                let disc = u32::from_le_bytes([
-                    plaintext[1], plaintext[2], plaintext[3], plaintext[4],
-                ]);
+                let disc =
+                    u32::from_le_bytes([plaintext[1], plaintext[2], plaintext[3], plaintext[4]]);
 
                 if matches!(disc, DISC_VOICE_OFFER | DISC_VOICE_ANSWER | DISC_VOICE_END) {
                     let target_wallet = extract_pubkey_from_json(&plaintext[5..]);
@@ -329,11 +332,14 @@ impl PacketHandler {
                         target = %target_wallet.as_deref().unwrap_or("unknown"),
                         "[VOICE_SIGNAL] Signal received"
                     );
-                    return Ok((session, DecryptedPayload::VoiceSignal {
-                        discriminant:  disc,
-                        target_wallet,
-                        payload:       plaintext,
-                    }));
+                    return Ok((
+                        session,
+                        DecryptedPayload::VoiceSignal {
+                            discriminant: disc,
+                            target_wallet,
+                            payload: plaintext,
+                        },
+                    ));
                 }
 
                 let memchain_payload = &plaintext[1..];
@@ -380,9 +386,8 @@ impl PacketHandler {
                 }
 
                 let mut dst_octets = [0u8; 4];
-                dst_octets.copy_from_slice(
-                    &plaintext[VOICE_DST_IP_OFFSET..VOICE_DST_IP_OFFSET + 4]
-                );
+                dst_octets
+                    .copy_from_slice(&plaintext[VOICE_DST_IP_OFFSET..VOICE_DST_IP_OFFSET + 4]);
                 let dst_ip = Ipv4Addr::from(dst_octets);
 
                 trace!(
@@ -392,7 +397,10 @@ impl PacketHandler {
                     "[VOICE] Audio frame decoded"
                 );
 
-                DecryptedPayload::Voice { dst_ip, payload: plaintext }
+                DecryptedPayload::Voice {
+                    dst_ip,
+                    payload: plaintext,
+                }
             }
 
             // ── Unknown ───────────────────────────────────────────────
@@ -420,10 +428,7 @@ impl PacketHandler {
     }
 
     /// Processes an IP packet from the TUN device (outbound: server → client).
-    pub fn handle_tun_packet(
-        &self,
-        ip_packet: &[u8],
-    ) -> Result<(Vec<u8>, std::net::SocketAddr)> {
+    pub fn handle_tun_packet(&self, ip_packet: &[u8]) -> Result<(Vec<u8>, std::net::SocketAddr)> {
         if ip_packet.len() < IPV4_HEADER_MIN_SIZE {
             return Err(ServerError::invalid_packet(
                 "0.0.0.0:0".parse().unwrap(),
@@ -431,13 +436,13 @@ impl PacketHandler {
             ));
         }
 
-        let dst_ip     = extract_ipv4_dst(ip_packet)?;
+        let dst_ip = extract_ipv4_dst(ip_packet)?;
         let session_id = self.routing.lookup_or_error(dst_ip)?;
-        let session    = self.sessions.get_or_error(&session_id)?;
+        let session = self.sessions.get_or_error(&session_id)?;
         if !self.policy.allow_traffic_bytes(ip_packet.len()) {
             return Err(ServerError::node_policy_rejected("bandwidth_limit_mbps"));
         }
-        let counter    = session.next_tx_counter();
+        let counter = session.next_tx_counter();
 
         let mut encrypted = vec![0u8; ip_packet.len() + ENCRYPTION_OVERHEAD];
         let actual_len = self.crypto.encrypt(
@@ -450,14 +455,15 @@ impl PacketHandler {
         encrypted.truncate(actual_len);
 
         let data_packet = DataPacket::new(*session.id.as_bytes(), counter, encrypted);
-        let output      = encode_data_packet(&data_packet).to_vec();
+        let output = encode_data_packet(&data_packet).to_vec();
 
         session.touch();
 
         // Session-level cumulative counter (billing audit).
         session.stats.record_tx(ip_packet.len() as u64);
         // Wallet-level delta counter (heartbeat quota enforcement).
-        self.traffic.record_tx(&session.wallet_hex, ip_packet.len() as u64);
+        self.traffic
+            .record_tx(&session.wallet_hex, ip_packet.len() as u64);
         self.record_encrypted_vpn_message();
 
         trace!(
@@ -473,7 +479,8 @@ impl PacketHandler {
 
     #[inline]
     fn record_encrypted_vpn_message(&self) {
-        self.encrypted_message_counter.fetch_add(1, Ordering::Relaxed);
+        self.encrypted_message_counter
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Builds an encrypted in-tunnel ICMP Echo Request for RTT measurement.
@@ -491,12 +498,8 @@ impl PacketHandler {
         ack_timeout: Duration,
     ) -> Result<(Vec<u8>, std::net::SocketAddr)> {
         let (identifier, sequence) = session.begin_keepalive_probe(ack_timeout);
-        let ip_packet = build_icmp_echo_request(
-            gateway_ip,
-            session.virtual_ip,
-            identifier,
-            sequence,
-        );
+        let ip_packet =
+            build_icmp_echo_request(gateway_ip, session.virtual_ip, identifier, sequence);
         let counter = session.next_tx_counter();
 
         let mut encrypted = vec![0u8; ip_packet.len() + ENCRYPTION_OVERHEAD];
@@ -639,19 +642,20 @@ fn extract_ipv4_dst(packet: &[u8]) -> Result<Ipv4Addr> {
 /// Reads "to" field first; falls back to "pubkey" for backward compatibility.
 fn extract_pubkey_from_json(json_bytes: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(json_bytes).ok()?;
-    extract_json_hex_field(s, "\"to\"")
-        .or_else(|| extract_json_hex_field(s, "\"pubkey\""))
+    extract_json_hex_field(s, "\"to\"").or_else(|| extract_json_hex_field(s, "\"pubkey\""))
 }
 
 fn extract_json_hex_field<'a>(s: &'a str, key: &str) -> Option<String> {
-    let key_pos     = s.find(key)?;
-    let after_key   = &s[key_pos + key.len()..];
-    let colon_pos   = after_key.find(':')?;
+    let key_pos = s.find(key)?;
+    let after_key = &s[key_pos + key.len()..];
+    let colon_pos = after_key.find(':')?;
     let after_colon = after_key[colon_pos + 1..].trim_start();
-    if !after_colon.starts_with('"') { return None; }
+    if !after_colon.starts_with('"') {
+        return None;
+    }
     let value_start = &after_colon[1..];
-    let end         = value_start.find('"')?;
-    let hex         = &value_start[..end];
+    let end = value_start.find('"')?;
+    let hex = &value_start[..end];
     if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
         Some(hex.to_string())
     } else {
@@ -670,7 +674,8 @@ mod tests {
     fn make_ipv4(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
         let mut p = vec![0u8; 20];
         p[0] = 0x45;
-        p[2] = 0x00; p[3] = 0x14;
+        p[2] = 0x00;
+        p[3] = 0x14;
         p[IPV4_SRC_OFFSET..IPV4_SRC_OFFSET + 4].copy_from_slice(&src.octets());
         p[IPV4_DST_OFFSET..IPV4_DST_OFFSET + 4].copy_from_slice(&dst.octets());
         p
@@ -708,8 +713,8 @@ mod tests {
     fn test_magic_bytes_no_collision() {
         assert_ne!(MEMCHAIN_MAGIC >> 4, 4u8);
         assert_ne!(MEMCHAIN_MAGIC >> 4, 6u8);
-        assert_ne!(VOICE_MAGIC >> 4,    4u8);
-        assert_ne!(VOICE_MAGIC >> 4,    6u8);
+        assert_ne!(VOICE_MAGIC >> 4, 4u8);
+        assert_ne!(VOICE_MAGIC >> 4, 6u8);
         assert_ne!(VOICE_MAGIC, MEMCHAIN_MAGIC);
     }
 
@@ -735,12 +740,12 @@ mod tests {
 
     #[test]
     fn test_voice_signal_discriminants() {
-        assert_eq!(DISC_VOICE_OFFER,  31u32);
+        assert_eq!(DISC_VOICE_OFFER, 31u32);
         assert_eq!(DISC_VOICE_ANSWER, 32u32);
-        assert_eq!(DISC_VOICE_END,    33u32);
-        assert!(DISC_VOICE_OFFER  >= 18);
+        assert_eq!(DISC_VOICE_END, 33u32);
+        assert!(DISC_VOICE_OFFER >= 18);
         assert!(DISC_VOICE_ANSWER >= 18);
-        assert!(DISC_VOICE_END    >= 18);
+        assert!(DISC_VOICE_END >= 18);
     }
 
     #[test]

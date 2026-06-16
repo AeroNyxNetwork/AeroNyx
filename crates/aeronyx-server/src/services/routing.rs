@@ -74,7 +74,7 @@ impl RoutingService {
     /// Adds a route mapping.
     pub fn add_route(&self, virtual_ip: Ipv4Addr, session_id: SessionId) -> Option<SessionId> {
         let previous = self.routes.insert(virtual_ip, session_id.clone());
-        
+
         if previous.is_some() {
             debug!(
                 virtual_ip = %virtual_ip,
@@ -95,7 +95,7 @@ impl RoutingService {
     /// Removes a route mapping.
     pub fn remove_route(&self, virtual_ip: Ipv4Addr) -> Option<SessionId> {
         let removed = self.routes.remove(&virtual_ip).map(|(_, id)| id);
-        
+
         if let Some(ref id) = removed {
             debug!(virtual_ip = %virtual_ip, session_id = %id, "Route removed");
         }
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn test_multiple_routes() {
         let routing = RoutingService::new();
-        
+
         let s1 = SessionId::generate();
         let s2 = SessionId::generate();
         let s3 = SessionId::generate();
@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn test_clear() {
         let routing = RoutingService::new();
-        
+
         routing.add_route(Ipv4Addr::new(100, 64, 0, 2), SessionId::generate());
         routing.add_route(Ipv4Addr::new(100, 64, 0, 3), SessionId::generate());
 

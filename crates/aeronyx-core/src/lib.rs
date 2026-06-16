@@ -87,9 +87,7 @@ pub mod ledger;
 pub mod protocol;
 
 // Re-export commonly used items — crypto & protocol
-pub use crypto::{
-    EphemeralKeyPair, HandshakeCrypto, IdentityKeyPair, SessionKey, TransportCrypto,
-};
+pub use crypto::{EphemeralKeyPair, HandshakeCrypto, IdentityKeyPair, SessionKey, TransportCrypto};
 pub use error::{CoreError, Result};
 pub use protocol::{
     ClientHello, MessageType, ProtocolVersion, ServerHello, CURRENT_PROTOCOL_VERSION,

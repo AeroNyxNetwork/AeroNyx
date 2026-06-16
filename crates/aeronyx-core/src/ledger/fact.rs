@@ -68,9 +68,9 @@ mod serde_bytes_64 {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
         let slice: Vec<u8> = serde_bytes::deserialize(d)?;
-        slice.try_into().map_err(|v: Vec<u8>| {
-            serde::de::Error::invalid_length(v.len(), &"64 bytes")
-        })
+        slice
+            .try_into()
+            .map_err(|v: Vec<u8>| serde::de::Error::invalid_length(v.len(), &"64 bytes"))
     }
 }
 
@@ -127,12 +127,7 @@ impl Fact {
     /// * `predicate` - Predicate string
     /// * `object`    - Object string
     #[must_use]
-    pub fn compute_hash(
-        timestamp: u64,
-        subject: &str,
-        predicate: &str,
-        object: &str,
-    ) -> [u8; 32] {
+    pub fn compute_hash(timestamp: u64, subject: &str, predicate: &str, object: &str) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(timestamp.to_le_bytes());
         hasher.update(subject.as_bytes());
@@ -154,12 +149,8 @@ impl Fact {
     /// `true` if the stored `fact_id` is consistent with the content.
     #[must_use]
     pub fn verify_id(&self) -> bool {
-        let expected = Self::compute_hash(
-            self.timestamp,
-            &self.subject,
-            &self.predicate,
-            &self.object,
-        );
+        let expected =
+            Self::compute_hash(self.timestamp, &self.subject, &self.predicate, &self.object);
         self.fact_id == expected
     }
 
@@ -168,12 +159,7 @@ impl Fact {
     /// `origin` and `signature` are left zeroed — the caller is
     /// responsible for signing after construction (see `MemPool::sign_and_add`).
     #[must_use]
-    pub fn new(
-        timestamp: u64,
-        subject: String,
-        predicate: String,
-        object: String,
-    ) -> Self {
+    pub fn new(timestamp: u64, subject: String, predicate: String, object: String) -> Self {
         let fact_id = Self::compute_hash(timestamp, &subject, &predicate, &object);
         Self {
             fact_id,
@@ -235,7 +221,10 @@ mod tests {
     #[test]
     fn test_new_sets_fact_id() {
         let fact = Fact::new(1_700_000_000, "a".into(), "b".into(), "c".into());
-        assert!(fact.verify_id(), "fact_id must match content hash after new()");
+        assert!(
+            fact.verify_id(),
+            "fact_id must match content hash after new()"
+        );
     }
 
     #[test]

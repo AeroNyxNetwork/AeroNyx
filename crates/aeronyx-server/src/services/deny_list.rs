@@ -59,8 +59,8 @@
 // Last Modified: v1.0.0-Membership — initial implementation
 // ============================================
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
 // ============================================
@@ -85,8 +85,8 @@ impl std::fmt::Display for DenyReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoPremiumAccess => write!(f, "no_premium_access"),
-            Self::QuotaExceeded  => write!(f, "quota_exceeded"),
-            Self::OperatorBan    => write!(f, "operator_ban"),
+            Self::QuotaExceeded => write!(f, "quota_exceeded"),
+            Self::OperatorBan => write!(f, "operator_ban"),
         }
     }
 }
@@ -97,7 +97,7 @@ impl std::fmt::Display for DenyReason {
 
 #[derive(Debug, Clone)]
 struct DenyEntry {
-    reason:    DenyReason,
+    reason: DenyReason,
     denied_at: Instant,
     /// Unix timestamp (seconds) after which this entry expires.
     /// u64::MAX = permanent.
@@ -132,7 +132,9 @@ pub struct DenyList {
 
 impl DenyList {
     pub fn new() -> Self {
-        Self { entries: DashMap::new() }
+        Self {
+            entries: DashMap::new(),
+        }
     }
 
     /// Adds a wallet to the deny list.
@@ -143,8 +145,8 @@ impl DenyList {
     pub fn add(&self, wallet_hex: &str, reason: DenyReason) {
         let expires_at_unix = match reason {
             DenyReason::NoPremiumAccess => u64::MAX,
-            DenyReason::QuotaExceeded   => next_month_unix(),
-            DenyReason::OperatorBan     => u64::MAX,
+            DenyReason::QuotaExceeded => next_month_unix(),
+            DenyReason::OperatorBan => u64::MAX,
         };
 
         info!(
@@ -155,11 +157,14 @@ impl DenyList {
             "[DENY_LIST] Wallet added"
         );
 
-        self.entries.insert(wallet_hex.to_string(), DenyEntry {
-            reason,
-            denied_at: Instant::now(),
-            expires_at_unix,
-        });
+        self.entries.insert(
+            wallet_hex.to_string(),
+            DenyEntry {
+                reason,
+                denied_at: Instant::now(),
+                expires_at_unix,
+            },
+        );
     }
 
     /// Returns true if the wallet is currently on the deny list and
@@ -229,7 +234,10 @@ impl DenyList {
             }
         });
         if evicted > 0 {
-            info!(evicted, "[DENY_LIST] Cleanup removed {} expired entries", evicted);
+            info!(
+                evicted,
+                "[DENY_LIST] Cleanup removed {} expired entries", evicted
+            );
         }
         evicted
     }
@@ -247,7 +255,9 @@ impl DenyList {
 }
 
 impl Default for DenyList {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl std::fmt::Debug for DenyList {
@@ -279,22 +289,22 @@ fn next_month_unix() -> u64 {
     // next month. Worst case off by one day (DST-free UTC, so exact).
     let days_since_epoch = now_secs / 86400;
     // Rata Die to Gregorian (algorithm by Howard Hinnant, public domain)
-    let z  = days_since_epoch as i64 + 719468;
+    let z = days_since_epoch as i64 + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y   = yoe + era * 400;
+    let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp  = (5 * doy + 2) / 153;
-    let m   = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y   = if m <= 2 { y + 1 } else { y };
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
 
     // Next month
     let (next_y, next_m) = if m == 12 { (y + 1, 1i64) } else { (y, m + 1) };
 
     // Convert next_y/next_m/1 back to Unix timestamp
     // Days from epoch to year (Gregorian proleptic)
-    let y0  = if next_m <= 2 { next_y - 1 } else { next_y };
+    let y0 = if next_m <= 2 { next_y - 1 } else { next_y };
     let era = if y0 >= 0 { y0 } else { y0 - 399 } / 400;
     let yoe = y0 - era * 400;
     let doy = (153 * (if next_m > 2 { next_m - 3 } else { next_m + 9 }) + 2) / 5;
@@ -369,11 +379,14 @@ mod tests {
         let dl = DenyList::new();
 
         // Insert an already-expired entry by manipulating expires_at_unix.
-        dl.entries.insert("expired_wallet".to_string(), DenyEntry {
-            reason:          DenyReason::QuotaExceeded,
-            denied_at:       Instant::now(),
-            expires_at_unix: 1, // Unix timestamp 1 = long expired
-        });
+        dl.entries.insert(
+            "expired_wallet".to_string(),
+            DenyEntry {
+                reason: DenyReason::QuotaExceeded,
+                denied_at: Instant::now(),
+                expires_at_unix: 1, // Unix timestamp 1 = long expired
+            },
+        );
 
         dl.add("active_wallet", DenyReason::NoPremiumAccess);
 
@@ -405,6 +418,9 @@ mod tests {
         let next = next_month_unix();
         assert!(next > now, "next_month_unix must be in the future");
         // Must be within ~32 days
-        assert!(next - now <= 32 * 86400, "next_month_unix must be within 32 days");
+        assert!(
+            next - now <= 32 * 86400,
+            "next_month_unix must be within 32 days"
+        );
     }
 }

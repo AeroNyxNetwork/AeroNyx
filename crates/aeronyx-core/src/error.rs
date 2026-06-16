@@ -50,7 +50,6 @@ pub enum CoreError {
     // ========================================
     // Cryptographic Errors
     // ========================================
-
     /// Failed to generate cryptographic key.
     #[error("Key generation failed: {context}")]
     KeyGeneration {
@@ -97,7 +96,6 @@ pub enum CoreError {
     // ========================================
     // Protocol Errors
     // ========================================
-
     /// Unknown or unsupported message type.
     #[error("Unknown message type: 0x{0:02x}")]
     UnknownMessageType(u8),
@@ -155,7 +153,6 @@ pub enum CoreError {
     // ========================================
     // State Errors
     // ========================================
-
     /// Operation not valid in current state.
     #[error("Invalid state for operation: {operation} requires {required_state}")]
     InvalidState {
@@ -175,7 +172,6 @@ pub enum CoreError {
     // ========================================
     // Wrapped Errors
     // ========================================
-
     /// Error from common crate.
     #[error(transparent)]
     Common(#[from] CommonError),
@@ -218,10 +214,7 @@ impl CoreError {
     }
 
     /// Creates an `InvalidState` error.
-    pub fn invalid_state(
-        operation: impl Into<String>,
-        required_state: impl Into<String>,
-    ) -> Self {
+    pub fn invalid_state(operation: impl Into<String>, required_state: impl Into<String>) -> Self {
         Self::InvalidState {
             operation: operation.into(),
             required_state: required_state.into(),
@@ -303,9 +296,9 @@ mod tests {
     fn test_error_classification() {
         assert!(CoreError::SignatureVerification.is_crypto_error());
         assert!(CoreError::SignatureVerification.is_suspicious());
-        
+
         assert!(CoreError::UnknownMessageType(0xFF).is_protocol_error());
-        
+
         let replay = CoreError::replay(5, 10);
         assert!(replay.is_protocol_error());
         assert!(replay.is_suspicious());

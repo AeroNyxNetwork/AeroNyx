@@ -37,15 +37,13 @@ use super::llm_provider::{ChatMessage, ChatRequest, CognitiveTaskType};
 use super::llm_router::LlmRouter;
 use super::storage_supernode::CognitiveTaskRow;
 // PrivacyLevel is re-exported from config_supernode via prompts
-use crate::config_supernode::{PrivacyLevel, WorkerConfig};
 use super::prompts::{
-    SessionTitleInput, build_session_title,
-    CommunityNarrativeInput, build_community_narrative,
-    ConflictResolutionInput, ConflictingEdge, build_conflict_resolution,
-    RecallSynthesisInput, build_recall_synthesis,
-    CodeAnalysisInput, build_code_analysis,
-    EntityDescriptionInput, build_entity_description,
+    build_code_analysis, build_community_narrative, build_conflict_resolution,
+    build_entity_description, build_recall_synthesis, build_session_title, CodeAnalysisInput,
+    CommunityNarrativeInput, ConflictResolutionInput, ConflictingEdge, EntityDescriptionInput,
+    RecallSynthesisInput, SessionTitleInput,
 };
+use crate::config_supernode::{PrivacyLevel, WorkerConfig};
 
 // ============================================
 // Constants
@@ -137,14 +135,24 @@ impl TaskWorker {
         let task_id = task.id;
         let task_type_str = task.task_type.as_str();
 
-        debug!(id = task_id, task_type = task_type_str, "[TASK_WORKER] Processing");
+        debug!(
+            id = task_id,
+            task_type = task_type_str,
+            "[TASK_WORKER] Processing"
+        );
 
         // v2.5.0+Unify: Use CognitiveTaskType::parse() (defined in config_supernode.rs)
         let task_type = match CognitiveTaskType::parse(task_type_str) {
             Some(t) => t,
             None => {
-                warn!(id = task_id, task_type = task_type_str, "[TASK_WORKER] Unknown task type");
-                let _ = storage.fail_task(task_id, &format!("unknown task_type: {}", task_type_str)).await;
+                warn!(
+                    id = task_id,
+                    task_type = task_type_str,
+                    "[TASK_WORKER] Unknown task type"
+                );
+                let _ = storage
+                    .fail_task(task_id, &format!("unknown task_type: {}", task_type_str))
+                    .await;
                 return;
             }
         };
@@ -153,7 +161,9 @@ impl TaskWorker {
             Ok(v) => v,
             Err(e) => {
                 warn!(id = task_id, "[TASK_WORKER] Invalid payload: {}", e);
-                let _ = storage.fail_task(task_id, &format!("invalid payload: {}", e)).await;
+                let _ = storage
+                    .fail_task(task_id, &format!("invalid payload: {}", e))
+                    .await;
                 return;
             }
         };
@@ -165,7 +175,9 @@ impl TaskWorker {
             Ok(req) => req,
             Err(e) => {
                 warn!(id = task_id, "[TASK_WORKER] Prompt build failed: {}", e);
-                let _ = storage.fail_task(task_id, &format!("prompt build: {}", e)).await;
+                let _ = storage
+                    .fail_task(task_id, &format!("prompt build: {}", e))
+                    .await;
                 return;
             }
         };
@@ -188,13 +200,15 @@ impl TaskWorker {
             "input": resp.usage.input_tokens,
             "output": resp.usage.output_tokens,
             "cached": resp.usage.cached_tokens,
-        }).to_string();
+        })
+        .to_string();
 
         // target_table and target_id are Option<String> — use as_deref()
-        if let (Some(table), Some(tid)) = (task.target_table.as_deref(), task.target_id.as_deref()) {
-            if let Err(e) = Self::write_back(
-                &storage, &task_type, table, tid, result_stored, &payload,
-            ).await {
+        if let (Some(table), Some(tid)) = (task.target_table.as_deref(), task.target_id.as_deref())
+        {
+            if let Err(e) =
+                Self::write_back(&storage, &task_type, table, tid, result_stored, &payload).await
+            {
                 warn!(
                     id = task_id, table = table, target_id = tid,
                     error = %e, "[TASK_WORKER] Writeback failed (result preserved in DB)"
@@ -202,21 +216,31 @@ impl TaskWorker {
             }
         }
 
-        if let Err(e) = storage.complete_task(
-            task_id, result_stored,
-            &resp.provider_name, &resp.model_used, &token_usage_json,
-        ).await {
+        if let Err(e) = storage
+            .complete_task(
+                task_id,
+                result_stored,
+                &resp.provider_name,
+                &resp.model_used,
+                &token_usage_json,
+            )
+            .await
+        {
             warn!(id = task_id, error = %e, "[TASK_WORKER] complete_task failed");
         }
 
-        if let Err(e) = storage.insert_usage_log(
-            Some(task_id),
-            &resp.provider_name, &resp.model_used,
-            resp.usage.input_tokens as i64,
-            resp.usage.output_tokens as i64,
-            resp.usage.cached_tokens as i64,
-            elapsed_ms as i64,
-        ).await {
+        if let Err(e) = storage
+            .insert_usage_log(
+                Some(task_id),
+                &resp.provider_name,
+                &resp.model_used,
+                resp.usage.input_tokens as i64,
+                resp.usage.output_tokens as i64,
+                resp.usage.cached_tokens as i64,
+                elapsed_ms as i64,
+            )
+            .await
+        {
             warn!(id = task_id, error = %e, "[TASK_WORKER] insert_usage_log failed");
         }
 
@@ -242,8 +266,11 @@ impl TaskWorker {
         let messages = match task_type {
             CognitiveTaskType::SessionTitle => {
                 let entity_names_raw: Vec<String> = payload["entity_names"]
-                    .as_array().unwrap_or(&vec![])
-                    .iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
                 let entity_refs: Vec<&str> = entity_names_raw.iter().map(|s| s.as_str()).collect();
 
                 build_session_title(&SessionTitleInput {
@@ -255,26 +282,41 @@ impl TaskWorker {
             }
 
             CognitiveTaskType::CommunityNarrative => {
-                let community_name = payload["community_name"].as_str()
+                let community_name = payload["community_name"]
+                    .as_str()
                     .unwrap_or("unknown community");
                 let members_raw: Vec<(String, String, i64)> = payload["members"]
-                    .as_array().unwrap_or(&vec![])
-                    .iter().filter_map(|v| Some((
-                        v["name"].as_str()?.to_string(),
-                        v["type"].as_str().unwrap_or("entity").to_string(),
-                        v["mention_count"].as_i64().unwrap_or(1),
-                    ))).collect();
-                let member_refs: Vec<(&str, &str, i64)> = members_raw.iter()
-                    .map(|(n, t, c)| (n.as_str(), t.as_str(), *c)).collect();
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|v| {
+                        Some((
+                            v["name"].as_str()?.to_string(),
+                            v["type"].as_str().unwrap_or("entity").to_string(),
+                            v["mention_count"].as_i64().unwrap_or(1),
+                        ))
+                    })
+                    .collect();
+                let member_refs: Vec<(&str, &str, i64)> = members_raw
+                    .iter()
+                    .map(|(n, t, c)| (n.as_str(), t.as_str(), *c))
+                    .collect();
                 let edges_raw: Vec<(String, String, String)> = payload["key_edges"]
-                    .as_array().unwrap_or(&vec![])
-                    .iter().filter_map(|v| Some((
-                        v["source"].as_str()?.to_string(),
-                        v["relation"].as_str()?.to_string(),
-                        v["target"].as_str()?.to_string(),
-                    ))).collect();
-                let edge_refs: Vec<(&str, &str, &str)> = edges_raw.iter()
-                    .map(|(s, r, t)| (s.as_str(), r.as_str(), t.as_str())).collect();
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|v| {
+                        Some((
+                            v["source"].as_str()?.to_string(),
+                            v["relation"].as_str()?.to_string(),
+                            v["target"].as_str()?.to_string(),
+                        ))
+                    })
+                    .collect();
+                let edge_refs: Vec<(&str, &str, &str)> = edges_raw
+                    .iter()
+                    .map(|(s, r, t)| (s.as_str(), r.as_str(), t.as_str()))
+                    .collect();
 
                 build_community_narrative(&CommunityNarrativeInput {
                     community_name,
@@ -286,8 +328,11 @@ impl TaskWorker {
 
             CognitiveTaskType::RecallSynthesis => {
                 let entity_names_raw: Vec<String> = payload["entity_names"]
-                    .as_array().unwrap_or(&vec![])
-                    .iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
                 let entity_refs: Vec<&str> = entity_names_raw.iter().map(|s| s.as_str()).collect();
 
                 build_recall_synthesis(&RecallSynthesisInput {
@@ -302,19 +347,27 @@ impl TaskWorker {
 
             CognitiveTaskType::ConflictResolution => {
                 let edge_ids: Vec<i64> = payload["conflict_edge_ids"]
-                    .as_array().unwrap_or(&vec![])
-                    .iter().filter_map(|v| v.as_i64()).collect();
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|v| v.as_i64())
+                    .collect();
                 let edges_raw: Vec<ConflictingEdge> = payload["edges"]
-                    .as_array().unwrap_or(&vec![])
-                    .iter().filter_map(|v| Some(ConflictingEdge {
-                        edge_id: v["edge_id"].as_i64()?,
-                        source: v["source"].as_str().unwrap_or("").to_string(),
-                        relation: v["relation"].as_str().unwrap_or("").to_string(),
-                        target: v["target"].as_str().unwrap_or("").to_string(),
-                        valid_from: v["valid_from"].as_i64().unwrap_or(0),
-                        fact_text: v["fact_text"].as_str().map(String::from),
-                        confidence: v["confidence"].as_f64(),
-                    })).collect();
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|v| {
+                        Some(ConflictingEdge {
+                            edge_id: v["edge_id"].as_i64()?,
+                            source: v["source"].as_str().unwrap_or("").to_string(),
+                            relation: v["relation"].as_str().unwrap_or("").to_string(),
+                            target: v["target"].as_str().unwrap_or("").to_string(),
+                            valid_from: v["valid_from"].as_i64().unwrap_or(0),
+                            fact_text: v["fact_text"].as_str().map(String::from),
+                            confidence: v["confidence"].as_f64(),
+                        })
+                    })
+                    .collect();
 
                 build_conflict_resolution(&ConflictResolutionInput {
                     conflict_edge_ids: &edge_ids,
@@ -325,8 +378,11 @@ impl TaskWorker {
 
             CognitiveTaskType::CodeAnalysis => {
                 let tags_raw: Vec<String> = payload["existing_tags"]
-                    .as_array().unwrap_or(&vec![])
-                    .iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
                 let tag_refs: Vec<&str> = tags_raw.iter().map(|s| s.as_str()).collect();
 
                 build_code_analysis(&CodeAnalysisInput {
@@ -341,16 +397,24 @@ impl TaskWorker {
 
             CognitiveTaskType::EntityDescription => {
                 let relations_raw: Vec<(String, String)> = payload["relations"]
-                    .as_array().unwrap_or(&vec![])
-                    .iter().filter_map(|v| Some((
-                        v["relation_type"].as_str()?.to_string(),
-                        v["other_name"].as_str().unwrap_or("").to_string(),
-                    ))).collect();
-                let rel_refs: Vec<(&str, &str)> = relations_raw.iter()
-                    .map(|(r, n)| (r.as_str(), n.as_str())).collect();
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|v| {
+                        Some((
+                            v["relation_type"].as_str()?.to_string(),
+                            v["other_name"].as_str().unwrap_or("").to_string(),
+                        ))
+                    })
+                    .collect();
+                let rel_refs: Vec<(&str, &str)> = relations_raw
+                    .iter()
+                    .map(|(r, n)| (r.as_str(), n.as_str()))
+                    .collect();
 
                 build_entity_description(&EntityDescriptionInput {
-                    entity_name: payload["entity_name"].as_str()
+                    entity_name: payload["entity_name"]
+                        .as_str()
                         .ok_or("missing entity_name")?,
                     entity_type: payload["entity_type"].as_str().unwrap_or("entity"),
                     relations: &rel_refs,
@@ -382,47 +446,71 @@ impl TaskWorker {
     ) -> Result<(), String> {
         match task_type {
             CognitiveTaskType::SessionTitle => {
-                let title = result.trim_matches(|c| c == '"' || c == '\'' || c == '`').trim();
-                if title.is_empty() { return Err("LLM returned empty title".to_string()); }
+                let title = result
+                    .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+                    .trim();
+                if title.is_empty() {
+                    return Err("LLM returned empty title".to_string());
+                }
                 let conn = storage.conn_lock().await;
                 conn.execute(
                     "UPDATE sessions SET title = ?1 WHERE session_id = ?2",
                     rusqlite::params![title, target_id],
-                ).map_err(|e| format!("sessions.title writeback: {}", e))?;
-                debug!(session = target_id, title = title, "[TASK_WORKER] session_title written");
+                )
+                .map_err(|e| format!("sessions.title writeback: {}", e))?;
+                debug!(
+                    session = target_id,
+                    title = title,
+                    "[TASK_WORKER] session_title written"
+                );
             }
 
             CognitiveTaskType::CommunityNarrative => {
                 let summary = result.trim();
-                if summary.is_empty() { return Err("LLM returned empty community summary".to_string()); }
+                if summary.is_empty() {
+                    return Err("LLM returned empty community summary".to_string());
+                }
                 // Write summary directly via SQL — avoids needing get_community()
                 // which doesn't exist on MemoryStorage. upsert_community requires
                 // owner + name which we don't have in the task context, so direct
                 // UPDATE is the correct approach for writeback.
                 let conn = storage.conn_lock().await;
-                let affected = conn.execute(
-                    "UPDATE communities SET summary = ?1 WHERE community_id = ?2",
-                    rusqlite::params![summary, target_id],
-                ).map_err(|e| format!("communities.summary writeback: {}", e))?;
+                let affected = conn
+                    .execute(
+                        "UPDATE communities SET summary = ?1 WHERE community_id = ?2",
+                        rusqlite::params![summary, target_id],
+                    )
+                    .map_err(|e| format!("communities.summary writeback: {}", e))?;
                 if affected == 0 {
                     return Err(format!("Community {} not found for writeback", target_id));
                 }
-                debug!(community = target_id, "[TASK_WORKER] community_narrative written");
+                debug!(
+                    community = target_id,
+                    "[TASK_WORKER] community_narrative written"
+                );
             }
 
             CognitiveTaskType::RecallSynthesis => {
                 let parsed = parse_json_result(result);
                 let summary = parsed["summary"].as_str().unwrap_or(result).trim();
                 let key_decisions = parsed["key_decisions"].as_str();
-                if summary.is_empty() { return Err("LLM returned empty summary".to_string()); }
-                storage.update_session_summary(target_id, summary, key_decisions, None).await;
-                debug!(session = target_id, "[TASK_WORKER] recall_synthesis written");
+                if summary.is_empty() {
+                    return Err("LLM returned empty summary".to_string());
+                }
+                storage
+                    .update_session_summary(target_id, summary, key_decisions, None)
+                    .await;
+                debug!(
+                    session = target_id,
+                    "[TASK_WORKER] recall_synthesis written"
+                );
             }
 
             CognitiveTaskType::ConflictResolution => {
                 let parsed = parse_json_result(result);
-                let keep_id = parsed["keep_edge_id"].as_i64()
-                    .ok_or_else(|| format!("conflict_resolution missing keep_edge_id: {}", result))?;
+                let keep_id = parsed["keep_edge_id"].as_i64().ok_or_else(|| {
+                    format!("conflict_resolution missing keep_edge_id: {}", result)
+                })?;
                 if let Some(edge_ids) = payload["conflict_edge_ids"].as_array() {
                     for val in edge_ids {
                         if let Some(eid) = val.as_i64() {
@@ -432,30 +520,42 @@ impl TaskWorker {
                         }
                     }
                 }
-                debug!(target_id = target_id, keep_id = keep_id, "[TASK_WORKER] conflict_resolution written");
+                debug!(
+                    target_id = target_id,
+                    keep_id = keep_id,
+                    "[TASK_WORKER] conflict_resolution written"
+                );
             }
 
             CognitiveTaskType::CodeAnalysis => {
                 let parsed = parse_json_result(result);
                 let description = parsed["description"].as_str().unwrap_or(result).trim();
-                if description.is_empty() { return Err("LLM returned empty code description".to_string()); }
+                if description.is_empty() {
+                    return Err("LLM returned empty code description".to_string());
+                }
                 let conn = storage.conn_lock().await;
                 conn.execute(
                     "UPDATE artifacts SET description = ?1 WHERE artifact_id = ?2",
                     rusqlite::params![description, target_id],
-                ).map_err(|e| format!("artifacts.description writeback: {}", e))?;
+                )
+                .map_err(|e| format!("artifacts.description writeback: {}", e))?;
                 debug!(artifact = target_id, "[TASK_WORKER] code_analysis written");
             }
 
             CognitiveTaskType::EntityDescription => {
                 let desc = result.trim_matches(|c| c == '"' || c == '\'').trim();
-                if desc.is_empty() { return Err("LLM returned empty entity description".to_string()); }
+                if desc.is_empty() {
+                    return Err("LLM returned empty entity description".to_string());
+                }
                 let conn = storage.conn_lock().await;
                 conn.execute(
                     "UPDATE entities SET description = ?1, updated_at = strftime('%s', 'now') WHERE entity_id = ?2",
                     rusqlite::params![desc, target_id],
                 ).map_err(|e| format!("entities.description writeback: {}", e))?;
-                debug!(entity = target_id, "[TASK_WORKER] entity_description written");
+                debug!(
+                    entity = target_id,
+                    "[TASK_WORKER] entity_description written"
+                );
             }
         }
 
@@ -477,8 +577,8 @@ fn clean_llm_response(raw: &str, task_type: &CognitiveTaskType) -> String {
     if matches!(
         task_type,
         CognitiveTaskType::RecallSynthesis
-        | CognitiveTaskType::ConflictResolution
-        | CognitiveTaskType::CodeAnalysis
+            | CognitiveTaskType::ConflictResolution
+            | CognitiveTaskType::CodeAnalysis
     ) {
         return trimmed.to_string();
     }
@@ -487,12 +587,16 @@ fn clean_llm_response(raw: &str, task_type: &CognitiveTaskType) -> String {
 
     match task_type {
         CognitiveTaskType::SessionTitle => {
-            let last_line = after_preamble.lines()
+            let last_line = after_preamble
+                .lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty())
                 .last()
                 .unwrap_or(after_preamble.trim());
-            last_line.trim_matches(|c| c == '"' || c == '\'' || c == '`').trim().to_string()
+            last_line
+                .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+                .trim()
+                .to_string()
         }
         _ => after_preamble.trim().to_string(),
     }
@@ -504,7 +608,9 @@ fn strip_think_tags(text: &str) -> String {
     }
     if let Some(end_pos) = text.rfind("</think>") {
         let after = &text[end_pos + "</think>".len()..];
-        if after.contains("<think>") { return strip_think_tags(after); }
+        if after.contains("<think>") {
+            return strip_think_tags(after);
+        }
         return after.trim_start().to_string();
     }
     if let Some(start_pos) = text.find("<think>") {
@@ -515,15 +621,29 @@ fn strip_think_tags(text: &str) -> String {
 
 fn strip_preamble(text: &str) -> &str {
     const PREAMBLES: &[&str] = &[
-        "Here is the title: ", "Here is the title:", "Here's the title: ",
-        "Here's the title:", "The title is: ", "The title is:", "Title: ",
-        "Sure, here's a summary: ", "Sure, here's a summary:", "Here is a summary: ",
-        "Here is a summary:", "Based on the conversation: ", "Based on the conversation,",
-        "Certainly! Here's", "Certainly, here's", "Of course! Here's", "Sure! Here's",
+        "Here is the title: ",
+        "Here is the title:",
+        "Here's the title: ",
+        "Here's the title:",
+        "The title is: ",
+        "The title is:",
+        "Title: ",
+        "Sure, here's a summary: ",
+        "Sure, here's a summary:",
+        "Here is a summary: ",
+        "Here is a summary:",
+        "Based on the conversation: ",
+        "Based on the conversation,",
+        "Certainly! Here's",
+        "Certainly, here's",
+        "Of course! Here's",
+        "Sure! Here's",
     ];
     let trimmed = text.trim();
     for p in PREAMBLES {
-        if let Some(s) = trimmed.strip_prefix(p) { return s.trim(); }
+        if let Some(s) = trimmed.strip_prefix(p) {
+            return s.trim();
+        }
     }
     trimmed
 }
@@ -537,17 +657,27 @@ fn parse_json_result(result: &str) -> serde_json::Value {
     if let Some(start) = trimmed.find("<r>") {
         if let Some(end) = trimmed.find("</r>") {
             let inner = trimmed[start + "<r>".len()..end].trim();
-            if let Ok(v) = serde_json::from_str(inner) { return v; }
+            if let Ok(v) = serde_json::from_str(inner) {
+                return v;
+            }
         }
     }
     let json_str = if trimmed.starts_with("```") {
-        trimmed.trim_start_matches("```json").trim_start_matches("```").trim()
-            .trim_end_matches("```").trim()
+        trimmed
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim()
+            .trim_end_matches("```")
+            .trim()
     } else {
         trimmed
     };
     serde_json::from_str(json_str).unwrap_or_else(|e| {
-        warn!("[TASK_WORKER] JSON parse failed: {} | preview: {}", e, &json_str[..json_str.len().min(200)]);
+        warn!(
+            "[TASK_WORKER] JSON parse failed: {} | preview: {}",
+            e,
+            &json_str[..json_str.len().min(200)]
+        );
         serde_json::Value::Null
     })
 }

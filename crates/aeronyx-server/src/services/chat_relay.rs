@@ -54,8 +54,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
-use sha2::Sha256;
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::Sha256;
 
 use tracing::{debug, info, warn};
 
@@ -162,10 +162,7 @@ impl MessageDedup {
         self.map.insert(*message_id, seq);
 
         if self.map.len() > self.capacity {
-            let oldest_key = self.map
-                .iter()
-                .min_by_key(|e| *e.value())
-                .map(|e| *e.key());
+            let oldest_key = self.map.iter().min_by_key(|e| *e.value()).map(|e| *e.key());
             if let Some(k) = oldest_key {
                 self.map.remove(&k);
             }
@@ -224,7 +221,10 @@ impl ChatRelayService {
         };
 
         svc.init_schema()?;
-        info!("[CHAT_RELAY] Service initialised (db: {})", svc.config.db_path);
+        info!(
+            "[CHAT_RELAY] Service initialised (db: {})",
+            svc.config.db_path
+        );
         Ok(svc)
     }
 
@@ -234,7 +234,8 @@ impl ChatRelayService {
 
     fn init_schema(&self) -> ChatRelayResult<()> {
         let conn = self.conn.lock();
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             CREATE TABLE IF NOT EXISTS pending_messages (
                 message_id   BLOB(16) PRIMARY KEY,
                 sender       BLOB(32) NOT NULL,
@@ -273,7 +274,8 @@ impl ChatRelayService {
             );
             CREATE INDEX IF NOT EXISTS idx_en_sender_pushed
                 ON expired_notifications(sender, pushed);
-        ")?;
+        ",
+        )?;
         Ok(())
     }
 
@@ -287,8 +289,8 @@ impl ChatRelayService {
         receiver: &[u8; 32],
         file_hash: &[u8; 32],
     ) -> String {
-        let mut mac = HmacSha256::new_from_slice(&self.node_secret)
-            .expect("HMAC accepts any key length");
+        let mut mac =
+            HmacSha256::new_from_slice(&self.node_secret).expect("HMAC accepts any key length");
         mac.update(sender);
         mac.update(receiver);
         mac.update(file_hash);
@@ -398,7 +400,10 @@ impl ChatRelayService {
                 message_id.copy_from_slice(id_bytes);
             }
             let envelope = decode_envelope(env_bytes)?;
-            messages.push(PendingMessage { message_id, envelope });
+            messages.push(PendingMessage {
+                message_id,
+                envelope,
+            });
         }
 
         Ok((messages, has_more))
@@ -498,14 +503,18 @@ impl ChatRelayService {
     pub fn get_blob(&self, blob_id: &str) -> ChatRelayResult<Vec<u8>> {
         let conn = self.conn.lock();
 
-        let data: Option<Vec<u8>> = conn.query_row(
-            "SELECT data FROM pending_blobs WHERE blob_id = ?",
-            params![blob_id],
-            |row| row.get::<_, Vec<u8>>(0),
-        ).optional()?;
+        let data: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT data FROM pending_blobs WHERE blob_id = ?",
+                params![blob_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
 
         match data {
-            None => Err(ChatRelayError::BlobNotFound { blob_id: blob_id.to_string() }),
+            None => Err(ChatRelayError::BlobNotFound {
+                blob_id: blob_id.to_string(),
+            }),
             Some(bytes) => {
                 let _ = conn.execute(
                     "UPDATE pending_blobs SET downloaded = 1 WHERE blob_id = ?",
@@ -530,16 +539,21 @@ impl ChatRelayService {
             return Ok(());
         }
 
-        let exists: bool = conn.query_row(
-            "SELECT 1 FROM pending_blobs WHERE blob_id = ?",
-            params![blob_id],
-            |_| Ok(true),
-        ).optional()?.unwrap_or(false);
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM pending_blobs WHERE blob_id = ?",
+                params![blob_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
 
         if exists {
             Err(ChatRelayError::Unauthorized)
         } else {
-            Err(ChatRelayError::BlobNotFound { blob_id: blob_id.to_string() })
+            Err(ChatRelayError::BlobNotFound {
+                blob_id: blob_id.to_string(),
+            })
         }
     }
 
@@ -559,32 +573,35 @@ impl ChatRelayService {
              ORDER BY created_at ASC",
         )?;
 
-        let rows = stmt.query_map(params![sender.as_slice()], |row| {
-            Ok(ExpiredNotification {
-                id: row.get::<_, i64>(0)?,
-                sender: {
-                    let b: Vec<u8> = row.get(1)?;
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&b);
-                    arr
-                },
-                receiver: {
-                    let b: Vec<u8> = row.get(2)?;
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&b);
-                    arr
-                },
-                message_ids_raw: row.get(3)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+        let rows = stmt
+            .query_map(params![sender.as_slice()], |row| {
+                Ok(ExpiredNotification {
+                    id: row.get::<_, i64>(0)?,
+                    sender: {
+                        let b: Vec<u8> = row.get(1)?;
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&b);
+                        arr
+                    },
+                    receiver: {
+                        let b: Vec<u8> = row.get(2)?;
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&b);
+                        arr
+                    },
+                    message_ids_raw: row.get(3)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(rows)
     }
 
     pub fn mark_notifications_pushed(&self, ids: &[i64]) -> ChatRelayResult<()> {
-        if ids.is_empty() { return Ok(()); }
+        if ids.is_empty() {
+            return Ok(());
+        }
         let conn = self.conn.lock();
         for id in ids {
             conn.execute(
@@ -644,15 +661,18 @@ impl ChatRelayService {
                     mid.copy_from_slice(&mid_b);
                     sender.copy_from_slice(&sender_b);
                     receiver.copy_from_slice(&receiver_b);
-                    Some(ExpiredRow { message_id: mid, sender, receiver })
+                    Some(ExpiredRow {
+                        message_id: mid,
+                        sender,
+                        receiver,
+                    })
                 })
                 .collect();
 
             let expired_message_count = expired_rows.len();
 
             use std::collections::HashMap;
-            let mut by_sender: HashMap<[u8; 32], HashMap<[u8; 32], Vec<[u8; 16]>>> =
-                HashMap::new();
+            let mut by_sender: HashMap<[u8; 32], HashMap<[u8; 32], Vec<[u8; 16]>>> = HashMap::new();
             for row in &expired_rows {
                 by_sender
                     .entry(row.sender)
@@ -683,8 +703,10 @@ impl ChatRelayService {
 
             conn.execute("DELETE FROM pending_messages WHERE status IN (1, 2)", [])?;
 
-            let expired_blobs =
-                conn.execute("DELETE FROM pending_blobs WHERE received_at < ?", params![cutoff])?;
+            let expired_blobs = conn.execute(
+                "DELETE FROM pending_blobs WHERE received_at < ?",
+                params![cutoff],
+            )?;
 
             conn.execute(
                 "DELETE FROM expired_notifications WHERE pushed = 1 OR created_at < ?",
@@ -695,8 +717,12 @@ impl ChatRelayService {
         })();
 
         match &result {
-            Ok(_) => { conn.execute_batch("COMMIT")?; }
-            Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
+            Ok(_) => {
+                conn.execute_batch("COMMIT")?;
+            }
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
         }
 
         if let Ok((expired_message_count, expired_blobs)) = &result {
@@ -752,11 +778,11 @@ pub fn derive_node_secret(ed25519_sk_bytes: &[u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
+    use aeronyx_common::types::SessionId;
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::protocol::chat::ChatContentType;
+    use sha2::{Digest, Sha256};
     use std::net::SocketAddr;
-    use aeronyx_common::types::SessionId;
 
     fn test_config() -> ChatRelayConfig {
         ChatRelayConfig {
@@ -839,11 +865,16 @@ mod tests {
         let sid = make_session();
 
         // announce via original
-        svc.wallet_routes.announce(&wallet, sid.clone(), make_addr(9001));
+        svc.wallet_routes
+            .announce(&wallet, sid.clone(), make_addr(9001));
 
         // lookup via clone — must see the same entry
         let results = routes_clone.lookup(&wallet);
-        assert_eq!(results.len(), 1, "Arc clone must share the same underlying cache");
+        assert_eq!(
+            results.len(),
+            1,
+            "Arc clone must share the same underlying cache"
+        );
     }
 
     // ── store → pull → ack (preserved) ───────────────────────────────────
@@ -858,7 +889,9 @@ mod tests {
 
         svc.store_pending(&env).expect("store");
 
-        let (msgs, has_more) = svc.pull_pending(&receiver, 0, &[0u8; 16], 50).expect("pull");
+        let (msgs, has_more) = svc
+            .pull_pending(&receiver, 0, &[0u8; 16], 50)
+            .expect("pull");
         assert_eq!(msgs.len(), 1);
         assert!(!has_more);
         assert_eq!(msgs[0].message_id, mid);
@@ -866,7 +899,9 @@ mod tests {
         let deleted = svc.ack_messages(&[mid], &receiver).expect("ack");
         assert_eq!(deleted, 1);
 
-        let (msgs2, _) = svc.pull_pending(&receiver, 0, &[0u8; 16], 50).expect("pull2");
+        let (msgs2, _) = svc
+            .pull_pending(&receiver, 0, &[0u8; 16], 50)
+            .expect("pull2");
         assert!(msgs2.is_empty());
     }
 
@@ -878,9 +913,12 @@ mod tests {
         let env = make_envelope(&kp, receiver);
 
         svc.store_pending(&env).expect("first store");
-        svc.store_pending(&env).expect("duplicate store — should not error");
+        svc.store_pending(&env)
+            .expect("duplicate store — should not error");
 
-        let (msgs, _) = svc.pull_pending(&receiver, 0, &[0u8; 16], 50).expect("pull");
+        let (msgs, _) = svc
+            .pull_pending(&receiver, 0, &[0u8; 16], 50)
+            .expect("pull");
         assert_eq!(msgs.len(), 1);
     }
 
@@ -914,7 +952,9 @@ mod tests {
         let deleted = svc.ack_messages(&[mid], &wrong_receiver).expect("ack");
         assert_eq!(deleted, 0, "Wrong receiver must not delete messages");
 
-        let (msgs, _) = svc.pull_pending(&receiver, 0, &[0u8; 16], 50).expect("pull");
+        let (msgs, _) = svc
+            .pull_pending(&receiver, 0, &[0u8; 16], 50)
+            .expect("pull");
         assert_eq!(msgs.len(), 1);
     }
 
@@ -951,7 +991,9 @@ mod tests {
         let data = b"encrypted_image_bytes";
         let file_hash: [u8; 32] = Sha256::digest(data).into();
 
-        let blob_id = svc.put_blob(&sender, &receiver, data, &file_hash).expect("put");
+        let blob_id = svc
+            .put_blob(&sender, &receiver, data, &file_hash)
+            .expect("put");
         assert_eq!(blob_id.len(), 32);
 
         let fetched = svc.get_blob(&blob_id).expect("get");
@@ -984,7 +1026,9 @@ mod tests {
         let data = b"file";
         let file_hash: [u8; 32] = Sha256::digest(data).into();
 
-        let blob_id = svc.put_blob(&sender, &receiver, data, &file_hash).expect("put");
+        let blob_id = svc
+            .put_blob(&sender, &receiver, data, &file_hash)
+            .expect("put");
         let wrong = [0xCCu8; 32];
         assert!(matches!(
             svc.delete_blob(&blob_id, &wrong),
@@ -1016,7 +1060,9 @@ mod tests {
         assert_eq!(expired, 0);
         assert_eq!(blobs, 0);
 
-        let (msgs, _) = svc.pull_pending(&receiver, 0, &[0u8; 16], 50).expect("pull");
+        let (msgs, _) = svc
+            .pull_pending(&receiver, 0, &[0u8; 16], 50)
+            .expect("pull");
         assert_eq!(msgs.len(), 1);
     }
 

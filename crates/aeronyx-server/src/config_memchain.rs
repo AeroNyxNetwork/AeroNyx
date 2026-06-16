@@ -103,7 +103,9 @@ pub enum MemChainMode {
 }
 
 impl Default for MemChainMode {
-    fn default() -> Self { Self::Local }
+    fn default() -> Self {
+        Self::Local
+    }
 }
 
 // ============================================
@@ -126,7 +128,9 @@ pub enum VectorQuantizationMode {
 }
 
 impl Default for VectorQuantizationMode {
-    fn default() -> Self { Self::None }
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 // ============================================
@@ -161,7 +165,6 @@ pub struct MemChainConfig {
     pub rawlog_batch_threshold: usize,
 
     // ── Embedding Engine (v2.1.0) ──────────────────────────────────────
-
     /// Path to the local embedding model directory.
     /// Must contain `model.onnx` and `tokenizer.json` for MiniLM-L6-v2.
     #[serde(default = "default_embed_model_path")]
@@ -190,14 +193,12 @@ pub struct MemChainConfig {
     pub embed_output_dim: usize,
 
     // ── MPI Auth (v2.1.0+MVF+Auth) ────────────────────────────────────
-
     /// MPI Bearer token secret for API authentication.
     /// When set (non-empty, >= 16 chars), all MPI endpoints require Bearer auth.
     #[serde(default)]
     pub api_secret: Option<String>,
 
     // ── Remote Storage (v2.3.0) ───────────────────────────────────────
-
     /// When true, accepts MPI requests from remote users via Ed25519 signature auth.
     #[serde(default)]
     pub allow_remote_storage: bool,
@@ -207,7 +208,6 @@ pub struct MemChainConfig {
     pub max_remote_owners: usize,
 
     // ── NER Engine (v2.4.0-GraphCognition) ───────────────────────────
-
     /// Enable the local GLiNER NER engine for entity extraction.
     ///
     /// When false (default), the entire cognitive graph pipeline is disabled.
@@ -229,7 +229,6 @@ pub struct MemChainConfig {
     pub ner_confidence_threshold: f32,
 
     // ── Knowledge Graph (v2.4.0-GraphCognition) ───────────────────────
-
     /// Enable knowledge graph traversal in recall queries.
     /// Requires ner_enabled = true to populate the graph.
     #[serde(default)]
@@ -248,7 +247,6 @@ pub struct MemChainConfig {
     pub graph_min_edge_weight: f32,
 
     // ── Entropy Filter (v2.4.0-GraphCognition) ────────────────────────
-
     /// Enable entropy-aware filtering on /log ingestion (Stage 1).
     #[serde(default)]
     pub entropy_filter_enabled: bool,
@@ -266,7 +264,6 @@ pub struct MemChainConfig {
     pub entropy_window_overlap: usize,
 
     // ── Miner Cognitive Steps (v2.4.0-GraphCognition) ─────────────────
-
     /// Enable Miner Step 7: Entity/relation extraction. Requires ner_enabled.
     #[serde(default)]
     pub miner_entity_extraction: bool,
@@ -291,7 +288,6 @@ pub struct MemChainConfig {
     pub miner_llm_endpoint: String,
 
     // ── Vector Optimization (v2.4.0-GraphCognition) ───────────────────
-
     /// Vector quantization strategy ("none" | "scalar_uint8").
     #[serde(default)]
     pub vector_quantization: VectorQuantizationMode,
@@ -305,7 +301,6 @@ pub struct MemChainConfig {
     pub vector_saturation_threshold: usize,
 
     // ── Reranker (v2.4.0+Reranker) ────────────────────────────────────
-
     /// Enable cross-encoder reranking for recall Step 3.5.
     #[serde(default)]
     pub reranker_enabled: bool,
@@ -319,7 +314,6 @@ pub struct MemChainConfig {
     pub reranker_max_seq_length: usize,
 
     // ── SuperNode (v2.5.0) ────────────────────────────────────────────
-
     /// LLM cognitive enhancement layer configuration.
     ///
     /// When supernode.enabled = false (default), system behaves identically
@@ -341,7 +335,6 @@ pub struct MemChainConfig {
     pub supernode: SuperNodeConfig,
 
     // ── Multi-Tenant SaaS (v1.0.0-MultiTenant) ───────────────────────
-
     /// SaaS mode infrastructure configuration.
     /// Only used when `mode = "saas"`. See config_saas.rs.
     ///
@@ -364,7 +357,6 @@ pub struct MemChainConfig {
     pub token_ttl_secs: u64,
 
     // ── Chat Relay (v1.1.0-ChatRelay) ────────────────────────────────
-
     /// Zero-knowledge P2P chat relay configuration.
     ///
     /// When `chat_relay.enabled = false` (default), all ChatRelay/ChatPull/
@@ -385,32 +377,84 @@ pub struct MemChainConfig {
 
 // ── Default functions ──────────────────────────────────────────────────────
 
-fn default_memchain_api_addr() -> SocketAddr { "127.0.0.1:8421".parse().unwrap() }
-fn default_memchain_db_path() -> String { "memchain.db".into() }
-fn default_memchain_aof_path() -> String { ".memchain".into() }
-fn default_miner_interval() -> u64 { 3600 }
-fn default_compaction_threshold() -> u64 { 500 }
-fn default_mvf_alpha() -> f32 { 0.5 }
-fn default_cold_start_threshold() -> usize { 10 }
-fn default_cold_start_until() -> usize { 200 }
-fn default_rawlog_batch_threshold() -> usize { 100 }
-fn default_embed_model_path() -> String { "models/minilm-l6-v2".into() }
-fn default_embed_dim() -> usize { 384 }
-fn default_embed_max_tokens() -> usize { 128 }
-fn default_embed_output_dim() -> usize { 384 }
-fn default_max_remote_owners() -> usize { 100 }
-fn default_ner_model_path() -> String { "models/gliner".into() }
-fn default_ner_confidence_threshold() -> f32 { 0.5 }
-fn default_graph_max_depth() -> usize { 2 }
-fn default_graph_max_nodes_per_hop() -> usize { 20 }
-fn default_graph_min_edge_weight() -> f32 { 0.3 }
-fn default_entropy_filter_threshold() -> f32 { 0.35 }
-fn default_entropy_window_size() -> usize { 10 }
-fn default_entropy_window_overlap() -> usize { 2 }
-fn default_vector_saturation_threshold() -> usize { 5 }
-fn default_reranker_model_path() -> String { "models/reranker".into() }
-fn default_reranker_max_seq_length() -> usize { 512 }
-fn default_jwt_ttl() -> u64 { 86400 }
+fn default_memchain_api_addr() -> SocketAddr {
+    "127.0.0.1:8421".parse().unwrap()
+}
+fn default_memchain_db_path() -> String {
+    "memchain.db".into()
+}
+fn default_memchain_aof_path() -> String {
+    ".memchain".into()
+}
+fn default_miner_interval() -> u64 {
+    3600
+}
+fn default_compaction_threshold() -> u64 {
+    500
+}
+fn default_mvf_alpha() -> f32 {
+    0.5
+}
+fn default_cold_start_threshold() -> usize {
+    10
+}
+fn default_cold_start_until() -> usize {
+    200
+}
+fn default_rawlog_batch_threshold() -> usize {
+    100
+}
+fn default_embed_model_path() -> String {
+    "models/minilm-l6-v2".into()
+}
+fn default_embed_dim() -> usize {
+    384
+}
+fn default_embed_max_tokens() -> usize {
+    128
+}
+fn default_embed_output_dim() -> usize {
+    384
+}
+fn default_max_remote_owners() -> usize {
+    100
+}
+fn default_ner_model_path() -> String {
+    "models/gliner".into()
+}
+fn default_ner_confidence_threshold() -> f32 {
+    0.5
+}
+fn default_graph_max_depth() -> usize {
+    2
+}
+fn default_graph_max_nodes_per_hop() -> usize {
+    20
+}
+fn default_graph_min_edge_weight() -> f32 {
+    0.3
+}
+fn default_entropy_filter_threshold() -> f32 {
+    0.35
+}
+fn default_entropy_window_size() -> usize {
+    10
+}
+fn default_entropy_window_overlap() -> usize {
+    2
+}
+fn default_vector_saturation_threshold() -> usize {
+    5
+}
+fn default_reranker_model_path() -> String {
+    "models/reranker".into()
+}
+fn default_reranker_max_seq_length() -> usize {
+    512
+}
+fn default_jwt_ttl() -> u64 {
+    86400
+}
 
 // ── validate() ────────────────────────────────────────────────────────────
 
@@ -422,16 +466,28 @@ impl MemChainConfig {
 
         // ── Basic address / path checks ──────────────────────────────────
         if self.api_listen_addr.port() == 0 {
-            return Err(ServerError::config_invalid("memchain.api_listen_addr", "port cannot be 0"));
+            return Err(ServerError::config_invalid(
+                "memchain.api_listen_addr",
+                "port cannot be 0",
+            ));
         }
         if self.db_path.is_empty() {
-            return Err(ServerError::config_invalid("memchain.db_path", "cannot be empty"));
+            return Err(ServerError::config_invalid(
+                "memchain.db_path",
+                "cannot be empty",
+            ));
         }
         if self.aof_path.is_empty() {
-            return Err(ServerError::config_invalid("memchain.aof_path", "cannot be empty"));
+            return Err(ServerError::config_invalid(
+                "memchain.aof_path",
+                "cannot be empty",
+            ));
         }
         if !self.api_listen_addr.ip().is_loopback() {
-            tracing::warn!("[MEMCHAIN] API binding to non-loopback {}", self.api_listen_addr);
+            tracing::warn!(
+                "[MEMCHAIN] API binding to non-loopback {}",
+                self.api_listen_addr
+            );
         }
         for (i, hex_key) in self.trusted_agents.iter().enumerate() {
             if hex_key.len() != 64 {
@@ -476,23 +532,35 @@ impl MemChainConfig {
 
         // ── 🐛 v2.3.0: embed dims > 0 ────────────────────────────────
         if self.embed_dim == 0 {
-            return Err(ServerError::config_invalid("memchain.embed_dim", "must be > 0"));
+            return Err(ServerError::config_invalid(
+                "memchain.embed_dim",
+                "must be > 0",
+            ));
         }
         if self.embed_max_tokens == 0 {
-            return Err(ServerError::config_invalid("memchain.embed_max_tokens", "must be > 0"));
+            return Err(ServerError::config_invalid(
+                "memchain.embed_max_tokens",
+                "must be > 0",
+            ));
         }
 
         // ── v2.5.0: embed_output_dim > 0 ─────────────────────────────
         if self.embed_output_dim == 0 {
-            return Err(ServerError::config_invalid("memchain.embed_output_dim", "must be > 0"));
+            return Err(ServerError::config_invalid(
+                "memchain.embed_output_dim",
+                "must be > 0",
+            ));
         }
 
         // ── v2.3.0: Remote storage ────────────────────────────────────
         if self.allow_remote_storage {
             info!(
                 "[MEMCHAIN] Remote storage enabled (max_remote_owners: {})",
-                if self.max_remote_owners == 0 { "unlimited".to_string() }
-                else { self.max_remote_owners.to_string() }
+                if self.max_remote_owners == 0 {
+                    "unlimited".to_string()
+                } else {
+                    self.max_remote_owners.to_string()
+                }
             );
             if self.effective_api_secret().is_none() {
                 tracing::warn!(
@@ -508,7 +576,10 @@ impl MemChainConfig {
             if self.ner_confidence_threshold <= 0.0 || self.ner_confidence_threshold >= 1.0 {
                 return Err(ServerError::config_invalid(
                     "memchain.ner_confidence_threshold",
-                    format!("must be in (0.0, 1.0), got {}", self.ner_confidence_threshold),
+                    format!(
+                        "must be in (0.0, 1.0), got {}",
+                        self.ner_confidence_threshold
+                    ),
                 ));
             }
             if self.ner_model_path.is_empty() {
@@ -556,7 +627,10 @@ impl MemChainConfig {
             if self.entropy_filter_threshold < 0.0 || self.entropy_filter_threshold > 1.0 {
                 return Err(ServerError::config_invalid(
                     "memchain.entropy_filter_threshold",
-                    format!("must be in [0.0, 1.0], got {}", self.entropy_filter_threshold),
+                    format!(
+                        "must be in [0.0, 1.0], got {}",
+                        self.entropy_filter_threshold
+                    ),
                 ));
             }
             if self.entropy_window_size < 2 {
@@ -615,7 +689,10 @@ impl MemChainConfig {
                 }
             }
             if self.token_ttl_secs == 0 {
-                return Err(ServerError::config_invalid("memchain.token_ttl_secs", "must be > 0"));
+                return Err(ServerError::config_invalid(
+                    "memchain.token_ttl_secs",
+                    "must be > 0",
+                ));
             }
             if let Some(ref saas) = self.saas {
                 saas.validate()?;
@@ -637,14 +714,26 @@ impl MemChainConfig {
 // ── Convenience methods ────────────────────────────────────────────────────
 
 impl MemChainConfig {
-    #[must_use] pub fn is_enabled(&self) -> bool { self.mode != MemChainMode::Off }
-    #[must_use] pub fn is_p2p(&self) -> bool { self.mode == MemChainMode::P2p }
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.mode != MemChainMode::Off
+    }
+    #[must_use]
+    pub fn is_p2p(&self) -> bool {
+        self.mode == MemChainMode::P2p
+    }
 
     /// v1.0.0-MultiTenant: Returns true when running in SaaS multi-tenant mode.
-    #[must_use] pub fn is_saas(&self) -> bool { self.mode == MemChainMode::Saas }
+    #[must_use]
+    pub fn is_saas(&self) -> bool {
+        self.mode == MemChainMode::Saas
+    }
 
     /// v1.1.0-ChatRelay: Returns true when the chat relay subsystem is enabled.
-    #[must_use] pub fn is_chat_relay_enabled(&self) -> bool { self.chat_relay.enabled }
+    #[must_use]
+    pub fn is_chat_relay_enabled(&self) -> bool {
+        self.chat_relay.enabled
+    }
 
     /// Returns the effective API secret, or None if auth is disabled.
     #[must_use]
@@ -654,14 +743,18 @@ impl MemChainConfig {
 
     /// Check whether remote storage is enabled.
     #[must_use]
-    pub fn is_remote_storage_enabled(&self) -> bool { self.allow_remote_storage }
+    pub fn is_remote_storage_enabled(&self) -> bool {
+        self.allow_remote_storage
+    }
 
     /// v2.4.0: Check whether the cognitive graph pipeline is fully enabled.
     ///
     /// Requires both NER and graph to be enabled. If NER is disabled,
     /// the graph has no data to traverse.
     #[must_use]
-    pub fn is_cognitive_graph_enabled(&self) -> bool { self.ner_enabled && self.graph_enabled }
+    pub fn is_cognitive_graph_enabled(&self) -> bool {
+        self.ner_enabled && self.graph_enabled
+    }
 
     /// v2.4.0: Check whether any Miner cognitive steps are enabled.
     #[must_use]
@@ -674,7 +767,9 @@ impl MemChainConfig {
 
     /// v2.5.0: Check whether the SuperNode cognitive enhancement layer is enabled.
     #[must_use]
-    pub fn is_supernode_enabled(&self) -> bool { self.supernode.enabled }
+    pub fn is_supernode_enabled(&self) -> bool {
+        self.supernode.enabled
+    }
 
     /// v2.4.0: Get the effective NER tokenizer path.
     ///
@@ -707,8 +802,12 @@ impl MemChainConfig {
 
     #[must_use]
     pub fn is_origin_trusted(&self, origin_hex: &str, server_pubkey_hex: &str) -> bool {
-        if origin_hex == server_pubkey_hex { return true; }
-        if self.trusted_agents.is_empty() { return true; }
+        if origin_hex == server_pubkey_hex {
+            return true;
+        }
+        if self.trusted_agents.is_empty() {
+            return true;
+        }
         self.trusted_agents.iter().any(|t| t == origin_hex)
     }
 }
@@ -848,10 +947,17 @@ mod tests {
             ner_confidence_threshold: 2.0,
             graph_max_depth: 99,
             entropy_filter_threshold: -1.0,
-            supernode: SuperNodeConfig { enabled: true, providers: Vec::new(), ..Default::default() },
+            supernode: SuperNodeConfig {
+                enabled: true,
+                providers: Vec::new(),
+                ..Default::default()
+            },
             jwt_secret: Some("short".into()),
             token_ttl_secs: 0,
-            saas: Some(SaasConfig { pool_max_connections: 0, ..Default::default() }),
+            saas: Some(SaasConfig {
+                pool_max_connections: 0,
+                ..Default::default()
+            }),
             chat_relay: ChatRelayConfig {
                 enabled: true,
                 offline_ttl_secs: 0,
@@ -867,7 +973,10 @@ mod tests {
 
     #[test]
     fn test_api_secret_too_short_rejected() {
-        let mc = MemChainConfig { api_secret: Some("short".into()), ..Default::default() };
+        let mc = MemChainConfig {
+            api_secret: Some("short".into()),
+            ..Default::default()
+        };
         assert!(mc.validate().is_err());
     }
 
@@ -882,7 +991,10 @@ mod tests {
 
     #[test]
     fn test_api_secret_empty_is_open() {
-        let mc = MemChainConfig { api_secret: Some(String::new()), ..Default::default() };
+        let mc = MemChainConfig {
+            api_secret: Some(String::new()),
+            ..Default::default()
+        };
         assert!(mc.validate().is_ok());
         assert!(mc.effective_api_secret().is_none());
     }
@@ -891,19 +1003,28 @@ mod tests {
 
     #[test]
     fn test_embed_output_dim_zero_rejected() {
-        let mc = MemChainConfig { embed_output_dim: 0, ..Default::default() };
+        let mc = MemChainConfig {
+            embed_output_dim: 0,
+            ..Default::default()
+        };
         assert!(mc.validate().is_err());
     }
 
     #[test]
     fn test_embed_dim_zero_rejected() {
-        let mc = MemChainConfig { embed_dim: 0, ..Default::default() };
+        let mc = MemChainConfig {
+            embed_dim: 0,
+            ..Default::default()
+        };
         assert!(mc.validate().is_err());
     }
 
     #[test]
     fn test_embed_max_tokens_zero_rejected() {
-        let mc = MemChainConfig { embed_max_tokens: 0, ..Default::default() };
+        let mc = MemChainConfig {
+            embed_max_tokens: 0,
+            ..Default::default()
+        };
         assert!(mc.validate().is_err());
     }
 
@@ -911,19 +1032,42 @@ mod tests {
 
     #[test]
     fn test_mvf_alpha_out_of_range() {
-        assert!(MemChainConfig { mvf_alpha: 1.5, ..Default::default() }.validate().is_err());
-        assert!(MemChainConfig { mvf_alpha: -0.1, ..Default::default() }.validate().is_err());
+        assert!(MemChainConfig {
+            mvf_alpha: 1.5,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(MemChainConfig {
+            mvf_alpha: -0.1,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
     fn test_mvf_alpha_boundary() {
-        assert!(MemChainConfig { mvf_alpha: 0.0, ..Default::default() }.validate().is_ok());
-        assert!(MemChainConfig { mvf_alpha: 1.0, ..Default::default() }.validate().is_ok());
+        assert!(MemChainConfig {
+            mvf_alpha: 0.0,
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
+        assert!(MemChainConfig {
+            mvf_alpha: 1.0,
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]
     fn test_miner_interval_zero_rejected() {
-        let mc = MemChainConfig { miner_interval_secs: 0, ..Default::default() };
+        let mc = MemChainConfig {
+            miner_interval_secs: 0,
+            ..Default::default()
+        };
         assert!(mc.validate().is_err());
     }
 
@@ -1003,17 +1147,32 @@ mod tests {
 
     #[test]
     fn test_graph_max_depth_rejected() {
-        assert!(MemChainConfig { graph_enabled: true, graph_max_depth: 0, ..Default::default() }
-            .validate().is_err());
-        assert!(MemChainConfig { graph_enabled: true, graph_max_depth: 4, ..Default::default() }
-            .validate().is_err());
+        assert!(MemChainConfig {
+            graph_enabled: true,
+            graph_max_depth: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(MemChainConfig {
+            graph_enabled: true,
+            graph_max_depth: 4,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
     fn test_graph_max_depth_boundary() {
         for d in [1usize, 3] {
-            assert!(MemChainConfig { graph_enabled: true, graph_max_depth: d, ..Default::default() }
-                .validate().is_ok());
+            assert!(MemChainConfig {
+                graph_enabled: true,
+                graph_max_depth: d,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok());
         }
     }
 
@@ -1059,7 +1218,11 @@ mod tests {
     #[test]
     fn test_supernode_validate_delegation_no_providers() {
         let mc = MemChainConfig {
-            supernode: SuperNodeConfig { enabled: true, providers: Vec::new(), ..Default::default() },
+            supernode: SuperNodeConfig {
+                enabled: true,
+                providers: Vec::new(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(mc.validate().is_err());
@@ -1112,7 +1275,10 @@ mod tests {
     fn test_saas_config_pool_zero_rejected() {
         let mc = MemChainConfig {
             mode: MemChainMode::Saas,
-            saas: Some(SaasConfig { pool_max_connections: 0, ..Default::default() }),
+            saas: Some(SaasConfig {
+                pool_max_connections: 0,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         assert!(mc.validate().is_err());
@@ -1122,7 +1288,10 @@ mod tests {
     fn test_local_mode_skips_saas_checks() {
         let mc = MemChainConfig {
             mode: MemChainMode::Local,
-            saas: Some(SaasConfig { pool_max_connections: 0, ..Default::default() }),
+            saas: Some(SaasConfig {
+                pool_max_connections: 0,
+                ..Default::default()
+            }),
             jwt_secret: Some("x".into()),
             token_ttl_secs: 0,
             ..Default::default()
@@ -1132,7 +1301,11 @@ mod tests {
 
     #[test]
     fn test_effective_saas_config_fallback() {
-        let mc = MemChainConfig { mode: MemChainMode::Saas, saas: None, ..Default::default() };
+        let mc = MemChainConfig {
+            mode: MemChainMode::Saas,
+            saas: None,
+            ..Default::default()
+        };
         let esc = mc.effective_saas_config();
         assert_eq!(esc.pool_max_connections, 100);
     }
@@ -1141,7 +1314,10 @@ mod tests {
     fn test_effective_saas_config_custom() {
         let mc = MemChainConfig {
             mode: MemChainMode::Saas,
-            saas: Some(SaasConfig { pool_max_connections: 50, ..Default::default() }),
+            saas: Some(SaasConfig {
+                pool_max_connections: 50,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         assert_eq!(mc.effective_saas_config().pool_max_connections, 50);
@@ -1159,7 +1335,10 @@ mod tests {
     #[test]
     fn test_chat_relay_enabled_propagates() {
         let mc = MemChainConfig {
-            chat_relay: ChatRelayConfig { enabled: true, ..Default::default() },
+            chat_relay: ChatRelayConfig {
+                enabled: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(mc.is_chat_relay_enabled());
@@ -1184,20 +1363,32 @@ mod tests {
     #[test]
     fn test_is_cognitive_graph_enabled() {
         assert!(MemChainConfig {
-            ner_enabled: true, graph_enabled: true, ..Default::default()
-        }.is_cognitive_graph_enabled());
+            ner_enabled: true,
+            graph_enabled: true,
+            ..Default::default()
+        }
+        .is_cognitive_graph_enabled());
         assert!(!MemChainConfig {
-            ner_enabled: true, graph_enabled: false, ..Default::default()
-        }.is_cognitive_graph_enabled());
+            ner_enabled: true,
+            graph_enabled: false,
+            ..Default::default()
+        }
+        .is_cognitive_graph_enabled());
         assert!(!MemChainConfig {
-            ner_enabled: false, graph_enabled: true, ..Default::default()
-        }.is_cognitive_graph_enabled());
+            ner_enabled: false,
+            graph_enabled: true,
+            ..Default::default()
+        }
+        .is_cognitive_graph_enabled());
     }
 
     #[test]
     fn test_effective_ner_tokenizer_path() {
         let mc = MemChainConfig::default();
-        assert_eq!(mc.effective_ner_tokenizer_path(), "models/gliner/tokenizer.json");
+        assert_eq!(
+            mc.effective_ner_tokenizer_path(),
+            "models/gliner/tokenizer.json"
+        );
         let mc2 = MemChainConfig {
             ner_tokenizer_path: "/custom/tokenizer.json".into(),
             ..Default::default()
@@ -1216,8 +1407,12 @@ mod tests {
         let server = "bbbb0000000000000000000000000000000000000000000000000000000000bb";
         assert!(config.is_origin_trusted(server, server));
         assert!(config.is_origin_trusted(
-            "aaaa0000000000000000000000000000000000000000000000000000000000aa", server));
+            "aaaa0000000000000000000000000000000000000000000000000000000000aa",
+            server
+        ));
         assert!(!config.is_origin_trusted(
-            "cccc0000000000000000000000000000000000000000000000000000000000cc", server));
+            "cccc0000000000000000000000000000000000000000000000000000000000cc",
+            server
+        ));
     }
 }

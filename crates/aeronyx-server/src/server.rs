@@ -52,27 +52,29 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use aeronyx_core::protocol::auth::{
-    verify_signed_message,
-    DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_DEVICE_REGISTER, DOMAIN_WALLET_PRESENCE,
+    verify_signed_message, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_DEVICE_REGISTER,
+    DOMAIN_WALLET_PRESENCE,
 };
 use sha2::{Digest, Sha256};
 
 use aeronyx_common::types::SessionId;
-use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::crypto::keys::IdentityPublicKey;
-use aeronyx_core::crypto::transport::{DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD};
+use aeronyx_core::crypto::transport::{
+    DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD,
+};
+use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::codec::{
-    decode_client_hello, encode_server_hello, encode_data_packet, ProtocolCodec,
+    decode_client_hello, encode_data_packet, encode_server_hello, ProtocolCodec,
 };
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
-use aeronyx_core::protocol::{DataPacket, MessageType};
 use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
+use aeronyx_core::protocol::{DataPacket, MessageType};
 use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::UdpTransport;
 
@@ -81,8 +83,8 @@ use aeronyx_transport::LinuxTun;
 
 use rusqlite::OptionalExtension;
 
-use crate::api::mpi::{build_mpi_router, MpiState, BaselineSnapshot, Mode};
 use crate::api::auth::{ensure_jwt_secret, generate_secret};
+use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
 use crate::api::voice::build_voice_router;
 use crate::api::vpn_health::{
     build_vpn_health_router, collect_node_operator_status_value, collect_vpn_health_value,
@@ -92,46 +94,45 @@ use crate::error::{Result, ServerError};
 use crate::handlers::packet::DecryptedPayload;
 use crate::handlers::PacketHandler;
 use crate::management::{
-    CommandHandler, HeartbeatReporter, ManagementClient, SessionReporter,
     reporter::{SessionEventSender, SessionQuality},
+    CommandHandler, HeartbeatReporter, ManagementClient, SessionReporter,
 };
 use crate::miner::ReflectionMiner;
-#[allow(deprecated)]
-use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
-use crate::services::memchain::derive_record_key;
+use crate::services::chat_relay::{derive_node_secret, ChatRelayService};
 use crate::services::memchain::derive_rawlog_key;
+use crate::services::memchain::derive_record_key;
 use crate::services::memchain::EmbedEngine;
 use crate::services::memchain::NerEngine;
 use crate::services::memchain::RerankerEngine;
-use crate::services::memchain::{LlmRouter, TaskWorker};
 use crate::services::memchain::{
-    SystemDb, VolumeRouter, StoragePool, VectorIndexPool,
-    ensure_volumes_config,
+    ensure_volumes_config, StoragePool, SystemDb, VectorIndexPool, VolumeRouter,
 };
-use crate::services::chat_relay::{ChatRelayService, derive_node_secret};
+#[allow(deprecated)]
+use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
+use crate::services::memchain::{LlmRouter, TaskWorker};
 use crate::services::{
     spawn_dns_proxy, HandshakeService, IpPoolService, NodePolicyRuntime, RoutingService,
     SessionManager,
 };
 // v1.0.0-Membership
-use crate::services::traffic_tracker::TrafficTracker;
-use crate::services::session::StatsSnapshot;
 use crate::services::deny_list::DenyList;
+use crate::services::session::StatsSnapshot;
+use crate::services::traffic_tracker::TrafficTracker;
 use crate::voucher_verifier::VoucherVerifier;
 
 // ============================================
 // Constants
 // ============================================
 
-const KEEPALIVE_PACKET_SIZE:       usize  = 17;
+const KEEPALIVE_PACKET_SIZE: usize = 17;
 #[allow(dead_code)]
-const DISCONNECT_PACKET_MIN_SIZE:  usize  = 18;
-const COMMAND_CHANNEL_BUFFER:      usize  = 100;
-const QUANTIZER_CAL_KEY_PREFIX:    &str   = "quantizer_cal";
-const POOL_EVICTION_INTERVAL_SECS: u64    = 300;
-const MINER_SCHEDULER_TICK_SECS:   u64    = 60;
-const KEEPALIVE_PROBE_INTERVAL_SECS: u64    = 60;
-const KEEPALIVE_ACK_TIMEOUT_SECS:    u64    = 90;
+const DISCONNECT_PACKET_MIN_SIZE: usize = 18;
+const COMMAND_CHANNEL_BUFFER: usize = 100;
+const QUANTIZER_CAL_KEY_PREFIX: &str = "quantizer_cal";
+const POOL_EVICTION_INTERVAL_SECS: u64 = 300;
+const MINER_SCHEDULER_TICK_SECS: u64 = 60;
+const KEEPALIVE_PROBE_INTERVAL_SECS: u64 = 60;
+const KEEPALIVE_ACK_TIMEOUT_SECS: u64 = 90;
 
 // ============================================
 // Server
@@ -163,17 +164,17 @@ fn quality_from_stats(snap: StatsSnapshot) -> SessionQuality {
 }
 
 pub struct Server {
-    config:      ServerConfig,
-    identity:    IdentityKeyPair,
+    config: ServerConfig,
+    identity: IdentityKeyPair,
     config_path: Option<PathBuf>,
-    shutdown:    Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
     shutdown_tx: broadcast::Sender<()>,
 }
 
 impl Server {
     pub fn new(
-        config:      ServerConfig,
-        identity:    IdentityKeyPair,
+        config: ServerConfig,
+        identity: IdentityKeyPair,
         config_path: Option<PathBuf>,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -203,25 +204,21 @@ impl Server {
             (None, None, None, None)
         };
 
-        let chat_relay: Option<Arc<ChatRelayService>> =
-            if self.config.memchain.is_enabled() {
-                let node_secret = derive_node_secret(&self.identity.to_bytes());
-                match ChatRelayService::new(
-                    self.config.memchain.chat_relay.clone(),
-                    node_secret,
-                ) {
-                    Ok(svc) => {
-                        info!("[CHAT_RELAY] Service initialized");
-                        Some(Arc::new(svc))
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "[CHAT_RELAY] Init failed — chat relay disabled");
-                        None
-                    }
+        let chat_relay: Option<Arc<ChatRelayService>> = if self.config.memchain.is_enabled() {
+            let node_secret = derive_node_secret(&self.identity.to_bytes());
+            match ChatRelayService::new(self.config.memchain.chat_relay.clone(), node_secret) {
+                Ok(svc) => {
+                    info!("[CHAT_RELAY] Service initialized");
+                    Some(Arc::new(svc))
                 }
-            } else {
-                None
-            };
+                Err(e) => {
+                    warn!(error = %e, "[CHAT_RELAY] Init failed — chat relay disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let udp = Arc::new(
             UdpTransport::bind_addr(self.config.listen_addr())
@@ -275,16 +272,18 @@ impl Server {
 
         // init_management_reporter needs udp + traffic_tracker,
         // so it is called here after both are available.
-        let session_event_sender = self.init_management_reporter(
-            &sessions,
-            Arc::clone(&ip_pool),
-            Arc::clone(&udp),
-            Arc::clone(&traffic_tracker),
-            Arc::clone(&deny_list),
-            Arc::clone(&node_policy),
-            Arc::clone(&voucher_verifier),
-            Arc::clone(&encrypted_message_counter),
-        ).await;
+        let session_event_sender = self
+            .init_management_reporter(
+                &sessions,
+                Arc::clone(&ip_pool),
+                Arc::clone(&udp),
+                Arc::clone(&traffic_tracker),
+                Arc::clone(&deny_list),
+                Arc::clone(&node_policy),
+                Arc::clone(&voucher_verifier),
+                Arc::clone(&encrypted_message_counter),
+            )
+            .await;
 
         let udp_task = self.spawn_udp_task(
             Arc::clone(&udp),
@@ -343,22 +342,25 @@ impl Server {
         tasks.push(("vpn-keepalive", keepalive_task));
 
         if let Some(ref relay) = chat_relay {
-            let routes     = Arc::clone(&relay.wallet_routes);
-            let mut rx     = self.shutdown_tx.subscribe();
-            tasks.push(("wallet-routes-cleanup", tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(60));
-                loop {
-                    tokio::select! {
-                        _ = rx.recv() => break,
-                        _ = interval.tick() => {
-                            let evicted = routes.cleanup_stale(Duration::from_secs(300));
-                            if evicted > 0 {
-                                debug!(evicted, "[CHAT_RELAY] Stale wallet routes evicted");
+            let routes = Arc::clone(&relay.wallet_routes);
+            let mut rx = self.shutdown_tx.subscribe();
+            tasks.push((
+                "wallet-routes-cleanup",
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(60));
+                    loop {
+                        tokio::select! {
+                            _ = rx.recv() => break,
+                            _ = interval.tick() => {
+                                let evicted = routes.cleanup_stale(Duration::from_secs(300));
+                                if evicted > 0 {
+                                    debug!(evicted, "[CHAT_RELAY] Stale wallet routes evicted");
+                                }
                             }
                         }
                     }
-                }
-            })));
+                }),
+            ));
             info!("[CHAT_RELAY] Wallet route cleanup task started (ttl=300s, interval=60s)");
         }
 
@@ -367,14 +369,13 @@ impl Server {
         {
             let is_saas = self.config.memchain.mode == MemChainMode::Saas;
 
-            let user_weights = Arc::new(parking_lot::RwLock::new(
-                std::collections::HashMap::new(),
-            ));
+            let user_weights = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
 
             if !is_saas {
                 let owner = self.identity.public_key_bytes();
                 if let Some(blob) = st.load_user_weights(&owner).await {
-                    if let Some(w) = crate::services::memchain::mvf::WeightVector::from_bytes(&blob) {
+                    if let Some(w) = crate::services::memchain::mvf::WeightVector::from_bytes(&blob)
+                    {
                         let mut map = user_weights.write();
                         map.insert(hex::encode(owner), w);
                         info!("[MEMCHAIN] Loaded MVF user weights from SQLite");
@@ -394,26 +395,27 @@ impl Server {
                     .unwrap_or(None);
                 drop(conn);
                 raw.and_then(|bytes| {
-                    serde_json::from_str::<BaselineSnapshot>(
-                        &String::from_utf8_lossy(&bytes),
-                    ).ok()
+                    serde_json::from_str::<BaselineSnapshot>(&String::from_utf8_lossy(&bytes)).ok()
                 })
             } else {
                 None
             };
 
-            let owner_key  = self.identity.public_key_bytes();
-            let api_secret = self.config.memchain.effective_api_secret().map(|s| s.to_string());
+            let owner_key = self.identity.public_key_bytes();
+            let api_secret = self
+                .config
+                .memchain
+                .effective_api_secret()
+                .map(|s| s.to_string());
 
-            let embed_engine    = self.init_embed_engine();
-            let ner_engine      = self.init_ner_engine();
+            let embed_engine = self.init_embed_engine();
+            let ner_engine = self.init_ner_engine();
             let reranker_engine = self.init_reranker_engine();
 
             let llm_router: Option<Arc<LlmRouter>> = self.init_llm_router().await;
 
             if llm_router.is_some() {
-                let timeout_secs =
-                    self.config.memchain.supernode.worker.task_timeout_secs as i64;
+                let timeout_secs = self.config.memchain.supernode.worker.task_timeout_secs as i64;
                 let recovered = st.reset_stale_processing_tasks(timeout_secs).await;
                 if recovered > 0 {
                     info!(recovered, timeout_secs, "[SUPERNODE] Recovered stale tasks");
@@ -430,7 +432,8 @@ impl Server {
                     ner_engine.clone(),
                     reranker_engine,
                     llm_router.clone(),
-                ).await?
+                )
+                .await?
             } else {
                 let mpi = MpiState::local(
                     Arc::clone(st),
@@ -459,35 +462,36 @@ impl Server {
             };
 
             if !is_saas {
-                let owner_hex      = hex::encode(owner_key);
+                let owner_hex = hex::encode(owner_key);
                 let identity_records = st
                     .get_active_records(
                         &owner_key,
                         Some(aeronyx_core::ledger::MemoryLayer::Identity),
                         100,
-                    ).await;
+                    )
+                    .await;
                 if !identity_records.is_empty() {
                     let mut cache = mpi_state.identity_cache.write();
                     cache.insert(owner_hex, identity_records);
                 }
-                mpi_state.index_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                mpi_state
+                    .index_ready
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
 
-                if self.config.memchain.mvf_enabled
-                    && mpi_state.mvf_baseline.read().is_none()
-                {
+                if self.config.memchain.mvf_enabled && mpi_state.mvf_baseline.read().is_none() {
                     let feedback = st.get_recent_feedback(200).await;
                     if !feedback.is_empty() {
                         let positive = feedback.iter().filter(|(s, _)| *s == 1).count();
-                        let rate     = positive as f32 / feedback.len() as f32;
-                        let now_ts   = SystemTime::now()
+                        let rate = positive as f32 / feedback.len() as f32;
+                        let now_ts = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs() as i64;
 
                         let baseline = BaselineSnapshot {
                             positive_rate: rate,
-                            sample_size:   feedback.len(),
-                            frozen_at:     now_ts,
+                            sample_size: feedback.len(),
+                            frozen_at: now_ts,
                         };
 
                         if let Ok(json) = serde_json::to_string(&baseline) {
@@ -525,11 +529,14 @@ impl Server {
                     self.config.memchain.supernode.worker.clone(),
                 );
                 let worker_shutdown = self.shutdown_tx.subscribe();
-                tasks.push(("supernode-worker", tokio::spawn(async move {
-                    worker.run(worker_shutdown).await;
-                })));
+                tasks.push((
+                    "supernode-worker",
+                    tokio::spawn(async move {
+                        worker.run(worker_shutdown).await;
+                    }),
+                ));
                 info!(
-                    poll_interval  = self.config.memchain.supernode.worker.poll_interval_secs,
+                    poll_interval = self.config.memchain.supernode.worker.poll_interval_secs,
                     max_concurrent = self.config.memchain.supernode.worker.max_concurrent,
                     "[SUPERNODE] TaskWorker spawned"
                 );
@@ -539,31 +546,37 @@ impl Server {
                 if let (Some(ref sp), Some(ref vp)) =
                     (&mpi_state.storage_pool, &mpi_state.vector_pool)
                 {
-                    let sp_clone   = Arc::clone(sp);
-                    let vp_clone   = Arc::clone(vp);
+                    let sp_clone = Arc::clone(sp);
+                    let vp_clone = Arc::clone(vp);
                     let mut evict_rx = self.shutdown_tx.subscribe();
-                    tasks.push(("pool-eviction", tokio::spawn(async move {
-                        let mut interval = tokio::time::interval(
-                            Duration::from_secs(POOL_EVICTION_INTERVAL_SECS)
-                        );
-                        loop {
-                            tokio::select! {
-                                _ = evict_rx.recv() => break,
-                                _ = interval.tick() => {
-                                    let evicted_s = sp_clone.evict_idle().await;
-                                    let evicted_v = vp_clone.evict_idle();
-                                    if evicted_s + evicted_v > 0 {
-                                        info!(
-                                            storage = evicted_s,
-                                            vector  = evicted_v,
-                                            "[POOL] Evicted idle connections"
-                                        );
+                    tasks.push((
+                        "pool-eviction",
+                        tokio::spawn(async move {
+                            let mut interval = tokio::time::interval(Duration::from_secs(
+                                POOL_EVICTION_INTERVAL_SECS,
+                            ));
+                            loop {
+                                tokio::select! {
+                                    _ = evict_rx.recv() => break,
+                                    _ = interval.tick() => {
+                                        let evicted_s = sp_clone.evict_idle().await;
+                                        let evicted_v = vp_clone.evict_idle();
+                                        if evicted_s + evicted_v > 0 {
+                                            info!(
+                                                storage = evicted_s,
+                                                vector  = evicted_v,
+                                                "[POOL] Evicted idle connections"
+                                            );
+                                        }
                                     }
                                 }
                             }
-                        }
-                    })));
-                    info!(interval_secs = POOL_EVICTION_INTERVAL_SECS, "[POOL] Eviction timer started");
+                        }),
+                    ));
+                    info!(
+                        interval_secs = POOL_EVICTION_INTERVAL_SECS,
+                        "[POOL] Eviction timer started"
+                    );
                 }
             }
 
@@ -575,30 +588,43 @@ impl Server {
                         let scheduler = crate::miner::MinerScheduler::new(
                             Arc::clone(sp),
                             Arc::clone(sys_db),
-                            self.config.memchain.saas.as_ref()
+                            self.config
+                                .memchain
+                                .saas
+                                .as_ref()
                                 .map(|s| s.miner_max_owners_per_tick)
                                 .unwrap_or(10),
-                            self.config.memchain.saas.as_ref()
+                            self.config
+                                .memchain
+                                .saas
+                                .as_ref()
                                 .map(|s| s.miner_max_rounds_per_hour)
                                 .unwrap_or(6) as u32,
                             self.identity.clone(),
                             llm_router.clone(),
                             embed_engine.clone(),
                             ner_engine.clone(),
-                        ).await;
+                        )
+                        .await;
                         let mut sched_rx = self.shutdown_tx.subscribe();
-                        tasks.push(("miner-scheduler", tokio::spawn(async move {
-                            let mut interval = tokio::time::interval(
-                                Duration::from_secs(MINER_SCHEDULER_TICK_SECS)
-                            );
-                            loop {
-                                tokio::select! {
-                                    _ = sched_rx.recv() => break,
-                                    _ = interval.tick() => { scheduler.tick().await; }
+                        tasks.push((
+                            "miner-scheduler",
+                            tokio::spawn(async move {
+                                let mut interval = tokio::time::interval(Duration::from_secs(
+                                    MINER_SCHEDULER_TICK_SECS,
+                                ));
+                                loop {
+                                    tokio::select! {
+                                        _ = sched_rx.recv() => break,
+                                        _ = interval.tick() => { scheduler.tick().await; }
+                                    }
                                 }
-                            }
-                        })));
-                        info!(tick_secs = MINER_SCHEDULER_TICK_SECS, "[MINER] SaaS MinerScheduler started");
+                            }),
+                        ));
+                        info!(
+                            tick_secs = MINER_SCHEDULER_TICK_SECS,
+                            "[MINER] SaaS MinerScheduler started"
+                        );
                     }
                 } else {
                     let miner = ReflectionMiner::new(
@@ -614,14 +640,29 @@ impl Server {
                     .with_compaction_threshold(self.config.memchain.compaction_threshold)
                     .with_mvf(self.config.memchain.mvf_enabled, Arc::clone(&user_weights));
 
-                    let miner = if let Some(ref ee) = embed_engine { miner.with_embed_engine(Arc::clone(ee)) } else { miner };
-                    let miner = if let Some(ref ne) = ner_engine   { miner.with_ner_engine(Arc::clone(ne))   } else { miner };
-                    let miner = if let Some(ref lr) = llm_router   { miner.with_llm_router(Arc::clone(lr))   } else { miner };
+                    let miner = if let Some(ref ee) = embed_engine {
+                        miner.with_embed_engine(Arc::clone(ee))
+                    } else {
+                        miner
+                    };
+                    let miner = if let Some(ref ne) = ner_engine {
+                        miner.with_ner_engine(Arc::clone(ne))
+                    } else {
+                        miner
+                    };
+                    let miner = if let Some(ref lr) = llm_router {
+                        miner.with_llm_router(Arc::clone(lr))
+                    } else {
+                        miner
+                    };
 
                     let miner_shutdown = self.shutdown_tx.subscribe();
-                    tasks.push(("miner", tokio::spawn(async move {
-                        miner.run(miner_shutdown).await;
-                    })));
+                    tasks.push((
+                        "miner",
+                        tokio::spawn(async move {
+                            miner.run(miner_shutdown).await;
+                        }),
+                    ));
                 }
             } else {
                 info!("[MINER] Disabled (interval=0)");
@@ -639,7 +680,7 @@ impl Server {
             match tokio::time::timeout(Duration::from_secs(5), task).await {
                 Ok(Ok(())) => debug!("Task '{}' completed", name),
                 Ok(Err(e)) => warn!("Task '{}' failed: {}", name, e),
-                Err(_)     => warn!("Task '{}' timed out", name),
+                Err(_) => warn!("Task '{}' timed out", name),
             }
         }
 
@@ -647,13 +688,11 @@ impl Server {
             warn!("UDP shutdown error: {}", e);
         }
 
-        if let (Some(ref st), Some(ref mp), Some(ref aw)) =
-            (&storage, &mempool, &aof_writer)
-        {
+        if let (Some(ref st), Some(ref mp), Some(ref aw)) = (&storage, &mempool, &aof_writer) {
             info!(
-                sqlite  = st.count().await,
+                sqlite = st.count().await,
                 mempool = mp.count(),
-                aof     = aw.lock().await.write_count(),
+                aof = aw.lock().await.write_count(),
                 "Shutdown complete (MemChain stats)"
             );
         } else {
@@ -668,11 +707,17 @@ impl Server {
     // ============================================
 
     async fn ensure_api_secret_on_disk(&self) {
-        if self.config.memchain.effective_api_secret().is_some() { return; }
-        let Some(ref path) = self.config_path else { return };
+        if self.config.memchain.effective_api_secret().is_some() {
+            return;
+        }
+        let Some(ref path) = self.config_path else {
+            return;
+        };
         let secret = generate_secret();
         match crate::api::auth::write_secret_to_config_pub(path, "api_secret", &secret) {
-            Ok(()) => info!(path = %path.display(), "[SECURITY] Auto-generated api_secret written to config"),
+            Ok(()) => {
+                info!(path = %path.display(), "[SECURITY] Auto-generated api_secret written to config")
+            }
             Err(e) => warn!(error = %e, "[SECURITY] Failed to persist api_secret"),
         }
     }
@@ -684,19 +729,22 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     async fn init_saas_mpi_state(
         &self,
-        _server_storage:  &Arc<MemoryStorage>,
-        owner_key:        [u8; 32],
-        api_secret:       Option<String>,
-        user_weights:     Arc<parking_lot::RwLock<std::collections::HashMap<String, crate::services::memchain::mvf::WeightVector>>>,
-        embed_engine:     Option<Arc<EmbedEngine>>,
-        ner_engine:       Option<Arc<NerEngine>>,
-        reranker_engine:  Option<Arc<RerankerEngine>>,
-        llm_router:       Option<Arc<LlmRouter>>,
+        _server_storage: &Arc<MemoryStorage>,
+        owner_key: [u8; 32],
+        api_secret: Option<String>,
+        user_weights: Arc<
+            parking_lot::RwLock<
+                std::collections::HashMap<String, crate::services::memchain::mvf::WeightVector>,
+            >,
+        >,
+        embed_engine: Option<Arc<EmbedEngine>>,
+        ner_engine: Option<Arc<NerEngine>>,
+        reranker_engine: Option<Arc<RerankerEngine>>,
+        llm_router: Option<Arc<LlmRouter>>,
     ) -> Result<Arc<MpiState>> {
-        let saas_cfg = self.config.memchain.saas.as_ref()
-            .ok_or_else(|| ServerError::startup_failed(
-                "mode=saas requires [memchain.saas] config section"
-            ))?;
+        let saas_cfg = self.config.memchain.saas.as_ref().ok_or_else(|| {
+            ServerError::startup_failed("mode=saas requires [memchain.saas] config section")
+        })?;
 
         let data_root = &saas_cfg.data_root;
 
@@ -724,7 +772,11 @@ impl Server {
 
         let quantization_enabled =
             self.config.memchain.vector_quantization == VectorQuantizationMode::ScalarUint8;
-        let saturation_threshold = if self.config.memchain.vector_early_termination { 0.001_f32 } else { 0.0_f32 };
+        let saturation_threshold = if self.config.memchain.vector_early_termination {
+            0.001_f32
+        } else {
+            0.0_f32
+        };
 
         let vector_pool = VectorIndexPool::new(
             Arc::clone(&volume_router),
@@ -736,7 +788,8 @@ impl Server {
         let jwt_secret = ensure_jwt_secret(
             self.config.memchain.jwt_secret.as_deref(),
             self.config_path.as_deref(),
-        ).map_err(|e| ServerError::startup_failed(format!("jwt_secret: {}", e)))?;
+        )
+        .map_err(|e| ServerError::startup_failed(format!("jwt_secret: {}", e)))?;
 
         info!(
             data_root     = %data_root.display(),
@@ -747,35 +800,35 @@ impl Server {
 
         let mpi_state = Arc::new(MpiState {
             mode: Mode::Saas,
-            storage:      None,
+            storage: None,
             vector_index: None,
-            identity:     self.identity.clone(),
+            identity: self.identity.clone(),
             identity_cache: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            index_ready:  std::sync::atomic::AtomicBool::new(true),
+            index_ready: std::sync::atomic::AtomicBool::new(true),
             user_weights,
-            mvf_alpha:    self.config.memchain.mvf_alpha,
-            mvf_enabled:  self.config.memchain.mvf_enabled,
+            mvf_alpha: self.config.memchain.mvf_alpha,
+            mvf_enabled: self.config.memchain.mvf_enabled,
             session_embeddings: parking_lot::RwLock::new(std::collections::HashMap::new()),
             mvf_baseline: parking_lot::RwLock::new(None),
             owner_key,
             api_secret,
             embed_engine,
             allow_remote_storage: false,
-            max_remote_owners:    0,
+            max_remote_owners: 0,
             ner_engine,
-            graph_enabled:           self.config.memchain.graph_enabled,
-            entropy_filter_enabled:  self.config.memchain.entropy_filter_enabled,
+            graph_enabled: self.config.memchain.graph_enabled,
+            entropy_filter_enabled: self.config.memchain.entropy_filter_enabled,
             reranker_engine,
-            rawlog_key:  Some(derive_rawlog_key(&self.identity.to_bytes())),
+            rawlog_key: Some(derive_rawlog_key(&self.identity.to_bytes())),
             llm_router,
-            storage_pool:    Some(storage_pool),
-            vector_pool:     Some(vector_pool),
-            volume_router:   Some(volume_router),
-            system_db:       Some(system_db),
-            jwt_secret:      Some(jwt_secret),
-            token_ttl_secs:          self.config.memchain.token_ttl_secs,
-            pool_max_connections:    saas_cfg.pool_max_connections,
-            pool_idle_timeout_secs:  saas_cfg.pool_idle_timeout_secs,
+            storage_pool: Some(storage_pool),
+            vector_pool: Some(vector_pool),
+            volume_router: Some(volume_router),
+            system_db: Some(system_db),
+            jwt_secret: Some(jwt_secret),
+            token_ttl_secs: self.config.memchain.token_ttl_secs,
+            pool_max_connections: saas_cfg.pool_max_connections,
+            pool_idle_timeout_secs: saas_cfg.pool_idle_timeout_secs,
         });
 
         Ok(mpi_state)
@@ -787,32 +840,57 @@ impl Server {
 
     fn init_embed_engine(&self) -> Option<Arc<EmbedEngine>> {
         let model_path = &self.config.memchain.embed_model_path;
-        match EmbedEngine::load(model_path, self.config.memchain.embed_max_tokens, self.config.memchain.embed_output_dim) {
+        match EmbedEngine::load(
+            model_path,
+            self.config.memchain.embed_max_tokens,
+            self.config.memchain.embed_output_dim,
+        ) {
             Ok(engine) => {
                 info!(model = %model_path, model_type = %engine.model_type(), dim = engine.dim(), "[EMBED] Local embedding engine loaded");
                 Some(Arc::new(engine))
             }
-            Err(e) => { warn!(model = %model_path, error = %e, "[EMBED] Unavailable"); None }
+            Err(e) => {
+                warn!(model = %model_path, error = %e, "[EMBED] Unavailable");
+                None
+            }
         }
     }
 
     fn init_ner_engine(&self) -> Option<Arc<NerEngine>> {
-        if !self.config.memchain.ner_enabled { debug!("[NER] Disabled"); return None; }
+        if !self.config.memchain.ner_enabled {
+            debug!("[NER] Disabled");
+            return None;
+        }
         let model_path = &self.config.memchain.ner_model_path;
-        let threshold  = self.config.memchain.ner_confidence_threshold;
+        let threshold = self.config.memchain.ner_confidence_threshold;
         match NerEngine::load(model_path, threshold, 0) {
-            Ok(engine) => { info!(model = %model_path, threshold, "[NER] Local NER engine loaded"); Some(Arc::new(engine)) }
-            Err(e)     => { warn!(model = %model_path, error = %e, "[NER] Unavailable"); None }
+            Ok(engine) => {
+                info!(model = %model_path, threshold, "[NER] Local NER engine loaded");
+                Some(Arc::new(engine))
+            }
+            Err(e) => {
+                warn!(model = %model_path, error = %e, "[NER] Unavailable");
+                None
+            }
         }
     }
 
     fn init_reranker_engine(&self) -> Option<Arc<RerankerEngine>> {
-        if !self.config.memchain.reranker_enabled { debug!("[RERANKER] Disabled"); return None; }
+        if !self.config.memchain.reranker_enabled {
+            debug!("[RERANKER] Disabled");
+            return None;
+        }
         let model_path = &self.config.memchain.reranker_model_path;
-        let max_seq    = self.config.memchain.reranker_max_seq_length;
+        let max_seq = self.config.memchain.reranker_max_seq_length;
         match RerankerEngine::load(model_path, max_seq) {
-            Ok(engine) => { info!(model = %model_path, blend_weight = %RerankerEngine::blend_weight(), "[RERANKER] Cross-encoder loaded"); Some(Arc::new(engine)) }
-            Err(e)     => { warn!(model = %model_path, error = %e, "[RERANKER] Unavailable"); None }
+            Ok(engine) => {
+                info!(model = %model_path, blend_weight = %RerankerEngine::blend_weight(), "[RERANKER] Cross-encoder loaded");
+                Some(Arc::new(engine))
+            }
+            Err(e) => {
+                warn!(model = %model_path, error = %e, "[RERANKER] Unavailable");
+                None
+            }
         }
     }
 
@@ -822,7 +900,7 @@ impl Server {
 
     async fn init_llm_router(&self) -> Option<Arc<LlmRouter>> {
         use crate::config_supernode::ProviderType;
-        use crate::services::memchain::{LlmProvider, OpenAiCompatProvider, AnthropicProvider};
+        use crate::services::memchain::{AnthropicProvider, LlmProvider, OpenAiCompatProvider};
 
         if !self.config.memchain.is_supernode_enabled() {
             debug!("[SUPERNODE] Disabled");
@@ -847,7 +925,9 @@ impl Server {
                 } else { k.clone() }
             });
 
-            let api_base = if provider_cfg.api_base.is_empty() && provider_cfg.provider_type == ProviderType::Anthropic {
+            let api_base = if provider_cfg.api_base.is_empty()
+                && provider_cfg.provider_type == ProviderType::Anthropic
+            {
                 "https://api.anthropic.com".to_string()
             } else {
                 provider_cfg.api_base.clone()
@@ -856,31 +936,51 @@ impl Server {
             let provider: Arc<dyn LlmProvider> = match provider_cfg.provider_type {
                 ProviderType::OpenaiCompatible => {
                     match OpenAiCompatProvider::new(
-                        provider_cfg.name.clone(), api_base.clone(),
-                        api_key.unwrap_or_default(), provider_cfg.model.clone(),
-                        provider_cfg.max_tokens, provider_cfg.temperature,
+                        provider_cfg.name.clone(),
+                        api_base.clone(),
+                        api_key.unwrap_or_default(),
+                        provider_cfg.model.clone(),
+                        provider_cfg.max_tokens,
+                        provider_cfg.temperature,
                     ) {
-                        Ok(p)  => Arc::new(p),
-                        Err(e) => { warn!(provider = %provider_cfg.name, error = %e, "[SUPERNODE] OpenAiCompatProvider failed"); continue; }
+                        Ok(p) => Arc::new(p),
+                        Err(e) => {
+                            warn!(provider = %provider_cfg.name, error = %e, "[SUPERNODE] OpenAiCompatProvider failed");
+                            continue;
+                        }
                     }
                 }
                 ProviderType::Anthropic => {
                     let key = match api_key {
                         Some(k) if !k.is_empty() => k,
-                        _ => { warn!(provider = %provider_cfg.name, "[SUPERNODE] Anthropic requires api_key"); continue; }
+                        _ => {
+                            warn!(provider = %provider_cfg.name, "[SUPERNODE] Anthropic requires api_key");
+                            continue;
+                        }
                     };
                     match AnthropicProvider::new(
-                        provider_cfg.name.clone(), key, provider_cfg.model.clone(),
-                        provider_cfg.max_tokens, provider_cfg.temperature,
+                        provider_cfg.name.clone(),
+                        key,
+                        provider_cfg.model.clone(),
+                        provider_cfg.max_tokens,
+                        provider_cfg.temperature,
                     ) {
-                        Ok(p)  => Arc::new(p),
-                        Err(e) => { warn!(provider = %provider_cfg.name, error = %e, "[SUPERNODE] AnthropicProvider failed"); continue; }
+                        Ok(p) => Arc::new(p),
+                        Err(e) => {
+                            warn!(provider = %provider_cfg.name, error = %e, "[SUPERNODE] AnthropicProvider failed");
+                            continue;
+                        }
                     }
                 }
             };
 
             info!(name = %provider_cfg.name, type_ = ?provider_cfg.provider_type, model = %provider_cfg.model, api_base = %api_base, "[SUPERNODE] Provider registered");
-            providers.push((provider_cfg.name.clone(), api_base, provider_cfg.model.clone(), provider));
+            providers.push((
+                provider_cfg.name.clone(),
+                api_base,
+                provider_cfg.model.clone(),
+                provider,
+            ));
         }
 
         if providers.is_empty() {
@@ -897,7 +997,9 @@ impl Server {
     // MemChain initialization
     // ============================================
 
-    async fn init_memchain(&self) -> Result<(
+    async fn init_memchain(
+        &self,
+    ) -> Result<(
         Arc<MemoryStorage>,
         Arc<VectorIndex>,
         Arc<MemPool>,
@@ -923,8 +1025,15 @@ impl Server {
         let quantization_enabled =
             self.config.memchain.vector_quantization == VectorQuantizationMode::ScalarUint8;
         let vector_index = Arc::new(if quantization_enabled {
-            let sat = if self.config.memchain.vector_early_termination { 0.001_f32 } else { 0.0_f32 };
-            info!(quantization = "scalar_uint8", "[MEMCHAIN] VectorIndex with scalar quantization");
+            let sat = if self.config.memchain.vector_early_termination {
+                0.001_f32
+            } else {
+                0.0_f32
+            };
+            info!(
+                quantization = "scalar_uint8",
+                "[MEMCHAIN] VectorIndex with scalar quantization"
+            );
             VectorIndex::with_config(true, sat)
         } else {
             VectorIndex::new()
@@ -932,20 +1041,29 @@ impl Server {
 
         let owner = self.identity.public_key_bytes();
         let records_with_model = storage.get_records_with_embedding(&owner).await;
-        let rebuild_count      = records_with_model.len();
+        let rebuild_count = records_with_model.len();
         for (r, model) in records_with_model {
             if r.has_embedding() {
-                vector_index.upsert(r.record_id, r.embedding.clone(), r.layer, r.timestamp, &r.owner, &model);
+                vector_index.upsert(
+                    r.record_id,
+                    r.embedding.clone(),
+                    r.layer,
+                    r.timestamp,
+                    &r.owner,
+                    &model,
+                );
             }
         }
 
         info!(db = %db_path, records = storage.count().await, vectors = rebuild_count, "[MEMCHAIN] SQLite + VectorIndex initialized");
 
         if quantization_enabled && rebuild_count > 0 {
-            let owner_hex  = hex::encode(owner);
+            let owner_hex = hex::encode(owner);
             let model_name = std::path::Path::new(&self.config.memchain.embed_model_path)
-                .file_name().and_then(|f| f.to_str()).unwrap_or("minilm-l6-v2");
-            let cal_key    = format!("{}:{}:{}", QUANTIZER_CAL_KEY_PREFIX, owner_hex, model_name);
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("minilm-l6-v2");
+            let cal_key = format!("{}:{}:{}", QUANTIZER_CAL_KEY_PREFIX, owner_hex, model_name);
 
             let restored = {
                 let conn = storage.conn_lock().await;
@@ -954,13 +1072,19 @@ impl Server {
                         "SELECT value FROM chain_state WHERE key = ?1",
                         rusqlite::params![cal_key],
                         |row| row.get::<_, Vec<u8>>(0),
-                    ).optional().unwrap_or(None);
+                    )
+                    .optional()
+                    .unwrap_or(None);
                 drop(conn);
                 if let Some(data) = cal_data {
                     let ok = vector_index.restore_quantizer(&owner, model_name, &data);
-                    if ok { info!(model = model_name, "[VECTOR] Quantizer restored"); }
+                    if ok {
+                        info!(model = model_name, "[VECTOR] Quantizer restored");
+                    }
                     ok
-                } else { false }
+                } else {
+                    false
+                }
             };
 
             if !restored {
@@ -972,7 +1096,10 @@ impl Server {
                         rusqlite::params![cal_key, cal_bytes.as_slice()],
                     );
                     drop(conn);
-                    info!(model = model_name, "[VECTOR] Quantizer calibrated and persisted");
+                    info!(
+                        model = model_name,
+                        "[VECTOR] Quantizer calibrated and persisted"
+                    );
                 }
             }
         }
@@ -986,21 +1113,28 @@ impl Server {
             }
         }
 
-        let (existing_facts, last_block) = AofWriter::replay(aof_path).await
+        let (existing_facts, last_block) = AofWriter::replay(aof_path)
+            .await
             .map_err(|e| ServerError::startup_failed(format!("AOF replay: {}", e)))?;
 
         let mempool = Arc::new(MemPool::new());
         let mut loaded = 0u64;
         for fact in existing_facts {
-            if mempool.add_fact(fact) { loaded += 1; }
+            if mempool.add_fact(fact) {
+                loaded += 1;
+            }
         }
 
-        let aof_writer = AofWriter::open(aof_path).await
+        let aof_writer = AofWriter::open(aof_path)
+            .await
             .map_err(|e| ServerError::startup_failed(format!("AOF open: {}", e)))?;
         aof_writer.set_chain_state(last_block.as_ref());
         let aof_writer = Arc::new(TokioMutex::new(aof_writer));
 
-        info!(facts = loaded, "[MEMCHAIN] Legacy MemPool + AOF initialized");
+        info!(
+            facts = loaded,
+            "[MEMCHAIN] Legacy MemPool + AOF initialized"
+        );
         Ok((storage, vector_index, mempool, aof_writer))
     }
 
@@ -1011,21 +1145,21 @@ impl Server {
     fn start_combined_api(
         &self,
         listen_addr: std::net::SocketAddr,
-        mpi_state:   Arc<MpiState>,
-        _mempool:    Arc<MemPool>,
+        mpi_state: Arc<MpiState>,
+        _mempool: Arc<MemPool>,
         _aof_writer: Arc<TokioMutex<AofWriter>>,
-        ip_pool:     Arc<IpPoolService>,
-        sessions:    Arc<SessionManager>,
-        _udp:        Arc<UdpTransport>,
+        ip_pool: Arc<IpPoolService>,
+        sessions: Arc<SessionManager>,
+        _udp: Arc<UdpTransport>,
         node_policy: Arc<NodePolicyRuntime>,
         voucher_verifier: Arc<VoucherVerifier>,
         encrypted_message_counter: Arc<AtomicU64>,
     ) -> JoinHandle<()> {
-        let mut shutdown_rx     = self.shutdown_tx.subscribe();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut shutdown_rx_vpn = self.shutdown_tx.subscribe();
-        let vpn_listen_addr: std::net::SocketAddr = format!(
-            "100.64.0.1:{}", listen_addr.port()
-        ).parse().unwrap_or_else(|_| "100.64.0.1:8421".parse().unwrap());
+        let vpn_listen_addr: std::net::SocketAddr = format!("100.64.0.1:{}", listen_addr.port())
+            .parse()
+            .unwrap_or_else(|_| "100.64.0.1:8421".parse().unwrap());
         let vpn_health_config = self.config.clone();
 
         tokio::spawn(async move {
@@ -1041,26 +1175,44 @@ impl Server {
                 ));
 
             let listener = match tokio::net::TcpListener::bind(listen_addr).await {
-                Ok(l)  => { info!("[API] MemChain API on http://{}", listen_addr); l }
-                Err(e) => { error!("[API] Bind failed {}: {}", listen_addr, e); return; }
+                Ok(l) => {
+                    info!("[API] MemChain API on http://{}", listen_addr);
+                    l
+                }
+                Err(e) => {
+                    error!("[API] Bind failed {}: {}", listen_addr, e);
+                    return;
+                }
             };
 
             match tokio::net::TcpListener::bind(vpn_listen_addr).await {
                 Ok(vpn_listener) => {
-                    info!("[API] Voice API also available on http://{} (VPN clients only)", vpn_listen_addr);
+                    info!(
+                        "[API] Voice API also available on http://{} (VPN clients only)",
+                        vpn_listen_addr
+                    );
                     let app_clone = app.clone();
                     tokio::spawn(async move {
-                        let server = axum::serve(vpn_listener, app_clone)
-                            .with_graceful_shutdown(async move { let _ = shutdown_rx_vpn.recv().await; });
-                        if let Err(e) = server.await { error!("[API] VPN listener error: {}", e); }
+                        let server = axum::serve(vpn_listener, app_clone).with_graceful_shutdown(
+                            async move {
+                                let _ = shutdown_rx_vpn.recv().await;
+                            },
+                        );
+                        if let Err(e) = server.await {
+                            error!("[API] VPN listener error: {}", e);
+                        }
                         info!("[API] VPN listener stopped");
                     });
                 }
                 Err(e) => {
-                    warn!("[API] VPN listener on {} not ready yet ({}), will retry every 10s", vpn_listen_addr, e);
+                    warn!(
+                        "[API] VPN listener on {} not ready yet ({}), will retry every 10s",
+                        vpn_listen_addr, e
+                    );
                     let app_clone = app.clone();
                     tokio::spawn(async move {
-                        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+                        let mut interval =
+                            tokio::time::interval(std::time::Duration::from_secs(10));
                         interval.tick().await;
                         loop {
                             tokio::select! {
@@ -1087,7 +1239,9 @@ impl Server {
                 let _ = shutdown_rx.recv().await;
                 info!("[API] Shutdown signal received");
             });
-            if let Err(e) = server.await { error!("[API] Server error: {}", e); }
+            if let Err(e) = server.await {
+                error!("[API] Server error: {}", e);
+            }
             info!("[API] Stopped");
         })
     }
@@ -1098,12 +1252,12 @@ impl Server {
 
     async fn init_management_reporter(
         &self,
-        sessions:        &Arc<SessionManager>,
-        ip_pool:         Arc<IpPoolService>,
-        udp:             Arc<UdpTransport>,
+        sessions: &Arc<SessionManager>,
+        ip_pool: Arc<IpPoolService>,
+        udp: Arc<UdpTransport>,
         traffic_tracker: Arc<TrafficTracker>,
-        deny_list:       Arc<DenyList>,
-        node_policy:     Arc<NodePolicyRuntime>,
+        deny_list: Arc<DenyList>,
+        node_policy: Arc<NodePolicyRuntime>,
         voucher_verifier: Arc<VoucherVerifier>,
         encrypted_message_counter: Arc<AtomicU64>,
     ) -> SessionEventSender {
@@ -1121,22 +1275,24 @@ impl Server {
         let session_event_sender = SessionEventSender::new(event_tx);
 
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_BUFFER);
-        let cmd_handler      = CommandHandler::new(cmd_rx, Arc::clone(&mgmt_client))
+        let cmd_handler = CommandHandler::new(cmd_rx, Arc::clone(&mgmt_client))
             .with_session_control(Arc::clone(sessions), session_event_sender.clone())
             .with_deny_list(Arc::clone(&deny_list))
             .with_node_policy(Arc::clone(&node_policy));
-        let cmd_shutdown     = self.shutdown_tx.subscribe();
-        tokio::spawn(async move { cmd_handler.run(cmd_shutdown).await; });
+        let cmd_shutdown = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            cmd_handler.run(cmd_shutdown).await;
+        });
 
         let memchain_status_fn: Option<crate::management::reporter::MemChainStatusFn> =
             if self.config.memchain.is_enabled() {
                 let allow_remote = self.config.memchain.allow_remote_storage;
-                let max_owners   = self.config.memchain.max_remote_owners;
+                let max_owners = self.config.memchain.max_remote_owners;
                 Some(Box::new(move || {
                     Some(crate::management::client::MemChainHeartbeatStatus {
-                        enabled:               true,
-                        allow_remote_storage:  allow_remote,
-                        max_remote_owners:     max_owners,
+                        enabled: true,
+                        allow_remote_storage: allow_remote,
+                        max_remote_owners: max_owners,
                         current_remote_owners: 0,
                     })
                 }))
@@ -1146,14 +1302,13 @@ impl Server {
 
         // Note: .with_sessions / .with_traffic_tracker / .with_udp are
         // injected here — all three are available at this call site.
-        let mut heartbeat =
-            HeartbeatReporter::new(Arc::clone(&mgmt_client), public_ip)
-                .with_command_sender(cmd_tx)
-                .with_sessions(Arc::clone(sessions))
-                .with_traffic_tracker(Arc::clone(&traffic_tracker))
-                .with_udp(Arc::clone(&udp))
-                .with_deny_list(Arc::clone(&deny_list))
-                .with_node_policy(Arc::clone(&node_policy));
+        let mut heartbeat = HeartbeatReporter::new(Arc::clone(&mgmt_client), public_ip)
+            .with_command_sender(cmd_tx)
+            .with_sessions(Arc::clone(sessions))
+            .with_traffic_tracker(Arc::clone(&traffic_tracker))
+            .with_udp(Arc::clone(&udp))
+            .with_deny_list(Arc::clone(&deny_list))
+            .with_node_policy(Arc::clone(&node_policy));
 
         if let Some(f) = memchain_status_fn {
             heartbeat = heartbeat.with_memchain_status(f);
@@ -1173,14 +1328,17 @@ impl Server {
             let verifier = Arc::clone(&vpn_health_verifier);
             let message_counter = Arc::clone(&vpn_health_message_counter);
             Box::pin(async move {
-                Some(collect_vpn_health_value(
-                    config,
-                    ip_pool,
-                    sessions,
-                    node_policy,
-                    verifier,
-                    message_counter,
-                ).await)
+                Some(
+                    collect_vpn_health_value(
+                        config,
+                        ip_pool,
+                        sessions,
+                        node_policy,
+                        verifier,
+                        message_counter,
+                    )
+                    .await,
+                )
             })
         }));
 
@@ -1198,18 +1356,21 @@ impl Server {
             let verifier = Arc::clone(&operator_status_verifier);
             let message_counter = Arc::clone(&operator_status_message_counter);
             Box::pin(async move {
-                Some(collect_node_operator_status_value(
-                    config,
-                    ip_pool,
-                    sessions,
-                    node_policy,
-                    verifier,
-                    message_counter,
-                ).await)
+                Some(
+                    collect_node_operator_status_value(
+                        config,
+                        ip_pool,
+                        sessions,
+                        node_policy,
+                        verifier,
+                        message_counter,
+                    )
+                    .await,
+                )
             })
         }));
 
-        let sess        = Arc::clone(sessions);
+        let sess = Arc::clone(sessions);
         let hb_shutdown = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             heartbeat
@@ -1218,7 +1379,9 @@ impl Server {
         });
 
         let sr_shutdown = self.shutdown_tx.subscribe();
-        tokio::spawn(async move { session_reporter.run(sr_shutdown).await; });
+        tokio::spawn(async move {
+            session_reporter.run(sr_shutdown).await;
+        });
 
         info!("[MANAGEMENT] Reporting started");
         session_event_sender
@@ -1241,7 +1404,10 @@ impl Server {
             "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip",
         ];
 
-        if let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(5)).build() {
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
             for url in &services {
                 let mut req = client.get(*url);
                 if url.contains("metadata.google.internal") {
@@ -1254,8 +1420,14 @@ impl Server {
                             if ip_str.len() <= 45 {
                                 if let Ok(addr) = ip_str.parse::<std::net::IpAddr>() {
                                     let is_private = match addr {
-                                        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_unspecified(),
-                                        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+                                        std::net::IpAddr::V4(v4) => {
+                                            v4.is_loopback()
+                                                || v4.is_private()
+                                                || v4.is_unspecified()
+                                        }
+                                        std::net::IpAddr::V6(v6) => {
+                                            v6.is_loopback() || v6.is_unspecified()
+                                        }
                                     };
                                     if !is_private {
                                         info!(ip = %addr, source = %url, "[NET] Public IP detected");
@@ -1279,15 +1451,25 @@ impl Server {
     // Core Services
     // ============================================
 
-    fn init_services(&self) -> Result<(Arc<IpPoolService>, Arc<SessionManager>, Arc<RoutingService>)> {
+    fn init_services(
+        &self,
+    ) -> Result<(Arc<IpPoolService>, Arc<SessionManager>, Arc<RoutingService>)> {
         let (network, prefix) = self.config.parse_ip_range()?;
-        let ip_pool  = Arc::new(IpPoolService::new(network, prefix, self.config.gateway_ip())?);
+        let ip_pool = Arc::new(IpPoolService::new(
+            network,
+            prefix,
+            self.config.gateway_ip(),
+        )?);
         let sessions = Arc::new(SessionManager::new(
             self.config.max_sessions(),
             Duration::from_secs(self.config.session_timeout_secs()),
         ));
-        let routing  = Arc::new(RoutingService::new());
-        info!(capacity = ip_pool.capacity(), max_sessions = self.config.max_sessions(), "Services initialized");
+        let routing = Arc::new(RoutingService::new());
+        info!(
+            capacity = ip_pool.capacity(),
+            max_sessions = self.config.max_sessions(),
+            "Services initialized"
+        );
         Ok((ip_pool, sessions, routing))
     }
 
@@ -1297,11 +1479,17 @@ impl Server {
             .with_address(self.config.gateway_ip())
             .with_netmask(Ipv4Addr::new(255, 255, 255, 0))
             .with_mtu(self.config.mtu());
-        let tun = LinuxTun::create(cfg).await
+        let tun = LinuxTun::create(cfg)
+            .await
             .map_err(|e| ServerError::startup_failed(format!("TUN: {}", e)))?;
-        tun.up().await
+        tun.up()
+            .await
             .map_err(|e| ServerError::startup_failed(format!("TUN up: {}", e)))?;
-        info!("TUN '{}' initialized @ {}", tun.name(), self.config.gateway_ip());
+        info!(
+            "TUN '{}' initialized @ {}",
+            tun.name(),
+            self.config.gateway_ip()
+        );
         Ok(Arc::new(tun))
     }
 
@@ -1312,29 +1500,29 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     fn spawn_udp_task(
         &self,
-        udp:              Arc<UdpTransport>,
+        udp: Arc<UdpTransport>,
         #[cfg(target_os = "linux")] tun: Arc<LinuxTun>,
-        handshake:        Arc<HandshakeService>,
-        packet_handler:   Arc<PacketHandler>,
+        handshake: Arc<HandshakeService>,
+        packet_handler: Arc<PacketHandler>,
         voucher_verifier: Arc<VoucherVerifier>,
-        sessions:         Arc<SessionManager>,
-        session_events:   SessionEventSender,
-        mempool:          Option<Arc<MemPool>>,
-        aof_writer:       Option<Arc<TokioMutex<AofWriter>>>,
-        storage:          Option<Arc<MemoryStorage>>,
-        vector_index:     Option<Arc<VectorIndex>>,
-        memchain_config:  MemChainConfig,
+        sessions: Arc<SessionManager>,
+        session_events: SessionEventSender,
+        mempool: Option<Arc<MemPool>>,
+        aof_writer: Option<Arc<TokioMutex<AofWriter>>>,
+        storage: Option<Arc<MemoryStorage>>,
+        vector_index: Option<Arc<VectorIndex>>,
+        memchain_config: MemChainConfig,
         server_pubkey_hex: String,
-        chat_relay:       Option<Arc<ChatRelayService>>,
-        routing:          Arc<RoutingService>,
+        chat_relay: Option<Arc<ChatRelayService>>,
+        routing: Arc<RoutingService>,
     ) -> JoinHandle<()> {
-        let shutdown    = Arc::clone(&self.shutdown);
+        let shutdown = Arc::clone(&self.shutdown);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let udp_reply   = Arc::clone(&udp);
+        let udp_reply = Arc::clone(&udp);
 
         tokio::spawn(async move {
-            let mut buf    = vec![0u8; 65535];
-            let crypto     = DefaultTransportCrypto::new();
+            let mut buf = vec![0u8; 65535];
+            let crypto = DefaultTransportCrypto::new();
 
             loop {
                 tokio::select! {
@@ -1496,18 +1684,18 @@ impl Server {
 
     #[allow(clippy::too_many_arguments)]
     async fn handle_memchain_message(
-        msg:              MemChainMessage,
-        mempool:          &Arc<MemPool>,
-        aof_writer:       &Arc<TokioMutex<AofWriter>>,
-        storage:          &Option<Arc<MemoryStorage>>,
-        vector_index:     &Option<Arc<VectorIndex>>,
-        config:           &MemChainConfig,
+        msg: MemChainMessage,
+        mempool: &Arc<MemPool>,
+        aof_writer: &Arc<TokioMutex<AofWriter>>,
+        storage: &Option<Arc<MemoryStorage>>,
+        vector_index: &Option<Arc<VectorIndex>>,
+        config: &MemChainConfig,
         server_pubkey_hex: &str,
-        session:          &Arc<crate::services::Session>,
-        udp:              &Arc<UdpTransport>,
-        crypto:           &DefaultTransportCrypto,
-        sessions:         &Arc<SessionManager>,
-        chat_relay:       &Option<Arc<ChatRelayService>>,
+        session: &Arc<crate::services::Session>,
+        udp: &Arc<UdpTransport>,
+        crypto: &DefaultTransportCrypto,
+        sessions: &Arc<SessionManager>,
+        chat_relay: &Option<Arc<ChatRelayService>>,
     ) {
         match msg {
             MemChainMessage::BroadcastFact(fact) => {
@@ -1516,9 +1704,13 @@ impl Server {
                     Ok(pk) => pk.verify(&fact.fact_id, &fact.signature).is_ok(),
                     Err(_) => false,
                 };
-                if !sig_ok { warn!("[MEMCHAIN] BroadcastFact sig failed"); return; }
+                if !sig_ok {
+                    warn!("[MEMCHAIN] BroadcastFact sig failed");
+                    return;
+                }
                 if !config.is_origin_trusted(&origin_hex, server_pubkey_hex) {
-                    warn!("[MEMCHAIN] BroadcastFact untrusted origin"); return;
+                    warn!("[MEMCHAIN] BroadcastFact untrusted origin");
+                    return;
                 }
                 if mempool.add_fact(fact.clone()) {
                     let mut w = aof_writer.lock().await;
@@ -1531,19 +1723,34 @@ impl Server {
                     Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                     Err(_) => false,
                 };
-                if !sig_ok { warn!(owner = %owner_hex, "[MEMCHAIN] BroadcastRecord sig failed"); return; }
+                if !sig_ok {
+                    warn!(owner = %owner_hex, "[MEMCHAIN] BroadcastRecord sig failed");
+                    return;
+                }
                 if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
-                    warn!(owner = %owner_hex, "[MEMCHAIN] BroadcastRecord untrusted"); return;
+                    warn!(owner = %owner_hex, "[MEMCHAIN] BroadcastRecord untrusted");
+                    return;
                 }
                 if !record.verify_id() {
-                    warn!(owner = %owner_hex, id = hex::encode(record.record_id), "[MEMCHAIN] record_id hash mismatch"); return;
+                    warn!(owner = %owner_hex, id = hex::encode(record.record_id), "[MEMCHAIN] record_id hash mismatch");
+                    return;
                 }
                 if let Some(ref st) = storage {
                     if st.insert(&record, "p2p-remote").await {
-                        info!(id = hex::encode(record.record_id), "[MEMCHAIN] BroadcastRecord stored");
+                        info!(
+                            id = hex::encode(record.record_id),
+                            "[MEMCHAIN] BroadcastRecord stored"
+                        );
                         if record.has_embedding() {
                             if let Some(ref vi) = vector_index {
-                                vi.upsert(record.record_id, record.embedding.clone(), record.layer, record.timestamp, &record.owner, "p2p-remote");
+                                vi.upsert(
+                                    record.record_id,
+                                    record.embedding.clone(),
+                                    record.layer,
+                                    record.timestamp,
+                                    &record.owner,
+                                    "p2p-remote",
+                                );
                             }
                         }
                     }
@@ -1551,7 +1758,7 @@ impl Server {
             }
             MemChainMessage::SyncRequest { last_known_hash } => {
                 let facts = mempool.get_facts_after(last_known_hash);
-                let resp  = MemChainMessage::SyncResponse { facts };
+                let resp = MemChainMessage::SyncResponse { facts };
                 Self::send_to_session(&resp, session, udp, crypto).await;
             }
             MemChainMessage::SyncResponse { facts } => {
@@ -1561,17 +1768,22 @@ impl Server {
                         Ok(pk) => pk.verify(&fact.fact_id, &fact.signature).is_ok(),
                         Err(_) => false,
                     };
-                    if !sig_ok || !config.is_origin_trusted(&origin_hex, server_pubkey_hex) { continue; }
+                    if !sig_ok || !config.is_origin_trusted(&origin_hex, server_pubkey_hex) {
+                        continue;
+                    }
                     if mempool.add_fact(fact.clone()) {
                         let mut w = aof_writer.lock().await;
                         let _ = w.append_fact(&fact).await;
                     }
                 }
             }
-            MemChainMessage::SyncRecordRequest { owner, after_timestamp } => {
+            MemChainMessage::SyncRecordRequest {
+                owner,
+                after_timestamp,
+            } => {
                 if let Some(ref st) = storage {
                     let records = st.query_by_owner_after(&owner, after_timestamp).await;
-                    let resp    = MemChainMessage::SyncRecordResponse { records };
+                    let resp = MemChainMessage::SyncRecordResponse { records };
                     Self::send_to_session(&resp, session, udp, crypto).await;
                 }
             }
@@ -1583,38 +1795,61 @@ impl Server {
                             Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
                             Err(_) => false,
                         };
-                        if !sig_ok { warn!(owner = %owner_hex, "[MEMCHAIN] SyncRecordResponse sig failed"); continue; }
-                        if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) { continue; }
+                        if !sig_ok {
+                            warn!(owner = %owner_hex, "[MEMCHAIN] SyncRecordResponse sig failed");
+                            continue;
+                        }
+                        if !config.is_origin_trusted(&owner_hex, server_pubkey_hex) {
+                            continue;
+                        }
                         if !record.verify_id() {
-                            warn!(owner = %owner_hex, id = hex::encode(record.record_id), "[MEMCHAIN] SyncRecordResponse hash mismatch"); continue;
+                            warn!(owner = %owner_hex, id = hex::encode(record.record_id), "[MEMCHAIN] SyncRecordResponse hash mismatch");
+                            continue;
                         }
                         let _ = st.insert(&record, "p2p-sync").await;
                     }
                 }
             }
             MemChainMessage::BlockAnnounce(header) => {
-                info!(height = header.height, hash = hex::encode(header.hash()), "[MEMCHAIN] BlockAnnounce received");
+                info!(
+                    height = header.height,
+                    hash = hex::encode(header.hash()),
+                    "[MEMCHAIN] BlockAnnounce received"
+                );
             }
             MemChainMessage::ChatRelay(envelope) => {
                 if envelope.verify_signature().is_err() {
-                    warn!(receiver = %hex::encode(&envelope.receiver[..4]), "[CHAT_RELAY] Envelope sig failed — dropped"); return;
+                    warn!(receiver = %hex::encode(&envelope.receiver[..4]), "[CHAT_RELAY] Envelope sig failed — dropped");
+                    return;
                 }
                 let Some(ref relay) = chat_relay else {
-                    warn!(receiver = %hex::encode(&envelope.receiver[..4]), "[CHAT_RELAY] Relay unavailable — dropped"); return;
+                    warn!(receiver = %hex::encode(&envelope.receiver[..4]), "[CHAT_RELAY] Relay unavailable — dropped");
+                    return;
                 };
                 if relay.is_online_duplicate(&envelope.message_id) {
-                    debug!(id = %hex::encode(envelope.message_id), "[CHAT_RELAY] Online duplicate — dropped"); return;
+                    debug!(id = %hex::encode(envelope.message_id), "[CHAT_RELAY] Online duplicate — dropped");
+                    return;
                 }
-                relay.wallet_routes.announce(&envelope.sender, session.id.clone(), session.client_endpoint);
-                let receiver      = envelope.receiver;
+                relay.wallet_routes.announce(
+                    &envelope.sender,
+                    session.id.clone(),
+                    session.client_endpoint,
+                );
+                let receiver = envelope.receiver;
                 let target_routes = relay.wallet_routes.lookup(&receiver);
 
                 if !target_routes.is_empty() {
-                    let mut all_failed  = true;
-                    let device_count    = target_routes.len();
+                    let mut all_failed = true;
+                    let device_count = target_routes.len();
                     for (target_sid, _endpoint) in &target_routes {
                         if let Some(target_session) = sessions.get(target_sid) {
-                            Self::send_to_session(&MemChainMessage::ChatRelay(envelope.clone()), &target_session, udp, crypto).await;
+                            Self::send_to_session(
+                                &MemChainMessage::ChatRelay(envelope.clone()),
+                                &target_session,
+                                udp,
+                                crypto,
+                            )
+                            .await;
                             all_failed = false;
                         } else {
                             relay.wallet_routes.remove_session(target_sid);
@@ -1638,114 +1873,221 @@ impl Server {
                     }
                 }
             }
-            MemChainMessage::ChatPull { wallet, after_timestamp, cursor, limit, request_timestamp, signature } => {
-                let Some(ref relay) = chat_relay else { return; };
-                let at_bytes    = after_timestamp.to_le_bytes();
+            MemChainMessage::ChatPull {
+                wallet,
+                after_timestamp,
+                cursor,
+                limit,
+                request_timestamp,
+                signature,
+            } => {
+                let Some(ref relay) = chat_relay else {
+                    return;
+                };
+                let at_bytes = after_timestamp.to_le_bytes();
                 let limit_bytes = limit.to_le_bytes();
-                let rts_bytes   = request_timestamp.to_le_bytes();
+                let rts_bytes = request_timestamp.to_le_bytes();
                 let verify_result = verify_signed_message(
                     DOMAIN_CHAT_PULL,
-                    &[wallet.as_ref(), at_bytes.as_ref(), cursor.as_ref(), limit_bytes.as_ref(), rts_bytes.as_ref()],
-                    &wallet, &signature, request_timestamp,
+                    &[
+                        wallet.as_ref(),
+                        at_bytes.as_ref(),
+                        cursor.as_ref(),
+                        limit_bytes.as_ref(),
+                        rts_bytes.as_ref(),
+                    ],
+                    &wallet,
+                    &signature,
+                    request_timestamp,
                 );
-                if verify_result.is_err() { return; }
-                relay.wallet_routes.announce(&wallet, session.id.clone(), session.client_endpoint);
+                if verify_result.is_err() {
+                    return;
+                }
+                relay
+                    .wallet_routes
+                    .announce(&wallet, session.id.clone(), session.client_endpoint);
                 match relay.pull_pending(&wallet, after_timestamp, &cursor, limit) {
                     Ok((messages, has_more)) => {
                         let envelopes: Vec<_> = messages.into_iter().map(|m| m.envelope).collect();
-                        let resp = MemChainMessage::ChatPullResponse { envelopes, has_more };
+                        let resp = MemChainMessage::ChatPullResponse {
+                            envelopes,
+                            has_more,
+                        };
                         Self::send_to_session(&resp, session, udp, crypto).await;
                     }
-                    Err(e) => { warn!(error = %e, wallet = %hex::encode(&wallet[..4]), "[CHAT_RELAY] pull_pending failed"); }
+                    Err(e) => {
+                        warn!(error = %e, wallet = %hex::encode(&wallet[..4]), "[CHAT_RELAY] pull_pending failed");
+                    }
                 }
             }
-            MemChainMessage::ChatAck { message_ids, wallet, ack_timestamp, signature } => {
-                let Some(ref relay) = chat_relay else { return; };
-                if message_ids.is_empty() { return; }
+            MemChainMessage::ChatAck {
+                message_ids,
+                wallet,
+                ack_timestamp,
+                signature,
+            } => {
+                let Some(ref relay) = chat_relay else {
+                    return;
+                };
+                if message_ids.is_empty() {
+                    return;
+                }
                 let mut id_hasher = Sha256::new();
-                for mid in &message_ids { id_hasher.update(mid.as_ref()); }
+                for mid in &message_ids {
+                    id_hasher.update(mid.as_ref());
+                }
                 let ids_hash: [u8; 32] = id_hasher.finalize().into();
                 let ack_ts_bytes = ack_timestamp.to_le_bytes();
                 let verify_result = verify_signed_message(
                     DOMAIN_CHAT_ACK,
                     &[wallet.as_ref(), ack_ts_bytes.as_ref(), ids_hash.as_ref()],
-                    &wallet, &signature, ack_timestamp,
+                    &wallet,
+                    &signature,
+                    ack_timestamp,
                 );
                 if let Err(e) = verify_result {
-                    warn!(wallet = %hex::encode(&wallet[..4]), error = %e, "[CHAT_RELAY] ChatAck sig failed"); return;
+                    warn!(wallet = %hex::encode(&wallet[..4]), error = %e, "[CHAT_RELAY] ChatAck sig failed");
+                    return;
                 }
                 match relay.ack_messages(&message_ids, &wallet) {
-                    Ok(deleted) => { debug!(deleted, wallet = %hex::encode(&wallet[..4]), "[CHAT_RELAY] ChatAck processed"); }
-                    Err(e)      => { warn!(error = %e, wallet = %hex::encode(&wallet[..4]), "[CHAT_RELAY] ack_messages failed"); }
+                    Ok(deleted) => {
+                        debug!(deleted, wallet = %hex::encode(&wallet[..4]), "[CHAT_RELAY] ChatAck processed");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, wallet = %hex::encode(&wallet[..4]), "[CHAT_RELAY] ack_messages failed");
+                    }
                 }
             }
-            MemChainMessage::DeviceRegister { device_id, device_name, wallet_pubkey, timestamp, signature } => {
+            MemChainMessage::DeviceRegister {
+                device_id,
+                device_name,
+                wallet_pubkey,
+                timestamp,
+                signature,
+            } => {
                 let ts_bytes = timestamp.to_le_bytes();
                 let verify_result = verify_signed_message(
                     DOMAIN_DEVICE_REGISTER,
-                    &[session.id.as_bytes().as_ref(), device_id.as_ref(), wallet_pubkey.as_ref(), ts_bytes.as_ref()],
-                    &wallet_pubkey, &signature, timestamp,
+                    &[
+                        session.id.as_bytes().as_ref(),
+                        device_id.as_ref(),
+                        wallet_pubkey.as_ref(),
+                        ts_bytes.as_ref(),
+                    ],
+                    &wallet_pubkey,
+                    &signature,
+                    timestamp,
                 );
                 if let Err(e) = verify_result {
-                    warn!(session = %session.id, wallet = %hex::encode(&wallet_pubkey[..4]), error = %e, "[CHAT_RELAY] DeviceRegister sig failed"); return;
+                    warn!(session = %session.id, wallet = %hex::encode(&wallet_pubkey[..4]), error = %e, "[CHAT_RELAY] DeviceRegister sig failed");
+                    return;
                 }
                 let name_display = if device_name.len() > 64 {
                     let mut end = 64;
-                    while !device_name.is_char_boundary(end) { end -= 1; }
+                    while !device_name.is_char_boundary(end) {
+                        end -= 1;
+                    }
                     &device_name[..end]
-                } else { &device_name };
-                let Some(ref relay) = chat_relay else { return; };
-                relay.wallet_routes.announce(&wallet_pubkey, session.id.clone(), session.client_endpoint);
+                } else {
+                    &device_name
+                };
+                let Some(ref relay) = chat_relay else {
+                    return;
+                };
+                relay.wallet_routes.announce(
+                    &wallet_pubkey,
+                    session.id.clone(),
+                    session.client_endpoint,
+                );
                 sessions.register_device(&wallet_pubkey, device_id, session.id.clone());
                 info!(session_id = %session.id, wallet = %hex::encode(&wallet_pubkey[..4]), device_id = %hex::encode(device_id), device_name = %name_display, "[CHAT_RELAY] Device registered");
                 match relay.pull_pending(&wallet_pubkey, 0, &[0u8; 16], 100) {
                     Ok((messages, _has_more)) if !messages.is_empty() => {
                         let count = messages.len();
                         for pm in messages {
-                            Self::send_to_session(&MemChainMessage::ChatRelay(pm.envelope), session, udp, crypto).await;
+                            Self::send_to_session(
+                                &MemChainMessage::ChatRelay(pm.envelope),
+                                session,
+                                udp,
+                                crypto,
+                            )
+                            .await;
                         }
                         info!(count, wallet = %hex::encode(&wallet_pubkey[..4]), "[CHAT_RELAY] Delivered pending messages on register");
                     }
-                    Ok(_)  => {}
-                    Err(e) => { warn!(error = %e, wallet = %hex::encode(&wallet_pubkey[..4]), "[CHAT_RELAY] pull_pending on register failed"); }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(error = %e, wallet = %hex::encode(&wallet_pubkey[..4]), "[CHAT_RELAY] pull_pending on register failed");
+                    }
                 }
             }
-            MemChainMessage::WalletPresence { wallet_pubkey, timestamp, signature } => {
-                let Some(ref relay) = chat_relay else { return; };
+            MemChainMessage::WalletPresence {
+                wallet_pubkey,
+                timestamp,
+                signature,
+            } => {
+                let Some(ref relay) = chat_relay else {
+                    return;
+                };
                 let ts_bytes = timestamp.to_le_bytes();
                 let verify_result = verify_signed_message(
                     DOMAIN_WALLET_PRESENCE,
-                    &[session.id.as_bytes().as_ref(), wallet_pubkey.as_ref(), ts_bytes.as_ref()],
-                    &wallet_pubkey, &signature, timestamp,
+                    &[
+                        session.id.as_bytes().as_ref(),
+                        wallet_pubkey.as_ref(),
+                        ts_bytes.as_ref(),
+                    ],
+                    &wallet_pubkey,
+                    &signature,
+                    timestamp,
                 );
                 if let Err(e) = verify_result {
-                    debug!(wallet = %hex::encode(&wallet_pubkey[..4]), error = %e, "[CHAT_RELAY] WalletPresence sig failed"); return;
+                    debug!(wallet = %hex::encode(&wallet_pubkey[..4]), error = %e, "[CHAT_RELAY] WalletPresence sig failed");
+                    return;
                 }
-                relay.wallet_routes.announce(&wallet_pubkey, session.id.clone(), session.client_endpoint);
+                relay.wallet_routes.announce(
+                    &wallet_pubkey,
+                    session.id.clone(),
+                    session.client_endpoint,
+                );
                 debug!(wallet = %hex::encode(&wallet_pubkey[..4]), "[CHAT_RELAY] WalletPresence: route refreshed");
             }
-            _ => { debug!("[MEMCHAIN] Unhandled message variant"); }
+            _ => {
+                debug!("[MEMCHAIN] Unhandled message variant");
+            }
         }
     }
 
     async fn send_to_session(
-        msg:     &MemChainMessage,
+        msg: &MemChainMessage,
         session: &Arc<crate::services::Session>,
-        udp:     &Arc<UdpTransport>,
-        crypto:  &DefaultTransportCrypto,
+        udp: &Arc<UdpTransport>,
+        crypto: &DefaultTransportCrypto,
     ) {
         let plaintext = match encode_memchain(msg) {
-            Ok(p)  => p,
-            Err(e) => { error!("[MEMCHAIN_TX] Encode: {}", e); return; }
+            Ok(p) => p,
+            Err(e) => {
+                error!("[MEMCHAIN_TX] Encode: {}", e);
+                return;
+            }
         };
-        let counter       = session.next_tx_counter();
+        let counter = session.next_tx_counter();
         let mut encrypted = vec![0u8; plaintext.len() + ENCRYPTION_OVERHEAD];
-        let len = match crypto.encrypt(&session.session_key, counter, session.id.as_bytes(), &plaintext, &mut encrypted) {
-            Ok(l)  => l,
-            Err(e) => { error!("[MEMCHAIN_TX] Encrypt: {}", e); return; }
+        let len = match crypto.encrypt(
+            &session.session_key,
+            counter,
+            session.id.as_bytes(),
+            &plaintext,
+            &mut encrypted,
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                error!("[MEMCHAIN_TX] Encrypt: {}", e);
+                return;
+            }
         };
         encrypted.truncate(len);
-        let pkt   = DataPacket::new(*session.id.as_bytes(), counter, encrypted);
+        let pkt = DataPacket::new(*session.id.as_bytes(), counter, encrypted);
         let bytes = encode_data_packet(&pkt).to_vec();
         let _ = udp.send(&bytes, &session.client_endpoint).await;
     }
@@ -1757,12 +2099,12 @@ impl Server {
     #[cfg(target_os = "linux")]
     fn spawn_tun_task(
         &self,
-        tun:     Arc<LinuxTun>,
-        udp:     Arc<UdpTransport>,
+        tun: Arc<LinuxTun>,
+        udp: Arc<UdpTransport>,
         handler: Arc<PacketHandler>,
     ) -> JoinHandle<()> {
-        let shutdown    = Arc::clone(&self.shutdown);
-        let mut rx      = self.shutdown_tx.subscribe();
+        let shutdown = Arc::clone(&self.shutdown);
+        let mut rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             loop {
@@ -1791,11 +2133,11 @@ impl Server {
     fn spawn_traffic_snapshot_task(
         &self,
         sessions: Arc<SessionManager>,
-        events:   SessionEventSender,
+        events: SessionEventSender,
         interval_secs: u64,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
-        let mut rx   = self.shutdown_tx.subscribe();
+        let mut rx = self.shutdown_tx.subscribe();
         let interval_secs = interval_secs.clamp(10, 300);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
@@ -1842,16 +2184,17 @@ impl Server {
 
     fn spawn_keepalive_probe_task(
         &self,
-        sessions:       Arc<SessionManager>,
-        udp:            Arc<UdpTransport>,
+        sessions: Arc<SessionManager>,
+        udp: Arc<UdpTransport>,
         packet_handler: Arc<PacketHandler>,
-        gateway_ip:     Ipv4Addr,
+        gateway_ip: Ipv4Addr,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
-        let mut rx   = self.shutdown_tx.subscribe();
+        let mut rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            let mut timer = tokio::time::interval(Duration::from_secs(KEEPALIVE_PROBE_INTERVAL_SECS));
+            let mut timer =
+                tokio::time::interval(Duration::from_secs(KEEPALIVE_PROBE_INTERVAL_SECS));
             loop {
                 tokio::select! {
                     _ = rx.recv() => break,
@@ -1894,16 +2237,16 @@ impl Server {
 
     fn spawn_cleanup_task(
         &self,
-        sessions:         Arc<SessionManager>,
-        ip_pool:          Arc<IpPoolService>,
-        routing:          Arc<RoutingService>,
-        events:           SessionEventSender,
-        chat_relay:       Option<Arc<ChatRelayService>>,
-        traffic_tracker:  Arc<TrafficTracker>,
-        deny_list:        Arc<DenyList>,
+        sessions: Arc<SessionManager>,
+        ip_pool: Arc<IpPoolService>,
+        routing: Arc<RoutingService>,
+        events: SessionEventSender,
+        chat_relay: Option<Arc<ChatRelayService>>,
+        traffic_tracker: Arc<TrafficTracker>,
+        deny_list: Arc<DenyList>,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
-        let mut rx   = self.shutdown_tx.subscribe();
+        let mut rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(Duration::from_secs(60));
             loop {
@@ -1947,7 +2290,9 @@ impl Server {
     // ============================================
 
     async fn wait_for_shutdown(&self) {
-        tokio::signal::ctrl_c().await.expect("Ctrl+C listener failed");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Ctrl+C listener failed");
         info!("Shutdown signal received");
     }
 
@@ -1961,8 +2306,8 @@ impl std::fmt::Debug for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Server")
             .field("listen", &self.config.listen_addr())
-            .field("tun",    &self.config.device_name())
-            .field("mode",   &self.config.memchain.mode)
+            .field("tun", &self.config.device_name())
+            .field("mode", &self.config.memchain.mode)
             .finish()
     }
 }

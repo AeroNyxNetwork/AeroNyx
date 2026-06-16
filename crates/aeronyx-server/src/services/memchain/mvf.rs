@@ -135,9 +135,15 @@ impl WeightVector {
     /// Serialize to 120 bytes: w(40) + μ(40) + σ(40).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(WEIGHT_BYTES_V24);
-        for &v in &self.weights { buf.extend_from_slice(&v.to_le_bytes()); }
-        for &v in &self.running_mean { buf.extend_from_slice(&v.to_le_bytes()); }
-        for &v in &self.running_std { buf.extend_from_slice(&v.to_le_bytes()); }
+        for &v in &self.weights {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for &v in &self.running_mean {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for &v in &self.running_std {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
         buf
     }
 
@@ -162,23 +168,31 @@ impl WeightVector {
             let read_dim = MVF_DIM_V23;
             for i in 0..read_dim {
                 let off = i * 4;
-                weights[i] = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+                weights[i] =
+                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
             }
             for i in 0..read_dim {
                 let off = read_dim * 4 + i * 4;
-                running_mean[i] = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+                running_mean[i] =
+                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
             }
             for i in 0..read_dim {
                 let off = read_dim * 2 * 4 + i * 4;
-                running_std[i] = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+                running_std[i] =
+                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
             }
 
             // φ₉ defaults (graph_traverse_weight)
-            weights[9] = 0.0;        // no graph influence initially
+            weights[9] = 0.0; // no graph influence initially
             running_mean[9] = 0.0;
             running_std[9] = 0.3;
 
-            return Some(Self { weights, running_mean, running_std, version: 0 });
+            return Some(Self {
+                weights,
+                running_mean,
+                running_std,
+                version: 0,
+            });
         }
 
         None
@@ -187,7 +201,9 @@ impl WeightVector {
     /// Internal: deserialize exactly `ndim` dimensions from data.
     fn from_bytes_ndim(data: &[u8], ndim: usize) -> Option<Self> {
         let expected = ndim * 3 * 4;
-        if data.len() < expected { return None; }
+        if data.len() < expected {
+            return None;
+        }
 
         let mut weights = [0.0f32; MVF_DIM];
         let mut running_mean = [0.0f32; MVF_DIM];
@@ -195,18 +211,26 @@ impl WeightVector {
 
         for i in 0..ndim {
             let off = i * 4;
-            weights[i] = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+            weights[i] =
+                f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
         }
         for i in 0..ndim {
             let off = ndim * 4 + i * 4;
-            running_mean[i] = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+            running_mean[i] =
+                f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
         }
         for i in 0..ndim {
             let off = ndim * 2 * 4 + i * 4;
-            running_std[i] = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+            running_std[i] =
+                f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
         }
 
-        Some(Self { weights, running_mean, running_std, version: 0 })
+        Some(Self {
+            weights,
+            running_mean,
+            running_std,
+            version: 0,
+        })
     }
 }
 
@@ -216,9 +240,9 @@ impl WeightVector {
 pub fn default_weights() -> WeightVector {
     WeightVector {
         //                φ₀    φ₁    φ₂    φ₃    φ₄    φ₅    φ₆    φ₇    φ₈    φ₉
-        weights:      [0.35, 0.15, 0.10, 0.20, 0.10, 0.02, 0.15, 0.05, -0.20, 0.0],
-        running_mean: [0.5,  0.5,  1.5,  0.5,  0.0,  0.0,  0.0,  0.0,   0.0,  0.0],
-        running_std:  [0.3,  0.3,  0.5,  0.3,  0.3,  0.3,  0.5,  0.3,   0.5,  0.3],
+        weights: [0.35, 0.15, 0.10, 0.20, 0.10, 0.02, 0.15, 0.05, -0.20, 0.0],
+        running_mean: [0.5, 0.5, 1.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        running_std: [0.3, 0.3, 0.5, 0.3, 0.3, 0.3, 0.5, 0.3, 0.5, 0.3],
         version: 0,
     }
 }
@@ -260,7 +284,11 @@ pub fn compute_features(
     let phi_0 = similarity.clamp(0.0, 1.0);
 
     // φ₁: time decay = exp(-Δt_hours / stability)
-    let hours = if now > timestamp { (now - timestamp) as f32 / 3600.0 } else { 0.0 };
+    let hours = if now > timestamp {
+        (now - timestamp) as f32 / 3600.0
+    } else {
+        0.0
+    };
     let stability = STABILITY_HOURS[layer_idx];
     let phi_1 = (-hours / stability).exp();
 
@@ -278,13 +306,19 @@ pub fn compute_features(
     // φ₅: graph centrality [0, 1]
     let phi_5 = if max_graph_degree > 0 {
         (graph_degree as f32) / (max_graph_degree as f32)
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     // φ₆: time match {0, 1}
     let phi_6 = match time_hint {
         Some((start, end)) => {
             let ts = timestamp as i64;
-            if ts >= start && ts <= end { 1.0 } else { 0.0 }
+            if ts >= start && ts <= end {
+                1.0
+            } else {
+                0.0
+            }
         }
         None => 0.0,
     };
@@ -298,7 +332,9 @@ pub fn compute_features(
     // φ₉: graph traverse weight [0, 1] (v2.4.0)
     let phi_9 = graph_traverse_weight.clamp(0.0, 1.0);
 
-    FeatureVector([phi_0, phi_1, phi_2, phi_3, phi_4, phi_5, phi_6, phi_7, phi_8, phi_9])
+    FeatureVector([
+        phi_0, phi_1, phi_2, phi_3, phi_4, phi_5, phi_6, phi_7, phi_8, phi_9,
+    ])
 }
 
 // ============================================
@@ -312,8 +348,8 @@ pub fn normalize(phi: &FeatureVector, w: &mut WeightVector) -> FeatureVector {
 
     for i in 0..MVF_DIM {
         w.running_mean[i] = EMA_BETA * w.running_mean[i] + (1.0 - EMA_BETA) * phi.0[i];
-        w.running_std[i] = EMA_BETA * w.running_std[i]
-            + (1.0 - EMA_BETA) * (phi.0[i] - w.running_mean[i]).abs();
+        w.running_std[i] =
+            EMA_BETA * w.running_std[i] + (1.0 - EMA_BETA) * (phi.0[i] - w.running_mean[i]).abs();
         normalized[i] = (phi.0[i] - w.running_mean[i]) / (w.running_std[i] + 1e-6);
     }
 
@@ -326,7 +362,9 @@ pub fn normalize(phi: &FeatureVector, w: &mut WeightVector) -> FeatureVector {
 
 /// Compute V(m, q, ctx) = σ(w · φ̂).
 pub fn compute_value(w: &WeightVector, phi_norm: &FeatureVector) -> f32 {
-    let dot: f32 = w.weights.iter()
+    let dot: f32 = w
+        .weights
+        .iter()
         .zip(phi_norm.0.iter())
         .map(|(wi, pi)| wi * pi)
         .sum();
@@ -359,9 +397,9 @@ pub fn sgd_update(w: &mut WeightVector, phi_norm: &FeatureVector, y: f32) {
     }
 
     // Hard constraints per dimension
-    w.weights[0] = w.weights[0].clamp(0.05, 1.0);  // φ₀ similarity: positive
-    w.weights[8] = w.weights[8].clamp(-1.0, 0.0);   // φ₈ conflict: non-positive
-    w.weights[9] = w.weights[9].clamp(0.0, 1.0);    // φ₉ graph_traverse: non-negative
+    w.weights[0] = w.weights[0].clamp(0.05, 1.0); // φ₀ similarity: positive
+    w.weights[8] = w.weights[8].clamp(-1.0, 0.0); // φ₈ conflict: non-positive
+    w.weights[9] = w.weights[9].clamp(0.0, 1.0); // φ₉ graph_traverse: non-negative
     for i in 1..8 {
         w.weights[i] = w.weights[i].clamp(-1.0, 1.0);
     }
@@ -375,7 +413,9 @@ pub fn sgd_update(w: &mut WeightVector, phi_norm: &FeatureVector, y: f32) {
 
 /// Check if MVF has collapsed: all Identity memories scoring < 0.01.
 pub fn check_collapse(identity_values: &[f32]) -> bool {
-    if identity_values.is_empty() { return false; }
+    if identity_values.is_empty() {
+        return false;
+    }
     identity_values.iter().all(|&v| v < 0.01)
 }
 
@@ -423,17 +463,23 @@ mod tests {
     fn test_weight_deserialization_backward_compat_v23() {
         // Simulate v2.3.0 format: 9 dims × 3 arrays × 4 bytes = 108 bytes
         let old_w = WeightVector {
-            weights:      [0.35, 0.15, 0.10, 0.20, 0.10, 0.02, 0.15, 0.05, -0.20, 0.0],
-            running_mean: [0.5,  0.5,  1.5,  0.5,  0.0,  0.0,  0.0,  0.0,   0.0,  0.0],
-            running_std:  [0.3,  0.3,  0.5,  0.3,  0.3,  0.3,  0.5,  0.3,   0.5,  0.3],
+            weights: [0.35, 0.15, 0.10, 0.20, 0.10, 0.02, 0.15, 0.05, -0.20, 0.0],
+            running_mean: [0.5, 0.5, 1.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            running_std: [0.3, 0.3, 0.5, 0.3, 0.3, 0.3, 0.5, 0.3, 0.5, 0.3],
             version: 0,
         };
 
         // Serialize only first 9 dims (simulate v2.3.0)
         let mut v23_bytes = Vec::with_capacity(108);
-        for i in 0..9 { v23_bytes.extend_from_slice(&old_w.weights[i].to_le_bytes()); }
-        for i in 0..9 { v23_bytes.extend_from_slice(&old_w.running_mean[i].to_le_bytes()); }
-        for i in 0..9 { v23_bytes.extend_from_slice(&old_w.running_std[i].to_le_bytes()); }
+        for i in 0..9 {
+            v23_bytes.extend_from_slice(&old_w.weights[i].to_le_bytes());
+        }
+        for i in 0..9 {
+            v23_bytes.extend_from_slice(&old_w.running_mean[i].to_le_bytes());
+        }
+        for i in 0..9 {
+            v23_bytes.extend_from_slice(&old_w.running_std[i].to_le_bytes());
+        }
         assert_eq!(v23_bytes.len(), 108);
 
         // Deserialize with v2.4.0 from_bytes — should pad φ₉
@@ -442,8 +488,11 @@ mod tests {
 
         // First 9 dims should match
         for i in 0..9 {
-            assert!((old_w.weights[i] - restored.weights[i]).abs() < 1e-6,
-                "weights[{}] mismatch", i);
+            assert!(
+                (old_w.weights[i] - restored.weights[i]).abs() < 1e-6,
+                "weights[{}] mismatch",
+                i
+            );
         }
 
         // φ₉ should have defaults
@@ -455,27 +504,48 @@ mod tests {
     #[test]
     fn test_compute_features_basic() {
         let phi = compute_features(
-            0.8, 2, 1_700_000_000, 1_700_010_000,
-            5, 3, 1, false, None, 0.5, 4, 10, 0.0,
+            0.8,
+            2,
+            1_700_000_000,
+            1_700_010_000,
+            5,
+            3,
+            1,
+            false,
+            None,
+            0.5,
+            4,
+            10,
+            0.0,
         );
 
-        assert!((phi.0[0] - 0.8).abs() < 1e-6);      // similarity
-        assert!(phi.0[1] > 0.0 && phi.0[1] < 1.0);    // time decay
-        assert!(phi.0[2] > 1.0);                        // freq boost
-        assert!((phi.0[3] - 0.33).abs() < 1e-2);       // Episode layer score
-        assert!((phi.0[4] - 0.4).abs() < 1e-2);        // (3-1)/(3+1+1) = 0.4
-        assert!((phi.0[5] - 0.4).abs() < 1e-2);        // 4/10
-        assert!((phi.0[6] - 0.0).abs() < 1e-6);        // no time_hint
-        assert!((phi.0[7] - 0.5).abs() < 1e-6);        // session centroid
-        assert!((phi.0[8] - 0.0).abs() < 1e-6);        // no conflict
-        assert!((phi.0[9] - 0.0).abs() < 1e-6);        // no graph traverse
+        assert!((phi.0[0] - 0.8).abs() < 1e-6); // similarity
+        assert!(phi.0[1] > 0.0 && phi.0[1] < 1.0); // time decay
+        assert!(phi.0[2] > 1.0); // freq boost
+        assert!((phi.0[3] - 0.33).abs() < 1e-2); // Episode layer score
+        assert!((phi.0[4] - 0.4).abs() < 1e-2); // (3-1)/(3+1+1) = 0.4
+        assert!((phi.0[5] - 0.4).abs() < 1e-2); // 4/10
+        assert!((phi.0[6] - 0.0).abs() < 1e-6); // no time_hint
+        assert!((phi.0[7] - 0.5).abs() < 1e-6); // session centroid
+        assert!((phi.0[8] - 0.0).abs() < 1e-6); // no conflict
+        assert!((phi.0[9] - 0.0).abs() < 1e-6); // no graph traverse
     }
 
     #[test]
     fn test_compute_features_with_graph_traverse() {
         let phi = compute_features(
-            0.8, 2, 1_700_000_000, 1_700_010_000,
-            5, 3, 1, false, None, 0.5, 4, 10,
+            0.8,
+            2,
+            1_700_000_000,
+            1_700_010_000,
+            5,
+            3,
+            1,
+            false,
+            None,
+            0.5,
+            4,
+            10,
             0.7, // 1 hop away
         );
         assert!((phi.0[9] - 0.7).abs() < 1e-6);
@@ -489,13 +559,41 @@ mod tests {
 
     #[test]
     fn test_time_hint_match() {
-        let phi = compute_features(0.5, 2, 1000, 2000, 0, 0, 0, false, Some((500, 1500)), 0.0, 0, 0, 0.0);
+        let phi = compute_features(
+            0.5,
+            2,
+            1000,
+            2000,
+            0,
+            0,
+            0,
+            false,
+            Some((500, 1500)),
+            0.0,
+            0,
+            0,
+            0.0,
+        );
         assert!((phi.0[6] - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_time_hint_no_match() {
-        let phi = compute_features(0.5, 2, 2000, 3000, 0, 0, 0, false, Some((500, 1500)), 0.0, 0, 0, 0.0);
+        let phi = compute_features(
+            0.5,
+            2,
+            2000,
+            3000,
+            0,
+            0,
+            0,
+            false,
+            Some((500, 1500)),
+            0.0,
+            0,
+            0,
+            0.0,
+        );
         assert!((phi.0[6] - 0.0).abs() < 1e-6);
     }
 

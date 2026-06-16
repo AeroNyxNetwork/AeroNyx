@@ -56,7 +56,6 @@ pub enum TransportError {
     // ========================================
     // Network Errors
     // ========================================
-
     /// Failed to bind to address.
     #[error("Failed to bind to {addr}: {reason}")]
     BindFailed {
@@ -96,7 +95,6 @@ pub enum TransportError {
     // ========================================
     // TUN Device Errors
     // ========================================
-
     /// Failed to create TUN device.
     #[error("Failed to create TUN device '{name}': {reason}")]
     TunCreateFailed {
@@ -139,7 +137,6 @@ pub enum TransportError {
     // ========================================
     // Configuration Errors
     // ========================================
-
     /// Invalid configuration.
     #[error("Invalid configuration: {field} - {reason}")]
     InvalidConfig {
@@ -166,7 +163,6 @@ pub enum TransportError {
     // ========================================
     // System Errors
     // ========================================
-
     /// Permission denied for operation.
     #[error("Permission denied: {operation}")]
     PermissionDenied {
@@ -195,7 +191,6 @@ pub enum TransportError {
     // ========================================
     // Wrapped Errors
     // ========================================
-
     /// I/O error from the system.
     #[error("I/O error: {context}")]
     Io {
@@ -261,9 +256,7 @@ impl TransportError {
             Self::Timeout { .. } => true,
             Self::Io { source, .. } => matches!(
                 source.kind(),
-                io::ErrorKind::WouldBlock
-                    | io::ErrorKind::Interrupted
-                    | io::ErrorKind::TimedOut
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
             ),
             Self::SendFailed { .. } => true,
             Self::ReceiveFailed { .. } => true,
@@ -330,10 +323,7 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let err = TransportError::bind_failed(
-            "127.0.0.1:8080".parse().unwrap(),
-            "address in use",
-        );
+        let err = TransportError::bind_failed("127.0.0.1:8080".parse().unwrap(), "address in use");
         assert!(err.to_string().contains("127.0.0.1:8080"));
         assert!(err.to_string().contains("address in use"));
     }

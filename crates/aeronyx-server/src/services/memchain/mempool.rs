@@ -509,7 +509,11 @@ mod tests {
         let fact = make_fact(100, "x");
         assert!(pool.add_fact(fact.clone()));
         assert!(!pool.add_fact(fact));
-        assert_eq!(pool.total_accepted(), 1, "total_accepted must be 1 after one unique insert");
+        assert_eq!(
+            pool.total_accepted(),
+            1,
+            "total_accepted must be 1 after one unique insert"
+        );
         assert_eq!(pool.count(), 1);
     }
 }

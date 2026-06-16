@@ -101,7 +101,8 @@ impl HardwareInfo {
             std::fs::read_to_string("/proc/cpuinfo")
                 .ok()
                 .and_then(|content| {
-                    content.lines()
+                    content
+                        .lines()
                         .find(|line| line.starts_with("model name"))
                         .and_then(|line| line.split(':').nth(1))
                         .map(|s| s.trim().to_string())
@@ -109,7 +110,9 @@ impl HardwareInfo {
                 .unwrap_or_else(|| "Unknown CPU".to_string())
         }
         #[cfg(not(target_os = "linux"))]
-        { "Unknown CPU".to_string() }
+        {
+            "Unknown CPU".to_string()
+        }
     }
 
     fn get_memory_info() -> String {
@@ -118,19 +121,26 @@ impl HardwareInfo {
             std::fs::read_to_string("/proc/meminfo")
                 .ok()
                 .and_then(|content| {
-                    content.lines()
+                    content
+                        .lines()
                         .find(|line| line.starts_with("MemTotal"))
                         .and_then(|line| line.split(':').nth(1))
                         .map(|s| {
-                            let kb: u64 = s.trim().split_whitespace().next()
-                                .and_then(|n| n.parse().ok()).unwrap_or(0);
+                            let kb: u64 = s
+                                .trim()
+                                .split_whitespace()
+                                .next()
+                                .and_then(|n| n.parse().ok())
+                                .unwrap_or(0);
                             format!("{}GB", kb / 1024 / 1024)
                         })
                 })
                 .unwrap_or_else(|| "Unknown".to_string())
         }
         #[cfg(not(target_os = "linux"))]
-        { "Unknown".to_string() }
+        {
+            "Unknown".to_string()
+        }
     }
 
     fn get_os_info() -> String {
@@ -139,7 +149,8 @@ impl HardwareInfo {
             std::fs::read_to_string("/etc/os-release")
                 .ok()
                 .and_then(|content| {
-                    content.lines()
+                    content
+                        .lines()
                         .find(|line| line.starts_with("PRETTY_NAME"))
                         .and_then(|line| line.split('=').nth(1))
                         .map(|s| s.trim_matches('"').to_string())
@@ -147,7 +158,9 @@ impl HardwareInfo {
                 .unwrap_or_else(|| "Linux".to_string())
         }
         #[cfg(not(target_os = "linux"))]
-        { "Unknown OS".to_string() }
+        {
+            "Unknown OS".to_string()
+        }
     }
 }
 
@@ -282,13 +295,16 @@ impl SystemStats {
                 .and_then(|c| c.split_whitespace().next()?.parse::<f32>().ok())
                 .map(|load| {
                     let cpus = std::thread::available_parallelism()
-                        .map(|p| p.get()).unwrap_or(1);
+                        .map(|p| p.get())
+                        .unwrap_or(1);
                     (load * 100.0 / cpus as f32).min(100.0)
                 })
                 .unwrap_or(0.0)
         }
         #[cfg(not(target_os = "linux"))]
-        { 0.0 }
+        {
+            0.0
+        }
     }
 
     /// Gets memory usage and total memory (cgroup-aware).
@@ -297,37 +313,57 @@ impl SystemStats {
     fn get_memory_info() -> (u64, Option<u64>) {
         #[cfg(target_os = "linux")]
         {
-            if let Some(r) = Self::get_memory_cgroup_v2() { return r; }
-            if let Some(r) = Self::get_memory_cgroup_v1() { return r; }
+            if let Some(r) = Self::get_memory_cgroup_v2() {
+                return r;
+            }
+            if let Some(r) = Self::get_memory_cgroup_v1() {
+                return r;
+            }
             Self::get_memory_procinfo()
         }
         #[cfg(not(target_os = "linux"))]
-        { (0, None) }
+        {
+            (0, None)
+        }
     }
 
     #[cfg(target_os = "linux")]
     fn get_memory_cgroup_v2() -> Option<(u64, Option<u64>)> {
         let current: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
-            .ok()?.trim().parse().ok()?;
-        let max = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        let max = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+            .ok()
             .and_then(|s| {
                 let t = s.trim();
-                if t == "max" { None } else { t.parse::<u64>().ok() }
+                if t == "max" {
+                    None
+                } else {
+                    t.parse::<u64>().ok()
+                }
             });
         Some((current / 1024 / 1024, max.map(|m| m / 1024 / 1024)))
     }
 
     #[cfg(target_os = "linux")]
     fn get_memory_cgroup_v1() -> Option<(u64, Option<u64>)> {
-        let usage: u64 = std::fs::read_to_string(
-            "/sys/fs/cgroup/memory/memory.usage_in_bytes"
-        ).ok()?.trim().parse().ok()?;
-        let limit = std::fs::read_to_string(
-            "/sys/fs/cgroup/memory/memory.limit_in_bytes"
-        ).ok().and_then(|s| {
-            let v: u64 = s.trim().parse().ok()?;
-            if v > 1_000_000_000_000 { None } else { Some(v) }
-        });
+        let usage: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        let limit = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+            .ok()
+            .and_then(|s| {
+                let v: u64 = s.trim().parse().ok()?;
+                if v > 1_000_000_000_000 {
+                    None
+                } else {
+                    Some(v)
+                }
+            });
         Some((usage / 1024 / 1024, limit.map(|l| l / 1024 / 1024)))
     }
 
@@ -365,16 +401,23 @@ impl SystemStats {
                     let mut total_tx = 0u64;
                     for line in content.lines().skip(2) {
                         let line = line.trim();
-                        if line.is_empty() { continue; }
+                        if line.is_empty() {
+                            continue;
+                        }
                         let parts: Vec<&str> = line.splitn(2, ':').collect();
-                        if parts.len() != 2 { continue; }
-                        if parts[0].trim() == "lo" { continue; }
+                        if parts.len() != 2 {
+                            continue;
+                        }
+                        if parts[0].trim() == "lo" {
+                            continue;
+                        }
                         let fields: Vec<&str> = parts[1].split_whitespace().collect();
-                        if fields.len() < 10 { continue; }
-                        if let (Ok(rx), Ok(tx)) = (
-                            fields[0].parse::<u64>(),
-                            fields[8].parse::<u64>(),
-                        ) {
+                        if fields.len() < 10 {
+                            continue;
+                        }
+                        if let (Ok(rx), Ok(tx)) =
+                            (fields[0].parse::<u64>(), fields[8].parse::<u64>())
+                        {
                             total_rx += rx;
                             total_tx += tx;
                         }
@@ -384,7 +427,9 @@ impl SystemStats {
                 .unwrap_or((None, None))
         }
         #[cfg(not(target_os = "linux"))]
-        { (None, None) }
+        {
+            (None, None)
+        }
     }
 }
 
@@ -462,7 +507,9 @@ fn default_empty_object() -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::new())
 }
 
-fn default_priority() -> u8 { 10 }
+fn default_priority() -> u8 {
+    10
+}
 
 /// Status report sent from Rust -> CMS after executing a command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,7 +531,9 @@ pub struct CommandStatusReport {
     pub timestamp: u64,
 }
 
-fn default_agent_type() -> String { "vpn".to_string() }
+fn default_agent_type() -> String {
+    "vpn".to_string()
+}
 
 /// Execution status for a CMS command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

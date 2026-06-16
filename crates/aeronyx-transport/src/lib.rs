@@ -85,7 +85,7 @@ pub mod tun;
 pub mod udp;
 
 // Re-export primary types
-pub use error::{TransportError, Result};
+pub use error::{Result, TransportError};
 pub use traits::{PacketSource, Transport, TunDevice};
 pub use udp::UdpTransport;
 

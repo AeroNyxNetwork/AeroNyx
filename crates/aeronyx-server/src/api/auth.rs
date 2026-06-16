@@ -241,11 +241,7 @@ pub async fn issue_token(
     let expires_at = now + state.token_ttl_secs;
     match issue_jwt(&req.pubkey, now, expires_at, &state.jwt_secret) {
         Ok(token) => {
-            info!(
-                pubkey = &req.pubkey[..8],
-                expires_at,
-                "[AUTH] JWT issued"
-            );
+            info!(pubkey = &req.pubkey[..8], expires_at, "[AUTH] JWT issued");
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -301,10 +297,7 @@ pub fn issue_jwt(
 ///
 /// # Errors
 /// Returns `jsonwebtoken::errors::Error` for any validation failure.
-pub fn verify_jwt(
-    token: &str,
-    secret: &str,
-) -> Result<Claims, jsonwebtoken::errors::Error> {
+pub fn verify_jwt(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
     let key = DecodingKey::from_secret(secret.as_bytes());
     let mut validation = Validation::new(Algorithm::HS256);
     validation.set_issuer(&[JWT_ISSUER]);
@@ -394,7 +387,7 @@ pub fn parse_pubkey_hex(hex_str: &str) -> Result<[u8; 32], &'static str> {
 
 /// Parse a base64-encoded Ed25519 signature into a 64-byte array.
 pub fn parse_signature_base64(b64: &str) -> Result<[u8; 64], &'static str> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     let bytes = BASE64
         .decode(b64)
         .map_err(|_| "signature is not valid base64")?;
@@ -438,9 +431,7 @@ pub fn write_secret_to_config(path: &Path, key: &str, value: &str) -> std::io::R
         if trimmed.starts_with('#') {
             continue;
         }
-        if trimmed.starts_with(&format!("{} =", key))
-            || trimmed.starts_with(&format!("{}=", key))
-        {
+        if trimmed.starts_with(&format!("{} =", key)) || trimmed.starts_with(&format!("{}=", key)) {
             *line = new_line.clone();
             replaced = true;
             break;
@@ -491,11 +482,7 @@ pub fn write_secret_to_config(path: &Path, key: &str, value: &str) -> std::io::R
 /// auto-generated api_secret. The `_pub` suffix makes the cross-module
 /// call site self-documenting without changing the underlying function.
 #[inline(always)]
-pub fn write_secret_to_config_pub(
-    path: &Path,
-    key: &str,
-    value: &str,
-) -> std::io::Result<()> {
+pub fn write_secret_to_config_pub(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
     write_secret_to_config(path, key, value)
 }
 
@@ -522,7 +509,9 @@ mod tests {
 
     const TEST_SECRET: &str = "test-secret-that-is-at-least-32-chars-long-for-safety";
 
-    fn make_test_secret() -> String { TEST_SECRET.to_string() }
+    fn make_test_secret() -> String {
+        TEST_SECRET.to_string()
+    }
 
     // -- JWT round-trip ---------------------------------------------------
 
@@ -562,17 +551,25 @@ mod tests {
     fn test_verify_wrong_issuer_fails() {
         let now = now_secs();
         #[derive(Serialize)]
-        struct BadClaims { sub: String, iat: u64, exp: u64, iss: String }
+        struct BadClaims {
+            sub: String,
+            iat: u64,
+            exp: u64,
+            iss: String,
+        }
         let bad = BadClaims {
             sub: hex::encode([0xAAu8; 32]),
-            iat: now, exp: now + 3600,
+            iat: now,
+            exp: now + 3600,
             iss: "evil".to_string(),
         };
         let key = jsonwebtoken::EncodingKey::from_secret(TEST_SECRET.as_bytes());
         let token = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-            &bad, &key,
-        ).unwrap();
+            &bad,
+            &key,
+        )
+        .unwrap();
         assert!(verify_jwt(&token, &make_test_secret()).is_err());
     }
 
@@ -601,7 +598,7 @@ mod tests {
 
     #[test]
     fn test_parse_signature_base64_valid() {
-        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
         let sig = [0x42u8; 64];
         let b64 = BASE64.encode(sig);
         assert_eq!(parse_signature_base64(&b64).unwrap(), sig);
@@ -609,7 +606,7 @@ mod tests {
 
     #[test]
     fn test_parse_signature_base64_wrong_size() {
-        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
         let short = BASE64.encode([0u8; 32]);
         assert!(parse_signature_base64(&short).is_err());
     }
@@ -647,7 +644,8 @@ mod tests {
         std::fs::write(
             &config_path,
             "[memchain]\nmode = \"saas\"\n\n[auth]\njwt_secret = \"\"\ntoken_ttl_secs = 86400\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let secret = ensure_jwt_secret(None, Some(&config_path)).unwrap();
         assert_eq!(secret.len(), 64);
@@ -678,7 +676,8 @@ mod tests {
         std::fs::write(
             &config_path,
             "[auth]\n# jwt_secret = \"example_do_not_use\"\njwt_secret = \"\"\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         write_secret_to_config(&config_path, "jwt_secret", "real_value").unwrap();
 

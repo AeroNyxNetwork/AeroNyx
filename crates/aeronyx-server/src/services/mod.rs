@@ -25,7 +25,7 @@ pub mod traffic_tracker;
 pub mod wallet_routes;
 
 // Re-export primary types
-pub use chat_relay::{ChatRelayService, derive_node_secret};
+pub use chat_relay::{derive_node_secret, ChatRelayService};
 pub use deny_list::{DenyList, DenyReason};
 pub use dns_proxy::spawn_dns_proxy;
 pub use handshake::HandshakeService;

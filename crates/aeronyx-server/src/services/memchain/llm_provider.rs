@@ -81,10 +81,14 @@ impl fmt::Display for LlmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transport(e) => write!(f, "transport error: {}", e),
-            Self::ApiError { status, body } => write!(f, "API error {}: {}", status, &body[..body.len().min(200)]),
+            Self::ApiError { status, body } => {
+                write!(f, "API error {}: {}", status, &body[..body.len().min(200)])
+            }
             Self::ParseError(e) => write!(f, "parse error: {}", e),
             Self::EmptyResponse => write!(f, "empty response from model"),
-            Self::RateLimit { retry_after_secs } => write!(f, "rate limit hit (retry after: {:?}s)", retry_after_secs),
+            Self::RateLimit { retry_after_secs } => {
+                write!(f, "rate limit hit (retry after: {:?}s)", retry_after_secs)
+            }
             Self::ContextTooLong => write!(f, "context too long for this model"),
             Self::NotConfigured(name) => write!(f, "provider '{}' not configured", name),
         }
@@ -107,13 +111,22 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: content.into() }
+        Self {
+            role: "system".into(),
+            content: content.into(),
+        }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into() }
+        Self {
+            role: "user".into(),
+            content: content.into(),
+        }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into() }
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+        }
     }
 }
 

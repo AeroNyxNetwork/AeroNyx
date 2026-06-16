@@ -186,9 +186,10 @@ impl FromStr for SessionId {
     type Err = SessionIdError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes = BASE64.decode(s)
+        let bytes = BASE64
+            .decode(s)
             .map_err(|e| SessionIdError::InvalidBase64(e.to_string()))?;
-        
+
         Self::from_bytes(&bytes).ok_or_else(|| SessionIdError::InvalidLength {
             expected: SESSION_ID_SIZE,
             actual: bytes.len(),
@@ -219,9 +220,8 @@ impl<'de> Deserialize<'de> for SessionId {
             s.parse().map_err(serde::de::Error::custom)
         } else {
             let bytes = <Vec<u8>>::deserialize(deserializer)?;
-            Self::from_bytes(&bytes).ok_or_else(|| {
-                serde::de::Error::invalid_length(bytes.len(), &"16 bytes")
-            })
+            Self::from_bytes(&bytes)
+                .ok_or_else(|| serde::de::Error::invalid_length(bytes.len(), &"16 bytes"))
         }
     }
 }
@@ -416,10 +416,10 @@ mod tests {
     fn test_session_id_generation() {
         let id1 = SessionId::generate();
         let id2 = SessionId::generate();
-        
+
         // Two random IDs should be different
         assert_ne!(id1, id2);
-        
+
         // Should be correct size
         assert_eq!(id1.as_bytes().len(), SESSION_ID_SIZE);
     }
@@ -427,12 +427,12 @@ mod tests {
     #[test]
     fn test_session_id_roundtrip() {
         let original = SessionId::generate();
-        
+
         // Byte roundtrip
         let bytes = original.as_bytes();
         let restored = SessionId::from_bytes(bytes).unwrap();
         assert_eq!(original, restored);
-        
+
         // String roundtrip
         let s = original.to_string();
         let parsed: SessionId = s.parse().unwrap();
@@ -443,7 +443,7 @@ mod tests {
     fn test_session_id_invalid_length() {
         let short = [0u8; 8];
         assert!(SessionId::from_bytes(&short).is_none());
-        
+
         let long = [0u8; 32];
         assert!(SessionId::from_bytes(&long).is_none());
     }
@@ -451,13 +451,13 @@ mod tests {
     #[test]
     fn test_virtual_ip_in_range() {
         let vip = VirtualIp::new(Ipv4Addr::new(100, 64, 0, 50));
-        
+
         // Should be in /24 range
         assert!(vip.is_in_range(Ipv4Addr::new(100, 64, 0, 0), 24));
-        
+
         // Should not be in different /24
         assert!(!vip.is_in_range(Ipv4Addr::new(192, 168, 0, 0), 24));
-        
+
         // Should be in /16 range
         assert!(vip.is_in_range(Ipv4Addr::new(100, 64, 0, 0), 16));
     }
@@ -466,10 +466,10 @@ mod tests {
     fn test_packet_counter() {
         let mut counter = PacketCounter::new();
         assert_eq!(counter.value(), 0);
-        
+
         counter.increment();
         assert_eq!(counter.value(), 1);
-        
+
         let old = PacketCounter::from_raw(5);
         let new = PacketCounter::from_raw(10);
         assert!(new.is_newer_than(&old));
@@ -493,7 +493,10 @@ mod tests {
 
     #[test]
     fn test_session_id_error_display() {
-        let err = SessionIdError::InvalidLength { expected: 16, actual: 8 };
+        let err = SessionIdError::InvalidLength {
+            expected: 16,
+            actual: 8,
+        };
         assert!(err.to_string().contains("16"));
         assert!(err.to_string().contains("8"));
     }

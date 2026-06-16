@@ -266,7 +266,7 @@ mod tests {
     #[tokio::test]
     async fn test_mock_tun_basic() {
         let tun = MockTun::new(TunConfig::new("mock0"));
-        
+
         assert_eq!(tun.name(), "mock0");
         assert!(!tun.is_up());
     }
@@ -274,12 +274,12 @@ mod tests {
     #[tokio::test]
     async fn test_mock_tun_up_down() {
         let tun = MockTun::new(TunConfig::new("mock0"));
-        
+
         assert!(!tun.is_up());
-        
+
         tun.up().await.unwrap();
         assert!(tun.is_up());
-        
+
         tun.down().await.unwrap();
         assert!(!tun.is_up());
     }
@@ -287,15 +287,15 @@ mod tests {
     #[tokio::test]
     async fn test_mock_tun_inject_read() {
         let tun = MockTun::new(TunConfig::new("mock0"));
-        
+
         // Inject packet
         tun.inject_packet(b"test packet".to_vec()).await;
         assert_eq!(tun.pending_read_count(), 1);
-        
+
         // Read it back
         let mut buf = [0u8; 100];
         let len = tun.read(&mut buf).await.unwrap();
-        
+
         assert_eq!(&buf[..len], b"test packet");
         assert_eq!(tun.pending_read_count(), 0);
     }
@@ -303,15 +303,15 @@ mod tests {
     #[tokio::test]
     async fn test_mock_tun_write_capture() {
         let tun = MockTun::new(TunConfig::new("mock0"));
-        
+
         // Write packets
         tun.write(b"packet 1").await.unwrap();
         tun.write(b"packet 2").await.unwrap();
         assert_eq!(tun.written_count(), 2);
-        
+
         // Capture them
         let captured = tun.take_written_packets();
-        
+
         assert_eq!(captured.len(), 2);
         assert_eq!(captured[0], b"packet 1");
         assert_eq!(captured[1], b"packet 2");
@@ -321,24 +321,24 @@ mod tests {
     #[tokio::test]
     async fn test_mock_tun_multiple_packets() {
         let tun = MockTun::new(TunConfig::new("mock0"));
-        
+
         let packets = vec![
             b"packet 1".to_vec(),
             b"packet 2".to_vec(),
             b"packet 3".to_vec(),
         ];
-        
+
         tun.inject_packets(packets).await;
         assert_eq!(tun.pending_read_count(), 3);
-        
+
         let mut buf = [0u8; 100];
-        
+
         let len = tun.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..len], b"packet 1");
-        
+
         let len = tun.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..len], b"packet 2");
-        
+
         let len = tun.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..len], b"packet 3");
     }
@@ -346,15 +346,15 @@ mod tests {
     #[tokio::test]
     async fn test_mock_tun_clear() {
         let tun = MockTun::new(TunConfig::new("mock0"));
-        
+
         tun.inject_packet(b"test".to_vec()).await;
         tun.write(b"test").await.unwrap();
-        
+
         assert_eq!(tun.pending_read_count(), 1);
         assert_eq!(tun.written_count(), 1);
-        
+
         tun.clear();
-        
+
         assert_eq!(tun.pending_read_count(), 0);
         assert_eq!(tun.written_count(), 0);
     }
@@ -362,14 +362,14 @@ mod tests {
     #[tokio::test]
     async fn test_mock_tun_buffer_truncation() {
         let tun = MockTun::new(TunConfig::new("mock0"));
-        
+
         // Inject large packet
         tun.inject_packet(vec![0x42; 1000]).await;
-        
+
         // Read into small buffer
         let mut buf = [0u8; 10];
         let len = tun.read(&mut buf).await.unwrap();
-        
+
         // Should be truncated
         assert_eq!(len, 10);
         assert_eq!(buf, [0x42; 10]);

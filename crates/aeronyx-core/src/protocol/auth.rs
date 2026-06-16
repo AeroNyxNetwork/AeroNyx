@@ -188,8 +188,8 @@ pub fn verify_signed_message(
     }
 
     // ── 3. Ed25519 verification ───────────────────────────────────────
-    let pk = IdentityPublicKey::from_bytes(wallet_pubkey)
-        .map_err(|_| AuthError::InvalidPublicKey)?;
+    let pk =
+        IdentityPublicKey::from_bytes(wallet_pubkey).map_err(|_| AuthError::InvalidPublicKey)?;
 
     pk.verify(&digest, signature)
         .map_err(|_| AuthError::SignatureMismatch)
@@ -264,7 +264,11 @@ mod tests {
             &sig,
             ts,
         );
-        assert!(result.is_ok(), "Multi-slice valid signature must pass: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Multi-slice valid signature must pass: {:?}",
+            result
+        );
     }
 
     // ── Timestamp window failure ─────────────────────────────────────────
@@ -296,7 +300,8 @@ mod tests {
         );
         assert!(
             matches!(result, Err(AuthError::TimestampOutOfWindow)),
-            "Stale timestamp must be rejected: {:?}", result,
+            "Stale timestamp must be rejected: {:?}",
+            result,
         );
     }
 
@@ -325,7 +330,8 @@ mod tests {
         );
         assert!(
             matches!(result, Err(AuthError::TimestampOutOfWindow)),
-            "Future timestamp must be rejected: {:?}", result,
+            "Future timestamp must be rejected: {:?}",
+            result,
         );
     }
 
@@ -349,7 +355,8 @@ mod tests {
         );
         assert!(
             matches!(result, Err(AuthError::InvalidPublicKey)),
-            "Invalid public key must be rejected: {:?}", result,
+            "Invalid public key must be rejected: {:?}",
+            result,
         );
     }
 
@@ -373,7 +380,8 @@ mod tests {
         );
         assert!(
             matches!(result, Err(AuthError::SignatureMismatch)),
-            "Wrong signature must be rejected: {:?}", result,
+            "Wrong signature must be rejected: {:?}",
+            result,
         );
     }
 
@@ -385,7 +393,7 @@ mod tests {
         let (ts, sig) = make_signed(&kp, DOMAIN_DEVICE_REGISTER, payload);
 
         let result = verify_signed_message(
-            DOMAIN_CHAT_PULL,    // <── wrong domain
+            DOMAIN_CHAT_PULL, // <── wrong domain
             &[payload.as_ref()],
             &kp.public_key_bytes(),
             &sig,
@@ -393,7 +401,8 @@ mod tests {
         );
         assert!(
             matches!(result, Err(AuthError::SignatureMismatch)),
-            "Wrong domain must cause signature mismatch: {:?}", result,
+            "Wrong domain must cause signature mismatch: {:?}",
+            result,
         );
     }
 
@@ -406,14 +415,15 @@ mod tests {
         let tampered = b"tampered__data";
         let result = verify_signed_message(
             DOMAIN_CHAT_ACK,
-            &[tampered.as_ref()],  // <── tampered
+            &[tampered.as_ref()], // <── tampered
             &kp.public_key_bytes(),
             &sig,
             ts,
         );
         assert!(
             matches!(result, Err(AuthError::SignatureMismatch)),
-            "Tampered payload must cause signature mismatch: {:?}", result,
+            "Tampered payload must cause signature mismatch: {:?}",
+            result,
         );
     }
 
@@ -434,7 +444,8 @@ mod tests {
         );
         assert!(
             matches!(result, Err(AuthError::SignatureMismatch)),
-            "Wrong public key must cause mismatch: {:?}", result,
+            "Wrong public key must cause mismatch: {:?}",
+            result,
         );
     }
 
@@ -467,7 +478,8 @@ mod tests {
         // delta == TIMESTAMP_WINDOW_SECS, which satisfies delta <= TIMESTAMP_WINDOW_SECS
         assert!(
             result.is_ok() || matches!(result, Err(AuthError::TimestampOutOfWindow)),
-            "Boundary result must be either Ok or TimestampOutOfWindow: {:?}", result,
+            "Boundary result must be either Ok or TimestampOutOfWindow: {:?}",
+            result,
         );
         // Note: this test is intentionally lenient at the exact boundary because
         // nanosecond-level clock differences between make_signed and verify can

@@ -190,7 +190,9 @@ impl AofWriter {
     /// Supports both:
     /// - **v0.5.0 format**: `[tag][u32 LE length][payload]`
     /// - **v0.3.0 legacy format**: `[u32 LE length][payload]` (tag-less, all Facts)
-    pub async fn replay(path: impl AsRef<Path>) -> std::io::Result<(Vec<Fact>, Option<BlockHeader>)> {
+    pub async fn replay(
+        path: impl AsRef<Path>,
+    ) -> std::io::Result<(Vec<Fact>, Option<BlockHeader>)> {
         let path = path.as_ref();
 
         if !path.exists() {
@@ -231,10 +233,16 @@ impl AofWriter {
                     Ok(_) => {}
                     Err(_) => break,
                 }
-                let length = u32::from_le_bytes([tag, remaining_len[0], remaining_len[1], remaining_len[2]]) as usize;
+                let length =
+                    u32::from_le_bytes([tag, remaining_len[0], remaining_len[1], remaining_len[2]])
+                        as usize;
 
                 if length > 10 * 1024 * 1024 {
-                    warn!(offset = offset, length = length, "[AOF] ⚠️ Absurd legacy record length, stopping");
+                    warn!(
+                        offset = offset,
+                        length = length,
+                        "[AOF] ⚠️ Absurd legacy record length, stopping"
+                    );
                     break;
                 }
 
@@ -266,7 +274,11 @@ impl AofWriter {
             let length = u32::from_le_bytes(len_buf) as usize;
 
             if length > 10 * 1024 * 1024 {
-                warn!(offset = offset, length = length, "[AOF] ⚠️ Absurd record length, stopping");
+                warn!(
+                    offset = offset,
+                    length = length,
+                    "[AOF] ⚠️ Absurd record length, stopping"
+                );
                 break;
             }
 
@@ -284,18 +296,28 @@ impl AofWriter {
                     if let Ok(fact) = bincode::deserialize::<Fact>(&payload) {
                         facts.push(fact);
                     } else {
-                        warn!(offset = offset, "[AOF] ⚠️ Failed to deserialise Fact record");
+                        warn!(
+                            offset = offset,
+                            "[AOF] ⚠️ Failed to deserialise Fact record"
+                        );
                     }
                 }
                 TAG_BLOCK => {
                     if let Ok(block) = bincode::deserialize::<Block>(&payload) {
                         last_block = Some(block.header);
                     } else {
-                        warn!(offset = offset, "[AOF] ⚠️ Failed to deserialise Block record");
+                        warn!(
+                            offset = offset,
+                            "[AOF] ⚠️ Failed to deserialise Block record"
+                        );
                     }
                 }
                 _ => {
-                    warn!(offset = offset, tag = tag, "[AOF] ⚠️ Unknown record tag, skipping");
+                    warn!(
+                        offset = offset,
+                        tag = tag,
+                        "[AOF] ⚠️ Unknown record tag, skipping"
+                    );
                 }
             }
 
@@ -370,7 +392,9 @@ impl std::fmt::Debug for AofWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aeronyx_core::ledger::{Block, BlockHeader, BLOCK_TYPE_NORMAL, GENESIS_PREV_HASH, merkle_root};
+    use aeronyx_core::ledger::{
+        merkle_root, Block, BlockHeader, BLOCK_TYPE_NORMAL, GENESIS_PREV_HASH,
+    };
     use tempfile::tempdir;
 
     fn make_fact(ts: u64, subject: &str) -> Fact {
@@ -396,8 +420,14 @@ mod tests {
 
         {
             let mut writer = AofWriter::open(&path).await.expect("open");
-            writer.append_fact(&make_fact(100, "first")).await.expect("append");
-            writer.append_fact(&make_fact(200, "second")).await.expect("append");
+            writer
+                .append_fact(&make_fact(100, "first"))
+                .await
+                .expect("append");
+            writer
+                .append_fact(&make_fact(200, "second"))
+                .await
+                .expect("append");
         }
 
         let (facts, last_block) = AofWriter::replay(&path).await.expect("replay");
@@ -434,7 +464,9 @@ mod tests {
     async fn test_replay_empty_file() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join(DEFAULT_AOF_FILENAME);
-        { let _w = AofWriter::open(&path).await.expect("open"); }
+        {
+            let _w = AofWriter::open(&path).await.expect("open");
+        }
 
         let (facts, last_block) = AofWriter::replay(&path).await.expect("replay");
         assert!(facts.is_empty());
