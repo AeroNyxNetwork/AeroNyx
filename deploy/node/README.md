@@ -9,8 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
-- Document production upgrade unit-template synchronization and rollback
-  behavior.
+- Document production upgrade unit-template synchronization, rollback behavior,
+  and node-local upgrade locking.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -36,6 +36,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.2.0-node-deploy - Documented node-local upgrade locking.
 v1.1.0-node-deploy - Documented upgrade-time systemd unit synchronization and
                      rollback behavior.
 v1.0.0-node-deploy - Added production deployment documentation.
@@ -106,6 +107,10 @@ sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx
 
 `upgrade.sh` checks active VPN sessions before restart. If users are connected,
 the script stops unless the operator explicitly passes `--force`.
+
+Only one upgrade can run on the same node at a time. The script takes a
+node-local lock before pulling, building, replacing the systemd unit, or
+restarting the service.
 
 During restart upgrades, the script also renders
 `deploy/node/aeronyx-server.service` into the installed systemd unit and
