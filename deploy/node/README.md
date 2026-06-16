@@ -39,6 +39,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.16.0-node-deploy - Documented --service-unit-only maintenance mode.
 v1.15.0-node-deploy - Documented systemd restart-policy diagnostics.
 v1.14.0-node-deploy - Documented network restore backup count diagnostics.
 v1.13.0-node-deploy - Documented --network-restore-only maintenance mode.
@@ -157,6 +158,13 @@ Keep the currently installed systemd unit while upgrading the binary:
 
 ```bash
 sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --skip-unit-update
+```
+
+Repair only the main systemd unit without pulling, building, or restarting the
+Rust node service:
+
+```bash
+sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --service-unit-only
 ```
 
 Keep the currently installed network restore unit:

@@ -16,6 +16,8 @@
 #   reboot-recovery improvements without a full reinstall.
 # - Provide a network-restore-only maintenance mode for low-risk reboot
 #   recovery repairs.
+# - Provide a service-unit-only maintenance mode for low-risk systemd template
+#   repairs.
 #
 # Main Functionality:
 # - Pulls the configured branch.
@@ -24,6 +26,7 @@
 # - Validates /etc/aeronyx/server.toml.
 # - Syncs the repository systemd unit template before restart.
 # - Syncs the generated network restore unit when persisted NAT rules exist.
+# - Can repair only the main systemd unit without pulling/building/restarting.
 # - Can repair only the network restore unit without pulling/building/restarting.
 # - Checks active VPN sessions before restart.
 # - Restarts systemd service and verifies post-upgrade health.
@@ -38,7 +41,7 @@
 #
 # Main Logical Flow:
 # 1. Acquire the node-local upgrade lock.
-# 2. Optionally repair only the network restore unit and exit.
+# 2. Optionally repair only the main or network restore systemd unit and exit.
 # 3. Update repo from Git.
 # 4. Build and validate the release binary.
 # 5. Restart only when no active sessions are present, unless --force is used.
@@ -58,6 +61,8 @@
 #   already exist.
 #
 # Last Modified:
+# v1.9.0-node-deploy - Added --service-unit-only for low-risk main systemd
+#                      unit maintenance.
 # v1.8.0-node-deploy - Added --network-restore-only for low-risk reboot
 #                      recovery unit maintenance.
 # v1.7.0-node-deploy - Syncs the generated network restore systemd unit during
@@ -97,6 +102,7 @@ SKIP_PULL=0
 SKIP_UNIT_UPDATE=0
 SKIP_NETWORK_RESTORE_UPDATE=0
 NETWORK_RESTORE_ONLY=0
+SERVICE_UNIT_ONLY=0
 NO_RESTART=0
 KEEP_RELEASES=10
 HEALTH_RETRIES=10
@@ -126,6 +132,8 @@ Options:
   --skip-unit-update  Do not render/install deploy/node/aeronyx-server.service.
   --skip-network-restore-update
                       Do not render/install aeronyx-network-restore.service.
+  --service-unit-only
+                      Only sync aeronyx-server.service; no pull/build/restart.
   --network-restore-only
                       Only sync aeronyx-network-restore.service; no pull/build/restart.
   --keep-releases N   Keep latest N binary/unit backups after success. Default: 10
@@ -147,6 +155,7 @@ while [ "$#" -gt 0 ]; do
         --skip-pull) SKIP_PULL=1; shift ;;
         --skip-unit-update) SKIP_UNIT_UPDATE=1; shift ;;
         --skip-network-restore-update) SKIP_NETWORK_RESTORE_UPDATE=1; shift ;;
+        --service-unit-only) SERVICE_UNIT_ONLY=1; NO_RESTART=1; SKIP_PULL=1; shift ;;
         --network-restore-only) NETWORK_RESTORE_ONLY=1; NO_RESTART=1; SKIP_PULL=1; shift ;;
         --keep-releases) KEEP_RELEASES="${2:?missing value}"; shift 2 ;;
         --health-retries) HEALTH_RETRIES="${2:?missing value}"; shift 2 ;;
@@ -299,7 +308,7 @@ backup_current_service_unit() {
 render_service_unit() {
     local template rendered
     [ "${SKIP_UNIT_UPDATE}" -eq 0 ] || { ok "Systemd unit update skipped"; return; }
-    [ "${NO_RESTART}" -eq 0 ] || { ok "Systemd unit update skipped by --no-restart"; return; }
+    [ "${NO_RESTART}" -eq 0 ] || [ "${SERVICE_UNIT_ONLY}" -eq 1 ] || { ok "Systemd unit update skipped by --no-restart"; return; }
 
     template="${REPO_DIR}/deploy/node/aeronyx-server.service"
     rendered="/tmp/${SERVICE_NAME}.upgrade.service"
@@ -579,6 +588,16 @@ main() {
     validate_keep_releases
     require_root
     acquire_lock
+    if [ "${SERVICE_UNIT_ONLY}" -eq 1 ]; then
+        if ! render_service_unit; then
+            rollback_service_unit
+            die "Service unit maintenance failed."
+        fi
+        run_healthcheck
+        prune_release_backups
+        ok "Service unit maintenance complete."
+        return
+    fi
     if [ "${NETWORK_RESTORE_ONLY}" -eq 1 ]; then
         if ! sync_network_restore_unit; then
             rollback_network_restore_unit
