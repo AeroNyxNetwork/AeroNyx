@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Document read-only --print-plan for verifying generated one-command install
+  commands without requiring root access or mutating the host.
 - Document environment-variable defaults and --quick first-install mode for
   one-command commercial node setup.
 - Document production upgrade unit-template synchronization, rollback behavior,
@@ -46,6 +48,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.27.0-node-deploy - Documented --print-plan for safe install command checks.
 v1.26.0-node-deploy - Documented --quick and AERONYX_* install defaults.
 v1.25.0-node-deploy - Documented healthcheck systemd repo path auto-detection.
 v1.24.0-node-deploy - Documented /22 default VPN pool for 1000-session
@@ -127,6 +130,17 @@ that generate one-line setup commands:
 - `AERONYX_REPO_DIR`
 - `AERONYX_REGISTRATION_CODE`
 - `AERONYX_START=1`
+
+Verify a generated command without root access, package installation, network
+changes, registration, or service start:
+
+```bash
+AERONYX_REGISTRATION_CODE=<NODEBOARD_CODE> ./deploy/node/install.sh --quick --print-plan
+```
+
+`--print-plan` hides the registration code value and prints only whether a code
+is present. This makes it safe to paste into support tickets and nodeboard
+diagnostic logs.
 
 For an existing checkout in a custom path:
 

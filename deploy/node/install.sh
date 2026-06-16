@@ -8,6 +8,9 @@
 #   sysctl, iptables, and build commands.
 #
 # Modification Reason:
+# - Add --print-plan so nodeboard, operators, and support automation can verify
+#   environment-variable parsing and one-command install intent without touching
+#   host state or printing registration secrets.
 # - Add environment-variable defaults and --quick first-install mode so
 #   operators can launch a commercial node with one copy-paste command while
 #   still using the existing preflight, lock, build, network, systemd, and
@@ -78,8 +81,12 @@
 #   side effects.
 # - Keep --quick as a thin first-install wrapper; do not bypass preflight,
 #   dirty-worktree protection, systemd verification, or registration failure.
+# - Keep --print-plan read-only and secret-safe; it must never print the
+#   registration code, private keys, API secrets, or wallet-level data.
 #
 # Last Modified:
+# v1.17.0-node-deploy - Added read-only --print-plan for one-command install
+#                       verification and nodeboard automation.
 # v1.16.0-node-deploy - Added environment defaults and --quick first-install
 #                       mode for one-command commercial node setup.
 # v1.15.0-node-deploy - Expanded default VPN pool fallback to /22 for
@@ -147,6 +154,7 @@ PREFLIGHT_ONLY=0
 ALLOW_DIRTY=0
 NETWORK_ONLY=0
 QUICK=0
+PRINT_PLAN=0
 
 case "${AERONYX_START:-}" in
     1|true|TRUE|yes|YES|on|ON) DO_START=1 ;;
@@ -173,6 +181,9 @@ Options:
   --registration-code C   Register node after build.
   --quick                 First-install shortcut. Requires --registration-code
                           or AERONYX_REGISTRATION_CODE and starts the service.
+  --print-plan            Print resolved install options and exit without
+                          requiring root, systemd, package install, build,
+                          network changes, registration, or service start.
   --start                 Start service after install. Automatically enabled when --registration-code is used.
   --no-build              Skip cargo release build.
   --no-network            Skip sysctl and NAT setup.
@@ -189,6 +200,7 @@ Options:
 Examples:
   sudo ./deploy/node/install.sh --registration-code NYX-1234-ABCDE --start
   sudo AERONYX_REGISTRATION_CODE=NYX-1234-ABCDE ./deploy/node/install.sh --quick
+  AERONYX_REGISTRATION_CODE=NYX-1234-ABCDE ./deploy/node/install.sh --quick --print-plan
   sudo ./deploy/node/install.sh --repo-dir /root/open/AeroNyx --no-build --no-network
 USAGE
 }
@@ -200,6 +212,7 @@ while [ "$#" -gt 0 ]; do
         --repo-dir) REPO_DIR="${2:?missing value}"; shift 2 ;;
         --registration-code) REGISTRATION_CODE="${2:?missing value}"; DO_START=1; shift 2 ;;
         --quick) QUICK=1; DO_START=1; shift ;;
+        --print-plan) PRINT_PLAN=1; shift ;;
         --start) DO_START=1; shift ;;
         --no-build) DO_BUILD=0; shift ;;
         --no-network) DO_NETWORK=0; shift ;;
@@ -257,6 +270,39 @@ validate_option_combinations() {
     if [ "${QUICK}" -eq 1 ] && { [ "${CONFIG_ONLY}" -eq 1 ] || [ "${PREFLIGHT_ONLY}" -eq 1 ] || [ "${NETWORK_ONLY}" -eq 1 ]; }; then
         die "--quick cannot be combined with --config-only, --preflight-only, or --network-only."
     fi
+}
+
+bool_word() {
+    if [ "${1:-0}" -eq 1 ]; then
+        printf 'yes\n'
+    else
+        printf 'no\n'
+    fi
+}
+
+print_install_plan() {
+    cat <<PLAN
+AeroNyx node install plan
+repo_url=${REPO_URL}
+branch=${BRANCH}
+repo_dir=${REPO_DIR}
+config_file=${CONFIG_FILE}
+service_name=${SERVICE_NAME}
+quick=$(bool_word "${QUICK}")
+config_only=$(bool_word "${CONFIG_ONLY}")
+preflight_only=$(bool_word "${PREFLIGHT_ONLY}")
+network_only=$(bool_word "${NETWORK_ONLY}")
+build=$(bool_word "${DO_BUILD}")
+network=$(bool_word "${DO_NETWORK}")
+enable_service=$(bool_word "${DO_ENABLE}")
+start_service=$(bool_word "${DO_START}")
+install_packages=$(bool_word "${INSTALL_PACKAGES}")
+install_rust=$(bool_word "${INSTALL_RUST}")
+allow_dirty=$(bool_word "${ALLOW_DIRTY}")
+dry_run=$(bool_word "${DRY_RUN}")
+registration_code_present=$([ -n "${REGISTRATION_CODE}" ] && printf 'yes' || printf 'no')
+registration_code_value=hidden
+PLAN
 }
 
 resolve_command_path() {
@@ -817,9 +863,14 @@ start_service() {
 }
 
 main() {
+    validate_option_combinations
+    if [ "${PRINT_PLAN}" -eq 1 ]; then
+        print_install_plan
+        exit 0
+    fi
+
     require_root
     require_linux_systemd
-    validate_option_combinations
     preflight_checks
     if [ "${PREFLIGHT_ONLY}" -eq 1 ]; then
         ok "Preflight-only checks complete."
