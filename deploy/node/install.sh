@@ -8,6 +8,10 @@
 #   sysctl, iptables, and build commands.
 #
 # Modification Reason:
+# - Add environment-variable defaults and --quick first-install mode so
+#   operators can launch a commercial node with one copy-paste command while
+#   still using the existing preflight, lock, build, network, systemd, and
+#   registration safeguards.
 # - Add install-time systemd unit verification while preserving the production
 #   deployment entrypoint for commercial VPN node operators.
 # - Render the generated network restore unit with detected system command
@@ -72,8 +76,12 @@
 #   expand the VPN IP pool or customize the TUN device.
 # - Keep --network-only free of binary build, registration, and service restart
 #   side effects.
+# - Keep --quick as a thin first-install wrapper; do not bypass preflight,
+#   dirty-worktree protection, systemd verification, or registration failure.
 #
 # Last Modified:
+# v1.16.0-node-deploy - Added environment defaults and --quick first-install
+#                       mode for one-command commercial node setup.
 # v1.15.0-node-deploy - Expanded default VPN pool fallback to /22 for
 #                       1000-session commercial capacity.
 # v1.14.0-node-deploy - Added capacity plan preflight for IP pool, configured
@@ -123,10 +131,10 @@ IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
 LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"
 LOCK_DIR=""
 
-REPO_URL="${DEFAULT_REPO_URL}"
-BRANCH="${DEFAULT_BRANCH}"
-REPO_DIR="${DEFAULT_REPO_DIR}"
-REGISTRATION_CODE=""
+REPO_URL="${AERONYX_REPO_URL:-${DEFAULT_REPO_URL}}"
+BRANCH="${AERONYX_BRANCH:-${DEFAULT_BRANCH}}"
+REPO_DIR="${AERONYX_REPO_DIR:-${DEFAULT_REPO_DIR}}"
+REGISTRATION_CODE="${AERONYX_REGISTRATION_CODE:-}"
 DO_BUILD=1
 DO_NETWORK=1
 DO_START=0
@@ -138,6 +146,15 @@ CONFIG_ONLY=0
 PREFLIGHT_ONLY=0
 ALLOW_DIRTY=0
 NETWORK_ONLY=0
+QUICK=0
+
+case "${AERONYX_START:-}" in
+    1|true|TRUE|yes|YES|on|ON) DO_START=1 ;;
+esac
+
+if [ -n "${REGISTRATION_CODE}" ]; then
+    DO_START=1
+fi
 
 log() { printf '[INFO] %s\n' "$*"; }
 ok() { printf '[OK] %s\n' "$*"; }
@@ -154,6 +171,8 @@ Options:
   --branch NAME           Git branch or ref. Default: main
   --repo-dir PATH         Install repository path. Default: /opt/aeronyx/AeroNyx
   --registration-code C   Register node after build.
+  --quick                 First-install shortcut. Requires --registration-code
+                          or AERONYX_REGISTRATION_CODE and starts the service.
   --start                 Start service after install. Automatically enabled when --registration-code is used.
   --no-build              Skip cargo release build.
   --no-network            Skip sysctl and NAT setup.
@@ -169,6 +188,7 @@ Options:
 
 Examples:
   sudo ./deploy/node/install.sh --registration-code NYX-1234-ABCDE --start
+  sudo AERONYX_REGISTRATION_CODE=NYX-1234-ABCDE ./deploy/node/install.sh --quick
   sudo ./deploy/node/install.sh --repo-dir /root/open/AeroNyx --no-build --no-network
 USAGE
 }
@@ -179,6 +199,7 @@ while [ "$#" -gt 0 ]; do
         --branch) BRANCH="${2:?missing value}"; shift 2 ;;
         --repo-dir) REPO_DIR="${2:?missing value}"; shift 2 ;;
         --registration-code) REGISTRATION_CODE="${2:?missing value}"; DO_START=1; shift 2 ;;
+        --quick) QUICK=1; DO_START=1; shift ;;
         --start) DO_START=1; shift ;;
         --no-build) DO_BUILD=0; shift ;;
         --no-network) DO_NETWORK=0; shift ;;
@@ -229,6 +250,12 @@ validate_option_combinations() {
     fi
     if [ "${NETWORK_ONLY}" -eq 1 ] && [ "${DRY_RUN}" -eq 0 ] && [ ! -f "${CONFIG_FILE}" ]; then
         die "--network-only requires existing config: ${CONFIG_FILE}"
+    fi
+    if [ "${QUICK}" -eq 1 ] && [ -z "${REGISTRATION_CODE}" ]; then
+        die "--quick requires --registration-code or AERONYX_REGISTRATION_CODE."
+    fi
+    if [ "${QUICK}" -eq 1 ] && { [ "${CONFIG_ONLY}" -eq 1 ] || [ "${PREFLIGHT_ONLY}" -eq 1 ] || [ "${NETWORK_ONLY}" -eq 1 ]; }; then
+        die "--quick cannot be combined with --config-only, --preflight-only, or --network-only."
     fi
 }
 

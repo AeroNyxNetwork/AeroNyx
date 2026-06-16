@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Document environment-variable defaults and --quick first-install mode for
+  one-command commercial node setup.
 - Document production upgrade unit-template synchronization, rollback behavior,
   shared node-local deployment locking, and install-time systemd unit
   verification, purge path safety, service-name validation, and release-backup
@@ -44,6 +46,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.26.0-node-deploy - Documented --quick and AERONYX_* install defaults.
 v1.25.0-node-deploy - Documented healthcheck systemd repo path auto-detection.
 v1.24.0-node-deploy - Documented /22 default VPN pool for 1000-session
                      commercial capacity.
@@ -101,6 +104,29 @@ healthcheck, and systemd service management.
 ```bash
 sudo ./deploy/node/install.sh --registration-code <NODEBOARD_CODE> --start
 ```
+
+For the lowest-friction first install, pass the nodeboard registration code as
+an environment variable and let `--quick` keep the normal commercial defaults:
+
+```bash
+sudo AERONYX_REGISTRATION_CODE=<NODEBOARD_CODE> ./deploy/node/install.sh --quick
+```
+
+`--quick` is intentionally a thin wrapper. It still runs preflight checks,
+capacity-plan warnings, package/Rust setup, repository update, config
+installation, network setup, release build, systemd verification, node
+registration, and service start. It fails when no registration code is
+provided, so an operator does not mistake an unregistered node for a live
+commercial node.
+
+The installer also accepts these environment defaults for automation systems
+that generate one-line setup commands:
+
+- `AERONYX_REPO_URL`
+- `AERONYX_BRANCH`
+- `AERONYX_REPO_DIR`
+- `AERONYX_REGISTRATION_CODE`
+- `AERONYX_START=1`
 
 For an existing checkout in a custom path:
 
