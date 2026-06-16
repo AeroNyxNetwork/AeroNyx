@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Document stale AeroNyx NAT cleanup during VPN pool migrations so operators
+  know --network-only removes old overlapping 100.64.0.0/* MASQUERADE rules.
 - Document read-only --print-plan for verifying generated one-command install
   commands without requiring root access or mutating the host.
 - Document environment-variable defaults and --quick first-install mode for
@@ -48,6 +50,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.28.0-node-deploy - Documented stale NAT cleanup for VPN pool migrations.
 v1.27.0-node-deploy - Documented --print-plan for safe install command checks.
 v1.26.0-node-deploy - Documented --quick and AERONYX_* install defaults.
 v1.25.0-node-deploy - Documented healthcheck systemd repo path auto-detection.
@@ -213,6 +216,12 @@ sudo ./deploy/node/install.sh --network-only
 
 This mode does not pull source, build the Rust binary, register the node,
 install the main systemd unit, or restart `aeronyx-server`.
+
+When the VPN pool changes, for example from `100.64.0.0/24` to
+`100.64.0.0/22`, `--network-only` removes stale AeroNyx
+`100.64.0.0/*` MASQUERADE rules on the detected egress interface before
+persisting `/etc/iptables/rules.v4`. The cleanup is scoped to the AeroNyx
+CGNAT pool so unrelated host NAT rules are left alone.
 
 The generated network restore service uses detected absolute paths for
 `sysctl` and `iptables-restore` so reboot recovery works across Linux

@@ -8,6 +8,9 @@
 #   sysctl, iptables, and build commands.
 #
 # Modification Reason:
+# - Remove stale AeroNyx 100.64.0.0/* NAT rules during network refresh so
+#   commercial pool migrations, such as /24 to /22, do not leave overlapping
+#   MASQUERADE rules in the persisted iptables set.
 # - Add --print-plan so nodeboard, operators, and support automation can verify
 #   environment-variable parsing and one-command install intent without touching
 #   host state or printing registration secrets.
@@ -83,8 +86,12 @@
 #   dirty-worktree protection, systemd verification, or registration failure.
 # - Keep --print-plan read-only and secret-safe; it must never print the
 #   registration code, private keys, API secrets, or wallet-level data.
+# - Keep stale NAT cleanup scoped to AeroNyx CGNAT pool rules on the detected
+#   egress interface; do not delete unrelated MASQUERADE rules.
 #
 # Last Modified:
+# v1.18.0-node-deploy - Cleans stale AeroNyx NAT rules during VPN pool
+#                       migrations before persisting iptables.
 # v1.17.0-node-deploy - Added read-only --print-plan for one-command install
 #                       verification and nodeboard automation.
 # v1.16.0-node-deploy - Added environment defaults and --quick first-install
@@ -717,12 +724,39 @@ configure_network() {
     if command -v iptables >/dev/null 2>&1; then
         log "Applying idempotent iptables NAT rules for ${vpn_subnet} on ${default_iface} via ${tun_device}"
         run_shell "iptables -t nat -C POSTROUTING -s '${vpn_subnet}' -o '${default_iface}' -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s '${vpn_subnet}' -o '${default_iface}' -j MASQUERADE"
+        cleanup_stale_aeronyx_nat_rules "${vpn_subnet}" "${default_iface}"
         run_shell "iptables -C FORWARD -i '${tun_device}' -j ACCEPT 2>/dev/null || iptables -A FORWARD -i '${tun_device}' -j ACCEPT"
         run_shell "iptables -C FORWARD -o '${tun_device}' -j ACCEPT 2>/dev/null || iptables -A FORWARD -o '${tun_device}' -j ACCEPT"
         persist_network_rules
     else
         warn "iptables not found; VPN clients may not reach the internet until NAT is configured."
     fi
+}
+
+cleanup_stale_aeronyx_nat_rules() {
+    local vpn_subnet="$1" default_iface="$2"
+    local out_iface rule source delete_rule
+
+    command -v iptables-save >/dev/null 2>&1 || return
+
+    iptables-save -t nat 2>/dev/null \
+        | awk '/^-A POSTROUTING / && / -j MASQUERADE/ {print}' \
+        | while IFS= read -r rule; do
+            source="$(printf '%s\n' "${rule}" | sed -n 's/.* -s \([^ ]*\) .*/\1/p')"
+            out_iface="$(printf '%s\n' "${rule}" | sed -n 's/.* -o \([^ ]*\) .*/\1/p')"
+
+            case "${source}" in
+                100.64.0.0/*) ;;
+                *) continue ;;
+            esac
+
+            [ "${source}" != "${vpn_subnet}" ] || continue
+            [ "${out_iface}" = "${default_iface}" ] || continue
+
+            delete_rule="$(printf '%s\n' "${rule}" | sed 's/^-A /-D /')"
+            log "Removing stale AeroNyx NAT rule for ${source} on ${default_iface}"
+            run_shell "iptables -t nat ${delete_rule}"
+        done
 }
 
 persist_network_rules() {
