@@ -8,7 +8,8 @@
 #
 # Modification Reason:
 # - Add production systemd unit synchronization, rollback, no-restart, and
-#   health polling controls while preserving active-session protection.
+#   health polling controls while preserving active-session protection and
+#   validating operator-provided service names.
 #
 # Main Functionality:
 # - Pulls the configured branch.
@@ -39,8 +40,11 @@
 #   disconnected by routine upgrades unless the operator explicitly forces it.
 # - Do not overwrite /etc/aeronyx/server.toml during upgrades.
 # - Keep this script compatible with current and older installed service units.
+# - Reject service names that look like paths or command-line options.
 #
 # Last Modified:
+# v1.5.0-node-deploy - Validates --service names before systemd, lock, or unit
+#                      path operations.
 # v1.4.0-node-deploy - Uses the shared node deployment lock across install and
 #                      upgrade workflows.
 # v1.3.0-node-deploy - Added node-local upgrade locking to prevent concurrent
@@ -125,6 +129,17 @@ run() {
 
 require_root() {
     [ "$(id -u)" -eq 0 ] || die "Please run as root, for example: sudo $0"
+}
+
+validate_service_name() {
+    case "${SERVICE_NAME}" in
+        ""|-*|*/*)
+            die "Invalid service name: ${SERVICE_NAME}"
+            ;;
+    esac
+
+    printf '%s' "${SERVICE_NAME}" | grep -Eq '^[A-Za-z0-9_.@-]+$' \
+        || die "Invalid service name: ${SERVICE_NAME}"
 }
 
 release_lock() {
@@ -372,6 +387,7 @@ run_healthcheck() {
 }
 
 main() {
+    validate_service_name
     require_root
     acquire_lock
     ensure_cargo_path

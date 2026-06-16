@@ -9,7 +9,7 @@
 #
 # Modification Reason:
 # - Add explicit purge path safety checks while preserving the production node
-#   uninstall workflow for commercial operations.
+#   uninstall workflow for commercial operations and validating service names.
 #
 # Main Functionality:
 # - Stops and disables the systemd service.
@@ -37,9 +37,12 @@
 # - Do not delete config/state/log/network persistence files unless --purge is
 #   used, the operator types the exact confirmation string, and the target path
 #   passes the AeroNyx purge allow-list.
+# - Reject service names that look like paths or command-line options.
 # - This script is Linux/systemd only; mobile/desktop clients are unaffected.
 #
 # Last Modified:
+# v1.3.0-node-deploy - Validates --service names before systemd or unit path
+#                      operations.
 # v1.2.0-node-deploy - Added purge path allow-list checks before destructive
 #                      state deletion.
 # v1.1.0-node-deploy - Added network restore unit removal and full purge cleanup.
@@ -116,6 +119,17 @@ require_root() {
 require_linux_systemd() {
     [ "$(uname -s)" = "Linux" ] || die "uninstall.sh supports Linux production nodes only."
     command -v systemctl >/dev/null 2>&1 || die "systemctl is required."
+}
+
+validate_service_name() {
+    case "${SERVICE_NAME}" in
+        ""|-*|*/*)
+            die "Invalid service name: ${SERVICE_NAME}"
+            ;;
+    esac
+
+    printf '%s' "${SERVICE_NAME}" | grep -Eq '^[A-Za-z0-9_.@-]+$' \
+        || die "Invalid service name: ${SERVICE_NAME}"
 }
 
 stop_service() {
@@ -228,6 +242,7 @@ purge_state() {
 }
 
 main() {
+    validate_service_name
     require_root
     require_linux_systemd
     stop_service

@@ -7,7 +7,8 @@
 #   nodes after install, upgrade, or incident response.
 #
 # Modification Reason:
-# - Initial production healthcheck for node deployment workflows.
+# - Add service-name validation while preserving the production healthcheck for
+#   node deployment workflows.
 #
 # Main Functionality:
 # - Checks repository, binary, config, registration state, systemd status,
@@ -33,8 +34,11 @@
 #   traffic, DNS contents, destinations, payloads, or client public IPs.
 # - Keep output stable; nodeboard or support tooling may parse these lines later.
 # - This script should never modify host state.
+# - Reject service names that look like paths or command-line options.
 #
 # Last Modified:
+# v1.6.0-node-deploy - Validates --service names before systemd and journal
+#                      diagnostics.
 # v1.5.0-node-deploy - Added runtime metadata, tracked worktree, and current
 #                      service-start journal diagnostics.
 # v1.4.0-node-deploy - Added sysctl/iptables persistence diagnostics.
@@ -88,6 +92,20 @@ done
 PASS=0
 WARN=0
 FAIL=0
+
+validate_service_name() {
+    case "${SERVICE_NAME}" in
+        ""|-*|*/*)
+            printf '[ERROR] Invalid service name: %s\n' "${SERVICE_NAME}" >&2
+            exit 1
+            ;;
+    esac
+
+    printf '%s' "${SERVICE_NAME}" | grep -Eq '^[A-Za-z0-9_.@-]+$' || {
+        printf '[ERROR] Invalid service name: %s\n' "${SERVICE_NAME}" >&2
+        exit 1
+    }
+}
 
 record_check() {
     local status="$1"
@@ -520,6 +538,7 @@ PY
 }
 
 main() {
+    validate_service_name
     check_system
     check_host_capacity
     check_repo_and_binary

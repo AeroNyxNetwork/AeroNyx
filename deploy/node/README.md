@@ -11,7 +11,7 @@ Creation Reason:
 Modification Reason:
 - Document production upgrade unit-template synchronization, rollback behavior,
   shared node-local deployment locking, and install-time systemd unit
-  verification, plus purge path safety.
+  verification, purge path safety, and service-name validation.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -37,6 +37,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.6.0-node-deploy - Documented --service name validation.
 v1.5.0-node-deploy - Documented uninstall purge path allow-list protection.
 v1.4.0-node-deploy - Documented install-time systemd unit verification.
 v1.3.0-node-deploy - Documented shared install/upgrade deployment locking.
@@ -248,6 +249,8 @@ Client/development platforms:
 - macOS, iOS, Android, and Windows are not production node targets for these
   scripts.
 - These scripts do not change mobile or desktop client APIs.
+- Scripts that accept `--service` reject names containing `/`, names beginning
+  with `-`, and names outside `[A-Za-z0-9_.@-]`.
 
 ## Next Developer Guide
 
