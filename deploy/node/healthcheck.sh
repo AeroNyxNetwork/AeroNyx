@@ -12,6 +12,7 @@
 # - Add release-backup diagnostics for node upgrade retention observability.
 # - Validate generated network restore command paths for reboot reliability.
 # - Expose network restore command paths in JSON for nodeboard automation.
+# - Include network restore unit backups in retention diagnostics.
 #
 # Main Functionality:
 # - Checks repository, binary, config, registration state, systemd status,
@@ -41,6 +42,8 @@
 # - Reject service names that look like paths or command-line options.
 #
 # Last Modified:
+# v1.10.0-node-deploy - Added network restore unit backup counts to release
+#                       retention diagnostics.
 # v1.9.0-node-deploy - Added structured network restore command diagnostics to
 #                      JSON output.
 # v1.8.0-node-deploy - Added network restore ExecStart command path checks.
@@ -286,7 +289,7 @@ count_release_backups() {
 }
 
 check_release_backups() {
-    local binary_count unit_count
+    local binary_count unit_count network_restore_unit_count
 
     if [ ! -d "${RELEASE_DIR}" ]; then
         pass "release backup directory absent; no retained upgrade backups"
@@ -295,11 +298,14 @@ check_release_backups() {
 
     binary_count="$(count_release_backups "aeronyx-server.*")"
     unit_count="$(count_release_backups "${SERVICE_NAME}.service.*")"
+    network_restore_unit_count="$(count_release_backups "${NETWORK_RESTORE_SERVICE}.service.*")"
 
-    if [ "${binary_count:-0}" -le "${RELEASE_BACKUP_KEEP_TARGET}" ] && [ "${unit_count:-0}" -le "${RELEASE_BACKUP_KEEP_TARGET}" ]; then
-        pass "release backups within retention target: binary=${binary_count:-0} systemd_unit=${unit_count:-0} keep_target=${RELEASE_BACKUP_KEEP_TARGET}"
+    if [ "${binary_count:-0}" -le "${RELEASE_BACKUP_KEEP_TARGET}" ] \
+        && [ "${unit_count:-0}" -le "${RELEASE_BACKUP_KEEP_TARGET}" ] \
+        && [ "${network_restore_unit_count:-0}" -le "${RELEASE_BACKUP_KEEP_TARGET}" ]; then
+        pass "release backups within retention target: binary=${binary_count:-0} systemd_unit=${unit_count:-0} network_restore_unit=${network_restore_unit_count:-0} keep_target=${RELEASE_BACKUP_KEEP_TARGET}"
     else
-        warn "release backups exceed retention target: binary=${binary_count:-0} systemd_unit=${unit_count:-0} keep_target=${RELEASE_BACKUP_KEEP_TARGET}; run a successful upgrade or prune manually"
+        warn "release backups exceed retention target: binary=${binary_count:-0} systemd_unit=${unit_count:-0} network_restore_unit=${network_restore_unit_count:-0} keep_target=${RELEASE_BACKUP_KEEP_TARGET}; run a successful upgrade or prune manually"
     fi
 }
 
@@ -582,6 +588,7 @@ release_backups = {
     "dir": release_dir,
     "binary_count": len(glob.glob(os.path.join(release_dir, "aeronyx-server.*"))),
     "systemd_unit_count": len(glob.glob(os.path.join(release_dir, f"{service_name}.service.*"))),
+    "network_restore_unit_count": len(glob.glob(os.path.join(release_dir, f"{network_restore_service}.service.*"))),
     "keep_target": 10,
 }
 runtime = {

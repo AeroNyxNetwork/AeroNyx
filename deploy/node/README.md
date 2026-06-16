@@ -39,6 +39,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.14.0-node-deploy - Documented network restore backup count diagnostics.
 v1.13.0-node-deploy - Documented --network-restore-only maintenance mode.
 v1.12.0-node-deploy - Documented upgrade-time network restore synchronization.
 v1.11.0-node-deploy - Documented network restore unit verification.
@@ -200,7 +201,7 @@ The healthcheck prints:
 - host capacity: TUN, default route, memory, disk, and ports
 - runtime metadata: git commit, branch, binary/config timestamps, service state
 - tracked worktree and current-start journal warning checks
-- release-backup counts for upgrade retention observability
+- release-backup counts for binary, main unit, and network restore unit
 - release binary presence
 - config validation result
 - node registration files
