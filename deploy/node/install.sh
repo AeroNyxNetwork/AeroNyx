@@ -14,6 +14,7 @@
 # - Detects Linux/systemd environment.
 # - Runs production preflight checks for TUN, default route, memory, disk, and
 #   common AeroNyx ports.
+# - Prevents concurrent install/upgrade runs on the same node.
 # - Installs host dependencies on supported Linux distributions.
 # - Clones or uses the AeroNyx repository.
 # - Creates /etc/aeronyx and /var/lib/aeronyx state directories.
@@ -30,9 +31,11 @@
 #   register, start, validate, status
 #
 # Main Logical Flow:
-# 1. Parse flags and validate host assumptions.
-# 2. Prepare repository, directories, config, and network forwarding.
-# 3. Build release binary, install systemd unit, optionally register/start.
+# 1. Parse flags and run production preflight checks.
+# 2. Exit early for --preflight-only without taking the deployment lock.
+# 3. Acquire the shared node deployment lock before host writes.
+# 4. Prepare repository, directories, config, and network forwarding.
+# 5. Build release binary, install systemd unit, optionally register/start.
 #
 # Important Note for Next Developer:
 # - Never overwrite /etc/aeronyx/server.toml, server_key.json, or node_info.json
@@ -42,6 +45,7 @@
 #   development/client platforms, not production node hosts for this script.
 #
 # Last Modified:
+# v1.5.0-node-deploy - Added shared deployment locking with upgrade.sh.
 # v1.4.0-node-deploy - Persisted sysctl and iptables NAT with a restore unit.
 # v1.3.0-node-deploy - Added --preflight-only for install readiness checks.
 # v1.2.0-node-deploy - Added production preflight checks for host readiness.
@@ -67,6 +71,8 @@ NETWORK_RESTORE_SERVICE="aeronyx-network-restore.service"
 NETWORK_RESTORE_FILE="/etc/systemd/system/${NETWORK_RESTORE_SERVICE}"
 SYSCTL_FILE="/etc/sysctl.d/99-aeronyx.conf"
 IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
+LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"
+LOCK_DIR=""
 
 REPO_URL="${DEFAULT_REPO_URL}"
 BRANCH="${DEFAULT_BRANCH}"
@@ -157,6 +163,32 @@ require_root() {
 require_linux_systemd() {
     [ "$(uname -s)" = "Linux" ] || die "install.sh supports Linux production nodes only."
     command -v systemctl >/dev/null 2>&1 || die "systemctl is required for production node service management."
+}
+
+release_lock() {
+    if [ -n "${LOCK_DIR}" ] && [ -d "${LOCK_DIR}" ]; then
+        rmdir "${LOCK_DIR}" 2>/dev/null || true
+    fi
+}
+
+acquire_deploy_lock() {
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] acquire deployment lock %s\n' "${LOCK_FILE}"
+        return
+    fi
+
+    if command -v flock >/dev/null 2>&1; then
+        mkdir -p "$(dirname "${LOCK_FILE}")"
+        exec 9>"${LOCK_FILE}"
+        flock -n 9 || die "Another ${SERVICE_NAME} install or upgrade is already running."
+        ok "Deployment lock acquired: ${LOCK_FILE}"
+        return
+    fi
+
+    LOCK_DIR="/tmp/${SERVICE_NAME}.deploy.lock"
+    mkdir "${LOCK_DIR}" 2>/dev/null || die "Another ${SERVICE_NAME} install or upgrade appears to be running: ${LOCK_DIR}"
+    trap release_lock EXIT
+    ok "Deployment lock acquired: ${LOCK_DIR}"
 }
 
 existing_path_for_df() {
@@ -467,6 +499,7 @@ main() {
         ok "Preflight-only checks complete."
         exit 0
     fi
+    acquire_deploy_lock
     install_packages
     if [ "${DO_BUILD}" -eq 1 ]; then
         install_rust_if_needed

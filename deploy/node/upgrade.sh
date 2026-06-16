@@ -41,6 +41,8 @@
 # - Keep this script compatible with current and older installed service units.
 #
 # Last Modified:
+# v1.4.0-node-deploy - Uses the shared node deployment lock across install and
+#                      upgrade workflows.
 # v1.3.0-node-deploy - Added node-local upgrade locking to prevent concurrent
 #                      binary/systemd unit replacement.
 # v1.2.0-node-deploy - Syncs systemd unit template during restart upgrades and
@@ -57,7 +59,7 @@ BRANCH="main"
 CONFIG_FILE="/etc/aeronyx/server.toml"
 SERVICE_NAME="aeronyx-server"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-LOCK_FILE="/run/lock/${SERVICE_NAME}.upgrade.lock"
+LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"
 LOCK_DIR=""
 FORCE=0
 DRY_RUN=0
@@ -100,7 +102,7 @@ while [ "$#" -gt 0 ]; do
         --repo-dir) REPO_DIR="${2:?missing value}"; shift 2 ;;
         --branch) BRANCH="${2:?missing value}"; shift 2 ;;
         --config) CONFIG_FILE="${2:?missing value}"; shift 2 ;;
-        --service) SERVICE_NAME="${2:?missing value}"; SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"; LOCK_FILE="/run/lock/${SERVICE_NAME}.upgrade.lock"; shift 2 ;;
+        --service) SERVICE_NAME="${2:?missing value}"; SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"; LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"; shift 2 ;;
         --force) FORCE=1; shift ;;
         --no-restart) NO_RESTART=1; shift ;;
         --skip-pull) SKIP_PULL=1; shift ;;
@@ -133,22 +135,22 @@ release_lock() {
 
 acquire_lock() {
     if [ "${DRY_RUN}" -eq 1 ]; then
-        printf '[DRY-RUN] acquire upgrade lock %s\n' "${LOCK_FILE}"
+        printf '[DRY-RUN] acquire deployment lock %s\n' "${LOCK_FILE}"
         return
     fi
 
     if command -v flock >/dev/null 2>&1; then
         mkdir -p "$(dirname "${LOCK_FILE}")"
         exec 9>"${LOCK_FILE}"
-        flock -n 9 || die "Another ${SERVICE_NAME} upgrade is already running."
-        ok "Upgrade lock acquired: ${LOCK_FILE}"
+        flock -n 9 || die "Another ${SERVICE_NAME} install or upgrade is already running."
+        ok "Deployment lock acquired: ${LOCK_FILE}"
         return
     fi
 
-    LOCK_DIR="/tmp/${SERVICE_NAME}.upgrade.lock"
-    mkdir "${LOCK_DIR}" 2>/dev/null || die "Another ${SERVICE_NAME} upgrade appears to be running: ${LOCK_DIR}"
+    LOCK_DIR="/tmp/${SERVICE_NAME}.deploy.lock"
+    mkdir "${LOCK_DIR}" 2>/dev/null || die "Another ${SERVICE_NAME} install or upgrade appears to be running: ${LOCK_DIR}"
     trap release_lock EXIT
-    ok "Upgrade lock acquired: ${LOCK_DIR}"
+    ok "Deployment lock acquired: ${LOCK_DIR}"
 }
 
 ensure_cargo_path() {

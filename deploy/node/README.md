@@ -10,7 +10,7 @@ Creation Reason:
 
 Modification Reason:
 - Document production upgrade unit-template synchronization, rollback behavior,
-  and node-local upgrade locking.
+  and shared node-local deployment locking.
 
 Main Functionality:
 - Explains first install, registration, upgrade, healthcheck, configuration
@@ -36,6 +36,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.3.0-node-deploy - Documented shared install/upgrade deployment locking.
 v1.2.0-node-deploy - Documented node-local upgrade locking.
 v1.1.0-node-deploy - Documented upgrade-time systemd unit synchronization and
                      rollback behavior.
@@ -78,6 +79,10 @@ The installer never overwrites these files when they already exist:
 - `/etc/aeronyx/node_info.json`
 - `/etc/aeronyx/aeronyx.env`
 
+Installation and upgrade share a node-local deployment lock, so an operator or
+automation system cannot run a second install/upgrade process while one is
+already replacing the repository, service unit, binary, or network rules.
+
 Before installation, `install.sh` performs non-blocking production preflight
 checks for:
 
@@ -108,9 +113,9 @@ sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx
 `upgrade.sh` checks active VPN sessions before restart. If users are connected,
 the script stops unless the operator explicitly passes `--force`.
 
-Only one upgrade can run on the same node at a time. The script takes a
-node-local lock before pulling, building, replacing the systemd unit, or
-restarting the service.
+Only one install or upgrade can run on the same node at a time. The script takes
+the shared node-local deployment lock before pulling, building, replacing the
+systemd unit, or restarting the service.
 
 During restart upgrades, the script also renders
 `deploy/node/aeronyx-server.service` into the installed systemd unit and
