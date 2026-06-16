@@ -131,6 +131,8 @@ The healthcheck prints:
 
 - system commands and OS support
 - host capacity: TUN, default route, memory, disk, and ports
+- runtime metadata: git commit, branch, binary/config timestamps, service state
+- tracked worktree and current-start journal warning checks
 - release binary presence
 - config validation result
 - node registration files

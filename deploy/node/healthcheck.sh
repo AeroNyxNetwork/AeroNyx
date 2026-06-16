@@ -35,6 +35,8 @@
 # - This script should never modify host state.
 #
 # Last Modified:
+# v1.5.0-node-deploy - Added runtime metadata, tracked worktree, and current
+#                      service-start journal diagnostics.
 # v1.4.0-node-deploy - Added sysctl/iptables persistence diagnostics.
 # v1.3.1-node-deploy - Checks systemd-managed AeroNyx directories.
 # v1.3.0-node-deploy - Added systemd hardening diagnostics.
@@ -214,6 +216,39 @@ check_repo_and_binary() {
     check_file "/etc/aeronyx/server_key.json" "node server key"
     check_file "/var/lib/aeronyx" "state directory"
     check_file "/var/log/aeronyx" "log directory"
+}
+
+check_runtime_metadata() {
+    local active_since dirty_lines journal_output journal_warnings
+
+    if command -v git >/dev/null 2>&1 && [ -d "${REPO_DIR}/.git" ]; then
+        dirty_lines="$(git -C "${REPO_DIR}" status --short --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')"
+        if [ "${dirty_lines:-0}" = "0" ]; then
+            pass "git tracked worktree clean"
+        else
+            warn "git tracked worktree has ${dirty_lines} modified file(s)"
+        fi
+    else
+        warn "git tracked worktree check skipped"
+    fi
+
+    if command -v journalctl >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+        active_since="$(systemctl show "${SERVICE_NAME}" -p ActiveEnterTimestamp --value 2>/dev/null || true)"
+        if [ -n "${active_since}" ]; then
+            journal_output="$(journalctl -u "${SERVICE_NAME}" --since "${active_since}" -p warning --no-pager 2>/dev/null || true)"
+            journal_output="$(printf '%s\n' "${journal_output}" | grep -Ev '^-- No entries --$' || true)"
+            journal_warnings="$(printf '%s\n' "${journal_output}" | sed '/^$/d' | wc -l | tr -d ' ')"
+            if [ "${journal_warnings:-0}" = "0" ]; then
+                pass "journal warnings since current service start: 0"
+            else
+                warn "journal warnings since current service start: ${journal_warnings}"
+            fi
+        else
+            warn "journal warning check skipped; service start timestamp unavailable"
+        fi
+    else
+        warn "journal warning check skipped"
+    fi
 }
 
 check_config_validation() {
@@ -424,13 +459,30 @@ emit_json_summary() {
         return 0
     fi
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "${CHECK_LOG}" <<PY
+        python3 - "${CHECK_LOG}" "${REPO_DIR}" "${CONFIG_FILE}" "${SERVICE_NAME}" "${NETWORK_RESTORE_SERVICE}" "${PASS}" "${WARN}" "${FAIL}" <<'PY'
 import json
+import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 
+checks_path, repo_dir, config_path, service_name, network_restore_service = sys.argv[1:6]
+pass_count, warn_count, fail_count = [int(value) for value in sys.argv[6:9]]
+
+def run(args):
+    try:
+        return subprocess.check_output(args, stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return None
+
+def file_mtime(path):
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(path), timezone.utc).isoformat()
+    except Exception:
+        return None
+
 checks = []
-with open(sys.argv[1], "r", encoding="utf-8") as handle:
+with open(checks_path, "r", encoding="utf-8") as handle:
     for line in handle:
         line = line.rstrip("\n")
         if not line:
@@ -438,12 +490,27 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
         status, _, message = line.partition("\t")
         checks.append({"status": status, "message": message})
 
+binary_path = os.path.join(repo_dir, "target/release/aeronyx-server")
+runtime = {
+    "git_commit": run(["git", "-C", repo_dir, "rev-parse", "--short", "HEAD"]),
+    "git_branch": run(["git", "-C", repo_dir, "rev-parse", "--abbrev-ref", "HEAD"]),
+    "git_tracked_dirty": bool(run(["git", "-C", repo_dir, "status", "--short", "--untracked-files=no"])),
+    "binary_path": binary_path,
+    "binary_mtime": file_mtime(binary_path),
+    "config_mtime": file_mtime(config_path),
+    "service_active": run(["systemctl", "is-active", service_name]),
+    "service_enabled": run(["systemctl", "is-enabled", service_name]),
+    "network_restore_active": run(["systemctl", "is-active", network_restore_service]),
+    "network_restore_enabled": run(["systemctl", "is-enabled", network_restore_service]),
+}
+
 print(json.dumps({
-    "success": ${FAIL} == 0,
-    "summary": {"pass": ${PASS}, "warn": ${WARN}, "fail": ${FAIL}},
-    "repo_dir": "${REPO_DIR}",
-    "config": "${CONFIG_FILE}",
-    "service": "${SERVICE_NAME}",
+    "success": fail_count == 0,
+    "summary": {"pass": pass_count, "warn": warn_count, "fail": fail_count},
+    "repo_dir": repo_dir,
+    "config": config_path,
+    "service": service_name,
+    "runtime": runtime,
     "checks": checks,
     "privacy_boundary": "diagnostics only; no private keys, registration secrets, client public IPs, destinations, DNS contents, packet payloads, or wallet-level traffic",
     "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -456,6 +523,7 @@ main() {
     check_system
     check_host_capacity
     check_repo_and_binary
+    check_runtime_metadata
     check_config_validation
     check_systemd
     check_systemd_hardening
