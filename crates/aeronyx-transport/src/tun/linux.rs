@@ -32,6 +32,8 @@
 //! - Test with mock implementation when possible
 //!
 //! ## Last Modified
+//! v0.1.1 - Flush existing global TUN addresses before applying the configured
+//!          address so CIDR changes such as /24 -> /22 take effect on restart.
 //! v0.1.0 - Initial Linux TUN implementation
 
 #![cfg(target_os = "linux")]
@@ -263,6 +265,25 @@ impl LinuxTun {
 
         debug!("Configuring TUN address: {} on {}", addr, self.config.name);
 
+        // The TUN device is owned by AeroNyx. Flush global addresses first so
+        // maintenance changes to the configured CIDR cannot be masked by an
+        // older address such as 100.64.0.1/24 already being present.
+        let flush_output = Command::new("ip")
+            .args(["addr", "flush", "dev", &self.config.name, "scope", "global"])
+            .output()
+            .map_err(|e| TransportError::TunConfigFailed {
+                name: self.config.name.clone(),
+                reason: format!("Failed to run ip flush command: {}", e),
+            })?;
+
+        if !flush_output.status.success() {
+            let stderr = String::from_utf8_lossy(&flush_output.stderr);
+            return Err(TransportError::TunConfigFailed {
+                name: self.config.name.clone(),
+                reason: format!("ip addr flush failed: {}", stderr),
+            });
+        }
+
         let output = Command::new("ip")
             .args(["addr", "add", &addr, "dev", &self.config.name])
             .output()
@@ -273,13 +294,10 @@ impl LinuxTun {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Ignore "already exists" errors
-            if !stderr.contains("RTNETLINK answers: File exists") {
-                return Err(TransportError::TunConfigFailed {
-                    name: self.config.name.clone(),
-                    reason: format!("ip addr add failed: {}", stderr),
-                });
-            }
+            return Err(TransportError::TunConfigFailed {
+                name: self.config.name.clone(),
+                reason: format!("ip addr add failed: {}", stderr),
+            });
         }
 
         Ok(())
