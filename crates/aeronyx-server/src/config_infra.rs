@@ -10,11 +10,14 @@
 //! MemChain subsystems and are cleanly separable.
 //!
 //! ## Modification Reason
+//! v1.2.0-DNSOwnership — Added `vpn.dns_proxy_enabled` so production nodes can
+//! explicitly choose whether Rust owns `gateway_ip:53` or an external system
+//! resolver, such as systemd-resolved, owns the gateway DNS listener.
 //! v1.1.0-ChatRelay — 🌟 Split from config.rs (no logic changes).
 //!
 //! ## Main Functionality
 //! - `NetworkConfig`  — listen address + public endpoint
-//! - `VpnConfig`      — virtual IP range + gateway
+//! - `VpnConfig`      — virtual IP range + gateway + DNS proxy ownership
 //! - `TunConfig`      — TUN device name + MTU
 //! - `ServerKeyConfig`— key file path
 //! - `LimitsConfig`   — max connections + session timeout
@@ -37,6 +40,7 @@
 //!   and must remain pub.
 //!
 //! ## Last Modified
+//! v1.2.0-DNSOwnership — Added backward-compatible VPN DNS proxy flag.
 //! v1.1.0-ChatRelay — Extracted from config.rs; zero logic changes.
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -99,6 +103,8 @@ pub struct VpnConfig {
     pub virtual_ip_range: String,
     #[serde(default = "default_gateway_ip")]
     pub gateway_ip: Ipv4Addr,
+    #[serde(default = "default_dns_proxy_enabled")]
+    pub dns_proxy_enabled: bool,
 }
 
 fn default_ip_range() -> String {
@@ -106,6 +112,9 @@ fn default_ip_range() -> String {
 }
 fn default_gateway_ip() -> Ipv4Addr {
     Ipv4Addr::new(100, 64, 0, 1)
+}
+fn default_dns_proxy_enabled() -> bool {
+    true
 }
 
 impl VpnConfig {
@@ -149,6 +158,7 @@ impl Default for VpnConfig {
         Self {
             virtual_ip_range: default_ip_range(),
             gateway_ip: default_gateway_ip(),
+            dns_proxy_enabled: default_dns_proxy_enabled(),
         }
     }
 }

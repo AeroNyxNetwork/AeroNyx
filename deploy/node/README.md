@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Document VPN DNS ownership so production operators can choose the default
+  built-in Rust DNS proxy or an external systemd-resolved listener without
+  confusing port-bind warnings.
 - Document --set-vpn-cidr so operators can update vpn.virtual_ip_range and
   refresh NAT/restore rules in one network-only maintenance command before a
   controlled service restart.
@@ -53,6 +56,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.30.0-node-deploy - Documented VPN DNS ownership modes.
 v1.29.0-node-deploy - Documented --set-vpn-cidr network-only VPN pool updates.
 v1.28.0-node-deploy - Documented stale NAT cleanup for VPN pool migrations.
 v1.27.0-node-deploy - Documented --print-plan for safe install command checks.
@@ -220,6 +224,21 @@ sudo ./deploy/node/install.sh --network-only
 
 This mode does not pull source, build the Rust binary, register the node,
 install the main systemd unit, or restart `aeronyx-server`.
+
+## VPN DNS Ownership
+
+Commercial VPN clients need DNS on the tunnel gateway, normally
+`100.64.0.1:53`. AeroNyx supports two ownership modes:
+
+- Built-in Rust proxy: keep `vpn.dns_proxy_enabled = true`. The Rust node binds
+  UDP `gateway_ip:53` and forwards opaque DNS datagrams to upstream resolvers.
+- External host resolver: set `vpn.dns_proxy_enabled = false` and configure a
+  host resolver, for example systemd-resolved, to listen on `gateway_ip:53`.
+
+The default remains `true` for backward compatibility. Use the external mode
+only when the host resolver is intentionally managed by operations automation.
+The health endpoint still checks for a DNS listener and performs a DNS query
+through `gateway_ip:53`; it does not expose user DNS contents or destinations.
 
 For the common commercial pool expansion from `/24` to `/22`, update the
 persisted config and refresh host networking in one idempotent command:

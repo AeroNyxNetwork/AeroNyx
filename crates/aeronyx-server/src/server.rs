@@ -19,8 +19,9 @@
 //   5. spawn_cleanup_task() signature + call site: added traffic_tracker param
 //   6. cleanup loop: calls traffic_tracker.remove_wallet(&wallet)
 //   7. encrypted_message_counter shared by PacketHandler and VPN health
-//   8. Starts a privacy-safe VPN DNS proxy on gateway_ip:53 so commercial
-//      clients can resolve domains through the tunnel.
+//   8. Optionally starts a privacy-safe VPN DNS proxy on gateway_ip:53 so
+//      commercial clients can resolve domains through the tunnel when Rust
+//      owns gateway DNS.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -35,8 +36,12 @@
 //     destination, DNS, URL, voucher, wallet, or client public IP details.
 //   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
 //     log, store, or report queried domains.
+//   - If vpn.dns_proxy_enabled=false, an external gateway DNS listener such as
+//     systemd-resolved must own gateway_ip:53. The health endpoint verifies
+//     that listener independently.
 //
 // Last Modified:
+//   v1.0.3-DNSOwnership - Honor vpn.dns_proxy_enabled before spawning DNS proxy
 //   v1.0.2-DNSProxy - VPN gateway DNS proxy wiring
 //   v2.5.3+Security    - Server::new() gains config_path
 //   v1.0.0-MultiTenant - SaaS startup branch
@@ -234,10 +239,19 @@ impl Server {
         let mut tasks: Vec<(&str, JoinHandle<()>)> = Vec::new();
 
         // Commercial VPN readiness requires DNS to be available at the tunnel
-        // gateway. This proxy forwards opaque UDP DNS bytes only and never
-        // records queried domains, DNS contents, destinations, or client IPs.
-        let dns_task = spawn_dns_proxy(self.config.gateway_ip(), self.shutdown_tx.subscribe());
-        tasks.push(("dns-proxy", dns_task));
+        // gateway. When enabled, this proxy forwards opaque UDP DNS bytes only
+        // and never records queried domains, DNS contents, destinations, or
+        // client IPs. Operators may disable it when systemd-resolved or another
+        // hardened host resolver intentionally owns gateway_ip:53.
+        if self.config.dns_proxy_enabled() {
+            let dns_task = spawn_dns_proxy(self.config.gateway_ip(), self.shutdown_tx.subscribe());
+            tasks.push(("dns-proxy", dns_task));
+        } else {
+            info!(
+                gateway_ip = %self.config.gateway_ip(),
+                "[DNS] Built-in VPN DNS proxy disabled by vpn.dns_proxy_enabled=false; expecting external gateway DNS listener"
+            );
+        }
 
         // v1.0.0-Membership: TrafficTracker must be created before
         // PacketHandler AND before init_management_reporter so both

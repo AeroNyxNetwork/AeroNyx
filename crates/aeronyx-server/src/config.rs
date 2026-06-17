@@ -53,6 +53,7 @@
 //!
 //! ## Last Modified
 //! v2.1.0            — Added MemChain config fields
+//! v1.2.0-DNSOwnership — Added DNS proxy ownership accessor for server startup
 //! v2.1.0+MVF+Auth   — Added api_secret
 //! v2.3.0+RemoteStorage — Added allow_remote_storage, max_remote_owners
 //! v2.4.0-GraphCognition — Added NER/graph/entropy/miner/vector fields
@@ -166,6 +167,11 @@ impl ServerConfig {
     }
 
     #[must_use]
+    pub fn dns_proxy_enabled(&self) -> bool {
+        self.vpn.dns_proxy_enabled
+    }
+
+    #[must_use]
     pub fn mtu(&self) -> u16 {
         self.tun.mtu
     }
@@ -225,6 +231,30 @@ mod tests {
         assert!(!config.memchain.supernode.enabled);
         assert!(!config.memchain.is_saas());
         assert!(!config.memchain.is_chat_relay_enabled());
+        assert!(config.dns_proxy_enabled());
+    }
+
+    #[test]
+    fn test_dns_proxy_enabled_backward_compat_default() {
+        let toml_str = r#"
+[vpn]
+virtual_ip_range = "100.64.0.0/22"
+gateway_ip = "100.64.0.1"
+"#;
+        let config = ServerConfig::from_str(toml_str).unwrap();
+        assert!(config.dns_proxy_enabled());
+    }
+
+    #[test]
+    fn test_dns_proxy_can_be_disabled_for_external_gateway_dns() {
+        let toml_str = r#"
+[vpn]
+virtual_ip_range = "100.64.0.0/22"
+gateway_ip = "100.64.0.1"
+dns_proxy_enabled = false
+"#;
+        let config = ServerConfig::from_str(toml_str).unwrap();
+        assert!(!config.dns_proxy_enabled());
     }
 
     // ── v1.1.0-ChatRelay: full TOML integration ───────────────────────────
