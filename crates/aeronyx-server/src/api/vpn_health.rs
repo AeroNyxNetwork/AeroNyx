@@ -17,6 +17,9 @@
 //! Rust or an external gateway resolver owns `gateway_ip:53`; it never includes
 //! DNS query names, resolver payloads, destinations, client public IPs,
 //! domains, URLs, browsing history, voucher secrets, or wallet-level traffic.
+//! Transport capability telemetry is also metadata only. Phase 1 reports that
+//! UDP is the only active data-plane carrier while TCP/TLS and WebSocket HTTPS
+//! remain planned fallback carriers until their runtime listeners are added.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -155,6 +158,31 @@ struct VpnCapacityStatus {
     privacy_boundary: &'static str,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct TransportCarrierStatus {
+    key: &'static str,
+    enabled: bool,
+    implemented: bool,
+    active: bool,
+    endpoint: Option<String>,
+    status: &'static str,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VpnTransportHealthStatus {
+    supported_transports: Vec<&'static str>,
+    configured_transports: Vec<&'static str>,
+    preferred_transport: String,
+    effective_transport: &'static str,
+    fallback_available: bool,
+    udp: TransportCarrierStatus,
+    tcp_tls: TransportCarrierStatus,
+    websocket_https: TransportCarrierStatus,
+    source: &'static str,
+    privacy_boundary: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 struct VpnHealthResponse {
     status: &'static str,
@@ -163,6 +191,9 @@ struct VpnHealthResponse {
     gateway_ip: String,
     dns_proxy_enabled: bool,
     dns_owner: &'static str,
+    supported_transports: Vec<&'static str>,
+    preferred_transport: String,
+    transport_health: VpnTransportHealthStatus,
     virtual_ip_range: String,
     tun_device: String,
     configured_mtu: u16,
@@ -343,7 +374,9 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     let service_manager = collect_service_manager_status(VPN_SERVICE_NAME).await;
 
     let mut checks = Vec::new();
-    checks.push(check_udp_listener(listen_addr).await);
+    let udp_listener_check = check_udp_listener(listen_addr).await;
+    let transport_health = collect_transport_health(&config, listen_addr, udp_listener_check.ok);
+    checks.push(udp_listener_check);
     checks.push(check_tun_device(&tun_device).await);
     checks.push(check_mtu_config(&tun_device, configured_mtu, running_mtu).await);
     checks.push(check_ip_forwarding().await);
@@ -383,6 +416,9 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         gateway_ip: gateway_ip.to_string(),
         dns_proxy_enabled,
         dns_owner,
+        supported_transports: transport_health.supported_transports.clone(),
+        preferred_transport: transport_health.preferred_transport.clone(),
+        transport_health,
         virtual_ip_range: ip_range,
         tun_device,
         configured_mtu,
@@ -447,6 +483,9 @@ async fn collect_node_operator_status_response(
             "gateway_ip": vpn_health.gateway_ip,
             "dns_proxy_enabled": vpn_health.dns_proxy_enabled,
             "dns_owner": vpn_health.dns_owner,
+            "supported_transports": vpn_health.supported_transports.clone(),
+            "preferred_transport": vpn_health.preferred_transport.clone(),
+            "transport_health": vpn_health.transport_health.clone(),
             "virtual_ip_range": vpn_health.virtual_ip_range,
             "tun_device": vpn_health.tun_device,
             "configured_mtu": vpn_health.configured_mtu,
@@ -657,6 +696,104 @@ async fn collect_node_operator_status_response(
             "only; no user plaintext, social graph plaintext, destinations, DNS ",
             "contents, packet payloads, domains, URLs, browsing history, voucher ",
             "secrets, or wallet-level traffic"
+        ),
+    }
+}
+
+fn collect_transport_health(
+    config: &ServerConfig,
+    udp_listen_addr: SocketAddr,
+    udp_listener_ok: bool,
+) -> VpnTransportHealthStatus {
+    let transports = config.vpn_transports();
+    let mut configured_transports = Vec::new();
+    if transports.udp_enabled {
+        configured_transports.push("udp");
+    }
+    if transports.tcp_tls_enabled {
+        configured_transports.push("tcp_tls");
+    }
+    if transports.websocket_enabled {
+        configured_transports.push("websocket_https");
+    }
+
+    // Phase 1 reports actual production support, not desired future config.
+    // This keeps nodeboard and public stats from advertising a fallback carrier
+    // before its server listener and client implementation exist.
+    let supported_transports = if transports.udp_enabled {
+        vec!["udp"]
+    } else {
+        Vec::new()
+    };
+
+    let udp = TransportCarrierStatus {
+        key: "udp",
+        enabled: transports.udp_enabled,
+        implemented: true,
+        active: transports.udp_enabled && udp_listener_ok,
+        endpoint: Some(udp_listen_addr.to_string()),
+        status: if transports.udp_enabled && udp_listener_ok {
+            "active"
+        } else {
+            "degraded"
+        },
+        detail: if transports.udp_enabled && udp_listener_ok {
+            format!("UDP data-plane listener is active at {}", udp_listen_addr)
+        } else {
+            format!("UDP is configured but listener check failed at {}", udp_listen_addr)
+        },
+    };
+
+    let tcp_tls = TransportCarrierStatus {
+        key: "tcp_tls",
+        enabled: transports.tcp_tls_enabled,
+        implemented: false,
+        active: false,
+        endpoint: transports.tcp_tls_public_endpoint.clone(),
+        status: if transports.tcp_tls_enabled {
+            "configured_not_active"
+        } else {
+            "planned"
+        },
+        detail: if transports.tcp_tls_enabled {
+            "TCP/TLS fallback is configured in metadata but its Rust data-plane listener is not implemented yet".to_string()
+        } else {
+            "TCP/TLS fallback is planned but disabled on this node".to_string()
+        },
+    };
+
+    let websocket_https = TransportCarrierStatus {
+        key: "websocket_https",
+        enabled: transports.websocket_enabled,
+        implemented: false,
+        active: false,
+        endpoint: transports.websocket_public_url.clone(),
+        status: if transports.websocket_enabled {
+            "configured_not_active"
+        } else {
+            "planned"
+        },
+        detail: if transports.websocket_enabled {
+            "WebSocket HTTPS fallback is configured in metadata but its Rust data-plane listener is not implemented yet".to_string()
+        } else {
+            "WebSocket HTTPS fallback is planned but disabled on this node".to_string()
+        },
+    };
+
+    VpnTransportHealthStatus {
+        supported_transports,
+        configured_transports,
+        preferred_transport: transports.preferred_transport.clone(),
+        effective_transport: "udp",
+        fallback_available: false,
+        udp,
+        tcp_tls,
+        websocket_https,
+        source: "rust_vpn_transport_capability_metadata",
+        privacy_boundary: concat!(
+            "transport capability metadata only; no packet payloads, DNS ",
+            "contents, destinations, domains, URLs, browsing history, voucher ",
+            "secrets, client public IPs, or wallet-level traffic"
         ),
     }
 }

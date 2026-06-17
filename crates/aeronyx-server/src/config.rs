@@ -52,6 +52,7 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v1.3.0-TransportCapability — Added VPN transport capability accessors
 //! v2.1.0            — Added MemChain config fields
 //! v1.2.0-DNSOwnership — Added DNS proxy ownership accessor for server startup
 //! v2.1.0+MVF+Auth   — Added api_secret
@@ -74,6 +75,7 @@ use crate::management::ManagementConfig;
 pub use crate::config_chat_relay::ChatRelayConfig;
 pub use crate::config_infra::{
     LimitsConfig, LoggingConfig, NetworkConfig, ServerKeyConfig, TunConfig, VpnConfig,
+    VpnTransportConfig,
 };
 pub use crate::config_memchain::{MemChainConfig, MemChainMode, VectorQuantizationMode};
 pub use crate::config_saas::SaasConfig;
@@ -172,6 +174,11 @@ impl ServerConfig {
     }
 
     #[must_use]
+    pub fn vpn_transports(&self) -> &VpnTransportConfig {
+        &self.vpn.transports
+    }
+
+    #[must_use]
     pub fn mtu(&self) -> u16 {
         self.tun.mtu
     }
@@ -243,6 +250,50 @@ gateway_ip = "100.64.0.1"
 "#;
         let config = ServerConfig::from_str(toml_str).unwrap();
         assert!(config.dns_proxy_enabled());
+    }
+
+    #[test]
+    fn test_vpn_transports_backward_compat_default_udp_only() {
+        let toml_str = r#"
+[vpn]
+virtual_ip_range = "100.64.0.0/22"
+gateway_ip = "100.64.0.1"
+"#;
+        let config = ServerConfig::from_str(toml_str).unwrap();
+        assert!(config.vpn_transports().udp_enabled);
+        assert!(!config.vpn_transports().tcp_tls_enabled);
+        assert!(!config.vpn_transports().websocket_enabled);
+        assert_eq!(config.vpn_transports().preferred_transport, "udp");
+    }
+
+    #[test]
+    fn test_vpn_transports_toml_parse_future_fallback_metadata() {
+        let toml_str = r#"
+[vpn]
+virtual_ip_range = "100.64.0.0/22"
+gateway_ip = "100.64.0.1"
+
+[vpn.transports]
+udp_enabled = true
+tcp_tls_enabled = true
+tcp_tls_public_endpoint = "vpn.example.com:443"
+websocket_enabled = true
+websocket_public_url = "wss://vpn.example.com/aeronyx/vpn"
+preferred_transport = "udp"
+"#;
+        let config = ServerConfig::from_str(toml_str).unwrap();
+        let transports = config.vpn_transports();
+        assert!(transports.udp_enabled);
+        assert!(transports.tcp_tls_enabled);
+        assert!(transports.websocket_enabled);
+        assert_eq!(
+            transports.tcp_tls_public_endpoint.as_deref(),
+            Some("vpn.example.com:443")
+        );
+        assert_eq!(
+            transports.websocket_public_url.as_deref(),
+            Some("wss://vpn.example.com/aeronyx/vpn")
+        );
     }
 
     #[test]

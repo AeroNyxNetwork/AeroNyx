@@ -10,6 +10,8 @@
 //! MemChain subsystems and are cleanly separable.
 //!
 //! ## Modification Reason
+//! v1.3.0-TransportCapability — Added `vpn.transports` metadata so nodes can
+//! report commercial transport readiness without changing the UDP data plane.
 //! v1.2.0-DNSOwnership — Added `vpn.dns_proxy_enabled` so production nodes can
 //! explicitly choose whether Rust owns `gateway_ip:53` or an external system
 //! resolver, such as systemd-resolved, owns the gateway DNS listener.
@@ -17,7 +19,7 @@
 //!
 //! ## Main Functionality
 //! - `NetworkConfig`  — listen address + public endpoint
-//! - `VpnConfig`      — virtual IP range + gateway + DNS proxy ownership
+//! - `VpnConfig`      — virtual IP range + gateway + DNS + transport metadata
 //! - `TunConfig`      — TUN device name + MTU
 //! - `ServerKeyConfig`— key file path
 //! - `LimitsConfig`   — max connections + session timeout
@@ -40,6 +42,7 @@
 //!   and must remain pub.
 //!
 //! ## Last Modified
+//! v1.3.0-TransportCapability — Added backward-compatible VPN transport metadata.
 //! v1.2.0-DNSOwnership — Added backward-compatible VPN DNS proxy flag.
 //! v1.1.0-ChatRelay — Extracted from config.rs; zero logic changes.
 
@@ -105,6 +108,8 @@ pub struct VpnConfig {
     pub gateway_ip: Ipv4Addr,
     #[serde(default = "default_dns_proxy_enabled")]
     pub dns_proxy_enabled: bool,
+    #[serde(default)]
+    pub transports: VpnTransportConfig,
 }
 
 fn default_ip_range() -> String {
@@ -125,6 +130,7 @@ impl VpnConfig {
                 "must be CIDR",
             ));
         }
+        self.transports.validate()?;
         Ok(())
     }
 
@@ -159,6 +165,73 @@ impl Default for VpnConfig {
             virtual_ip_range: default_ip_range(),
             gateway_ip: default_gateway_ip(),
             dns_proxy_enabled: default_dns_proxy_enabled(),
+            transports: VpnTransportConfig::default(),
+        }
+    }
+}
+
+// ============================================
+// VpnTransportConfig
+// ============================================
+
+/// Privacy-safe VPN transport capability metadata.
+///
+/// Phase 1 intentionally reports capability only. The Rust node still binds the
+/// UDP data plane through `network.listen_addr`; TCP/TLS and WebSocket fields
+/// are reserved for later carriers and must be treated as not active until
+/// their runtime listeners are implemented.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VpnTransportConfig {
+    #[serde(default = "default_udp_enabled")]
+    pub udp_enabled: bool,
+    #[serde(default)]
+    pub tcp_tls_enabled: bool,
+    #[serde(default)]
+    pub tcp_tls_public_endpoint: Option<String>,
+    #[serde(default)]
+    pub websocket_enabled: bool,
+    #[serde(default)]
+    pub websocket_public_url: Option<String>,
+    #[serde(default = "default_preferred_transport")]
+    pub preferred_transport: String,
+}
+
+fn default_udp_enabled() -> bool {
+    true
+}
+
+fn default_preferred_transport() -> String {
+    "udp".into()
+}
+
+impl VpnTransportConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !self.udp_enabled {
+            return Err(ServerError::config_invalid(
+                "vpn.transports.udp_enabled",
+                "UDP must remain enabled until a non-UDP data-plane carrier is implemented",
+            ));
+        }
+
+        match self.preferred_transport.as_str() {
+            "udp" | "tcp_tls" | "websocket_https" => Ok(()),
+            _ => Err(ServerError::config_invalid(
+                "vpn.transports.preferred_transport",
+                "must be one of udp, tcp_tls, websocket_https",
+            )),
+        }
+    }
+}
+
+impl Default for VpnTransportConfig {
+    fn default() -> Self {
+        Self {
+            udp_enabled: default_udp_enabled(),
+            tcp_tls_enabled: false,
+            tcp_tls_public_endpoint: None,
+            websocket_enabled: false,
+            websocket_public_url: None,
+            preferred_transport: default_preferred_transport(),
         }
     }
 }
@@ -354,6 +427,40 @@ mod tests {
         let (net, prefix) = vc.parse_ip_range().unwrap();
         assert_eq!(net, Ipv4Addr::new(100, 64, 0, 0));
         assert_eq!(prefix, 22);
+    }
+
+    #[test]
+    fn test_vpn_transport_defaults_udp_only() {
+        let vc = VpnConfig::default();
+        assert!(vc.transports.udp_enabled);
+        assert!(!vc.transports.tcp_tls_enabled);
+        assert!(!vc.transports.websocket_enabled);
+        assert_eq!(vc.transports.preferred_transport, "udp");
+        assert!(vc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_vpn_transport_invalid_preferred_rejected() {
+        let vc = VpnConfig {
+            transports: VpnTransportConfig {
+                preferred_transport: "http_connect".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(vc.validate().is_err());
+    }
+
+    #[test]
+    fn test_vpn_transport_udp_cannot_be_disabled_yet() {
+        let vc = VpnConfig {
+            transports: VpnTransportConfig {
+                udp_enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(vc.validate().is_err());
     }
 
     #[test]
