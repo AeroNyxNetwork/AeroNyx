@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Document --set-vpn-cidr so operators can update vpn.virtual_ip_range and
+  refresh NAT/restore rules in one network-only maintenance command before a
+  controlled service restart.
 - Document stale AeroNyx NAT cleanup during VPN pool migrations so operators
   know --network-only removes old overlapping 100.64.0.0/* MASQUERADE rules.
 - Document read-only --print-plan for verifying generated one-command install
@@ -50,6 +53,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.29.0-node-deploy - Documented --set-vpn-cidr network-only VPN pool updates.
 v1.28.0-node-deploy - Documented stale NAT cleanup for VPN pool migrations.
 v1.27.0-node-deploy - Documented --print-plan for safe install command checks.
 v1.26.0-node-deploy - Documented --quick and AERONYX_* install defaults.
@@ -216,6 +220,35 @@ sudo ./deploy/node/install.sh --network-only
 
 This mode does not pull source, build the Rust binary, register the node,
 install the main systemd unit, or restart `aeronyx-server`.
+
+For the common commercial pool expansion from `/24` to `/22`, update the
+persisted config and refresh host networking in one idempotent command:
+
+```bash
+sudo ./deploy/node/install.sh --network-only --set-vpn-cidr 100.64.0.0/22
+```
+
+`--set-vpn-cidr` is intentionally restricted to `--network-only`. It creates a
+timestamped backup such as:
+
+```text
+/etc/aeronyx/server.toml.bak.20260617T045733Z.vpn_cidr
+```
+
+Then it updates only `[vpn].virtual_ip_range` in `/etc/aeronyx/server.toml`,
+prints the refreshed capacity plan, applies the matching MASQUERADE rule, and
+persists reboot recovery. It does **not** restart `aeronyx-server`; the running
+Rust process and TUN prefix change only after a controlled restart.
+
+Recommended safe maintenance sequence for a live commercial node:
+
+1. Set the node to maintenance mode from nodeboard or backend policy.
+2. Wait until active sessions drain to zero.
+3. Run `sudo ./deploy/node/install.sh --network-only --set-vpn-cidr 100.64.0.0/22`.
+4. Restart `aeronyx-server` during the maintenance window.
+5. Verify `ip addr show aeronyx0`, `ip route`, nodeboard capacity, and backend
+   `data.nodes[].system.capacity`.
+6. End maintenance mode after the backend heartbeat reports the new capacity.
 
 When the VPN pool changes, for example from `100.64.0.0/24` to
 `100.64.0.0/22`, `--network-only` removes stale AeroNyx

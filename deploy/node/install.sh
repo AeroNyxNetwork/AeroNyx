@@ -8,6 +8,9 @@
 #   sysctl, iptables, and build commands.
 #
 # Modification Reason:
+# - Add --set-vpn-cidr for network-only VPN pool maintenance so operators can
+#   safely update /etc/aeronyx/server.toml and refresh NAT/restore rules
+#   without rebuilding, registering, or restarting the Rust service.
 # - Remove stale AeroNyx 100.64.0.0/* NAT rules during network refresh so
 #   commercial pool migrations, such as /24 to /22, do not leave overlapping
 #   MASQUERADE rules in the persisted iptables set.
@@ -88,8 +91,13 @@
 #   registration code, private keys, API secrets, or wallet-level data.
 # - Keep stale NAT cleanup scoped to AeroNyx CGNAT pool rules on the detected
 #   egress interface; do not delete unrelated MASQUERADE rules.
+# - Keep --set-vpn-cidr restricted to --network-only. Changing the persisted
+#   pool is safe without restart, but Rust/TUN capacity only changes after a
+#   separate maintenance-window service restart.
 #
 # Last Modified:
+# v1.19.0-node-deploy - Added --set-vpn-cidr for safe network-only VPN pool
+#                       config updates.
 # v1.18.0-node-deploy - Cleans stale AeroNyx NAT rules during VPN pool
 #                       migrations before persisting iptables.
 # v1.17.0-node-deploy - Added read-only --print-plan for one-command install
@@ -162,6 +170,7 @@ ALLOW_DIRTY=0
 NETWORK_ONLY=0
 QUICK=0
 PRINT_PLAN=0
+SET_VPN_CIDR=""
 
 case "${AERONYX_START:-}" in
     1|true|TRUE|yes|YES|on|ON) DO_START=1 ;;
@@ -200,6 +209,9 @@ Options:
   --config-only           Only create config/env directories and server.toml if missing.
   --preflight-only        Run production readiness checks and exit.
   --network-only          Only refresh sysctl, iptables, and network restore service.
+  --set-vpn-cidr CIDR     With --network-only, update vpn.virtual_ip_range in
+                          /etc/aeronyx/server.toml before refreshing NAT.
+                          Does not restart aeronyx-server.
   --allow-dirty           Allow install to update an existing repo with tracked Git changes.
   --dry-run               Print actions without changing the host.
   -h, --help              Show this help.
@@ -229,6 +241,7 @@ while [ "$#" -gt 0 ]; do
         --config-only) CONFIG_ONLY=1; DO_BUILD=0; DO_NETWORK=0; DO_START=0; DO_ENABLE=0; INSTALL_PACKAGES=0; INSTALL_RUST=0; shift ;;
         --preflight-only) PREFLIGHT_ONLY=1; DO_BUILD=0; DO_NETWORK=0; DO_START=0; DO_ENABLE=0; INSTALL_PACKAGES=0; INSTALL_RUST=0; shift ;;
         --network-only) NETWORK_ONLY=1; DO_BUILD=0; DO_NETWORK=1; DO_START=0; DO_ENABLE=0; INSTALL_PACKAGES=0; INSTALL_RUST=0; shift ;;
+        --set-vpn-cidr) SET_VPN_CIDR="${2:?missing value}"; shift 2 ;;
         --allow-dirty) ALLOW_DIRTY=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -268,8 +281,20 @@ validate_option_combinations() {
     if [ "${NETWORK_ONLY}" -eq 1 ] && [ "${PREFLIGHT_ONLY}" -eq 1 ]; then
         die "--network-only cannot be combined with --preflight-only."
     fi
-    if [ "${NETWORK_ONLY}" -eq 1 ] && [ "${DRY_RUN}" -eq 0 ] && [ ! -f "${CONFIG_FILE}" ]; then
+    if [ "${NETWORK_ONLY}" -eq 1 ] && [ "${DRY_RUN}" -eq 0 ] && [ "${PRINT_PLAN}" -eq 0 ] && [ ! -f "${CONFIG_FILE}" ]; then
         die "--network-only requires existing config: ${CONFIG_FILE}"
+    fi
+    if [ -n "${SET_VPN_CIDR}" ] && [ "${NETWORK_ONLY}" -ne 1 ]; then
+        die "--set-vpn-cidr must be combined with --network-only."
+    fi
+    if [ -n "${SET_VPN_CIDR}" ] && [ "${CONFIG_ONLY}" -eq 1 ]; then
+        die "--set-vpn-cidr cannot be combined with --config-only."
+    fi
+    if [ -n "${SET_VPN_CIDR}" ] && [ "${PREFLIGHT_ONLY}" -eq 1 ]; then
+        die "--set-vpn-cidr cannot be combined with --preflight-only."
+    fi
+    if [ -n "${SET_VPN_CIDR}" ] && [ "${QUICK}" -eq 1 ]; then
+        die "--set-vpn-cidr cannot be combined with --quick."
     fi
     if [ "${QUICK}" -eq 1 ] && [ -z "${REGISTRATION_CODE}" ]; then
         die "--quick requires --registration-code or AERONYX_REGISTRATION_CODE."
@@ -307,6 +332,7 @@ install_packages=$(bool_word "${INSTALL_PACKAGES}")
 install_rust=$(bool_word "${INSTALL_RUST}")
 allow_dirty=$(bool_word "${ALLOW_DIRTY}")
 dry_run=$(bool_word "${DRY_RUN}")
+set_vpn_cidr=$([ -n "${SET_VPN_CIDR}" ] && printf '%s' "${SET_VPN_CIDR}" || printf 'none')
 registration_code_present=$([ -n "${REGISTRATION_CODE}" ] && printf 'yes' || printf 'no')
 registration_code_value=hidden
 PLAN
@@ -399,6 +425,11 @@ PY
 
 config_cidr() {
     local raw default_value="$1"
+    if [ -n "${SET_VPN_CIDR}" ]; then
+        normalize_cidr_arg "${SET_VPN_CIDR}"
+        return
+    fi
+
     raw="$(config_value vpn virtual_ip_range "${default_value}")"
     if ! command -v python3 >/dev/null 2>&1; then
         if printf '%s' "${raw}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$'; then
@@ -419,6 +450,93 @@ try:
 except Exception:
     print(default)
 PY
+}
+
+normalize_cidr_arg() {
+    local raw="$1"
+    command -v python3 >/dev/null 2>&1 || die "python3 is required to validate --set-vpn-cidr."
+    python3 - "${raw}" <<'PY'
+import ipaddress
+import sys
+
+raw = sys.argv[1]
+try:
+    network = ipaddress.ip_network(raw, strict=False)
+except Exception as exc:
+    raise SystemExit(f"invalid CIDR {raw!r}: {exc}")
+
+if network.version != 4:
+    raise SystemExit("AeroNyx VPN pools must be IPv4 CIDR ranges.")
+
+print(network.with_prefixlen)
+PY
+}
+
+update_vpn_cidr_config() {
+    local normalized backup_path timestamp
+    [ -n "${SET_VPN_CIDR}" ] || return
+
+    normalized="$(normalize_cidr_arg "${SET_VPN_CIDR}")"
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup_path="${CONFIG_FILE}.bak.${timestamp}.vpn_cidr"
+
+    log "Updating ${CONFIG_FILE} vpn.virtual_ip_range to ${normalized}"
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] cp -a %s %s\n' "${CONFIG_FILE}" "${backup_path}"
+        printf '[DRY-RUN] set [vpn] virtual_ip_range = \"%s\" in %s\n' "${normalized}" "${CONFIG_FILE}"
+        return
+    fi
+
+    [ -f "${CONFIG_FILE}" ] || die "Cannot update VPN CIDR; config not found: ${CONFIG_FILE}"
+    cp -a "${CONFIG_FILE}" "${backup_path}"
+    python3 - "${CONFIG_FILE}" "${normalized}" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+cidr = sys.argv[2]
+lines = path.read_text(encoding="utf-8").splitlines()
+out = []
+current = None
+in_vpn = False
+updated = False
+inserted = False
+
+for raw in lines:
+    stripped = raw.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        if in_vpn and not updated and not inserted:
+            out.append(f'virtual_ip_range = "{cidr}"')
+            inserted = True
+        current = stripped[1:-1].strip()
+        in_vpn = current == "vpn"
+        out.append(raw)
+        continue
+
+    if in_vpn and stripped.startswith("virtual_ip_range") and "=" in stripped:
+        prefix = raw[: len(raw) - len(raw.lstrip())]
+        comment = ""
+        if "#" in raw:
+            comment_text = raw.split("#", 1)[1].strip()
+            comment = f" # {comment_text}" if comment_text else ""
+        out.append(f'{prefix}virtual_ip_range = "{cidr}"{comment}')
+        updated = True
+        continue
+
+    out.append(raw)
+
+if in_vpn and not updated and not inserted:
+    out.append(f'virtual_ip_range = "{cidr}"')
+    inserted = True
+
+if not updated and not inserted:
+    raise SystemExit("Missing [vpn] section in config; refusing to update.")
+
+path.write_text("\n".join(out) + "\n", encoding="utf-8")
+PY
+    chmod 600 "${CONFIG_FILE}"
+    ok "VPN CIDR updated; backup saved: ${backup_path}"
+    warn "Rust/TUN capacity changes after a controlled ${SERVICE_NAME} restart. Use maintenance mode and wait for active sessions to drain first."
 }
 
 config_tun_device() {
@@ -912,8 +1030,15 @@ main() {
     fi
     acquire_deploy_lock
     if [ "${NETWORK_ONLY}" -eq 1 ]; then
+        update_vpn_cidr_config
+        if [ -n "${SET_VPN_CIDR}" ]; then
+            capacity_plan_checks
+        fi
         configure_network
         ok "Network-only maintenance complete."
+        if [ -n "${SET_VPN_CIDR}" ]; then
+            warn "Persisted VPN CIDR is updated, but running Rust/TUN state changes only after a controlled ${SERVICE_NAME} restart."
+        fi
         exit 0
     fi
 
