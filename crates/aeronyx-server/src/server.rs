@@ -1475,9 +1475,10 @@ impl Server {
 
     #[cfg(target_os = "linux")]
     async fn init_tun(&self) -> Result<Arc<LinuxTun>> {
+        let (_network, prefix_len) = self.config.parse_ip_range()?;
         let cfg = TunConfig::new(self.config.device_name())
             .with_address(self.config.gateway_ip())
-            .with_netmask(Ipv4Addr::new(255, 255, 255, 0))
+            .with_netmask(prefix_to_netmask(prefix_len))
             .with_mtu(self.config.mtu());
         let tun = LinuxTun::create(cfg)
             .await
@@ -2302,6 +2303,14 @@ impl Server {
     }
 }
 
+fn prefix_to_netmask(prefix_len: u8) -> Ipv4Addr {
+    if prefix_len == 0 {
+        return Ipv4Addr::new(0, 0, 0, 0);
+    }
+
+    Ipv4Addr::from(u32::MAX << (32 - prefix_len))
+}
+
 impl std::fmt::Debug for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Server")
@@ -2309,5 +2318,18 @@ impl std::fmt::Debug for Server {
             .field("tun", &self.config.device_name())
             .field("mode", &self.config.memchain.mode)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefix_to_netmask;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn prefix_to_netmask_supports_vpn_pool_expansion() {
+        assert_eq!(prefix_to_netmask(22), Ipv4Addr::new(255, 255, 252, 0));
+        assert_eq!(prefix_to_netmask(24), Ipv4Addr::new(255, 255, 255, 0));
+        assert_eq!(prefix_to_netmask(0), Ipv4Addr::new(0, 0, 0, 0));
     }
 }
