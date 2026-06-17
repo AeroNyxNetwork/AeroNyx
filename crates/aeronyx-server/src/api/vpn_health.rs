@@ -12,6 +12,11 @@
 //! Rust node is currently ready to provide. The capacity block includes
 //! structured placement risks so nodeboard, CLI healthchecks, and backend
 //! automation can share the same commercial readiness decisions.
+//!
+//! DNS ownership telemetry is configuration metadata only. It reports whether
+//! Rust or an external gateway resolver owns `gateway_ip:53`; it never includes
+//! DNS query names, resolver payloads, destinations, client public IPs,
+//! domains, URLs, browsing history, voucher secrets, or wallet-level traffic.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -156,6 +161,8 @@ struct VpnHealthResponse {
     checked_at: u64,
     listen_addr: String,
     gateway_ip: String,
+    dns_proxy_enabled: bool,
+    dns_owner: &'static str,
     virtual_ip_range: String,
     tun_device: String,
     configured_mtu: u16,
@@ -322,6 +329,12 @@ pub async fn collect_node_operator_status_value(
 async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse {
     let config = state.config;
     let gateway_ip = config.gateway_ip();
+    let dns_proxy_enabled = config.dns_proxy_enabled();
+    let dns_owner = if dns_proxy_enabled {
+        "rust_dns_proxy"
+    } else {
+        "external_gateway_dns"
+    };
     let listen_addr = config.listen_addr();
     let tun_device = config.device_name().to_string();
     let configured_mtu = config.mtu();
@@ -368,6 +381,8 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         checked_at: unix_now_secs(),
         listen_addr: listen_addr.to_string(),
         gateway_ip: gateway_ip.to_string(),
+        dns_proxy_enabled,
+        dns_owner,
         virtual_ip_range: ip_range,
         tun_device,
         configured_mtu,
@@ -430,6 +445,8 @@ async fn collect_node_operator_status_response(
         metrics: serde_json::json!({
             "listen_addr": vpn_health.listen_addr,
             "gateway_ip": vpn_health.gateway_ip,
+            "dns_proxy_enabled": vpn_health.dns_proxy_enabled,
+            "dns_owner": vpn_health.dns_owner,
             "virtual_ip_range": vpn_health.virtual_ip_range,
             "tun_device": vpn_health.tun_device,
             "configured_mtu": vpn_health.configured_mtu,
