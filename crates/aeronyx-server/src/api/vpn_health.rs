@@ -184,6 +184,11 @@ struct VpnCapacityStatus {
     policy_max_sessions: u32,
     active_sessions: usize,
     session_capacity_remaining: Option<u32>,
+    bandwidth_limit_mbps: u32,
+    bandwidth_limit_bytes_per_second: u64,
+    bandwidth_window_bytes: u64,
+    bandwidth_window_used_percent: Option<f64>,
+    traffic_capacity_status: String,
     conntrack: ConntrackCapacityStatus,
     file_descriptors: FileDescriptorCapacityStatus,
     disk: DiskCapacityStatus,
@@ -1443,6 +1448,11 @@ async fn collect_capacity_status(
         conntrack.used_percent,
         file_descriptors.used_percent,
         &disk,
+        placement_readiness.bandwidth_limit_mbps,
+        placement_readiness.bandwidth_limit_bytes_per_second,
+        placement_readiness.bandwidth_window_bytes,
+        placement_readiness.bandwidth_window_used_percent,
+        &placement_readiness.traffic_capacity_status,
         packet_drops_total,
     );
 
@@ -1455,6 +1465,11 @@ async fn collect_capacity_status(
         policy_max_sessions,
         active_sessions,
         session_capacity_remaining: placement_readiness.session_capacity_remaining,
+        bandwidth_limit_mbps: placement_readiness.bandwidth_limit_mbps,
+        bandwidth_limit_bytes_per_second: placement_readiness.bandwidth_limit_bytes_per_second,
+        bandwidth_window_bytes: placement_readiness.bandwidth_window_bytes,
+        bandwidth_window_used_percent: placement_readiness.bandwidth_window_used_percent,
+        traffic_capacity_status: placement_readiness.traffic_capacity_status.clone(),
         conntrack,
         file_descriptors,
         disk,
@@ -1480,6 +1495,11 @@ fn collect_capacity_risks(
     conntrack_used_percent: Option<f64>,
     fd_used_percent: Option<f64>,
     disk: &DiskCapacityStatus,
+    bandwidth_limit_mbps: u32,
+    bandwidth_limit_bytes_per_second: u64,
+    bandwidth_window_bytes: u64,
+    bandwidth_window_used_percent: Option<f64>,
+    traffic_capacity_status: &str,
     packet_drops_total: Option<u64>,
 ) -> Vec<CapacityRiskStatus> {
     let mut risks = Vec::new();
@@ -1572,6 +1592,35 @@ fn collect_capacity_risks(
                     .to_string(),
                 });
             }
+        }
+    }
+
+    if bandwidth_limit_bytes_per_second > 0 {
+        let bandwidth_percent = bandwidth_window_used_percent.unwrap_or_else(|| {
+            round_two(
+                (bandwidth_window_bytes as f64 / bandwidth_limit_bytes_per_second as f64) * 100.0,
+            )
+        });
+        if traffic_capacity_status == "saturated" || bandwidth_percent >= 100.0 {
+            risks.push(CapacityRiskStatus {
+                severity: "critical",
+                code: "bandwidth_limit_pressure",
+                message: format!(
+                    "Bandwidth limiter is saturated at {:.2}% of the {} Mbps cap.",
+                    bandwidth_percent, bandwidth_limit_mbps
+                ),
+                remediation: "Raise bandwidth_limit_mbps, reduce placement weight, or move traffic to another region before admitting more paid sessions.".to_string(),
+            });
+        } else if traffic_capacity_status == "near_limit" || bandwidth_percent >= 80.0 {
+            risks.push(CapacityRiskStatus {
+                severity: "warning",
+                code: "bandwidth_limit_pressure",
+                message: format!(
+                    "Bandwidth limiter is near capacity at {:.2}% of the {} Mbps cap.",
+                    bandwidth_percent, bandwidth_limit_mbps
+                ),
+                remediation: "Review bandwidth_limit_mbps and regional placement before increasing commercial traffic.".to_string(),
+            });
         }
     }
 
