@@ -8,6 +8,9 @@
 #   sysctl, iptables, and build commands.
 #
 # Modification Reason:
+# - Preserve the current install phase for ERR traps so nodeboard can show
+#   whether a failed install stopped during preflight, dependencies, repository
+#   setup, network, build, systemd, registration, or service start.
 # - Add --set-vpn-cidr for network-only VPN pool maintenance so operators can
 #   safely update /etc/aeronyx/server.toml and refresh NAT/restore rules
 #   without rebuilding, registering, or restarting the Rust service.
@@ -101,6 +104,7 @@
 #   separate maintenance-window service restart.
 #
 # Last Modified:
+# v1.22.0-node-deploy - Reports exact failed install phase to nodeboard.
 # v1.21.0-node-deploy - Reports privacy-safe install progress to nodeboard.
 # v1.20.0-node-deploy - Injects AERONYX_GIT_COMMIT into release builds for
 #                       nodeboard runtime provenance.
@@ -180,6 +184,8 @@ NETWORK_ONLY=0
 QUICK=0
 PRINT_PLAN=0
 SET_VPN_CIDR=""
+CURRENT_INSTALL_STEP="not_started"
+CURRENT_INSTALL_MESSAGE="Install has not started."
 
 case "${AERONYX_START:-}" in
     1|true|TRUE|yes|YES|on|ON) DO_START=1 ;;
@@ -267,9 +273,15 @@ PY
         || warn "Unable to report install progress to nodeboard (${step})."
 }
 
+set_install_step() {
+    CURRENT_INSTALL_STEP="$1"
+    CURRENT_INSTALL_MESSAGE="$2"
+    report_install_progress "running" "${CURRENT_INSTALL_STEP}" "${CURRENT_INSTALL_MESSAGE}"
+}
+
 install_failed_trap() {
     local exit_code="$?"
-    report_install_progress "failed" "failed" "Install failed with exit code ${exit_code}."
+    report_install_progress "failed" "${CURRENT_INSTALL_STEP}" "${CURRENT_INSTALL_MESSAGE} failed with exit code ${exit_code}."
     exit "${exit_code}"
 }
 
@@ -1117,7 +1129,7 @@ main() {
     fi
 
     trap install_failed_trap ERR
-    report_install_progress "running" "preflight" "Running host preflight checks."
+    set_install_step "preflight" "Running host preflight checks."
     require_root
     require_linux_systemd
     preflight_checks
@@ -1128,7 +1140,7 @@ main() {
     fi
     acquire_deploy_lock
     if [ "${NETWORK_ONLY}" -eq 1 ]; then
-        report_install_progress "running" "network" "Refreshing AeroNyx privacy protocol network rules."
+        set_install_step "network" "Refreshing AeroNyx privacy protocol network rules."
         update_vpn_cidr_config
         if [ -n "${SET_VPN_CIDR}" ]; then
             capacity_plan_checks
@@ -1142,14 +1154,14 @@ main() {
         exit 0
     fi
 
-    report_install_progress "running" "dependencies" "Installing host dependencies and checking Rust toolchain."
+    set_install_step "dependencies" "Installing host dependencies and checking Rust toolchain."
     install_packages
     if [ "${DO_BUILD}" -eq 1 ]; then
         install_rust_if_needed
     else
         ok "Rust toolchain check skipped"
     fi
-    report_install_progress "running" "repository" "Preparing AeroNyx repository and configuration."
+    set_install_step "repository" "Preparing AeroNyx repository and configuration."
     prepare_repo
     prepare_directories
     install_config
@@ -1160,15 +1172,15 @@ main() {
         exit 0
     fi
 
-    report_install_progress "running" "network" "Configuring forwarding and NAT."
+    set_install_step "network" "Configuring forwarding and NAT."
     configure_network
-    report_install_progress "running" "build" "Building AeroNyx Rust release binary."
+    set_install_step "build" "Building AeroNyx Rust release binary."
     build_binary
-    report_install_progress "running" "systemd" "Installing and verifying systemd service."
+    set_install_step "systemd" "Installing and verifying systemd service."
     install_service
-    report_install_progress "running" "register" "Registering node with nodeboard."
+    set_install_step "register" "Registering node with nodeboard."
     register_node
-    report_install_progress "running" "start" "Starting or verifying AeroNyx service."
+    set_install_step "start" "Starting or verifying AeroNyx service."
     start_service
     report_install_progress "completed" "completed" "Install workflow completed."
     trap - ERR
