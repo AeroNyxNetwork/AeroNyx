@@ -22,6 +22,15 @@
 //   8. Optionally starts a privacy-safe VPN DNS proxy on gateway_ip:53 so
 //      commercial clients can resolve domains through the tunnel when Rust
 //      owns gateway DNS.
+//   9. Optionally hydrates PeerStore from verified discovery bootstrap
+//      snapshots when discovery bootstrap is enabled.
+//  10. Generates this node's signed discovery descriptor at startup when
+//      discovery self-advertisement is enabled.
+//  11. Optionally persists verified discovery peers to a local JSON cache so
+//      restarts do not depend entirely on remote bootstrap availability.
+//  12. Optionally starts outbound discovery gossip to known public peers.
+//  13. Optionally relays signed encrypted chat envelopes to discovered
+//      `ChatRelay` peers while retaining local pending-storage fallback.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -49,6 +58,11 @@
 //   v1.0.0-Voice+SessionFix - Voice API, session fixes
 //   v1.0.0-Membership  - TrafficTracker wiring
 //   v1.0.1-VpnMessageStats - encrypted message counter wiring
+//   v0.7.0-DiscoveryChatRelay - Peer-discovered encrypted chat relay fanout
+//   v0.5.0-DiscoveryPeerCache - Optional local PeerStore cache load/writeback
+//   v0.6.0-DiscoveryOutboundGossip - Periodic descriptor announce + snapshot sync
+//   v0.4.0-DiscoverySelfDescriptor - Generate and register signed self descriptor
+//   v0.3.0-DiscoveryBootstrap - PeerStore bootstrap snapshot loading
 // ============================================
 
 use std::net::Ipv4Addr;
@@ -66,6 +80,7 @@ use aeronyx_core::protocol::auth::{
     verify_signed_message, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_DEVICE_REGISTER,
     DOMAIN_WALLET_PRESENCE,
 };
+use aeronyx_core::protocol::chat::ChatEnvelope;
 use sha2::{Digest, Sha256};
 
 use aeronyx_common::types::SessionId;
@@ -79,7 +94,10 @@ use aeronyx_core::protocol::codec::{
 };
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
 use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
-use aeronyx_core::protocol::{DataPacket, MessageType};
+use aeronyx_core::protocol::{
+    DataPacket, MessageType, NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor,
+    NodeDiscoveryMessage, NodePolicy, SignedNodeDescriptor,
+};
 use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::UdpTransport;
 
@@ -89,6 +107,8 @@ use aeronyx_transport::LinuxTun;
 use rusqlite::OptionalExtension;
 
 use crate::api::auth::{ensure_jwt_secret, generate_secret};
+use crate::api::chat_peer::{build_chat_peer_router, PeerChatRelayRequest};
+use crate::api::discovery::{build_discovery_router, DiscoveryApiPolicy, GossipResponse};
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
 use crate::api::voice::build_voice_router;
 use crate::api::vpn_health::{
@@ -116,7 +136,7 @@ use crate::services::memchain::{
 use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
 use crate::services::memchain::{LlmRouter, TaskWorker};
 use crate::services::{
-    spawn_dns_proxy, HandshakeService, IpPoolService, NodePolicyRuntime, RoutingService,
+    spawn_dns_proxy, HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore, RoutingService,
     SessionManager,
 };
 // v1.0.0-Membership
@@ -138,6 +158,7 @@ const POOL_EVICTION_INTERVAL_SECS: u64 = 300;
 const MINER_SCHEDULER_TICK_SECS: u64 = 60;
 const KEEPALIVE_PROBE_INTERVAL_SECS: u64 = 60;
 const KEEPALIVE_ACK_TIMEOUT_SECS: u64 = 90;
+const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
 
 // ============================================
 // Server
@@ -166,6 +187,13 @@ fn quality_from_stats(snap: StatsSnapshot) -> SessionQuality {
         keepalive_missed: Some(snap.keepalive_missed),
         keepalive_pending: Some(snap.keepalive_pending),
     }
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 pub struct Server {
@@ -200,6 +228,10 @@ impl Server {
         }
 
         let (ip_pool, sessions, routing) = self.init_services()?;
+        let peer_store = self.init_peer_store().await;
+        let _peer_store_persistence_task =
+            self.spawn_peer_store_persistence_task(Arc::clone(&peer_store));
+        let _discovery_gossip_task = self.spawn_discovery_gossip_task(Arc::clone(&peer_store));
 
         let (storage, vector_index, mempool, aof_writer) = if self.config.memchain.is_enabled() {
             let (st, vi, mp, aw) = self.init_memchain().await?;
@@ -238,7 +270,7 @@ impl Server {
         let server_pubkey_hex = hex::encode(self.identity.public_key_bytes());
         let mut tasks: Vec<(&str, JoinHandle<()>)> = Vec::new();
 
-        // Commercial VPN readiness requires DNS to be available at the tunnel
+        // AeroNyx client readiness requires DNS to be available at the tunnel
         // gateway. When enabled, this proxy forwards opaque UDP DNS bytes only
         // and never records queried domains, DNS contents, destinations, or
         // client IPs. Operators may disable it when systemd-resolved or another
@@ -296,6 +328,7 @@ impl Server {
                 Arc::clone(&node_policy),
                 Arc::clone(&voucher_verifier),
                 Arc::clone(&encrypted_message_counter),
+                Arc::clone(&peer_store),
             )
             .await;
 
@@ -316,6 +349,7 @@ impl Server {
             server_pubkey_hex.clone(),
             chat_relay.clone(),
             Arc::clone(&routing),
+            Arc::clone(&peer_store),
         );
         tasks.push(("udp", udp_task));
 
@@ -533,6 +567,9 @@ impl Server {
                 Arc::clone(&node_policy),
                 Arc::clone(&voucher_verifier),
                 Arc::clone(&encrypted_message_counter),
+                Arc::clone(&peer_store),
+                chat_relay.clone(),
+                Arc::clone(&udp),
             );
             tasks.push(("memchain-api", api_task));
 
@@ -1168,6 +1205,9 @@ impl Server {
         node_policy: Arc<NodePolicyRuntime>,
         voucher_verifier: Arc<VoucherVerifier>,
         encrypted_message_counter: Arc<AtomicU64>,
+        peer_store: Arc<PeerStore>,
+        chat_relay: Option<Arc<ChatRelayService>>,
+        udp: Arc<UdpTransport>,
     ) -> JoinHandle<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut shutdown_rx_vpn = self.shutdown_tx.subscribe();
@@ -1175,6 +1215,7 @@ impl Server {
             .parse()
             .unwrap_or_else(|_| "100.64.0.1:8421".parse().unwrap());
         let vpn_health_config = self.config.clone();
+        let discovery_api_policy = DiscoveryApiPolicy::from_config(&self.config.discovery);
 
         tokio::spawn(async move {
             let app = build_mpi_router(mpi_state)
@@ -1182,11 +1223,17 @@ impl Server {
                 .merge(build_vpn_health_router(
                     vpn_health_config,
                     Arc::clone(&ip_pool),
-                    sessions,
+                    Arc::clone(&sessions),
                     node_policy,
                     voucher_verifier,
                     encrypted_message_counter,
-                ));
+                ))
+                .merge(build_chat_peer_router(
+                    chat_relay,
+                    Arc::clone(&sessions),
+                    udp,
+                ))
+                .merge(build_discovery_router(peer_store, discovery_api_policy));
 
             let listener = match tokio::net::TcpListener::bind(listen_addr).await {
                 Ok(l) => {
@@ -1274,6 +1321,7 @@ impl Server {
         node_policy: Arc<NodePolicyRuntime>,
         voucher_verifier: Arc<VoucherVerifier>,
         encrypted_message_counter: Arc<AtomicU64>,
+        peer_store: Arc<PeerStore>,
     ) -> SessionEventSender {
         info!("Initializing management reporting...");
 
@@ -1384,6 +1432,21 @@ impl Server {
             })
         }));
 
+        let discovery_status_peer_store = Arc::clone(&peer_store);
+        heartbeat = heartbeat.with_discovery_status(Box::new(move || {
+            let peer_store = Arc::clone(&discovery_status_peer_store);
+            Box::pin(async move {
+                let now = unix_now_secs();
+                let status = peer_store.status(now);
+                Some(serde_json::json!({
+                    "generated_at": now,
+                    "peer_store": status,
+                    "source": "rust_peer_store",
+                    "privacy_boundary": "aggregate node discovery counters only; no client IPs, destinations, DNS contents, packet payloads, chat plaintext, voucher secrets, private keys, or wallet-level traffic"
+                }))
+            })
+        }));
+
         let sess = Arc::clone(sessions);
         let hb_shutdown = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -1465,6 +1528,598 @@ impl Server {
     // Core Services
     // ============================================
 
+    async fn init_peer_store(&self) -> Arc<PeerStore> {
+        let peer_store = Arc::new(PeerStore::new());
+        peer_store.set_max_peers(Some(self.config.discovery.max_peers));
+        peer_store.configure_bootstrap_status(
+            self.config.discovery.enabled,
+            self.config.discovery.peer_cache_path.is_some(),
+            self.config.discovery.gossip_enabled,
+        );
+        let now = unix_now_secs();
+        if !self.config.discovery.enabled {
+            info!("[DISCOVERY] Bootstrap disabled");
+            peer_store.record_bootstrap_source(now, "config", "skipped", "discovery_enabled=false");
+            return peer_store;
+        }
+
+        if let Some(path) = &self.config.discovery.peer_cache_path {
+            self.load_peer_cache(&peer_store, path, now).await;
+        }
+
+        if let Some(path) = &self.config.discovery.bootstrap_snapshot_path {
+            match tokio::fs::read(path).await {
+                Ok(bytes) => {
+                    Self::import_bootstrap_snapshot_bytes(&peer_store, "file", path, &bytes, now);
+                }
+                Err(e) => {
+                    peer_store.record_bootstrap_source(now, "file", "failed", "read_failed");
+                    warn!(
+                        source = %path,
+                        error = %e,
+                        "[DISCOVERY] Failed to read bootstrap snapshot"
+                    );
+                }
+            }
+        }
+
+        if let Some(url) = &self.config.discovery.bootstrap_snapshot_url {
+            match reqwest::Client::builder()
+                .timeout(Duration::from_secs(
+                    self.config.discovery.fetch_timeout_secs,
+                ))
+                .build()
+            {
+                Ok(client) => match client.get(url).send().await {
+                    Ok(response) => {
+                        let status = response.status();
+                        if status.is_success() {
+                            match response.bytes().await {
+                                Ok(bytes) => {
+                                    Self::import_bootstrap_snapshot_bytes(
+                                        &peer_store,
+                                        "url",
+                                        url,
+                                        bytes.as_ref(),
+                                        now,
+                                    );
+                                }
+                                Err(e) => {
+                                    peer_store.record_bootstrap_source(
+                                        now,
+                                        "url",
+                                        "failed",
+                                        "body_read_failed",
+                                    );
+                                    warn!(
+                                        source = %url,
+                                        error = %e,
+                                        "[DISCOVERY] Failed to read bootstrap response body"
+                                    );
+                                }
+                            }
+                        } else {
+                            peer_store.record_bootstrap_source(
+                                now,
+                                "url",
+                                "failed",
+                                format!("http_status={status}"),
+                            );
+                            warn!(
+                                source = %url,
+                                status = %status,
+                                "[DISCOVERY] Bootstrap URL returned non-success status"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        peer_store.record_bootstrap_source(now, "url", "failed", "fetch_failed");
+                        warn!(
+                            source = %url,
+                            error = %e,
+                            "[DISCOVERY] Failed to fetch bootstrap snapshot"
+                        );
+                    }
+                },
+                Err(e) => {
+                    peer_store.record_bootstrap_source(
+                        now,
+                        "url",
+                        "failed",
+                        "http_client_build_failed",
+                    );
+                    warn!(
+                        error = %e,
+                        "[DISCOVERY] Failed to build bootstrap HTTP client"
+                    );
+                }
+            }
+        }
+
+        if self.config.discovery.advertise_self {
+            match self.build_self_discovery_descriptor(now) {
+                Ok(descriptor) => match peer_store.upsert_verified(descriptor, now) {
+                    Ok(true) => {
+                        peer_store.record_self_descriptor_status(now, "success", "registered");
+                        info!("[DISCOVERY] Self descriptor registered");
+                    }
+                    Ok(false) => {
+                        peer_store.record_self_descriptor_status(now, "success", "already_current");
+                        info!("[DISCOVERY] Self descriptor already current");
+                    }
+                    Err(e) => {
+                        peer_store.record_self_descriptor_status(
+                            now,
+                            "failed",
+                            "peer_store_rejected",
+                        );
+                        warn!(
+                            error = %e,
+                            "[DISCOVERY] Self descriptor rejected by local PeerStore"
+                        );
+                    }
+                },
+                Err(e) => {
+                    peer_store.record_self_descriptor_status(now, "failed", "build_failed");
+                    warn!(
+                        error = %e,
+                        "[DISCOVERY] Failed to build self descriptor"
+                    );
+                }
+            }
+        }
+
+        let snapshot = peer_store.snapshot(now);
+        info!(
+            total_peers = snapshot.total_peers,
+            valid_peers = snapshot.valid_peers,
+            public_peers = snapshot.public_peers,
+            public_exit_peers = snapshot.public_exit_peers,
+            "[DISCOVERY] PeerStore bootstrap complete"
+        );
+        peer_store
+    }
+
+    async fn load_peer_cache(&self, peer_store: &PeerStore, path: &str, now: u64) {
+        match tokio::fs::read(path).await {
+            Ok(bytes) => {
+                Self::import_bootstrap_snapshot_bytes(peer_store, "cache", path, &bytes, now);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                peer_store.record_bootstrap_source(now, "cache", "missing", "file_not_found");
+                info!(
+                    source = %path,
+                    "[DISCOVERY] Peer cache not found; starting with bootstrap only"
+                );
+            }
+            Err(e) => {
+                peer_store.record_bootstrap_source(now, "cache", "failed", "read_failed");
+                warn!(
+                    source = %path,
+                    error = %e,
+                    "[DISCOVERY] Failed to read peer cache"
+                );
+            }
+        }
+    }
+
+    fn spawn_peer_store_persistence_task(
+        &self,
+        peer_store: Arc<PeerStore>,
+    ) -> Option<JoinHandle<()>> {
+        if !self.config.discovery.enabled {
+            return None;
+        }
+        let Some(path) = self.config.discovery.peer_cache_path.clone() else {
+            return None;
+        };
+
+        let interval_secs = self.config.discovery.peer_cache_write_interval_secs;
+        let shutdown = Arc::clone(&self.shutdown);
+        let mut rx = self.shutdown_tx.subscribe();
+
+        Some(tokio::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(interval_secs));
+            loop {
+                tokio::select! {
+                    _ = rx.recv() => break,
+                    _ = timer.tick() => {
+                        if shutdown.load(Ordering::SeqCst) { break; }
+                        let now = unix_now_secs();
+                        match Self::save_peer_store_cache_snapshot(&peer_store, &path, now).await {
+                            Ok(()) => {
+                                peer_store.record_cache_save_status(now, "success", "snapshot_persisted");
+                                debug!(
+                                    source = %path,
+                                    "[DISCOVERY] Peer cache snapshot persisted"
+                                );
+                            }
+                            Err(e) => {
+                                peer_store.record_cache_save_status(now, "failed", "write_failed");
+                                warn!(
+                                    source = %path,
+                                    error = %e,
+                                    "[DISCOVERY] Failed to persist peer cache snapshot"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+    }
+
+    fn spawn_discovery_gossip_task(&self, peer_store: Arc<PeerStore>) -> Option<JoinHandle<()>> {
+        if !self.config.discovery.enabled || !self.config.discovery.gossip_enabled {
+            return None;
+        }
+
+        let config = self.config.clone();
+        let identity = self.identity.clone();
+        let self_node_id = identity.public_key_bytes();
+        let shutdown = Arc::clone(&self.shutdown);
+        let mut rx = self.shutdown_tx.subscribe();
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.discovery.fetch_timeout_secs))
+            .build()
+        {
+            Ok(client) => client,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "[DISCOVERY] Failed to build outbound gossip HTTP client"
+                );
+                return None;
+            }
+        };
+
+        Some(tokio::spawn(async move {
+            let mut timer =
+                tokio::time::interval(Duration::from_secs(config.discovery.gossip_interval_secs));
+            loop {
+                tokio::select! {
+                    _ = rx.recv() => break,
+                    _ = timer.tick() => {
+                        if shutdown.load(Ordering::SeqCst) { break; }
+                        let now = unix_now_secs();
+                        let Ok(self_descriptor) =
+                            Self::build_self_discovery_descriptor_for(&config, &identity, now)
+                        else {
+                            warn!("[DISCOVERY] Skipping outbound gossip; self descriptor build failed");
+                            continue;
+                        };
+
+                        let snapshot = peer_store.export_bootstrap_snapshot(
+                            now,
+                            now,
+                            true,
+                            Some(usize::from(config.discovery.gossip_peer_limit)),
+                        );
+                        let mut attempted = 0usize;
+                        let mut succeeded = 0usize;
+
+                        for peer in snapshot.peers {
+                            if peer.node_id() == self_node_id {
+                                continue;
+                            }
+                            let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
+                                continue;
+                            };
+                            let Some(url) = Self::discovery_gossip_url(endpoint) else {
+                                continue;
+                            };
+
+                            attempted += 1;
+                            match Self::gossip_with_peer(
+                                &client,
+                                &peer_store,
+                                &url,
+                                self_descriptor.clone(),
+                                now,
+                                config.discovery.gossip_peer_limit,
+                            )
+                            .await
+                            {
+                                Ok(()) => succeeded += 1,
+                                Err(e) => {
+                                    debug!(
+                                        peer = %url,
+                                        error = %e,
+                                        "[DISCOVERY] Outbound gossip peer sync failed"
+                                    );
+                                }
+                            }
+                        }
+
+                        if attempted > 0 {
+                            info!(
+                                attempted,
+                                succeeded,
+                                "[DISCOVERY] Outbound gossip round complete"
+                            );
+                        }
+                        peer_store.record_gossip_round(now, attempted, succeeded);
+                    }
+                }
+            }
+        }))
+    }
+
+    async fn gossip_with_peer(
+        client: &reqwest::Client,
+        peer_store: &PeerStore,
+        url: &str,
+        self_descriptor: SignedNodeDescriptor,
+        now: u64,
+        limit: u16,
+    ) -> std::result::Result<(), String> {
+        client
+            .post(url)
+            .json(&NodeDiscoveryMessage::DescriptorAnnounce {
+                descriptor: self_descriptor,
+            })
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?;
+
+        let response = client
+            .post(url)
+            .json(&NodeDiscoveryMessage::SnapshotRequest {
+                requested_at: now,
+                limit: Some(limit),
+            })
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .json::<GossipResponse>()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(message) = response.response {
+            peer_store.apply_discovery_message(&message, now);
+        }
+        peer_store.mark_gossip_at(now);
+
+        Ok(())
+    }
+
+    fn discovery_gossip_url(endpoint: &str) -> Option<String> {
+        let endpoint = endpoint.trim().trim_end_matches('/');
+        if endpoint.is_empty() {
+            return None;
+        }
+        let base = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+            endpoint.to_string()
+        } else {
+            format!("http://{endpoint}")
+        };
+        Some(format!("{base}/api/discovery/gossip"))
+    }
+
+    async fn relay_chat_envelope_to_discovered_peers(
+        client: Option<&reqwest::Client>,
+        peer_store: &PeerStore,
+        self_node_id: &[u8; 32],
+        envelope: &ChatEnvelope,
+    ) -> usize {
+        let Some(client) = client else {
+            return 0;
+        };
+
+        let now = unix_now_secs();
+        let mut attempted = 0usize;
+        let mut accepted = 0usize;
+
+        for peer in peer_store
+            .peers_with_capability(NodeCapability::ChatRelay, now)
+            .into_iter()
+            .filter(|peer| peer.node_id() != *self_node_id)
+            .take(CHAT_PEER_RELAY_FANOUT_LIMIT)
+        {
+            let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
+                continue;
+            };
+            let Some(url) = Self::chat_peer_relay_url(endpoint) else {
+                continue;
+            };
+
+            attempted += 1;
+            let response = client
+                .post(&url)
+                .json(&PeerChatRelayRequest {
+                    envelope: envelope.clone(),
+                })
+                .send()
+                .await;
+
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    accepted += 1;
+                }
+                Ok(response) => {
+                    debug!(
+                        peer = %url,
+                        status = %response.status(),
+                        "[CHAT_RELAY] Peer relay rejected encrypted envelope"
+                    );
+                }
+                Err(error) => {
+                    debug!(
+                        peer = %url,
+                        error = %error,
+                        "[CHAT_RELAY] Peer relay request failed"
+                    );
+                }
+            }
+        }
+
+        if attempted > 0 {
+            debug!(
+                attempted,
+                accepted,
+                id = %hex::encode(envelope.message_id),
+                "[CHAT_RELAY] Peer relay fanout complete"
+            );
+        }
+
+        accepted
+    }
+
+    fn chat_peer_relay_url(endpoint: &str) -> Option<String> {
+        let endpoint = endpoint.trim().trim_end_matches('/');
+        if endpoint.is_empty() {
+            return None;
+        }
+        let base = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+            endpoint.to_string()
+        } else {
+            format!("http://{endpoint}")
+        };
+        Some(format!("{base}/api/chat/peer/relay"))
+    }
+
+    async fn save_peer_store_cache_snapshot(
+        peer_store: &PeerStore,
+        path: &str,
+        now: u64,
+    ) -> Result<()> {
+        let path = PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+
+        let snapshot = peer_store.export_bootstrap_snapshot(now, now, false, None);
+        let bytes = snapshot.to_json_pretty()?;
+        let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+
+        tokio::fs::write(&tmp_path, bytes).await?;
+        tokio::fs::rename(&tmp_path, &path).await?;
+        Ok(())
+    }
+
+    fn build_self_discovery_descriptor(&self, now: u64) -> Result<SignedNodeDescriptor> {
+        Self::build_self_discovery_descriptor_for(&self.config, &self.identity, now)
+    }
+
+    fn build_self_discovery_descriptor_for(
+        config: &ServerConfig,
+        identity: &IdentityKeyPair,
+        now: u64,
+    ) -> Result<SignedNodeDescriptor> {
+        let ttl = config.discovery.descriptor_ttl_secs;
+        let expires_at = now.saturating_add(ttl);
+        let mut descriptor = NodeDescriptor::new(
+            identity.public_key_bytes(),
+            now,
+            now,
+            expires_at,
+            env!("CARGO_PKG_VERSION"),
+        );
+
+        descriptor.public_endpoint = config
+            .discovery
+            .public_endpoint
+            .as_ref()
+            .or(config.network.public_endpoint.as_ref())
+            .map(|endpoint| endpoint.trim().to_string())
+            .filter(|endpoint| !endpoint.is_empty());
+
+        descriptor.capabilities = Self::discovery_capabilities_for(config);
+        descriptor.capacity = NodeCapacity {
+            max_sessions: u32::try_from(config.max_sessions()).unwrap_or(u32::MAX),
+            max_bps: None,
+            max_pps: None,
+        };
+        descriptor.policy = NodePolicy {
+            allows_public_exit: false,
+            public_discovery: config.discovery.public_discovery,
+            region: config
+                .discovery
+                .region
+                .as_ref()
+                .map(|region| region.trim().to_string())
+                .filter(|region| !region.is_empty()),
+        };
+
+        SignedNodeDescriptor::sign(descriptor, identity).map_err(ServerError::from)
+    }
+
+    fn discovery_capabilities(&self) -> Vec<NodeCapability> {
+        Self::discovery_capabilities_for(&self.config)
+    }
+
+    fn discovery_capabilities_for(config: &ServerConfig) -> Vec<NodeCapability> {
+        let mut capabilities = vec![NodeCapability::PrivacyRelay];
+
+        if config.memchain.is_chat_relay_enabled() {
+            capabilities.push(NodeCapability::ChatRelay);
+        }
+        if config.memchain.is_enabled() {
+            capabilities.push(NodeCapability::EncryptedStorage);
+        }
+        if config.memchain.is_supernode_enabled() {
+            capabilities.push(NodeCapability::AgentRelay);
+        }
+
+        capabilities
+    }
+
+    fn import_bootstrap_snapshot_bytes(
+        peer_store: &PeerStore,
+        source_kind: &'static str,
+        source: &str,
+        bytes: &[u8],
+        now: u64,
+    ) {
+        match NodeBootstrapSnapshot::from_json_bytes(bytes) {
+            Ok(snapshot) => {
+                let report = peer_store.load_bootstrap_snapshot(&snapshot, now);
+                peer_store.record_bootstrap_source(
+                    now,
+                    source_kind,
+                    if report.rejected > 0 || report.stale > 0 {
+                        "warning"
+                    } else {
+                        "success"
+                    },
+                    format!(
+                        "total={} inserted={} unchanged={} stale={} rejected={}",
+                        report.total,
+                        report.inserted,
+                        report.unchanged,
+                        report.stale,
+                        report.rejected
+                    ),
+                );
+                info!(
+                    source_kind,
+                    source = %source,
+                    total = report.total,
+                    inserted = report.inserted,
+                    unchanged = report.unchanged,
+                    stale = report.stale,
+                    rejected = report.rejected,
+                    "[DISCOVERY] Bootstrap snapshot imported"
+                );
+            }
+            Err(e) => {
+                peer_store.record_bootstrap_source(now, source_kind, "failed", "json_rejected");
+                warn!(
+                    source_kind,
+                    source = %source,
+                    error = %e,
+                    "[DISCOVERY] Bootstrap snapshot rejected"
+                );
+            }
+        }
+    }
+
     fn init_services(
         &self,
     ) -> Result<(Arc<IpPoolService>, Arc<SessionManager>, Arc<RoutingService>)> {
@@ -1530,14 +2185,20 @@ impl Server {
         server_pubkey_hex: String,
         chat_relay: Option<Arc<ChatRelayService>>,
         routing: Arc<RoutingService>,
+        peer_store: Arc<PeerStore>,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let udp_reply = Arc::clone(&udp);
+        let self_node_id = self.identity.public_key_bytes();
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let crypto = DefaultTransportCrypto::new();
+            let chat_peer_client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .ok();
 
             loop {
                 tokio::select! {
@@ -1673,11 +2334,11 @@ impl Server {
                                                         msg, mp, aw, &storage, &vector_index,
                                                         &memchain_config, &server_pubkey_hex,
                                                         &session, &udp_reply, &crypto,
-                                                        &sessions, &chat_relay,
+                                                        &sessions, &chat_relay, &peer_store,
+                                                        &self_node_id, chat_peer_client.as_ref(),
                                                     ).await;
                                                 }
                                             }
-                                            Err(_) => {}
                                         }
                                     }
                                     _ => {}
@@ -1711,6 +2372,9 @@ impl Server {
         crypto: &DefaultTransportCrypto,
         sessions: &Arc<SessionManager>,
         chat_relay: &Option<Arc<ChatRelayService>>,
+        peer_store: &Arc<PeerStore>,
+        self_node_id: &[u8; 32],
+        chat_peer_client: Option<&reqwest::Client>,
     ) {
         match msg {
             MemChainMessage::BroadcastFact(fact) => {
@@ -1872,6 +2536,13 @@ impl Server {
                         }
                     }
                     if all_failed {
+                        Self::relay_chat_envelope_to_discovered_peers(
+                            chat_peer_client,
+                            peer_store,
+                            self_node_id,
+                            &envelope,
+                        )
+                        .await;
                         if let Err(e) = relay.store_pending(&envelope) {
                             warn!(error = %e, receiver = %hex::encode(&receiver[..4]), "[CHAT_RELAY] Fallback store_pending failed");
                         } else {
@@ -1881,6 +2552,13 @@ impl Server {
                         debug!(receiver = %hex::encode(&receiver[..4]), devices = device_count, "[CHAT_RELAY] Online delivery to {} device(s)", device_count);
                     }
                 } else {
+                    Self::relay_chat_envelope_to_discovered_peers(
+                        chat_peer_client,
+                        peer_store,
+                        self_node_id,
+                        &envelope,
+                    )
+                    .await;
                     if let Err(e) = relay.store_pending(&envelope) {
                         warn!(error = %e, receiver = %hex::encode(&receiver[..4]), "[CHAT_RELAY] store_pending failed");
                     } else {
@@ -2337,13 +3015,347 @@ impl std::fmt::Debug for Server {
 
 #[cfg(test)]
 mod tests {
-    use super::prefix_to_netmask;
+    use super::{prefix_to_netmask, Server};
+    use aeronyx_core::crypto::IdentityKeyPair;
+    use aeronyx_core::protocol::chat::{ChatContentType, ChatEnvelope};
+    use aeronyx_core::protocol::{
+        NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor, NodeDiscoveryMessage,
+        SignedNodeDescriptor,
+    };
+    use axum::{routing::post, Json, Router};
     use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::net::TcpListener;
+
+    use crate::api::chat_peer::{PeerChatRelayRequest, PeerChatRelayResponse};
+    use crate::api::discovery::GossipResponse;
+    use crate::config::ServerConfig;
+    use crate::services::{PeerStore, PeerStoreImportReport};
+
+    fn signed_test_chat_envelope(now: u64) -> ChatEnvelope {
+        let sender = IdentityKeyPair::generate();
+        let mut envelope = ChatEnvelope {
+            message_id: [0x55; 16],
+            sender: sender.public_key_bytes(),
+            receiver: [0x66; 32],
+            timestamp: now,
+            ciphertext: b"opaque encrypted payload".to_vec(),
+            nonce: [0x77; 24],
+            content_type: ChatContentType::Text,
+            signature: [0; 64],
+        };
+        envelope.signature = sender.sign(&envelope.sign_data());
+        envelope
+    }
+
+    fn signed_chat_relay_peer_descriptor(
+        endpoint: String,
+        sequence: u64,
+        expires_at: u64,
+    ) -> SignedNodeDescriptor {
+        let peer_identity = IdentityKeyPair::generate();
+        let mut descriptor = NodeDescriptor::new(
+            peer_identity.public_key_bytes(),
+            sequence,
+            sequence,
+            expires_at,
+            "test-peer",
+        );
+        descriptor.public_endpoint = Some(endpoint);
+        descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        descriptor.capacity = NodeCapacity {
+            max_sessions: 32,
+            max_bps: None,
+            max_pps: None,
+        };
+        SignedNodeDescriptor::sign(descriptor, &peer_identity).unwrap()
+    }
 
     #[test]
     fn prefix_to_netmask_supports_vpn_pool_expansion() {
         assert_eq!(prefix_to_netmask(22), Ipv4Addr::new(255, 255, 252, 0));
         assert_eq!(prefix_to_netmask(24), Ipv4Addr::new(255, 255, 255, 0));
         assert_eq!(prefix_to_netmask(0), Ipv4Addr::new(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn self_discovery_descriptor_uses_privacy_safe_public_metadata() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+        config.discovery.region = Some("us-central".to_string());
+        config.discovery.descriptor_ttl_secs = 900;
+        config.discovery.public_discovery = false;
+
+        let identity = IdentityKeyPair::generate();
+        let node_id = identity.public_key_bytes();
+        let server = Server::new(config, identity, None);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let signed = server.build_self_discovery_descriptor(now).unwrap();
+
+        assert!(signed.verify_at(now + 1).is_ok());
+        assert_eq!(signed.descriptor.node_id, node_id);
+        assert_eq!(signed.descriptor.sequence, now);
+        assert_eq!(signed.descriptor.issued_at, now);
+        assert_eq!(signed.descriptor.expires_at, now + 900);
+        assert_eq!(
+            signed.descriptor.public_endpoint.as_deref(),
+            Some("node.example.com:443")
+        );
+        assert_eq!(
+            signed.descriptor.policy.region.as_deref(),
+            Some("us-central")
+        );
+        assert!(!signed.descriptor.policy.allows_public_exit);
+        assert!(!signed.descriptor.policy.public_discovery);
+        assert!(signed
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::PrivacyRelay));
+        assert_eq!(
+            signed.descriptor.capacity.max_sessions,
+            server.config.max_sessions() as u32
+        );
+    }
+
+    #[test]
+    fn self_discovery_descriptor_can_fallback_to_network_endpoint() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.network.public_endpoint = Some("198.51.100.10:51820".to_string());
+
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let signed = server
+            .build_self_discovery_descriptor(1_800_000_000)
+            .unwrap();
+
+        assert_eq!(
+            signed.descriptor.public_endpoint.as_deref(),
+            Some("198.51.100.10:51820")
+        );
+    }
+
+    #[test]
+    fn discovery_gossip_url_normalizes_endpoint_forms() {
+        assert_eq!(
+            Server::discovery_gossip_url("198.51.100.10:51820").as_deref(),
+            Some("http://198.51.100.10:51820/api/discovery/gossip")
+        );
+        assert_eq!(
+            Server::discovery_gossip_url("https://node.example.com").as_deref(),
+            Some("https://node.example.com/api/discovery/gossip")
+        );
+        assert_eq!(Server::discovery_gossip_url("   "), None);
+    }
+
+    #[test]
+    fn chat_peer_relay_url_normalizes_endpoint_forms() {
+        assert_eq!(
+            Server::chat_peer_relay_url("198.51.100.10:8421").as_deref(),
+            Some("http://198.51.100.10:8421/api/chat/peer/relay")
+        );
+        assert_eq!(
+            Server::chat_peer_relay_url("https://node.example.com/").as_deref(),
+            Some("https://node.example.com/api/chat/peer/relay")
+        );
+        assert_eq!(Server::chat_peer_relay_url("   "), None);
+    }
+
+    #[tokio::test]
+    async fn discovered_chat_relay_peer_receives_encrypted_envelope_fanout() {
+        let received = Arc::new(AtomicUsize::new(0));
+        let received_for_handler = Arc::clone(&received);
+        let app = Router::new().route(
+            "/api/chat/peer/relay",
+            post(move |Json(request): Json<PeerChatRelayRequest>| {
+                let received_for_handler = Arc::clone(&received_for_handler);
+                async move {
+                    assert_eq!(request.envelope.message_id, [0x55; 16]);
+                    received_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                    Json(PeerChatRelayResponse {
+                        accepted: true,
+                        duplicate: false,
+                        delivered_online: 0,
+                        stored_pending: true,
+                    })
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mock_peer = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let peer_store = PeerStore::new();
+        let peer_descriptor = signed_chat_relay_peer_descriptor(endpoint, now, now + 300);
+        peer_store
+            .upsert_verified(peer_descriptor, now)
+            .expect("mock peer descriptor should verify");
+
+        let client = reqwest::Client::new();
+        let accepted = Server::relay_chat_envelope_to_discovered_peers(
+            Some(&client),
+            &peer_store,
+            &[0x99; 32],
+            &signed_test_chat_envelope(now),
+        )
+        .await;
+
+        assert_eq!(accepted, 1);
+        assert_eq!(received.load(AtomicOrdering::SeqCst), 1);
+        mock_peer.abort();
+    }
+
+    #[tokio::test]
+    async fn outbound_gossip_imports_snapshot_response_from_peer() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_handler = Arc::clone(&calls);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let remote_descriptor =
+            signed_chat_relay_peer_descriptor("http://127.0.0.1:9".to_string(), now, now + 300);
+        let remote_node_id = remote_descriptor.node_id();
+        let snapshot_response = NodeDiscoveryMessage::SnapshotResponse {
+            snapshot: NodeBootstrapSnapshot::new(now, vec![remote_descriptor.clone()]),
+        };
+        let app = Router::new().route(
+            "/api/discovery/gossip",
+            post(move |Json(message): Json<NodeDiscoveryMessage>| {
+                let calls_for_handler = Arc::clone(&calls_for_handler);
+                let snapshot_response = snapshot_response.clone();
+                async move {
+                    calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                    let response = match message {
+                        NodeDiscoveryMessage::DescriptorAnnounce { .. } => GossipResponse {
+                            applied: PeerStoreImportReport::empty(),
+                            response: None,
+                        },
+                        NodeDiscoveryMessage::SnapshotRequest { .. } => GossipResponse {
+                            applied: PeerStoreImportReport::empty(),
+                            response: Some(snapshot_response),
+                        },
+                        NodeDiscoveryMessage::SnapshotResponse { .. } => GossipResponse {
+                            applied: PeerStoreImportReport::empty(),
+                            response: None,
+                        },
+                    };
+                    Json(response)
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/api/discovery/gossip",
+            listener.local_addr().unwrap()
+        );
+        let mock_peer = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let peer_store = PeerStore::new();
+        let self_descriptor =
+            signed_chat_relay_peer_descriptor("http://127.0.0.1:1".to_string(), now, now + 300);
+        let client = reqwest::Client::new();
+
+        Server::gossip_with_peer(&client, &peer_store, &url, self_descriptor, now, 8)
+            .await
+            .expect("mock discovery peer should accept gossip exchange");
+
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        assert!(peer_store.get_valid(&remote_node_id, now + 1).is_some());
+        assert_eq!(peer_store.status(now + 1).runtime.last_gossip_at, Some(now));
+        mock_peer.abort();
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_persists_verified_snapshot_json() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let now = 1_800_000_000;
+        let signed = server.build_self_discovery_descriptor(now).unwrap();
+        let peer_store = Arc::new(PeerStore::new());
+        assert!(peer_store.upsert_verified(signed, now).unwrap());
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-{unique}.json"));
+        let path_str = path.to_string_lossy().to_string();
+
+        Server::save_peer_store_cache_snapshot(&peer_store, &path_str, now)
+            .await
+            .unwrap();
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let snapshot = NodeBootstrapSnapshot::from_json_bytes(&bytes).unwrap();
+
+        assert_eq!(snapshot.peers.len(), 1);
+        assert_eq!(snapshot.verified_count_at(now + 1), 1);
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_can_restore_verified_peers_after_restart() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let now = 1_800_000_000;
+        let signed = server.build_self_discovery_descriptor(now).unwrap();
+        let original_store = Arc::new(PeerStore::new());
+        assert!(original_store.upsert_verified(signed.clone(), now).unwrap());
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-restore-{unique}.json"));
+        let path_str = path.to_string_lossy().to_string();
+
+        Server::save_peer_store_cache_snapshot(&original_store, &path_str, now)
+            .await
+            .unwrap();
+
+        let restored_store = PeerStore::new();
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        Server::import_bootstrap_snapshot_bytes(&restored_store, "cache", &path_str, &bytes, now);
+
+        assert_eq!(restored_store.len(), 1);
+        assert!(restored_store
+            .get_valid(&signed.node_id(), now + 1)
+            .is_some());
+
+        let status = restored_store.status(now + 1);
+        assert_eq!(status.snapshot.valid_peers, 1);
+        assert_eq!(status.bootstrap.last_source_kind.as_deref(), Some("cache"));
+        assert_eq!(
+            status.bootstrap.last_source_status.as_deref(),
+            Some("success")
+        );
+        assert!(status
+            .recent_audit_events
+            .iter()
+            .any(|event| event.action == "bootstrap_source"));
+
+        let _ = tokio::fs::remove_file(path).await;
     }
 }

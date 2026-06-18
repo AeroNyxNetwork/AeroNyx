@@ -32,6 +32,8 @@
 //! - [`admin_handlers`]: v1.0.0-MultiTenant Admin endpoints (volumes, pool, usage)
 //! - [`local`]: Legacy Axum router (deprecated)
 //! - [`voice`]: v1.0.0-Voice Peer virtual IP resolution for UDP direct-connect
+//! - [`discovery`]: v0.1.0 Discovery snapshot/gossip endpoints
+//! - [`chat_peer`]: v0.1.0 node-to-node encrypted chat envelope relay
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - When adding new ORIGINAL-style endpoints → add to mpi_handlers.rs
@@ -60,6 +62,10 @@
 //!   GET /api/peer-virtual-ip?pubkey=<hex> → { online, virtual_ip, last_seen }
 //!   Two-pass lookup: wallet_index (O(1)) → all_sessions fallback (O(n)).
 //!   No auth required (virtual IP is network-layer routing info, not PII).
+//! v0.1.0-DiscoveryAPI - Added discovery submodule:
+//!   GET /api/discovery/snapshot and POST /api/discovery/gossip.
+//! v0.1.0-ChatPeerRelay - Added chat_peer submodule:
+//!   POST /api/chat/peer/relay for inter-node encrypted envelope relay.
 
 // ── Core MPI module (state, auth, router) ──
 pub mod mpi;
@@ -78,6 +84,8 @@ pub mod admin_handlers;
 // ── Legacy API (deprecated) ──
 pub mod local;
 // ── v1.0.0-Voice: Peer virtual IP resolution for UDP direct-connect routing ──
+pub mod chat_peer;
+pub mod discovery;
 pub mod voice;
 pub mod vpn_health;
 

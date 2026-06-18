@@ -61,6 +61,11 @@
 //! v2.5.0-SuperNode  — Added SuperNode config
 //! v1.0.0-MultiTenant — Added SaaS mode
 //! v1.1.0-ChatRelay  — 🌟 Split into multi-file layout; this file now thin
+//! v0.7.0-DiscoverySafetyStatus — Added nodeboard status and safety policy config
+//! v0.6.0-DiscoveryOutboundGossip — Added optional outbound peer gossip config
+//! v0.5.0-DiscoveryPeerCache — Added optional local PeerStore cache config
+//! v0.4.0-DiscoverySelfDescriptor — Added signed self descriptor config
+//! v0.3.0-DiscoveryBootstrap — Added optional discovery bootstrap config
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -80,6 +85,301 @@ pub use crate::config_infra::{
 pub use crate::config_memchain::{MemChainConfig, MemChainMode, VectorQuantizationMode};
 pub use crate::config_saas::SaasConfig;
 pub use crate::config_supernode::SuperNodeConfig;
+
+// ============================================
+// DiscoveryConfig
+// ============================================
+
+/// Configuration for decentralized node discovery bootstrap and self advertisement.
+///
+/// The bootstrap layer is disabled by default for backward compatibility.
+/// When enabled, the node can hydrate its verified in-memory peer store from
+/// a local JSON snapshot and/or an HTTPS JSON snapshot URL, then optionally
+/// sign and publish its own descriptor into the local peer store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryConfig {
+    /// Enables bootstrap snapshot loading at server startup.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Enables generating this node's signed descriptor at startup.
+    #[serde(default = "DiscoveryConfig::default_advertise_self")]
+    pub advertise_self: bool,
+    /// Optional local JSON bootstrap snapshot path.
+    #[serde(default)]
+    pub bootstrap_snapshot_path: Option<String>,
+    /// Optional HTTP(S) JSON bootstrap snapshot URL.
+    #[serde(default)]
+    pub bootstrap_snapshot_url: Option<String>,
+    /// Timeout in seconds for fetching a remote bootstrap snapshot.
+    #[serde(default = "DiscoveryConfig::default_fetch_timeout_secs")]
+    pub fetch_timeout_secs: u64,
+    /// Optional local verified peer cache path.
+    ///
+    /// The cache uses the same JSON schema as bootstrap snapshots and is
+    /// re-verified on every load, so stale or tampered descriptors are skipped.
+    #[serde(default)]
+    pub peer_cache_path: Option<String>,
+    /// Periodic cache write interval in seconds.
+    #[serde(default = "DiscoveryConfig::default_peer_cache_write_interval_secs")]
+    pub peer_cache_write_interval_secs: u64,
+    /// Enables periodic outbound discovery gossip to known public peers.
+    ///
+    /// Kept disabled by default so simply enabling bootstrap does not create
+    /// unexpected outbound network traffic.
+    #[serde(default)]
+    pub gossip_enabled: bool,
+    /// Periodic outbound gossip interval in seconds.
+    #[serde(default = "DiscoveryConfig::default_gossip_interval_secs")]
+    pub gossip_interval_secs: u64,
+    /// Maximum number of public peers contacted per gossip round.
+    #[serde(default = "DiscoveryConfig::default_gossip_peer_limit")]
+    pub gossip_peer_limit: u16,
+    /// Maximum descriptors retained in the local verified peer store.
+    #[serde(default = "DiscoveryConfig::default_max_peers")]
+    pub max_peers: usize,
+    /// Maximum descriptors returned by a single snapshot response.
+    #[serde(default = "DiscoveryConfig::default_max_snapshot_limit")]
+    pub max_snapshot_limit: usize,
+    /// Global inbound gossip request budget per minute.
+    #[serde(default = "DiscoveryConfig::default_gossip_rate_limit_per_minute")]
+    pub gossip_rate_limit_per_minute: u32,
+    /// Optional allow-list of peer node ids as lowercase/uppercase hex.
+    #[serde(default)]
+    pub allowed_peer_ids: Vec<String>,
+    /// Optional deny-list of peer node ids as lowercase/uppercase hex.
+    #[serde(default)]
+    pub denied_peer_ids: Vec<String>,
+    /// Optional discovery control-plane endpoint advertised to other nodes.
+    ///
+    /// When absent, `network.public_endpoint` is reused. If both are absent,
+    /// the node still signs a descriptor but leaves endpoint discovery empty.
+    #[serde(default)]
+    pub public_endpoint: Option<String>,
+    /// Optional region label for nodeboard and future peer selection.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Descriptor validity window in seconds.
+    #[serde(default = "DiscoveryConfig::default_descriptor_ttl_secs")]
+    pub descriptor_ttl_secs: u64,
+    /// Whether this node may appear in public bootstrap snapshots.
+    #[serde(default = "DiscoveryConfig::default_public_discovery")]
+    pub public_discovery: bool,
+}
+
+impl DiscoveryConfig {
+    /// Default self advertisement behavior when discovery is enabled.
+    #[must_use]
+    pub const fn default_advertise_self() -> bool {
+        true
+    }
+
+    /// Default remote bootstrap fetch timeout.
+    #[must_use]
+    pub const fn default_fetch_timeout_secs() -> u64 {
+        10
+    }
+
+    /// Default local peer cache write interval.
+    #[must_use]
+    pub const fn default_peer_cache_write_interval_secs() -> u64 {
+        300
+    }
+
+    /// Default outbound gossip interval.
+    #[must_use]
+    pub const fn default_gossip_interval_secs() -> u64 {
+        60
+    }
+
+    /// Default outbound gossip peer limit per round.
+    #[must_use]
+    pub const fn default_gossip_peer_limit() -> u16 {
+        32
+    }
+
+    /// Default maximum verified peers retained locally.
+    #[must_use]
+    pub const fn default_max_peers() -> usize {
+        2048
+    }
+
+    /// Default maximum descriptors in one snapshot response.
+    #[must_use]
+    pub const fn default_max_snapshot_limit() -> usize {
+        256
+    }
+
+    /// Default global inbound gossip request budget per minute.
+    #[must_use]
+    pub const fn default_gossip_rate_limit_per_minute() -> u32 {
+        120
+    }
+
+    /// Default signed descriptor time-to-live.
+    #[must_use]
+    pub const fn default_descriptor_ttl_secs() -> u64 {
+        3600
+    }
+
+    /// Default public discovery visibility.
+    #[must_use]
+    pub const fn default_public_discovery() -> bool {
+        true
+    }
+
+    /// Validates discovery bootstrap configuration.
+    pub fn validate(&self) -> Result<()> {
+        if self.fetch_timeout_secs == 0 {
+            return Err(ServerError::config_invalid(
+                "discovery.fetch_timeout_secs",
+                "must be greater than zero",
+            ));
+        }
+
+        if let Some(path) = &self.bootstrap_snapshot_path {
+            if path.trim().is_empty() {
+                return Err(ServerError::config_invalid(
+                    "discovery.bootstrap_snapshot_path",
+                    "must not be empty when provided",
+                ));
+            }
+        }
+
+        if let Some(url) = &self.bootstrap_snapshot_url {
+            let trimmed = url.trim();
+            if trimmed.is_empty() {
+                return Err(ServerError::config_invalid(
+                    "discovery.bootstrap_snapshot_url",
+                    "must not be empty when provided",
+                ));
+            }
+            if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+                return Err(ServerError::config_invalid(
+                    "discovery.bootstrap_snapshot_url",
+                    "must start with http:// or https://",
+                ));
+            }
+        }
+
+        if let Some(path) = &self.peer_cache_path {
+            if path.trim().is_empty() {
+                return Err(ServerError::config_invalid(
+                    "discovery.peer_cache_path",
+                    "must not be empty when provided",
+                ));
+            }
+        }
+
+        if self.peer_cache_write_interval_secs < 30 {
+            return Err(ServerError::config_invalid(
+                "discovery.peer_cache_write_interval_secs",
+                "must be at least 30 seconds",
+            ));
+        }
+
+        if self.gossip_interval_secs < 30 {
+            return Err(ServerError::config_invalid(
+                "discovery.gossip_interval_secs",
+                "must be at least 30 seconds",
+            ));
+        }
+
+        if self.gossip_peer_limit == 0 {
+            return Err(ServerError::config_invalid(
+                "discovery.gossip_peer_limit",
+                "must be greater than zero",
+            ));
+        }
+
+        if self.max_peers == 0 {
+            return Err(ServerError::config_invalid(
+                "discovery.max_peers",
+                "must be greater than zero",
+            ));
+        }
+
+        if self.max_snapshot_limit == 0 {
+            return Err(ServerError::config_invalid(
+                "discovery.max_snapshot_limit",
+                "must be greater than zero",
+            ));
+        }
+
+        if self.gossip_rate_limit_per_minute == 0 {
+            return Err(ServerError::config_invalid(
+                "discovery.gossip_rate_limit_per_minute",
+                "must be greater than zero",
+            ));
+        }
+
+        for peer_id in self
+            .allowed_peer_ids
+            .iter()
+            .chain(self.denied_peer_ids.iter())
+        {
+            let trimmed = peer_id.trim();
+            if trimmed.len() != 64 || !trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                return Err(ServerError::config_invalid(
+                    "discovery.allowed_peer_ids/denied_peer_ids",
+                    "peer ids must be 32-byte hex strings",
+                ));
+            }
+        }
+
+        if let Some(endpoint) = &self.public_endpoint {
+            if endpoint.trim().is_empty() {
+                return Err(ServerError::config_invalid(
+                    "discovery.public_endpoint",
+                    "must not be empty when provided",
+                ));
+            }
+        }
+
+        if let Some(region) = &self.region {
+            if region.trim().is_empty() {
+                return Err(ServerError::config_invalid(
+                    "discovery.region",
+                    "must not be empty when provided",
+                ));
+            }
+        }
+
+        if self.descriptor_ttl_secs < 60 {
+            return Err(ServerError::config_invalid(
+                "discovery.descriptor_ttl_secs",
+                "must be at least 60 seconds",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            advertise_self: Self::default_advertise_self(),
+            bootstrap_snapshot_path: None,
+            bootstrap_snapshot_url: None,
+            fetch_timeout_secs: Self::default_fetch_timeout_secs(),
+            peer_cache_path: None,
+            peer_cache_write_interval_secs: Self::default_peer_cache_write_interval_secs(),
+            gossip_enabled: false,
+            gossip_interval_secs: Self::default_gossip_interval_secs(),
+            gossip_peer_limit: Self::default_gossip_peer_limit(),
+            max_peers: Self::default_max_peers(),
+            max_snapshot_limit: Self::default_max_snapshot_limit(),
+            gossip_rate_limit_per_minute: Self::default_gossip_rate_limit_per_minute(),
+            allowed_peer_ids: Vec::new(),
+            denied_peer_ids: Vec::new(),
+            public_endpoint: None,
+            region: None,
+            descriptor_ttl_secs: Self::default_descriptor_ttl_secs(),
+            public_discovery: Self::default_public_discovery(),
+        }
+    }
+}
 
 // ============================================
 // ServerConfig
@@ -103,6 +403,8 @@ pub struct ServerConfig {
     pub management: ManagementConfig,
     #[serde(default)]
     pub memchain: MemChainConfig,
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
 }
 
 impl ServerConfig {
@@ -138,6 +440,7 @@ impl ServerConfig {
             .validate()
             .map_err(|e| ServerError::config_invalid("management", e))?;
         self.memchain.validate()?;
+        self.discovery.validate()?;
         Ok(())
     }
 
@@ -209,6 +512,7 @@ impl Default for ServerConfig {
             logging: LoggingConfig::default(),
             management: ManagementConfig::default(),
             memchain: MemChainConfig::default(),
+            discovery: DiscoveryConfig::default(),
         }
     }
 }
@@ -239,6 +543,45 @@ mod tests {
         assert!(!config.memchain.is_saas());
         assert!(!config.memchain.is_chat_relay_enabled());
         assert!(config.dns_proxy_enabled());
+        assert!(!config.discovery.enabled);
+        assert!(config.discovery.advertise_self);
+        assert_eq!(
+            config.discovery.fetch_timeout_secs,
+            DiscoveryConfig::default_fetch_timeout_secs()
+        );
+        assert!(config.discovery.peer_cache_path.is_none());
+        assert_eq!(
+            config.discovery.peer_cache_write_interval_secs,
+            DiscoveryConfig::default_peer_cache_write_interval_secs()
+        );
+        assert!(!config.discovery.gossip_enabled);
+        assert_eq!(
+            config.discovery.gossip_interval_secs,
+            DiscoveryConfig::default_gossip_interval_secs()
+        );
+        assert_eq!(
+            config.discovery.gossip_peer_limit,
+            DiscoveryConfig::default_gossip_peer_limit()
+        );
+        assert_eq!(
+            config.discovery.max_peers,
+            DiscoveryConfig::default_max_peers()
+        );
+        assert_eq!(
+            config.discovery.max_snapshot_limit,
+            DiscoveryConfig::default_max_snapshot_limit()
+        );
+        assert_eq!(
+            config.discovery.gossip_rate_limit_per_minute,
+            DiscoveryConfig::default_gossip_rate_limit_per_minute()
+        );
+        assert!(config.discovery.allowed_peer_ids.is_empty());
+        assert!(config.discovery.denied_peer_ids.is_empty());
+        assert_eq!(
+            config.discovery.descriptor_ttl_secs,
+            DiscoveryConfig::default_descriptor_ttl_secs()
+        );
+        assert!(config.discovery.public_discovery);
     }
 
     #[test]
@@ -306,6 +649,174 @@ dns_proxy_enabled = false
 "#;
         let config = ServerConfig::from_str(toml_str).unwrap();
         assert!(!config.dns_proxy_enabled());
+    }
+
+    #[test]
+    fn test_discovery_backward_compat_default_disabled() {
+        let toml_str = r#"
+[memchain]
+mode = "local"
+db_path = "memchain.db"
+"#;
+        let config = ServerConfig::from_str(toml_str).unwrap();
+        assert!(!config.discovery.enabled);
+        assert!(config.discovery.bootstrap_snapshot_path.is_none());
+        assert!(config.discovery.bootstrap_snapshot_url.is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_discovery_bootstrap_toml_parse() {
+        let toml_str = r#"
+[discovery]
+enabled = true
+bootstrap_snapshot_path = "/etc/aeronyx/bootstrap-peers.json"
+bootstrap_snapshot_url = "https://nodes.aeronyx.network/bootstrap.json"
+fetch_timeout_secs = 15
+peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
+peer_cache_write_interval_secs = 120
+gossip_enabled = true
+gossip_interval_secs = 45
+gossip_peer_limit = 8
+max_peers = 512
+max_snapshot_limit = 64
+gossip_rate_limit_per_minute = 30
+allowed_peer_ids = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+denied_peer_ids = ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+public_endpoint = "node.example.com:443"
+region = "us-central"
+descriptor_ttl_secs = 7200
+public_discovery = false
+"#;
+        let config = ServerConfig::from_str(toml_str).unwrap();
+        assert!(config.discovery.enabled);
+        assert!(config.discovery.advertise_self);
+        assert_eq!(
+            config.discovery.bootstrap_snapshot_path.as_deref(),
+            Some("/etc/aeronyx/bootstrap-peers.json")
+        );
+        assert_eq!(
+            config.discovery.bootstrap_snapshot_url.as_deref(),
+            Some("https://nodes.aeronyx.network/bootstrap.json")
+        );
+        assert_eq!(config.discovery.fetch_timeout_secs, 15);
+        assert_eq!(
+            config.discovery.peer_cache_path.as_deref(),
+            Some("/var/lib/aeronyx/peers-cache.json")
+        );
+        assert_eq!(config.discovery.peer_cache_write_interval_secs, 120);
+        assert!(config.discovery.gossip_enabled);
+        assert_eq!(config.discovery.gossip_interval_secs, 45);
+        assert_eq!(config.discovery.gossip_peer_limit, 8);
+        assert_eq!(config.discovery.max_peers, 512);
+        assert_eq!(config.discovery.max_snapshot_limit, 64);
+        assert_eq!(config.discovery.gossip_rate_limit_per_minute, 30);
+        assert_eq!(
+            config.discovery.allowed_peer_ids,
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+        );
+        assert_eq!(
+            config.discovery.denied_peer_ids,
+            vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+        );
+        assert_eq!(
+            config.discovery.public_endpoint.as_deref(),
+            Some("node.example.com:443")
+        );
+        assert_eq!(config.discovery.region.as_deref(), Some("us-central"));
+        assert_eq!(config.discovery.descriptor_ttl_secs, 7200);
+        assert!(!config.discovery.public_discovery);
+    }
+
+    #[test]
+    fn test_discovery_rejects_invalid_url_scheme() {
+        let toml_str = r#"
+[discovery]
+enabled = true
+bootstrap_snapshot_url = "file:///tmp/bootstrap.json"
+"#;
+        assert!(ServerConfig::from_str(toml_str).is_err());
+    }
+
+    #[test]
+    fn test_discovery_rejects_zero_timeout() {
+        let toml_str = r#"
+[discovery]
+enabled = true
+fetch_timeout_secs = 0
+"#;
+        assert!(ServerConfig::from_str(toml_str).is_err());
+    }
+
+    #[test]
+    fn test_discovery_rejects_short_peer_cache_interval() {
+        let toml_str = r#"
+[discovery]
+enabled = true
+peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
+peer_cache_write_interval_secs = 5
+"#;
+        assert!(ServerConfig::from_str(toml_str).is_err());
+    }
+
+    #[test]
+    fn test_discovery_rejects_invalid_gossip_policy() {
+        let short_interval = r#"
+[discovery]
+enabled = true
+gossip_enabled = true
+gossip_interval_secs = 5
+"#;
+        assert!(ServerConfig::from_str(short_interval).is_err());
+
+        let zero_limit = r#"
+[discovery]
+enabled = true
+gossip_enabled = true
+gossip_peer_limit = 0
+"#;
+        assert!(ServerConfig::from_str(zero_limit).is_err());
+    }
+
+    #[test]
+    fn test_discovery_rejects_invalid_safety_policy() {
+        let zero_max_peers = r#"
+[discovery]
+enabled = true
+max_peers = 0
+"#;
+        assert!(ServerConfig::from_str(zero_max_peers).is_err());
+
+        let zero_snapshot_limit = r#"
+[discovery]
+enabled = true
+max_snapshot_limit = 0
+"#;
+        assert!(ServerConfig::from_str(zero_snapshot_limit).is_err());
+
+        let zero_rate_limit = r#"
+[discovery]
+enabled = true
+gossip_rate_limit_per_minute = 0
+"#;
+        assert!(ServerConfig::from_str(zero_rate_limit).is_err());
+
+        let bad_peer_id = r#"
+[discovery]
+enabled = true
+allowed_peer_ids = ["not-a-node-id"]
+"#;
+        assert!(ServerConfig::from_str(bad_peer_id).is_err());
+    }
+
+    #[test]
+    fn test_discovery_rejects_short_descriptor_ttl() {
+        let toml_str = r#"
+[discovery]
+enabled = true
+descriptor_ttl_secs = 10
+"#;
+        assert!(ServerConfig::from_str(toml_str).is_err());
     }
 
     // ── v1.1.0-ChatRelay: full TOML integration ───────────────────────────

@@ -17,6 +17,7 @@
 //! v0.2.0 - Added register command, simplified user flow
 //! v0.3.0 - Added MemChain status and config display
 //! v1.0.0-MultiTenant - Pass config_path to Server::new() (3rd argument)
+//! v0.3.0-DiscoveryBootstrap - Show discovery bootstrap config in validate
 
 use std::path::PathBuf;
 
@@ -389,7 +390,7 @@ async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
         println!("   Public:     {}", ep);
     }
     println!();
-    println!("VPN:");
+    println!("AeroNyx Privacy Protocol:");
     println!("   IP Range:   {}", config.ip_range());
     println!("   Gateway:    {}", config.gateway_ip());
     println!();
@@ -406,6 +407,19 @@ async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
     if config.memchain.is_enabled() {
         println!("   API Listen:       {}", config.memchain.api_listen_addr);
         println!("   AOF Path:         {}", config.memchain.aof_path);
+    }
+    println!();
+    println!("Discovery:");
+    println!("   Enabled:          {}", config.discovery.enabled);
+    if let Some(path) = &config.discovery.bootstrap_snapshot_path {
+        println!("   Snapshot Path:    {}", path);
+    }
+    if let Some(url) = &config.discovery.bootstrap_snapshot_url {
+        println!("   Snapshot URL:     {}", url);
+        println!(
+            "   Fetch Timeout:    {}s",
+            config.discovery.fetch_timeout_secs
+        );
     }
     println!();
 

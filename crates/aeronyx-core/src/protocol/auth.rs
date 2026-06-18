@@ -6,6 +6,11 @@
 // Modification Reason:
 //   New file. Centralises per-message wallet signature verification so that
 //   every chat handler uses an identical, audited code path.
+//   v1.3.1-PrivacyHardening — Removed production-inappropriate debug logging
+//   from signature verification. Verification behavior and public API are
+//   unchanged; sensitive sign input/hash/pubkey material is no longer emitted.
+//   Also corrected the non-matching-public-key rejection test so it remains
+//   stable across Ed25519 dependency versions.
 //
 // Main Functionality:
 //   - verify_signed_message(): canonical Ed25519 verification with:
@@ -40,7 +45,10 @@
 //   - AuthError intentionally does NOT implement From<CoreError> to prevent
 //     accidental leakage of internal crypto error detail to callers.
 //
-// Last Modified: v1.3.0-Sovereign — Initial implementation
+// Last Modified:
+//   v1.3.0-Sovereign — Initial implementation
+//   v1.3.1-PrivacyHardening — Removed sensitive verification logs and fixed
+//                              non-matching-public-key rejection test
 // ============================================================================
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -73,7 +81,7 @@ pub const DOMAIN_WALLET_PRESENCE: &str = "AeroNyx-WalletPresence-v1";
 /// and the server clock. Messages outside this window are rejected to
 /// prevent replay attacks.
 ///
-/// 60 seconds is deliberately tight. VPN clients are expected to have
+/// 60 seconds is deliberately tight. AeroNyx clients are expected to have
 /// reasonably synchronised clocks (NTP). Widening this value increases
 /// the replay attack window proportionally.
 pub const TIMESTAMP_WINDOW_SECS: u64 = 60;
@@ -169,23 +177,6 @@ pub fn verify_signed_message(
         hasher.update(slice);
     }
     let digest: [u8; 32] = hasher.finalize().into();
-
-    // ── DEBUG: dump sign input and digest (remove before production) ──
-    {
-        let mut sign_input_debug = Vec::new();
-        sign_input_debug.extend_from_slice(domain.as_bytes());
-        for s in payload_slices {
-            sign_input_debug.extend_from_slice(s);
-        }
-        tracing::info!(
-            "[VERIFY] domain={} input_len={} input_hex={} hash_hex={} pubkey={}",
-            domain,
-            sign_input_debug.len(),
-            hex::encode(&sign_input_debug),
-            hex::encode(&digest),
-            hex::encode(wallet_pubkey),
-        );
-    }
 
     // ── 3. Ed25519 verification ───────────────────────────────────────
     let pk =
@@ -338,13 +329,16 @@ mod tests {
     // ── Public key failure ────────────────────────────────────────────────
 
     #[test]
-    fn test_verify_invalid_public_key_rejected() {
+    fn test_verify_non_matching_public_key_rejected() {
         let kp = IdentityKeyPair::generate();
         let payload = b"data";
         let (ts, sig) = make_signed(&kp, DOMAIN_DEVICE_REGISTER, payload);
 
-        // All-zeros is not a valid compressed Ed25519 point
-        let bad_pubkey = [0u8; 32];
+        // Ed25519 implementations differ on whether a 32-byte compressed key
+        // is rejected during parsing or later during signature verification.
+        // The security contract here is stable: a non-matching key must never
+        // validate a signature produced by another wallet.
+        let bad_pubkey = [0xffu8; 32];
 
         let result = verify_signed_message(
             DOMAIN_DEVICE_REGISTER,
@@ -354,8 +348,11 @@ mod tests {
             ts,
         );
         assert!(
-            matches!(result, Err(AuthError::InvalidPublicKey)),
-            "Invalid public key must be rejected: {:?}",
+            matches!(
+                result,
+                Err(AuthError::InvalidPublicKey | AuthError::SignatureMismatch)
+            ),
+            "Non-matching public key must be rejected: {:?}",
             result,
         );
     }

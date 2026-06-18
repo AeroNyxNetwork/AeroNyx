@@ -9,6 +9,8 @@
 //   per-message signature-based authentication for all chat operations.
 //   Also added dedup_cache as an Arc<Mutex<LruCache>> for the online-path
 //   deduplication that will be used by the new handler in server.rs.
+//   v1.3.1-Maintenance — Removed stale imports after the chat relay schema and
+//   wallet-route integration stabilized. No database schema or API behavior changed.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -44,9 +46,9 @@
 // Last Modified:
 //   v1.1.0-ChatRelay — Initial implementation
 //   v1.3.0-Sovereign — Added wallet_routes: Arc<WalletRouteCache> field
+//   v1.3.1-Maintenance — Removed stale imports; behavior unchanged
 // ============================================================================
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,7 +59,7 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::Sha256;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use aeronyx_core::protocol::chat::{decode_envelope, encode_envelope, ChatEnvelope};
 

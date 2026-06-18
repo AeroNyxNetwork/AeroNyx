@@ -83,6 +83,15 @@ pub type VpnHealthStatusFn =
 pub type OperatorStatusFn =
     Box<dyn Fn() -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>> + Send + Sync>;
 
+/// Async peer-discovery snapshot injected by server startup.
+///
+/// The probe returns aggregate node discovery counters for heartbeat
+/// `system_stats.discovery_status`. It must not include client IPs,
+/// destinations, DNS contents, packet payloads, chat plaintext, voucher
+/// secrets, private keys, or wallet-level traffic.
+pub type DiscoveryStatusFn =
+    Box<dyn Fn() -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>> + Send + Sync>;
+
 // ============================================
 // Session Events
 // ============================================
@@ -264,6 +273,7 @@ pub struct HeartbeatReporter {
     memchain_status_fn: Option<MemChainStatusFn>,
     vpn_health_status_fn: Option<VpnHealthStatusFn>,
     operator_status_fn: Option<OperatorStatusFn>,
+    discovery_status_fn: Option<DiscoveryStatusFn>,
 
     // v1.0.0-Membership
     sessions: Option<Arc<SessionManager>>,
@@ -290,6 +300,7 @@ impl HeartbeatReporter {
             memchain_status_fn: None,
             vpn_health_status_fn: None,
             operator_status_fn: None,
+            discovery_status_fn: None,
             sessions: None,
             traffic: None,
             udp: None,
@@ -317,6 +328,11 @@ impl HeartbeatReporter {
 
     pub fn with_operator_status(mut self, f: OperatorStatusFn) -> Self {
         self.operator_status_fn = Some(f);
+        self
+    }
+
+    pub fn with_discovery_status(mut self, f: DiscoveryStatusFn) -> Self {
+        self.discovery_status_fn = Some(f);
         self
     }
 
@@ -391,6 +407,12 @@ impl HeartbeatReporter {
                         None
                     };
 
+                    let discovery_status = if let Some(ref f) = self.discovery_status_fn {
+                        f().await
+                    } else {
+                        None
+                    };
+
                     // v1.0.0-Membership: collect connected wallets (deduplicated).
                     let connected_wallets: Vec<String> =
                         if let Some(ref sm) = self.sessions {
@@ -429,6 +451,7 @@ impl HeartbeatReporter {
                             traffic_delta,
                             vpn_health_status,
                             operator_status,
+                            discovery_status,
                         ),
                     ).await;
 
