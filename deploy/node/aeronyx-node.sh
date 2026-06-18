@@ -9,6 +9,10 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
+# - Add `quickstart` as the commercial one-command operator workflow:
+#   clone/pull is handled by nodeboard's generated shell command, then this
+#   repository-local entrypoint runs plan, waits for explicit operator approval,
+#   installs/registers/starts the node, prints status, and runs healthcheck.
 # - Add a privacy-safe operator recommendation to `status` by reading the
 #   existing healthcheck `operator_action` JSON. This gives ordinary node
 #   operators and AI assistants a clear next step without scraping logs.
@@ -25,8 +29,8 @@
 #
 # Main Functionality:
 # - Offers a guided interactive menu when no command is provided.
-# - Provides command aliases for plan, install, upgrade, health, status, logs,
-#   doctor, and network maintenance.
+# - Provides command aliases for quickstart, plan, install, upgrade, health,
+#   status, logs, doctor, and network maintenance.
 # - Passes common options such as --repo-dir, --branch, --registration-code,
 #   --config, and --service to the appropriate lower-level script.
 # - Keeps secret handling safe: registration codes are accepted as arguments or
@@ -59,6 +63,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.5.0-node-entrypoint - Added quickstart one-command install workflow.
 # v1.4.0-node-entrypoint - Show healthcheck operator recommendation in status.
 # v1.3.0-node-entrypoint - Align quick install preview with nodeboard install.
 # v1.2.0-node-entrypoint - Show local upgrade-status.json in status output.
@@ -119,6 +124,7 @@ Source:
 
 Commands:
   plan       Print the resolved one-command install plan without host changes.
+  quickstart Preview, confirm, install/register/start, status, and healthcheck.
   install    Install/register/start an AeroNyx privacy protocol node.
   upgrade    Pull/build/validate/upgrade the Rust node with safety checks.
   health     Run the node health check. Use --json or --json-only for tooling.
@@ -167,6 +173,7 @@ Command-specific options:
 
 Examples:
   ./deploy/node/aeronyx-node.sh plan --quick --registration-code NYX-1234-ABCDE
+  ./deploy/node/aeronyx-node.sh quickstart --quick --registration-code NYX-1234-ABCDE
   sudo ./deploy/node/aeronyx-node.sh install --quick --registration-code NYX-1234-ABCDE
   sudo ./deploy/node/aeronyx-node.sh upgrade --no-restart
   ./deploy/node/aeronyx-node.sh health --json
@@ -194,6 +201,21 @@ append_registration_code() {
     if [ -n "${REGISTRATION_CODE}" ]; then
         EXTRA_ARGS+=("--registration-code" "${REGISTRATION_CODE}")
     fi
+}
+
+array_has_value() {
+    local needle="$1"
+    shift
+    local value
+    for value in "$@"; do
+        [ "${value}" = "${needle}" ] && return 0
+    done
+    return 1
+}
+
+ensure_extra_arg() {
+    local value="$1"
+    array_has_value "${value}" "${EXTRA_ARGS[@]}" || EXTRA_ARGS+=("${value}")
 }
 
 parse_args() {
@@ -255,6 +277,68 @@ run_install() {
         --repo-dir "${REPO_DIR}" \
         --branch "${BRANCH}" \
         "${EXTRA_ARGS[@]}"
+}
+
+run_install_with_privilege() {
+    if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+        run_install
+        return
+    fi
+
+    command -v sudo >/dev/null 2>&1 || die "quickstart install requires root. Re-run with sudo or install sudo."
+
+    log "Requesting sudo for install/register/start after approved plan."
+    sudo env \
+        AERONYX_REGISTRATION_CODE="${REGISTRATION_CODE}" \
+        AERONYX_REPO_DIR="${REPO_DIR}" \
+        AERONYX_BRANCH="${BRANCH}" \
+        AERONYX_CONFIG_FILE="${CONFIG_FILE}" \
+        AERONYX_SERVICE_NAME="${SERVICE_NAME}" \
+        "${SCRIPT_DIR}/aeronyx-node.sh" install \
+        --repo-dir "${REPO_DIR}" \
+        --branch "${BRANCH}" \
+        "${EXTRA_ARGS[@]}"
+}
+
+confirm_quickstart_install() {
+    cat <<'CONFIRM'
+
+AeroNyx quickstart has printed the read-only install plan above.
+Type INSTALL to continue with host changes, registration, service start,
+status, and healthcheck. Press Enter to stop safely.
+CONFIRM
+    printf 'Confirm: '
+    local confirmation
+    IFS= read -r confirmation || confirmation=""
+    [ "${confirmation}" = "INSTALL" ] || die "Quickstart stopped before install."
+}
+
+run_quickstart() {
+    [ -n "${REGISTRATION_CODE}" ] || die "quickstart requires --registration-code or AERONYX_REGISTRATION_CODE."
+
+    local original_extra=("${EXTRA_ARGS[@]}")
+
+    log "Step 1/4: preview install plan"
+    EXTRA_ARGS=("${original_extra[@]}")
+    ensure_extra_arg "--quick"
+    run_plan
+
+    confirm_quickstart_install
+
+    log "Step 2/4: install, register, and start AeroNyx privacy protocol node"
+    EXTRA_ARGS=("${original_extra[@]}")
+    ensure_extra_arg "--quick"
+    ensure_extra_arg "--start"
+    run_install_with_privilege
+
+    log "Step 3/4: status and operator recommendation"
+    EXTRA_ARGS=()
+    show_status
+
+    log "Step 4/4: healthcheck JSON summary"
+    EXTRA_ARGS=()
+    JSON=1
+    run_health
 }
 
 run_upgrade() {
@@ -465,7 +549,7 @@ interactive_menu() {
 AeroNyx Node Operator
 
 1) Preview install plan
-2) Install or register node
+2) Quickstart: preview, install/register/start, status, healthcheck
 3) Upgrade build without restart
 4) Upgrade and restart when safe
 5) Health check
@@ -489,7 +573,7 @@ MENU
         2)
             read_optional_registration_code
             EXTRA_ARGS+=("--quick")
-            run_install
+            run_quickstart
             ;;
         3)
             NO_RESTART=1
@@ -533,6 +617,9 @@ main() {
             ;;
         plan)
             run_plan
+            ;;
+        quickstart)
+            run_quickstart
             ;;
         install)
             run_install
