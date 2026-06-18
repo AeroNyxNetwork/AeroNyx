@@ -8,6 +8,9 @@
 #   sysctl, iptables, and build commands.
 #
 # Modification Reason:
+# - Keep --print-plan entirely side-effect free by skipping nodeboard install
+#   progress reports during read-only plan generation; operators should not see
+#   remote reporting warnings before they approve an install.
 # - Add structured, privacy-safe install context to nodeboard progress reports
 #   so operators can see command mode, service/config path, host OS/arch, failed
 #   phase, and exit code without scraping SSH logs.
@@ -107,6 +110,8 @@
 #   separate maintenance-window service restart.
 #
 # Last Modified:
+# v1.24.0-node-deploy - Keeps --print-plan free of remote progress reporting
+#                       side effects and warning noise.
 # v1.23.0-node-deploy - Adds structured install report context for nodeboard.
 # v1.22.0-node-deploy - Reports exact failed install phase to nodeboard.
 # v1.21.0-node-deploy - Reports privacy-safe install progress to nodeboard.
@@ -238,6 +243,9 @@ report_install_progress() {
     local exit_code="${4:-}"
 
     [ -n "${REGISTRATION_CODE}" ] || return 0
+    # --print-plan is the operator approval preview. Keep it fully read-only and
+    # free of nodeboard reporting warnings when a test/expired code is used.
+    [ "${PRINT_PLAN:-0}" -eq 0 ] || return 0
     command -v curl >/dev/null 2>&1 || return 0
     command -v python3 >/dev/null 2>&1 || return 0
 
