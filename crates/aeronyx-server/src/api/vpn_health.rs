@@ -29,6 +29,10 @@
 //! workflow state so nodeboard can show the current operator action without
 //! exposing registration codes, private keys, user identifiers, destinations,
 //! DNS contents, payloads, chat plaintext, or wallet-level traffic.
+//! Disk capacity telemetry reports only aggregate filesystem usage for `/` and
+//! `/var/lib/aeronyx`; it never lists files, paths below those operational
+//! roots, message contents, MemChain records, user identifiers, destinations,
+//! DNS contents, payloads, chat plaintext, or wallet-level traffic.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -36,7 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
+use axum::{Json, Router, extract::State, response::IntoResponse, routing::get};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::net::{TcpStream, UdpSocket};
@@ -57,6 +61,7 @@ const DNS_QUERY_NAME: &str = "api.aeronyx.network";
 const EGRESS_CHECK_ADDR: &str = "1.1.1.1:443";
 const VPN_SERVICE_NAME: &str = "aeronyx-server";
 const UPGRADE_STATUS_FILE: &str = "/var/lib/aeronyx/upgrade-status.json";
+const AERONYX_STATE_DIR: &str = "/var/lib/aeronyx";
 static RUNTIME_STARTED_AT: OnceLock<u64> = OnceLock::new();
 
 #[derive(Clone)]
@@ -144,6 +149,24 @@ struct FileDescriptorCapacityStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct DiskPathCapacityStatus {
+    reported: bool,
+    path: &'static str,
+    total_bytes: Option<u64>,
+    used_bytes: Option<u64>,
+    available_bytes: Option<u64>,
+    used_percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DiskCapacityStatus {
+    root: DiskPathCapacityStatus,
+    state: DiskPathCapacityStatus,
+    source: &'static str,
+    privacy_boundary: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct CapacityRiskStatus {
     severity: &'static str,
     code: &'static str,
@@ -163,6 +186,7 @@ struct VpnCapacityStatus {
     session_capacity_remaining: Option<u32>,
     conntrack: ConntrackCapacityStatus,
     file_descriptors: FileDescriptorCapacityStatus,
+    disk: DiskCapacityStatus,
     interface: InterfaceCapacityStatus,
     packet_drops_total: Option<u64>,
     risks: Vec<CapacityRiskStatus>,
@@ -1409,6 +1433,7 @@ async fn collect_capacity_status(
     let policy_max_sessions = node_policy.max_sessions;
     let conntrack = collect_conntrack_capacity();
     let file_descriptors = collect_fd_capacity();
+    let disk = collect_disk_capacity().await;
     let risks = collect_capacity_risks(
         &virtual_ip_range,
         ip_pool_capacity,
@@ -1417,6 +1442,7 @@ async fn collect_capacity_status(
         policy_max_sessions,
         conntrack.used_percent,
         file_descriptors.used_percent,
+        &disk,
         packet_drops_total,
     );
 
@@ -1431,6 +1457,7 @@ async fn collect_capacity_status(
         session_capacity_remaining: placement_readiness.session_capacity_remaining,
         conntrack,
         file_descriptors,
+        disk,
         interface,
         packet_drops_total,
         risks,
@@ -1452,6 +1479,7 @@ fn collect_capacity_risks(
     policy_max_sessions: u32,
     conntrack_used_percent: Option<f64>,
     fd_used_percent: Option<f64>,
+    disk: &DiskCapacityStatus,
     packet_drops_total: Option<u64>,
 ) -> Vec<CapacityRiskStatus> {
     let mut risks = Vec::new();
@@ -1522,6 +1550,28 @@ fn collect_capacity_risks(
                 message: format!("Process file descriptor usage is {:.2}%.", percent),
                 remediation: "Raise the systemd LimitNOFILE value or reduce active load before adding clients.".to_string(),
             });
+        }
+    }
+
+    for disk_path in [&disk.root, &disk.state] {
+        if let Some(percent) = disk_path.used_percent {
+            if percent >= 85.0 {
+                risks.push(CapacityRiskStatus {
+                    severity: if percent >= 95.0 {
+                        "critical"
+                    } else {
+                        "warning"
+                    },
+                    code: "disk_pressure",
+                    message: format!("Filesystem {} usage is {:.2}%.", disk_path.path, percent),
+                    remediation: concat!(
+                        "Free disk space or expand the volume before build logs, ",
+                        "upgrade artifacts, MemChain data, or encrypted storage growth ",
+                        "interrupt node operations."
+                    )
+                    .to_string(),
+                });
+            }
         }
     }
 
@@ -1679,6 +1729,72 @@ fn collect_fd_capacity() -> FileDescriptorCapacityStatus {
         hard_limit,
         used_percent: percent(used, soft_limit),
     }
+}
+
+async fn collect_disk_capacity() -> DiskCapacityStatus {
+    DiskCapacityStatus {
+        root: collect_disk_path_capacity("/").await,
+        state: collect_disk_path_capacity(AERONYX_STATE_DIR).await,
+        source: "df_posix_block_usage",
+        privacy_boundary: concat!(
+            "aggregate filesystem usage for AeroNyx operations only; no file ",
+            "lists, MemChain records, encrypted storage contents, client public ",
+            "IPs, destinations, DNS contents, packet payloads, domains, URLs, ",
+            "browsing history, voucher secrets, chat plaintext, or wallet-level traffic"
+        ),
+    }
+}
+
+async fn collect_disk_path_capacity(path: &'static str) -> DiskPathCapacityStatus {
+    let mut status = DiskPathCapacityStatus {
+        reported: false,
+        path,
+        total_bytes: None,
+        used_bytes: None,
+        available_bytes: None,
+        used_percent: None,
+    };
+
+    let Ok(command_result) = timeout(
+        CHECK_TIMEOUT,
+        TokioCommand::new("df")
+            .arg("-P")
+            .arg("-B1")
+            .arg(path)
+            .output(),
+    )
+    .await
+    else {
+        return status;
+    };
+
+    let Ok(output) = command_result else {
+        return status;
+    };
+
+    if !output.status.success() {
+        return status;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(line) = stdout.lines().nth(1) else {
+        return status;
+    };
+    let columns: Vec<&str> = line.split_whitespace().collect();
+    if columns.len() < 6 {
+        return status;
+    }
+
+    status.total_bytes = columns.get(1).and_then(|value| value.parse::<u64>().ok());
+    status.used_bytes = columns.get(2).and_then(|value| value.parse::<u64>().ok());
+    status.available_bytes = columns.get(3).and_then(|value| value.parse::<u64>().ok());
+    status.used_percent = columns
+        .get(4)
+        .and_then(|value| value.trim_end_matches('%').parse::<f64>().ok());
+    status.reported = status.total_bytes.is_some()
+        || status.used_bytes.is_some()
+        || status.available_bytes.is_some();
+    status
 }
 
 fn read_u64_file(path: &str) -> Option<u64> {
