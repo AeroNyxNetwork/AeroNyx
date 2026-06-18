@@ -11,6 +11,9 @@
 # - Add --set-vpn-cidr for network-only VPN pool maintenance so operators can
 #   safely update /etc/aeronyx/server.toml and refresh NAT/restore rules
 #   without rebuilding, registering, or restarting the Rust service.
+# - Report code-scoped install progress to nodeboard so operators and AI
+#   assistants can see plan/build/register/start failures without SSH log
+#   archaeology.
 # - Inject the current Git commit into release builds so nodeboard can display
 #   exact Rust runtime provenance after install or upgrade.
 # - Remove stale AeroNyx 100.64.0.0/* NAT rules during network refresh so
@@ -98,6 +101,7 @@
 #   separate maintenance-window service restart.
 #
 # Last Modified:
+# v1.21.0-node-deploy - Reports privacy-safe install progress to nodeboard.
 # v1.20.0-node-deploy - Injects AERONYX_GIT_COMMIT into release builds for
 #                       nodeboard runtime provenance.
 # v1.19.0-node-deploy - Added --set-vpn-cidr for safe network-only VPN pool
@@ -144,6 +148,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO_URL="https://github.com/AeroNyxNetwork/AeroNyx.git"
 DEFAULT_BRANCH="main"
 DEFAULT_REPO_DIR="/opt/aeronyx/AeroNyx"
+DEFAULT_CMS_URL="https://api.aeronyx.network/api/privacy_network"
 CONFIG_DIR="/etc/aeronyx"
 CONFIG_FILE="${CONFIG_DIR}/server.toml"
 ENV_FILE="${CONFIG_DIR}/aeronyx.env"
@@ -188,6 +193,85 @@ log() { printf '[INFO] %s\n' "$*"; }
 ok() { printf '[OK] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
 die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+
+install_progress_url() {
+    local cms_url="${AERONYX_CMS_URL:-}"
+    if [ -z "${cms_url}" ] && [ -f "${CONFIG_FILE}" ] && command -v python3 >/dev/null 2>&1; then
+        cms_url="$(python3 - "${CONFIG_FILE}" <<'PY' 2>/dev/null || true
+import sys
+path = sys.argv[1]
+current = None
+for raw in open(path, "r", encoding="utf-8"):
+    line = raw.split("#", 1)[0].strip()
+    if not line:
+        continue
+    if line.startswith("[") and line.endswith("]"):
+        current = line[1:-1].strip()
+        continue
+    if current == "management" and line.startswith("cms_url") and "=" in line:
+        value = line.split("=", 1)[1].strip().strip('"').strip("'")
+        print(value)
+        break
+PY
+)"
+    fi
+    cms_url="${cms_url:-${DEFAULT_CMS_URL}}"
+    cms_url="${cms_url%/}"
+    printf '%s/codes/install-progress/\n' "${cms_url}"
+}
+
+report_install_progress() {
+    local status_name="$1"
+    local step="$2"
+    local message="$3"
+
+    [ -n "${REGISTRATION_CODE}" ] || return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+
+    local url payload
+    url="$(install_progress_url)"
+    payload="$(REGISTRATION_CODE="${REGISTRATION_CODE}" \
+        STATUS_NAME="${status_name}" \
+        STEP_NAME="${step}" \
+        MESSAGE_TEXT="${message}" \
+        REPO_DIR_VALUE="${REPO_DIR}" \
+        BRANCH_VALUE="${BRANCH}" \
+        DRY_RUN_VALUE="${DRY_RUN}" \
+        QUICK_VALUE="${QUICK}" \
+        PRINT_PLAN_VALUE="${PRINT_PLAN}" \
+        python3 - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "code": os.environ["REGISTRATION_CODE"],
+    "status": os.environ.get("STATUS_NAME", "running"),
+    "step": os.environ.get("STEP_NAME", ""),
+    "message": os.environ.get("MESSAGE_TEXT", ""),
+    "details": {
+        "entrypoint": "deploy/node/install.sh",
+        "repo_dir": os.environ.get("REPO_DIR_VALUE", ""),
+        "branch": os.environ.get("BRANCH_VALUE", ""),
+        "dry_run": os.environ.get("DRY_RUN_VALUE", ""),
+        "quick": os.environ.get("QUICK_VALUE", ""),
+        "print_plan": os.environ.get("PRINT_PLAN_VALUE", ""),
+    },
+}))
+PY
+)"
+
+    curl -fsS --max-time 4 -X POST "${url}" \
+        -H 'Content-Type: application/json' \
+        --data "${payload}" >/dev/null 2>&1 \
+        || warn "Unable to report install progress to nodeboard (${step})."
+}
+
+install_failed_trap() {
+    local exit_code="$?"
+    report_install_progress "failed" "failed" "Install failed with exit code ${exit_code}."
+    exit "${exit_code}"
+}
 
 usage() {
     cat <<'USAGE'
@@ -1027,51 +1111,67 @@ start_service() {
 main() {
     validate_option_combinations
     if [ "${PRINT_PLAN}" -eq 1 ]; then
+        report_install_progress "planning" "plan" "Install plan generated; waiting for operator approval."
         print_install_plan
         exit 0
     fi
 
+    trap install_failed_trap ERR
+    report_install_progress "running" "preflight" "Running host preflight checks."
     require_root
     require_linux_systemd
     preflight_checks
     if [ "${PREFLIGHT_ONLY}" -eq 1 ]; then
         ok "Preflight-only checks complete."
+        report_install_progress "completed" "preflight" "Preflight-only checks complete."
         exit 0
     fi
     acquire_deploy_lock
     if [ "${NETWORK_ONLY}" -eq 1 ]; then
+        report_install_progress "running" "network" "Refreshing AeroNyx privacy protocol network rules."
         update_vpn_cidr_config
         if [ -n "${SET_VPN_CIDR}" ]; then
             capacity_plan_checks
         fi
         configure_network
         ok "Network-only maintenance complete."
+        report_install_progress "completed" "network" "Network-only maintenance complete."
         if [ -n "${SET_VPN_CIDR}" ]; then
             warn "Persisted VPN CIDR is updated, but running Rust/TUN state changes only after a controlled ${SERVICE_NAME} restart."
         fi
         exit 0
     fi
 
+    report_install_progress "running" "dependencies" "Installing host dependencies and checking Rust toolchain."
     install_packages
     if [ "${DO_BUILD}" -eq 1 ]; then
         install_rust_if_needed
     else
         ok "Rust toolchain check skipped"
     fi
+    report_install_progress "running" "repository" "Preparing AeroNyx repository and configuration."
     prepare_repo
     prepare_directories
     install_config
 
     if [ "${CONFIG_ONLY}" -eq 1 ]; then
         ok "Config-only install complete."
+        report_install_progress "completed" "config" "Config-only install complete."
         exit 0
     fi
 
+    report_install_progress "running" "network" "Configuring forwarding and NAT."
     configure_network
+    report_install_progress "running" "build" "Building AeroNyx Rust release binary."
     build_binary
+    report_install_progress "running" "systemd" "Installing and verifying systemd service."
     install_service
+    report_install_progress "running" "register" "Registering node with nodeboard."
     register_node
+    report_install_progress "running" "start" "Starting or verifying AeroNyx service."
     start_service
+    report_install_progress "completed" "completed" "Install workflow completed."
+    trap - ERR
 }
 
 main "$@"
