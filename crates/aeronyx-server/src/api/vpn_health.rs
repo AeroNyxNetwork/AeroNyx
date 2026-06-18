@@ -35,7 +35,7 @@
 //! DNS contents, payloads, chat plaintext, or wallet-level traffic.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1961,7 +1961,7 @@ fn sanitize_operational_log_message(input: &str) -> String {
         let lower = value.to_ascii_lowercase();
         let replacement = if lower.starts_with("http://") || lower.starts_with("https://") {
             Some("[url]")
-        } else if value.parse::<Ipv4Addr>().is_ok() {
+        } else if looks_like_network_destination(value) {
             Some("[ip]")
         } else if looks_like_key_material(value) {
             Some("[redacted]")
@@ -1987,6 +1987,59 @@ fn sanitize_operational_log_message(input: &str) -> String {
         message.push_str("...");
     }
     message
+}
+
+fn looks_like_network_destination(value: &str) -> bool {
+    let value = value.trim_matches(|c: char| {
+        matches!(c, ',' | ';' | ')' | '(' | '[' | ']' | '"' | '\'' | '.')
+    });
+
+    if value.parse::<Ipv4Addr>().is_ok()
+        || value.parse::<Ipv6Addr>().is_ok()
+        || value.parse::<SocketAddr>().is_ok()
+    {
+        return true;
+    }
+
+    if let Some((host, port)) = value.rsplit_once(':') {
+        if !host.contains(':')
+            && port.parse::<u16>().is_ok()
+            && (host.parse::<Ipv4Addr>().is_ok() || looks_like_domain_name(host))
+        {
+            return true;
+        }
+    }
+
+    looks_like_domain_name(value)
+}
+
+fn looks_like_domain_name(value: &str) -> bool {
+    let value = value.trim_end_matches('.');
+    if value.len() > 253 || !value.contains('.') {
+        return false;
+    }
+
+    let mut labels = value.split('.').peekable();
+    let mut label_count = 0usize;
+    while let Some(label) = labels.next() {
+        label_count += 1;
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return false;
+        }
+
+        if labels.peek().is_none()
+            && (label.len() < 2 || !label.chars().all(|c| c.is_ascii_alphabetic()))
+        {
+            return false;
+        }
+    }
+
+    label_count >= 2
 }
 
 fn looks_like_key_material(value: &str) -> bool {
@@ -2064,6 +2117,20 @@ mod tests {
 
     #[test]
     fn capacity_risks_include_actionable_ip_pool_remediation() {
+        let disk_path = DiskPathCapacityStatus {
+            reported: false,
+            path: "/",
+            total_bytes: None,
+            used_bytes: None,
+            available_bytes: None,
+            used_percent: None,
+        };
+        let disk = DiskCapacityStatus {
+            root: disk_path.clone(),
+            state: disk_path,
+            source: "test",
+            privacy_boundary: "aggregate disk capacity only",
+        };
         let risks = collect_capacity_risks(
             "100.64.0.0/24",
             253,
@@ -2072,6 +2139,12 @@ mod tests {
             0,
             Some(0.05),
             Some(0.0),
+            &disk,
+            0,
+            0,
+            0,
+            None,
+            "within_limit",
             Some(0),
         );
 
@@ -2084,13 +2157,19 @@ mod tests {
     #[test]
     fn recent_error_sanitizer_redacts_sensitive_tokens() {
         let sanitized = sanitize_operational_log_message(
-            "failed peer 203.0.113.10 url=https://example.com/path key=0123456789abcdef0123456789abcdef",
+            "failed peer 203.0.113.10 endpoint=198.51.100.8:443 ipv6=2001:db8::1 host=api.example.com url=https://example.com/path key=0123456789abcdef0123456789abcdef",
         );
 
         assert!(sanitized.contains("[ip]"));
+        assert!(sanitized.contains("endpoint=[ip]"));
+        assert!(sanitized.contains("ipv6=[ip]"));
+        assert!(sanitized.contains("host=[ip]"));
         assert!(sanitized.contains("url=[url]") || sanitized.contains("[url]"));
         assert!(sanitized.contains("key=[redacted]") || sanitized.contains("[redacted]"));
         assert!(!sanitized.contains("203.0.113.10"));
+        assert!(!sanitized.contains("198.51.100.8"));
+        assert!(!sanitized.contains("2001:db8::1"));
+        assert!(!sanitized.contains("api.example.com"));
         assert!(!sanitized.contains("0123456789abcdef0123456789abcdef"));
     }
 }
