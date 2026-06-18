@@ -24,6 +24,11 @@
 //! capped so nodeboard can triage node operations without collecting client
 //! public IPs, destinations, DNS contents, packet payloads, domains, URLs,
 //! voucher secrets, chat plaintext, or wallet-level traffic.
+//! Upgrade workflow telemetry is read from `/var/lib/aeronyx/upgrade-status.json`
+//! and allow-listed before heartbeat reporting. It reports only install/upgrade
+//! workflow state so nodeboard can show the current operator action without
+//! exposing registration codes, private keys, user identifiers, destinations,
+//! DNS contents, payloads, chat plaintext, or wallet-level traffic.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -51,6 +56,7 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_QUERY_NAME: &str = "api.aeronyx.network";
 const EGRESS_CHECK_ADDR: &str = "1.1.1.1:443";
 const VPN_SERVICE_NAME: &str = "aeronyx-server";
+const UPGRADE_STATUS_FILE: &str = "/var/lib/aeronyx/upgrade-status.json";
 static RUNTIME_STARTED_AT: OnceLock<u64> = OnceLock::new();
 
 #[derive(Clone)]
@@ -174,6 +180,23 @@ struct RecentErrorEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct NodeUpgradeStatus {
+    reported: bool,
+    status: Option<String>,
+    step: Option<String>,
+    message: Option<String>,
+    repo_dir: Option<String>,
+    branch: Option<String>,
+    service: Option<String>,
+    config: Option<String>,
+    no_restart: Option<bool>,
+    force: Option<bool>,
+    updated_at: Option<String>,
+    source: &'static str,
+    privacy_boundary: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct TransportCarrierStatus {
     key: &'static str,
     enabled: bool,
@@ -221,6 +244,7 @@ struct VpnHealthResponse {
     placement_readiness: NodePolicyPlacementSnapshot,
     capacity: VpnCapacityStatus,
     recent_errors: Vec<RecentErrorEvent>,
+    upgrade_status: NodeUpgradeStatus,
     voucher_metrics: VoucherMetricsSnapshot,
     encrypted_message_forwarding: EncryptedMessageForwardingStatus,
     session_cleanup: SessionCleanupStatus,
@@ -441,6 +465,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     .await;
     let runtime = collect_runtime_version_status().await;
     let recent_errors = collect_recent_error_events(VPN_SERVICE_NAME).await;
+    let upgrade_status = collect_upgrade_status().await;
 
     VpnHealthResponse {
         status,
@@ -464,6 +489,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         placement_readiness,
         capacity,
         recent_errors,
+        upgrade_status,
         voucher_metrics: state.voucher_verifier.metrics_snapshot(),
         encrypted_message_forwarding: EncryptedMessageForwardingStatus {
             count: state.encrypted_message_counter.load(Ordering::Relaxed),
@@ -535,6 +561,7 @@ async fn collect_node_operator_status_response(
             "placement_readiness": vpn_health.placement_readiness,
             "capacity": vpn_health.capacity,
             "recent_errors": vpn_health.recent_errors,
+            "upgrade_status": vpn_health.upgrade_status.clone(),
             "failed_checks": vpn_health.checks.iter().filter(|check| !check.ok).count(),
             "runtime_rollout": runtime_rollout.clone(),
         }),
@@ -665,6 +692,19 @@ async fn collect_node_operator_status_response(
             code: "runtime_restart_required",
             message: "Rust process is running an executable that has been replaced on disk".to_string(),
             remediation: "Drain active sessions, enter maintenance mode, then restart the AeroNyx Rust node so the staged binary takes effect".to_string(),
+        });
+    }
+
+    if vpn_health.upgrade_status.status.as_deref() == Some("failed") {
+        risks.push(OperatorRisk {
+            severity: "warning",
+            code: "upgrade_workflow_failed",
+            message: vpn_health
+                .upgrade_status
+                .message
+                .clone()
+                .unwrap_or_else(|| "Last Rust upgrade workflow failed".to_string()),
+            remediation: "Open node detail, inspect upgrade status, run healthcheck, then rerun deploy/node/aeronyx-node.sh upgrade --no-restart after resolving the failed step".to_string(),
         });
     }
 
@@ -919,6 +959,106 @@ fn collect_runtime_version_status_with_rollout(
             "browsing history, voucher secrets, or wallet-level traffic"
         ),
     }
+}
+
+async fn collect_upgrade_status() -> NodeUpgradeStatus {
+    // File creation/modification notes:
+    // Source path:
+    //   /root/open/AeroNyx/crates/aeronyx-server/src/api/vpn_health.rs
+    // Local producer:
+    //   /root/open/AeroNyx/deploy/node/upgrade.sh
+    // Backend consumer:
+    //   /root/aeronyx/privacy_network/api/vpn_observability.py
+    // Nodeboard consumer:
+    //   /root/open/nodeboard/app/dashboard/nodes/[id]/page.tsx
+    //
+    // Main logical flow:
+    // 1. Read `/var/lib/aeronyx/upgrade-status.json` when present.
+    // 2. Allow-list only operator workflow fields used by nodeboard.
+    // 3. Return `reported=false` for missing or invalid files so old nodes
+    //    remain backward compatible.
+    //
+    // Important note for next developer:
+    // - Do not forward arbitrary JSON from the local status file. Keep this
+    //   allow-list tight. The heartbeat is signed node telemetry and must
+    //   never contain registration codes, private keys, client public IPs,
+    //   destinations, DNS contents, packet payloads, chat plaintext, voucher
+    //   secrets, or wallet-level traffic.
+    let privacy_boundary = concat!(
+        "upgrade workflow metadata only; no registration codes, private keys, ",
+        "client public IPs, destinations, DNS contents, packet payloads, chat ",
+        "plaintext, voucher secrets, or wallet-level traffic"
+    );
+
+    let Ok(raw) = tokio::fs::read_to_string(UPGRADE_STATUS_FILE).await else {
+        return NodeUpgradeStatus {
+            reported: false,
+            status: None,
+            step: None,
+            message: None,
+            repo_dir: None,
+            branch: None,
+            service: None,
+            config: None,
+            no_restart: None,
+            force: None,
+            updated_at: None,
+            source: UPGRADE_STATUS_FILE,
+            privacy_boundary,
+        };
+    };
+
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return NodeUpgradeStatus {
+            reported: false,
+            status: Some("unreadable".to_string()),
+            step: None,
+            message: Some("Local upgrade status file is not valid JSON".to_string()),
+            repo_dir: None,
+            branch: None,
+            service: None,
+            config: None,
+            no_restart: None,
+            force: None,
+            updated_at: None,
+            source: UPGRADE_STATUS_FILE,
+            privacy_boundary,
+        };
+    };
+
+    let string_field = |key: &str, max_len: usize| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|text| sanitize_status_text(text, max_len))
+            .filter(|text| !text.is_empty())
+    };
+
+    NodeUpgradeStatus {
+        reported: true,
+        status: string_field("status", 32),
+        step: string_field("step", 64),
+        message: string_field("message", 240),
+        repo_dir: string_field("repo_dir", 256),
+        branch: string_field("branch", 80),
+        service: string_field("service", 80),
+        config: string_field("config", 256),
+        no_restart: value.get("no_restart").and_then(Value::as_bool),
+        force: value.get("force").and_then(Value::as_bool),
+        updated_at: string_field("updated_at", 80),
+        source: UPGRADE_STATUS_FILE,
+        privacy_boundary,
+    }
+}
+
+fn sanitize_status_text(value: &str, max_len: usize) -> String {
+    value
+        .replace('\0', "")
+        .chars()
+        .take(max_len)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn build_git_commit() -> &'static str {
