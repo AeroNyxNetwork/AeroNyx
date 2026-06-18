@@ -36,6 +36,8 @@
 //  15. Optionally contacts configured discovery seed endpoints every gossip
 //      round so nodes can recover from stale cached peer endpoints.
 //  16. Reports privacy-safe seed endpoint recovery counters for nodeboard.
+//  17. Treats stale bootstrap descriptors as benign when newer cache/gossip
+//      state already exists, while still warning on rejected descriptors.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -65,6 +67,7 @@
 //   v1.0.1-VpnMessageStats - encrypted message counter wiring
 //   v0.7.0-DiscoveryChatRelay - Peer-discovered encrypted chat relay fanout
 //   v0.9.1-DiscoverySeedStatus - Seed endpoint recovery counters in status
+//   v0.9.2-DiscoveryBootstrapStatus - Avoid warning on benign stale bootstrap descriptors
 //   v0.9.0-DiscoverySeedEndpoints - Periodic seed endpoint gossip recovery
 //   v0.8.0-DiscoveryPublicApi - Optional public-only discovery listener
 //   v0.5.0-DiscoveryPeerCache - Optional local PeerStore cache load/writeback
@@ -2191,7 +2194,7 @@ impl Server {
                 peer_store.record_bootstrap_source(
                     now,
                     source_kind,
-                    if report.rejected > 0 || report.stale > 0 {
+                    if report.rejected > 0 {
                         "warning"
                     } else {
                         "success"
