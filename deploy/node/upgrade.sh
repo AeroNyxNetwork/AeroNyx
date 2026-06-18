@@ -7,6 +7,8 @@
 #   nodes without requiring manual git/build/systemd commands.
 #
 # Modification Reason:
+# - Inject the current Git commit into release builds so nodeboard can display
+#   exact Rust runtime provenance after source upgrades.
 # - Add production systemd unit synchronization, rollback, no-restart, and
 #   health polling controls while preserving active-session protection and
 #   validating operator-provided service names.
@@ -67,6 +69,8 @@
 #   directories can remain untracked on production nodes.
 #
 # Last Modified:
+# v1.12.0-node-deploy - Injects AERONYX_GIT_COMMIT into release builds for
+#                       nodeboard runtime provenance.
 # v1.11.0-node-deploy - Added tracked dirty-worktree protection before source
 #                       upgrades.
 # v1.10.0-node-deploy - Rejects contradictory unit-only maintenance options.
@@ -313,14 +317,21 @@ update_source() {
     run git -C "${REPO_DIR}" pull --ff-only origin "${BRANCH}"
 }
 
+resolve_build_git_commit() {
+    git -C "${REPO_DIR}" rev-parse --short=12 HEAD 2>/dev/null || printf 'unknown'
+}
+
 build_release() {
+    local build_git_commit
+    build_git_commit="$(resolve_build_git_commit)"
+
     log "Building release binary"
     if [ "${DRY_RUN}" -eq 1 ]; then
-        printf '[DRY-RUN] cd %s && cargo build -p aeronyx-server --release\n' "${REPO_DIR}"
+        printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s cargo build -p aeronyx-server --release\n' "${REPO_DIR}" "${build_git_commit}"
     else
         (
             cd "${REPO_DIR}"
-            cargo build -p aeronyx-server --release
+            AERONYX_GIT_COMMIT="${build_git_commit}" cargo build -p aeronyx-server --release
         )
     fi
 }

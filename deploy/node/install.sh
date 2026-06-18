@@ -11,6 +11,8 @@
 # - Add --set-vpn-cidr for network-only VPN pool maintenance so operators can
 #   safely update /etc/aeronyx/server.toml and refresh NAT/restore rules
 #   without rebuilding, registering, or restarting the Rust service.
+# - Inject the current Git commit into release builds so nodeboard can display
+#   exact Rust runtime provenance after install or upgrade.
 # - Remove stale AeroNyx 100.64.0.0/* NAT rules during network refresh so
 #   commercial pool migrations, such as /24 to /22, do not leave overlapping
 #   MASQUERADE rules in the persisted iptables set.
@@ -96,6 +98,8 @@
 #   separate maintenance-window service restart.
 #
 # Last Modified:
+# v1.20.0-node-deploy - Injects AERONYX_GIT_COMMIT into release builds for
+#                       nodeboard runtime provenance.
 # v1.19.0-node-deploy - Added --set-vpn-cidr for safe network-only VPN pool
 #                       config updates.
 # v1.18.0-node-deploy - Cleans stale AeroNyx NAT rules during VPN pool
@@ -951,16 +955,22 @@ install_network_restore_service() {
     run systemctl enable "${NETWORK_RESTORE_SERVICE}"
 }
 
+resolve_build_git_commit() {
+    git -C "${REPO_DIR}" rev-parse --short=12 HEAD 2>/dev/null || printf 'unknown'
+}
+
 build_binary() {
+    local build_git_commit
     [ "${DO_BUILD}" -eq 1 ] || { ok "Build skipped"; return; }
 
+    build_git_commit="$(resolve_build_git_commit)"
     log "Building aeronyx-server release binary"
     if [ "${DRY_RUN}" -eq 1 ]; then
-        printf '[DRY-RUN] cd %s && cargo build -p aeronyx-server --release\n' "${REPO_DIR}"
+        printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s cargo build -p aeronyx-server --release\n' "${REPO_DIR}" "${build_git_commit}"
     else
         (
             cd "${REPO_DIR}"
-            cargo build -p aeronyx-server --release
+            AERONYX_GIT_COMMIT="${build_git_commit}" cargo build -p aeronyx-server --release
         )
     fi
 }
