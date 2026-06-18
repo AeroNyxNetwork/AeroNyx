@@ -40,6 +40,11 @@
 //! risks, service manager state, and upgrade workflow metadata. It is a compact
 //! nodeboard/AI runbook summary and does not collect additional user traffic
 //! data.
+//! Privacy protocol health telemetry is an additive nodeboard contract that
+//! summarizes protocol status, failed checks, active aggregate sessions, service
+//! state, transport model, and AeroNyx protocol runtime usage. It avoids requiring
+//! backend or UI code to infer AeroNyx privacy protocol readiness from several
+//! lower-level fields, and it remains aggregate operations metadata only.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -262,6 +267,33 @@ struct VpnTransportHealthStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct PrivacyProtocolRuntimeStatus {
+    active: bool,
+    status: &'static str,
+    detail: &'static str,
+    source: &'static str,
+    privacy_boundary: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PrivacyProtocolHealthStatus {
+    protocol: &'static str,
+    label: &'static str,
+    status: &'static str,
+    checked_at: u64,
+    failed_checks: usize,
+    active_sessions: usize,
+    active_wallet_devices: usize,
+    data_plane: &'static str,
+    preferred_transport: String,
+    effective_transport: &'static str,
+    service_active_state: String,
+    protocol_runtime: PrivacyProtocolRuntimeStatus,
+    source: &'static str,
+    privacy_boundary: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct OperatorActionSummary {
     status: &'static str,
     priority: &'static str,
@@ -283,6 +315,7 @@ struct VpnHealthResponse {
     supported_transports: Vec<&'static str>,
     preferred_transport: String,
     transport_health: VpnTransportHealthStatus,
+    privacy_protocol_health: PrivacyProtocolHealthStatus,
     virtual_ip_range: String,
     tun_device: String,
     configured_mtu: u16,
@@ -525,10 +558,20 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         &upgrade_status,
         &service_manager,
     );
+    let checked_at = unix_now_secs();
+    let privacy_protocol_health = collect_privacy_protocol_health(
+        status,
+        checked_at,
+        failed,
+        active_sessions,
+        active_wallet_devices,
+        &transport_health,
+        &service_manager,
+    );
 
     VpnHealthResponse {
         status,
-        checked_at: unix_now_secs(),
+        checked_at,
         listen_addr: listen_addr.to_string(),
         gateway_ip: gateway_ip.to_string(),
         dns_proxy_enabled,
@@ -536,6 +579,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         supported_transports: transport_health.supported_transports.clone(),
         preferred_transport: transport_health.preferred_transport.clone(),
         transport_health,
+        privacy_protocol_health,
         virtual_ip_range: ip_range,
         tun_device,
         configured_mtu,
@@ -608,6 +652,7 @@ async fn collect_node_operator_status_response(
             "supported_transports": vpn_health.supported_transports.clone(),
             "preferred_transport": vpn_health.preferred_transport.clone(),
             "transport_health": vpn_health.transport_health.clone(),
+            "privacy_protocol_health": vpn_health.privacy_protocol_health.clone(),
             "virtual_ip_range": vpn_health.virtual_ip_range,
             "tun_device": vpn_health.tun_device,
             "configured_mtu": vpn_health.configured_mtu,
@@ -1059,6 +1104,49 @@ fn collect_transport_health(
             "transport capability metadata only; no packet payloads, DNS ",
             "contents, destinations, domains, URLs, browsing history, voucher ",
             "secrets, client public IPs, or wallet-level traffic"
+        ),
+    }
+}
+
+fn collect_privacy_protocol_health(
+    status: &'static str,
+    checked_at: u64,
+    failed_checks: usize,
+    active_sessions: usize,
+    active_wallet_devices: usize,
+    transport_health: &VpnTransportHealthStatus,
+    service_manager: &ServiceManagerStatus,
+) -> PrivacyProtocolHealthStatus {
+    PrivacyProtocolHealthStatus {
+        protocol: "aeronyx_privacy_protocol",
+        label: "AeroNyx Privacy Protocol",
+        status,
+        checked_at,
+        failed_checks,
+        active_sessions,
+        active_wallet_devices,
+        data_plane: "aeronyx_privacy_protocol",
+        preferred_transport: transport_health.preferred_transport.clone(),
+        effective_transport: transport_health.effective_transport,
+        service_active_state: service_manager.active_state.clone(),
+        protocol_runtime: PrivacyProtocolRuntimeStatus {
+            active: status != "failed",
+            status,
+            detail: "This Rust node reports AeroNyx privacy protocol runtime health from aggregate service, transport, and routing checks.",
+            source: "rust_vpn_health.protocol_model",
+            privacy_boundary: concat!(
+                "protocol model metadata only; no client public IPs, ",
+                "destinations, DNS contents, packet payloads, domains, URLs, ",
+                "browsing history, voucher secrets, chat plaintext, or ",
+                "wallet-level traffic"
+            ),
+        },
+        source: "rust_vpn_health.privacy_protocol_health",
+        privacy_boundary: concat!(
+            "aggregate privacy protocol operations metadata only; no client ",
+            "public IPs, destinations, DNS contents, packet payloads, domains, ",
+            "URLs, browsing history, voucher secrets, chat plaintext, private ",
+            "keys, or wallet-level traffic"
         ),
     }
 }
