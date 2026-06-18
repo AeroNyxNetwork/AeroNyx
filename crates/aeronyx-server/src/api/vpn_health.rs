@@ -33,6 +33,10 @@
 //! `/var/lib/aeronyx`; it never lists files, paths below those operational
 //! roots, message contents, MemChain records, user identifiers, destinations,
 //! DNS contents, payloads, chat plaintext, or wallet-level traffic.
+//! Operator action telemetry is derived from the same local checks, capacity
+//! risks, service manager state, and upgrade workflow metadata. It is a compact
+//! nodeboard/AI runbook summary and does not collect additional user traffic
+//! data.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -40,7 +44,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::{Json, Router, extract::State, response::IntoResponse, routing::get};
+use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::net::{TcpStream, UdpSocket};
@@ -250,6 +254,17 @@ struct VpnTransportHealthStatus {
     privacy_boundary: &'static str,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct OperatorActionSummary {
+    status: &'static str,
+    priority: &'static str,
+    title: String,
+    detail: String,
+    next_step: String,
+    source: &'static str,
+    privacy_boundary: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 struct VpnHealthResponse {
     status: &'static str,
@@ -274,6 +289,7 @@ struct VpnHealthResponse {
     capacity: VpnCapacityStatus,
     recent_errors: Vec<RecentErrorEvent>,
     upgrade_status: NodeUpgradeStatus,
+    operator_action: OperatorActionSummary,
     voucher_metrics: VoucherMetricsSnapshot,
     encrypted_message_forwarding: EncryptedMessageForwardingStatus,
     session_cleanup: SessionCleanupStatus,
@@ -495,6 +511,13 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     let runtime = collect_runtime_version_status().await;
     let recent_errors = collect_recent_error_events(VPN_SERVICE_NAME).await;
     let upgrade_status = collect_upgrade_status().await;
+    let operator_action = collect_operator_action_summary(
+        status,
+        &checks,
+        &capacity,
+        &upgrade_status,
+        &service_manager,
+    );
 
     VpnHealthResponse {
         status,
@@ -519,6 +542,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         capacity,
         recent_errors,
         upgrade_status,
+        operator_action,
         voucher_metrics: state.voucher_verifier.metrics_snapshot(),
         encrypted_message_forwarding: EncryptedMessageForwardingStatus {
             count: state.encrypted_message_counter.load(Ordering::Relaxed),
@@ -591,6 +615,7 @@ async fn collect_node_operator_status_response(
             "capacity": vpn_health.capacity,
             "recent_errors": vpn_health.recent_errors,
             "upgrade_status": vpn_health.upgrade_status.clone(),
+            "operator_action": vpn_health.operator_action.clone(),
             "failed_checks": vpn_health.checks.iter().filter(|check| !check.ok).count(),
             "runtime_rollout": runtime_rollout.clone(),
         }),
@@ -804,6 +829,129 @@ async fn collect_node_operator_status_response(
             "contents, packet payloads, domains, URLs, browsing history, voucher ",
             "secrets, or wallet-level traffic"
         ),
+    }
+}
+
+fn collect_operator_action_summary(
+    status: &'static str,
+    checks: &[HealthCheck],
+    capacity: &VpnCapacityStatus,
+    upgrade_status: &NodeUpgradeStatus,
+    service_manager: &ServiceManagerStatus,
+) -> OperatorActionSummary {
+    let privacy_boundary = concat!(
+        "operator action is derived from aggregate node operations metadata ",
+        "only; no client public IPs, destinations, DNS contents, packet ",
+        "payloads, domains, URLs, browsing history, voucher secrets, chat ",
+        "plaintext, private keys, or wallet-level traffic"
+    );
+
+    if let Some(check) = checks.iter().find(|check| !check.ok) {
+        return OperatorActionSummary {
+            status: if status == "failed" { "critical" } else { "warning" },
+            priority: "fix_failed_health_check",
+            title: "AeroNyx privacy protocol check failed".to_string(),
+            detail: format!("{}: {}", check.name, check.detail),
+            next_step: "Open node detail health checks, fix the failed check, then rerun deploy/node/aeronyx-node.sh health --json.".to_string(),
+            source: "rust_vpn_health.checks",
+            privacy_boundary,
+        };
+    }
+
+    if upgrade_status.status.as_deref() == Some("failed") {
+        return OperatorActionSummary {
+            status: "critical",
+            priority: "fix_failed_upgrade",
+            title: "Rust upgrade workflow failed".to_string(),
+            detail: upgrade_status
+                .message
+                .clone()
+                .unwrap_or_else(|| "Last upgrade workflow reported failure.".to_string()),
+            next_step: "Inspect upgrade_status, resolve the failed step, then rerun deploy/node/aeronyx-node.sh upgrade --no-restart before a controlled restart.".to_string(),
+            source: "rust_vpn_health.upgrade_status",
+            privacy_boundary,
+        };
+    }
+
+    if service_manager.active_state != "active" {
+        return OperatorActionSummary {
+            status: "warning",
+            priority: "service_not_active",
+            title: "Rust service is not active".to_string(),
+            detail: service_manager.detail.clone(),
+            next_step: "Run deploy/node/aeronyx-node.sh status and logs --lines 200 before restart or upgrade actions.".to_string(),
+            source: "rust_vpn_health.service_manager",
+            privacy_boundary,
+        };
+    }
+
+    if let Some(risk) = capacity
+        .risks
+        .iter()
+        .find(|risk| risk.severity == "critical")
+    {
+        return OperatorActionSummary {
+            status: "critical",
+            priority: risk.code,
+            title: "Capacity blocks commercial placement".to_string(),
+            detail: risk.message.clone(),
+            next_step: risk.remediation.clone(),
+            source: "rust_vpn_health.capacity.risks",
+            privacy_boundary,
+        };
+    }
+
+    if let Some(risk) = capacity
+        .risks
+        .iter()
+        .find(|risk| risk.severity == "warning")
+    {
+        return OperatorActionSummary {
+            status: "warning",
+            priority: risk.code,
+            title: "Capacity needs operator review".to_string(),
+            detail: risk.message.clone(),
+            next_step: risk.remediation.clone(),
+            source: "rust_vpn_health.capacity.risks",
+            privacy_boundary,
+        };
+    }
+
+    if status == "degraded" {
+        return OperatorActionSummary {
+            status: "warning",
+            priority: "privacy_protocol_degraded",
+            title: "AeroNyx privacy protocol is degraded".to_string(),
+            detail: "Local health checks passed enough to stay online, but the node is not fully clean.".to_string(),
+            next_step: "Review node detail health checks, capacity, recent events, and network rules before accepting more traffic.".to_string(),
+            source: "rust_vpn_health.status",
+            privacy_boundary,
+        };
+    }
+
+    if upgrade_status.status.as_deref() == Some("staged") {
+        return OperatorActionSummary {
+            status: "info",
+            priority: "upgrade_staged",
+            title: "Rust upgrade is staged".to_string(),
+            detail: upgrade_status
+                .message
+                .clone()
+                .unwrap_or_else(|| "A new Rust build is staged without restart.".to_string()),
+            next_step: "Use maintenance mode, drain active sessions, then perform a controlled restart when ready.".to_string(),
+            source: "rust_vpn_health.upgrade_status",
+            privacy_boundary,
+        };
+    }
+
+    OperatorActionSummary {
+        status: "ok",
+        priority: "monitor",
+        title: "Node is ready for monitoring".to_string(),
+        detail: "No failed health checks or capacity blockers are reported.".to_string(),
+        next_step: "Keep monitoring heartbeat freshness, capacity, traffic, and recent events in nodeboard.".to_string(),
+        source: "rust_vpn_health",
+        privacy_boundary,
     }
 }
 
@@ -1990,9 +2138,8 @@ fn sanitize_operational_log_message(input: &str) -> String {
 }
 
 fn looks_like_network_destination(value: &str) -> bool {
-    let value = value.trim_matches(|c: char| {
-        matches!(c, ',' | ';' | ')' | '(' | '[' | ']' | '"' | '\'' | '.')
-    });
+    let value = value
+        .trim_matches(|c: char| matches!(c, ',' | ';' | ')' | '(' | '[' | ']' | '"' | '\'' | '.'));
 
     if value.parse::<Ipv4Addr>().is_ok()
         || value.parse::<Ipv6Addr>().is_ok()
