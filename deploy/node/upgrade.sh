@@ -7,6 +7,9 @@
 #   nodes without requiring manual git/build/systemd commands.
 #
 # Modification Reason:
+# - Write a local, privacy-safe upgrade status snapshot so nodeboard, health
+#   checks, AI assistants, and operators can understand which upgrade stage is
+#   running or failed without scraping shell logs.
 # - Inject the current Git commit into release builds so nodeboard can display
 #   exact Rust runtime provenance after source upgrades.
 # - Add production systemd unit synchronization, rollback, no-restart, and
@@ -37,6 +40,9 @@
 # - Restores the previous systemd unit and binary if restart or health
 #   verification fails.
 # - Prunes old release backups after a successful upgrade.
+# - Writes /var/lib/aeronyx/upgrade-status.json with stage/status/message
+#   metadata only; never writes registration codes, private keys, client IPs,
+#   DNS contents, packet payloads, chat plaintext, or wallet-level traffic.
 #
 # Dependencies:
 # - deploy/node/healthcheck.sh
@@ -67,8 +73,12 @@
 #   success.
 # - Keep the dirty-worktree check limited to tracked files so runtime/build
 #   directories can remain untracked on production nodes.
+# - Keep upgrade-status.json privacy-safe. It is an operator progress file, not
+#   a support log and not a traffic/debug dump.
 #
 # Last Modified:
+# v1.13.0-node-deploy - Added privacy-safe local upgrade status snapshots for
+#                       nodeboard/healthcheck/operator automation.
 # v1.12.0-node-deploy - Injects AERONYX_GIT_COMMIT into release builds for
 #                       nodeboard runtime provenance.
 # v1.11.0-node-deploy - Added tracked dirty-worktree protection before source
@@ -104,7 +114,9 @@ SERVICE_NAME="aeronyx-server"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"
 LOCK_DIR=""
+STATE_DIR="/var/lib/aeronyx"
 RELEASE_DIR="/var/lib/aeronyx/releases"
+UPGRADE_STATUS_FILE="/var/lib/aeronyx/upgrade-status.json"
 NETWORK_RESTORE_SERVICE="aeronyx-network-restore.service"
 NETWORK_RESTORE_FILE="/etc/systemd/system/${NETWORK_RESTORE_SERVICE}"
 SYSCTL_FILE="/etc/sysctl.d/99-aeronyx.conf"
@@ -124,11 +136,19 @@ HEALTH_DELAY=2
 BACKUP_BINARY=""
 BACKUP_SERVICE_FILE=""
 BACKUP_NETWORK_RESTORE_FILE=""
+CURRENT_UPGRADE_STEP="not_started"
+CURRENT_UPGRADE_MESSAGE="Upgrade workflow has not started."
 
 log() { printf '[INFO] %s\n' "$*"; }
 ok() { printf '[OK] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
-die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+die() {
+    printf '[ERROR] %s\n' "$*" >&2
+    if declare -F write_upgrade_status >/dev/null 2>&1; then
+        write_upgrade_status "failed" "${CURRENT_UPGRADE_STEP:-failed}" "$*" || true
+    fi
+    exit 1
+}
 
 usage() {
     cat <<'USAGE'
@@ -157,6 +177,70 @@ Options:
   --dry-run           Print actions without changing the host.
   -h, --help          Show this help.
 USAGE
+}
+
+write_upgrade_status() {
+    local status_name="$1"
+    local step_name="$2"
+    local message="$3"
+
+    [ "${DRY_RUN}" -eq 0 ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+
+    mkdir -p "${STATE_DIR}" 2>/dev/null || return 0
+    STATUS_NAME="${status_name}" \
+    STEP_NAME="${step_name}" \
+    STATUS_MESSAGE="${message}" \
+    REPO_DIR_VALUE="${REPO_DIR}" \
+    BRANCH_VALUE="${BRANCH}" \
+    CONFIG_FILE_VALUE="${CONFIG_FILE}" \
+    SERVICE_NAME_VALUE="${SERVICE_NAME}" \
+    NO_RESTART_VALUE="${NO_RESTART}" \
+    FORCE_VALUE="${FORCE}" \
+    python3 - "${UPGRADE_STATUS_FILE}" <<'PY' || true
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+path = sys.argv[1]
+payload = {
+    "status": os.environ.get("STATUS_NAME", "running"),
+    "step": os.environ.get("STEP_NAME", "unknown"),
+    "message": os.environ.get("STATUS_MESSAGE", ""),
+    "repo_dir": os.environ.get("REPO_DIR_VALUE", ""),
+    "branch": os.environ.get("BRANCH_VALUE", ""),
+    "config": os.environ.get("CONFIG_FILE_VALUE", ""),
+    "service": os.environ.get("SERVICE_NAME_VALUE", ""),
+    "no_restart": os.environ.get("NO_RESTART_VALUE", "0") == "1",
+    "force": os.environ.get("FORCE_VALUE", "0") == "1",
+    "privacy_boundary": (
+        "upgrade workflow metadata only; no registration codes, private keys, "
+        "client public IPs, destinations, DNS contents, packet payloads, chat "
+        "plaintext, voucher secrets, or wallet-level traffic"
+    ),
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+}
+tmp_path = f"{path}.tmp"
+with open(tmp_path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, separators=(",", ":"))
+    handle.write("\n")
+os.replace(tmp_path, path)
+PY
+}
+
+set_upgrade_step() {
+    CURRENT_UPGRADE_STEP="$1"
+    CURRENT_UPGRADE_MESSAGE="$2"
+    write_upgrade_status "running" "${CURRENT_UPGRADE_STEP}" "${CURRENT_UPGRADE_MESSAGE}"
+    log "${CURRENT_UPGRADE_MESSAGE}"
+}
+
+handle_upgrade_error() {
+    local exit_code="$1"
+    trap - ERR
+    write_upgrade_status "failed" "${CURRENT_UPGRADE_STEP}" "${CURRENT_UPGRADE_MESSAGE} failed with exit code ${exit_code}." || true
+    exit "${exit_code}"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -639,46 +723,68 @@ main() {
     validate_keep_releases
     validate_option_combinations
     require_root
+    trap 'handle_upgrade_error $?' ERR
+    set_upgrade_step "preflight" "Acquiring deployment lock and validating upgrade options."
     acquire_lock
     if [ "${SERVICE_UNIT_ONLY}" -eq 1 ]; then
+        set_upgrade_step "service_unit" "Syncing AeroNyx systemd service unit only."
         if ! render_service_unit; then
             rollback_service_unit
             die "Service unit maintenance failed."
         fi
+        set_upgrade_step "healthcheck" "Running healthcheck after service unit maintenance."
         run_healthcheck
+        set_upgrade_step "cleanup" "Pruning old release backups after service unit maintenance."
         prune_release_backups
+        write_upgrade_status "completed" "completed" "Service unit maintenance complete."
         ok "Service unit maintenance complete."
         return
     fi
     if [ "${NETWORK_RESTORE_ONLY}" -eq 1 ]; then
+        set_upgrade_step "network_restore" "Syncing AeroNyx network restore unit only."
         if ! sync_network_restore_unit; then
             rollback_network_restore_unit
             die "Network restore maintenance failed."
         fi
+        set_upgrade_step "healthcheck" "Running healthcheck after network restore maintenance."
         run_healthcheck
+        set_upgrade_step "cleanup" "Pruning old release backups after network restore maintenance."
         prune_release_backups
+        write_upgrade_status "completed" "completed" "Network restore maintenance complete."
         ok "Network restore maintenance complete."
         return
     fi
+    set_upgrade_step "dependencies" "Checking Rust toolchain and repository prerequisites."
     ensure_cargo_path
     [ -d "${REPO_DIR}/.git" ] || die "Repository not found: ${REPO_DIR}"
     ensure_tracked_worktree_clean
+    set_upgrade_step "backup" "Backing up current release binary before upgrade."
     backup_current_binary
+    set_upgrade_step "repository" "Updating AeroNyx source from Git."
     update_source
+    set_upgrade_step "build" "Building AeroNyx Rust release binary."
     build_release
+    set_upgrade_step "validate" "Validating AeroNyx server configuration."
     validate_config
+    set_upgrade_step "systemd" "Rendering and verifying AeroNyx systemd service unit."
     render_service_unit
+    set_upgrade_step "network_restore" "Rendering and verifying AeroNyx network restore unit."
     if ! sync_network_restore_unit; then
         rollback_network_restore_unit
         die "Upgrade failed while syncing network restore unit."
     fi
+    set_upgrade_step "restart" "Restarting AeroNyx service when restart policy allows it."
     restart_service
     if [ "${NO_RESTART}" -eq 0 ]; then
+        set_upgrade_step "healthcheck" "Running post-upgrade healthcheck."
         run_healthcheck
     else
+        set_upgrade_step "staged" "Build and validation complete; restart intentionally skipped."
         ok "Build and validation complete. Service was not restarted."
     fi
+    set_upgrade_step "cleanup" "Pruning old release backups after successful upgrade."
     prune_release_backups
+    write_upgrade_status "completed" "completed" "Upgrade workflow completed."
 }
 
 main "$@"

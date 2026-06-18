@@ -7,6 +7,9 @@
 #   nodes after install, upgrade, or incident response.
 #
 # Modification Reason:
+# - Include local upgrade-status.json in JSON output so nodeboard, AI
+#   assistants, and operators can inspect staged or failed upgrade workflows
+#   without parsing shell logs.
 # - Add service-name validation while preserving the production healthcheck for
 #   node deployment workflows.
 # - Add release-backup diagnostics for node upgrade retention observability.
@@ -31,6 +34,7 @@
 # - Records commercial capacity risk as structured checks and JSON.
 # - Checks that generated network restore ExecStart command paths exist.
 # - Emits machine-readable JSON for nodeboard or support automation.
+# - Includes privacy-safe local upgrade workflow status when available.
 # - Warns when installed systemd hardening is weaker than the production
 #   template.
 #
@@ -56,6 +60,7 @@
 #   tun.device_name from the installed config.
 #
 # Last Modified:
+# v1.17.0-node-deploy - Added local upgrade workflow status to JSON summary.
 # v1.16.0-node-deploy - Auto-detect live systemd repo path when --repo-dir is
 #                       not provided.
 # v1.15.0-node-deploy - Expanded default VPN pool fallback to /22 for
@@ -101,6 +106,7 @@ SYSCTL_FILE="/etc/sysctl.d/99-aeronyx.conf"
 IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
 NETWORK_RESTORE_SERVICE="aeronyx-network-restore"
 RELEASE_DIR="/var/lib/aeronyx/releases"
+UPGRADE_STATUS_FILE="/var/lib/aeronyx/upgrade-status.json"
 RELEASE_BACKUP_KEEP_TARGET=10
 trap 'rm -f "${CHECK_LOG}" "${HEALTH_JSON_FILE}"' EXIT
 
@@ -784,7 +790,7 @@ emit_json_summary() {
         return 0
     fi
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "${CHECK_LOG}" "${REPO_DIR}" "${CONFIG_FILE}" "${SERVICE_NAME}" "${NETWORK_RESTORE_SERVICE}" "${HEALTH_JSON_FILE}" "${PASS}" "${WARN}" "${FAIL}" <<'PY'
+        python3 - "${CHECK_LOG}" "${REPO_DIR}" "${CONFIG_FILE}" "${SERVICE_NAME}" "${NETWORK_RESTORE_SERVICE}" "${HEALTH_JSON_FILE}" "${UPGRADE_STATUS_FILE}" "${PASS}" "${WARN}" "${FAIL}" <<'PY'
 import json
 import glob
 import os
@@ -792,8 +798,8 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-checks_path, repo_dir, config_path, service_name, network_restore_service, health_json_path = sys.argv[1:7]
-pass_count, warn_count, fail_count = [int(value) for value in sys.argv[7:10]]
+checks_path, repo_dir, config_path, service_name, network_restore_service, health_json_path, upgrade_status_path = sys.argv[1:8]
+pass_count, warn_count, fail_count = [int(value) for value in sys.argv[8:11]]
 
 def run(args):
     try:
@@ -831,6 +837,35 @@ def local_health_payload(path):
             return json.load(handle)
     except Exception:
         return {}
+
+def upgrade_status_payload(path):
+    try:
+        if not os.path.exists(path) or not os.path.getsize(path):
+            return {"reported": False, "source": path}
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return {
+            "reported": True,
+            "source": path,
+            "status": data.get("status"),
+            "step": data.get("step"),
+            "message": data.get("message"),
+            "repo_dir": data.get("repo_dir"),
+            "branch": data.get("branch"),
+            "service": data.get("service"),
+            "config": data.get("config"),
+            "no_restart": data.get("no_restart"),
+            "force": data.get("force"),
+            "updated_at": data.get("updated_at"),
+            "privacy_boundary": data.get("privacy_boundary") or (
+                "upgrade workflow metadata only; no registration codes, "
+                "private keys, client public IPs, destinations, DNS contents, "
+                "packet payloads, chat plaintext, voucher secrets, or "
+                "wallet-level traffic"
+            ),
+        }
+    except Exception as exc:
+        return {"reported": False, "source": path, "error": str(exc)}
 
 def vpn_config(path):
     data = {}
@@ -933,6 +968,7 @@ runtime = {
     "release_backups": release_backups,
 }
 local_health = local_health_payload(health_json_path)
+upgrade_status = upgrade_status_payload(upgrade_status_path)
 
 print(json.dumps({
     "success": fail_count == 0,
@@ -951,6 +987,7 @@ print(json.dumps({
         "privacy_boundary": "aggregate local VPN health only; no client public IPs, destinations, DNS contents, packet payloads, domains, URLs, browsing history, voucher secrets, or wallet-level traffic",
     },
     "runtime": runtime,
+    "upgrade_status": upgrade_status,
     "checks": checks,
     "privacy_boundary": "diagnostics only; no private keys, registration secrets, client public IPs, destinations, DNS contents, packet payloads, or wallet-level traffic",
     "generated_at": datetime.now(timezone.utc).isoformat(),

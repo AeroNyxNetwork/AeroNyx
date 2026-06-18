@@ -360,6 +360,20 @@ before restarting. When persisted iptables rules exist, it also regenerates and
 verifies `aeronyx-network-restore.service` so existing nodes receive reboot
 recovery improvements without a full reinstall.
 
+`upgrade.sh` writes a local structured progress snapshot to:
+
+```text
+/var/lib/aeronyx/upgrade-status.json
+```
+
+The file contains only operator workflow metadata: status, step, message,
+repo path, branch, service name, config path, `--no-restart`, `--force`, and
+`updated_at`. It intentionally excludes registration codes, private keys,
+client public IPs, DNS contents, destinations, packet payloads, chat plaintext,
+voucher secrets, and wallet-level traffic. `aeronyx-node.sh status` displays a
+short summary of this file, and `healthcheck.sh --json-only` exposes it as
+top-level `upgrade_status` for nodeboard or AI maintenance automation.
+
 Build and validate without restarting:
 
 ```bash
@@ -443,6 +457,7 @@ The healthcheck prints:
 - network restore command path checks
 - structured JSON runtime fields for release backups and network restore commands
 - local VPN health endpoint status
+- upgrade workflow status from `/var/lib/aeronyx/upgrade-status.json`
 - capacity telemetry: IP pool, conntrack, file descriptors, drops, pps, bps
 - capacity risk checks: `max_connections` / policy `max_sessions` versus
   usable VPN IP pool, IP-pool exhaustion, fd usage, conntrack usage, and packet
@@ -451,8 +466,8 @@ The healthcheck prints:
 It does not print private keys, user traffic destinations, DNS contents,
 payloads, wallet-level traffic, or client public IPs.
 
-`--json-only` includes a top-level `capacity` object copied from the local Rust
-VPN health endpoint and a `local_vpn_health` summary for nodeboard automation.
+`--json-only` includes top-level `capacity` and `upgrade_status` objects plus a
+`local_vpn_health` summary for nodeboard automation.
 These fields remain aggregate-only and preserve the same privacy boundary as
 the Rust `/api/vpn/health` response.
 

@@ -9,6 +9,8 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
+- Show the local structured upgrade status file from `status` so operators and
+  AI assistants can see staged/failed upgrade state without scraping logs.
 # - Initial production entrypoint for ordinary node operators. This script
 #   delegates to existing deployment scripts instead of duplicating their
 #   host-writing logic.
@@ -51,6 +53,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.2.0-node-entrypoint - Show local upgrade-status.json in status output.
 # v1.1.0-node-entrypoint - Documented GitHub origin and repository-local path.
 # v1.0.0-node-entrypoint - Added single operator-facing AeroNyx node command.
 # ============================================
@@ -66,6 +69,7 @@ DEFAULT_BRANCH="main"
 DEFAULT_REPO_DIR="/opt/aeronyx/AeroNyx"
 DEFAULT_CONFIG_FILE="/etc/aeronyx/server.toml"
 DEFAULT_SERVICE_NAME="aeronyx-server"
+UPGRADE_STATUS_FILE="/var/lib/aeronyx/upgrade-status.json"
 
 COMMAND=""
 REPO_DIR="${AERONYX_REPO_DIR:-${DEFAULT_REPO_DIR}}"
@@ -303,6 +307,38 @@ show_status() {
         printf '\n'
     else
         warn "curl not found"
+    fi
+
+    log "Local upgrade workflow status"
+    if [ -s "${UPGRADE_STATUS_FILE}" ]; then
+        if command -v python3 >/dev/null 2>&1; then
+            python3 - "${UPGRADE_STATUS_FILE}" <<'PY'
+import json
+import sys
+
+try:
+    data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+except Exception as exc:
+    print(f"upgrade_status=unreadable error={exc}")
+    raise SystemExit(0)
+
+print(
+    "upgrade_status={status} step={step} updated_at={updated_at} no_restart={no_restart}".format(
+        status=data.get("status", "unknown"),
+        step=data.get("step", "unknown"),
+        updated_at=data.get("updated_at", "unknown"),
+        no_restart=data.get("no_restart", "unknown"),
+    )
+)
+message = data.get("message")
+if message:
+    print(f"upgrade_message={message}")
+PY
+        else
+            cat "${UPGRADE_STATUS_FILE}"
+        fi
+    else
+        warn "No local upgrade status file found: ${UPGRADE_STATUS_FILE}"
     fi
 }
 
