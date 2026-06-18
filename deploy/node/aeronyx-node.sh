@@ -9,8 +9,8 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
-- Show the local structured upgrade status file from `status` so operators and
-  AI assistants can see staged/failed upgrade state without scraping logs.
+# - Show the local structured upgrade status file from `status` so operators and
+#   AI assistants can see staged/failed upgrade state without scraping logs.
 # - Initial production entrypoint for ordinary node operators. This script
 #   delegates to existing deployment scripts instead of duplicating their
 #   host-writing logic.
