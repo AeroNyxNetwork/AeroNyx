@@ -19,6 +19,7 @@
 //! - Privacy-safe discovery audit events for rate-limit, policy, import, and
 //!   snapshot export operations
 //! - Bootstrap/cache/gossip runtime status for nodeboard diagnostics
+//! - Seed endpoint recovery counters without exposing seed endpoint values
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -43,6 +44,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.7.0-DiscoverySeedStatus - Added privacy-safe seed endpoint recovery counters
 //! v0.6.0-DiscoveryBootstrapStatus - Added bootstrap/cache/gossip status snapshot
 //! v0.5.0-DiscoveryAuditLog - Added privacy-safe discovery audit ring buffer
 //! v0.4.0-DiscoverySafetyStatus - Added capacity limit, runtime stats, status API support
@@ -144,6 +146,12 @@ pub struct PeerStoreBootstrapStatus {
     pub peer_cache_configured: bool,
     /// Whether outbound gossip is enabled in local config.
     pub gossip_enabled: bool,
+    /// Number of configured discovery seed endpoints.
+    ///
+    /// The endpoint values themselves are intentionally omitted from status and
+    /// heartbeat payloads. Operators only need this aggregate to diagnose
+    /// whether seed recovery is configured.
+    pub seed_endpoints_configured: u64,
     /// Last bootstrap/cache source kind observed.
     pub last_source_kind: Option<String>,
     /// Last bootstrap/cache source status: success, failed, missing, skipped.
@@ -164,6 +172,8 @@ pub struct PeerStoreBootstrapStatus {
     pub last_cache_save_at: Option<u64>,
     /// Number of peers attempted in the last outbound gossip round.
     pub last_gossip_attempted: u64,
+    /// Number of configured seed endpoints attempted in the last gossip round.
+    pub last_gossip_seed_attempted: u64,
     /// Number of peers successfully contacted in the last outbound gossip round.
     pub last_gossip_succeeded: u64,
     /// Timestamp of the last outbound gossip round.
@@ -176,6 +186,7 @@ impl Default for PeerStoreBootstrapStatus {
             enabled: false,
             peer_cache_configured: false,
             gossip_enabled: false,
+            seed_endpoints_configured: 0,
             last_source_kind: None,
             last_source_status: None,
             last_source_detail: None,
@@ -186,6 +197,7 @@ impl Default for PeerStoreBootstrapStatus {
             last_cache_save_detail: None,
             last_cache_save_at: None,
             last_gossip_attempted: 0,
+            last_gossip_seed_attempted: 0,
             last_gossip_succeeded: 0,
             last_gossip_round_at: None,
         }
@@ -376,11 +388,13 @@ impl PeerStore {
         enabled: bool,
         peer_cache_configured: bool,
         gossip_enabled: bool,
+        seed_endpoints_configured: usize,
     ) {
         let mut status = self.bootstrap_status.write();
         status.enabled = enabled;
         status.peer_cache_configured = peer_cache_configured;
         status.gossip_enabled = gossip_enabled;
+        status.seed_endpoints_configured = seed_endpoints_configured as u64;
     }
 
     /// Records a bootstrap or peer-cache load source result.
@@ -445,10 +459,17 @@ impl PeerStore {
     }
 
     /// Records outbound gossip round result.
-    pub fn record_gossip_round(&self, now: u64, attempted: usize, succeeded: usize) {
+    pub fn record_gossip_round(
+        &self,
+        now: u64,
+        attempted: usize,
+        succeeded: usize,
+        seed_attempted: usize,
+    ) {
         {
             let mut status = self.bootstrap_status.write();
             status.last_gossip_attempted = attempted as u64;
+            status.last_gossip_seed_attempted = seed_attempted as u64;
             status.last_gossip_succeeded = succeeded as u64;
             status.last_gossip_round_at = Some(now);
         }
@@ -460,7 +481,7 @@ impl PeerStore {
             } else {
                 "warning"
             },
-            format!("attempted={attempted} succeeded={succeeded}"),
+            format!("attempted={attempted} succeeded={succeeded} seed_attempted={seed_attempted}"),
         );
     }
 
@@ -1132,7 +1153,7 @@ mod tests {
     fn test_bootstrap_status_is_recorded() {
         let store = PeerStore::new();
 
-        store.configure_bootstrap_status(true, true, true);
+        store.configure_bootstrap_status(true, true, true, 2);
         store.record_bootstrap_source(
             1_700_000_010,
             "cache",
@@ -1141,12 +1162,13 @@ mod tests {
         );
         store.record_self_descriptor_status(1_700_000_011, "success", "registered");
         store.record_cache_save_status(1_700_000_012, "success", "exported=1");
-        store.record_gossip_round(1_700_000_013, 2, 1);
+        store.record_gossip_round(1_700_000_013, 2, 1, 1);
 
         let status = store.status(1_700_000_100);
         assert!(status.bootstrap.enabled);
         assert!(status.bootstrap.peer_cache_configured);
         assert!(status.bootstrap.gossip_enabled);
+        assert_eq!(status.bootstrap.seed_endpoints_configured, 2);
         assert_eq!(status.bootstrap.last_source_kind.as_deref(), Some("cache"));
         assert_eq!(
             status.bootstrap.last_source_status.as_deref(),
@@ -1161,6 +1183,7 @@ mod tests {
             Some("success")
         );
         assert_eq!(status.bootstrap.last_gossip_attempted, 2);
+        assert_eq!(status.bootstrap.last_gossip_seed_attempted, 1);
         assert_eq!(status.bootstrap.last_gossip_succeeded, 1);
         assert!(status
             .recent_audit_events

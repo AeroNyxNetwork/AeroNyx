@@ -35,6 +35,7 @@
 //      only `/api/discovery/*` and `/api/chat/peer/relay`.
 //  15. Optionally contacts configured discovery seed endpoints every gossip
 //      round so nodes can recover from stale cached peer endpoints.
+//  16. Reports privacy-safe seed endpoint recovery counters for nodeboard.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -63,6 +64,7 @@
 //   v1.0.0-Membership  - TrafficTracker wiring
 //   v1.0.1-VpnMessageStats - encrypted message counter wiring
 //   v0.7.0-DiscoveryChatRelay - Peer-discovered encrypted chat relay fanout
+//   v0.9.1-DiscoverySeedStatus - Seed endpoint recovery counters in status
 //   v0.9.0-DiscoverySeedEndpoints - Periodic seed endpoint gossip recovery
 //   v0.8.0-DiscoveryPublicApi - Optional public-only discovery listener
 //   v0.5.0-DiscoveryPeerCache - Optional local PeerStore cache load/writeback
@@ -1601,6 +1603,7 @@ impl Server {
             self.config.discovery.enabled,
             self.config.discovery.peer_cache_path.is_some(),
             self.config.discovery.gossip_enabled,
+            self.config.discovery.seed_endpoints.len(),
         );
         let now = unix_now_secs();
         if !self.config.discovery.enabled {
@@ -1889,6 +1892,8 @@ impl Server {
                         let mut attempted = 0usize;
                         let mut succeeded = 0usize;
 
+                        let seed_attempted = gossip_urls.len();
+
                         for peer in snapshot.peers {
                             if gossip_urls.len() >= peer_limit {
                                 break;
@@ -1941,7 +1946,7 @@ impl Server {
                                 "[DISCOVERY] Outbound gossip round complete"
                             );
                         }
-                        peer_store.record_gossip_round(now, attempted, succeeded);
+                        peer_store.record_gossip_round(now, attempted, succeeded, seed_attempted);
                     }
                 }
             }
