@@ -12,6 +12,8 @@
 # - Initial production entrypoint for ordinary node operators. This script
 #   delegates to existing deployment scripts instead of duplicating their
 #   host-writing logic.
+# - Clarify that this script is repository-local and is obtained from the
+#   open-source AeroNyx Rust repository, not from the host operating system.
 #
 # Main Functionality:
 # - Offers a guided interactive menu when no command is provided.
@@ -27,6 +29,8 @@
 # - deploy/node/upgrade.sh
 # - deploy/node/healthcheck.sh
 # - systemctl and journalctl for status/log views on Linux/systemd hosts.
+# - GitHub source repository:
+#   https://github.com/AeroNyxNetwork/AeroNyx
 #
 # Main Logical Flow:
 # 1. Parse the high-level command and common options.
@@ -47,6 +51,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.1.0-node-entrypoint - Documented GitHub origin and repository-local path.
 # v1.0.0-node-entrypoint - Added single operator-facing AeroNyx node command.
 # ============================================
 
@@ -87,6 +92,18 @@ usage() {
     cat <<'USAGE'
 Usage:
   ./deploy/node/aeronyx-node.sh [COMMAND] [OPTIONS]
+
+Source:
+  This script is not installed globally by Linux. It is repository-local:
+    https://github.com/AeroNyxNetwork/AeroNyx
+    AeroNyx/deploy/node/aeronyx-node.sh
+
+  From a fresh server:
+    mkdir -p /root/open
+    cd /root/open
+    git clone https://github.com/AeroNyxNetwork/AeroNyx.git AeroNyx
+    cd AeroNyx
+    ./deploy/node/aeronyx-node.sh plan --repo-dir "$PWD" --branch main
 
 Commands:
   plan       Print the resolved one-command install plan without host changes.

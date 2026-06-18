@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Clarify where the unified `deploy/node/aeronyx-node.sh` entrypoint comes
+  from, so human operators and AI assistants know to clone/update the AeroNyx
+  Rust repository before running repository-local commands.
 - Document VPN DNS ownership so production operators can choose the default
   built-in Rust DNS proxy or an external systemd-resolved listener without
   confusing port-bind warnings.
@@ -40,6 +43,7 @@ Dependencies:
 - deploy/node/install.sh
 - deploy/node/upgrade.sh
 - deploy/node/healthcheck.sh
+- deploy/node/aeronyx-node.sh
 - deploy/node/server.example.toml
 - deploy/node/aeronyx-server.service
 - crates/aeronyx-server/src/main.rs
@@ -56,6 +60,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.31.0-node-deploy - Documented aeronyx-node.sh GitHub origin and
+                     repository-local execution path.
 v1.30.0-node-deploy - Documented VPN DNS ownership modes.
 v1.29.0-node-deploy - Documented --set-vpn-cidr network-only VPN pool updates.
 v1.28.0-node-deploy - Documented stale NAT cleanup for VPN pool migrations.
@@ -103,11 +109,51 @@ This directory is the production deployment package for AeroNyx Rust privacy
 nodes. It gives node operators a predictable path for first install, upgrade,
 healthcheck, and systemd service management.
 
+## Where `aeronyx-node.sh` Comes From
+
+`./deploy/node/aeronyx-node.sh` is not a Linux system command and is not
+installed globally by default. It is part of the open-source AeroNyx Rust
+repository:
+
+```bash
+https://github.com/AeroNyxNetwork/AeroNyx
+```
+
+After cloning or updating the repository, the script path is:
+
+```bash
+AeroNyx/deploy/node/aeronyx-node.sh
+```
+
+Every command that starts with `./deploy/node/aeronyx-node.sh` expects the
+current shell to already be inside the `AeroNyx` repository. From a fresh
+server, start with:
+
+```bash
+mkdir -p /root/open
+cd /root/open
+git clone https://github.com/AeroNyxNetwork/AeroNyx.git AeroNyx
+cd AeroNyx
+./deploy/node/aeronyx-node.sh plan --repo-dir "$PWD" --branch main
+```
+
+If the repository already exists, update it first:
+
+```bash
+cd /root/open/AeroNyx
+git fetch origin main
+git checkout main
+git pull --ff-only origin main
+./deploy/node/aeronyx-node.sh plan --repo-dir "$PWD" --branch main
+```
+
 ## Files
 
 - `install.sh`: one-command production installer.
 - `upgrade.sh`: safe source update, release build, config validation, and
   restart workflow.
+- `aeronyx-node.sh`: unified operator entrypoint that delegates to install,
+  upgrade, healthcheck, status, logs, and network maintenance commands.
 - `healthcheck.sh`: read-only node diagnostics and capacity telemetry summary.
 - `uninstall.sh`: safe service removal while preserving node identity by default.
 - `server.example.toml`: public, safe default config template.
