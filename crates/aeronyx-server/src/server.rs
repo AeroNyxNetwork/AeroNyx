@@ -31,6 +31,8 @@
 //  12. Optionally starts outbound discovery gossip to known public peers.
 //  13. Optionally relays signed encrypted chat envelopes to discovered
 //      `ChatRelay` peers while retaining local pending-storage fallback.
+//  14. Optionally starts a public-only discovery API listener that exposes
+//      only `/api/discovery/*` and `/api/chat/peer/relay`.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -59,13 +61,14 @@
 //   v1.0.0-Membership  - TrafficTracker wiring
 //   v1.0.1-VpnMessageStats - encrypted message counter wiring
 //   v0.7.0-DiscoveryChatRelay - Peer-discovered encrypted chat relay fanout
+//   v0.8.0-DiscoveryPublicApi - Optional public-only discovery listener
 //   v0.5.0-DiscoveryPeerCache - Optional local PeerStore cache load/writeback
 //   v0.6.0-DiscoveryOutboundGossip - Periodic descriptor announce + snapshot sync
 //   v0.4.0-DiscoverySelfDescriptor - Generate and register signed self descriptor
 //   v0.3.0-DiscoveryBootstrap - PeerStore bootstrap snapshot loading
 // ============================================
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1211,13 +1214,29 @@ impl Server {
     ) -> JoinHandle<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut shutdown_rx_vpn = self.shutdown_tx.subscribe();
+        let mut shutdown_rx_public = self.shutdown_tx.subscribe();
         let vpn_listen_addr: std::net::SocketAddr = format!("100.64.0.1:{}", listen_addr.port())
             .parse()
             .unwrap_or_else(|_| "100.64.0.1:8421".parse().unwrap());
         let vpn_health_config = self.config.clone();
         let discovery_api_policy = DiscoveryApiPolicy::from_config(&self.config.discovery);
+        let public_api_listen_addr = self.config.discovery.public_api_listen_addr;
 
         tokio::spawn(async move {
+            if let Some(public_addr) = public_api_listen_addr {
+                let public_app = Self::build_public_discovery_router(
+                    Arc::clone(&peer_store),
+                    discovery_api_policy.clone(),
+                    chat_relay.clone(),
+                    Arc::clone(&sessions),
+                    Arc::clone(&udp),
+                );
+                tokio::spawn(async move {
+                    Self::serve_public_discovery_api(public_addr, public_app, shutdown_rx_public)
+                        .await;
+                });
+            }
+
             let app = build_mpi_router(mpi_state)
                 .merge(build_voice_router(Arc::clone(&sessions)))
                 .merge(build_vpn_health_router(
@@ -1305,6 +1324,49 @@ impl Server {
             }
             info!("[API] Stopped");
         })
+    }
+
+    fn build_public_discovery_router(
+        peer_store: Arc<PeerStore>,
+        discovery_api_policy: DiscoveryApiPolicy,
+        chat_relay: Option<Arc<ChatRelayService>>,
+        sessions: Arc<SessionManager>,
+        udp: Arc<UdpTransport>,
+    ) -> axum::Router {
+        build_discovery_router(peer_store, discovery_api_policy)
+            .merge(build_chat_peer_router(chat_relay, sessions, udp))
+    }
+
+    async fn serve_public_discovery_api(
+        listen_addr: SocketAddr,
+        app: axum::Router,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) {
+        let listener = match tokio::net::TcpListener::bind(listen_addr).await {
+            Ok(listener) => {
+                info!(
+                    "[DISCOVERY] Public discovery API on http://{} (routes: /api/discovery/*, /api/chat/peer/relay)",
+                    listen_addr
+                );
+                listener
+            }
+            Err(error) => {
+                error!(
+                    "[DISCOVERY] Public discovery API bind failed {}: {}",
+                    listen_addr, error
+                );
+                return;
+            }
+        };
+
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = shutdown_rx.recv().await;
+            info!("[DISCOVERY] Public discovery API shutdown signal received");
+        });
+        if let Err(error) = server.await {
+            error!("[DISCOVERY] Public discovery API error: {}", error);
+        }
+        info!("[DISCOVERY] Public discovery API stopped");
     }
 
     // ============================================

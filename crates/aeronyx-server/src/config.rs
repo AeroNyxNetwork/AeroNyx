@@ -66,6 +66,7 @@
 //! v0.5.0-DiscoveryPeerCache — Added optional local PeerStore cache config
 //! v0.4.0-DiscoverySelfDescriptor — Added signed self descriptor config
 //! v0.3.0-DiscoveryBootstrap — Added optional discovery bootstrap config
+//! v0.8.0-DiscoveryPublicApi — Added optional public-only discovery listener
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -155,6 +156,13 @@ pub struct DiscoveryConfig {
     /// the node still signs a descriptor but leaves endpoint discovery empty.
     #[serde(default)]
     pub public_endpoint: Option<String>,
+    /// Optional public-only API listener for discovery and peer chat relay.
+    ///
+    /// This listener is separate from `memchain.api_listen_addr` and exposes
+    /// only `/api/discovery/*` plus `/api/chat/peer/relay`. It stays disabled
+    /// by default so existing deployments never expose the full local API.
+    #[serde(default)]
+    pub public_api_listen_addr: Option<SocketAddr>,
     /// Optional region label for nodeboard and future peer selection.
     #[serde(default)]
     pub region: Option<String>,
@@ -335,6 +343,15 @@ impl DiscoveryConfig {
             }
         }
 
+        if let Some(addr) = self.public_api_listen_addr {
+            if addr.port() == 0 {
+                return Err(ServerError::config_invalid(
+                    "discovery.public_api_listen_addr",
+                    "port must be greater than zero",
+                ));
+            }
+        }
+
         if let Some(region) = &self.region {
             if region.trim().is_empty() {
                 return Err(ServerError::config_invalid(
@@ -374,6 +391,7 @@ impl Default for DiscoveryConfig {
             allowed_peer_ids: Vec::new(),
             denied_peer_ids: Vec::new(),
             public_endpoint: None,
+            public_api_listen_addr: None,
             region: None,
             descriptor_ttl_secs: Self::default_descriptor_ttl_secs(),
             public_discovery: Self::default_public_discovery(),
@@ -684,6 +702,7 @@ gossip_rate_limit_per_minute = 30
 allowed_peer_ids = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
 denied_peer_ids = ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
 public_endpoint = "node.example.com:443"
+public_api_listen_addr = "0.0.0.0:8422"
 region = "us-central"
 descriptor_ttl_secs = 7200
 public_discovery = false
@@ -723,6 +742,10 @@ public_discovery = false
             config.discovery.public_endpoint.as_deref(),
             Some("node.example.com:443")
         );
+        assert_eq!(
+            config.discovery.public_api_listen_addr,
+            Some("0.0.0.0:8422".parse().unwrap())
+        );
         assert_eq!(config.discovery.region.as_deref(), Some("us-central"));
         assert_eq!(config.discovery.descriptor_ttl_secs, 7200);
         assert!(!config.discovery.public_discovery);
@@ -755,6 +778,16 @@ fetch_timeout_secs = 0
 enabled = true
 peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
 peer_cache_write_interval_secs = 5
+"#;
+        assert!(ServerConfig::from_str(toml_str).is_err());
+    }
+
+    #[test]
+    fn test_discovery_rejects_zero_public_api_port() {
+        let toml_str = r#"
+[discovery]
+enabled = true
+public_api_listen_addr = "0.0.0.0:0"
 "#;
         assert!(ServerConfig::from_str(toml_str).is_err());
     }
