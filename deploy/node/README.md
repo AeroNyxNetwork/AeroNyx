@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Document recent operational event severity mapping so nodeboard can
+  prioritize critical service failures without exposing raw logs or user data.
 - Document that nodeboard-generated preview commands include `--quick` so the
   read-only plan matches the exact first-install path that the operator will
   run after approval.
@@ -63,6 +65,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.33.0-node-deploy - Documented recent error severity mapping.
 v1.32.0-node-deploy - Documented quick install preview alignment.
 v1.31.0-node-deploy - Documented aeronyx-node.sh GitHub origin and
                      repository-local execution path.
@@ -477,6 +480,16 @@ payloads, wallet-level traffic, or client public IPs.
 `local_vpn_health` summary for nodeboard automation.
 These fields remain aggregate-only and preserve the same privacy boundary as
 the Rust `/api/vpn/health` response.
+
+Rust `/api/vpn/health` also reports capped recent operational events from local
+systemd service warnings. These events are sanitized and classified as `info`,
+`warning`, or `critical` before nodeboard sees them. The classifier is for
+operator prioritization only: fatal/error/failed/timeout/alert-style messages
+become `critical`, notice/info-style messages become `info`, and remaining
+warning-level service summaries stay `warning`. The payload must remain an
+operations summary and must not include client public IPs, destinations, DNS
+contents, packet payloads, domains, URLs, browsing history, voucher secrets,
+chat plaintext, private keys, registration secrets, or wallet-level traffic.
 
 ## Safe Uninstall
 

@@ -24,6 +24,9 @@
 //! capped so nodeboard can triage node operations without collecting client
 //! public IPs, destinations, DNS contents, packet payloads, domains, URLs,
 //! voucher secrets, chat plaintext, or wallet-level traffic.
+//! Journal severity is mapped to `info`, `warning`, or `critical` before
+//! heartbeat reporting so nodeboard can prioritize operator action without
+//! shipping raw service logs.
 //! Upgrade workflow telemetry is read from `/var/lib/aeronyx/upgrade-status.json`
 //! and allow-listed before heartbeat reporting. It reports only install/upgrade
 //! workflow state so nodeboard can show the current operator action without
@@ -2151,7 +2154,9 @@ fn parse_recent_error_line(line: &str) -> Option<RecentErrorEvent> {
     let timestamp = parts.next().map(|value| value.to_string());
     let _host = parts.next();
     let _unit = parts.next();
-    let message = parts.collect::<Vec<_>>().join(" ");
+    let raw_message = parts.collect::<Vec<_>>().join(" ");
+    let severity = classify_recent_error_severity(&raw_message);
+    let message = raw_message;
     let message = sanitize_operational_log_message(&message);
     if message.is_empty() {
         return None;
@@ -2159,7 +2164,7 @@ fn parse_recent_error_line(line: &str) -> Option<RecentErrorEvent> {
 
     Some(RecentErrorEvent {
         timestamp,
-        severity: "warning",
+        severity,
         source: "systemd_journal_aeronyx_server_warning_alert",
         message,
         privacy_boundary: concat!(
@@ -2168,6 +2173,35 @@ fn parse_recent_error_line(line: &str) -> Option<RecentErrorEvent> {
             "voucher secrets, chat plaintext, and wallet-level traffic are redacted"
         ),
     })
+}
+
+fn classify_recent_error_severity(message: &str) -> &'static str {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("emerg")
+        || normalized.contains("emergency")
+        || normalized.contains("alert")
+        || normalized.contains("critical")
+        || normalized.contains("crit")
+        || normalized.contains("panic")
+        || normalized.contains("fatal")
+    {
+        return "critical";
+    }
+
+    if normalized.contains("error")
+        || normalized.contains("failed")
+        || normalized.contains("failure")
+        || normalized.contains("timed out")
+        || normalized.contains("timeout")
+    {
+        return "critical";
+    }
+
+    if normalized.contains("notice") || normalized.contains("info") {
+        return "info";
+    }
+
+    "warning"
 }
 
 fn sanitize_operational_log_message(input: &str) -> String {
@@ -2411,6 +2445,33 @@ mod tests {
         assert!(!sanitized.contains("2001:db8::1"));
         assert!(!sanitized.contains("api.example.com"));
         assert!(!sanitized.contains("0123456789abcdef0123456789abcdef"));
+    }
+
+    #[test]
+    fn recent_error_parser_classifies_severity_without_leaking_sensitive_tokens() {
+        let critical = parse_recent_error_line(
+            "2026-06-18T12:00:00Z host aeronyx-server[42]: ERROR failed endpoint=203.0.113.10:443 key=0123456789abcdef0123456789abcdef",
+        )
+        .expect("critical event");
+        assert_eq!(critical.severity, "critical");
+        assert!(critical.message.contains("endpoint=[ip]"));
+        assert!(critical.message.contains("key=[redacted]"));
+        assert!(!critical.message.contains("203.0.113.10"));
+        assert!(!critical
+            .message
+            .contains("0123456789abcdef0123456789abcdef"));
+
+        let warning = parse_recent_error_line(
+            "2026-06-18T12:00:01Z host aeronyx-server[42]: warning capacity threshold near limit",
+        )
+        .expect("warning event");
+        assert_eq!(warning.severity, "warning");
+
+        let info = parse_recent_error_line(
+            "2026-06-18T12:00:02Z host aeronyx-server[42]: notice service recovered after restart",
+        )
+        .expect("info event");
+        assert_eq!(info.severity, "info");
     }
 }
 
