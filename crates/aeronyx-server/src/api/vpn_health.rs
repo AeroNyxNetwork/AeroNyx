@@ -176,6 +176,10 @@ struct CapacityRiskStatus {
     code: &'static str,
     message: String,
     remediation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recommended_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recommended_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1593,8 +1597,8 @@ async fn collect_capacity_status(
         ip_pool_free,
         max_connections,
         policy_max_sessions,
-        conntrack.used_percent,
-        file_descriptors.used_percent,
+        &conntrack,
+        &file_descriptors,
         &disk,
         placement_readiness.bandwidth_limit_mbps,
         placement_readiness.bandwidth_limit_bytes_per_second,
@@ -1640,8 +1644,8 @@ fn collect_capacity_risks(
     ip_pool_free: usize,
     max_connections: usize,
     policy_max_sessions: u32,
-    conntrack_used_percent: Option<f64>,
-    fd_used_percent: Option<f64>,
+    conntrack: &ConntrackCapacityStatus,
+    file_descriptors: &FileDescriptorCapacityStatus,
     disk: &DiskCapacityStatus,
     bandwidth_limit_mbps: u32,
     bandwidth_limit_bytes_per_second: u64,
@@ -1664,9 +1668,17 @@ fn collect_capacity_risks(
                 max_connections, ip_pool_capacity
             ),
             remediation: format!(
-                "During a maintenance window, expand vpn.virtual_ip_range to at least {} or lower limits.max_connections to {} or below, then run deploy/node/install.sh --network-only.",
+                "During a maintenance window, expand vpn.virtual_ip_range to at least {} or lower limits.max_connections to {} or below, then run deploy/node/aeronyx-node.sh network.",
                 recommended, ip_pool_capacity
             ),
+            recommended_value: Some(format!(
+                "vpn.virtual_ip_range >= {} or limits.max_connections <= {}",
+                recommended, ip_pool_capacity
+            )),
+            recommended_command: Some(format!(
+                "sudo ./deploy/node/aeronyx-node.sh network --set-vpn-cidr {}",
+                recommended
+            )),
         });
     }
 
@@ -1685,10 +1697,25 @@ fn collect_capacity_risks(
                 "Expand vpn.virtual_ip_range to at least {} or lower the nodeboard policy max_sessions before commercial placement.",
                 recommended
             ),
+            recommended_value: Some(format!(
+                "nodeboard max_sessions <= {} or vpn.virtual_ip_range >= {}",
+                ip_pool_capacity, recommended
+            )),
+            recommended_command: Some(format!(
+                "sudo ./deploy/node/aeronyx-node.sh network --set-vpn-cidr {}",
+                recommended
+            )),
         });
     }
 
     if ip_pool_free == 0 {
+        let recommended = recommended_ipv4_cidr(
+            virtual_ip_range,
+            ip_pool_capacity
+                .saturating_add(256)
+                .max(ip_pool_capacity.saturating_add(1)),
+        )
+        .unwrap_or_else(|| "a larger vpn.virtual_ip_range".to_string());
         risks.push(CapacityRiskStatus {
             severity: "critical",
             code: "vpn_ip_pool_exhausted",
@@ -1696,27 +1723,45 @@ fn collect_capacity_risks(
             remediation:
                 "Drain traffic or expand vpn.virtual_ip_range before admitting additional clients."
                     .to_string(),
+            recommended_value: Some(format!("vpn.virtual_ip_range >= {}", recommended)),
+            recommended_command: Some(format!(
+                "sudo ./deploy/node/aeronyx-node.sh network --set-vpn-cidr {}",
+                recommended
+            )),
         });
     }
 
-    if let Some(percent) = conntrack_used_percent {
+    if let Some(percent) = conntrack.used_percent {
         if percent >= 80.0 {
+            let recommended = recommended_conntrack_max(conntrack.used, conntrack.max);
             risks.push(CapacityRiskStatus {
                 severity: if percent >= 90.0 { "critical" } else { "warning" },
                 code: "conntrack_pressure",
                 message: format!("Linux conntrack usage is {:.2}%.", percent),
                 remediation: "Raise nf_conntrack_max and keep conntrack headroom above 20% before scaling traffic.".to_string(),
+                recommended_value: Some(format!("net.netfilter.nf_conntrack_max >= {}", recommended)),
+                recommended_command: Some(format!(
+                    "sudo sysctl -w net.netfilter.nf_conntrack_max={}",
+                    recommended
+                )),
             });
         }
     }
 
-    if let Some(percent) = fd_used_percent {
+    if let Some(percent) = file_descriptors.used_percent {
         if percent >= 80.0 {
+            let recommended =
+                recommended_fd_soft_limit(file_descriptors.used, file_descriptors.soft_limit);
             risks.push(CapacityRiskStatus {
                 severity: if percent >= 90.0 { "critical" } else { "warning" },
                 code: "file_descriptor_pressure",
                 message: format!("Process file descriptor usage is {:.2}%.", percent),
                 remediation: "Raise the systemd LimitNOFILE value or reduce active load before adding clients.".to_string(),
+                recommended_value: Some(format!("systemd LimitNOFILE >= {}", recommended)),
+                recommended_command: Some(format!(
+                    "sudo systemctl edit aeronyx-server # set [Service] LimitNOFILE={}",
+                    recommended
+                )),
             });
         }
     }
@@ -1738,6 +1783,8 @@ fn collect_capacity_risks(
                         "interrupt node operations."
                     )
                     .to_string(),
+                    recommended_value: Some(format!("Keep {} below 85% used", disk_path.path)),
+                    recommended_command: None,
                 });
             }
         }
@@ -1758,6 +1805,11 @@ fn collect_capacity_risks(
                     bandwidth_percent, bandwidth_limit_mbps
                 ),
                 remediation: "Raise bandwidth_limit_mbps, reduce placement weight, or move traffic to another region before admitting more paid sessions.".to_string(),
+                recommended_value: Some(format!(
+                    "bandwidth_limit_mbps > {} or lower placement weight",
+                    bandwidth_limit_mbps
+                )),
+                recommended_command: None,
             });
         } else if traffic_capacity_status == "near_limit" || bandwidth_percent >= 80.0 {
             risks.push(CapacityRiskStatus {
@@ -1768,6 +1820,11 @@ fn collect_capacity_risks(
                     bandwidth_percent, bandwidth_limit_mbps
                 ),
                 remediation: "Review bandwidth_limit_mbps and regional placement before increasing commercial traffic.".to_string(),
+                recommended_value: Some(format!(
+                    "Keep bandwidth window below 80% of {} Mbps cap",
+                    bandwidth_limit_mbps
+                )),
+                recommended_command: None,
             });
         }
     }
@@ -1779,6 +1836,8 @@ fn collect_capacity_risks(
                 code: "packet_drops_detected",
                 message: format!("{} packet drops were reported by the VPN interface or policy layer.", drops),
                 remediation: "Inspect host NIC/TUN queues, CPU pressure, and policy bandwidth drops before increasing placement weight.".to_string(),
+                recommended_value: Some("packet drops should return to 0 before increasing placement".to_string()),
+                recommended_command: Some("./deploy/node/aeronyx-node.sh health --json".to_string()),
             });
         }
     }
@@ -1805,6 +1864,20 @@ fn recommended_ipv4_cidr(current_cidr: &str, required_usable_ips: usize) -> Opti
     }
 
     None
+}
+
+fn recommended_conntrack_max(used: Option<u64>, current_max: Option<u64>) -> u64 {
+    let used_target = used
+        .map(|value| value.saturating_mul(10).saturating_add(6) / 7)
+        .unwrap_or(0);
+    let doubled_current = current_max.unwrap_or(0).saturating_mul(2);
+    used_target.max(doubled_current).max(262_144)
+}
+
+fn recommended_fd_soft_limit(used: Option<u64>, current_soft_limit: Option<u64>) -> u64 {
+    let used_target = used.unwrap_or(0).saturating_mul(2);
+    let doubled_current = current_soft_limit.unwrap_or(0).saturating_mul(2);
+    used_target.max(doubled_current).max(65_535)
 }
 
 fn usable_ipv4_clients_for_prefix(prefix: u32) -> usize {
@@ -2278,14 +2351,25 @@ mod tests {
             source: "test",
             privacy_boundary: "aggregate disk capacity only",
         };
+        let conntrack = ConntrackCapacityStatus {
+            used: Some(10),
+            max: Some(1_000),
+            used_percent: Some(1.0),
+        };
+        let file_descriptors = FileDescriptorCapacityStatus {
+            used: Some(10),
+            soft_limit: Some(1_024),
+            hard_limit: Some(4_096),
+            used_percent: Some(1.0),
+        };
         let risks = collect_capacity_risks(
             "100.64.0.0/24",
             253,
             253,
             1_000,
             0,
-            Some(0.05),
-            Some(0.0),
+            &conntrack,
+            &file_descriptors,
             &disk,
             0,
             0,
@@ -2298,7 +2382,16 @@ mod tests {
         assert_eq!(risks.len(), 1);
         assert_eq!(risks[0].code, "vpn_ip_pool_below_max_connections");
         assert!(risks[0].remediation.contains("100.64.0.0/22"));
-        assert!(risks[0].remediation.contains("install.sh --network-only"));
+        assert!(risks[0]
+            .recommended_value
+            .as_deref()
+            .unwrap_or("")
+            .contains("100.64.0.0/22"));
+        assert!(risks[0]
+            .recommended_command
+            .as_deref()
+            .unwrap_or("")
+            .contains("aeronyx-node.sh network"));
     }
 
     #[test]
