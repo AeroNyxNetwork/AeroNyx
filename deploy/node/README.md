@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Document that nodeboard-generated preview commands include `--quick` so the
+  read-only plan matches the exact first-install path that the operator will
+  run after approval.
 - Clarify where the unified `deploy/node/aeronyx-node.sh` entrypoint comes
   from, so human operators and AI assistants know to clone/update the AeroNyx
   Rust repository before running repository-local commands.
@@ -60,6 +63,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.32.0-node-deploy - Documented quick install preview alignment.
 v1.31.0-node-deploy - Documented aeronyx-node.sh GitHub origin and
                      repository-local execution path.
 v1.30.0-node-deploy - Documented VPN DNS ownership modes.
@@ -192,12 +196,15 @@ Verify a generated command without root access, package installation, network
 changes, registration, or service start:
 
 ```bash
-AERONYX_REGISTRATION_CODE=<NODEBOARD_CODE> ./deploy/node/install.sh --quick --print-plan
+AERONYX_REGISTRATION_CODE=<NODEBOARD_CODE> ./deploy/node/aeronyx-node.sh plan --repo-dir "$PWD" --branch main --quick
 ```
 
-`--print-plan` hides the registration code value and prints only whether a code
-is present. This makes it safe to paste into support tickets and nodeboard
-diagnostic logs.
+`aeronyx-node.sh plan --quick` delegates to the same read-only `install.sh
+--quick --print-plan` path used by the lower-level installer. It hides the
+registration code value and prints only whether a code is present. This makes
+the preview safe to paste into support tickets and nodeboard diagnostic logs,
+while matching the actual quick install command nodeboard displays after
+operator approval.
 
 For an existing checkout in a custom path:
 

@@ -9,6 +9,9 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
+# - Keep preview/plan aligned with the commercial quick install path when a
+#   registration code is present, so operators do not approve a different plan
+#   from the command that nodeboard actually installs.
 # - Show the local structured upgrade status file from `status` so operators and
 #   AI assistants can see staged/failed upgrade state without scraping logs.
 # - Initial production entrypoint for ordinary node operators. This script
@@ -53,6 +56,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.3.0-node-entrypoint - Align quick install preview with nodeboard install.
 # v1.2.0-node-entrypoint - Show local upgrade-status.json in status output.
 # v1.1.0-node-entrypoint - Documented GitHub origin and repository-local path.
 # v1.0.0-node-entrypoint - Added single operator-facing AeroNyx node command.
@@ -158,7 +162,7 @@ Command-specific options:
     --set-vpn-cidr CIDR    Update vpn.virtual_ip_range and refresh NAT.
 
 Examples:
-  ./deploy/node/aeronyx-node.sh plan --registration-code NYX-1234-ABCDE
+  ./deploy/node/aeronyx-node.sh plan --quick --registration-code NYX-1234-ABCDE
   sudo ./deploy/node/aeronyx-node.sh install --quick --registration-code NYX-1234-ABCDE
   sudo ./deploy/node/aeronyx-node.sh upgrade --no-restart
   ./deploy/node/aeronyx-node.sh health --json
@@ -402,6 +406,9 @@ MENU
     case "${choice}" in
         1)
             read_optional_registration_code
+            if [ -n "${REGISTRATION_CODE}" ]; then
+                EXTRA_ARGS+=("--quick")
+            fi
             run_plan
             ;;
         2)
