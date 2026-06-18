@@ -111,6 +111,13 @@ pub struct DiscoveryConfig {
     /// Optional HTTP(S) JSON bootstrap snapshot URL.
     #[serde(default)]
     pub bootstrap_snapshot_url: Option<String>,
+    /// Optional public discovery endpoints contacted on every gossip round.
+    ///
+    /// These seed endpoints are not trusted authorities; they only provide
+    /// signed discovery gossip/snapshot transport so nodes can recover when a
+    /// cached peer descriptor has an outdated public endpoint.
+    #[serde(default)]
+    pub seed_endpoints: Vec<String>,
     /// Timeout in seconds for fetching a remote bootstrap snapshot.
     #[serde(default = "DiscoveryConfig::default_fetch_timeout_secs")]
     pub fetch_timeout_secs: u64,
@@ -269,6 +276,10 @@ impl DiscoveryConfig {
             }
         }
 
+        for endpoint in &self.seed_endpoints {
+            Self::validate_seed_endpoint(endpoint)?;
+        }
+
         if let Some(path) = &self.peer_cache_path {
             if path.trim().is_empty() {
                 return Err(ServerError::config_invalid(
@@ -370,6 +381,32 @@ impl DiscoveryConfig {
 
         Ok(())
     }
+
+    fn validate_seed_endpoint(endpoint: &str) -> Result<()> {
+        let trimmed = endpoint.trim();
+        if trimmed.is_empty() {
+            return Err(ServerError::config_invalid(
+                "discovery.seed_endpoints",
+                "entries must not be empty",
+            ));
+        }
+        if trimmed.contains(char::is_whitespace) {
+            return Err(ServerError::config_invalid(
+                "discovery.seed_endpoints",
+                "entries must not contain whitespace",
+            ));
+        }
+        if !(trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.contains(':'))
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.seed_endpoints",
+                "entries must be http(s) URLs or host:port endpoints",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for DiscoveryConfig {
@@ -379,6 +416,7 @@ impl Default for DiscoveryConfig {
             advertise_self: Self::default_advertise_self(),
             bootstrap_snapshot_path: None,
             bootstrap_snapshot_url: None,
+            seed_endpoints: Vec::new(),
             fetch_timeout_secs: Self::default_fetch_timeout_secs(),
             peer_cache_path: None,
             peer_cache_write_interval_secs: Self::default_peer_cache_write_interval_secs(),
@@ -690,6 +728,7 @@ db_path = "memchain.db"
 enabled = true
 bootstrap_snapshot_path = "/etc/aeronyx/bootstrap-peers.json"
 bootstrap_snapshot_url = "https://nodes.aeronyx.network/bootstrap.json"
+seed_endpoints = ["http://34.136.167.59:8422", "8.213.146.244:8422"]
 fetch_timeout_secs = 15
 peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
 peer_cache_write_interval_secs = 120
@@ -717,6 +756,13 @@ public_discovery = false
         assert_eq!(
             config.discovery.bootstrap_snapshot_url.as_deref(),
             Some("https://nodes.aeronyx.network/bootstrap.json")
+        );
+        assert_eq!(
+            config.discovery.seed_endpoints,
+            vec![
+                "http://34.136.167.59:8422".to_string(),
+                "8.213.146.244:8422".to_string()
+            ]
         );
         assert_eq!(config.discovery.fetch_timeout_secs, 15);
         assert_eq!(
@@ -759,6 +805,23 @@ enabled = true
 bootstrap_snapshot_url = "file:///tmp/bootstrap.json"
 "#;
         assert!(ServerConfig::from_str(toml_str).is_err());
+    }
+
+    #[test]
+    fn test_discovery_rejects_invalid_seed_endpoint() {
+        let empty_seed = r#"
+[discovery]
+enabled = true
+seed_endpoints = [""]
+"#;
+        assert!(ServerConfig::from_str(empty_seed).is_err());
+
+        let missing_scheme_or_port = r#"
+[discovery]
+enabled = true
+seed_endpoints = ["node.example.com"]
+"#;
+        assert!(ServerConfig::from_str(missing_scheme_or_port).is_err());
     }
 
     #[test]

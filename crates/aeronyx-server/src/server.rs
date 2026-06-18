@@ -33,6 +33,8 @@
 //      `ChatRelay` peers while retaining local pending-storage fallback.
 //  14. Optionally starts a public-only discovery API listener that exposes
 //      only `/api/discovery/*` and `/api/chat/peer/relay`.
+//  15. Optionally contacts configured discovery seed endpoints every gossip
+//      round so nodes can recover from stale cached peer endpoints.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -61,6 +63,7 @@
 //   v1.0.0-Membership  - TrafficTracker wiring
 //   v1.0.1-VpnMessageStats - encrypted message counter wiring
 //   v0.7.0-DiscoveryChatRelay - Peer-discovered encrypted chat relay fanout
+//   v0.9.0-DiscoverySeedEndpoints - Periodic seed endpoint gossip recovery
 //   v0.8.0-DiscoveryPublicApi - Optional public-only discovery listener
 //   v0.5.0-DiscoveryPeerCache - Optional local PeerStore cache load/writeback
 //   v0.6.0-DiscoveryOutboundGossip - Periodic descriptor announce + snapshot sync
@@ -68,6 +71,7 @@
 //   v0.3.0-DiscoveryBootstrap - PeerStore bootstrap snapshot loading
 // ============================================
 
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1851,16 +1855,44 @@ impl Server {
                             continue;
                         };
 
+                        let peer_limit = usize::from(config.discovery.gossip_peer_limit);
+                        let self_gossip_url = config
+                            .discovery
+                            .public_endpoint
+                            .as_deref()
+                            .or(config.network.public_endpoint.as_deref())
+                            .and_then(Self::discovery_gossip_url);
+                        let mut seen_urls = HashSet::new();
+                        let mut gossip_urls = Vec::new();
+
+                        for endpoint in &config.discovery.seed_endpoints {
+                            let Some(url) = Self::discovery_gossip_url(endpoint) else {
+                                continue;
+                            };
+                            if self_gossip_url.as_deref() == Some(url.as_str()) {
+                                continue;
+                            }
+                            if seen_urls.insert(url.clone()) {
+                                gossip_urls.push(url);
+                            }
+                            if gossip_urls.len() >= peer_limit {
+                                break;
+                            }
+                        }
+
                         let snapshot = peer_store.export_bootstrap_snapshot(
                             now,
                             now,
                             true,
-                            Some(usize::from(config.discovery.gossip_peer_limit)),
+                            Some(peer_limit),
                         );
                         let mut attempted = 0usize;
                         let mut succeeded = 0usize;
 
                         for peer in snapshot.peers {
+                            if gossip_urls.len() >= peer_limit {
+                                break;
+                            }
                             if peer.node_id() == self_node_id {
                                 continue;
                             }
@@ -1870,7 +1902,16 @@ impl Server {
                             let Some(url) = Self::discovery_gossip_url(endpoint) else {
                                 continue;
                             };
+                            if self_gossip_url.as_deref() == Some(url.as_str()) {
+                                continue;
+                            }
+                            if !seen_urls.insert(url.clone()) {
+                                continue;
+                            }
+                            gossip_urls.push(url);
+                        }
 
+                        for url in gossip_urls {
                             attempted += 1;
                             match Self::gossip_with_peer(
                                 &client,
