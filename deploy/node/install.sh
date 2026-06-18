@@ -8,6 +8,9 @@
 #   sysctl, iptables, and build commands.
 #
 # Modification Reason:
+# - Add structured, privacy-safe install context to nodeboard progress reports
+#   so operators can see command mode, service/config path, host OS/arch, failed
+#   phase, and exit code without scraping SSH logs.
 # - Preserve the current install phase for ERR traps so nodeboard can show
 #   whether a failed install stopped during preflight, dependencies, repository
 #   setup, network, build, systemd, registration, or service start.
@@ -104,6 +107,7 @@
 #   separate maintenance-window service restart.
 #
 # Last Modified:
+# v1.23.0-node-deploy - Adds structured install report context for nodeboard.
 # v1.22.0-node-deploy - Reports exact failed install phase to nodeboard.
 # v1.21.0-node-deploy - Reports privacy-safe install progress to nodeboard.
 # v1.20.0-node-deploy - Injects AERONYX_GIT_COMMIT into release builds for
@@ -165,6 +169,7 @@ SYSCTL_FILE="/etc/sysctl.d/99-aeronyx.conf"
 IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
 LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"
 LOCK_DIR=""
+SCRIPT_VERSION="v1.23.0-node-deploy"
 
 REPO_URL="${AERONYX_REPO_URL:-${DEFAULT_REPO_URL}}"
 BRANCH="${AERONYX_BRANCH:-${DEFAULT_BRANCH}}"
@@ -230,39 +235,74 @@ report_install_progress() {
     local status_name="$1"
     local step="$2"
     local message="$3"
+    local exit_code="${4:-}"
 
     [ -n "${REGISTRATION_CODE}" ] || return 0
     command -v curl >/dev/null 2>&1 || return 0
     command -v python3 >/dev/null 2>&1 || return 0
 
-    local url payload
+    local url payload command_mode host_name os_name arch_name
     url="$(install_progress_url)"
+    command_mode="$(install_command_mode)"
+    host_name="$(hostname 2>/dev/null || printf 'unknown')"
+    os_name="$(uname -s 2>/dev/null || printf 'unknown')"
+    arch_name="$(uname -m 2>/dev/null || printf 'unknown')"
     payload="$(REGISTRATION_CODE="${REGISTRATION_CODE}" \
         STATUS_NAME="${status_name}" \
         STEP_NAME="${step}" \
         MESSAGE_TEXT="${message}" \
+        COMMAND_MODE="${command_mode}" \
         REPO_DIR_VALUE="${REPO_DIR}" \
         BRANCH_VALUE="${BRANCH}" \
+        SERVICE_NAME_VALUE="${SERVICE_NAME}" \
+        CONFIG_FILE_VALUE="${CONFIG_FILE}" \
         DRY_RUN_VALUE="${DRY_RUN}" \
         QUICK_VALUE="${QUICK}" \
         PRINT_PLAN_VALUE="${PRINT_PLAN}" \
+        EXIT_CODE_VALUE="${exit_code}" \
+        SCRIPT_VERSION_VALUE="${SCRIPT_VERSION}" \
+        HOST_VALUE="${host_name}" \
+        OS_VALUE="${os_name}" \
+        ARCH_VALUE="${arch_name}" \
         python3 - <<'PY'
 import json
 import os
 
+def env_bool(name):
+    return os.environ.get(name, "0") == "1"
+
+status = os.environ.get("STATUS_NAME", "running")
+step = os.environ.get("STEP_NAME", "")
+details = {
+    "entrypoint": "deploy/node/install.sh",
+    "command": os.environ.get("COMMAND_MODE", ""),
+    "repo_dir": os.environ.get("REPO_DIR_VALUE", ""),
+    "branch": os.environ.get("BRANCH_VALUE", ""),
+    "service": os.environ.get("SERVICE_NAME_VALUE", ""),
+    "config": os.environ.get("CONFIG_FILE_VALUE", ""),
+    "dry_run": env_bool("DRY_RUN_VALUE"),
+    "quick": env_bool("QUICK_VALUE"),
+    "print_plan": env_bool("PRINT_PLAN_VALUE"),
+    "script_version": os.environ.get("SCRIPT_VERSION_VALUE", ""),
+    "host": os.environ.get("HOST_VALUE", ""),
+    "os": os.environ.get("OS_VALUE", ""),
+    "arch": os.environ.get("ARCH_VALUE", ""),
+}
+
+if status == "failed":
+    details["failed_phase"] = step
+    exit_code = os.environ.get("EXIT_CODE_VALUE", "")
+    if exit_code:
+        details["exit_code"] = exit_code
+
+details = {key: value for key, value in details.items() if value not in ("", None)}
+
 print(json.dumps({
     "code": os.environ["REGISTRATION_CODE"],
-    "status": os.environ.get("STATUS_NAME", "running"),
-    "step": os.environ.get("STEP_NAME", ""),
+    "status": status,
+    "step": step,
     "message": os.environ.get("MESSAGE_TEXT", ""),
-    "details": {
-        "entrypoint": "deploy/node/install.sh",
-        "repo_dir": os.environ.get("REPO_DIR_VALUE", ""),
-        "branch": os.environ.get("BRANCH_VALUE", ""),
-        "dry_run": os.environ.get("DRY_RUN_VALUE", ""),
-        "quick": os.environ.get("QUICK_VALUE", ""),
-        "print_plan": os.environ.get("PRINT_PLAN_VALUE", ""),
-    },
+    "details": details,
 }))
 PY
 )"
@@ -279,9 +319,25 @@ set_install_step() {
     report_install_progress "running" "${CURRENT_INSTALL_STEP}" "${CURRENT_INSTALL_MESSAGE}"
 }
 
+install_command_mode() {
+    if [ "${PRINT_PLAN}" -eq 1 ]; then
+        printf 'plan\n'
+    elif [ "${NETWORK_ONLY}" -eq 1 ]; then
+        printf 'network-only\n'
+    elif [ "${PREFLIGHT_ONLY}" -eq 1 ]; then
+        printf 'preflight-only\n'
+    elif [ "${CONFIG_ONLY}" -eq 1 ]; then
+        printf 'config-only\n'
+    elif [ "${QUICK}" -eq 1 ]; then
+        printf 'quick-install\n'
+    else
+        printf 'install\n'
+    fi
+}
+
 install_failed_trap() {
     local exit_code="$?"
-    report_install_progress "failed" "${CURRENT_INSTALL_STEP}" "${CURRENT_INSTALL_MESSAGE} failed with exit code ${exit_code}."
+    report_install_progress "failed" "${CURRENT_INSTALL_STEP}" "${CURRENT_INSTALL_MESSAGE} failed with exit code ${exit_code}." "${exit_code}"
     exit "${exit_code}"
 }
 
