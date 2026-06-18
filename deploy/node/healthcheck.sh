@@ -7,6 +7,9 @@
 #   nodes after install, upgrade, or incident response.
 #
 # Modification Reason:
+# - Add a privacy-safe operator_action JSON summary so nodeboard, support
+#   runbooks, and AI assistants can surface the next remediation step without
+#   reinterpreting raw checks in each UI.
 # - Include local upgrade-status.json in JSON output so nodeboard, AI
 #   assistants, and operators can inspect staged or failed upgrade workflows
 #   without parsing shell logs.
@@ -60,6 +63,7 @@
 #   tun.device_name from the installed config.
 #
 # Last Modified:
+# v1.18.0-node-deploy - Added operator_action JSON summary for nodeboard.
 # v1.17.0-node-deploy - Added local upgrade workflow status to JSON summary.
 # v1.16.0-node-deploy - Auto-detect live systemd repo path when --repo-dir is
 #                       not provided.
@@ -932,6 +936,91 @@ def systemd_unit_binding(service_name, repo_dir, config_path, binary_path):
         "exec_start_matches": bool(exec_start and binary_path in exec_start and f" -c {config_path}" in exec_start),
     }
 
+def first_check(checks, status):
+    for check in checks:
+        if check.get("status") == status:
+            return check.get("message") or ""
+    return ""
+
+def operator_action_payload(checks, fail_count, warn_count, local_health, upgrade_status, runtime):
+    failed_check = first_check(checks, "fail")
+    warning_check = first_check(checks, "warn")
+    local_status = local_health.get("status")
+    service_active = runtime.get("service_active")
+    upgrade_reported = bool(upgrade_status.get("reported"))
+    upgrade_state = upgrade_status.get("status")
+    upgrade_step = upgrade_status.get("step")
+    upgrade_message = upgrade_status.get("message")
+
+    if fail_count > 0:
+        return {
+            "status": "critical",
+            "priority": "fix_failed_healthcheck",
+            "title": "Healthcheck failed",
+            "detail": failed_check or "One or more required node checks failed.",
+            "next_step": "Open node detail, inspect failed checks, then run ./deploy/node/aeronyx-node.sh health --json after fixing the host.",
+            "source": "deploy/node/healthcheck.sh checks",
+        }
+
+    if upgrade_reported and upgrade_state == "failed":
+        return {
+            "status": "critical",
+            "priority": "fix_failed_upgrade",
+            "title": "Upgrade workflow failed",
+            "detail": upgrade_message or ("Upgrade stopped at %s." % upgrade_step if upgrade_step else "Upgrade workflow reported failure."),
+            "next_step": "Inspect upgrade_status, fix the failed step, then rerun ./deploy/node/aeronyx-node.sh upgrade --no-restart before a controlled restart.",
+            "source": "upgrade_status",
+        }
+
+    if service_active and service_active != "active":
+        return {
+            "status": "warning",
+            "priority": "service_not_active",
+            "title": "Service is not active",
+            "detail": "systemd reports %s for %s." % (service_active, service_name),
+            "next_step": "Run ./deploy/node/aeronyx-node.sh status and inspect ./deploy/node/aeronyx-node.sh logs --lines 200 before restarting.",
+            "source": "runtime.service_active",
+        }
+
+    if local_status in ("failed", "degraded"):
+        return {
+            "status": "warning",
+            "priority": "privacy_protocol_degraded",
+            "title": "AeroNyx privacy protocol health is %s" % local_status,
+            "detail": "The local health endpoint reports %s." % local_status,
+            "next_step": "Review capacity, network rules, recent operational events, then rerun healthcheck.",
+            "source": "local_vpn_health.status",
+        }
+
+    if warn_count > 0:
+        return {
+            "status": "warning",
+            "priority": "review_warnings",
+            "title": "Healthcheck has warnings",
+            "detail": warning_check or "One or more checks need operator review.",
+            "next_step": "Review warning checks and capacity risks before accepting more commercial traffic.",
+            "source": "deploy/node/healthcheck.sh checks",
+        }
+
+    if upgrade_reported and upgrade_state == "staged":
+        return {
+            "status": "info",
+            "priority": "upgrade_staged",
+            "title": "Upgrade is staged",
+            "detail": upgrade_message or "A new Rust build is staged without restart.",
+            "next_step": "Use maintenance mode, wait for active sessions to drain, then perform a controlled restart.",
+            "source": "upgrade_status",
+        }
+
+    return {
+        "status": "ok",
+        "priority": "monitor",
+        "title": "Node healthcheck is clean",
+        "detail": "No failed checks were found.",
+        "next_step": "Keep monitoring heartbeat freshness, capacity, traffic, and recent events in nodeboard.",
+        "source": "deploy/node/healthcheck.sh checks",
+    }
+
 checks = []
 with open(checks_path, "r", encoding="utf-8") as handle:
     for line in handle:
@@ -969,6 +1058,7 @@ runtime = {
 }
 local_health = local_health_payload(health_json_path)
 upgrade_status = upgrade_status_payload(upgrade_status_path)
+operator_action = operator_action_payload(checks, fail_count, warn_count, local_health, upgrade_status, runtime)
 
 print(json.dumps({
     "success": fail_count == 0,
@@ -988,6 +1078,7 @@ print(json.dumps({
     },
     "runtime": runtime,
     "upgrade_status": upgrade_status,
+    "operator_action": operator_action,
     "checks": checks,
     "privacy_boundary": "diagnostics only; no private keys, registration secrets, client public IPs, destinations, DNS contents, packet payloads, or wallet-level traffic",
     "generated_at": datetime.now(timezone.utc).isoformat(),
