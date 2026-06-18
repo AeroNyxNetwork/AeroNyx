@@ -197,6 +197,21 @@ impl ManagementClient {
             .clone()
     }
 
+    fn build_git_commit() -> &'static str {
+        option_env!("AERONYX_GIT_COMMIT")
+            .or(option_env!("GIT_COMMIT"))
+            .or(option_env!("VERGEN_GIT_SHA"))
+            .unwrap_or("unknown")
+    }
+
+    fn build_profile() -> &'static str {
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    }
+
     /// Creates an Ed25519 signature over SHA256(node_id + timestamp + body).
     fn create_signature(&self, timestamp: u64, body: &str) -> String {
         let node_id = self.node_id();
@@ -298,6 +313,7 @@ impl ManagementClient {
         let stats = SystemStats::collect(active_sessions);
         let runtime_id = self.runtime_id(&node_id);
         let runtime_started_at = Self::runtime_started_at();
+        let now = Self::current_timestamp();
 
         // Build system_stats (unchanged from v2.3.0).
         let mut system_stats_json = serde_json::json!({
@@ -306,6 +322,12 @@ impl ManagementClient {
             "active_sessions": stats.active_sessions,
             "runtime_id":      runtime_id,
             "runtime_started_at": runtime_started_at,
+            "runtime_uptime_seconds": now.saturating_sub(runtime_started_at),
+            "runtime_version": super::integrity::get_version(),
+            "runtime_git_commit": Self::build_git_commit(),
+            "runtime_build_profile": Self::build_profile(),
+            "runtime_build_target": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            "runtime_process_id": std::process::id(),
         });
 
         if let Some(obj) = system_stats_json.as_object_mut() {

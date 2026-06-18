@@ -35,6 +35,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
 use crate::config::ServerConfig;
+use crate::management::integrity;
 use crate::services::session::CLIENT_LIVENESS_TIMEOUT_SECS;
 use crate::services::{
     IpPoolService, NodePolicyEnforcementSnapshot, NodePolicyPlacementSnapshot, NodePolicyRuntime,
@@ -46,6 +47,7 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_QUERY_NAME: &str = "api.aeronyx.network";
 const EGRESS_CHECK_ADDR: &str = "1.1.1.1:443";
 const VPN_SERVICE_NAME: &str = "aeronyx-server";
+static RUNTIME_STARTED_AT: OnceLock<u64> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct VpnHealthState {
@@ -208,6 +210,7 @@ struct VpnHealthResponse {
     voucher_metrics: VoucherMetricsSnapshot,
     encrypted_message_forwarding: EncryptedMessageForwardingStatus,
     session_cleanup: SessionCleanupStatus,
+    runtime: RuntimeVersionStatus,
     checks: Vec<HealthCheck>,
 }
 
@@ -235,6 +238,20 @@ struct RuntimeRolloutStatus {
     executable_replaced: bool,
     restart_required: bool,
     detail: String,
+    source: &'static str,
+    privacy_boundary: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeVersionStatus {
+    version: &'static str,
+    git_commit: &'static str,
+    build_profile: &'static str,
+    build_target: String,
+    process_id: u32,
+    started_at: u64,
+    uptime_seconds: u64,
+    rollout: RuntimeRolloutStatus,
     source: &'static str,
     privacy_boundary: &'static str,
 }
@@ -408,6 +425,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         active_sessions,
     )
     .await;
+    let runtime = collect_runtime_version_status().await;
 
     VpnHealthResponse {
         status,
@@ -449,6 +467,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
                 "voucher secrets, client public IPs, or wallet-level traffic"
             ),
         },
+        runtime,
         checks,
     }
 }
@@ -466,6 +485,7 @@ async fn collect_node_operator_status_response(
     let api_secret_configured = config.memchain.effective_api_secret().is_some();
     let encrypted_messages = state.encrypted_message_counter.load(Ordering::Relaxed);
     let runtime_rollout = collect_runtime_rollout_status().await;
+    let runtime_version = collect_runtime_version_status_with_rollout(runtime_rollout.clone());
     let mut services = Vec::new();
     let mut risks = Vec::new();
 
@@ -495,6 +515,7 @@ async fn collect_node_operator_status_response(
             "service_manager": vpn_health.service_manager,
             "encrypted_message_forwarding": vpn_health.encrypted_message_forwarding,
             "session_cleanup": vpn_health.session_cleanup,
+            "runtime": runtime_version.clone(),
             "placement_readiness": vpn_health.placement_readiness,
             "capacity": vpn_health.capacity,
             "failed_checks": vpn_health.checks.iter().filter(|check| !check.ok).count(),
@@ -740,7 +761,10 @@ fn collect_transport_health(
         detail: if transports.udp_enabled && udp_listener_ok {
             format!("UDP data-plane listener is active at {}", udp_listen_addr)
         } else {
-            format!("UDP is configured but listener check failed at {}", udp_listen_addr)
+            format!(
+                "UDP is configured but listener check failed at {}",
+                udp_listen_addr
+            )
         },
     };
 
@@ -841,6 +865,57 @@ async fn collect_runtime_rollout_status() -> RuntimeRolloutStatus {
             "contents, packet payloads, domains, URLs, browsing history, ",
             "voucher secrets, client public IPs, or wallet-level traffic"
         ),
+    }
+}
+
+async fn collect_runtime_version_status() -> RuntimeVersionStatus {
+    let rollout = collect_runtime_rollout_status().await;
+    collect_runtime_version_status_with_rollout(rollout)
+}
+
+fn collect_runtime_version_status_with_rollout(
+    rollout: RuntimeRolloutStatus,
+) -> RuntimeVersionStatus {
+    // Source path:
+    //   /root/open/AeroNyx/crates/aeronyx-server/src/api/vpn_health.rs
+    //
+    // This is node runtime metadata for commercial operations. It helps
+    // nodeboard distinguish "online but old binary" from an actually upgraded
+    // node. It intentionally excludes client identifiers, destinations, DNS
+    // contents, packet payloads, domains, URLs, browsing history, voucher
+    // secrets, and wallet-level traffic.
+    let started_at = *RUNTIME_STARTED_AT.get_or_init(unix_now_secs);
+    let now = unix_now_secs();
+    RuntimeVersionStatus {
+        version: integrity::get_version(),
+        git_commit: build_git_commit(),
+        build_profile: build_profile(),
+        build_target: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        process_id: std::process::id(),
+        started_at,
+        uptime_seconds: now.saturating_sub(started_at),
+        rollout,
+        source: "rust_process_runtime_metadata",
+        privacy_boundary: concat!(
+            "runtime build/process metadata only; no client public IPs, ",
+            "destinations, DNS contents, packet payloads, domains, URLs, ",
+            "browsing history, voucher secrets, or wallet-level traffic"
+        ),
+    }
+}
+
+fn build_git_commit() -> &'static str {
+    option_env!("AERONYX_GIT_COMMIT")
+        .or(option_env!("GIT_COMMIT"))
+        .or(option_env!("VERGEN_GIT_SHA"))
+        .unwrap_or("unknown")
+}
+
+fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
     }
 }
 
