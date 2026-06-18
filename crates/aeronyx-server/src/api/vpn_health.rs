@@ -20,6 +20,10 @@
 //! Transport capability telemetry is also metadata only. Phase 1 reports that
 //! UDP is the only active data-plane carrier while TCP/TLS and WebSocket HTTPS
 //! remain planned fallback carriers until their runtime listeners are added.
+//! Recent error telemetry is sourced from local service logs, sanitized, and
+//! capped so nodeboard can triage node operations without collecting client
+//! public IPs, destinations, DNS contents, packet payloads, domains, URLs,
+//! voucher secrets, chat plaintext, or wallet-level traffic.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -161,6 +165,15 @@ struct VpnCapacityStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct RecentErrorEvent {
+    timestamp: Option<String>,
+    severity: &'static str,
+    source: &'static str,
+    message: String,
+    privacy_boundary: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct TransportCarrierStatus {
     key: &'static str,
     enabled: bool,
@@ -207,6 +220,7 @@ struct VpnHealthResponse {
     policy_enforcement: NodePolicyEnforcementSnapshot,
     placement_readiness: NodePolicyPlacementSnapshot,
     capacity: VpnCapacityStatus,
+    recent_errors: Vec<RecentErrorEvent>,
     voucher_metrics: VoucherMetricsSnapshot,
     encrypted_message_forwarding: EncryptedMessageForwardingStatus,
     session_cleanup: SessionCleanupStatus,
@@ -426,6 +440,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     )
     .await;
     let runtime = collect_runtime_version_status().await;
+    let recent_errors = collect_recent_error_events(VPN_SERVICE_NAME).await;
 
     VpnHealthResponse {
         status,
@@ -448,6 +463,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         policy_enforcement,
         placement_readiness,
         capacity,
+        recent_errors,
         voucher_metrics: state.voucher_verifier.metrics_snapshot(),
         encrypted_message_forwarding: EncryptedMessageForwardingStatus {
             count: state.encrypted_message_counter.load(Ordering::Relaxed),
@@ -518,6 +534,7 @@ async fn collect_node_operator_status_response(
             "runtime": runtime_version.clone(),
             "placement_readiness": vpn_health.placement_readiness,
             "capacity": vpn_health.capacity,
+            "recent_errors": vpn_health.recent_errors,
             "failed_checks": vpn_health.checks.iter().filter(|check| !check.ok).count(),
             "runtime_rollout": runtime_rollout.clone(),
         }),
@@ -1568,6 +1585,119 @@ fn round_two(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
+async fn collect_recent_error_events(service_name: &str) -> Vec<RecentErrorEvent> {
+    let output = match run_command(
+        "journalctl",
+        &[
+            "-u",
+            service_name,
+            "-p",
+            "warning..alert",
+            "--since",
+            "-24 hours",
+            "--no-pager",
+            "--output=short-iso",
+            "--lines=20",
+        ],
+        Duration::from_secs(3),
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(_) => return Vec::new(),
+    };
+
+    output
+        .lines()
+        .rev()
+        .filter_map(parse_recent_error_line)
+        .take(5)
+        .collect()
+}
+
+fn parse_recent_error_line(line: &str) -> Option<RecentErrorEvent> {
+    let line = line.trim();
+    if line.is_empty() || line == "-- No entries --" {
+        return None;
+    }
+
+    let mut parts = line.split_whitespace();
+    let timestamp = parts.next().map(|value| value.to_string());
+    let _host = parts.next();
+    let _unit = parts.next();
+    let message = parts.collect::<Vec<_>>().join(" ");
+    let message = sanitize_operational_log_message(&message);
+    if message.is_empty() {
+        return None;
+    }
+
+    Some(RecentErrorEvent {
+        timestamp,
+        severity: "warning",
+        source: "systemd_journal_aeronyx_server_warning_alert",
+        message,
+        privacy_boundary: concat!(
+            "sanitized node service log summary only; client public IPs, URLs, ",
+            "long key-like values, DNS contents, destinations, packet payloads, ",
+            "voucher secrets, chat plaintext, and wallet-level traffic are redacted"
+        ),
+    })
+}
+
+fn sanitize_operational_log_message(input: &str) -> String {
+    let mut out = Vec::new();
+    for token in input.split_whitespace() {
+        let trimmed = token
+            .trim_matches(|c: char| matches!(c, ',' | ';' | ')' | '(' | '[' | ']' | '"' | '\''));
+        let (prefix, value) = trimmed
+            .split_once('=')
+            .map(|(key, value)| (Some(key), value))
+            .unwrap_or((None, trimmed));
+        let lower = value.to_ascii_lowercase();
+        let replacement = if lower.starts_with("http://") || lower.starts_with("https://") {
+            Some("[url]")
+        } else if value.parse::<Ipv4Addr>().is_ok() {
+            Some("[ip]")
+        } else if looks_like_key_material(value) {
+            Some("[redacted]")
+        } else {
+            None
+        };
+
+        if let Some(replacement) = replacement {
+            if let Some(prefix) = prefix {
+                out.push(format!("{}={}", prefix, replacement));
+            } else {
+                out.push(replacement.to_string());
+            }
+        } else {
+            out.push(token.to_string());
+        }
+    }
+
+    let mut message = out.join(" ").replace('\0', "");
+    const MAX_LEN: usize = 240;
+    if message.len() > MAX_LEN {
+        message.truncate(MAX_LEN);
+        message.push_str("...");
+    }
+    message
+}
+
+fn looks_like_key_material(value: &str) -> bool {
+    if value.len() >= 32 && value.chars().all(|c| c.is_ascii_hexdigit()) {
+        return true;
+    }
+    if value.len() >= 24
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '=' | '/' | '+'))
+    {
+        return true;
+    }
+    false
+}
+
 async fn dns_query_a(server_ip: Ipv4Addr, name: &str) -> std::result::Result<u16, String> {
     let server = SocketAddr::from((server_ip, 53));
     let socket = UdpSocket::bind("0.0.0.0:0")
@@ -1644,6 +1774,19 @@ mod tests {
         assert_eq!(risks[0].code, "vpn_ip_pool_below_max_connections");
         assert!(risks[0].remediation.contains("100.64.0.0/22"));
         assert!(risks[0].remediation.contains("install.sh --network-only"));
+    }
+
+    #[test]
+    fn recent_error_sanitizer_redacts_sensitive_tokens() {
+        let sanitized = sanitize_operational_log_message(
+            "failed peer 203.0.113.10 url=https://example.com/path key=0123456789abcdef0123456789abcdef",
+        );
+
+        assert!(sanitized.contains("[ip]"));
+        assert!(sanitized.contains("url=[url]") || sanitized.contains("[url]"));
+        assert!(sanitized.contains("key=[redacted]") || sanitized.contains("[redacted]"));
+        assert!(!sanitized.contains("203.0.113.10"));
+        assert!(!sanitized.contains("0123456789abcdef0123456789abcdef"));
     }
 }
 
