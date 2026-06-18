@@ -9,6 +9,9 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
+# - Add a privacy-safe operator recommendation to `status` by reading the
+#   existing healthcheck `operator_action` JSON. This gives ordinary node
+#   operators and AI assistants a clear next step without scraping logs.
 # - Keep preview/plan aligned with the commercial quick install path when a
 #   registration code is present, so operators do not approve a different plan
 #   from the command that nodeboard actually installs.
@@ -56,6 +59,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.4.0-node-entrypoint - Show healthcheck operator recommendation in status.
 # v1.3.0-node-entrypoint - Align quick install preview with nodeboard install.
 # v1.2.0-node-entrypoint - Show local upgrade-status.json in status output.
 # v1.1.0-node-entrypoint - Documented GitHub origin and repository-local path.
@@ -119,7 +123,7 @@ Commands:
   upgrade    Pull/build/validate/upgrade the Rust node with safety checks.
   health     Run the node health check. Use --json or --json-only for tooling.
   doctor     Alias for health.
-  status     Show systemd service status and local runtime endpoints.
+  status     Show service, local endpoints, upgrade state, and next action.
   logs       Show recent systemd logs. Use --follow to tail.
   network    Refresh forwarding/NAT or update the privacy protocol IP pool.
   menu       Open the interactive operator menu.
@@ -292,6 +296,75 @@ run_health() {
         "${EXTRA_ARGS[@]}"
 }
 
+show_operator_recommendation() {
+    log "Operator recommendation"
+    if [ ! -x "${HEALTHCHECK_SCRIPT}" ]; then
+        warn "Healthcheck script not executable or missing: ${HEALTHCHECK_SCRIPT}"
+        return
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 not found; run ./deploy/node/aeronyx-node.sh health --json for the full recommendation"
+        return
+    fi
+
+    local tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/aeronyx-health.XXXXXX")" || {
+        warn "Could not create temporary file for healthcheck recommendation"
+        return
+    }
+
+    local healthcheck_exit=0
+    "${HEALTHCHECK_SCRIPT}" \
+        --repo-dir "${REPO_DIR}" \
+        --config "${CONFIG_FILE}" \
+        --service "${SERVICE_NAME}" \
+        --json-only >"${tmp}" 2>/dev/null || healthcheck_exit=$?
+
+    if [ ! -s "${tmp}" ]; then
+        rm -f "${tmp}"
+        warn "Healthcheck recommendation unavailable; run ./deploy/node/aeronyx-node.sh health --json for details"
+        return
+    fi
+
+    python3 - "${tmp}" <<'PY' || true
+import json
+import sys
+
+def clean(value, limit=520):
+    if value is None:
+        return "unknown"
+    text = str(value).replace("\n", " ").replace("\r", " ").strip()
+    return text[:limit] if text else "unknown"
+
+try:
+    data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+except Exception as exc:
+    print(f"operator_action=unreadable error={clean(exc)}")
+    raise SystemExit(0)
+
+action = data.get("operator_action") or {}
+if not isinstance(action, dict) or not action:
+    print("operator_action=unavailable")
+    raise SystemExit(0)
+
+print(
+    "operator_status={status} priority={priority} source={source}".format(
+        status=clean(action.get("status")),
+        priority=clean(action.get("priority")),
+        source=clean(action.get("source")),
+    )
+)
+print(f"operator_title={clean(action.get('title'))}")
+print(f"operator_detail={clean(action.get('detail'))}")
+print(f"operator_next_step={clean(action.get('next_step'))}")
+PY
+    if [ "${healthcheck_exit}" -ne 0 ]; then
+        warn "Healthcheck exited with ${healthcheck_exit}; recommendation was still parsed from JSON"
+    fi
+    rm -f "${tmp}"
+}
+
 show_status() {
     validate_service_name
 
@@ -344,6 +417,8 @@ PY
     else
         warn "No local upgrade status file found: ${UPGRADE_STATUS_FILE}"
     fi
+
+    show_operator_recommendation
 }
 
 show_logs() {

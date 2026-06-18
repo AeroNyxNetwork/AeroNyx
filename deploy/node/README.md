@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Document that `aeronyx-node.sh status` includes the healthcheck
+  operator_action recommendation so ordinary operators can see the next step
+  without parsing JSON or service logs.
 - Document recent operational event severity mapping so nodeboard can
   prioritize critical service failures without exposing raw logs or user data.
 - Document that nodeboard-generated preview commands include `--quick` so the
@@ -65,6 +68,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.34.0-node-deploy - Documented status operator recommendation.
 v1.33.0-node-deploy - Documented recent error severity mapping.
 v1.32.0-node-deploy - Documented quick install preview alignment.
 v1.31.0-node-deploy - Documented aeronyx-node.sh GitHub origin and
@@ -383,6 +387,22 @@ client public IPs, DNS contents, destinations, packet payloads, chat plaintext,
 voucher secrets, and wallet-level traffic. `aeronyx-node.sh status` displays a
 short summary of this file, and `healthcheck.sh --json-only` exposes it as
 top-level `upgrade_status` for nodeboard or AI maintenance automation.
+
+`aeronyx-node.sh status` also runs the read-only healthcheck JSON path and
+prints the privacy-safe `operator_action` summary:
+
+```text
+operator_status=warning priority=review_warnings source=deploy/node/healthcheck.sh checks
+operator_title=Healthcheck has warnings
+operator_detail=...
+operator_next_step=Review warning checks and capacity risks before accepting more commercial traffic.
+```
+
+This is the recommended first command for human operators and AI maintenance
+assistants because it combines service state, local endpoints, upgrade state,
+and the next action in one place without exposing client public IPs,
+destinations, DNS contents, packet payloads, chat plaintext, registration
+codes, private keys, voucher secrets, or wallet-level traffic.
 
 Build and validate without restarting:
 
