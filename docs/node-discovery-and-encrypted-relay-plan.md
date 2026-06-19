@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.2.0 - Added the Blind Node Invariant as the first protocol-level privacy rule before continuing discovery, encrypted relay, Memory Chain coordination, multi-hop, or onion routing work.
+Modification Reason: v0.3.0 - Added the discovery restart-recovery gate. A node should not be considered a stable relay or multihop foundation only because its current in-memory PeerStore is fresh; it must also have seed recovery or peer-cache persistence configured.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordination.
+Last Modified: v0.3.0 - Added restart-recovery gate for PeerStore relay foundation readiness.
+Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordination.
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
@@ -224,6 +225,7 @@ Discovery status may report:
 - valid peers
 - public peers
 - gossip freshness
+- restart recovery readiness
 - rejected or stale descriptor counters
 - seed endpoint count
 
@@ -238,6 +240,34 @@ Discovery status must not report:
 
 This is the boundary between a privacy protocol and a network of readable
 middleboxes.
+
+### 5.5 Restart recovery gate for relay foundation
+
+A fresh in-memory peer view is not enough for a commercial relay foundation.
+Rust nodes restart during upgrades, host maintenance, kernel work, and incident
+recovery. If the node loses all verified peers after restart and has no seed
+recovery path, later relay or multihop features will fail unpredictably.
+
+`PeerStoreStabilityStatus.restart_recovery_configured` is therefore part of
+the discovery readiness contract.
+
+The field is true when at least one restart recovery path is configured:
+
+- discovery seed endpoints can rehydrate peers through signed gossip; or
+- peer-cache persistence can restore the last verified snapshot locally.
+
+Relay foundation readiness should require:
+
+1. discovery enabled
+2. at least two valid signed peers
+3. fresh outbound gossip when gossip is enabled
+4. no repeated gossip failure threshold breach
+5. restart recovery configured through seed endpoints or peer cache
+
+This gate is intentionally privacy-safe. It reports only whether recovery is
+configured; it does not expose seed endpoint values, peer URLs, full public
+keys, user routes, packet payloads, DNS contents, destinations, Memory Chain
+plaintext, or wallet-level traffic.
 
 ## 6. Node Identity
 

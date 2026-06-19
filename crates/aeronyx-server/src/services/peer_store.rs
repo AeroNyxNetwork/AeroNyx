@@ -37,14 +37,17 @@
 //! 7. Gossip message handlers reuse the same verification and anti-rollback path
 //!
 //! ## Important Note for Next Developer
-//! - This store is memory-only in Phase 2. Bootstrap snapshots can hydrate it,
-//!   but local persistence and gossip are intentionally separate future steps.
+//! - This store keeps verified descriptors in memory, while optional peer-cache
+//!   persistence and seed gossip provide restart recovery. Do not treat a
+//!   currently healthy in-memory peer view as commercially resilient unless
+//!   `PeerStoreStabilityStatus.restart_recovery_configured` is true.
 //! - Do not store client-level traffic, wallet traffic, DNS contents, packet
 //!   payloads, browsing history, voucher secrets, or private keys here.
 //! - Do not use this as public-exit authorization. `allows_public_exit` stays
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.10.0-DiscoveryRestartRecovery - Gate relay foundation on restart recovery
 //! v0.9.0-DiscoveryStability - Added aggregate discovery stability summary
 //! v0.8.0-DiscoveryGossipHealth - Added outbound gossip health summary fields
 //! v0.7.0-DiscoverySeedStatus - Added privacy-safe seed endpoint recovery counters
@@ -252,6 +255,8 @@ pub struct PeerStoreStabilityStatus {
     pub seed_recovery_configured: bool,
     /// Configured stale window for gossip freshness checks.
     pub stale_after_seconds: u64,
+    /// Whether this node has at least one configured recovery path after restart.
+    pub restart_recovery_configured: bool,
 }
 
 /// Cumulative runtime counters for nodeboard and operator diagnostics.
@@ -910,6 +915,8 @@ impl PeerStore {
             Self::optional_age(now, bootstrap.last_gossip_success_at);
         let last_gossip_round_age_seconds = Self::optional_age(now, bootstrap.last_gossip_round_at);
         let seed_recovery_configured = bootstrap.seed_endpoints_configured > 0;
+        let restart_recovery_configured =
+            seed_recovery_configured || bootstrap.peer_cache_configured;
         let has_minimum_peer_view = snapshot.valid_peers >= 2;
         let gossip_success_is_fresh = !bootstrap.gossip_enabled
             || last_gossip_success_age_seconds
@@ -965,6 +972,13 @@ impl PeerStore {
                 "PeerStore has only one valid signed peer, so the multi-node relay foundation is incomplete.",
                 "Add or recover at least one additional signed AeroNyx peer before testing relay paths.",
             )
+        } else if !restart_recovery_configured {
+            (
+                "degraded",
+                false,
+                "PeerStore has fresh peers, but no seed recovery or peer cache is configured for restart resilience.",
+                "Configure discovery seed endpoints or peer_cache_path before treating this node as a stable relay foundation.",
+            )
         } else if gossip_success_is_fresh {
             (
                 "healthy",
@@ -990,6 +1004,7 @@ impl PeerStore {
             last_gossip_round_age_seconds,
             seed_recovery_configured,
             stale_after_seconds: DISCOVERY_GOSSIP_STALE_AFTER_SECS,
+            restart_recovery_configured,
         }
     }
 
@@ -1459,6 +1474,7 @@ mod tests {
         assert_eq!(status.stability.last_gossip_success_age_seconds, Some(60));
         assert_eq!(status.stability.last_gossip_round_age_seconds, Some(60));
         assert!(status.stability.seed_recovery_configured);
+        assert!(status.stability.restart_recovery_configured);
     }
 
     #[test]
@@ -1506,5 +1522,48 @@ mod tests {
             status.stability.stale_after_seconds,
             DISCOVERY_GOSSIP_STALE_AFTER_SECS
         );
+    }
+
+    #[test]
+    fn test_stability_requires_restart_recovery_for_relay_foundation() {
+        let store = PeerStore::new();
+        store.configure_bootstrap_status(true, false, true, 0);
+        let now = 1_700_000_180;
+        store
+            .upsert_verified(signed_descriptor(1, 1_700_001_000), now)
+            .unwrap();
+        store
+            .upsert_verified(signed_descriptor(1, 1_700_001_000), now)
+            .unwrap();
+        store.record_gossip_round(now - 60, 2, 2, 0, None);
+
+        let status = store.status(now);
+
+        assert_eq!(status.stability.health, "degraded");
+        assert!(!status.stability.relay_foundation_ready);
+        assert!(!status.stability.seed_recovery_configured);
+        assert!(!status.stability.restart_recovery_configured);
+        assert!(status.stability.next_action.contains("peer_cache_path"));
+    }
+
+    #[test]
+    fn test_stability_accepts_peer_cache_as_restart_recovery() {
+        let store = PeerStore::new();
+        store.configure_bootstrap_status(true, true, true, 0);
+        let now = 1_700_000_180;
+        store
+            .upsert_verified(signed_descriptor(1, 1_700_001_000), now)
+            .unwrap();
+        store
+            .upsert_verified(signed_descriptor(1, 1_700_001_000), now)
+            .unwrap();
+        store.record_gossip_round(now - 60, 2, 2, 0, None);
+
+        let status = store.status(now);
+
+        assert_eq!(status.stability.health, "healthy");
+        assert!(status.stability.relay_foundation_ready);
+        assert!(!status.stability.seed_recovery_configured);
+        assert!(status.stability.restart_recovery_configured);
     }
 }
