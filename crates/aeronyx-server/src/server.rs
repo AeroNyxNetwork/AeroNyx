@@ -48,6 +48,8 @@
 //      privacy-safe peer-discovery readiness contract.
 //  22. Saves the verified PeerStore cache once immediately after bootstrap so
 //      restart recovery is durable before the first periodic write interval.
+//  23. Flushes the verified PeerStore cache once more during graceful shutdown
+//      so recently discovered peers are not lost during node upgrades.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -67,6 +69,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.0.6-DiscoveryShutdownCacheFlush - Persist PeerStore cache on shutdown
 //   v1.0.5-DiscoveryImmediateCacheSave - Persist PeerStore cache after bootstrap
 //   v1.0.4-DiscoveryHealthContract - PeerStore summary in VPN health
 //   v1.0.3-DNSOwnership - Honor vpn.dns_proxy_enabled before spawning DNS proxy
@@ -1903,24 +1906,40 @@ impl Server {
 
         Some(tokio::spawn(async move {
             let mut timer = tokio::time::interval(Duration::from_secs(interval_secs));
-            loop {
-                tokio::select! {
-                    _ = rx.recv() => break,
-                    _ = timer.tick() => {
-                        if shutdown.load(Ordering::SeqCst) { break; }
-                        let now = unix_now_secs();
-                        if let Err(e) = Self::persist_peer_store_cache_once(&peer_store, &path, now).await {
-                            warn!(
-                                source = %path,
-                                error = %e,
-                                "[DISCOVERY] Failed to persist peer cache snapshot"
-                            );
-                        } else {
+            let persist_snapshot =
+                |peer_store: Arc<PeerStore>, path: String, reason: &'static str| async move {
+                    let now = unix_now_secs();
+                    match Self::persist_peer_store_cache_once(&peer_store, &path, now).await {
+                        Ok(()) => {
                             debug!(
                                 source = %path,
+                                reason = reason,
                                 "[DISCOVERY] Peer cache snapshot persisted"
                             );
                         }
+                        Err(e) => {
+                            warn!(
+                                source = %path,
+                                reason = reason,
+                                error = %e,
+                                "[DISCOVERY] Failed to persist peer cache snapshot"
+                            );
+                        }
+                    }
+                };
+
+            loop {
+                tokio::select! {
+                    _ = rx.recv() => {
+                        persist_snapshot(Arc::clone(&peer_store), path.clone(), "shutdown").await;
+                        break;
+                    }
+                    _ = timer.tick() => {
+                        if shutdown.load(Ordering::SeqCst) {
+                            persist_snapshot(Arc::clone(&peer_store), path.clone(), "shutdown_flag").await;
+                            break;
+                        }
+                        persist_snapshot(Arc::clone(&peer_store), path.clone(), "interval").await;
                     }
                 }
             }
@@ -3586,7 +3605,7 @@ mod tests {
         config.discovery.public_endpoint = Some("node.example.com:443".to_string());
 
         let server = Server::new(config, IdentityKeyPair::generate(), None);
-        let now = 1_800_000_000;
+        let now = unix_now_secs();
         let signed = server.build_self_discovery_descriptor(now).unwrap();
         let peer_store = Arc::new(PeerStore::new());
         assert!(peer_store.upsert_verified(signed, now).unwrap());
@@ -3697,6 +3716,60 @@ mod tests {
             Some("snapshot_persisted")
         );
         assert!(status.stability.restart_recovery_configured);
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_persistence_task_flushes_cache_on_shutdown() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.peer_cache_write_interval_secs = 3600;
+        config.discovery.peer_cache_path = Some(
+            std::env::temp_dir()
+                .join(format!(
+                    "aeronyx-peer-cache-shutdown-{}.json",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))
+                .to_string_lossy()
+                .to_string(),
+        );
+        config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+
+        let server = Server::new(config.clone(), IdentityKeyPair::generate(), None);
+        let now = unix_now_secs();
+        let signed = server.build_self_discovery_descriptor(now).unwrap();
+        let peer_store = Arc::new(PeerStore::new());
+        assert!(peer_store.upsert_verified(signed, now).unwrap());
+
+        let path = config.discovery.peer_cache_path.unwrap();
+        let handle = server
+            .spawn_peer_store_persistence_task(Arc::clone(&peer_store))
+            .expect("peer cache persistence should be enabled");
+        server
+            .shutdown_tx
+            .send(())
+            .expect("shutdown receiver should be subscribed");
+        handle.await.expect("peer cache task should stop cleanly");
+
+        let bytes = tokio::fs::read(&path)
+            .await
+            .expect("shutdown should flush PeerStore cache");
+        let snapshot = NodeBootstrapSnapshot::from_json_bytes(&bytes).unwrap();
+        assert_eq!(snapshot.verified_count_at(now + 1), 1);
+
+        let status = peer_store.status(now + 1);
+        assert_eq!(
+            status.bootstrap.last_cache_save_status.as_deref(),
+            Some("success")
+        );
+        assert_eq!(
+            status.bootstrap.last_cache_save_detail.as_deref(),
+            Some("snapshot_persisted")
+        );
 
         let _ = tokio::fs::remove_file(path).await;
     }
