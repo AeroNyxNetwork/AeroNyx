@@ -52,6 +52,7 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v1.4.0-DiscoveryRelayCapabilities — Added explicit onion-middle advertisement gate
 //! v1.3.0-TransportCapability — Added VPN transport capability accessors
 //! v2.1.0            — Added MemChain config fields
 //! v1.2.0-DNSOwnership — Added DNS proxy ownership accessor for server startup
@@ -196,6 +197,13 @@ pub struct DiscoveryConfig {
     /// Whether this node may appear in public bootstrap snapshots.
     #[serde(default = "DiscoveryConfig::default_public_discovery")]
     pub public_discovery: bool,
+    /// Whether this node explicitly advertises future no-exit onion middle-hop relay.
+    ///
+    /// This stays disabled by default because it changes a node's public
+    /// routing role. Enabling it only announces node-level relay capability;
+    /// payloads remain opaque and are never parsed by the node.
+    #[serde(default)]
+    pub advertise_onion_middle: bool,
 }
 
 impl DiscoveryConfig {
@@ -493,6 +501,7 @@ impl Default for DiscoveryConfig {
             region: None,
             descriptor_ttl_secs: Self::default_descriptor_ttl_secs(),
             public_discovery: Self::default_public_discovery(),
+            advertise_onion_middle: false,
         }
     }
 }
@@ -820,6 +829,7 @@ public_api_listen_addr = "0.0.0.0:8422"
 region = "us-central"
 descriptor_ttl_secs = 7200
 public_discovery = false
+advertise_onion_middle = true
 "#;
         let config = ServerConfig::from_str(toml_str).unwrap();
         assert!(config.discovery.enabled);
@@ -873,6 +883,7 @@ public_discovery = false
         assert_eq!(config.discovery.region.as_deref(), Some("us-central"));
         assert_eq!(config.discovery.descriptor_ttl_secs, 7200);
         assert!(!config.discovery.public_discovery);
+        assert!(config.discovery.advertise_onion_middle);
     }
 
     #[test]

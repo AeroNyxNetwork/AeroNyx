@@ -6,6 +6,8 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - Document discovery peer-store, public peer API, and explicit onion-middle
+#   advertisement controls for future no-exit multi-hop relay planning.
 # - Document vpn.transports capability metadata for commercial transport
 #   readiness. Phase 1 remains UDP-only at the data-plane runtime.
 # - Document vpn.dns_proxy_enabled so operators can explicitly choose whether
@@ -38,6 +40,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.4.0-node-deploy - Added discovery peer-store and onion-middle controls.
 # v1.3.0-node-deploy - Added VPN transport capability metadata defaults.
 # v1.2.0-node-deploy - Added DNS proxy ownership flag.
 # v1.1.0-node-deploy - Expanded default VPN pool to /22 for 1000-session
@@ -90,6 +93,35 @@ session_report_interval_secs = 30
 request_timeout_secs = 10
 max_retries = 3
 node_info_path = "/etc/aeronyx/node_info.json"
+
+[discovery]
+# Discovery is the node-to-node control plane for signed peer descriptors.
+# It never carries chat plaintext, packet payloads, DNS contents, destinations,
+# voucher secrets, wallet traffic, or private keys.
+enabled = true
+advertise_self = true
+peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
+peer_cache_write_interval_secs = 120
+gossip_enabled = true
+gossip_interval_secs = 45
+gossip_peer_limit = 8
+gossip_jitter_percent = 15
+gossip_backpressure_failure_threshold = 4
+gossip_failure_backoff_max_secs = 180
+max_peers = 512
+max_snapshot_limit = 64
+gossip_rate_limit_per_minute = 30
+# Set this to the public HTTP(S) endpoint that reaches public_api_listen_addr.
+# ChatRelay and OnionMiddle capabilities are not advertised unless this is set,
+# which prevents stale or UDP-only VPN endpoints from polluting peer routing.
+# public_endpoint = "https://node.example.com"
+public_api_listen_addr = "0.0.0.0:8422"
+region = "unknown"
+descriptor_ttl_secs = 7200
+public_discovery = false
+# No-exit onion middle-hop capability is opt-in. Leave disabled until the
+# operator explicitly wants this node to participate in multi-hop relay paths.
+advertise_onion_middle = false
 
 # Commercial VPN nodes should start with MemChain disabled unless the operator
 # explicitly wants local memory-chain services on the same machine.

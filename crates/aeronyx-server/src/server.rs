@@ -2582,9 +2582,20 @@ impl Server {
 
     fn discovery_capabilities_for(config: &ServerConfig) -> Vec<NodeCapability> {
         let mut capabilities = vec![NodeCapability::PrivacyRelay];
+        let advertises_peer_api = config.discovery.public_api_listen_addr.is_some()
+            && config
+                .discovery
+                .public_endpoint
+                .as_deref()
+                .map(str::trim)
+                .map(|endpoint| !endpoint.is_empty())
+                .unwrap_or(false);
 
-        if config.memchain.is_chat_relay_enabled() {
+        if config.memchain.is_chat_relay_enabled() && advertises_peer_api {
             capabilities.push(NodeCapability::ChatRelay);
+        }
+        if config.discovery.advertise_onion_middle && advertises_peer_api {
+            capabilities.push(NodeCapability::OnionMiddle);
         }
         if config.memchain.is_enabled() {
             capabilities.push(NodeCapability::EncryptedStorage);
@@ -3670,6 +3681,82 @@ mod tests {
             signed.descriptor.public_endpoint.as_deref(),
             Some("198.51.100.10:51820")
         );
+    }
+
+    #[test]
+    fn self_discovery_descriptor_requires_peer_api_endpoint_for_chat_relay_capability() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.network.public_endpoint = Some("198.51.100.10:51820".to_string());
+        config.memchain.chat_relay.enabled = true;
+
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let signed = server
+            .build_self_discovery_descriptor(1_800_000_000)
+            .unwrap();
+
+        assert_eq!(
+            signed.descriptor.public_endpoint.as_deref(),
+            Some("198.51.100.10:51820")
+        );
+        assert!(!signed
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::ChatRelay));
+        assert!(!signed
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::OnionMiddle));
+    }
+
+    #[test]
+    fn self_discovery_descriptor_requires_peer_api_listener_for_chat_relay_capability() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.public_endpoint = Some("https://node.example.com".to_string());
+        config.memchain.chat_relay.enabled = true;
+
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let signed = server
+            .build_self_discovery_descriptor(1_800_000_000)
+            .unwrap();
+
+        assert!(!signed
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::ChatRelay));
+        assert!(!signed
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::OnionMiddle));
+    }
+
+    #[test]
+    fn self_discovery_descriptor_can_advertise_onion_middle_when_explicitly_enabled() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.public_endpoint = Some("https://node.example.com".to_string());
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        config.discovery.advertise_onion_middle = true;
+        config.memchain.chat_relay.enabled = true;
+
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let signed = server
+            .build_self_discovery_descriptor(1_800_000_000)
+            .unwrap();
+
+        assert!(signed
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::ChatRelay));
+        assert!(signed
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::OnionMiddle));
+        assert!(signed
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::PrivacyRelay));
     }
 
     #[test]
