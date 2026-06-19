@@ -50,6 +50,7 @@
 //!   encrypted_blob stays opaque and must not be parsed.
 //!
 //! ## Last Modified
+//! v0.5.0-BlindRelayRouteHealth - Feed next-hop success/failure back into PeerStore scoring
 //! v0.4.0-BlindRelayBackpressure - Added blind relay in-flight pressure gate
 //! v0.3.0-BlindRelayEndpoint - Added node-to-node opaque blind relay endpoint
 //! v0.2.0-PeerRelayHealth - Record inbound peer relay health counters
@@ -496,10 +497,16 @@ async fn process_peer_blind_relay(
         .ok_or_else(|| {
             state
                 .peer_store
+                .record_route_forward_failure(&next_hop, now, "missing_endpoint");
+            state
+                .peer_store
                 .record_blind_relay_rejected(now, "missing_endpoint");
             BlindRelayError::InvalidEndpoint
         })?;
     let url = blind_peer_relay_url(endpoint).ok_or_else(|| {
+        state
+            .peer_store
+            .record_route_forward_failure(&next_hop, now, "invalid_endpoint");
         state
             .peer_store
             .record_blind_relay_rejected(now, "invalid_endpoint");
@@ -528,21 +535,29 @@ async fn process_peer_blind_relay(
             );
             state
                 .peer_store
+                .record_route_forward_failure(&next_hop, now, "request_failed");
+            state
+                .peer_store
                 .record_blind_relay_rejected(now, "request_failed");
             BlindRelayError::ForwardFailed
         })?;
 
     if !response.status().is_success() {
+        let reason = format!("http_{}", response.status().as_u16());
         debug!(
             status = %response.status(),
             "[BLIND_RELAY] Next-hop returned non-success"
         );
         state
             .peer_store
-            .record_blind_relay_rejected(now, format!("http_{}", response.status().as_u16()));
+            .record_route_forward_failure(&next_hop, now, reason.clone());
+        state.peer_store.record_blind_relay_rejected(now, reason);
         return Err(BlindRelayError::ForwardFailed);
     }
 
+    state
+        .peer_store
+        .record_route_forward_success(&next_hop, now);
     state
         .peer_store
         .record_blind_relay_forwarded(now, ttl_remaining);

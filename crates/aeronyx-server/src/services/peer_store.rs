@@ -33,6 +33,8 @@
 //!   node-level signed descriptor metadata and never encrypted payload content
 //! - Blind relay runtime counters and drop reason buckets for nodeboard,
 //!   without exposing encrypted payloads, peer endpoint URLs, or user metadata
+//! - Per-peer blind relay route health feedback so failed next hops are
+//!   naturally deprioritized without exposing payloads or full peer endpoints
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -59,6 +61,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.17.0-RouteHealthFeedback - Added per-peer blind relay success/failure scoring
 //! v0.16.0-BlindRelayRuntimeStats - Added blind relay drop reason counters
 //! v0.13.0-GossipBackpressureStatus - Added outbound gossip jitter/backpressure status
 //! v0.14.0-ExpiredPeerCleanupStats - Added expired peer cleanup counters/audit
@@ -92,6 +95,7 @@ const PEER_DESCRIPTOR_STALE_WINDOW_SECS: u64 = 300;
 const PEER_ROUTE_LAST_SEEN_FRESH_SECS: u64 = 300;
 const PEER_ROUTE_LAST_SEEN_ACCEPTABLE_SECS: u64 = 900;
 const PEER_ROUTE_LAST_SEEN_STALE_SECS: u64 = 1_800;
+const PEER_ROUTE_RECENT_FAILURE_SECS: u64 = 600;
 const PEER_ROUTE_STATUS_LIMIT: usize = 8;
 
 // ============================================
@@ -419,6 +423,16 @@ struct PeerRuntimeMetadata {
     imported_count: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PeerRouteHealth {
+    success_count: u64,
+    failure_count: u64,
+    consecutive_failures: u64,
+    last_success_at: Option<u64>,
+    last_failure_at: Option<u64>,
+    last_failure_reason: Option<String>,
+}
+
 /// Privacy-safe per-peer nodeboard row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerStorePeerSummary {
@@ -504,6 +518,21 @@ pub struct PeerStoreRouteCandidate {
     pub source: String,
     /// Stable health bucket: healthy or stale.
     pub health: String,
+    /// Local route health bucket from recent blind relay forward attempts.
+    ///
+    /// This is node-level control-plane feedback only. It never includes route
+    /// ids, endpoint URLs, encrypted blobs, receivers, client IPs, or content.
+    pub route_health: String,
+    /// Recent route failure count used to penalize unstable next hops.
+    pub route_failure_count: u64,
+    /// Consecutive route failures since the last successful forward.
+    pub route_consecutive_failures: u64,
+    /// Last successful blind relay forward to this candidate.
+    pub last_route_success_at: Option<u64>,
+    /// Last failed blind relay forward to this candidate.
+    pub last_route_failure_at: Option<u64>,
+    /// Coarse failure reason bucket from the last failed forward.
+    pub last_route_failure_reason: Option<String>,
     /// Age of the last observation at status generation time.
     pub last_seen_age_seconds: u64,
     /// Remaining descriptor TTL in seconds.
@@ -686,6 +715,7 @@ impl PeerStoreImportReport {
 pub struct PeerStore {
     peers: RwLock<HashMap<[u8; 32], SignedNodeDescriptor>>,
     peer_runtime: RwLock<HashMap<[u8; 32], PeerRuntimeMetadata>>,
+    route_health: RwLock<HashMap<[u8; 32], PeerRouteHealth>>,
     max_peers: RwLock<Option<usize>>,
     counters: PeerStoreCounters,
     audit_events: RwLock<VecDeque<PeerStoreAuditEvent>>,
@@ -699,6 +729,7 @@ impl PeerStore {
         Self {
             peers: RwLock::new(HashMap::new()),
             peer_runtime: RwLock::new(HashMap::new()),
+            route_health: RwLock::new(HashMap::new()),
             max_peers: RwLock::new(None),
             counters: PeerStoreCounters::new(),
             audit_events: RwLock::new(VecDeque::with_capacity(MAX_AUDIT_EVENTS)),
@@ -1243,6 +1274,55 @@ impl PeerStore {
         self.record_audit_event(now, "blind_relay_forward", "rejected", reason.to_string());
     }
 
+    /// Records successful opaque forwarding to a verified next hop.
+    ///
+    /// The key is retained only inside this process for route health scoring.
+    /// Public status exposes only a short prefix and aggregate counters. Never
+    /// pass route ids, encrypted blobs, client identifiers, endpoint URLs, or
+    /// payload-derived details into this method.
+    pub fn record_route_forward_success(&self, node_id: &[u8; 32], now: u64) {
+        let mut route_health = self.route_health.write();
+        let health = route_health.entry(*node_id).or_default();
+        health.success_count = health.success_count.saturating_add(1);
+        health.consecutive_failures = 0;
+        health.last_success_at = Some(now);
+        self.record_audit_event(
+            now,
+            "blind_relay_route_health",
+            "accepted",
+            format!("node_prefix={} result=success", hex::encode(&node_id[..4])),
+        );
+    }
+
+    /// Records failed opaque forwarding to a verified next hop.
+    ///
+    /// The reason must be a stable coarse bucket such as `request_failed` or
+    /// `http_502`; no endpoint URL, route id, ciphertext, receiver, or client
+    /// traffic metadata may be recorded here.
+    pub fn record_route_forward_failure(
+        &self,
+        node_id: &[u8; 32],
+        now: u64,
+        reason: impl Into<String>,
+    ) {
+        let reason = reason.into();
+        let mut route_health = self.route_health.write();
+        let health = route_health.entry(*node_id).or_default();
+        health.failure_count = health.failure_count.saturating_add(1);
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+        health.last_failure_at = Some(now);
+        health.last_failure_reason = Some(reason.clone());
+        self.record_audit_event(
+            now,
+            "blind_relay_route_health",
+            "rejected",
+            format!(
+                "node_prefix={} result=failure reason={reason}",
+                hex::encode(&node_id[..4])
+            ),
+        );
+    }
+
     /// Records a privacy-safe discovery control-plane audit event.
     ///
     /// Events are bounded and newest-last. Full peer public keys, client
@@ -1395,6 +1475,10 @@ impl PeerStore {
             let mut metadata = self.peer_runtime.write();
             for node_id in &removed {
                 metadata.remove(node_id);
+            }
+            let mut route_health = self.route_health.write();
+            for node_id in &removed {
+                route_health.remove(node_id);
             }
         }
         let removed_count = before.saturating_sub(self.peers.read().len());
@@ -1638,12 +1722,45 @@ impl PeerStore {
         sessions + bps + pps
     }
 
+    fn route_health_bucket_and_score(
+        route_health: Option<&PeerRouteHealth>,
+        now: u64,
+    ) -> (&'static str, i64) {
+        let Some(route_health) = route_health else {
+            return ("unknown", 0);
+        };
+        let recent_failure = route_health
+            .last_failure_at
+            .map(|failed_at| now.saturating_sub(failed_at) <= PEER_ROUTE_RECENT_FAILURE_SECS)
+            .unwrap_or(false);
+        let success_after_failure =
+            match (route_health.last_success_at, route_health.last_failure_at) {
+                (Some(success_at), Some(failure_at)) => success_at >= failure_at,
+                (Some(_), None) => true,
+                _ => false,
+            };
+
+        if recent_failure && !success_after_failure {
+            let penalty = (route_health.consecutive_failures.min(4) as i64) * 35;
+            if route_health.consecutive_failures >= 3 {
+                ("failing", -140)
+            } else {
+                ("degraded", -penalty)
+            }
+        } else if route_health.success_count > 0 {
+            ("healthy", 8)
+        } else {
+            ("unknown", 0)
+        }
+    }
+
     fn route_score(
         descriptor: &SignedNodeDescriptor,
         source: &str,
         health: &str,
         last_seen_age_seconds: u64,
         ttl_remaining_seconds: Option<u64>,
+        route_health_score: i64,
     ) -> i64 {
         let health_score = match health {
             "healthy" => 100,
@@ -1655,6 +1772,7 @@ impl PeerStore {
             + Self::last_seen_score(last_seen_age_seconds)
             + Self::ttl_score(ttl_remaining_seconds)
             + Self::capacity_score(descriptor)
+            + route_health_score
     }
 
     fn scored_route_candidates(
@@ -1665,6 +1783,7 @@ impl PeerStore {
     ) -> Vec<ScoredPeerRouteCandidate> {
         let peers = self.peers.read();
         let metadata = self.peer_runtime.read();
+        let route_health = self.route_health.read();
         let capability_label = Self::capability_label(capability).to_string();
         let mut candidates = Vec::new();
 
@@ -1687,12 +1806,16 @@ impl PeerStore {
             if health == "expired" {
                 continue;
             }
+            let route_health_entry = route_health.get(node_id);
+            let (route_health_bucket, route_health_score) =
+                Self::route_health_bucket_and_score(route_health_entry, now);
             let score = Self::route_score(
                 descriptor,
                 &source,
                 health,
                 last_seen_age_seconds,
                 ttl_remaining_seconds,
+                route_health_score,
             );
 
             candidates.push(ScoredPeerRouteCandidate {
@@ -1703,6 +1826,19 @@ impl PeerStore {
                     score,
                     source,
                     health: health.to_string(),
+                    route_health: route_health_bucket.to_string(),
+                    route_failure_count: route_health_entry
+                        .map(|value| value.failure_count)
+                        .unwrap_or(0),
+                    route_consecutive_failures: route_health_entry
+                        .map(|value| value.consecutive_failures)
+                        .unwrap_or(0),
+                    last_route_success_at: route_health_entry
+                        .and_then(|value| value.last_success_at),
+                    last_route_failure_at: route_health_entry
+                        .and_then(|value| value.last_failure_at),
+                    last_route_failure_reason: route_health_entry
+                        .and_then(|value| value.last_failure_reason.clone()),
                     last_seen_age_seconds,
                     ttl_remaining_seconds,
                     endpoint_advertised: true,
@@ -2084,6 +2220,71 @@ mod tests {
         assert_eq!(status.chat_relay[1].health, "stale");
         assert!(status.chat_relay[0].endpoint_advertised);
         assert!(status.chat_relay[0].score > status.chat_relay[1].score);
+    }
+
+    #[test]
+    fn test_route_candidates_deprioritize_recent_forward_failures_without_payload_data() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let healthy_kp = IdentityKeyPair::generate();
+        let failing_kp = IdentityKeyPair::generate();
+
+        let mut healthy = signed_descriptor_for(&healthy_kp, 1, now + 2_000);
+        healthy.descriptor.public_endpoint = Some("https://healthy.example".to_string());
+        healthy = SignedNodeDescriptor::sign(healthy.descriptor, &healthy_kp).unwrap();
+
+        let mut failing = signed_descriptor_for(&failing_kp, 1, now + 2_000);
+        failing.descriptor.public_endpoint = Some("https://failing.example".to_string());
+        failing = SignedNodeDescriptor::sign(failing.descriptor, &failing_kp).unwrap();
+        let failing_node_id = failing.node_id();
+        let failing_prefix = hex::encode(&failing_node_id[..4]);
+
+        store
+            .upsert_verified_from_source(healthy.clone(), now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(failing.clone(), now, "gossip_announce")
+            .unwrap();
+
+        store.record_route_forward_failure(&failing_node_id, now + 1, "request_failed");
+        store.record_route_forward_failure(&failing_node_id, now + 2, "request_failed");
+        store.record_route_forward_failure(&failing_node_id, now + 3, "http_502");
+
+        let candidates =
+            store.route_candidates_with_capability(NodeCapability::ChatRelay, now + 4, 8);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].node_id(), healthy.node_id());
+        assert_eq!(candidates[1].node_id(), failing_node_id);
+
+        let status = store.route_candidate_status(now + 4);
+        let failing_row = status
+            .chat_relay
+            .iter()
+            .find(|row| row.node_id_prefix == failing_prefix)
+            .expect("failing peer should remain visible as a degraded candidate");
+        assert_eq!(failing_row.route_health, "failing");
+        assert_eq!(failing_row.route_failure_count, 3);
+        assert_eq!(failing_row.route_consecutive_failures, 3);
+        assert_eq!(
+            failing_row.last_route_failure_reason.as_deref(),
+            Some("http_502")
+        );
+
+        let status_json = serde_json::to_string(&status).unwrap();
+        assert!(!status_json.contains("failing.example"));
+        assert!(!status_json.contains(&hex::encode(failing_node_id)));
+        assert!(!status_json.contains("encrypted_blob"));
+
+        store.record_route_forward_success(&failing_node_id, now + 5);
+        let recovered = store.route_candidate_status(now + 6);
+        let recovered_row = recovered
+            .chat_relay
+            .iter()
+            .find(|row| row.node_id_prefix == failing_prefix)
+            .expect("recovered peer should still be reported");
+        assert_eq!(recovered_row.route_health, "healthy");
+        assert_eq!(recovered_row.route_consecutive_failures, 0);
+        assert_eq!(recovered_row.last_route_success_at, Some(now + 5));
     }
 
     #[test]
