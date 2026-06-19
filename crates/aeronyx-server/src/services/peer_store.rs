@@ -43,6 +43,9 @@
 //!   only descriptor metadata and route health while exposing only safe prefixes
 //! - Blind relay retry counters so nodeboard can distinguish transient
 //!   next-hop recovery from final forwarding failures without payload metadata
+//! - Startup self-check status so operators can see whether discovery has the
+//!   cache, gossip, self-advertisement, and public endpoint wiring needed for
+//!   commercial restart recovery without exposing endpoint values
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -69,6 +72,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.22.0-DiscoveryStartupSelfCheck - Added privacy-safe discovery startup self-check status
 //! v0.21.0-BlindRelayRetryStats - Added privacy-safe blind relay retry observability
 //! v0.20.0-BlindRelaySizeBuckets - Bucket blind relay encrypted blob sizes in audit events
 //! v0.19.0-ControlledRoutePathPlanner - Added privacy-safe multi-hop path planning foundation
@@ -256,6 +260,17 @@ pub struct PeerStoreBootstrapStatus {
     pub next_gossip_jitter_seconds: i64,
     /// Timestamp when the current gossip schedule was calculated.
     pub last_gossip_schedule_at: Option<u64>,
+    /// Startup discovery readiness bucket: skipped, ready, or warning.
+    ///
+    /// This is recorded once during server startup from local configuration so
+    /// nodeboard can distinguish "discovery is healthy" from "discovery is
+    /// running but missing commercial recovery paths". It never stores config
+    /// values such as file paths, peer URLs, seed URLs, or public endpoints.
+    pub startup_self_check_status: Option<String>,
+    /// Privacy-safe aggregate detail for the startup readiness bucket.
+    pub startup_self_check_detail: Option<String>,
+    /// Unix timestamp when startup readiness was evaluated.
+    pub startup_self_check_at: Option<u64>,
 }
 
 impl Default for PeerStoreBootstrapStatus {
@@ -290,6 +305,9 @@ impl Default for PeerStoreBootstrapStatus {
             next_gossip_delay_seconds: None,
             next_gossip_jitter_seconds: 0,
             last_gossip_schedule_at: None,
+            startup_self_check_status: None,
+            startup_self_check_detail: None,
+            startup_self_check_at: None,
         }
     }
 }
@@ -854,6 +872,35 @@ impl PeerStore {
         status.peer_cache_configured = peer_cache_configured;
         status.gossip_enabled = gossip_enabled;
         status.seed_endpoints_configured = seed_endpoints_configured as u64;
+    }
+
+    /// Records startup discovery readiness without exposing endpoint values.
+    ///
+    /// `detail` must be a stable bucket list such as
+    /// `missing=peer_cache_path,seed_endpoints`; callers must not include raw
+    /// file paths, public endpoints, seed URLs, peer IDs, client IPs,
+    /// destinations, DNS contents, packet payloads, chat plaintext, voucher
+    /// secrets, private keys, or wallet-level traffic.
+    pub fn record_startup_self_check(
+        &self,
+        now: u64,
+        status_bucket: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        let status_bucket = status_bucket.into();
+        let detail = detail.into();
+        {
+            let mut status = self.bootstrap_status.write();
+            status.startup_self_check_status = Some(status_bucket.clone());
+            status.startup_self_check_detail = Some(detail.clone());
+            status.startup_self_check_at = Some(now);
+        }
+        let outcome = match status_bucket.as_str() {
+            "ready" => "accepted",
+            "skipped" => "ignored",
+            _ => "warning",
+        };
+        self.record_audit_event(now, "startup_self_check", outcome, detail);
     }
 
     /// Records a bootstrap or peer-cache load source result.
@@ -2879,6 +2926,34 @@ mod tests {
             "gossip_policy_rejected"
         );
         assert_eq!(status.recent_audit_events[1].action, "gossip_rate_limited");
+    }
+
+    #[test]
+    fn startup_self_check_status_is_recorded_without_config_values() {
+        let store = PeerStore::new();
+
+        store.record_startup_self_check(
+            1_700_000_350,
+            "warning",
+            "missing=peer_cache_path,seed_endpoints,public_endpoint",
+        );
+
+        let status = store.status(1_700_000_400);
+        assert_eq!(
+            status.bootstrap.startup_self_check_status.as_deref(),
+            Some("warning")
+        );
+        assert_eq!(
+            status.bootstrap.startup_self_check_detail.as_deref(),
+            Some("missing=peer_cache_path,seed_endpoints,public_endpoint")
+        );
+        assert_eq!(status.bootstrap.startup_self_check_at, Some(1_700_000_350));
+        assert!(status.recent_audit_events.iter().any(|event| {
+            event.action == "startup_self_check"
+                && event.outcome == "warning"
+                && !event.detail.contains("https://")
+                && !event.detail.contains("/root/")
+        }));
     }
 
     #[test]

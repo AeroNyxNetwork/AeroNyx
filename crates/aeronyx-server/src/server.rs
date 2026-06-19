@@ -62,6 +62,9 @@
 //      not retry stale peers in synchronized bursts during incidents.
 //  28. Durably fsyncs PeerStore cache writes and the parent directory after
 //      atomic rename, reducing peer-cache loss during host crashes/upgrades.
+//  29. Records a privacy-safe discovery startup self-check so nodeboard can
+//      tell whether cache, gossip, self advertisement, and public endpoint
+//      wiring are production-ready without exposing endpoint values.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -81,6 +84,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.1.3-DiscoveryStartupSelfCheck - Report discovery startup readiness buckets
 //   v1.1.2-DurablePeerCacheFsync - Fsync PeerStore cache temp file and parent directory
 //   v1.1.1-DiscoveryGossipBackpressure - Add jitter/backpressure for outbound discovery gossip
 //   v1.1.0-CommercialPeerSummary - Tag PeerStore source buckets for nodeboard
@@ -1748,6 +1752,21 @@ impl Server {
             self.config.discovery.seed_endpoints.len(),
         );
         let now = unix_now_secs();
+        let (self_check_status, self_check_detail) =
+            Self::discovery_startup_self_check(&self.config);
+        peer_store.record_startup_self_check(now, self_check_status, self_check_detail.clone());
+        if self_check_status == "warning" {
+            warn!(
+                detail = %self_check_detail,
+                "[DISCOVERY] Startup self-check warning"
+            );
+        } else {
+            info!(
+                status = %self_check_status,
+                detail = %self_check_detail,
+                "[DISCOVERY] Startup self-check complete"
+            );
+        }
         if !self.config.discovery.enabled {
             info!("[DISCOVERY] Bootstrap disabled");
             peer_store.record_bootstrap_source(now, "config", "skipped", "discovery_enabled=false");
@@ -1909,6 +1928,48 @@ impl Server {
             }
         }
         peer_store
+    }
+
+    fn discovery_startup_self_check(config: &ServerConfig) -> (&'static str, String) {
+        let discovery = &config.discovery;
+        if !discovery.enabled {
+            return ("skipped", "discovery_enabled=false".to_string());
+        }
+
+        let mut missing = Vec::new();
+        if !discovery.advertise_self {
+            missing.push("self_advertisement");
+        }
+        if discovery.peer_cache_path.is_none() {
+            missing.push("peer_cache_path");
+        }
+        if !discovery.gossip_enabled {
+            missing.push("gossip_enabled");
+        }
+        if discovery.gossip_enabled && discovery.seed_endpoints.is_empty() {
+            missing.push("seed_endpoints");
+        }
+        let public_endpoint_configured =
+            discovery.public_endpoint.is_some() || config.network.public_endpoint.is_some();
+        if !public_endpoint_configured {
+            missing.push("public_endpoint");
+        }
+        if discovery.public_api_listen_addr.is_none() {
+            missing.push("public_api_listener");
+        }
+        if discovery.descriptor_ttl_secs < discovery.gossip_interval_secs.saturating_mul(2) {
+            missing.push("descriptor_ttl_for_gossip");
+        }
+
+        if missing.is_empty() {
+            (
+                "ready",
+                "cache,gossip,self_advertisement,public_endpoint,public_api_listener configured"
+                    .to_string(),
+            )
+        } else {
+            ("warning", format!("missing={}", missing.join(",")))
+        }
     }
 
     async fn load_peer_cache(&self, peer_store: &PeerStore, path: &str, now: u64) {
@@ -3668,6 +3729,35 @@ mod tests {
         assert_eq!(prefix_to_netmask(22), Ipv4Addr::new(255, 255, 252, 0));
         assert_eq!(prefix_to_netmask(24), Ipv4Addr::new(255, 255, 255, 0));
         assert_eq!(prefix_to_netmask(0), Ipv4Addr::new(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn discovery_startup_self_check_reports_commercial_readiness_buckets() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.gossip_enabled = true;
+
+        let (status, detail) = Server::discovery_startup_self_check(&config);
+
+        assert_eq!(status, "warning");
+        assert!(detail.contains("peer_cache_path"));
+        assert!(detail.contains("seed_endpoints"));
+        assert!(detail.contains("public_endpoint"));
+        assert!(detail.contains("public_api_listener"));
+        assert!(!detail.contains("https://"));
+        assert!(!detail.contains("/root/"));
+
+        config.discovery.peer_cache_path = Some("/root/private/peer-cache.json".to_string());
+        config.discovery.seed_endpoints = vec!["https://seed.example.com".to_string()];
+        config.discovery.public_endpoint = Some("https://node.example.com".to_string());
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+
+        let (status, detail) = Server::discovery_startup_self_check(&config);
+
+        assert_eq!(status, "ready");
+        assert!(detail.contains("cache"));
+        assert!(!detail.contains("seed.example.com"));
+        assert!(!detail.contains("/root/private"));
     }
 
     #[test]
