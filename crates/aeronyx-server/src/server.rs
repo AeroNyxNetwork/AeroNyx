@@ -46,6 +46,8 @@
 //  21. Wires PeerStore discovery summary into local VPN health and operator
 //      status so CLI healthchecks, heartbeat, and nodeboard share one
 //      privacy-safe peer-discovery readiness contract.
+//  22. Saves the verified PeerStore cache once immediately after bootstrap so
+//      restart recovery is durable before the first periodic write interval.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -65,6 +67,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.0.5-DiscoveryImmediateCacheSave - Persist PeerStore cache after bootstrap
 //   v1.0.4-DiscoveryHealthContract - PeerStore summary in VPN health
 //   v1.0.3-DNSOwnership - Honor vpn.dns_proxy_enabled before spawning DNS proxy
 //   v1.0.2-DNSProxy - VPN gateway DNS proxy wiring
@@ -1839,6 +1842,24 @@ impl Server {
             public_exit_peers = snapshot.public_exit_peers,
             "[DISCOVERY] PeerStore bootstrap complete"
         );
+
+        if let Some(path) = &self.config.discovery.peer_cache_path {
+            let cache_save_at = unix_now_secs();
+            if let Err(e) =
+                Self::persist_peer_store_cache_once(&peer_store, path, cache_save_at).await
+            {
+                warn!(
+                    source = %path,
+                    error = %e,
+                    "[DISCOVERY] Failed to persist initial peer cache snapshot"
+                );
+            } else {
+                debug!(
+                    source = %path,
+                    "[DISCOVERY] Initial peer cache snapshot persisted"
+                );
+            }
+        }
         peer_store
     }
 
@@ -1888,22 +1909,17 @@ impl Server {
                     _ = timer.tick() => {
                         if shutdown.load(Ordering::SeqCst) { break; }
                         let now = unix_now_secs();
-                        match Self::save_peer_store_cache_snapshot(&peer_store, &path, now).await {
-                            Ok(()) => {
-                                peer_store.record_cache_save_status(now, "success", "snapshot_persisted");
-                                debug!(
-                                    source = %path,
-                                    "[DISCOVERY] Peer cache snapshot persisted"
-                                );
-                            }
-                            Err(e) => {
-                                peer_store.record_cache_save_status(now, "failed", "write_failed");
-                                warn!(
-                                    source = %path,
-                                    error = %e,
-                                    "[DISCOVERY] Failed to persist peer cache snapshot"
-                                );
-                            }
+                        if let Err(e) = Self::persist_peer_store_cache_once(&peer_store, &path, now).await {
+                            warn!(
+                                source = %path,
+                                error = %e,
+                                "[DISCOVERY] Failed to persist peer cache snapshot"
+                            );
+                        } else {
+                            debug!(
+                                source = %path,
+                                "[DISCOVERY] Peer cache snapshot persisted"
+                            );
                         }
                     }
                 }
@@ -2264,6 +2280,23 @@ impl Server {
         tokio::fs::write(&tmp_path, bytes).await?;
         tokio::fs::rename(&tmp_path, &path).await?;
         Ok(())
+    }
+
+    async fn persist_peer_store_cache_once(
+        peer_store: &PeerStore,
+        path: &str,
+        now: u64,
+    ) -> Result<()> {
+        match Self::save_peer_store_cache_snapshot(peer_store, path, now).await {
+            Ok(()) => {
+                peer_store.record_cache_save_status(now, "success", "snapshot_persisted");
+                Ok(())
+            }
+            Err(e) => {
+                peer_store.record_cache_save_status(now, "failed", "write_failed");
+                Err(e)
+            }
+        }
     }
 
     fn build_self_discovery_descriptor(&self, now: u64) -> Result<SignedNodeDescriptor> {
@@ -3280,7 +3313,7 @@ impl std::fmt::Debug for Server {
 
 #[cfg(test)]
 mod tests {
-    use super::{prefix_to_netmask, Server};
+    use super::{prefix_to_netmask, unix_now_secs, Server};
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::protocol::chat::{ChatContentType, ChatEnvelope};
     use aeronyx_core::protocol::{
@@ -3621,6 +3654,49 @@ mod tests {
             .recent_audit_events
             .iter()
             .any(|event| event.action == "bootstrap_source"));
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_immediate_cache_save_records_restart_recovery_evidence() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.peer_cache_path = Some(
+            std::env::temp_dir()
+                .join(format!(
+                    "aeronyx-peer-cache-immediate-{}.json",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))
+                .to_string_lossy()
+                .to_string(),
+        );
+        config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+
+        let server = Server::new(config.clone(), IdentityKeyPair::generate(), None);
+        let peer_store = server.init_peer_store().await;
+        let path = config.discovery.peer_cache_path.unwrap();
+
+        let bytes = tokio::fs::read(&path)
+            .await
+            .expect("initial PeerStore cache should be saved during bootstrap");
+        let snapshot = NodeBootstrapSnapshot::from_json_bytes(&bytes).unwrap();
+        let now = unix_now_secs();
+        assert!(snapshot.verified_count_at(now) >= 1);
+
+        let status = peer_store.status(now);
+        assert_eq!(
+            status.bootstrap.last_cache_save_status.as_deref(),
+            Some("success")
+        );
+        assert_eq!(
+            status.bootstrap.last_cache_save_detail.as_deref(),
+            Some("snapshot_persisted")
+        );
+        assert!(status.stability.restart_recovery_configured);
 
         let _ = tokio::fs::remove_file(path).await;
     }
