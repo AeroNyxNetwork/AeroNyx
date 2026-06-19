@@ -50,6 +50,7 @@
 //!   encrypted_blob stays opaque and must not be parsed.
 //!
 //! ## Last Modified
+//! v0.6.0-BlindRelayRetryJitter - Retry transient next-hop blind relay failures with privacy-safe jitter
 //! v0.5.0-BlindRelayRouteHealth - Feed next-hop success/failure back into PeerStore scoring
 //! v0.4.0-BlindRelayBackpressure - Added blind relay in-flight pressure gate
 //! v0.3.0-BlindRelayEndpoint - Added node-to-node opaque blind relay endpoint
@@ -57,9 +58,12 @@
 //! v0.1.0-DiscoveryPhase9 - Initial inter-node encrypted chat relay endpoint
 // ============================================================================
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use aeronyx_core::crypto::transport::{
@@ -76,6 +80,7 @@ use aeronyx_transport::traits::Transport;
 use aeronyx_transport::UdpTransport;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
+use tokio::time::sleep;
 use tracing::{debug, warn};
 
 use crate::services::peer_store::PeerStore;
@@ -99,6 +104,18 @@ const MAX_PEER_CHAT_ENVELOPE_BYTES: usize = 128 * 1024;
 /// possible fanout. This is local backpressure only; callers should retry with
 /// jitter at the transport/client layer.
 const MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS: usize = 64;
+
+/// Maximum attempts for a single next-hop blind relay POST.
+///
+/// The relay still treats `encrypted_blob` as opaque. Retry decisions are based
+/// only on transport status buckets such as timeout/connect/5xx.
+const MAX_BLIND_RELAY_FORWARD_ATTEMPTS: usize = 3;
+
+/// Lower bound for transient next-hop retry jitter.
+const BLIND_RELAY_RETRY_BASE_MS: u64 = 25;
+
+/// Extra deterministic jitter window used to avoid retry herds.
+const BLIND_RELAY_RETRY_JITTER_MS: u64 = 35;
 
 // ============================================
 // State / Request / Response Types
@@ -519,41 +536,17 @@ async fn process_peer_blind_relay(
         .sign_with(state.node_identity.as_ref());
     let ttl_remaining = forwarded_envelope.ttl;
 
-    let response = state
-        .http_client
-        .post(&url)
-        .json(&PeerBlindRelayRequest {
+    forward_blind_relay_with_retry(
+        &state,
+        &url,
+        next_hop,
+        PeerBlindRelayRequest {
             envelope: forwarded_envelope,
             previous_hop_node_id: self_node_id,
-        })
-        .send()
-        .await
-        .map_err(|error| {
-            debug!(
-                reason = %classify_reqwest_error("blind_relay_request", &error),
-                "[BLIND_RELAY] Next-hop forward failed"
-            );
-            state
-                .peer_store
-                .record_route_forward_failure(&next_hop, now, "request_failed");
-            state
-                .peer_store
-                .record_blind_relay_rejected(now, "request_failed");
-            BlindRelayError::ForwardFailed
-        })?;
-
-    if !response.status().is_success() {
-        let reason = format!("http_{}", response.status().as_u16());
-        debug!(
-            status = %response.status(),
-            "[BLIND_RELAY] Next-hop returned non-success"
-        );
-        state
-            .peer_store
-            .record_route_forward_failure(&next_hop, now, reason.clone());
-        state.peer_store.record_blind_relay_rejected(now, reason);
-        return Err(BlindRelayError::ForwardFailed);
-    }
+        },
+        now,
+    )
+    .await?;
 
     state
         .peer_store
@@ -569,6 +562,99 @@ async fn process_peer_blind_relay(
         ttl_remaining,
         reason: Some("forwarded".to_string()),
     })
+}
+
+async fn forward_blind_relay_with_retry(
+    state: &ChatPeerState,
+    url: &str,
+    next_hop: [u8; 32],
+    request: PeerBlindRelayRequest,
+    now: u64,
+) -> Result<(), BlindRelayError> {
+    for attempt in 1..=MAX_BLIND_RELAY_FORWARD_ATTEMPTS {
+        match state.http_client.post(url).json(&request).send().await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) => {
+                let status = response.status();
+                let reason = format!("http_{}", status.as_u16());
+                if attempt < MAX_BLIND_RELAY_FORWARD_ATTEMPTS
+                    && is_retryable_blind_relay_status(status)
+                {
+                    debug!(
+                        attempt,
+                        status = %status,
+                        "[BLIND_RELAY] Next-hop returned retryable status"
+                    );
+                    sleep(blind_relay_retry_delay(
+                        &request.envelope.route_id,
+                        &next_hop,
+                        attempt,
+                    ))
+                    .await;
+                    continue;
+                }
+
+                debug!(
+                    attempt,
+                    status = %status,
+                    "[BLIND_RELAY] Next-hop returned non-success"
+                );
+                state
+                    .peer_store
+                    .record_route_forward_failure(&next_hop, now, reason.clone());
+                state.peer_store.record_blind_relay_rejected(now, reason);
+                return Err(BlindRelayError::ForwardFailed);
+            }
+            Err(error) => {
+                let reason = classify_reqwest_error("blind_relay_request", &error);
+                if attempt < MAX_BLIND_RELAY_FORWARD_ATTEMPTS && is_retryable_reqwest_error(&error)
+                {
+                    debug!(
+                        attempt,
+                        reason = %reason,
+                        "[BLIND_RELAY] Next-hop forward failed; retrying"
+                    );
+                    sleep(blind_relay_retry_delay(
+                        &request.envelope.route_id,
+                        &next_hop,
+                        attempt,
+                    ))
+                    .await;
+                    continue;
+                }
+
+                debug!(
+                    attempt,
+                    reason = %reason,
+                    "[BLIND_RELAY] Next-hop forward failed"
+                );
+                state
+                    .peer_store
+                    .record_route_forward_failure(&next_hop, now, reason.clone());
+                state.peer_store.record_blind_relay_rejected(now, reason);
+                return Err(BlindRelayError::ForwardFailed);
+            }
+        }
+    }
+
+    Err(BlindRelayError::ForwardFailed)
+}
+
+fn is_retryable_blind_relay_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn is_retryable_reqwest_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request()
+}
+
+fn blind_relay_retry_delay(route_id: &[u8; 16], next_hop: &[u8; 32], attempt: usize) -> Duration {
+    let mut seed = attempt as u64;
+    for byte in route_id.iter().chain(next_hop.iter()) {
+        seed = seed.wrapping_mul(31).wrapping_add(u64::from(*byte));
+    }
+    let jitter = seed % (BLIND_RELAY_RETRY_JITTER_MS + 1);
+    Duration::from_millis(BLIND_RELAY_RETRY_BASE_MS + jitter)
 }
 
 fn validate_blind_relay_envelope(
@@ -684,9 +770,15 @@ mod tests {
 
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::protocol::chat::ChatContentType;
+    use aeronyx_core::protocol::{
+        NodeCapability, NodeCapacity, NodeDescriptor, SignedNodeDescriptor,
+    };
     use aeronyx_transport::UdpTransport;
     use axum::body::Body;
     use axum::http::Request;
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::net::TcpListener;
     use tower::ServiceExt;
 
     use crate::config::ChatRelayConfig;
@@ -713,6 +805,29 @@ mod tests {
             db_path: path,
             ..ChatRelayConfig::default()
         }
+    }
+
+    fn signed_chat_relay_peer_descriptor_for(
+        peer_identity: &IdentityKeyPair,
+        endpoint: String,
+        sequence: u64,
+        expires_at: u64,
+    ) -> SignedNodeDescriptor {
+        let mut descriptor = NodeDescriptor::new(
+            peer_identity.public_key_bytes(),
+            sequence,
+            sequence,
+            expires_at,
+            "test-chat-peer",
+        );
+        descriptor.public_endpoint = Some(endpoint);
+        descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        descriptor.capacity = NodeCapacity {
+            max_sessions: 32,
+            max_bps: None,
+            max_pps: None,
+        };
+        SignedNodeDescriptor::sign(descriptor, peer_identity).unwrap()
     }
 
     #[test]
@@ -858,5 +973,89 @@ mod tests {
         };
 
         assert!(BlindRelayInFlightGuard::try_acquire(&state).is_none());
+    }
+
+    #[tokio::test]
+    async fn blind_relay_forward_retries_transient_next_hop_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_route = Arc::clone(&attempts);
+        let next_hop_app = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(move |Json(_request): Json<PeerBlindRelayRequest>| {
+                let attempts_for_request = Arc::clone(&attempts_for_route);
+                async move {
+                    let attempt = attempts_for_request.fetch_add(1, AtomicOrdering::SeqCst);
+                    if attempt == 0 {
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    } else {
+                        Json(PeerBlindRelayResponse {
+                            accepted: true,
+                            terminal: true,
+                            forwarded: false,
+                            ttl_remaining: 1,
+                            reason: Some("terminal_next_hop".to_string()),
+                        })
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, next_hop_app).await.unwrap();
+        });
+
+        let now = now_secs();
+        let previous_hop = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let next_hop_identity = IdentityKeyPair::generate();
+        let peer_store = Arc::new(PeerStore::new());
+        peer_store
+            .upsert_verified_from_source(
+                signed_chat_relay_peer_descriptor_for(&next_hop_identity, endpoint, now, now + 300),
+                now,
+                "gossip_snapshot",
+            )
+            .unwrap();
+
+        let state = ChatPeerState {
+            chat_relay: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity,
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+        };
+        let envelope = BlindRelayEnvelope {
+            route_id: [0x42u8; 16],
+            next_hop: next_hop_identity.public_key_bytes(),
+            ttl: 2,
+            encrypted_blob: b"opaque encrypted relay bytes".to_vec(),
+            timestamp: now,
+            signature: [0u8; 64],
+        }
+        .sign_with(&previous_hop);
+
+        let response = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: previous_hop.public_key_bytes(),
+            },
+        )
+        .await
+        .unwrap();
+
+        server.abort();
+
+        assert!(response.accepted);
+        assert!(response.forwarded);
+        assert!(!response.terminal);
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+        let blind_stats = peer_store.status(now + 5).runtime.blind_relay;
+        assert_eq!(blind_stats.forwarded, 1);
+        assert_eq!(blind_stats.rejected, 0);
     }
 }
