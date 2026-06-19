@@ -53,6 +53,8 @@
 //  24. Keeps a previous verified PeerStore cache backup and falls back to it
 //      when the primary cache file is missing, unreadable, JSON-corrupted, or
 //      contains no usable verified descriptors.
+//  25. Loads static bootstrap snapshots before the local PeerStore cache so
+//      the most recent verified cache can supersede expired file seed warnings.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -72,6 +74,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.0.9-DiscoveryCacheSourcePriority - Load peer cache after static bootstrap seeds
 //   v1.0.8-DiscoveryPeerCacheUsableFallback - Fallback when primary cache imports no usable peers
 //   v1.0.7-DiscoveryPeerCacheBackup - Backup and fallback for PeerStore cache
 //   v1.0.6-DiscoveryShutdownCacheFlush - Persist PeerStore cache on shutdown
@@ -1716,10 +1719,6 @@ impl Server {
             return peer_store;
         }
 
-        if let Some(path) = &self.config.discovery.peer_cache_path {
-            self.load_peer_cache(&peer_store, path, now).await;
-        }
-
         if let Some(path) = &self.config.discovery.bootstrap_snapshot_path {
             match tokio::fs::read(path).await {
                 Ok(bytes) => {
@@ -1807,6 +1806,10 @@ impl Server {
                     );
                 }
             }
+        }
+
+        if let Some(path) = &self.config.discovery.peer_cache_path {
+            self.load_peer_cache(&peer_store, path, now).await;
         }
 
         if self.config.discovery.advertise_self {
@@ -3880,6 +3883,62 @@ mod tests {
         assert!(status.stability.restart_recovery_configured);
 
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_source_supersedes_expired_static_bootstrap_warning() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let bootstrap_path =
+            std::env::temp_dir().join(format!("aeronyx-expired-bootstrap-{unique}.json"));
+        let cache_path = std::env::temp_dir().join(format!("aeronyx-fresh-cache-{unique}.json"));
+        let bootstrap_path_str = bootstrap_path.to_string_lossy().to_string();
+        let cache_path_str = cache_path.to_string_lossy().to_string();
+
+        let now = unix_now_secs();
+        let expired =
+            signed_chat_relay_peer_descriptor("http://127.0.0.1:9".to_string(), now - 600, now - 1);
+        let expired_snapshot = NodeBootstrapSnapshot::new(now - 600, vec![expired]);
+        tokio::fs::write(&bootstrap_path, expired_snapshot.to_json_pretty().unwrap())
+            .await
+            .unwrap();
+
+        let fresh =
+            signed_chat_relay_peer_descriptor("http://127.0.0.1:10".to_string(), now, now + 300);
+        let cache_store = Arc::new(PeerStore::new());
+        assert!(cache_store.upsert_verified(fresh.clone(), now).unwrap());
+        Server::save_peer_store_cache_snapshot(&cache_store, &cache_path_str, now)
+            .await
+            .unwrap();
+
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.advertise_self = false;
+        config.discovery.bootstrap_snapshot_path = Some(bootstrap_path_str.clone());
+        config.discovery.peer_cache_path = Some(cache_path_str.clone());
+        config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let restored_store = server.init_peer_store().await;
+        let status = restored_store.status(now + 1);
+
+        assert!(restored_store
+            .get_valid(&fresh.node_id(), now + 1)
+            .is_some());
+        assert_eq!(status.snapshot.valid_peers, 1);
+        assert_eq!(status.runtime.rejected, 1);
+        assert_eq!(status.bootstrap.last_source_kind.as_deref(), Some("cache"));
+        assert_eq!(
+            status.bootstrap.last_source_status.as_deref(),
+            Some("success")
+        );
+        assert_eq!(status.bootstrap.recovery_status.as_deref(), Some("success"));
+
+        let _ = tokio::fs::remove_file(bootstrap_path).await;
+        let _ = tokio::fs::remove_file(cache_path).await;
+        let _ = tokio::fs::remove_file(Server::peer_cache_backup_path(&cache_path_str)).await;
     }
 
     #[tokio::test]
