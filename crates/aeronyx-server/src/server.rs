@@ -58,6 +58,8 @@
 //  26. Tags PeerStore imports with source buckets (file/url/cache/backup/self/
 //      gossip) so heartbeat/nodeboard can show stale/discovered/cache peers
 //      without exposing peer URLs or client traffic.
+//  27. Adds outbound discovery gossip jitter/backpressure so node fleets do
+//      not retry stale peers in synchronized bursts during incidents.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -77,6 +79,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.1.1-DiscoveryGossipBackpressure - Add jitter/backpressure for outbound discovery gossip
 //   v1.1.0-CommercialPeerSummary - Tag PeerStore source buckets for nodeboard
 //   v1.0.9-DiscoveryCacheSourcePriority - Load peer cache after static bootstrap seeds
 //   v1.0.8-DiscoveryPeerCacheUsableFallback - Fallback when primary cache imports no usable peers
@@ -156,7 +159,9 @@ use crate::api::voice::build_voice_router;
 use crate::api::vpn_health::{
     build_vpn_health_router, collect_node_operator_status_value, collect_vpn_health_value,
 };
-use crate::config::{MemChainConfig, MemChainMode, ServerConfig, VectorQuantizationMode};
+use crate::config::{
+    DiscoveryConfig, MemChainConfig, MemChainMode, ServerConfig, VectorQuantizationMode,
+};
 use crate::error::{Result, ServerError};
 use crate::handlers::packet::DecryptedPayload;
 use crate::handlers::PacketHandler;
@@ -2013,6 +2018,8 @@ impl Server {
         let mut rx = self.shutdown_tx.subscribe();
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_secs(config.discovery.fetch_timeout_secs))
+            .pool_max_idle_per_host(8)
+            .pool_idle_timeout(Duration::from_secs(90))
             .build()
         {
             Ok(client) => client,
@@ -2026,129 +2033,241 @@ impl Server {
         };
 
         Some(tokio::spawn(async move {
-            let mut timer =
-                tokio::time::interval(Duration::from_secs(config.discovery.gossip_interval_secs));
+            let mut run_immediately = true;
             loop {
-                tokio::select! {
-                    _ = rx.recv() => break,
-                    _ = timer.tick() => {
-                        if shutdown.load(Ordering::SeqCst) { break; }
-                        let now = unix_now_secs();
-                        let Ok(self_descriptor) =
-                            Self::build_self_discovery_descriptor_for(&config, &identity, now)
-                        else {
-                            warn!("[DISCOVERY] Skipping outbound gossip; self descriptor build failed");
-                            peer_store.record_gossip_round(
-                                now,
-                                0,
-                                0,
-                                0,
-                                Some("self_descriptor_build_failed".to_string()),
-                            );
-                            continue;
-                        };
-
-                        let peer_limit = usize::from(config.discovery.gossip_peer_limit);
-                        let self_gossip_url = config
-                            .discovery
-                            .public_endpoint
-                            .as_deref()
-                            .or(config.network.public_endpoint.as_deref())
-                            .and_then(Self::discovery_gossip_url);
-                        let mut seen_urls = HashSet::new();
-                        let mut gossip_urls = Vec::new();
-
-                        for endpoint in &config.discovery.seed_endpoints {
-                            let Some(url) = Self::discovery_gossip_url(endpoint) else {
-                                continue;
-                            };
-                            if self_gossip_url.as_deref() == Some(url.as_str()) {
-                                continue;
-                            }
-                            if seen_urls.insert(url.clone()) {
-                                gossip_urls.push(url);
-                            }
-                            if gossip_urls.len() >= peer_limit {
-                                break;
-                            }
-                        }
-
-                        let snapshot = peer_store.export_bootstrap_snapshot(
-                            now,
-                            now,
-                            true,
-                            Some(peer_limit),
+                if run_immediately {
+                    run_immediately = false;
+                    peer_store.record_gossip_schedule(unix_now_secs(), false, 0, 0);
+                } else {
+                    let schedule_now = unix_now_secs();
+                    let consecutive_failures = peer_store.consecutive_gossip_failures();
+                    let (delay, backpressure_active, delay_secs, jitter_secs) =
+                        Self::discovery_gossip_schedule(
+                            &config.discovery,
+                            &self_node_id,
+                            schedule_now,
+                            consecutive_failures,
                         );
-                        let mut attempted = 0usize;
-                        let mut succeeded = 0usize;
-                        let mut last_failure_reason: Option<String> = None;
+                    peer_store.record_gossip_schedule(
+                        schedule_now,
+                        backpressure_active,
+                        delay_secs,
+                        jitter_secs,
+                    );
 
-                        let seed_attempted = gossip_urls.len();
-
-                        for peer in snapshot.peers {
-                            if gossip_urls.len() >= peer_limit {
-                                break;
-                            }
-                            if peer.node_id() == self_node_id {
-                                continue;
-                            }
-                            let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
-                                continue;
-                            };
-                            let Some(url) = Self::discovery_gossip_url(endpoint) else {
-                                continue;
-                            };
-                            if self_gossip_url.as_deref() == Some(url.as_str()) {
-                                continue;
-                            }
-                            if !seen_urls.insert(url.clone()) {
-                                continue;
-                            }
-                            gossip_urls.push(url);
-                        }
-
-                        for url in gossip_urls {
-                            attempted += 1;
-                            match Self::gossip_with_peer(
-                                &client,
-                                &peer_store,
-                                &url,
-                                self_descriptor.clone(),
-                                now,
-                                config.discovery.gossip_peer_limit,
-                            )
-                            .await
-                            {
-                                Ok(()) => succeeded += 1,
-                                Err(e) => {
-                                    last_failure_reason = Some(e.clone());
-                                    debug!(
-                                        peer = %url,
-                                        error = %e,
-                                        "[DISCOVERY] Outbound gossip peer sync failed"
-                                    );
-                                }
-                            }
-                        }
-
-                        if attempted > 0 {
-                            info!(
-                                attempted,
-                                succeeded,
-                                "[DISCOVERY] Outbound gossip round complete"
-                            );
-                        }
-                        peer_store.record_gossip_round(
-                            now,
-                            attempted,
-                            succeeded,
-                            seed_attempted,
-                            last_failure_reason,
-                        );
+                    tokio::select! {
+                        _ = rx.recv() => break,
+                        _ = tokio::time::sleep(delay) => {}
                     }
                 }
+
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let now = unix_now_secs();
+                let Ok(self_descriptor) =
+                    Self::build_self_discovery_descriptor_for(&config, &identity, now)
+                else {
+                    warn!("[DISCOVERY] Skipping outbound gossip; self descriptor build failed");
+                    peer_store.record_gossip_round(
+                        now,
+                        0,
+                        0,
+                        0,
+                        Some("self_descriptor_build_failed".to_string()),
+                    );
+                    continue;
+                };
+
+                let consecutive_failures = peer_store.consecutive_gossip_failures();
+                let backpressure_active = Self::discovery_gossip_backpressure_active(
+                    &config.discovery,
+                    consecutive_failures,
+                );
+                let peer_limit = usize::from(config.discovery.gossip_peer_limit);
+                let seed_limit = config.discovery.seed_endpoints.len().max(1);
+                let round_peer_limit = if backpressure_active {
+                    peer_limit.min(seed_limit)
+                } else {
+                    peer_limit
+                };
+                let include_cached_peers =
+                    !backpressure_active || config.discovery.seed_endpoints.is_empty();
+                let self_gossip_url = config
+                    .discovery
+                    .public_endpoint
+                    .as_deref()
+                    .or(config.network.public_endpoint.as_deref())
+                    .and_then(Self::discovery_gossip_url);
+                let mut seen_urls = HashSet::new();
+                let mut gossip_urls = Vec::new();
+
+                for endpoint in &config.discovery.seed_endpoints {
+                    let Some(url) = Self::discovery_gossip_url(endpoint) else {
+                        continue;
+                    };
+                    if self_gossip_url.as_deref() == Some(url.as_str()) {
+                        continue;
+                    }
+                    if seen_urls.insert(url.clone()) {
+                        gossip_urls.push(url);
+                    }
+                    if gossip_urls.len() >= round_peer_limit {
+                        break;
+                    }
+                }
+
+                let mut attempted = 0usize;
+                let mut succeeded = 0usize;
+                let mut last_failure_reason: Option<String> = None;
+
+                let seed_attempted = gossip_urls.len();
+
+                if include_cached_peers && gossip_urls.len() < round_peer_limit {
+                    let snapshot = peer_store.export_bootstrap_snapshot(
+                        now,
+                        now,
+                        true,
+                        Some(round_peer_limit),
+                    );
+
+                    for peer in snapshot.peers {
+                        if gossip_urls.len() >= round_peer_limit {
+                            break;
+                        }
+                        if peer.node_id() == self_node_id {
+                            continue;
+                        }
+                        let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
+                            continue;
+                        };
+                        let Some(url) = Self::discovery_gossip_url(endpoint) else {
+                            continue;
+                        };
+                        if self_gossip_url.as_deref() == Some(url.as_str()) {
+                            continue;
+                        }
+                        if !seen_urls.insert(url.clone()) {
+                            continue;
+                        }
+                        gossip_urls.push(url);
+                    }
+                }
+
+                for url in gossip_urls {
+                    attempted += 1;
+                    match Self::gossip_with_peer(
+                        &client,
+                        &peer_store,
+                        &url,
+                        self_descriptor.clone(),
+                        now,
+                        config.discovery.gossip_peer_limit,
+                    )
+                    .await
+                    {
+                        Ok(()) => succeeded += 1,
+                        Err(e) => {
+                            last_failure_reason = Some(e.clone());
+                            debug!(
+                                peer = %url,
+                                error = %e,
+                                backpressure_active,
+                                "[DISCOVERY] Outbound gossip peer sync failed"
+                            );
+                        }
+                    }
+                }
+
+                if attempted > 0 {
+                    info!(
+                        attempted,
+                        succeeded,
+                        backpressure_active,
+                        "[DISCOVERY] Outbound gossip round complete"
+                    );
+                }
+                peer_store.record_gossip_round(
+                    now,
+                    attempted,
+                    succeeded,
+                    seed_attempted,
+                    last_failure_reason,
+                );
             }
         }))
+    }
+
+    fn discovery_gossip_backpressure_active(
+        discovery: &DiscoveryConfig,
+        consecutive_failures: u64,
+    ) -> bool {
+        consecutive_failures >= discovery.gossip_backpressure_failure_threshold
+    }
+
+    fn discovery_gossip_schedule(
+        discovery: &DiscoveryConfig,
+        self_node_id: &[u8],
+        now: u64,
+        consecutive_failures: u64,
+    ) -> (Duration, bool, u64, i64) {
+        let base_secs = discovery.gossip_interval_secs.max(1);
+        let backpressure_active =
+            Self::discovery_gossip_backpressure_active(discovery, consecutive_failures);
+        let backoff_multiplier = if backpressure_active {
+            let backoff_steps = consecutive_failures
+                .saturating_sub(discovery.gossip_backpressure_failure_threshold)
+                .min(5);
+            1u64 << backoff_steps
+        } else {
+            1
+        };
+        let raw_delay_secs = base_secs
+            .saturating_mul(backoff_multiplier)
+            .min(discovery.gossip_failure_backoff_max_secs.max(base_secs));
+        let jitter_secs = Self::discovery_gossip_jitter_seconds(
+            raw_delay_secs,
+            discovery.gossip_jitter_percent,
+            now,
+            self_node_id,
+            consecutive_failures,
+        );
+        let delayed = i128::from(raw_delay_secs) + i128::from(jitter_secs);
+        let delay_secs = delayed.clamp(
+            1,
+            i128::from(discovery.gossip_failure_backoff_max_secs.max(base_secs)),
+        ) as u64;
+
+        (
+            Duration::from_secs(delay_secs),
+            backpressure_active,
+            delay_secs,
+            jitter_secs,
+        )
+    }
+
+    fn discovery_gossip_jitter_seconds(
+        base_secs: u64,
+        jitter_percent: u8,
+        now: u64,
+        self_node_id: &[u8],
+        consecutive_failures: u64,
+    ) -> i64 {
+        let window = base_secs.saturating_mul(u64::from(jitter_percent)) / 100;
+        if window == 0 {
+            return 0;
+        }
+
+        let period = now / base_secs.max(1);
+        let mut mixed = period ^ consecutive_failures.rotate_left(13) ^ base_secs.rotate_left(7);
+        for byte in self_node_id.iter().take(16) {
+            mixed = mixed
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(u64::from(*byte));
+        }
+        let span = window.saturating_mul(2).saturating_add(1);
+        (mixed % span) as i64 - window as i64
     }
 
     async fn gossip_with_peer(
@@ -3414,7 +3533,7 @@ mod tests {
 
     use crate::api::chat_peer::{PeerChatRelayRequest, PeerChatRelayResponse};
     use crate::api::discovery::GossipResponse;
-    use crate::config::ServerConfig;
+    use crate::config::{DiscoveryConfig, ServerConfig};
     use crate::services::{PeerStore, PeerStoreImportReport};
 
     fn signed_test_chat_envelope(now: u64) -> ChatEnvelope {
@@ -3535,6 +3654,38 @@ mod tests {
             Some("https://node.example.com/api/discovery/gossip")
         );
         assert_eq!(Server::discovery_gossip_url("   "), None);
+    }
+
+    #[test]
+    fn discovery_gossip_schedule_applies_jitter_and_backpressure() {
+        let mut discovery = DiscoveryConfig {
+            enabled: true,
+            gossip_enabled: true,
+            gossip_interval_secs: 60,
+            gossip_jitter_percent: 10,
+            gossip_backpressure_failure_threshold: 3,
+            gossip_failure_backoff_max_secs: 300,
+            ..DiscoveryConfig::default()
+        };
+        let node_id = [0x42; 32];
+
+        let (_delay, backpressure_active, delay_secs, jitter_secs) =
+            Server::discovery_gossip_schedule(&discovery, &node_id, 1_800_000_000, 0);
+        assert!(!backpressure_active);
+        assert!((54..=66).contains(&delay_secs));
+        assert!((-6..=6).contains(&jitter_secs));
+
+        let (_delay, backpressure_active, delay_secs, _jitter_secs) =
+            Server::discovery_gossip_schedule(&discovery, &node_id, 1_800_000_060, 5);
+        assert!(backpressure_active);
+        assert!((216..=264).contains(&delay_secs));
+
+        discovery.gossip_jitter_percent = 0;
+        let (_delay, backpressure_active, delay_secs, jitter_secs) =
+            Server::discovery_gossip_schedule(&discovery, &node_id, 1_800_000_120, 8);
+        assert!(backpressure_active);
+        assert_eq!(delay_secs, 300);
+        assert_eq!(jitter_secs, 0);
     }
 
     #[test]

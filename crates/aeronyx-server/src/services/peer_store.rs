@@ -25,6 +25,8 @@
 //!   not mask a later successful seed-gossip recovery path
 //! - Commercial peer metadata summary: source, last_seen, TTL, capabilities,
 //!   and health bucket for nodeboard capacity and stale-peer visibility
+//! - Gossip scheduler visibility for jitter/backpressure diagnostics without
+//!   exposing seed endpoint values or peer URLs
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -51,6 +53,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.13.0-GossipBackpressureStatus - Added outbound gossip jitter/backpressure status
 //! v0.12.0-CommercialPeerSummary - Added source/TTL/health/capability peer summary
 //! v0.11.0-DiscoveryRecoveryStatus - Added effective recovery status for nodeboard
 //! v0.10.0-DiscoveryRestartRecovery - Gate relay foundation on restart recovery
@@ -216,6 +219,14 @@ pub struct PeerStoreBootstrapStatus {
     pub last_gossip_success_at: Option<u64>,
     /// Timestamp of the last outbound gossip round.
     pub last_gossip_round_at: Option<u64>,
+    /// Whether outbound gossip is currently reducing fanout after failures.
+    pub gossip_backpressure_active: bool,
+    /// Delay planned before the next outbound gossip round.
+    pub next_gossip_delay_seconds: Option<u64>,
+    /// Jitter offset applied to the next gossip delay. May be negative.
+    pub next_gossip_jitter_seconds: i64,
+    /// Timestamp when the current gossip schedule was calculated.
+    pub last_gossip_schedule_at: Option<u64>,
 }
 
 impl Default for PeerStoreBootstrapStatus {
@@ -246,6 +257,10 @@ impl Default for PeerStoreBootstrapStatus {
             consecutive_gossip_failures: 0,
             last_gossip_success_at: None,
             last_gossip_round_at: None,
+            gossip_backpressure_active: false,
+            next_gossip_delay_seconds: None,
+            next_gossip_jitter_seconds: 0,
+            last_gossip_schedule_at: None,
         }
     }
 }
@@ -691,6 +706,45 @@ impl PeerStore {
                 "attempted={attempted} succeeded={succeeded} failed={failed} seed_attempted={seed_attempted} status={status_bucket} consecutive_failures={consecutive_gossip_failures}{reason_detail}"
             ),
         );
+    }
+
+    /// Records the next outbound gossip schedule.
+    ///
+    /// This is intentionally aggregate scheduler state only. It never stores
+    /// peer URLs, seed URLs, client identifiers, ciphertext, plaintext, packet
+    /// payloads, voucher secrets, private keys, or wallet-level traffic.
+    pub fn record_gossip_schedule(
+        &self,
+        now: u64,
+        backpressure_active: bool,
+        next_delay_seconds: u64,
+        jitter_seconds: i64,
+    ) {
+        {
+            let mut status = self.bootstrap_status.write();
+            status.gossip_backpressure_active = backpressure_active;
+            status.next_gossip_delay_seconds = Some(next_delay_seconds);
+            status.next_gossip_jitter_seconds = jitter_seconds;
+            status.last_gossip_schedule_at = Some(now);
+        }
+
+        if backpressure_active {
+            self.record_audit_event(
+                now,
+                "outbound_gossip_backpressure",
+                "limited",
+                format!("next_delay_seconds={next_delay_seconds} jitter_seconds={jitter_seconds}"),
+            );
+        }
+    }
+
+    /// Returns the current consecutive outbound gossip failure count.
+    ///
+    /// The scheduler uses this aggregate counter to decide whether to reduce
+    /// fanout. It is exposed as a method so task code does not need to inspect
+    /// the full status snapshot or any peer-level state.
+    pub fn consecutive_gossip_failures(&self) -> u64 {
+        self.bootstrap_status.read().consecutive_gossip_failures
     }
 
     /// Verifies and inserts or refreshes a descriptor.
@@ -1701,6 +1755,7 @@ mod tests {
         );
         store.record_self_descriptor_status(1_700_000_011, "success", "registered");
         store.record_cache_save_status(1_700_000_012, "success", "exported=1");
+        store.record_gossip_schedule(1_700_000_012, true, 180, -7);
         store.record_gossip_round(
             1_700_000_013,
             2,
@@ -1741,10 +1796,21 @@ mod tests {
         );
         assert_eq!(status.bootstrap.consecutive_gossip_failures, 0);
         assert_eq!(status.bootstrap.last_gossip_success_at, Some(1_700_000_013));
+        assert!(status.bootstrap.gossip_backpressure_active);
+        assert_eq!(status.bootstrap.next_gossip_delay_seconds, Some(180));
+        assert_eq!(status.bootstrap.next_gossip_jitter_seconds, -7);
+        assert_eq!(
+            status.bootstrap.last_gossip_schedule_at,
+            Some(1_700_000_012)
+        );
         assert!(status
             .recent_audit_events
             .iter()
             .any(|event| event.action == "outbound_gossip_round"));
+        assert!(status
+            .recent_audit_events
+            .iter()
+            .any(|event| event.action == "outbound_gossip_backpressure"));
     }
 
     #[test]
@@ -1787,6 +1853,28 @@ mod tests {
         assert_eq!(status.bootstrap.last_gossip_failure_reason, None);
         assert_eq!(status.bootstrap.consecutive_gossip_failures, 0);
         assert_eq!(status.bootstrap.last_gossip_success_at, Some(1_700_000_050));
+    }
+
+    #[test]
+    fn test_gossip_schedule_status_tracks_backpressure_without_peer_details() {
+        let store = PeerStore::new();
+
+        store.record_gossip_schedule(1_700_000_020, true, 240, 12);
+        assert_eq!(store.consecutive_gossip_failures(), 0);
+
+        let status = store.status(1_700_000_030);
+        assert!(status.bootstrap.gossip_backpressure_active);
+        assert_eq!(status.bootstrap.next_gossip_delay_seconds, Some(240));
+        assert_eq!(status.bootstrap.next_gossip_jitter_seconds, 12);
+        assert_eq!(
+            status.bootstrap.last_gossip_schedule_at,
+            Some(1_700_000_020)
+        );
+        assert!(status.recent_audit_events.iter().any(|event| {
+            event.action == "outbound_gossip_backpressure"
+                && event.outcome == "limited"
+                && !event.detail.contains("http")
+        }));
     }
 
     #[test]

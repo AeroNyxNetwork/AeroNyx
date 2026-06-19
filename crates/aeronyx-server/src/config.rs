@@ -66,6 +66,7 @@
 //! v0.5.0-DiscoveryPeerCache — Added optional local PeerStore cache config
 //! v0.4.0-DiscoverySelfDescriptor — Added signed self descriptor config
 //! v0.3.0-DiscoveryBootstrap — Added optional discovery bootstrap config
+//! v0.9.0-DiscoveryGossipBackpressure — Added outbound gossip jitter/backpressure controls
 //! v0.8.0-DiscoveryPublicApi — Added optional public-only discovery listener
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -142,6 +143,22 @@ pub struct DiscoveryConfig {
     /// Maximum number of public peers contacted per gossip round.
     #[serde(default = "DiscoveryConfig::default_gossip_peer_limit")]
     pub gossip_peer_limit: u16,
+    /// Percent of `gossip_interval_secs` used as per-node scheduling jitter.
+    ///
+    /// This keeps a fleet of nodes from contacting seeds at the exact same
+    /// second after restart or after a temporary network incident.
+    #[serde(default = "DiscoveryConfig::default_gossip_jitter_percent")]
+    pub gossip_jitter_percent: u8,
+    /// Consecutive failed outbound gossip rounds before seed-only backpressure.
+    ///
+    /// Backpressure does not disable discovery. It temporarily reduces fanout to
+    /// configured seed endpoints so a failing node does not amplify errors by
+    /// retrying every stale peer endpoint.
+    #[serde(default = "DiscoveryConfig::default_gossip_backpressure_failure_threshold")]
+    pub gossip_backpressure_failure_threshold: u64,
+    /// Maximum delay between outbound gossip attempts while backpressure is active.
+    #[serde(default = "DiscoveryConfig::default_gossip_failure_backoff_max_secs")]
+    pub gossip_failure_backoff_max_secs: u64,
     /// Maximum descriptors retained in the local verified peer store.
     #[serde(default = "DiscoveryConfig::default_max_peers")]
     pub max_peers: usize,
@@ -210,6 +227,24 @@ impl DiscoveryConfig {
     #[must_use]
     pub const fn default_gossip_peer_limit() -> u16 {
         32
+    }
+
+    /// Default outbound gossip scheduling jitter as a percent of base interval.
+    #[must_use]
+    pub const fn default_gossip_jitter_percent() -> u8 {
+        20
+    }
+
+    /// Default consecutive failure threshold before seed-only backpressure.
+    #[must_use]
+    pub const fn default_gossip_backpressure_failure_threshold() -> u64 {
+        3
+    }
+
+    /// Default maximum outbound gossip delay while backpressure is active.
+    #[must_use]
+    pub const fn default_gossip_failure_backoff_max_secs() -> u64 {
+        300
     }
 
     /// Default maximum verified peers retained locally.
@@ -307,6 +342,27 @@ impl DiscoveryConfig {
             return Err(ServerError::config_invalid(
                 "discovery.gossip_peer_limit",
                 "must be greater than zero",
+            ));
+        }
+
+        if self.gossip_jitter_percent > 50 {
+            return Err(ServerError::config_invalid(
+                "discovery.gossip_jitter_percent",
+                "must be 50 or less",
+            ));
+        }
+
+        if self.gossip_backpressure_failure_threshold == 0 {
+            return Err(ServerError::config_invalid(
+                "discovery.gossip_backpressure_failure_threshold",
+                "must be greater than zero",
+            ));
+        }
+
+        if self.gossip_failure_backoff_max_secs < self.gossip_interval_secs {
+            return Err(ServerError::config_invalid(
+                "discovery.gossip_failure_backoff_max_secs",
+                "must be at least discovery.gossip_interval_secs",
             ));
         }
 
@@ -423,6 +479,10 @@ impl Default for DiscoveryConfig {
             gossip_enabled: false,
             gossip_interval_secs: Self::default_gossip_interval_secs(),
             gossip_peer_limit: Self::default_gossip_peer_limit(),
+            gossip_jitter_percent: Self::default_gossip_jitter_percent(),
+            gossip_backpressure_failure_threshold:
+                Self::default_gossip_backpressure_failure_threshold(),
+            gossip_failure_backoff_max_secs: Self::default_gossip_failure_backoff_max_secs(),
             max_peers: Self::default_max_peers(),
             max_snapshot_limit: Self::default_max_snapshot_limit(),
             gossip_rate_limit_per_minute: Self::default_gossip_rate_limit_per_minute(),
@@ -620,6 +680,18 @@ mod tests {
             DiscoveryConfig::default_gossip_peer_limit()
         );
         assert_eq!(
+            config.discovery.gossip_jitter_percent,
+            DiscoveryConfig::default_gossip_jitter_percent()
+        );
+        assert_eq!(
+            config.discovery.gossip_backpressure_failure_threshold,
+            DiscoveryConfig::default_gossip_backpressure_failure_threshold()
+        );
+        assert_eq!(
+            config.discovery.gossip_failure_backoff_max_secs,
+            DiscoveryConfig::default_gossip_failure_backoff_max_secs()
+        );
+        assert_eq!(
             config.discovery.max_peers,
             DiscoveryConfig::default_max_peers()
         );
@@ -735,6 +807,9 @@ peer_cache_write_interval_secs = 120
 gossip_enabled = true
 gossip_interval_secs = 45
 gossip_peer_limit = 8
+gossip_jitter_percent = 15
+gossip_backpressure_failure_threshold = 4
+gossip_failure_backoff_max_secs = 180
 max_peers = 512
 max_snapshot_limit = 64
 gossip_rate_limit_per_minute = 30
@@ -773,6 +848,9 @@ public_discovery = false
         assert!(config.discovery.gossip_enabled);
         assert_eq!(config.discovery.gossip_interval_secs, 45);
         assert_eq!(config.discovery.gossip_peer_limit, 8);
+        assert_eq!(config.discovery.gossip_jitter_percent, 15);
+        assert_eq!(config.discovery.gossip_backpressure_failure_threshold, 4);
+        assert_eq!(config.discovery.gossip_failure_backoff_max_secs, 180);
         assert_eq!(config.discovery.max_peers, 512);
         assert_eq!(config.discovery.max_snapshot_limit, 64);
         assert_eq!(config.discovery.gossip_rate_limit_per_minute, 30);
@@ -872,6 +950,31 @@ gossip_enabled = true
 gossip_peer_limit = 0
 "#;
         assert!(ServerConfig::from_str(zero_limit).is_err());
+
+        let excessive_jitter = r#"
+[discovery]
+enabled = true
+gossip_enabled = true
+gossip_jitter_percent = 51
+"#;
+        assert!(ServerConfig::from_str(excessive_jitter).is_err());
+
+        let zero_backpressure_threshold = r#"
+[discovery]
+enabled = true
+gossip_enabled = true
+gossip_backpressure_failure_threshold = 0
+"#;
+        assert!(ServerConfig::from_str(zero_backpressure_threshold).is_err());
+
+        let short_backoff_max = r#"
+[discovery]
+enabled = true
+gossip_enabled = true
+gossip_interval_secs = 60
+gossip_failure_backoff_max_secs = 30
+"#;
+        assert!(ServerConfig::from_str(short_backoff_max).is_err());
     }
 
     #[test]
