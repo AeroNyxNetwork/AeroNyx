@@ -42,6 +42,10 @@
 //     1000 stale packets after live restart validation on US1.
 //   v1.0.4-PacketRuntimeStatus — expose privacy-safe packet counters for
 //     vpn_health/heartbeat so operators do not need raw journal access.
+//   v1.0.5-PrivacyLogRedaction — remove session identifiers, virtual IPs,
+//     wallet targets, client endpoints, and decrypted packet header dumps from
+//     packet-path logs. Relay nodes must stay blind in both protocol handling
+//     and local observability.
 // ============================================
 
 use std::net::Ipv4Addr;
@@ -49,7 +53,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use tracing::{debug, trace, warn};
 
 use aeronyx_common::types::SessionId;
@@ -200,42 +203,28 @@ impl PacketHandler {
             ));
         }
 
-        let raw_session_id = &data[0..16];
         debug!(
-            "[PACKET_HANDLER] Processing packet, raw SessionID bytes: {:02X?}",
-            raw_session_id
-        );
-        debug!(
-            "[PACKET_HANDLER] SessionID (base64): {}",
-            BASE64.encode(raw_session_id)
+            wire_len = data.len(),
+            "[PACKET_HANDLER] Processing encrypted packet"
         );
 
         let packet = decode_data_packet(data)?;
 
-        debug!(
-            "[PACKET_HANDLER] Decoded packet.session_id (base64): {}",
-            BASE64.encode(&packet.session_id)
-        );
-
         let session_id = SessionId::from_bytes(&packet.session_id).ok_or_else(|| {
-            warn!(
-                "[PACKET_HANDLER] Invalid session ID format: {:02X?}",
-                &packet.session_id
-            );
+            warn!("[PACKET_HANDLER] Invalid session ID format");
             ServerError::invalid_packet("0.0.0.0:0".parse().unwrap(), "Invalid session ID")
         })?;
 
-        debug!("[PACKET_HANDLER] Looking up SessionID: {}", session_id);
         debug!(
-            "[PACKET_HANDLER] Active sessions count: {}",
-            self.sessions.count()
+            active_sessions = self.sessions.count(),
+            "[PACKET_HANDLER] Session lookup requested"
         );
 
         let session = match self.sessions.get(&session_id) {
             Some(s) => {
                 debug!(
-                    "[PACKET_HANDLER] Session FOUND: {}, virtual_ip={}, endpoint={}",
-                    session_id, s.virtual_ip, s.client_endpoint
+                    active_sessions = self.sessions.count(),
+                    "[PACKET_HANDLER] Session found"
                 );
                 s
             }
@@ -244,15 +233,12 @@ impl PacketHandler {
                     self.unknown_session_counter.fetch_add(1, Ordering::Relaxed) + 1;
                 if unknown_count <= 5 || unknown_count % 1000 == 0 {
                     warn!(
-                        session_id = %session_id,
-                        session_id_base64 = %BASE64.encode(session_id.as_bytes()),
                         unknown_session_packets = unknown_count,
                         active_sessions = self.sessions.count(),
                         "[PACKET_HANDLER] Unknown session packet dropped; likely stale client traffic after restart"
                     );
                 } else {
                     debug!(
-                        session_id = %session_id,
                         unknown_session_packets = unknown_count,
                         "[PACKET_HANDLER] Unknown session packet dropped"
                     );
@@ -262,11 +248,7 @@ impl PacketHandler {
         };
 
         if !session.validate_rx_counter(packet.counter) {
-            warn!(
-                session_id = %session_id,
-                counter    = packet.counter,
-                "Replay attack detected"
-            );
+            warn!(counter = packet.counter, "Replay attack detected");
             return Err(ServerError::Core(aeronyx_core::error::CoreError::replay(
                 packet.counter,
                 session.rx_counter.load(std::sync::atomic::Ordering::SeqCst),
@@ -304,27 +286,18 @@ impl PacketHandler {
             Some(b) if b >> 4 == 4 => {
                 if plaintext_len < IPV4_HEADER_MIN_SIZE {
                     return Err(ServerError::invalid_packet(
-                        session.client_endpoint,
+                        redacted_packet_addr(),
                         "IP packet too short",
                     ));
                 }
 
                 let src_ip = extract_ipv4_src(&plaintext)?;
                 if src_ip != session.virtual_ip {
-                    debug!(
-                        session_id = %session_id,
-                        expected   = %session.virtual_ip,
-                        actual     = %src_ip,
-                        "src IP mismatch (iOS/macOS NE — packet accepted)"
-                    );
+                    debug!("src IP mismatch (iOS/macOS NE — packet accepted)");
                 }
 
                 if let Some(rtt_ms) = record_keepalive_echo_reply(&session, &plaintext) {
-                    trace!(
-                        session_id = %session_id,
-                        rtt_ms,
-                        "[KEEPALIVE] ICMP echo reply received"
-                    );
+                    trace!(rtt_ms, "[KEEPALIVE] ICMP echo reply received");
                     return Ok((session, DecryptedPayload::KeepaliveAck { rtt_ms }));
                 }
 
@@ -339,7 +312,7 @@ impl PacketHandler {
                     .record_rx(&session.wallet_hex, plaintext_len as u64);
                 self.record_encrypted_vpn_message();
 
-                trace!(session_id = %session_id, len = plaintext_len, "VPN IPv4 decrypted");
+                trace!(len = plaintext_len, "VPN IPv4 decrypted");
                 DecryptedPayload::Vpn(plaintext)
             }
 
@@ -355,7 +328,7 @@ impl PacketHandler {
                     .record_rx(&session.wallet_hex, plaintext_len as u64);
                 self.record_encrypted_vpn_message();
 
-                trace!(session_id = %session_id, len = plaintext_len, "VPN IPv6 decrypted");
+                trace!(len = plaintext_len, "VPN IPv6 decrypted");
                 DecryptedPayload::Vpn(plaintext)
             }
 
@@ -363,7 +336,7 @@ impl PacketHandler {
             Some(MEMCHAIN_MAGIC) => {
                 if plaintext_len < 5 {
                     return Err(ServerError::invalid_packet(
-                        session.client_endpoint,
+                        redacted_packet_addr(),
                         "0xAE packet too short for discriminant",
                     ));
                 }
@@ -373,12 +346,7 @@ impl PacketHandler {
 
                 if matches!(disc, DISC_VOICE_OFFER | DISC_VOICE_ANSWER | DISC_VOICE_END) {
                     let target_wallet = extract_pubkey_from_json(&plaintext[5..]);
-                    trace!(
-                        session_id = %session_id,
-                        disc,
-                        target = %target_wallet.as_deref().unwrap_or("unknown"),
-                        "[VOICE_SIGNAL] Signal received"
-                    );
+                    trace!(disc, "[VOICE_SIGNAL] Signal received");
                     return Ok((
                         session,
                         DecryptedPayload::VoiceSignal {
@@ -393,24 +361,19 @@ impl PacketHandler {
                 match decode_memchain(memchain_payload) {
                     Ok(msg) => {
                         debug!(
-                            session_id = %session_id,
                             msg_type   = ?std::mem::discriminant(&msg),
                             "[MEMCHAIN] Message decoded"
                         );
                         DecryptedPayload::MemChain(msg)
                     }
                     Err(e) => {
-                        let dump_len = plaintext.len().min(16);
                         warn!(
-                            session_id            = %session_id,
                             error                 = %e,
                             plaintext_total_len   = plaintext.len(),
-                            header_hex            = %hex::encode(&plaintext[..dump_len]),
-                            discriminant_bytes    = %hex::encode(&plaintext[1..plaintext.len().min(5)]),
                             "[MEMCHAIN] Failed to decode payload"
                         );
                         return Err(ServerError::invalid_packet(
-                            session.client_endpoint,
+                            redacted_packet_addr(),
                             format!("MemChain decode error: {}", e),
                         ));
                     }
@@ -421,13 +384,12 @@ impl PacketHandler {
             Some(VOICE_MAGIC) => {
                 if plaintext_len < VOICE_PACKET_MIN_SIZE {
                     warn!(
-                        session_id = %session_id,
-                        len        = plaintext_len,
+                        len = plaintext_len,
                         "[VOICE] Packet too short (need {} bytes for dst_ip)",
                         VOICE_PACKET_MIN_SIZE
                     );
                     return Err(ServerError::invalid_packet(
-                        session.client_endpoint,
+                        redacted_packet_addr(),
                         "Voice packet too short",
                     ));
                 }
@@ -437,12 +399,7 @@ impl PacketHandler {
                     .copy_from_slice(&plaintext[VOICE_DST_IP_OFFSET..VOICE_DST_IP_OFFSET + 4]);
                 let dst_ip = Ipv4Addr::from(dst_octets);
 
-                trace!(
-                    session_id = %session_id,
-                    dst_ip     = %dst_ip,
-                    len        = plaintext_len,
-                    "[VOICE] Audio frame decoded"
-                );
+                trace!(len = plaintext_len, "[VOICE] Audio frame decoded");
 
                 DecryptedPayload::Voice {
                     dst_ip,
@@ -453,19 +410,18 @@ impl PacketHandler {
             // ── Unknown ───────────────────────────────────────────────
             Some(b) => {
                 warn!(
-                    session_id  = %session_id,
-                    first_byte  = format_args!("0x{:02X}", b),
+                    first_byte = format_args!("0x{:02X}", b),
                     "Unknown plaintext type"
                 );
                 return Err(ServerError::invalid_packet(
-                    session.client_endpoint,
+                    redacted_packet_addr(),
                     format!("Unknown plaintext first byte: 0x{:02X}", b),
                 ));
             }
 
             None => {
                 return Err(ServerError::invalid_packet(
-                    session.client_endpoint,
+                    redacted_packet_addr(),
                     "Empty plaintext after decryption",
                 ));
             }
@@ -514,10 +470,8 @@ impl PacketHandler {
         self.record_encrypted_vpn_message();
 
         trace!(
-            session_id    = %session_id,
-            dst_ip        = %dst_ip,
             plaintext_len = ip_packet.len(),
-            wire_len      = output.len(),
+            wire_len = output.len(),
             "TUN packet encrypted and sent"
         );
 
@@ -627,6 +581,12 @@ fn extract_ipv4_src(packet: &[u8]) -> Result<Ipv4Addr> {
     let mut octets = [0u8; 4];
     octets.copy_from_slice(&packet[IPV4_SRC_OFFSET..IPV4_SRC_OFFSET + 4]);
     Ok(Ipv4Addr::from(octets))
+}
+
+fn redacted_packet_addr() -> std::net::SocketAddr {
+    "0.0.0.0:0"
+        .parse()
+        .expect("static redacted packet address must parse")
 }
 
 fn record_keepalive_echo_reply(session: &Arc<Session>, packet: &[u8]) -> Option<f64> {
