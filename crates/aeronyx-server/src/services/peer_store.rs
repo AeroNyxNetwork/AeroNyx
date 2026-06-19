@@ -37,6 +37,8 @@
 //!   naturally deprioritized without exposing payloads or full peer endpoints
 //! - Exclude-list route candidate selection so server internals can remove
 //!   self or already-used hops before applying fanout/path limits
+//! - Controlled route path planning for future multi-hop/onion relay, using
+//!   only descriptor metadata and route health while exposing only safe prefixes
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -63,6 +65,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.19.0-ControlledRoutePathPlanner - Added privacy-safe multi-hop path planning foundation
 //! v0.18.0-RouteCandidateExclusion - Added exclude-before-limit route selection
 //! v0.17.0-RouteHealthFeedback - Added per-peer blind relay success/failure scoring
 //! v0.16.0-BlindRelayRuntimeStats - Added blind relay drop reason counters
@@ -565,6 +568,64 @@ pub struct PeerStoreRouteCandidateStatus {
     pub chat_relay: Vec<PeerStoreRouteCandidate>,
     /// Candidates for future no-exit onion middle-hop relay.
     pub onion_middle: Vec<PeerStoreRouteCandidate>,
+    /// Privacy-safe previews for controlled routes that future relay layers can use.
+    pub planned_paths: PeerStoreRoutePathStatus,
+}
+
+// ============================================
+// Route path planning summary
+// ============================================
+
+/// Privacy-safe hop preview for a planned route path.
+///
+/// This row intentionally mirrors only route-control metadata. It never
+/// contains full node ids, endpoint URLs, route ids, encrypted blobs, receiver
+/// identities, client IPs, destinations, DNS contents, voucher secrets, private
+/// keys, or wallet-level traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreRoutePathHop {
+    /// Hop position in the planned route, starting at zero.
+    pub hop_index: usize,
+    /// Capability required for this hop.
+    pub capability: String,
+    /// Short node id prefix for operator debugging without exposing full keys.
+    pub node_id_prefix: String,
+    /// Route score inherited from the candidate scorer.
+    pub score: i64,
+    /// Descriptor health bucket at planning time.
+    pub health: String,
+    /// Local route health bucket at planning time.
+    pub route_health: String,
+    /// Age of the last observation at status generation time.
+    pub last_seen_age_seconds: u64,
+    /// Remaining descriptor TTL in seconds.
+    pub ttl_remaining_seconds: Option<u64>,
+    /// Optional region hint from signed descriptor policy.
+    pub region: Option<String>,
+}
+
+/// Privacy-safe preview for one controlled route plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreRoutePathPlan {
+    /// Stable plan label for nodeboard and health checks.
+    pub label: String,
+    /// Required capability sequence for this plan.
+    pub required_capabilities: Vec<String>,
+    /// Whether every requested hop was selected.
+    pub complete: bool,
+    /// Number of selected hops.
+    pub hop_count: usize,
+    /// Selected hop previews, with no full keys or endpoints.
+    pub hops: Vec<PeerStoreRoutePathHop>,
+}
+
+/// Controlled route previews for future multi-hop relay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreRoutePathStatus {
+    /// One-hop encrypted chat relay path.
+    pub chat_single_hop: PeerStoreRoutePathPlan,
+    /// Two-hop path shaped for future onion relay: middle hop then chat relay.
+    pub chat_two_hop_onion_ready: PeerStoreRoutePathPlan,
 }
 
 #[derive(Debug, Clone)]
@@ -1489,6 +1550,43 @@ impl PeerStore {
             .collect()
     }
 
+    /// Plans a complete controlled route for the requested capability sequence.
+    ///
+    /// The planner selects one unique healthy-ranked peer for each requested
+    /// capability, excluding self or already-used hops before each hop is
+    /// chosen. It returns `None` unless the full path can be satisfied. This
+    /// keeps future multi-hop/onion relay callers from accidentally using a
+    /// partial route that weakens the intended privacy boundary.
+    ///
+    /// This method never reads or derives from encrypted chat/media blobs,
+    /// packet payloads, DNS data, destinations, client public IPs, voucher
+    /// secrets, private keys, wallet-level traffic, or plaintext content.
+    #[must_use]
+    pub fn route_path_with_capabilities_excluding(
+        &self,
+        capabilities: &[NodeCapability],
+        now: u64,
+        excluded_node_ids: &[[u8; 32]],
+    ) -> Option<Vec<SignedNodeDescriptor>> {
+        let mut excluded = excluded_node_ids.to_vec();
+        let mut path = Vec::with_capacity(capabilities.len());
+
+        for capability in capabilities {
+            let next = self
+                .scored_route_candidates(*capability, now, None)
+                .into_iter()
+                .find(|candidate| {
+                    let node_id = candidate.descriptor.node_id();
+                    !excluded.iter().any(|excluded| *excluded == node_id)
+                })?;
+            let node_id = next.descriptor.node_id();
+            excluded.push(node_id);
+            path.push(next.descriptor);
+        }
+
+        Some(path)
+    }
+
     /// Removes descriptors that are no longer valid at `now`.
     pub fn cleanup_expired(&self, now: u64) -> usize {
         let mut peers = self.peers.write();
@@ -1917,6 +2015,69 @@ impl PeerStore {
             .collect()
     }
 
+    fn route_path_plan_preview(
+        &self,
+        label: &str,
+        capabilities: &[NodeCapability],
+        now: u64,
+    ) -> PeerStoreRoutePathPlan {
+        let mut excluded = Vec::with_capacity(capabilities.len());
+        let mut hops = Vec::with_capacity(capabilities.len());
+
+        for capability in capabilities {
+            let Some(next) = self
+                .scored_route_candidates(*capability, now, None)
+                .into_iter()
+                .find(|candidate| {
+                    let node_id = candidate.descriptor.node_id();
+                    !excluded.iter().any(|excluded| *excluded == node_id)
+                })
+            else {
+                break;
+            };
+
+            let node_id = next.descriptor.node_id();
+            excluded.push(node_id);
+            hops.push(PeerStoreRoutePathHop {
+                hop_index: hops.len(),
+                capability: Self::capability_label(*capability).to_string(),
+                node_id_prefix: next.summary.node_id_prefix,
+                score: next.summary.score,
+                health: next.summary.health,
+                route_health: next.summary.route_health,
+                last_seen_age_seconds: next.summary.last_seen_age_seconds,
+                ttl_remaining_seconds: next.summary.ttl_remaining_seconds,
+                region: next.summary.region,
+            });
+        }
+
+        PeerStoreRoutePathPlan {
+            label: label.to_string(),
+            required_capabilities: capabilities
+                .iter()
+                .map(|capability| Self::capability_label(*capability).to_string())
+                .collect(),
+            complete: hops.len() == capabilities.len(),
+            hop_count: hops.len(),
+            hops,
+        }
+    }
+
+    fn route_path_status(&self, now: u64) -> PeerStoreRoutePathStatus {
+        PeerStoreRoutePathStatus {
+            chat_single_hop: self.route_path_plan_preview(
+                "chat_single_hop",
+                &[NodeCapability::ChatRelay],
+                now,
+            ),
+            chat_two_hop_onion_ready: self.route_path_plan_preview(
+                "chat_two_hop_onion_ready",
+                &[NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+                now,
+            ),
+        }
+    }
+
     /// Builds privacy-safe route candidate lists for nodeboard.
     #[must_use]
     pub fn route_candidate_status(&self, now: u64) -> PeerStoreRouteCandidateStatus {
@@ -1925,6 +2086,7 @@ impl PeerStore {
             privacy_relay: self.route_candidate_summaries(NodeCapability::PrivacyRelay, now),
             chat_relay: self.route_candidate_summaries(NodeCapability::ChatRelay, now),
             onion_middle: self.route_candidate_summaries(NodeCapability::OnionMiddle, now),
+            planned_paths: self.route_path_status(now),
         }
     }
 
@@ -2353,6 +2515,110 @@ mod tests {
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].node_id(), peer_node_id);
+    }
+
+    #[test]
+    fn test_route_path_planner_selects_unique_hops_without_payload_data() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let self_kp = IdentityKeyPair::generate();
+        let shared_kp = IdentityKeyPair::generate();
+        let middle_kp = IdentityKeyPair::generate();
+        let relay_kp = IdentityKeyPair::generate();
+
+        let mut self_descriptor = signed_descriptor_for(&self_kp, 1, now + 2_000);
+        self_descriptor.descriptor.capabilities =
+            vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay];
+        self_descriptor.descriptor.public_endpoint = Some("https://self.example".to_string());
+        self_descriptor.descriptor.capacity.max_sessions = 4096;
+        self_descriptor = SignedNodeDescriptor::sign(self_descriptor.descriptor, &self_kp).unwrap();
+        let self_node_id = self_descriptor.node_id();
+
+        let mut shared_descriptor = signed_descriptor_for(&shared_kp, 1, now + 2_000);
+        shared_descriptor.descriptor.capabilities =
+            vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay];
+        shared_descriptor.descriptor.public_endpoint = Some("https://shared.example".to_string());
+        shared_descriptor.descriptor.capacity.max_sessions = 2048;
+        shared_descriptor =
+            SignedNodeDescriptor::sign(shared_descriptor.descriptor, &shared_kp).unwrap();
+        let shared_node_id = shared_descriptor.node_id();
+
+        let mut middle_descriptor = signed_descriptor_for(&middle_kp, 1, now + 2_000);
+        middle_descriptor.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        middle_descriptor.descriptor.public_endpoint = Some("https://middle.example".to_string());
+        middle_descriptor.descriptor.capacity.max_sessions = 512;
+        middle_descriptor =
+            SignedNodeDescriptor::sign(middle_descriptor.descriptor, &middle_kp).unwrap();
+
+        let mut relay_descriptor = signed_descriptor_for(&relay_kp, 1, now + 2_000);
+        relay_descriptor.descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        relay_descriptor.descriptor.public_endpoint = Some("https://relay.example".to_string());
+        relay_descriptor.descriptor.capacity.max_sessions = 256;
+        relay_descriptor =
+            SignedNodeDescriptor::sign(relay_descriptor.descriptor, &relay_kp).unwrap();
+        let relay_node_id = relay_descriptor.node_id();
+
+        store
+            .upsert_verified_from_source(self_descriptor, now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(shared_descriptor, now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(middle_descriptor, now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(relay_descriptor, now, "gossip_announce")
+            .unwrap();
+
+        let path = store
+            .route_path_with_capabilities_excluding(
+                &[NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+                now,
+                &[self_node_id],
+            )
+            .expect("two-hop path should be available");
+
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].node_id(), shared_node_id);
+        assert_eq!(path[1].node_id(), relay_node_id);
+        assert_ne!(path[0].node_id(), path[1].node_id());
+        assert!(!path.iter().any(|hop| hop.node_id() == self_node_id));
+    }
+
+    #[test]
+    fn test_route_path_status_is_privacy_safe_and_marks_incomplete_paths() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let middle_kp = IdentityKeyPair::generate();
+
+        let mut middle_descriptor = signed_descriptor_for(&middle_kp, 1, now + 2_000);
+        middle_descriptor.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        middle_descriptor.descriptor.public_endpoint =
+            Some("https://private-middle.example".to_string());
+        middle_descriptor =
+            SignedNodeDescriptor::sign(middle_descriptor.descriptor, &middle_kp).unwrap();
+        let middle_node_id = middle_descriptor.node_id();
+
+        store
+            .upsert_verified_from_source(middle_descriptor, now, "gossip_announce")
+            .unwrap();
+
+        let status = store.route_candidate_status(now);
+        assert!(!status.planned_paths.chat_single_hop.complete);
+        assert_eq!(status.planned_paths.chat_single_hop.hop_count, 0);
+        assert!(!status.planned_paths.chat_two_hop_onion_ready.complete);
+        assert_eq!(status.planned_paths.chat_two_hop_onion_ready.hop_count, 1);
+        assert_eq!(
+            status.planned_paths.chat_two_hop_onion_ready.hops[0].capability,
+            "onion_middle"
+        );
+
+        let status_json = serde_json::to_string(&status).unwrap();
+        assert!(!status_json.contains("private-middle.example"));
+        assert!(!status_json.contains(&hex::encode(middle_node_id)));
+        assert!(!status_json.contains("encrypted_blob"));
+        assert!(!status_json.contains("receiver_pubkey"));
     }
 
     #[test]
