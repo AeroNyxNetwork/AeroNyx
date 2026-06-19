@@ -56,14 +56,19 @@
 //!   returned to the client after POST /api/chat/blob, then embedded here.
 //! - file_key is independent of the chat E2E shared_secret — double-layer protection.
 //!
+//! - `BlindRelayEnvelope`: node-to-node opaque forwarding frame for future
+//!   controlled multi-hop/onion routing. Nodes see route_id/next_hop/ttl and
+//!   an opaque encrypted_blob only; they do not parse the inner chat/media data.
+//!
 //! ## Last Modified
+//! v1.1.0-BlindRelayEnvelope — Added opaque node-to-node relay envelope skeleton
 //! v1.0.0-ChatRelay — Initial implementation
 
 use bincode::Options;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-use crate::crypto::keys::IdentityPublicKey;
+use crate::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
 use crate::error::CoreError;
 
 // ============================================
@@ -74,6 +79,9 @@ use crate::error::CoreError;
 /// Text ciphertext ≤ 64 KB + fixed fields ≤ ~1 KB overhead.
 /// Prevents bincode length-prefix OOM attacks.
 const MAX_ENVELOPE_BYTES: u64 = 128 * 1024; // 128 KB
+const MAX_BLIND_RELAY_ENVELOPE_BYTES: u64 = 256 * 1024; // 256 KB opaque relay frame cap
+const MAX_BLIND_RELAY_BLOB_BYTES: usize = 192 * 1024; // media/file bytes must use blob storage
+const BLIND_RELAY_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-v1";
 
 // ============================================
 // Serde helper for [u8; 64]
@@ -84,8 +92,6 @@ const MAX_ENVELOPE_BYTES: u64 = 128 * 1024; // 128 KB
 
 mod serde_bytes64 {
     use super::*;
-    use serde::de::{self, Visitor};
-    use std::fmt;
 
     pub fn serialize<S: Serializer>(v: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
         // Serialize as a tuple of two [u8;32] — both halves have stable serde impls.
@@ -274,6 +280,139 @@ impl ChatEnvelope {
     pub fn receiver_hex(&self) -> String {
         hex::encode(self.receiver)
     }
+}
+
+// ============================================
+// BlindRelayEnvelope
+// ============================================
+
+/// Opaque node-to-node forwarding envelope for future multi-hop/onion routing.
+///
+/// ## Blind relay invariant
+/// A Rust node can read only:
+///
+/// - `route_id`
+/// - `next_hop`
+/// - `ttl`
+/// - `encrypted_blob` length/hash
+/// - `timestamp`
+/// - `signature`
+///
+/// It must not parse the inner encrypted payload. The payload may contain a
+/// chat envelope, agent protocol frame, Memory Chain coordination message, or
+/// future onion layer, but this type intentionally treats it as opaque bytes.
+///
+/// ## Signature model
+/// The signing public key is supplied by the caller/transport context instead
+/// of being embedded here, keeping the envelope aligned with the minimal field
+/// set above. HTTP/gossip layers can bind the previous-hop node identity before
+/// calling `verify_signature_from()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindRelayEnvelope {
+    /// Route correlation id. Random per route; not a user/message id.
+    pub route_id: [u8; 16],
+    /// Next AeroNyx node id that should receive this opaque blob.
+    pub next_hop: [u8; 32],
+    /// Hop budget. Receivers must decrement before forwarding.
+    pub ttl: u8,
+    /// Opaque encrypted bytes. Nodes must not parse or log contents.
+    pub encrypted_blob: Vec<u8>,
+    /// Sender timestamp, Unix seconds.
+    pub timestamp: u64,
+    /// Ed25519 signature over `blind_relay_signing_data(self)`.
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl BlindRelayEnvelope {
+    /// Builds canonical signing bytes.
+    ///
+    /// Layout:
+    /// ```text
+    /// domain || route_id(16) || next_hop(32) || ttl(1) ||
+    /// timestamp_le(8) || SHA256(encrypted_blob)(32)
+    /// ```
+    #[must_use]
+    pub fn signing_data(&self) -> Vec<u8> {
+        let blob_hash = Sha256::digest(&self.encrypted_blob);
+        let mut data = Vec::with_capacity(BLIND_RELAY_SIGNING_DOMAIN.len() + 16 + 32 + 1 + 8 + 32);
+        data.extend_from_slice(BLIND_RELAY_SIGNING_DOMAIN);
+        data.extend_from_slice(&self.route_id);
+        data.extend_from_slice(&self.next_hop);
+        data.push(self.ttl);
+        data.extend_from_slice(&self.timestamp.to_le_bytes());
+        data.extend_from_slice(&blob_hash);
+        data
+    }
+
+    /// Signs this envelope with a previous-hop node key.
+    ///
+    /// The caller must create the opaque `encrypted_blob` before signing.
+    pub fn sign_with(mut self, keypair: &IdentityKeyPair) -> Self {
+        self.signature = keypair.sign(&self.signing_data());
+        self
+    }
+
+    /// Verifies signature using the previous-hop node public key supplied by
+    /// the transport/auth layer.
+    pub fn verify_signature_from(&self, previous_hop: &IdentityPublicKey) -> Result<(), CoreError> {
+        previous_hop.verify(&self.signing_data(), &self.signature)
+    }
+
+    /// Returns true if this envelope can be forwarded one more hop.
+    #[must_use]
+    pub const fn can_forward(&self) -> bool {
+        self.ttl > 0
+    }
+
+    /// Returns the next-hop envelope after decrementing TTL.
+    ///
+    /// `ttl` is covered by the signature, so the previous-hop signature is
+    /// intentionally cleared after decrementing. The forwarding layer must
+    /// re-sign the returned envelope with the current node key before sending
+    /// it onward. This keeps each hop accountable without allowing a relay to
+    /// mutate signed routing fields silently.
+    #[must_use]
+    pub fn decremented_ttl(&self) -> Option<Self> {
+        if self.ttl == 0 {
+            return None;
+        }
+        let mut next = self.clone();
+        next.ttl = next.ttl.saturating_sub(1);
+        next.signature = [0u8; 64];
+        Some(next)
+    }
+}
+
+/// Encodes a blind relay envelope with a bounded bincode cap.
+pub fn encode_blind_relay_envelope(envelope: &BlindRelayEnvelope) -> Result<Vec<u8>, CoreError> {
+    if envelope.encrypted_blob.len() > MAX_BLIND_RELAY_BLOB_BYTES {
+        return Err(CoreError::MessageTooLarge {
+            max: MAX_BLIND_RELAY_BLOB_BYTES,
+            actual: envelope.encrypted_blob.len(),
+        });
+    }
+    bincode::options()
+        .with_fixint_encoding()
+        .with_limit(MAX_BLIND_RELAY_ENVELOPE_BYTES)
+        .serialize(envelope)
+        .map_err(|err| CoreError::malformed(format!("blind relay envelope encode: {err}")))
+}
+
+/// Decodes a blind relay envelope with size bounds and blob cap checks.
+pub fn decode_blind_relay_envelope(bytes: &[u8]) -> Result<BlindRelayEnvelope, CoreError> {
+    let envelope: BlindRelayEnvelope = bincode::options()
+        .with_fixint_encoding()
+        .with_limit(MAX_BLIND_RELAY_ENVELOPE_BYTES)
+        .deserialize(bytes)
+        .map_err(|err| CoreError::malformed(format!("blind relay envelope decode: {err}")))?;
+    if envelope.encrypted_blob.len() > MAX_BLIND_RELAY_BLOB_BYTES {
+        return Err(CoreError::MessageTooLarge {
+            max: MAX_BLIND_RELAY_BLOB_BYTES,
+            actual: envelope.encrypted_blob.len(),
+        });
+    }
+    Ok(envelope)
 }
 
 // ============================================
@@ -543,6 +682,107 @@ mod tests {
         let env = make_signed_envelope(&kp);
         assert_eq!(env.sender_hex().len(), 64);
         assert_eq!(env.receiver_hex().len(), 64);
+    }
+
+    // ── BlindRelayEnvelope ──
+
+    fn make_blind_envelope(kp: &IdentityKeyPair) -> BlindRelayEnvelope {
+        BlindRelayEnvelope {
+            route_id: [0xA1u8; 16],
+            next_hop: [0xB2u8; 32],
+            ttl: 3,
+            encrypted_blob: b"opaque encrypted relay payload".to_vec(),
+            timestamp: 1_700_000_100,
+            signature: [0u8; 64],
+        }
+        .sign_with(kp)
+    }
+
+    #[test]
+    fn test_blind_relay_envelope_signature_ok() {
+        let kp = IdentityKeyPair::generate();
+        let pk = IdentityPublicKey::from_bytes(&kp.public_key_bytes()).unwrap();
+        let env = make_blind_envelope(&kp);
+
+        assert!(env.verify_signature_from(&pk).is_ok());
+    }
+
+    #[test]
+    fn test_blind_relay_envelope_tampered_blob_rejected() {
+        let kp = IdentityKeyPair::generate();
+        let pk = IdentityPublicKey::from_bytes(&kp.public_key_bytes()).unwrap();
+        let mut env = make_blind_envelope(&kp);
+        env.encrypted_blob[0] ^= 0xFF;
+
+        assert!(env.verify_signature_from(&pk).is_err());
+    }
+
+    #[test]
+    fn test_blind_relay_envelope_tampered_ttl_rejected() {
+        let kp = IdentityKeyPair::generate();
+        let pk = IdentityPublicKey::from_bytes(&kp.public_key_bytes()).unwrap();
+        let mut env = make_blind_envelope(&kp);
+        env.ttl = env.ttl.saturating_sub(1);
+
+        assert!(env.verify_signature_from(&pk).is_err());
+    }
+
+    #[test]
+    fn test_blind_relay_envelope_decrements_ttl_without_parsing_blob() {
+        let kp = IdentityKeyPair::generate();
+        let pk = IdentityPublicKey::from_bytes(&kp.public_key_bytes()).unwrap();
+        let env = make_blind_envelope(&kp);
+        let next = env.decremented_ttl().unwrap();
+
+        assert_eq!(next.ttl, 2);
+        assert_eq!(next.encrypted_blob, env.encrypted_blob);
+        assert_eq!(next.signature, [0u8; 64]);
+        assert!(next.verify_signature_from(&pk).is_err());
+
+        let resigned = next.sign_with(&kp);
+        assert!(resigned.verify_signature_from(&pk).is_ok());
+    }
+
+    #[test]
+    fn test_blind_relay_envelope_ttl_zero_not_forwardable() {
+        let env = BlindRelayEnvelope {
+            route_id: [1u8; 16],
+            next_hop: [2u8; 32],
+            ttl: 0,
+            encrypted_blob: vec![3u8; 16],
+            timestamp: 1_700_000_100,
+            signature: [0u8; 64],
+        };
+
+        assert!(!env.can_forward());
+        assert!(env.decremented_ttl().is_none());
+    }
+
+    #[test]
+    fn test_blind_relay_envelope_bounded_codec() {
+        let kp = IdentityKeyPair::generate();
+        let env = make_blind_envelope(&kp);
+
+        let bytes = encode_blind_relay_envelope(&env).unwrap();
+        let decoded = decode_blind_relay_envelope(&bytes).unwrap();
+
+        assert_eq!(decoded, env);
+    }
+
+    #[test]
+    fn test_blind_relay_rejects_oversized_blob() {
+        let kp = IdentityKeyPair::generate();
+        let env = BlindRelayEnvelope {
+            route_id: [1u8; 16],
+            next_hop: [2u8; 32],
+            ttl: 1,
+            encrypted_blob: vec![7u8; MAX_BLIND_RELAY_BLOB_BYTES + 1],
+            timestamp: 1_700_000_100,
+            signature: [0u8; 64],
+        }
+        .sign_with(&kp);
+
+        assert!(encode_blind_relay_envelope(&env).is_err());
     }
 
     // ── MediaPointer ──

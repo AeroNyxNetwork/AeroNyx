@@ -55,6 +55,9 @@
 //      contains no usable verified descriptors.
 //  25. Loads static bootstrap snapshots before the local PeerStore cache so
 //      the most recent verified cache can supersede expired file seed warnings.
+//  26. Tags PeerStore imports with source buckets (file/url/cache/backup/self/
+//      gossip) so heartbeat/nodeboard can show stale/discovered/cache peers
+//      without exposing peer URLs or client traffic.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -74,6 +77,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.1.0-CommercialPeerSummary - Tag PeerStore source buckets for nodeboard
 //   v1.0.9-DiscoveryCacheSourcePriority - Load peer cache after static bootstrap seeds
 //   v1.0.8-DiscoveryPeerCacheUsableFallback - Fallback when primary cache imports no usable peers
 //   v1.0.7-DiscoveryPeerCacheBackup - Backup and fallback for PeerStore cache
@@ -1814,7 +1818,9 @@ impl Server {
 
         if self.config.discovery.advertise_self {
             match self.build_self_discovery_descriptor(now) {
-                Ok(descriptor) => match peer_store.upsert_verified(descriptor, now) {
+                Ok(descriptor) => match peer_store
+                    .upsert_verified_from_source(descriptor, now, "self")
+                {
                     Ok(true) => {
                         peer_store.record_self_descriptor_status(now, "success", "registered");
                         info!("[DISCOVERY] Self descriptor registered");
@@ -2451,7 +2457,8 @@ impl Server {
     ) -> bool {
         match NodeBootstrapSnapshot::from_json_bytes(bytes) {
             Ok(snapshot) => {
-                let report = peer_store.load_bootstrap_snapshot(&snapshot, now);
+                let report =
+                    peer_store.load_bootstrap_snapshot_from_source(&snapshot, now, source_kind);
                 peer_store.record_bootstrap_source(
                     now,
                     source_kind,

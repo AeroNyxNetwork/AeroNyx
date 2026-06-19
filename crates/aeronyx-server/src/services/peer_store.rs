@@ -23,6 +23,8 @@
 //! - Discovery stability summary for operator health gates and nodeboard
 //! - Effective discovery recovery status so stale bootstrap-file warnings do
 //!   not mask a later successful seed-gossip recovery path
+//! - Commercial peer metadata summary: source, last_seen, TTL, capabilities,
+//!   and health bucket for nodeboard capacity and stale-peer visibility
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -49,6 +51,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.12.0-CommercialPeerSummary - Added source/TTL/health/capability peer summary
 //! v0.11.0-DiscoveryRecoveryStatus - Added effective recovery status for nodeboard
 //! v0.10.0-DiscoveryRestartRecovery - Gate relay foundation on restart recovery
 //! v0.9.0-DiscoveryStability - Added aggregate discovery stability summary
@@ -62,7 +65,7 @@
 //! v0.3.0-DiscoveryPhase4 - Added discovery gossip apply/export helpers
 // ============================================================================
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aeronyx_core::protocol::discovery::{
@@ -73,6 +76,7 @@ use serde::{Deserialize, Serialize};
 
 const DISCOVERY_GOSSIP_STALE_AFTER_SECS: u64 = 900;
 const DISCOVERY_GOSSIP_FAILURE_ATTENTION_THRESHOLD: u64 = 3;
+const PEER_DESCRIPTOR_STALE_WINDOW_SECS: u64 = 300;
 
 // ============================================
 // PeerStoreError
@@ -319,6 +323,88 @@ pub struct PeerStoreStatus {
     pub bootstrap: PeerStoreBootstrapStatus,
     /// Aggregate discovery stability summary for health gates and nodeboard.
     pub stability: PeerStoreStabilityStatus,
+    /// Commercial peer summary for nodeboard capacity and stale-peer panels.
+    ///
+    /// This contains only node-level signed descriptor metadata and aggregate
+    /// source counters. It must never include client IPs, payloads, DNS,
+    /// destinations, wallet-level traffic, or chat/message content.
+    pub peer_summary: PeerStorePeerSummaryStatus,
+}
+
+// ============================================
+// Commercial peer metadata summary
+// ============================================
+
+#[derive(Debug, Clone)]
+struct PeerRuntimeMetadata {
+    source: String,
+    first_seen_at: u64,
+    last_seen_at: u64,
+    last_sequence: u64,
+    imported_count: u64,
+}
+
+/// Privacy-safe per-peer nodeboard row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStorePeerSummary {
+    /// Short node id prefix for operator debugging without exposing full keys.
+    pub node_id_prefix: String,
+    /// Last import source bucket: self, file, url, cache, cache_backup,
+    /// gossip_snapshot, gossip_announce, or unknown.
+    pub source: String,
+    /// Last descriptor sequence seen for this node.
+    pub sequence: u64,
+    /// Number of accepted imports/upgrades observed for this peer in this process.
+    pub imported_count: u64,
+    /// Unix timestamp when this peer was first seen by this process.
+    pub first_seen_at: u64,
+    /// Unix timestamp when this peer was most recently observed.
+    pub last_seen_at: u64,
+    /// Age of the last observation at status generation time.
+    pub last_seen_age_seconds: u64,
+    /// Descriptor expiry timestamp.
+    pub expires_at: u64,
+    /// Remaining descriptor TTL in seconds, if still valid.
+    pub ttl_remaining_seconds: Option<u64>,
+    /// Stable health bucket: healthy, stale, expired.
+    pub health: String,
+    /// Public capability labels advertised by the signed descriptor.
+    pub capabilities: Vec<String>,
+    /// Whether the peer advertises a public discovery endpoint.
+    pub endpoint_advertised: bool,
+    /// Whether the peer is included in public discovery snapshots.
+    pub public_discovery: bool,
+    /// Optional region hint from the signed descriptor policy.
+    pub region: Option<String>,
+}
+
+/// Aggregate peer summary attached to heartbeat/nodeboard discovery status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStorePeerSummaryStatus {
+    /// Number of descriptors currently retained by PeerStore.
+    pub total_peers: usize,
+    /// Number of descriptors that verify at status generation time.
+    pub valid_peers: usize,
+    /// Valid peers with descriptor TTL comfortably above the stale window.
+    pub healthy_peers: usize,
+    /// Valid peers whose descriptor TTL is close to expiry.
+    pub stale_peers: usize,
+    /// Retained descriptors that no longer verify at status generation time.
+    pub expired_peers: usize,
+    /// Number of peers advertising privacy relay capability.
+    pub privacy_relay_peers: usize,
+    /// Number of peers advertising encrypted chat relay capability.
+    pub chat_relay_peers: usize,
+    /// Number of peers advertising encrypted storage capability.
+    pub encrypted_storage_peers: usize,
+    /// Number of peers advertising agent relay capability.
+    pub agent_relay_peers: usize,
+    /// Number of peers advertising future onion middle-hop capability.
+    pub onion_middle_peers: usize,
+    /// Counts by coarse source bucket, never raw peer URLs.
+    pub source_counts: BTreeMap<String, usize>,
+    /// Privacy-safe per-peer rows for operator UI.
+    pub peers: Vec<PeerStorePeerSummary>,
 }
 
 struct PeerStoreCounters {
@@ -419,6 +505,7 @@ impl PeerStoreImportReport {
 /// In-memory verified descriptor store for known AeroNyx nodes.
 pub struct PeerStore {
     peers: RwLock<HashMap<[u8; 32], SignedNodeDescriptor>>,
+    peer_runtime: RwLock<HashMap<[u8; 32], PeerRuntimeMetadata>>,
     max_peers: RwLock<Option<usize>>,
     counters: PeerStoreCounters,
     audit_events: RwLock<VecDeque<PeerStoreAuditEvent>>,
@@ -431,6 +518,7 @@ impl PeerStore {
     pub fn new() -> Self {
         Self {
             peers: RwLock::new(HashMap::new()),
+            peer_runtime: RwLock::new(HashMap::new()),
             max_peers: RwLock::new(None),
             counters: PeerStoreCounters::new(),
             audit_events: RwLock::new(VecDeque::with_capacity(MAX_AUDIT_EVENTS)),
@@ -615,12 +703,27 @@ impl PeerStore {
         descriptor: SignedNodeDescriptor,
         now: u64,
     ) -> Result<bool, PeerStoreError> {
+        self.upsert_verified_from_source(descriptor, now, "unknown")
+    }
+
+    /// Verifies and inserts or refreshes a descriptor with a source bucket.
+    ///
+    /// Source buckets are intentionally coarse (`cache`, `gossip_snapshot`,
+    /// `self`, etc.). They let nodeboard distinguish restart recovery from
+    /// live discovery without exposing peer URLs or transport metadata.
+    pub fn upsert_verified_from_source(
+        &self,
+        descriptor: SignedNodeDescriptor,
+        now: u64,
+        source: impl Into<String>,
+    ) -> Result<bool, PeerStoreError> {
         descriptor
             .verify_at(now)
             .map_err(|_| PeerStoreError::VerificationFailed)?;
 
         let node_id = descriptor.node_id();
         let incoming_sequence = descriptor.sequence();
+        let source = source.into();
         let mut peers = self.peers.write();
 
         let is_existing_peer = if let Some(existing) = peers.get(&node_id) {
@@ -632,6 +735,8 @@ impl PeerStore {
                 });
             }
             if incoming_sequence == current {
+                drop(peers);
+                self.record_peer_runtime(&descriptor, now, source, false);
                 return Ok(false);
             }
             true
@@ -648,8 +753,36 @@ impl PeerStore {
             }
         }
 
-        peers.insert(node_id, descriptor);
+        peers.insert(node_id, descriptor.clone());
+        drop(peers);
+        self.record_peer_runtime(&descriptor, now, source, true);
         Ok(true)
+    }
+
+    fn record_peer_runtime(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+        source: String,
+        inserted_or_upgraded: bool,
+    ) {
+        let node_id = descriptor.node_id();
+        let mut metadata = self.peer_runtime.write();
+        let entry = metadata
+            .entry(node_id)
+            .or_insert_with(|| PeerRuntimeMetadata {
+                source: source.clone(),
+                first_seen_at: now,
+                last_seen_at: now,
+                last_sequence: descriptor.sequence(),
+                imported_count: 0,
+            });
+        entry.source = source;
+        entry.last_seen_at = now;
+        entry.last_sequence = descriptor.sequence();
+        if inserted_or_upgraded {
+            entry.imported_count = entry.imported_count.saturating_add(1);
+        }
     }
 
     /// Imports all descriptors from a validated bootstrap snapshot.
@@ -662,6 +795,17 @@ impl PeerStore {
         snapshot: &NodeBootstrapSnapshot,
         now: u64,
     ) -> PeerStoreImportReport {
+        self.load_bootstrap_snapshot_from_source(snapshot, now, "unknown")
+    }
+
+    /// Imports descriptors from a snapshot and tags runtime metadata source.
+    pub fn load_bootstrap_snapshot_from_source(
+        &self,
+        snapshot: &NodeBootstrapSnapshot,
+        now: u64,
+        source: impl Into<String>,
+    ) -> PeerStoreImportReport {
+        let source = source.into();
         let mut report = PeerStoreImportReport {
             total: snapshot.peers.len(),
             inserted: 0,
@@ -671,7 +815,7 @@ impl PeerStore {
         };
 
         for descriptor in &snapshot.peers {
-            match self.upsert_verified(descriptor.clone(), now) {
+            match self.upsert_verified_from_source(descriptor.clone(), now, source.clone()) {
                 Ok(true) => report.inserted += 1,
                 Ok(false) => report.unchanged += 1,
                 Err(PeerStoreError::StaleSequence { .. }) => report.stale += 1,
@@ -696,7 +840,7 @@ impl PeerStore {
         match message {
             NodeDiscoveryMessage::SnapshotRequest { .. } => PeerStoreImportReport::empty(),
             NodeDiscoveryMessage::SnapshotResponse { snapshot } => {
-                self.load_bootstrap_snapshot(snapshot, now)
+                self.load_bootstrap_snapshot_from_source(snapshot, now, "gossip_snapshot")
             }
             NodeDiscoveryMessage::DescriptorAnnounce { descriptor } => {
                 let mut report = PeerStoreImportReport {
@@ -706,7 +850,7 @@ impl PeerStore {
                     stale: 0,
                     rejected: 0,
                 };
-                match self.upsert_verified(descriptor.clone(), now) {
+                match self.upsert_verified_from_source(descriptor.clone(), now, "gossip_announce") {
                     Ok(true) => report.inserted = 1,
                     Ok(false) => report.unchanged = 1,
                     Err(PeerStoreError::StaleSequence { .. }) => report.stale = 1,
@@ -896,8 +1040,22 @@ impl PeerStore {
     pub fn cleanup_expired(&self, now: u64) -> usize {
         let mut peers = self.peers.write();
         let before = peers.len();
-        peers.retain(|_node_id, descriptor| descriptor.verify_at(now).is_ok());
-        before - peers.len()
+        let mut removed = Vec::new();
+        peers.retain(|node_id, descriptor| {
+            let keep = descriptor.verify_at(now).is_ok();
+            if !keep {
+                removed.push(*node_id);
+            }
+            keep
+        });
+        drop(peers);
+        if !removed.is_empty() {
+            let mut metadata = self.peer_runtime.write();
+            for node_id in &removed {
+                metadata.remove(node_id);
+            }
+        }
+        before.saturating_sub(self.peers.read().len())
     }
 
     /// Returns a monitoring snapshot.
@@ -1040,6 +1198,7 @@ impl PeerStore {
         let snapshot = self.snapshot(now);
         let bootstrap = self.bootstrap_status.read().clone();
         let stability = Self::stability(&snapshot, &bootstrap, now);
+        let peer_summary = self.peer_summary(now);
 
         PeerStoreStatus {
             snapshot,
@@ -1048,6 +1207,155 @@ impl PeerStore {
             recent_audit_events: self.recent_audit_events(),
             bootstrap,
             stability,
+            peer_summary,
+        }
+    }
+
+    fn capability_label(capability: NodeCapability) -> &'static str {
+        match capability {
+            NodeCapability::PrivacyRelay => "privacy_relay",
+            NodeCapability::ChatRelay => "chat_relay",
+            NodeCapability::EncryptedStorage => "encrypted_storage",
+            NodeCapability::AgentRelay => "agent_relay",
+            NodeCapability::OnionMiddle => "onion_middle",
+        }
+    }
+
+    fn descriptor_health(
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+    ) -> (&'static str, Option<u64>) {
+        if descriptor.verify_at(now).is_err() {
+            return ("expired", None);
+        }
+        let remaining = descriptor.descriptor.expires_at.saturating_sub(now);
+        if remaining <= PEER_DESCRIPTOR_STALE_WINDOW_SECS {
+            ("stale", Some(remaining))
+        } else {
+            ("healthy", Some(remaining))
+        }
+    }
+
+    /// Builds a commercial peer summary for heartbeat/nodeboard.
+    #[must_use]
+    pub fn peer_summary(&self, now: u64) -> PeerStorePeerSummaryStatus {
+        let peers = self.peers.read();
+        let metadata = self.peer_runtime.read();
+        let mut source_counts = BTreeMap::new();
+        let mut rows = Vec::with_capacity(peers.len().min(64));
+        let mut healthy_peers = 0usize;
+        let mut stale_peers = 0usize;
+        let mut expired_peers = 0usize;
+        let mut valid_peers = 0usize;
+        let mut privacy_relay_peers = 0usize;
+        let mut chat_relay_peers = 0usize;
+        let mut encrypted_storage_peers = 0usize;
+        let mut agent_relay_peers = 0usize;
+        let mut onion_middle_peers = 0usize;
+
+        for (node_id, descriptor) in peers.iter() {
+            let meta = metadata.get(node_id);
+            let source = meta
+                .map(|value| value.source.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            *source_counts.entry(source.clone()).or_insert(0) += 1;
+
+            let (health, ttl_remaining_seconds) = Self::descriptor_health(descriptor, now);
+            match health {
+                "healthy" => {
+                    healthy_peers += 1;
+                    valid_peers += 1;
+                }
+                "stale" => {
+                    stale_peers += 1;
+                    valid_peers += 1;
+                }
+                _ => expired_peers += 1,
+            }
+
+            if descriptor
+                .descriptor
+                .capabilities
+                .contains(&NodeCapability::PrivacyRelay)
+            {
+                privacy_relay_peers += 1;
+            }
+            if descriptor
+                .descriptor
+                .capabilities
+                .contains(&NodeCapability::ChatRelay)
+            {
+                chat_relay_peers += 1;
+            }
+            if descriptor
+                .descriptor
+                .capabilities
+                .contains(&NodeCapability::EncryptedStorage)
+            {
+                encrypted_storage_peers += 1;
+            }
+            if descriptor
+                .descriptor
+                .capabilities
+                .contains(&NodeCapability::AgentRelay)
+            {
+                agent_relay_peers += 1;
+            }
+            if descriptor
+                .descriptor
+                .capabilities
+                .contains(&NodeCapability::OnionMiddle)
+            {
+                onion_middle_peers += 1;
+            }
+
+            rows.push(PeerStorePeerSummary {
+                node_id_prefix: hex::encode(&node_id[..4]),
+                source,
+                sequence: descriptor.sequence(),
+                imported_count: meta.map(|value| value.imported_count).unwrap_or(0),
+                first_seen_at: meta.map(|value| value.first_seen_at).unwrap_or(now),
+                last_seen_at: meta.map(|value| value.last_seen_at).unwrap_or(now),
+                last_seen_age_seconds: meta
+                    .map(|value| now.saturating_sub(value.last_seen_at))
+                    .unwrap_or(0),
+                expires_at: descriptor.descriptor.expires_at,
+                ttl_remaining_seconds,
+                health: health.to_string(),
+                capabilities: descriptor
+                    .descriptor
+                    .capabilities
+                    .iter()
+                    .copied()
+                    .map(Self::capability_label)
+                    .map(str::to_string)
+                    .collect(),
+                endpoint_advertised: descriptor.descriptor.public_endpoint.is_some(),
+                public_discovery: descriptor.descriptor.policy.public_discovery,
+                region: descriptor.descriptor.policy.region.clone(),
+            });
+        }
+
+        rows.sort_by(|a, b| {
+            a.health
+                .cmp(&b.health)
+                .then_with(|| a.source.cmp(&b.source))
+                .then_with(|| a.node_id_prefix.cmp(&b.node_id_prefix))
+        });
+
+        PeerStorePeerSummaryStatus {
+            total_peers: peers.len(),
+            valid_peers,
+            healthy_peers,
+            stale_peers,
+            expired_peers,
+            privacy_relay_peers,
+            chat_relay_peers,
+            encrypted_storage_peers,
+            agent_relay_peers,
+            onion_middle_peers,
+            source_counts,
+            peers: rows,
         }
     }
 
@@ -1505,6 +1813,52 @@ mod tests {
             Some("gossip_recovered attempted=2 succeeded=2 seed_attempted=1")
         );
         assert_eq!(status.bootstrap.recovery_at, Some(1_700_000_050));
+    }
+
+    #[test]
+    fn test_peer_summary_tracks_source_ttl_health_and_capabilities() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let healthy = signed_descriptor(1, now + 1_000);
+        let stale = signed_descriptor(1, now + 120);
+
+        store
+            .upsert_verified_from_source(healthy.clone(), now, "cache")
+            .unwrap();
+        store
+            .upsert_verified_from_source(stale.clone(), now, "gossip_snapshot")
+            .unwrap();
+        store
+            .upsert_verified_from_source(healthy, now + 20, "gossip_announce")
+            .unwrap();
+
+        let status = store.status(now + 30);
+
+        assert_eq!(status.peer_summary.total_peers, 2);
+        assert_eq!(status.peer_summary.valid_peers, 2);
+        assert_eq!(status.peer_summary.healthy_peers, 1);
+        assert_eq!(status.peer_summary.stale_peers, 1);
+        assert_eq!(status.peer_summary.expired_peers, 0);
+        assert_eq!(status.peer_summary.chat_relay_peers, 2);
+        assert_eq!(status.peer_summary.privacy_relay_peers, 2);
+        assert_eq!(
+            status.peer_summary.source_counts.get("gossip_announce"),
+            Some(&1)
+        );
+        assert_eq!(
+            status.peer_summary.source_counts.get("gossip_snapshot"),
+            Some(&1)
+        );
+        assert!(status
+            .peer_summary
+            .peers
+            .iter()
+            .any(|peer| peer.health == "stale" && peer.ttl_remaining_seconds == Some(90)));
+        assert!(status
+            .peer_summary
+            .peers
+            .iter()
+            .all(|peer| peer.capabilities.contains(&"chat_relay".to_string())));
     }
 
     #[test]
