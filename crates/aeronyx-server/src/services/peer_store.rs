@@ -27,6 +27,8 @@
 //!   and health bucket for nodeboard capacity and stale-peer visibility
 //! - Gossip scheduler visibility for jitter/backpressure diagnostics without
 //!   exposing seed endpoint values or peer URLs
+//! - Expired-peer cleanup counters so stale descriptor eviction is observable
+//!   without exposing peer endpoints or user traffic metadata
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -54,6 +56,7 @@
 //!
 //! ## Last Modified
 //! v0.13.0-GossipBackpressureStatus - Added outbound gossip jitter/backpressure status
+//! v0.14.0-ExpiredPeerCleanupStats - Added expired peer cleanup counters/audit
 //! v0.12.0-CommercialPeerSummary - Added source/TTL/health/capability peer summary
 //! v0.11.0-DiscoveryRecoveryStatus - Added effective recovery status for nodeboard
 //! v0.10.0-DiscoveryRestartRecovery - Gate relay foundation on restart recovery
@@ -315,12 +318,16 @@ pub struct PeerStoreRuntimeStats {
     pub policy_rejected: u64,
     /// Total inbound gossip requests rejected by rate limiting.
     pub rate_limited: u64,
+    /// Total expired descriptors removed by cleanup.
+    pub expired_removed: u64,
     /// Unix timestamp of the last descriptor import attempt.
     pub last_import_at: Option<u64>,
     /// Unix timestamp of the last gossip exchange observed by this node.
     pub last_gossip_at: Option<u64>,
     /// Unix timestamp of the last exported snapshot.
     pub last_snapshot_at: Option<u64>,
+    /// Unix timestamp of the last cleanup that removed at least one expired peer.
+    pub last_cleanup_at: Option<u64>,
 }
 
 /// Combined peer store status payload for nodeboard.
@@ -431,9 +438,11 @@ struct PeerStoreCounters {
     capacity_rejected: AtomicU64,
     policy_rejected: AtomicU64,
     rate_limited: AtomicU64,
+    expired_removed: AtomicU64,
     last_import_at: AtomicU64,
     last_gossip_at: AtomicU64,
     last_snapshot_at: AtomicU64,
+    last_cleanup_at: AtomicU64,
 }
 
 impl PeerStoreCounters {
@@ -447,9 +456,11 @@ impl PeerStoreCounters {
             capacity_rejected: AtomicU64::new(0),
             policy_rejected: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
+            expired_removed: AtomicU64::new(0),
             last_import_at: AtomicU64::new(0),
             last_gossip_at: AtomicU64::new(0),
             last_snapshot_at: AtomicU64::new(0),
+            last_cleanup_at: AtomicU64::new(0),
         }
     }
 
@@ -467,9 +478,11 @@ impl PeerStoreCounters {
             capacity_rejected: self.capacity_rejected.load(Ordering::Relaxed),
             policy_rejected: self.policy_rejected.load(Ordering::Relaxed),
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
+            expired_removed: self.expired_removed.load(Ordering::Relaxed),
             last_import_at: Self::optional_ts(self.last_import_at.load(Ordering::Relaxed)),
             last_gossip_at: Self::optional_ts(self.last_gossip_at.load(Ordering::Relaxed)),
             last_snapshot_at: Self::optional_ts(self.last_snapshot_at.load(Ordering::Relaxed)),
+            last_cleanup_at: Self::optional_ts(self.last_cleanup_at.load(Ordering::Relaxed)),
         }
     }
 }
@@ -1109,7 +1122,20 @@ impl PeerStore {
                 metadata.remove(node_id);
             }
         }
-        before.saturating_sub(self.peers.read().len())
+        let removed_count = before.saturating_sub(self.peers.read().len());
+        if removed_count > 0 {
+            self.counters
+                .expired_removed
+                .fetch_add(removed_count as u64, Ordering::Relaxed);
+            self.counters.last_cleanup_at.store(now, Ordering::Relaxed);
+            self.record_audit_event(
+                now,
+                "expired_peer_cleanup",
+                "accepted",
+                format!("removed={removed_count}"),
+            );
+        }
+        removed_count
     }
 
     /// Returns a monitoring snapshot.
@@ -1580,6 +1606,15 @@ mod tests {
         store.upsert_verified(descriptor, 1_700_000_100).unwrap();
         assert_eq!(store.cleanup_expired(1_700_002_000), 1);
         assert!(store.is_empty());
+
+        let status = store.status(1_700_002_001);
+        assert_eq!(status.runtime.expired_removed, 1);
+        assert_eq!(status.runtime.last_cleanup_at, Some(1_700_002_000));
+        assert!(status.recent_audit_events.iter().any(|event| {
+            event.action == "expired_peer_cleanup"
+                && event.outcome == "accepted"
+                && event.detail == "removed=1"
+        }));
     }
 
     #[test]
