@@ -38,6 +38,8 @@
 //  16. Reports privacy-safe seed endpoint recovery counters for nodeboard.
 //  17. Treats stale bootstrap descriptors as benign when newer cache/gossip
 //      state already exists, while still warning on rejected descriptors.
+//  18. Records privacy-safe outbound gossip health buckets for node stability
+//      monitoring without exposing seed endpoint values or peer URLs.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -66,6 +68,7 @@
 //   v1.0.0-Membership  - TrafficTracker wiring
 //   v1.0.1-VpnMessageStats - encrypted message counter wiring
 //   v0.7.0-DiscoveryChatRelay - Peer-discovered encrypted chat relay fanout
+//   v0.9.3-DiscoveryGossipHealth - Outbound gossip status and failure buckets
 //   v0.9.1-DiscoverySeedStatus - Seed endpoint recovery counters in status
 //   v0.9.2-DiscoveryBootstrapStatus - Avoid warning on benign stale bootstrap descriptors
 //   v0.9.0-DiscoverySeedEndpoints - Periodic seed endpoint gossip recovery
@@ -1858,6 +1861,13 @@ impl Server {
                             Self::build_self_discovery_descriptor_for(&config, &identity, now)
                         else {
                             warn!("[DISCOVERY] Skipping outbound gossip; self descriptor build failed");
+                            peer_store.record_gossip_round(
+                                now,
+                                0,
+                                0,
+                                0,
+                                Some("self_descriptor_build_failed".to_string()),
+                            );
                             continue;
                         };
 
@@ -1894,6 +1904,7 @@ impl Server {
                         );
                         let mut attempted = 0usize;
                         let mut succeeded = 0usize;
+                        let mut last_failure_reason: Option<String> = None;
 
                         let seed_attempted = gossip_urls.len();
 
@@ -1933,6 +1944,7 @@ impl Server {
                             {
                                 Ok(()) => succeeded += 1,
                                 Err(e) => {
+                                    last_failure_reason = Some(e.clone());
                                     debug!(
                                         peer = %url,
                                         error = %e,
@@ -1949,7 +1961,13 @@ impl Server {
                                 "[DISCOVERY] Outbound gossip round complete"
                             );
                         }
-                        peer_store.record_gossip_round(now, attempted, succeeded, seed_attempted);
+                        peer_store.record_gossip_round(
+                            now,
+                            attempted,
+                            succeeded,
+                            seed_attempted,
+                            last_failure_reason,
+                        );
                     }
                 }
             }
@@ -1964,18 +1982,20 @@ impl Server {
         now: u64,
         limit: u16,
     ) -> std::result::Result<(), String> {
-        client
+        let announce_response = client
             .post(url)
             .json(&NodeDiscoveryMessage::DescriptorAnnounce {
                 descriptor: self_descriptor,
             })
             .send()
             .await
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Self::classify_reqwest_error("announce_request", &e))?;
 
-        let response = client
+        announce_response
+            .error_for_status()
+            .map_err(|e| Self::classify_reqwest_error("announce_status", &e))?;
+
+        let snapshot_response = client
             .post(url)
             .json(&NodeDiscoveryMessage::SnapshotRequest {
                 requested_at: now,
@@ -1983,12 +2003,14 @@ impl Server {
             })
             .send()
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| Self::classify_reqwest_error("snapshot_request", &e))?;
+
+        let response = snapshot_response
             .error_for_status()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| Self::classify_reqwest_error("snapshot_status", &e))?
             .json::<GossipResponse>()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Self::classify_reqwest_error("snapshot_decode", &e))?;
 
         if let Some(message) = response.response {
             peer_store.apply_discovery_message(&message, now);
@@ -1996,6 +2018,31 @@ impl Server {
         peer_store.mark_gossip_at(now);
 
         Ok(())
+    }
+
+    fn classify_reqwest_error(phase: &str, error: &reqwest::Error) -> String {
+        if error.is_timeout() {
+            return format!("{phase}_timeout");
+        }
+        if error.is_connect() {
+            return format!("{phase}_connect");
+        }
+        if error.is_status() {
+            if let Some(status) = error.status() {
+                return format!("{phase}_http_{}", status.as_u16());
+            }
+            return format!("{phase}_http_status");
+        }
+        if error.is_decode() {
+            return format!("{phase}_decode");
+        }
+        if error.is_body() {
+            return format!("{phase}_body");
+        }
+        if error.is_request() {
+            return format!("{phase}_request");
+        }
+        format!("{phase}_unknown")
     }
 
     fn discovery_gossip_url(endpoint: &str) -> Option<String> {

@@ -44,6 +44,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.8.0-DiscoveryGossipHealth - Added outbound gossip health summary fields
 //! v0.7.0-DiscoverySeedStatus - Added privacy-safe seed endpoint recovery counters
 //! v0.6.0-DiscoveryBootstrapStatus - Added bootstrap/cache/gossip status snapshot
 //! v0.5.0-DiscoveryAuditLog - Added privacy-safe discovery audit ring buffer
@@ -176,6 +177,16 @@ pub struct PeerStoreBootstrapStatus {
     pub last_gossip_seed_attempted: u64,
     /// Number of peers successfully contacted in the last outbound gossip round.
     pub last_gossip_succeeded: u64,
+    /// Number of peers that failed in the last outbound gossip round.
+    pub last_gossip_failed: u64,
+    /// Health bucket for the last outbound gossip round: healthy, degraded, failed, idle.
+    pub last_gossip_status: Option<String>,
+    /// Stable privacy-safe reason bucket for the last outbound gossip failure.
+    pub last_gossip_failure_reason: Option<String>,
+    /// Consecutive outbound gossip rounds with zero successful peer contacts.
+    pub consecutive_gossip_failures: u64,
+    /// Timestamp of the last outbound gossip round with at least one success.
+    pub last_gossip_success_at: Option<u64>,
     /// Timestamp of the last outbound gossip round.
     pub last_gossip_round_at: Option<u64>,
 }
@@ -199,6 +210,11 @@ impl Default for PeerStoreBootstrapStatus {
             last_gossip_attempted: 0,
             last_gossip_seed_attempted: 0,
             last_gossip_succeeded: 0,
+            last_gossip_failed: 0,
+            last_gossip_status: None,
+            last_gossip_failure_reason: None,
+            consecutive_gossip_failures: 0,
+            last_gossip_success_at: None,
             last_gossip_round_at: None,
         }
     }
@@ -465,23 +481,60 @@ impl PeerStore {
         attempted: usize,
         succeeded: usize,
         seed_attempted: usize,
+        failure_reason: Option<String>,
     ) {
+        let failed = attempted.saturating_sub(succeeded);
+        let status_bucket = if attempted == 0 && failure_reason.is_some() {
+            "failed"
+        } else if attempted == 0 {
+            "idle"
+        } else if succeeded == attempted {
+            "healthy"
+        } else if succeeded > 0 {
+            "degraded"
+        } else {
+            "failed"
+        };
+        let failure_reason = if failed > 0 || (attempted == 0 && status_bucket == "failed") {
+            Some(failure_reason.unwrap_or_else(|| "unknown".to_string()))
+        } else {
+            None
+        };
+        let consecutive_gossip_failures;
         {
             let mut status = self.bootstrap_status.write();
+            if succeeded > 0 {
+                status.consecutive_gossip_failures = 0;
+                status.last_gossip_success_at = Some(now);
+            } else if attempted > 0 || failure_reason.is_some() {
+                status.consecutive_gossip_failures =
+                    status.consecutive_gossip_failures.saturating_add(1);
+            }
+            consecutive_gossip_failures = status.consecutive_gossip_failures;
             status.last_gossip_attempted = attempted as u64;
             status.last_gossip_seed_attempted = seed_attempted as u64;
             status.last_gossip_succeeded = succeeded as u64;
+            status.last_gossip_failed = failed as u64;
+            status.last_gossip_status = Some(status_bucket.to_string());
+            status.last_gossip_failure_reason = failure_reason.clone();
             status.last_gossip_round_at = Some(now);
         }
+        let outcome = match status_bucket {
+            "healthy" => "accepted",
+            "idle" => "ignored",
+            _ => "warning",
+        };
+        let reason_detail = failure_reason
+            .as_deref()
+            .map(|reason| format!(" failure_reason={reason}"))
+            .unwrap_or_default();
         self.record_audit_event(
             now,
             "outbound_gossip_round",
-            if attempted == succeeded {
-                "accepted"
-            } else {
-                "warning"
-            },
-            format!("attempted={attempted} succeeded={succeeded} seed_attempted={seed_attempted}"),
+            outcome,
+            format!(
+                "attempted={attempted} succeeded={succeeded} failed={failed} seed_attempted={seed_attempted} status={status_bucket} consecutive_failures={consecutive_gossip_failures}{reason_detail}"
+            ),
         );
     }
 
@@ -1162,7 +1215,13 @@ mod tests {
         );
         store.record_self_descriptor_status(1_700_000_011, "success", "registered");
         store.record_cache_save_status(1_700_000_012, "success", "exported=1");
-        store.record_gossip_round(1_700_000_013, 2, 1, 1);
+        store.record_gossip_round(
+            1_700_000_013,
+            2,
+            1,
+            1,
+            Some("snapshot_request_timeout".to_string()),
+        );
 
         let status = store.status(1_700_000_100);
         assert!(status.bootstrap.enabled);
@@ -1185,9 +1244,62 @@ mod tests {
         assert_eq!(status.bootstrap.last_gossip_attempted, 2);
         assert_eq!(status.bootstrap.last_gossip_seed_attempted, 1);
         assert_eq!(status.bootstrap.last_gossip_succeeded, 1);
+        assert_eq!(status.bootstrap.last_gossip_failed, 1);
+        assert_eq!(
+            status.bootstrap.last_gossip_status.as_deref(),
+            Some("degraded")
+        );
+        assert_eq!(
+            status.bootstrap.last_gossip_failure_reason.as_deref(),
+            Some("snapshot_request_timeout")
+        );
+        assert_eq!(status.bootstrap.consecutive_gossip_failures, 0);
+        assert_eq!(status.bootstrap.last_gossip_success_at, Some(1_700_000_013));
         assert!(status
             .recent_audit_events
             .iter()
             .any(|event| event.action == "outbound_gossip_round"));
+    }
+
+    #[test]
+    fn test_gossip_round_tracks_consecutive_failures() {
+        let store = PeerStore::new();
+
+        store.record_gossip_round(
+            1_700_000_020,
+            1,
+            0,
+            1,
+            Some("announce_request_connect".to_string()),
+        );
+        store.record_gossip_round(
+            1_700_000_030,
+            1,
+            0,
+            1,
+            Some("snapshot_request_timeout".to_string()),
+        );
+
+        let status = store.status(1_700_000_040);
+        assert_eq!(
+            status.bootstrap.last_gossip_status.as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            status.bootstrap.last_gossip_failure_reason.as_deref(),
+            Some("snapshot_request_timeout")
+        );
+        assert_eq!(status.bootstrap.consecutive_gossip_failures, 2);
+        assert_eq!(status.bootstrap.last_gossip_success_at, None);
+
+        store.record_gossip_round(1_700_000_050, 1, 1, 1, None);
+        let status = store.status(1_700_000_060);
+        assert_eq!(
+            status.bootstrap.last_gossip_status.as_deref(),
+            Some("healthy")
+        );
+        assert_eq!(status.bootstrap.last_gossip_failure_reason, None);
+        assert_eq!(status.bootstrap.consecutive_gossip_failures, 0);
+        assert_eq!(status.bootstrap.last_gossip_success_at, Some(1_700_000_050));
     }
 }
