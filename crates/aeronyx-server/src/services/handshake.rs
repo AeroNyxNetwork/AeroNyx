@@ -16,6 +16,8 @@
 //   - process(): Step 0 (new) — deny list check before any resource alloc
 //   - All other steps unchanged
 //   - Tests: added test_denied_wallet_rejected
+//   - v1.0.1 privacy hardening: handshake logs no longer persist client IPs,
+//     session IDs, wallet prefixes, or virtual IP assignments.
 //
 // Main Logical Flow:
 //   0. Check deny list → if denied, return WalletDenied immediately
@@ -40,6 +42,7 @@
 // Last Modified:
 //   v0.1.0          - Initial handshake service
 //   v1.0.0-Membership - Added DenyList check (Step 0)
+//   v1.0.1-PrivacyLogs - Redacted handshake/session correlation metadata
 // ============================================
 
 use std::net::SocketAddr;
@@ -105,14 +108,10 @@ impl HandshakeService {
         client_hello: &ClientHello,
         client_addr: SocketAddr,
     ) -> Result<HandshakeResult> {
-        debug!(client = %client_addr, "Processing handshake");
+        debug!("Processing handshake");
 
         if let Err(reason) = self.policy.validate_new_session(self.sessions.count()) {
-            warn!(
-                client = %client_addr,
-                reason = reason,
-                "[NODE_POLICY] Handshake rejected"
-            );
+            warn!(reason = reason, "[NODE_POLICY] Handshake rejected");
             return Err(ServerError::node_policy_rejected(reason));
         }
 
@@ -127,8 +126,6 @@ impl HandshakeService {
                 .map(|r| r.to_string())
                 .unwrap_or_else(|| "denied".to_string());
             warn!(
-                client = %client_addr,
-                wallet = %&wallet_hex[..8],
                 reason = %reason,
                 "[HANDSHAKE] Wallet on deny list — rejected"
             );
@@ -137,24 +134,24 @@ impl HandshakeService {
 
         // ── Step 1: Verify ClientHello signature ──────────────────────────
         self.crypto.verify_client_hello(client_hello).map_err(|e| {
-            warn!(client = %client_addr, error = %e, "Handshake signature verification failed");
+            warn!(error = %e, "Handshake signature verification failed");
             e
         })?;
 
-        debug!(client = %client_addr, "ClientHello signature verified");
+        debug!("ClientHello signature verified");
 
         // ── Step 2: Allocate virtual IP ───────────────────────────────────
         let virtual_ip = self.ip_pool.allocate().map_err(|e| {
-            warn!(client = %client_addr, "IP allocation failed: {}", e);
+            warn!("IP allocation failed: {}", e);
             e
         })?;
 
-        debug!(client = %client_addr, virtual_ip = %virtual_ip, "IP allocated");
+        debug!("IP allocated for handshake");
 
         // ── Step 3: Generate session ID ───────────────────────────────────
         let session_id = aeronyx_common::SessionId::generate();
 
-        debug!(client = %client_addr, session_id = %session_id, "Generated session ID");
+        debug!("Generated session ID");
 
         // ── Step 4: Cryptographic handshake ───────────────────────────────
         let (server_hello, session_key) = match self.crypto.process_handshake(
@@ -165,7 +162,7 @@ impl HandshakeService {
             Ok(result) => result,
             Err(e) => {
                 self.ip_pool.release(virtual_ip);
-                warn!(client = %client_addr, error = %e, "Handshake crypto failed");
+                warn!(error = %e, "Handshake crypto failed");
                 return Err(e.into());
             }
         };
@@ -189,7 +186,7 @@ impl HandshakeService {
             Ok(s) => s,
             Err(e) => {
                 self.ip_pool.release(virtual_ip);
-                warn!(client = %client_addr, error = %e, "Session creation failed");
+                warn!(error = %e, "Session creation failed");
                 return Err(e);
             }
         };
@@ -197,12 +194,7 @@ impl HandshakeService {
         // ── Step 6: Register route ────────────────────────────────────────
         self.routing.add_route(virtual_ip, session.id.clone());
 
-        info!(
-            client     = %client_addr,
-            session_id = %session.id,
-            virtual_ip = %virtual_ip,
-            "Handshake completed successfully"
-        );
+        info!("Handshake completed successfully");
 
         Ok(HandshakeResult {
             session,
@@ -212,7 +204,7 @@ impl HandshakeService {
 
     /// Cleans up resources for a failed or closed session.
     pub fn cleanup(&self, session_id: &aeronyx_common::SessionId, virtual_ip: std::net::Ipv4Addr) {
-        debug!(session_id = %session_id, virtual_ip = %virtual_ip, "Cleaning up session resources");
+        debug!("Cleaning up session resources");
         self.routing.remove_route(virtual_ip);
         self.ip_pool.release(virtual_ip);
         self.sessions.remove(session_id);

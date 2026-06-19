@@ -77,11 +77,19 @@
 //! - Commercial maintenance drain depends on client liveness, not just local
 //!   server activity. Do not let server→client traffic or keepalive probes keep
 //!   an otherwise disconnected session alive forever.
+//! - Local node logs must not persist client public IPs, session IDs, wallet
+//!   prefixes, device IDs, or virtual IP assignments. Keep aggregate counters
+//!   only unless an incident-specific privacy review approves more detail.
 //! - 🔴 DO NOT revert `has_seen_any` back to a u64 sentinel. The sentinel
 //!   approach is fundamentally incompatible with the `counter > highest_seen`
 //!   comparison because any real counter value can be a valid "first packet".
 //!
 //! ## Last Modified
+//! v1.2.2-PrivacyLogs
+//!   - Redacted local session lifecycle logs to avoid persisting client IPs,
+//!     session IDs, wallet prefixes, device IDs, or virtual IP assignments.
+//!   - Preserved aggregate replay/packet counters for operator diagnostics.
+//!
 //! v1.2.1-ReplayWindowFix
 //!   - `ReplayWindow::new()` no longer uses u64::MAX sentinel
 //!   - Added `has_seen_any: bool` flag
@@ -715,28 +723,17 @@ impl Session {
         }
         match result {
             ReplayCheckResult::Accept | ReplayCheckResult::AcceptAndAdvance => {
-                trace!(
-                    session_id = %self.id,
-                    counter,
-                    highest = window.highest_seen(),
-                    "Counter accepted"
-                );
+                trace!(counter, highest = window.highest_seen(), "Counter accepted");
                 true
             }
             ReplayCheckResult::Replay => {
                 self.stats.record_replay_rejected();
-                debug!(
-                    session_id = %self.id,
-                    counter,
-                    highest = window.highest_seen(),
-                    "Replay detected"
-                );
+                debug!(counter, highest = window.highest_seen(), "Replay detected");
                 false
             }
             ReplayCheckResult::TooOld => {
                 self.stats.record_too_old_rejected();
                 debug!(
-                    session_id = %self.id,
                     counter,
                     window_base = window.window_base(),
                     "Counter too old"
@@ -937,12 +934,7 @@ impl SessionManager {
         self.sessions
             .insert(session_id.clone(), Arc::clone(&session));
 
-        info!(
-            session_id = %session_id,
-            virtual_ip = %virtual_ip,
-            client = %client_endpoint,
-            "Session created (device registration pending)"
-        );
+        info!("Session created (device registration pending)");
 
         Ok(session)
     }
@@ -971,13 +963,7 @@ impl SessionManager {
             session_id: session_id.clone(),
         });
 
-        debug!(
-            wallet = %hex::encode(&wallet[..4]),
-            device_id = %hex::encode(device_id),
-            session_id = %session_id,
-            device_count = entry.len(),
-            "Device registered"
-        );
+        debug!(device_count = entry.len(), "Device registered");
     }
 
     /// Returns the session with the given id, if any.
@@ -1042,8 +1028,6 @@ impl SessionManager {
 
             let stats = session.stats_snapshot();
             info!(
-                session_id = %id,
-                virtual_ip = %session.virtual_ip,
                 packets_rx = stats.packets_rx,
                 packets_tx = stats.packets_tx,
                 replays_rejected = stats.replays_rejected,
@@ -1070,8 +1054,6 @@ impl SessionManager {
                 should_remove_wallet = true;
             } else {
                 debug!(
-                    session_id = %id,
-                    wallet = %hex::encode(&wallet[..4]),
                     remaining_devices = entries.len(),
                     "Device unregistered (other devices still active)"
                 );
@@ -1080,11 +1062,7 @@ impl SessionManager {
 
         if should_remove_wallet {
             self.wallet_index.remove(wallet);
-            debug!(
-                session_id = %id,
-                wallet = %hex::encode(&wallet[..4]),
-                "wallet_index entry removed (no more devices)"
-            );
+            debug!("wallet_index entry removed (no more devices)");
         }
     }
 
@@ -1143,7 +1121,7 @@ impl SessionManager {
         }
 
         for (id, ip, _, _, _, _) in &expired {
-            debug!(session_id = %id, virtual_ip = %ip, "Session expired");
+            debug!("Session expired");
             self.remove(id);
             // Stage the released IP into the cooldown pool.
             // spawn_cleanup_task calls drain_cooldown_pool() each tick
