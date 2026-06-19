@@ -47,6 +47,9 @@
 //! lower-level fields, and it remains aggregate operations metadata only.
 //! Packet runtime telemetry reports process-local aggregate packet counters so
 //! operators can diagnose restart recovery pressure without reading raw journals.
+//! Discovery status telemetry reports the local verified PeerStore summary so
+//! healthchecks can prove that nodes know about other signed AeroNyx peers
+//! before future multi-hop routing work starts.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -67,7 +70,7 @@ use crate::management::integrity;
 use crate::services::session::CLIENT_LIVENESS_TIMEOUT_SECS;
 use crate::services::{
     IpPoolService, NodePolicyEnforcementSnapshot, NodePolicyPlacementSnapshot, NodePolicyRuntime,
-    NodePolicySnapshot, SessionManager,
+    NodePolicySnapshot, PeerStore, SessionManager,
 };
 use crate::voucher_verifier::{VoucherMetricsSnapshot, VoucherVerifier};
 
@@ -88,6 +91,7 @@ pub struct VpnHealthState {
     voucher_verifier: Arc<VoucherVerifier>,
     encrypted_message_counter: Arc<AtomicU64>,
     packet_handler: Arc<PacketHandler>,
+    peer_store: Arc<PeerStore>,
 }
 
 #[derive(Debug, Serialize)]
@@ -332,6 +336,7 @@ struct VpnHealthResponse {
     placement_readiness: NodePolicyPlacementSnapshot,
     capacity: VpnCapacityStatus,
     packet_runtime: PacketRuntimeStatus,
+    discovery_status: Value,
     recent_errors: Vec<RecentErrorEvent>,
     upgrade_status: NodeUpgradeStatus,
     operator_action: OperatorActionSummary,
@@ -402,6 +407,7 @@ pub fn build_vpn_health_router(
     voucher_verifier: Arc<VoucherVerifier>,
     encrypted_message_counter: Arc<AtomicU64>,
     packet_handler: Arc<PacketHandler>,
+    peer_store: Arc<PeerStore>,
 ) -> Router {
     Router::new()
         .route("/api/vpn/health", get(vpn_health_handler))
@@ -418,6 +424,7 @@ pub fn build_vpn_health_router(
             voucher_verifier,
             encrypted_message_counter,
             packet_handler,
+            peer_store,
         })
 }
 
@@ -446,6 +453,7 @@ pub async fn collect_vpn_health_value(
     voucher_verifier: Arc<VoucherVerifier>,
     encrypted_message_counter: Arc<AtomicU64>,
     packet_handler: Arc<PacketHandler>,
+    peer_store: Arc<PeerStore>,
 ) -> Value {
     let state = VpnHealthState {
         config,
@@ -455,6 +463,7 @@ pub async fn collect_vpn_health_value(
         voucher_verifier,
         encrypted_message_counter,
         packet_handler,
+        peer_store,
     };
     serde_json::to_value(collect_vpn_health_response(state).await).unwrap_or_else(|e| {
         serde_json::json!({
@@ -484,6 +493,7 @@ pub async fn collect_node_operator_status_value(
     voucher_verifier: Arc<VoucherVerifier>,
     encrypted_message_counter: Arc<AtomicU64>,
     packet_handler: Arc<PacketHandler>,
+    peer_store: Arc<PeerStore>,
 ) -> Value {
     let state = VpnHealthState {
         config,
@@ -493,6 +503,7 @@ pub async fn collect_node_operator_status_value(
         voucher_verifier,
         encrypted_message_counter,
         packet_handler,
+        peer_store,
     };
     serde_json::to_value(collect_node_operator_status_response(state).await).unwrap_or_else(|e| {
         serde_json::json!({
@@ -560,6 +571,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     )
     .await;
     let packet_runtime = state.packet_handler.runtime_status();
+    let discovery_status = collect_discovery_status_value(&state.peer_store);
     let runtime = collect_runtime_version_status().await;
     let recent_errors = collect_recent_error_events(VPN_SERVICE_NAME).await;
     let upgrade_status = collect_upgrade_status().await;
@@ -604,6 +616,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         placement_readiness,
         capacity,
         packet_runtime,
+        discovery_status,
         recent_errors,
         upgrade_status,
         operator_action,
@@ -629,6 +642,21 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         runtime,
         checks,
     }
+}
+
+fn collect_discovery_status_value(peer_store: &PeerStore) -> Value {
+    let now = unix_now_secs();
+    let status = peer_store.status(now);
+    serde_json::json!({
+        "generated_at": now,
+        "peer_store": status,
+        "source": "rust_peer_store",
+        "privacy_boundary": concat!(
+            "aggregate node discovery counters only; no client IPs, ",
+            "destinations, DNS contents, packet payloads, chat plaintext, ",
+            "voucher secrets, private keys, peer private keys, or wallet-level traffic"
+        )
+    })
 }
 
 async fn collect_node_operator_status_response(
@@ -679,6 +707,7 @@ async fn collect_node_operator_status_response(
             "placement_readiness": vpn_health.placement_readiness,
             "capacity": vpn_health.capacity,
             "packet_runtime": vpn_health.packet_runtime,
+            "discovery_status": vpn_health.discovery_status,
             "recent_errors": vpn_health.recent_errors,
             "upgrade_status": vpn_health.upgrade_status.clone(),
             "operator_action": vpn_health.operator_action.clone(),

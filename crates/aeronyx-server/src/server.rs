@@ -43,6 +43,9 @@
 //  19. Reports privacy-safe encrypted chat peer relay health counters.
 //  20. Treats memchain.chat_relay.enabled=false as a hard runtime gate while
 //      still reporting disabled chat relay telemetry to nodeboard.
+//  21. Wires PeerStore discovery summary into local VPN health and operator
+//      status so CLI healthchecks, heartbeat, and nodeboard share one
+//      privacy-safe peer-discovery readiness contract.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -62,6 +65,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.0.4-DiscoveryHealthContract - PeerStore summary in VPN health
 //   v1.0.3-DNSOwnership - Honor vpn.dns_proxy_enabled before spawning DNS proxy
 //   v1.0.2-DNSProxy - VPN gateway DNS proxy wiring
 //   v2.5.3+Security    - Server::new() gains config_path
@@ -1275,6 +1279,7 @@ impl Server {
                     voucher_verifier,
                     encrypted_message_counter,
                     packet_handler,
+                    Arc::clone(&peer_store),
                 ))
                 .merge(build_chat_peer_router(
                     chat_relay,
@@ -1477,6 +1482,7 @@ impl Server {
         let vpn_health_verifier = Arc::clone(&voucher_verifier);
         let vpn_health_message_counter = Arc::clone(&encrypted_message_counter);
         let vpn_health_packet_handler = Arc::clone(&packet_handler);
+        let vpn_health_peer_store = Arc::clone(&peer_store);
         heartbeat = heartbeat.with_vpn_health_status(Box::new(move || {
             let config = vpn_health_config.clone();
             let ip_pool = Arc::clone(&vpn_health_ip_pool);
@@ -1485,6 +1491,7 @@ impl Server {
             let verifier = Arc::clone(&vpn_health_verifier);
             let message_counter = Arc::clone(&vpn_health_message_counter);
             let packet_handler = Arc::clone(&vpn_health_packet_handler);
+            let peer_store = Arc::clone(&vpn_health_peer_store);
             Box::pin(async move {
                 Some(
                     collect_vpn_health_value(
@@ -1495,6 +1502,7 @@ impl Server {
                         verifier,
                         message_counter,
                         packet_handler,
+                        peer_store,
                     )
                     .await,
                 )
@@ -1508,6 +1516,7 @@ impl Server {
         let operator_status_verifier = Arc::clone(&voucher_verifier);
         let operator_status_message_counter = Arc::clone(&encrypted_message_counter);
         let operator_status_packet_handler = Arc::clone(&packet_handler);
+        let operator_status_peer_store = Arc::clone(&peer_store);
         heartbeat = heartbeat.with_operator_status(Box::new(move || {
             let config = operator_status_config.clone();
             let ip_pool = Arc::clone(&operator_status_ip_pool);
@@ -1516,6 +1525,7 @@ impl Server {
             let verifier = Arc::clone(&operator_status_verifier);
             let message_counter = Arc::clone(&operator_status_message_counter);
             let packet_handler = Arc::clone(&operator_status_packet_handler);
+            let peer_store = Arc::clone(&operator_status_peer_store);
             Box::pin(async move {
                 Some(
                     collect_node_operator_status_value(
@@ -1526,6 +1536,7 @@ impl Server {
                         verifier,
                         message_counter,
                         packet_handler,
+                        peer_store,
                     )
                     .await,
                 )

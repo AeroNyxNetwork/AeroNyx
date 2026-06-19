@@ -2,13 +2,14 @@
 
 ## File Creation / Modification Notes
 
-Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, and a future Directory Chain without smart contracts.
+Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: Initial planning document requested during product architecture discussion. This file should be maintained as implementation progresses.
+Modification Reason: v0.2.0 - Added the Blind Node Invariant as the first protocol-level privacy rule before continuing discovery, encrypted relay, Memory Chain coordination, multi-hop, or onion routing work.
 
 Main Functionality:
 
 - Record the product boundary for AeroNyx as an open privacy protocol, not a node operator.
+- Define the non-negotiable blind-node invariant for relay nodes and Memory Chain coordinators.
 - Describe how nodes discover, verify, and sync with each other.
 - Define the first protocol primitives: Node Identity, Signed Node Descriptor, Peer Store, Bootstrap Snapshot, Gossip Sync, and Encrypted Envelope Relay.
 - Track the Rust, backend, nodeboard, client, and docs files that are expected to change.
@@ -23,11 +24,13 @@ Dependencies:
 Important Note for Next Developer:
 
 - Do not describe AeroNyx as a centralized node operator or public exit provider.
+- Do not implement any relay, coordinator, queue, health report, or analytics path that lets a node operator read content, reconstruct who is talking to whom, or correlate user-level traffic.
 - Do not add smart contracts to this design. The proposed Directory Chain is a signed, append-only node directory ledger only.
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
+Last Modified: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordination.
+Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
 
@@ -108,7 +111,135 @@ This means:
 - Revoked descriptors must be removed or marked unsafe.
 - Directory snapshots can be signed by witnesses later, but node descriptor self-signature remains required.
 
-## 5. Node Identity
+## 5. Blind Node Invariant
+
+The first invariant of AeroNyx privacy protocol design is:
+
+```text
+Relay nodes and Memory Chain coordinators must be blind.
+```
+
+This invariant is more important than any individual feature. If a commercial
+node operator can read user content, reconstruct the social graph, or correlate
+user-level traffic, the protocol has failed its privacy promise.
+
+### 5.1 Relay node blindness
+
+An AeroNyx relay node may process only the minimum control-plane data needed to
+move an encrypted object to the next hop or local delivery queue.
+
+Allowed relay-visible data:
+
+- encrypted blob bytes
+- bounded next-hop or delivery class
+- expiry / TTL
+- coarse capability class
+- anti-replay or deduplication token that is not globally linkable
+- aggregate counters needed for abuse control and health
+
+Forbidden relay-visible data:
+
+- chat plaintext
+- Memory Chain plaintext
+- encrypted storage plaintext
+- packet payload contents
+- DNS contents
+- destination domains or URLs
+- client public IPs
+- long-lived sender-to-recipient route identifiers
+- wallet-level traffic records
+- stable social graph edges such as "user A talks to user B"
+
+Relay operators must not be able to answer:
+
+```text
+Who is talking to whom?
+What did they say?
+Which destinations, domains, or URLs did they access?
+Which wallet generated which traffic stream?
+```
+
+The first relay implementation may still have narrower metadata than a full
+onion design, but every step must move toward less operator visibility, not
+more. Future onion routing, cover traffic, batching, padding, and timing
+defense work must be treated as privacy requirements, not decorative features.
+
+### 5.2 Memory Chain coordinator blindness
+
+The centralized-first Memory Chain coordinator is allowed to be a dumb
+append-only ordering service only.
+
+Allowed coordinator-visible data:
+
+- encrypted object bytes
+- object hash / content address
+- append sequence or version vector
+- timestamp or logical clock
+- owner-controlled authorization proof that does not reveal plaintext
+- coarse storage pressure and replication health
+
+Forbidden coordinator-visible data:
+
+- decrypted memory records
+- chat plaintext
+- social graph contents
+- raw user identity mappings
+- private keys
+- recovery secrets
+- plaintext file names
+- semantic tags derived from plaintext
+- wallet-level traffic analysis
+
+The coordinator may order, timestamp, store, replicate, and return encrypted
+objects. It must not interpret them. The correct mental model is closer to a
+Git object store for ciphertext plus version vectors than to an application
+database that understands user data.
+
+### 5.3 Engineering gates
+
+Before any new discovery, relay, Memory Chain, or onion-routing feature ships,
+the implementation must answer these questions:
+
+1. What exact fields can the node operator see?
+2. Can those fields reveal content?
+3. Can those fields reveal who communicates with whom?
+4. Can logs, metrics, health reports, or nodeboard views leak more than the
+   protocol payload itself?
+5. Can timing, replay IDs, route IDs, or queue IDs become stable cross-session
+   correlators?
+6. What gets deleted, rotated, padded, batched, or aggregated to reduce linkage?
+
+No feature should be considered production-ready until the privacy answer is
+explicit in code comments, docs, API contracts, and nodeboard copy.
+
+### 5.4 Design consequence for node discovery
+
+Peer discovery may reveal node descriptors and aggregate capability metadata.
+It must not reveal user routes. A `PeerStore` entry is about node capability,
+not user relationships.
+
+Discovery status may report:
+
+- total peers
+- valid peers
+- public peers
+- gossip freshness
+- rejected or stale descriptor counters
+- seed endpoint count
+
+Discovery status must not report:
+
+- user route choices
+- per-user next hops
+- sender-recipient pairs
+- client public IPs
+- destination IPs, domains, URLs, or DNS contents
+- plaintext or ciphertext samples
+
+This is the boundary between a privacy protocol and a network of readable
+middleboxes.
+
+## 6. Node Identity
 
 Each Rust node needs a long-lived identity:
 
@@ -139,7 +270,7 @@ crates/aeronyx-server/src/services/discovery/identity.rs
 deploy/node/aeronyx-node.sh
 ```
 
-## 6. Signed Node Descriptor
+## 7. Signed Node Descriptor
 
 `NodeDescriptor` is the minimum unit of discovery.
 
@@ -206,7 +337,7 @@ crates/aeronyx-server/src/management/reporter.rs
 crates/aeronyx-server/src/services/discovery/descriptor.rs
 ```
 
-## 7. Bootstrap Directory
+## 8. Bootstrap Directory
 
 The first version may use backend/nodeboard as a bootstrap directory.
 
@@ -253,7 +384,7 @@ crates/aeronyx-server/src/services/discovery/snapshot.rs
 crates/aeronyx-server/src/server.rs
 ```
 
-## 8. Peer Store
+## 9. Peer Store
 
 Every Rust node should keep a local verified peer store.
 
@@ -299,7 +430,7 @@ crates/aeronyx-server/src/config_discovery.rs
 crates/aeronyx-server/src/server.rs
 ```
 
-## 9. Gossip Sync
+## 10. Gossip Sync
 
 Gossip should start simple.
 
@@ -340,7 +471,7 @@ crates/aeronyx-server/src/services/discovery/gossip.rs
 crates/aeronyx-server/src/api/discovery.rs
 ```
 
-## 10. Encrypted Envelope Relay
+## 11. Encrypted Envelope Relay
 
 Nodes should relay encrypted envelopes, not plaintext.
 
@@ -417,7 +548,7 @@ crates/aeronyx-server/src/services/peer_store.rs
 crates/aeronyx-server/src/server.rs
 ```
 
-## 11. Store-and-Forward Queue
+## 12. Store-and-Forward Queue
 
 For offline chat, agent messages, or delayed relay, each node may keep a bounded pending queue.
 
@@ -450,7 +581,7 @@ crates/aeronyx-server/src/config_discovery.rs
 crates/aeronyx-server/src/config_chat_relay.rs
 ```
 
-## 12. Directory Chain Without Smart Contracts
+## 13. Directory Chain Without Smart Contracts
 
 Directory Chain is a future append-only descriptor ledger.
 
@@ -497,7 +628,7 @@ crates/aeronyx-server/src/services/discovery/directory_chain.rs
 crates/aeronyx-server/src/services/discovery/witness.rs
 ```
 
-## 13. Onion Routing Relationship
+## 14. Onion Routing Relationship
 
 Onion routing should come after discovery and encrypted relay.
 
@@ -528,7 +659,7 @@ crates/aeronyx-server/src/services/onion/packet.rs
 crates/aeronyx-server/src/services/onion/path_selection.rs
 ```
 
-## 14. Client Product Implications
+## 15. Client Product Implications
 
 The client should be feature-oriented, not server-list-oriented.
 
@@ -567,7 +698,7 @@ rust/
 
 Exact client paths should be filled in when the client implementation work starts.
 
-## 15. nodeboard Product Implications
+## 16. nodeboard Product Implications
 
 nodeboard should show descriptor and discovery health without becoming the operator.
 
@@ -594,7 +725,7 @@ app/dashboard/events/page.tsx
 lib/i18n/index.ts
 ```
 
-## 16. Backend Product Implications
+## 17. Backend Product Implications
 
 Backend should act as a bootstrap and observability service, not the source of cryptographic trust.
 
@@ -619,7 +750,7 @@ privacy_network/services/directory_service.py
 privacy_network/api/vpn_observability.py
 ```
 
-## 17. Development Phases
+## 18. Development Phases
 
 ### Phase 0 - Current State Audit
 
@@ -831,7 +962,7 @@ Verification:
 - Each hop only sees previous and next hop metadata.
 - No public exit by default.
 
-## 18. Open Questions
+## 19. Open Questions
 
 - Should node signing keys be generated during registration or first local startup?
 - Should operator key be wallet-based, nodeboard-account-based, or both?
@@ -841,7 +972,7 @@ Verification:
 - How should a node rotate keys without losing reputation/history?
 - What is the first client use case: chat relay, privacy relay, storage, or agent relay?
 
-## 19. Maintenance Log
+## 20. Maintenance Log
 
 Use this section to record implementation progress.
 
@@ -857,6 +988,18 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-06-19 - Added Blind Node Invariant as protocol gate.
+- Files changed:
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Verification:
+  - Documentation-only specification update.
+- Notes:
+  - Relay nodes and Memory Chain coordinators must be blind by design.
+  - Nodes may move encrypted blobs and aggregate counters, but must not read
+    content, reconstruct social graphs, or correlate user-level traffic.
+  - Future discovery, relay, Memory Chain, and onion routing work must document
+    visible fields and correlation risks before shipping.
+
 2026-06-18 - Created architecture and development plan.
 - Files changed:
   - docs/node-discovery-and-encrypted-relay-plan.md
