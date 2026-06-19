@@ -30,8 +30,10 @@
 //! - Never change HKDF_SALT without protocol version bump
 //! - Info parameter order matters for key derivation
 //! - Always include both public keys in info for key binding
+//! - Never log shared secrets, derived keys, HKDF info, or raw public keys.
 //!
 //! ## Last Modified
+//! v0.1.1 - Redacted sensitive key material from crypto logs
 //! v0.1.0 - Initial KDF implementation
 
 use hkdf::Hkdf;
@@ -44,18 +46,17 @@ use crate::crypto::SessionKey;
 use crate::error::{CoreError, Result};
 
 // ============================================
-// Helper function for hex encoding (no external crate needed)
+// Helper function for privacy-safe diagnostics
 // ============================================
 
-/// Convert bytes to hex string for debug logging
-fn to_hex(bytes: &[u8]) -> String {
-    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-    let mut result = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        result.push(HEX_CHARS[(byte >> 4) as usize] as char);
-        result.push(HEX_CHARS[(byte & 0x0f) as usize] as char);
-    }
-    result
+/// Returns a length-only placeholder for sensitive bytes.
+///
+/// Handshake material and KDF inputs must never be printed to operator logs.
+/// Length-only diagnostics preserve enough context for troubleshooting without
+/// leaking shared secrets, session keys, public-key identifiers, or signed
+/// transcript bytes into journald/centralized log collectors.
+fn redacted_len(bytes: &[u8]) -> String {
+    format!("<redacted:{} bytes>", bytes.len())
 }
 
 // ============================================
@@ -97,26 +98,26 @@ pub fn derive_session_key(
     // Log all inputs
     info!(
         "[CRYPTO-DEBUG] Input - Shared Secret: {}",
-        to_hex(shared_secret)
+        redacted_len(shared_secret)
     );
     info!(
         "[CRYPTO-DEBUG] Input - Client Public Key: {}",
-        to_hex(client_public)
+        redacted_len(client_public)
     );
     info!(
         "[CRYPTO-DEBUG] Input - Server Public Key: {}",
-        to_hex(server_public)
+        redacted_len(server_public)
     );
 
     // Log HKDF parameters
     debug!(
         "[CRYPTO-DEBUG] HKDF Salt: {} (\"{}\")",
-        to_hex(HKDF_SALT),
+        redacted_len(HKDF_SALT),
         String::from_utf8_lossy(HKDF_SALT)
     );
     debug!(
         "[CRYPTO-DEBUG] HKDF Info Prefix: {} (\"{}\")",
-        to_hex(HKDF_INFO_PREFIX),
+        redacted_len(HKDF_INFO_PREFIX),
         String::from_utf8_lossy(HKDF_INFO_PREFIX)
     );
 
@@ -127,25 +128,25 @@ pub fn derive_session_key(
     info.extend_from_slice(server_public);
 
     debug!(
-        "[CRYPTO-DEBUG] HKDF Info (full): {} ({} bytes)",
-        to_hex(&info),
+        "[CRYPTO-DEBUG] HKDF Info (redacted): {} ({} bytes)",
+        redacted_len(&info),
         info.len()
     );
     debug!("[CRYPTO-DEBUG] HKDF Info breakdown:");
     debug!(
         "[CRYPTO-DEBUG]   - Prefix ({} bytes): {}",
         HKDF_INFO_PREFIX.len(),
-        to_hex(HKDF_INFO_PREFIX)
+        redacted_len(HKDF_INFO_PREFIX)
     );
     debug!(
         "[CRYPTO-DEBUG]   - Client Public ({} bytes): {}",
         ED25519_PUBLIC_KEY_SIZE,
-        to_hex(client_public)
+        redacted_len(client_public)
     );
     debug!(
         "[CRYPTO-DEBUG]   - Server Public ({} bytes): {}",
         ED25519_PUBLIC_KEY_SIZE,
-        to_hex(server_public)
+        redacted_len(server_public)
     );
 
     // Perform HKDF-SHA256
@@ -167,8 +168,8 @@ pub fn derive_session_key(
     }
 
     info!(
-        "[CRYPTO-DEBUG] Output - Derived Session Key: {}",
-        to_hex(&key_bytes)
+        "[CRYPTO-DEBUG] Output - Derived Session Key (redacted): {}",
+        redacted_len(&key_bytes)
     );
 
     // Clear sensitive intermediate data
@@ -181,17 +182,20 @@ pub fn derive_session_key(
     info!("[CRYPTO-DEBUG] ====== KEY DERIVATION SUMMARY ======");
     info!(
         "[CRYPTO-DEBUG]   Shared Secret:     {}",
-        to_hex(shared_secret)
+        redacted_len(shared_secret)
     );
     info!(
         "[CRYPTO-DEBUG]   Client Public:     {}",
-        to_hex(client_public)
+        redacted_len(client_public)
     );
     info!(
         "[CRYPTO-DEBUG]   Server Public:     {}",
-        to_hex(server_public)
+        redacted_len(server_public)
     );
-    info!("[CRYPTO-DEBUG]   Derived Key:       {}", to_hex(&key_bytes));
+    info!(
+        "[CRYPTO-DEBUG]   Derived Key:       {}",
+        redacted_len(&key_bytes)
+    );
     info!("[CRYPTO-DEBUG] ====================================");
 
     Ok(SessionKey::from_bytes(key_bytes))
@@ -219,17 +223,17 @@ pub fn hkdf_expand(
     debug!("[CRYPTO-DEBUG] ========== hkdf_expand START ==========");
     debug!(
         "[CRYPTO-DEBUG] Input - shared_secret: {} ({} bytes)",
-        to_hex(shared_secret),
+        redacted_len(shared_secret),
         shared_secret.len()
     );
     debug!(
         "[CRYPTO-DEBUG] Input - salt: {} ({} bytes)",
-        to_hex(salt),
+        redacted_len(salt),
         salt.len()
     );
     debug!(
         "[CRYPTO-DEBUG] Input - info: {} ({} bytes)",
-        to_hex(info),
+        redacted_len(info),
         info.len()
     );
     debug!("[CRYPTO-DEBUG] Input - output_len: {} bytes", output_len);
@@ -241,7 +245,7 @@ pub fn hkdf_expand(
         Ok(()) => {
             debug!(
                 "[CRYPTO-DEBUG] Output: {} ({} bytes)",
-                to_hex(&output),
+                redacted_len(&output),
                 output.len()
             );
             debug!("[CRYPTO-DEBUG] ========== hkdf_expand SUCCESS ==========");
