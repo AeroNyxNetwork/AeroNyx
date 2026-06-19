@@ -50,6 +50,11 @@
 //! Discovery status telemetry reports the local verified PeerStore summary so
 //! healthchecks can prove that nodes know about other signed AeroNyx peers
 //! before future multi-hop routing work starts.
+//! Startup self-check telemetry aggregates validated config, runtime listeners,
+//! peer-cache recovery, seed gossip, and capacity prerequisites into one
+//! nodeboard-ready readiness contract. It is operational metadata only and
+//! never includes user traffic, chat payloads, DNS names, destinations, wallet
+//! traffic, voucher secrets, or private keys.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -94,7 +99,7 @@ pub struct VpnHealthState {
     peer_store: Arc<PeerStore>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct HealthCheck {
     name: &'static str,
     ok: bool,
@@ -312,6 +317,29 @@ struct OperatorActionSummary {
     privacy_boundary: &'static str,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct StartupSelfCheckItem {
+    name: &'static str,
+    ok: bool,
+    severity: &'static str,
+    detail: String,
+    next_step: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StartupSelfCheckStatus {
+    status: &'static str,
+    ready: bool,
+    checked_at: u64,
+    failed_checks: usize,
+    warning_checks: usize,
+    blocking_checks: Vec<&'static str>,
+    recommended_action: String,
+    checks: Vec<StartupSelfCheckItem>,
+    source: &'static str,
+    privacy_boundary: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 struct VpnHealthResponse {
     status: &'static str,
@@ -324,6 +352,7 @@ struct VpnHealthResponse {
     preferred_transport: String,
     transport_health: VpnTransportHealthStatus,
     privacy_protocol_health: PrivacyProtocolHealthStatus,
+    startup_self_check: StartupSelfCheckStatus,
     virtual_ip_range: String,
     tun_device: String,
     configured_mtu: u16,
@@ -575,6 +604,14 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     let runtime = collect_runtime_version_status().await;
     let recent_errors = collect_recent_error_events(VPN_SERVICE_NAME).await;
     let upgrade_status = collect_upgrade_status().await;
+    let startup_self_check = collect_startup_self_check(
+        &config,
+        &checks,
+        &service_manager,
+        &transport_health,
+        &capacity,
+        &discovery_status,
+    );
     let operator_action = collect_operator_action_summary(
         status,
         &checks,
@@ -604,6 +641,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         preferred_transport: transport_health.preferred_transport.clone(),
         transport_health,
         privacy_protocol_health,
+        startup_self_check,
         virtual_ip_range: ip_range,
         tun_device,
         configured_mtu,
@@ -659,6 +697,301 @@ fn collect_discovery_status_value(peer_store: &PeerStore) -> Value {
     })
 }
 
+fn collect_startup_self_check(
+    config: &ServerConfig,
+    health_checks: &[HealthCheck],
+    service_manager: &ServiceManagerStatus,
+    transport_health: &VpnTransportHealthStatus,
+    capacity: &VpnCapacityStatus,
+    discovery_status: &Value,
+) -> StartupSelfCheckStatus {
+    let mut checks = Vec::new();
+
+    match config.validate() {
+        Ok(()) => checks.push(startup_item(
+            "config_schema",
+            true,
+            "critical",
+            "ServerConfig validation passed at runtime".to_string(),
+            "No action required.".to_string(),
+        )),
+        Err(error) => checks.push(startup_item(
+            "config_schema",
+            false,
+            "critical",
+            format!("ServerConfig validation failed: {error}"),
+            "Fix /etc/aeronyx/server.toml, then run deploy/node/aeronyx-node.sh health --json before restart.".to_string(),
+        )),
+    }
+
+    checks.push(startup_item(
+        "service_manager_active",
+        service_manager.active_state == "active",
+        "critical",
+        service_manager.detail.clone(),
+        "Run deploy/node/aeronyx-node.sh status and logs --lines 200; restart only after confirming active sessions and maintenance mode.".to_string(),
+    ));
+
+    push_runtime_health_check(
+        &mut checks,
+        health_checks,
+        "udp_listener",
+        "critical",
+        "Ensure UDP listen_addr is reachable and no other process owns the configured port, then restart the AeroNyx Rust node.".to_string(),
+    );
+    push_runtime_health_check(
+        &mut checks,
+        health_checks,
+        "tun_device",
+        "critical",
+        "Run deploy/node/aeronyx-node.sh network to recreate the TUN device and routing rules."
+            .to_string(),
+    );
+    push_runtime_health_check(
+        &mut checks,
+        health_checks,
+        "mtu_config",
+        "warning",
+        "Align tun.mtu with the running interface MTU during a maintenance window.".to_string(),
+    );
+    push_runtime_health_check(
+        &mut checks,
+        health_checks,
+        "ip_forward",
+        "critical",
+        "Enable net.ipv4.ip_forward=1, then rerun deploy/node/aeronyx-node.sh network.".to_string(),
+    );
+    push_runtime_health_check(
+        &mut checks,
+        health_checks,
+        "nat_masquerade",
+        "critical",
+        "Restore the VPN MASQUERADE rule with deploy/node/aeronyx-node.sh network.".to_string(),
+    );
+    push_runtime_health_check(
+        &mut checks,
+        health_checks,
+        "dns_stub",
+        "critical",
+        "Start the built-in DNS proxy or provide an external listener on gateway_ip:53."
+            .to_string(),
+    );
+    push_runtime_health_check(
+        &mut checks,
+        health_checks,
+        "dns_query",
+        "warning",
+        "Check upstream DNS reachability from the node and gateway DNS listener health."
+            .to_string(),
+    );
+    push_runtime_health_check(
+        &mut checks,
+        health_checks,
+        "internet_egress",
+        "critical",
+        "Verify host firewall, cloud security group, and default route before accepting traffic."
+            .to_string(),
+    );
+
+    checks.push(startup_item(
+        "effective_transport",
+        transport_health.udp.active && transport_health.effective_transport == "udp",
+        "critical",
+        format!(
+            "effective_transport={} udp_active={} fallback_available={}",
+            transport_health.effective_transport,
+            transport_health.udp.active,
+            transport_health.fallback_available
+        ),
+        "Keep UDP active until TCP/TLS or WebSocket HTTPS fallback listeners are implemented."
+            .to_string(),
+    ));
+
+    checks.push(startup_item(
+        "ip_pool_capacity",
+        capacity.ip_pool_free > 0 && capacity.max_connections <= capacity.ip_pool_capacity,
+        "warning",
+        format!(
+            "ip_pool_capacity={} used={} free={} max_connections={}",
+            capacity.ip_pool_capacity,
+            capacity.ip_pool_used,
+            capacity.ip_pool_free,
+            capacity.max_connections
+        ),
+        "Expand vpn.virtual_ip_range or lower limits.max_connections before commercial traffic exceeds the IP pool.".to_string(),
+    ));
+
+    let discovery_enabled = config.discovery.enabled;
+    let peer_cache_configured = discovery_bool(
+        discovery_status,
+        &["peer_store", "bootstrap", "peer_cache_configured"],
+    )
+    .unwrap_or(config.discovery.peer_cache_path.is_some());
+    let gossip_enabled = discovery_bool(
+        discovery_status,
+        &["peer_store", "bootstrap", "gossip_enabled"],
+    )
+    .unwrap_or(config.discovery.gossip_enabled);
+    let seed_count = discovery_u64(
+        discovery_status,
+        &["peer_store", "bootstrap", "seed_endpoints_configured"],
+    )
+    .unwrap_or(config.discovery.seed_endpoints.len() as u64);
+    let stability_health = discovery_str(discovery_status, &["peer_store", "stability", "health"])
+        .unwrap_or("unknown");
+    let restart_recovery_configured = discovery_bool(
+        discovery_status,
+        &["peer_store", "stability", "restart_recovery_configured"],
+    )
+    .unwrap_or(false);
+
+    checks.push(startup_item(
+        "peer_store_restart_recovery",
+        !discovery_enabled || (peer_cache_configured && restart_recovery_configured),
+        if discovery_enabled { "critical" } else { "warning" },
+        format!(
+            "discovery_enabled={} peer_cache_configured={} restart_recovery_configured={}",
+            discovery_enabled, peer_cache_configured, restart_recovery_configured
+        ),
+        "Set discovery.peer_cache_path so verified peers survive restart without depending on the center service.".to_string(),
+    ));
+
+    checks.push(startup_item(
+        "discovery_seed_recovery",
+        !gossip_enabled || seed_count > 0,
+        if gossip_enabled { "warning" } else { "info" },
+        format!(
+            "gossip_enabled={} seed_endpoints_configured={}",
+            gossip_enabled, seed_count
+        ),
+        "Configure at least one discovery.seed_endpoints entry for live peer recovery.".to_string(),
+    ));
+
+    checks.push(startup_item(
+        "public_discovery_api",
+        !discovery_enabled || config.discovery.public_api_listen_addr.is_some(),
+        if discovery_enabled { "warning" } else { "info" },
+        format!(
+            "discovery_enabled={} public_api_listen_addr_configured={}",
+            discovery_enabled,
+            config.discovery.public_api_listen_addr.is_some()
+        ),
+        "Set discovery.public_api_listen_addr when this node should be discoverable by other AeroNyx nodes.".to_string(),
+    ));
+
+    checks.push(startup_item(
+        "peer_store_stability",
+        !matches!(stability_health, "failed" | "stale"),
+        "warning",
+        format!("peer_store_stability={stability_health}"),
+        "Wait for live gossip recovery or refresh the peer cache/bootstrap snapshot before enabling multi-hop routing.".to_string(),
+    ));
+
+    let failed_checks = checks
+        .iter()
+        .filter(|check| !check.ok && check.severity == "critical")
+        .count();
+    let warning_checks = checks
+        .iter()
+        .filter(|check| !check.ok && check.severity != "critical")
+        .count();
+    let blocking_checks = checks
+        .iter()
+        .filter(|check| !check.ok && check.severity == "critical")
+        .map(|check| check.name)
+        .collect::<Vec<_>>();
+    let status = if failed_checks > 0 {
+        "failed"
+    } else if warning_checks > 0 {
+        "degraded"
+    } else {
+        "ready"
+    };
+    let recommended_action = checks
+        .iter()
+        .find(|check| !check.ok)
+        .map(|check| check.next_step.clone())
+        .unwrap_or_else(|| "No action required; startup self-check is ready.".to_string());
+
+    StartupSelfCheckStatus {
+        status,
+        ready: status == "ready",
+        checked_at: unix_now_secs(),
+        failed_checks,
+        warning_checks,
+        blocking_checks,
+        recommended_action,
+        checks,
+        source: "rust_startup_self_check",
+        privacy_boundary: concat!(
+            "aggregate startup/config readiness only; no client public IPs, ",
+            "destinations, DNS query names, packet payloads, chat plaintext, ",
+            "ciphertext, voucher secrets, private keys, or wallet-level traffic"
+        ),
+    }
+}
+
+fn startup_item(
+    name: &'static str,
+    ok: bool,
+    severity: &'static str,
+    detail: String,
+    next_step: String,
+) -> StartupSelfCheckItem {
+    StartupSelfCheckItem {
+        name,
+        ok,
+        severity,
+        detail,
+        next_step,
+    }
+}
+
+fn push_runtime_health_check(
+    checks: &mut Vec<StartupSelfCheckItem>,
+    health_checks: &[HealthCheck],
+    name: &'static str,
+    severity: &'static str,
+    next_step: String,
+) {
+    match health_checks.iter().find(|check| check.name == name) {
+        Some(check) => checks.push(startup_item(
+            name,
+            check.ok,
+            severity,
+            check.detail.clone(),
+            next_step,
+        )),
+        None => checks.push(startup_item(
+            name,
+            false,
+            severity,
+            "runtime health check did not run".to_string(),
+            next_step,
+        )),
+    }
+}
+
+fn discovery_value<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn discovery_bool(value: &Value, path: &[&str]) -> Option<bool> {
+    discovery_value(value, path).and_then(Value::as_bool)
+}
+
+fn discovery_u64(value: &Value, path: &[&str]) -> Option<u64> {
+    discovery_value(value, path).and_then(Value::as_u64)
+}
+
+fn discovery_str<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
+    discovery_value(value, path).and_then(Value::as_str)
+}
+
 async fn collect_node_operator_status_response(
     state: VpnHealthState,
 ) -> NodeOperatorStatusResponse {
@@ -694,6 +1027,7 @@ async fn collect_node_operator_status_response(
             "preferred_transport": vpn_health.preferred_transport.clone(),
             "transport_health": vpn_health.transport_health.clone(),
             "privacy_protocol_health": vpn_health.privacy_protocol_health.clone(),
+            "startup_self_check": vpn_health.startup_self_check.clone(),
             "virtual_ip_range": vpn_health.virtual_ip_range,
             "tun_device": vpn_health.tun_device,
             "configured_mtu": vpn_health.configured_mtu,
@@ -715,6 +1049,23 @@ async fn collect_node_operator_status_response(
             "runtime_rollout": runtime_rollout.clone(),
         }),
     });
+
+    if vpn_health.startup_self_check.status != "ready" {
+        risks.push(OperatorRisk {
+            severity: if vpn_health.startup_self_check.status == "failed" {
+                "critical"
+            } else {
+                "warning"
+            },
+            code: "startup_self_check",
+            message: format!(
+                "Startup self-check is {} with {} blocking checks",
+                vpn_health.startup_self_check.status,
+                vpn_health.startup_self_check.blocking_checks.len()
+            ),
+            remediation: vpn_health.startup_self_check.recommended_action.clone(),
+        });
+    }
 
     services.push(OperatorServiceStatus {
         key: "memchain",
@@ -2560,6 +2911,88 @@ mod tests {
     }
 
     #[test]
+    fn startup_self_check_ready_when_runtime_and_recovery_are_ready() {
+        let config = ServerConfig::default();
+        let checks = healthy_runtime_checks();
+        let service_manager = healthy_service_manager();
+        let transport = healthy_transport();
+        let capacity = healthy_capacity();
+        let discovery_status = serde_json::json!({
+            "peer_store": {
+                "bootstrap": {
+                    "peer_cache_configured": false,
+                    "gossip_enabled": false,
+                    "seed_endpoints_configured": 0
+                },
+                "stability": {
+                    "health": "healthy",
+                    "restart_recovery_configured": false
+                }
+            }
+        });
+
+        let status = collect_startup_self_check(
+            &config,
+            &checks,
+            &service_manager,
+            &transport,
+            &capacity,
+            &discovery_status,
+        );
+
+        assert_eq!(status.status, "ready");
+        assert!(status.ready);
+        assert_eq!(status.failed_checks, 0);
+        assert_eq!(status.warning_checks, 0);
+        assert!(status.blocking_checks.is_empty());
+    }
+
+    #[test]
+    fn startup_self_check_blocks_discovery_without_peer_cache_recovery() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.gossip_enabled = true;
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        config.discovery.seed_endpoints = vec!["http://127.0.0.1:8422".to_string()];
+
+        let checks = healthy_runtime_checks();
+        let service_manager = healthy_service_manager();
+        let transport = healthy_transport();
+        let capacity = healthy_capacity();
+        let discovery_status = serde_json::json!({
+            "peer_store": {
+                "bootstrap": {
+                    "peer_cache_configured": false,
+                    "gossip_enabled": true,
+                    "seed_endpoints_configured": 1
+                },
+                "stability": {
+                    "health": "healthy",
+                    "restart_recovery_configured": false
+                }
+            }
+        });
+
+        let status = collect_startup_self_check(
+            &config,
+            &checks,
+            &service_manager,
+            &transport,
+            &capacity,
+            &discovery_status,
+        );
+
+        assert_eq!(status.status, "failed");
+        assert!(!status.ready);
+        assert!(status
+            .blocking_checks
+            .contains(&"peer_store_restart_recovery"));
+        assert!(status
+            .recommended_action
+            .contains("discovery.peer_cache_path"));
+    }
+
+    #[test]
     fn recent_error_sanitizer_redacts_sensitive_tokens() {
         let sanitized = sanitize_operational_log_message(
             "failed peer 203.0.113.10 endpoint=198.51.100.8:443 ipv6=2001:db8::1 host=api.example.com url=https://example.com/path key=0123456789abcdef0123456789abcdef",
@@ -2576,6 +3009,143 @@ mod tests {
         assert!(!sanitized.contains("2001:db8::1"));
         assert!(!sanitized.contains("api.example.com"));
         assert!(!sanitized.contains("0123456789abcdef0123456789abcdef"));
+    }
+
+    fn healthy_runtime_checks() -> Vec<HealthCheck> {
+        [
+            "udp_listener",
+            "tun_device",
+            "mtu_config",
+            "ip_forward",
+            "nat_masquerade",
+            "dns_stub",
+            "dns_query",
+            "internet_egress",
+        ]
+        .into_iter()
+        .map(|name| HealthCheck {
+            name,
+            ok: true,
+            detail: "ok".to_string(),
+        })
+        .collect()
+    }
+
+    fn healthy_service_manager() -> ServiceManagerStatus {
+        ServiceManagerStatus {
+            manager: "systemd",
+            service_name: VPN_SERVICE_NAME,
+            load_state: "loaded".to_string(),
+            active_state: "active".to_string(),
+            unit_file_state: "enabled".to_string(),
+            restart_supported: true,
+            detail: "service is active".to_string(),
+        }
+    }
+
+    fn healthy_transport() -> VpnTransportHealthStatus {
+        let udp = TransportCarrierStatus {
+            key: "udp",
+            enabled: true,
+            implemented: true,
+            active: true,
+            endpoint: Some("0.0.0.0:51820".to_string()),
+            status: "active",
+            detail: "UDP listener active".to_string(),
+        };
+        let tcp_tls = TransportCarrierStatus {
+            key: "tcp_tls",
+            enabled: false,
+            implemented: false,
+            active: false,
+            endpoint: None,
+            status: "planned",
+            detail: "planned".to_string(),
+        };
+        let websocket_https = TransportCarrierStatus {
+            key: "websocket_https",
+            enabled: false,
+            implemented: false,
+            active: false,
+            endpoint: None,
+            status: "planned",
+            detail: "planned".to_string(),
+        };
+        VpnTransportHealthStatus {
+            supported_transports: vec!["udp"],
+            configured_transports: vec!["udp"],
+            preferred_transport: "udp".to_string(),
+            effective_transport: "udp",
+            fallback_available: false,
+            udp,
+            tcp_tls,
+            websocket_https,
+            source: "test",
+            privacy_boundary: "aggregate transport state only",
+        }
+    }
+
+    fn healthy_capacity() -> VpnCapacityStatus {
+        let disk_path = DiskPathCapacityStatus {
+            reported: true,
+            path: "/",
+            total_bytes: Some(100),
+            used_bytes: Some(10),
+            available_bytes: Some(90),
+            used_percent: Some(10.0),
+        };
+        VpnCapacityStatus {
+            virtual_ip_range: "100.64.0.0/22".to_string(),
+            ip_pool_capacity: 1_021,
+            ip_pool_used: 1,
+            ip_pool_free: 1_020,
+            max_connections: 1_000,
+            policy_max_sessions: 0,
+            active_sessions: 0,
+            session_capacity_remaining: Some(1_000),
+            bandwidth_limit_mbps: 0,
+            bandwidth_limit_bytes_per_second: 0,
+            bandwidth_window_bytes: 0,
+            bandwidth_window_used_percent: None,
+            traffic_capacity_status: "unlimited".to_string(),
+            conntrack: ConntrackCapacityStatus {
+                used: Some(10),
+                max: Some(10_000),
+                used_percent: Some(0.1),
+            },
+            file_descriptors: FileDescriptorCapacityStatus {
+                used: Some(10),
+                soft_limit: Some(10_000),
+                hard_limit: Some(10_000),
+                used_percent: Some(0.1),
+            },
+            disk: DiskCapacityStatus {
+                root: disk_path.clone(),
+                state: disk_path,
+                source: "test",
+                privacy_boundary: "aggregate disk capacity only",
+            },
+            interface: InterfaceCapacityStatus {
+                interface: "aeronyx0".to_string(),
+                rx_bytes: Some(0),
+                tx_bytes: Some(0),
+                rx_packets: Some(0),
+                tx_packets: Some(0),
+                rx_dropped: Some(0),
+                tx_dropped: Some(0),
+                packet_drops: Some(0),
+                rx_pps: Some(0.0),
+                tx_pps: Some(0.0),
+                total_pps: Some(0.0),
+                rx_bps: Some(0.0),
+                tx_bps: Some(0.0),
+                total_bps: Some(0.0),
+            },
+            packet_drops_total: Some(0),
+            risks: Vec::new(),
+            source: "test",
+            privacy_boundary: "aggregate node capacity only",
+        }
     }
 
     #[test]
