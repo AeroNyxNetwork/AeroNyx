@@ -20,6 +20,7 @@
 //!   snapshot export operations
 //! - Bootstrap/cache/gossip runtime status for nodeboard diagnostics
 //! - Seed endpoint recovery counters without exposing seed endpoint values
+//! - Discovery stability summary for operator health gates and nodeboard
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -44,6 +45,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.9.0-DiscoveryStability - Added aggregate discovery stability summary
 //! v0.8.0-DiscoveryGossipHealth - Added outbound gossip health summary fields
 //! v0.7.0-DiscoverySeedStatus - Added privacy-safe seed endpoint recovery counters
 //! v0.6.0-DiscoveryBootstrapStatus - Added bootstrap/cache/gossip status snapshot
@@ -62,6 +64,9 @@ use aeronyx_core::protocol::discovery::{
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+
+const DISCOVERY_GOSSIP_STALE_AFTER_SECS: u64 = 900;
+const DISCOVERY_GOSSIP_FAILURE_ATTENTION_THRESHOLD: u64 = 3;
 
 // ============================================
 // PeerStoreError
@@ -220,6 +225,35 @@ impl Default for PeerStoreBootstrapStatus {
     }
 }
 
+/// Operator-facing stability summary derived from verified PeerStore state.
+///
+/// This is deliberately a compact aggregate contract. It never includes peer
+/// URLs, full peer public keys, client IPs, destinations, DNS contents, packet
+/// payloads, chat plaintext, voucher secrets, private keys, wallet-level
+/// traffic, or per-user traffic. The goal is to let nodeboard and backend
+/// health checks decide whether discovery is ready for future blind relay work
+/// without reconstructing policy from raw counters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreStabilityStatus {
+    /// Stable health bucket: disabled, pending, healthy, degraded, stale, failed.
+    pub health: String,
+    /// Whether this node has enough fresh aggregate discovery state to be used
+    /// as a foundation for later multi-hop / blind relay development.
+    pub relay_foundation_ready: bool,
+    /// Privacy-safe operator-facing detail.
+    pub detail: String,
+    /// Privacy-safe next action for nodeboard / AI runbooks.
+    pub next_action: String,
+    /// Age of the last successful outbound gossip round, when known.
+    pub last_gossip_success_age_seconds: Option<u64>,
+    /// Age of the last outbound gossip round, when known.
+    pub last_gossip_round_age_seconds: Option<u64>,
+    /// Whether discovery seed recovery is configured.
+    pub seed_recovery_configured: bool,
+    /// Configured stale window for gossip freshness checks.
+    pub stale_after_seconds: u64,
+}
+
 /// Cumulative runtime counters for nodeboard and operator diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerStoreRuntimeStats {
@@ -260,6 +294,8 @@ pub struct PeerStoreStatus {
     pub recent_audit_events: Vec<PeerStoreAuditEvent>,
     /// Bootstrap/cache/gossip runtime status.
     pub bootstrap: PeerStoreBootstrapStatus,
+    /// Aggregate discovery stability summary for health gates and nodeboard.
+    pub stability: PeerStoreStabilityStatus,
 }
 
 struct PeerStoreCounters {
@@ -861,15 +897,116 @@ impl PeerStore {
         }
     }
 
+    fn optional_age(now: u64, timestamp: Option<u64>) -> Option<u64> {
+        timestamp.map(|value| now.saturating_sub(value))
+    }
+
+    fn stability(
+        snapshot: &PeerStoreSnapshot,
+        bootstrap: &PeerStoreBootstrapStatus,
+        now: u64,
+    ) -> PeerStoreStabilityStatus {
+        let last_gossip_success_age_seconds =
+            Self::optional_age(now, bootstrap.last_gossip_success_at);
+        let last_gossip_round_age_seconds = Self::optional_age(now, bootstrap.last_gossip_round_at);
+        let seed_recovery_configured = bootstrap.seed_endpoints_configured > 0;
+        let has_minimum_peer_view = snapshot.valid_peers >= 2;
+        let gossip_success_is_fresh = !bootstrap.gossip_enabled
+            || last_gossip_success_age_seconds
+                .map(|age| age <= DISCOVERY_GOSSIP_STALE_AFTER_SECS)
+                .unwrap_or(false);
+        let repeated_gossip_failure =
+            bootstrap.consecutive_gossip_failures >= DISCOVERY_GOSSIP_FAILURE_ATTENTION_THRESHOLD;
+        let last_gossip_failed = bootstrap.last_gossip_status.as_deref() == Some("failed");
+        let last_gossip_stale = bootstrap.gossip_enabled
+            && last_gossip_success_age_seconds
+                .map(|age| age > DISCOVERY_GOSSIP_STALE_AFTER_SECS)
+                .unwrap_or(false);
+
+        let (health, relay_foundation_ready, detail, next_action) = if !bootstrap.enabled {
+            (
+                "disabled",
+                false,
+                "Discovery is disabled in local configuration.",
+                "Enable discovery and configure signed seed or peer bootstrap before relying on peer discovery.",
+            )
+        } else if snapshot.valid_peers == 0 {
+            (
+                "pending",
+                false,
+                "No valid signed AeroNyx peers are currently in PeerStore.",
+                "Confirm local descriptor registration, seed endpoints, peer cache, and inbound discovery reachability.",
+            )
+        } else if bootstrap.gossip_enabled && repeated_gossip_failure {
+            (
+                "failed",
+                false,
+                "Outbound discovery gossip has failed for multiple consecutive rounds.",
+                "Check peer reachability, seed recovery, firewall rules, and discovery endpoint health.",
+            )
+        } else if last_gossip_stale {
+            (
+                "stale",
+                false,
+                "PeerStore has valid peers, but the last successful outbound gossip is stale.",
+                "Wait for a fresh gossip success or inspect seed recovery and peer endpoint connectivity.",
+            )
+        } else if bootstrap.gossip_enabled && last_gossip_failed {
+            (
+                "degraded",
+                false,
+                "The latest outbound gossip round failed, but the consecutive failure threshold has not been reached.",
+                "Monitor the next gossip round and inspect the privacy-safe failure bucket if it repeats.",
+            )
+        } else if !has_minimum_peer_view {
+            (
+                "degraded",
+                false,
+                "PeerStore has only one valid signed peer, so the multi-node relay foundation is incomplete.",
+                "Add or recover at least one additional signed AeroNyx peer before testing relay paths.",
+            )
+        } else if gossip_success_is_fresh {
+            (
+                "healthy",
+                true,
+                "PeerStore has multiple valid signed peers and discovery gossip is fresh enough for relay foundation checks.",
+                "Continue monitoring gossip freshness, rejected descriptors, and peer-cache persistence.",
+            )
+        } else {
+            (
+                "pending",
+                false,
+                "Discovery is enabled and peers exist, but no successful outbound gossip has been observed yet.",
+                "Wait for the first successful gossip round or verify configured seed endpoints.",
+            )
+        };
+
+        PeerStoreStabilityStatus {
+            health: health.to_string(),
+            relay_foundation_ready,
+            detail: detail.to_string(),
+            next_action: next_action.to_string(),
+            last_gossip_success_age_seconds,
+            last_gossip_round_age_seconds,
+            seed_recovery_configured,
+            stale_after_seconds: DISCOVERY_GOSSIP_STALE_AFTER_SECS,
+        }
+    }
+
     /// Returns nodeboard-friendly peer store status.
     #[must_use]
     pub fn status(&self, now: u64) -> PeerStoreStatus {
+        let snapshot = self.snapshot(now);
+        let bootstrap = self.bootstrap_status.read().clone();
+        let stability = Self::stability(&snapshot, &bootstrap, now);
+
         PeerStoreStatus {
-            snapshot: self.snapshot(now),
+            snapshot,
             runtime: self.counters.snapshot(),
             max_peers: self.max_peers(),
             recent_audit_events: self.recent_audit_events(),
-            bootstrap: self.bootstrap_status.read().clone(),
+            bootstrap,
+            stability,
         }
     }
 
@@ -1301,5 +1438,73 @@ mod tests {
         assert_eq!(status.bootstrap.last_gossip_failure_reason, None);
         assert_eq!(status.bootstrap.consecutive_gossip_failures, 0);
         assert_eq!(status.bootstrap.last_gossip_success_at, Some(1_700_000_050));
+    }
+
+    #[test]
+    fn test_stability_marks_ready_when_peer_view_and_gossip_are_fresh() {
+        let store = PeerStore::new();
+        store.configure_bootstrap_status(true, true, true, 2);
+        store
+            .upsert_verified(signed_descriptor(1, 1_700_001_000), 1_700_000_100)
+            .unwrap();
+        store
+            .upsert_verified(signed_descriptor(1, 1_700_001_000), 1_700_000_100)
+            .unwrap();
+        store.record_gossip_round(1_700_000_120, 2, 2, 1, None);
+
+        let status = store.status(1_700_000_180);
+
+        assert_eq!(status.stability.health, "healthy");
+        assert!(status.stability.relay_foundation_ready);
+        assert_eq!(status.stability.last_gossip_success_age_seconds, Some(60));
+        assert_eq!(status.stability.last_gossip_round_age_seconds, Some(60));
+        assert!(status.stability.seed_recovery_configured);
+    }
+
+    #[test]
+    fn test_stability_blocks_after_repeated_gossip_failures() {
+        let store = PeerStore::new();
+        store.configure_bootstrap_status(true, true, true, 1);
+        store
+            .upsert_verified(signed_descriptor(1, 1_700_001_000), 1_700_000_100)
+            .unwrap();
+        store
+            .upsert_verified(signed_descriptor(1, 1_700_001_000), 1_700_000_100)
+            .unwrap();
+
+        for now in [1_700_000_120, 1_700_000_180, 1_700_000_240] {
+            store.record_gossip_round(now, 2, 0, 1, Some("snapshot_request_timeout".to_string()));
+        }
+
+        let status = store.status(1_700_000_300);
+
+        assert_eq!(status.stability.health, "failed");
+        assert!(!status.stability.relay_foundation_ready);
+        assert_eq!(status.bootstrap.consecutive_gossip_failures, 3);
+        assert_eq!(status.stability.last_gossip_round_age_seconds, Some(60));
+        assert_eq!(status.stability.last_gossip_success_age_seconds, None);
+    }
+
+    #[test]
+    fn test_stability_marks_gossip_success_as_stale() {
+        let store = PeerStore::new();
+        store.configure_bootstrap_status(true, true, true, 1);
+        store
+            .upsert_verified(signed_descriptor(1, 1_700_010_000), 1_700_000_100)
+            .unwrap();
+        store
+            .upsert_verified(signed_descriptor(1, 1_700_010_000), 1_700_000_100)
+            .unwrap();
+        store.record_gossip_round(1_700_000_120, 2, 2, 1, None);
+
+        let status = store.status(1_700_001_100);
+
+        assert_eq!(status.stability.health, "stale");
+        assert!(!status.stability.relay_foundation_ready);
+        assert_eq!(status.stability.last_gossip_success_age_seconds, Some(980));
+        assert_eq!(
+            status.stability.stale_after_seconds,
+            DISCOVERY_GOSSIP_STALE_AFTER_SECS
+        );
     }
 }

@@ -1249,4 +1249,25 @@ Initial entry:
   - Add dedicated peer relay counters/audit entries beyond debug logs.
   - Add route scoring and receiver affinity instead of simple bounded fanout.
   - Add future generic relay envelope for agent/onion relay once the narrower ChatEnvelope bridge is stable.
+
+2026-06-19 - Added PeerStore discovery stability summary for Rust/nodeboard health gates.
+- Files changed:
+  - crates/aeronyx-server/src/services/peer_store.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Verification:
+  - cargo fmt --check
+  - cargo test -p aeronyx-server peer_store -- --nocapture
+  - cargo test -p aeronyx-server vpn_health -- --nocapture
+  - cargo build -p aeronyx-server --release
+- Behavior:
+  - PeerStoreStatus now includes a `stability` block derived from existing verified peer counts, gossip success freshness, consecutive gossip failures, and seed recovery configuration.
+  - Stability health buckets are `disabled`, `pending`, `healthy`, `degraded`, `stale`, and `failed`.
+  - `relay_foundation_ready` is true only when multiple valid signed peers exist and outbound gossip freshness is acceptable for future relay foundation checks.
+  - `last_gossip_success_age_seconds`, `last_gossip_round_age_seconds`, `seed_recovery_configured`, and `stale_after_seconds` are exposed as aggregate operator metadata.
+- Privacy boundary:
+  - The stability summary is aggregate control-plane telemetry only.
+  - It does not expose peer URLs, full peer public keys, client IPs, destinations, DNS contents, packet payloads, chat plaintext, ciphertext, Memory Chain plaintext, voucher secrets, private keys, wallet-level traffic, or per-user traffic.
+- Remaining work:
+  - Let backend and nodeboard prioritize this `stability` block directly instead of inferring readiness from raw gossip counters.
+  - Use the same health gate before future generic blind relay or multi-hop path tests.
 ```
