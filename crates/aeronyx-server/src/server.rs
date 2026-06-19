@@ -41,6 +41,8 @@
 //  18. Records privacy-safe outbound gossip health buckets for node stability
 //      monitoring without exposing seed endpoint values or peer URLs.
 //  19. Reports privacy-safe encrypted chat peer relay health counters.
+//  20. Treats memchain.chat_relay.enabled=false as a hard runtime gate while
+//      still reporting disabled chat relay telemetry to nodeboard.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -70,6 +72,7 @@
 //   v1.0.1-VpnMessageStats - encrypted message counter wiring
 //   v0.7.0-DiscoveryChatRelay - Peer-discovered encrypted chat relay fanout
 //   v0.7.1-ChatPeerRelayHealth - Peer relay health status in heartbeat
+//   v0.7.2-ChatRelayDisabledGate - Honor disabled chat relay config at runtime
 //   v0.9.3-DiscoveryGossipHealth - Outbound gossip status and failure buckets
 //   v0.9.1-DiscoverySeedStatus - Seed endpoint recovery counters in status
 //   v0.9.2-DiscoveryBootstrapStatus - Avoid warning on benign stale bootstrap descriptors
@@ -258,7 +261,8 @@ impl Server {
             (None, None, None, None)
         };
 
-        let chat_relay: Option<Arc<ChatRelayService>> = if self.config.memchain.is_enabled() {
+        let chat_relay_enabled = self.config.memchain.is_chat_relay_enabled();
+        let chat_relay: Option<Arc<ChatRelayService>> = if chat_relay_enabled {
             let node_secret = derive_node_secret(&self.identity.to_bytes());
             match ChatRelayService::new(self.config.memchain.chat_relay.clone(), node_secret) {
                 Ok(svc) => {
@@ -271,6 +275,11 @@ impl Server {
                 }
             }
         } else {
+            if self.config.memchain.is_enabled() {
+                info!(
+                    "[CHAT_RELAY] Disabled by memchain.chat_relay.enabled=false; chat routes remain unavailable"
+                );
+            }
             None
         };
 
@@ -347,6 +356,7 @@ impl Server {
                 Arc::clone(&encrypted_message_counter),
                 Arc::clone(&peer_store),
                 chat_relay.clone(),
+                chat_relay_enabled,
             )
             .await;
 
@@ -1400,6 +1410,7 @@ impl Server {
         encrypted_message_counter: Arc<AtomicU64>,
         peer_store: Arc<PeerStore>,
         chat_relay: Option<Arc<ChatRelayService>>,
+        chat_relay_enabled: bool,
     ) -> SessionEventSender {
         info!("Initializing management reporting...");
 
@@ -1535,6 +1546,40 @@ impl Server {
                         "generated_at": now,
                         "peer_relay": relay.peer_status(),
                         "source": "rust_chat_relay_service",
+                        "privacy_boundary": "aggregate encrypted chat peer relay counters only; no message ids, wallet ids, client IPs, destinations, DNS contents, packet payloads, chat plaintext, ciphertext, private keys, voucher secrets, or per-user traffic"
+                    }))
+                })
+            }));
+        } else if !chat_relay_enabled {
+            heartbeat = heartbeat.with_chat_relay_status(Box::new(move || {
+                Box::pin(async move {
+                    let now = unix_now_secs();
+                    Some(serde_json::json!({
+                        "generated_at": now,
+                        "peer_relay": {
+                            "enabled": false,
+                            "outbound_attempted_total": 0,
+                            "outbound_accepted_total": 0,
+                            "outbound_failed_total": 0,
+                            "outbound_rounds": 0,
+                            "last_outbound_attempted": 0,
+                            "last_outbound_accepted": 0,
+                            "last_outbound_failed": 0,
+                            "last_outbound_status": null,
+                            "last_outbound_failure_reason": null,
+                            "consecutive_outbound_failures": 0,
+                            "last_outbound_success_at": null,
+                            "last_outbound_at": null,
+                            "inbound_accepted_total": 0,
+                            "inbound_duplicate_total": 0,
+                            "inbound_delivered_online_total": 0,
+                            "inbound_stored_pending_total": 0,
+                            "inbound_rejected_total": 0,
+                            "last_inbound_status": null,
+                            "last_inbound_failure_reason": null,
+                            "last_inbound_at": null
+                        },
+                        "source": "rust_chat_relay_disabled_config",
                         "privacy_boundary": "aggregate encrypted chat peer relay counters only; no message ids, wallet ids, client IPs, destinations, DNS contents, packet payloads, chat plaintext, ciphertext, private keys, voucher secrets, or per-user traffic"
                     }))
                 })
