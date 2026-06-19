@@ -51,7 +51,8 @@
 //  23. Flushes the verified PeerStore cache once more during graceful shutdown
 //      so recently discovered peers are not lost during node upgrades.
 //  24. Keeps a previous verified PeerStore cache backup and falls back to it
-//      when the primary cache file is missing or JSON-corrupted.
+//      when the primary cache file is missing, unreadable, JSON-corrupted, or
+//      contains no usable verified descriptors.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -71,6 +72,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.0.8-DiscoveryPeerCacheUsableFallback - Fallback when primary cache imports no usable peers
 //   v1.0.7-DiscoveryPeerCacheBackup - Backup and fallback for PeerStore cache
 //   v1.0.6-DiscoveryShutdownCacheFlush - Persist PeerStore cache on shutdown
 //   v1.0.5-DiscoveryImmediateCacheSave - Persist PeerStore cache after bootstrap
@@ -2474,7 +2476,7 @@ impl Server {
                     rejected = report.rejected,
                     "[DISCOVERY] Bootstrap snapshot imported"
                 );
-                true
+                report.inserted > 0 || report.unchanged > 0
             }
             Err(e) => {
                 peer_store.record_bootstrap_source(now, source_kind, "failed", "json_rejected");
@@ -3757,6 +3759,61 @@ mod tests {
             .unwrap();
         tokio::fs::copy(&path, &backup_path).await.unwrap();
         tokio::fs::write(&path, b"{not-json").await.unwrap();
+
+        let restored_store = PeerStore::new();
+        server
+            .load_peer_cache(&restored_store, &path_str, now + 1)
+            .await;
+
+        assert!(restored_store
+            .get_valid(&signed.node_id(), now + 1)
+            .is_some());
+
+        let status = restored_store.status(now + 1);
+        assert_eq!(status.snapshot.valid_peers, 1);
+        assert_eq!(
+            status.bootstrap.last_source_kind.as_deref(),
+            Some("cache_backup")
+        );
+        assert_eq!(
+            status.bootstrap.last_source_status.as_deref(),
+            Some("success")
+        );
+
+        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio::fs::remove_file(backup_path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_falls_back_to_backup_when_primary_has_no_usable_peers() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let now = unix_now_secs();
+        let signed = server.build_self_discovery_descriptor(now).unwrap();
+        let original_store = Arc::new(PeerStore::new());
+        assert!(original_store.upsert_verified(signed.clone(), now).unwrap());
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("aeronyx-peer-cache-empty-restore-{unique}.json"));
+        let path_str = path.to_string_lossy().to_string();
+        let backup_path = Server::peer_cache_backup_path(&path_str);
+
+        Server::save_peer_store_cache_snapshot(&original_store, &path_str, now)
+            .await
+            .unwrap();
+        tokio::fs::copy(&path, &backup_path).await.unwrap();
+
+        let empty_snapshot = NodeBootstrapSnapshot::new(now, Vec::new());
+        tokio::fs::write(&path, empty_snapshot.to_json_pretty().unwrap())
+            .await
+            .unwrap();
 
         let restored_store = PeerStore::new();
         server
