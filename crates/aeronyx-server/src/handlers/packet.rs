@@ -10,6 +10,7 @@
 //   (per-wallet delta, drained each heartbeat).
 //   Adds an aggregate encrypted VPN message counter for public stats.
 //   Uses session.wallet_hex cache — no allocation per packet.
+//   Rate-limits stale unknown-session warnings after node restarts.
 //
 // Main Functionality:
 //   - PacketHandler: handles UDP and TUN packet processing
@@ -36,6 +37,7 @@
 //   v1.0.0-VoiceSignal    — disc=31/32/33 routed as voice signals
 //   v1.0.0-Membership     — TrafficTracker dual-write on VPN path
 //   v1.0.1-VpnMessageStats — aggregate encrypted VPN message counter
+//   v1.0.2-UnknownSessionLogGate — aggregate/rate-limit stale session logs
 // ============================================
 
 use std::net::Ipv4Addr;
@@ -130,6 +132,12 @@ pub struct PacketHandler {
     /// Aggregate encrypted VPN message counter for public network stats.
     /// Counts successful VPN data packets only; excludes control/voice/memory.
     encrypted_message_counter: Arc<AtomicU64>,
+    /// Aggregate unknown-session packet counter.
+    ///
+    /// After a controlled restart, clients can briefly retransmit packets for
+    /// sessions that no longer exist in node memory. This counter keeps that
+    /// expected stale-packet signal visible without flooding systemd logs.
+    unknown_session_counter: AtomicU64,
     /// Operator policy from nodeboard Settings.
     policy: Arc<NodePolicyRuntime>,
 }
@@ -148,6 +156,7 @@ impl PacketHandler {
             crypto: DefaultTransportCrypto::new(),
             traffic,
             encrypted_message_counter,
+            unknown_session_counter: AtomicU64::new(0),
             policy,
         }
     }
@@ -205,11 +214,23 @@ impl PacketHandler {
                 s
             }
             None => {
-                warn!(
-                    "[PACKET_HANDLER] Session NOT FOUND: {} (base64: {})",
-                    session_id,
-                    BASE64.encode(session_id.as_bytes())
-                );
+                let unknown_count =
+                    self.unknown_session_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                if unknown_count <= 5 || unknown_count % 100 == 0 {
+                    warn!(
+                        session_id = %session_id,
+                        session_id_base64 = %BASE64.encode(session_id.as_bytes()),
+                        unknown_session_packets = unknown_count,
+                        active_sessions = self.sessions.count(),
+                        "[PACKET_HANDLER] Unknown session packet dropped; likely stale client traffic after restart"
+                    );
+                } else {
+                    debug!(
+                        session_id = %session_id,
+                        unknown_session_packets = unknown_count,
+                        "[PACKET_HANDLER] Unknown session packet dropped"
+                    );
+                }
                 return Err(self.sessions.get_or_error(&session_id).unwrap_err());
             }
         };
