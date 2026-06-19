@@ -60,6 +60,8 @@
 //      without exposing peer URLs or client traffic.
 //  27. Adds outbound discovery gossip jitter/backpressure so node fleets do
 //      not retry stale peers in synchronized bursts during incidents.
+//  28. Durably fsyncs PeerStore cache writes and the parent directory after
+//      atomic rename, reducing peer-cache loss during host crashes/upgrades.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -79,6 +81,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.1.2-DurablePeerCacheFsync - Fsync PeerStore cache temp file and parent directory
 //   v1.1.1-DiscoveryGossipBackpressure - Add jitter/backpressure for outbound discovery gossip
 //   v1.1.0-CommercialPeerSummary - Tag PeerStore source buckets for nodeboard
 //   v1.0.9-DiscoveryCacheSourcePriority - Load peer cache after static bootstrap seeds
@@ -117,6 +120,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
@@ -2500,12 +2504,56 @@ impl Server {
         let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
         let backup_path = Self::peer_cache_backup_path(path.to_string_lossy().as_ref());
 
-        tokio::fs::write(&tmp_path, bytes).await?;
+        let mut tmp_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .await?;
+        tmp_file.write_all(&bytes).await?;
+        tmp_file.flush().await?;
+        tmp_file.sync_all().await?;
+        drop(tmp_file);
+
         if tokio::fs::metadata(&path).await.is_ok() {
-            let _ = tokio::fs::copy(&path, &backup_path).await;
+            if tokio::fs::copy(&path, &backup_path).await.is_ok() {
+                let _ = Self::sync_file_for_durability(&backup_path).await;
+            }
         }
         tokio::fs::rename(&tmp_path, &path).await?;
+        Self::sync_parent_dir_for_durability(&path).await?;
         Ok(())
+    }
+
+    async fn sync_file_for_durability(path: &PathBuf) -> Result<()> {
+        let file = tokio::fs::OpenOptions::new().read(true).open(path).await?;
+        file.sync_all().await?;
+        Ok(())
+    }
+
+    async fn sync_parent_dir_for_durability(path: &PathBuf) -> Result<()> {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        if parent.as_os_str().is_empty() {
+            return Ok(());
+        }
+
+        match tokio::fs::File::open(parent).await {
+            Ok(dir) => {
+                dir.sync_all().await?;
+                Ok(())
+            }
+            Err(e) if cfg!(target_os = "windows") => {
+                debug!(
+                    source = %path.display(),
+                    error = %e,
+                    "[DISCOVERY] Parent directory fsync unavailable on this platform"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn peer_cache_backup_path(path: &str) -> PathBuf {
