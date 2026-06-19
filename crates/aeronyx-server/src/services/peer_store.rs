@@ -41,6 +41,8 @@
 //!   self or already-used hops before applying fanout/path limits
 //! - Controlled route path planning for future multi-hop/onion relay, using
 //!   only descriptor metadata and route health while exposing only safe prefixes
+//! - Blind relay retry counters so nodeboard can distinguish transient
+//!   next-hop recovery from final forwarding failures without payload metadata
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -67,6 +69,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.21.0-BlindRelayRetryStats - Added privacy-safe blind relay retry observability
 //! v0.20.0-BlindRelaySizeBuckets - Bucket blind relay encrypted blob sizes in audit events
 //! v0.19.0-ControlledRoutePathPlanner - Added privacy-safe multi-hop path planning foundation
 //! v0.18.0-RouteCandidateExclusion - Added exclude-before-limit route selection
@@ -386,6 +389,12 @@ pub struct PeerStoreBlindRelayStats {
     pub invalid_endpoint: u64,
     /// Requests rejected because forwarding to next hop failed.
     pub forward_failed: u64,
+    /// Retry sleeps scheduled for transient next-hop failures.
+    pub retry_attempted: u64,
+    /// Blind relay forwards that succeeded after at least one retry.
+    pub retry_succeeded: u64,
+    /// Blind relay forwards that still failed after retry attempts were exhausted.
+    pub retry_exhausted: u64,
     /// Unix timestamp of the last blind relay event.
     pub last_event_at: Option<u64>,
 }
@@ -658,6 +667,9 @@ struct PeerStoreCounters {
     blind_relay_no_route: AtomicU64,
     blind_relay_invalid_endpoint: AtomicU64,
     blind_relay_forward_failed: AtomicU64,
+    blind_relay_retry_attempted: AtomicU64,
+    blind_relay_retry_succeeded: AtomicU64,
+    blind_relay_retry_exhausted: AtomicU64,
     last_import_at: AtomicU64,
     last_gossip_at: AtomicU64,
     last_snapshot_at: AtomicU64,
@@ -688,6 +700,9 @@ impl PeerStoreCounters {
             blind_relay_no_route: AtomicU64::new(0),
             blind_relay_invalid_endpoint: AtomicU64::new(0),
             blind_relay_forward_failed: AtomicU64::new(0),
+            blind_relay_retry_attempted: AtomicU64::new(0),
+            blind_relay_retry_succeeded: AtomicU64::new(0),
+            blind_relay_retry_exhausted: AtomicU64::new(0),
             last_import_at: AtomicU64::new(0),
             last_gossip_at: AtomicU64::new(0),
             last_snapshot_at: AtomicU64::new(0),
@@ -725,6 +740,9 @@ impl PeerStoreCounters {
                 no_route: self.blind_relay_no_route.load(Ordering::Relaxed),
                 invalid_endpoint: self.blind_relay_invalid_endpoint.load(Ordering::Relaxed),
                 forward_failed: self.blind_relay_forward_failed.load(Ordering::Relaxed),
+                retry_attempted: self.blind_relay_retry_attempted.load(Ordering::Relaxed),
+                retry_succeeded: self.blind_relay_retry_succeeded.load(Ordering::Relaxed),
+                retry_exhausted: self.blind_relay_retry_exhausted.load(Ordering::Relaxed),
                 last_event_at: Self::optional_ts(self.last_blind_relay_at.load(Ordering::Relaxed)),
             },
             last_import_at: Self::optional_ts(self.last_import_at.load(Ordering::Relaxed)),
@@ -1291,6 +1309,67 @@ impl PeerStore {
             "blind_relay_forward",
             "accepted",
             format!("ttl_remaining={ttl_remaining} encrypted_blob_size_bucket=opaque"),
+        );
+    }
+
+    /// Records a scheduled retry after a transient blind relay forward failure.
+    ///
+    /// This is intentionally aggregate-only. The reason bucket may be `http_503`,
+    /// `blind_relay_request_timeout`, or similar transport state, but callers
+    /// must not pass route ids, full peer ids, endpoint URLs, encrypted blobs,
+    /// receiver identities, client IPs, DNS contents, voucher secrets, or
+    /// payload-derived metadata.
+    pub fn record_blind_relay_retry_attempt(&self, now: u64, reason: impl AsRef<str>) {
+        let reason = reason.as_ref();
+        self.counters
+            .blind_relay_retry_attempted
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .last_blind_relay_at
+            .store(now, Ordering::Relaxed);
+        self.record_audit_event(
+            now,
+            "blind_relay_retry",
+            "scheduled",
+            format!("reason_bucket={reason}"),
+        );
+    }
+
+    /// Records that a blind relay forward succeeded after retrying.
+    pub fn record_blind_relay_retry_succeeded(&self, now: u64, attempts: usize) {
+        self.counters
+            .blind_relay_retry_succeeded
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .last_blind_relay_at
+            .store(now, Ordering::Relaxed);
+        self.record_audit_event(
+            now,
+            "blind_relay_retry",
+            "accepted",
+            format!("attempts={attempts}"),
+        );
+    }
+
+    /// Records that retry attempts were exhausted before the final forward failed.
+    pub fn record_blind_relay_retry_exhausted(
+        &self,
+        now: u64,
+        attempts: usize,
+        reason: impl AsRef<str>,
+    ) {
+        let reason = reason.as_ref();
+        self.counters
+            .blind_relay_retry_exhausted
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .last_blind_relay_at
+            .store(now, Ordering::Relaxed);
+        self.record_audit_event(
+            now,
+            "blind_relay_retry",
+            "rejected",
+            format!("attempts={attempts} reason_bucket={reason}"),
         );
     }
 
