@@ -46,6 +46,8 @@
 //     wallet targets, client endpoints, and decrypted packet header dumps from
 //     packet-path logs. Relay nodes must stay blind in both protocol handling
 //     and local observability.
+//   v1.0.6-DropReasonCounters — expose aggregate packet drop reasons for
+//     heartbeat/nodeboard stability triage without logging per-session details.
 // ============================================
 
 use std::net::Ipv4Addr;
@@ -111,10 +113,41 @@ pub struct PacketRuntimeStatus {
     pub active_sessions: usize,
     /// Compact operator status for stale packet pressure.
     pub unknown_session_status: &'static str,
+    /// Aggregate packet drop reasons for stability dashboards.
+    pub drop_reasons: PacketDropReasonCounters,
     /// Stable source marker for backend/nodeboard consumers.
     pub source: &'static str,
     /// Explicit privacy boundary for future integrations.
     pub privacy_boundary: &'static str,
+}
+
+/// Privacy-safe packet drop counters.
+///
+/// These are aggregate process-local counters only. They intentionally avoid
+/// session IDs, wallet IDs, client IPs, virtual IPs, packet bytes, domains,
+/// URLs, DNS contents, message IDs, and ciphertext/plaintext material.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PacketDropReasonCounters {
+    /// Sum of all drop reason counters below.
+    pub total: u64,
+    /// Packet was too short before a safe decode/decrypt path existed.
+    pub short_packet: u64,
+    /// Packet frame/header failed decoding or contained an invalid identifier.
+    pub malformed_packet: u64,
+    /// Session identifier was validly shaped but no longer active locally.
+    pub unknown_session: u64,
+    /// Packet counter failed replay protection.
+    pub replay: u64,
+    /// Authenticated encryption failed or produced invalid output.
+    pub decrypt_failed: u64,
+    /// Node policy rejected traffic, usually capacity or bandwidth limits.
+    pub policy_rejected: u64,
+    /// Decrypted plaintext did not match an allowed AeroNyx protocol arm.
+    pub protocol_invalid: u64,
+    /// Outbound TUN packet could not be mapped to an active route/session.
+    pub routing_failed: u64,
+    /// Outbound encryption failed before the packet could be sent.
+    pub encrypt_failed: u64,
 }
 
 /// Result of decrypting an incoming DataPacket.
@@ -147,6 +180,19 @@ pub enum DecryptedPayload {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PacketDropReason {
+    ShortPacket,
+    MalformedPacket,
+    UnknownSession,
+    Replay,
+    DecryptFailed,
+    PolicyRejected,
+    ProtocolInvalid,
+    RoutingFailed,
+    EncryptFailed,
+}
+
 // ============================================
 // PacketHandler
 // ============================================
@@ -167,6 +213,15 @@ pub struct PacketHandler {
     /// sessions that no longer exist in node memory. This counter keeps that
     /// expected stale-packet signal visible without flooding systemd logs.
     unknown_session_counter: AtomicU64,
+    /// Aggregate privacy-safe drop reason counters for heartbeat/nodeboard.
+    drop_short_packet: AtomicU64,
+    drop_malformed_packet: AtomicU64,
+    drop_replay: AtomicU64,
+    drop_decrypt_failed: AtomicU64,
+    drop_policy_rejected: AtomicU64,
+    drop_protocol_invalid: AtomicU64,
+    drop_routing_failed: AtomicU64,
+    drop_encrypt_failed: AtomicU64,
     /// Operator policy from nodeboard Settings.
     policy: Arc<NodePolicyRuntime>,
 }
@@ -186,6 +241,14 @@ impl PacketHandler {
             traffic,
             encrypted_message_counter,
             unknown_session_counter: AtomicU64::new(0),
+            drop_short_packet: AtomicU64::new(0),
+            drop_malformed_packet: AtomicU64::new(0),
+            drop_replay: AtomicU64::new(0),
+            drop_decrypt_failed: AtomicU64::new(0),
+            drop_policy_rejected: AtomicU64::new(0),
+            drop_protocol_invalid: AtomicU64::new(0),
+            drop_routing_failed: AtomicU64::new(0),
+            drop_encrypt_failed: AtomicU64::new(0),
             policy,
         }
     }
@@ -197,6 +260,7 @@ impl PacketHandler {
     /// caller should send 0xFF RESET to client.
     pub fn handle_udp_packet(&self, data: &[u8]) -> Result<(Arc<Session>, DecryptedPayload)> {
         if data.len() < DATA_PACKET_HEADER_SIZE + ENCRYPTION_OVERHEAD {
+            self.record_drop_reason(PacketDropReason::ShortPacket);
             return Err(ServerError::invalid_packet(
                 "0.0.0.0:0".parse().unwrap(),
                 "Packet too short",
@@ -208,12 +272,25 @@ impl PacketHandler {
             "[PACKET_HANDLER] Processing encrypted packet"
         );
 
-        let packet = decode_data_packet(data)?;
+        let packet = match decode_data_packet(data) {
+            Ok(packet) => packet,
+            Err(e) => {
+                self.record_drop_reason(PacketDropReason::MalformedPacket);
+                return Err(ServerError::Core(e));
+            }
+        };
 
-        let session_id = SessionId::from_bytes(&packet.session_id).ok_or_else(|| {
-            warn!("[PACKET_HANDLER] Invalid session ID format");
-            ServerError::invalid_packet("0.0.0.0:0".parse().unwrap(), "Invalid session ID")
-        })?;
+        let session_id = match SessionId::from_bytes(&packet.session_id) {
+            Some(session_id) => session_id,
+            None => {
+                self.record_drop_reason(PacketDropReason::MalformedPacket);
+                warn!("[PACKET_HANDLER] Invalid session ID format");
+                return Err(ServerError::invalid_packet(
+                    "0.0.0.0:0".parse().unwrap(),
+                    "Invalid session ID",
+                ));
+            }
+        };
 
         debug!(
             active_sessions = self.sessions.count(),
@@ -229,8 +306,8 @@ impl PacketHandler {
                 s
             }
             None => {
-                let unknown_count =
-                    self.unknown_session_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                self.record_drop_reason(PacketDropReason::UnknownSession);
+                let unknown_count = self.unknown_session_counter.load(Ordering::Relaxed);
                 if unknown_count <= 5 || unknown_count % 1000 == 0 {
                     warn!(
                         unknown_session_packets = unknown_count,
@@ -248,6 +325,7 @@ impl PacketHandler {
         };
 
         if !session.validate_rx_counter(packet.counter) {
+            self.record_drop_reason(PacketDropReason::Replay);
             warn!(counter = packet.counter, "Replay attack detected");
             return Err(ServerError::Core(aeronyx_core::error::CoreError::replay(
                 packet.counter,
@@ -256,13 +334,19 @@ impl PacketHandler {
         }
 
         let mut plaintext = vec![0u8; packet.encrypted_payload.len()];
-        let plaintext_len = self.crypto.decrypt(
+        let plaintext_len = match self.crypto.decrypt(
             &session.session_key,
             packet.counter,
             &packet.session_id,
             &packet.encrypted_payload,
             &mut plaintext,
-        )?;
+        ) {
+            Ok(plaintext_len) => plaintext_len,
+            Err(e) => {
+                self.record_drop_reason(PacketDropReason::DecryptFailed);
+                return Err(ServerError::Core(e));
+            }
+        };
         plaintext.truncate(plaintext_len);
 
         session.touch();
@@ -285,6 +369,7 @@ impl PacketHandler {
             // ── IPv4 VPN ──────────────────────────────────────────────
             Some(b) if b >> 4 == 4 => {
                 if plaintext_len < IPV4_HEADER_MIN_SIZE {
+                    self.record_drop_reason(PacketDropReason::ProtocolInvalid);
                     return Err(ServerError::invalid_packet(
                         redacted_packet_addr(),
                         "IP packet too short",
@@ -303,6 +388,7 @@ impl PacketHandler {
 
                 // Session-level cumulative counter (billing audit).
                 if !self.policy.allow_traffic_bytes(plaintext_len) {
+                    self.record_drop_reason(PacketDropReason::PolicyRejected);
                     return Err(ServerError::node_policy_rejected("bandwidth_limit_mbps"));
                 }
                 session.stats.record_rx(plaintext_len as u64);
@@ -320,6 +406,7 @@ impl PacketHandler {
             Some(b) if b >> 4 == 6 => {
                 // Session-level cumulative counter.
                 if !self.policy.allow_traffic_bytes(plaintext_len) {
+                    self.record_drop_reason(PacketDropReason::PolicyRejected);
                     return Err(ServerError::node_policy_rejected("bandwidth_limit_mbps"));
                 }
                 session.stats.record_rx(plaintext_len as u64);
@@ -335,6 +422,7 @@ impl PacketHandler {
             // ── 0xAE: MemChain or Voice Signal ────────────────────────
             Some(MEMCHAIN_MAGIC) => {
                 if plaintext_len < 5 {
+                    self.record_drop_reason(PacketDropReason::ProtocolInvalid);
                     return Err(ServerError::invalid_packet(
                         redacted_packet_addr(),
                         "0xAE packet too short for discriminant",
@@ -367,6 +455,7 @@ impl PacketHandler {
                         DecryptedPayload::MemChain(msg)
                     }
                     Err(e) => {
+                        self.record_drop_reason(PacketDropReason::ProtocolInvalid);
                         warn!(
                             error                 = %e,
                             plaintext_total_len   = plaintext.len(),
@@ -383,6 +472,7 @@ impl PacketHandler {
             // ── 0xAF: Voice audio frame ───────────────────────────────
             Some(VOICE_MAGIC) => {
                 if plaintext_len < VOICE_PACKET_MIN_SIZE {
+                    self.record_drop_reason(PacketDropReason::ProtocolInvalid);
                     warn!(
                         len = plaintext_len,
                         "[VOICE] Packet too short (need {} bytes for dst_ip)",
@@ -409,6 +499,7 @@ impl PacketHandler {
 
             // ── Unknown ───────────────────────────────────────────────
             Some(b) => {
+                self.record_drop_reason(PacketDropReason::ProtocolInvalid);
                 warn!(
                     first_byte = format_args!("0x{:02X}", b),
                     "Unknown plaintext type"
@@ -420,6 +511,7 @@ impl PacketHandler {
             }
 
             None => {
+                self.record_drop_reason(PacketDropReason::ProtocolInvalid);
                 return Err(ServerError::invalid_packet(
                     redacted_packet_addr(),
                     "Empty plaintext after decryption",
@@ -433,28 +525,54 @@ impl PacketHandler {
     /// Processes an IP packet from the TUN device (outbound: server → client).
     pub fn handle_tun_packet(&self, ip_packet: &[u8]) -> Result<(Vec<u8>, std::net::SocketAddr)> {
         if ip_packet.len() < IPV4_HEADER_MIN_SIZE {
+            self.record_drop_reason(PacketDropReason::ShortPacket);
             return Err(ServerError::invalid_packet(
                 "0.0.0.0:0".parse().unwrap(),
                 "TUN packet too short",
             ));
         }
 
-        let dst_ip = extract_ipv4_dst(ip_packet)?;
-        let session_id = self.routing.lookup_or_error(dst_ip)?;
-        let session = self.sessions.get_or_error(&session_id)?;
+        let dst_ip = match extract_ipv4_dst(ip_packet) {
+            Ok(dst_ip) => dst_ip,
+            Err(e) => {
+                self.record_drop_reason(PacketDropReason::MalformedPacket);
+                return Err(e);
+            }
+        };
+        let session_id = match self.routing.lookup_or_error(dst_ip) {
+            Ok(session_id) => session_id,
+            Err(e) => {
+                self.record_drop_reason(PacketDropReason::RoutingFailed);
+                return Err(e);
+            }
+        };
+        let session = match self.sessions.get_or_error(&session_id) {
+            Ok(session) => session,
+            Err(e) => {
+                self.record_drop_reason(PacketDropReason::UnknownSession);
+                return Err(e);
+            }
+        };
         if !self.policy.allow_traffic_bytes(ip_packet.len()) {
+            self.record_drop_reason(PacketDropReason::PolicyRejected);
             return Err(ServerError::node_policy_rejected("bandwidth_limit_mbps"));
         }
         let counter = session.next_tx_counter();
 
         let mut encrypted = vec![0u8; ip_packet.len() + ENCRYPTION_OVERHEAD];
-        let actual_len = self.crypto.encrypt(
+        let actual_len = match self.crypto.encrypt(
             &session.session_key,
             counter,
             session.id.as_bytes(),
             ip_packet,
             &mut encrypted,
-        )?;
+        ) {
+            Ok(actual_len) => actual_len,
+            Err(e) => {
+                self.record_drop_reason(PacketDropReason::EncryptFailed);
+                return Err(ServerError::Core(e));
+            }
+        };
         encrypted.truncate(actual_len);
 
         let data_packet = DataPacket::new(*session.id.as_bytes(), counter, encrypted);
@@ -484,6 +602,22 @@ impl PacketHandler {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    #[inline]
+    fn record_drop_reason(&self, reason: PacketDropReason) {
+        match reason {
+            PacketDropReason::ShortPacket => &self.drop_short_packet,
+            PacketDropReason::MalformedPacket => &self.drop_malformed_packet,
+            PacketDropReason::UnknownSession => &self.unknown_session_counter,
+            PacketDropReason::Replay => &self.drop_replay,
+            PacketDropReason::DecryptFailed => &self.drop_decrypt_failed,
+            PacketDropReason::PolicyRejected => &self.drop_policy_rejected,
+            PacketDropReason::ProtocolInvalid => &self.drop_protocol_invalid,
+            PacketDropReason::RoutingFailed => &self.drop_routing_failed,
+            PacketDropReason::EncryptFailed => &self.drop_encrypt_failed,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Returns aggregate packet counters for heartbeat and nodeboard health.
     ///
     /// Source path:
@@ -495,6 +629,7 @@ impl PacketHandler {
     pub fn runtime_status(&self) -> PacketRuntimeStatus {
         let unknown_session_packets = self.unknown_session_counter.load(Ordering::Relaxed);
         let active_sessions = self.sessions.count();
+        let drop_reasons = self.drop_reason_counters(unknown_session_packets);
         let unknown_session_status = if unknown_session_packets == 0 {
             "clear"
         } else if active_sessions == 0 {
@@ -508,13 +643,48 @@ impl PacketHandler {
             unknown_session_packets,
             active_sessions,
             unknown_session_status,
+            drop_reasons,
             source: "rust_packet_handler_runtime_counters",
             privacy_boundary: concat!(
                 "aggregate packet counters only; no session ids, wallet ids, ",
                 "client public IPs, destinations, DNS contents, packet payloads, ",
                 "domains, URLs, browsing history, voucher secrets, chat plaintext, ",
-                "ciphertext, private keys, or wallet-level traffic"
+                "ciphertext, private keys, wallet-level traffic, or per-session ",
+                "drop reasons"
             ),
+        }
+    }
+
+    fn drop_reason_counters(&self, unknown_session: u64) -> PacketDropReasonCounters {
+        let short_packet = self.drop_short_packet.load(Ordering::Relaxed);
+        let malformed_packet = self.drop_malformed_packet.load(Ordering::Relaxed);
+        let replay = self.drop_replay.load(Ordering::Relaxed);
+        let decrypt_failed = self.drop_decrypt_failed.load(Ordering::Relaxed);
+        let policy_rejected = self.drop_policy_rejected.load(Ordering::Relaxed);
+        let protocol_invalid = self.drop_protocol_invalid.load(Ordering::Relaxed);
+        let routing_failed = self.drop_routing_failed.load(Ordering::Relaxed);
+        let encrypt_failed = self.drop_encrypt_failed.load(Ordering::Relaxed);
+        let total = short_packet
+            .saturating_add(malformed_packet)
+            .saturating_add(unknown_session)
+            .saturating_add(replay)
+            .saturating_add(decrypt_failed)
+            .saturating_add(policy_rejected)
+            .saturating_add(protocol_invalid)
+            .saturating_add(routing_failed)
+            .saturating_add(encrypt_failed);
+
+        PacketDropReasonCounters {
+            total,
+            short_packet,
+            malformed_packet,
+            unknown_session,
+            replay,
+            decrypt_failed,
+            policy_rejected,
+            protocol_invalid,
+            routing_failed,
+            encrypt_failed,
         }
     }
 
@@ -712,6 +882,17 @@ fn extract_json_hex_field<'a>(s: &'a str, key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn make_handler() -> PacketHandler {
+        let encrypted_message_counter = Arc::new(AtomicU64::new(0));
+        PacketHandler::new(
+            Arc::new(SessionManager::new(16, Duration::from_secs(60))),
+            Arc::new(RoutingService::new()),
+            Arc::new(TrafficTracker::new()),
+            Arc::clone(&encrypted_message_counter),
+            Arc::new(NodePolicyRuntime::default()),
+        )
+    }
+
     fn make_ipv4(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
         let mut p = vec![0u8; 20];
         p[0] = 0x45;
@@ -817,23 +998,50 @@ mod tests {
 
     #[test]
     fn test_runtime_status_starts_clear_and_privacy_safe() {
-        let encrypted_message_counter = Arc::new(AtomicU64::new(0));
-        let handler = PacketHandler::new(
-            Arc::new(SessionManager::new(16, Duration::from_secs(60))),
-            Arc::new(RoutingService::new()),
-            Arc::new(TrafficTracker::new()),
-            Arc::clone(&encrypted_message_counter),
-            Arc::new(NodePolicyRuntime::default()),
-        );
+        let handler = make_handler();
 
         let status = handler.runtime_status();
         assert_eq!(status.encrypted_vpn_packets, 0);
         assert_eq!(status.unknown_session_packets, 0);
         assert_eq!(status.active_sessions, 0);
         assert_eq!(status.unknown_session_status, "clear");
+        assert_eq!(status.drop_reasons.total, 0);
+        assert_eq!(status.drop_reasons.short_packet, 0);
+        assert_eq!(status.drop_reasons.malformed_packet, 0);
+        assert_eq!(status.drop_reasons.unknown_session, 0);
+        assert_eq!(status.drop_reasons.replay, 0);
+        assert_eq!(status.drop_reasons.decrypt_failed, 0);
+        assert_eq!(status.drop_reasons.policy_rejected, 0);
+        assert_eq!(status.drop_reasons.protocol_invalid, 0);
+        assert_eq!(status.drop_reasons.routing_failed, 0);
+        assert_eq!(status.drop_reasons.encrypt_failed, 0);
         assert_eq!(status.source, "rust_packet_handler_runtime_counters");
         assert!(status
             .privacy_boundary
             .contains("aggregate packet counters"));
+    }
+
+    #[test]
+    fn test_udp_short_packet_records_privacy_safe_drop_reason() {
+        let handler = make_handler();
+
+        assert!(handler.handle_udp_packet(&[0x01, 0x02, 0x03]).is_err());
+
+        let status = handler.runtime_status();
+        assert_eq!(status.drop_reasons.short_packet, 1);
+        assert_eq!(status.drop_reasons.total, 1);
+        assert_eq!(status.unknown_session_packets, 0);
+    }
+
+    #[test]
+    fn test_tun_unrouted_packet_records_routing_drop_reason() {
+        let handler = make_handler();
+        let packet = make_ipv4(Ipv4Addr::new(100, 64, 0, 2), Ipv4Addr::new(100, 64, 0, 99));
+
+        assert!(handler.handle_tun_packet(&packet).is_err());
+
+        let status = handler.runtime_status();
+        assert_eq!(status.drop_reasons.routing_failed, 1);
+        assert_eq!(status.drop_reasons.total, 1);
     }
 }
