@@ -50,12 +50,16 @@
 //!   encrypted_blob stays opaque and must not be parsed.
 //!
 //! ## Last Modified
+//! v0.4.0-BlindRelayBackpressure - Added blind relay in-flight pressure gate
 //! v0.3.0-BlindRelayEndpoint - Added node-to-node opaque blind relay endpoint
 //! v0.2.0-PeerRelayHealth - Record inbound peer relay health counters
 //! v0.1.0-DiscoveryPhase9 - Initial inter-node encrypted chat relay endpoint
 // ============================================================================
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use aeronyx_core::crypto::transport::{
     DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD,
@@ -87,6 +91,14 @@ use crate::services::{ChatRelayService, Session, SessionManager};
 /// the peer envelope relay path.
 const MAX_PEER_CHAT_ENVELOPE_BYTES: usize = 128 * 1024;
 
+/// Maximum concurrent blind relay requests handled by this process.
+///
+/// Blind relay is intentionally opaque and can carry large encrypted blobs, so
+/// it needs a hard in-flight cap before future multi-hop routing increases the
+/// possible fanout. This is local backpressure only; callers should retry with
+/// jitter at the transport/client layer.
+const MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS: usize = 64;
+
 // ============================================
 // State / Request / Response Types
 // ============================================
@@ -99,6 +111,7 @@ struct ChatPeerState {
     peer_store: Arc<PeerStore>,
     node_identity: Arc<IdentityKeyPair>,
     http_client: Arc<reqwest::Client>,
+    blind_relay_in_flight: Arc<AtomicUsize>,
 }
 
 /// Node-to-node encrypted envelope relay request.
@@ -260,6 +273,7 @@ pub fn build_chat_peer_router(
         peer_store,
         node_identity,
         http_client,
+        blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
     };
 
     Router::new()
@@ -295,6 +309,23 @@ async fn peer_blind_relay_handler(
     State(state): State<ChatPeerState>,
     Json(request): Json<PeerBlindRelayRequest>,
 ) -> impl IntoResponse {
+    let Some(_in_flight) = BlindRelayInFlightGuard::try_acquire(&state) else {
+        state
+            .peer_store
+            .record_blind_relay_rejected(now_secs(), "backpressure");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(PeerBlindRelayResponse {
+                accepted: false,
+                terminal: false,
+                forwarded: false,
+                ttl_remaining: 0,
+                reason: Some("backpressure".to_string()),
+            }),
+        )
+            .into_response();
+    };
+
     match process_peer_blind_relay(state, request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => (
@@ -308,6 +339,37 @@ async fn peer_blind_relay_handler(
             }),
         )
             .into_response(),
+    }
+}
+
+struct BlindRelayInFlightGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl BlindRelayInFlightGuard {
+    fn try_acquire(state: &ChatPeerState) -> Option<Self> {
+        let counter = Arc::clone(&state.blind_relay_in_flight);
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            if current >= MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self { counter }),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for BlindRelayInFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -390,26 +452,18 @@ async fn process_peer_blind_relay(
     let envelope = request.envelope;
 
     validate_blind_relay_envelope(&envelope, &request.previous_hop_node_id).map_err(|error| {
-        state.peer_store.record_audit_event(
-            now,
-            "blind_relay_inbound",
-            "rejected",
-            error.reason_bucket(),
-        );
+        state
+            .peer_store
+            .record_blind_relay_rejected(now, error.reason_bucket());
         error
     })?;
 
     let self_node_id = state.node_identity.public_key_bytes();
     if envelope.next_hop == self_node_id {
-        state.peer_store.record_audit_event(
+        state.peer_store.record_blind_relay_terminal(
             now,
-            "blind_relay_terminal",
-            "accepted",
-            format!(
-                "ttl_remaining={} encrypted_blob_bytes={}",
-                envelope.ttl,
-                envelope.encrypted_blob.len()
-            ),
+            envelope.ttl,
+            envelope.encrypted_blob.len(),
         );
         return Ok(PeerBlindRelayResponse {
             accepted: true,
@@ -421,12 +475,9 @@ async fn process_peer_blind_relay(
     }
 
     if !envelope.can_forward() {
-        state.peer_store.record_audit_event(
-            now,
-            "blind_relay_forward",
-            "rejected",
-            "ttl_exhausted",
-        );
+        state
+            .peer_store
+            .record_blind_relay_rejected(now, "ttl_exhausted");
         return Err(BlindRelayError::TtlExhausted);
     }
 
@@ -434,7 +485,7 @@ async fn process_peer_blind_relay(
     let descriptor = state.peer_store.get_valid(&next_hop, now).ok_or_else(|| {
         state
             .peer_store
-            .record_audit_event(now, "blind_relay_forward", "rejected", "no_route");
+            .record_blind_relay_rejected(now, "no_route");
         BlindRelayError::NoRoute
     })?;
 
@@ -443,21 +494,15 @@ async fn process_peer_blind_relay(
         .public_endpoint
         .as_deref()
         .ok_or_else(|| {
-            state.peer_store.record_audit_event(
-                now,
-                "blind_relay_forward",
-                "rejected",
-                "missing_endpoint",
-            );
+            state
+                .peer_store
+                .record_blind_relay_rejected(now, "missing_endpoint");
             BlindRelayError::InvalidEndpoint
         })?;
     let url = blind_peer_relay_url(endpoint).ok_or_else(|| {
-        state.peer_store.record_audit_event(
-            now,
-            "blind_relay_forward",
-            "rejected",
-            "invalid_endpoint",
-        );
+        state
+            .peer_store
+            .record_blind_relay_rejected(now, "invalid_endpoint");
         BlindRelayError::InvalidEndpoint
     })?;
 
@@ -481,12 +526,9 @@ async fn process_peer_blind_relay(
                 reason = %classify_reqwest_error("blind_relay_request", &error),
                 "[BLIND_RELAY] Next-hop forward failed"
             );
-            state.peer_store.record_audit_event(
-                now,
-                "blind_relay_forward",
-                "rejected",
-                "request_failed",
-            );
+            state
+                .peer_store
+                .record_blind_relay_rejected(now, "request_failed");
             BlindRelayError::ForwardFailed
         })?;
 
@@ -495,21 +537,15 @@ async fn process_peer_blind_relay(
             status = %response.status(),
             "[BLIND_RELAY] Next-hop returned non-success"
         );
-        state.peer_store.record_audit_event(
-            now,
-            "blind_relay_forward",
-            "rejected",
-            format!("http_{}", response.status().as_u16()),
-        );
+        state
+            .peer_store
+            .record_blind_relay_rejected(now, format!("http_{}", response.status().as_u16()));
         return Err(BlindRelayError::ForwardFailed);
     }
 
-    state.peer_store.record_audit_event(
-        now,
-        "blind_relay_forward",
-        "accepted",
-        format!("ttl_remaining={ttl_remaining} encrypted_blob_bytes=opaque"),
-    );
+    state
+        .peer_store
+        .record_blind_relay_forwarded(now, ttl_remaining);
 
     Ok(PeerBlindRelayResponse {
         accepted: true,
@@ -782,9 +818,30 @@ mod tests {
         assert!(parsed.terminal);
         assert!(!parsed.forwarded);
         assert_eq!(parsed.ttl_remaining, 2);
+        let blind_stats = peer_store.status(1_800_000_010).runtime.blind_relay;
+        assert_eq!(blind_stats.received, 1);
+        assert_eq!(blind_stats.terminal, 1);
+        assert_eq!(blind_stats.forwarded, 0);
+        assert_eq!(blind_stats.rejected, 0);
         assert!(peer_store
             .recent_audit_events()
             .iter()
             .any(|event| event.action == "blind_relay_terminal"));
+    }
+
+    #[tokio::test]
+    async fn blind_relay_in_flight_guard_enforces_backpressure_limit() {
+        let peer_store = Arc::new(PeerStore::new());
+        let state = ChatPeerState {
+            chat_relay: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store,
+            node_identity: Arc::new(IdentityKeyPair::generate()),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS)),
+        };
+
+        assert!(BlindRelayInFlightGuard::try_acquire(&state).is_none());
     }
 }

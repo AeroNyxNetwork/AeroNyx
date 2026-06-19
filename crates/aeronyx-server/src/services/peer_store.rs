@@ -31,6 +31,8 @@
 //!   without exposing peer endpoints or user traffic metadata
 //! - Health-ranked route candidates for blind relay preparation, using only
 //!   node-level signed descriptor metadata and never encrypted payload content
+//! - Blind relay runtime counters and drop reason buckets for nodeboard,
+//!   without exposing encrypted payloads, peer endpoint URLs, or user metadata
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -57,6 +59,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.16.0-BlindRelayRuntimeStats - Added blind relay drop reason counters
 //! v0.13.0-GossipBackpressureStatus - Added outbound gossip jitter/backpressure status
 //! v0.14.0-ExpiredPeerCleanupStats - Added expired peer cleanup counters/audit
 //! v0.15.0-RouteCandidateScoring - Added health-ranked peer route candidates
@@ -327,6 +330,8 @@ pub struct PeerStoreRuntimeStats {
     pub rate_limited: u64,
     /// Total expired descriptors removed by cleanup.
     pub expired_removed: u64,
+    /// Opaque node-to-node blind relay counters and drop reason buckets.
+    pub blind_relay: PeerStoreBlindRelayStats,
     /// Unix timestamp of the last descriptor import attempt.
     pub last_import_at: Option<u64>,
     /// Unix timestamp of the last gossip exchange observed by this node.
@@ -335,6 +340,41 @@ pub struct PeerStoreRuntimeStats {
     pub last_snapshot_at: Option<u64>,
     /// Unix timestamp of the last cleanup that removed at least one expired peer.
     pub last_cleanup_at: Option<u64>,
+}
+
+/// Opaque blind relay counters exposed to nodeboard.
+///
+/// These counters are deliberately coarse. They never include route ids,
+/// previous-hop ids, full next-hop ids, peer endpoint URLs, encrypted blobs,
+/// message bodies, client IPs, DNS contents, destinations, voucher secrets, or
+/// wallet-level traffic. They exist to prove the relay is healthy and to make
+/// pressure/drop reasons actionable for operators.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreBlindRelayStats {
+    /// Total blind relay HTTP requests that reached routing logic.
+    pub received: u64,
+    /// Requests where this node was the requested next hop.
+    pub terminal: u64,
+    /// Requests forwarded to another verified node descriptor.
+    pub forwarded: u64,
+    /// Requests rejected before terminal handling or next-hop forwarding.
+    pub rejected: u64,
+    /// Requests rejected because the endpoint was under local backpressure.
+    pub backpressure_dropped: u64,
+    /// Requests rejected because the previous-hop key or signature was invalid.
+    pub invalid_signature: u64,
+    /// Requests rejected because the signed envelope exceeded size limits.
+    pub envelope_too_large: u64,
+    /// Requests rejected because TTL was already exhausted.
+    pub ttl_exhausted: u64,
+    /// Requests rejected because `next_hop` was not in verified PeerStore.
+    pub no_route: u64,
+    /// Requests rejected because the next hop had no usable public endpoint.
+    pub invalid_endpoint: u64,
+    /// Requests rejected because forwarding to next hop failed.
+    pub forward_failed: u64,
+    /// Unix timestamp of the last blind relay event.
+    pub last_event_at: Option<u64>,
 }
 
 /// Combined peer store status payload for nodeboard.
@@ -511,10 +551,22 @@ struct PeerStoreCounters {
     policy_rejected: AtomicU64,
     rate_limited: AtomicU64,
     expired_removed: AtomicU64,
+    blind_relay_received: AtomicU64,
+    blind_relay_terminal: AtomicU64,
+    blind_relay_forwarded: AtomicU64,
+    blind_relay_rejected: AtomicU64,
+    blind_relay_backpressure_dropped: AtomicU64,
+    blind_relay_invalid_signature: AtomicU64,
+    blind_relay_envelope_too_large: AtomicU64,
+    blind_relay_ttl_exhausted: AtomicU64,
+    blind_relay_no_route: AtomicU64,
+    blind_relay_invalid_endpoint: AtomicU64,
+    blind_relay_forward_failed: AtomicU64,
     last_import_at: AtomicU64,
     last_gossip_at: AtomicU64,
     last_snapshot_at: AtomicU64,
     last_cleanup_at: AtomicU64,
+    last_blind_relay_at: AtomicU64,
 }
 
 impl PeerStoreCounters {
@@ -529,10 +581,22 @@ impl PeerStoreCounters {
             policy_rejected: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
             expired_removed: AtomicU64::new(0),
+            blind_relay_received: AtomicU64::new(0),
+            blind_relay_terminal: AtomicU64::new(0),
+            blind_relay_forwarded: AtomicU64::new(0),
+            blind_relay_rejected: AtomicU64::new(0),
+            blind_relay_backpressure_dropped: AtomicU64::new(0),
+            blind_relay_invalid_signature: AtomicU64::new(0),
+            blind_relay_envelope_too_large: AtomicU64::new(0),
+            blind_relay_ttl_exhausted: AtomicU64::new(0),
+            blind_relay_no_route: AtomicU64::new(0),
+            blind_relay_invalid_endpoint: AtomicU64::new(0),
+            blind_relay_forward_failed: AtomicU64::new(0),
             last_import_at: AtomicU64::new(0),
             last_gossip_at: AtomicU64::new(0),
             last_snapshot_at: AtomicU64::new(0),
             last_cleanup_at: AtomicU64::new(0),
+            last_blind_relay_at: AtomicU64::new(0),
         }
     }
 
@@ -551,6 +615,22 @@ impl PeerStoreCounters {
             policy_rejected: self.policy_rejected.load(Ordering::Relaxed),
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
             expired_removed: self.expired_removed.load(Ordering::Relaxed),
+            blind_relay: PeerStoreBlindRelayStats {
+                received: self.blind_relay_received.load(Ordering::Relaxed),
+                terminal: self.blind_relay_terminal.load(Ordering::Relaxed),
+                forwarded: self.blind_relay_forwarded.load(Ordering::Relaxed),
+                rejected: self.blind_relay_rejected.load(Ordering::Relaxed),
+                backpressure_dropped: self
+                    .blind_relay_backpressure_dropped
+                    .load(Ordering::Relaxed),
+                invalid_signature: self.blind_relay_invalid_signature.load(Ordering::Relaxed),
+                envelope_too_large: self.blind_relay_envelope_too_large.load(Ordering::Relaxed),
+                ttl_exhausted: self.blind_relay_ttl_exhausted.load(Ordering::Relaxed),
+                no_route: self.blind_relay_no_route.load(Ordering::Relaxed),
+                invalid_endpoint: self.blind_relay_invalid_endpoint.load(Ordering::Relaxed),
+                forward_failed: self.blind_relay_forward_failed.load(Ordering::Relaxed),
+                last_event_at: Self::optional_ts(self.last_blind_relay_at.load(Ordering::Relaxed)),
+            },
             last_import_at: Self::optional_ts(self.last_import_at.load(Ordering::Relaxed)),
             last_gossip_at: Self::optional_ts(self.last_gossip_at.load(Ordering::Relaxed)),
             last_snapshot_at: Self::optional_ts(self.last_snapshot_at.load(Ordering::Relaxed)),
@@ -1059,6 +1139,108 @@ impl PeerStore {
     pub fn record_rate_limited(&self, now: u64, detail: impl Into<String>) {
         self.counters.rate_limited.fetch_add(1, Ordering::Relaxed);
         self.record_audit_event(now, "gossip_rate_limited", "limited", detail);
+    }
+
+    /// Records a blind relay request that terminates at this node.
+    ///
+    /// Only aggregate routing facts are recorded. The route id, previous-hop
+    /// id, full next-hop id, endpoint URL, encrypted blob bytes, and any
+    /// payload-derived metadata remain outside PeerStore status.
+    pub fn record_blind_relay_terminal(&self, now: u64, ttl_remaining: u8, blob_bytes: usize) {
+        self.counters
+            .blind_relay_received
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .blind_relay_terminal
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .last_blind_relay_at
+            .store(now, Ordering::Relaxed);
+        self.record_audit_event(
+            now,
+            "blind_relay_terminal",
+            "accepted",
+            format!("ttl_remaining={ttl_remaining} encrypted_blob_bytes={blob_bytes}"),
+        );
+    }
+
+    /// Records a blind relay request forwarded to the next verified node.
+    pub fn record_blind_relay_forwarded(&self, now: u64, ttl_remaining: u8) {
+        self.counters
+            .blind_relay_received
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .blind_relay_forwarded
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .last_blind_relay_at
+            .store(now, Ordering::Relaxed);
+        self.record_audit_event(
+            now,
+            "blind_relay_forward",
+            "accepted",
+            format!("ttl_remaining={ttl_remaining} encrypted_blob_bytes=opaque"),
+        );
+    }
+
+    /// Records a blind relay rejection with a stable privacy-safe reason.
+    pub fn record_blind_relay_rejected(&self, now: u64, reason: impl AsRef<str>) {
+        let reason = reason.as_ref();
+        self.counters
+            .blind_relay_received
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .blind_relay_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .last_blind_relay_at
+            .store(now, Ordering::Relaxed);
+
+        match reason {
+            "backpressure" => {
+                self.counters
+                    .blind_relay_backpressure_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "invalid_previous_hop" | "invalid_signature" => {
+                self.counters
+                    .blind_relay_invalid_signature
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "envelope_too_large" => {
+                self.counters
+                    .blind_relay_envelope_too_large
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "ttl_exhausted" => {
+                self.counters
+                    .blind_relay_ttl_exhausted
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "no_route" => {
+                self.counters
+                    .blind_relay_no_route
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "missing_endpoint" | "invalid_endpoint" => {
+                self.counters
+                    .blind_relay_invalid_endpoint
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "request_failed" | "forward_failed" => {
+                self.counters
+                    .blind_relay_forward_failed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            reason if reason.starts_with("http_") => {
+                self.counters
+                    .blind_relay_forward_failed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+
+        self.record_audit_event(now, "blind_relay_forward", "rejected", reason.to_string());
     }
 
     /// Records a privacy-safe discovery control-plane audit event.
@@ -2216,6 +2398,43 @@ mod tests {
                 && event.outcome == "limited"
                 && !event.detail.contains("http")
         }));
+    }
+
+    #[test]
+    fn test_blind_relay_runtime_stats_track_drop_reasons_without_payload_data() {
+        let store = PeerStore::new();
+
+        store.record_blind_relay_terminal(1_700_000_010, 2, 128);
+        store.record_blind_relay_forwarded(1_700_000_011, 1);
+        store.record_blind_relay_rejected(1_700_000_012, "backpressure");
+        store.record_blind_relay_rejected(1_700_000_013, "invalid_signature");
+        store.record_blind_relay_rejected(1_700_000_014, "ttl_exhausted");
+        store.record_blind_relay_rejected(1_700_000_015, "no_route");
+        store.record_blind_relay_rejected(1_700_000_016, "missing_endpoint");
+        store.record_blind_relay_rejected(1_700_000_017, "http_502");
+
+        let status = store.status(1_700_000_020);
+        let stats = status.runtime.blind_relay;
+
+        assert_eq!(stats.received, 8);
+        assert_eq!(stats.terminal, 1);
+        assert_eq!(stats.forwarded, 1);
+        assert_eq!(stats.rejected, 6);
+        assert_eq!(stats.backpressure_dropped, 1);
+        assert_eq!(stats.invalid_signature, 1);
+        assert_eq!(stats.ttl_exhausted, 1);
+        assert_eq!(stats.no_route, 1);
+        assert_eq!(stats.invalid_endpoint, 1);
+        assert_eq!(stats.forward_failed, 1);
+        assert_eq!(stats.last_event_at, Some(1_700_000_017));
+        assert!(status
+            .recent_audit_events
+            .iter()
+            .all(|event| !event.detail.contains("route_id")));
+        assert!(status
+            .recent_audit_events
+            .iter()
+            .all(|event| !event.detail.contains("encrypted_blob=")));
     }
 
     #[test]
