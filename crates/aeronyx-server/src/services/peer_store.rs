@@ -29,6 +29,8 @@
 //!   exposing seed endpoint values or peer URLs
 //! - Expired-peer cleanup counters so stale descriptor eviction is observable
 //!   without exposing peer endpoints or user traffic metadata
+//! - Health-ranked route candidates for blind relay preparation, using only
+//!   node-level signed descriptor metadata and never encrypted payload content
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -57,6 +59,7 @@
 //! ## Last Modified
 //! v0.13.0-GossipBackpressureStatus - Added outbound gossip jitter/backpressure status
 //! v0.14.0-ExpiredPeerCleanupStats - Added expired peer cleanup counters/audit
+//! v0.15.0-RouteCandidateScoring - Added health-ranked peer route candidates
 //! v0.12.0-CommercialPeerSummary - Added source/TTL/health/capability peer summary
 //! v0.11.0-DiscoveryRecoveryStatus - Added effective recovery status for nodeboard
 //! v0.10.0-DiscoveryRestartRecovery - Gate relay foundation on restart recovery
@@ -83,6 +86,10 @@ use serde::{Deserialize, Serialize};
 const DISCOVERY_GOSSIP_STALE_AFTER_SECS: u64 = 900;
 const DISCOVERY_GOSSIP_FAILURE_ATTENTION_THRESHOLD: u64 = 3;
 const PEER_DESCRIPTOR_STALE_WINDOW_SECS: u64 = 300;
+const PEER_ROUTE_LAST_SEEN_FRESH_SECS: u64 = 300;
+const PEER_ROUTE_LAST_SEEN_ACCEPTABLE_SECS: u64 = 900;
+const PEER_ROUTE_LAST_SEEN_STALE_SECS: u64 = 1_800;
+const PEER_ROUTE_STATUS_LIMIT: usize = 8;
 
 // ============================================
 // PeerStoreError
@@ -351,6 +358,12 @@ pub struct PeerStoreStatus {
     /// source counters. It must never include client IPs, payloads, DNS,
     /// destinations, wallet-level traffic, or chat/message content.
     pub peer_summary: PeerStorePeerSummaryStatus,
+    /// Privacy-safe health-ranked route candidates for future blind relay paths.
+    ///
+    /// Candidate rows intentionally omit full peer ids and public endpoints.
+    /// Server internals can use `route_candidates_with_capability()` when they
+    /// need signed descriptors for actual node-to-node transport.
+    pub route_candidates: PeerStoreRouteCandidateStatus,
 }
 
 // ============================================
@@ -427,6 +440,65 @@ pub struct PeerStorePeerSummaryStatus {
     pub source_counts: BTreeMap<String, usize>,
     /// Privacy-safe per-peer rows for operator UI.
     pub peers: Vec<PeerStorePeerSummary>,
+}
+
+// ============================================
+// Route candidate summary
+// ============================================
+
+/// Privacy-safe route candidate row for nodeboard and health reporting.
+///
+/// The score is derived from signed node descriptor metadata plus local
+/// discovery observation age. It never uses chat plaintext, encrypted blob
+/// contents, packet payloads, DNS data, client public IPs, voucher secrets,
+/// private keys, or wallet-level traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreRouteCandidate {
+    /// Short node id prefix for operator debugging without exposing full keys.
+    pub node_id_prefix: String,
+    /// Capability requested for this route list.
+    pub capability: String,
+    /// Stable score bucket used for sorting candidates.
+    pub score: i64,
+    /// Last import source bucket such as cache, gossip_snapshot, or gossip_announce.
+    pub source: String,
+    /// Stable health bucket: healthy or stale.
+    pub health: String,
+    /// Age of the last observation at status generation time.
+    pub last_seen_age_seconds: u64,
+    /// Remaining descriptor TTL in seconds.
+    pub ttl_remaining_seconds: Option<u64>,
+    /// Whether a public node-to-node endpoint exists.
+    pub endpoint_advertised: bool,
+    /// Whether this descriptor is public-discovery visible.
+    pub public_discovery: bool,
+    /// Optional region hint from the signed descriptor policy.
+    pub region: Option<String>,
+    /// Coarse max session capacity advertised by the peer.
+    pub max_sessions: u32,
+    /// Optional bandwidth policy advertised by the peer.
+    pub max_bps: Option<u64>,
+    /// Optional packet-rate policy advertised by the peer.
+    pub max_pps: Option<u64>,
+}
+
+/// Health-ranked candidate lists used by nodeboard before blind relay rollout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreRouteCandidateStatus {
+    /// Unix timestamp when the candidate lists were generated.
+    pub generated_at: u64,
+    /// Candidates for privacy protocol packet relay.
+    pub privacy_relay: Vec<PeerStoreRouteCandidate>,
+    /// Candidates for E2E encrypted chat envelope relay.
+    pub chat_relay: Vec<PeerStoreRouteCandidate>,
+    /// Candidates for future no-exit onion middle-hop relay.
+    pub onion_middle: Vec<PeerStoreRouteCandidate>,
+}
+
+#[derive(Debug, Clone)]
+struct ScoredPeerRouteCandidate {
+    descriptor: SignedNodeDescriptor,
+    summary: PeerStoreRouteCandidate,
 }
 
 struct PeerStoreCounters {
@@ -1103,6 +1175,27 @@ impl PeerStore {
             .collect()
     }
 
+    /// Returns health-ranked route candidates for a capability.
+    ///
+    /// This method is the server-internal companion to the privacy-safe
+    /// `PeerStoreStatus.route_candidates` payload. It sorts only by signed
+    /// descriptor metadata and local discovery observation age. It never reads
+    /// or derives from encrypted chat/media blobs, packet payloads, DNS data,
+    /// destinations, client public IPs, voucher secrets, private keys, or
+    /// wallet-level traffic.
+    #[must_use]
+    pub fn route_candidates_with_capability(
+        &self,
+        capability: NodeCapability,
+        now: u64,
+        limit: usize,
+    ) -> Vec<SignedNodeDescriptor> {
+        self.scored_route_candidates(capability, now, Some(limit))
+            .into_iter()
+            .map(|candidate| candidate.descriptor)
+            .collect()
+    }
+
     /// Removes descriptors that are no longer valid at `now`.
     pub fn cleanup_expired(&self, now: u64) -> usize {
         let mut peers = self.peers.write();
@@ -1279,6 +1372,7 @@ impl PeerStore {
         let bootstrap = self.bootstrap_status.read().clone();
         let stability = Self::stability(&snapshot, &bootstrap, now);
         let peer_summary = self.peer_summary(now);
+        let route_candidates = self.route_candidate_status(now);
 
         PeerStoreStatus {
             snapshot,
@@ -1288,6 +1382,7 @@ impl PeerStore {
             bootstrap,
             stability,
             peer_summary,
+            route_candidates,
         }
     }
 
@@ -1313,6 +1408,174 @@ impl PeerStore {
             ("stale", Some(remaining))
         } else {
             ("healthy", Some(remaining))
+        }
+    }
+
+    fn source_score(source: &str) -> i64 {
+        match source {
+            "self" => 30,
+            "gossip_announce" | "gossip_snapshot" => 25,
+            "cache" | "cache_backup" => 18,
+            "url" | "file" => 12,
+            _ => 0,
+        }
+    }
+
+    fn last_seen_score(last_seen_age_seconds: u64) -> i64 {
+        if last_seen_age_seconds <= PEER_ROUTE_LAST_SEEN_FRESH_SECS {
+            20
+        } else if last_seen_age_seconds <= PEER_ROUTE_LAST_SEEN_ACCEPTABLE_SECS {
+            10
+        } else if last_seen_age_seconds <= PEER_ROUTE_LAST_SEEN_STALE_SECS {
+            0
+        } else {
+            -20
+        }
+    }
+
+    fn ttl_score(ttl_remaining_seconds: Option<u64>) -> i64 {
+        ttl_remaining_seconds
+            .map(|ttl| (ttl / PEER_DESCRIPTOR_STALE_WINDOW_SECS).min(20) as i64)
+            .unwrap_or(-50)
+    }
+
+    fn capacity_score(descriptor: &SignedNodeDescriptor) -> i64 {
+        let sessions = (descriptor.descriptor.capacity.max_sessions / 32).min(20) as i64;
+        let bps = descriptor
+            .descriptor
+            .capacity
+            .max_bps
+            .map(|value| (value / 100_000_000).min(10) as i64)
+            .unwrap_or(0);
+        let pps = descriptor
+            .descriptor
+            .capacity
+            .max_pps
+            .map(|value| (value / 10_000).min(10) as i64)
+            .unwrap_or(0);
+        sessions + bps + pps
+    }
+
+    fn route_score(
+        descriptor: &SignedNodeDescriptor,
+        source: &str,
+        health: &str,
+        last_seen_age_seconds: u64,
+        ttl_remaining_seconds: Option<u64>,
+    ) -> i64 {
+        let health_score = match health {
+            "healthy" => 100,
+            "stale" => 40,
+            _ => -100,
+        };
+        health_score
+            + Self::source_score(source)
+            + Self::last_seen_score(last_seen_age_seconds)
+            + Self::ttl_score(ttl_remaining_seconds)
+            + Self::capacity_score(descriptor)
+    }
+
+    fn scored_route_candidates(
+        &self,
+        capability: NodeCapability,
+        now: u64,
+        limit: Option<usize>,
+    ) -> Vec<ScoredPeerRouteCandidate> {
+        let peers = self.peers.read();
+        let metadata = self.peer_runtime.read();
+        let capability_label = Self::capability_label(capability).to_string();
+        let mut candidates = Vec::new();
+
+        for (node_id, descriptor) in peers.iter() {
+            if descriptor.verify_at(now).is_err()
+                || !descriptor.descriptor.capabilities.contains(&capability)
+                || descriptor.descriptor.public_endpoint.is_none()
+            {
+                continue;
+            }
+
+            let meta = metadata.get(node_id);
+            let source = meta
+                .map(|value| value.source.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            let last_seen_age_seconds = meta
+                .map(|value| now.saturating_sub(value.last_seen_at))
+                .unwrap_or(u64::MAX);
+            let (health, ttl_remaining_seconds) = Self::descriptor_health(descriptor, now);
+            if health == "expired" {
+                continue;
+            }
+            let score = Self::route_score(
+                descriptor,
+                &source,
+                health,
+                last_seen_age_seconds,
+                ttl_remaining_seconds,
+            );
+
+            candidates.push(ScoredPeerRouteCandidate {
+                descriptor: descriptor.clone(),
+                summary: PeerStoreRouteCandidate {
+                    node_id_prefix: hex::encode(&node_id[..4]),
+                    capability: capability_label.clone(),
+                    score,
+                    source,
+                    health: health.to_string(),
+                    last_seen_age_seconds,
+                    ttl_remaining_seconds,
+                    endpoint_advertised: true,
+                    public_discovery: descriptor.descriptor.policy.public_discovery,
+                    region: descriptor.descriptor.policy.region.clone(),
+                    max_sessions: descriptor.descriptor.capacity.max_sessions,
+                    max_bps: descriptor.descriptor.capacity.max_bps,
+                    max_pps: descriptor.descriptor.capacity.max_pps,
+                },
+            });
+        }
+
+        candidates.sort_by(|a, b| {
+            b.summary
+                .score
+                .cmp(&a.summary.score)
+                .then_with(|| {
+                    a.summary
+                        .last_seen_age_seconds
+                        .cmp(&b.summary.last_seen_age_seconds)
+                })
+                .then_with(|| {
+                    b.summary
+                        .ttl_remaining_seconds
+                        .unwrap_or(0)
+                        .cmp(&a.summary.ttl_remaining_seconds.unwrap_or(0))
+                })
+                .then_with(|| a.descriptor.node_id().cmp(&b.descriptor.node_id()))
+        });
+
+        if let Some(limit) = limit {
+            candidates.truncate(limit);
+        }
+        candidates
+    }
+
+    fn route_candidate_summaries(
+        &self,
+        capability: NodeCapability,
+        now: u64,
+    ) -> Vec<PeerStoreRouteCandidate> {
+        self.scored_route_candidates(capability, now, Some(PEER_ROUTE_STATUS_LIMIT))
+            .into_iter()
+            .map(|candidate| candidate.summary)
+            .collect()
+    }
+
+    /// Builds privacy-safe route candidate lists for nodeboard.
+    #[must_use]
+    pub fn route_candidate_status(&self, now: u64) -> PeerStoreRouteCandidateStatus {
+        PeerStoreRouteCandidateStatus {
+            generated_at: now,
+            privacy_relay: self.route_candidate_summaries(NodeCapability::PrivacyRelay, now),
+            chat_relay: self.route_candidate_summaries(NodeCapability::ChatRelay, now),
+            onion_middle: self.route_candidate_summaries(NodeCapability::OnionMiddle, now),
         }
     }
 
@@ -1596,6 +1859,49 @@ mod tests {
 
         let peers = store.peers_with_capability(NodeCapability::ChatRelay, 1_700_000_100);
         assert_eq!(peers.len(), 1);
+    }
+
+    #[test]
+    fn test_route_candidates_rank_healthy_endpoint_peers_without_payload_data() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let preferred_kp = IdentityKeyPair::generate();
+        let stale_kp = IdentityKeyPair::generate();
+        let no_endpoint_kp = IdentityKeyPair::generate();
+
+        let mut preferred = signed_descriptor_for(&preferred_kp, 1, now + 2_000);
+        preferred.descriptor.public_endpoint = Some("https://preferred.example".to_string());
+        preferred.descriptor.capacity.max_sessions = 512;
+        preferred = SignedNodeDescriptor::sign(preferred.descriptor, &preferred_kp).unwrap();
+
+        let mut stale = signed_descriptor_for(&stale_kp, 1, now + 90);
+        stale.descriptor.public_endpoint = Some("https://stale.example".to_string());
+        stale.descriptor.capacity.max_sessions = 64;
+        stale = SignedNodeDescriptor::sign(stale.descriptor, &stale_kp).unwrap();
+
+        let no_endpoint = signed_descriptor_for(&no_endpoint_kp, 1, now + 2_000);
+
+        store
+            .upsert_verified_from_source(preferred.clone(), now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(stale.clone(), now, "gossip_snapshot")
+            .unwrap();
+        store
+            .upsert_verified_from_source(no_endpoint, now, "gossip_announce")
+            .unwrap();
+
+        let candidates = store.route_candidates_with_capability(NodeCapability::ChatRelay, now, 8);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].node_id(), preferred.node_id());
+        assert_eq!(candidates[1].node_id(), stale.node_id());
+
+        let status = store.route_candidate_status(now);
+        assert_eq!(status.chat_relay.len(), 2);
+        assert_eq!(status.chat_relay[0].health, "healthy");
+        assert_eq!(status.chat_relay[1].health, "stale");
+        assert!(status.chat_relay[0].endpoint_advertised);
+        assert!(status.chat_relay[0].score > status.chat_relay[1].score);
     }
 
     #[test]

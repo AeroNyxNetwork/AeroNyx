@@ -2379,10 +2379,13 @@ impl Server {
         let mut last_failure_reason: Option<String> = None;
 
         for peer in peer_store
-            .peers_with_capability(NodeCapability::ChatRelay, now)
+            .route_candidates_with_capability(
+                NodeCapability::ChatRelay,
+                now,
+                CHAT_PEER_RELAY_FANOUT_LIMIT,
+            )
             .into_iter()
             .filter(|peer| peer.node_id() != *self_node_id)
-            .take(CHAT_PEER_RELAY_FANOUT_LIMIT)
         {
             let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
                 continue;
