@@ -38,6 +38,8 @@
 //   v1.0.0-Membership     — TrafficTracker dual-write on VPN path
 //   v1.0.1-VpnMessageStats — aggregate encrypted VPN message counter
 //   v1.0.2-UnknownSessionLogGate — aggregate/rate-limit stale session logs
+//   v1.0.3-UnknownSessionLogGate — tighten aggregate warning cadence to every
+//     1000 stale packets after live restart validation on US1.
 // ============================================
 
 use std::net::Ipv4Addr;
@@ -216,7 +218,7 @@ impl PacketHandler {
             None => {
                 let unknown_count =
                     self.unknown_session_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                if unknown_count <= 5 || unknown_count % 100 == 0 {
+                if unknown_count <= 5 || unknown_count % 1000 == 0 {
                     warn!(
                         session_id = %session_id,
                         session_id_base64 = %BASE64.encode(session_id.as_bytes()),
