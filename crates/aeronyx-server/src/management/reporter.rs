@@ -92,6 +92,15 @@ pub type OperatorStatusFn =
 pub type DiscoveryStatusFn =
     Box<dyn Fn() -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>> + Send + Sync>;
 
+/// Async encrypted chat relay snapshot injected by server startup.
+///
+/// The probe returns aggregate node-to-node relay counters for heartbeat
+/// `system_stats.chat_relay_status`. It must not include message IDs, wallet
+/// IDs, client IPs, destinations, DNS contents, packet payloads, chat
+/// plaintext, ciphertext, private keys, voucher secrets, or per-user traffic.
+pub type ChatRelayStatusFn =
+    Box<dyn Fn() -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>> + Send + Sync>;
+
 // ============================================
 // Session Events
 // ============================================
@@ -274,6 +283,7 @@ pub struct HeartbeatReporter {
     vpn_health_status_fn: Option<VpnHealthStatusFn>,
     operator_status_fn: Option<OperatorStatusFn>,
     discovery_status_fn: Option<DiscoveryStatusFn>,
+    chat_relay_status_fn: Option<ChatRelayStatusFn>,
 
     // v1.0.0-Membership
     sessions: Option<Arc<SessionManager>>,
@@ -301,6 +311,7 @@ impl HeartbeatReporter {
             vpn_health_status_fn: None,
             operator_status_fn: None,
             discovery_status_fn: None,
+            chat_relay_status_fn: None,
             sessions: None,
             traffic: None,
             udp: None,
@@ -333,6 +344,11 @@ impl HeartbeatReporter {
 
     pub fn with_discovery_status(mut self, f: DiscoveryStatusFn) -> Self {
         self.discovery_status_fn = Some(f);
+        self
+    }
+
+    pub fn with_chat_relay_status(mut self, f: ChatRelayStatusFn) -> Self {
+        self.chat_relay_status_fn = Some(f);
         self
     }
 
@@ -413,6 +429,12 @@ impl HeartbeatReporter {
                         None
                     };
 
+                    let chat_relay_status = if let Some(ref f) = self.chat_relay_status_fn {
+                        f().await
+                    } else {
+                        None
+                    };
+
                     // v1.0.0-Membership: collect connected wallets (deduplicated).
                     let connected_wallets: Vec<String> =
                         if let Some(ref sm) = self.sessions {
@@ -452,6 +474,7 @@ impl HeartbeatReporter {
                             vpn_health_status,
                             operator_status,
                             discovery_status,
+                            chat_relay_status,
                         ),
                     ).await;
 

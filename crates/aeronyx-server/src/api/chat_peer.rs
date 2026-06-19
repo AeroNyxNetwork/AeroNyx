@@ -40,6 +40,7 @@
 //!   `MemChainMessage::ChatRelay(ChatEnvelope)`.
 //!
 //! ## Last Modified
+//! v0.2.0-PeerRelayHealth - Record inbound peer relay health counters
 //! v0.1.0-DiscoveryPhase9 - Initial inter-node encrypted chat relay endpoint
 // ============================================================================
 
@@ -130,6 +131,16 @@ impl ChatPeerRelayError {
             Self::StoreFailed => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
+
+    fn reason_bucket(&self) -> &'static str {
+        match self {
+            Self::RelayUnavailable => "relay_unavailable",
+            Self::InvalidSignature => "invalid_signature",
+            Self::EnvelopeTooLarge { .. } => "envelope_too_large",
+            Self::Serialization => "envelope_serialization_failed",
+            Self::StoreFailed => "store_pending_failed",
+        }
+    }
 }
 
 // ============================================
@@ -180,7 +191,13 @@ async fn process_peer_relay(
     state: ChatPeerState,
     envelope: ChatEnvelope,
 ) -> Result<PeerChatRelayResponse, ChatPeerRelayError> {
-    validate_peer_envelope(&envelope)?;
+    let now = now_secs();
+    if let Err(error) = validate_peer_envelope(&envelope) {
+        if let Some(relay) = state.chat_relay.as_ref() {
+            relay.record_peer_relay_inbound_rejected(now, error.reason_bucket());
+        }
+        return Err(error);
+    }
 
     let Some(relay) = state.chat_relay else {
         return Err(ChatPeerRelayError::RelayUnavailable);
@@ -191,6 +208,7 @@ async fn process_peer_relay(
             id = %hex::encode(envelope.message_id),
             "[CHAT_PEER] Duplicate peer envelope ignored"
         );
+        relay.record_peer_relay_inbound_accepted(now, true, 0, false);
         return Ok(PeerChatRelayResponse {
             accepted: true,
             duplicate: true,
@@ -215,6 +233,7 @@ async fn process_peer_relay(
                 error = %error,
                 "[CHAT_PEER] Failed to store peer envelope for offline receiver"
             );
+            relay.record_peer_relay_inbound_rejected(now, "store_pending_failed");
             ChatPeerRelayError::StoreFailed
         })?;
         true
@@ -222,12 +241,21 @@ async fn process_peer_relay(
         false
     };
 
+    relay.record_peer_relay_inbound_accepted(now, false, delivered_online, stored_pending);
+
     Ok(PeerChatRelayResponse {
         accepted: true,
         duplicate: false,
         delivered_online,
         stored_pending,
     })
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn validate_peer_envelope(envelope: &ChatEnvelope) -> Result<(), ChatPeerRelayError> {

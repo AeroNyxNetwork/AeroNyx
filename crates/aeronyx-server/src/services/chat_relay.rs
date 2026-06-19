@@ -11,6 +11,8 @@
 //   deduplication that will be used by the new handler in server.rs.
 //   v1.3.1-Maintenance — Removed stale imports after the chat relay schema and
 //   wallet-route integration stabilized. No database schema or API behavior changed.
+//   v1.4.0-PeerRelayHealth — Added privacy-safe node-to-node relay health
+//   counters for heartbeat/nodeboard diagnostics.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -20,6 +22,7 @@
 //   - Expired notifications: Queued ChatExpired delivery for offline senders
 //   - Online deduplication: LRU cache prevents duplicate delivery (online path)
 //   - WalletRouteCache: In-memory wallet → session routing (v1.3.0-Sovereign)
+//   - Peer relay health: aggregate outbound/inbound node-to-node relay status
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -44,6 +47,7 @@
 //   - node_secret is HKDF-derived from Ed25519 private key; stable across restarts.
 //
 // Last Modified:
+//   v1.4.0-PeerRelayHealth — Added node-to-node relay health status snapshot
 //   v1.1.0-ChatRelay — Initial implementation
 //   v1.3.0-Sovereign — Added wallet_routes: Arc<WalletRouteCache> field
 //   v1.3.1-Maintenance — Removed stale imports; behavior unchanged
@@ -55,8 +59,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use tracing::{debug, info};
@@ -71,6 +76,90 @@ use crate::services::wallet_routes::WalletRouteCache;
 // ============================================
 
 type HmacSha256 = Hmac<Sha256>;
+
+// ============================================
+// Peer relay health status
+// ============================================
+
+/// Privacy-safe node-to-node encrypted chat relay health snapshot.
+///
+/// This structure intentionally contains only aggregate counters and stable
+/// reason buckets. It must not include message IDs, wallet IDs, client IPs,
+/// destinations, DNS contents, URLs, chat plaintext, ciphertext, private keys,
+/// voucher secrets, or per-user traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatRelayPeerStatus {
+    /// Whether chat relay is enabled in local config.
+    pub enabled: bool,
+    /// Total outbound peer relay attempts.
+    pub outbound_attempted_total: u64,
+    /// Total outbound peer relay requests accepted by peer nodes.
+    pub outbound_accepted_total: u64,
+    /// Total outbound peer relay requests that failed or were rejected.
+    pub outbound_failed_total: u64,
+    /// Total outbound fanout rounds observed.
+    pub outbound_rounds: u64,
+    /// Number of peers attempted in the last outbound fanout round.
+    pub last_outbound_attempted: u64,
+    /// Number of peers that accepted the last outbound fanout round.
+    pub last_outbound_accepted: u64,
+    /// Number of peers that failed the last outbound fanout round.
+    pub last_outbound_failed: u64,
+    /// Last outbound health bucket: healthy, degraded, failed, idle.
+    pub last_outbound_status: Option<String>,
+    /// Privacy-safe reason bucket for the last outbound relay failure.
+    pub last_outbound_failure_reason: Option<String>,
+    /// Consecutive outbound rounds with zero accepted peer relays.
+    pub consecutive_outbound_failures: u64,
+    /// Timestamp of the last outbound round with at least one accepted peer.
+    pub last_outbound_success_at: Option<u64>,
+    /// Timestamp of the last outbound fanout round.
+    pub last_outbound_at: Option<u64>,
+    /// Total inbound peer relay envelopes accepted for local processing.
+    pub inbound_accepted_total: u64,
+    /// Total inbound duplicate envelopes ignored idempotently.
+    pub inbound_duplicate_total: u64,
+    /// Total inbound envelopes delivered to online local sessions.
+    pub inbound_delivered_online_total: u64,
+    /// Total inbound envelopes stored in the local pending queue.
+    pub inbound_stored_pending_total: u64,
+    /// Total inbound peer relay requests rejected by local validation/storage.
+    pub inbound_rejected_total: u64,
+    /// Last inbound status bucket: accepted, duplicate, rejected.
+    pub last_inbound_status: Option<String>,
+    /// Privacy-safe reason bucket for the last inbound rejection.
+    pub last_inbound_failure_reason: Option<String>,
+    /// Timestamp of the last inbound peer relay request processed.
+    pub last_inbound_at: Option<u64>,
+}
+
+impl ChatRelayPeerStatus {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            outbound_attempted_total: 0,
+            outbound_accepted_total: 0,
+            outbound_failed_total: 0,
+            outbound_rounds: 0,
+            last_outbound_attempted: 0,
+            last_outbound_accepted: 0,
+            last_outbound_failed: 0,
+            last_outbound_status: None,
+            last_outbound_failure_reason: None,
+            consecutive_outbound_failures: 0,
+            last_outbound_success_at: None,
+            last_outbound_at: None,
+            inbound_accepted_total: 0,
+            inbound_duplicate_total: 0,
+            inbound_delivered_online_total: 0,
+            inbound_stored_pending_total: 0,
+            inbound_rejected_total: 0,
+            last_inbound_status: None,
+            last_inbound_failure_reason: None,
+            last_inbound_at: None,
+        }
+    }
+}
 
 // ============================================
 // Error type
@@ -188,6 +277,7 @@ pub struct ChatRelayService {
     conn: Mutex<Connection>,
     node_secret: [u8; 32],
     dedup: MessageDedup,
+    peer_status: RwLock<ChatRelayPeerStatus>,
     /// In-memory wallet → session routing table.
     ///
     /// Arc so the cleanup task and each handler can hold independent references
@@ -213,11 +303,13 @@ impl ChatRelayService {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
 
         let dedup_capacity = config.dedup_lru_capacity;
+        let relay_enabled = config.enabled;
         let svc = Self {
             config,
             conn: Mutex::new(conn),
             node_secret,
             dedup: MessageDedup::new(dedup_capacity),
+            peer_status: RwLock::new(ChatRelayPeerStatus::new(relay_enabled)),
             // v1.3.0-Sovereign: initialise empty route cache
             wallet_routes: Arc::new(WalletRouteCache::new()),
         };
@@ -743,12 +835,111 @@ impl ChatRelayService {
     }
 
     // ============================================
+    // Peer relay health
+    // ============================================
+
+    /// Records an outbound node-to-node encrypted chat relay fanout round.
+    ///
+    /// The failure reason must be a stable bucket such as
+    /// `peer_relay_request_timeout` or `peer_relay_http_503`; do not pass peer
+    /// URLs, message IDs, wallet IDs, client IPs, or payload-derived data.
+    pub fn record_peer_relay_outbound(
+        &self,
+        now: u64,
+        attempted: usize,
+        accepted: usize,
+        failure_reason: Option<String>,
+    ) {
+        let failed = attempted.saturating_sub(accepted);
+        let status_bucket = if attempted == 0 && failure_reason.is_some() {
+            "failed"
+        } else if attempted == 0 {
+            "idle"
+        } else if accepted == attempted {
+            "healthy"
+        } else if accepted > 0 {
+            "degraded"
+        } else {
+            "failed"
+        };
+        let failure_reason = if failed > 0 || (attempted == 0 && status_bucket == "failed") {
+            Some(failure_reason.unwrap_or_else(|| "unknown".to_string()))
+        } else {
+            None
+        };
+
+        let mut status = self.peer_status.write();
+        status.outbound_attempted_total = status
+            .outbound_attempted_total
+            .saturating_add(attempted as u64);
+        status.outbound_accepted_total = status
+            .outbound_accepted_total
+            .saturating_add(accepted as u64);
+        status.outbound_failed_total = status.outbound_failed_total.saturating_add(failed as u64);
+        status.outbound_rounds = status.outbound_rounds.saturating_add(1);
+        status.last_outbound_attempted = attempted as u64;
+        status.last_outbound_accepted = accepted as u64;
+        status.last_outbound_failed = failed as u64;
+        status.last_outbound_status = Some(status_bucket.to_string());
+        status.last_outbound_failure_reason = failure_reason;
+        status.last_outbound_at = Some(now);
+
+        if accepted > 0 {
+            status.consecutive_outbound_failures = 0;
+            status.last_outbound_success_at = Some(now);
+        } else if attempted > 0 || status.last_outbound_failure_reason.is_some() {
+            status.consecutive_outbound_failures =
+                status.consecutive_outbound_failures.saturating_add(1);
+        }
+    }
+
+    /// Records an accepted inbound peer relay request.
+    pub fn record_peer_relay_inbound_accepted(
+        &self,
+        now: u64,
+        duplicate: bool,
+        delivered_online: usize,
+        stored_pending: bool,
+    ) {
+        let mut status = self.peer_status.write();
+        status.inbound_accepted_total = status.inbound_accepted_total.saturating_add(1);
+        if duplicate {
+            status.inbound_duplicate_total = status.inbound_duplicate_total.saturating_add(1);
+        }
+        status.inbound_delivered_online_total = status
+            .inbound_delivered_online_total
+            .saturating_add(delivered_online as u64);
+        if stored_pending {
+            status.inbound_stored_pending_total =
+                status.inbound_stored_pending_total.saturating_add(1);
+        }
+        status.last_inbound_status = Some(if duplicate { "duplicate" } else { "accepted" }.into());
+        status.last_inbound_failure_reason = None;
+        status.last_inbound_at = Some(now);
+    }
+
+    /// Records a rejected inbound peer relay request with a stable reason bucket.
+    pub fn record_peer_relay_inbound_rejected(&self, now: u64, reason: impl Into<String>) {
+        let mut status = self.peer_status.write();
+        status.inbound_rejected_total = status.inbound_rejected_total.saturating_add(1);
+        status.last_inbound_status = Some("rejected".to_string());
+        status.last_inbound_failure_reason = Some(reason.into());
+        status.last_inbound_at = Some(now);
+    }
+
+    // ============================================
     // Accessors
     // ============================================
 
     #[must_use]
     pub fn config(&self) -> &ChatRelayConfig {
         &self.config
+    }
+
+    /// Returns a privacy-safe node-to-node relay health snapshot.
+    #[must_use]
+    pub fn peer_status(&self) -> ChatRelayPeerStatus {
+        self.peer_status.read().clone()
     }
 }
 
@@ -804,6 +995,73 @@ mod tests {
     fn make_service() -> ChatRelayService {
         let secret = derive_node_secret(&[0x42u8; 32]);
         ChatRelayService::new(test_config(), secret).expect("init")
+    }
+
+    #[test]
+    fn test_peer_relay_outbound_health_tracks_failure_and_recovery() {
+        let svc = make_service();
+
+        svc.record_peer_relay_outbound(
+            1_800_000_010,
+            2,
+            1,
+            Some("peer_relay_request_timeout".to_string()),
+        );
+        let status = svc.peer_status();
+        assert_eq!(status.last_outbound_status.as_deref(), Some("degraded"));
+        assert_eq!(status.last_outbound_attempted, 2);
+        assert_eq!(status.last_outbound_accepted, 1);
+        assert_eq!(status.last_outbound_failed, 1);
+        assert_eq!(status.consecutive_outbound_failures, 0);
+        assert_eq!(status.last_outbound_success_at, Some(1_800_000_010));
+
+        svc.record_peer_relay_outbound(
+            1_800_000_020,
+            1,
+            0,
+            Some("peer_relay_http_503".to_string()),
+        );
+        let status = svc.peer_status();
+        assert_eq!(status.last_outbound_status.as_deref(), Some("failed"));
+        assert_eq!(
+            status.last_outbound_failure_reason.as_deref(),
+            Some("peer_relay_http_503")
+        );
+        assert_eq!(status.consecutive_outbound_failures, 1);
+
+        svc.record_peer_relay_outbound(1_800_000_030, 1, 1, None);
+        let status = svc.peer_status();
+        assert_eq!(status.last_outbound_status.as_deref(), Some("healthy"));
+        assert_eq!(status.last_outbound_failure_reason, None);
+        assert_eq!(status.consecutive_outbound_failures, 0);
+        assert_eq!(status.last_outbound_success_at, Some(1_800_000_030));
+    }
+
+    #[test]
+    fn test_peer_relay_inbound_health_tracks_accept_and_reject() {
+        let svc = make_service();
+
+        svc.record_peer_relay_inbound_accepted(1_800_000_010, false, 0, true);
+        let status = svc.peer_status();
+        assert_eq!(status.inbound_accepted_total, 1);
+        assert_eq!(status.inbound_stored_pending_total, 1);
+        assert_eq!(status.last_inbound_status.as_deref(), Some("accepted"));
+        assert_eq!(status.last_inbound_failure_reason, None);
+
+        svc.record_peer_relay_inbound_accepted(1_800_000_020, true, 0, false);
+        let status = svc.peer_status();
+        assert_eq!(status.inbound_accepted_total, 2);
+        assert_eq!(status.inbound_duplicate_total, 1);
+        assert_eq!(status.last_inbound_status.as_deref(), Some("duplicate"));
+
+        svc.record_peer_relay_inbound_rejected(1_800_000_030, "invalid_signature");
+        let status = svc.peer_status();
+        assert_eq!(status.inbound_rejected_total, 1);
+        assert_eq!(status.last_inbound_status.as_deref(), Some("rejected"));
+        assert_eq!(
+            status.last_inbound_failure_reason.as_deref(),
+            Some("invalid_signature")
+        );
     }
 
     fn make_envelope(kp: &IdentityKeyPair, receiver: [u8; 32]) -> ChatEnvelope {

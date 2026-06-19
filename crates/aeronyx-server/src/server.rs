@@ -40,6 +40,7 @@
 //      state already exists, while still warning on rejected descriptors.
 //  18. Records privacy-safe outbound gossip health buckets for node stability
 //      monitoring without exposing seed endpoint values or peer URLs.
+//  19. Reports privacy-safe encrypted chat peer relay health counters.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -68,6 +69,7 @@
 //   v1.0.0-Membership  - TrafficTracker wiring
 //   v1.0.1-VpnMessageStats - encrypted message counter wiring
 //   v0.7.0-DiscoveryChatRelay - Peer-discovered encrypted chat relay fanout
+//   v0.7.1-ChatPeerRelayHealth - Peer relay health status in heartbeat
 //   v0.9.3-DiscoveryGossipHealth - Outbound gossip status and failure buckets
 //   v0.9.1-DiscoverySeedStatus - Seed endpoint recovery counters in status
 //   v0.9.2-DiscoveryBootstrapStatus - Avoid warning on benign stale bootstrap descriptors
@@ -344,6 +346,7 @@ impl Server {
                 Arc::clone(&voucher_verifier),
                 Arc::clone(&encrypted_message_counter),
                 Arc::clone(&peer_store),
+                chat_relay.clone(),
             )
             .await;
 
@@ -1396,6 +1399,7 @@ impl Server {
         voucher_verifier: Arc<VoucherVerifier>,
         encrypted_message_counter: Arc<AtomicU64>,
         peer_store: Arc<PeerStore>,
+        chat_relay: Option<Arc<ChatRelayService>>,
     ) -> SessionEventSender {
         info!("Initializing management reporting...");
 
@@ -1520,6 +1524,22 @@ impl Server {
                 }))
             })
         }));
+
+        if let Some(relay) = chat_relay.as_ref() {
+            let chat_relay_status: Arc<ChatRelayService> = Arc::clone(relay);
+            heartbeat = heartbeat.with_chat_relay_status(Box::new(move || {
+                let relay = Arc::clone(&chat_relay_status);
+                Box::pin(async move {
+                    let now = unix_now_secs();
+                    Some(serde_json::json!({
+                        "generated_at": now,
+                        "peer_relay": relay.peer_status(),
+                        "source": "rust_chat_relay_service",
+                        "privacy_boundary": "aggregate encrypted chat peer relay counters only; no message ids, wallet ids, client IPs, destinations, DNS contents, packet payloads, chat plaintext, ciphertext, private keys, voucher secrets, or per-user traffic"
+                    }))
+                })
+            }));
+        }
 
         let sess = Arc::clone(sessions);
         let hb_shutdown = self.shutdown_tx.subscribe();
@@ -2060,17 +2080,27 @@ impl Server {
 
     async fn relay_chat_envelope_to_discovered_peers(
         client: Option<&reqwest::Client>,
+        relay: Option<&ChatRelayService>,
         peer_store: &PeerStore,
         self_node_id: &[u8; 32],
         envelope: &ChatEnvelope,
     ) -> usize {
+        let now = unix_now_secs();
         let Some(client) = client else {
+            if let Some(relay) = relay {
+                relay.record_peer_relay_outbound(
+                    now,
+                    0,
+                    0,
+                    Some("peer_http_client_unavailable".to_string()),
+                );
+            }
             return 0;
         };
 
-        let now = unix_now_secs();
         let mut attempted = 0usize;
         let mut accepted = 0usize;
+        let mut last_failure_reason: Option<String> = None;
 
         for peer in peer_store
             .peers_with_capability(NodeCapability::ChatRelay, now)
@@ -2099,6 +2129,8 @@ impl Server {
                     accepted += 1;
                 }
                 Ok(response) => {
+                    last_failure_reason =
+                        Some(format!("peer_relay_http_{}", response.status().as_u16()));
                     debug!(
                         peer = %url,
                         status = %response.status(),
@@ -2106,6 +2138,8 @@ impl Server {
                     );
                 }
                 Err(error) => {
+                    last_failure_reason =
+                        Some(Self::classify_reqwest_error("peer_relay_request", &error));
                     debug!(
                         peer = %url,
                         error = %error,
@@ -2113,6 +2147,10 @@ impl Server {
                     );
                 }
             }
+        }
+
+        if let Some(relay) = relay {
+            relay.record_peer_relay_outbound(now, attempted, accepted, last_failure_reason);
         }
 
         if attempted > 0 {
@@ -2696,6 +2734,7 @@ impl Server {
                     if all_failed {
                         Self::relay_chat_envelope_to_discovered_peers(
                             chat_peer_client,
+                            Some(relay.as_ref()),
                             peer_store,
                             self_node_id,
                             &envelope,
@@ -2712,6 +2751,7 @@ impl Server {
                 } else {
                     Self::relay_chat_envelope_to_discovered_peers(
                         chat_peer_client,
+                        Some(relay.as_ref()),
                         peer_store,
                         self_node_id,
                         &envelope,
@@ -3364,6 +3404,7 @@ mod tests {
         let client = reqwest::Client::new();
         let accepted = Server::relay_chat_envelope_to_discovered_peers(
             Some(&client),
+            None,
             &peer_store,
             &[0x99; 32],
             &signed_test_chat_envelope(now),

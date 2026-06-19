@@ -29,6 +29,7 @@
 //   v1.0.0         - Initial implementation
 //   v1.2.0         - Fixed JSON field ordering (json! macro)
 //   v1.3.0         - Added report_command_status(), fixed eprintln!
+//   v2.4.0         - Added chat_relay_status to heartbeat system_stats
 //   v2.3.0         - Added memchain_status to heartbeat system_stats
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
@@ -307,6 +308,7 @@ impl ManagementClient {
         vpn_health: Option<serde_json::Value>,
         operator_status: Option<serde_json::Value>,
         discovery_status: Option<serde_json::Value>,
+        chat_relay_status: Option<serde_json::Value>,
     ) -> Result<HeartbeatResponse, String> {
         let url = format!("{}/node/heartbeat/", self.config.cms_url);
         let timestamp = Self::current_timestamp();
@@ -358,6 +360,9 @@ impl ManagementClient {
             }
             if let Some(status) = discovery_status {
                 obj.insert("discovery_status".to_string(), status);
+            }
+            if let Some(status) = chat_relay_status {
+                obj.insert("chat_relay_status".to_string(), status);
             }
         }
 
