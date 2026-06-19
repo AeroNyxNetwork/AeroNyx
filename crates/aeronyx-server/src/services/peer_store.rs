@@ -21,6 +21,8 @@
 //! - Bootstrap/cache/gossip runtime status for nodeboard diagnostics
 //! - Seed endpoint recovery counters without exposing seed endpoint values
 //! - Discovery stability summary for operator health gates and nodeboard
+//! - Effective discovery recovery status so stale bootstrap-file warnings do
+//!   not mask a later successful seed-gossip recovery path
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -47,6 +49,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.11.0-DiscoveryRecoveryStatus - Added effective recovery status for nodeboard
 //! v0.10.0-DiscoveryRestartRecovery - Gate relay foundation on restart recovery
 //! v0.9.0-DiscoveryStability - Added aggregate discovery stability summary
 //! v0.8.0-DiscoveryGossipHealth - Added outbound gossip health summary fields
@@ -169,6 +172,18 @@ pub struct PeerStoreBootstrapStatus {
     pub last_source_detail: Option<String>,
     /// Timestamp of the last bootstrap/cache source event.
     pub last_source_at: Option<u64>,
+    /// Effective discovery recovery status after combining source load,
+    /// self-descriptor, and successful seed/peer gossip evidence.
+    ///
+    /// This deliberately complements `last_source_status` instead of
+    /// replacing it: operators can still see that a static bootstrap file was
+    /// stale, while nodeboard can show that discovery recovered via live
+    /// gossip without exposing peer URLs or descriptors.
+    pub recovery_status: Option<String>,
+    /// Privacy-safe aggregate detail for `recovery_status`.
+    pub recovery_detail: Option<String>,
+    /// Timestamp of the last effective recovery evidence.
+    pub recovery_at: Option<u64>,
     /// Self descriptor registration status.
     pub self_descriptor_status: Option<String>,
     /// Timestamp of the last self descriptor event.
@@ -210,6 +225,9 @@ impl Default for PeerStoreBootstrapStatus {
             last_source_status: None,
             last_source_detail: None,
             last_source_at: None,
+            recovery_status: None,
+            recovery_detail: None,
+            recovery_at: None,
             self_descriptor_status: None,
             self_descriptor_at: None,
             last_cache_save_status: None,
@@ -471,6 +489,9 @@ impl PeerStore {
             status.last_source_status = Some(source_status.clone());
             status.last_source_detail = Some(detail.clone());
             status.last_source_at = Some(now);
+            status.recovery_status = Some(source_status.clone());
+            status.recovery_detail = Some(format!("source_kind={source_kind} {detail}"));
+            status.recovery_at = Some(now);
         }
         self.record_audit_event(
             now,
@@ -547,6 +568,11 @@ impl PeerStore {
             if succeeded > 0 {
                 status.consecutive_gossip_failures = 0;
                 status.last_gossip_success_at = Some(now);
+                status.recovery_status = Some("success".to_string());
+                status.recovery_detail = Some(format!(
+                    "gossip_recovered attempted={attempted} succeeded={succeeded} seed_attempted={seed_attempted}"
+                ));
+                status.recovery_at = Some(now);
             } else if attempted > 0 || failure_reason.is_some() {
                 status.consecutive_gossip_failures =
                     status.consecutive_gossip_failures.saturating_add(1);
@@ -1453,6 +1479,32 @@ mod tests {
         assert_eq!(status.bootstrap.last_gossip_failure_reason, None);
         assert_eq!(status.bootstrap.consecutive_gossip_failures, 0);
         assert_eq!(status.bootstrap.last_gossip_success_at, Some(1_700_000_050));
+    }
+
+    #[test]
+    fn test_gossip_success_sets_effective_recovery_status_without_hiding_source_warning() {
+        let store = PeerStore::new();
+
+        store.record_bootstrap_source(
+            1_700_000_010,
+            "file",
+            "warning",
+            "total=1 inserted=0 unchanged=0 stale=0 rejected=1",
+        );
+        store.record_gossip_round(1_700_000_050, 2, 2, 1, None);
+
+        let status = store.status(1_700_000_060);
+        assert_eq!(
+            status.bootstrap.last_source_status.as_deref(),
+            Some("warning")
+        );
+        assert_eq!(status.bootstrap.last_source_kind.as_deref(), Some("file"));
+        assert_eq!(status.bootstrap.recovery_status.as_deref(), Some("success"));
+        assert_eq!(
+            status.bootstrap.recovery_detail.as_deref(),
+            Some("gossip_recovered attempted=2 succeeded=2 seed_attempted=1")
+        );
+        assert_eq!(status.bootstrap.recovery_at, Some(1_700_000_050));
     }
 
     #[test]
