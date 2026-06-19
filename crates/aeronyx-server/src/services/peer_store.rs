@@ -33,6 +33,8 @@
 //!   node-level signed descriptor metadata and never encrypted payload content
 //! - Blind relay runtime counters and drop reason buckets for nodeboard,
 //!   without exposing encrypted payloads, peer endpoint URLs, or user metadata
+//! - Blind relay audit size buckets so exact encrypted blob sizes do not become
+//!   traffic fingerprints in nodeboard or heartbeat diagnostics
 //! - Per-peer node-to-node route health feedback so failed next hops are
 //!   naturally deprioritized without exposing payloads or full peer endpoints
 //! - Exclude-list route candidate selection so server internals can remove
@@ -65,6 +67,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.20.0-BlindRelaySizeBuckets - Bucket blind relay encrypted blob sizes in audit events
 //! v0.19.0-ControlledRoutePathPlanner - Added privacy-safe multi-hop path planning foundation
 //! v0.18.0-RouteCandidateExclusion - Added exclude-before-limit route selection
 //! v0.17.0-RouteHealthFeedback - Added per-peer blind relay success/failure scoring
@@ -1239,7 +1242,7 @@ impl PeerStore {
     /// Records a blind relay request that terminates at this node.
     ///
     /// Only aggregate routing facts are recorded. The route id, previous-hop
-    /// id, full next-hop id, endpoint URL, encrypted blob bytes, and any
+    /// id, full next-hop id, endpoint URL, exact encrypted blob bytes, and any
     /// payload-derived metadata remain outside PeerStore status.
     pub fn record_blind_relay_terminal(&self, now: u64, ttl_remaining: u8, blob_bytes: usize) {
         self.counters
@@ -1255,8 +1258,21 @@ impl PeerStore {
             now,
             "blind_relay_terminal",
             "accepted",
-            format!("ttl_remaining={ttl_remaining} encrypted_blob_bytes={blob_bytes}"),
+            format!(
+                "ttl_remaining={ttl_remaining} encrypted_blob_size_bucket={}",
+                Self::blind_relay_blob_size_bucket(blob_bytes)
+            ),
         );
+    }
+
+    fn blind_relay_blob_size_bucket(blob_bytes: usize) -> &'static str {
+        match blob_bytes {
+            0..=4_096 => "lte_4kb",
+            4_097..=65_536 => "lte_64kb",
+            65_537..=262_144 => "lte_256kb",
+            262_145..=1_048_576 => "lte_1mb",
+            _ => "gt_1mb",
+        }
     }
 
     /// Records a blind relay request forwarded to the next verified node.
@@ -1274,7 +1290,7 @@ impl PeerStore {
             now,
             "blind_relay_forward",
             "accepted",
-            format!("ttl_remaining={ttl_remaining} encrypted_blob_bytes=opaque"),
+            format!("ttl_remaining={ttl_remaining} encrypted_blob_size_bucket=opaque"),
         );
     }
 
@@ -2970,6 +2986,14 @@ mod tests {
             .recent_audit_events
             .iter()
             .all(|event| !event.detail.contains("encrypted_blob=")));
+        assert!(status
+            .recent_audit_events
+            .iter()
+            .all(|event| !event.detail.contains("encrypted_blob_bytes")));
+        assert!(status.recent_audit_events.iter().any(|event| {
+            event.action == "blind_relay_terminal"
+                && event.detail.contains("encrypted_blob_size_bucket=lte_4kb")
+        }));
     }
 
     #[test]
