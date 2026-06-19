@@ -50,6 +50,8 @@
 //      restart recovery is durable before the first periodic write interval.
 //  23. Flushes the verified PeerStore cache once more during graceful shutdown
 //      so recently discovered peers are not lost during node upgrades.
+//  24. Keeps a previous verified PeerStore cache backup and falls back to it
+//      when the primary cache file is missing or JSON-corrupted.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -69,6 +71,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.0.7-DiscoveryPeerCacheBackup - Backup and fallback for PeerStore cache
 //   v1.0.6-DiscoveryShutdownCacheFlush - Persist PeerStore cache on shutdown
 //   v1.0.5-DiscoveryImmediateCacheSave - Persist PeerStore cache after bootstrap
 //   v1.0.4-DiscoveryHealthContract - PeerStore summary in VPN health
@@ -1869,7 +1872,9 @@ impl Server {
     async fn load_peer_cache(&self, peer_store: &PeerStore, path: &str, now: u64) {
         match tokio::fs::read(path).await {
             Ok(bytes) => {
-                Self::import_bootstrap_snapshot_bytes(peer_store, "cache", path, &bytes, now);
+                if !Self::import_bootstrap_snapshot_bytes(peer_store, "cache", path, &bytes, now) {
+                    self.load_peer_cache_backup(peer_store, path, now).await;
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 peer_store.record_bootstrap_source(now, "cache", "missing", "file_not_found");
@@ -1877,6 +1882,7 @@ impl Server {
                     source = %path,
                     "[DISCOVERY] Peer cache not found; starting with bootstrap only"
                 );
+                self.load_peer_cache_backup(peer_store, path, now).await;
             }
             Err(e) => {
                 peer_store.record_bootstrap_source(now, "cache", "failed", "read_failed");
@@ -1884,6 +1890,44 @@ impl Server {
                     source = %path,
                     error = %e,
                     "[DISCOVERY] Failed to read peer cache"
+                );
+                self.load_peer_cache_backup(peer_store, path, now).await;
+            }
+        }
+    }
+
+    async fn load_peer_cache_backup(&self, peer_store: &PeerStore, path: &str, now: u64) {
+        let backup_path = Self::peer_cache_backup_path(path);
+        let backup_source = backup_path.to_string_lossy().to_string();
+        match tokio::fs::read(&backup_path).await {
+            Ok(bytes) => {
+                if Self::import_bootstrap_snapshot_bytes(
+                    peer_store,
+                    "cache_backup",
+                    &backup_source,
+                    &bytes,
+                    now,
+                ) {
+                    info!(
+                        source = %backup_source,
+                        "[DISCOVERY] Peer cache backup restored"
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                peer_store.record_bootstrap_source(
+                    now,
+                    "cache_backup",
+                    "missing",
+                    "file_not_found",
+                );
+            }
+            Err(e) => {
+                peer_store.record_bootstrap_source(now, "cache_backup", "failed", "read_failed");
+                warn!(
+                    source = %backup_source,
+                    error = %e,
+                    "[DISCOVERY] Failed to read peer cache backup"
                 );
             }
         }
@@ -2295,10 +2339,18 @@ impl Server {
         let snapshot = peer_store.export_bootstrap_snapshot(now, now, false, None);
         let bytes = snapshot.to_json_pretty()?;
         let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+        let backup_path = Self::peer_cache_backup_path(path.to_string_lossy().as_ref());
 
         tokio::fs::write(&tmp_path, bytes).await?;
+        if tokio::fs::metadata(&path).await.is_ok() {
+            let _ = tokio::fs::copy(&path, &backup_path).await;
+        }
         tokio::fs::rename(&tmp_path, &path).await?;
         Ok(())
+    }
+
+    fn peer_cache_backup_path(path: &str) -> PathBuf {
+        PathBuf::from(format!("{path}.bak"))
     }
 
     async fn persist_peer_store_cache_once(
@@ -2391,7 +2443,7 @@ impl Server {
         source: &str,
         bytes: &[u8],
         now: u64,
-    ) {
+    ) -> bool {
         match NodeBootstrapSnapshot::from_json_bytes(bytes) {
             Ok(snapshot) => {
                 let report = peer_store.load_bootstrap_snapshot(&snapshot, now);
@@ -2422,6 +2474,7 @@ impl Server {
                     rejected = report.rejected,
                     "[DISCOVERY] Bootstrap snapshot imported"
                 );
+                true
             }
             Err(e) => {
                 peer_store.record_bootstrap_source(now, source_kind, "failed", "json_rejected");
@@ -2431,6 +2484,7 @@ impl Server {
                     error = %e,
                     "[DISCOVERY] Bootstrap snapshot rejected"
                 );
+                false
             }
         }
     }
@@ -3675,6 +3729,57 @@ mod tests {
             .any(|event| event.action == "bootstrap_source"));
 
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_falls_back_to_backup_when_primary_is_corrupt() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let now = unix_now_secs();
+        let signed = server.build_self_discovery_descriptor(now).unwrap();
+        let original_store = Arc::new(PeerStore::new());
+        assert!(original_store.upsert_verified(signed.clone(), now).unwrap());
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("aeronyx-peer-cache-backup-restore-{unique}.json"));
+        let path_str = path.to_string_lossy().to_string();
+        let backup_path = Server::peer_cache_backup_path(&path_str);
+
+        Server::save_peer_store_cache_snapshot(&original_store, &path_str, now)
+            .await
+            .unwrap();
+        tokio::fs::copy(&path, &backup_path).await.unwrap();
+        tokio::fs::write(&path, b"{not-json").await.unwrap();
+
+        let restored_store = PeerStore::new();
+        server
+            .load_peer_cache(&restored_store, &path_str, now + 1)
+            .await;
+
+        assert!(restored_store
+            .get_valid(&signed.node_id(), now + 1)
+            .is_some());
+
+        let status = restored_store.status(now + 1);
+        assert_eq!(status.snapshot.valid_peers, 1);
+        assert_eq!(
+            status.bootstrap.last_source_kind.as_deref(),
+            Some("cache_backup")
+        );
+        assert_eq!(
+            status.bootstrap.last_source_status.as_deref(),
+            Some("success")
+        );
+
+        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio::fs::remove_file(backup_path).await;
     }
 
     #[tokio::test]
