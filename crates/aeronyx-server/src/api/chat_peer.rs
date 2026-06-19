@@ -11,15 +11,20 @@
 //! ## Main Functionality
 //! - `POST /api/chat/peer/relay`: accepts a signed `ChatEnvelope` from another
 //!   AeroNyx node
+//! - `POST /api/chat/peer/blind-relay`: accepts a signed `BlindRelayEnvelope`
+//!   and forwards only opaque encrypted bytes toward `next_hop`
 //! - Verifies the envelope signature before doing any delivery or storage
 //! - Delivers to locally online receiver devices when possible
 //! - Falls back to the existing SQLite pending queue when the receiver is
 //!   offline or all local routes are stale
 //!
 //! ## Dependencies
-//! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope` and envelope encoding
+//! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
+//!   and bounded envelope encoding
 //! - aeronyx-core/src/protocol/memchain.rs: wraps envelope for client delivery
 //! - aeronyx-server/src/services/chat_relay.rs: pending queue and dedup logic
+//! - aeronyx-server/src/services/peer_store.rs: verified node descriptors for
+//!   next-hop routing
 //! - aeronyx-server/src/services/session.rs: active receiver sessions
 //! - aeronyx-transport/src/udp.rs: encrypted client packet send path
 //!
@@ -30,6 +35,8 @@
 //! 4. Online receiver sessions get the envelope through the existing encrypted
 //!    client transport
 //! 5. Offline receivers keep the existing pending-message fallback
+//! 6. Blind relay requests verify the previous-hop signature, decrement TTL,
+//!    re-sign with this node key, and POST to the verified `next_hop`
 //!
 //! ## Important Note for Next Developer
 //! - Never decrypt, inspect, log, store, or report ciphertext contents.
@@ -38,8 +45,12 @@
 //!   analytics to this endpoint.
 //! - The endpoint is node-to-node plumbing only. Client wire format remains
 //!   `MemChainMessage::ChatRelay(ChatEnvelope)`.
+//! - Blind relay keeps the relay invariant: route_id / next_hop / ttl /
+//!   encrypted_blob / timestamp / signature are handled as routing metadata;
+//!   encrypted_blob stays opaque and must not be parsed.
 //!
 //! ## Last Modified
+//! v0.3.0-BlindRelayEndpoint - Added node-to-node opaque blind relay endpoint
 //! v0.2.0-PeerRelayHealth - Record inbound peer relay health counters
 //! v0.1.0-DiscoveryPhase9 - Initial inter-node encrypted chat relay endpoint
 // ============================================================================
@@ -49,7 +60,10 @@ use std::sync::Arc;
 use aeronyx_core::crypto::transport::{
     DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD,
 };
-use aeronyx_core::protocol::chat::{encode_envelope, ChatEnvelope};
+use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
+use aeronyx_core::protocol::chat::{
+    encode_blind_relay_envelope, encode_envelope, BlindRelayEnvelope, ChatEnvelope,
+};
 use aeronyx_core::protocol::codec::encode_data_packet;
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
 use aeronyx_core::protocol::DataPacket;
@@ -59,6 +73,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::po
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::services::peer_store::PeerStore;
 use crate::services::{ChatRelayService, Session, SessionManager};
 
 // ============================================
@@ -81,6 +96,9 @@ struct ChatPeerState {
     chat_relay: Option<Arc<ChatRelayService>>,
     sessions: Arc<SessionManager>,
     udp: Arc<UdpTransport>,
+    peer_store: Arc<PeerStore>,
+    node_identity: Arc<IdentityKeyPair>,
+    http_client: Arc<reqwest::Client>,
 }
 
 /// Node-to-node encrypted envelope relay request.
@@ -103,6 +121,36 @@ pub struct PeerChatRelayResponse {
     pub stored_pending: bool,
 }
 
+/// Node-to-node blind relay request.
+///
+/// `previous_hop_node_id` is transport/auth context for signature
+/// verification. It is intentionally outside `BlindRelayEnvelope` so the
+/// envelope itself remains the minimal route metadata set documented in
+/// aeronyx-core. Do not add user ids, receiver wallet ids, domains, URLs, DNS
+/// contents, or payload-derived information here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerBlindRelayRequest {
+    /// Opaque encrypted relay envelope. `encrypted_blob` must not be parsed.
+    pub envelope: BlindRelayEnvelope,
+    /// Ed25519 node id that signed this hop.
+    pub previous_hop_node_id: [u8; 32],
+}
+
+/// Node-to-node blind relay response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerBlindRelayResponse {
+    /// Whether this node accepted the request as valid relay work.
+    pub accepted: bool,
+    /// Whether this node is the requested next hop.
+    pub terminal: bool,
+    /// Whether this node forwarded the opaque envelope to another node.
+    pub forwarded: bool,
+    /// Remaining TTL observed or forwarded by this node.
+    pub ttl_remaining: u8,
+    /// Privacy-safe coarse result bucket for nodeboard/audits.
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 enum ChatPeerRelayError {
     #[error("chat relay disabled")]
@@ -119,6 +167,55 @@ enum ChatPeerRelayError {
 
     #[error("pending store failed")]
     StoreFailed,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum BlindRelayError {
+    #[error("invalid previous hop public key")]
+    InvalidPreviousHop,
+
+    #[error("invalid blind envelope signature")]
+    InvalidSignature,
+
+    #[error("blind envelope too large")]
+    EnvelopeTooLarge,
+
+    #[error("ttl exhausted")]
+    TtlExhausted,
+
+    #[error("next hop not found")]
+    NoRoute,
+
+    #[error("next hop endpoint missing or invalid")]
+    InvalidEndpoint,
+
+    #[error("blind relay forward failed")]
+    ForwardFailed,
+}
+
+impl BlindRelayError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            Self::InvalidPreviousHop
+            | Self::InvalidSignature
+            | Self::EnvelopeTooLarge
+            | Self::TtlExhausted => StatusCode::BAD_REQUEST,
+            Self::NoRoute | Self::InvalidEndpoint => StatusCode::BAD_GATEWAY,
+            Self::ForwardFailed => StatusCode::BAD_GATEWAY,
+        }
+    }
+
+    fn reason_bucket(&self) -> &'static str {
+        match self {
+            Self::InvalidPreviousHop => "invalid_previous_hop",
+            Self::InvalidSignature => "invalid_signature",
+            Self::EnvelopeTooLarge => "envelope_too_large",
+            Self::TtlExhausted => "ttl_exhausted",
+            Self::NoRoute => "no_route",
+            Self::InvalidEndpoint => "invalid_endpoint",
+            Self::ForwardFailed => "forward_failed",
+        }
+    }
 }
 
 impl ChatPeerRelayError {
@@ -152,15 +249,22 @@ pub fn build_chat_peer_router(
     chat_relay: Option<Arc<ChatRelayService>>,
     sessions: Arc<SessionManager>,
     udp: Arc<UdpTransport>,
+    peer_store: Arc<PeerStore>,
+    node_identity: Arc<IdentityKeyPair>,
+    http_client: Arc<reqwest::Client>,
 ) -> Router {
     let state = ChatPeerState {
         chat_relay,
         sessions,
         udp,
+        peer_store,
+        node_identity,
+        http_client,
     };
 
     Router::new()
         .route("/api/chat/peer/relay", post(peer_relay_handler))
+        .route("/api/chat/peer/blind-relay", post(peer_blind_relay_handler))
         .with_state(state)
 }
 
@@ -181,6 +285,26 @@ async fn peer_relay_handler(
                 duplicate: false,
                 delivered_online: 0,
                 stored_pending: false,
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn peer_blind_relay_handler(
+    State(state): State<ChatPeerState>,
+    Json(request): Json<PeerBlindRelayRequest>,
+) -> impl IntoResponse {
+    match process_peer_blind_relay(state, request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => (
+            error.status_code(),
+            Json(PeerBlindRelayResponse {
+                accepted: false,
+                terminal: false,
+                forwarded: false,
+                ttl_remaining: 0,
+                reason: Some(error.reason_bucket().to_string()),
             }),
         )
             .into_response(),
@@ -256,6 +380,195 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+async fn process_peer_blind_relay(
+    state: ChatPeerState,
+    request: PeerBlindRelayRequest,
+) -> Result<PeerBlindRelayResponse, BlindRelayError> {
+    let now = now_secs();
+    let envelope = request.envelope;
+
+    validate_blind_relay_envelope(&envelope, &request.previous_hop_node_id).map_err(|error| {
+        state.peer_store.record_audit_event(
+            now,
+            "blind_relay_inbound",
+            "rejected",
+            error.reason_bucket(),
+        );
+        error
+    })?;
+
+    let self_node_id = state.node_identity.public_key_bytes();
+    if envelope.next_hop == self_node_id {
+        state.peer_store.record_audit_event(
+            now,
+            "blind_relay_terminal",
+            "accepted",
+            format!(
+                "ttl_remaining={} encrypted_blob_bytes={}",
+                envelope.ttl,
+                envelope.encrypted_blob.len()
+            ),
+        );
+        return Ok(PeerBlindRelayResponse {
+            accepted: true,
+            terminal: true,
+            forwarded: false,
+            ttl_remaining: envelope.ttl,
+            reason: Some("terminal_next_hop".to_string()),
+        });
+    }
+
+    if !envelope.can_forward() {
+        state.peer_store.record_audit_event(
+            now,
+            "blind_relay_forward",
+            "rejected",
+            "ttl_exhausted",
+        );
+        return Err(BlindRelayError::TtlExhausted);
+    }
+
+    let next_hop = envelope.next_hop;
+    let descriptor = state.peer_store.get_valid(&next_hop, now).ok_or_else(|| {
+        state
+            .peer_store
+            .record_audit_event(now, "blind_relay_forward", "rejected", "no_route");
+        BlindRelayError::NoRoute
+    })?;
+
+    let endpoint = descriptor
+        .descriptor
+        .public_endpoint
+        .as_deref()
+        .ok_or_else(|| {
+            state.peer_store.record_audit_event(
+                now,
+                "blind_relay_forward",
+                "rejected",
+                "missing_endpoint",
+            );
+            BlindRelayError::InvalidEndpoint
+        })?;
+    let url = blind_peer_relay_url(endpoint).ok_or_else(|| {
+        state.peer_store.record_audit_event(
+            now,
+            "blind_relay_forward",
+            "rejected",
+            "invalid_endpoint",
+        );
+        BlindRelayError::InvalidEndpoint
+    })?;
+
+    let forwarded_envelope = envelope
+        .decremented_ttl()
+        .ok_or(BlindRelayError::TtlExhausted)?
+        .sign_with(state.node_identity.as_ref());
+    let ttl_remaining = forwarded_envelope.ttl;
+
+    let response = state
+        .http_client
+        .post(&url)
+        .json(&PeerBlindRelayRequest {
+            envelope: forwarded_envelope,
+            previous_hop_node_id: self_node_id,
+        })
+        .send()
+        .await
+        .map_err(|error| {
+            debug!(
+                reason = %classify_reqwest_error("blind_relay_request", &error),
+                "[BLIND_RELAY] Next-hop forward failed"
+            );
+            state.peer_store.record_audit_event(
+                now,
+                "blind_relay_forward",
+                "rejected",
+                "request_failed",
+            );
+            BlindRelayError::ForwardFailed
+        })?;
+
+    if !response.status().is_success() {
+        debug!(
+            status = %response.status(),
+            "[BLIND_RELAY] Next-hop returned non-success"
+        );
+        state.peer_store.record_audit_event(
+            now,
+            "blind_relay_forward",
+            "rejected",
+            format!("http_{}", response.status().as_u16()),
+        );
+        return Err(BlindRelayError::ForwardFailed);
+    }
+
+    state.peer_store.record_audit_event(
+        now,
+        "blind_relay_forward",
+        "accepted",
+        format!("ttl_remaining={ttl_remaining} encrypted_blob_bytes=opaque"),
+    );
+
+    Ok(PeerBlindRelayResponse {
+        accepted: true,
+        terminal: false,
+        forwarded: true,
+        ttl_remaining,
+        reason: Some("forwarded".to_string()),
+    })
+}
+
+fn validate_blind_relay_envelope(
+    envelope: &BlindRelayEnvelope,
+    previous_hop_node_id: &[u8; 32],
+) -> Result<(), BlindRelayError> {
+    let previous_hop = IdentityPublicKey::from_bytes(previous_hop_node_id)
+        .map_err(|_| BlindRelayError::InvalidPreviousHop)?;
+    envelope
+        .verify_signature_from(&previous_hop)
+        .map_err(|_| BlindRelayError::InvalidSignature)?;
+    encode_blind_relay_envelope(envelope).map_err(|_| BlindRelayError::EnvelopeTooLarge)?;
+    Ok(())
+}
+
+fn blind_peer_relay_url(endpoint: &str) -> Option<String> {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    if endpoint.is_empty() {
+        return None;
+    }
+    let base = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    };
+    Some(format!("{base}/api/chat/peer/blind-relay"))
+}
+
+fn classify_reqwest_error(phase: &str, error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        return format!("{phase}_timeout");
+    }
+    if error.is_connect() {
+        return format!("{phase}_connect");
+    }
+    if error.is_status() {
+        if let Some(status) = error.status() {
+            return format!("{phase}_http_{}", status.as_u16());
+        }
+        return format!("{phase}_http_status");
+    }
+    if error.is_decode() {
+        return format!("{phase}_decode");
+    }
+    if error.is_body() {
+        return format!("{phase}_body");
+    }
+    if error.is_request() {
+        return format!("{phase}_request");
+    }
+    format!("{phase}_unknown")
 }
 
 fn validate_peer_envelope(envelope: &ChatEnvelope) -> Result<(), ChatPeerRelayError> {
@@ -378,10 +691,20 @@ mod tests {
         );
         let sessions = Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60)));
         let udp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let peer_store = Arc::new(PeerStore::new());
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let http_client = Arc::new(reqwest::Client::new());
         let envelope = signed_envelope();
         let receiver = envelope.receiver;
 
-        let app = build_chat_peer_router(Some(Arc::clone(&relay)), sessions, udp);
+        let app = build_chat_peer_router(
+            Some(Arc::clone(&relay)),
+            sessions,
+            udp,
+            peer_store,
+            node_identity,
+            http_client,
+        );
         let body = serde_json::to_vec(&PeerChatRelayRequest { envelope }).unwrap();
         let response = app
             .oneshot(
@@ -403,5 +726,65 @@ mod tests {
         assert_eq!(messages.len(), 1);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn blind_relay_endpoint_terminal_accepts_opaque_blob_without_parsing() {
+        let previous_hop = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let sessions = Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60)));
+        let udp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let peer_store = Arc::new(PeerStore::new());
+        let http_client = Arc::new(reqwest::Client::new());
+        let opaque_blob = br#"{"looks_like":"json","must_not_be_parsed":true}"#.to_vec();
+        let envelope = BlindRelayEnvelope {
+            route_id: [0x41u8; 16],
+            next_hop: node_identity.public_key_bytes(),
+            ttl: 2,
+            encrypted_blob: opaque_blob,
+            timestamp: 1_800_000_001,
+            signature: [0u8; 64],
+        }
+        .sign_with(&previous_hop);
+
+        let app = build_chat_peer_router(
+            None,
+            sessions,
+            udp,
+            Arc::clone(&peer_store),
+            node_identity,
+            http_client,
+        );
+        let body = serde_json::to_vec(&PeerBlindRelayRequest {
+            envelope,
+            previous_hop_node_id: previous_hop.public_key_bytes(),
+        })
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/blind-relay")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: PeerBlindRelayResponse = serde_json::from_slice(&body).unwrap();
+
+        assert!(parsed.accepted);
+        assert!(parsed.terminal);
+        assert!(!parsed.forwarded);
+        assert_eq!(parsed.ttl_remaining, 2);
+        assert!(peer_store
+            .recent_audit_events()
+            .iter()
+            .any(|event| event.action == "blind_relay_terminal"));
     }
 }

@@ -1276,6 +1276,13 @@ impl Server {
         let vpn_health_config = self.config.clone();
         let discovery_api_policy = DiscoveryApiPolicy::from_config(&self.config.discovery);
         let public_api_listen_addr = self.config.discovery.public_api_listen_addr;
+        let node_identity = Arc::new(self.identity.clone());
+        let peer_http_client = Arc::new(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+        );
 
         tokio::spawn(async move {
             if let Some(public_addr) = public_api_listen_addr {
@@ -1285,6 +1292,8 @@ impl Server {
                     chat_relay.clone(),
                     Arc::clone(&sessions),
                     Arc::clone(&udp),
+                    Arc::clone(&node_identity),
+                    Arc::clone(&peer_http_client),
                 );
                 tokio::spawn(async move {
                     Self::serve_public_discovery_api(public_addr, public_app, shutdown_rx_public)
@@ -1308,6 +1317,9 @@ impl Server {
                     chat_relay,
                     Arc::clone(&sessions),
                     udp,
+                    Arc::clone(&peer_store),
+                    node_identity,
+                    peer_http_client,
                 ))
                 .merge(build_discovery_router(peer_store, discovery_api_policy));
 
@@ -1389,9 +1401,19 @@ impl Server {
         chat_relay: Option<Arc<ChatRelayService>>,
         sessions: Arc<SessionManager>,
         udp: Arc<UdpTransport>,
+        node_identity: Arc<IdentityKeyPair>,
+        peer_http_client: Arc<reqwest::Client>,
     ) -> axum::Router {
-        build_discovery_router(peer_store, discovery_api_policy)
-            .merge(build_chat_peer_router(chat_relay, sessions, udp))
+        build_discovery_router(Arc::clone(&peer_store), discovery_api_policy).merge(
+            build_chat_peer_router(
+                chat_relay,
+                sessions,
+                udp,
+                peer_store,
+                node_identity,
+                peer_http_client,
+            ),
+        )
     }
 
     async fn serve_public_discovery_api(
@@ -1402,7 +1424,7 @@ impl Server {
         let listener = match tokio::net::TcpListener::bind(listen_addr).await {
             Ok(listener) => {
                 info!(
-                    "[DISCOVERY] Public discovery API on http://{} (routes: /api/discovery/*, /api/chat/peer/relay)",
+                    "[DISCOVERY] Public discovery API on http://{} (routes: /api/discovery/*, /api/chat/peer/relay, /api/chat/peer/blind-relay)",
                     listen_addr
                 );
                 listener
