@@ -45,6 +45,8 @@
 //! state, transport model, and AeroNyx protocol runtime usage. It avoids requiring
 //! backend or UI code to infer AeroNyx privacy protocol readiness from several
 //! lower-level fields, and it remains aggregate operations metadata only.
+//! Packet runtime telemetry reports process-local aggregate packet counters so
+//! operators can diagnose restart recovery pressure without reading raw journals.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -60,6 +62,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
 use crate::config::ServerConfig;
+use crate::handlers::packet::{PacketHandler, PacketRuntimeStatus};
 use crate::management::integrity;
 use crate::services::session::CLIENT_LIVENESS_TIMEOUT_SECS;
 use crate::services::{
@@ -84,6 +87,7 @@ pub struct VpnHealthState {
     node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
     encrypted_message_counter: Arc<AtomicU64>,
+    packet_handler: Arc<PacketHandler>,
 }
 
 #[derive(Debug, Serialize)]
@@ -327,6 +331,7 @@ struct VpnHealthResponse {
     policy_enforcement: NodePolicyEnforcementSnapshot,
     placement_readiness: NodePolicyPlacementSnapshot,
     capacity: VpnCapacityStatus,
+    packet_runtime: PacketRuntimeStatus,
     recent_errors: Vec<RecentErrorEvent>,
     upgrade_status: NodeUpgradeStatus,
     operator_action: OperatorActionSummary,
@@ -396,6 +401,7 @@ pub fn build_vpn_health_router(
     node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
     encrypted_message_counter: Arc<AtomicU64>,
+    packet_handler: Arc<PacketHandler>,
 ) -> Router {
     Router::new()
         .route("/api/vpn/health", get(vpn_health_handler))
@@ -411,6 +417,7 @@ pub fn build_vpn_health_router(
             node_policy,
             voucher_verifier,
             encrypted_message_counter,
+            packet_handler,
         })
 }
 
@@ -438,6 +445,7 @@ pub async fn collect_vpn_health_value(
     node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
     encrypted_message_counter: Arc<AtomicU64>,
+    packet_handler: Arc<PacketHandler>,
 ) -> Value {
     let state = VpnHealthState {
         config,
@@ -446,6 +454,7 @@ pub async fn collect_vpn_health_value(
         node_policy,
         voucher_verifier,
         encrypted_message_counter,
+        packet_handler,
     };
     serde_json::to_value(collect_vpn_health_response(state).await).unwrap_or_else(|e| {
         serde_json::json!({
@@ -474,6 +483,7 @@ pub async fn collect_node_operator_status_value(
     node_policy: Arc<NodePolicyRuntime>,
     voucher_verifier: Arc<VoucherVerifier>,
     encrypted_message_counter: Arc<AtomicU64>,
+    packet_handler: Arc<PacketHandler>,
 ) -> Value {
     let state = VpnHealthState {
         config,
@@ -482,6 +492,7 @@ pub async fn collect_node_operator_status_value(
         node_policy,
         voucher_verifier,
         encrypted_message_counter,
+        packet_handler,
     };
     serde_json::to_value(collect_node_operator_status_response(state).await).unwrap_or_else(|e| {
         serde_json::json!({
@@ -548,6 +559,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         active_sessions,
     )
     .await;
+    let packet_runtime = state.packet_handler.runtime_status();
     let runtime = collect_runtime_version_status().await;
     let recent_errors = collect_recent_error_events(VPN_SERVICE_NAME).await;
     let upgrade_status = collect_upgrade_status().await;
@@ -591,6 +603,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         policy_enforcement,
         placement_readiness,
         capacity,
+        packet_runtime,
         recent_errors,
         upgrade_status,
         operator_action,
@@ -665,6 +678,7 @@ async fn collect_node_operator_status_response(
             "runtime": runtime_version.clone(),
             "placement_readiness": vpn_health.placement_readiness,
             "capacity": vpn_health.capacity,
+            "packet_runtime": vpn_health.packet_runtime,
             "recent_errors": vpn_health.recent_errors,
             "upgrade_status": vpn_health.upgrade_status.clone(),
             "operator_action": vpn_health.operator_action.clone(),

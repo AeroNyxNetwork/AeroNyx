@@ -354,6 +354,7 @@ impl Server {
                 Arc::clone(&node_policy),
                 Arc::clone(&voucher_verifier),
                 Arc::clone(&encrypted_message_counter),
+                Arc::clone(&packet_handler),
                 Arc::clone(&peer_store),
                 chat_relay.clone(),
                 chat_relay_enabled,
@@ -595,6 +596,7 @@ impl Server {
                 Arc::clone(&node_policy),
                 Arc::clone(&voucher_verifier),
                 Arc::clone(&encrypted_message_counter),
+                Arc::clone(&packet_handler),
                 Arc::clone(&peer_store),
                 chat_relay.clone(),
                 Arc::clone(&udp),
@@ -1233,6 +1235,7 @@ impl Server {
         node_policy: Arc<NodePolicyRuntime>,
         voucher_verifier: Arc<VoucherVerifier>,
         encrypted_message_counter: Arc<AtomicU64>,
+        packet_handler: Arc<PacketHandler>,
         peer_store: Arc<PeerStore>,
         chat_relay: Option<Arc<ChatRelayService>>,
         udp: Arc<UdpTransport>,
@@ -1271,6 +1274,7 @@ impl Server {
                     node_policy,
                     voucher_verifier,
                     encrypted_message_counter,
+                    packet_handler,
                 ))
                 .merge(build_chat_peer_router(
                     chat_relay,
@@ -1408,6 +1412,7 @@ impl Server {
         node_policy: Arc<NodePolicyRuntime>,
         voucher_verifier: Arc<VoucherVerifier>,
         encrypted_message_counter: Arc<AtomicU64>,
+        packet_handler: Arc<PacketHandler>,
         peer_store: Arc<PeerStore>,
         chat_relay: Option<Arc<ChatRelayService>>,
         chat_relay_enabled: bool,
@@ -1471,6 +1476,7 @@ impl Server {
         let vpn_health_policy = Arc::clone(&node_policy);
         let vpn_health_verifier = Arc::clone(&voucher_verifier);
         let vpn_health_message_counter = Arc::clone(&encrypted_message_counter);
+        let vpn_health_packet_handler = Arc::clone(&packet_handler);
         heartbeat = heartbeat.with_vpn_health_status(Box::new(move || {
             let config = vpn_health_config.clone();
             let ip_pool = Arc::clone(&vpn_health_ip_pool);
@@ -1478,6 +1484,7 @@ impl Server {
             let node_policy = Arc::clone(&vpn_health_policy);
             let verifier = Arc::clone(&vpn_health_verifier);
             let message_counter = Arc::clone(&vpn_health_message_counter);
+            let packet_handler = Arc::clone(&vpn_health_packet_handler);
             Box::pin(async move {
                 Some(
                     collect_vpn_health_value(
@@ -1487,6 +1494,7 @@ impl Server {
                         node_policy,
                         verifier,
                         message_counter,
+                        packet_handler,
                     )
                     .await,
                 )
@@ -1499,6 +1507,7 @@ impl Server {
         let operator_status_policy = Arc::clone(&node_policy);
         let operator_status_verifier = Arc::clone(&voucher_verifier);
         let operator_status_message_counter = Arc::clone(&encrypted_message_counter);
+        let operator_status_packet_handler = Arc::clone(&packet_handler);
         heartbeat = heartbeat.with_operator_status(Box::new(move || {
             let config = operator_status_config.clone();
             let ip_pool = Arc::clone(&operator_status_ip_pool);
@@ -1506,6 +1515,7 @@ impl Server {
             let node_policy = Arc::clone(&operator_status_policy);
             let verifier = Arc::clone(&operator_status_verifier);
             let message_counter = Arc::clone(&operator_status_message_counter);
+            let packet_handler = Arc::clone(&operator_status_packet_handler);
             Box::pin(async move {
                 Some(
                     collect_node_operator_status_value(
@@ -1515,6 +1525,7 @@ impl Server {
                         node_policy,
                         verifier,
                         message_counter,
+                        packet_handler,
                     )
                     .await,
                 )

@@ -40,6 +40,8 @@
 //   v1.0.2-UnknownSessionLogGate — aggregate/rate-limit stale session logs
 //   v1.0.3-UnknownSessionLogGate — tighten aggregate warning cadence to every
 //     1000 stale packets after live restart validation on US1.
+//   v1.0.4-PacketRuntimeStatus — expose privacy-safe packet counters for
+//     vpn_health/heartbeat so operators do not need raw journal access.
 // ============================================
 
 use std::net::Ipv4Addr;
@@ -89,6 +91,28 @@ pub const DISC_VOICE_END: u32 = 33;
 // ============================================
 // DecryptedPayload
 // ============================================
+
+/// Privacy-safe packet runtime snapshot for node health reporting.
+///
+/// This intentionally contains only aggregate counters. It does not include
+/// session IDs, wallet IDs, client public IPs, destinations, DNS contents,
+/// packet payloads, domains, URLs, browsing history, voucher secrets, chat
+/// plaintext, ciphertext, private keys, or wallet-level traffic.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PacketRuntimeStatus {
+    /// Successful encrypted AeroNyx privacy protocol VPN data packets.
+    pub encrypted_vpn_packets: u64,
+    /// Packets dropped because the session id is no longer present locally.
+    pub unknown_session_packets: u64,
+    /// Current in-memory active sessions, used only for operator context.
+    pub active_sessions: usize,
+    /// Compact operator status for stale packet pressure.
+    pub unknown_session_status: &'static str,
+    /// Stable source marker for backend/nodeboard consumers.
+    pub source: &'static str,
+    /// Explicit privacy boundary for future integrations.
+    pub privacy_boundary: &'static str,
+}
 
 /// Result of decrypting an incoming DataPacket.
 ///
@@ -506,6 +530,40 @@ impl PacketHandler {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Returns aggregate packet counters for heartbeat and nodeboard health.
+    ///
+    /// Source path:
+    ///   /root/open/AeroNyx/crates/aeronyx-server/src/handlers/packet.rs
+    ///
+    /// These counters are process-local runtime telemetry. They are meant to
+    /// reveal restart recovery pressure and encrypted packet volume without
+    /// requiring raw logs or any per-user traffic details.
+    pub fn runtime_status(&self) -> PacketRuntimeStatus {
+        let unknown_session_packets = self.unknown_session_counter.load(Ordering::Relaxed);
+        let active_sessions = self.sessions.count();
+        let unknown_session_status = if unknown_session_packets == 0 {
+            "clear"
+        } else if active_sessions == 0 {
+            "stale_after_restart"
+        } else {
+            "watch"
+        };
+
+        PacketRuntimeStatus {
+            encrypted_vpn_packets: self.encrypted_message_counter.load(Ordering::Relaxed),
+            unknown_session_packets,
+            active_sessions,
+            unknown_session_status,
+            source: "rust_packet_handler_runtime_counters",
+            privacy_boundary: concat!(
+                "aggregate packet counters only; no session ids, wallet ids, ",
+                "client public IPs, destinations, DNS contents, packet payloads, ",
+                "domains, URLs, browsing history, voucher secrets, chat plaintext, ",
+                "ciphertext, private keys, or wallet-level traffic"
+            ),
+        }
+    }
+
     /// Builds an encrypted in-tunnel ICMP Echo Request for RTT measurement.
     ///
     /// Source path:
@@ -795,5 +853,27 @@ mod tests {
         );
 
         assert!(extract_pubkey_from_json(br#"{"type":"offer"}"#).is_none());
+    }
+
+    #[test]
+    fn test_runtime_status_starts_clear_and_privacy_safe() {
+        let encrypted_message_counter = Arc::new(AtomicU64::new(0));
+        let handler = PacketHandler::new(
+            Arc::new(SessionManager::new(16, Duration::from_secs(60))),
+            Arc::new(RoutingService::new()),
+            Arc::new(TrafficTracker::new()),
+            Arc::clone(&encrypted_message_counter),
+            Arc::new(NodePolicyRuntime::default()),
+        );
+
+        let status = handler.runtime_status();
+        assert_eq!(status.encrypted_vpn_packets, 0);
+        assert_eq!(status.unknown_session_packets, 0);
+        assert_eq!(status.active_sessions, 0);
+        assert_eq!(status.unknown_session_status, "clear");
+        assert_eq!(status.source, "rust_packet_handler_runtime_counters");
+        assert!(status
+            .privacy_boundary
+            .contains("aggregate packet counters"));
     }
 }
