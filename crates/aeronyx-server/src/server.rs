@@ -2400,19 +2400,20 @@ impl Server {
         let mut accepted = 0usize;
         let mut last_failure_reason: Option<String> = None;
 
-        for peer in peer_store
-            .route_candidates_with_capability(
-                NodeCapability::ChatRelay,
-                now,
-                CHAT_PEER_RELAY_FANOUT_LIMIT,
-            )
-            .into_iter()
-            .filter(|peer| peer.node_id() != *self_node_id)
-        {
+        let excluded_node_ids = [*self_node_id];
+        for peer in peer_store.route_candidates_with_capability_excluding(
+            NodeCapability::ChatRelay,
+            now,
+            CHAT_PEER_RELAY_FANOUT_LIMIT,
+            &excluded_node_ids,
+        ) {
+            let peer_node_id = peer.node_id();
             let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
+                peer_store.record_route_forward_failure(&peer_node_id, now, "missing_endpoint");
                 continue;
             };
             let Some(url) = Self::chat_peer_relay_url(endpoint) else {
+                peer_store.record_route_forward_failure(&peer_node_id, now, "invalid_endpoint");
                 continue;
             };
 
@@ -2428,10 +2429,12 @@ impl Server {
             match response {
                 Ok(response) if response.status().is_success() => {
                     accepted += 1;
+                    peer_store.record_route_forward_success(&peer_node_id, now);
                 }
                 Ok(response) => {
-                    last_failure_reason =
-                        Some(format!("peer_relay_http_{}", response.status().as_u16()));
+                    let reason = format!("peer_relay_http_{}", response.status().as_u16());
+                    peer_store.record_route_forward_failure(&peer_node_id, now, reason.clone());
+                    last_failure_reason = Some(reason);
                     debug!(
                         peer = %url,
                         status = %response.status(),
@@ -2439,8 +2442,9 @@ impl Server {
                     );
                 }
                 Err(error) => {
-                    last_failure_reason =
-                        Some(Self::classify_reqwest_error("peer_relay_request", &error));
+                    let reason = Self::classify_reqwest_error("peer_relay_request", &error);
+                    peer_store.record_route_forward_failure(&peer_node_id, now, reason.clone());
+                    last_failure_reason = Some(reason);
                     debug!(
                         peer = %url,
                         error = %error,
@@ -3758,6 +3762,8 @@ mod tests {
             .as_secs();
         let peer_store = PeerStore::new();
         let peer_descriptor = signed_chat_relay_peer_descriptor(endpoint, now, now + 300);
+        let peer_node_id = peer_descriptor.node_id();
+        let peer_prefix = hex::encode(&peer_node_id[..4]);
         peer_store
             .upsert_verified(peer_descriptor, now)
             .expect("mock peer descriptor should verify");
@@ -3774,6 +3780,15 @@ mod tests {
 
         assert_eq!(accepted, 1);
         assert_eq!(received.load(AtomicOrdering::SeqCst), 1);
+        let route_status = peer_store.route_candidate_status(now + 1);
+        let row = route_status
+            .chat_relay
+            .iter()
+            .find(|row| row.node_id_prefix == peer_prefix)
+            .expect("mock peer should remain in route candidate status");
+        assert_eq!(row.route_health, "healthy");
+        assert_eq!(row.route_consecutive_failures, 0);
+        assert_eq!(row.last_route_success_at, Some(now));
         mock_peer.abort();
     }
 

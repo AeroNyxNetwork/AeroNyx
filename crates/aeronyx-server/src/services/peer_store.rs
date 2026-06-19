@@ -33,8 +33,10 @@
 //!   node-level signed descriptor metadata and never encrypted payload content
 //! - Blind relay runtime counters and drop reason buckets for nodeboard,
 //!   without exposing encrypted payloads, peer endpoint URLs, or user metadata
-//! - Per-peer blind relay route health feedback so failed next hops are
+//! - Per-peer node-to-node route health feedback so failed next hops are
 //!   naturally deprioritized without exposing payloads or full peer endpoints
+//! - Exclude-list route candidate selection so server internals can remove
+//!   self or already-used hops before applying fanout/path limits
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -61,6 +63,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.18.0-RouteCandidateExclusion - Added exclude-before-limit route selection
 //! v0.17.0-RouteHealthFeedback - Added per-peer blind relay success/failure scoring
 //! v0.16.0-BlindRelayRuntimeStats - Added blind relay drop reason counters
 //! v0.13.0-GossipBackpressureStatus - Added outbound gossip jitter/backpressure status
@@ -527,9 +530,9 @@ pub struct PeerStoreRouteCandidate {
     pub route_failure_count: u64,
     /// Consecutive route failures since the last successful forward.
     pub route_consecutive_failures: u64,
-    /// Last successful blind relay forward to this candidate.
+    /// Last successful node-to-node relay forward to this candidate.
     pub last_route_success_at: Option<u64>,
-    /// Last failed blind relay forward to this candidate.
+    /// Last failed node-to-node relay forward to this candidate.
     pub last_route_failure_at: Option<u64>,
     /// Coarse failure reason bucket from the last failed forward.
     pub last_route_failure_reason: Option<String>,
@@ -1274,7 +1277,7 @@ impl PeerStore {
         self.record_audit_event(now, "blind_relay_forward", "rejected", reason.to_string());
     }
 
-    /// Records successful opaque forwarding to a verified next hop.
+    /// Records successful opaque node-to-node forwarding to a verified next hop.
     ///
     /// The key is retained only inside this process for route health scoring.
     /// Public status exposes only a short prefix and aggregate counters. Never
@@ -1294,7 +1297,7 @@ impl PeerStore {
         );
     }
 
-    /// Records failed opaque forwarding to a verified next hop.
+    /// Records failed opaque node-to-node forwarding to a verified next hop.
     ///
     /// The reason must be a stable coarse bucket such as `request_failed` or
     /// `http_502`; no endpoint URL, route id, ciphertext, receiver, or client
@@ -1452,8 +1455,36 @@ impl PeerStore {
         now: u64,
         limit: usize,
     ) -> Vec<SignedNodeDescriptor> {
-        self.scored_route_candidates(capability, now, Some(limit))
+        self.route_candidates_with_capability_excluding(capability, now, limit, &[])
+    }
+
+    /// Returns health-ranked route candidates after excluding specific node ids.
+    ///
+    /// Exclusion happens before the limit is applied. This matters for fanout
+    /// and future controlled multi-hop planning: self, already-used hops, or
+    /// policy-excluded peers must not consume the limited candidate budget.
+    ///
+    /// The selection still uses only signed node descriptor metadata plus local
+    /// node-to-node route health. It never reads encrypted blobs, plaintext,
+    /// client IPs, destinations, DNS contents, voucher secrets, private keys,
+    /// or wallet-level traffic.
+    #[must_use]
+    pub fn route_candidates_with_capability_excluding(
+        &self,
+        capability: NodeCapability,
+        now: u64,
+        limit: usize,
+        excluded_node_ids: &[[u8; 32]],
+    ) -> Vec<SignedNodeDescriptor> {
+        self.scored_route_candidates(capability, now, None)
             .into_iter()
+            .filter(|candidate| {
+                let node_id = candidate.descriptor.node_id();
+                !excluded_node_ids
+                    .iter()
+                    .any(|excluded| *excluded == node_id)
+            })
+            .take(limit)
             .map(|candidate| candidate.descriptor)
             .collect()
     }
@@ -2285,6 +2316,43 @@ mod tests {
         assert_eq!(recovered_row.route_health, "healthy");
         assert_eq!(recovered_row.route_consecutive_failures, 0);
         assert_eq!(recovered_row.last_route_success_at, Some(now + 5));
+    }
+
+    #[test]
+    fn test_route_candidates_apply_exclusion_before_limit_for_self_filtering() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let self_kp = IdentityKeyPair::generate();
+        let peer_kp = IdentityKeyPair::generate();
+
+        let mut self_descriptor = signed_descriptor_for(&self_kp, 1, now + 2_000);
+        self_descriptor.descriptor.public_endpoint = Some("https://self.example".to_string());
+        self_descriptor.descriptor.capacity.max_sessions = 1024;
+        self_descriptor = SignedNodeDescriptor::sign(self_descriptor.descriptor, &self_kp).unwrap();
+        let self_node_id = self_descriptor.node_id();
+
+        let mut peer_descriptor = signed_descriptor_for(&peer_kp, 1, now + 2_000);
+        peer_descriptor.descriptor.public_endpoint = Some("https://peer.example".to_string());
+        peer_descriptor.descriptor.capacity.max_sessions = 32;
+        peer_descriptor = SignedNodeDescriptor::sign(peer_descriptor.descriptor, &peer_kp).unwrap();
+        let peer_node_id = peer_descriptor.node_id();
+
+        store
+            .upsert_verified_from_source(self_descriptor, now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(peer_descriptor, now, "gossip_announce")
+            .unwrap();
+
+        let candidates = store.route_candidates_with_capability_excluding(
+            NodeCapability::ChatRelay,
+            now,
+            1,
+            &[self_node_id],
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].node_id(), peer_node_id);
     }
 
     #[test]
