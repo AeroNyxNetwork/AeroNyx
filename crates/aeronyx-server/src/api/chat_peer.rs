@@ -51,8 +51,12 @@
 //! - Blind relay rejects immediate self/previous-hop loops using only node-level
 //!   route metadata, preserving the "blind relay" invariant while preparing
 //!   for future controlled multi-hop/onion routing.
+//! - Blind relay keeps a bounded local `route_id` replay cache. The cache is
+//!   in-memory only, stores no payload/peer endpoint/user data, and prevents a
+//!   repeated encrypted route frame from being forwarded twice by this node.
 //!
 //! ## Last Modified
+//! v0.9.0-BlindRelayReplayGuard - Drop duplicate route_id frames idempotently
 //! v0.8.0-BlindRelayLoopGuard - Reject immediate self/previous-hop relay loops
 //! v0.7.0-BlindRelayRetryStats - Report retry recovery/exhaustion to PeerStore status
 //! v0.6.0-BlindRelayRetryJitter - Retry transient next-hop blind relay failures with privacy-safe jitter
@@ -64,9 +68,10 @@
 // ============================================================================
 
 use std::{
+    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -122,6 +127,15 @@ const BLIND_RELAY_RETRY_BASE_MS: u64 = 25;
 /// Extra deterministic jitter window used to avoid retry herds.
 const BLIND_RELAY_RETRY_JITTER_MS: u64 = 35;
 
+/// Maximum route ids retained by one node for blind relay replay suppression.
+///
+/// The value is deliberately small and local-only: it prevents immediate
+/// replay amplification without becoming a durable route history.
+const MAX_BLIND_RELAY_SEEN_ROUTES: usize = 8192;
+
+/// Replay cache horizon for blind relay route ids.
+const BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS: u64 = 10 * 60;
+
 // ============================================
 // State / Request / Response Types
 // ============================================
@@ -135,6 +149,55 @@ struct ChatPeerState {
     node_identity: Arc<IdentityKeyPair>,
     http_client: Arc<reqwest::Client>,
     blind_relay_in_flight: Arc<AtomicUsize>,
+    blind_relay_seen_routes: Arc<Mutex<BlindRelayRouteReplayCache>>,
+}
+
+#[derive(Debug, Default)]
+struct BlindRelayRouteReplayCache {
+    seen: HashMap<[u8; 16], u64>,
+    order: VecDeque<[u8; 16]>,
+}
+
+impl BlindRelayRouteReplayCache {
+    fn observe(&mut self, route_id: [u8; 16], now: u64) -> bool {
+        self.evict_expired(now);
+        if self.seen.contains_key(&route_id) {
+            return true;
+        }
+
+        self.seen.insert(route_id, now);
+        self.order.push_back(route_id);
+        self.evict_over_capacity();
+        false
+    }
+
+    fn evict_expired(&mut self, now: u64) {
+        while let Some(route_id) = self.order.front().copied() {
+            let Some(first_seen_at) = self.seen.get(&route_id).copied() else {
+                self.order.pop_front();
+                continue;
+            };
+            if now.saturating_sub(first_seen_at) <= BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS {
+                break;
+            }
+            self.order.pop_front();
+            self.seen.remove(&route_id);
+        }
+    }
+
+    fn evict_over_capacity(&mut self) {
+        while self.seen.len() > MAX_BLIND_RELAY_SEEN_ROUTES {
+            if let Some(route_id) = self.order.pop_front() {
+                self.seen.remove(&route_id);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn forget(&mut self, route_id: &[u8; 16]) {
+        self.seen.remove(route_id);
+    }
 }
 
 /// Node-to-node encrypted envelope relay request.
@@ -302,6 +365,7 @@ pub fn build_chat_peer_router(
         node_identity,
         http_client,
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+        blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
     };
 
     Router::new()
@@ -493,7 +557,11 @@ async fn process_peer_blind_relay(
             .record_blind_relay_rejected(now, "self_loop");
         return Err(BlindRelayError::RouteLoop);
     }
+
     if envelope.next_hop == self_node_id {
+        if observe_blind_relay_route(&state, envelope.route_id, now) {
+            return Ok(duplicate_blind_relay_response(&state, now, envelope.ttl));
+        }
         state.peer_store.record_blind_relay_terminal(
             now,
             envelope.ttl,
@@ -553,13 +621,17 @@ async fn process_peer_blind_relay(
         BlindRelayError::InvalidEndpoint
     })?;
 
+    if observe_blind_relay_route(&state, envelope.route_id, now) {
+        return Ok(duplicate_blind_relay_response(&state, now, envelope.ttl));
+    }
+
     let forwarded_envelope = envelope
         .decremented_ttl()
         .ok_or(BlindRelayError::TtlExhausted)?
         .sign_with(state.node_identity.as_ref());
     let ttl_remaining = forwarded_envelope.ttl;
 
-    forward_blind_relay_with_retry(
+    if let Err(error) = forward_blind_relay_with_retry(
         &state,
         &url,
         next_hop,
@@ -569,7 +641,11 @@ async fn process_peer_blind_relay(
         },
         now,
     )
-    .await?;
+    .await
+    {
+        forget_blind_relay_route(&state, &envelope.route_id);
+        return Err(error);
+    }
 
     state
         .peer_store
@@ -585,6 +661,39 @@ async fn process_peer_blind_relay(
         ttl_remaining,
         reason: Some("forwarded".to_string()),
     })
+}
+
+fn observe_blind_relay_route(state: &ChatPeerState, route_id: [u8; 16], now: u64) -> bool {
+    let mut seen_routes = state
+        .blind_relay_seen_routes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    seen_routes.observe(route_id, now)
+}
+
+fn forget_blind_relay_route(state: &ChatPeerState, route_id: &[u8; 16]) {
+    let mut seen_routes = state
+        .blind_relay_seen_routes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    seen_routes.forget(route_id);
+}
+
+fn duplicate_blind_relay_response(
+    state: &ChatPeerState,
+    now: u64,
+    ttl_remaining: u8,
+) -> PeerBlindRelayResponse {
+    state
+        .peer_store
+        .record_blind_relay_rejected(now, "duplicate_route");
+    PeerBlindRelayResponse {
+        accepted: true,
+        terminal: false,
+        forwarded: false,
+        ttl_remaining,
+        reason: Some("duplicate_route".to_string()),
+    }
 }
 
 async fn forward_blind_relay_with_retry(
@@ -1016,6 +1125,7 @@ mod tests {
             node_identity: Arc::new(IdentityKeyPair::generate()),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
         };
 
         assert!(BlindRelayInFlightGuard::try_acquire(&state).is_none());
@@ -1034,6 +1144,7 @@ mod tests {
             node_identity,
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x44u8; 16],
@@ -1064,6 +1175,78 @@ mod tests {
             event.action == "blind_relay_forward"
                 && event.outcome == "rejected"
                 && event.detail == "route_loop"
+        }));
+    }
+
+    #[test]
+    fn blind_relay_replay_cache_forgets_failed_route_ids() {
+        let mut cache = BlindRelayRouteReplayCache::default();
+        let route_id = [0x46u8; 16];
+
+        assert!(!cache.observe(route_id, 1_800_000_000));
+        assert!(cache.observe(route_id, 1_800_000_001));
+        cache.forget(&route_id);
+        assert!(!cache.observe(route_id, 1_800_000_002));
+    }
+
+    #[tokio::test]
+    async fn blind_relay_drops_duplicate_route_id_without_forwarding_again() {
+        let previous_hop = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let peer_store = Arc::new(PeerStore::new());
+        let state = ChatPeerState {
+            chat_relay: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&node_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+        };
+        let envelope = BlindRelayEnvelope {
+            route_id: [0x45u8; 16],
+            next_hop: node_identity.public_key_bytes(),
+            ttl: 2,
+            encrypted_blob: b"opaque encrypted replay candidate".to_vec(),
+            timestamp: now_secs(),
+            signature: [0u8; 64],
+        }
+        .sign_with(&previous_hop);
+
+        let first = process_peer_blind_relay(
+            state.clone(),
+            PeerBlindRelayRequest {
+                envelope: envelope.clone(),
+                previous_hop_node_id: previous_hop.public_key_bytes(),
+            },
+        )
+        .await
+        .unwrap();
+        let duplicate = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: previous_hop.public_key_bytes(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(first.terminal);
+        assert!(!duplicate.terminal);
+        assert!(!duplicate.forwarded);
+        assert_eq!(duplicate.reason.as_deref(), Some("duplicate_route"));
+        let blind_stats = peer_store.status(now_secs() + 1).runtime.blind_relay;
+        assert_eq!(blind_stats.received, 2);
+        assert_eq!(blind_stats.terminal, 1);
+        assert_eq!(blind_stats.forwarded, 0);
+        assert_eq!(blind_stats.rejected, 1);
+        assert_eq!(blind_stats.replay_dropped, 1);
+        assert!(peer_store.recent_audit_events().iter().any(|event| {
+            event.action == "blind_relay_forward"
+                && event.outcome == "rejected"
+                && event.detail == "duplicate_route"
         }));
     }
 
@@ -1119,6 +1302,7 @@ mod tests {
             node_identity,
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x42u8; 16],
@@ -1199,6 +1383,7 @@ mod tests {
             node_identity,
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x43u8; 16],
