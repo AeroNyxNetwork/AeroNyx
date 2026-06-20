@@ -58,6 +58,9 @@
 //! - Peer-cache startup recovery evidence that records cache/backup load
 //!   status separately from generic bootstrap source status, so nodeboard can
 //!   diagnose restart recovery without exposing cache paths or peer endpoints
+//! - Network story status that converts peer summary, route candidates, and
+//!   discovery stability into a product-facing aggregate readiness bucket for
+//!   app/nodeboard/website surfaces without exposing endpoints or user data
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -84,6 +87,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.28.0-NetworkStoryStatus - Added product-facing aggregate discovery readiness story
 //! v0.27.0-PeerCacheRecoveryEvidence - Added peer-cache load evidence and restart recovery sources
 //! v0.26.0-PeerHealthSummary - Added privacy-safe per-peer health summary
 //! v0.25.0-BlindRelayAbuseGuard - Added aggregate rate-limit/quarantine counters
@@ -504,6 +508,55 @@ pub struct PeerStoreStatus {
     /// identities, client IPs, destinations, DNS contents, voucher secrets,
     /// private keys, wallet-level traffic, or plaintext content.
     pub peer_health_summary: PeerStorePeerHealthStatus,
+    /// Product-facing aggregate story for app/nodeboard/website surfaces.
+    ///
+    /// This is derived from existing discovery status objects and must remain
+    /// aggregate-only: no full node ids, endpoint URLs, route ids, encrypted
+    /// payloads, receiver identities, client IPs, destinations, DNS contents,
+    /// voucher secrets, private keys, wallet-level traffic, or plaintext.
+    pub network_story: PeerStoreNetworkStoryStatus,
+}
+
+/// Product-facing aggregate discovery readiness story.
+///
+/// This is the compact state a user or investor can understand: whether the
+/// node has discovered other protocol nodes, whether routeable encrypted-chat
+/// relay peers exist, whether a future two-hop onion-shaped path can be planned,
+/// and whether restart recovery is configured. It deliberately reuses only
+/// aggregate node-control-plane status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreNetworkStoryStatus {
+    /// Unix timestamp when the story was generated.
+    pub generated_at: u64,
+    /// Stable bucket: disabled, discovering, peer_view_ready, relay_ready,
+    /// onion_ready, or attention.
+    pub status: String,
+    /// Short display headline for dashboards and website stats.
+    pub headline: String,
+    /// Operator-facing detail with aggregate counts only.
+    pub detail: String,
+    /// Total retained node descriptors.
+    pub discovered_nodes: usize,
+    /// Valid node descriptors at generation time.
+    pub valid_nodes: usize,
+    /// Retained descriptors advertising chat relay capability.
+    pub chat_relay_nodes: usize,
+    /// Retained descriptors advertising future onion middle-hop capability.
+    pub onion_middle_nodes: usize,
+    /// Health-ranked chat relay route candidates with public endpoints.
+    pub routeable_chat_relays: usize,
+    /// Health-ranked onion middle-hop route candidates with public endpoints.
+    pub routeable_onion_middle_hops: usize,
+    /// Whether a one-hop encrypted chat relay path can be planned.
+    pub chat_single_hop_ready: bool,
+    /// Whether a two-hop onion-shaped path can be planned.
+    pub chat_two_hop_onion_ready: bool,
+    /// Whether peer cache or seed recovery is configured for restart survival.
+    pub restart_recovery_configured: bool,
+    /// Whether discovery stability says the relay foundation is ready.
+    pub relay_foundation_ready: bool,
+    /// Explicit privacy boundary for downstream UI and API consumers.
+    pub privacy_boundary: String,
 }
 
 // ============================================
@@ -2229,6 +2282,8 @@ impl PeerStore {
         let peer_summary = self.peer_summary(now);
         let route_candidates = self.route_candidate_status(now);
         let peer_health_summary = self.peer_health_summary(now);
+        let network_story =
+            Self::network_story_status(now, &stability, &peer_summary, &route_candidates);
 
         PeerStoreStatus {
             snapshot,
@@ -2240,6 +2295,74 @@ impl PeerStore {
             peer_summary,
             route_candidates,
             peer_health_summary,
+            network_story,
+        }
+    }
+
+    fn network_story_status(
+        now: u64,
+        stability: &PeerStoreStabilityStatus,
+        peer_summary: &PeerStorePeerSummaryStatus,
+        route_candidates: &PeerStoreRouteCandidateStatus,
+    ) -> PeerStoreNetworkStoryStatus {
+        let chat_single_hop_ready = route_candidates.planned_paths.chat_single_hop.complete;
+        let chat_two_hop_onion_ready = route_candidates
+            .planned_paths
+            .chat_two_hop_onion_ready
+            .complete;
+        let routeable_chat_relays = route_candidates.chat_relay.len();
+        let routeable_onion_middle_hops = route_candidates.onion_middle.len();
+
+        let status = if chat_two_hop_onion_ready {
+            "onion_ready"
+        } else if chat_single_hop_ready {
+            "relay_ready"
+        } else if peer_summary.valid_peers > 0 {
+            "peer_view_ready"
+        } else if stability.health == "disabled" {
+            "disabled"
+        } else if stability.health == "failed" || stability.health == "degraded" {
+            "attention"
+        } else {
+            "discovering"
+        };
+
+        let headline = match status {
+            "onion_ready" => "Discovery can plan a two-hop privacy path",
+            "relay_ready" => "Discovery can route encrypted relay traffic",
+            "peer_view_ready" => "Discovery has a verified peer view",
+            "disabled" => "Discovery is disabled",
+            "attention" => "Discovery needs operator attention",
+            _ => "Discovery is learning the network",
+        };
+
+        let detail = format!(
+            "valid_nodes={} chat_relay_nodes={} onion_middle_nodes={} routeable_chat_relays={} routeable_onion_middle_hops={} restart_recovery_configured={} relay_foundation_ready={}",
+            peer_summary.valid_peers,
+            peer_summary.chat_relay_peers,
+            peer_summary.onion_middle_peers,
+            routeable_chat_relays,
+            routeable_onion_middle_hops,
+            stability.restart_recovery_configured,
+            stability.relay_foundation_ready
+        );
+
+        PeerStoreNetworkStoryStatus {
+            generated_at: now,
+            status: status.to_string(),
+            headline: headline.to_string(),
+            detail,
+            discovered_nodes: peer_summary.total_peers,
+            valid_nodes: peer_summary.valid_peers,
+            chat_relay_nodes: peer_summary.chat_relay_peers,
+            onion_middle_nodes: peer_summary.onion_middle_peers,
+            routeable_chat_relays,
+            routeable_onion_middle_hops,
+            chat_single_hop_ready,
+            chat_two_hop_onion_ready,
+            restart_recovery_configured: stability.restart_recovery_configured,
+            relay_foundation_ready: stability.relay_foundation_ready,
+            privacy_boundary: "aggregate node discovery status only; no full node ids, endpoint URLs, route ids, encrypted payloads, receiver identities, client IPs, destinations, DNS contents, voucher secrets, private keys, wallet-level traffic, or plaintext".to_string(),
         }
     }
 
@@ -3299,6 +3422,59 @@ mod tests {
         assert!(!status_json.contains(&hex::encode(middle_node_id)));
         assert!(!status_json.contains("encrypted_blob"));
         assert!(!status_json.contains("receiver_pubkey"));
+    }
+
+    #[test]
+    fn test_network_story_reports_onion_ready_without_endpoint_or_full_node_id() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        store.configure_bootstrap_status(true, true, true, 2);
+        store.record_gossip_round(now + 20, 2, 2, 1, None);
+
+        let middle_kp = IdentityKeyPair::generate();
+        let relay_kp = IdentityKeyPair::generate();
+
+        let mut middle_descriptor = signed_descriptor_for(&middle_kp, 1, now + 2_000);
+        middle_descriptor.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        middle_descriptor.descriptor.public_endpoint =
+            Some("https://story-middle.example".to_string());
+        middle_descriptor =
+            SignedNodeDescriptor::sign(middle_descriptor.descriptor, &middle_kp).unwrap();
+        let middle_node_id = middle_descriptor.node_id();
+
+        let mut relay_descriptor = signed_descriptor_for(&relay_kp, 1, now + 2_000);
+        relay_descriptor.descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        relay_descriptor.descriptor.public_endpoint =
+            Some("https://story-relay.example".to_string());
+        relay_descriptor =
+            SignedNodeDescriptor::sign(relay_descriptor.descriptor, &relay_kp).unwrap();
+        let relay_node_id = relay_descriptor.node_id();
+
+        store
+            .upsert_verified_from_source(middle_descriptor, now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(relay_descriptor, now, "gossip_announce")
+            .unwrap();
+
+        let story = store.status(now + 30).network_story;
+
+        assert_eq!(story.status, "onion_ready");
+        assert!(story.chat_single_hop_ready);
+        assert!(story.chat_two_hop_onion_ready);
+        assert_eq!(story.valid_nodes, 2);
+        assert_eq!(story.routeable_chat_relays, 1);
+        assert_eq!(story.routeable_onion_middle_hops, 1);
+        assert!(story.relay_foundation_ready);
+        assert!(story.restart_recovery_configured);
+
+        let story_json = serde_json::to_string(&story).unwrap();
+        assert!(!story_json.contains("story-middle.example"));
+        assert!(!story_json.contains("story-relay.example"));
+        assert!(!story_json.contains(&hex::encode(middle_node_id)));
+        assert!(!story_json.contains(&hex::encode(relay_node_id)));
+        assert!(!story_json.contains("encrypted_blob"));
+        assert!(!story_json.contains("receiver_pubkey"));
     }
 
     #[test]
