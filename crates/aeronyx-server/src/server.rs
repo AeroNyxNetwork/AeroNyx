@@ -1614,15 +1614,19 @@ impl Server {
             })
         }));
 
+        let discovery_status_config = self.config.clone();
         let discovery_status_peer_store = Arc::clone(&peer_store);
         heartbeat = heartbeat.with_discovery_status(Box::new(move || {
+            let config = discovery_status_config.clone();
             let peer_store = Arc::clone(&discovery_status_peer_store);
             Box::pin(async move {
                 let now = unix_now_secs();
                 let status = peer_store.status(now);
+                let local_capabilities = Self::discovery_local_capability_status_for(&config);
                 Some(serde_json::json!({
                     "generated_at": now,
                     "peer_store": status,
+                    "local_capabilities": local_capabilities,
                     "source": "rust_peer_store",
                     "privacy_boundary": "aggregate node discovery counters only; no client IPs, destinations, DNS contents, packet payloads, chat plaintext, voucher secrets, private keys, or wallet-level traffic"
                 }))
