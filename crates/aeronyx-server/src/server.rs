@@ -165,7 +165,10 @@ use rusqlite::OptionalExtension;
 
 use crate::api::auth::{ensure_jwt_secret, generate_secret};
 use crate::api::chat_peer::{build_chat_peer_router, PeerChatRelayRequest};
-use crate::api::discovery::{build_discovery_router, DiscoveryApiPolicy, GossipResponse};
+use crate::api::discovery::{
+    build_discovery_router_with_local_status, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
+    GossipResponse,
+};
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
 use crate::api::voice::build_voice_router;
 use crate::api::vpn_health::{
@@ -1287,6 +1290,8 @@ impl Server {
             .unwrap_or_else(|_| "100.64.0.1:8421".parse().unwrap());
         let vpn_health_config = self.config.clone();
         let discovery_api_policy = DiscoveryApiPolicy::from_config(&self.config.discovery);
+        let local_capability_status =
+            Self::discovery_local_capability_status_for(&vpn_health_config);
         let public_api_listen_addr = self.config.discovery.public_api_listen_addr;
         let node_identity = Arc::new(self.identity.clone());
         let peer_http_client = Arc::new(
@@ -1306,6 +1311,7 @@ impl Server {
                     Arc::clone(&udp),
                     Arc::clone(&node_identity),
                     Arc::clone(&peer_http_client),
+                    local_capability_status.clone(),
                 );
                 tokio::spawn(async move {
                     Self::serve_public_discovery_api(public_addr, public_app, shutdown_rx_public)
@@ -1333,7 +1339,11 @@ impl Server {
                     node_identity,
                     peer_http_client,
                 ))
-                .merge(build_discovery_router(peer_store, discovery_api_policy));
+                .merge(build_discovery_router_with_local_status(
+                    peer_store,
+                    discovery_api_policy,
+                    local_capability_status,
+                ));
 
             let listener = match tokio::net::TcpListener::bind(listen_addr).await {
                 Ok(l) => {
@@ -1415,17 +1425,21 @@ impl Server {
         udp: Arc<UdpTransport>,
         node_identity: Arc<IdentityKeyPair>,
         peer_http_client: Arc<reqwest::Client>,
+        local_capability_status: DiscoveryLocalCapabilityStatus,
     ) -> axum::Router {
-        build_discovery_router(Arc::clone(&peer_store), discovery_api_policy).merge(
-            build_chat_peer_router(
-                chat_relay,
-                sessions,
-                udp,
-                peer_store,
-                node_identity,
-                peer_http_client,
-            ),
+        build_discovery_router_with_local_status(
+            Arc::clone(&peer_store),
+            discovery_api_policy,
+            local_capability_status,
         )
+        .merge(build_chat_peer_router(
+            chat_relay,
+            sessions,
+            udp,
+            peer_store,
+            node_identity,
+            peer_http_client,
+        ))
     }
 
     async fn serve_public_discovery_api(
@@ -2695,14 +2709,7 @@ impl Server {
 
     fn discovery_capabilities_for(config: &ServerConfig) -> Vec<NodeCapability> {
         let mut capabilities = vec![NodeCapability::PrivacyRelay];
-        let advertises_peer_api = config.discovery.public_api_listen_addr.is_some()
-            && config
-                .discovery
-                .public_endpoint
-                .as_deref()
-                .map(str::trim)
-                .map(|endpoint| !endpoint.is_empty())
-                .unwrap_or(false);
+        let advertises_peer_api = Self::discovery_peer_api_ready_for(config);
 
         if config.memchain.is_chat_relay_enabled() && advertises_peer_api {
             capabilities.push(NodeCapability::ChatRelay);
@@ -2718,6 +2725,28 @@ impl Server {
         }
 
         capabilities
+    }
+
+    fn discovery_peer_api_ready_for(config: &ServerConfig) -> bool {
+        config.discovery.public_api_listen_addr.is_some()
+            && config
+                .discovery
+                .public_endpoint
+                .as_deref()
+                .map(str::trim)
+                .map(|endpoint| !endpoint.is_empty())
+                .unwrap_or(false)
+    }
+
+    fn discovery_local_capability_status_for(
+        config: &ServerConfig,
+    ) -> DiscoveryLocalCapabilityStatus {
+        let capabilities = Self::discovery_capabilities_for(config);
+        DiscoveryLocalCapabilityStatus::new(
+            config.memchain.is_chat_relay_enabled(),
+            Self::discovery_peer_api_ready_for(config),
+            capabilities.contains(&NodeCapability::ChatRelay),
+        )
     }
 
     fn import_bootstrap_snapshot_bytes(
@@ -3871,6 +3900,51 @@ mod tests {
             .descriptor
             .capabilities
             .contains(&NodeCapability::OnionMiddle));
+    }
+
+    #[test]
+    fn local_capability_status_is_ready_when_chat_relay_is_configured_and_advertised() {
+        let mut config = ServerConfig::default();
+        config.discovery.public_endpoint = Some("https://node.example.com".to_string());
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        config.memchain.chat_relay.enabled = true;
+
+        let status = Server::discovery_local_capability_status_for(&config);
+
+        assert_eq!(status.status, "ready");
+        assert!(status.chat_relay_configured);
+        assert!(status.blind_relay_endpoint_ready);
+        assert!(status.advertised_chat_relay_capability);
+        assert!(status.capability_config_consistent);
+    }
+
+    #[test]
+    fn local_capability_status_reports_disabled_without_chat_relay_config() {
+        let mut config = ServerConfig::default();
+        config.discovery.public_endpoint = Some("https://node.example.com".to_string());
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+
+        let status = Server::discovery_local_capability_status_for(&config);
+
+        assert_eq!(status.status, "disabled");
+        assert!(!status.chat_relay_configured);
+        assert!(status.blind_relay_endpoint_ready);
+        assert!(!status.advertised_chat_relay_capability);
+        assert!(status.capability_config_consistent);
+    }
+
+    #[test]
+    fn local_capability_status_reports_misconfigured_when_chat_relay_lacks_peer_api() {
+        let mut config = ServerConfig::default();
+        config.memchain.chat_relay.enabled = true;
+
+        let status = Server::discovery_local_capability_status_for(&config);
+
+        assert_eq!(status.status, "misconfigured");
+        assert!(status.chat_relay_configured);
+        assert!(!status.blind_relay_endpoint_ready);
+        assert!(!status.advertised_chat_relay_capability);
+        assert!(status.capability_config_consistent);
     }
 
     #[test]

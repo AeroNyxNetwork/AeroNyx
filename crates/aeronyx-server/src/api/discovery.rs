@@ -36,8 +36,12 @@
 //! - Public exit remains disabled by default at descriptor policy level.
 //! - Security decisions are recorded as privacy-safe aggregate audit events in
 //!   `PeerStoreStatus.recent_audit_events`.
+//! - `DiscoveryLocalCapabilityStatus` reports only local configuration and
+//!   endpoint readiness; it must not include node ids, route ids, client data,
+//!   peer endpoints, payloads, or wallet-level information.
 //!
 //! ## Last Modified
+//! v0.5.0-LocalCapabilityStatus - Report ChatRelay/blind relay readiness self-check
 //! v0.4.0-DiscoveryAuditLog - Added audit events for rate-limit/policy decisions
 //! v0.3.0-DiscoveryPhase10-11 - Added status endpoint and inbound safety policy
 //! v0.2.0-DiscoveryPhase6 - Public gossip response type for outbound sync
@@ -70,6 +74,7 @@ use crate::services::{PeerStore, PeerStoreImportReport, PeerStoreStatus};
 struct DiscoveryApiState {
     peer_store: Arc<PeerStore>,
     policy: DiscoveryApiPolicy,
+    local_capabilities: DiscoveryLocalCapabilityStatus,
     rate_limit: Arc<Mutex<RateLimitState>>,
 }
 
@@ -185,6 +190,7 @@ pub struct DiscoveryStatusResponse {
     generated_at: u64,
     peer_store: PeerStoreStatus,
     policy: DiscoveryPolicyStatus,
+    local_capabilities: DiscoveryLocalCapabilityStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -198,15 +204,102 @@ struct DiscoveryPolicyStatus {
     private_descriptors_hidden_by_default: bool,
 }
 
+/// Privacy-safe local protocol capability readiness.
+///
+/// This object is intentionally small and aggregate-only. It tells operators
+/// whether the node configuration, public peer API endpoint, and advertised
+/// descriptor capabilities agree with each other, without exposing route ids,
+/// peer endpoints, client addresses, payloads, or user identifiers.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveryLocalCapabilityStatus {
+    /// Whether `[memchain.chat_relay].enabled` is true.
+    pub chat_relay_configured: bool,
+    /// Whether this process has the public discovery/peer API listener and a
+    /// public endpoint configured, which is required by peer relay routes.
+    pub blind_relay_endpoint_ready: bool,
+    /// Whether the self descriptor advertises `NodeCapability::ChatRelay`.
+    pub advertised_chat_relay_capability: bool,
+    /// Whether config, endpoint readiness, and advertised capability agree.
+    pub capability_config_consistent: bool,
+    /// Stable operator-facing status: `ready`, `disabled`, or `misconfigured`.
+    pub status: &'static str,
+    /// Short remediation-oriented detail safe for public discovery status.
+    pub detail: &'static str,
+}
+
+impl DiscoveryLocalCapabilityStatus {
+    /// Builds a privacy-safe readiness summary for local discovery status.
+    #[must_use]
+    pub fn new(
+        chat_relay_configured: bool,
+        blind_relay_endpoint_ready: bool,
+        advertised_chat_relay_capability: bool,
+    ) -> Self {
+        let expected_advertisement = chat_relay_configured && blind_relay_endpoint_ready;
+        let capability_config_consistent =
+            advertised_chat_relay_capability == expected_advertisement;
+        let (status, detail) = if !capability_config_consistent {
+            (
+                "misconfigured",
+                "chat relay capability advertisement does not match config and endpoint readiness",
+            )
+        } else if advertised_chat_relay_capability {
+            (
+                "ready",
+                "chat relay and blind relay peer endpoint are configured and advertised",
+            )
+        } else if chat_relay_configured {
+            (
+                "misconfigured",
+                "chat relay is enabled but public peer API endpoint is not ready",
+            )
+        } else {
+            (
+                "disabled",
+                "chat relay is disabled; blind relay endpoint remains available for discovery API plumbing",
+            )
+        };
+
+        Self {
+            chat_relay_configured,
+            blind_relay_endpoint_ready,
+            advertised_chat_relay_capability,
+            capability_config_consistent,
+            status,
+            detail,
+        }
+    }
+}
+
+impl Default for DiscoveryLocalCapabilityStatus {
+    fn default() -> Self {
+        Self::new(false, false, false)
+    }
+}
+
 // ============================================
 // Router
 // ============================================
 
 /// Builds the discovery API router.
 pub fn build_discovery_router(peer_store: Arc<PeerStore>, policy: DiscoveryApiPolicy) -> Router {
+    build_discovery_router_with_local_status(
+        peer_store,
+        policy,
+        DiscoveryLocalCapabilityStatus::default(),
+    )
+}
+
+/// Builds the discovery API router with local capability readiness status.
+pub fn build_discovery_router_with_local_status(
+    peer_store: Arc<PeerStore>,
+    policy: DiscoveryApiPolicy,
+    local_capabilities: DiscoveryLocalCapabilityStatus,
+) -> Router {
     let state = DiscoveryApiState {
         peer_store,
         policy,
+        local_capabilities,
         rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
     };
     Router::new()
@@ -314,6 +407,7 @@ async fn status_handler(State(state): State<DiscoveryApiState>) -> Json<Discover
             snapshot_default_public_only: true,
             private_descriptors_hidden_by_default: true,
         },
+        local_capabilities: state.local_capabilities,
     })
 }
 
@@ -451,6 +545,53 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_status_endpoint_returns_local_capability_status() {
+        let store = Arc::new(PeerStore::new());
+        let app = build_discovery_router_with_local_status(
+            store,
+            DiscoveryApiPolicy::default(),
+            DiscoveryLocalCapabilityStatus::new(true, true, true),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["local_capabilities"]["status"].as_str(),
+            Some("ready")
+        );
+        assert_eq!(
+            parsed["local_capabilities"]["chat_relay_configured"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["local_capabilities"]["blind_relay_endpoint_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["local_capabilities"]["advertised_chat_relay_capability"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["local_capabilities"]["capability_config_consistent"].as_bool(),
+            Some(true)
+        );
     }
 
     #[tokio::test]
