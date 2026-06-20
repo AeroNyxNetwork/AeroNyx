@@ -55,6 +55,9 @@
 //! - Per-peer health summary for operators, using only signed node metadata,
 //!   gossip/import observation buckets, route-health counters, and relay
 //!   protection buckets without payload or route reconstruction data
+//! - Peer-cache startup recovery evidence that records cache/backup load
+//!   status separately from generic bootstrap source status, so nodeboard can
+//!   diagnose restart recovery without exposing cache paths or peer endpoints
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -81,6 +84,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.27.0-PeerCacheRecoveryEvidence - Added peer-cache load evidence and restart recovery sources
 //! v0.26.0-PeerHealthSummary - Added privacy-safe per-peer health summary
 //! v0.25.0-BlindRelayAbuseGuard - Added aggregate rate-limit/quarantine counters
 //! v0.24.0-BlindRelayReplayGuard - Added privacy-safe duplicate route drop counter
@@ -248,6 +252,19 @@ pub struct PeerStoreBootstrapStatus {
     pub last_cache_save_detail: Option<String>,
     /// Timestamp of the last peer-cache save attempt.
     pub last_cache_save_at: Option<u64>,
+    /// Last peer-cache startup load source bucket: cache or cache_backup.
+    ///
+    /// This is separated from `last_source_kind` because generic bootstrap
+    /// sources may include file/url/config events. Operators need a stable
+    /// restart-recovery signal without exposing the cache path or peer
+    /// endpoints.
+    pub last_cache_load_source: Option<String>,
+    /// Last peer-cache startup load status: success, warning, failed, missing.
+    pub last_cache_load_status: Option<String>,
+    /// Last peer-cache startup load detail with aggregate import counts only.
+    pub last_cache_load_detail: Option<String>,
+    /// Timestamp of the last peer-cache startup load attempt.
+    pub last_cache_load_at: Option<u64>,
     /// Number of peers attempted in the last outbound gossip round.
     pub last_gossip_attempted: u64,
     /// Number of configured seed endpoints attempted in the last gossip round.
@@ -306,6 +323,10 @@ impl Default for PeerStoreBootstrapStatus {
             last_cache_save_status: None,
             last_cache_save_detail: None,
             last_cache_save_at: None,
+            last_cache_load_source: None,
+            last_cache_load_status: None,
+            last_cache_load_detail: None,
+            last_cache_load_at: None,
             last_gossip_attempted: 0,
             last_gossip_seed_attempted: 0,
             last_gossip_succeeded: 0,
@@ -355,6 +376,14 @@ pub struct PeerStoreStabilityStatus {
     pub stale_after_seconds: u64,
     /// Whether this node has at least one configured recovery path after restart.
     pub restart_recovery_configured: bool,
+    /// Configured restart recovery source buckets, such as `seed_endpoints`
+    /// and `peer_cache`.
+    ///
+    /// This is configuration evidence only. It deliberately does not expose
+    /// seed URLs, cache paths, peer URLs, public keys, client IPs, destinations,
+    /// DNS contents, packet payloads, voucher secrets, private keys, or
+    /// wallet-level traffic.
+    pub restart_recovery_sources: Vec<String>,
 }
 
 /// Cumulative runtime counters for nodeboard and operator diagnostics.
@@ -1067,10 +1096,47 @@ impl PeerStore {
             status.recovery_status = Some(source_status.clone());
             status.recovery_detail = Some(format!("source_kind={source_kind} {detail}"));
             status.recovery_at = Some(now);
+            if matches!(source_kind.as_str(), "cache" | "cache_backup") {
+                status.last_cache_load_source = Some(source_kind.clone());
+                status.last_cache_load_status = Some(source_status.clone());
+                status.last_cache_load_detail = Some(detail.clone());
+                status.last_cache_load_at = Some(now);
+            }
         }
         self.record_audit_event(
             now,
             "bootstrap_source",
+            source_status,
+            format!("kind={source_kind} {detail}"),
+        );
+    }
+
+    /// Records peer-cache startup load status without exposing local paths.
+    ///
+    /// This method exists for callers that need to update cache recovery
+    /// evidence without changing the generic bootstrap source state. Most
+    /// bootstrap imports should continue using `record_bootstrap_source()`,
+    /// which already mirrors cache/cache_backup events into these fields.
+    pub fn record_peer_cache_load_status(
+        &self,
+        now: u64,
+        source_kind: impl Into<String>,
+        source_status: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        let source_kind = source_kind.into();
+        let source_status = source_status.into();
+        let detail = detail.into();
+        {
+            let mut status = self.bootstrap_status.write();
+            status.last_cache_load_source = Some(source_kind.clone());
+            status.last_cache_load_status = Some(source_status.clone());
+            status.last_cache_load_detail = Some(detail.clone());
+            status.last_cache_load_at = Some(now);
+        }
+        self.record_audit_event(
+            now,
+            "peer_cache_load",
             source_status,
             format!("kind={source_kind} {detail}"),
         );
@@ -2054,8 +2120,14 @@ impl PeerStore {
             Self::optional_age(now, bootstrap.last_gossip_success_at);
         let last_gossip_round_age_seconds = Self::optional_age(now, bootstrap.last_gossip_round_at);
         let seed_recovery_configured = bootstrap.seed_endpoints_configured > 0;
-        let restart_recovery_configured =
-            seed_recovery_configured || bootstrap.peer_cache_configured;
+        let mut restart_recovery_sources = Vec::new();
+        if seed_recovery_configured {
+            restart_recovery_sources.push("seed_endpoints".to_string());
+        }
+        if bootstrap.peer_cache_configured {
+            restart_recovery_sources.push("peer_cache".to_string());
+        }
+        let restart_recovery_configured = !restart_recovery_sources.is_empty();
         let has_minimum_peer_view = snapshot.valid_peers >= 2;
         let gossip_success_is_fresh = !bootstrap.gossip_enabled
             || last_gossip_success_age_seconds
@@ -2144,6 +2216,7 @@ impl PeerStore {
             seed_recovery_configured,
             stale_after_seconds: DISCOVERY_GOSSIP_STALE_AFTER_SECS,
             restart_recovery_configured,
+            restart_recovery_sources,
         }
     }
 
@@ -3652,6 +3725,40 @@ mod tests {
     }
 
     #[test]
+    fn test_peer_cache_load_evidence_is_separate_from_generic_recovery_status() {
+        let store = PeerStore::new();
+
+        store.record_bootstrap_source(1_700_000_010, "cache", "failed", "json_rejected");
+        store.record_bootstrap_source(
+            1_700_000_011,
+            "cache_backup",
+            "success",
+            "total=2 inserted=2 unchanged=0 stale=0 rejected=0",
+        );
+        store.record_gossip_round(1_700_000_050, 2, 2, 1, None);
+
+        let status = store.status(1_700_000_060);
+        assert_eq!(
+            status.bootstrap.last_cache_load_source.as_deref(),
+            Some("cache_backup")
+        );
+        assert_eq!(
+            status.bootstrap.last_cache_load_status.as_deref(),
+            Some("success")
+        );
+        assert_eq!(
+            status.bootstrap.last_cache_load_detail.as_deref(),
+            Some("total=2 inserted=2 unchanged=0 stale=0 rejected=0")
+        );
+        assert_eq!(status.bootstrap.last_cache_load_at, Some(1_700_000_011));
+        assert_eq!(status.bootstrap.recovery_status.as_deref(), Some("success"));
+        assert_eq!(
+            status.bootstrap.recovery_detail.as_deref(),
+            Some("gossip_recovered attempted=2 succeeded=2 seed_attempted=1")
+        );
+    }
+
+    #[test]
     fn test_peer_summary_tracks_source_ttl_health_and_capabilities() {
         let store = PeerStore::new();
         let now = 1_700_000_100;
@@ -3717,6 +3824,10 @@ mod tests {
         assert_eq!(status.stability.last_gossip_round_age_seconds, Some(60));
         assert!(status.stability.seed_recovery_configured);
         assert!(status.stability.restart_recovery_configured);
+        assert_eq!(
+            status.stability.restart_recovery_sources,
+            vec!["seed_endpoints".to_string(), "peer_cache".to_string()]
+        );
     }
 
     #[test]
@@ -3785,6 +3896,7 @@ mod tests {
         assert!(!status.stability.relay_foundation_ready);
         assert!(!status.stability.seed_recovery_configured);
         assert!(!status.stability.restart_recovery_configured);
+        assert!(status.stability.restart_recovery_sources.is_empty());
         assert!(status.stability.next_action.contains("peer_cache_path"));
     }
 
@@ -3807,5 +3919,9 @@ mod tests {
         assert!(status.stability.relay_foundation_ready);
         assert!(!status.stability.seed_recovery_configured);
         assert!(status.stability.restart_recovery_configured);
+        assert_eq!(
+            status.stability.restart_recovery_sources,
+            vec!["peer_cache".to_string()]
+        );
     }
 }

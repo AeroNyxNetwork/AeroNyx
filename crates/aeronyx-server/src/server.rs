@@ -65,6 +65,9 @@
 //  29. Records a privacy-safe discovery startup self-check so nodeboard can
 //      tell whether cache, gossip, self advertisement, and public endpoint
 //      wiring are production-ready without exposing endpoint values.
+//  30. Mirrors cache/cache_backup startup load results into dedicated
+//      PeerStore cache-load evidence so restart recovery can be audited
+//      without exposing cache paths, peer endpoints, or user traffic.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -84,6 +87,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.1.4-PeerCacheLoadEvidence - Expose cache/backup startup load evidence
 //   v1.1.3-DiscoveryStartupSelfCheck - Report discovery startup readiness buckets
 //   v1.1.2-DurablePeerCacheFsync - Fsync PeerStore cache temp file and parent directory
 //   v1.1.1-DiscoveryGossipBackpressure - Add jitter/backpressure for outbound discovery gossip
@@ -4151,6 +4155,15 @@ mod tests {
             status.bootstrap.last_source_status.as_deref(),
             Some("success")
         );
+        assert_eq!(
+            status.bootstrap.last_cache_load_source.as_deref(),
+            Some("cache")
+        );
+        assert_eq!(
+            status.bootstrap.last_cache_load_status.as_deref(),
+            Some("success")
+        );
+        assert_eq!(status.bootstrap.last_cache_load_at, Some(now));
         assert!(status
             .recent_audit_events
             .iter()
@@ -4205,6 +4218,15 @@ mod tests {
             status.bootstrap.last_source_status.as_deref(),
             Some("success")
         );
+        assert_eq!(
+            status.bootstrap.last_cache_load_source.as_deref(),
+            Some("cache_backup")
+        );
+        assert_eq!(
+            status.bootstrap.last_cache_load_status.as_deref(),
+            Some("success")
+        );
+        assert_eq!(status.bootstrap.last_cache_load_at, Some(now + 1));
 
         let _ = tokio::fs::remove_file(path).await;
         let _ = tokio::fs::remove_file(backup_path).await;
