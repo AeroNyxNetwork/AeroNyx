@@ -48,8 +48,12 @@
 //! - Blind relay keeps the relay invariant: route_id / next_hop / ttl /
 //!   encrypted_blob / timestamp / signature are handled as routing metadata;
 //!   encrypted_blob stays opaque and must not be parsed.
+//! - Blind relay rejects immediate self/previous-hop loops using only node-level
+//!   route metadata, preserving the "blind relay" invariant while preparing
+//!   for future controlled multi-hop/onion routing.
 //!
 //! ## Last Modified
+//! v0.8.0-BlindRelayLoopGuard - Reject immediate self/previous-hop relay loops
 //! v0.7.0-BlindRelayRetryStats - Report retry recovery/exhaustion to PeerStore status
 //! v0.6.0-BlindRelayRetryJitter - Retry transient next-hop blind relay failures with privacy-safe jitter
 //! v0.5.0-BlindRelayRouteHealth - Feed next-hop success/failure back into PeerStore scoring
@@ -215,6 +219,9 @@ enum BlindRelayError {
     #[error("ttl exhausted")]
     TtlExhausted,
 
+    #[error("blind relay route loop detected")]
+    RouteLoop,
+
     #[error("next hop not found")]
     NoRoute,
 
@@ -231,7 +238,8 @@ impl BlindRelayError {
             Self::InvalidPreviousHop
             | Self::InvalidSignature
             | Self::EnvelopeTooLarge
-            | Self::TtlExhausted => StatusCode::BAD_REQUEST,
+            | Self::TtlExhausted
+            | Self::RouteLoop => StatusCode::BAD_REQUEST,
             Self::NoRoute | Self::InvalidEndpoint => StatusCode::BAD_GATEWAY,
             Self::ForwardFailed => StatusCode::BAD_GATEWAY,
         }
@@ -243,6 +251,7 @@ impl BlindRelayError {
             Self::InvalidSignature => "invalid_signature",
             Self::EnvelopeTooLarge => "envelope_too_large",
             Self::TtlExhausted => "ttl_exhausted",
+            Self::RouteLoop => "route_loop",
             Self::NoRoute => "no_route",
             Self::InvalidEndpoint => "invalid_endpoint",
             Self::ForwardFailed => "forward_failed",
@@ -478,6 +487,12 @@ async fn process_peer_blind_relay(
     })?;
 
     let self_node_id = state.node_identity.public_key_bytes();
+    if request.previous_hop_node_id == self_node_id {
+        state
+            .peer_store
+            .record_blind_relay_rejected(now, "self_loop");
+        return Err(BlindRelayError::RouteLoop);
+    }
     if envelope.next_hop == self_node_id {
         state.peer_store.record_blind_relay_terminal(
             now,
@@ -491,6 +506,13 @@ async fn process_peer_blind_relay(
             ttl_remaining: envelope.ttl,
             reason: Some("terminal_next_hop".to_string()),
         });
+    }
+
+    if envelope.next_hop == request.previous_hop_node_id {
+        state
+            .peer_store
+            .record_blind_relay_rejected(now, "route_loop");
+        return Err(BlindRelayError::RouteLoop);
     }
 
     if !envelope.can_forward() {
@@ -997,6 +1019,52 @@ mod tests {
         };
 
         assert!(BlindRelayInFlightGuard::try_acquire(&state).is_none());
+    }
+
+    #[tokio::test]
+    async fn blind_relay_rejects_immediate_previous_hop_loop_without_parsing_blob() {
+        let previous_hop = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let peer_store = Arc::new(PeerStore::new());
+        let state = ChatPeerState {
+            chat_relay: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity,
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+        };
+        let envelope = BlindRelayEnvelope {
+            route_id: [0x44u8; 16],
+            next_hop: previous_hop.public_key_bytes(),
+            ttl: 2,
+            encrypted_blob: br#"{"opaque":"must_not_be_parsed"}"#.to_vec(),
+            timestamp: now_secs(),
+            signature: [0u8; 64],
+        }
+        .sign_with(&previous_hop);
+
+        let result = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: previous_hop.public_key_bytes(),
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(BlindRelayError::RouteLoop)));
+        let blind_stats = peer_store.status(now_secs() + 1).runtime.blind_relay;
+        assert_eq!(blind_stats.received, 1);
+        assert_eq!(blind_stats.forwarded, 0);
+        assert_eq!(blind_stats.rejected, 1);
+        assert_eq!(blind_stats.loop_detected, 1);
+        assert!(peer_store.recent_audit_events().iter().any(|event| {
+            event.action == "blind_relay_forward"
+                && event.outcome == "rejected"
+                && event.detail == "route_loop"
+        }));
     }
 
     #[tokio::test]

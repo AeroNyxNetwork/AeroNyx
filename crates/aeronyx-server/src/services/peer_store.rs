@@ -46,6 +46,8 @@
 //! - Startup self-check status so operators can see whether discovery has the
 //!   cache, gossip, self-advertisement, and public endpoint wiring needed for
 //!   commercial restart recovery without exposing endpoint values
+//! - Blind relay loop-detection counters so immediate self/previous-hop loops
+//!   are visible as aggregate drop reasons before future multi-hop rollout
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -72,6 +74,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.23.0-BlindRelayLoopGuard - Added privacy-safe blind relay loop drop counter
 //! v0.22.0-DiscoveryStartupSelfCheck - Added privacy-safe discovery startup self-check status
 //! v0.21.0-BlindRelayRetryStats - Added privacy-safe blind relay retry observability
 //! v0.20.0-BlindRelaySizeBuckets - Bucket blind relay encrypted blob sizes in audit events
@@ -407,6 +410,8 @@ pub struct PeerStoreBlindRelayStats {
     pub invalid_endpoint: u64,
     /// Requests rejected because forwarding to next hop failed.
     pub forward_failed: u64,
+    /// Requests rejected because route metadata would immediately loop.
+    pub loop_detected: u64,
     /// Retry sleeps scheduled for transient next-hop failures.
     pub retry_attempted: u64,
     /// Blind relay forwards that succeeded after at least one retry.
@@ -685,6 +690,7 @@ struct PeerStoreCounters {
     blind_relay_no_route: AtomicU64,
     blind_relay_invalid_endpoint: AtomicU64,
     blind_relay_forward_failed: AtomicU64,
+    blind_relay_loop_detected: AtomicU64,
     blind_relay_retry_attempted: AtomicU64,
     blind_relay_retry_succeeded: AtomicU64,
     blind_relay_retry_exhausted: AtomicU64,
@@ -718,6 +724,7 @@ impl PeerStoreCounters {
             blind_relay_no_route: AtomicU64::new(0),
             blind_relay_invalid_endpoint: AtomicU64::new(0),
             blind_relay_forward_failed: AtomicU64::new(0),
+            blind_relay_loop_detected: AtomicU64::new(0),
             blind_relay_retry_attempted: AtomicU64::new(0),
             blind_relay_retry_succeeded: AtomicU64::new(0),
             blind_relay_retry_exhausted: AtomicU64::new(0),
@@ -758,6 +765,7 @@ impl PeerStoreCounters {
                 no_route: self.blind_relay_no_route.load(Ordering::Relaxed),
                 invalid_endpoint: self.blind_relay_invalid_endpoint.load(Ordering::Relaxed),
                 forward_failed: self.blind_relay_forward_failed.load(Ordering::Relaxed),
+                loop_detected: self.blind_relay_loop_detected.load(Ordering::Relaxed),
                 retry_attempted: self.blind_relay_retry_attempted.load(Ordering::Relaxed),
                 retry_succeeded: self.blind_relay_retry_succeeded.load(Ordering::Relaxed),
                 retry_exhausted: self.blind_relay_retry_exhausted.load(Ordering::Relaxed),
@@ -1467,6 +1475,11 @@ impl PeerStore {
             "request_failed" | "forward_failed" => {
                 self.counters
                     .blind_relay_forward_failed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "self_loop" | "route_loop" => {
+                self.counters
+                    .blind_relay_loop_detected
                     .fetch_add(1, Ordering::Relaxed);
             }
             reason if reason.starts_with("http_") => {
@@ -3117,21 +3130,23 @@ mod tests {
         store.record_blind_relay_rejected(1_700_000_015, "no_route");
         store.record_blind_relay_rejected(1_700_000_016, "missing_endpoint");
         store.record_blind_relay_rejected(1_700_000_017, "http_502");
+        store.record_blind_relay_rejected(1_700_000_018, "route_loop");
 
         let status = store.status(1_700_000_020);
         let stats = status.runtime.blind_relay;
 
-        assert_eq!(stats.received, 8);
+        assert_eq!(stats.received, 9);
         assert_eq!(stats.terminal, 1);
         assert_eq!(stats.forwarded, 1);
-        assert_eq!(stats.rejected, 6);
+        assert_eq!(stats.rejected, 7);
         assert_eq!(stats.backpressure_dropped, 1);
         assert_eq!(stats.invalid_signature, 1);
         assert_eq!(stats.ttl_exhausted, 1);
         assert_eq!(stats.no_route, 1);
         assert_eq!(stats.invalid_endpoint, 1);
         assert_eq!(stats.forward_failed, 1);
-        assert_eq!(stats.last_event_at, Some(1_700_000_017));
+        assert_eq!(stats.loop_detected, 1);
+        assert_eq!(stats.last_event_at, Some(1_700_000_018));
         assert!(status
             .recent_audit_events
             .iter()
