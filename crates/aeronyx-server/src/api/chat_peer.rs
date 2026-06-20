@@ -57,8 +57,12 @@
 //! - Blind relay applies previous-hop rate limiting and short quarantine using
 //!   only node-level metadata. This protects commercial nodes from relay abuse
 //!   while preserving the invariant that encrypted blobs are never parsed.
+//! - Blind relay reports privacy-safe previous-hop health buckets to PeerStore
+//!   so nodeboard can show protection status without route ids, endpoints,
+//!   encrypted blobs, or user metadata.
 //!
 //! ## Last Modified
+//! v0.11.0-PeerHealthSummary - Report previous-hop abuse buckets to PeerStore
 //! v0.10.0-BlindRelayAbuseGuard - Add previous-hop rate limit and quarantine
 //! v0.9.0-BlindRelayReplayGuard - Drop duplicate route_id frames idempotently
 //! v0.8.0-BlindRelayLoopGuard - Reject immediate self/previous-hop relay loops
@@ -226,8 +230,8 @@ impl BlindRelayRouteReplayCache {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlindRelayAbuseDecision {
     Allowed,
-    RateLimited,
-    Quarantined,
+    RateLimited { quarantine_until: u64 },
+    Quarantined { quarantine_until: u64 },
 }
 
 #[derive(Debug, Default)]
@@ -256,7 +260,9 @@ impl BlindRelayAbuseGuard {
             .quarantine_until
             .is_some_and(|quarantine_until| now < quarantine_until)
         {
-            return BlindRelayAbuseDecision::Quarantined;
+            return BlindRelayAbuseDecision::Quarantined {
+                quarantine_until: bucket.quarantine_until.unwrap_or(now),
+            };
         }
         if now.saturating_sub(bucket.rate_window_start) > BLIND_RELAY_PREVIOUS_HOP_RATE_WINDOW_SECS
         {
@@ -266,14 +272,15 @@ impl BlindRelayAbuseGuard {
 
         bucket.rate_count = bucket.rate_count.saturating_add(1);
         if bucket.rate_count > BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT {
-            bucket.quarantine_until = Some(now + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS);
-            return BlindRelayAbuseDecision::RateLimited;
+            let quarantine_until = now + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS;
+            bucket.quarantine_until = Some(quarantine_until);
+            return BlindRelayAbuseDecision::RateLimited { quarantine_until };
         }
 
         BlindRelayAbuseDecision::Allowed
     }
 
-    fn record_failure(&mut self, previous_hop: [u8; 32], now: u64) -> bool {
+    fn record_failure(&mut self, previous_hop: [u8; 32], now: u64) -> Option<u64> {
         let bucket = self.bucket_mut(previous_hop, now);
         bucket.last_seen_at = now;
         if now.saturating_sub(bucket.failure_window_start)
@@ -285,11 +292,12 @@ impl BlindRelayAbuseGuard {
 
         bucket.failure_score = bucket.failure_score.saturating_add(1);
         if bucket.failure_score >= BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD {
-            bucket.quarantine_until = Some(now + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS);
+            let quarantine_until = now + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS;
+            bucket.quarantine_until = Some(quarantine_until);
             bucket.failure_score = 0;
-            return true;
+            return Some(quarantine_until);
         }
-        false
+        None
     }
 
     fn record_success(&mut self, previous_hop: [u8; 32], now: u64) {
@@ -854,19 +862,37 @@ fn check_blind_relay_previous_hop_allowed(
 
     match decision {
         BlindRelayAbuseDecision::Allowed => Ok(()),
-        BlindRelayAbuseDecision::RateLimited => {
+        BlindRelayAbuseDecision::RateLimited { quarantine_until } => {
             state
                 .peer_store
                 .record_blind_relay_rejected(now, "rate_limited");
             state
                 .peer_store
                 .record_blind_relay_quarantine_started(now, "rate_limit");
+            state
+                .peer_store
+                .record_peer_relay_rejection(&previous_hop, now, "rate_limited");
+            state.peer_store.record_peer_relay_quarantine_started(
+                &previous_hop,
+                now,
+                quarantine_until,
+                "rate_limit",
+            );
             Err(BlindRelayError::RateLimited)
         }
-        BlindRelayAbuseDecision::Quarantined => {
+        BlindRelayAbuseDecision::Quarantined { quarantine_until } => {
             state
                 .peer_store
                 .record_blind_relay_rejected(now, "quarantined");
+            state
+                .peer_store
+                .record_peer_relay_rejection(&previous_hop, now, "quarantined");
+            state.peer_store.record_peer_relay_quarantine_started(
+                &previous_hop,
+                now,
+                quarantine_until,
+                "still_quarantined",
+            );
             Err(BlindRelayError::Quarantined)
         }
     }
@@ -879,21 +905,30 @@ fn reject_blind_relay_previous_hop(
     reason: &'static str,
 ) {
     state.peer_store.record_blind_relay_rejected(now, reason);
+    state
+        .peer_store
+        .record_peer_relay_rejection(&previous_hop, now, reason);
     if !blind_relay_reason_counts_toward_quarantine(reason) {
         return;
     }
 
-    let quarantine_started = {
+    let quarantine_until = {
         let mut abuse_guard = state
             .blind_relay_abuse_guard
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         abuse_guard.record_failure(previous_hop, now)
     };
-    if quarantine_started {
+    if let Some(quarantine_until) = quarantine_until {
         state
             .peer_store
             .record_blind_relay_quarantine_started(now, "failure_threshold");
+        state.peer_store.record_peer_relay_quarantine_started(
+            &previous_hop,
+            now,
+            quarantine_until,
+            "failure_threshold",
+        );
     }
 }
 
@@ -1447,11 +1482,15 @@ mod tests {
 
         assert_eq!(
             guard.observe_request(previous_hop, now),
-            BlindRelayAbuseDecision::RateLimited
+            BlindRelayAbuseDecision::RateLimited {
+                quarantine_until: now + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
+            }
         );
         assert_eq!(
             guard.observe_request(previous_hop, now + 1),
-            BlindRelayAbuseDecision::Quarantined
+            BlindRelayAbuseDecision::Quarantined {
+                quarantine_until: now + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
+            }
         );
     }
 
@@ -1462,19 +1501,22 @@ mod tests {
         let now = 1_800_000_000;
 
         for offset in 0..(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD - 1) {
-            assert!(!guard.record_failure(previous_hop, now + u64::from(offset)));
+            assert_eq!(
+                guard.record_failure(previous_hop, now + u64::from(offset)),
+                None
+            );
         }
 
-        assert!(guard.record_failure(
-            previous_hop,
-            now + u64::from(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD)
-        ));
+        let quarantine_at = now + u64::from(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD);
         assert_eq!(
-            guard.observe_request(
-                previous_hop,
-                now + u64::from(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD) + 1
-            ),
-            BlindRelayAbuseDecision::Quarantined
+            guard.record_failure(previous_hop, quarantine_at),
+            Some(quarantine_at + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS)
+        );
+        assert_eq!(
+            guard.observe_request(previous_hop, quarantine_at + 1),
+            BlindRelayAbuseDecision::Quarantined {
+                quarantine_until: quarantine_at + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
+            }
         );
     }
 

@@ -52,6 +52,9 @@
 //!   exposing route ids, previous hops, next hops, endpoints, or payload data
 //! - Blind relay abuse-guard counters for previous-hop rate limiting and
 //!   short quarantine without exposing peer identities or route metadata
+//! - Per-peer health summary for operators, using only signed node metadata,
+//!   gossip/import observation buckets, route-health counters, and relay
+//!   protection buckets without payload or route reconstruction data
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -78,6 +81,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.26.0-PeerHealthSummary - Added privacy-safe per-peer health summary
 //! v0.25.0-BlindRelayAbuseGuard - Added aggregate rate-limit/quarantine counters
 //! v0.24.0-BlindRelayReplayGuard - Added privacy-safe duplicate route drop counter
 //! v0.23.0-BlindRelayLoopGuard - Added privacy-safe blind relay loop drop counter
@@ -122,6 +126,7 @@ const PEER_ROUTE_LAST_SEEN_ACCEPTABLE_SECS: u64 = 900;
 const PEER_ROUTE_LAST_SEEN_STALE_SECS: u64 = 1_800;
 const PEER_ROUTE_RECENT_FAILURE_SECS: u64 = 600;
 const PEER_ROUTE_STATUS_LIMIT: usize = 8;
+const PEER_HEALTH_STATUS_LIMIT: usize = 64;
 
 // ============================================
 // PeerStoreError
@@ -463,6 +468,13 @@ pub struct PeerStoreStatus {
     /// Server internals can use `route_candidates_with_capability()` when they
     /// need signed descriptors for actual node-to-node transport.
     pub route_candidates: PeerStoreRouteCandidateStatus,
+    /// Privacy-safe per-peer health summary for nodeboard security panels.
+    ///
+    /// Rows use only node-level descriptor/runtime buckets and short prefixes.
+    /// They never include route ids, endpoint URLs, encrypted blobs, receiver
+    /// identities, client IPs, destinations, DNS contents, voucher secrets,
+    /// private keys, wallet-level traffic, or plaintext content.
+    pub peer_health_summary: PeerStorePeerHealthStatus,
 }
 
 // ============================================
@@ -486,6 +498,17 @@ struct PeerRouteHealth {
     last_success_at: Option<u64>,
     last_failure_at: Option<u64>,
     last_failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PeerRelayProtectionHealth {
+    rejection_count: u64,
+    quarantine_count: u64,
+    quarantine_until: Option<u64>,
+    last_rejection_at: Option<u64>,
+    last_rejection_reason: Option<String>,
+    last_quarantine_at: Option<u64>,
+    last_quarantine_reason: Option<String>,
 }
 
 /// Privacy-safe per-peer nodeboard row.
@@ -549,6 +572,91 @@ pub struct PeerStorePeerSummaryStatus {
     pub source_counts: BTreeMap<String, usize>,
     /// Privacy-safe per-peer rows for operator UI.
     pub peers: Vec<PeerStorePeerSummary>,
+}
+
+// ============================================
+// Peer health summary
+// ============================================
+
+/// Privacy-safe per-peer health row for nodeboard security and capacity pages.
+///
+/// This row is intentionally diagnostic-only. It joins signed descriptor
+/// freshness, local gossip/import observation buckets, node-to-node route
+/// counters, and relay protection buckets. It must never contain route ids,
+/// full node ids, endpoint URLs, encrypted blobs, receiver identities, client
+/// IPs, destinations, DNS contents, voucher secrets, private keys,
+/// wallet-level traffic, or plaintext content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStorePeerHealth {
+    /// Short node id prefix for operator debugging without exposing full keys.
+    pub node_id_prefix: String,
+    /// Overall node-level health bucket: healthy, stale, degraded, failing,
+    /// quarantined, or expired.
+    pub health: String,
+    /// Signed descriptor health bucket: healthy, stale, or expired.
+    pub descriptor_health: String,
+    /// Last import/source bucket such as gossip_snapshot, gossip_announce,
+    /// cache, file, url, self, or unknown.
+    pub source: String,
+    /// Last successful gossip/import observation for this peer, when the latest
+    /// accepted source was live gossip.
+    pub last_successful_gossip_at: Option<u64>,
+    /// Age of `last_successful_gossip_at`.
+    pub last_successful_gossip_age_seconds: Option<u64>,
+    /// Last time this process accepted or refreshed this peer descriptor from
+    /// any privacy-safe source.
+    pub last_seen_at: u64,
+    /// Age of the last accepted/refreshed descriptor observation.
+    pub last_seen_age_seconds: u64,
+    /// Route health bucket from opaque node-to-node forwarding attempts.
+    pub route_health: String,
+    /// Successful opaque node-to-node forwards to this peer.
+    pub route_success_count: u64,
+    /// Failed opaque node-to-node forwards to this peer.
+    pub route_failure_count: u64,
+    /// Consecutive failed opaque node-to-node forwards since last success.
+    pub route_consecutive_failures: u64,
+    /// Last successful opaque node-to-node forward timestamp.
+    pub last_route_success_at: Option<u64>,
+    /// Last failed opaque node-to-node forward timestamp.
+    pub last_route_failure_at: Option<u64>,
+    /// Coarse reason bucket for the last opaque route failure.
+    pub last_route_failure_reason: Option<String>,
+    /// Local relay-protection rejection count for this peer as previous hop.
+    pub relay_rejection_count: u64,
+    /// Number of short local relay-protection quarantines started.
+    pub relay_quarantine_count: u64,
+    /// Whether this peer is currently quarantined as a previous hop.
+    pub relay_quarantined: bool,
+    /// Remaining local quarantine time in seconds, when quarantined.
+    pub relay_quarantine_remaining_seconds: Option<u64>,
+    /// Last relay-protection rejection timestamp.
+    pub last_relay_rejection_at: Option<u64>,
+    /// Coarse reason bucket for the last relay-protection rejection.
+    pub last_relay_rejection_reason: Option<String>,
+    /// Last relay-protection quarantine timestamp.
+    pub last_relay_quarantine_at: Option<u64>,
+    /// Coarse reason bucket for the last relay-protection quarantine.
+    pub last_relay_quarantine_reason: Option<String>,
+}
+
+/// Aggregate peer health summary exposed in discovery status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStorePeerHealthStatus {
+    /// Unix timestamp when the summary was generated.
+    pub generated_at: u64,
+    /// Total retained peer descriptors considered by this summary.
+    pub total_peers: usize,
+    /// Peers with no current descriptor, route, or relay-protection attention bucket.
+    pub healthy_peers: usize,
+    /// Peers that need operator attention but are not hard failing.
+    pub degraded_peers: usize,
+    /// Peers with repeated recent route failures.
+    pub failing_peers: usize,
+    /// Peers currently under short local relay-protection quarantine.
+    pub quarantined_peers: usize,
+    /// Privacy-safe per-peer health rows, capped for nodeboard.
+    pub peers: Vec<PeerStorePeerHealth>,
 }
 
 // ============================================
@@ -853,6 +961,7 @@ pub struct PeerStore {
     peers: RwLock<HashMap<[u8; 32], SignedNodeDescriptor>>,
     peer_runtime: RwLock<HashMap<[u8; 32], PeerRuntimeMetadata>>,
     route_health: RwLock<HashMap<[u8; 32], PeerRouteHealth>>,
+    relay_protection_health: RwLock<HashMap<[u8; 32], PeerRelayProtectionHealth>>,
     max_peers: RwLock<Option<usize>>,
     counters: PeerStoreCounters,
     audit_events: RwLock<VecDeque<PeerStoreAuditEvent>>,
@@ -867,6 +976,7 @@ impl PeerStore {
             peers: RwLock::new(HashMap::new()),
             peer_runtime: RwLock::new(HashMap::new()),
             route_health: RwLock::new(HashMap::new()),
+            relay_protection_health: RwLock::new(HashMap::new()),
             max_peers: RwLock::new(None),
             counters: PeerStoreCounters::new(),
             audit_events: RwLock::new(VecDeque::with_capacity(MAX_AUDIT_EVENTS)),
@@ -1599,6 +1709,67 @@ impl PeerStore {
         );
     }
 
+    /// Records a relay-protection rejection for a previous-hop peer.
+    ///
+    /// This is peer-level control-plane health only. Status exposes a short
+    /// node prefix, counters, and coarse reason buckets; it never includes full
+    /// node ids, route ids, endpoint URLs, encrypted blobs, receiver identities,
+    /// client IPs, DNS contents, voucher secrets, private keys, wallet-level
+    /// traffic, or payload-derived details.
+    pub fn record_peer_relay_rejection(
+        &self,
+        node_id: &[u8; 32],
+        now: u64,
+        reason: impl Into<String>,
+    ) {
+        let reason = reason.into();
+        let mut relay_health = self.relay_protection_health.write();
+        let health = relay_health.entry(*node_id).or_default();
+        health.rejection_count = health.rejection_count.saturating_add(1);
+        health.last_rejection_at = Some(now);
+        health.last_rejection_reason = Some(reason.clone());
+        self.record_audit_event(
+            now,
+            "blind_relay_peer_protection",
+            "rejected",
+            format!(
+                "node_prefix={} reason_bucket={reason}",
+                hex::encode(&node_id[..4])
+            ),
+        );
+    }
+
+    /// Records that relay protection started a short quarantine for a peer.
+    ///
+    /// `quarantine_until` is a local control-plane timestamp. It is exposed as
+    /// remaining seconds only; callers must not pass route ids, endpoint URLs,
+    /// encrypted blobs, receivers, client traffic metadata, wallet ids, or
+    /// plaintext-derived values into this method.
+    pub fn record_peer_relay_quarantine_started(
+        &self,
+        node_id: &[u8; 32],
+        now: u64,
+        quarantine_until: u64,
+        reason: impl Into<String>,
+    ) {
+        let reason = reason.into();
+        let mut relay_health = self.relay_protection_health.write();
+        let health = relay_health.entry(*node_id).or_default();
+        health.quarantine_count = health.quarantine_count.saturating_add(1);
+        health.quarantine_until = Some(quarantine_until);
+        health.last_quarantine_at = Some(now);
+        health.last_quarantine_reason = Some(reason.clone());
+        self.record_audit_event(
+            now,
+            "blind_relay_peer_quarantine",
+            "limited",
+            format!(
+                "node_prefix={} reason_bucket={reason}",
+                hex::encode(&node_id[..4])
+            ),
+        );
+    }
+
     /// Records a privacy-safe discovery control-plane audit event.
     ///
     /// Events are bounded and newest-last. Full peer public keys, client
@@ -1821,6 +1992,10 @@ impl PeerStore {
             for node_id in &removed {
                 route_health.remove(node_id);
             }
+            let mut relay_health = self.relay_protection_health.write();
+            for node_id in &removed {
+                relay_health.remove(node_id);
+            }
         }
         let removed_count = before.saturating_sub(self.peers.read().len());
         if removed_count > 0 {
@@ -1980,6 +2155,7 @@ impl PeerStore {
         let stability = Self::stability(&snapshot, &bootstrap, now);
         let peer_summary = self.peer_summary(now);
         let route_candidates = self.route_candidate_status(now);
+        let peer_health_summary = self.peer_health_summary(now);
 
         PeerStoreStatus {
             snapshot,
@@ -1990,6 +2166,7 @@ impl PeerStore {
             stability,
             peer_summary,
             route_candidates,
+            peer_health_summary,
         }
     }
 
@@ -2425,6 +2602,157 @@ impl PeerStore {
         }
     }
 
+    fn source_is_live_gossip(source: &str) -> bool {
+        matches!(source, "gossip_snapshot" | "gossip_announce")
+    }
+
+    fn peer_health_bucket(
+        descriptor_health: &str,
+        route_health: &str,
+        relay_quarantined: bool,
+        relay_rejection_count: u64,
+    ) -> &'static str {
+        if relay_quarantined {
+            return "quarantined";
+        }
+        if descriptor_health == "expired" {
+            return "expired";
+        }
+        if route_health == "failing" {
+            return "failing";
+        }
+        if descriptor_health == "stale" || route_health == "degraded" || relay_rejection_count > 0 {
+            return "degraded";
+        }
+        "healthy"
+    }
+
+    /// Builds a privacy-safe per-peer health summary for nodeboard.
+    ///
+    /// The summary intentionally combines only node-level control-plane state:
+    /// signed descriptor freshness, import/gossip source buckets, local opaque
+    /// route-health counters, and relay-protection buckets. It never includes
+    /// endpoint URLs, route ids, encrypted blobs, receiver identities, client
+    /// IPs, destinations, DNS contents, voucher secrets, private keys,
+    /// wallet-level traffic, or plaintext content.
+    #[must_use]
+    pub fn peer_health_summary(&self, now: u64) -> PeerStorePeerHealthStatus {
+        let peers = self.peers.read();
+        let metadata = self.peer_runtime.read();
+        let route_health = self.route_health.read();
+        let relay_health = self.relay_protection_health.read();
+
+        let mut rows = Vec::with_capacity(peers.len().min(PEER_HEALTH_STATUS_LIMIT));
+        let mut healthy_peers = 0usize;
+        let mut degraded_peers = 0usize;
+        let mut failing_peers = 0usize;
+        let mut quarantined_peers = 0usize;
+
+        for (node_id, descriptor) in peers.iter() {
+            let meta = metadata.get(node_id);
+            let source = meta
+                .map(|value| value.source.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            let last_seen_at = meta.map(|value| value.last_seen_at).unwrap_or(now);
+            let last_seen_age_seconds = now.saturating_sub(last_seen_at);
+            let last_successful_gossip_at = meta.and_then(|value| {
+                Self::source_is_live_gossip(&value.source).then_some(value.last_seen_at)
+            });
+            let last_successful_gossip_age_seconds =
+                last_successful_gossip_at.map(|value| now.saturating_sub(value));
+
+            let (descriptor_health, _) = Self::descriptor_health(descriptor, now);
+            let route_health_entry = route_health.get(node_id);
+            let (route_health_bucket, _) =
+                Self::route_health_bucket_and_score(route_health_entry, now);
+            let relay_health_entry = relay_health.get(node_id);
+            let relay_quarantine_remaining_seconds = relay_health_entry
+                .and_then(|value| value.quarantine_until)
+                .and_then(|quarantine_until| {
+                    (now < quarantine_until).then_some(quarantine_until.saturating_sub(now))
+                });
+            let relay_quarantined = relay_quarantine_remaining_seconds.is_some();
+            let relay_rejection_count = relay_health_entry
+                .map(|value| value.rejection_count)
+                .unwrap_or(0);
+            let health = Self::peer_health_bucket(
+                descriptor_health,
+                route_health_bucket,
+                relay_quarantined,
+                relay_rejection_count,
+            );
+
+            match health {
+                "quarantined" => quarantined_peers += 1,
+                "failing" => failing_peers += 1,
+                "degraded" | "expired" => degraded_peers += 1,
+                _ => healthy_peers += 1,
+            }
+
+            rows.push(PeerStorePeerHealth {
+                node_id_prefix: hex::encode(&node_id[..4]),
+                health: health.to_string(),
+                descriptor_health: descriptor_health.to_string(),
+                source,
+                last_successful_gossip_at,
+                last_successful_gossip_age_seconds,
+                last_seen_at,
+                last_seen_age_seconds,
+                route_health: route_health_bucket.to_string(),
+                route_success_count: route_health_entry
+                    .map(|value| value.success_count)
+                    .unwrap_or(0),
+                route_failure_count: route_health_entry
+                    .map(|value| value.failure_count)
+                    .unwrap_or(0),
+                route_consecutive_failures: route_health_entry
+                    .map(|value| value.consecutive_failures)
+                    .unwrap_or(0),
+                last_route_success_at: route_health_entry.and_then(|value| value.last_success_at),
+                last_route_failure_at: route_health_entry.and_then(|value| value.last_failure_at),
+                last_route_failure_reason: route_health_entry
+                    .and_then(|value| value.last_failure_reason.clone()),
+                relay_rejection_count,
+                relay_quarantine_count: relay_health_entry
+                    .map(|value| value.quarantine_count)
+                    .unwrap_or(0),
+                relay_quarantined,
+                relay_quarantine_remaining_seconds,
+                last_relay_rejection_at: relay_health_entry
+                    .and_then(|value| value.last_rejection_at),
+                last_relay_rejection_reason: relay_health_entry
+                    .and_then(|value| value.last_rejection_reason.clone()),
+                last_relay_quarantine_at: relay_health_entry
+                    .and_then(|value| value.last_quarantine_at),
+                last_relay_quarantine_reason: relay_health_entry
+                    .and_then(|value| value.last_quarantine_reason.clone()),
+            });
+        }
+
+        rows.sort_by(|a, b| {
+            peer_health_rank(&a.health)
+                .cmp(&peer_health_rank(&b.health))
+                .then_with(|| {
+                    b.route_consecutive_failures
+                        .cmp(&a.route_consecutive_failures)
+                })
+                .then_with(|| b.relay_rejection_count.cmp(&a.relay_rejection_count))
+                .then_with(|| a.last_seen_age_seconds.cmp(&b.last_seen_age_seconds))
+                .then_with(|| a.node_id_prefix.cmp(&b.node_id_prefix))
+        });
+        rows.truncate(PEER_HEALTH_STATUS_LIMIT);
+
+        PeerStorePeerHealthStatus {
+            generated_at: now,
+            total_peers: peers.len(),
+            healthy_peers,
+            degraded_peers,
+            failing_peers,
+            quarantined_peers,
+            peers: rows,
+        }
+    }
+
     /// Returns the number of stored descriptors.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -2435,6 +2763,17 @@ impl PeerStore {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+fn peer_health_rank(health: &str) -> u8 {
+    match health {
+        "quarantined" => 0,
+        "failing" => 1,
+        "degraded" => 2,
+        "expired" => 3,
+        "stale" => 4,
+        _ => 5,
     }
 }
 
@@ -2690,6 +3029,62 @@ mod tests {
         assert_eq!(recovered_row.route_health, "healthy");
         assert_eq!(recovered_row.route_consecutive_failures, 0);
         assert_eq!(recovered_row.last_route_success_at, Some(now + 5));
+    }
+
+    #[test]
+    fn test_peer_health_summary_reports_gossip_route_and_quarantine_without_payload_data() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let peer_kp = IdentityKeyPair::generate();
+        let mut descriptor = signed_descriptor_for(&peer_kp, 1, now + 2_000);
+        descriptor.descriptor.public_endpoint = Some("https://peer-health.example".to_string());
+        descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &peer_kp).unwrap();
+        let node_id = descriptor.node_id();
+        let node_prefix = hex::encode(&node_id[..4]);
+
+        store
+            .upsert_verified_from_source(descriptor, now, "gossip_announce")
+            .unwrap();
+        store.record_route_forward_failure(&node_id, now + 1, "request_failed");
+        store.record_route_forward_failure(&node_id, now + 2, "http_502");
+        store.record_peer_relay_rejection(&node_id, now + 3, "duplicate_route");
+        store.record_peer_relay_quarantine_started(
+            &node_id,
+            now + 4,
+            now + 304,
+            "failure_threshold",
+        );
+
+        let status = store.status(now + 10).peer_health_summary;
+        assert_eq!(status.total_peers, 1);
+        assert_eq!(status.quarantined_peers, 1);
+        let row = status.peers.first().expect("peer health row");
+        assert_eq!(row.node_id_prefix, node_prefix);
+        assert_eq!(row.health, "quarantined");
+        assert_eq!(row.source, "gossip_announce");
+        assert_eq!(row.last_successful_gossip_at, Some(now));
+        assert_eq!(row.last_successful_gossip_age_seconds, Some(10));
+        assert_eq!(row.route_failure_count, 2);
+        assert_eq!(row.route_consecutive_failures, 2);
+        assert_eq!(row.last_route_failure_reason.as_deref(), Some("http_502"));
+        assert!(row.relay_quarantined);
+        assert_eq!(row.relay_rejection_count, 1);
+        assert_eq!(row.relay_quarantine_count, 1);
+        assert_eq!(row.relay_quarantine_remaining_seconds, Some(294));
+        assert_eq!(
+            row.last_relay_rejection_reason.as_deref(),
+            Some("duplicate_route")
+        );
+        assert_eq!(
+            row.last_relay_quarantine_reason.as_deref(),
+            Some("failure_threshold")
+        );
+
+        let status_json = serde_json::to_string(&status).unwrap();
+        assert!(!status_json.contains("peer-health.example"));
+        assert!(!status_json.contains(&hex::encode(node_id)));
+        assert!(!status_json.contains("encrypted_blob"));
+        assert!(!status_json.contains("route_id"));
     }
 
     #[test]
