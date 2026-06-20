@@ -54,8 +54,12 @@
 //! - Blind relay keeps a bounded local `route_id` replay cache. The cache is
 //!   in-memory only, stores no payload/peer endpoint/user data, and prevents a
 //!   repeated encrypted route frame from being forwarded twice by this node.
+//! - Blind relay applies previous-hop rate limiting and short quarantine using
+//!   only node-level metadata. This protects commercial nodes from relay abuse
+//!   while preserving the invariant that encrypted blobs are never parsed.
 //!
 //! ## Last Modified
+//! v0.10.0-BlindRelayAbuseGuard - Add previous-hop rate limit and quarantine
 //! v0.9.0-BlindRelayReplayGuard - Drop duplicate route_id frames idempotently
 //! v0.8.0-BlindRelayLoopGuard - Reject immediate self/previous-hop relay loops
 //! v0.7.0-BlindRelayRetryStats - Report retry recovery/exhaustion to PeerStore status
@@ -136,6 +140,24 @@ const MAX_BLIND_RELAY_SEEN_ROUTES: usize = 8192;
 /// Replay cache horizon for blind relay route ids.
 const BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS: u64 = 10 * 60;
 
+/// Per previous-hop accepted relay attempts allowed in the short window.
+const BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT: u32 = 120;
+
+/// Sliding window for previous-hop relay rate limiting.
+const BLIND_RELAY_PREVIOUS_HOP_RATE_WINDOW_SECS: u64 = 60;
+
+/// Privacy-safe failure score that puts one previous-hop node into quarantine.
+const BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD: u32 = 12;
+
+/// Failure score decay horizon before a previous-hop gets a clean bucket.
+const BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS: u64 = 5 * 60;
+
+/// Short local quarantine for noisy previous-hop nodes.
+const BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS: u64 = 5 * 60;
+
+/// Maximum previous-hop abuse buckets retained by this process.
+const MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS: usize = 4096;
+
 // ============================================
 // State / Request / Response Types
 // ============================================
@@ -150,6 +172,7 @@ struct ChatPeerState {
     http_client: Arc<reqwest::Client>,
     blind_relay_in_flight: Arc<AtomicUsize>,
     blind_relay_seen_routes: Arc<Mutex<BlindRelayRouteReplayCache>>,
+    blind_relay_abuse_guard: Arc<Mutex<BlindRelayAbuseGuard>>,
 }
 
 #[derive(Debug, Default)]
@@ -197,6 +220,132 @@ impl BlindRelayRouteReplayCache {
 
     fn forget(&mut self, route_id: &[u8; 16]) {
         self.seen.remove(route_id);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlindRelayAbuseDecision {
+    Allowed,
+    RateLimited,
+    Quarantined,
+}
+
+#[derive(Debug, Default)]
+struct BlindRelayPreviousHopBucket {
+    rate_window_start: u64,
+    rate_count: u32,
+    failure_window_start: u64,
+    failure_score: u32,
+    quarantine_until: Option<u64>,
+    last_seen_at: u64,
+}
+
+#[derive(Debug, Default)]
+struct BlindRelayAbuseGuard {
+    buckets: HashMap<[u8; 32], BlindRelayPreviousHopBucket>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl BlindRelayAbuseGuard {
+    fn observe_request(&mut self, previous_hop: [u8; 32], now: u64) -> BlindRelayAbuseDecision {
+        self.evict_idle(now);
+        let bucket = self.bucket_mut(previous_hop, now);
+        bucket.last_seen_at = now;
+
+        if bucket
+            .quarantine_until
+            .is_some_and(|quarantine_until| now < quarantine_until)
+        {
+            return BlindRelayAbuseDecision::Quarantined;
+        }
+        if now.saturating_sub(bucket.rate_window_start) > BLIND_RELAY_PREVIOUS_HOP_RATE_WINDOW_SECS
+        {
+            bucket.rate_window_start = now;
+            bucket.rate_count = 0;
+        }
+
+        bucket.rate_count = bucket.rate_count.saturating_add(1);
+        if bucket.rate_count > BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT {
+            bucket.quarantine_until = Some(now + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS);
+            return BlindRelayAbuseDecision::RateLimited;
+        }
+
+        BlindRelayAbuseDecision::Allowed
+    }
+
+    fn record_failure(&mut self, previous_hop: [u8; 32], now: u64) -> bool {
+        let bucket = self.bucket_mut(previous_hop, now);
+        bucket.last_seen_at = now;
+        if now.saturating_sub(bucket.failure_window_start)
+            > BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS
+        {
+            bucket.failure_window_start = now;
+            bucket.failure_score = 0;
+        }
+
+        bucket.failure_score = bucket.failure_score.saturating_add(1);
+        if bucket.failure_score >= BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD {
+            bucket.quarantine_until = Some(now + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS);
+            bucket.failure_score = 0;
+            return true;
+        }
+        false
+    }
+
+    fn record_success(&mut self, previous_hop: [u8; 32], now: u64) {
+        if let Some(bucket) = self.buckets.get_mut(&previous_hop) {
+            bucket.last_seen_at = now;
+            if now.saturating_sub(bucket.failure_window_start)
+                > BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS
+            {
+                bucket.failure_window_start = now;
+                bucket.failure_score = 0;
+            }
+        }
+    }
+
+    fn bucket_mut(&mut self, previous_hop: [u8; 32], now: u64) -> &mut BlindRelayPreviousHopBucket {
+        if !self.buckets.contains_key(&previous_hop) {
+            self.order.push_back(previous_hop);
+        }
+        self.evict_over_capacity();
+        self.buckets
+            .entry(previous_hop)
+            .or_insert_with(|| BlindRelayPreviousHopBucket {
+                rate_window_start: now,
+                failure_window_start: now,
+                last_seen_at: now,
+                ..BlindRelayPreviousHopBucket::default()
+            })
+    }
+
+    fn evict_idle(&mut self, now: u64) {
+        let retention_secs =
+            BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS;
+        while let Some(previous_hop) = self.order.front().copied() {
+            let Some(bucket) = self.buckets.get(&previous_hop) else {
+                self.order.pop_front();
+                continue;
+            };
+            let quarantine_active = bucket
+                .quarantine_until
+                .is_some_and(|quarantine_until| now < quarantine_until);
+            if quarantine_active || now.saturating_sub(bucket.last_seen_at) <= retention_secs {
+                break;
+            }
+            self.order.pop_front();
+            self.buckets.remove(&previous_hop);
+        }
+    }
+
+    fn evict_over_capacity(&mut self) {
+        while self.buckets.len() >= MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS {
+            if let Some(previous_hop) = self.order.pop_front() {
+                self.buckets.remove(&previous_hop);
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -282,6 +431,12 @@ enum BlindRelayError {
     #[error("ttl exhausted")]
     TtlExhausted,
 
+    #[error("previous hop rate limited")]
+    RateLimited,
+
+    #[error("previous hop quarantined")]
+    Quarantined,
+
     #[error("blind relay route loop detected")]
     RouteLoop,
 
@@ -303,6 +458,7 @@ impl BlindRelayError {
             | Self::EnvelopeTooLarge
             | Self::TtlExhausted
             | Self::RouteLoop => StatusCode::BAD_REQUEST,
+            Self::RateLimited | Self::Quarantined => StatusCode::TOO_MANY_REQUESTS,
             Self::NoRoute | Self::InvalidEndpoint => StatusCode::BAD_GATEWAY,
             Self::ForwardFailed => StatusCode::BAD_GATEWAY,
         }
@@ -314,6 +470,8 @@ impl BlindRelayError {
             Self::InvalidSignature => "invalid_signature",
             Self::EnvelopeTooLarge => "envelope_too_large",
             Self::TtlExhausted => "ttl_exhausted",
+            Self::RateLimited => "rate_limited",
+            Self::Quarantined => "quarantined",
             Self::RouteLoop => "route_loop",
             Self::NoRoute => "no_route",
             Self::InvalidEndpoint => "invalid_endpoint",
@@ -366,6 +524,7 @@ pub fn build_chat_peer_router(
         http_client,
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+        blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
     };
 
     Router::new()
@@ -541,27 +700,32 @@ async fn process_peer_blind_relay(
     request: PeerBlindRelayRequest,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
     let now = now_secs();
+    let previous_hop_node_id = request.previous_hop_node_id;
     let envelope = request.envelope;
 
-    validate_blind_relay_envelope(&envelope, &request.previous_hop_node_id).map_err(|error| {
-        state
-            .peer_store
-            .record_blind_relay_rejected(now, error.reason_bucket());
+    check_blind_relay_previous_hop_allowed(&state, previous_hop_node_id, now)?;
+
+    validate_blind_relay_envelope(&envelope, &previous_hop_node_id).map_err(|error| {
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, error.reason_bucket());
         error
     })?;
 
     let self_node_id = state.node_identity.public_key_bytes();
-    if request.previous_hop_node_id == self_node_id {
-        state
-            .peer_store
-            .record_blind_relay_rejected(now, "self_loop");
+    if previous_hop_node_id == self_node_id {
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "self_loop");
         return Err(BlindRelayError::RouteLoop);
     }
 
     if envelope.next_hop == self_node_id {
         if observe_blind_relay_route(&state, envelope.route_id, now) {
-            return Ok(duplicate_blind_relay_response(&state, now, envelope.ttl));
+            return Ok(duplicate_blind_relay_response(
+                &state,
+                previous_hop_node_id,
+                now,
+                envelope.ttl,
+            ));
         }
+        record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
         state.peer_store.record_blind_relay_terminal(
             now,
             envelope.ttl,
@@ -576,25 +740,19 @@ async fn process_peer_blind_relay(
         });
     }
 
-    if envelope.next_hop == request.previous_hop_node_id {
-        state
-            .peer_store
-            .record_blind_relay_rejected(now, "route_loop");
+    if envelope.next_hop == previous_hop_node_id {
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "route_loop");
         return Err(BlindRelayError::RouteLoop);
     }
 
     if !envelope.can_forward() {
-        state
-            .peer_store
-            .record_blind_relay_rejected(now, "ttl_exhausted");
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "ttl_exhausted");
         return Err(BlindRelayError::TtlExhausted);
     }
 
     let next_hop = envelope.next_hop;
     let descriptor = state.peer_store.get_valid(&next_hop, now).ok_or_else(|| {
-        state
-            .peer_store
-            .record_blind_relay_rejected(now, "no_route");
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
         BlindRelayError::NoRoute
     })?;
 
@@ -606,23 +764,24 @@ async fn process_peer_blind_relay(
             state
                 .peer_store
                 .record_route_forward_failure(&next_hop, now, "missing_endpoint");
-            state
-                .peer_store
-                .record_blind_relay_rejected(now, "missing_endpoint");
+            reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "missing_endpoint");
             BlindRelayError::InvalidEndpoint
         })?;
     let url = blind_peer_relay_url(endpoint).ok_or_else(|| {
         state
             .peer_store
             .record_route_forward_failure(&next_hop, now, "invalid_endpoint");
-        state
-            .peer_store
-            .record_blind_relay_rejected(now, "invalid_endpoint");
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "invalid_endpoint");
         BlindRelayError::InvalidEndpoint
     })?;
 
     if observe_blind_relay_route(&state, envelope.route_id, now) {
-        return Ok(duplicate_blind_relay_response(&state, now, envelope.ttl));
+        return Ok(duplicate_blind_relay_response(
+            &state,
+            previous_hop_node_id,
+            now,
+            envelope.ttl,
+        ));
     }
 
     let forwarded_envelope = envelope
@@ -650,6 +809,7 @@ async fn process_peer_blind_relay(
     state
         .peer_store
         .record_route_forward_success(&next_hop, now);
+    record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
     state
         .peer_store
         .record_blind_relay_forwarded(now, ttl_remaining);
@@ -679,14 +839,95 @@ fn forget_blind_relay_route(state: &ChatPeerState, route_id: &[u8; 16]) {
     seen_routes.forget(route_id);
 }
 
+fn check_blind_relay_previous_hop_allowed(
+    state: &ChatPeerState,
+    previous_hop: [u8; 32],
+    now: u64,
+) -> Result<(), BlindRelayError> {
+    let decision = {
+        let mut abuse_guard = state
+            .blind_relay_abuse_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        abuse_guard.observe_request(previous_hop, now)
+    };
+
+    match decision {
+        BlindRelayAbuseDecision::Allowed => Ok(()),
+        BlindRelayAbuseDecision::RateLimited => {
+            state
+                .peer_store
+                .record_blind_relay_rejected(now, "rate_limited");
+            state
+                .peer_store
+                .record_blind_relay_quarantine_started(now, "rate_limit");
+            Err(BlindRelayError::RateLimited)
+        }
+        BlindRelayAbuseDecision::Quarantined => {
+            state
+                .peer_store
+                .record_blind_relay_rejected(now, "quarantined");
+            Err(BlindRelayError::Quarantined)
+        }
+    }
+}
+
+fn reject_blind_relay_previous_hop(
+    state: &ChatPeerState,
+    previous_hop: [u8; 32],
+    now: u64,
+    reason: &'static str,
+) {
+    state.peer_store.record_blind_relay_rejected(now, reason);
+    if !blind_relay_reason_counts_toward_quarantine(reason) {
+        return;
+    }
+
+    let quarantine_started = {
+        let mut abuse_guard = state
+            .blind_relay_abuse_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        abuse_guard.record_failure(previous_hop, now)
+    };
+    if quarantine_started {
+        state
+            .peer_store
+            .record_blind_relay_quarantine_started(now, "failure_threshold");
+    }
+}
+
+fn record_blind_relay_previous_hop_success(
+    state: &ChatPeerState,
+    previous_hop: [u8; 32],
+    now: u64,
+) {
+    let mut abuse_guard = state
+        .blind_relay_abuse_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    abuse_guard.record_success(previous_hop, now);
+}
+
+fn blind_relay_reason_counts_toward_quarantine(reason: &str) -> bool {
+    matches!(
+        reason,
+        "invalid_previous_hop"
+            | "invalid_signature"
+            | "self_loop"
+            | "route_loop"
+            | "duplicate_route"
+            | "ttl_exhausted"
+    )
+}
+
 fn duplicate_blind_relay_response(
     state: &ChatPeerState,
+    previous_hop: [u8; 32],
     now: u64,
     ttl_remaining: u8,
 ) -> PeerBlindRelayResponse {
-    state
-        .peer_store
-        .record_blind_relay_rejected(now, "duplicate_route");
+    reject_blind_relay_previous_hop(state, previous_hop, now, "duplicate_route");
     PeerBlindRelayResponse {
         accepted: true,
         terminal: false,
@@ -1126,6 +1367,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
         };
 
         assert!(BlindRelayInFlightGuard::try_acquire(&state).is_none());
@@ -1145,6 +1387,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x44u8; 16],
@@ -1189,6 +1432,52 @@ mod tests {
         assert!(!cache.observe(route_id, 1_800_000_002));
     }
 
+    #[test]
+    fn blind_relay_abuse_guard_rate_limits_previous_hop_without_payload_data() {
+        let mut guard = BlindRelayAbuseGuard::default();
+        let previous_hop = [0x52u8; 32];
+        let now = 1_800_000_000;
+
+        for _ in 0..BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT {
+            assert_eq!(
+                guard.observe_request(previous_hop, now),
+                BlindRelayAbuseDecision::Allowed
+            );
+        }
+
+        assert_eq!(
+            guard.observe_request(previous_hop, now),
+            BlindRelayAbuseDecision::RateLimited
+        );
+        assert_eq!(
+            guard.observe_request(previous_hop, now + 1),
+            BlindRelayAbuseDecision::Quarantined
+        );
+    }
+
+    #[test]
+    fn blind_relay_abuse_guard_quarantines_repeated_bad_previous_hop() {
+        let mut guard = BlindRelayAbuseGuard::default();
+        let previous_hop = [0x53u8; 32];
+        let now = 1_800_000_000;
+
+        for offset in 0..(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD - 1) {
+            assert!(!guard.record_failure(previous_hop, now + u64::from(offset)));
+        }
+
+        assert!(guard.record_failure(
+            previous_hop,
+            now + u64::from(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD)
+        ));
+        assert_eq!(
+            guard.observe_request(
+                previous_hop,
+                now + u64::from(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD) + 1
+            ),
+            BlindRelayAbuseDecision::Quarantined
+        );
+    }
+
     #[tokio::test]
     async fn blind_relay_drops_duplicate_route_id_without_forwarding_again() {
         let previous_hop = IdentityKeyPair::generate();
@@ -1203,6 +1492,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x45u8; 16],
@@ -1303,6 +1593,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x42u8; 16],
@@ -1384,6 +1675,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x43u8; 16],
