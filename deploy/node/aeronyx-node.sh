@@ -16,6 +16,9 @@
 #   nodes where Git cannot be pulled safely. This supports drain-aware binary
 #   replacement with hash verification, config validation, backup, restart, and
 #   post-restart health checks.
+# - Add a privacy-safe `relay-probe` command that sends one synthetic opaque
+#   BlindRelay envelope through the local node to a discovered ChatRelay peer
+#   and reports only aggregate counter deltas.
 # - Add a read-only discovery readiness summary to `status` so operators can
 #   see ChatRelay advertisement and peer quorum state without hand-curling the
 #   public peer API.
@@ -40,7 +43,8 @@
 # Main Functionality:
 # - Offers a guided interactive menu when no command is provided.
 # - Provides command aliases for quickstart, plan, install, upgrade, health,
-#   status, logs, doctor, binary promotion, and network maintenance.
+#   status, logs, doctor, relay route probing, binary promotion, and network
+#   maintenance.
 # - Passes common options such as --repo-dir, --branch, --registration-code,
 #   --config, and --service to the appropriate lower-level script.
 # - Keeps secret handling safe: registration codes are accepted as arguments or
@@ -73,6 +77,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.9.0-node-entrypoint - Added synthetic BlindRelay route probe command.
 # v1.8.0-node-entrypoint - Added guarded staged-binary promotion command.
 # v1.7.0-node-entrypoint - Added guarded ChatRelay enable/disable config helper.
 # v1.6.0-node-entrypoint - Show discovery ChatRelay and peer quorum readiness in status.
@@ -116,6 +121,9 @@ CHAT_RELAY_DISABLE=0
 RESTART_AFTER_CONFIG=0
 PROMOTE_BINARY_PATH=""
 EXPECTED_SHA256=""
+PEER_CACHE_FILE="${AERONYX_PEER_CACHE_FILE:-/var/lib/aeronyx/peers-cache.json}"
+SERVER_KEY_FILE="${AERONYX_SERVER_KEY_FILE:-/etc/aeronyx/server_key.json}"
+RELAY_PROBE_PEER_PREFIX=""
 YES=0
 EXTRA_ARGS=()
 
@@ -150,6 +158,7 @@ Commands:
   doctor     Alias for health.
   status     Show service, local endpoints, discovery readiness, upgrade state, and next action.
   chat-relay Enable or disable blind ChatRelay capability in server.toml.
+  relay-probe Send one synthetic BlindRelay route probe to a discovered peer.
   promote-binary Promote a staged aeronyx-server binary with drain checks.
   logs       Show recent systemd logs. Use --follow to tail.
   network    Refresh forwarding/NAT or update the privacy protocol IP pool.
@@ -198,6 +207,13 @@ Command-specific options:
     --restart               Restart service after config validation.
     --yes                   Skip confirmation prompts and allow restart with active sessions.
 
+  relay-probe:
+    --peer-prefix PREFIX     Optional privacy-safe peer prefix to target.
+    --peer-cache PATH        Peer cache path. Default: /var/lib/aeronyx/peers-cache.json.
+    --server-key PATH        Local node key path. Default: /etc/aeronyx/server_key.json.
+    --json                  Emit JSON result for nodeboard/automation.
+    --json-only             Emit only JSON.
+
   promote-binary:
     --binary PATH            Staged aeronyx-server binary to promote.
     --expected-sha256 HASH   Optional SHA-256 expected for the staged binary.
@@ -211,6 +227,7 @@ Examples:
   sudo ./deploy/node/aeronyx-node.sh upgrade --no-restart
   ./deploy/node/aeronyx-node.sh health --json
   ./deploy/node/aeronyx-node.sh status
+  ./deploy/node/aeronyx-node.sh relay-probe --json
   sudo ./deploy/node/aeronyx-node.sh chat-relay --enable-chat-relay --restart
   sudo ./deploy/node/aeronyx-node.sh promote-binary --binary ./target/release/aeronyx-server.next --expected-sha256 HASH
 USAGE
@@ -282,6 +299,9 @@ parse_args() {
             --restart) RESTART_AFTER_CONFIG=1; shift ;;
             --binary|--staged-binary) PROMOTE_BINARY_PATH="${2:?missing value}"; shift 2 ;;
             --expected-sha256) EXPECTED_SHA256="${2:?missing value}"; shift 2 ;;
+            --peer-prefix) RELAY_PROBE_PEER_PREFIX="${2:?missing value}"; shift 2 ;;
+            --peer-cache) PEER_CACHE_FILE="${2:?missing value}"; shift 2 ;;
+            --server-key) SERVER_KEY_FILE="${2:?missing value}"; shift 2 ;;
             --yes|-y) YES=1; shift ;;
             -h|--help) COMMAND="help"; shift ;;
             --quick|--start|--no-build|--no-network|--no-enable|--skip-package-install|--skip-rust-install|--allow-dirty|--skip-pull)
@@ -741,6 +761,254 @@ PY
     rm -f "${tmp}"
 }
 
+run_relay_probe() {
+    command -v python3 >/dev/null 2>&1 || die "relay-probe requires python3"
+    [ -r "${PEER_CACHE_FILE}" ] || die "Peer cache not readable: ${PEER_CACHE_FILE}"
+    [ -r "${SERVER_KEY_FILE}" ] || die "Server key public metadata not readable: ${SERVER_KEY_FILE}"
+
+    local local_status_url local_relay_url
+    local_status_url="$(discovery_status_url)"
+    local_relay_url="${local_status_url%/api/discovery/status}/api/chat/peer/blind-relay"
+
+    if [ "${JSON_ONLY}" -ne 1 ]; then
+        log "Synthetic BlindRelay route probe"
+        log "Local relay endpoint: ${local_relay_url}"
+        log "Peer cache: ${PEER_CACHE_FILE}"
+        log "Privacy boundary: synthetic opaque blob only; no user message, wallet id, DNS, destination, domain, URL, or packet payload"
+    fi
+
+    python3 - \
+        "${local_status_url}" \
+        "${local_relay_url}" \
+        "${PEER_CACHE_FILE}" \
+        "${SERVER_KEY_FILE}" \
+        "${RELAY_PROBE_PEER_PREFIX}" \
+        "${JSON}" \
+        "${JSON_ONLY}" <<'PY'
+import base64
+import hashlib
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+except Exception as exc:
+    print(json.dumps({
+        "status": "error",
+        "reason": "missing_python_cryptography",
+        "detail": str(exc)[:240],
+    }, sort_keys=True))
+    raise SystemExit(2)
+
+DOMAIN = b"AeroNyx-BlindRelay-v1"
+(
+    local_status_url,
+    local_relay_url,
+    peer_cache_path,
+    server_key_path,
+    peer_prefix_filter,
+    json_requested,
+    json_only,
+) = sys.argv[1:8]
+json_requested = json_requested == "1"
+json_only = json_only == "1"
+
+
+def fetch_json(url):
+    with urllib.request.urlopen(url, timeout=12) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def blind_stats(status):
+    return status["peer_store"]["runtime"]["blind_relay"]
+
+
+def int_delta(after, before, key):
+    return int(after.get(key, 0) or 0) - int(before.get(key, 0) or 0)
+
+
+def b64decode_key(value):
+    return base64.b64decode(value)
+
+
+def node_id_prefix(node_id):
+    return bytes(node_id).hex()[:8]
+
+
+def has_chat_relay(capabilities):
+    return any(str(item).lower() in {"chatrelay", "chat_relay"} for item in capabilities or [])
+
+
+def choose_peer(snapshot, self_pub, prefix_filter):
+    peers = snapshot.get("peers") if isinstance(snapshot, dict) else []
+    if not isinstance(peers, list):
+        peers = []
+    candidates = []
+    for peer in peers:
+        if not isinstance(peer, dict):
+            continue
+        descriptor = peer.get("descriptor")
+        if not isinstance(descriptor, dict):
+            continue
+        node_id = descriptor.get("node_id")
+        endpoint = descriptor.get("public_endpoint")
+        capabilities = descriptor.get("capabilities")
+        if not isinstance(node_id, list) or len(node_id) != 32:
+            continue
+        try:
+            node_id_bytes = bytes(int(item) & 0xFF for item in node_id)
+        except Exception:
+            continue
+        if node_id_bytes == self_pub:
+            continue
+        if not endpoint or not has_chat_relay(capabilities):
+            continue
+        prefix = node_id_bytes.hex()[:8]
+        if prefix_filter and not prefix.startswith(prefix_filter.lower()):
+            continue
+        candidates.append((node_id_bytes, str(endpoint).rstrip("/"), prefix, descriptor))
+    if not candidates:
+        raise RuntimeError("no_routeable_chat_relay_peer")
+    candidates.sort(key=lambda item: item[2])
+    return candidates[0]
+
+
+def sign_data(route_id, next_hop, ttl, timestamp, blob, private_key):
+    payload = (
+        DOMAIN
+        + route_id
+        + next_hop
+        + bytes([ttl])
+        + int(timestamp).to_bytes(8, "little")
+        + hashlib.sha256(blob).digest()
+    )
+    return private_key.sign(payload)
+
+
+def signature_tuple(signature):
+    return [list(signature[:32]), list(signature[32:])]
+
+
+def post_json(url, body):
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=18) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = {"raw": raw[:500]}
+        return exc.code, parsed
+
+
+server_key = json.load(open(server_key_path, "r", encoding="utf-8"))
+self_pub = b64decode_key(server_key["public_key"])
+snapshot = json.load(open(peer_cache_path, "r", encoding="utf-8"))
+target_node_id, target_endpoint, target_prefix, _descriptor = choose_peer(
+    snapshot,
+    self_pub,
+    peer_prefix_filter.strip(),
+)
+
+remote_status_url = f"{target_endpoint}/api/discovery/status"
+before_local = blind_stats(fetch_json(local_status_url))
+before_remote = blind_stats(fetch_json(remote_status_url))
+
+previous_private = Ed25519PrivateKey.generate()
+previous_pub = previous_private.public_key().public_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PublicFormat.Raw,
+)
+route_id = os.urandom(16)
+ttl = 2
+timestamp = int(time.time())
+blob = b"synthetic-blind-relay-probe:v1:no-user-payload"
+signature = sign_data(route_id, target_node_id, ttl, timestamp, blob, previous_private)
+
+body = {
+    "envelope": {
+        "route_id": list(route_id),
+        "next_hop": list(target_node_id),
+        "ttl": ttl,
+        "encrypted_blob": list(blob),
+        "timestamp": timestamp,
+        "signature": signature_tuple(signature),
+    },
+    "previous_hop_node_id": list(previous_pub),
+}
+
+response_status, response_body = post_json(local_relay_url, body)
+time.sleep(2)
+after_local = blind_stats(fetch_json(local_status_url))
+after_remote = blind_stats(fetch_json(remote_status_url))
+
+local_delta = {
+    key: int_delta(after_local, before_local, key)
+    for key in ["received", "forwarded", "terminal", "rejected", "forward_failed", "no_route"]
+}
+remote_delta = {
+    key: int_delta(after_remote, before_remote, key)
+    for key in ["received", "forwarded", "terminal", "rejected", "forward_failed", "no_route"]
+}
+ok = (
+    response_status == 200
+    and response_body.get("accepted") is True
+    and response_body.get("forwarded") is True
+    and local_delta.get("forwarded") == 1
+    and remote_delta.get("terminal") == 1
+    and local_delta.get("rejected") == 0
+    and remote_delta.get("rejected") == 0
+)
+result = {
+    "status": "ok" if ok else "attention",
+    "response_status": response_status,
+    "response_body": response_body,
+    "target_peer_prefix": target_prefix,
+    "route_id_prefix": route_id.hex()[:8],
+    "local_delta": local_delta,
+    "remote_delta": remote_delta,
+    "source": "aeronyx-node.sh relay-probe",
+    "privacy_boundary": "synthetic opaque blob only; no user message, wallet id, DNS, destination, domain, URL, or packet payload",
+}
+
+if not json_only:
+    print(
+        "relay_probe_status={status} target_peer_prefix={peer} response_status={code}".format(
+            status=result["status"],
+            peer=target_prefix,
+            code=response_status,
+        )
+    )
+    print(
+        "relay_probe_local_delta=received:{received} forwarded:{forwarded} terminal:{terminal} rejected:{rejected} forward_failed:{forward_failed} no_route:{no_route}".format(
+            **local_delta
+        )
+    )
+    print(
+        "relay_probe_remote_delta=received:{received} forwarded:{forwarded} terminal:{terminal} rejected:{rejected} forward_failed:{forward_failed} no_route:{no_route}".format(
+            **remote_delta
+        )
+    )
+
+if json_requested or json_only:
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+
+raise SystemExit(0 if ok else 3)
+PY
+}
+
 sha256_file() {
     local path="$1"
     if command -v sha256sum >/dev/null 2>&1; then
@@ -1132,6 +1400,9 @@ main() {
             ;;
         chat-relay)
             run_chat_relay_config
+            ;;
+        relay-probe)
+            run_relay_probe
             ;;
         promote-binary)
             run_promote_binary
