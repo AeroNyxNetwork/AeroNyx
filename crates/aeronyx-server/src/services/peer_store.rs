@@ -64,6 +64,9 @@
 //! - Privacy-safe recent peer lifecycle events so operators can understand
 //!   whether peers are being inserted, refreshed, rejected, or expired without
 //!   exposing full node IDs, endpoints, route IDs, payloads, or user metadata
+//! - Peer quorum readiness summary that tells operators whether the verified
+//!   peer view has enough fresh, routeable, restart-survivable peers for future
+//!   multi-hop work without claiming global consensus or exposing endpoints
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -90,6 +93,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.31.0-PeerQuorumReadiness - Added privacy-safe peer quorum readiness summary
 //! v0.30.0-PeerLifecycleEvents - Added privacy-safe recent peer discovery lifecycle events
 //! v0.29.0-NetworkStoryAttentionPriority - Make degraded discovery stability outrank peer-view marketing status
 //! v0.28.0-NetworkStoryStatus - Added product-facing aggregate discovery readiness story
@@ -140,6 +144,8 @@ const PEER_ROUTE_LAST_SEEN_STALE_SECS: u64 = 1_800;
 const PEER_ROUTE_RECENT_FAILURE_SECS: u64 = 600;
 const PEER_ROUTE_STATUS_LIMIT: usize = 8;
 const PEER_HEALTH_STATUS_LIMIT: usize = 64;
+const PEER_QUORUM_MIN_VALID_PEERS: usize = 2;
+const PEER_QUORUM_MIN_ROUTEABLE_CHAT_RELAYS: usize = 1;
 
 // ============================================
 // PeerStoreError
@@ -548,6 +554,15 @@ pub struct PeerStoreStatus {
     /// identities, client IPs, destinations, DNS contents, voucher secrets,
     /// private keys, wallet-level traffic, or plaintext content.
     pub peer_health_summary: PeerStorePeerHealthStatus,
+    /// Privacy-safe quorum readiness for peer discovery.
+    ///
+    /// This is not chain consensus. It is an operator-facing readiness summary
+    /// derived from verified descriptors, route candidates, and restart
+    /// recovery status. It never exposes full node ids, endpoint URLs, route
+    /// ids, encrypted payloads, receiver identities, client IPs, destinations,
+    /// DNS contents, voucher secrets, private keys, wallet-level traffic, or
+    /// plaintext.
+    pub peer_quorum: PeerStorePeerQuorumStatus,
     /// Product-facing aggregate story for app/nodeboard/website surfaces.
     ///
     /// This is derived from existing discovery status objects and must remain
@@ -555,6 +570,49 @@ pub struct PeerStoreStatus {
     /// payloads, receiver identities, client IPs, destinations, DNS contents,
     /// voucher secrets, private keys, wallet-level traffic, or plaintext.
     pub network_story: PeerStoreNetworkStoryStatus,
+}
+
+/// Privacy-safe peer quorum readiness for future multi-hop work.
+///
+/// The word "quorum" here is intentionally scoped to this node's verified peer
+/// view. It is not public-chain consensus, not ledger finality, and not a vote
+/// over user traffic. The goal is to help nodeboard and automated runbooks tell
+/// whether a node has enough fresh routeable peer state to continue with
+/// encrypted relay and future onion-shaped path work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStorePeerQuorumStatus {
+    /// Unix timestamp when this summary was generated.
+    pub generated_at: u64,
+    /// Stable bucket: disabled, forming, peer_view_ready, route_ready, or attention.
+    pub status: String,
+    /// Whether the local verified peer view meets the minimum readiness gates.
+    pub quorum_ready: bool,
+    /// Minimum valid descriptors required by this readiness gate.
+    pub min_valid_peers: usize,
+    /// Minimum routeable chat relay candidates required by this readiness gate.
+    pub min_routeable_chat_relays: usize,
+    /// Valid descriptors at generation time.
+    pub valid_peers: usize,
+    /// Healthy valid descriptors at generation time.
+    pub healthy_peers: usize,
+    /// Stale-but-valid descriptors at generation time.
+    pub stale_peers: usize,
+    /// Routeable encrypted chat relay candidates.
+    pub routeable_chat_relays: usize,
+    /// Routeable future onion middle-hop candidates.
+    pub routeable_onion_middle_hops: usize,
+    /// Healthy valid descriptor percentage, rounded down.
+    pub healthy_ratio_percent: u8,
+    /// Whether peer cache or seed recovery is configured for restart survival.
+    pub restart_recovery_configured: bool,
+    /// Whether discovery stability says the relay foundation is ready.
+    pub relay_foundation_ready: bool,
+    /// Short operator-facing detail with aggregate counts only.
+    pub detail: String,
+    /// Privacy-safe next action for nodeboard / AI runbooks.
+    pub next_action: String,
+    /// Explicit privacy boundary for downstream UI and API consumers.
+    pub privacy_boundary: String,
 }
 
 /// Product-facing aggregate discovery readiness story.
@@ -2421,6 +2479,8 @@ impl PeerStore {
         let peer_summary = self.peer_summary(now);
         let route_candidates = self.route_candidate_status(now);
         let peer_health_summary = self.peer_health_summary(now);
+        let peer_quorum =
+            Self::peer_quorum_status(now, &stability, &peer_summary, &route_candidates);
         let network_story =
             Self::network_story_status(now, &stability, &peer_summary, &route_candidates);
 
@@ -2435,7 +2495,86 @@ impl PeerStore {
             peer_summary,
             route_candidates,
             peer_health_summary,
+            peer_quorum,
             network_story,
+        }
+    }
+
+    fn peer_quorum_status(
+        now: u64,
+        stability: &PeerStoreStabilityStatus,
+        peer_summary: &PeerStorePeerSummaryStatus,
+        route_candidates: &PeerStoreRouteCandidateStatus,
+    ) -> PeerStorePeerQuorumStatus {
+        let routeable_chat_relays = route_candidates.chat_relay.len();
+        let routeable_onion_middle_hops = route_candidates.onion_middle.len();
+        let healthy_ratio_percent = if peer_summary.valid_peers == 0 {
+            0
+        } else {
+            ((peer_summary.healthy_peers * 100) / peer_summary.valid_peers).min(100) as u8
+        };
+        let enough_valid_peers = peer_summary.valid_peers >= PEER_QUORUM_MIN_VALID_PEERS;
+        let enough_routeable_chat_relays =
+            routeable_chat_relays >= PEER_QUORUM_MIN_ROUTEABLE_CHAT_RELAYS;
+        let stability_needs_attention =
+            matches!(stability.health.as_str(), "failed" | "degraded" | "stale");
+        let quorum_ready = !stability_needs_attention
+            && enough_valid_peers
+            && enough_routeable_chat_relays
+            && stability.restart_recovery_configured
+            && stability.relay_foundation_ready;
+
+        let status = if stability.health == "disabled" {
+            "disabled"
+        } else if stability_needs_attention {
+            "attention"
+        } else if !enough_valid_peers {
+            "forming"
+        } else if enough_routeable_chat_relays {
+            "route_ready"
+        } else {
+            "peer_view_ready"
+        };
+
+        let next_action = match status {
+            "disabled" => "enable discovery and configure peer recovery before testing multi-hop routing",
+            "attention" => "restore discovery stability before relying on the peer view",
+            "forming" => "add seed endpoints, peer cache, or live gossip until the verified peer view reaches quorum",
+            "peer_view_ready" => "ensure at least one verified peer advertises a public chat relay endpoint",
+            _ if !stability.restart_recovery_configured => {
+                "configure peer cache or seed endpoints so peer quorum survives restart"
+            }
+            _ => "peer quorum is ready for controlled encrypted relay experiments",
+        };
+
+        let detail = format!(
+            "valid_peers={} healthy_peers={} stale_peers={} routeable_chat_relays={} routeable_onion_middle_hops={} restart_recovery_configured={} relay_foundation_ready={}",
+            peer_summary.valid_peers,
+            peer_summary.healthy_peers,
+            peer_summary.stale_peers,
+            routeable_chat_relays,
+            routeable_onion_middle_hops,
+            stability.restart_recovery_configured,
+            stability.relay_foundation_ready
+        );
+
+        PeerStorePeerQuorumStatus {
+            generated_at: now,
+            status: status.to_string(),
+            quorum_ready,
+            min_valid_peers: PEER_QUORUM_MIN_VALID_PEERS,
+            min_routeable_chat_relays: PEER_QUORUM_MIN_ROUTEABLE_CHAT_RELAYS,
+            valid_peers: peer_summary.valid_peers,
+            healthy_peers: peer_summary.healthy_peers,
+            stale_peers: peer_summary.stale_peers,
+            routeable_chat_relays,
+            routeable_onion_middle_hops,
+            healthy_ratio_percent,
+            restart_recovery_configured: stability.restart_recovery_configured,
+            relay_foundation_ready: stability.relay_foundation_ready,
+            detail,
+            next_action: next_action.to_string(),
+            privacy_boundary: "aggregate local peer-view readiness only; not public-chain consensus; no full node ids, endpoint URLs, route ids, encrypted payloads, receiver identities, client IPs, destinations, DNS contents, voucher secrets, private keys, wallet-level traffic, or plaintext".to_string(),
         }
     }
 
@@ -4206,6 +4345,72 @@ mod tests {
             .peers
             .iter()
             .all(|peer| peer.capabilities.contains(&"chat_relay".to_string())));
+    }
+
+    #[test]
+    fn test_peer_quorum_reports_peer_view_ready_without_routeable_endpoint() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        store.configure_bootstrap_status(true, true, true, 2);
+        store
+            .upsert_verified_from_source(signed_descriptor(1, now + 1_000), now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(signed_descriptor(1, now + 1_000), now, "gossip_snapshot")
+            .unwrap();
+        store.record_gossip_round(now + 20, 2, 2, 1, None);
+
+        let status = store.status(now + 60);
+
+        assert_eq!(status.peer_quorum.status, "peer_view_ready");
+        assert!(!status.peer_quorum.quorum_ready);
+        assert_eq!(status.peer_quorum.valid_peers, 2);
+        assert_eq!(status.peer_quorum.routeable_chat_relays, 0);
+        assert_eq!(status.peer_quorum.healthy_ratio_percent, 100);
+        assert!(status
+            .peer_quorum
+            .next_action
+            .contains("public chat relay endpoint"));
+    }
+
+    #[test]
+    fn test_peer_quorum_ready_requires_fresh_routeable_restart_recoverable_peers() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let first_kp = IdentityKeyPair::generate();
+        let second_kp = IdentityKeyPair::generate();
+
+        let mut first = signed_descriptor_for(&first_kp, 1, now + 1_000);
+        first.descriptor.public_endpoint = Some("https://peer-one.example".to_string());
+        first = SignedNodeDescriptor::sign(first.descriptor, &first_kp).unwrap();
+
+        let mut second = signed_descriptor_for(&second_kp, 1, now + 1_000);
+        second.descriptor.public_endpoint = Some("https://peer-two.example".to_string());
+        second = SignedNodeDescriptor::sign(second.descriptor, &second_kp).unwrap();
+
+        store.configure_bootstrap_status(true, true, true, 2);
+        store
+            .upsert_verified_from_source(first, now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(second, now, "gossip_snapshot")
+            .unwrap();
+        store.record_gossip_round(now + 20, 2, 2, 1, None);
+
+        let status = store.status(now + 60);
+
+        assert_eq!(status.peer_quorum.status, "route_ready");
+        assert!(status.peer_quorum.quorum_ready);
+        assert_eq!(status.peer_quorum.min_valid_peers, 2);
+        assert_eq!(status.peer_quorum.valid_peers, 2);
+        assert_eq!(status.peer_quorum.healthy_peers, 2);
+        assert_eq!(status.peer_quorum.routeable_chat_relays, 2);
+        assert!(status.peer_quorum.restart_recovery_configured);
+        assert!(status.peer_quorum.relay_foundation_ready);
+        assert!(status
+            .peer_quorum
+            .privacy_boundary
+            .contains("not public-chain consensus"));
     }
 
     #[test]
