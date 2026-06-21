@@ -61,6 +61,9 @@
 //! - Network story status that converts peer summary, route candidates, and
 //!   discovery stability into a product-facing aggregate readiness bucket for
 //!   app/nodeboard/website surfaces without exposing endpoints or user data
+//! - Privacy-safe recent peer lifecycle events so operators can understand
+//!   whether peers are being inserted, refreshed, rejected, or expired without
+//!   exposing full node IDs, endpoints, route IDs, payloads, or user metadata
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -87,6 +90,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.30.0-PeerLifecycleEvents - Added privacy-safe recent peer discovery lifecycle events
 //! v0.29.0-NetworkStoryAttentionPriority - Make degraded discovery stability outrank peer-view marketing status
 //! v0.28.0-NetworkStoryStatus - Added product-facing aggregate discovery readiness story
 //! v0.27.0-PeerCacheRecoveryEvidence - Added peer-cache load evidence and restart recovery sources
@@ -189,6 +193,7 @@ pub struct PeerStoreSnapshot {
 /// The audit log is intentionally bounded because this process may run on
 /// small operator nodes. It is diagnostic evidence, not a durable ledger.
 const MAX_AUDIT_EVENTS: usize = 64;
+const MAX_PEER_EVENTS: usize = 64;
 
 /// Privacy-safe discovery control-plane audit event.
 ///
@@ -206,6 +211,34 @@ pub struct PeerStoreAuditEvent {
     pub outcome: String,
     /// Human-readable aggregate detail with counts or policy scope only.
     pub detail: String,
+}
+
+/// Privacy-safe peer discovery lifecycle event.
+///
+/// This is separate from the generic audit log because nodeboard and backend
+/// status pages need an easy way to explain peer discovery motion: inserted,
+/// refreshed, rejected, or expired. It intentionally exposes only a short node
+/// prefix plus stable reason/source buckets. It must never include endpoint
+/// URLs, full public keys, route ids, encrypted blobs, receiver identities,
+/// client IPs, destinations, DNS contents, voucher secrets, private keys,
+/// wallet-level traffic, or plaintext content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStorePeerEvent {
+    /// Unix timestamp when the peer lifecycle event was recorded.
+    pub at: u64,
+    /// Stable event bucket: peer_inserted, peer_upgraded, peer_refreshed,
+    /// peer_rejected, or peer_expired.
+    pub event: String,
+    /// Outcome bucket: accepted, ignored, rejected, or expired.
+    pub outcome: String,
+    /// Coarse import/source bucket such as self, cache, gossip_snapshot, or gossip_announce.
+    pub source: String,
+    /// Short node id prefix for operator debugging without exposing full keys.
+    pub node_id_prefix: String,
+    /// Descriptor sequence observed with this event, when available.
+    pub sequence: Option<u64>,
+    /// Stable reason bucket for rejected/expired events.
+    pub reason: Option<String>,
 }
 
 /// Runtime status for discovery bootstrap, peer-cache persistence, and gossip.
@@ -486,6 +519,12 @@ pub struct PeerStoreStatus {
     pub max_peers: Option<usize>,
     /// Recent privacy-safe discovery control-plane audit events.
     pub recent_audit_events: Vec<PeerStoreAuditEvent>,
+    /// Recent privacy-safe peer discovery lifecycle events.
+    ///
+    /// These events are meant for nodeboard/app surfaces that need to show
+    /// concrete peer discovery motion while preserving the blind-node privacy
+    /// invariant. Rows contain only short node prefixes and reason buckets.
+    pub recent_peer_events: Vec<PeerStorePeerEvent>,
     /// Bootstrap/cache/gossip runtime status.
     pub bootstrap: PeerStoreBootstrapStatus,
     /// Aggregate discovery stability summary for health gates and nodeboard.
@@ -1048,6 +1087,7 @@ pub struct PeerStore {
     max_peers: RwLock<Option<usize>>,
     counters: PeerStoreCounters,
     audit_events: RwLock<VecDeque<PeerStoreAuditEvent>>,
+    peer_events: RwLock<VecDeque<PeerStorePeerEvent>>,
     bootstrap_status: RwLock<PeerStoreBootstrapStatus>,
 }
 
@@ -1063,6 +1103,7 @@ impl PeerStore {
             max_peers: RwLock::new(None),
             counters: PeerStoreCounters::new(),
             audit_events: RwLock::new(VecDeque::with_capacity(MAX_AUDIT_EVENTS)),
+            peer_events: RwLock::new(VecDeque::with_capacity(MAX_PEER_EVENTS)),
             bootstrap_status: RwLock::new(PeerStoreBootstrapStatus::default()),
         }
     }
@@ -1363,18 +1404,37 @@ impl PeerStore {
         now: u64,
         source: impl Into<String>,
     ) -> Result<bool, PeerStoreError> {
-        descriptor
-            .verify_at(now)
-            .map_err(|_| PeerStoreError::VerificationFailed)?;
-
         let node_id = descriptor.node_id();
         let incoming_sequence = descriptor.sequence();
         let source = source.into();
+        if descriptor.verify_at(now).is_err() {
+            self.record_peer_event(
+                now,
+                "peer_rejected",
+                "rejected",
+                source,
+                &node_id,
+                Some(incoming_sequence),
+                Some("verification_failed"),
+            );
+            return Err(PeerStoreError::VerificationFailed);
+        }
+
         let mut peers = self.peers.write();
 
         let is_existing_peer = if let Some(existing) = peers.get(&node_id) {
             let current = existing.sequence();
             if incoming_sequence < current {
+                drop(peers);
+                self.record_peer_event(
+                    now,
+                    "peer_rejected",
+                    "rejected",
+                    source,
+                    &node_id,
+                    Some(incoming_sequence),
+                    Some("stale_sequence"),
+                );
                 return Err(PeerStoreError::StaleSequence {
                     current,
                     incoming: incoming_sequence,
@@ -1382,7 +1442,16 @@ impl PeerStore {
             }
             if incoming_sequence == current {
                 drop(peers);
-                self.record_peer_runtime(&descriptor, now, source, false);
+                self.record_peer_runtime(&descriptor, now, source.clone(), false);
+                self.record_peer_event(
+                    now,
+                    "peer_refreshed",
+                    "ignored",
+                    source,
+                    &node_id,
+                    Some(incoming_sequence),
+                    Some("same_sequence"),
+                );
                 return Ok(false);
             }
             true
@@ -1395,13 +1464,36 @@ impl PeerStore {
                 self.counters
                     .capacity_rejected
                     .fetch_add(1, Ordering::Relaxed);
+                drop(peers);
+                self.record_peer_event(
+                    now,
+                    "peer_rejected",
+                    "rejected",
+                    source,
+                    &node_id,
+                    Some(incoming_sequence),
+                    Some("capacity_exceeded"),
+                );
                 return Err(PeerStoreError::CapacityExceeded { max_peers });
             }
         }
 
         peers.insert(node_id, descriptor.clone());
         drop(peers);
-        self.record_peer_runtime(&descriptor, now, source, true);
+        self.record_peer_runtime(&descriptor, now, source.clone(), true);
+        self.record_peer_event(
+            now,
+            if is_existing_peer {
+                "peer_upgraded"
+            } else {
+                "peer_inserted"
+            },
+            "accepted",
+            source,
+            &node_id,
+            Some(incoming_sequence),
+            None,
+        );
         Ok(true)
     }
 
@@ -1914,10 +2006,45 @@ impl PeerStore {
         });
     }
 
+    fn record_peer_event(
+        &self,
+        now: u64,
+        event: impl Into<String>,
+        outcome: impl Into<String>,
+        source: impl Into<String>,
+        node_id: &[u8; 32],
+        sequence: Option<u64>,
+        reason: Option<&str>,
+    ) {
+        let mut events = self.peer_events.write();
+        if events.len() >= MAX_PEER_EVENTS {
+            events.pop_front();
+        }
+        events.push_back(PeerStorePeerEvent {
+            at: now,
+            event: event.into(),
+            outcome: outcome.into(),
+            source: source.into(),
+            node_id_prefix: Self::node_id_prefix(node_id),
+            sequence,
+            reason: reason.map(str::to_string),
+        });
+    }
+
+    fn node_id_prefix(node_id: &[u8; 32]) -> String {
+        hex::encode(&node_id[..4])
+    }
+
     /// Returns newest discovery audit events in chronological order.
     #[must_use]
     pub fn recent_audit_events(&self) -> Vec<PeerStoreAuditEvent> {
         self.audit_events.read().iter().cloned().collect()
+    }
+
+    /// Returns recent peer lifecycle events in chronological order.
+    #[must_use]
+    pub fn recent_peer_events(&self) -> Vec<PeerStorePeerEvent> {
+        self.peer_events.read().iter().cloned().collect()
     }
 
     /// Exports valid descriptors as a bootstrap snapshot for gossip response.
@@ -2123,6 +2250,17 @@ impl PeerStore {
                 .expired_removed
                 .fetch_add(removed_count as u64, Ordering::Relaxed);
             self.counters.last_cleanup_at.store(now, Ordering::Relaxed);
+            for node_id in &removed {
+                self.record_peer_event(
+                    now,
+                    "peer_expired",
+                    "expired",
+                    "cleanup",
+                    node_id,
+                    None,
+                    Some("descriptor_expired"),
+                );
+            }
             self.record_audit_event(
                 now,
                 "expired_peer_cleanup",
@@ -2291,6 +2429,7 @@ impl PeerStore {
             runtime: self.counters.snapshot(),
             max_peers: self.max_peers(),
             recent_audit_events: self.recent_audit_events(),
+            recent_peer_events: self.recent_peer_events(),
             bootstrap,
             stability,
             peer_summary,
@@ -3539,6 +3678,12 @@ mod tests {
         let status = store.status(1_700_002_001);
         assert_eq!(status.runtime.expired_removed, 1);
         assert_eq!(status.runtime.last_cleanup_at, Some(1_700_002_000));
+        assert!(status.recent_peer_events.iter().any(|event| {
+            event.event == "peer_expired"
+                && event.outcome == "expired"
+                && event.source == "cleanup"
+                && event.reason.as_deref() == Some("descriptor_expired")
+        }));
         assert!(status.recent_audit_events.iter().any(|event| {
             event.action == "expired_peer_cleanup"
                 && event.outcome == "accepted"
@@ -3572,6 +3717,18 @@ mod tests {
         assert_eq!(status.runtime.inserted, 1);
         assert_eq!(status.runtime.rejected, 1);
         assert_eq!(status.runtime.last_import_at, Some(1_700_000_100));
+        assert!(status.recent_peer_events.iter().any(|event| {
+            event.event == "peer_inserted"
+                && event.outcome == "accepted"
+                && event.source == "unknown"
+                && event.sequence == Some(1)
+        }));
+        assert!(status.recent_peer_events.iter().any(|event| {
+            event.event == "peer_rejected"
+                && event.outcome == "rejected"
+                && event.source == "unknown"
+                && event.reason.as_deref() == Some("verification_failed")
+        }));
     }
 
     #[test]
@@ -3602,6 +3759,19 @@ mod tests {
             }
         );
         assert!(!report.changed());
+        let status = store.status(1_700_000_100);
+        assert!(status.recent_peer_events.iter().any(|event| {
+            event.event == "peer_refreshed"
+                && event.outcome == "ignored"
+                && event.source == "unknown"
+                && event.reason.as_deref() == Some("same_sequence")
+        }));
+        assert!(status.recent_peer_events.iter().any(|event| {
+            event.event == "peer_rejected"
+                && event.outcome == "rejected"
+                && event.source == "unknown"
+                && event.reason.as_deref() == Some("stale_sequence")
+        }));
     }
 
     #[test]
@@ -3655,6 +3825,14 @@ mod tests {
 
         assert_eq!(report.inserted, 1);
         assert_eq!(store.len(), 1);
+        let status = store.status(1_700_000_100);
+        assert!(status.recent_peer_events.iter().any(|event| {
+            event.event == "peer_inserted"
+                && event.outcome == "accepted"
+                && event.source == "gossip_announce"
+                && event.sequence == Some(1)
+                && event.reason.is_none()
+        }));
     }
 
     #[test]
