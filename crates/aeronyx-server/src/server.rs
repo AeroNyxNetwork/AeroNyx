@@ -71,6 +71,9 @@
 //  31. Adds a compact `discovery_readiness` heartbeat object so backend,
 //      nodeboard, and AI maintenance tools can read ChatRelay capability and
 //      peer quorum readiness without parsing internal PeerStore structures.
+//  32. Validates peer relay ACK bodies before marking a discovered chat relay
+//      route healthy, so HTTP 2xx with `accepted=false` is treated as a real
+//      encrypted-envelope delivery failure.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -90,6 +93,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.1.6-PeerRelayAckValidation - Require accepted peer relay ACK before route success
 //   v1.1.5-DiscoveryReadinessHeartbeat - Add compact ChatRelay/quorum readiness to heartbeat
 //   v1.1.4-PeerCacheLoadEvidence - Expose cache/backup startup load evidence
 //   v1.1.3-DiscoveryStartupSelfCheck - Report discovery startup readiness buckets
@@ -168,7 +172,7 @@ use aeronyx_transport::LinuxTun;
 use rusqlite::OptionalExtension;
 
 use crate::api::auth::{ensure_jwt_secret, generate_secret};
-use crate::api::chat_peer::{build_chat_peer_router, PeerChatRelayRequest};
+use crate::api::chat_peer::{build_chat_peer_router, PeerChatRelayRequest, PeerChatRelayResponse};
 use crate::api::discovery::{
     build_discovery_router_with_local_status, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
     GossipResponse,
@@ -2539,8 +2543,39 @@ impl Server {
 
             match response {
                 Ok(response) if response.status().is_success() => {
-                    accepted += 1;
-                    peer_store.record_route_forward_success(&peer_node_id, now);
+                    match response.json::<PeerChatRelayResponse>().await {
+                        Ok(ack) if ack.accepted => {
+                            accepted += 1;
+                            peer_store.record_route_forward_success(&peer_node_id, now);
+                        }
+                        Ok(_ack) => {
+                            let reason = "peer_relay_ack_rejected".to_string();
+                            peer_store.record_route_forward_failure(
+                                &peer_node_id,
+                                now,
+                                reason.clone(),
+                            );
+                            last_failure_reason = Some(reason);
+                            debug!(
+                                peer = %url,
+                                "[CHAT_RELAY] Peer relay ACK rejected encrypted envelope"
+                            );
+                        }
+                        Err(error) => {
+                            let reason = Self::classify_reqwest_error("peer_relay_ack", &error);
+                            peer_store.record_route_forward_failure(
+                                &peer_node_id,
+                                now,
+                                reason.clone(),
+                            );
+                            last_failure_reason = Some(reason);
+                            debug!(
+                                peer = %url,
+                                error = %error,
+                                "[CHAT_RELAY] Peer relay ACK decode failed"
+                            );
+                        }
+                    }
                 }
                 Ok(response) => {
                     let reason = format!("peer_relay_http_{}", response.status().as_u16());
@@ -4259,6 +4294,72 @@ mod tests {
         assert_eq!(row.route_health, "healthy");
         assert_eq!(row.route_consecutive_failures, 0);
         assert_eq!(row.last_route_success_at, Some(now));
+        mock_peer.abort();
+    }
+
+    #[tokio::test]
+    async fn discovered_chat_relay_peer_rejected_ack_marks_route_failure() {
+        let received = Arc::new(AtomicUsize::new(0));
+        let received_for_handler = Arc::clone(&received);
+        let app = Router::new().route(
+            "/api/chat/peer/relay",
+            post(move |Json(request): Json<PeerChatRelayRequest>| {
+                let received_for_handler = Arc::clone(&received_for_handler);
+                async move {
+                    assert_eq!(request.envelope.message_id, [0x55; 16]);
+                    received_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                    Json(PeerChatRelayResponse {
+                        accepted: false,
+                        duplicate: false,
+                        delivered_online: 0,
+                        stored_pending: false,
+                    })
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mock_peer = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let peer_store = PeerStore::new();
+        let peer_descriptor = signed_chat_relay_peer_descriptor(endpoint, now, now + 300);
+        let peer_node_id = peer_descriptor.node_id();
+        let peer_prefix = hex::encode(&peer_node_id[..4]);
+        peer_store
+            .upsert_verified(peer_descriptor, now)
+            .expect("mock peer descriptor should verify");
+
+        let client = reqwest::Client::new();
+        let accepted = Server::relay_chat_envelope_to_discovered_peers(
+            Some(&client),
+            None,
+            &peer_store,
+            &[0x99; 32],
+            &signed_test_chat_envelope(now),
+        )
+        .await;
+
+        assert_eq!(accepted, 0);
+        assert_eq!(received.load(AtomicOrdering::SeqCst), 1);
+        let route_status = peer_store.route_candidate_status(now + 1);
+        let row = route_status
+            .chat_relay
+            .iter()
+            .find(|row| row.node_id_prefix == peer_prefix)
+            .expect("mock peer should remain in route candidate status");
+        assert_eq!(row.route_health, "degraded");
+        assert_eq!(row.route_consecutive_failures, 1);
+        assert_eq!(
+            row.last_route_failure_reason.as_deref(),
+            Some("peer_relay_ack_rejected")
+        );
+        assert_eq!(row.last_route_success_at, None);
         mock_peer.abort();
     }
 
