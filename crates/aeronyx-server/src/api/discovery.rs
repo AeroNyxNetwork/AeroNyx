@@ -36,11 +36,13 @@
 //! - Public exit remains disabled by default at descriptor policy level.
 //! - Security decisions are recorded as privacy-safe aggregate audit events in
 //!   `PeerStoreStatus.recent_audit_events`.
-//! - `DiscoveryLocalCapabilityStatus` reports only local configuration and
-//!   endpoint readiness; it must not include node ids, route ids, client data,
-//!   peer endpoints, payloads, or wallet-level information.
+//! - `DiscoveryLocalCapabilityStatus` reports only local configuration,
+//!   runtime service readiness, and endpoint readiness; it must not include
+//!   node ids, route ids, client data, peer endpoints, payloads, or
+//!   wallet-level information.
 //!
 //! ## Last Modified
+//! v0.6.0-RuntimeRelayAdvertisementGate - Gate ChatRelay advertisement on service runtime readiness
 //! v0.5.0-LocalCapabilityStatus - Report ChatRelay/blind relay readiness self-check
 //! v0.4.0-DiscoveryAuditLog - Added audit events for rate-limit/policy decisions
 //! v0.3.0-DiscoveryPhase10-11 - Added status endpoint and inbound safety policy
@@ -207,9 +209,10 @@ struct DiscoveryPolicyStatus {
 /// Privacy-safe local protocol capability readiness.
 ///
 /// This object is intentionally small and aggregate-only. It tells operators
-/// whether the node configuration, public peer API endpoint, and advertised
-/// descriptor capabilities agree with each other, without exposing route ids,
-/// peer endpoints, client addresses, payloads, or user identifiers.
+/// whether the node configuration, runtime relay service, public peer API
+/// endpoint, and advertised descriptor capabilities agree with each other,
+/// without exposing route ids, peer endpoints, client addresses, payloads, or
+/// user identifiers.
 #[derive(Debug, Clone, Serialize)]
 pub struct DiscoveryLocalCapabilityStatus {
     /// Whether `[memchain.chat_relay].enabled` is true.
@@ -217,10 +220,20 @@ pub struct DiscoveryLocalCapabilityStatus {
     /// Whether this process has the public discovery/peer API listener and a
     /// public endpoint configured, which is required by peer relay routes.
     pub blind_relay_endpoint_ready: bool,
+    /// Whether `ChatRelayService` initialized successfully at runtime.
+    ///
+    /// This prevents the node from advertising `NodeCapability::ChatRelay`
+    /// when configuration is enabled but the backing relay service failed to
+    /// start, for example because SQLite or the relay DB path is unavailable.
+    pub chat_relay_runtime_ready: bool,
     /// Whether the self descriptor advertises `NodeCapability::ChatRelay`.
     pub advertised_chat_relay_capability: bool,
+    /// Whether it is safe for this node to advertise `ChatRelay`.
+    pub safe_to_advertise_chat_relay: bool,
     /// Whether config, endpoint readiness, and advertised capability agree.
     pub capability_config_consistent: bool,
+    /// Stable privacy-safe reason buckets that block ChatRelay advertisement.
+    pub advertisement_blockers: Vec<&'static str>,
     /// Stable operator-facing status: `ready`, `disabled`, or `misconfigured`.
     pub status: &'static str,
     /// Short remediation-oriented detail safe for public discovery status.
@@ -233,20 +246,38 @@ impl DiscoveryLocalCapabilityStatus {
     pub fn new(
         chat_relay_configured: bool,
         blind_relay_endpoint_ready: bool,
+        chat_relay_runtime_ready: bool,
         advertised_chat_relay_capability: bool,
     ) -> Self {
-        let expected_advertisement = chat_relay_configured && blind_relay_endpoint_ready;
+        let safe_to_advertise_chat_relay =
+            chat_relay_configured && blind_relay_endpoint_ready && chat_relay_runtime_ready;
+        let expected_advertisement = safe_to_advertise_chat_relay;
         let capability_config_consistent =
             advertised_chat_relay_capability == expected_advertisement;
+        let mut advertisement_blockers = Vec::new();
+        if !chat_relay_configured {
+            advertisement_blockers.push("chat_relay_disabled");
+        }
+        if !blind_relay_endpoint_ready {
+            advertisement_blockers.push("public_peer_api_not_ready");
+        }
+        if chat_relay_configured && !chat_relay_runtime_ready {
+            advertisement_blockers.push("chat_relay_runtime_not_ready");
+        }
         let (status, detail) = if !capability_config_consistent {
             (
                 "misconfigured",
-                "chat relay capability advertisement does not match config and endpoint readiness",
+                "chat relay capability advertisement does not match config, endpoint, and runtime readiness",
             )
         } else if advertised_chat_relay_capability {
             (
                 "ready",
-                "chat relay and blind relay peer endpoint are configured and advertised",
+                "chat relay runtime and blind relay peer endpoint are configured and advertised",
+            )
+        } else if chat_relay_configured && !chat_relay_runtime_ready {
+            (
+                "misconfigured",
+                "chat relay is enabled but the runtime relay service is not ready",
             )
         } else if chat_relay_configured {
             (
@@ -263,8 +294,11 @@ impl DiscoveryLocalCapabilityStatus {
         Self {
             chat_relay_configured,
             blind_relay_endpoint_ready,
+            chat_relay_runtime_ready,
             advertised_chat_relay_capability,
+            safe_to_advertise_chat_relay,
             capability_config_consistent,
+            advertisement_blockers,
             status,
             detail,
         }
@@ -273,7 +307,7 @@ impl DiscoveryLocalCapabilityStatus {
 
 impl Default for DiscoveryLocalCapabilityStatus {
     fn default() -> Self {
-        Self::new(false, false, false)
+        Self::new(false, false, false, false)
     }
 }
 
@@ -553,7 +587,7 @@ mod tests {
         let app = build_discovery_router_with_local_status(
             store,
             DiscoveryApiPolicy::default(),
-            DiscoveryLocalCapabilityStatus::new(true, true, true),
+            DiscoveryLocalCapabilityStatus::new(true, true, true, true),
         );
 
         let response = app
@@ -582,6 +616,14 @@ mod tests {
         );
         assert_eq!(
             parsed["local_capabilities"]["blind_relay_endpoint_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["local_capabilities"]["chat_relay_runtime_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["local_capabilities"]["safe_to_advertise_chat_relay"].as_bool(),
             Some(true)
         );
         assert_eq!(

@@ -290,10 +290,6 @@ impl Server {
         }
 
         let (ip_pool, sessions, routing) = self.init_services()?;
-        let peer_store = self.init_peer_store().await;
-        let _peer_store_persistence_task =
-            self.spawn_peer_store_persistence_task(Arc::clone(&peer_store));
-        let _discovery_gossip_task = self.spawn_discovery_gossip_task(Arc::clone(&peer_store));
 
         let (storage, vector_index, mempool, aof_writer) = if self.config.memchain.is_enabled() {
             let (st, vi, mp, aw) = self.init_memchain().await?;
@@ -324,6 +320,13 @@ impl Server {
             }
             None
         };
+        let chat_relay_runtime_ready = chat_relay.is_some();
+
+        let peer_store = self.init_peer_store(chat_relay_runtime_ready).await;
+        let _peer_store_persistence_task =
+            self.spawn_peer_store_persistence_task(Arc::clone(&peer_store));
+        let _discovery_gossip_task =
+            self.spawn_discovery_gossip_task(Arc::clone(&peer_store), chat_relay_runtime_ready);
 
         let udp = Arc::new(
             UdpTransport::bind_addr(self.config.listen_addr())
@@ -1290,8 +1293,11 @@ impl Server {
             .unwrap_or_else(|_| "100.64.0.1:8421".parse().unwrap());
         let vpn_health_config = self.config.clone();
         let discovery_api_policy = DiscoveryApiPolicy::from_config(&self.config.discovery);
-        let local_capability_status =
-            Self::discovery_local_capability_status_for(&vpn_health_config);
+        let chat_relay_runtime_ready = chat_relay.is_some();
+        let local_capability_status = Self::discovery_local_capability_status_for_runtime(
+            &vpn_health_config,
+            chat_relay_runtime_ready,
+        );
         let public_api_listen_addr = self.config.discovery.public_api_listen_addr;
         let node_identity = Arc::new(self.identity.clone());
         let peer_http_client = Arc::new(
@@ -1616,13 +1622,17 @@ impl Server {
 
         let discovery_status_config = self.config.clone();
         let discovery_status_peer_store = Arc::clone(&peer_store);
+        let discovery_chat_relay_runtime_ready = chat_relay.is_some();
         heartbeat = heartbeat.with_discovery_status(Box::new(move || {
             let config = discovery_status_config.clone();
             let peer_store = Arc::clone(&discovery_status_peer_store);
             Box::pin(async move {
                 let now = unix_now_secs();
                 let status = peer_store.status(now);
-                let local_capabilities = Self::discovery_local_capability_status_for(&config);
+                let local_capabilities = Self::discovery_local_capability_status_for_runtime(
+                    &config,
+                    discovery_chat_relay_runtime_ready,
+                );
                 Some(serde_json::json!({
                     "generated_at": now,
                     "peer_store": status,
@@ -1764,7 +1774,7 @@ impl Server {
     // Core Services
     // ============================================
 
-    async fn init_peer_store(&self) -> Arc<PeerStore> {
+    async fn init_peer_store(&self, chat_relay_runtime_ready: bool) -> Arc<PeerStore> {
         let peer_store = Arc::new(PeerStore::new());
         peer_store.set_max_peers(Some(self.config.discovery.max_peers));
         peer_store.configure_bootstrap_status(
@@ -1889,7 +1899,7 @@ impl Server {
         }
 
         if self.config.discovery.advertise_self {
-            match self.build_self_discovery_descriptor(now) {
+            match self.build_self_discovery_descriptor_with_runtime(now, chat_relay_runtime_ready) {
                 Ok(descriptor) => match peer_store
                     .upsert_verified_from_source(descriptor, now, "self")
                 {
@@ -2115,7 +2125,11 @@ impl Server {
         }))
     }
 
-    fn spawn_discovery_gossip_task(&self, peer_store: Arc<PeerStore>) -> Option<JoinHandle<()>> {
+    fn spawn_discovery_gossip_task(
+        &self,
+        peer_store: Arc<PeerStore>,
+        chat_relay_runtime_ready: bool,
+    ) -> Option<JoinHandle<()>> {
         if !self.config.discovery.enabled || !self.config.discovery.gossip_enabled {
             return None;
         }
@@ -2175,9 +2189,12 @@ impl Server {
                 }
 
                 let now = unix_now_secs();
-                let Ok(self_descriptor) =
-                    Self::build_self_discovery_descriptor_for(&config, &identity, now)
-                else {
+                let Ok(self_descriptor) = Self::build_self_discovery_descriptor_for_runtime(
+                    &config,
+                    &identity,
+                    now,
+                    chat_relay_runtime_ready,
+                ) else {
                     warn!("[DISCOVERY] Skipping outbound gossip; self descriptor build failed");
                     peer_store.record_gossip_round(
                         now,
@@ -2664,10 +2681,37 @@ impl Server {
         Self::build_self_discovery_descriptor_for(&self.config, &self.identity, now)
     }
 
+    fn build_self_discovery_descriptor_with_runtime(
+        &self,
+        now: u64,
+        chat_relay_runtime_ready: bool,
+    ) -> Result<SignedNodeDescriptor> {
+        Self::build_self_discovery_descriptor_for_runtime(
+            &self.config,
+            &self.identity,
+            now,
+            chat_relay_runtime_ready,
+        )
+    }
+
     fn build_self_discovery_descriptor_for(
         config: &ServerConfig,
         identity: &IdentityKeyPair,
         now: u64,
+    ) -> Result<SignedNodeDescriptor> {
+        Self::build_self_discovery_descriptor_for_runtime(
+            config,
+            identity,
+            now,
+            config.memchain.is_chat_relay_enabled(),
+        )
+    }
+
+    fn build_self_discovery_descriptor_for_runtime(
+        config: &ServerConfig,
+        identity: &IdentityKeyPair,
+        now: u64,
+        chat_relay_runtime_ready: bool,
     ) -> Result<SignedNodeDescriptor> {
         let ttl = config.discovery.descriptor_ttl_secs;
         let expires_at = now.saturating_add(ttl);
@@ -2687,7 +2731,8 @@ impl Server {
             .map(|endpoint| endpoint.trim().to_string())
             .filter(|endpoint| !endpoint.is_empty());
 
-        descriptor.capabilities = Self::discovery_capabilities_for(config);
+        descriptor.capabilities =
+            Self::discovery_capabilities_for_runtime(config, chat_relay_runtime_ready);
         descriptor.capacity = NodeCapacity {
             max_sessions: u32::try_from(config.max_sessions()).unwrap_or(u32::MAX),
             max_bps: None,
@@ -2707,15 +2752,17 @@ impl Server {
         SignedNodeDescriptor::sign(descriptor, identity).map_err(ServerError::from)
     }
 
-    fn discovery_capabilities(&self) -> Vec<NodeCapability> {
-        Self::discovery_capabilities_for(&self.config)
-    }
-
-    fn discovery_capabilities_for(config: &ServerConfig) -> Vec<NodeCapability> {
+    fn discovery_capabilities_for_runtime(
+        config: &ServerConfig,
+        chat_relay_runtime_ready: bool,
+    ) -> Vec<NodeCapability> {
         let mut capabilities = vec![NodeCapability::PrivacyRelay];
         let advertises_peer_api = Self::discovery_peer_api_ready_for(config);
 
-        if config.memchain.is_chat_relay_enabled() && advertises_peer_api {
+        if config.memchain.is_chat_relay_enabled()
+            && chat_relay_runtime_ready
+            && advertises_peer_api
+        {
             capabilities.push(NodeCapability::ChatRelay);
         }
         if config.discovery.advertise_onion_middle && advertises_peer_api {
@@ -2745,10 +2792,22 @@ impl Server {
     fn discovery_local_capability_status_for(
         config: &ServerConfig,
     ) -> DiscoveryLocalCapabilityStatus {
-        let capabilities = Self::discovery_capabilities_for(config);
+        Self::discovery_local_capability_status_for_runtime(
+            config,
+            config.memchain.is_chat_relay_enabled(),
+        )
+    }
+
+    fn discovery_local_capability_status_for_runtime(
+        config: &ServerConfig,
+        chat_relay_runtime_ready: bool,
+    ) -> DiscoveryLocalCapabilityStatus {
+        let capabilities =
+            Self::discovery_capabilities_for_runtime(config, chat_relay_runtime_ready);
         DiscoveryLocalCapabilityStatus::new(
             config.memchain.is_chat_relay_enabled(),
             Self::discovery_peer_api_ready_for(config),
+            chat_relay_runtime_ready,
             capabilities.contains(&NodeCapability::ChatRelay),
         )
     }
@@ -3907,6 +3966,32 @@ mod tests {
     }
 
     #[test]
+    fn self_discovery_descriptor_requires_chat_relay_runtime_for_chat_relay_capability() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.public_endpoint = Some("https://node.example.com".to_string());
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        config.memchain.chat_relay.enabled = true;
+
+        let signed = Server::build_self_discovery_descriptor_for_runtime(
+            &config,
+            &IdentityKeyPair::generate(),
+            1_800_000_000,
+            false,
+        )
+        .unwrap();
+
+        assert!(!signed
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::ChatRelay));
+        assert!(signed
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::PrivacyRelay));
+    }
+
+    #[test]
     fn local_capability_status_is_ready_when_chat_relay_is_configured_and_advertised() {
         let mut config = ServerConfig::default();
         config.discovery.public_endpoint = Some("https://node.example.com".to_string());
@@ -3918,6 +4003,8 @@ mod tests {
         assert_eq!(status.status, "ready");
         assert!(status.chat_relay_configured);
         assert!(status.blind_relay_endpoint_ready);
+        assert!(status.chat_relay_runtime_ready);
+        assert!(status.safe_to_advertise_chat_relay);
         assert!(status.advertised_chat_relay_capability);
         assert!(status.capability_config_consistent);
     }
@@ -3933,6 +4020,8 @@ mod tests {
         assert_eq!(status.status, "disabled");
         assert!(!status.chat_relay_configured);
         assert!(status.blind_relay_endpoint_ready);
+        assert!(!status.chat_relay_runtime_ready);
+        assert!(!status.safe_to_advertise_chat_relay);
         assert!(!status.advertised_chat_relay_capability);
         assert!(status.capability_config_consistent);
     }
@@ -3947,8 +4036,31 @@ mod tests {
         assert_eq!(status.status, "misconfigured");
         assert!(status.chat_relay_configured);
         assert!(!status.blind_relay_endpoint_ready);
+        assert!(status.chat_relay_runtime_ready);
+        assert!(!status.safe_to_advertise_chat_relay);
         assert!(!status.advertised_chat_relay_capability);
         assert!(status.capability_config_consistent);
+    }
+
+    #[test]
+    fn local_capability_status_reports_misconfigured_when_chat_relay_runtime_is_missing() {
+        let mut config = ServerConfig::default();
+        config.discovery.public_endpoint = Some("https://node.example.com".to_string());
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        config.memchain.chat_relay.enabled = true;
+
+        let status = Server::discovery_local_capability_status_for_runtime(&config, false);
+
+        assert_eq!(status.status, "misconfigured");
+        assert!(status.chat_relay_configured);
+        assert!(status.blind_relay_endpoint_ready);
+        assert!(!status.chat_relay_runtime_ready);
+        assert!(!status.safe_to_advertise_chat_relay);
+        assert!(!status.advertised_chat_relay_capability);
+        assert!(status.capability_config_consistent);
+        assert!(status
+            .advertisement_blockers
+            .contains(&"chat_relay_runtime_not_ready"));
     }
 
     #[test]
@@ -4384,7 +4496,7 @@ mod tests {
         config.discovery.public_endpoint = Some("node.example.com:443".to_string());
 
         let server = Server::new(config.clone(), IdentityKeyPair::generate(), None);
-        let peer_store = server.init_peer_store().await;
+        let peer_store = server.init_peer_store(false).await;
         let path = config.discovery.peer_cache_path.unwrap();
 
         let bytes = tokio::fs::read(&path)
@@ -4444,7 +4556,7 @@ mod tests {
         config.discovery.public_endpoint = Some("node.example.com:443".to_string());
 
         let server = Server::new(config, IdentityKeyPair::generate(), None);
-        let restored_store = server.init_peer_store().await;
+        let restored_store = server.init_peer_store(false).await;
         let status = restored_store.status(now + 1);
 
         assert!(restored_store
