@@ -12,6 +12,10 @@
 # - Add a guarded ChatRelay config helper so operators and AI assistants can
 #   enable or disable blind relay advertisement with backup, validation,
 #   active-session warning, and optional restart.
+# - Add a guarded staged-binary promotion helper for dirty/diverged production
+#   nodes where Git cannot be pulled safely. This supports drain-aware binary
+#   replacement with hash verification, config validation, backup, restart, and
+#   post-restart health checks.
 # - Add a read-only discovery readiness summary to `status` so operators can
 #   see ChatRelay advertisement and peer quorum state without hand-curling the
 #   public peer API.
@@ -36,7 +40,7 @@
 # Main Functionality:
 # - Offers a guided interactive menu when no command is provided.
 # - Provides command aliases for quickstart, plan, install, upgrade, health,
-#   status, logs, doctor, and network maintenance.
+#   status, logs, doctor, binary promotion, and network maintenance.
 # - Passes common options such as --repo-dir, --branch, --registration-code,
 #   --config, and --service to the appropriate lower-level script.
 # - Keeps secret handling safe: registration codes are accepted as arguments or
@@ -69,6 +73,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.8.0-node-entrypoint - Added guarded staged-binary promotion command.
 # v1.7.0-node-entrypoint - Added guarded ChatRelay enable/disable config helper.
 # v1.6.0-node-entrypoint - Show discovery ChatRelay and peer quorum readiness in status.
 # v1.5.0-node-entrypoint - Added quickstart one-command install workflow.
@@ -109,6 +114,8 @@ SET_VPN_CIDR=""
 CHAT_RELAY_ENABLE=0
 CHAT_RELAY_DISABLE=0
 RESTART_AFTER_CONFIG=0
+PROMOTE_BINARY_PATH=""
+EXPECTED_SHA256=""
 YES=0
 EXTRA_ARGS=()
 
@@ -143,6 +150,7 @@ Commands:
   doctor     Alias for health.
   status     Show service, local endpoints, discovery readiness, upgrade state, and next action.
   chat-relay Enable or disable blind ChatRelay capability in server.toml.
+  promote-binary Promote a staged aeronyx-server binary with drain checks.
   logs       Show recent systemd logs. Use --follow to tail.
   network    Refresh forwarding/NAT or update the privacy protocol IP pool.
   menu       Open the interactive operator menu.
@@ -190,6 +198,12 @@ Command-specific options:
     --restart               Restart service after config validation.
     --yes                   Skip confirmation prompts and allow restart with active sessions.
 
+  promote-binary:
+    --binary PATH            Staged aeronyx-server binary to promote.
+    --expected-sha256 HASH   Optional SHA-256 expected for the staged binary.
+    --force                  Allow promotion when active sessions are non-zero or unknown.
+    --yes                   Skip confirmation prompt. Required with --force.
+
 Examples:
   ./deploy/node/aeronyx-node.sh plan --quick --registration-code NYX-1234-ABCDE
   ./deploy/node/aeronyx-node.sh quickstart --quick --registration-code NYX-1234-ABCDE
@@ -198,6 +212,7 @@ Examples:
   ./deploy/node/aeronyx-node.sh health --json
   ./deploy/node/aeronyx-node.sh status
   sudo ./deploy/node/aeronyx-node.sh chat-relay --enable-chat-relay --restart
+  sudo ./deploy/node/aeronyx-node.sh promote-binary --binary ./target/release/aeronyx-server.next --expected-sha256 HASH
 USAGE
 }
 
@@ -265,6 +280,8 @@ parse_args() {
             --enable-chat-relay) CHAT_RELAY_ENABLE=1; shift ;;
             --disable-chat-relay) CHAT_RELAY_DISABLE=1; shift ;;
             --restart) RESTART_AFTER_CONFIG=1; shift ;;
+            --binary|--staged-binary) PROMOTE_BINARY_PATH="${2:?missing value}"; shift 2 ;;
+            --expected-sha256) EXPECTED_SHA256="${2:?missing value}"; shift 2 ;;
             --yes|-y) YES=1; shift ;;
             -h|--help) COMMAND="help"; shift ;;
             --quick|--start|--no-build|--no-network|--no-enable|--skip-package-install|--skip-rust-install|--allow-dirty|--skip-pull)
@@ -724,6 +741,117 @@ PY
     rm -f "${tmp}"
 }
 
+sha256_file() {
+    local path="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "${path}" | awk '{print $1}'
+        return
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "${path}" | awk '{print $1}'
+        return
+    fi
+    die "sha256sum or shasum is required for binary promotion"
+}
+
+confirm_promote_binary() {
+    [ "${YES}" -eq 1 ] && return
+    [ "${DRY_RUN}" -eq 1 ] && return
+
+    cat <<CONFIRM
+
+This will replace the active aeronyx-server binary, restart ${SERVICE_NAME},
+and keep a timestamped backup of the previous binary.
+Type PROMOTE BINARY to continue. Press Enter to stop safely.
+CONFIRM
+    printf 'Confirm: '
+    local confirmation
+    IFS= read -r confirmation || confirmation=""
+    [ "${confirmation}" = "PROMOTE BINARY" ] || die "Binary promotion stopped before modifying the active binary."
+}
+
+run_promote_binary() {
+    validate_service_name
+
+    [ -n "${PROMOTE_BINARY_PATH}" ] || die "promote-binary requires --binary PATH"
+    [ -f "${PROMOTE_BINARY_PATH}" ] || die "Staged binary not found: ${PROMOTE_BINARY_PATH}"
+    command -v systemctl >/dev/null 2>&1 || die "promote-binary requires systemctl"
+
+    local target_binary
+    target_binary="${REPO_DIR}/target/release/aeronyx-server"
+    [ -x "${target_binary}" ] || die "Active binary is missing or not executable: ${target_binary}"
+
+    chmod 755 "${PROMOTE_BINARY_PATH}" 2>/dev/null || true
+    [ -x "${PROMOTE_BINARY_PATH}" ] || die "Staged binary is not executable: ${PROMOTE_BINARY_PATH}"
+
+    local staged_sha current_sha
+    staged_sha="$(sha256_file "${PROMOTE_BINARY_PATH}")"
+    current_sha="$(sha256_file "${target_binary}")"
+
+    if [ -n "${EXPECTED_SHA256}" ] && [ "${staged_sha}" != "${EXPECTED_SHA256}" ]; then
+        die "Staged binary SHA-256 mismatch. expected=${EXPECTED_SHA256} actual=${staged_sha}"
+    fi
+
+    local active_sessions
+    active_sessions="$(active_sessions_count)"
+    log "Current active_sessions=${active_sessions}"
+    log "Current binary sha256=${current_sha}"
+    log "Staged binary sha256=${staged_sha}"
+
+    if [ "${FORCE}" -eq 1 ] && [ "${YES}" -ne 1 ]; then
+        die "Refusing forced binary promotion without --yes"
+    fi
+
+    if [ "${DRY_RUN}" -eq 0 ] && [ "${FORCE}" -ne 1 ]; then
+        case "${active_sessions}" in
+            ''|*[!0-9]*)
+                die "Cannot prove active sessions are drained. Re-run after health is reachable, or use --force --yes during maintenance."
+                ;;
+            0)
+                ;;
+            *)
+                die "Refusing binary promotion while active_sessions=${active_sessions}. Drain sessions first."
+                ;;
+        esac
+    fi
+
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf 'would_promote_binary=%s\n' "${PROMOTE_BINARY_PATH}"
+        printf 'would_replace_binary=%s\n' "${target_binary}"
+        printf 'active_sessions=%s\n' "${active_sessions}"
+        printf 'current_sha256=%s\n' "${current_sha}"
+        printf 'staged_sha256=%s\n' "${staged_sha}"
+        printf 'would_restart_service=%s\n' "${SERVICE_NAME}"
+        return
+    fi
+
+    confirm_promote_binary
+
+    if ! "${PROMOTE_BINARY_PATH}" validate -c "${CONFIG_FILE}"; then
+        die "Staged binary cannot validate config: ${CONFIG_FILE}"
+    fi
+
+    local timestamp backup tmp_target
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup="${target_binary}.bak.${timestamp}.promote"
+    tmp_target="${target_binary}.tmp.${timestamp}.promote"
+
+    cp -p "${target_binary}" "${backup}"
+    ok "Backup created: ${backup}"
+
+    install -m 0755 "${PROMOTE_BINARY_PATH}" "${tmp_target}"
+    mv -f "${tmp_target}" "${target_binary}"
+    ok "Promoted staged binary to ${target_binary}"
+
+    log "Restarting ${SERVICE_NAME}"
+    systemctl restart "${SERVICE_NAME}"
+    systemctl is-active "${SERVICE_NAME}" >/dev/null
+    ok "${SERVICE_NAME} restarted"
+
+    show_discovery_readiness
+    run_health
+}
+
 confirm_chat_relay_change() {
     local action="$1"
     [ "${YES}" -eq 1 ] && return
@@ -1004,6 +1132,9 @@ main() {
             ;;
         chat-relay)
             run_chat_relay_config
+            ;;
+        promote-binary)
+            run_promote_binary
             ;;
         logs)
             show_logs
