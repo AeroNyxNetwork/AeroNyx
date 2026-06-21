@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Document the guarded `aeronyx-node.sh chat-relay` helper for enabling or
+  disabling blind ChatRelay with config backup, validation, active-session
+  warning, and optional restart.
 - Document ChatRelay capability readiness so operators understand how
   `[memchain.chat_relay]`, the public peer API, descriptor advertisement, and
   peer quorum route readiness relate without exposing relay payloads or user
@@ -72,6 +75,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.36.0-node-deploy - Documented guarded ChatRelay config helper.
 v1.35.0-node-deploy - Documented ChatRelay capability readiness and peer quorum
                      route-ready checks.
 v1.34.0-node-deploy - Documented status operator recommendation.
@@ -383,7 +387,26 @@ enabled = true
 db_path = "/var/lib/aeronyx/chat_pending.db"
 ```
 
-After changing the config, validate and restart during a maintenance window:
+The recommended path is the guarded node entrypoint helper:
+
+```bash
+./deploy/node/aeronyx-node.sh chat-relay --enable-chat-relay --dry-run
+sudo ./deploy/node/aeronyx-node.sh chat-relay --enable-chat-relay --restart
+```
+
+The helper creates a timestamped `/etc/aeronyx/server.toml` backup, updates only
+`[memchain.chat_relay].enabled`, validates the config, restores the backup if
+validation fails, and refuses a restart while active sessions are present unless
+the operator explicitly passes `--yes` during a maintenance window.
+
+To disable the blind relay capability:
+
+```bash
+sudo ./deploy/node/aeronyx-node.sh chat-relay --disable-chat-relay --restart
+```
+
+Manual changes are still possible, but they should follow the same validation
+and maintenance-window pattern:
 
 ```bash
 sudo /root/open/AeroNyx/target/release/aeronyx-server validate -c /etc/aeronyx/server.toml

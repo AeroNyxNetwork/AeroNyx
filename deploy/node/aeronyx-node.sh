@@ -9,6 +9,9 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
+# - Add a guarded ChatRelay config helper so operators and AI assistants can
+#   enable or disable blind relay advertisement with backup, validation,
+#   active-session warning, and optional restart.
 # - Add a read-only discovery readiness summary to `status` so operators can
 #   see ChatRelay advertisement and peer quorum state without hand-curling the
 #   public peer API.
@@ -66,6 +69,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.7.0-node-entrypoint - Added guarded ChatRelay enable/disable config helper.
 # v1.6.0-node-entrypoint - Show discovery ChatRelay and peer quorum readiness in status.
 # v1.5.0-node-entrypoint - Added quickstart one-command install workflow.
 # v1.4.0-node-entrypoint - Show healthcheck operator recommendation in status.
@@ -102,6 +106,10 @@ JSON_ONLY=0
 FOLLOW_LOGS=0
 LINES=160
 SET_VPN_CIDR=""
+CHAT_RELAY_ENABLE=0
+CHAT_RELAY_DISABLE=0
+RESTART_AFTER_CONFIG=0
+YES=0
 EXTRA_ARGS=()
 
 log() { printf '[INFO] %s\n' "$*"; }
@@ -134,6 +142,7 @@ Commands:
   health     Run the node health check. Use --json or --json-only for tooling.
   doctor     Alias for health.
   status     Show service, local endpoints, discovery readiness, upgrade state, and next action.
+  chat-relay Enable or disable blind ChatRelay capability in server.toml.
   logs       Show recent systemd logs. Use --follow to tail.
   network    Refresh forwarding/NAT or update the privacy protocol IP pool.
   menu       Open the interactive operator menu.
@@ -175,6 +184,12 @@ Command-specific options:
   network:
     --set-vpn-cidr CIDR    Update vpn.virtual_ip_range and refresh NAT.
 
+  chat-relay:
+    --enable-chat-relay     Set [memchain.chat_relay].enabled = true.
+    --disable-chat-relay    Set [memchain.chat_relay].enabled = false.
+    --restart               Restart service after config validation.
+    --yes                   Skip confirmation prompts and allow restart with active sessions.
+
 Examples:
   ./deploy/node/aeronyx-node.sh plan --quick --registration-code NYX-1234-ABCDE
   ./deploy/node/aeronyx-node.sh quickstart --quick --registration-code NYX-1234-ABCDE
@@ -182,6 +197,7 @@ Examples:
   sudo ./deploy/node/aeronyx-node.sh upgrade --no-restart
   ./deploy/node/aeronyx-node.sh health --json
   ./deploy/node/aeronyx-node.sh status
+  sudo ./deploy/node/aeronyx-node.sh chat-relay --enable-chat-relay --restart
 USAGE
 }
 
@@ -246,6 +262,10 @@ parse_args() {
             --follow) FOLLOW_LOGS=1; shift ;;
             --lines) LINES="${2:?missing value}"; shift 2 ;;
             --set-vpn-cidr) SET_VPN_CIDR="${2:?missing value}"; shift 2 ;;
+            --enable-chat-relay) CHAT_RELAY_ENABLE=1; shift ;;
+            --disable-chat-relay) CHAT_RELAY_DISABLE=1; shift ;;
+            --restart) RESTART_AFTER_CONFIG=1; shift ;;
+            --yes|-y) YES=1; shift ;;
             -h|--help) COMMAND="help"; shift ;;
             --quick|--start|--no-build|--no-network|--no-enable|--skip-package-install|--skip-rust-install|--allow-dirty|--skip-pull)
                 EXTRA_ARGS+=("$1")
@@ -667,6 +687,223 @@ run_network() {
         "${EXTRA_ARGS[@]}"
 }
 
+active_sessions_count() {
+    if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        printf 'unknown\n'
+        return
+    fi
+
+    local tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/aeronyx-health-active.XXXXXX")" || {
+        printf 'unknown\n'
+        return
+    }
+
+    if ! curl -fsS http://127.0.0.1:8421/api/vpn/health >"${tmp}" 2>/dev/null; then
+        rm -f "${tmp}"
+        printf 'unknown\n'
+        return
+    fi
+
+    python3 - "${tmp}" <<'PY' || printf 'unknown\n'
+import json
+import sys
+
+try:
+    data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+except Exception:
+    print("unknown")
+    raise SystemExit(0)
+
+value = data.get("active_sessions")
+try:
+    print(int(value))
+except Exception:
+    print("unknown")
+PY
+    rm -f "${tmp}"
+}
+
+confirm_chat_relay_change() {
+    local action="$1"
+    [ "${YES}" -eq 1 ] && return
+    [ "${DRY_RUN}" -eq 1 ] && return
+
+    cat <<CONFIRM
+
+This will update ${CONFIG_FILE} and create a timestamped backup.
+It does not expose private keys, payloads, DNS contents, destinations, or user traffic.
+Type ${action} to continue. Press Enter to stop safely.
+CONFIRM
+    printf 'Confirm: '
+    local confirmation
+    IFS= read -r confirmation || confirmation=""
+    [ "${confirmation}" = "${action}" ] || die "ChatRelay config change stopped before modifying ${CONFIG_FILE}."
+}
+
+run_chat_relay_config() {
+    validate_service_name
+
+    if [ "${CHAT_RELAY_ENABLE}" -eq "${CHAT_RELAY_DISABLE}" ]; then
+        die "chat-relay requires exactly one of --enable-chat-relay or --disable-chat-relay"
+    fi
+    command -v python3 >/dev/null 2>&1 || die "chat-relay requires python3"
+    [ -f "${CONFIG_FILE}" ] || die "Config file not found: ${CONFIG_FILE}"
+
+    local target="false"
+    local confirm_word="DISABLE CHATRELAY"
+    if [ "${CHAT_RELAY_ENABLE}" -eq 1 ]; then
+        target="true"
+        confirm_word="ENABLE CHATRELAY"
+    fi
+
+    local active_sessions
+    active_sessions="$(active_sessions_count)"
+    log "Current active_sessions=${active_sessions}"
+    if [ "${RESTART_AFTER_CONFIG}" -eq 1 ] && [ "${YES}" -ne 1 ]; then
+        case "${active_sessions}" in
+            ''|*[!0-9]*)
+                die "Cannot prove active sessions are drained. Re-run with --yes during a maintenance window if restart is intentional."
+                ;;
+            0)
+                ;;
+            *)
+                die "Refusing restart while active_sessions=${active_sessions}. Drain sessions or re-run with --yes during maintenance."
+                ;;
+        esac
+    fi
+
+    confirm_chat_relay_change "${confirm_word}"
+
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        python3 - "${CONFIG_FILE}" "${target}" "1" <<'PY'
+import re
+import sys
+
+path, target, dry_run = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+lines = open(path, "r", encoding="utf-8").read().splitlines(True)
+section_start = None
+section_end = len(lines)
+for idx, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped == "[memchain.chat_relay]":
+        section_start = idx
+        continue
+    if section_start is not None and idx > section_start and re.match(r"^\s*\[[^]]+\]\s*$", line):
+        section_end = idx
+        break
+
+enabled_found = False
+if section_start is not None:
+    for line in lines[section_start + 1:section_end]:
+        if re.match(r"^\s*enabled\s*=", line):
+            enabled_found = True
+            break
+
+print(f"would_set_memchain_chat_relay_enabled={target}")
+print(f"would_create_memchain_chat_relay_section={str(section_start is None).lower()}")
+print(f"would_insert_enabled_key={str(section_start is not None and not enabled_found).lower()}")
+PY
+        return
+    fi
+
+    [ -w "${CONFIG_FILE}" ] || die "Config file is not writable. Re-run with sudo: ${CONFIG_FILE}"
+
+    local timestamp backup
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup="${CONFIG_FILE}.bak.${timestamp}.chat_relay"
+    cp -p "${CONFIG_FILE}" "${backup}"
+    ok "Backup created: ${backup}"
+
+    python3 - "${CONFIG_FILE}" "${target}" <<'PY'
+import os
+import re
+import sys
+import tempfile
+
+path, target = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as handle:
+    lines = handle.read().splitlines(True)
+
+section_start = None
+section_end = len(lines)
+for idx, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped == "[memchain.chat_relay]":
+        section_start = idx
+        section_end = len(lines)
+        continue
+    if section_start is not None and idx > section_start and re.match(r"^\s*\[[^]]+\]\s*$", line):
+        section_end = idx
+        break
+
+if section_start is None:
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    if lines and lines[-1].strip():
+        lines.append("\n")
+    lines.extend([
+        "[memchain.chat_relay]\n",
+        f"enabled = {target}\n",
+        "offline_ttl_secs = 259200\n",
+        "max_pending_per_wallet = 500\n",
+        'db_path = "/var/lib/aeronyx/chat_pending.db"\n',
+        "max_message_size = 65536\n",
+        "max_blob_size = 10485760\n",
+        "max_blobs_per_receiver = 50\n",
+        "cleanup_interval_secs = 60\n",
+        "dedup_lru_capacity = 10000\n",
+        "expired_notification_ttl_secs = 604800\n",
+    ])
+else:
+    enabled_idx = None
+    for idx in range(section_start + 1, section_end):
+        if re.match(r"^\s*enabled\s*=", lines[idx]):
+            enabled_idx = idx
+            break
+    if enabled_idx is None:
+        lines.insert(section_start + 1, f"enabled = {target}\n")
+    else:
+        indent = re.match(r"^(\s*)", lines[enabled_idx]).group(1)
+        lines[enabled_idx] = f"{indent}enabled = {target}\n"
+
+directory = os.path.dirname(path) or "."
+fd, tmp_path = tempfile.mkstemp(prefix=".aeronyx-chat-relay.", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.writelines(lines)
+    os.replace(tmp_path, path)
+finally:
+    if os.path.exists(tmp_path):
+        os.unlink(tmp_path)
+PY
+
+    local binary
+    binary="${REPO_DIR}/target/release/aeronyx-server"
+    if [ ! -x "${binary}" ]; then
+        binary="aeronyx-server"
+    fi
+    if command -v "${binary}" >/dev/null 2>&1 || [ -x "${binary}" ]; then
+        if ! "${binary}" validate -c "${CONFIG_FILE}"; then
+            cp -p "${backup}" "${CONFIG_FILE}"
+            die "Config validation failed; restored ${CONFIG_FILE} from ${backup}"
+        fi
+    else
+        warn "aeronyx-server binary not found; config was updated but not validated"
+    fi
+
+    ok "ChatRelay enabled=${target} in ${CONFIG_FILE}"
+    if [ "${RESTART_AFTER_CONFIG}" -eq 1 ]; then
+        log "Restarting ${SERVICE_NAME}"
+        systemctl restart "${SERVICE_NAME}"
+        systemctl is-active "${SERVICE_NAME}" >/dev/null
+        ok "${SERVICE_NAME} restarted"
+        show_discovery_readiness
+    else
+        warn "Service not restarted. Run with --restart during maintenance, or restart ${SERVICE_NAME} manually."
+    fi
+}
+
 read_optional_registration_code() {
     if [ -n "${REGISTRATION_CODE}" ]; then
         return
@@ -764,6 +1001,9 @@ main() {
             ;;
         status)
             show_status
+            ;;
+        chat-relay)
+            run_chat_relay_config
             ;;
         logs)
             show_logs
