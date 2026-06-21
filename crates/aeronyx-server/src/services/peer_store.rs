@@ -67,6 +67,8 @@
 //! - Peer quorum readiness summary that tells operators whether the verified
 //!   peer view has enough fresh, routeable, restart-survivable peers for future
 //!   multi-hop work without claiming global consensus or exposing endpoints
+//! - Route-level failure quarantine so repeated opaque next-hop failures stop
+//!   being selected for live relay paths while remaining visible to operators
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -93,6 +95,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.32.0-PeerRouteFailureQuarantine - Added route-level next-hop quarantine after repeated failures
 //! v0.31.0-PeerQuorumReadiness - Added privacy-safe peer quorum readiness summary
 //! v0.30.0-PeerLifecycleEvents - Added privacy-safe recent peer discovery lifecycle events
 //! v0.29.0-NetworkStoryAttentionPriority - Make degraded discovery stability outrank peer-view marketing status
@@ -142,6 +145,8 @@ const PEER_ROUTE_LAST_SEEN_FRESH_SECS: u64 = 300;
 const PEER_ROUTE_LAST_SEEN_ACCEPTABLE_SECS: u64 = 900;
 const PEER_ROUTE_LAST_SEEN_STALE_SECS: u64 = 1_800;
 const PEER_ROUTE_RECENT_FAILURE_SECS: u64 = 600;
+const PEER_ROUTE_FAILURE_QUARANTINE_THRESHOLD: u64 = 3;
+const PEER_ROUTE_FAILURE_QUARANTINE_SECS: u64 = 300;
 const PEER_ROUTE_STATUS_LIMIT: usize = 8;
 const PEER_HEALTH_STATUS_LIMIT: usize = 64;
 const PEER_QUORUM_MIN_VALID_PEERS: usize = 2;
@@ -678,6 +683,10 @@ struct PeerRouteHealth {
     last_success_at: Option<u64>,
     last_failure_at: Option<u64>,
     last_failure_reason: Option<String>,
+    quarantine_count: u64,
+    quarantine_until: Option<u64>,
+    last_quarantine_at: Option<u64>,
+    last_quarantine_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -802,6 +811,17 @@ pub struct PeerStorePeerHealth {
     pub last_route_failure_at: Option<u64>,
     /// Coarse reason bucket for the last opaque route failure.
     pub last_route_failure_reason: Option<String>,
+    /// Whether this peer is temporarily suppressed as a next hop after
+    /// repeated opaque route failures.
+    pub route_quarantined: bool,
+    /// Remaining route-level suppression window in seconds, when active.
+    pub route_quarantine_remaining_seconds: Option<u64>,
+    /// Number of route-level quarantine windows started for this peer.
+    pub route_quarantine_count: u64,
+    /// Last route-level quarantine timestamp.
+    pub last_route_quarantine_at: Option<u64>,
+    /// Coarse reason bucket for the last route-level quarantine.
+    pub last_route_quarantine_reason: Option<String>,
     /// Local relay-protection rejection count for this peer as previous hop.
     pub relay_rejection_count: u64,
     /// Number of short local relay-protection quarantines started.
@@ -876,6 +896,13 @@ pub struct PeerStoreRouteCandidate {
     pub last_route_failure_at: Option<u64>,
     /// Coarse failure reason bucket from the last failed forward.
     pub last_route_failure_reason: Option<String>,
+    /// Whether route selection is temporarily suppressing this peer after
+    /// repeated opaque next-hop failures.
+    pub route_quarantined: bool,
+    /// Remaining route-suppression window in seconds, when active.
+    pub route_quarantine_remaining_seconds: Option<u64>,
+    /// Number of route-level quarantine windows started for this peer.
+    pub route_quarantine_count: u64,
     /// Age of the last observation at status generation time.
     pub last_seen_age_seconds: u64,
     /// Remaining descriptor TTL in seconds.
@@ -1942,6 +1969,7 @@ impl PeerStore {
         health.success_count = health.success_count.saturating_add(1);
         health.consecutive_failures = 0;
         health.last_success_at = Some(now);
+        health.quarantine_until = None;
         self.record_audit_event(
             now,
             "blind_relay_route_health",
@@ -1968,15 +1996,40 @@ impl PeerStore {
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         health.last_failure_at = Some(now);
         health.last_failure_reason = Some(reason.clone());
+        let starts_new_quarantine = health.consecutive_failures
+            >= PEER_ROUTE_FAILURE_QUARANTINE_THRESHOLD
+            && health
+                .quarantine_until
+                .map(|quarantine_until| now >= quarantine_until)
+                .unwrap_or(true);
+        if starts_new_quarantine {
+            health.quarantine_count = health.quarantine_count.saturating_add(1);
+            health.quarantine_until = Some(now.saturating_add(PEER_ROUTE_FAILURE_QUARANTINE_SECS));
+            health.last_quarantine_at = Some(now);
+            health.last_quarantine_reason = Some("consecutive_route_failures".to_string());
+        }
         self.record_audit_event(
             now,
             "blind_relay_route_health",
             "rejected",
             format!(
-                "node_prefix={} result=failure reason={reason}",
-                hex::encode(&node_id[..4])
+                "node_prefix={} result=failure reason={reason} consecutive_failures={}",
+                hex::encode(&node_id[..4]),
+                health.consecutive_failures
             ),
         );
+        if starts_new_quarantine {
+            self.record_audit_event(
+                now,
+                "blind_relay_route_quarantine",
+                "limited",
+                format!(
+                    "node_prefix={} reason_bucket=consecutive_route_failures duration_seconds={}",
+                    hex::encode(&node_id[..4]),
+                    PEER_ROUTE_FAILURE_QUARANTINE_SECS
+                ),
+            );
+        }
     }
 
     /// Records a relay-protection rejection for a previous-hop peer.
@@ -2225,7 +2278,7 @@ impl PeerStore {
         limit: usize,
         excluded_node_ids: &[[u8; 32]],
     ) -> Vec<SignedNodeDescriptor> {
-        self.scored_route_candidates(capability, now, None)
+        self.scored_route_candidates(capability, now, None, false)
             .into_iter()
             .filter(|candidate| {
                 let node_id = candidate.descriptor.node_id();
@@ -2261,7 +2314,7 @@ impl PeerStore {
 
         for capability in capabilities {
             let next = self
-                .scored_route_candidates(*capability, now, None)
+                .scored_route_candidates(*capability, now, None, false)
                 .into_iter()
                 .find(|candidate| {
                     let node_id = candidate.descriptor.node_id();
@@ -2506,8 +2559,16 @@ impl PeerStore {
         peer_summary: &PeerStorePeerSummaryStatus,
         route_candidates: &PeerStoreRouteCandidateStatus,
     ) -> PeerStorePeerQuorumStatus {
-        let routeable_chat_relays = route_candidates.chat_relay.len();
-        let routeable_onion_middle_hops = route_candidates.onion_middle.len();
+        let routeable_chat_relays = route_candidates
+            .chat_relay
+            .iter()
+            .filter(|peer| !peer.route_quarantined)
+            .count();
+        let routeable_onion_middle_hops = route_candidates
+            .onion_middle
+            .iter()
+            .filter(|peer| !peer.route_quarantined)
+            .count();
         let healthy_ratio_percent = if peer_summary.valid_peers == 0 {
             0
         } else {
@@ -2589,8 +2650,16 @@ impl PeerStore {
             .planned_paths
             .chat_two_hop_onion_ready
             .complete;
-        let routeable_chat_relays = route_candidates.chat_relay.len();
-        let routeable_onion_middle_hops = route_candidates.onion_middle.len();
+        let routeable_chat_relays = route_candidates
+            .chat_relay
+            .iter()
+            .filter(|peer| !peer.route_quarantined)
+            .count();
+        let routeable_onion_middle_hops = route_candidates
+            .onion_middle
+            .iter()
+            .filter(|peer| !peer.route_quarantined)
+            .count();
 
         let stability_needs_attention =
             matches!(stability.health.as_str(), "failed" | "degraded" | "stale");
@@ -2725,6 +2794,9 @@ impl PeerStore {
         let Some(route_health) = route_health else {
             return ("unknown", 0);
         };
+        if Self::route_quarantine_remaining_seconds(route_health, now).is_some() {
+            return ("quarantined", -300);
+        }
         let recent_failure = route_health
             .last_failure_at
             .map(|failed_at| now.saturating_sub(failed_at) <= PEER_ROUTE_RECENT_FAILURE_SECS)
@@ -2748,6 +2820,12 @@ impl PeerStore {
         } else {
             ("unknown", 0)
         }
+    }
+
+    fn route_quarantine_remaining_seconds(route_health: &PeerRouteHealth, now: u64) -> Option<u64> {
+        route_health.quarantine_until.and_then(|quarantine_until| {
+            (now < quarantine_until).then_some(quarantine_until.saturating_sub(now))
+        })
     }
 
     fn route_score(
@@ -2776,6 +2854,7 @@ impl PeerStore {
         capability: NodeCapability,
         now: u64,
         limit: Option<usize>,
+        include_route_quarantined: bool,
     ) -> Vec<ScoredPeerRouteCandidate> {
         let peers = self.peers.read();
         let metadata = self.peer_runtime.read();
@@ -2805,6 +2884,11 @@ impl PeerStore {
             let route_health_entry = route_health.get(node_id);
             let (route_health_bucket, route_health_score) =
                 Self::route_health_bucket_and_score(route_health_entry, now);
+            if !include_route_quarantined && route_health_bucket == "quarantined" {
+                continue;
+            }
+            let route_quarantine_remaining_seconds = route_health_entry
+                .and_then(|value| Self::route_quarantine_remaining_seconds(value, now));
             let score = Self::route_score(
                 descriptor,
                 &source,
@@ -2835,6 +2919,11 @@ impl PeerStore {
                         .and_then(|value| value.last_failure_at),
                     last_route_failure_reason: route_health_entry
                         .and_then(|value| value.last_failure_reason.clone()),
+                    route_quarantined: route_quarantine_remaining_seconds.is_some(),
+                    route_quarantine_remaining_seconds,
+                    route_quarantine_count: route_health_entry
+                        .map(|value| value.quarantine_count)
+                        .unwrap_or(0),
                     last_seen_age_seconds,
                     ttl_remaining_seconds,
                     endpoint_advertised: true,
@@ -2876,7 +2965,7 @@ impl PeerStore {
         capability: NodeCapability,
         now: u64,
     ) -> Vec<PeerStoreRouteCandidate> {
-        self.scored_route_candidates(capability, now, Some(PEER_ROUTE_STATUS_LIMIT))
+        self.scored_route_candidates(capability, now, Some(PEER_ROUTE_STATUS_LIMIT), true)
             .into_iter()
             .map(|candidate| candidate.summary)
             .collect()
@@ -2893,7 +2982,7 @@ impl PeerStore {
 
         for capability in capabilities {
             let Some(next) = self
-                .scored_route_candidates(*capability, now, None)
+                .scored_route_candidates(*capability, now, None, false)
                 .into_iter()
                 .find(|candidate| {
                     let node_id = candidate.descriptor.node_id();
@@ -3090,7 +3179,7 @@ impl PeerStore {
         relay_quarantined: bool,
         relay_rejection_count: u64,
     ) -> &'static str {
-        if relay_quarantined {
+        if relay_quarantined || route_health == "quarantined" {
             return "quarantined";
         }
         if descriptor_health == "expired" {
@@ -3143,6 +3232,8 @@ impl PeerStore {
             let route_health_entry = route_health.get(node_id);
             let (route_health_bucket, _) =
                 Self::route_health_bucket_and_score(route_health_entry, now);
+            let route_quarantine_remaining_seconds = route_health_entry
+                .and_then(|value| Self::route_quarantine_remaining_seconds(value, now));
             let relay_health_entry = relay_health.get(node_id);
             let relay_quarantine_remaining_seconds = relay_health_entry
                 .and_then(|value| value.quarantine_until)
@@ -3190,6 +3281,15 @@ impl PeerStore {
                 last_route_failure_at: route_health_entry.and_then(|value| value.last_failure_at),
                 last_route_failure_reason: route_health_entry
                     .and_then(|value| value.last_failure_reason.clone()),
+                route_quarantined: route_quarantine_remaining_seconds.is_some(),
+                route_quarantine_remaining_seconds,
+                route_quarantine_count: route_health_entry
+                    .map(|value| value.quarantine_count)
+                    .unwrap_or(0),
+                last_route_quarantine_at: route_health_entry
+                    .and_then(|value| value.last_quarantine_at),
+                last_route_quarantine_reason: route_health_entry
+                    .and_then(|value| value.last_quarantine_reason.clone()),
                 relay_rejection_count,
                 relay_quarantine_count: relay_health_entry
                     .map(|value| value.quarantine_count)
@@ -3474,17 +3574,22 @@ mod tests {
 
         let candidates =
             store.route_candidates_with_capability(NodeCapability::ChatRelay, now + 4, 8);
-        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].node_id(), healthy.node_id());
-        assert_eq!(candidates[1].node_id(), failing_node_id);
 
         let status = store.route_candidate_status(now + 4);
         let failing_row = status
             .chat_relay
             .iter()
             .find(|row| row.node_id_prefix == failing_prefix)
-            .expect("failing peer should remain visible as a degraded candidate");
-        assert_eq!(failing_row.route_health, "failing");
+            .expect("failing peer should remain visible as a quarantined candidate");
+        assert_eq!(failing_row.route_health, "quarantined");
+        assert!(failing_row.route_quarantined);
+        assert_eq!(failing_row.route_quarantine_count, 1);
+        assert_eq!(
+            failing_row.route_quarantine_remaining_seconds,
+            Some(PEER_ROUTE_FAILURE_QUARANTINE_SECS - 1)
+        );
         assert_eq!(failing_row.route_failure_count, 3);
         assert_eq!(failing_row.route_consecutive_failures, 3);
         assert_eq!(
@@ -3505,6 +3610,8 @@ mod tests {
             .find(|row| row.node_id_prefix == failing_prefix)
             .expect("recovered peer should still be reported");
         assert_eq!(recovered_row.route_health, "healthy");
+        assert!(!recovered_row.route_quarantined);
+        assert_eq!(recovered_row.route_quarantine_remaining_seconds, None);
         assert_eq!(recovered_row.route_consecutive_failures, 0);
         assert_eq!(recovered_row.last_route_success_at, Some(now + 5));
     }
