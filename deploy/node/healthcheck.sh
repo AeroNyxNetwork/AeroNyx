@@ -10,6 +10,8 @@
 # - Add privacy-safe discovery readiness JSON for ChatRelay capability and
 #   peer quorum so nodeboard and AI maintenance tools can see route-readiness
 #   blockers without parsing operator text.
+# - Keep JSON emission reliable when optional network-restore units are absent;
+#   missing reboot-persistence helpers should be warnings, not early exits.
 # - Add a privacy-safe operator_action JSON summary so nodeboard, support
 #   runbooks, and AI assistants can surface the next remediation step without
 #   reinterpreting raw checks in each UI.
@@ -66,6 +68,7 @@
 #   tun.device_name from the installed config.
 #
 # Last Modified:
+# v1.20.0-node-deploy - Keep healthcheck JSON output alive when optional network restore unit is absent.
 # v1.19.0-node-deploy - Added discovery readiness JSON for ChatRelay/quorum.
 # v1.18.0-node-deploy - Added operator_action JSON summary for nodeboard.
 # v1.17.0-node-deploy - Added local upgrade workflow status to JSON summary.
@@ -674,7 +677,7 @@ check_network() {
         else
             warn "network restore service not enabled: ${NETWORK_RESTORE_SERVICE}"
         fi
-        restore_paths="$(systemctl cat "${NETWORK_RESTORE_SERVICE}.service" 2>/dev/null \
+        restore_paths="$({ systemctl cat "${NETWORK_RESTORE_SERVICE}.service" 2>/dev/null || true; } \
             | awk -F= '/^ExecStart=/ {print $2}' \
             | awk '{print $1}')"
         if [ -n "${restore_paths}" ]; then
