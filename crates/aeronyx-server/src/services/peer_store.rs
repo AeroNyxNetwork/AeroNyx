@@ -87,6 +87,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.29.0-NetworkStoryAttentionPriority - Make degraded discovery stability outrank peer-view marketing status
 //! v0.28.0-NetworkStoryStatus - Added product-facing aggregate discovery readiness story
 //! v0.27.0-PeerCacheRecoveryEvidence - Added peer-cache load evidence and restart recovery sources
 //! v0.26.0-PeerHealthSummary - Added privacy-safe per-peer health summary
@@ -2313,16 +2314,19 @@ impl PeerStore {
         let routeable_chat_relays = route_candidates.chat_relay.len();
         let routeable_onion_middle_hops = route_candidates.onion_middle.len();
 
-        let status = if chat_two_hop_onion_ready {
+        let stability_needs_attention =
+            matches!(stability.health.as_str(), "failed" | "degraded" | "stale");
+
+        let status = if stability.health == "disabled" {
+            "disabled"
+        } else if stability_needs_attention {
+            "attention"
+        } else if chat_two_hop_onion_ready {
             "onion_ready"
         } else if chat_single_hop_ready {
             "relay_ready"
         } else if peer_summary.valid_peers > 0 {
             "peer_view_ready"
-        } else if stability.health == "disabled" {
-            "disabled"
-        } else if stability.health == "failed" || stability.health == "degraded" {
-            "attention"
         } else {
             "discovering"
         };
@@ -3473,6 +3477,52 @@ mod tests {
         assert!(!story_json.contains("story-relay.example"));
         assert!(!story_json.contains(&hex::encode(middle_node_id)));
         assert!(!story_json.contains(&hex::encode(relay_node_id)));
+        assert!(!story_json.contains("encrypted_blob"));
+        assert!(!story_json.contains("receiver_pubkey"));
+    }
+
+    #[test]
+    fn test_network_story_attention_overrides_peer_view_when_recovery_is_missing() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        store.configure_bootstrap_status(true, false, false, 0);
+
+        let first_kp = IdentityKeyPair::generate();
+        let second_kp = IdentityKeyPair::generate();
+
+        let mut first_descriptor = signed_descriptor_for(&first_kp, 1, now + 2_000);
+        first_descriptor.descriptor.public_endpoint =
+            Some("https://recovery-missing-a.example".to_string());
+        first_descriptor = SignedNodeDescriptor::sign(first_descriptor.descriptor, &first_kp)
+            .expect("descriptor should sign");
+        let first_node_id = first_descriptor.node_id();
+
+        let mut second_descriptor = signed_descriptor_for(&second_kp, 1, now + 2_000);
+        second_descriptor.descriptor.public_endpoint =
+            Some("https://recovery-missing-b.example".to_string());
+        second_descriptor = SignedNodeDescriptor::sign(second_descriptor.descriptor, &second_kp)
+            .expect("descriptor should sign");
+        let second_node_id = second_descriptor.node_id();
+
+        store
+            .upsert_verified_from_source(first_descriptor, now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(second_descriptor, now, "gossip_announce")
+            .unwrap();
+
+        let story = store.status(now + 30).network_story;
+
+        assert_eq!(story.status, "attention");
+        assert_eq!(story.valid_nodes, 2);
+        assert!(!story.relay_foundation_ready);
+        assert!(!story.restart_recovery_configured);
+
+        let story_json = serde_json::to_string(&story).unwrap();
+        assert!(!story_json.contains("recovery-missing-a.example"));
+        assert!(!story_json.contains("recovery-missing-b.example"));
+        assert!(!story_json.contains(&hex::encode(first_node_id)));
+        assert!(!story_json.contains(&hex::encode(second_node_id)));
         assert!(!story_json.contains("encrypted_blob"));
         assert!(!story_json.contains("receiver_pubkey"));
     }
