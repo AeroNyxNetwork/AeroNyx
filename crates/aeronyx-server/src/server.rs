@@ -68,6 +68,9 @@
 //  30. Mirrors cache/cache_backup startup load results into dedicated
 //      PeerStore cache-load evidence so restart recovery can be audited
 //      without exposing cache paths, peer endpoints, or user traffic.
+//  31. Adds a compact `discovery_readiness` heartbeat object so backend,
+//      nodeboard, and AI maintenance tools can read ChatRelay capability and
+//      peer quorum readiness without parsing internal PeerStore structures.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -87,6 +90,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.1.5-DiscoveryReadinessHeartbeat - Add compact ChatRelay/quorum readiness to heartbeat
 //   v1.1.4-PeerCacheLoadEvidence - Expose cache/backup startup load evidence
 //   v1.1.3-DiscoveryStartupSelfCheck - Report discovery startup readiness buckets
 //   v1.1.2-DurablePeerCacheFsync - Fsync PeerStore cache temp file and parent directory
@@ -198,8 +202,8 @@ use crate::services::memchain::{
 use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
 use crate::services::memchain::{LlmRouter, TaskWorker};
 use crate::services::{
-    spawn_dns_proxy, HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore, RoutingService,
-    SessionManager,
+    spawn_dns_proxy, HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore,
+    PeerStoreStatus, RoutingService, SessionManager,
 };
 // v1.0.0-Membership
 use crate::services::deny_list::DenyList;
@@ -1633,10 +1637,13 @@ impl Server {
                     &config,
                     discovery_chat_relay_runtime_ready,
                 );
+                let discovery_readiness =
+                    Self::discovery_readiness_status_value(&status, &local_capabilities);
                 Some(serde_json::json!({
                     "generated_at": now,
                     "peer_store": status,
                     "local_capabilities": local_capabilities,
+                    "discovery_readiness": discovery_readiness,
                     "source": "rust_peer_store",
                     "privacy_boundary": "aggregate node discovery counters only; no client IPs, destinations, DNS contents, packet payloads, chat plaintext, voucher secrets, private keys, or wallet-level traffic"
                 }))
@@ -2810,6 +2817,50 @@ impl Server {
             chat_relay_runtime_ready,
             capabilities.contains(&NodeCapability::ChatRelay),
         )
+    }
+
+    fn discovery_readiness_status_value(
+        status: &PeerStoreStatus,
+        local_capabilities: &DiscoveryLocalCapabilityStatus,
+    ) -> serde_json::Value {
+        let peer_quorum = &status.peer_quorum;
+        let network_story = &status.network_story;
+
+        serde_json::json!({
+            "chat_relay_capability": {
+                "status": local_capabilities.status,
+                "chat_relay_configured": local_capabilities.chat_relay_configured,
+                "blind_relay_endpoint_ready": local_capabilities.blind_relay_endpoint_ready,
+                "chat_relay_runtime_ready": local_capabilities.chat_relay_runtime_ready,
+                "advertised_chat_relay_capability": local_capabilities.advertised_chat_relay_capability,
+                "safe_to_advertise_chat_relay": local_capabilities.safe_to_advertise_chat_relay,
+                "capability_config_consistent": local_capabilities.capability_config_consistent,
+                "advertisement_blockers": &local_capabilities.advertisement_blockers,
+                "detail": local_capabilities.detail,
+            },
+            "peer_quorum": {
+                "status": &peer_quorum.status,
+                "quorum_ready": peer_quorum.quorum_ready,
+                "valid_peers": peer_quorum.valid_peers,
+                "healthy_peers": peer_quorum.healthy_peers,
+                "stale_peers": peer_quorum.stale_peers,
+                "routeable_chat_relays": peer_quorum.routeable_chat_relays,
+                "routeable_onion_middle_hops": peer_quorum.routeable_onion_middle_hops,
+                "restart_recovery_configured": peer_quorum.restart_recovery_configured,
+                "relay_foundation_ready": peer_quorum.relay_foundation_ready,
+                "next_action": &peer_quorum.next_action,
+            },
+            "network_story": {
+                "status": &network_story.status,
+                "headline": &network_story.headline,
+                "chat_single_hop_ready": network_story.chat_single_hop_ready,
+                "chat_two_hop_onion_ready": network_story.chat_two_hop_onion_ready,
+                "routeable_chat_relays": network_story.routeable_chat_relays,
+                "routeable_onion_middle_hops": network_story.routeable_onion_middle_hops,
+            },
+            "source": "rust_discovery_readiness_heartbeat",
+            "privacy_boundary": "aggregate discovery readiness only; no full node ids, endpoint URLs, route ids, encrypted payloads, receiver identities, client public IPs, DNS contents, destinations, Memory Chain plaintext, voucher secrets, private keys, or wallet-level traffic",
+        })
     }
 
     fn import_bootstrap_snapshot_bytes(
