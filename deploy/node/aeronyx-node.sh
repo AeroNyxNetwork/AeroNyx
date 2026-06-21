@@ -19,6 +19,10 @@
 # - Add a privacy-safe `relay-probe` command that sends one synthetic opaque
 #   BlindRelay envelope through the local node to a discovered ChatRelay peer
 #   and reports only aggregate counter deltas.
+# - Add `healthcheck` as a command alias and summarize local health/operator
+#   JSON in `status` instead of printing full endpoint payloads. This keeps the
+#   one-command operator view readable for humans and AI assistants while
+#   preserving the explicit privacy boundary.
 # - Add a read-only discovery readiness summary to `status` so operators can
 #   see ChatRelay advertisement and peer quorum state without hand-curling the
 #   public peer API.
@@ -77,6 +81,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.10.0-node-entrypoint - Added healthcheck alias and compact status endpoint summaries.
 # v1.9.0-node-entrypoint - Added synthetic BlindRelay route probe command.
 # v1.8.0-node-entrypoint - Added guarded staged-binary promotion command.
 # v1.7.0-node-entrypoint - Added guarded ChatRelay enable/disable config helper.
@@ -155,6 +160,7 @@ Commands:
   install    Install/register/start an AeroNyx privacy protocol node.
   upgrade    Pull/build/validate/upgrade the Rust node with safety checks.
   health     Run the node health check. Use --json or --json-only for tooling.
+  healthcheck Alias for health.
   doctor     Alias for health.
   status     Show service, local endpoints, discovery readiness, upgrade state, and next action.
   chat-relay Enable or disable blind ChatRelay capability in server.toml.
@@ -636,6 +642,200 @@ PY
     rm -f "${tmp}"
 }
 
+show_local_health_summary() {
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "curl not found; local health summary unavailable"
+        return
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 not found; run curl http://127.0.0.1:8421/api/vpn/health for raw health JSON"
+        return
+    fi
+
+    local tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/aeronyx-local-health.XXXXXX")" || {
+        warn "Could not create temporary file for local health summary"
+        return
+    }
+
+    if ! curl -fsS http://127.0.0.1:8421/api/vpn/health >"${tmp}" 2>/dev/null; then
+        rm -f "${tmp}"
+        warn "Local /api/vpn/health is not reachable"
+        return
+    fi
+
+    log "Local privacy protocol health summary"
+    python3 - "${tmp}" <<'PY' || true
+import json
+import sys
+
+def clean(value, limit=220):
+    if value is None:
+        return "unknown"
+    text = str(value).replace("\n", " ").replace("\r", " ").strip()
+    return text[:limit] if text else "unknown"
+
+def number(value):
+    try:
+        return str(int(value))
+    except Exception:
+        return "unknown"
+
+def percent(value):
+    try:
+        return f"{float(value):.2f}%"
+    except Exception:
+        return "unknown"
+
+try:
+    data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+except Exception as exc:
+    print(f"health_status=unreadable error={clean(exc)}")
+    raise SystemExit(0)
+
+protocol = data.get("privacy_protocol_health") or {}
+transport = data.get("transport_health") or {}
+capacity = data.get("capacity") or {}
+interface = capacity.get("interface") or {}
+startup = data.get("startup_self_check") or {}
+policy = data.get("node_policy") or {}
+discovery = data.get("discovery_status") or {}
+peer_store = discovery.get("peer_store") or {}
+runtime = peer_store.get("runtime") or {}
+blind = runtime.get("blind_relay") or {}
+
+print(
+    "health_status={status} protocol_status={protocol_status} active_sessions={sessions} active_wallet_devices={devices}".format(
+        status=clean(data.get("status")),
+        protocol_status=clean(protocol.get("status")),
+        sessions=number(data.get("active_sessions")),
+        devices=number(data.get("active_wallet_devices")),
+    )
+)
+print(
+    "transport=preferred:{preferred} effective:{effective} udp:{udp_status} fallback_available:{fallback}".format(
+        preferred=clean(transport.get("preferred_transport")),
+        effective=clean(transport.get("effective_transport")),
+        udp_status=clean((transport.get("udp") or {}).get("status")),
+        fallback=clean(transport.get("fallback_available")),
+    )
+)
+print(
+    "startup_self_check=status:{status} failed:{failed} warnings:{warnings}".format(
+        status=clean(startup.get("status")),
+        failed=number(startup.get("failed_checks")),
+        warnings=number(startup.get("warning_checks")),
+    )
+)
+print(
+    "capacity=ip_pool:{used}/{total} free:{free} max_connections:{max_conn} policy_max_sessions:{policy_max}".format(
+        used=number(capacity.get("ip_pool_used")),
+        total=number(capacity.get("ip_pool_capacity")),
+        free=number(capacity.get("ip_pool_free")),
+        max_conn=number(capacity.get("max_connections")),
+        policy_max=number(capacity.get("policy_max_sessions")),
+    )
+)
+print(
+    "runtime_limits=conntrack:{conntrack} fd:{fd} packet_drops:{drops} pps:{pps} bps:{bps}".format(
+        conntrack=percent((capacity.get("conntrack") or {}).get("used_percent")),
+        fd=percent((capacity.get("file_descriptors") or {}).get("used_percent")),
+        drops=number(capacity.get("packet_drops_total")),
+        pps=clean(interface.get("total_pps"), 40),
+        bps=clean(interface.get("total_bps"), 40),
+    )
+)
+print(
+    "node_policy=tier:{tier} maintenance:{maintenance} max_sessions:{max_sessions} bandwidth_mbps:{bandwidth}".format(
+        tier=clean(policy.get("node_tier"), 80),
+        maintenance=clean(policy.get("maintenance_mode"), 20),
+        max_sessions=number(policy.get("max_sessions")),
+        bandwidth=number(policy.get("bandwidth_limit_mbps")),
+    )
+)
+if blind:
+    failures = int(blind.get("rejected") or 0) + int(blind.get("forward_failed") or 0) + int(blind.get("no_route") or 0)
+    print(
+        "blind_relay=received:{received} forwarded:{forwarded} terminal:{terminal} failures:{failures} last_event_at:{last}".format(
+            received=number(blind.get("received")),
+            forwarded=number(blind.get("forwarded")),
+            terminal=number(blind.get("terminal")),
+            failures=failures,
+            last=clean(blind.get("last_event_at"), 40),
+        )
+    )
+print("privacy_boundary=aggregate node health only; no client public IPs, destinations, DNS contents, packet payloads, chat plaintext, private keys, voucher secrets, wallet-level traffic, route IDs, or social graph edges")
+PY
+    rm -f "${tmp}"
+}
+
+show_local_operator_status_summary() {
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "curl not found; local operator status summary unavailable"
+        return
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 not found; run curl http://127.0.0.1:8421/api/operator/status for raw operator JSON"
+        return
+    fi
+
+    local tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/aeronyx-operator-status.XXXXXX")" || {
+        warn "Could not create temporary file for operator status summary"
+        return
+    }
+
+    if ! curl -fsS http://127.0.0.1:8421/api/operator/status >"${tmp}" 2>/dev/null; then
+        rm -f "${tmp}"
+        warn "Local /api/operator/status is not reachable"
+        return
+    fi
+
+    log "Local operator status summary"
+    python3 - "${tmp}" <<'PY' || true
+import json
+import sys
+
+def clean(value, limit=220):
+    if value is None:
+        return "unknown"
+    text = str(value).replace("\n", " ").replace("\r", " ").strip()
+    return text[:limit] if text else "unknown"
+
+try:
+    data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+except Exception as exc:
+    print(f"operator_status=unreadable error={clean(exc)}")
+    raise SystemExit(0)
+
+services = data.get("services") or []
+risks = data.get("risks") or []
+if not isinstance(services, list):
+    services = []
+if not isinstance(risks, list):
+    risks = []
+
+service_summary = []
+for service in services[:8]:
+    if not isinstance(service, dict):
+        continue
+    service_summary.append(f"{clean(service.get('key'), 60)}:{clean(service.get('status'), 40)}")
+
+print("operator_services=" + (", ".join(service_summary) if service_summary else "unavailable"))
+print(f"operator_risks={len(risks)}")
+for risk in risks[:5]:
+    if isinstance(risk, dict):
+        print(
+            "operator_risk={severity}:{code}:{message}".format(
+                severity=clean(risk.get("severity"), 40),
+                code=clean(risk.get("code"), 80),
+                message=clean(risk.get("message"), 180),
+            )
+        )
+PY
+    rm -f "${tmp}"
+}
+
 show_status() {
     validate_service_name
 
@@ -646,16 +846,8 @@ show_status() {
         warn "systemctl not found"
     fi
 
-    if command -v curl >/dev/null 2>&1; then
-        log "Local privacy protocol health endpoint"
-        curl -fsS http://127.0.0.1:8421/api/vpn/health 2>/dev/null || warn "Local /api/vpn/health is not reachable"
-        printf '\n'
-        log "Local operator status endpoint"
-        curl -fsS http://127.0.0.1:8421/api/operator/status 2>/dev/null || warn "Local /api/operator/status is not reachable"
-        printf '\n'
-    else
-        warn "curl not found"
-    fi
+    show_local_health_summary
+    show_local_operator_status_summary
 
     show_discovery_readiness
 
@@ -1392,7 +1584,7 @@ main() {
         upgrade)
             run_upgrade
             ;;
-        health|doctor)
+        health|healthcheck|doctor)
             run_health
             ;;
         status)
