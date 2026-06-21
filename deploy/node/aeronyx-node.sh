@@ -9,6 +9,9 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
+# - Add a read-only discovery readiness summary to `status` so operators can
+#   see ChatRelay advertisement and peer quorum state without hand-curling the
+#   public peer API.
 # - Add `quickstart` as the commercial one-command operator workflow:
 #   clone/pull is handled by nodeboard's generated shell command, then this
 #   repository-local entrypoint runs plan, waits for explicit operator approval,
@@ -63,6 +66,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.6.0-node-entrypoint - Show discovery ChatRelay and peer quorum readiness in status.
 # v1.5.0-node-entrypoint - Added quickstart one-command install workflow.
 # v1.4.0-node-entrypoint - Show healthcheck operator recommendation in status.
 # v1.3.0-node-entrypoint - Align quick install preview with nodeboard install.
@@ -129,7 +133,7 @@ Commands:
   upgrade    Pull/build/validate/upgrade the Rust node with safety checks.
   health     Run the node health check. Use --json or --json-only for tooling.
   doctor     Alias for health.
-  status     Show service, local endpoints, upgrade state, and next action.
+  status     Show service, local endpoints, discovery readiness, upgrade state, and next action.
   logs       Show recent systemd logs. Use --follow to tail.
   network    Refresh forwarding/NAT or update the privacy protocol IP pool.
   menu       Open the interactive operator menu.
@@ -449,6 +453,132 @@ PY
     rm -f "${tmp}"
 }
 
+discovery_status_url() {
+    if command -v python3 >/dev/null 2>&1 && [ -r "${CONFIG_FILE}" ]; then
+        python3 - "${CONFIG_FILE}" <<'PY' || {
+import sys
+
+config_path = sys.argv[1]
+section = None
+listen = "127.0.0.1:8422"
+
+try:
+    with open(config_path, "r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line.strip("[]").strip()
+                continue
+            if section == "discovery" and line.startswith("public_api_listen_addr"):
+                _, value = line.split("=", 1)
+                value = value.strip().strip('"').strip("'")
+                if value:
+                    listen = value
+except Exception:
+    pass
+
+port = "8422"
+if ":" in listen:
+    port = listen.rsplit(":", 1)[-1].strip()
+if not port.isdigit():
+    port = "8422"
+
+print(f"http://127.0.0.1:{port}/api/discovery/status")
+PY
+            printf 'http://127.0.0.1:8422/api/discovery/status\n'
+        }
+        return
+    fi
+
+    printf 'http://127.0.0.1:8422/api/discovery/status\n'
+}
+
+show_discovery_readiness() {
+    log "Local discovery readiness"
+
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "curl not found; discovery readiness unavailable"
+        return
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 not found; discovery readiness summary unavailable"
+        return
+    fi
+
+    local url
+    url="$(discovery_status_url)"
+    local tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/aeronyx-discovery.XXXXXX")" || {
+        warn "Could not create temporary file for discovery readiness"
+        return
+    }
+
+    if ! curl -fsS "${url}" >"${tmp}" 2>/dev/null; then
+        rm -f "${tmp}"
+        warn "Local discovery status is not reachable at ${url}"
+        return
+    fi
+
+    python3 - "${tmp}" <<'PY' || true
+import json
+import sys
+
+def clean(value, limit=520):
+    if value is None:
+        return "unknown"
+    text = str(value).replace("\n", " ").replace("\r", " ").strip()
+    return text[:limit] if text else "unknown"
+
+def bool_text(value):
+    return "true" if bool(value) else "false"
+
+try:
+    data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+except Exception as exc:
+    print(f"discovery_status=unreadable error={clean(exc)}")
+    raise SystemExit(0)
+
+local = data.get("local_capabilities") or {}
+peer_store = data.get("peer_store") or {}
+quorum = peer_store.get("peer_quorum") or {}
+blockers = local.get("advertisement_blockers") or []
+if not isinstance(blockers, list):
+    blockers = []
+
+print(
+    "chat_relay_capability_status={status} configured={configured} runtime_ready={runtime_ready} advertised={advertised} safe_to_advertise={safe}".format(
+        status=clean(local.get("status")),
+        configured=bool_text(local.get("chat_relay_configured")),
+        runtime_ready=bool_text(local.get("chat_relay_runtime_ready")),
+        advertised=bool_text(local.get("advertised_chat_relay_capability")),
+        safe=bool_text(local.get("safe_to_advertise_chat_relay")),
+    )
+)
+if blockers:
+    print("chat_relay_blockers=" + ",".join(clean(item, 80) for item in blockers))
+print("chat_relay_detail=" + clean(local.get("detail")))
+
+if quorum:
+    print(
+        "peer_quorum_status={status} quorum_ready={ready} valid_peers={valid} healthy_peers={healthy} routeable_chat_relays={relays} onion_hops={hops}".format(
+            status=clean(quorum.get("status")),
+            ready=bool_text(quorum.get("quorum_ready")),
+            valid=clean(quorum.get("valid_peers"), 40),
+            healthy=clean(quorum.get("healthy_peers"), 40),
+            relays=clean(quorum.get("routeable_chat_relays"), 40),
+            hops=clean(quorum.get("routeable_onion_middle_hops"), 40),
+        )
+    )
+    print("peer_quorum_next_action=" + clean(quorum.get("next_action")))
+else:
+    print("peer_quorum_status=unavailable")
+PY
+    rm -f "${tmp}"
+}
+
 show_status() {
     validate_service_name
 
@@ -469,6 +599,8 @@ show_status() {
     else
         warn "curl not found"
     fi
+
+    show_discovery_readiness
 
     log "Local upgrade workflow status"
     if [ -s "${UPGRADE_STATUS_FILE}" ]; then

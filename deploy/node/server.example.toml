@@ -6,6 +6,9 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - Add an explicit opt-in ChatRelay blind relay capability block so operators
+#   understand why peer quorum remains below route-ready until relay service,
+#   public peer API, and self-advertisement are all intentionally enabled.
 # - Document discovery peer-store, public peer API, and explicit onion-middle
 #   advertisement controls for future no-exit multi-hop relay planning.
 # - Document vpn.transports capability metadata for commercial transport
@@ -40,6 +43,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.5.0-node-deploy - Added explicit ChatRelay capability opt-in defaults.
 # v1.4.0-node-deploy - Added discovery peer-store and onion-middle controls.
 # v1.3.0-node-deploy - Added VPN transport capability metadata defaults.
 # v1.2.0-node-deploy - Added DNS proxy ownership flag.
@@ -131,3 +135,26 @@ api_listen_addr = "127.0.0.1:8421"
 db_path = "/var/lib/aeronyx/memchain.db"
 aof_path = "/var/lib/aeronyx/.memchain"
 miner_interval_secs = 60
+
+# ChatRelay is a blind store-and-forward relay for E2E-encrypted chat and
+# media envelopes. It is intentionally disabled by default. To advertise this
+# node as a routeable ChatRelay peer, all three conditions must be true:
+# 1. [memchain.chat_relay].enabled = true
+# 2. [discovery].public_endpoint points to this node's public peer API
+# 3. [discovery].public_api_listen_addr is reachable by peers
+#
+# The relay stores only ciphertext blobs and metadata needed for delivery; it
+# must never inspect chat plaintext, message content, DNS contents, client
+# public IPs, destinations, browsing history, wallet-level traffic, or private
+# keys.
+[memchain.chat_relay]
+enabled = false
+offline_ttl_secs = 259200
+max_pending_per_wallet = 500
+db_path = "/var/lib/aeronyx/chat_pending.db"
+max_message_size = 65536
+max_blob_size = 10485760
+max_blobs_per_receiver = 50
+cleanup_interval_secs = 60
+dedup_lru_capacity = 10000
+expired_notification_ttl_secs = 604800

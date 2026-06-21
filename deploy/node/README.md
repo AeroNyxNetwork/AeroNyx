@@ -9,6 +9,10 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Document ChatRelay capability readiness so operators understand how
+  `[memchain.chat_relay]`, the public peer API, descriptor advertisement, and
+  peer quorum route readiness relate without exposing relay payloads or user
+  metadata.
 - Document that `aeronyx-node.sh status` includes the healthcheck
   operator_action recommendation so ordinary operators can see the next step
   without parsing JSON or service logs.
@@ -68,6 +72,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.35.0-node-deploy - Documented ChatRelay capability readiness and peer quorum
+                     route-ready checks.
 v1.34.0-node-deploy - Documented status operator recommendation.
 v1.33.0-node-deploy - Documented recent error severity mapping.
 v1.32.0-node-deploy - Documented quick install preview alignment.
@@ -344,6 +350,64 @@ Before installing the main service or generated network restore service,
 `systemd-analyze verify`. A malformed service unit fails before it can replace
 the installed unit.
 
+## ChatRelay Capability Readiness
+
+ChatRelay is the blind relay layer for E2E-encrypted chat and encrypted media
+envelopes. It is separate from the VPN data plane and separate from local
+Memory Chain mining. Relay nodes must stay blind: they store and forward
+ciphertext plus delivery metadata only, and must not inspect chat plaintext,
+message content, client public IPs, DNS contents, destinations, browsing
+history, wallet-level traffic, voucher secrets, or private keys.
+
+The default commercial node template keeps ChatRelay disabled:
+
+```toml
+[memchain]
+mode = "off"
+
+[memchain.chat_relay]
+enabled = false
+db_path = "/var/lib/aeronyx/chat_pending.db"
+```
+
+To advertise this node as a routeable ChatRelay peer, enable it only after the
+public peer API is reachable:
+
+```toml
+[discovery]
+public_endpoint = "https://node.example.com"
+public_api_listen_addr = "0.0.0.0:8422"
+
+[memchain.chat_relay]
+enabled = true
+db_path = "/var/lib/aeronyx/chat_pending.db"
+```
+
+After changing the config, validate and restart during a maintenance window:
+
+```bash
+sudo /root/open/AeroNyx/target/release/aeronyx-server validate -c /etc/aeronyx/server.toml
+sudo systemctl restart aeronyx-server
+./deploy/node/aeronyx-node.sh status
+```
+
+`aeronyx-node.sh status` prints a privacy-safe discovery readiness summary:
+
+- `chat_relay_capability_status`: whether local config, runtime service, public
+  peer API, and descriptor advertisement agree.
+- `chat_relay_blockers`: stable reason buckets such as
+  `chat_relay_disabled`, `public_peer_api_not_ready`, or
+  `chat_relay_runtime_not_ready`.
+- `peer_quorum_status`: whether the node has enough fresh peer view state for
+  the next relay/multi-hop protocol layer.
+- `peer_quorum_next_action`: the next safe operator action, for example
+  enabling at least one verified peer that advertises public ChatRelay.
+
+Peer quorum is local peer-view readiness, not public-chain consensus. A node can
+be healthy and still report `peer_view_ready` instead of `route_ready` when no
+verified peer advertises ChatRelay yet. This is expected and safer than
+pretending a relay path exists.
+
 Run preflight only:
 
 ```bash
@@ -554,6 +618,8 @@ purge allow-list:
 - max connections: `1000`
 - management API: `https://api.aeronyx.network/api/privacy_network`
 - MemChain: `off`
+- ChatRelay: disabled by default; explicit opt-in through
+  `[memchain.chat_relay].enabled = true`
 
 `vpn.virtual_ip_range` and `tun.device_name` are operational inputs, not only
 application settings. `install.sh` uses them when writing host NAT/FORWARD
