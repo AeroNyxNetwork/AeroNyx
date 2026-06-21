@@ -7,6 +7,9 @@
 #   nodes after install, upgrade, or incident response.
 #
 # Modification Reason:
+# - Add privacy-safe discovery readiness JSON for ChatRelay capability and
+#   peer quorum so nodeboard and AI maintenance tools can see route-readiness
+#   blockers without parsing operator text.
 # - Add a privacy-safe operator_action JSON summary so nodeboard, support
 #   runbooks, and AI assistants can surface the next remediation step without
 #   reinterpreting raw checks in each UI.
@@ -63,6 +66,7 @@
 #   tun.device_name from the installed config.
 #
 # Last Modified:
+# v1.19.0-node-deploy - Added discovery readiness JSON for ChatRelay/quorum.
 # v1.18.0-node-deploy - Added operator_action JSON summary for nodeboard.
 # v1.17.0-node-deploy - Added local upgrade workflow status to JSON summary.
 # v1.16.0-node-deploy - Auto-detect live systemd repo path when --repo-dir is
@@ -106,13 +110,14 @@ JSON=0
 JSON_ONLY=0
 CHECK_LOG="$(mktemp)"
 HEALTH_JSON_FILE="$(mktemp)"
+DISCOVERY_JSON_FILE="$(mktemp)"
 SYSCTL_FILE="/etc/sysctl.d/99-aeronyx.conf"
 IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
 NETWORK_RESTORE_SERVICE="aeronyx-network-restore"
 RELEASE_DIR="/var/lib/aeronyx/releases"
 UPGRADE_STATUS_FILE="/var/lib/aeronyx/upgrade-status.json"
 RELEASE_BACKUP_KEEP_TARGET=10
-trap 'rm -f "${CHECK_LOG}" "${HEALTH_JSON_FILE}"' EXIT
+trap 'rm -f "${CHECK_LOG}" "${HEALTH_JSON_FILE}" "${DISCOVERY_JSON_FILE}"' EXIT
 
 usage() {
     cat <<'USAGE'
@@ -789,12 +794,127 @@ EOF
     fi
 }
 
+discovery_status_url() {
+    if command -v python3 >/dev/null 2>&1 && [ -r "${CONFIG_FILE}" ]; then
+        python3 - "${CONFIG_FILE}" <<'PY' || {
+import sys
+
+config_path = sys.argv[1]
+section = None
+listen = "127.0.0.1:8422"
+
+try:
+    with open(config_path, "r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line.strip("[]").strip()
+                continue
+            if section == "discovery" and line.startswith("public_api_listen_addr"):
+                _, value = line.split("=", 1)
+                value = value.strip().strip('"').strip("'")
+                if value:
+                    listen = value
+except Exception:
+    pass
+
+port = "8422"
+if ":" in listen:
+    port = listen.rsplit(":", 1)[-1].strip()
+if not port.isdigit():
+    port = "8422"
+print(f"http://127.0.0.1:{port}/api/discovery/status")
+PY
+            printf 'http://127.0.0.1:8422/api/discovery/status\n'
+        }
+        return
+    fi
+
+    printf 'http://127.0.0.1:8422/api/discovery/status\n'
+}
+
+check_discovery_endpoint() {
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "discovery readiness skipped; curl missing"
+        return
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "discovery readiness skipped; python3 missing"
+        return
+    fi
+
+    : >"${DISCOVERY_JSON_FILE}"
+    local url
+    url="$(discovery_status_url)"
+    if ! curl -fsS --max-time 5 "${url}" >"${DISCOVERY_JSON_FILE}" 2>/dev/null; then
+        warn "local discovery status endpoint unavailable: ${url}"
+        return
+    fi
+
+    while IFS="$(printf '\t')" read -r status message; do
+        [ -n "${status}" ] || continue
+        case "${status}" in
+            pass) pass "${message}" ;;
+            warn) warn "${message}" ;;
+            info) [ "${JSON_ONLY}" -eq 1 ] || printf '[INFO] %s\n' "${message}" ;;
+        esac
+    done <<EOF
+$(python3 - "${DISCOVERY_JSON_FILE}" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+local = data.get("local_capabilities") or {}
+peer_store = data.get("peer_store") or {}
+quorum = peer_store.get("peer_quorum") or {}
+
+local_status = local.get("status")
+configured = bool(local.get("chat_relay_configured"))
+runtime_ready = bool(local.get("chat_relay_runtime_ready"))
+advertised = bool(local.get("advertised_chat_relay_capability"))
+safe = bool(local.get("safe_to_advertise_chat_relay"))
+
+print("info\tdiscovery chat_relay status=%s configured=%s runtime_ready=%s advertised=%s safe_to_advertise=%s" % (
+    local_status,
+    str(configured).lower(),
+    str(runtime_ready).lower(),
+    str(advertised).lower(),
+    str(safe).lower(),
+))
+if local_status == "misconfigured":
+    print("warn\tdiscovery ChatRelay capability is misconfigured")
+elif local_status == "ready":
+    print("pass\tdiscovery ChatRelay capability is ready")
+
+status = quorum.get("status")
+ready = bool(quorum.get("quorum_ready"))
+valid_peers = quorum.get("valid_peers")
+healthy_peers = quorum.get("healthy_peers")
+routeable = quorum.get("routeable_chat_relays")
+print("info\tdiscovery peer quorum status=%s ready=%s valid_peers=%s healthy_peers=%s routeable_chat_relays=%s" % (
+    status,
+    str(ready).lower(),
+    valid_peers,
+    healthy_peers,
+    routeable,
+))
+if status == "attention":
+    print("warn\tdiscovery peer quorum needs operator attention")
+elif status == "route_ready":
+    print("pass\tdiscovery peer quorum route-ready")
+PY
+)
+EOF
+}
+
 emit_json_summary() {
     if [ "${JSON}" -ne 1 ]; then
         return 0
     fi
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "${CHECK_LOG}" "${REPO_DIR}" "${CONFIG_FILE}" "${SERVICE_NAME}" "${NETWORK_RESTORE_SERVICE}" "${HEALTH_JSON_FILE}" "${UPGRADE_STATUS_FILE}" "${PASS}" "${WARN}" "${FAIL}" <<'PY'
+        python3 - "${CHECK_LOG}" "${REPO_DIR}" "${CONFIG_FILE}" "${SERVICE_NAME}" "${NETWORK_RESTORE_SERVICE}" "${HEALTH_JSON_FILE}" "${DISCOVERY_JSON_FILE}" "${UPGRADE_STATUS_FILE}" "${PASS}" "${WARN}" "${FAIL}" <<'PY'
 import json
 import glob
 import os
@@ -802,8 +922,8 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-checks_path, repo_dir, config_path, service_name, network_restore_service, health_json_path, upgrade_status_path = sys.argv[1:8]
-pass_count, warn_count, fail_count = [int(value) for value in sys.argv[8:11]]
+checks_path, repo_dir, config_path, service_name, network_restore_service, health_json_path, discovery_json_path, upgrade_status_path = sys.argv[1:9]
+pass_count, warn_count, fail_count = [int(value) for value in sys.argv[9:12]]
 
 def run(args):
     try:
@@ -841,6 +961,68 @@ def local_health_payload(path):
             return json.load(handle)
     except Exception:
         return {}
+
+def discovery_readiness_payload(discovery_path, local_health):
+    try:
+        if os.path.getsize(discovery_path):
+            with open(discovery_path, "r", encoding="utf-8") as handle:
+                discovery_status = json.load(handle)
+        else:
+            discovery_status = {}
+    except Exception:
+        discovery_status = {}
+
+    vpn_discovery = local_health.get("discovery_status") or {}
+    peer_store = discovery_status.get("peer_store") or vpn_discovery.get("peer_store") or {}
+    local = discovery_status.get("local_capabilities") or {}
+    quorum = peer_store.get("peer_quorum") or {}
+    network_story = peer_store.get("network_story") or {}
+
+    blockers = local.get("advertisement_blockers")
+    if not isinstance(blockers, list):
+        blockers = []
+
+    return {
+        "reported": bool(discovery_status or vpn_discovery),
+        "source": "local_discovery_status_and_vpn_health",
+        "chat_relay_capability": {
+            "status": local.get("status"),
+            "chat_relay_configured": local.get("chat_relay_configured"),
+            "blind_relay_endpoint_ready": local.get("blind_relay_endpoint_ready"),
+            "chat_relay_runtime_ready": local.get("chat_relay_runtime_ready"),
+            "advertised_chat_relay_capability": local.get("advertised_chat_relay_capability"),
+            "safe_to_advertise_chat_relay": local.get("safe_to_advertise_chat_relay"),
+            "capability_config_consistent": local.get("capability_config_consistent"),
+            "advertisement_blockers": blockers,
+            "detail": local.get("detail"),
+        },
+        "peer_quorum": {
+            "status": quorum.get("status"),
+            "quorum_ready": quorum.get("quorum_ready"),
+            "valid_peers": quorum.get("valid_peers"),
+            "healthy_peers": quorum.get("healthy_peers"),
+            "stale_peers": quorum.get("stale_peers"),
+            "routeable_chat_relays": quorum.get("routeable_chat_relays"),
+            "routeable_onion_middle_hops": quorum.get("routeable_onion_middle_hops"),
+            "restart_recovery_configured": quorum.get("restart_recovery_configured"),
+            "relay_foundation_ready": quorum.get("relay_foundation_ready"),
+            "next_action": quorum.get("next_action"),
+        },
+        "network_story": {
+            "status": network_story.get("status"),
+            "headline": network_story.get("headline"),
+            "chat_single_hop_ready": network_story.get("chat_single_hop_ready"),
+            "chat_two_hop_onion_ready": network_story.get("chat_two_hop_onion_ready"),
+            "routeable_chat_relays": network_story.get("routeable_chat_relays"),
+            "routeable_onion_middle_hops": network_story.get("routeable_onion_middle_hops"),
+        },
+        "privacy_boundary": (
+            "aggregate discovery readiness only; no full node ids, endpoint URLs, "
+            "route ids, encrypted payloads, receiver identities, client public IPs, "
+            "DNS contents, destinations, Memory Chain plaintext, voucher secrets, "
+            "private keys, or wallet-level traffic"
+        ),
+    }
 
 def upgrade_status_payload(path):
     try:
@@ -1057,6 +1239,7 @@ runtime = {
     "release_backups": release_backups,
 }
 local_health = local_health_payload(health_json_path)
+discovery_readiness = discovery_readiness_payload(discovery_json_path, local_health)
 upgrade_status = upgrade_status_payload(upgrade_status_path)
 operator_action = operator_action_payload(checks, fail_count, warn_count, local_health, upgrade_status, runtime)
 
@@ -1076,6 +1259,7 @@ print(json.dumps({
         "encrypted_message_forwarding": local_health.get("encrypted_message_forwarding"),
         "privacy_boundary": "aggregate local VPN health only; no client public IPs, destinations, DNS contents, packet payloads, domains, URLs, browsing history, voucher secrets, or wallet-level traffic",
     },
+    "discovery_readiness": discovery_readiness,
     "runtime": runtime,
     "upgrade_status": upgrade_status,
     "operator_action": operator_action,
@@ -1100,6 +1284,7 @@ main() {
     check_systemd_hardening
     check_network
     check_health_endpoint
+    check_discovery_endpoint
 
     [ "${JSON_ONLY}" -eq 1 ] || printf '[SUMMARY] pass=%s warn=%s fail=%s\n' "${PASS}" "${WARN}" "${FAIL}"
     emit_json_summary
