@@ -73,8 +73,12 @@
 //! - Blind relay tests cover unresponsive next-hop endpoints so timeout
 //!   failures stay retryable, aggregate-only, and never leak endpoint URLs into
 //!   audit status.
+//! - Blind relay rejects stale or too-far-in-the-future routing timestamps so
+//!   old opaque route frames cannot be replayed indefinitely. This uses only
+//!   envelope routing metadata and never inspects encrypted blob contents.
 //!
 //! ## Last Modified
+//! v0.16.0-BlindRelayTimestampFreshness - Reject stale/future opaque route frames
 //! v0.15.0-BlindRelayTimeoutTest - Cover unresponsive next-hop retry exhaustion
 //! v0.14.0-BlindRelayMalformedAckTest - Cover malformed 2xx next-hop ACK as forward_failed
 //! v0.13.0-BlindRelayAckValidation - Require accepted next-hop ACK before route success
@@ -178,6 +182,17 @@ const BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS: u64 = 5 * 60;
 
 /// Maximum previous-hop abuse buckets retained by this process.
 const MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS: usize = 4096;
+
+/// Maximum accepted age for an opaque blind-relay routing frame.
+///
+/// This is intentionally based only on `BlindRelayEnvelope.timestamp`, a signed
+/// routing metadata field. It does not inspect or derive anything from the
+/// encrypted blob, preserving the blind relay invariant while reducing replay
+/// risk for commercial node operators.
+const BLIND_RELAY_MAX_ENVELOPE_AGE_SECS: u64 = 10 * 60;
+
+/// Small clock-skew allowance for peers whose clocks run slightly ahead.
+const BLIND_RELAY_MAX_FUTURE_SKEW_SECS: u64 = 120;
 
 // ============================================
 // State / Request / Response Types
@@ -456,6 +471,12 @@ enum BlindRelayError {
     #[error("ttl exhausted")]
     TtlExhausted,
 
+    #[error("blind envelope timestamp expired")]
+    TimestampExpired,
+
+    #[error("blind envelope timestamp is too far in the future")]
+    TimestampInFuture,
+
     #[error("previous hop rate limited")]
     RateLimited,
 
@@ -482,6 +503,8 @@ impl BlindRelayError {
             | Self::InvalidSignature
             | Self::EnvelopeTooLarge
             | Self::TtlExhausted
+            | Self::TimestampExpired
+            | Self::TimestampInFuture
             | Self::RouteLoop => StatusCode::BAD_REQUEST,
             Self::RateLimited | Self::Quarantined => StatusCode::TOO_MANY_REQUESTS,
             Self::NoRoute | Self::InvalidEndpoint => StatusCode::BAD_GATEWAY,
@@ -495,6 +518,8 @@ impl BlindRelayError {
             Self::InvalidSignature => "invalid_signature",
             Self::EnvelopeTooLarge => "envelope_too_large",
             Self::TtlExhausted => "ttl_exhausted",
+            Self::TimestampExpired => "timestamp_expired",
+            Self::TimestampInFuture => "timestamp_in_future",
             Self::RateLimited => "rate_limited",
             Self::Quarantined => "quarantined",
             Self::RouteLoop => "route_loop",
@@ -730,7 +755,7 @@ async fn process_peer_blind_relay(
 
     check_blind_relay_previous_hop_allowed(&state, previous_hop_node_id, now)?;
 
-    validate_blind_relay_envelope(&envelope, &previous_hop_node_id).map_err(|error| {
+    validate_blind_relay_envelope(&envelope, &previous_hop_node_id, now).map_err(|error| {
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, error.reason_bucket());
         error
     })?;
@@ -1153,13 +1178,25 @@ fn blind_relay_retry_delay(route_id: &[u8; 16], next_hop: &[u8; 32], attempt: us
 fn validate_blind_relay_envelope(
     envelope: &BlindRelayEnvelope,
     previous_hop_node_id: &[u8; 32],
+    now: u64,
 ) -> Result<(), BlindRelayError> {
     let previous_hop = IdentityPublicKey::from_bytes(previous_hop_node_id)
         .map_err(|_| BlindRelayError::InvalidPreviousHop)?;
     envelope
         .verify_signature_from(&previous_hop)
         .map_err(|_| BlindRelayError::InvalidSignature)?;
+    validate_blind_relay_timestamp(envelope.timestamp, now)?;
     encode_blind_relay_envelope(envelope).map_err(|_| BlindRelayError::EnvelopeTooLarge)?;
+    Ok(())
+}
+
+fn validate_blind_relay_timestamp(timestamp: u64, now: u64) -> Result<(), BlindRelayError> {
+    if timestamp > now.saturating_add(BLIND_RELAY_MAX_FUTURE_SKEW_SECS) {
+        return Err(BlindRelayError::TimestampInFuture);
+    }
+    if now.saturating_sub(timestamp) > BLIND_RELAY_MAX_ENVELOPE_AGE_SECS {
+        return Err(BlindRelayError::TimestampExpired);
+    }
     Ok(())
 }
 
@@ -1412,12 +1449,13 @@ mod tests {
         let peer_store = Arc::new(PeerStore::new());
         let http_client = Arc::new(reqwest::Client::new());
         let opaque_blob = br#"{"looks_like":"json","must_not_be_parsed":true}"#.to_vec();
+        let now = now_secs();
         let envelope = BlindRelayEnvelope {
             route_id: [0x41u8; 16],
             next_hop: node_identity.public_key_bytes(),
             ttl: 2,
             encrypted_blob: opaque_blob,
-            timestamp: 1_800_000_001,
+            timestamp: now,
             signature: [0u8; 64],
         }
         .sign_with(&previous_hop);
@@ -1457,7 +1495,7 @@ mod tests {
         assert!(parsed.terminal);
         assert!(!parsed.forwarded);
         assert_eq!(parsed.ttl_remaining, 2);
-        let blind_stats = peer_store.status(1_800_000_010).runtime.blind_relay;
+        let blind_stats = peer_store.status(now + 10).runtime.blind_relay;
         assert_eq!(blind_stats.received, 1);
         assert_eq!(blind_stats.terminal, 1);
         assert_eq!(blind_stats.forwarded, 0);
@@ -1466,6 +1504,102 @@ mod tests {
             .recent_audit_events()
             .iter()
             .any(|event| event.action == "blind_relay_terminal"));
+    }
+
+    #[tokio::test]
+    async fn blind_relay_rejects_stale_timestamp_without_parsing_blob() {
+        let previous_hop = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let peer_store = Arc::new(PeerStore::new());
+        let state = ChatPeerState {
+            chat_relay: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&node_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let now = now_secs();
+        let envelope = BlindRelayEnvelope {
+            route_id: [0x42u8; 16],
+            next_hop: node_identity.public_key_bytes(),
+            ttl: 2,
+            encrypted_blob: br#"{"opaque":"old route frame"}"#.to_vec(),
+            timestamp: now - BLIND_RELAY_MAX_ENVELOPE_AGE_SECS - 1,
+            signature: [0u8; 64],
+        }
+        .sign_with(&previous_hop);
+
+        let result = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: previous_hop.public_key_bytes(),
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(BlindRelayError::TimestampExpired)));
+        let blind_stats = peer_store.status(now + 1).runtime.blind_relay;
+        assert_eq!(blind_stats.received, 1);
+        assert_eq!(blind_stats.forwarded, 0);
+        assert_eq!(blind_stats.rejected, 1);
+        assert!(peer_store.recent_audit_events().iter().any(|event| {
+            event.action == "blind_relay_forward"
+                && event.outcome == "rejected"
+                && event.detail == "timestamp_expired"
+        }));
+    }
+
+    #[tokio::test]
+    async fn blind_relay_rejects_future_timestamp_without_parsing_blob() {
+        let previous_hop = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let peer_store = Arc::new(PeerStore::new());
+        let state = ChatPeerState {
+            chat_relay: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&node_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let now = now_secs();
+        let envelope = BlindRelayEnvelope {
+            route_id: [0x43u8; 16],
+            next_hop: node_identity.public_key_bytes(),
+            ttl: 2,
+            encrypted_blob: br#"{"opaque":"future route frame"}"#.to_vec(),
+            timestamp: now + BLIND_RELAY_MAX_FUTURE_SKEW_SECS + 1,
+            signature: [0u8; 64],
+        }
+        .sign_with(&previous_hop);
+
+        let result = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: previous_hop.public_key_bytes(),
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(BlindRelayError::TimestampInFuture)));
+        let blind_stats = peer_store.status(now + 1).runtime.blind_relay;
+        assert_eq!(blind_stats.received, 1);
+        assert_eq!(blind_stats.forwarded, 0);
+        assert_eq!(blind_stats.rejected, 1);
+        assert!(peer_store.recent_audit_events().iter().any(|event| {
+            event.action == "blind_relay_forward"
+                && event.outcome == "rejected"
+                && event.detail == "timestamp_in_future"
+        }));
     }
 
     #[tokio::test]
@@ -2093,16 +2227,18 @@ mod tests {
     async fn blind_relay_forward_retries_timeout_without_endpoint_leak() {
         let next_hop_app = Router::new().route(
             "/api/chat/peer/blind-relay",
-            post(move |Json(_request): Json<PeerBlindRelayRequest>| async move {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                Json(PeerBlindRelayResponse {
-                    accepted: true,
-                    terminal: true,
-                    forwarded: false,
-                    ttl_remaining: 1,
-                    reason: Some("terminal_next_hop".to_string()),
-                })
-            }),
+            post(
+                move |Json(_request): Json<PeerBlindRelayRequest>| async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    Json(PeerBlindRelayResponse {
+                        accepted: true,
+                        terminal: true,
+                        forwarded: false,
+                        ttl_remaining: 1,
+                        reason: Some("terminal_next_hop".to_string()),
+                    })
+                },
+            ),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -2179,13 +2315,17 @@ mod tests {
         assert!(peer_store.recent_audit_events().iter().any(|event| {
             event.action == "blind_relay_retry"
                 && event.outcome == "scheduled"
-                && event.detail.contains("reason_bucket=blind_relay_request_timeout")
+                && event
+                    .detail
+                    .contains("reason_bucket=blind_relay_request_timeout")
                 && !event.detail.contains(&endpoint)
         }));
         assert!(peer_store.recent_audit_events().iter().any(|event| {
             event.action == "blind_relay_retry"
                 && event.outcome == "rejected"
-                && event.detail.contains("reason_bucket=blind_relay_request_timeout")
+                && event
+                    .detail
+                    .contains("reason_bucket=blind_relay_request_timeout")
                 && !event.detail.contains(&endpoint)
                 && !event.detail.contains("opaque encrypted relay bytes")
         }));
