@@ -46,6 +46,7 @@
 //!   used by both public/local discovery status and backend heartbeat reports.
 //!
 //! ## Last Modified
+//! v0.9.0-ProtocolFoundationSummary - Add product-facing privacy protocol foundation readiness
 //! v0.8.1-BlindRelayProbeFreshness - Include synthetic probe age in readiness
 //! v0.8.0-BlindRelayProbeReadiness - Include synthetic blind relay probe counters in readiness
 //! v0.7.0-DiscoveryReadinessStatus - Share compact discovery readiness with status endpoint
@@ -334,8 +335,77 @@ pub fn discovery_readiness_status_value(
     let peer_quorum = &status.peer_quorum;
     let network_story = &status.network_story;
     let blind_relay_quality = &status.blind_relay_quality;
+    let local_relay_ready = local_capabilities.safe_to_advertise_chat_relay;
+    let peer_mesh_ready = peer_quorum.quorum_ready;
+    let blind_relay_ready = blind_relay_quality.runtime_ready && blind_relay_quality.quality_ready;
+    let restart_recovery_ready = peer_quorum.restart_recovery_configured;
+    let checks_total = 4u8;
+    let checks_passed = [
+        local_relay_ready,
+        peer_mesh_ready,
+        blind_relay_ready,
+        restart_recovery_ready,
+    ]
+    .into_iter()
+    .filter(|ready| *ready)
+    .count() as u8;
+    let foundation_status = if checks_passed == checks_total {
+        "ready"
+    } else if blind_relay_ready && peer_quorum.valid_peers >= peer_quorum.min_valid_peers {
+        "live"
+    } else if peer_quorum.valid_peers > 0 || blind_relay_quality.runtime_ready {
+        "forming"
+    } else if !local_capabilities.chat_relay_configured {
+        "disabled"
+    } else {
+        "pending"
+    };
+    let foundation_stage = if network_story.chat_two_hop_onion_ready {
+        "two_hop_path_ready"
+    } else if network_story.chat_single_hop_ready || blind_relay_ready {
+        "single_hop_relay_ready"
+    } else if peer_quorum.valid_peers > 0 {
+        "verified_peer_view"
+    } else {
+        "bootstrap"
+    };
+    let foundation_headline = match foundation_status {
+        "ready" => "AeroNyx privacy protocol foundation is live",
+        "live" => "AeroNyx privacy protocol has live relay evidence",
+        "forming" => "AeroNyx nodes are forming a verified relay mesh",
+        "disabled" => "AeroNyx privacy protocol discovery is not enabled",
+        _ => "AeroNyx privacy protocol is waiting for live peer evidence",
+    };
+    let foundation_next_action = match foundation_status {
+        "ready" => "monitor peer freshness, blind relay probe age, and restart recovery",
+        "live" if !restart_recovery_ready => {
+            "configure peer cache or seed endpoints before treating relay state as restart-resilient"
+        }
+        "live" => "wait for peer quorum to become fully ready",
+        "forming" => "add or recover verified peers and routeable relay candidates",
+        "disabled" => "enable discovery and chat relay capability before advertising protocol readiness",
+        _ => "wait for verified peer discovery and the first blind relay runtime check",
+    };
 
     serde_json::json!({
+        "protocol_foundation": {
+            "status": foundation_status,
+            "stage": foundation_stage,
+            "headline": foundation_headline,
+            "checks_passed": checks_passed,
+            "checks_total": checks_total,
+            "local_relay_ready": local_relay_ready,
+            "peer_mesh_ready": peer_mesh_ready,
+            "blind_relay_ready": blind_relay_ready,
+            "restart_recovery_ready": restart_recovery_ready,
+            "single_hop_relay_ready": network_story.chat_single_hop_ready,
+            "two_hop_onion_ready": network_story.chat_two_hop_onion_ready,
+            "verified_peer_count": peer_quorum.valid_peers,
+            "routeable_relay_count": peer_quorum.routeable_chat_relays,
+            "last_probe_age_seconds": blind_relay_quality.last_probe_age_seconds,
+            "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
+            "next_action": foundation_next_action,
+        },
         "chat_relay_capability": {
             "status": local_capabilities.status,
             "chat_relay_configured": local_capabilities.chat_relay_configured,
@@ -748,6 +818,30 @@ mod tests {
         assert_eq!(
             parsed["discovery_readiness"]["chat_relay_capability"]["status"].as_str(),
             Some("ready")
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["protocol_foundation"]["status"].as_str(),
+            Some("forming")
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["protocol_foundation"]["stage"].as_str(),
+            Some("single_hop_relay_ready")
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["protocol_foundation"]["checks_total"].as_u64(),
+            Some(4)
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["protocol_foundation"]["checks_passed"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["protocol_foundation"]["blind_relay_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["protocol_foundation"]["privacy_invariant"].as_str(),
+            Some("blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status")
         );
         assert_eq!(
             parsed["discovery_readiness"]["blind_relay_runtime"]["status"].as_str(),

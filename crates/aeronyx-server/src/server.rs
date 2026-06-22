@@ -4291,7 +4291,20 @@ mod tests {
         let blind_relay_runtime = readiness
             .get("blind_relay_runtime")
             .expect("blind relay runtime readiness object");
+        let protocol_foundation = readiness
+            .get("protocol_foundation")
+            .expect("protocol foundation readiness object");
 
+        assert_eq!(protocol_foundation["status"], "forming");
+        assert_eq!(protocol_foundation["stage"], "single_hop_relay_ready");
+        assert_eq!(protocol_foundation["checks_total"], 4);
+        assert_eq!(protocol_foundation["checks_passed"], 2);
+        assert_eq!(protocol_foundation["local_relay_ready"], true);
+        assert_eq!(protocol_foundation["blind_relay_ready"], true);
+        assert_eq!(
+            protocol_foundation["privacy_invariant"],
+            "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status"
+        );
         assert_eq!(blind_relay_runtime["status"], "ready");
         assert_eq!(blind_relay_runtime["runtime_ready"], true);
         assert_eq!(blind_relay_runtime["quality_ready"], true);
