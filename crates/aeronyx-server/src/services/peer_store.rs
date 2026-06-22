@@ -72,6 +72,8 @@
 //! - Blind relay transport failure buckets count as forward failures so
 //!   nodeboard and public health surfaces do not under-report unresponsive
 //!   next-hop relay paths
+//! - Blind relay quality summary converts opaque runtime counters into a
+//!   privacy-safe readiness bucket for nodeboard, website, and AI runbooks
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -98,6 +100,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.34.0-BlindRelayQualityStatus - Added aggregate blind relay quality summary
 //! v0.33.0-BlindRelayTransportFailureStats - Count transport buckets as forward failures
 //! v0.32.0-PeerRouteFailureQuarantine - Added route-level next-hop quarantine after repeated failures
 //! v0.31.0-PeerQuorumReadiness - Added privacy-safe peer quorum readiness summary
@@ -523,6 +526,47 @@ pub struct PeerStoreBlindRelayStats {
     pub last_event_at: Option<u64>,
 }
 
+/// Aggregate quality bucket for blind relay operations.
+///
+/// This summary is intentionally derived only from cumulative in-process
+/// counters. It gives nodeboard, public website status, and AI runbooks a stable
+/// operator signal without exposing route ids, peer endpoints, previous/next
+/// hops, encrypted blobs, receiver identities, client IPs, DNS contents,
+/// destinations, voucher secrets, private keys, wallet-level traffic, or
+/// plaintext. Because it is cumulative rather than sliding-window based, it
+/// should be displayed as "runtime evidence" instead of final SLA truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreBlindRelayQualityStatus {
+    /// Unix timestamp when this summary was generated.
+    pub generated_at: u64,
+    /// Stable bucket: idle, observing, ready, protecting, degraded, or attention.
+    pub status: String,
+    /// Whether this process has seen accepted terminal or forwarded blind relay work.
+    pub runtime_ready: bool,
+    /// Whether successful terminal/forwarded events exist without final transport failures.
+    pub quality_ready: bool,
+    /// Accepted terminal plus forwarded requests.
+    pub accepted_total: u64,
+    /// Rejected requests counted as transport/next-hop forwarding failures.
+    pub forward_failed: u64,
+    /// Retry attempts that were exhausted without a successful next-hop ACK.
+    pub retry_exhausted: u64,
+    /// Requests dropped by local backpressure.
+    pub backpressure_dropped: u64,
+    /// Whether abuse protection counters have fired in this process.
+    pub protection_active: bool,
+    /// Percentage of received requests accepted as terminal or forwarded.
+    pub accepted_percent: u8,
+    /// Seconds since the last blind relay event, when known.
+    pub last_event_age_seconds: Option<u64>,
+    /// Operator-facing detail with aggregate counters only.
+    pub detail: String,
+    /// Privacy-safe next action for nodeboard / AI runbooks.
+    pub next_action: String,
+    /// Explicit privacy boundary for downstream UI and API consumers.
+    pub privacy_boundary: String,
+}
+
 /// Combined peer store status payload for nodeboard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerStoreStatus {
@@ -530,6 +574,8 @@ pub struct PeerStoreStatus {
     pub snapshot: PeerStoreSnapshot,
     /// Cumulative runtime counters.
     pub runtime: PeerStoreRuntimeStats,
+    /// Aggregate blind relay runtime quality for dashboards and runbooks.
+    pub blind_relay_quality: PeerStoreBlindRelayQualityStatus,
     /// Configured maximum peer count.
     pub max_peers: Option<usize>,
     /// Recent privacy-safe discovery control-plane audit events.
@@ -1934,9 +1980,7 @@ impl PeerStore {
                     .blind_relay_quarantined
                     .fetch_add(1, Ordering::Relaxed);
             }
-            reason if reason.starts_with("http_")
-                || reason.starts_with("blind_relay_request_") =>
-            {
+            reason if reason.starts_with("http_") || reason.starts_with("blind_relay_request_") => {
                 self.counters
                     .blind_relay_forward_failed
                     .fetch_add(1, Ordering::Relaxed);
@@ -2534,6 +2578,8 @@ impl PeerStore {
     pub fn status(&self, now: u64) -> PeerStoreStatus {
         let snapshot = self.snapshot(now);
         let bootstrap = self.bootstrap_status.read().clone();
+        let runtime = self.counters.snapshot();
+        let blind_relay_quality = Self::blind_relay_quality_status(now, &runtime.blind_relay);
         let stability = Self::stability(&snapshot, &bootstrap, now);
         let peer_summary = self.peer_summary(now);
         let route_candidates = self.route_candidate_status(now);
@@ -2545,7 +2591,8 @@ impl PeerStore {
 
         PeerStoreStatus {
             snapshot,
-            runtime: self.counters.snapshot(),
+            runtime,
+            blind_relay_quality,
             max_peers: self.max_peers(),
             recent_audit_events: self.recent_audit_events(),
             recent_peer_events: self.recent_peer_events(),
@@ -2556,6 +2603,95 @@ impl PeerStore {
             peer_health_summary,
             peer_quorum,
             network_story,
+        }
+    }
+
+    fn blind_relay_quality_status(
+        now: u64,
+        stats: &PeerStoreBlindRelayStats,
+    ) -> PeerStoreBlindRelayQualityStatus {
+        let accepted_total = stats.terminal.saturating_add(stats.forwarded);
+        let runtime_ready = accepted_total > 0;
+        let protection_active = stats.rate_limited > 0
+            || stats.quarantined > 0
+            || stats.quarantine_started > 0
+            || stats.replay_dropped > 0
+            || stats.loop_detected > 0
+            || stats.invalid_signature > 0;
+        let transport_attention =
+            stats.forward_failed > 0 || stats.retry_exhausted > 0 || stats.backpressure_dropped > 0;
+        let quality_ready = runtime_ready && !transport_attention;
+
+        let status = if stats.received == 0 {
+            "idle"
+        } else if stats.retry_exhausted > 0 || stats.backpressure_dropped > 0 {
+            "attention"
+        } else if stats.forward_failed > 0 {
+            "degraded"
+        } else if protection_active {
+            "protecting"
+        } else if runtime_ready {
+            "ready"
+        } else {
+            "observing"
+        };
+
+        let accepted_percent = if stats.received == 0 {
+            0
+        } else {
+            ((accepted_total.saturating_mul(100)) / stats.received).min(100) as u8
+        };
+        let last_event_age_seconds = stats
+            .last_event_at
+            .map(|last_event_at| now.saturating_sub(last_event_at));
+
+        let next_action = match status {
+            "idle" => "wait for encrypted blind relay traffic or run a synthetic relay probe",
+            "attention" => {
+                "inspect next-hop reachability, retry exhaustion, and local relay backpressure"
+            }
+            "degraded" => "inspect route candidates and next-hop transport health",
+            "protecting" => {
+                "review aggregate abuse-guard buckets while preserving blind relay metadata"
+            }
+            "ready" => "blind relay runtime has accepted encrypted relay work",
+            _ => "observe additional relay traffic before declaring runtime quality ready",
+        };
+
+        let detail = format!(
+            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} protection_active={} accepted_percent={} last_event_age_seconds={}",
+            stats.received,
+            accepted_total,
+            stats.terminal,
+            stats.forwarded,
+            stats.rejected,
+            stats.forward_failed,
+            stats.retry_attempted,
+            stats.retry_succeeded,
+            stats.retry_exhausted,
+            stats.backpressure_dropped,
+            protection_active,
+            accepted_percent,
+            last_event_age_seconds
+                .map(|age| age.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+
+        PeerStoreBlindRelayQualityStatus {
+            generated_at: now,
+            status: status.to_string(),
+            runtime_ready,
+            quality_ready,
+            accepted_total,
+            forward_failed: stats.forward_failed,
+            retry_exhausted: stats.retry_exhausted,
+            backpressure_dropped: stats.backpressure_dropped,
+            protection_active,
+            accepted_percent,
+            last_event_age_seconds,
+            detail,
+            next_action: next_action.to_string(),
+            privacy_boundary: "aggregate blind relay runtime counters only; no full node ids, endpoint URLs, route ids, encrypted payloads, receiver identities, client IPs, DNS contents, destinations, voucher secrets, private keys, wallet-level traffic, or plaintext".to_string(),
         }
     }
 
@@ -4353,6 +4489,55 @@ mod tests {
             event.action == "blind_relay_terminal"
                 && event.detail.contains("encrypted_blob_size_bucket=lte_4kb")
         }));
+    }
+
+    #[test]
+    fn test_blind_relay_quality_reports_ready_without_private_metadata() {
+        let store = PeerStore::new();
+
+        store.record_blind_relay_terminal(1_700_000_010, 2, 128);
+        store.record_blind_relay_forwarded(1_700_000_011, 1);
+
+        let quality = store.status(1_700_000_021).blind_relay_quality;
+
+        assert_eq!(quality.status, "ready");
+        assert!(quality.runtime_ready);
+        assert!(quality.quality_ready);
+        assert_eq!(quality.accepted_total, 2);
+        assert_eq!(quality.accepted_percent, 100);
+        assert_eq!(quality.last_event_age_seconds, Some(10));
+        assert!(!quality.detail.contains("https://"));
+        assert!(!quality.detail.contains("route_id"));
+        assert!(!quality.detail.contains("encrypted_blob"));
+        assert!(!quality.detail.contains("payload"));
+        assert!(quality
+            .privacy_boundary
+            .contains("aggregate blind relay runtime counters only"));
+    }
+
+    #[test]
+    fn test_blind_relay_quality_surfaces_transport_attention_without_endpoint_data() {
+        let store = PeerStore::new();
+
+        store.record_blind_relay_forwarded(1_700_000_010, 1);
+        store.record_blind_relay_retry_attempt(1_700_000_011, "blind_relay_request_timeout");
+        store.record_blind_relay_retry_exhausted(1_700_000_012, 2, "blind_relay_request_timeout");
+        store.record_blind_relay_rejected(1_700_000_013, "blind_relay_request_timeout");
+
+        let quality = store.status(1_700_000_018).blind_relay_quality;
+
+        assert_eq!(quality.status, "attention");
+        assert!(quality.runtime_ready);
+        assert!(!quality.quality_ready);
+        assert_eq!(quality.forward_failed, 1);
+        assert_eq!(quality.retry_exhausted, 1);
+        assert_eq!(quality.last_event_age_seconds, Some(5));
+        assert!(quality.next_action.contains("next-hop reachability"));
+        assert!(!quality.detail.contains("https://"));
+        assert!(!quality.detail.contains("endpoint"));
+        assert!(!quality.detail.contains("route_id"));
+        assert!(!quality.detail.contains("encrypted_blob"));
+        assert!(!quality.detail.contains("payload"));
     }
 
     #[test]

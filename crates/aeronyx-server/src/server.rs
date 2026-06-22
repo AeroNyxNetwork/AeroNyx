@@ -74,6 +74,9 @@
 //  32. Validates peer relay ACK bodies before marking a discovered chat relay
 //      route healthy, so HTTP 2xx with `accepted=false` is treated as a real
 //      encrypted-envelope delivery failure.
+//  33. Adds blind relay runtime quality to discovery_readiness so nodeboard,
+//      backend, website, and AI maintenance tools can show relay evidence
+//      without parsing full PeerStore internals or exposing private metadata.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -93,6 +96,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.1.7-BlindRelayQualityReadiness - Expose aggregate blind relay quality in discovery readiness
 //   v1.1.6-PeerRelayAckValidation - Require accepted peer relay ACK before route success
 //   v1.1.5-DiscoveryReadinessHeartbeat - Add compact ChatRelay/quorum readiness to heartbeat
 //   v1.1.4-PeerCacheLoadEvidence - Expose cache/backup startup load evidence
@@ -2860,6 +2864,7 @@ impl Server {
     ) -> serde_json::Value {
         let peer_quorum = &status.peer_quorum;
         let network_story = &status.network_story;
+        let blind_relay_quality = &status.blind_relay_quality;
 
         serde_json::json!({
             "chat_relay_capability": {
@@ -2892,6 +2897,19 @@ impl Server {
                 "chat_two_hop_onion_ready": network_story.chat_two_hop_onion_ready,
                 "routeable_chat_relays": network_story.routeable_chat_relays,
                 "routeable_onion_middle_hops": network_story.routeable_onion_middle_hops,
+            },
+            "blind_relay_runtime": {
+                "status": &blind_relay_quality.status,
+                "runtime_ready": blind_relay_quality.runtime_ready,
+                "quality_ready": blind_relay_quality.quality_ready,
+                "accepted_total": blind_relay_quality.accepted_total,
+                "forward_failed": blind_relay_quality.forward_failed,
+                "retry_exhausted": blind_relay_quality.retry_exhausted,
+                "backpressure_dropped": blind_relay_quality.backpressure_dropped,
+                "protection_active": blind_relay_quality.protection_active,
+                "accepted_percent": blind_relay_quality.accepted_percent,
+                "last_event_age_seconds": blind_relay_quality.last_event_age_seconds,
+                "next_action": &blind_relay_quality.next_action,
             },
             "source": "rust_discovery_readiness_heartbeat",
             "privacy_boundary": "aggregate discovery readiness only; no full node ids, endpoint URLs, route ids, encrypted payloads, receiver identities, client public IPs, DNS contents, destinations, Memory Chain plaintext, voucher secrets, private keys, or wallet-level traffic",
@@ -4147,6 +4165,37 @@ mod tests {
         assert!(status
             .advertisement_blockers
             .contains(&"chat_relay_runtime_not_ready"));
+    }
+
+    #[test]
+    fn discovery_readiness_includes_blind_relay_runtime_quality_without_private_metadata() {
+        let mut config = ServerConfig::default();
+        config.discovery.public_endpoint = Some("https://node.example.com".to_string());
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        config.memchain.chat_relay.enabled = true;
+
+        let peer_store = PeerStore::new();
+        peer_store.record_blind_relay_forwarded(1_700_000_010, 1);
+        let status = peer_store.status(1_700_000_020);
+        let local_capabilities = Server::discovery_local_capability_status_for(&config);
+        let readiness = Server::discovery_readiness_status_value(&status, &local_capabilities);
+        let blind_relay_runtime = readiness
+            .get("blind_relay_runtime")
+            .expect("blind relay runtime readiness object");
+
+        assert_eq!(blind_relay_runtime["status"], "ready");
+        assert_eq!(blind_relay_runtime["runtime_ready"], true);
+        assert_eq!(blind_relay_runtime["quality_ready"], true);
+        assert_eq!(blind_relay_runtime["accepted_total"], 1);
+        assert_eq!(blind_relay_runtime["forward_failed"], 0);
+        assert_eq!(blind_relay_runtime["last_event_age_seconds"], 10);
+
+        let serialized = serde_json::to_string(&readiness).unwrap();
+        assert!(!serialized.contains("https://node.example.com"));
+        assert!(!serialized.contains("route_id"));
+        assert!(!serialized.contains("encrypted_blob"));
+        assert!(!serialized.contains("payload_b64"));
+        assert!(!serialized.contains("client_ip"));
     }
 
     #[test]
