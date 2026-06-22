@@ -46,6 +46,7 @@
 //!   used by both public/local discovery status and backend heartbeat reports.
 //!
 //! ## Last Modified
+//! v0.9.1-BlindRelayReadinessReason - Expose privacy-safe relay readiness reason
 //! v0.9.0-ProtocolFoundationSummary - Add product-facing privacy protocol foundation readiness
 //! v0.8.1-BlindRelayProbeFreshness - Include synthetic probe age in readiness
 //! v0.8.0-BlindRelayProbeReadiness - Include synthetic blind relay probe counters in readiness
@@ -404,6 +405,7 @@ pub fn discovery_readiness_status_value(
             "routeable_relay_count": peer_quorum.routeable_chat_relays,
             "last_probe_age_seconds": blind_relay_quality.last_probe_age_seconds,
             "relay_evidence_mode": &blind_relay_quality.evidence_mode,
+            "relay_readiness_reason": &blind_relay_quality.readiness_reason,
             "real_relay_ready": blind_relay_quality.real_relay_ready,
             "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
             "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
@@ -447,6 +449,7 @@ pub fn discovery_readiness_status_value(
             "real_relay_ready": blind_relay_quality.real_relay_ready,
             "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
             "evidence_mode": &blind_relay_quality.evidence_mode,
+            "readiness_reason": &blind_relay_quality.readiness_reason,
             "accepted_total": blind_relay_quality.accepted_total,
             "forward_failed": blind_relay_quality.forward_failed,
             "retry_exhausted": blind_relay_quality.retry_exhausted,
@@ -850,6 +853,10 @@ mod tests {
             Some("real_relay_traffic")
         );
         assert_eq!(
+            parsed["discovery_readiness"]["protocol_foundation"]["relay_readiness_reason"].as_str(),
+            Some("real_relay_observed")
+        );
+        assert_eq!(
             parsed["discovery_readiness"]["protocol_foundation"]["real_relay_ready"].as_bool(),
             Some(true)
         );
@@ -872,6 +879,10 @@ mod tests {
         assert_eq!(
             parsed["discovery_readiness"]["blind_relay_runtime"]["evidence_mode"].as_str(),
             Some("real_relay_traffic")
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["blind_relay_runtime"]["readiness_reason"].as_str(),
+            Some("real_relay_observed")
         );
         assert_eq!(
             parsed["discovery_readiness"]["blind_relay_runtime"]["real_relay_ready"].as_bool(),
