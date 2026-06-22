@@ -96,6 +96,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.1.9-BlindRelayProbeCooldown - Rate-limit synthetic relay probes so discovery health checks stay low-noise
 //   v1.1.8-BlindRelaySyntheticProbe - Low-frequency opaque route probes after successful discovery gossip
 //   v1.1.7-BlindRelayQualityReadiness - Expose aggregate blind relay quality in discovery readiness
 //   v1.1.6-PeerRelayAckValidation - Require accepted peer relay ACK before route success
@@ -237,6 +238,7 @@ const MINER_SCHEDULER_TICK_SECS: u64 = 60;
 const KEEPALIVE_PROBE_INTERVAL_SECS: u64 = 60;
 const KEEPALIVE_ACK_TIMEOUT_SECS: u64 = 90;
 const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
+const BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS: u64 = 15 * 60;
 
 // ============================================
 // Server
@@ -2176,6 +2178,7 @@ impl Server {
 
         Some(tokio::spawn(async move {
             let mut run_immediately = true;
+            let mut last_blind_relay_probe_at = 0u64;
             loop {
                 if run_immediately {
                     run_immediately = false;
@@ -2341,17 +2344,43 @@ impl Server {
                     last_failure_reason,
                 );
                 if chat_relay_runtime_ready && succeeded > 0 {
-                    Self::probe_blind_relay_candidate(
-                        &client,
-                        &peer_store,
-                        &identity,
-                        &self_node_id,
-                        unix_now_secs(),
-                    )
-                    .await;
+                    let probe_now = unix_now_secs();
+                    let probe_cooldown_secs =
+                        Self::blind_relay_probe_cooldown_secs(&config.discovery);
+                    let probe_due = last_blind_relay_probe_at == 0
+                        || probe_now.saturating_sub(last_blind_relay_probe_at)
+                            >= probe_cooldown_secs;
+
+                    if probe_due {
+                        if Self::probe_blind_relay_candidate(
+                            &client,
+                            &peer_store,
+                            &identity,
+                            &self_node_id,
+                            probe_now,
+                        )
+                        .await
+                        {
+                            last_blind_relay_probe_at = probe_now;
+                        }
+                    } else {
+                        trace!(
+                            cooldown_secs = probe_cooldown_secs,
+                            last_probe_age_secs =
+                                probe_now.saturating_sub(last_blind_relay_probe_at),
+                            "[DISCOVERY] Blind relay synthetic probe skipped during cooldown"
+                        );
+                    }
                 }
             }
         }))
+    }
+
+    fn blind_relay_probe_cooldown_secs(discovery: &DiscoveryConfig) -> u64 {
+        discovery
+            .gossip_interval_secs
+            .saturating_mul(3)
+            .max(BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS)
     }
 
     fn discovery_gossip_backpressure_active(
@@ -2477,7 +2506,7 @@ impl Server {
         identity: &IdentityKeyPair,
         self_node_id: &[u8; 32],
         now: u64,
-    ) {
+    ) -> bool {
         let Some(candidate) = peer_store
             .route_candidates_with_capability_excluding(
                 NodeCapability::ChatRelay,
@@ -2488,19 +2517,19 @@ impl Server {
             .into_iter()
             .next()
         else {
-            return;
+            return false;
         };
 
         let next_hop = candidate.node_id();
         let Some(endpoint) = candidate.descriptor.public_endpoint.as_deref() else {
             peer_store.record_blind_relay_probe_result(now, false, "missing_endpoint");
             peer_store.record_route_forward_failure(&next_hop, now, "missing_endpoint");
-            return;
+            return true;
         };
         let Some(url) = Self::blind_relay_probe_url(endpoint) else {
             peer_store.record_blind_relay_probe_result(now, false, "invalid_endpoint");
             peer_store.record_route_forward_failure(&next_hop, now, "invalid_endpoint");
-            return;
+            return true;
         };
 
         let envelope = BlindRelayEnvelope {
@@ -2553,6 +2582,7 @@ impl Server {
                 peer_store.record_route_forward_failure(&next_hop, now, reason);
             }
         }
+        true
     }
 
     fn blind_relay_probe_url(endpoint: &str) -> Option<String> {
@@ -3944,7 +3974,7 @@ impl std::fmt::Debug for Server {
 
 #[cfg(test)]
 mod tests {
-    use super::{prefix_to_netmask, unix_now_secs, Server};
+    use super::{prefix_to_netmask, unix_now_secs, Server, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS};
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::protocol::chat::{ChatContentType, ChatEnvelope};
     use aeronyx_core::protocol::{
@@ -4348,6 +4378,22 @@ mod tests {
         assert!(backpressure_active);
         assert_eq!(delay_secs, 300);
         assert_eq!(jitter_secs, 0);
+    }
+
+    #[test]
+    fn blind_relay_probe_cooldown_keeps_synthetic_checks_low_frequency() {
+        let mut discovery = DiscoveryConfig {
+            gossip_interval_secs: 60,
+            ..DiscoveryConfig::default()
+        };
+
+        assert_eq!(
+            Server::blind_relay_probe_cooldown_secs(&discovery),
+            BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS
+        );
+
+        discovery.gossip_interval_secs = 600;
+        assert_eq!(Server::blind_relay_probe_cooldown_secs(&discovery), 1_800);
     }
 
     #[test]
