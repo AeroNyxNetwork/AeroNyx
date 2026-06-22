@@ -178,8 +178,8 @@ use rusqlite::OptionalExtension;
 use crate::api::auth::{ensure_jwt_secret, generate_secret};
 use crate::api::chat_peer::{build_chat_peer_router, PeerChatRelayRequest, PeerChatRelayResponse};
 use crate::api::discovery::{
-    build_discovery_router_with_local_status, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
-    GossipResponse,
+    build_discovery_router_with_local_status, discovery_readiness_status_value, DiscoveryApiPolicy,
+    DiscoveryLocalCapabilityStatus, GossipResponse,
 };
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
 use crate::api::voice::build_voice_router;
@@ -210,8 +210,8 @@ use crate::services::memchain::{
 use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
 use crate::services::memchain::{LlmRouter, TaskWorker};
 use crate::services::{
-    spawn_dns_proxy, HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore,
-    PeerStoreStatus, RoutingService, SessionManager,
+    spawn_dns_proxy, HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore, RoutingService,
+    SessionManager,
 };
 // v1.0.0-Membership
 use crate::services::deny_list::DenyList;
@@ -1646,7 +1646,7 @@ impl Server {
                     discovery_chat_relay_runtime_ready,
                 );
                 let discovery_readiness =
-                    Self::discovery_readiness_status_value(&status, &local_capabilities);
+                    discovery_readiness_status_value(&status, &local_capabilities);
                 Some(serde_json::json!({
                     "generated_at": now,
                     "peer_store": status,
@@ -2856,64 +2856,6 @@ impl Server {
             chat_relay_runtime_ready,
             capabilities.contains(&NodeCapability::ChatRelay),
         )
-    }
-
-    fn discovery_readiness_status_value(
-        status: &PeerStoreStatus,
-        local_capabilities: &DiscoveryLocalCapabilityStatus,
-    ) -> serde_json::Value {
-        let peer_quorum = &status.peer_quorum;
-        let network_story = &status.network_story;
-        let blind_relay_quality = &status.blind_relay_quality;
-
-        serde_json::json!({
-            "chat_relay_capability": {
-                "status": local_capabilities.status,
-                "chat_relay_configured": local_capabilities.chat_relay_configured,
-                "blind_relay_endpoint_ready": local_capabilities.blind_relay_endpoint_ready,
-                "chat_relay_runtime_ready": local_capabilities.chat_relay_runtime_ready,
-                "advertised_chat_relay_capability": local_capabilities.advertised_chat_relay_capability,
-                "safe_to_advertise_chat_relay": local_capabilities.safe_to_advertise_chat_relay,
-                "capability_config_consistent": local_capabilities.capability_config_consistent,
-                "advertisement_blockers": &local_capabilities.advertisement_blockers,
-                "detail": local_capabilities.detail,
-            },
-            "peer_quorum": {
-                "status": &peer_quorum.status,
-                "quorum_ready": peer_quorum.quorum_ready,
-                "valid_peers": peer_quorum.valid_peers,
-                "healthy_peers": peer_quorum.healthy_peers,
-                "stale_peers": peer_quorum.stale_peers,
-                "routeable_chat_relays": peer_quorum.routeable_chat_relays,
-                "routeable_onion_middle_hops": peer_quorum.routeable_onion_middle_hops,
-                "restart_recovery_configured": peer_quorum.restart_recovery_configured,
-                "relay_foundation_ready": peer_quorum.relay_foundation_ready,
-                "next_action": &peer_quorum.next_action,
-            },
-            "network_story": {
-                "status": &network_story.status,
-                "headline": &network_story.headline,
-                "chat_single_hop_ready": network_story.chat_single_hop_ready,
-                "chat_two_hop_onion_ready": network_story.chat_two_hop_onion_ready,
-                "routeable_chat_relays": network_story.routeable_chat_relays,
-                "routeable_onion_middle_hops": network_story.routeable_onion_middle_hops,
-            },
-            "blind_relay_runtime": {
-                "status": &blind_relay_quality.status,
-                "runtime_ready": blind_relay_quality.runtime_ready,
-                "quality_ready": blind_relay_quality.quality_ready,
-                "accepted_total": blind_relay_quality.accepted_total,
-                "forward_failed": blind_relay_quality.forward_failed,
-                "retry_exhausted": blind_relay_quality.retry_exhausted,
-                "backpressure_dropped": blind_relay_quality.backpressure_dropped,
-                "protection_active": blind_relay_quality.protection_active,
-                "accepted_percent": blind_relay_quality.accepted_percent,
-                "last_event_age_seconds": blind_relay_quality.last_event_age_seconds,
-                "next_action": &blind_relay_quality.next_action,
-            },
-            "source": "rust_discovery_readiness_heartbeat",
-            "privacy_boundary": "aggregate discovery readiness only; no full node ids, endpoint URLs, route ids, encrypted payloads, receiver identities, client public IPs, DNS contents, destinations, Memory Chain plaintext, voucher secrets, private keys, or wallet-level traffic",
-        })
     }
 
     fn import_bootstrap_snapshot_bytes(
@@ -4178,7 +4120,8 @@ mod tests {
         peer_store.record_blind_relay_forwarded(1_700_000_010, 1);
         let status = peer_store.status(1_700_000_020);
         let local_capabilities = Server::discovery_local_capability_status_for(&config);
-        let readiness = Server::discovery_readiness_status_value(&status, &local_capabilities);
+        let readiness =
+            crate::api::discovery::discovery_readiness_status_value(&status, &local_capabilities);
         let blind_relay_runtime = readiness
             .get("blind_relay_runtime")
             .expect("blind relay runtime readiness object");

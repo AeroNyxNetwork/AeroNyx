@@ -14,6 +14,8 @@
 //! - `POST /api/discovery/gossip`: accepts a JSON `NodeDiscoveryMessage`,
 //!   applies descriptor/snapshot updates, and returns a snapshot response for
 //!   request messages
+//! - `GET /api/discovery/status`: returns aggregate peer-store status, local
+//!   capability readiness, and compact discovery readiness for dashboards
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -40,8 +42,11 @@
 //!   runtime service readiness, and endpoint readiness; it must not include
 //!   node ids, route ids, client data, peer endpoints, payloads, or
 //!   wallet-level information.
+//! - `discovery_readiness_status_value()` is the shared compact status contract
+//!   used by both public/local discovery status and backend heartbeat reports.
 //!
 //! ## Last Modified
+//! v0.7.0-DiscoveryReadinessStatus - Share compact discovery readiness with status endpoint
 //! v0.6.0-RuntimeRelayAdvertisementGate - Gate ChatRelay advertisement on service runtime readiness
 //! v0.5.0-LocalCapabilityStatus - Report ChatRelay/blind relay readiness self-check
 //! v0.4.0-DiscoveryAuditLog - Added audit events for rate-limit/policy decisions
@@ -193,6 +198,7 @@ pub struct DiscoveryStatusResponse {
     peer_store: PeerStoreStatus,
     policy: DiscoveryPolicyStatus,
     local_capabilities: DiscoveryLocalCapabilityStatus,
+    discovery_readiness: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -309,6 +315,72 @@ impl Default for DiscoveryLocalCapabilityStatus {
     fn default() -> Self {
         Self::new(false, false, false, false)
     }
+}
+
+/// Builds the compact aggregate discovery readiness contract.
+///
+/// This helper intentionally mirrors only privacy-safe, operator-facing fields
+/// from `PeerStoreStatus` and `DiscoveryLocalCapabilityStatus`. It is used by
+/// both `/api/discovery/status` and backend heartbeat payloads so nodeboard,
+/// public website surfaces, and AI runbooks can depend on one stable JSON shape
+/// without parsing the full internal peer store object.
+#[must_use]
+pub fn discovery_readiness_status_value(
+    status: &PeerStoreStatus,
+    local_capabilities: &DiscoveryLocalCapabilityStatus,
+) -> serde_json::Value {
+    let peer_quorum = &status.peer_quorum;
+    let network_story = &status.network_story;
+    let blind_relay_quality = &status.blind_relay_quality;
+
+    serde_json::json!({
+        "chat_relay_capability": {
+            "status": local_capabilities.status,
+            "chat_relay_configured": local_capabilities.chat_relay_configured,
+            "blind_relay_endpoint_ready": local_capabilities.blind_relay_endpoint_ready,
+            "chat_relay_runtime_ready": local_capabilities.chat_relay_runtime_ready,
+            "advertised_chat_relay_capability": local_capabilities.advertised_chat_relay_capability,
+            "safe_to_advertise_chat_relay": local_capabilities.safe_to_advertise_chat_relay,
+            "capability_config_consistent": local_capabilities.capability_config_consistent,
+            "advertisement_blockers": &local_capabilities.advertisement_blockers,
+            "detail": local_capabilities.detail,
+        },
+        "peer_quorum": {
+            "status": &peer_quorum.status,
+            "quorum_ready": peer_quorum.quorum_ready,
+            "valid_peers": peer_quorum.valid_peers,
+            "healthy_peers": peer_quorum.healthy_peers,
+            "stale_peers": peer_quorum.stale_peers,
+            "routeable_chat_relays": peer_quorum.routeable_chat_relays,
+            "routeable_onion_middle_hops": peer_quorum.routeable_onion_middle_hops,
+            "restart_recovery_configured": peer_quorum.restart_recovery_configured,
+            "relay_foundation_ready": peer_quorum.relay_foundation_ready,
+            "next_action": &peer_quorum.next_action,
+        },
+        "network_story": {
+            "status": &network_story.status,
+            "headline": &network_story.headline,
+            "chat_single_hop_ready": network_story.chat_single_hop_ready,
+            "chat_two_hop_onion_ready": network_story.chat_two_hop_onion_ready,
+            "routeable_chat_relays": network_story.routeable_chat_relays,
+            "routeable_onion_middle_hops": network_story.routeable_onion_middle_hops,
+        },
+        "blind_relay_runtime": {
+            "status": &blind_relay_quality.status,
+            "runtime_ready": blind_relay_quality.runtime_ready,
+            "quality_ready": blind_relay_quality.quality_ready,
+            "accepted_total": blind_relay_quality.accepted_total,
+            "forward_failed": blind_relay_quality.forward_failed,
+            "retry_exhausted": blind_relay_quality.retry_exhausted,
+            "backpressure_dropped": blind_relay_quality.backpressure_dropped,
+            "protection_active": blind_relay_quality.protection_active,
+            "accepted_percent": blind_relay_quality.accepted_percent,
+            "last_event_age_seconds": blind_relay_quality.last_event_age_seconds,
+            "next_action": &blind_relay_quality.next_action,
+        },
+        "source": "rust_discovery_readiness",
+        "privacy_boundary": "aggregate discovery readiness only; no full node ids, endpoint URLs, route ids, encrypted payloads, receiver identities, client public IPs, DNS contents, destinations, Memory Chain plaintext, voucher secrets, private keys, or wallet-level traffic",
+    })
 }
 
 // ============================================
@@ -429,9 +501,12 @@ async fn gossip_handler(
 
 async fn status_handler(State(state): State<DiscoveryApiState>) -> Json<DiscoveryStatusResponse> {
     let now = now_secs();
+    let peer_store = state.peer_store.status(now);
+    let local_capabilities = state.local_capabilities;
+    let discovery_readiness = discovery_readiness_status_value(&peer_store, &local_capabilities);
     Json(DiscoveryStatusResponse {
         generated_at: now,
-        peer_store: state.peer_store.status(now),
+        peer_store,
         policy: DiscoveryPolicyStatus {
             max_snapshot_limit: state.policy.max_snapshot_limit,
             gossip_rate_limit_per_minute: state.policy.gossip_rate_limit_per_minute,
@@ -441,7 +516,8 @@ async fn status_handler(State(state): State<DiscoveryApiState>) -> Json<Discover
             snapshot_default_public_only: true,
             private_descriptors_hidden_by_default: true,
         },
-        local_capabilities: state.local_capabilities,
+        local_capabilities,
+        discovery_readiness,
     })
 }
 
@@ -634,6 +710,57 @@ mod tests {
             parsed["local_capabilities"]["capability_config_consistent"].as_bool(),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn test_status_endpoint_returns_compact_discovery_readiness_without_private_metadata() {
+        let store = Arc::new(PeerStore::new());
+        store.record_blind_relay_forwarded(1_700_000_010, 1);
+        let app = build_discovery_router_with_local_status(
+            store,
+            DiscoveryApiPolicy::default(),
+            DiscoveryLocalCapabilityStatus::new(true, true, true, true),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            parsed["discovery_readiness"]["chat_relay_capability"]["status"].as_str(),
+            Some("ready")
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["blind_relay_runtime"]["status"].as_str(),
+            Some("ready")
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["blind_relay_runtime"]["runtime_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["blind_relay_runtime"]["accepted_total"].as_u64(),
+            Some(1)
+        );
+
+        let serialized = serde_json::to_string(&parsed["discovery_readiness"]).unwrap();
+        assert!(!serialized.contains("route_id"));
+        assert!(!serialized.contains("encrypted_blob"));
+        assert!(!serialized.contains("payload_b64"));
+        assert!(!serialized.contains("client_ip"));
     }
 
     #[tokio::test]
