@@ -46,6 +46,7 @@
 //!   used by both public/local discovery status and backend heartbeat reports.
 //!
 //! ## Last Modified
+//! v0.8.1-BlindRelayProbeFreshness - Include synthetic probe age in readiness
 //! v0.8.0-BlindRelayProbeReadiness - Include synthetic blind relay probe counters in readiness
 //! v0.7.0-DiscoveryReadinessStatus - Share compact discovery readiness with status endpoint
 //! v0.6.0-RuntimeRelayAdvertisementGate - Gate ChatRelay advertisement on service runtime readiness
@@ -380,6 +381,7 @@ pub fn discovery_readiness_status_value(
             "protection_active": blind_relay_quality.protection_active,
             "accepted_percent": blind_relay_quality.accepted_percent,
             "last_event_age_seconds": blind_relay_quality.last_event_age_seconds,
+            "last_probe_age_seconds": blind_relay_quality.last_probe_age_seconds,
             "next_action": &blind_relay_quality.next_action,
         },
         "source": "rust_discovery_readiness",

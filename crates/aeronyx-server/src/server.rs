@@ -4298,6 +4298,7 @@ mod tests {
         assert_eq!(blind_relay_runtime["accepted_total"], 1);
         assert_eq!(blind_relay_runtime["forward_failed"], 0);
         assert_eq!(blind_relay_runtime["last_event_age_seconds"], 10);
+        assert!(blind_relay_runtime["last_probe_age_seconds"].is_null());
 
         let serialized = serde_json::to_string(&readiness).unwrap();
         assert!(!serialized.contains("https://node.example.com"));

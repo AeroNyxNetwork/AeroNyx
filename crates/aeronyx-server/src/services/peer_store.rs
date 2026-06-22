@@ -74,8 +74,9 @@
 //!   next-hop relay paths
 //! - Blind relay quality summary converts opaque runtime counters into a
 //!   privacy-safe readiness bucket for nodeboard, website, and AI runbooks
-//! - Blind relay synthetic probe counters provide low-frequency route
-//!   readiness evidence without inflating real encrypted message traffic totals
+//! - Blind relay synthetic probe counters and last-probe age provide
+//!   low-frequency route readiness evidence without inflating real encrypted
+//!   message traffic totals
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -102,6 +103,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.35.1-BlindRelayProbeAge - Expose synthetic probe age separately from real relay event age
 //! v0.35.0-BlindRelayProbeStats - Added privacy-safe blind relay synthetic probe counters
 //! v0.34.0-BlindRelayQualityStatus - Added aggregate blind relay quality summary
 //! v0.33.0-BlindRelayTransportFailureStats - Count transport buckets as forward failures
@@ -534,6 +536,11 @@ pub struct PeerStoreBlindRelayStats {
     pub probe_succeeded: u64,
     /// Synthetic probes rejected or failed at transport/ACK validation.
     pub probe_failed: u64,
+    /// Unix timestamp of the last synthetic route readiness probe.
+    ///
+    /// This is not user traffic and must not be used to infer encrypted
+    /// message, packet, or payload byte activity.
+    pub last_probe_at: Option<u64>,
     /// Unix timestamp of the last blind relay event.
     pub last_event_at: Option<u64>,
 }
@@ -577,6 +584,11 @@ pub struct PeerStoreBlindRelayQualityStatus {
     pub accepted_percent: u8,
     /// Seconds since the last blind relay event, when known.
     pub last_event_age_seconds: Option<u64>,
+    /// Seconds since the last synthetic route readiness probe, when known.
+    ///
+    /// This is separate from real relay event age so dashboards can show probe
+    /// freshness without implying user traffic occurred.
+    pub last_probe_age_seconds: Option<u64>,
     /// Operator-facing detail with aggregate counters only.
     pub detail: String,
     /// Privacy-safe next action for nodeboard / AI runbooks.
@@ -1098,6 +1110,7 @@ struct PeerStoreCounters {
     blind_relay_probe_attempted: AtomicU64,
     blind_relay_probe_succeeded: AtomicU64,
     blind_relay_probe_failed: AtomicU64,
+    last_blind_relay_probe_at: AtomicU64,
     last_import_at: AtomicU64,
     last_gossip_at: AtomicU64,
     last_snapshot_at: AtomicU64,
@@ -1139,6 +1152,7 @@ impl PeerStoreCounters {
             blind_relay_probe_attempted: AtomicU64::new(0),
             blind_relay_probe_succeeded: AtomicU64::new(0),
             blind_relay_probe_failed: AtomicU64::new(0),
+            last_blind_relay_probe_at: AtomicU64::new(0),
             last_import_at: AtomicU64::new(0),
             last_gossip_at: AtomicU64::new(0),
             last_snapshot_at: AtomicU64::new(0),
@@ -1187,6 +1201,9 @@ impl PeerStoreCounters {
                 probe_attempted: self.blind_relay_probe_attempted.load(Ordering::Relaxed),
                 probe_succeeded: self.blind_relay_probe_succeeded.load(Ordering::Relaxed),
                 probe_failed: self.blind_relay_probe_failed.load(Ordering::Relaxed),
+                last_probe_at: Self::optional_ts(
+                    self.last_blind_relay_probe_at.load(Ordering::Relaxed),
+                ),
                 last_event_at: Self::optional_ts(self.last_blind_relay_at.load(Ordering::Relaxed)),
             },
             last_import_at: Self::optional_ts(self.last_import_at.load(Ordering::Relaxed)),
@@ -1969,6 +1986,9 @@ impl PeerStore {
         self.counters
             .last_blind_relay_at
             .store(now, Ordering::Relaxed);
+        self.counters
+            .last_blind_relay_probe_at
+            .store(now, Ordering::Relaxed);
         self.record_audit_event(
             now,
             "blind_relay_probe",
@@ -2713,6 +2733,9 @@ impl PeerStore {
         let last_event_age_seconds = stats
             .last_event_at
             .map(|last_event_at| now.saturating_sub(last_event_at));
+        let last_probe_age_seconds = stats
+            .last_probe_at
+            .map(|last_probe_at| now.saturating_sub(last_probe_at));
 
         let next_action = match status {
             "idle" => "wait for encrypted blind relay traffic or run a synthetic relay probe",
@@ -2731,7 +2754,7 @@ impl PeerStore {
         };
 
         let detail = format!(
-            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} protection_active={} accepted_percent={} last_event_age_seconds={}",
+            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} protection_active={} accepted_percent={} last_event_age_seconds={} last_probe_age_seconds={}",
             stats.received,
             accepted_total,
             stats.terminal,
@@ -2748,6 +2771,9 @@ impl PeerStore {
             protection_active,
             accepted_percent,
             last_event_age_seconds
+                .map(|age| age.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            last_probe_age_seconds
                 .map(|age| age.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         );
@@ -2767,6 +2793,7 @@ impl PeerStore {
             protection_active,
             accepted_percent,
             last_event_age_seconds,
+            last_probe_age_seconds,
             detail,
             next_action: next_action.to_string(),
             privacy_boundary: "aggregate blind relay runtime counters only; no full node ids, endpoint URLs, route ids, encrypted payloads, receiver identities, client IPs, DNS contents, destinations, voucher secrets, private keys, wallet-level traffic, or plaintext".to_string(),
@@ -4584,6 +4611,7 @@ mod tests {
         assert_eq!(quality.accepted_total, 2);
         assert_eq!(quality.accepted_percent, 100);
         assert_eq!(quality.last_event_age_seconds, Some(10));
+        assert_eq!(quality.last_probe_age_seconds, None);
         assert!(!quality.detail.contains("https://"));
         assert!(!quality.detail.contains("route_id"));
         assert!(!quality.detail.contains("encrypted_blob"));
@@ -4634,12 +4662,15 @@ mod tests {
         assert_eq!(stats.probe_attempted, 1);
         assert_eq!(stats.probe_succeeded, 1);
         assert_eq!(stats.probe_failed, 0);
+        assert_eq!(stats.last_probe_at, Some(1_700_000_010));
         assert_eq!(quality.accepted_total, 0);
         assert!(quality.runtime_ready);
         assert!(quality.quality_ready);
         assert_eq!(quality.probe_attempted, 1);
         assert_eq!(quality.probe_succeeded, 1);
         assert_eq!(quality.probe_failed, 0);
+        assert_eq!(quality.last_probe_age_seconds, Some(10));
+        assert!(quality.detail.contains("last_probe_age_seconds=10"));
         assert!(quality
             .next_action
             .contains("wait for real encrypted relay traffic"));
