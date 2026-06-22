@@ -81,6 +81,8 @@
 //!   probes so public surfaces do not overstate user-message movement
 //! - Blind relay readiness reason gives operators a stable privacy-safe bucket
 //!   for why the relay path is ready, probe-only, degraded, protected, or idle
+//! - Blind relay timestamp freshness counters show stale/future route-frame
+//!   protection without exposing route ids, peer endpoints, payloads, or users
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -107,6 +109,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.35.4-BlindRelayTimestampProtection - Count stale/future route-frame protection
 //! v0.35.3-BlindRelayReadinessReason - Added privacy-safe readiness reason bucket
 //! v0.35.2-BlindRelayEvidenceMode - Distinguish real relay traffic from synthetic probe evidence
 //! v0.35.1-BlindRelayProbeAge - Expose synthetic probe age separately from real relay event age
@@ -521,6 +524,12 @@ pub struct PeerStoreBlindRelayStats {
     pub loop_detected: u64,
     /// Requests dropped because this node already observed the route id.
     pub replay_dropped: u64,
+    /// Requests rejected because signed routing timestamps were stale or too far ahead.
+    ///
+    /// This is a coarse replay/freshness protection counter. It must not be
+    /// expanded into route ids, exact timestamps, previous-hop ids, endpoint
+    /// URLs, encrypted blobs, receiver identities, or user metadata.
+    pub timestamp_rejected: u64,
     /// Requests rejected by local previous-hop rate limiting.
     pub rate_limited: u64,
     /// Requests rejected while the previous-hop bucket was quarantined.
@@ -1120,6 +1129,7 @@ struct PeerStoreCounters {
     blind_relay_forward_failed: AtomicU64,
     blind_relay_loop_detected: AtomicU64,
     blind_relay_replay_dropped: AtomicU64,
+    blind_relay_timestamp_rejected: AtomicU64,
     blind_relay_rate_limited: AtomicU64,
     blind_relay_quarantined: AtomicU64,
     blind_relay_quarantine_started: AtomicU64,
@@ -1162,6 +1172,7 @@ impl PeerStoreCounters {
             blind_relay_forward_failed: AtomicU64::new(0),
             blind_relay_loop_detected: AtomicU64::new(0),
             blind_relay_replay_dropped: AtomicU64::new(0),
+            blind_relay_timestamp_rejected: AtomicU64::new(0),
             blind_relay_rate_limited: AtomicU64::new(0),
             blind_relay_quarantined: AtomicU64::new(0),
             blind_relay_quarantine_started: AtomicU64::new(0),
@@ -1211,6 +1222,7 @@ impl PeerStoreCounters {
                 forward_failed: self.blind_relay_forward_failed.load(Ordering::Relaxed),
                 loop_detected: self.blind_relay_loop_detected.load(Ordering::Relaxed),
                 replay_dropped: self.blind_relay_replay_dropped.load(Ordering::Relaxed),
+                timestamp_rejected: self.blind_relay_timestamp_rejected.load(Ordering::Relaxed),
                 rate_limited: self.blind_relay_rate_limited.load(Ordering::Relaxed),
                 quarantined: self.blind_relay_quarantined.load(Ordering::Relaxed),
                 quarantine_started: self.blind_relay_quarantine_started.load(Ordering::Relaxed),
@@ -2075,6 +2087,11 @@ impl PeerStore {
                     .blind_relay_replay_dropped
                     .fetch_add(1, Ordering::Relaxed);
             }
+            "timestamp_expired" | "timestamp_in_future" => {
+                self.counters
+                    .blind_relay_timestamp_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             "rate_limited" => {
                 self.counters
                     .blind_relay_rate_limited
@@ -2736,6 +2753,7 @@ impl PeerStore {
             || stats.quarantine_started > 0
             || stats.replay_dropped > 0
             || stats.loop_detected > 0
+            || stats.timestamp_rejected > 0
             || stats.invalid_signature > 0;
         let transport_attention = stats.forward_failed > 0
             || stats.retry_exhausted > 0
@@ -4617,15 +4635,17 @@ mod tests {
         store.record_blind_relay_rejected(1_700_000_020, "rate_limited");
         store.record_blind_relay_rejected(1_700_000_021, "quarantined");
         store.record_blind_relay_rejected(1_700_000_022, "blind_relay_request_timeout");
-        store.record_blind_relay_quarantine_started(1_700_000_023, "failure_threshold");
+        store.record_blind_relay_rejected(1_700_000_023, "timestamp_expired");
+        store.record_blind_relay_rejected(1_700_000_024, "timestamp_in_future");
+        store.record_blind_relay_quarantine_started(1_700_000_025, "failure_threshold");
 
-        let status = store.status(1_700_000_024);
+        let status = store.status(1_700_000_026);
         let stats = status.runtime.blind_relay;
 
-        assert_eq!(stats.received, 13);
+        assert_eq!(stats.received, 15);
         assert_eq!(stats.terminal, 1);
         assert_eq!(stats.forwarded, 1);
-        assert_eq!(stats.rejected, 11);
+        assert_eq!(stats.rejected, 13);
         assert_eq!(stats.backpressure_dropped, 1);
         assert_eq!(stats.invalid_signature, 1);
         assert_eq!(stats.ttl_exhausted, 1);
@@ -4634,10 +4654,11 @@ mod tests {
         assert_eq!(stats.forward_failed, 2);
         assert_eq!(stats.loop_detected, 1);
         assert_eq!(stats.replay_dropped, 1);
+        assert_eq!(stats.timestamp_rejected, 2);
         assert_eq!(stats.rate_limited, 1);
         assert_eq!(stats.quarantined, 1);
         assert_eq!(stats.quarantine_started, 1);
-        assert_eq!(stats.last_event_at, Some(1_700_000_023));
+        assert_eq!(stats.last_event_at, Some(1_700_000_025));
         assert!(status
             .recent_audit_events
             .iter()
@@ -4683,6 +4704,31 @@ mod tests {
         assert!(quality
             .privacy_boundary
             .contains("aggregate blind relay runtime counters only"));
+    }
+
+    #[test]
+    fn test_blind_relay_quality_marks_timestamp_replay_protection_active() {
+        let store = PeerStore::new();
+
+        store.record_blind_relay_rejected(1_700_000_010, "timestamp_expired");
+
+        let status = store.status(1_700_000_020);
+        let stats = status.runtime.blind_relay;
+        let quality = status.blind_relay_quality;
+
+        assert_eq!(stats.timestamp_rejected, 1);
+        assert_eq!(quality.status, "protecting");
+        assert!(!quality.runtime_ready);
+        assert!(!quality.quality_ready);
+        assert!(!quality.real_relay_ready);
+        assert_eq!(quality.evidence_mode, "real_relay_attempted");
+        assert_eq!(quality.readiness_reason, "protection_active");
+        assert!(quality.protection_active);
+        assert_eq!(quality.last_event_age_seconds, Some(10));
+        assert!(!quality.detail.contains("route_id"));
+        assert!(!quality.detail.contains("endpoint"));
+        assert!(!quality.detail.contains("encrypted_blob"));
+        assert!(!quality.detail.contains("payload"));
     }
 
     #[test]
