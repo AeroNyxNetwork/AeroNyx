@@ -403,6 +403,9 @@ pub fn discovery_readiness_status_value(
             "verified_peer_count": peer_quorum.valid_peers,
             "routeable_relay_count": peer_quorum.routeable_chat_relays,
             "last_probe_age_seconds": blind_relay_quality.last_probe_age_seconds,
+            "relay_evidence_mode": &blind_relay_quality.evidence_mode,
+            "real_relay_ready": blind_relay_quality.real_relay_ready,
+            "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
             "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
             "next_action": foundation_next_action,
         },
@@ -441,6 +444,9 @@ pub fn discovery_readiness_status_value(
             "status": &blind_relay_quality.status,
             "runtime_ready": blind_relay_quality.runtime_ready,
             "quality_ready": blind_relay_quality.quality_ready,
+            "real_relay_ready": blind_relay_quality.real_relay_ready,
+            "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
+            "evidence_mode": &blind_relay_quality.evidence_mode,
             "accepted_total": blind_relay_quality.accepted_total,
             "forward_failed": blind_relay_quality.forward_failed,
             "retry_exhausted": blind_relay_quality.retry_exhausted,
@@ -840,6 +846,18 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            parsed["discovery_readiness"]["protocol_foundation"]["relay_evidence_mode"].as_str(),
+            Some("real_relay_traffic")
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["protocol_foundation"]["real_relay_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["protocol_foundation"]["synthetic_probe_ready"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
             parsed["discovery_readiness"]["protocol_foundation"]["privacy_invariant"].as_str(),
             Some("blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status")
         );
@@ -850,6 +868,18 @@ mod tests {
         assert_eq!(
             parsed["discovery_readiness"]["blind_relay_runtime"]["runtime_ready"].as_bool(),
             Some(true)
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["blind_relay_runtime"]["evidence_mode"].as_str(),
+            Some("real_relay_traffic")
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["blind_relay_runtime"]["real_relay_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["blind_relay_runtime"]["synthetic_probe_ready"].as_bool(),
+            Some(false)
         );
         assert_eq!(
             parsed["discovery_readiness"]["blind_relay_runtime"]["accepted_total"].as_u64(),

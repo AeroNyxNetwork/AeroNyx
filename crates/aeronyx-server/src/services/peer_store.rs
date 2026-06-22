@@ -77,6 +77,8 @@
 //! - Blind relay synthetic probe counters and last-probe age provide
 //!   low-frequency route readiness evidence without inflating real encrypted
 //!   message traffic totals
+//! - Blind relay evidence mode separates real relay traffic from synthetic
+//!   probes so public surfaces do not overstate user-message movement
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -103,6 +105,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.35.2-BlindRelayEvidenceMode - Distinguish real relay traffic from synthetic probe evidence
 //! v0.35.1-BlindRelayProbeAge - Expose synthetic probe age separately from real relay event age
 //! v0.35.0-BlindRelayProbeStats - Added privacy-safe blind relay synthetic probe counters
 //! v0.34.0-BlindRelayQualityStatus - Added aggregate blind relay quality summary
@@ -564,6 +567,13 @@ pub struct PeerStoreBlindRelayQualityStatus {
     pub runtime_ready: bool,
     /// Whether successful terminal/forwarded events exist without final transport failures.
     pub quality_ready: bool,
+    /// Whether this process has accepted real terminal or forwarded relay work.
+    pub real_relay_ready: bool,
+    /// Whether this process has successful synthetic route probe evidence.
+    pub synthetic_probe_ready: bool,
+    /// Stable evidence bucket: idle, real_relay_traffic, synthetic_probe,
+    /// probe_failed, or real_relay_attempted.
+    pub evidence_mode: String,
     /// Accepted terminal plus forwarded requests.
     pub accepted_total: u64,
     /// Rejected requests counted as transport/next-hop forwarding failures.
@@ -2698,7 +2708,20 @@ impl PeerStore {
     ) -> PeerStoreBlindRelayQualityStatus {
         let accepted_total = stats.terminal.saturating_add(stats.forwarded);
         let probe_ready = stats.probe_succeeded > 0;
-        let runtime_ready = accepted_total > 0 || probe_ready;
+        let real_relay_ready = accepted_total > 0;
+        let synthetic_probe_ready = probe_ready;
+        let runtime_ready = real_relay_ready || synthetic_probe_ready;
+        let evidence_mode = if real_relay_ready {
+            "real_relay_traffic"
+        } else if synthetic_probe_ready {
+            "synthetic_probe"
+        } else if stats.probe_attempted > 0 {
+            "probe_failed"
+        } else if stats.received > 0 {
+            "real_relay_attempted"
+        } else {
+            "idle"
+        };
         let protection_active = stats.rate_limited > 0
             || stats.quarantined > 0
             || stats.quarantine_started > 0
@@ -2754,7 +2777,7 @@ impl PeerStore {
         };
 
         let detail = format!(
-            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} protection_active={} accepted_percent={} last_event_age_seconds={} last_probe_age_seconds={}",
+            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} real_relay_ready={} synthetic_probe_ready={} evidence_mode={} protection_active={} accepted_percent={} last_event_age_seconds={} last_probe_age_seconds={}",
             stats.received,
             accepted_total,
             stats.terminal,
@@ -2768,6 +2791,9 @@ impl PeerStore {
             stats.probe_attempted,
             stats.probe_succeeded,
             stats.probe_failed,
+            real_relay_ready,
+            synthetic_probe_ready,
+            evidence_mode,
             protection_active,
             accepted_percent,
             last_event_age_seconds
@@ -2783,6 +2809,9 @@ impl PeerStore {
             status: status.to_string(),
             runtime_ready,
             quality_ready,
+            real_relay_ready,
+            synthetic_probe_ready,
+            evidence_mode: evidence_mode.to_string(),
             accepted_total,
             forward_failed: stats.forward_failed,
             retry_exhausted: stats.retry_exhausted,
@@ -4608,6 +4637,9 @@ mod tests {
         assert_eq!(quality.status, "ready");
         assert!(quality.runtime_ready);
         assert!(quality.quality_ready);
+        assert!(quality.real_relay_ready);
+        assert!(!quality.synthetic_probe_ready);
+        assert_eq!(quality.evidence_mode, "real_relay_traffic");
         assert_eq!(quality.accepted_total, 2);
         assert_eq!(quality.accepted_percent, 100);
         assert_eq!(quality.last_event_age_seconds, Some(10));
@@ -4635,6 +4667,8 @@ mod tests {
         assert_eq!(quality.status, "attention");
         assert!(quality.runtime_ready);
         assert!(!quality.quality_ready);
+        assert!(quality.real_relay_ready);
+        assert_eq!(quality.evidence_mode, "real_relay_traffic");
         assert_eq!(quality.forward_failed, 1);
         assert_eq!(quality.retry_exhausted, 1);
         assert_eq!(quality.last_event_age_seconds, Some(5));
@@ -4666,11 +4700,15 @@ mod tests {
         assert_eq!(quality.accepted_total, 0);
         assert!(quality.runtime_ready);
         assert!(quality.quality_ready);
+        assert!(!quality.real_relay_ready);
+        assert!(quality.synthetic_probe_ready);
+        assert_eq!(quality.evidence_mode, "synthetic_probe");
         assert_eq!(quality.probe_attempted, 1);
         assert_eq!(quality.probe_succeeded, 1);
         assert_eq!(quality.probe_failed, 0);
         assert_eq!(quality.last_probe_age_seconds, Some(10));
         assert!(quality.detail.contains("last_probe_age_seconds=10"));
+        assert!(quality.detail.contains("evidence_mode=synthetic_probe"));
         assert!(quality
             .next_action
             .contains("wait for real encrypted relay traffic"));
