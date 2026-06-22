@@ -96,6 +96,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.1.8-BlindRelaySyntheticProbe - Low-frequency opaque route probes after successful discovery gossip
 //   v1.1.7-BlindRelayQualityReadiness - Expose aggregate blind relay quality in discovery readiness
 //   v1.1.6-PeerRelayAckValidation - Require accepted peer relay ACK before route success
 //   v1.1.5-DiscoveryReadinessHeartbeat - Add compact ChatRelay/quorum readiness to heartbeat
@@ -149,7 +150,7 @@ use aeronyx_core::protocol::auth::{
     verify_signed_message, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_DEVICE_REGISTER,
     DOMAIN_WALLET_PRESENCE,
 };
-use aeronyx_core::protocol::chat::ChatEnvelope;
+use aeronyx_core::protocol::chat::{BlindRelayEnvelope, ChatEnvelope};
 use sha2::{Digest, Sha256};
 
 use aeronyx_common::types::SessionId;
@@ -176,7 +177,10 @@ use aeronyx_transport::LinuxTun;
 use rusqlite::OptionalExtension;
 
 use crate::api::auth::{ensure_jwt_secret, generate_secret};
-use crate::api::chat_peer::{build_chat_peer_router, PeerChatRelayRequest, PeerChatRelayResponse};
+use crate::api::chat_peer::{
+    build_chat_peer_router, PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayRequest,
+    PeerChatRelayResponse,
+};
 use crate::api::discovery::{
     build_discovery_router_with_local_status, discovery_readiness_status_value, DiscoveryApiPolicy,
     DiscoveryLocalCapabilityStatus, GossipResponse,
@@ -2336,6 +2340,16 @@ impl Server {
                     seed_attempted,
                     last_failure_reason,
                 );
+                if chat_relay_runtime_ready && succeeded > 0 {
+                    Self::probe_blind_relay_candidate(
+                        &client,
+                        &peer_store,
+                        &identity,
+                        &self_node_id,
+                        unix_now_secs(),
+                    )
+                    .await;
+                }
             }
         }))
     }
@@ -2455,6 +2469,128 @@ impl Server {
         peer_store.mark_gossip_at(now);
 
         Ok(())
+    }
+
+    async fn probe_blind_relay_candidate(
+        client: &reqwest::Client,
+        peer_store: &PeerStore,
+        identity: &IdentityKeyPair,
+        self_node_id: &[u8; 32],
+        now: u64,
+    ) {
+        let Some(candidate) = peer_store
+            .route_candidates_with_capability_excluding(
+                NodeCapability::ChatRelay,
+                now,
+                1,
+                &[*self_node_id],
+            )
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
+
+        let next_hop = candidate.node_id();
+        let Some(endpoint) = candidate.descriptor.public_endpoint.as_deref() else {
+            peer_store.record_blind_relay_probe_result(now, false, "missing_endpoint");
+            peer_store.record_route_forward_failure(&next_hop, now, "missing_endpoint");
+            return;
+        };
+        let Some(url) = Self::blind_relay_probe_url(endpoint) else {
+            peer_store.record_blind_relay_probe_result(now, false, "invalid_endpoint");
+            peer_store.record_route_forward_failure(&next_hop, now, "invalid_endpoint");
+            return;
+        };
+
+        let envelope = BlindRelayEnvelope {
+            route_id: Self::blind_relay_probe_route_id(now, self_node_id, &next_hop),
+            next_hop,
+            ttl: 1,
+            encrypted_blob: Self::blind_relay_probe_blob(now, self_node_id, &next_hop),
+            timestamp: now,
+            signature: [0u8; 64],
+        }
+        .sign_with(identity);
+        let request = PeerBlindRelayRequest {
+            envelope,
+            previous_hop_node_id: *self_node_id,
+        };
+
+        match client.post(url).json(&request).send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<PeerBlindRelayResponse>().await {
+                    Ok(ack) if ack.accepted => {
+                        peer_store.record_blind_relay_probe_result(now, true, "accepted");
+                        peer_store.record_route_forward_success(&next_hop, now);
+                    }
+                    Ok(_ack) => {
+                        peer_store.record_blind_relay_probe_result(now, false, "ack_rejected");
+                        peer_store.record_route_forward_failure(&next_hop, now, "ack_rejected");
+                    }
+                    Err(error) => {
+                        debug!(
+                            error = %error,
+                            "[DISCOVERY] Blind relay probe ACK decode failed"
+                        );
+                        peer_store.record_blind_relay_probe_result(now, false, "ack_decode");
+                        peer_store.record_route_forward_failure(&next_hop, now, "ack_decode");
+                    }
+                }
+            }
+            Ok(response) => {
+                let reason = format!("http_{}", response.status().as_u16());
+                peer_store.record_blind_relay_probe_result(now, false, &reason);
+                peer_store.record_route_forward_failure(&next_hop, now, reason);
+            }
+            Err(error) => {
+                let reason = Self::classify_reqwest_error("blind_relay_probe", &error);
+                debug!(
+                    reason = %reason,
+                    "[DISCOVERY] Blind relay probe failed"
+                );
+                peer_store.record_blind_relay_probe_result(now, false, &reason);
+                peer_store.record_route_forward_failure(&next_hop, now, reason);
+            }
+        }
+    }
+
+    fn blind_relay_probe_url(endpoint: &str) -> Option<String> {
+        let endpoint = endpoint.trim().trim_end_matches('/');
+        if endpoint.is_empty() {
+            return None;
+        }
+        let base = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+            endpoint.to_string()
+        } else {
+            format!("http://{endpoint}")
+        };
+        Some(format!("{base}/api/chat/peer/blind-relay"))
+    }
+
+    fn blind_relay_probe_route_id(
+        now: u64,
+        self_node_id: &[u8; 32],
+        next_hop: &[u8; 32],
+    ) -> [u8; 16] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"aeronyx:blind-relay-probe:route-id:v1");
+        hasher.update(now.to_le_bytes());
+        hasher.update(&self_node_id[..]);
+        hasher.update(&next_hop[..]);
+        let digest = hasher.finalize();
+        let mut route_id = [0u8; 16];
+        route_id.copy_from_slice(&digest[..16]);
+        route_id
+    }
+
+    fn blind_relay_probe_blob(now: u64, self_node_id: &[u8; 32], next_hop: &[u8; 32]) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"aeronyx:blind-relay-probe:opaque-blob:v1");
+        hasher.update(now.to_le_bytes());
+        hasher.update(&self_node_id[..]);
+        hasher.update(&next_hop[..]);
+        hasher.finalize().to_vec()
     }
 
     fn classify_reqwest_error(phase: &str, error: &reqwest::Error) -> String {

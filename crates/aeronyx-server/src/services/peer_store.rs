@@ -74,6 +74,8 @@
 //!   next-hop relay paths
 //! - Blind relay quality summary converts opaque runtime counters into a
 //!   privacy-safe readiness bucket for nodeboard, website, and AI runbooks
+//! - Blind relay synthetic probe counters provide low-frequency route
+//!   readiness evidence without inflating real encrypted message traffic totals
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -100,6 +102,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.35.0-BlindRelayProbeStats - Added privacy-safe blind relay synthetic probe counters
 //! v0.34.0-BlindRelayQualityStatus - Added aggregate blind relay quality summary
 //! v0.33.0-BlindRelayTransportFailureStats - Count transport buckets as forward failures
 //! v0.32.0-PeerRouteFailureQuarantine - Added route-level next-hop quarantine after repeated failures
@@ -522,6 +525,15 @@ pub struct PeerStoreBlindRelayStats {
     pub retry_succeeded: u64,
     /// Blind relay forwards that still failed after retry attempts were exhausted.
     pub retry_exhausted: u64,
+    /// Low-frequency synthetic blind relay probes attempted by this node.
+    ///
+    /// Probe counters are not user traffic and must not be added to encrypted
+    /// message, packet, or payload byte totals.
+    pub probe_attempted: u64,
+    /// Synthetic probes accepted by a verified next-hop blind relay endpoint.
+    pub probe_succeeded: u64,
+    /// Synthetic probes rejected or failed at transport/ACK validation.
+    pub probe_failed: u64,
     /// Unix timestamp of the last blind relay event.
     pub last_event_at: Option<u64>,
 }
@@ -553,6 +565,12 @@ pub struct PeerStoreBlindRelayQualityStatus {
     pub retry_exhausted: u64,
     /// Requests dropped by local backpressure.
     pub backpressure_dropped: u64,
+    /// Low-frequency synthetic route probes attempted by this process.
+    pub probe_attempted: u64,
+    /// Synthetic route probes accepted by verified next-hop blind relay endpoints.
+    pub probe_succeeded: u64,
+    /// Synthetic route probes that failed without exposing endpoint or route data.
+    pub probe_failed: u64,
     /// Whether abuse protection counters have fired in this process.
     pub protection_active: bool,
     /// Percentage of received requests accepted as terminal or forwarded.
@@ -1077,6 +1095,9 @@ struct PeerStoreCounters {
     blind_relay_retry_attempted: AtomicU64,
     blind_relay_retry_succeeded: AtomicU64,
     blind_relay_retry_exhausted: AtomicU64,
+    blind_relay_probe_attempted: AtomicU64,
+    blind_relay_probe_succeeded: AtomicU64,
+    blind_relay_probe_failed: AtomicU64,
     last_import_at: AtomicU64,
     last_gossip_at: AtomicU64,
     last_snapshot_at: AtomicU64,
@@ -1115,6 +1136,9 @@ impl PeerStoreCounters {
             blind_relay_retry_attempted: AtomicU64::new(0),
             blind_relay_retry_succeeded: AtomicU64::new(0),
             blind_relay_retry_exhausted: AtomicU64::new(0),
+            blind_relay_probe_attempted: AtomicU64::new(0),
+            blind_relay_probe_succeeded: AtomicU64::new(0),
+            blind_relay_probe_failed: AtomicU64::new(0),
             last_import_at: AtomicU64::new(0),
             last_gossip_at: AtomicU64::new(0),
             last_snapshot_at: AtomicU64::new(0),
@@ -1160,6 +1184,9 @@ impl PeerStoreCounters {
                 retry_attempted: self.blind_relay_retry_attempted.load(Ordering::Relaxed),
                 retry_succeeded: self.blind_relay_retry_succeeded.load(Ordering::Relaxed),
                 retry_exhausted: self.blind_relay_retry_exhausted.load(Ordering::Relaxed),
+                probe_attempted: self.blind_relay_probe_attempted.load(Ordering::Relaxed),
+                probe_succeeded: self.blind_relay_probe_succeeded.load(Ordering::Relaxed),
+                probe_failed: self.blind_relay_probe_failed.load(Ordering::Relaxed),
                 last_event_at: Self::optional_ts(self.last_blind_relay_at.load(Ordering::Relaxed)),
             },
             last_import_at: Self::optional_ts(self.last_import_at.load(Ordering::Relaxed)),
@@ -1911,6 +1938,45 @@ impl PeerStore {
         );
     }
 
+    /// Records the result of a low-frequency synthetic blind relay route probe.
+    ///
+    /// Probe traffic is operator readiness evidence, not user traffic. It must
+    /// never be added to encrypted message totals, packet totals, payload byte
+    /// totals, billing, rewards, or user-facing usage claims. The detail is a
+    /// stable reason bucket only; callers must not pass endpoint URLs, full
+    /// node ids, route ids, encrypted blobs, receiver identities, client IPs,
+    /// DNS contents, destinations, voucher secrets, wallet-level metadata, or
+    /// plaintext.
+    pub fn record_blind_relay_probe_result(
+        &self,
+        now: u64,
+        accepted: bool,
+        reason: impl AsRef<str>,
+    ) {
+        let reason = reason.as_ref();
+        self.counters
+            .blind_relay_probe_attempted
+            .fetch_add(1, Ordering::Relaxed);
+        if accepted {
+            self.counters
+                .blind_relay_probe_succeeded
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.counters
+                .blind_relay_probe_failed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.counters
+            .last_blind_relay_at
+            .store(now, Ordering::Relaxed);
+        self.record_audit_event(
+            now,
+            "blind_relay_probe",
+            if accepted { "accepted" } else { "rejected" },
+            format!("reason_bucket={reason}"),
+        );
+    }
+
     /// Records a blind relay rejection with a stable privacy-safe reason.
     pub fn record_blind_relay_rejected(&self, now: u64, reason: impl AsRef<str>) {
         let reason = reason.as_ref();
@@ -2611,22 +2677,25 @@ impl PeerStore {
         stats: &PeerStoreBlindRelayStats,
     ) -> PeerStoreBlindRelayQualityStatus {
         let accepted_total = stats.terminal.saturating_add(stats.forwarded);
-        let runtime_ready = accepted_total > 0;
+        let probe_ready = stats.probe_succeeded > 0;
+        let runtime_ready = accepted_total > 0 || probe_ready;
         let protection_active = stats.rate_limited > 0
             || stats.quarantined > 0
             || stats.quarantine_started > 0
             || stats.replay_dropped > 0
             || stats.loop_detected > 0
             || stats.invalid_signature > 0;
-        let transport_attention =
-            stats.forward_failed > 0 || stats.retry_exhausted > 0 || stats.backpressure_dropped > 0;
+        let transport_attention = stats.forward_failed > 0
+            || stats.retry_exhausted > 0
+            || stats.backpressure_dropped > 0
+            || stats.probe_failed > 0;
         let quality_ready = runtime_ready && !transport_attention;
 
-        let status = if stats.received == 0 {
+        let status = if stats.received == 0 && stats.probe_attempted == 0 {
             "idle"
         } else if stats.retry_exhausted > 0 || stats.backpressure_dropped > 0 {
             "attention"
-        } else if stats.forward_failed > 0 {
+        } else if stats.forward_failed > 0 || stats.probe_failed > 0 {
             "degraded"
         } else if protection_active {
             "protecting"
@@ -2654,12 +2723,15 @@ impl PeerStore {
             "protecting" => {
                 "review aggregate abuse-guard buckets while preserving blind relay metadata"
             }
-            "ready" => "blind relay runtime has accepted encrypted relay work",
+            "ready" if accepted_total > 0 => {
+                "blind relay runtime has accepted encrypted relay work"
+            }
+            "ready" => "synthetic relay probe succeeded; wait for real encrypted relay traffic",
             _ => "observe additional relay traffic before declaring runtime quality ready",
         };
 
         let detail = format!(
-            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} protection_active={} accepted_percent={} last_event_age_seconds={}",
+            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} protection_active={} accepted_percent={} last_event_age_seconds={}",
             stats.received,
             accepted_total,
             stats.terminal,
@@ -2670,6 +2742,9 @@ impl PeerStore {
             stats.retry_succeeded,
             stats.retry_exhausted,
             stats.backpressure_dropped,
+            stats.probe_attempted,
+            stats.probe_succeeded,
+            stats.probe_failed,
             protection_active,
             accepted_percent,
             last_event_age_seconds
@@ -2686,6 +2761,9 @@ impl PeerStore {
             forward_failed: stats.forward_failed,
             retry_exhausted: stats.retry_exhausted,
             backpressure_dropped: stats.backpressure_dropped,
+            probe_attempted: stats.probe_attempted,
+            probe_succeeded: stats.probe_succeeded,
+            probe_failed: stats.probe_failed,
             protection_active,
             accepted_percent,
             last_event_age_seconds,
@@ -4538,6 +4616,41 @@ mod tests {
         assert!(!quality.detail.contains("route_id"));
         assert!(!quality.detail.contains("encrypted_blob"));
         assert!(!quality.detail.contains("payload"));
+    }
+
+    #[test]
+    fn test_blind_relay_probe_quality_does_not_inflate_real_traffic_counters() {
+        let store = PeerStore::new();
+
+        store.record_blind_relay_probe_result(1_700_000_010, true, "accepted");
+
+        let status = store.status(1_700_000_020);
+        let stats = status.runtime.blind_relay;
+        let quality = status.blind_relay_quality;
+
+        assert_eq!(stats.received, 0);
+        assert_eq!(stats.terminal, 0);
+        assert_eq!(stats.forwarded, 0);
+        assert_eq!(stats.probe_attempted, 1);
+        assert_eq!(stats.probe_succeeded, 1);
+        assert_eq!(stats.probe_failed, 0);
+        assert_eq!(quality.accepted_total, 0);
+        assert!(quality.runtime_ready);
+        assert!(quality.quality_ready);
+        assert_eq!(quality.probe_attempted, 1);
+        assert_eq!(quality.probe_succeeded, 1);
+        assert_eq!(quality.probe_failed, 0);
+        assert!(quality
+            .next_action
+            .contains("wait for real encrypted relay traffic"));
+
+        let serialized = serde_json::to_string(&quality).unwrap();
+        assert!(!serialized.contains("route_id"));
+        assert!(!serialized.contains("encrypted_blob"));
+        assert!(!serialized.contains("payload_b64"));
+        assert!(!serialized.contains("client_ip"));
+        assert!(!serialized.contains("http://"));
+        assert!(!serialized.contains("https://"));
     }
 
     #[test]
