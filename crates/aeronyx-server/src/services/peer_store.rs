@@ -69,6 +69,9 @@
 //!   multi-hop work without claiming global consensus or exposing endpoints
 //! - Route-level failure quarantine so repeated opaque next-hop failures stop
 //!   being selected for live relay paths while remaining visible to operators
+//! - Blind relay transport failure buckets count as forward failures so
+//!   nodeboard and public health surfaces do not under-report unresponsive
+//!   next-hop relay paths
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -95,6 +98,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.33.0-BlindRelayTransportFailureStats - Count transport buckets as forward failures
 //! v0.32.0-PeerRouteFailureQuarantine - Added route-level next-hop quarantine after repeated failures
 //! v0.31.0-PeerQuorumReadiness - Added privacy-safe peer quorum readiness summary
 //! v0.30.0-PeerLifecycleEvents - Added privacy-safe recent peer discovery lifecycle events
@@ -1930,7 +1934,9 @@ impl PeerStore {
                     .blind_relay_quarantined
                     .fetch_add(1, Ordering::Relaxed);
             }
-            reason if reason.starts_with("http_") => {
+            reason if reason.starts_with("http_")
+                || reason.starts_with("blind_relay_request_") =>
+            {
                 self.counters
                     .blind_relay_forward_failed
                     .fetch_add(1, Ordering::Relaxed);
@@ -4309,27 +4315,28 @@ mod tests {
         store.record_blind_relay_rejected(1_700_000_019, "duplicate_route");
         store.record_blind_relay_rejected(1_700_000_020, "rate_limited");
         store.record_blind_relay_rejected(1_700_000_021, "quarantined");
-        store.record_blind_relay_quarantine_started(1_700_000_022, "failure_threshold");
+        store.record_blind_relay_rejected(1_700_000_022, "blind_relay_request_timeout");
+        store.record_blind_relay_quarantine_started(1_700_000_023, "failure_threshold");
 
-        let status = store.status(1_700_000_023);
+        let status = store.status(1_700_000_024);
         let stats = status.runtime.blind_relay;
 
-        assert_eq!(stats.received, 12);
+        assert_eq!(stats.received, 13);
         assert_eq!(stats.terminal, 1);
         assert_eq!(stats.forwarded, 1);
-        assert_eq!(stats.rejected, 10);
+        assert_eq!(stats.rejected, 11);
         assert_eq!(stats.backpressure_dropped, 1);
         assert_eq!(stats.invalid_signature, 1);
         assert_eq!(stats.ttl_exhausted, 1);
         assert_eq!(stats.no_route, 1);
         assert_eq!(stats.invalid_endpoint, 1);
-        assert_eq!(stats.forward_failed, 1);
+        assert_eq!(stats.forward_failed, 2);
         assert_eq!(stats.loop_detected, 1);
         assert_eq!(stats.replay_dropped, 1);
         assert_eq!(stats.rate_limited, 1);
         assert_eq!(stats.quarantined, 1);
         assert_eq!(stats.quarantine_started, 1);
-        assert_eq!(stats.last_event_at, Some(1_700_000_022));
+        assert_eq!(stats.last_event_at, Some(1_700_000_023));
         assert!(status
             .recent_audit_events
             .iter()
