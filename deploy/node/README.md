@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Document the gated `aeronyx-node.sh relay-probe --two-hop` operator command,
+  which attempts an outer+onward live middle-hop proof only when three distinct
+  routeable nodes exist.
 - Document the Rust BlindRelay `onward_envelope` handler support for controlled
   no-exit middle-hop experiments, including the production requirement for a
   third non-returning node before a full live two-hop probe can be claimed.
@@ -82,6 +85,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.40.0-node-deploy - Documented gated relay-probe --two-hop live proof mode.
 v1.39.0-node-deploy - Documented optional onward envelope support for controlled
                      two-hop middle-hop forwarding.
 v1.38.0-node-deploy - Documented relay-probe single-hop evidence and two-hop
@@ -500,6 +504,18 @@ to itself, it may forward the already-opaque onward frame to the next verified
 ChatRelay peer. The middle hop still must not parse encrypted blobs and still
 learns only node-level routing metadata: previous node, next node, TTL, route
 bucket, and aggregate counters.
+
+Operators can preflight the live two-hop path with:
+
+```bash
+./deploy/node/aeronyx-node.sh relay-probe --two-hop --json
+```
+
+This command is gated. It attempts a live outer+onward proof only when it can
+select three distinct routeable nodes: the local entry node, one `OnionMiddle`,
+and one different terminal `ChatRelay`. If the fleet has only two routeable
+nodes, it returns `status=blocked` with `reason=needs_three_distinct_routeable_nodes`
+instead of pretending that a return path is a valid two-hop proof.
 
 Production operators should not claim a live full two-hop proof until there
 are at least three distinct routeable nodes. With only two nodes, a synthetic

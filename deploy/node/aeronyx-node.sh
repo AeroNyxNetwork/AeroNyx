@@ -87,6 +87,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.14.0-node-entrypoint - Added gated relay-probe --two-hop live probe mode.
 # v1.13.0-node-entrypoint - Updated relay-probe two-hop blocker wording after onward envelope support.
 # v1.12.0-node-entrypoint - Clarified relay-probe scope and added two-hop readiness output.
 # v1.11.0-node-entrypoint - Added guarded no-exit OnionMiddle enable/disable config helper.
@@ -140,6 +141,7 @@ EXPECTED_SHA256=""
 PEER_CACHE_FILE="${AERONYX_PEER_CACHE_FILE:-/var/lib/aeronyx/peers-cache.json}"
 SERVER_KEY_FILE="${AERONYX_SERVER_KEY_FILE:-/etc/aeronyx/server_key.json}"
 RELAY_PROBE_PEER_PREFIX=""
+RELAY_PROBE_TWO_HOP=0
 YES=0
 EXTRA_ARGS=()
 
@@ -232,6 +234,7 @@ Command-specific options:
     --yes                   Skip confirmation prompts and allow restart with active sessions.
 
   relay-probe:
+    --two-hop               Attempt a live outer+onward middle-hop probe.
     --peer-prefix PREFIX     Optional privacy-safe peer prefix to target.
     --peer-cache PATH        Peer cache path. Default: /var/lib/aeronyx/peers-cache.json.
     --server-key PATH        Local node key path. Default: /etc/aeronyx/server_key.json.
@@ -326,6 +329,7 @@ parse_args() {
             --restart) RESTART_AFTER_CONFIG=1; shift ;;
             --binary|--staged-binary) PROMOTE_BINARY_PATH="${2:?missing value}"; shift 2 ;;
             --expected-sha256) EXPECTED_SHA256="${2:?missing value}"; shift 2 ;;
+            --two-hop) RELAY_PROBE_TWO_HOP=1; shift ;;
             --peer-prefix) RELAY_PROBE_PEER_PREFIX="${2:?missing value}"; shift 2 ;;
             --peer-cache) PEER_CACHE_FILE="${2:?missing value}"; shift 2 ;;
             --server-key) SERVER_KEY_FILE="${2:?missing value}"; shift 2 ;;
@@ -996,6 +1000,7 @@ run_relay_probe() {
         "${PEER_CACHE_FILE}" \
         "${SERVER_KEY_FILE}" \
         "${RELAY_PROBE_PEER_PREFIX}" \
+        "${RELAY_PROBE_TWO_HOP}" \
         "${JSON}" \
         "${JSON_ONLY}" <<'PY'
 import base64
@@ -1025,9 +1030,11 @@ DOMAIN = b"AeroNyx-BlindRelay-v1"
     peer_cache_path,
     server_key_path,
     peer_prefix_filter,
+    two_hop_requested,
     json_requested,
     json_only,
-) = sys.argv[1:8]
+) = sys.argv[1:9]
+two_hop_requested = two_hop_requested == "1"
 json_requested = json_requested == "1"
 json_only = json_only == "1"
 
@@ -1089,12 +1096,8 @@ def route_readiness_summary(status):
         ),
         "planned_two_hop_count": int_or_none(two_hop.get("hop_count")),
         "planned_two_hop_prefixes": two_hop_prefixes[:3],
-        "two_hop_probe_supported": False,
-        "two_hop_probe_blocker": (
-            "Rust handler supports optional onward_envelope for controlled "
-            "middle-hop forwarding; live full two-hop proof requires three "
-            "distinct routeable nodes and a path-aware encrypted route envelope"
-        ),
+        "two_hop_probe_supported": True,
+        "two_hop_probe_blocker": None,
     }
 
 
@@ -1110,8 +1113,16 @@ def node_id_prefix(node_id):
     return bytes(node_id).hex()[:8]
 
 
+def has_capability(capabilities, expected):
+    aliases = {
+        "chat_relay": {"chatrelay", "chat_relay"},
+        "onion_middle": {"onionmiddle", "onion_middle"},
+    }.get(expected, {expected})
+    return any(str(item).lower() in aliases for item in capabilities or [])
+
+
 def has_chat_relay(capabilities):
-    return any(str(item).lower() in {"chatrelay", "chat_relay"} for item in capabilities or [])
+    return has_capability(capabilities, "chat_relay")
 
 
 def choose_peer(snapshot, self_pub, prefix_filter):
@@ -1146,6 +1157,48 @@ def choose_peer(snapshot, self_pub, prefix_filter):
         raise RuntimeError("no_routeable_chat_relay_peer")
     candidates.sort(key=lambda item: item[2])
     return candidates[0]
+
+
+def routeable_peer_candidates(snapshot, self_pub, capability, prefix_filter=""):
+    peers = snapshot.get("peers") if isinstance(snapshot, dict) else []
+    if not isinstance(peers, list):
+        peers = []
+    candidates = []
+    for peer in peers:
+        if not isinstance(peer, dict):
+            continue
+        descriptor = peer.get("descriptor")
+        if not isinstance(descriptor, dict):
+            continue
+        node_id = descriptor.get("node_id")
+        endpoint = descriptor.get("public_endpoint")
+        capabilities = descriptor.get("capabilities")
+        if not isinstance(node_id, list) or len(node_id) != 32:
+            continue
+        try:
+            node_id_bytes = bytes(int(item) & 0xFF for item in node_id)
+        except Exception:
+            continue
+        if node_id_bytes == self_pub:
+            continue
+        if not endpoint or not has_capability(capabilities, capability):
+            continue
+        prefix = node_id_bytes.hex()[:8]
+        if prefix_filter and not prefix.startswith(prefix_filter.lower()):
+            continue
+        candidates.append((node_id_bytes, str(endpoint).rstrip("/"), prefix, descriptor))
+    candidates.sort(key=lambda item: item[2])
+    return candidates
+
+
+def choose_two_hop_path(snapshot, self_pub, prefix_filter):
+    middles = routeable_peer_candidates(snapshot, self_pub, "onion_middle", prefix_filter)
+    terminals = routeable_peer_candidates(snapshot, self_pub, "chat_relay", "")
+    for middle in middles:
+        for terminal in terminals:
+            if terminal[0] != middle[0] and terminal[0] != self_pub:
+                return middle, terminal
+    raise RuntimeError("needs_three_distinct_routeable_nodes")
 
 
 def sign_data(route_id, next_hop, ttl, timestamp, blob, private_key):
@@ -1186,86 +1239,201 @@ def post_json(url, body):
 server_key = json.load(open(server_key_path, "r", encoding="utf-8"))
 self_pub = b64decode_key(server_key["public_key"])
 snapshot = json.load(open(peer_cache_path, "r", encoding="utf-8"))
-target_node_id, target_endpoint, target_prefix, _descriptor = choose_peer(
-    snapshot,
-    self_pub,
-    peer_prefix_filter.strip(),
-)
-
-remote_status_url = f"{target_endpoint}/api/discovery/status"
 local_status_before = fetch_json(local_status_url)
 two_hop_readiness = route_readiness_summary(local_status_before)
 before_local = blind_stats(local_status_before)
-before_remote = blind_stats(fetch_json(remote_status_url))
 
 previous_private = Ed25519PrivateKey.generate()
 previous_pub = previous_private.public_key().public_bytes(
     encoding=serialization.Encoding.Raw,
     format=serialization.PublicFormat.Raw,
 )
-route_id = os.urandom(16)
-ttl = 2
 timestamp = int(time.time())
-blob = b"synthetic-blind-relay-probe:v1:no-user-payload"
-signature = sign_data(route_id, target_node_id, ttl, timestamp, blob, previous_private)
+counter_keys = ["received", "forwarded", "terminal", "rejected", "forward_failed", "no_route"]
 
-body = {
-    "envelope": {
-        "route_id": list(route_id),
-        "next_hop": list(target_node_id),
-        "ttl": ttl,
-        "encrypted_blob": list(blob),
-        "timestamp": timestamp,
-        "signature": signature_tuple(signature),
-    },
-    "previous_hop_node_id": list(previous_pub),
-}
+if two_hop_requested:
+    try:
+        middle, terminal = choose_two_hop_path(snapshot, self_pub, peer_prefix_filter.strip())
+    except RuntimeError as exc:
+        result = {
+            "status": "blocked",
+            "reason": str(exc),
+            "probe_scope": "two_hop_blind_relay_transport",
+            "two_hop_readiness": two_hop_readiness,
+            "required_distinct_nodes": 3,
+            "source": "aeronyx-node.sh relay-probe --two-hop",
+            "privacy_boundary": "synthetic opaque blobs only; no user message, wallet id, DNS, destination, domain, URL, or packet payload",
+        }
+        if not json_only:
+            print(
+                "relay_probe_status=blocked scope=two_hop_blind_relay_transport reason={reason}".format(
+                    **result
+                )
+            )
+            print(
+                "relay_probe_two_hop_readiness=stage:{stage} two_hop_ready:{two_hop_ready} onion_middle_hops:{routeable_onion_middle_hops} chat_relays:{routeable_chat_relays} planned_hops:{planned_two_hop_count}".format(
+                    **two_hop_readiness
+                )
+            )
+        if json_requested or json_only:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        raise SystemExit(0)
 
-response_status, response_body = post_json(local_relay_url, body)
-time.sleep(2)
-after_local = blind_stats(fetch_json(local_status_url))
-after_remote = blind_stats(fetch_json(remote_status_url))
+    middle_node_id, middle_endpoint, middle_prefix, _middle_descriptor = middle
+    terminal_node_id, terminal_endpoint, terminal_prefix, _terminal_descriptor = terminal
+    middle_status_url = f"{middle_endpoint}/api/discovery/status"
+    terminal_status_url = f"{terminal_endpoint}/api/discovery/status"
+    before_middle = blind_stats(fetch_json(middle_status_url))
+    before_terminal = blind_stats(fetch_json(terminal_status_url))
 
-local_delta = {
-    key: int_delta(after_local, before_local, key)
-    for key in ["received", "forwarded", "terminal", "rejected", "forward_failed", "no_route"]
-}
-remote_delta = {
-    key: int_delta(after_remote, before_remote, key)
-    for key in ["received", "forwarded", "terminal", "rejected", "forward_failed", "no_route"]
-}
-ok = (
-    response_status == 200
-    and response_body.get("accepted") is True
-    and response_body.get("forwarded") is True
-    and local_delta.get("forwarded") == 1
-    and remote_delta.get("terminal") == 1
-    and local_delta.get("rejected") == 0
-    and remote_delta.get("rejected") == 0
-)
-result = {
-    "status": "ok" if ok else "attention",
-    "probe_scope": "single_hop_blind_relay_transport",
-    "two_hop_readiness": two_hop_readiness,
-    "response_status": response_status,
-    "response_body": response_body,
-    "target_peer_prefix": target_prefix,
-    "route_id_prefix": route_id.hex()[:8],
-    "local_delta": local_delta,
-    "remote_delta": remote_delta,
-    "source": "aeronyx-node.sh relay-probe",
-    "privacy_boundary": "synthetic opaque blob only; no user message, wallet id, DNS, destination, domain, URL, or packet payload",
-}
+    outer_route_id = os.urandom(16)
+    onward_route_id = os.urandom(16)
+    outer_blob = b"synthetic-two-hop-outer:v1:no-user-payload"
+    onward_blob = b"synthetic-two-hop-onward:v1:no-user-payload"
+    outer_ttl = 2
+    onward_ttl = 1
+    outer_signature = sign_data(
+        outer_route_id,
+        middle_node_id,
+        outer_ttl,
+        timestamp,
+        outer_blob,
+        previous_private,
+    )
+    onward_signature = sign_data(
+        onward_route_id,
+        terminal_node_id,
+        onward_ttl,
+        timestamp,
+        onward_blob,
+        previous_private,
+    )
+    body = {
+        "envelope": {
+            "route_id": list(outer_route_id),
+            "next_hop": list(middle_node_id),
+            "ttl": outer_ttl,
+            "encrypted_blob": list(outer_blob),
+            "timestamp": timestamp,
+            "signature": signature_tuple(outer_signature),
+        },
+        "previous_hop_node_id": list(previous_pub),
+        "onward_envelope": {
+            "route_id": list(onward_route_id),
+            "next_hop": list(terminal_node_id),
+            "ttl": onward_ttl,
+            "encrypted_blob": list(onward_blob),
+            "timestamp": timestamp,
+            "signature": signature_tuple(onward_signature),
+        },
+    }
+
+    response_status, response_body = post_json(local_relay_url, body)
+    time.sleep(3)
+    after_local = blind_stats(fetch_json(local_status_url))
+    after_middle = blind_stats(fetch_json(middle_status_url))
+    after_terminal = blind_stats(fetch_json(terminal_status_url))
+    local_delta = {key: int_delta(after_local, before_local, key) for key in counter_keys}
+    middle_delta = {key: int_delta(after_middle, before_middle, key) for key in counter_keys}
+    terminal_delta = {key: int_delta(after_terminal, before_terminal, key) for key in counter_keys}
+    ok = (
+        response_status == 200
+        and response_body.get("accepted") is True
+        and response_body.get("forwarded") is True
+        and local_delta.get("forwarded") == 1
+        and middle_delta.get("forwarded") == 1
+        and terminal_delta.get("terminal") == 1
+        and local_delta.get("rejected") == 0
+        and middle_delta.get("rejected") == 0
+        and terminal_delta.get("rejected") == 0
+    )
+    result = {
+        "status": "ok" if ok else "attention",
+        "probe_scope": "two_hop_blind_relay_transport",
+        "two_hop_readiness": two_hop_readiness,
+        "response_status": response_status,
+        "response_body": response_body,
+        "middle_peer_prefix": middle_prefix,
+        "terminal_peer_prefix": terminal_prefix,
+        "outer_route_id_prefix": outer_route_id.hex()[:8],
+        "onward_route_id_prefix": onward_route_id.hex()[:8],
+        "local_delta": local_delta,
+        "middle_delta": middle_delta,
+        "terminal_delta": terminal_delta,
+        "source": "aeronyx-node.sh relay-probe --two-hop",
+        "privacy_boundary": "synthetic opaque blobs only; no user message, wallet id, DNS, destination, domain, URL, or packet payload",
+    }
+else:
+    target_node_id, target_endpoint, target_prefix, _descriptor = choose_peer(
+        snapshot,
+        self_pub,
+        peer_prefix_filter.strip(),
+    )
+
+    remote_status_url = f"{target_endpoint}/api/discovery/status"
+    before_remote = blind_stats(fetch_json(remote_status_url))
+
+    route_id = os.urandom(16)
+    ttl = 2
+    blob = b"synthetic-blind-relay-probe:v1:no-user-payload"
+    signature = sign_data(route_id, target_node_id, ttl, timestamp, blob, previous_private)
+
+    body = {
+        "envelope": {
+            "route_id": list(route_id),
+            "next_hop": list(target_node_id),
+            "ttl": ttl,
+            "encrypted_blob": list(blob),
+            "timestamp": timestamp,
+            "signature": signature_tuple(signature),
+        },
+        "previous_hop_node_id": list(previous_pub),
+    }
+
+    response_status, response_body = post_json(local_relay_url, body)
+    time.sleep(2)
+    after_local = blind_stats(fetch_json(local_status_url))
+    after_remote = blind_stats(fetch_json(remote_status_url))
+
+    local_delta = {key: int_delta(after_local, before_local, key) for key in counter_keys}
+    remote_delta = {key: int_delta(after_remote, before_remote, key) for key in counter_keys}
+    ok = (
+        response_status == 200
+        and response_body.get("accepted") is True
+        and response_body.get("forwarded") is True
+        and local_delta.get("forwarded") == 1
+        and remote_delta.get("terminal") == 1
+        and local_delta.get("rejected") == 0
+        and remote_delta.get("rejected") == 0
+    )
+    result = {
+        "status": "ok" if ok else "attention",
+        "probe_scope": "single_hop_blind_relay_transport",
+        "two_hop_readiness": two_hop_readiness,
+        "response_status": response_status,
+        "response_body": response_body,
+        "target_peer_prefix": target_prefix,
+        "route_id_prefix": route_id.hex()[:8],
+        "local_delta": local_delta,
+        "remote_delta": remote_delta,
+        "source": "aeronyx-node.sh relay-probe",
+        "privacy_boundary": "synthetic opaque blob only; no user message, wallet id, DNS, destination, domain, URL, or packet payload",
+    }
 
 if not json_only:
     print(
         "relay_probe_status={status} target_peer_prefix={peer} response_status={code}".format(
             status=result["status"],
-            peer=target_prefix,
+            peer=result.get("target_peer_prefix", result.get("middle_peer_prefix", "none")),
             code=response_status,
         )
     )
-    print("relay_probe_scope=single_hop_blind_relay_transport two_hop_probe_supported=false")
+    print(
+        "relay_probe_scope={scope} two_hop_requested={two_hop}".format(
+            scope=result["probe_scope"],
+            two_hop=str(two_hop_requested).lower(),
+        )
+    )
     print(
         "relay_probe_two_hop_readiness=stage:{stage} two_hop_ready:{two_hop_ready} onion_middle_hops:{routeable_onion_middle_hops} chat_relays:{routeable_chat_relays} planned_hops:{planned_two_hop_count}".format(
             **two_hop_readiness
@@ -1276,11 +1444,23 @@ if not json_only:
             **local_delta
         )
     )
-    print(
-        "relay_probe_remote_delta=received:{received} forwarded:{forwarded} terminal:{terminal} rejected:{rejected} forward_failed:{forward_failed} no_route:{no_route}".format(
-            **remote_delta
+    if two_hop_requested:
+        print(
+            "relay_probe_middle_delta=received:{received} forwarded:{forwarded} terminal:{terminal} rejected:{rejected} forward_failed:{forward_failed} no_route:{no_route}".format(
+                **middle_delta
+            )
         )
-    )
+        print(
+            "relay_probe_terminal_delta=received:{received} forwarded:{forwarded} terminal:{terminal} rejected:{rejected} forward_failed:{forward_failed} no_route:{no_route}".format(
+                **terminal_delta
+            )
+        )
+    else:
+        print(
+            "relay_probe_remote_delta=received:{received} forwarded:{forwarded} terminal:{terminal} rejected:{rejected} forward_failed:{forward_failed} no_route:{no_route}".format(
+                **remote_delta
+            )
+        )
 
 if json_requested or json_only:
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
