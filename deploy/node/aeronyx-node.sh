@@ -87,6 +87,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.13.0-node-entrypoint - Updated relay-probe two-hop blocker wording after onward envelope support.
 # v1.12.0-node-entrypoint - Clarified relay-probe scope and added two-hop readiness output.
 # v1.11.0-node-entrypoint - Added guarded no-exit OnionMiddle enable/disable config helper.
 # v1.10.0-node-entrypoint - Added healthcheck alias and compact status endpoint summaries.
@@ -1090,8 +1091,9 @@ def route_readiness_summary(status):
         "planned_two_hop_prefixes": two_hop_prefixes[:3],
         "two_hop_probe_supported": False,
         "two_hop_probe_blocker": (
-            "current BlindRelayEnvelope carries one next_hop; full two-hop "
-            "transport proof requires a path-aware encrypted route envelope"
+            "Rust handler supports optional onward_envelope for controlled "
+            "middle-hop forwarding; live full two-hop proof requires three "
+            "distinct routeable nodes and a path-aware encrypted route envelope"
         ),
     }
 
