@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Document the Rust BlindRelay `onward_envelope` handler support for controlled
+  no-exit middle-hop experiments, including the production requirement for a
+  third non-returning node before a full live two-hop probe can be claimed.
 - Document the `aeronyx-node.sh relay-probe` evidence boundary: it proves
   single-hop BlindRelay transport with a synthetic opaque blob, while reporting
   two-hop OnionMiddle readiness separately until the protocol adds a path-aware
@@ -79,6 +82,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.39.0-node-deploy - Documented optional onward envelope support for controlled
+                     two-hop middle-hop forwarding.
 v1.38.0-node-deploy - Documented relay-probe single-hop evidence and two-hop
                      readiness boundary.
 v1.37.0-node-deploy - Documented guarded OnionMiddle config helper for no-exit
@@ -487,9 +492,21 @@ The command also reports `two_hop_readiness`, including protocol foundation
 stage, routeable `OnionMiddle` count, routeable `ChatRelay` count, and planned
 two-hop prefixes. That readiness means the peer store can plan a two-hop
 privacy path. It is not yet a full two-hop transport proof because the current
-`BlindRelayEnvelope` carries one `next_hop`. A complete two-hop proof requires
-a path-aware encrypted route envelope where the middle hop remains blind and
-learns only the next routing step, never plaintext or the whole social graph.
+`BlindRelayEnvelope` carries one visible `next_hop` per hop.
+
+The Rust peer handler now accepts an optional `onward_envelope` for controlled
+no-exit middle-hop experiments. When a node receives an outer frame addressed
+to itself, it may forward the already-opaque onward frame to the next verified
+ChatRelay peer. The middle hop still must not parse encrypted blobs and still
+learns only node-level routing metadata: previous node, next node, TTL, route
+bucket, and aggregate counters.
+
+Production operators should not claim a live full two-hop proof until there
+are at least three distinct routeable nodes. With only two nodes, a synthetic
+path would need to return to the previous hop (`A -> B -> A`), and the loop
+guard correctly rejects that shape. A complete production probe should use a
+path-aware encrypted route envelope where each hop learns only the next routing
+step, never plaintext or the user social graph.
 
 Run preflight only:
 

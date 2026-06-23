@@ -2544,6 +2544,7 @@ impl Server {
         let request = PeerBlindRelayRequest {
             envelope,
             previous_hop_node_id: *self_node_id,
+            onward_envelope: None,
         };
 
         match client.post(url).json(&request).send().await {

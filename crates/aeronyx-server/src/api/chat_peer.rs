@@ -76,8 +76,13 @@
 //! - Blind relay rejects stale or too-far-in-the-future routing timestamps so
 //!   old opaque route frames cannot be replayed indefinitely. This uses only
 //!   envelope routing metadata and never inspects encrypted blob contents.
+//! - Blind relay supports an optional `onward_envelope` for controlled two-hop
+//!   experiments. A middle hop accepts an outer frame addressed to itself, then
+//!   forwards only the already-opaque onward frame to its next node without
+//!   parsing the encrypted blob or learning any user-level receiver identity.
 //!
 //! ## Last Modified
+//! v0.17.0-BlindRelayOnwardEnvelope - Add optional two-hop middle-hop forwarding
 //! v0.16.0-BlindRelayTimestampFreshness - Reject stale/future opaque route frames
 //! v0.15.0-BlindRelayTimeoutTest - Cover unresponsive next-hop retry exhaustion
 //! v0.14.0-BlindRelayMalformedAckTest - Cover malformed 2xx next-hop ACK as forward_failed
@@ -422,6 +427,15 @@ pub struct PeerBlindRelayRequest {
     pub envelope: BlindRelayEnvelope,
     /// Ed25519 node id that signed this hop.
     pub previous_hop_node_id: [u8; 32],
+    /// Optional already-opaque next routing frame for a no-exit middle hop.
+    ///
+    /// This field is absent for existing single-hop requests. When present,
+    /// only the node named by `envelope.next_hop` may use it, and it must still
+    /// verify/re-sign the onward frame as normal blind relay work. Do not place
+    /// user identifiers, plaintext, DNS data, domains, URLs, packet payloads,
+    /// or full route/social-graph metadata here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onward_envelope: Option<BlindRelayEnvelope>,
 }
 
 /// Node-to-node blind relay response.
@@ -767,6 +781,16 @@ async fn process_peer_blind_relay(
     }
 
     if envelope.next_hop == self_node_id {
+        if let Some(onward_envelope) = request.onward_envelope {
+            return process_onion_middle_blind_relay(
+                state,
+                previous_hop_node_id,
+                envelope,
+                onward_envelope,
+                now,
+            )
+            .await;
+        }
         if observe_blind_relay_route(&state, envelope.route_id, now) {
             return Ok(duplicate_blind_relay_response(
                 &state,
@@ -851,6 +875,9 @@ async fn process_peer_blind_relay(
         .decremented_ttl()
         .ok_or(BlindRelayError::TtlExhausted)?
         .sign_with(state.node_identity.as_ref());
+    let forwarded_onward_envelope = request
+        .onward_envelope
+        .map(|envelope| envelope.sign_with(state.node_identity.as_ref()));
     let ttl_remaining = forwarded_envelope.ttl;
 
     if let Err(error) = forward_blind_relay_with_retry(
@@ -860,6 +887,7 @@ async fn process_peer_blind_relay(
         PeerBlindRelayRequest {
             envelope: forwarded_envelope,
             previous_hop_node_id: self_node_id,
+            onward_envelope: forwarded_onward_envelope,
         },
         now,
     )
@@ -883,6 +911,124 @@ async fn process_peer_blind_relay(
         forwarded: true,
         ttl_remaining,
         reason: Some("forwarded".to_string()),
+    })
+}
+
+async fn process_onion_middle_blind_relay(
+    state: ChatPeerState,
+    previous_hop_node_id: [u8; 32],
+    outer_envelope: BlindRelayEnvelope,
+    onward_envelope: BlindRelayEnvelope,
+    now: u64,
+) -> Result<PeerBlindRelayResponse, BlindRelayError> {
+    validate_blind_relay_envelope(&onward_envelope, &previous_hop_node_id, now).map_err(
+        |error| {
+            reject_blind_relay_previous_hop(
+                &state,
+                previous_hop_node_id,
+                now,
+                error.reason_bucket(),
+            );
+            error
+        },
+    )?;
+
+    let self_node_id = state.node_identity.public_key_bytes();
+    if onward_envelope.next_hop == self_node_id || onward_envelope.next_hop == previous_hop_node_id
+    {
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "route_loop");
+        return Err(BlindRelayError::RouteLoop);
+    }
+
+    if !onward_envelope.can_forward() {
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "ttl_exhausted");
+        return Err(BlindRelayError::TtlExhausted);
+    }
+
+    let next_hop = onward_envelope.next_hop;
+    let descriptor = state.peer_store.get_valid(&next_hop, now).ok_or_else(|| {
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
+        BlindRelayError::NoRoute
+    })?;
+    if !descriptor
+        .descriptor
+        .capabilities
+        .contains(&NodeCapability::ChatRelay)
+    {
+        state.peer_store.record_route_forward_failure(
+            &next_hop,
+            now,
+            "missing_chat_relay_capability",
+        );
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
+        return Err(BlindRelayError::NoRoute);
+    }
+
+    let endpoint = descriptor
+        .descriptor
+        .public_endpoint
+        .as_deref()
+        .ok_or_else(|| {
+            state
+                .peer_store
+                .record_route_forward_failure(&next_hop, now, "missing_endpoint");
+            reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "missing_endpoint");
+            BlindRelayError::InvalidEndpoint
+        })?;
+    let url = blind_peer_relay_url(endpoint).ok_or_else(|| {
+        state
+            .peer_store
+            .record_route_forward_failure(&next_hop, now, "invalid_endpoint");
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "invalid_endpoint");
+        BlindRelayError::InvalidEndpoint
+    })?;
+
+    if observe_blind_relay_route(&state, outer_envelope.route_id, now) {
+        return Ok(duplicate_blind_relay_response(
+            &state,
+            previous_hop_node_id,
+            now,
+            outer_envelope.ttl,
+        ));
+    }
+
+    let forwarded_envelope = onward_envelope
+        .decremented_ttl()
+        .ok_or(BlindRelayError::TtlExhausted)?
+        .sign_with(state.node_identity.as_ref());
+    let ttl_remaining = forwarded_envelope.ttl;
+
+    if let Err(error) = forward_blind_relay_with_retry(
+        &state,
+        &url,
+        next_hop,
+        PeerBlindRelayRequest {
+            envelope: forwarded_envelope,
+            previous_hop_node_id: self_node_id,
+            onward_envelope: None,
+        },
+        now,
+    )
+    .await
+    {
+        forget_blind_relay_route(&state, &outer_envelope.route_id);
+        return Err(error);
+    }
+
+    state
+        .peer_store
+        .record_route_forward_success(&next_hop, now);
+    record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
+    state
+        .peer_store
+        .record_blind_relay_forwarded(now, ttl_remaining);
+
+    Ok(PeerBlindRelayResponse {
+        accepted: true,
+        terminal: false,
+        forwarded: true,
+        ttl_remaining,
+        reason: Some("onion_middle_forwarded".to_string()),
     })
 }
 
@@ -1471,6 +1617,7 @@ mod tests {
         let body = serde_json::to_vec(&PeerBlindRelayRequest {
             envelope,
             previous_hop_node_id: previous_hop.public_key_bytes(),
+            onward_envelope: None,
         })
         .unwrap();
         let response = app
@@ -1538,6 +1685,7 @@ mod tests {
             PeerBlindRelayRequest {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: None,
             },
         )
         .await;
@@ -1586,6 +1734,7 @@ mod tests {
             PeerBlindRelayRequest {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: None,
             },
         )
         .await;
@@ -1651,6 +1800,7 @@ mod tests {
             PeerBlindRelayRequest {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: None,
             },
         )
         .await;
@@ -1763,6 +1913,7 @@ mod tests {
             PeerBlindRelayRequest {
                 envelope: envelope.clone(),
                 previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: None,
             },
         )
         .await
@@ -1772,6 +1923,7 @@ mod tests {
             PeerBlindRelayRequest {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: None,
             },
         )
         .await
@@ -1864,6 +2016,7 @@ mod tests {
             PeerBlindRelayRequest {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: None,
             },
         )
         .await
@@ -1885,6 +2038,129 @@ mod tests {
             .recent_audit_events()
             .iter()
             .any(|event| { event.action == "blind_relay_retry" && event.outcome == "accepted" }));
+    }
+
+    #[tokio::test]
+    async fn blind_relay_middle_hop_forwards_onward_envelope_without_payload_inspection() {
+        let terminal_requests: Arc<Mutex<Vec<PeerBlindRelayRequest>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let terminal_requests_for_route = Arc::clone(&terminal_requests);
+        let terminal_app = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(move |Json(request): Json<PeerBlindRelayRequest>| {
+                let terminal_requests_for_request = Arc::clone(&terminal_requests_for_route);
+                async move {
+                    terminal_requests_for_request.lock().unwrap().push(request);
+                    Json(PeerBlindRelayResponse {
+                        accepted: true,
+                        terminal: true,
+                        forwarded: false,
+                        ttl_remaining: 0,
+                        reason: Some("terminal_next_hop".to_string()),
+                    })
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let terminal_endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, terminal_app).await.unwrap();
+        });
+
+        let now = now_secs();
+        let entry_identity = IdentityKeyPair::generate();
+        let middle_identity = Arc::new(IdentityKeyPair::generate());
+        let terminal_identity = IdentityKeyPair::generate();
+        let peer_store = Arc::new(PeerStore::new());
+        peer_store
+            .upsert_verified_from_source(
+                signed_chat_relay_peer_descriptor_for(
+                    &terminal_identity,
+                    terminal_endpoint,
+                    now,
+                    now + 300,
+                ),
+                now,
+                "gossip_snapshot",
+            )
+            .unwrap();
+
+        let state = ChatPeerState {
+            chat_relay: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&middle_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let outer_envelope = BlindRelayEnvelope {
+            route_id: [0x62u8; 16],
+            next_hop: middle_identity.public_key_bytes(),
+            ttl: 2,
+            encrypted_blob: b"opaque middle-hop carrier; do not parse".to_vec(),
+            timestamp: now,
+            signature: [0u8; 64],
+        }
+        .sign_with(&entry_identity);
+        let onward_envelope = BlindRelayEnvelope {
+            route_id: [0x63u8; 16],
+            next_hop: terminal_identity.public_key_bytes(),
+            ttl: 1,
+            encrypted_blob: b"opaque terminal relay blob; do not parse".to_vec(),
+            timestamp: now,
+            signature: [0u8; 64],
+        }
+        .sign_with(&entry_identity);
+
+        let response = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope: outer_envelope,
+                previous_hop_node_id: entry_identity.public_key_bytes(),
+                onward_envelope: Some(onward_envelope),
+            },
+        )
+        .await
+        .unwrap();
+
+        server.abort();
+
+        assert!(response.accepted);
+        assert!(response.forwarded);
+        assert!(!response.terminal);
+        assert_eq!(response.reason.as_deref(), Some("onion_middle_forwarded"));
+
+        let terminal_requests = terminal_requests.lock().unwrap();
+        assert_eq!(terminal_requests.len(), 1);
+        let terminal_request = &terminal_requests[0];
+        assert_eq!(
+            terminal_request.previous_hop_node_id,
+            middle_identity.public_key_bytes()
+        );
+        assert_eq!(
+            terminal_request.envelope.next_hop,
+            terminal_identity.public_key_bytes()
+        );
+        assert_eq!(terminal_request.envelope.ttl, 0);
+        assert!(terminal_request.onward_envelope.is_none());
+        let middle_public =
+            IdentityPublicKey::from_bytes(&middle_identity.public_key_bytes()).unwrap();
+        assert!(terminal_request
+            .envelope
+            .verify_signature_from(&middle_public)
+            .is_ok());
+        assert_eq!(
+            terminal_request.envelope.encrypted_blob,
+            b"opaque terminal relay blob; do not parse".to_vec()
+        );
+
+        let blind_stats = peer_store.status(now + 5).runtime.blind_relay;
+        assert_eq!(blind_stats.forwarded, 1);
+        assert_eq!(blind_stats.rejected, 0);
     }
 
     #[tokio::test]
@@ -1952,6 +2228,7 @@ mod tests {
             PeerBlindRelayRequest {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: None,
             },
         )
         .await;
@@ -2030,6 +2307,7 @@ mod tests {
             PeerBlindRelayRequest {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: None,
             },
         )
         .await;
@@ -2117,6 +2395,7 @@ mod tests {
             PeerBlindRelayRequest {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: None,
             },
         )
         .await;
@@ -2195,6 +2474,7 @@ mod tests {
             PeerBlindRelayRequest {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: None,
             },
         )
         .await;
@@ -2295,6 +2575,7 @@ mod tests {
             PeerBlindRelayRequest {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: None,
             },
         )
         .await;
