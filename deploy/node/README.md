@@ -75,6 +75,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.37.0-node-deploy - Documented guarded OnionMiddle config helper for no-exit
+                     two-hop encrypted relay readiness.
 v1.36.0-node-deploy - Documented guarded ChatRelay config helper.
 v1.35.0-node-deploy - Documented ChatRelay capability readiness and peer quorum
                      route-ready checks.
@@ -405,6 +407,32 @@ To disable the blind relay capability:
 sudo ./deploy/node/aeronyx-node.sh chat-relay --disable-chat-relay --restart
 ```
 
+### No-exit OnionMiddle readiness
+
+`OnionMiddle` is the no-exit middle-hop capability used for future two-hop
+encrypted relay paths. It is intentionally opt-in. Enabling it does not make the
+node a public exit and does not grant the node access to message plaintext,
+payloads, DNS contents, destinations, wallet-level traffic, voucher secrets, or
+private keys.
+
+Use the guarded entrypoint helper rather than editing the TOML by hand:
+
+```bash
+./deploy/node/aeronyx-node.sh onion-middle --enable-onion-middle --dry-run
+sudo ./deploy/node/aeronyx-node.sh onion-middle --enable-onion-middle --restart
+```
+
+The helper creates a timestamped `/etc/aeronyx/server.toml` backup, updates only
+`[discovery].advertise_onion_middle`, validates the config, restores the backup
+if validation fails, and refuses a restart while active sessions are present
+unless the operator explicitly passes `--yes` during a maintenance window.
+
+To remove the no-exit middle-hop advertisement:
+
+```bash
+sudo ./deploy/node/aeronyx-node.sh onion-middle --disable-onion-middle --restart
+```
+
 Manual changes are still possible, but they should follow the same validation
 and maintenance-window pattern:
 
@@ -643,6 +671,8 @@ purge allow-list:
 - MemChain: `off`
 - ChatRelay: disabled by default; explicit opt-in through
   `[memchain.chat_relay].enabled = true`
+- OnionMiddle: disabled by default; explicit no-exit opt-in through
+  `[discovery].advertise_onion_middle = true`
 
 `vpn.virtual_ip_range` and `tun.device_name` are operational inputs, not only
 application settings. `install.sh` uses them when writing host NAT/FORWARD

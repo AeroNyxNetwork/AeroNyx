@@ -9,6 +9,10 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
+# - Add a guarded OnionMiddle config helper so operators can explicitly enable
+#   or disable no-exit middle-hop advertisement for future two-hop encrypted
+#   relay paths with backup, validation, active-session warning, and optional
+#   restart.
 # - Add a guarded ChatRelay config helper so operators and AI assistants can
 #   enable or disable blind relay advertisement with backup, validation,
 #   active-session warning, and optional restart.
@@ -81,6 +85,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.11.0-node-entrypoint - Added guarded no-exit OnionMiddle enable/disable config helper.
 # v1.10.0-node-entrypoint - Added healthcheck alias and compact status endpoint summaries.
 # v1.9.0-node-entrypoint - Added synthetic BlindRelay route probe command.
 # v1.8.0-node-entrypoint - Added guarded staged-binary promotion command.
@@ -123,6 +128,8 @@ LINES=160
 SET_VPN_CIDR=""
 CHAT_RELAY_ENABLE=0
 CHAT_RELAY_DISABLE=0
+ONION_MIDDLE_ENABLE=0
+ONION_MIDDLE_DISABLE=0
 RESTART_AFTER_CONFIG=0
 PROMOTE_BINARY_PATH=""
 EXPECTED_SHA256=""
@@ -164,6 +171,7 @@ Commands:
   doctor     Alias for health.
   status     Show service, local endpoints, discovery readiness, upgrade state, and next action.
   chat-relay Enable or disable blind ChatRelay capability in server.toml.
+  onion-middle Enable or disable no-exit OnionMiddle capability in server.toml.
   relay-probe Send one synthetic BlindRelay route probe to a discovered peer.
   promote-binary Promote a staged aeronyx-server binary with drain checks.
   logs       Show recent systemd logs. Use --follow to tail.
@@ -213,6 +221,12 @@ Command-specific options:
     --restart               Restart service after config validation.
     --yes                   Skip confirmation prompts and allow restart with active sessions.
 
+  onion-middle:
+    --enable-onion-middle   Set [discovery].advertise_onion_middle = true.
+    --disable-onion-middle  Set [discovery].advertise_onion_middle = false.
+    --restart               Restart service after config validation.
+    --yes                   Skip confirmation prompts and allow restart with active sessions.
+
   relay-probe:
     --peer-prefix PREFIX     Optional privacy-safe peer prefix to target.
     --peer-cache PATH        Peer cache path. Default: /var/lib/aeronyx/peers-cache.json.
@@ -235,6 +249,7 @@ Examples:
   ./deploy/node/aeronyx-node.sh status
   ./deploy/node/aeronyx-node.sh relay-probe --json
   sudo ./deploy/node/aeronyx-node.sh chat-relay --enable-chat-relay --restart
+  sudo ./deploy/node/aeronyx-node.sh onion-middle --enable-onion-middle --restart
   sudo ./deploy/node/aeronyx-node.sh promote-binary --binary ./target/release/aeronyx-server.next --expected-sha256 HASH
 USAGE
 }
@@ -302,6 +317,8 @@ parse_args() {
             --set-vpn-cidr) SET_VPN_CIDR="${2:?missing value}"; shift 2 ;;
             --enable-chat-relay) CHAT_RELAY_ENABLE=1; shift ;;
             --disable-chat-relay) CHAT_RELAY_DISABLE=1; shift ;;
+            --enable-onion-middle) ONION_MIDDLE_ENABLE=1; shift ;;
+            --disable-onion-middle) ONION_MIDDLE_DISABLE=1; shift ;;
             --restart) RESTART_AFTER_CONFIG=1; shift ;;
             --binary|--staged-binary) PROMOTE_BINARY_PATH="${2:?missing value}"; shift 2 ;;
             --expected-sha256) EXPECTED_SHA256="${2:?missing value}"; shift 2 ;;
@@ -1492,6 +1509,180 @@ PY
     fi
 }
 
+confirm_onion_middle_change() {
+    local action="$1"
+    [ "${YES}" -eq 1 ] && return
+    [ "${DRY_RUN}" -eq 1 ] && return
+
+    cat <<CONFIRM
+
+This will update ${CONFIG_FILE} and create a timestamped backup.
+OnionMiddle is a no-exit encrypted relay role. It advertises only aggregate
+node capability for future multi-hop path planning and must not expose private
+keys, payloads, DNS contents, destinations, wallet-level traffic, or user data.
+Type ${action} to continue. Press Enter to stop safely.
+CONFIRM
+    printf 'Confirm: '
+    local confirmation
+    IFS= read -r confirmation || confirmation=""
+    [ "${confirmation}" = "${action}" ] || die "OnionMiddle config change stopped before modifying ${CONFIG_FILE}."
+}
+
+run_onion_middle_config() {
+    validate_service_name
+
+    if [ "${ONION_MIDDLE_ENABLE}" -eq "${ONION_MIDDLE_DISABLE}" ]; then
+        die "onion-middle requires exactly one of --enable-onion-middle or --disable-onion-middle"
+    fi
+    command -v python3 >/dev/null 2>&1 || die "onion-middle requires python3"
+    [ -f "${CONFIG_FILE}" ] || die "Config file not found: ${CONFIG_FILE}"
+
+    local target="false"
+    local confirm_word="DISABLE ONIONMIDDLE"
+    if [ "${ONION_MIDDLE_ENABLE}" -eq 1 ]; then
+        target="true"
+        confirm_word="ENABLE ONIONMIDDLE"
+    fi
+
+    local active_sessions
+    active_sessions="$(active_sessions_count)"
+    log "Current active_sessions=${active_sessions}"
+    if [ "${RESTART_AFTER_CONFIG}" -eq 1 ] && [ "${YES}" -ne 1 ]; then
+        case "${active_sessions}" in
+            ''|*[!0-9]*)
+                die "Cannot prove active sessions are drained. Re-run with --yes during a maintenance window if restart is intentional."
+                ;;
+            0)
+                ;;
+            *)
+                die "Refusing restart while active_sessions=${active_sessions}. Drain sessions or re-run with --yes during maintenance."
+                ;;
+        esac
+    fi
+
+    confirm_onion_middle_change "${confirm_word}"
+
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        python3 - "${CONFIG_FILE}" "${target}" <<'PY'
+import re
+import sys
+
+path, target = sys.argv[1], sys.argv[2]
+lines = open(path, "r", encoding="utf-8").read().splitlines(True)
+section_start = None
+section_end = len(lines)
+for idx, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped == "[discovery]":
+        section_start = idx
+        section_end = len(lines)
+        continue
+    if section_start is not None and idx > section_start and re.match(r"^\s*\[[^]]+\]\s*$", line):
+        section_end = idx
+        break
+
+key_found = False
+if section_start is not None:
+    for line in lines[section_start + 1:section_end]:
+        if re.match(r"^\s*advertise_onion_middle\s*=", line):
+            key_found = True
+            break
+
+print(f"would_set_discovery_advertise_onion_middle={target}")
+print(f"would_create_discovery_section={str(section_start is None).lower()}")
+print(f"would_insert_advertise_onion_middle_key={str(section_start is not None and not key_found).lower()}")
+PY
+        return
+    fi
+
+    [ -w "${CONFIG_FILE}" ] || die "Config file is not writable. Re-run with sudo: ${CONFIG_FILE}"
+
+    local timestamp backup
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup="${CONFIG_FILE}.bak.${timestamp}.onion_middle"
+    cp -p "${CONFIG_FILE}" "${backup}"
+    ok "Backup created: ${backup}"
+
+    python3 - "${CONFIG_FILE}" "${target}" <<'PY'
+import os
+import re
+import sys
+import tempfile
+
+path, target = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as handle:
+    lines = handle.read().splitlines(True)
+
+section_start = None
+section_end = len(lines)
+for idx, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped == "[discovery]":
+        section_start = idx
+        section_end = len(lines)
+        continue
+    if section_start is not None and idx > section_start and re.match(r"^\s*\[[^]]+\]\s*$", line):
+        section_end = idx
+        break
+
+if section_start is None:
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    if lines and lines[-1].strip():
+        lines.append("\n")
+    lines.extend([
+        "[discovery]\n",
+        f"advertise_onion_middle = {target}\n",
+    ])
+else:
+    key_idx = None
+    for idx in range(section_start + 1, section_end):
+        if re.match(r"^\s*advertise_onion_middle\s*=", lines[idx]):
+            key_idx = idx
+            break
+    if key_idx is None:
+        lines.insert(section_end, f"advertise_onion_middle = {target}\n")
+    else:
+        indent = re.match(r"^(\s*)", lines[key_idx]).group(1)
+        lines[key_idx] = f"{indent}advertise_onion_middle = {target}\n"
+
+directory = os.path.dirname(path) or "."
+fd, tmp_path = tempfile.mkstemp(prefix=".aeronyx-onion-middle.", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.writelines(lines)
+    os.replace(tmp_path, path)
+finally:
+    if os.path.exists(tmp_path):
+        os.unlink(tmp_path)
+PY
+
+    local binary
+    binary="${REPO_DIR}/target/release/aeronyx-server"
+    if [ ! -x "${binary}" ]; then
+        binary="aeronyx-server"
+    fi
+    if command -v "${binary}" >/dev/null 2>&1 || [ -x "${binary}" ]; then
+        if ! "${binary}" validate -c "${CONFIG_FILE}"; then
+            cp -p "${backup}" "${CONFIG_FILE}"
+            die "Config validation failed; restored ${CONFIG_FILE} from ${backup}"
+        fi
+    else
+        warn "aeronyx-server binary not found; config was updated but not validated"
+    fi
+
+    ok "OnionMiddle advertise_onion_middle=${target} in ${CONFIG_FILE}"
+    if [ "${RESTART_AFTER_CONFIG}" -eq 1 ]; then
+        log "Restarting ${SERVICE_NAME}"
+        systemctl restart "${SERVICE_NAME}"
+        systemctl is-active "${SERVICE_NAME}" >/dev/null
+        ok "${SERVICE_NAME} restarted"
+        show_discovery_readiness
+    else
+        warn "Service not restarted. Run with --restart during maintenance, or restart ${SERVICE_NAME} manually."
+    fi
+}
+
 read_optional_registration_code() {
     if [ -n "${REGISTRATION_CODE}" ]; then
         return
@@ -1592,6 +1783,9 @@ main() {
             ;;
         chat-relay)
             run_chat_relay_config
+            ;;
+        onion-middle)
+            run_onion_middle_config
             ;;
         relay-probe)
             run_relay_probe
