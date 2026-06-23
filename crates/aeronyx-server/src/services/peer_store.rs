@@ -606,6 +606,13 @@ pub struct PeerStoreBlindRelayQualityStatus {
     pub probe_succeeded: u64,
     /// Synthetic route probes that failed without exposing endpoint or route data.
     pub probe_failed: u64,
+    /// Stale or future-dated opaque route frames rejected by the freshness guard.
+    ///
+    /// This is an aggregate protection counter only. Do not expand it into
+    /// route ids, exact timestamps, previous-hop ids, endpoints, encrypted
+    /// payloads, receiver identities, client IPs, DNS contents, Memory Chain
+    /// plaintext, or social graph edges.
+    pub timestamp_rejected: u64,
     /// Whether abuse protection counters have fired in this process.
     pub protection_active: bool,
     /// Percentage of received requests accepted as terminal or forwarded.
@@ -2824,7 +2831,7 @@ impl PeerStore {
         };
 
         let detail = format!(
-            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} real_relay_ready={} synthetic_probe_ready={} evidence_mode={} readiness_reason={} protection_active={} accepted_percent={} last_event_age_seconds={} last_probe_age_seconds={}",
+            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} timestamp_rejected={} real_relay_ready={} synthetic_probe_ready={} evidence_mode={} readiness_reason={} protection_active={} accepted_percent={} last_event_age_seconds={} last_probe_age_seconds={}",
             stats.received,
             accepted_total,
             stats.terminal,
@@ -2838,6 +2845,7 @@ impl PeerStore {
             stats.probe_attempted,
             stats.probe_succeeded,
             stats.probe_failed,
+            stats.timestamp_rejected,
             real_relay_ready,
             synthetic_probe_ready,
             evidence_mode,
@@ -2868,6 +2876,7 @@ impl PeerStore {
             probe_attempted: stats.probe_attempted,
             probe_succeeded: stats.probe_succeeded,
             probe_failed: stats.probe_failed,
+            timestamp_rejected: stats.timestamp_rejected,
             protection_active,
             accepted_percent,
             last_event_age_seconds,
@@ -4723,6 +4732,7 @@ mod tests {
         assert!(!quality.real_relay_ready);
         assert_eq!(quality.evidence_mode, "real_relay_attempted");
         assert_eq!(quality.readiness_reason, "protection_active");
+        assert_eq!(quality.timestamp_rejected, 1);
         assert!(quality.protection_active);
         assert_eq!(quality.last_event_age_seconds, Some(10));
         assert!(!quality.detail.contains("route_id"));
@@ -4786,6 +4796,7 @@ mod tests {
         assert_eq!(quality.probe_attempted, 1);
         assert_eq!(quality.probe_succeeded, 1);
         assert_eq!(quality.probe_failed, 0);
+        assert_eq!(quality.timestamp_rejected, 0);
         assert_eq!(quality.last_probe_age_seconds, Some(10));
         assert!(quality.detail.contains("last_probe_age_seconds=10"));
         assert!(quality.detail.contains("evidence_mode=synthetic_probe"));

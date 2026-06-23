@@ -46,6 +46,7 @@
 //!   used by both public/local discovery status and backend heartbeat reports.
 //!
 //! ## Last Modified
+//! v0.9.2-BlindRelayFreshnessGuard - Expose timestamp rejection aggregate in compact readiness
 //! v0.9.1-BlindRelayReadinessReason - Expose privacy-safe relay readiness reason
 //! v0.9.0-ProtocolFoundationSummary - Add product-facing privacy protocol foundation readiness
 //! v0.8.1-BlindRelayProbeFreshness - Include synthetic probe age in readiness
@@ -406,6 +407,7 @@ pub fn discovery_readiness_status_value(
             "last_probe_age_seconds": blind_relay_quality.last_probe_age_seconds,
             "relay_evidence_mode": &blind_relay_quality.evidence_mode,
             "relay_readiness_reason": &blind_relay_quality.readiness_reason,
+            "timestamp_rejected": blind_relay_quality.timestamp_rejected,
             "real_relay_ready": blind_relay_quality.real_relay_ready,
             "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
             "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
@@ -457,6 +459,7 @@ pub fn discovery_readiness_status_value(
             "probe_attempted": blind_relay_quality.probe_attempted,
             "probe_succeeded": blind_relay_quality.probe_succeeded,
             "probe_failed": blind_relay_quality.probe_failed,
+            "timestamp_rejected": blind_relay_quality.timestamp_rejected,
             "protection_active": blind_relay_quality.protection_active,
             "accepted_percent": blind_relay_quality.accepted_percent,
             "last_event_age_seconds": blind_relay_quality.last_event_age_seconds,
@@ -857,6 +860,10 @@ mod tests {
             Some("real_relay_observed")
         );
         assert_eq!(
+            parsed["discovery_readiness"]["protocol_foundation"]["timestamp_rejected"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
             parsed["discovery_readiness"]["protocol_foundation"]["real_relay_ready"].as_bool(),
             Some(true)
         );
@@ -895,6 +902,10 @@ mod tests {
         assert_eq!(
             parsed["discovery_readiness"]["blind_relay_runtime"]["accepted_total"].as_u64(),
             Some(1)
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["blind_relay_runtime"]["timestamp_rejected"].as_u64(),
+            Some(0)
         );
 
         let serialized = serde_json::to_string(&parsed["discovery_readiness"]).unwrap();
