@@ -9,6 +9,10 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Document the `aeronyx-node.sh relay-probe` evidence boundary: it proves
+  single-hop BlindRelay transport with a synthetic opaque blob, while reporting
+  two-hop OnionMiddle readiness separately until the protocol adds a path-aware
+  encrypted route envelope.
 - Document the guarded `aeronyx-node.sh chat-relay` helper for enabling or
   disabling blind ChatRelay with config backup, validation, active-session
   warning, and optional restart.
@@ -75,6 +79,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.38.0-node-deploy - Documented relay-probe single-hop evidence and two-hop
+                     readiness boundary.
 v1.37.0-node-deploy - Documented guarded OnionMiddle config helper for no-exit
                      two-hop encrypted relay readiness.
 v1.36.0-node-deploy - Documented guarded ChatRelay config helper.
@@ -458,6 +464,32 @@ Peer quorum is local peer-view readiness, not public-chain consensus. A node can
 be healthy and still report `peer_view_ready` instead of `route_ready` when no
 verified peer advertises ChatRelay yet. This is expected and safer than
 pretending a relay path exists.
+
+### Relay probe evidence boundary
+
+`aeronyx-node.sh relay-probe` is a privacy-safe live transport check. It sends
+one synthetic opaque BlindRelay envelope from the local node to a discovered
+ChatRelay peer and verifies aggregate counter deltas:
+
+```bash
+./deploy/node/aeronyx-node.sh relay-probe --json
+```
+
+The command proves single-hop BlindRelay transport only:
+
+- local node receives and forwards one synthetic opaque blob;
+- remote ChatRelay peer receives it as terminal relay work;
+- output contains no user message, receiver identity, DNS content,
+  destination, packet payload, wallet-level traffic, private key, or full node
+  identifier.
+
+The command also reports `two_hop_readiness`, including protocol foundation
+stage, routeable `OnionMiddle` count, routeable `ChatRelay` count, and planned
+two-hop prefixes. That readiness means the peer store can plan a two-hop
+privacy path. It is not yet a full two-hop transport proof because the current
+`BlindRelayEnvelope` carries one `next_hop`. A complete two-hop proof requires
+a path-aware encrypted route envelope where the middle hop remains blind and
+learns only the next routing step, never plaintext or the whole social graph.
 
 Run preflight only:
 

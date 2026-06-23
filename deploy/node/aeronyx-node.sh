@@ -22,7 +22,9 @@
 #   post-restart health checks.
 # - Add a privacy-safe `relay-probe` command that sends one synthetic opaque
 #   BlindRelay envelope through the local node to a discovered ChatRelay peer
-#   and reports only aggregate counter deltas.
+#   and reports only aggregate counter deltas. The command also reports
+#   two-hop readiness separately so operators do not mistake a single-hop
+#   transport probe for a full multi-hop proof.
 # - Add `healthcheck` as a command alias and summarize local health/operator
 #   JSON in `status` instead of printing full endpoint payloads. This keeps the
 #   one-command operator view readable for humans and AI assistants while
@@ -85,6 +87,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.12.0-node-entrypoint - Clarified relay-probe scope and added two-hop readiness output.
 # v1.11.0-node-entrypoint - Added guarded no-exit OnionMiddle enable/disable config helper.
 # v1.10.0-node-entrypoint - Added healthcheck alias and compact status endpoint summaries.
 # v1.9.0-node-entrypoint - Added synthetic BlindRelay route probe command.
@@ -1037,6 +1040,62 @@ def blind_stats(status):
     return status["peer_store"]["runtime"]["blind_relay"]
 
 
+def int_or_none(value):
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def route_readiness_summary(status):
+    readiness = status.get("discovery_readiness") or {}
+    protocol = readiness.get("protocol_foundation") or {}
+    story = readiness.get("network_story") or {}
+    quorum = readiness.get("peer_quorum") or {}
+    route_candidates = (status.get("peer_store") or {}).get("route_candidates") or {}
+    planned_paths = route_candidates.get("planned_paths") or {}
+    single_hop = planned_paths.get("chat_single_hop") or {}
+    two_hop = planned_paths.get("chat_two_hop_onion_ready") or {}
+    two_hop_hops = two_hop.get("hops") if isinstance(two_hop.get("hops"), list) else []
+
+    two_hop_prefixes = []
+    for hop in two_hop_hops:
+        if not isinstance(hop, dict):
+            continue
+        prefix = hop.get("node_id_prefix")
+        capability = hop.get("capability")
+        if prefix and capability:
+            two_hop_prefixes.append(f"{capability}:{prefix}")
+
+    return {
+        "stage": protocol.get("stage") or "unknown",
+        "status": protocol.get("status") or "unknown",
+        "single_hop_ready": bool(
+            single_hop.get("complete")
+            or protocol.get("single_hop_relay_ready")
+            or story.get("chat_single_hop_ready")
+        ),
+        "two_hop_ready": bool(
+            two_hop.get("complete")
+            or protocol.get("two_hop_onion_ready")
+            or story.get("chat_two_hop_onion_ready")
+        ),
+        "routeable_chat_relays": int_or_none(
+            story.get("routeable_chat_relays", quorum.get("routeable_chat_relays"))
+        ),
+        "routeable_onion_middle_hops": int_or_none(
+            story.get("routeable_onion_middle_hops", quorum.get("routeable_onion_middle_hops"))
+        ),
+        "planned_two_hop_count": int_or_none(two_hop.get("hop_count")),
+        "planned_two_hop_prefixes": two_hop_prefixes[:3],
+        "two_hop_probe_supported": False,
+        "two_hop_probe_blocker": (
+            "current BlindRelayEnvelope carries one next_hop; full two-hop "
+            "transport proof requires a path-aware encrypted route envelope"
+        ),
+    }
+
+
 def int_delta(after, before, key):
     return int(after.get(key, 0) or 0) - int(before.get(key, 0) or 0)
 
@@ -1132,7 +1191,9 @@ target_node_id, target_endpoint, target_prefix, _descriptor = choose_peer(
 )
 
 remote_status_url = f"{target_endpoint}/api/discovery/status"
-before_local = blind_stats(fetch_json(local_status_url))
+local_status_before = fetch_json(local_status_url)
+two_hop_readiness = route_readiness_summary(local_status_before)
+before_local = blind_stats(local_status_before)
 before_remote = blind_stats(fetch_json(remote_status_url))
 
 previous_private = Ed25519PrivateKey.generate()
@@ -1182,6 +1243,8 @@ ok = (
 )
 result = {
     "status": "ok" if ok else "attention",
+    "probe_scope": "single_hop_blind_relay_transport",
+    "two_hop_readiness": two_hop_readiness,
     "response_status": response_status,
     "response_body": response_body,
     "target_peer_prefix": target_prefix,
@@ -1198,6 +1261,12 @@ if not json_only:
             status=result["status"],
             peer=target_prefix,
             code=response_status,
+        )
+    )
+    print("relay_probe_scope=single_hop_blind_relay_transport two_hop_probe_supported=false")
+    print(
+        "relay_probe_two_hop_readiness=stage:{stage} two_hop_ready:{two_hop_ready} onion_middle_hops:{routeable_onion_middle_hops} chat_relays:{routeable_chat_relays} planned_hops:{planned_two_hop_count}".format(
+            **two_hop_readiness
         )
     )
     print(
