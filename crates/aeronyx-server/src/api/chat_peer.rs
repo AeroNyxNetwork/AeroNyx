@@ -80,8 +80,12 @@
 //!   experiments. A middle hop accepts an outer frame addressed to itself, then
 //!   forwards only the already-opaque onward frame to its next node without
 //!   parsing the encrypted blob or learning any user-level receiver identity.
+//! - Blind relay forwards only to peers with fresh routeability evidence.
+//!   Signed descriptors prove identity/capability, but routeability probes
+//!   prove the next hop can actually receive encrypted relay work.
 //!
 //! ## Last Modified
+//! v0.18.0-BlindRelayRouteabilityGate - Require fresh routeability evidence before next-hop forwarding
 //! v0.17.0-BlindRelayOnwardEnvelope - Add optional two-hop middle-hop forwarding
 //! v0.16.0-BlindRelayTimestampFreshness - Reject stale/future opaque route frames
 //! v0.15.0-BlindRelayTimeoutTest - Cover unresponsive next-hop retry exhaustion
@@ -842,6 +846,13 @@ async fn process_peer_blind_relay(
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
         return Err(BlindRelayError::NoRoute);
     }
+    if !state.peer_store.is_routeable_now(&next_hop, now) {
+        state
+            .peer_store
+            .record_route_forward_failure(&next_hop, now, "routeability_not_ready");
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
+        return Err(BlindRelayError::NoRoute);
+    }
 
     let endpoint = descriptor
         .descriptor
@@ -960,6 +971,13 @@ async fn process_onion_middle_blind_relay(
             now,
             "missing_chat_relay_capability",
         );
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
+        return Err(BlindRelayError::NoRoute);
+    }
+    if !state.peer_store.is_routeable_now(&next_hop, now) {
+        state
+            .peer_store
+            .record_route_forward_failure(&next_hop, now, "routeability_not_ready");
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
         return Err(BlindRelayError::NoRoute);
     }
@@ -1989,6 +2007,7 @@ mod tests {
                 "gossip_snapshot",
             )
             .unwrap();
+        peer_store.record_route_forward_success(&next_hop_identity.public_key_bytes(), now);
 
         let state = ChatPeerState {
             chat_relay: None,
@@ -2085,6 +2104,7 @@ mod tests {
                 "gossip_snapshot",
             )
             .unwrap();
+        peer_store.record_route_forward_success(&terminal_identity.public_key_bytes(), now);
 
         let state = ChatPeerState {
             chat_relay: None,
@@ -2201,6 +2221,7 @@ mod tests {
                 "gossip_snapshot",
             )
             .unwrap();
+        peer_store.record_route_forward_success(&next_hop_identity.public_key_bytes(), now);
 
         let state = ChatPeerState {
             chat_relay: None,
@@ -2280,6 +2301,7 @@ mod tests {
                 "gossip_snapshot",
             )
             .unwrap();
+        peer_store.record_route_forward_success(&next_hop_identity.public_key_bytes(), now);
 
         let state = ChatPeerState {
             chat_relay: None,
@@ -2416,6 +2438,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blind_relay_requires_routeability_evidence_before_forwarding() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_route = Arc::clone(&attempts);
+        let next_hop_app = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(move |Json(_request): Json<PeerBlindRelayRequest>| {
+                let attempts_for_request = Arc::clone(&attempts_for_route);
+                async move {
+                    attempts_for_request.fetch_add(1, AtomicOrdering::SeqCst);
+                    Json(PeerBlindRelayResponse {
+                        accepted: true,
+                        terminal: true,
+                        forwarded: false,
+                        ttl_remaining: 1,
+                        reason: Some("terminal_next_hop".to_string()),
+                    })
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, next_hop_app).await.unwrap();
+        });
+
+        let now = now_secs();
+        let previous_hop = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let next_hop_identity = IdentityKeyPair::generate();
+        let next_hop_node_id = next_hop_identity.public_key_bytes();
+        let peer_store = Arc::new(PeerStore::new());
+        peer_store
+            .upsert_verified_from_source(
+                signed_chat_relay_peer_descriptor_for(&next_hop_identity, endpoint, now, now + 300),
+                now,
+                "gossip_snapshot",
+            )
+            .unwrap();
+
+        let state = ChatPeerState {
+            chat_relay: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity,
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let envelope = BlindRelayEnvelope {
+            route_id: [0x59u8; 16],
+            next_hop: next_hop_node_id,
+            ttl: 2,
+            encrypted_blob: b"opaque encrypted relay bytes".to_vec(),
+            timestamp: now,
+            signature: [0u8; 64],
+        }
+        .sign_with(&previous_hop);
+
+        let result = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: None,
+            },
+        )
+        .await;
+
+        server.abort();
+
+        assert!(matches!(result, Err(BlindRelayError::NoRoute)));
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 0);
+        let blind_stats = peer_store.status(now + 5).runtime.blind_relay;
+        assert_eq!(blind_stats.forwarded, 0);
+        assert_eq!(blind_stats.rejected, 1);
+        assert_eq!(blind_stats.no_route, 1);
+        let route_status = peer_store.route_candidate_status(now + 5);
+        let route_row = route_status
+            .chat_relay
+            .iter()
+            .find(|row| row.node_id_prefix == hex::encode(&next_hop_node_id[..4]))
+            .expect("chat relay row should remain visible");
+        assert_eq!(route_row.routeability_state, "unreachable");
+        assert!(!route_row.routeability_ready);
+        assert_eq!(
+            route_row.last_route_failure_reason.as_deref(),
+            Some("routeability_not_ready")
+        );
+        assert!(peer_store.recent_audit_events().iter().any(|event| {
+            event.action == "blind_relay_route_health"
+                && event.outcome == "rejected"
+                && event.detail.contains("reason=routeability_not_ready")
+                && !event.detail.contains("opaque encrypted relay bytes")
+        }));
+    }
+
+    #[tokio::test]
     async fn blind_relay_forward_reports_retry_exhaustion_without_payload_data() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_for_route = Arc::clone(&attempts);
@@ -2447,6 +2568,7 @@ mod tests {
                 "gossip_snapshot",
             )
             .unwrap();
+        peer_store.record_route_forward_success(&next_hop_identity.public_key_bytes(), now);
 
         let state = ChatPeerState {
             chat_relay: None,
@@ -2543,6 +2665,7 @@ mod tests {
                 "gossip_snapshot",
             )
             .unwrap();
+        peer_store.record_route_forward_success(&next_hop_identity.public_key_bytes(), now);
 
         let state = ChatPeerState {
             chat_relay: None,

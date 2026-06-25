@@ -88,6 +88,8 @@
 //!   inflated by unprobed peers
 //! - Expired peers are downgraded and retained instead of deleted so local
 //!   peer history survives cleanup and restart without being treated as live
+//! - Blind relay forwarding can query routeability readiness directly, keeping
+//!   node-to-node encrypted routing tied to fresh probe/forward evidence
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -114,6 +116,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.38.0-RouteabilityForwardGate - Exposed routeability readiness helper for blind relay next-hop selection
 //! v0.37.0-ExpiredPeerRetention - Downgrade expired signed peers instead of deleting local peer state
 //! v0.36.0-RouteabilityEvidence - Require fresh probe/forward evidence for route-ready peer status
 //! v0.35.4-BlindRelayTimestampProtection - Count stale/future route-frame protection
@@ -3421,6 +3424,20 @@ impl PeerStore {
         }
     }
 
+    /// Returns whether a peer has fresh routeability evidence at `now`.
+    ///
+    /// This is intentionally stricter than descriptor validity. A peer may be
+    /// signed, unexpired, and capability-compatible while still being unknown,
+    /// stale, unreachable, or quarantined from the routing layer's point of
+    /// view. Blind relay forwarding must use this helper so encrypted envelopes
+    /// are sent only to nodes with fresh successful probe/forward evidence.
+    #[must_use]
+    pub fn is_routeable_now(&self, node_id: &[u8; 32], now: u64) -> bool {
+        let route_health = self.route_health.read();
+        let (_, ready) = Self::routeability_state_and_ready(route_health.get(node_id), now);
+        ready
+    }
+
     fn route_quarantine_remaining_seconds(route_health: &PeerRouteHealth, now: u64) -> Option<u64> {
         route_health.quarantine_until.and_then(|quarantine_until| {
             (now < quarantine_until).then_some(quarantine_until.saturating_sub(now))
@@ -4162,6 +4179,31 @@ mod tests {
         assert_eq!(status.chat_relay[0].routeability_state, "unknown");
         assert!(!status.chat_relay[0].routeability_ready);
         assert!(status.chat_relay[0].score > status.chat_relay[1].score);
+    }
+
+    #[test]
+    fn test_is_routeable_now_requires_fresh_successful_route_evidence() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let peer_kp = IdentityKeyPair::generate();
+        let mut descriptor = signed_descriptor_for(&peer_kp, 1, now + 2_000);
+        descriptor.descriptor.public_endpoint = Some("https://routeable.example".to_string());
+        descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &peer_kp).unwrap();
+        let node_id = descriptor.node_id();
+
+        store
+            .upsert_verified_from_source(descriptor, now, "gossip_announce")
+            .unwrap();
+
+        assert!(!store.is_routeable_now(&node_id, now));
+
+        store.record_route_forward_failure(&node_id, now + 1, "request_failed");
+        assert!(!store.is_routeable_now(&node_id, now + 2));
+
+        store.record_route_forward_success(&node_id, now + 3);
+        assert!(store.is_routeable_now(&node_id, now + 4));
+
+        assert!(!store.is_routeable_now(&node_id, now + 3 + PEER_ROUTEABILITY_STALE_AFTER_SECS + 1));
     }
 
     #[test]
