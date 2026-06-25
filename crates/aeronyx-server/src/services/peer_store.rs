@@ -83,6 +83,9 @@
 //!   for why the relay path is ready, probe-only, degraded, protected, or idle
 //! - Blind relay timestamp freshness counters show stale/future route-frame
 //!   protection without exposing route ids, peer endpoints, payloads, or users
+//! - Routeability evidence separates advertised endpoints from actually
+//!   reachable relay paths, so quorum and network-story readiness cannot be
+//!   inflated by unprobed peers
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -109,6 +112,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.36.0-RouteabilityEvidence - Require fresh probe/forward evidence for route-ready peer status
 //! v0.35.4-BlindRelayTimestampProtection - Count stale/future route-frame protection
 //! v0.35.3-BlindRelayReadinessReason - Added privacy-safe readiness reason bucket
 //! v0.35.2-BlindRelayEvidenceMode - Distinguish real relay traffic from synthetic probe evidence
@@ -166,6 +170,7 @@ const PEER_ROUTE_LAST_SEEN_FRESH_SECS: u64 = 300;
 const PEER_ROUTE_LAST_SEEN_ACCEPTABLE_SECS: u64 = 900;
 const PEER_ROUTE_LAST_SEEN_STALE_SECS: u64 = 1_800;
 const PEER_ROUTE_RECENT_FAILURE_SECS: u64 = 600;
+const PEER_ROUTEABILITY_STALE_AFTER_SECS: u64 = 1_800;
 const PEER_ROUTE_FAILURE_QUARANTINE_THRESHOLD: u64 = 3;
 const PEER_ROUTE_FAILURE_QUARANTINE_SECS: u64 = 300;
 const PEER_ROUTE_STATUS_LIMIT: usize = 8;
@@ -914,6 +919,18 @@ pub struct PeerStorePeerHealth {
     pub last_seen_age_seconds: u64,
     /// Route health bucket from opaque node-to-node forwarding attempts.
     pub route_health: String,
+    /// Routeability bucket derived from fresh opaque probe/forward evidence.
+    ///
+    /// Stable values are `unknown`, `reachable`, `unreachable`, `stale`, and
+    /// `quarantined`. This is endpoint-readiness evidence only; it never
+    /// exposes endpoint URLs, route ids, encrypted payloads, or user metadata.
+    pub routeability_state: String,
+    /// Whether this peer has fresh successful routeability evidence.
+    pub routeability_ready: bool,
+    /// Last opaque routeability probe or forward timestamp.
+    pub last_routeability_probe_at: Option<u64>,
+    /// Age of the last opaque routeability probe or forward timestamp.
+    pub last_routeability_probe_age_seconds: Option<u64>,
     /// Successful opaque node-to-node forwards to this peer.
     pub route_success_count: u64,
     /// Failed opaque node-to-node forwards to this peer.
@@ -1001,6 +1018,18 @@ pub struct PeerStoreRouteCandidate {
     /// This is node-level control-plane feedback only. It never includes route
     /// ids, endpoint URLs, encrypted blobs, receivers, client IPs, or content.
     pub route_health: String,
+    /// Endpoint routeability state derived from fresh probe or forward evidence.
+    ///
+    /// A signed descriptor with a public endpoint is only `unknown` until this
+    /// node observes a successful blind-relay probe or real opaque forward.
+    /// Public readiness surfaces must count only `routeability_ready=true`.
+    pub routeability_state: String,
+    /// Whether this candidate is safe to count as currently routeable.
+    pub routeability_ready: bool,
+    /// Last opaque routeability probe or forward timestamp.
+    pub last_routeability_probe_at: Option<u64>,
+    /// Age of the last opaque routeability probe or forward timestamp.
+    pub last_routeability_probe_age_seconds: Option<u64>,
     /// Recent route failure count used to penalize unstable next hops.
     pub route_failure_count: u64,
     /// Consecutive route failures since the last successful forward.
@@ -2896,12 +2925,12 @@ impl PeerStore {
         let routeable_chat_relays = route_candidates
             .chat_relay
             .iter()
-            .filter(|peer| !peer.route_quarantined)
+            .filter(|peer| peer.routeability_ready && !peer.route_quarantined)
             .count();
         let routeable_onion_middle_hops = route_candidates
             .onion_middle
             .iter()
-            .filter(|peer| !peer.route_quarantined)
+            .filter(|peer| peer.routeability_ready && !peer.route_quarantined)
             .count();
         let healthy_ratio_percent = if peer_summary.valid_peers == 0 {
             0
@@ -2935,6 +2964,9 @@ impl PeerStore {
             "disabled" => "enable discovery and configure peer recovery before testing multi-hop routing",
             "attention" => "restore discovery stability before relying on the peer view",
             "forming" => "add seed endpoints, peer cache, or live gossip until the verified peer view reaches quorum",
+            "peer_view_ready" if route_candidates.chat_relay.iter().any(|peer| peer.endpoint_advertised) => {
+                "wait for a fresh successful routeability probe before declaring encrypted relay readiness"
+            }
             "peer_view_ready" => "ensure at least one verified peer advertises a public chat relay endpoint",
             _ if !stability.restart_recovery_configured => {
                 "configure peer cache or seed endpoints so peer quorum survives restart"
@@ -2987,12 +3019,12 @@ impl PeerStore {
         let routeable_chat_relays = route_candidates
             .chat_relay
             .iter()
-            .filter(|peer| !peer.route_quarantined)
+            .filter(|peer| peer.routeability_ready && !peer.route_quarantined)
             .count();
         let routeable_onion_middle_hops = route_candidates
             .onion_middle
             .iter()
-            .filter(|peer| !peer.route_quarantined)
+            .filter(|peer| peer.routeability_ready && !peer.route_quarantined)
             .count();
 
         let stability_needs_attention =
@@ -3156,6 +3188,54 @@ impl PeerStore {
         }
     }
 
+    fn routeability_probe_at(route_health: Option<&PeerRouteHealth>) -> Option<u64> {
+        route_health.and_then(
+            |health| match (health.last_success_at, health.last_failure_at) {
+                (Some(success_at), Some(failure_at)) => Some(success_at.max(failure_at)),
+                (Some(success_at), None) => Some(success_at),
+                (None, Some(failure_at)) => Some(failure_at),
+                (None, None) => None,
+            },
+        )
+    }
+
+    fn routeability_state_and_ready(
+        route_health: Option<&PeerRouteHealth>,
+        now: u64,
+    ) -> (&'static str, bool) {
+        let Some(route_health) = route_health else {
+            return ("unknown", false);
+        };
+        if Self::route_quarantine_remaining_seconds(route_health, now).is_some() {
+            return ("quarantined", false);
+        }
+
+        match (route_health.last_success_at, route_health.last_failure_at) {
+            (Some(success_at), Some(failure_at)) if failure_at > success_at => {
+                if now.saturating_sub(failure_at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS {
+                    ("unreachable", false)
+                } else {
+                    ("stale", false)
+                }
+            }
+            (Some(success_at), _) => {
+                if now.saturating_sub(success_at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS {
+                    ("reachable", true)
+                } else {
+                    ("stale", false)
+                }
+            }
+            (None, Some(failure_at)) => {
+                if now.saturating_sub(failure_at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS {
+                    ("unreachable", false)
+                } else {
+                    ("stale", false)
+                }
+            }
+            (None, None) => ("unknown", false),
+        }
+    }
+
     fn route_quarantine_remaining_seconds(route_health: &PeerRouteHealth, now: u64) -> Option<u64> {
         route_health.quarantine_until.and_then(|quarantine_until| {
             (now < quarantine_until).then_some(quarantine_until.saturating_sub(now))
@@ -3218,6 +3298,11 @@ impl PeerStore {
             let route_health_entry = route_health.get(node_id);
             let (route_health_bucket, route_health_score) =
                 Self::route_health_bucket_and_score(route_health_entry, now);
+            let (routeability_state, routeability_ready) =
+                Self::routeability_state_and_ready(route_health_entry, now);
+            let last_routeability_probe_at = Self::routeability_probe_at(route_health_entry);
+            let last_routeability_probe_age_seconds =
+                last_routeability_probe_at.map(|probe_at| now.saturating_sub(probe_at));
             if !include_route_quarantined && route_health_bucket == "quarantined" {
                 continue;
             }
@@ -3241,6 +3326,10 @@ impl PeerStore {
                     source,
                     health: health.to_string(),
                     route_health: route_health_bucket.to_string(),
+                    routeability_state: routeability_state.to_string(),
+                    routeability_ready,
+                    last_routeability_probe_at,
+                    last_routeability_probe_age_seconds,
                     route_failure_count: route_health_entry
                         .map(|value| value.failure_count)
                         .unwrap_or(0),
@@ -3318,6 +3407,7 @@ impl PeerStore {
             let Some(next) = self
                 .scored_route_candidates(*capability, now, None, false)
                 .into_iter()
+                .filter(|candidate| candidate.summary.routeability_ready)
                 .find(|candidate| {
                     let node_id = candidate.descriptor.node_id();
                     !excluded.iter().any(|excluded| *excluded == node_id)
@@ -3566,6 +3656,11 @@ impl PeerStore {
             let route_health_entry = route_health.get(node_id);
             let (route_health_bucket, _) =
                 Self::route_health_bucket_and_score(route_health_entry, now);
+            let (routeability_state, routeability_ready) =
+                Self::routeability_state_and_ready(route_health_entry, now);
+            let last_routeability_probe_at = Self::routeability_probe_at(route_health_entry);
+            let last_routeability_probe_age_seconds =
+                last_routeability_probe_at.map(|probe_at| now.saturating_sub(probe_at));
             let route_quarantine_remaining_seconds = route_health_entry
                 .and_then(|value| Self::route_quarantine_remaining_seconds(value, now));
             let relay_health_entry = relay_health.get(node_id);
@@ -3602,6 +3697,10 @@ impl PeerStore {
                 last_seen_at,
                 last_seen_age_seconds,
                 route_health: route_health_bucket.to_string(),
+                routeability_state: routeability_state.to_string(),
+                routeability_ready,
+                last_routeability_probe_at,
+                last_routeability_probe_age_seconds,
                 route_success_count: route_health_entry
                     .map(|value| value.success_count)
                     .unwrap_or(0),
@@ -3875,6 +3974,8 @@ mod tests {
         assert_eq!(status.chat_relay[0].health, "healthy");
         assert_eq!(status.chat_relay[1].health, "stale");
         assert!(status.chat_relay[0].endpoint_advertised);
+        assert_eq!(status.chat_relay[0].routeability_state, "unknown");
+        assert!(!status.chat_relay[0].routeability_ready);
         assert!(status.chat_relay[0].score > status.chat_relay[1].score);
     }
 
@@ -3918,6 +4019,8 @@ mod tests {
             .find(|row| row.node_id_prefix == failing_prefix)
             .expect("failing peer should remain visible as a quarantined candidate");
         assert_eq!(failing_row.route_health, "quarantined");
+        assert_eq!(failing_row.routeability_state, "quarantined");
+        assert!(!failing_row.routeability_ready);
         assert!(failing_row.route_quarantined);
         assert_eq!(failing_row.route_quarantine_count, 1);
         assert_eq!(
@@ -3944,6 +4047,9 @@ mod tests {
             .find(|row| row.node_id_prefix == failing_prefix)
             .expect("recovered peer should still be reported");
         assert_eq!(recovered_row.route_health, "healthy");
+        assert_eq!(recovered_row.routeability_state, "reachable");
+        assert!(recovered_row.routeability_ready);
+        assert_eq!(recovered_row.last_routeability_probe_at, Some(now + 5));
         assert!(!recovered_row.route_quarantined);
         assert_eq!(recovered_row.route_quarantine_remaining_seconds, None);
         assert_eq!(recovered_row.route_consecutive_failures, 0);
@@ -3985,6 +4091,10 @@ mod tests {
         assert_eq!(row.last_successful_gossip_age_seconds, Some(10));
         assert_eq!(row.route_failure_count, 2);
         assert_eq!(row.route_consecutive_failures, 2);
+        assert_eq!(row.routeability_state, "unreachable");
+        assert!(!row.routeability_ready);
+        assert_eq!(row.last_routeability_probe_at, Some(now + 2));
+        assert_eq!(row.last_routeability_probe_age_seconds, Some(8));
         assert_eq!(row.last_route_failure_reason.as_deref(), Some("http_502"));
         assert!(row.relay_quarantined);
         assert_eq!(row.relay_rejection_count, 1);
@@ -4134,11 +4244,10 @@ mod tests {
         assert!(!status.planned_paths.chat_single_hop.complete);
         assert_eq!(status.planned_paths.chat_single_hop.hop_count, 0);
         assert!(!status.planned_paths.chat_two_hop_onion_ready.complete);
-        assert_eq!(status.planned_paths.chat_two_hop_onion_ready.hop_count, 1);
-        assert_eq!(
-            status.planned_paths.chat_two_hop_onion_ready.hops[0].capability,
-            "onion_middle"
-        );
+        assert_eq!(status.planned_paths.chat_two_hop_onion_ready.hop_count, 0);
+        assert_eq!(status.onion_middle.len(), 1);
+        assert_eq!(status.onion_middle[0].routeability_state, "unknown");
+        assert!(!status.onion_middle[0].routeability_ready);
 
         let status_json = serde_json::to_string(&status).unwrap();
         assert!(!status_json.contains("private-middle.example"));
@@ -4179,6 +4288,8 @@ mod tests {
         store
             .upsert_verified_from_source(relay_descriptor, now, "gossip_announce")
             .unwrap();
+        store.record_route_forward_success(&middle_node_id, now + 25);
+        store.record_route_forward_success(&relay_node_id, now + 26);
 
         let story = store.status(now + 30).network_story;
 
@@ -4958,10 +5069,12 @@ mod tests {
         let mut first = signed_descriptor_for(&first_kp, 1, now + 1_000);
         first.descriptor.public_endpoint = Some("https://peer-one.example".to_string());
         first = SignedNodeDescriptor::sign(first.descriptor, &first_kp).unwrap();
+        let first_node_id = first.node_id();
 
         let mut second = signed_descriptor_for(&second_kp, 1, now + 1_000);
         second.descriptor.public_endpoint = Some("https://peer-two.example".to_string());
         second = SignedNodeDescriptor::sign(second.descriptor, &second_kp).unwrap();
+        let second_node_id = second.node_id();
 
         store.configure_bootstrap_status(true, true, true, 2);
         store
@@ -4971,6 +5084,8 @@ mod tests {
             .upsert_verified_from_source(second, now, "gossip_snapshot")
             .unwrap();
         store.record_gossip_round(now + 20, 2, 2, 1, None);
+        store.record_route_forward_success(&first_node_id, now + 30);
+        store.record_route_forward_success(&second_node_id, now + 31);
 
         let status = store.status(now + 60);
 
