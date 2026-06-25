@@ -16,6 +16,7 @@
 //! - `NodeCapacity`: coarse capacity hints for peer selection
 //! - `NodeBootstrapSnapshot`: JSON-friendly bootstrap list of signed descriptors
 //! - `NodeDiscoveryMessage`: bounded gossip message envelope for peer sync
+//! - Signature-only descriptor verification for local peer-cache retention
 //!
 //! ## Dependencies
 //! - crates/aeronyx-core/src/crypto/keys.rs: IdentityKeyPair / IdentityPublicKey
@@ -25,8 +26,9 @@
 //! ## Main Logical Flow
 //! 1. Node builds a `NodeDescriptor` with its public identity and capabilities
 //! 2. Node signs `descriptor.signing_bytes()` with `IdentityKeyPair`
-//! 3. Peers call `SignedNodeDescriptor::verify_at(now)` before storing it
-//! 4. Server-side `PeerStore` keeps only verified, non-expired descriptors
+//! 3. Peers call `SignedNodeDescriptor::verify_at(now)` before treating it as live
+//! 4. Server-side `PeerStore` may use `verify_signature()` only to retain
+//!    expired cache records as non-routeable history
 //! 5. Bootstrap snapshots carry a bounded list of signed descriptors for
 //!    first-contact peer discovery
 //! 6. Gossip messages exchange snapshot requests/responses and descriptor
@@ -42,6 +44,7 @@
 //!   exit behavior through a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.4.0-DiscoverySignatureOnlyVerify - Added signature-only verification for expired peer-cache retention
 //! v0.1.0-DiscoveryPhase1 - Initial signed descriptor primitives
 //! v0.2.0-DiscoveryPhase2 - Added bounded bootstrap snapshot type
 //! v0.3.0-DiscoveryPhase4 - Added bounded discovery gossip messages
@@ -286,6 +289,25 @@ impl SignedNodeDescriptor {
             return Err(CoreError::SignatureVerification);
         }
 
+        self.verify_signature()
+    }
+
+    /// Verifies only the descriptor schema version and Ed25519 signature.
+    ///
+    /// This method deliberately does not check `issued_at` / `expires_at`.
+    /// It exists so a local peer cache can retain expired-but-authentic node
+    /// records as non-routeable history after restart. Callers must still use
+    /// `verify_at(now)` before counting a descriptor as live, valid, routeable,
+    /// gossip-exportable, or relay-eligible.
+    ///
+    /// # Errors
+    /// Returns `CoreError::SignatureVerification` if the schema version is
+    /// unsupported or signature verification fails.
+    pub fn verify_signature(&self) -> Result<(), CoreError> {
+        if self.descriptor.schema_version != NODE_DESCRIPTOR_SCHEMA_VERSION {
+            return Err(CoreError::SignatureVerification);
+        }
+
         let pk = IdentityPublicKey::from_bytes(&self.descriptor.node_id)?;
         let bytes = self.descriptor.signing_bytes()?;
         pk.verify(&bytes, &self.signature)
@@ -491,6 +513,19 @@ mod tests {
         let signed = SignedNodeDescriptor::sign(descriptor_for(&kp), &kp).unwrap();
 
         assert!(signed.verify_at(1_700_004_000).is_err());
+    }
+
+    #[test]
+    fn test_signature_only_verification_keeps_expired_records_non_live() {
+        let kp = IdentityKeyPair::generate();
+        let signed = SignedNodeDescriptor::sign(descriptor_for(&kp), &kp).unwrap();
+
+        assert!(signed.verify_at(1_700_004_000).is_err());
+        assert!(signed.verify_signature().is_ok());
+
+        let mut tampered = signed.clone();
+        tampered.signature[0] ^= 0x01;
+        assert!(tampered.verify_signature().is_err());
     }
 
     #[test]

@@ -86,6 +86,8 @@
 //! - Routeability evidence separates advertised endpoints from actually
 //!   reachable relay paths, so quorum and network-story readiness cannot be
 //!   inflated by unprobed peers
+//! - Expired peers are downgraded and retained instead of deleted so local
+//!   peer history survives cleanup and restart without being treated as live
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -112,6 +114,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.37.0-ExpiredPeerRetention - Downgrade expired signed peers instead of deleting local peer state
 //! v0.36.0-RouteabilityEvidence - Require fresh probe/forward evidence for route-ready peer status
 //! v0.35.4-BlindRelayTimestampProtection - Count stale/future route-frame protection
 //! v0.35.3-BlindRelayReadinessReason - Added privacy-safe readiness reason bucket
@@ -480,8 +483,13 @@ pub struct PeerStoreRuntimeStats {
     pub policy_rejected: u64,
     /// Total inbound gossip requests rejected by rate limiting.
     pub rate_limited: u64,
-    /// Total expired descriptors removed by cleanup.
+    /// Legacy counter for expired descriptors physically removed by cleanup.
+    ///
+    /// New code should prefer `expired_degraded`. This field is retained for
+    /// backward-compatible nodeboard/API consumers.
     pub expired_removed: u64,
+    /// Total expired signed descriptors downgraded and retained locally.
+    pub expired_degraded: u64,
     /// Opaque node-to-node blind relay counters and drop reason buckets.
     pub blind_relay: PeerStoreBlindRelayStats,
     /// Unix timestamp of the last descriptor import attempt.
@@ -490,7 +498,7 @@ pub struct PeerStoreRuntimeStats {
     pub last_gossip_at: Option<u64>,
     /// Unix timestamp of the last exported snapshot.
     pub last_snapshot_at: Option<u64>,
-    /// Unix timestamp of the last cleanup that removed at least one expired peer.
+    /// Unix timestamp of the last cleanup that downgraded or removed at least one expired peer.
     pub last_cleanup_at: Option<u64>,
 }
 
@@ -793,6 +801,7 @@ struct PeerRuntimeMetadata {
     last_seen_at: u64,
     last_sequence: u64,
     imported_count: u64,
+    expired_degraded_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1152,6 +1161,7 @@ struct PeerStoreCounters {
     policy_rejected: AtomicU64,
     rate_limited: AtomicU64,
     expired_removed: AtomicU64,
+    expired_degraded: AtomicU64,
     blind_relay_received: AtomicU64,
     blind_relay_terminal: AtomicU64,
     blind_relay_forwarded: AtomicU64,
@@ -1195,6 +1205,7 @@ impl PeerStoreCounters {
             policy_rejected: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
             expired_removed: AtomicU64::new(0),
+            expired_degraded: AtomicU64::new(0),
             blind_relay_received: AtomicU64::new(0),
             blind_relay_terminal: AtomicU64::new(0),
             blind_relay_forwarded: AtomicU64::new(0),
@@ -1242,6 +1253,7 @@ impl PeerStoreCounters {
             policy_rejected: self.policy_rejected.load(Ordering::Relaxed),
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
             expired_removed: self.expired_removed.load(Ordering::Relaxed),
+            expired_degraded: self.expired_degraded.load(Ordering::Relaxed),
             blind_relay: PeerStoreBlindRelayStats {
                 received: self.blind_relay_received.load(Ordering::Relaxed),
                 terminal: self.blind_relay_terminal.load(Ordering::Relaxed),
@@ -1760,10 +1772,12 @@ impl PeerStore {
                 last_seen_at: now,
                 last_sequence: descriptor.sequence(),
                 imported_count: 0,
+                expired_degraded_at: None,
             });
         entry.source = source;
         entry.last_seen_at = now;
         entry.last_sequence = descriptor.sequence();
+        entry.expired_degraded_at = None;
         if inserted_or_upgraded {
             entry.imported_count = entry.imported_count.saturating_add(1);
         }
@@ -1810,6 +1824,120 @@ impl PeerStore {
 
         self.record_import_report(&report, now);
         report
+    }
+
+    /// Imports descriptors from a local peer-cache snapshot.
+    ///
+    /// Unlike gossip/bootstrap imports, peer-cache recovery may retain
+    /// expired-but-authentic signed descriptors so operators do not lose local
+    /// peer history after restart. Retained expired records are never counted
+    /// as valid, exported to public gossip, or selected as routeable peers
+    /// until a fresh signed descriptor is received and `verify_at(now)` passes.
+    pub fn load_peer_cache_snapshot_from_source(
+        &self,
+        snapshot: &NodeBootstrapSnapshot,
+        now: u64,
+        source: impl Into<String>,
+    ) -> PeerStoreImportReport {
+        let source = source.into();
+        let mut report = PeerStoreImportReport {
+            total: snapshot.peers.len(),
+            inserted: 0,
+            unchanged: 0,
+            stale: 0,
+            rejected: 0,
+        };
+
+        for descriptor in &snapshot.peers {
+            if descriptor.verify_at(now).is_ok() {
+                match self.upsert_verified_from_source(descriptor.clone(), now, source.clone()) {
+                    Ok(true) => report.inserted += 1,
+                    Ok(false) => report.unchanged += 1,
+                    Err(PeerStoreError::StaleSequence { .. }) => report.stale += 1,
+                    Err(PeerStoreError::VerificationFailed)
+                    | Err(PeerStoreError::CapacityExceeded { .. }) => report.rejected += 1,
+                }
+                continue;
+            }
+
+            match self.retain_signed_expired_from_cache(descriptor.clone(), now, source.clone()) {
+                Ok(true) => report.inserted += 1,
+                Ok(false) => report.unchanged += 1,
+                Err(PeerStoreError::StaleSequence { .. }) => report.stale += 1,
+                Err(PeerStoreError::VerificationFailed)
+                | Err(PeerStoreError::CapacityExceeded { .. }) => report.rejected += 1,
+            }
+        }
+
+        self.record_import_report(&report, now);
+        report
+    }
+
+    fn retain_signed_expired_from_cache(
+        &self,
+        descriptor: SignedNodeDescriptor,
+        now: u64,
+        source: String,
+    ) -> Result<bool, PeerStoreError> {
+        if descriptor.verify_signature().is_err() || descriptor.descriptor.is_valid_at(now) {
+            return Err(PeerStoreError::VerificationFailed);
+        }
+
+        let node_id = descriptor.node_id();
+        let incoming_sequence = descriptor.sequence();
+        let mut peers = self.peers.write();
+        let existing_sequence = peers.get(&node_id).map(SignedNodeDescriptor::sequence);
+
+        if let Some(current) = existing_sequence {
+            if incoming_sequence < current {
+                return Err(PeerStoreError::StaleSequence {
+                    current,
+                    incoming: incoming_sequence,
+                });
+            }
+        } else if let Some(max_peers) = self.max_peers() {
+            if peers.len() >= max_peers {
+                return Err(PeerStoreError::CapacityExceeded { max_peers });
+            }
+        }
+
+        let changed = existing_sequence != Some(incoming_sequence);
+        if changed {
+            peers.insert(node_id, descriptor.clone());
+        }
+        drop(peers);
+
+        {
+            let mut metadata = self.peer_runtime.write();
+            let entry = metadata
+                .entry(node_id)
+                .or_insert_with(|| PeerRuntimeMetadata {
+                    source: source.clone(),
+                    first_seen_at: now,
+                    last_seen_at: now,
+                    last_sequence: incoming_sequence,
+                    imported_count: 0,
+                    expired_degraded_at: Some(now),
+                });
+            entry.source = source.clone();
+            entry.last_seen_at = now;
+            entry.last_sequence = incoming_sequence;
+            entry.expired_degraded_at = Some(now);
+            if changed {
+                entry.imported_count = entry.imported_count.saturating_add(1);
+            }
+        }
+
+        self.record_peer_event(
+            now,
+            "peer_expired",
+            "retained",
+            source,
+            &node_id,
+            Some(incoming_sequence),
+            Some("signature_valid_descriptor_expired"),
+        );
+        Ok(changed)
     }
 
     /// Applies a discovery gossip message to this store.
@@ -2410,6 +2538,51 @@ impl PeerStore {
         NodeBootstrapSnapshot::new(generated_at, descriptors)
     }
 
+    /// Exports a local peer-cache snapshot, including expired signed peers.
+    ///
+    /// This snapshot is for local restart recovery only. Public gossip and
+    /// bootstrap responses must continue to use `export_bootstrap_snapshot()`,
+    /// which filters to descriptors that are valid at `now`. Cache consumers
+    /// must call `load_peer_cache_snapshot_from_source()` so expired records
+    /// are retained only after signature verification and remain non-routeable.
+    #[must_use]
+    pub fn export_peer_cache_snapshot(&self, generated_at: u64) -> NodeBootstrapSnapshot {
+        self.counters
+            .last_snapshot_at
+            .store(generated_at, Ordering::Relaxed);
+        let mut valid = 0usize;
+        let mut expired = 0usize;
+        let mut descriptors: Vec<SignedNodeDescriptor> = self
+            .peers
+            .read()
+            .values()
+            .filter(|descriptor| descriptor.verify_signature().is_ok())
+            .inspect(|descriptor| {
+                if descriptor.descriptor.is_valid_at(generated_at) {
+                    valid += 1;
+                } else {
+                    expired += 1;
+                }
+            })
+            .cloned()
+            .collect();
+
+        descriptors.sort_by_key(|descriptor| (descriptor.node_id(), descriptor.sequence()));
+        self.record_audit_event(
+            generated_at,
+            "peer_cache_export",
+            "accepted",
+            format!(
+                "retained={} valid={} expired={}",
+                descriptors.len(),
+                valid,
+                expired
+            ),
+        );
+
+        NodeBootstrapSnapshot::new(generated_at, descriptors)
+    }
+
     /// Builds a discovery snapshot response from current valid peers.
     #[must_use]
     pub fn build_snapshot_response(
@@ -2536,58 +2709,70 @@ impl PeerStore {
         Some(path)
     }
 
-    /// Removes descriptors that are no longer valid at `now`.
+    /// Downgrades descriptors that are no longer valid at `now`.
+    ///
+    /// Expired peers are retained as signed, non-routeable local history so a
+    /// node does not forget known peers during cleanup or restart. Validity
+    /// gates elsewhere (`verify_at(now)`, route candidates, gossip export)
+    /// still prevent expired descriptors from being counted as live peers.
     pub fn cleanup_expired(&self, now: u64) -> usize {
-        let mut peers = self.peers.write();
-        let before = peers.len();
-        let mut removed = Vec::new();
-        peers.retain(|node_id, descriptor| {
-            let keep = descriptor.verify_at(now).is_ok();
-            if !keep {
-                removed.push(*node_id);
-            }
-            keep
-        });
-        drop(peers);
-        if !removed.is_empty() {
+        let expired: Vec<([u8; 32], u64)> = self
+            .peers
+            .read()
+            .iter()
+            .filter(|(_, descriptor)| descriptor.verify_at(now).is_err())
+            .map(|(node_id, descriptor)| (*node_id, descriptor.sequence()))
+            .collect();
+
+        let mut newly_degraded = Vec::new();
+        if !expired.is_empty() {
             let mut metadata = self.peer_runtime.write();
-            for node_id in &removed {
-                metadata.remove(node_id);
-            }
-            let mut route_health = self.route_health.write();
-            for node_id in &removed {
-                route_health.remove(node_id);
-            }
-            let mut relay_health = self.relay_protection_health.write();
-            for node_id in &removed {
-                relay_health.remove(node_id);
+            for (node_id, sequence) in expired {
+                let entry = metadata
+                    .entry(node_id)
+                    .or_insert_with(|| PeerRuntimeMetadata {
+                        source: "unknown".to_string(),
+                        first_seen_at: now,
+                        last_seen_at: now,
+                        last_sequence: sequence,
+                        imported_count: 0,
+                        expired_degraded_at: None,
+                    });
+                if entry.expired_degraded_at.is_none() {
+                    entry.expired_degraded_at = Some(now);
+                    newly_degraded.push((node_id, sequence));
+                }
             }
         }
-        let removed_count = before.saturating_sub(self.peers.read().len());
-        if removed_count > 0 {
+
+        let degraded_count = newly_degraded.len();
+        if degraded_count > 0 {
             self.counters
-                .expired_removed
-                .fetch_add(removed_count as u64, Ordering::Relaxed);
+                .expired_degraded
+                .fetch_add(degraded_count as u64, Ordering::Relaxed);
             self.counters.last_cleanup_at.store(now, Ordering::Relaxed);
-            for node_id in &removed {
+            for (node_id, sequence) in &newly_degraded {
                 self.record_peer_event(
                     now,
                     "peer_expired",
-                    "expired",
+                    "degraded",
                     "cleanup",
                     node_id,
-                    None,
-                    Some("descriptor_expired"),
+                    Some(*sequence),
+                    Some("descriptor_expired_retained"),
                 );
             }
             self.record_audit_event(
                 now,
                 "expired_peer_cleanup",
                 "accepted",
-                format!("removed={removed_count}"),
+                format!(
+                    "degraded={degraded_count} retained_total={} removed=0",
+                    self.peers.read().len()
+                ),
             );
         }
-        removed_count
+        degraded_count
     }
 
     /// Returns a monitoring snapshot.
@@ -4358,28 +4543,80 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_expired_removes_old_peers() {
+    fn test_cleanup_expired_degrades_and_retains_old_peers() {
         let store = PeerStore::new();
         let descriptor = signed_descriptor(1, 1_700_001_000);
 
         store.upsert_verified(descriptor, 1_700_000_100).unwrap();
         assert_eq!(store.cleanup_expired(1_700_002_000), 1);
-        assert!(store.is_empty());
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.snapshot(1_700_002_001).valid_peers, 0);
+        assert_eq!(store.cleanup_expired(1_700_002_100), 0);
 
         let status = store.status(1_700_002_001);
-        assert_eq!(status.runtime.expired_removed, 1);
+        assert_eq!(status.runtime.expired_removed, 0);
+        assert_eq!(status.runtime.expired_degraded, 1);
         assert_eq!(status.runtime.last_cleanup_at, Some(1_700_002_000));
+        assert_eq!(status.peer_summary.expired_peers, 1);
         assert!(status.recent_peer_events.iter().any(|event| {
             event.event == "peer_expired"
-                && event.outcome == "expired"
+                && event.outcome == "degraded"
                 && event.source == "cleanup"
-                && event.reason.as_deref() == Some("descriptor_expired")
+                && event.reason.as_deref() == Some("descriptor_expired_retained")
         }));
         assert!(status.recent_audit_events.iter().any(|event| {
             event.action == "expired_peer_cleanup"
                 && event.outcome == "accepted"
-                && event.detail == "removed=1"
+                && event.detail.contains("degraded=1")
+                && event.detail.contains("removed=0")
         }));
+
+        let public_snapshot =
+            store.export_bootstrap_snapshot(1_700_002_002, 1_700_002_002, false, None);
+        assert_eq!(public_snapshot.peers.len(), 0);
+        let cache_snapshot = store.export_peer_cache_snapshot(1_700_002_002);
+        assert_eq!(cache_snapshot.peers.len(), 1);
+    }
+
+    #[test]
+    fn test_peer_cache_snapshot_retains_expired_signed_records_without_making_them_live() {
+        let store = PeerStore::new();
+        let expired = signed_descriptor(1, 1_700_001_000);
+        let node_id = expired.node_id();
+        let snapshot = NodeBootstrapSnapshot::new(1_700_002_000, vec![expired.clone()]);
+
+        let report = store.load_peer_cache_snapshot_from_source(&snapshot, 1_700_002_000, "cache");
+
+        assert_eq!(
+            report,
+            PeerStoreImportReport {
+                total: 1,
+                inserted: 1,
+                unchanged: 0,
+                stale: 0,
+                rejected: 0,
+            }
+        );
+        assert_eq!(store.len(), 1);
+        assert!(store.get_valid(&node_id, 1_700_002_000).is_none());
+        let status = store.status(1_700_002_000);
+        assert_eq!(status.snapshot.valid_peers, 0);
+        assert_eq!(status.peer_summary.expired_peers, 1);
+        assert!(status.recent_peer_events.iter().any(|event| {
+            event.event == "peer_expired"
+                && event.outcome == "retained"
+                && event.source == "cache"
+                && event.reason.as_deref() == Some("signature_valid_descriptor_expired")
+        }));
+
+        let mut tampered = expired;
+        tampered.signature[0] ^= 0x01;
+        let rejected = store.load_peer_cache_snapshot_from_source(
+            &NodeBootstrapSnapshot::new(1_700_002_010, vec![tampered]),
+            1_700_002_010,
+            "cache",
+        );
+        assert_eq!(rejected.rejected, 1);
     }
 
     #[test]

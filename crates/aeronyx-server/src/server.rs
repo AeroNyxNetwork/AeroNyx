@@ -2812,7 +2812,7 @@ impl Server {
             }
         }
 
-        let snapshot = peer_store.export_bootstrap_snapshot(now, now, false, None);
+        let snapshot = peer_store.export_peer_cache_snapshot(now);
         let bytes = snapshot.to_json_pretty()?;
         let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
         let backup_path = Self::peer_cache_backup_path(path.to_string_lossy().as_ref());
@@ -3034,8 +3034,11 @@ impl Server {
     ) -> bool {
         match NodeBootstrapSnapshot::from_json_bytes(bytes) {
             Ok(snapshot) => {
-                let report =
-                    peer_store.load_bootstrap_snapshot_from_source(&snapshot, now, source_kind);
+                let report = if matches!(source_kind, "cache" | "cache_backup") {
+                    peer_store.load_peer_cache_snapshot_from_source(&snapshot, now, source_kind)
+                } else {
+                    peer_store.load_bootstrap_snapshot_from_source(&snapshot, now, source_kind)
+                };
                 peer_store.record_bootstrap_source(
                     now,
                     source_kind,
@@ -4654,7 +4657,7 @@ mod tests {
         config.discovery.public_endpoint = Some("node.example.com:443".to_string());
 
         let server = Server::new(config, IdentityKeyPair::generate(), None);
-        let now = 1_800_000_000;
+        let now: u64 = 1_800_000_000;
         let signed = server.build_self_discovery_descriptor(now).unwrap();
         let original_store = Arc::new(PeerStore::new());
         assert!(original_store.upsert_verified(signed.clone(), now).unwrap());
@@ -4699,6 +4702,61 @@ mod tests {
             .recent_audit_events
             .iter()
             .any(|event| event.action == "bootstrap_source"));
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_retains_expired_signed_peers_after_restart() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let now: u64 = 1_800_000_000;
+        let peer_key = IdentityKeyPair::generate();
+        let expired_descriptor = NodeDescriptor::new(
+            peer_key.public_key_bytes(),
+            7,
+            now.saturating_sub(2_000),
+            now.saturating_sub(1_000),
+            "aeronyx-test-expired",
+        );
+        let expired = SignedNodeDescriptor::sign(expired_descriptor, &peer_key).unwrap();
+        let node_id = expired.node_id();
+        let original_store = Arc::new(PeerStore::new());
+        let cache_snapshot = NodeBootstrapSnapshot::new(now, vec![expired]);
+        let report =
+            original_store.load_peer_cache_snapshot_from_source(&cache_snapshot, now, "cache");
+        assert_eq!(report.inserted, 1);
+        assert_eq!(original_store.status(now).peer_summary.expired_peers, 1);
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("aeronyx-peer-cache-expired-restore-{unique}.json"));
+        let path_str = path.to_string_lossy().to_string();
+
+        Server::save_peer_store_cache_snapshot(&original_store, &path_str, now)
+            .await
+            .unwrap();
+
+        let restored_store = PeerStore::new();
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        Server::import_bootstrap_snapshot_bytes(&restored_store, "cache", &path_str, &bytes, now);
+
+        assert_eq!(restored_store.len(), 1);
+        assert!(restored_store.get_valid(&node_id, now).is_none());
+        let status = restored_store.status(now);
+        assert_eq!(status.snapshot.valid_peers, 0);
+        assert_eq!(status.peer_summary.expired_peers, 1);
+        assert_eq!(status.bootstrap.last_source_kind.as_deref(), Some("cache"));
+        assert_eq!(
+            status.bootstrap.last_source_status.as_deref(),
+            Some("success")
+        );
 
         let _ = tokio::fs::remove_file(path).await;
     }
