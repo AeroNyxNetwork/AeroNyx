@@ -1663,13 +1663,18 @@ impl Server {
                 );
                 let discovery_readiness =
                     discovery_readiness_status_value(&status, &local_capabilities);
+                let signed_peer_records = peer_store.export_signed_peer_records_for_heartbeat(
+                    now,
+                    Some(config.discovery.max_snapshot_limit),
+                );
                 Some(serde_json::json!({
                     "generated_at": now,
                     "peer_store": status,
+                    "signed_peer_records": signed_peer_records,
                     "local_capabilities": local_capabilities,
                     "discovery_readiness": discovery_readiness,
                     "source": "rust_peer_store",
-                    "privacy_boundary": "aggregate node discovery counters only; no client IPs, destinations, DNS contents, packet payloads, chat plaintext, voucher secrets, private keys, or wallet-level traffic"
+                    "privacy_boundary": "aggregate node discovery counters plus signed node-level discovery descriptors for central verification; no client IPs, destinations, DNS contents, packet payloads, chat plaintext, voucher secrets, private keys, or wallet-level traffic"
                 }))
             })
         }));

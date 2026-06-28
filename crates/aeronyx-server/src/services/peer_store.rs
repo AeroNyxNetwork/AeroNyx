@@ -90,6 +90,8 @@
 //!   peer history survives cleanup and restart without being treated as live
 //! - Blind relay forwarding can query routeability readiness directly, keeping
 //!   node-to-node encrypted routing tied to fresh probe/forward evidence
+//! - Heartbeat can export a bounded signed peer-record snapshot so centralized
+//!   coordination can verify peer records instead of trusting derived counters
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -116,6 +118,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.39.0-SignedPeerRecordsHeartbeat - Added bounded verifiable peer-record snapshot for heartbeat
 //! v0.38.0-RouteabilityForwardGate - Exposed routeability readiness helper for blind relay next-hop selection
 //! v0.37.0-ExpiredPeerRetention - Downgrade expired signed peers instead of deleting local peer state
 //! v0.36.0-RouteabilityEvidence - Require fresh probe/forward evidence for route-ready peer status
@@ -645,6 +648,37 @@ pub struct PeerStoreBlindRelayQualityStatus {
     /// Privacy-safe next action for nodeboard / AI runbooks.
     pub next_action: String,
     /// Explicit privacy boundary for downstream UI and API consumers.
+    pub privacy_boundary: String,
+}
+
+/// Bounded signed peer records exported for heartbeat verification.
+///
+/// This payload is intentionally separate from `PeerStoreStatus`: nodeboard
+/// and website surfaces should keep using aggregate summaries, while the
+/// centralized coordination server can verify each signed descriptor before
+/// accepting peer-discovery claims. Records contain node-level discovery
+/// metadata only. They must never include client IPs, route ids, encrypted
+/// payloads, receiver identities, DNS contents, voucher secrets, private keys,
+/// wallet-level traffic, or plaintext.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreSignedPeerRecordsStatus {
+    /// Unix timestamp when this signed snapshot was generated.
+    pub generated_at: u64,
+    /// Stable source label for downstream ingestion.
+    pub source: String,
+    /// Total descriptors currently retained in this PeerStore.
+    pub total_retained_records: usize,
+    /// Retained descriptors that verify at `generated_at`.
+    pub valid_signed_records: usize,
+    /// Valid signed descriptors exported after applying `limit`.
+    pub exported_signed_records: usize,
+    /// Export limit applied to the signed record snapshot.
+    pub limit: Option<usize>,
+    /// Verifiable signed descriptor snapshot.
+    pub records: NodeBootstrapSnapshot,
+    /// Explicit verification rule for the central server and future agents.
+    pub verification_rule: String,
+    /// Explicit privacy boundary for downstream consumers.
     pub privacy_boundary: String,
 }
 
@@ -2539,6 +2573,63 @@ impl PeerStore {
         );
 
         NodeBootstrapSnapshot::new(generated_at, descriptors)
+    }
+
+    /// Exports a bounded verifiable peer-record snapshot for heartbeat.
+    ///
+    /// Heartbeat consumers should verify every descriptor in `records` using
+    /// `SignedNodeDescriptor::verify_at(generated_at)` before accepting peer
+    /// claims. This method deliberately exports signed node-level discovery
+    /// metadata, not client/session traffic. It filters out expired or invalid
+    /// descriptors and does not include retained expired cache history.
+    #[must_use]
+    pub fn export_signed_peer_records_for_heartbeat(
+        &self,
+        generated_at: u64,
+        limit: Option<usize>,
+    ) -> PeerStoreSignedPeerRecordsStatus {
+        let peers = self.peers.read();
+        let total_retained_records = peers.len();
+        let mut descriptors: Vec<SignedNodeDescriptor> = peers
+            .values()
+            .filter(|descriptor| descriptor.verify_at(generated_at).is_ok())
+            .cloned()
+            .collect();
+        drop(peers);
+
+        descriptors.sort_by_key(|descriptor| (descriptor.node_id(), descriptor.sequence()));
+        let valid_signed_records = descriptors.len();
+        if let Some(limit) = limit {
+            descriptors.truncate(limit);
+        }
+        let exported_signed_records = descriptors.len();
+
+        self.record_audit_event(
+            generated_at,
+            "heartbeat_signed_peer_records_export",
+            "accepted",
+            format!(
+                "retained={} valid={} exported={} limit={}",
+                total_retained_records,
+                valid_signed_records,
+                exported_signed_records,
+                limit.map_or_else(|| "none".to_string(), |value| value.to_string())
+            ),
+        );
+
+        PeerStoreSignedPeerRecordsStatus {
+            generated_at,
+            source: "rust_peer_store_signed_descriptors".to_string(),
+            total_retained_records,
+            valid_signed_records,
+            exported_signed_records,
+            limit,
+            records: NodeBootstrapSnapshot::new(generated_at, descriptors),
+            verification_rule:
+                "verify each records.peers[] with SignedNodeDescriptor::verify_at(generated_at)"
+                    .to_string(),
+            privacy_boundary: "signed node discovery descriptors only; may include node public keys and public endpoints, but no client IPs, route ids, encrypted payloads, receiver identities, DNS contents, voucher secrets, private keys, wallet-level traffic, or plaintext".to_string(),
+        }
     }
 
     /// Exports a local peer-cache snapshot, including expired signed peers.
@@ -4759,6 +4850,44 @@ mod tests {
         let snapshot = store.export_bootstrap_snapshot(1_700_000_200, 1_700_000_100, true, None);
         assert_eq!(snapshot.peers.len(), 1);
         assert!(snapshot.peers[0].descriptor.policy.public_discovery);
+    }
+
+    #[test]
+    fn test_heartbeat_signed_peer_records_export_only_verifiable_live_records() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let valid = signed_descriptor(1, 1_700_001_000);
+        let valid_node_id = valid.node_id();
+        let expired = signed_descriptor(1, 1_699_999_999);
+        let mut tampered = signed_descriptor(1, 1_700_001_000);
+        tampered.signature[0] ^= 0x01;
+
+        store.upsert_verified(valid, now).unwrap();
+        store.peers.write().insert(expired.node_id(), expired);
+        store.peers.write().insert(tampered.node_id(), tampered);
+
+        let signed_records = store.export_signed_peer_records_for_heartbeat(now, Some(8));
+
+        assert_eq!(signed_records.total_retained_records, 3);
+        assert_eq!(signed_records.valid_signed_records, 1);
+        assert_eq!(signed_records.exported_signed_records, 1);
+        assert_eq!(signed_records.records.generated_at, now);
+        assert_eq!(signed_records.records.peers.len(), 1);
+        assert_eq!(signed_records.records.peers[0].node_id(), valid_node_id);
+        assert!(signed_records.records.peers[0].verify_at(now).is_ok());
+        assert!(signed_records
+            .verification_rule
+            .contains("SignedNodeDescriptor::verify_at"));
+        assert!(signed_records
+            .privacy_boundary
+            .contains("signed node discovery descriptors only"));
+        assert!(store.recent_audit_events().iter().any(|event| {
+            event.action == "heartbeat_signed_peer_records_export"
+                && event.outcome == "accepted"
+                && event.detail.contains("retained=3")
+                && event.detail.contains("valid=1")
+                && event.detail.contains("exported=1")
+        }));
     }
 
     #[test]
