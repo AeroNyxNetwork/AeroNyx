@@ -303,6 +303,16 @@ impl Server {
     pub async fn run(&self) -> Result<()> {
         info!("Starting AeroNyx server v{}", env!("CARGO_PKG_VERSION"));
 
+        // Onion routing forward secrecy: initialize the in-memory rotating onion
+        // key at startup. It is never persisted, so a restart yields a fresh key
+        // and the old secret is unrecoverable. The grace window is tied to the
+        // descriptor TTL so a previous key outlives any descriptor still in
+        // circulation. See services::onion_keys.
+        crate::services::onion_keys::init_shared(
+            unix_now_secs(),
+            self.config.discovery.descriptor_ttl_secs,
+        );
+
         if self.config.memchain.is_enabled() {
             self.ensure_api_secret_on_disk().await;
         }
@@ -1920,6 +1930,7 @@ impl Server {
         }
 
         if self.config.discovery.advertise_self {
+            crate::services::onion_keys::tick_rotation(now);
             match self.build_self_discovery_descriptor_with_runtime(now, chat_relay_runtime_ready) {
                 Ok(descriptor) => match peer_store
                     .upsert_verified_from_source(descriptor, now, "self")
@@ -2211,6 +2222,9 @@ impl Server {
                 }
 
                 let now = unix_now_secs();
+                // Rotate the onion key on the discovery cadence (no-op until the
+                // rotation period elapses). Forward secrecy — see onion_keys.
+                crate::services::onion_keys::tick_rotation(now);
                 let Ok(self_descriptor) = Self::build_self_discovery_descriptor_for_runtime(
                     &config,
                     &identity,
@@ -2961,6 +2975,12 @@ impl Server {
                 .map(|region| region.trim().to_string())
                 .filter(|region| !region.is_empty()),
         };
+
+        // Onion routing: publish the node's CURRENT rotating onion KEM public
+        // key (forward secrecy — see services::onion_keys). NOT identity-derived:
+        // the X25519 public is not recoverable from the Ed25519 node_id, and a
+        // rotating key bounds exposure of past routing metadata if a key leaks.
+        descriptor = descriptor.with_x25519_kem(crate::services::onion_keys::current_public_key());
 
         SignedNodeDescriptor::sign(descriptor, identity).map_err(ServerError::from)
     }

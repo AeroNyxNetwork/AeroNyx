@@ -119,10 +119,11 @@ use aeronyx_core::crypto::transport::{
 };
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::chat::{
-    encode_blind_relay_envelope, encode_envelope, BlindRelayEnvelope, ChatEnvelope,
+    decode_envelope, encode_blind_relay_envelope, encode_envelope, BlindRelayEnvelope, ChatEnvelope,
 };
 use aeronyx_core::protocol::codec::encode_data_packet;
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
+use aeronyx_core::protocol::onion::{is_onion_blob, try_open_onion_layer};
 use aeronyx_core::protocol::{DataPacket, NodeCapability};
 use aeronyx_transport::traits::Transport;
 use aeronyx_transport::UdpTransport;
@@ -512,6 +513,9 @@ enum BlindRelayError {
 
     #[error("blind relay forward failed")]
     ForwardFailed,
+
+    #[error("onion layer peel failed")]
+    OnionPeelFailed,
 }
 
 impl BlindRelayError {
@@ -523,7 +527,8 @@ impl BlindRelayError {
             | Self::TtlExhausted
             | Self::TimestampExpired
             | Self::TimestampInFuture
-            | Self::RouteLoop => StatusCode::BAD_REQUEST,
+            | Self::RouteLoop
+            | Self::OnionPeelFailed => StatusCode::BAD_REQUEST,
             Self::RateLimited | Self::Quarantined => StatusCode::TOO_MANY_REQUESTS,
             Self::NoRoute | Self::InvalidEndpoint => StatusCode::BAD_GATEWAY,
             Self::ForwardFailed => StatusCode::BAD_GATEWAY,
@@ -544,6 +549,7 @@ impl BlindRelayError {
             Self::NoRoute => "no_route",
             Self::InvalidEndpoint => "invalid_endpoint",
             Self::ForwardFailed => "forward_failed",
+            Self::OnionPeelFailed => "onion_peel_failed",
         }
     }
 }
@@ -785,6 +791,13 @@ async fn process_peer_blind_relay(
     }
 
     if envelope.next_hop == self_node_id {
+        // Onion routing v1: if the opaque blob is an onion layer addressed to
+        // this node, peel exactly one layer and either deliver locally
+        // (terminal) or forward the inner layer to the revealed next hop. Legacy
+        // opaque blobs (no onion magic) fall through to the existing behavior.
+        if is_onion_blob(&envelope.encrypted_blob) {
+            return process_onion_blind_relay(state, previous_hop_node_id, envelope, now).await;
+        }
         if let Some(onward_envelope) = request.onward_envelope {
             return process_onion_middle_blind_relay(
                 state,
@@ -923,6 +936,216 @@ async fn process_peer_blind_relay(
         ttl_remaining,
         reason: Some("forwarded".to_string()),
     })
+}
+
+/// Onion routing v1 — this node is the addressed hop and the opaque blob is an
+/// onion layer. Peel exactly one layer with the node's rotating onion key(s),
+/// then either deliver locally (terminal hop) or forward the revealed inner
+/// layer to the next hop (entry/middle hop).
+///
+/// Privacy invariant: a relay learns only the previous hop (transport auth) and
+/// the immediate next hop (from its own peeled layer). It never sees the
+/// original source, the final destination, or the payload. The onion secret
+/// keys (current + previous within the rotation grace window, see
+/// services::onion_keys) are never logged.
+async fn process_onion_blind_relay(
+    state: ChatPeerState,
+    previous_hop_node_id: [u8; 32],
+    envelope: BlindRelayEnvelope,
+    now: u64,
+) -> Result<PeerBlindRelayResponse, BlindRelayError> {
+    let self_node_id = state.node_identity.public_key_bytes();
+
+    // Per-route replay/dedup, identical to the opaque terminal/forward paths.
+    if observe_blind_relay_route(&state, envelope.route_id, now) {
+        return Ok(duplicate_blind_relay_response(
+            &state,
+            previous_hop_node_id,
+            now,
+            envelope.ttl,
+        ));
+    }
+
+    // Peel exactly one onion layer with the node's rotating onion key(s): the
+    // current key, plus the previous key while it is within the rotation grace
+    // window (forward secrecy — see services::onion_keys). A failure yields a
+    // coarse bucket only, never a payload leak.
+    let onion_secrets = crate::services::onion_keys::peel_secrets(now);
+    let peel = match try_open_onion_layer(&envelope.encrypted_blob, &onion_secrets) {
+        Ok(peel) => peel,
+        Err(_) => {
+            forget_blind_relay_route(&state, &envelope.route_id);
+            reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "onion_peel_failed");
+            return Err(BlindRelayError::OnionPeelFailed);
+        }
+    };
+
+    match peel.next_hop {
+        // Terminal hop: `inner` is the delivered payload (a ChatEnvelope).
+        None => {
+            let inner_envelope = decode_envelope(&peel.inner).map_err(|_| {
+                forget_blind_relay_route(&state, &envelope.route_id);
+                reject_blind_relay_previous_hop(
+                    &state,
+                    previous_hop_node_id,
+                    now,
+                    "onion_terminal_decode_failed",
+                );
+                BlindRelayError::OnionPeelFailed
+            })?;
+
+            // Deliver via the existing zero-knowledge chat relay store-and-forward.
+            // Best-effort: an offline receiver is handled by the relay's pending
+            // queue; a relay error must not leak onto the relay metadata path.
+            let _ = process_peer_relay(state.clone(), inner_envelope).await;
+
+            record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
+            state.peer_store.record_blind_relay_terminal(
+                now,
+                envelope.ttl,
+                envelope.encrypted_blob.len(),
+            );
+            Ok(PeerBlindRelayResponse {
+                accepted: true,
+                terminal: true,
+                forwarded: false,
+                ttl_remaining: envelope.ttl,
+                reason: Some("onion_terminal_delivered".to_string()),
+            })
+        }
+        // Entry/middle hop: forward the inner layer to the revealed next hop.
+        Some(next_hop) => {
+            if next_hop == self_node_id || next_hop == previous_hop_node_id {
+                forget_blind_relay_route(&state, &envelope.route_id);
+                reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "route_loop");
+                return Err(BlindRelayError::RouteLoop);
+            }
+            if !is_onion_blob(&peel.inner) {
+                forget_blind_relay_route(&state, &envelope.route_id);
+                reject_blind_relay_previous_hop(
+                    &state,
+                    previous_hop_node_id,
+                    now,
+                    "onion_inner_not_layer",
+                );
+                return Err(BlindRelayError::OnionPeelFailed);
+            }
+            if !envelope.can_forward() {
+                forget_blind_relay_route(&state, &envelope.route_id);
+                reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "ttl_exhausted");
+                return Err(BlindRelayError::TtlExhausted);
+            }
+
+            let descriptor = state.peer_store.get_valid(&next_hop, now).ok_or_else(|| {
+                forget_blind_relay_route(&state, &envelope.route_id);
+                reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
+                BlindRelayError::NoRoute
+            })?;
+            if !descriptor
+                .descriptor
+                .capabilities
+                .contains(&NodeCapability::ChatRelay)
+            {
+                state.peer_store.record_route_forward_failure(
+                    &next_hop,
+                    now,
+                    "missing_chat_relay_capability",
+                );
+                forget_blind_relay_route(&state, &envelope.route_id);
+                reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
+                return Err(BlindRelayError::NoRoute);
+            }
+            if !state.peer_store.is_routeable_now(&next_hop, now) {
+                state.peer_store.record_route_forward_failure(
+                    &next_hop,
+                    now,
+                    "routeability_not_ready",
+                );
+                forget_blind_relay_route(&state, &envelope.route_id);
+                reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
+                return Err(BlindRelayError::NoRoute);
+            }
+
+            let endpoint = descriptor
+                .descriptor
+                .public_endpoint
+                .as_deref()
+                .ok_or_else(|| {
+                    state.peer_store.record_route_forward_failure(
+                        &next_hop,
+                        now,
+                        "missing_endpoint",
+                    );
+                    forget_blind_relay_route(&state, &envelope.route_id);
+                    reject_blind_relay_previous_hop(
+                        &state,
+                        previous_hop_node_id,
+                        now,
+                        "missing_endpoint",
+                    );
+                    BlindRelayError::InvalidEndpoint
+                })?;
+            let url = blind_peer_relay_url(endpoint).ok_or_else(|| {
+                state
+                    .peer_store
+                    .record_route_forward_failure(&next_hop, now, "invalid_endpoint");
+                forget_blind_relay_route(&state, &envelope.route_id);
+                reject_blind_relay_previous_hop(
+                    &state,
+                    previous_hop_node_id,
+                    now,
+                    "invalid_endpoint",
+                );
+                BlindRelayError::InvalidEndpoint
+            })?;
+
+            // Fresh envelope carrying the peeled inner layer onward. Re-signed by
+            // this node; next_hop is addressed to the revealed relay.
+            let forwarded_envelope = BlindRelayEnvelope {
+                route_id: envelope.route_id,
+                next_hop,
+                ttl: envelope.ttl.saturating_sub(1),
+                encrypted_blob: peel.inner,
+                timestamp: now,
+                signature: [0u8; 64],
+            }
+            .sign_with(state.node_identity.as_ref());
+            let ttl_remaining = forwarded_envelope.ttl;
+
+            if let Err(error) = forward_blind_relay_with_retry(
+                &state,
+                &url,
+                next_hop,
+                PeerBlindRelayRequest {
+                    envelope: forwarded_envelope,
+                    previous_hop_node_id: self_node_id,
+                    onward_envelope: None,
+                },
+                now,
+            )
+            .await
+            {
+                forget_blind_relay_route(&state, &envelope.route_id);
+                return Err(error);
+            }
+
+            state
+                .peer_store
+                .record_route_forward_success(&next_hop, now);
+            record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
+            state
+                .peer_store
+                .record_blind_relay_forwarded(now, ttl_remaining);
+
+            Ok(PeerBlindRelayResponse {
+                accepted: true,
+                terminal: false,
+                forwarded: true,
+                ttl_remaining,
+                reason: Some("onion_forwarded".to_string()),
+            })
+        }
+    }
 }
 
 async fn process_onion_middle_blind_relay(
@@ -1767,6 +1990,104 @@ mod tests {
                 && event.outcome == "rejected"
                 && event.detail == "timestamp_in_future"
         }));
+    }
+
+    #[tokio::test]
+    async fn onion_terminal_layer_is_peeled_and_delivered() {
+        use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
+
+        let source = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let peer_store = Arc::new(PeerStore::new());
+        let state = ChatPeerState {
+            chat_relay: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&node_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let now = now_secs();
+
+        // Single-hop onion addressed to this node; inner payload is a ChatEnvelope.
+        let inner = encode_envelope(&signed_envelope()).unwrap();
+        let hop = OnionHop {
+            node_id: node_identity.public_key_bytes(),
+            // Build to the node's CURRENT rotating onion key — what the handler
+            // peels with (not the identity-derived key).
+            kem_pub: crate::services::onion_keys::current_public_key(),
+        };
+        let envelope = build_onion_envelope(&[hop], &inner, [0x55u8; 16], 4, now, &source).unwrap();
+        assert!(is_onion_blob(&envelope.encrypted_blob));
+
+        let result = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: source.public_key_bytes(),
+                onward_envelope: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(result.terminal);
+        assert!(!result.forwarded);
+        assert_eq!(result.reason.as_deref(), Some("onion_terminal_delivered"));
+        let blind_stats = peer_store.status(now + 1).runtime.blind_relay;
+        assert_eq!(blind_stats.terminal, 1);
+        assert_eq!(blind_stats.rejected, 0);
+    }
+
+    #[tokio::test]
+    async fn onion_layer_with_wrong_node_key_is_rejected() {
+        use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
+
+        let source = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let wrong_target = IdentityKeyPair::generate();
+        let peer_store = Arc::new(PeerStore::new());
+        let state = ChatPeerState {
+            chat_relay: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&node_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let now = now_secs();
+
+        // Layer is sealed to a different node's KEM key, but addressed (next_hop)
+        // to this node — peel must fail without leaking anything.
+        let inner = encode_envelope(&signed_envelope()).unwrap();
+        let sealed_for_wrong = OnionHop {
+            node_id: node_identity.public_key_bytes(),
+            kem_pub: wrong_target.x25519_public_key_bytes(),
+        };
+        let envelope =
+            build_onion_envelope(&[sealed_for_wrong], &inner, [0x56u8; 16], 4, now, &source)
+                .unwrap();
+
+        let result = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: source.public_key_bytes(),
+                onward_envelope: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(BlindRelayError::OnionPeelFailed)));
+        let blind_stats = peer_store.status(now + 1).runtime.blind_relay;
+        assert_eq!(blind_stats.terminal, 0);
+        assert_eq!(blind_stats.rejected, 1);
     }
 
     #[tokio::test]

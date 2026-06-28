@@ -178,6 +178,7 @@ arc-swap = { workspace = true }
 
 # Cryptography (for key management)
 rand = { workspace = true }
+x25519-dalek = { workspace = true }
 base64 = { workspace = true }
 blind-rsa-signatures = "0.17.2"
 

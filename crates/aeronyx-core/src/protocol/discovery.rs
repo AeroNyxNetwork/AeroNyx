@@ -68,7 +68,7 @@ use crate::error::CoreError;
 const MAX_DESCRIPTOR_BYTES: u64 = 16 * 1024;
 
 /// Current signed descriptor schema version.
-pub const NODE_DESCRIPTOR_SCHEMA_VERSION: u16 = 1;
+pub const NODE_DESCRIPTOR_SCHEMA_VERSION: u16 = 2;
 
 /// Current bootstrap snapshot schema version.
 pub const NODE_BOOTSTRAP_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
@@ -201,6 +201,18 @@ pub struct NodeDescriptor {
     pub capacity: NodeCapacity,
     /// Public policy hints.
     pub policy: NodePolicy,
+    /// KEM algorithm id for the onion-routing per-hop key (schema v2+).
+    ///
+    /// `0` = none (node is not an onion hop), `1` = X25519 (`KEM_ALG_X25519`),
+    /// `2` = reserved for the hybrid post-quantum X-Wing KEM. A node's X25519
+    /// public key is NOT derivable from its Ed25519 `node_id`, so it must be
+    /// published here for clients to build onion layers addressed to this node.
+    pub kem_alg: u8,
+    /// KEM public key bytes for onion layer encryption (schema v2+).
+    ///
+    /// All-zero when `kem_alg == 0`. For `kem_alg == 1` this is the node's
+    /// X25519 public key (`IdentityKeyPair::x25519_public_key_bytes()`).
+    pub kem_public: [u8; 32],
 }
 
 impl NodeDescriptor {
@@ -224,6 +236,28 @@ impl NodeDescriptor {
             capabilities: Vec::new(),
             capacity: NodeCapacity::default(),
             policy: NodePolicy::default(),
+            kem_alg: 0,
+            kem_public: [0u8; 32],
+        }
+    }
+
+    /// Publishes an X25519 KEM public key so this node can serve as an onion
+    /// hop. Sets `kem_alg = 1` (`KEM_ALG_X25519`).
+    #[must_use]
+    pub fn with_x25519_kem(mut self, kem_public: [u8; 32]) -> Self {
+        self.kem_alg = 1;
+        self.kem_public = kem_public;
+        self
+    }
+
+    /// Returns the published X25519 KEM key if this node advertises one
+    /// (`kem_alg == 1` and the key is non-zero), else `None`.
+    #[must_use]
+    pub fn x25519_kem_public(&self) -> Option<[u8; 32]> {
+        if self.kem_alg == 1 && self.kem_public != [0u8; 32] {
+            Some(self.kem_public)
+        } else {
+            None
         }
     }
 
@@ -282,7 +316,11 @@ impl SignedNodeDescriptor {
     /// not yet valid, has an unsupported schema version, or signature
     /// verification fails.
     pub fn verify_at(&self, now: u64) -> Result<(), CoreError> {
-        if self.descriptor.schema_version != NODE_DESCRIPTOR_SCHEMA_VERSION {
+        // Accept any known schema (1 = pre-onion, 2 = onion KEM key). A v1
+        // descriptor simply advertises no onion KEM key. Reject unknown/newer.
+        if self.descriptor.schema_version == 0
+            || self.descriptor.schema_version > NODE_DESCRIPTOR_SCHEMA_VERSION
+        {
             return Err(CoreError::SignatureVerification);
         }
         if !self.descriptor.is_valid_at(now) {
@@ -304,7 +342,11 @@ impl SignedNodeDescriptor {
     /// Returns `CoreError::SignatureVerification` if the schema version is
     /// unsupported or signature verification fails.
     pub fn verify_signature(&self) -> Result<(), CoreError> {
-        if self.descriptor.schema_version != NODE_DESCRIPTOR_SCHEMA_VERSION {
+        // Accept any known schema (1 = pre-onion, 2 = onion KEM key). A v1
+        // descriptor simply advertises no onion KEM key. Reject unknown/newer.
+        if self.descriptor.schema_version == 0
+            || self.descriptor.schema_version > NODE_DESCRIPTOR_SCHEMA_VERSION
+        {
             return Err(CoreError::SignatureVerification);
         }
 
@@ -496,6 +538,39 @@ mod tests {
         assert!(signed.verify_at(1_700_000_100).is_ok());
         assert_eq!(signed.node_id(), kp.public_key_bytes());
         assert_eq!(signed.sequence(), 7);
+    }
+
+    #[test]
+    fn test_descriptor_publishes_x25519_kem_key() {
+        let kp = IdentityKeyPair::generate();
+        let kem = kp.x25519_public_key_bytes();
+        let descriptor = descriptor_for(&kp).with_x25519_kem(kem);
+        assert_eq!(descriptor.schema_version, NODE_DESCRIPTOR_SCHEMA_VERSION);
+        assert_eq!(descriptor.kem_alg, 1);
+        assert_eq!(descriptor.x25519_kem_public(), Some(kem));
+
+        // KEM key is covered by the signature and survives encode/decode.
+        let signed = SignedNodeDescriptor::sign(descriptor, &kp).unwrap();
+        assert!(signed.verify_at(1_700_000_100).is_ok());
+        let bytes = encode_discovery_message(&NodeDiscoveryMessage::DescriptorAnnounce {
+            descriptor: signed.clone(),
+        })
+        .unwrap();
+        let decoded = decode_discovery_message(&bytes).unwrap();
+        if let NodeDiscoveryMessage::DescriptorAnnounce { descriptor } = decoded {
+            assert_eq!(descriptor.descriptor.x25519_kem_public(), Some(kem));
+            assert!(descriptor.verify_at(1_700_000_100).is_ok());
+        } else {
+            panic!("unexpected discovery message variant");
+        }
+    }
+
+    #[test]
+    fn test_descriptor_without_kem_reports_none() {
+        let kp = IdentityKeyPair::generate();
+        let descriptor = descriptor_for(&kp);
+        assert_eq!(descriptor.kem_alg, 0);
+        assert_eq!(descriptor.x25519_kem_public(), None);
     }
 
     #[test]

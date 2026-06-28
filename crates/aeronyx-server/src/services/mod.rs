@@ -25,6 +25,7 @@ pub mod handshake;
 pub mod ip_pool;
 pub mod memchain;
 pub mod node_policy;
+pub mod onion_keys;
 pub mod peer_store;
 pub mod routing;
 pub mod session;

@@ -63,6 +63,7 @@ pub mod codec;
 pub mod discovery;
 pub mod memchain;
 pub mod messages;
+pub mod onion;
 pub mod version;
 
 // Re-export primary types
@@ -79,4 +80,8 @@ pub use discovery::{
 };
 pub use memchain::{decode_memchain, encode_memchain, MemChainMessage, MEMCHAIN_MAGIC};
 pub use messages::{ClientHello, DataPacket, MessageType, ServerHello};
+pub use onion::{
+    build_onion_envelope, is_onion_blob, open_onion_layer, OnionHop, OnionPeel, KEM_ALG_X25519,
+    KEM_ALG_XWING, ONION_MAGIC, ONION_SALT,
+};
 pub use version::{ProtocolVersion, CURRENT_PROTOCOL_VERSION};
