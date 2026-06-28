@@ -36,11 +36,20 @@
 //!   magic:   [0xA0, 0x01]   (2B  — ONION_V1 marker)
 //!   eph_pub: [u8; 32]       (client ephemeral X25519 public for THIS hop)
 //!   nonce:   [u8; 24]       (random XChaCha20 nonce)
-//!   ct:      Vec<u8>        (XChaCha20-Poly1305 over the encoded OnionHopPayload)
+//!   ct:      [u8]           (XChaCha20-Poly1305 over the encoded OnionHopPayload)
 //! ```
 //! Key derivation (both sides identical):
 //! `key = HKDF-SHA256(ikm = ECDH(eph, hop_kem), salt = ONION_SALT,
 //!                    info = eph_pub || hop_kem_pub, len = 32)`.
+//! No AEAD AAD is used; the key already binds `eph_pub` and `hop_kem_pub`.
+//!
+//! The decrypted plaintext is an `OnionHopPayload`, encoded as:
+//! ```text
+//!   flags:     u8        (bit0: 1 = forward / next_hop present, 0 = terminal)
+//!   next_hop:  [u8; 32]  (present ONLY when flags bit0 == 1)
+//!   inner_len: u32 LE
+//!   inner:     [u8; inner_len]
+//! ```
 //!
 //! ## Threat model (v1)
 //! Honest-but-curious relays. v1 does NOT defend against a *global passive
@@ -50,7 +59,9 @@
 //! upgrade. See `docs/onion-routing-v1-spec.md`.
 //!
 //! ## ⚠️ Important Notes for Next Developer
-//! - The `OnionHopPayload` bincode layout is a wire contract. Do NOT reorder
+//! - Both byte layouts (the layer header below and the `OnionHopPayload` in
+//!   `encode_payload`) are wire contracts shared with non-Rust clients. They are
+//!   explicit byte layouts (no Rust serialization library). Do NOT reorder
 //!   fields. Add new fields only with a versioned magic (e.g. `[0xA0, 0x02]`).
 //! - `open_onion_layer` must never log plaintext or the peeled `inner` bytes.
 //! - A relay's X25519 *public* key is NOT derivable from its Ed25519 `node_id`
@@ -60,11 +71,9 @@
 //! ## Last Modified
 //! v1.0.0-OnionV1 — Initial layered onion construction over the blind relay frame
 
-use bincode::Options;
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroize;
@@ -95,8 +104,9 @@ pub const KEM_ALG_XWING: u8 = 2;
 /// Fixed layer header length: magic(2) + eph_pub(32) + nonce(24).
 const LAYER_HEADER_LEN: usize = 2 + 32 + 24;
 
-/// Upper bound for a decoded `OnionHopPayload` (matches the blind relay frame cap).
-const MAX_ONION_PAYLOAD_BYTES: u64 = 256 * 1024;
+/// Upper bound for a decoded `OnionHopPayload` inner field (matches the blind
+/// relay frame cap).
+const MAX_ONION_PAYLOAD_BYTES: usize = 256 * 1024;
 
 // ============================================
 // Types
@@ -121,9 +131,11 @@ pub struct OnionPeel {
     pub inner: Vec<u8>,
 }
 
-/// Plaintext carried inside one onion layer. Bincode positional layout is a
-/// wire contract — do not reorder.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Plaintext carried inside one onion layer. Encoded with an explicit,
+/// language-neutral byte layout (see `encode_payload`) so non-Rust clients can
+/// produce it without a Rust serialization library — the layout is a wire
+/// contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct OnionHopPayload {
     next_hop: Option<[u8; 32]>,
     inner: Vec<u8>,
@@ -307,20 +319,69 @@ fn derive_layer_key(
     Ok(key)
 }
 
+/// Encodes an `OnionHopPayload` with an explicit, language-neutral byte layout
+/// (so non-Rust clients do not need a Rust serialization library):
+/// ```text
+///   flags:     u8        // bit0: 1 = forward (next_hop present), 0 = terminal
+///   next_hop:  [u8; 32]  // present ONLY when flags bit0 == 1
+///   inner_len: u32 LE    // length of inner, <= MAX_ONION_PAYLOAD_BYTES
+///   inner:     [u8; inner_len]
+/// ```
 fn encode_payload(payload: &OnionHopPayload) -> Result<Vec<u8>, CoreError> {
-    bincode::options()
-        .with_fixint_encoding()
-        .with_limit(MAX_ONION_PAYLOAD_BYTES)
-        .serialize(payload)
-        .map_err(|err| CoreError::malformed(format!("onion payload encode: {err}")))
+    if payload.inner.len() > MAX_ONION_PAYLOAD_BYTES {
+        return Err(CoreError::malformed("onion payload: inner too large"));
+    }
+    let mut out = Vec::with_capacity(1 + 32 + 4 + payload.inner.len());
+    match &payload.next_hop {
+        Some(next_hop) => {
+            out.push(0x01);
+            out.extend_from_slice(next_hop);
+        }
+        None => out.push(0x00),
+    }
+    out.extend_from_slice(&(payload.inner.len() as u32).to_le_bytes());
+    out.extend_from_slice(&payload.inner);
+    Ok(out)
 }
 
 fn decode_payload(bytes: &[u8]) -> Result<OnionHopPayload, CoreError> {
-    bincode::options()
-        .with_fixint_encoding()
-        .with_limit(MAX_ONION_PAYLOAD_BYTES)
-        .deserialize(bytes)
-        .map_err(|err| CoreError::malformed(format!("onion payload decode: {err}")))
+    let mut cursor = 0usize;
+    let flags = *bytes
+        .get(cursor)
+        .ok_or_else(|| CoreError::malformed("onion payload: missing flags"))?;
+    cursor += 1;
+
+    let next_hop = if flags & 0x01 == 0x01 {
+        let slice = bytes
+            .get(cursor..cursor + 32)
+            .ok_or_else(|| CoreError::malformed("onion payload: truncated next_hop"))?;
+        let mut next_hop = [0u8; 32];
+        next_hop.copy_from_slice(slice);
+        cursor += 32;
+        Some(next_hop)
+    } else {
+        None
+    };
+
+    let len_slice = bytes
+        .get(cursor..cursor + 4)
+        .ok_or_else(|| CoreError::malformed("onion payload: truncated length"))?;
+    let inner_len = u32::from_le_bytes(len_slice.try_into().expect("4-byte slice")) as usize;
+    cursor += 4;
+    if inner_len > MAX_ONION_PAYLOAD_BYTES {
+        return Err(CoreError::malformed("onion payload: inner too large"));
+    }
+
+    let inner = bytes
+        .get(cursor..cursor + inner_len)
+        .ok_or_else(|| CoreError::malformed("onion payload: truncated inner"))?
+        .to_vec();
+    cursor += inner_len;
+    if cursor != bytes.len() {
+        return Err(CoreError::malformed("onion payload: trailing bytes"));
+    }
+
+    Ok(OnionHopPayload { next_hop, inner })
 }
 
 // ============================================
@@ -477,6 +538,36 @@ mod tests {
         // No correct key → fail.
         let only_wrong = [x25519_secret(&wrong)];
         assert!(try_open_onion_layer(&env.encrypted_blob, &only_wrong).is_err());
+    }
+
+    #[test]
+    fn payload_byte_layout_is_explicit() {
+        // Terminal: flags=0x00, then inner_len(LE u32)=3, then inner.
+        let terminal = OnionHopPayload {
+            next_hop: None,
+            inner: vec![1, 2, 3],
+        };
+        assert_eq!(
+            encode_payload(&terminal).unwrap(),
+            vec![0x00, 0x03, 0x00, 0x00, 0x00, 1, 2, 3]
+        );
+
+        // Forward: flags=0x01, next_hop(32B), inner_len=1, inner.
+        let forward = OnionHopPayload {
+            next_hop: Some([0xAB; 32]),
+            inner: vec![9],
+        };
+        let encoded = encode_payload(&forward).unwrap();
+        assert_eq!(encoded[0], 0x01);
+        assert_eq!(&encoded[1..33], &[0xAB; 32]);
+        assert_eq!(&encoded[33..37], &[0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(encoded[37], 9);
+
+        // Round-trips, and rejects trailing garbage.
+        assert_eq!(decode_payload(&encoded).unwrap(), forward);
+        let mut trailing = encoded.clone();
+        trailing.push(0xFF);
+        assert!(decode_payload(&trailing).is_err());
     }
 
     #[test]
