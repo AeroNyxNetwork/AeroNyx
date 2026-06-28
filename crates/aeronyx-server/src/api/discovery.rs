@@ -65,7 +65,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aeronyx_core::protocol::{NodeBootstrapSnapshot, NodeDiscoveryMessage};
+use aeronyx_core::protocol::{NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -189,6 +189,42 @@ impl RateLimitState {
 struct SnapshotQuery {
     limit: Option<usize>,
     public_only: Option<bool>,
+}
+
+/// Query for the onion relay candidate endpoint.
+#[derive(Debug, Deserialize)]
+struct OnionCandidatesQuery {
+    limit: Option<usize>,
+}
+
+/// One onion-routing relay candidate: the signed, public node discovery
+/// metadata a client needs to build an onion layer addressed to this hop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnionRelayCandidate {
+    /// Relay Ed25519 node id, hex-encoded.
+    pub node_id: String,
+    /// KEM algorithm id (1 = X25519; 2 = X-Wing, reserved).
+    pub kem_alg: u8,
+    /// Relay KEM public key, hex-encoded — build the onion layer against this.
+    pub kem_public: String,
+    /// Public control-plane endpoint for node-to-node relay traffic.
+    pub public_endpoint: String,
+    /// Advertised capability flags (lets the client pick middle vs exit hops).
+    pub capabilities: Vec<NodeCapability>,
+}
+
+/// Response for `GET /api/discovery/onion-candidates`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnionCandidatesResponse {
+    /// Unix timestamp when the candidate set was generated.
+    pub generated_at: u64,
+    /// Number of candidates returned.
+    pub count: usize,
+    /// Health-ranked onion relay candidates; each advertises a KEM key and a
+    /// reachable public endpoint.
+    pub candidates: Vec<OnionRelayCandidate>,
+    /// Explicit privacy boundary for downstream consumers.
+    pub privacy_boundary: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -500,6 +536,10 @@ pub fn build_discovery_router_with_local_status(
         .route("/api/discovery/snapshot", get(snapshot_handler))
         .route("/api/discovery/gossip", post(gossip_handler))
         .route("/api/discovery/status", get(status_handler))
+        .route(
+            "/api/discovery/onion-candidates",
+            get(onion_candidates_handler),
+        )
         .with_state(state)
 }
 
@@ -519,6 +559,47 @@ async fn snapshot_handler(
         query.public_only.unwrap_or(true),
         Some(limit),
     ))
+}
+
+/// `GET /api/discovery/onion-candidates` — health-ranked onion relay candidates
+/// for client-side path selection.
+///
+/// Each candidate advertises a KEM public key (so the client can build an onion
+/// layer addressed to it) and a reachable public endpoint. Only signed, public
+/// node discovery metadata is exposed — never client traffic, route ids, or
+/// payloads. Candidates without a KEM key or a public endpoint are filtered out
+/// (they cannot serve as an onion hop). Because the KEM key rotates on the
+/// relay's onion-key schedule, clients should fetch fresh candidates rather than
+/// caching keys for long periods.
+async fn onion_candidates_handler(
+    State(state): State<DiscoveryApiState>,
+    Query(query): Query<OnionCandidatesQuery>,
+) -> Json<OnionCandidatesResponse> {
+    let now = now_secs();
+    let limit = state.policy.snapshot_limit(query.limit);
+    let candidates: Vec<OnionRelayCandidate> = state
+        .peer_store
+        .route_candidates_with_capability(NodeCapability::ChatRelay, now, limit)
+        .into_iter()
+        .filter_map(|descriptor| {
+            let kem_public = descriptor.descriptor.x25519_kem_public()?;
+            let public_endpoint = descriptor.descriptor.public_endpoint.clone()?;
+            Some(OnionRelayCandidate {
+                node_id: hex::encode(descriptor.node_id()),
+                kem_alg: descriptor.descriptor.kem_alg,
+                kem_public: hex::encode(kem_public),
+                public_endpoint,
+                capabilities: descriptor.descriptor.capabilities.clone(),
+            })
+        })
+        .collect();
+
+    Json(OnionCandidatesResponse {
+        generated_at: now,
+        count: candidates.len(),
+        candidates,
+        privacy_boundary: "signed node discovery metadata only (node id, KEM public key, public endpoint, capabilities); no client IPs, route ids, encrypted payloads, receiver identities, DNS contents, destinations, voucher secrets, private keys, or wallet-level traffic".to_string(),
+    })
 }
 
 async fn gossip_handler(
@@ -668,6 +749,71 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_onion_candidates_endpoint_exposes_kem_for_relays() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+
+        // (a) ChatRelay relay advertising a KEM key + endpoint -> included.
+        let kp = IdentityKeyPair::generate();
+        let kem = kp.x25519_public_key_bytes();
+        let mut included = NodeDescriptor::new(
+            kp.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now + 300,
+            "test",
+        );
+        included.capabilities = vec![NodeCapability::ChatRelay];
+        included.public_endpoint = Some("relay.example:443".to_string());
+        let included = included.with_x25519_kem(kem);
+        let included = aeronyx_core::protocol::SignedNodeDescriptor::sign(included, &kp).unwrap();
+        let want_node_id = hex::encode(included.node_id());
+        store.upsert_verified(included, now).unwrap();
+
+        // (b) ChatRelay relay WITHOUT a KEM key -> filtered out (cannot be a hop).
+        let kp2 = IdentityKeyPair::generate();
+        let mut no_kem = NodeDescriptor::new(
+            kp2.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now + 300,
+            "test",
+        );
+        no_kem.capabilities = vec![NodeCapability::ChatRelay];
+        no_kem.public_endpoint = Some("nokem.example:443".to_string());
+        let no_kem = aeronyx_core::protocol::SignedNodeDescriptor::sign(no_kem, &kp2).unwrap();
+        store.upsert_verified(no_kem, now).unwrap();
+
+        let app = build_discovery_router(store, DiscoveryApiPolicy::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+
+        // Only the KEM-bearing relay is exposed, with its KEM key for the client.
+        assert_eq!(parsed.count, 1);
+        assert_eq!(parsed.candidates.len(), 1);
+        let candidate = &parsed.candidates[0];
+        assert_eq!(candidate.node_id, want_node_id);
+        assert_eq!(candidate.kem_alg, 1);
+        assert_eq!(candidate.kem_public, hex::encode(kem));
+        assert_eq!(candidate.public_endpoint, "relay.example:443");
+        assert!(candidate.capabilities.contains(&NodeCapability::ChatRelay));
     }
 
     #[tokio::test]
