@@ -453,13 +453,18 @@ impl HeartbeatReporter {
                             Vec::new()
                         };
 
-                    // v1.0.0-Membership: drain per-wallet traffic deltas.
-                    let traffic_delta: HashMap<String, TrafficDelta> =
-                        if let Some(ref t) = self.traffic {
-                            t.drain()
-                        } else {
-                            HashMap::new()
-                        };
+                    // [2026-06-29] Voucher-allowance quota model: per-wallet byte
+                    // deltas are NOT reported to CMS. VPN auth uses blind-signature
+                    // (RSA-PSS) vouchers, so the client connection key is
+                    // cryptographically UNLINKABLE to a wallet — CMS cannot attribute
+                    // bytes to an account (it only logged "unknown wallet" every
+                    // heartbeat). Per-account quota is enforced at voucher ISSUANCE,
+                    // not by metering node-reported bytes. Drain the local tracker to
+                    // bound memory, but report an empty map.
+                    if let Some(ref t) = self.traffic {
+                        let _ = t.drain();
+                    }
+                    let traffic_delta: HashMap<String, TrafficDelta> = HashMap::new();
 
                     let timeout_secs = if in_cold_start { COLD_START_TIMEOUT_SECS } else { 60 };
 
