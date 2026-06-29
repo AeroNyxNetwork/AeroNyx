@@ -377,6 +377,8 @@ pub fn discovery_readiness_status_value(
     let local_relay_ready = local_capabilities.safe_to_advertise_chat_relay;
     let peer_mesh_ready = peer_quorum.quorum_ready;
     let blind_relay_ready = blind_relay_quality.runtime_ready && blind_relay_quality.quality_ready;
+    let two_hop_path_ready =
+        network_story.chat_two_hop_onion_ready || blind_relay_quality.two_hop_probe_ready;
     let restart_recovery_ready = peer_quorum.restart_recovery_configured;
     let checks_total = 4u8;
     let checks_passed = [
@@ -399,7 +401,7 @@ pub fn discovery_readiness_status_value(
     } else {
         "pending"
     };
-    let foundation_stage = if network_story.chat_two_hop_onion_ready {
+    let foundation_stage = if two_hop_path_ready {
         "two_hop_path_ready"
     } else if network_story.chat_single_hop_ready || blind_relay_ready {
         "single_hop_relay_ready"
@@ -438,7 +440,12 @@ pub fn discovery_readiness_status_value(
             "blind_relay_ready": blind_relay_ready,
             "restart_recovery_ready": restart_recovery_ready,
             "single_hop_relay_ready": network_story.chat_single_hop_ready,
-            "two_hop_onion_ready": network_story.chat_two_hop_onion_ready,
+            "two_hop_onion_ready": two_hop_path_ready,
+            "two_hop_path_proof_ready": blind_relay_quality.two_hop_probe_ready,
+            "two_hop_probe_attempted": blind_relay_quality.two_hop_probe_attempted,
+            "two_hop_probe_succeeded": blind_relay_quality.two_hop_probe_succeeded,
+            "two_hop_probe_failed": blind_relay_quality.two_hop_probe_failed,
+            "last_two_hop_probe_age_seconds": blind_relay_quality.last_two_hop_probe_age_seconds,
             "verified_peer_count": peer_quorum.valid_peers,
             "routeable_relay_count": peer_quorum.routeable_chat_relays,
             "last_probe_age_seconds": blind_relay_quality.last_probe_age_seconds,
@@ -496,11 +503,16 @@ pub fn discovery_readiness_status_value(
             "probe_attempted": blind_relay_quality.probe_attempted,
             "probe_succeeded": blind_relay_quality.probe_succeeded,
             "probe_failed": blind_relay_quality.probe_failed,
+            "two_hop_probe_ready": blind_relay_quality.two_hop_probe_ready,
+            "two_hop_probe_attempted": blind_relay_quality.two_hop_probe_attempted,
+            "two_hop_probe_succeeded": blind_relay_quality.two_hop_probe_succeeded,
+            "two_hop_probe_failed": blind_relay_quality.two_hop_probe_failed,
             "timestamp_rejected": blind_relay_quality.timestamp_rejected,
             "protection_active": blind_relay_quality.protection_active,
             "accepted_percent": blind_relay_quality.accepted_percent,
             "last_event_age_seconds": blind_relay_quality.last_event_age_seconds,
             "last_probe_age_seconds": blind_relay_quality.last_probe_age_seconds,
+            "last_two_hop_probe_age_seconds": blind_relay_quality.last_two_hop_probe_age_seconds,
             "next_action": &blind_relay_quality.next_action,
         },
         "source": "rust_discovery_readiness",
@@ -1045,6 +1057,16 @@ mod tests {
             Some(false)
         );
         assert_eq!(
+            parsed["discovery_readiness"]["protocol_foundation"]["two_hop_path_proof_ready"]
+                .as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["protocol_foundation"]["two_hop_probe_succeeded"]
+                .as_u64(),
+            Some(0)
+        );
+        assert_eq!(
             parsed["discovery_readiness"]["protocol_foundation"]["privacy_invariant"].as_str(),
             Some("blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status")
         );
@@ -1070,6 +1092,10 @@ mod tests {
         );
         assert_eq!(
             parsed["discovery_readiness"]["blind_relay_runtime"]["synthetic_probe_ready"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["blind_relay_runtime"]["two_hop_probe_ready"].as_bool(),
             Some(false)
         );
         assert_eq!(
