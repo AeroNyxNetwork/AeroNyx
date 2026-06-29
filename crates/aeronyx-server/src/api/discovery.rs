@@ -46,6 +46,7 @@
 //!   used by both public/local discovery status and backend heartbeat reports.
 //!
 //! ## Last Modified
+//! v0.9.3-OnionCandidatesRouteabilityGate - Only expose fresh routeable onion candidates to clients
 //! v0.9.2-BlindRelayFreshnessGuard - Expose timestamp rejection aggregate in compact readiness
 //! v0.9.1-BlindRelayReadinessReason - Expose privacy-safe relay readiness reason
 //! v0.9.0-ProtocolFoundationSummary - Add product-facing privacy protocol foundation readiness
@@ -568,9 +569,11 @@ async fn snapshot_handler(
 /// layer addressed to it) and a reachable public endpoint. Only signed, public
 /// node discovery metadata is exposed — never client traffic, route ids, or
 /// payloads. Candidates without a KEM key or a public endpoint are filtered out
-/// (they cannot serve as an onion hop). Because the KEM key rotates on the
-/// relay's onion-key schedule, clients should fetch fresh candidates rather than
-/// caching keys for long periods.
+/// (they cannot serve as an onion hop). Candidates also need fresh routeability
+/// evidence from local probes or successful forwards; signed descriptors prove
+/// identity/capability, but they do not prove the endpoint is currently usable.
+/// Because the KEM key rotates on the relay's onion-key schedule, clients should
+/// fetch fresh candidates rather than caching keys for long periods.
 async fn onion_candidates_handler(
     State(state): State<DiscoveryApiState>,
     Query(query): Query<OnionCandidatesQuery>,
@@ -582,10 +585,14 @@ async fn onion_candidates_handler(
         .route_candidates_with_capability(NodeCapability::ChatRelay, now, limit)
         .into_iter()
         .filter_map(|descriptor| {
+            let node_id = descriptor.node_id();
+            if !state.peer_store.is_routeable_now(&node_id, now) {
+                return None;
+            }
             let kem_public = descriptor.descriptor.x25519_kem_public()?;
             let public_endpoint = descriptor.descriptor.public_endpoint.clone()?;
             Some(OnionRelayCandidate {
-                node_id: hex::encode(descriptor.node_id()),
+                node_id: hex::encode(node_id),
                 kem_alg: descriptor.descriptor.kem_alg,
                 kem_public: hex::encode(kem_public),
                 public_endpoint,
@@ -598,7 +605,7 @@ async fn onion_candidates_handler(
         generated_at: now,
         count: candidates.len(),
         candidates,
-        privacy_boundary: "signed node discovery metadata only (node id, KEM public key, public endpoint, capabilities); no client IPs, route ids, encrypted payloads, receiver identities, DNS contents, destinations, voucher secrets, private keys, or wallet-level traffic".to_string(),
+        privacy_boundary: "fresh routeable signed node discovery metadata only (node id, KEM public key, public endpoint, capabilities); no client IPs, route ids, encrypted payloads, receiver identities, DNS contents, destinations, voucher secrets, private keys, or wallet-level traffic".to_string(),
     })
 }
 
@@ -752,11 +759,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_onion_candidates_endpoint_exposes_kem_for_relays() {
+    async fn test_onion_candidates_endpoint_exposes_routeable_kem_relays() {
         let store = Arc::new(PeerStore::new());
         let now = now_secs();
 
-        // (a) ChatRelay relay advertising a KEM key + endpoint -> included.
+        // (a) Routeable ChatRelay relay advertising a KEM key + endpoint -> included.
         let kp = IdentityKeyPair::generate();
         let kem = kp.x25519_public_key_bytes();
         let mut included = NodeDescriptor::new(
@@ -771,7 +778,9 @@ mod tests {
         let included = included.with_x25519_kem(kem);
         let included = aeronyx_core::protocol::SignedNodeDescriptor::sign(included, &kp).unwrap();
         let want_node_id = hex::encode(included.node_id());
+        let included_node_id = included.node_id();
         store.upsert_verified(included, now).unwrap();
+        store.record_route_forward_success(&included_node_id, now);
 
         // (b) ChatRelay relay WITHOUT a KEM key -> filtered out (cannot be a hop).
         let kp2 = IdentityKeyPair::generate();
@@ -786,6 +795,23 @@ mod tests {
         no_kem.public_endpoint = Some("nokem.example:443".to_string());
         let no_kem = aeronyx_core::protocol::SignedNodeDescriptor::sign(no_kem, &kp2).unwrap();
         store.upsert_verified(no_kem, now).unwrap();
+
+        // (c) KEM-bearing ChatRelay without routeability evidence -> filtered
+        // out. This keeps clients from building paths through unknown peers
+        // while allowing internal probes to continue learning about them.
+        let kp3 = IdentityKeyPair::generate();
+        let mut unknown = NodeDescriptor::new(
+            kp3.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now + 300,
+            "test",
+        );
+        unknown.capabilities = vec![NodeCapability::ChatRelay];
+        unknown.public_endpoint = Some("unknown.example:443".to_string());
+        let unknown = unknown.with_x25519_kem(kp3.x25519_public_key_bytes());
+        let unknown = aeronyx_core::protocol::SignedNodeDescriptor::sign(unknown, &kp3).unwrap();
+        store.upsert_verified(unknown, now).unwrap();
 
         let app = build_discovery_router(store, DiscoveryApiPolicy::default());
         let response = app
@@ -805,7 +831,7 @@ mod tests {
             .unwrap();
         let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
 
-        // Only the KEM-bearing relay is exposed, with its KEM key for the client.
+        // Only the routeable KEM-bearing relay is exposed, with its KEM key for the client.
         assert_eq!(parsed.count, 1);
         assert_eq!(parsed.candidates.len(), 1);
         let candidate = &parsed.candidates[0];
@@ -814,6 +840,7 @@ mod tests {
         assert_eq!(candidate.kem_public, hex::encode(kem));
         assert_eq!(candidate.public_endpoint, "relay.example:443");
         assert!(candidate.capabilities.contains(&NodeCapability::ChatRelay));
+        assert!(parsed.privacy_boundary.contains("fresh routeable"));
     }
 
     #[tokio::test]

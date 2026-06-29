@@ -44,6 +44,7 @@
 //!   exit behavior through a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.5.0-DescriptorKemBackwardCompatibility - Accept schema v1 descriptors without KEM fields
 //! v0.4.0-DiscoverySignatureOnlyVerify - Added signature-only verification for expired peer-cache retention
 //! v0.1.0-DiscoveryPhase1 - Initial signed descriptor primitives
 //! v0.2.0-DiscoveryPhase2 - Added bounded bootstrap snapshot type
@@ -207,12 +208,56 @@ pub struct NodeDescriptor {
     /// `2` = reserved for the hybrid post-quantum X-Wing KEM. A node's X25519
     /// public key is NOT derivable from its Ed25519 `node_id`, so it must be
     /// published here for clients to build onion layers addressed to this node.
+    #[serde(default)]
     pub kem_alg: u8,
     /// KEM public key bytes for onion layer encryption (schema v2+).
     ///
     /// All-zero when `kem_alg == 0`. For `kem_alg == 1` this is the node's
     /// X25519 public key (`IdentityKeyPair::x25519_public_key_bytes()`).
+    #[serde(default)]
     pub kem_public: [u8; 32],
+}
+
+/// Legacy schema-v1 descriptor layout used before onion KEM fields existed.
+///
+/// This is intentionally private and used only to verify old signed peer-cache
+/// and bootstrap records. The public descriptor type keeps v2 fields so new
+/// nodes publish onion KEM material, while schema-v1 signatures remain
+/// verifiable after serde fills missing KEM fields with safe defaults.
+#[derive(Debug, Serialize)]
+struct LegacyNodeDescriptorV1<'a> {
+    schema_version: u16,
+    node_id: &'a [u8; 32],
+    sequence: u64,
+    issued_at: u64,
+    expires_at: u64,
+    public_endpoint: &'a Option<String>,
+    software_version: &'a String,
+    capabilities: &'a Vec<NodeCapability>,
+    capacity: &'a NodeCapacity,
+    policy: &'a NodePolicy,
+}
+
+fn legacy_descriptor_v1_signing_bytes(descriptor: &NodeDescriptor) -> Result<Vec<u8>, CoreError> {
+    let legacy = LegacyNodeDescriptorV1 {
+        schema_version: descriptor.schema_version,
+        node_id: &descriptor.node_id,
+        sequence: descriptor.sequence,
+        issued_at: descriptor.issued_at,
+        expires_at: descriptor.expires_at,
+        public_endpoint: &descriptor.public_endpoint,
+        software_version: &descriptor.software_version,
+        capabilities: &descriptor.capabilities,
+        capacity: &descriptor.capacity,
+        policy: &descriptor.policy,
+    };
+
+    bincode::options()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_DESCRIPTOR_BYTES)
+        .serialize(&legacy)
+        .map_err(|err| CoreError::malformed(format!("legacy node descriptor serialization: {err}")))
 }
 
 impl NodeDescriptor {
@@ -272,6 +317,10 @@ impl NodeDescriptor {
     /// # Errors
     /// Returns a `CoreError` if serialization fails.
     pub fn signing_bytes(&self) -> Result<Vec<u8>, CoreError> {
+        if self.schema_version == 1 {
+            return legacy_descriptor_v1_signing_bytes(self);
+        }
+
         bincode::options()
             .with_fixint_encoding()
             .allow_trailing_bytes()
@@ -571,6 +620,35 @@ mod tests {
         let descriptor = descriptor_for(&kp);
         assert_eq!(descriptor.kem_alg, 0);
         assert_eq!(descriptor.x25519_kem_public(), None);
+    }
+
+    #[test]
+    fn test_schema_v1_descriptor_without_kem_fields_still_verifies() {
+        let kp = IdentityKeyPair::generate();
+        let mut descriptor = descriptor_for(&kp);
+        descriptor.schema_version = 1;
+        descriptor.kem_alg = 0;
+        descriptor.kem_public = [0u8; 32];
+        let signature = kp.sign(&legacy_descriptor_v1_signing_bytes(&descriptor).unwrap());
+        let signed = SignedNodeDescriptor {
+            descriptor,
+            signature,
+        };
+
+        let mut json = serde_json::to_value(&signed).unwrap();
+        let descriptor_json = json
+            .get_mut("descriptor")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("descriptor json object");
+        descriptor_json.remove("kem_alg");
+        descriptor_json.remove("kem_public");
+
+        let decoded: SignedNodeDescriptor = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.descriptor.schema_version, 1);
+        assert_eq!(decoded.descriptor.kem_alg, 0);
+        assert_eq!(decoded.descriptor.kem_public, [0u8; 32]);
+        assert_eq!(decoded.descriptor.x25519_kem_public(), None);
+        assert!(decoded.verify_at(1_700_000_100).is_ok());
     }
 
     #[test]
