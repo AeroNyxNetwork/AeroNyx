@@ -85,6 +85,7 @@
 //!   prove the next hop can actually receive encrypted relay work.
 //!
 //! ## Last Modified
+//! v0.19.0-BlindRelayDescriptorHint - Allow signed next-hop descriptor hints for controlled two-hop proofs
 //! v0.18.0-BlindRelayRouteabilityGate - Require fresh routeability evidence before next-hop forwarding
 //! v0.17.0-BlindRelayOnwardEnvelope - Add optional two-hop middle-hop forwarding
 //! v0.16.0-BlindRelayTimestampFreshness - Reject stale/future opaque route frames
@@ -122,6 +123,7 @@ use aeronyx_core::protocol::chat::{
     decode_envelope, encode_blind_relay_envelope, encode_envelope, BlindRelayEnvelope, ChatEnvelope,
 };
 use aeronyx_core::protocol::codec::encode_data_packet;
+use aeronyx_core::protocol::discovery::SignedNodeDescriptor;
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
 use aeronyx_core::protocol::onion::{is_onion_blob, try_open_onion_layer};
 use aeronyx_core::protocol::{DataPacket, NodeCapability};
@@ -441,6 +443,16 @@ pub struct PeerBlindRelayRequest {
     /// or full route/social-graph metadata here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onward_envelope: Option<BlindRelayEnvelope>,
+    /// Optional signed descriptor for the onward `next_hop`.
+    ///
+    /// This is used by controlled two-hop path proofs when the middle node has
+    /// not yet warmed its local routeability cache for the terminal node. The
+    /// descriptor is still node-control-plane metadata: it must verify, match
+    /// the onward `next_hop`, and advertise `ChatRelay`. It must never carry
+    /// user ids, receiver identities, plaintext, DNS data, domains, URLs,
+    /// packet payloads, route ids, or social-graph metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onward_descriptor_hint: Option<SignedNodeDescriptor>,
 }
 
 /// Node-to-node blind relay response.
@@ -775,6 +787,7 @@ async fn process_peer_blind_relay(
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
     let now = now_secs();
     let previous_hop_node_id = request.previous_hop_node_id;
+    let onward_descriptor_hint = request.onward_descriptor_hint;
     let envelope = request.envelope;
 
     check_blind_relay_previous_hop_allowed(&state, previous_hop_node_id, now)?;
@@ -804,6 +817,7 @@ async fn process_peer_blind_relay(
                 previous_hop_node_id,
                 envelope,
                 onward_envelope,
+                onward_descriptor_hint,
                 now,
             )
             .await;
@@ -842,7 +856,13 @@ async fn process_peer_blind_relay(
     }
 
     let next_hop = envelope.next_hop;
-    let descriptor = state.peer_store.get_valid(&next_hop, now).ok_or_else(|| {
+    let (descriptor, used_descriptor_hint) = resolve_blind_relay_next_hop_descriptor(
+        &state,
+        &next_hop,
+        now,
+        onward_descriptor_hint.as_ref(),
+    )
+    .ok_or_else(|| {
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
         BlindRelayError::NoRoute
     })?;
@@ -859,7 +879,7 @@ async fn process_peer_blind_relay(
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
         return Err(BlindRelayError::NoRoute);
     }
-    if !state.peer_store.is_routeable_now(&next_hop, now) {
+    if !used_descriptor_hint && !state.peer_store.is_routeable_now(&next_hop, now) {
         state
             .peer_store
             .record_route_forward_failure(&next_hop, now, "routeability_not_ready");
@@ -902,6 +922,7 @@ async fn process_peer_blind_relay(
     let forwarded_onward_envelope = request
         .onward_envelope
         .map(|envelope| envelope.sign_with(state.node_identity.as_ref()));
+    let forwarded_onward_descriptor_hint = onward_descriptor_hint;
     let ttl_remaining = forwarded_envelope.ttl;
 
     if let Err(error) = forward_blind_relay_with_retry(
@@ -912,6 +933,7 @@ async fn process_peer_blind_relay(
             envelope: forwarded_envelope,
             previous_hop_node_id: self_node_id,
             onward_envelope: forwarded_onward_envelope,
+            onward_descriptor_hint: forwarded_onward_descriptor_hint,
         },
         now,
     )
@@ -1120,6 +1142,7 @@ async fn process_onion_blind_relay(
                     envelope: forwarded_envelope,
                     previous_hop_node_id: self_node_id,
                     onward_envelope: None,
+                    onward_descriptor_hint: None,
                 },
                 now,
             )
@@ -1153,6 +1176,7 @@ async fn process_onion_middle_blind_relay(
     previous_hop_node_id: [u8; 32],
     outer_envelope: BlindRelayEnvelope,
     onward_envelope: BlindRelayEnvelope,
+    onward_descriptor_hint: Option<SignedNodeDescriptor>,
     now: u64,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
     validate_blind_relay_envelope(&onward_envelope, &previous_hop_node_id, now).map_err(
@@ -1180,7 +1204,13 @@ async fn process_onion_middle_blind_relay(
     }
 
     let next_hop = onward_envelope.next_hop;
-    let descriptor = state.peer_store.get_valid(&next_hop, now).ok_or_else(|| {
+    let (descriptor, used_descriptor_hint) = resolve_blind_relay_next_hop_descriptor(
+        &state,
+        &next_hop,
+        now,
+        onward_descriptor_hint.as_ref(),
+    )
+    .ok_or_else(|| {
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
         BlindRelayError::NoRoute
     })?;
@@ -1197,7 +1227,7 @@ async fn process_onion_middle_blind_relay(
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
         return Err(BlindRelayError::NoRoute);
     }
-    if !state.peer_store.is_routeable_now(&next_hop, now) {
+    if !used_descriptor_hint && !state.peer_store.is_routeable_now(&next_hop, now) {
         state
             .peer_store
             .record_route_forward_failure(&next_hop, now, "routeability_not_ready");
@@ -1247,6 +1277,7 @@ async fn process_onion_middle_blind_relay(
             envelope: forwarded_envelope,
             previous_hop_node_id: self_node_id,
             onward_envelope: None,
+            onward_descriptor_hint: None,
         },
         now,
     )
@@ -1271,6 +1302,33 @@ async fn process_onion_middle_blind_relay(
         ttl_remaining,
         reason: Some("onion_middle_forwarded".to_string()),
     })
+}
+
+fn resolve_blind_relay_next_hop_descriptor(
+    state: &ChatPeerState,
+    next_hop: &[u8; 32],
+    now: u64,
+    descriptor_hint: Option<&SignedNodeDescriptor>,
+) -> Option<(SignedNodeDescriptor, bool)> {
+    if let Some(descriptor) = state.peer_store.get_valid(next_hop, now) {
+        return Some((descriptor, false));
+    }
+
+    let descriptor = descriptor_hint?;
+    if descriptor.node_id() != *next_hop {
+        return None;
+    }
+    if descriptor.verify_at(now).is_err() {
+        return None;
+    }
+    if !descriptor
+        .descriptor
+        .capabilities
+        .contains(&NodeCapability::ChatRelay)
+    {
+        return None;
+    }
+    Some((descriptor.clone(), true))
 }
 
 fn observe_blind_relay_route(state: &ChatPeerState, route_id: [u8; 16], now: u64) -> bool {
@@ -1859,6 +1917,7 @@ mod tests {
             envelope,
             previous_hop_node_id: previous_hop.public_key_bytes(),
             onward_envelope: None,
+            onward_descriptor_hint: None,
         })
         .unwrap();
         let response = app
@@ -1927,6 +1986,7 @@ mod tests {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
                 onward_envelope: None,
+                onward_descriptor_hint: None,
             },
         )
         .await;
@@ -1976,6 +2036,7 @@ mod tests {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
                 onward_envelope: None,
+                onward_descriptor_hint: None,
             },
         )
         .await;
@@ -2029,6 +2090,7 @@ mod tests {
                 envelope,
                 previous_hop_node_id: source.public_key_bytes(),
                 onward_envelope: None,
+                onward_descriptor_hint: None,
             },
         )
         .await
@@ -2080,6 +2142,7 @@ mod tests {
                 envelope,
                 previous_hop_node_id: source.public_key_bytes(),
                 onward_envelope: None,
+                onward_descriptor_hint: None,
             },
         )
         .await;
@@ -2140,6 +2203,7 @@ mod tests {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
                 onward_envelope: None,
+                onward_descriptor_hint: None,
             },
         )
         .await;
@@ -2253,6 +2317,7 @@ mod tests {
                 envelope: envelope.clone(),
                 previous_hop_node_id: previous_hop.public_key_bytes(),
                 onward_envelope: None,
+                onward_descriptor_hint: None,
             },
         )
         .await
@@ -2263,6 +2328,7 @@ mod tests {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
                 onward_envelope: None,
+                onward_descriptor_hint: None,
             },
         )
         .await
@@ -2357,6 +2423,7 @@ mod tests {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
                 onward_envelope: None,
+                onward_descriptor_hint: None,
             },
         )
         .await
@@ -2463,6 +2530,7 @@ mod tests {
                 envelope: outer_envelope,
                 previous_hop_node_id: entry_identity.public_key_bytes(),
                 onward_envelope: Some(onward_envelope),
+                onward_descriptor_hint: None,
             },
         )
         .await
@@ -2571,6 +2639,7 @@ mod tests {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
                 onward_envelope: None,
+                onward_descriptor_hint: None,
             },
         )
         .await;
@@ -2651,6 +2720,7 @@ mod tests {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
                 onward_envelope: None,
+                onward_descriptor_hint: None,
             },
         )
         .await;
@@ -2739,6 +2809,7 @@ mod tests {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
                 onward_envelope: None,
+                onward_descriptor_hint: None,
             },
         )
         .await;
@@ -2825,6 +2896,7 @@ mod tests {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
                 onward_envelope: None,
+                onward_descriptor_hint: None,
             },
         )
         .await;
@@ -2918,6 +2990,7 @@ mod tests {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
                 onward_envelope: None,
+                onward_descriptor_hint: None,
             },
         )
         .await;
@@ -3020,6 +3093,7 @@ mod tests {
                 envelope,
                 previous_hop_node_id: previous_hop.public_key_bytes(),
                 onward_envelope: None,
+                onward_descriptor_hint: None,
             },
         )
         .await;

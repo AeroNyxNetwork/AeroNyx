@@ -2593,6 +2593,7 @@ impl Server {
             envelope,
             previous_hop_node_id: *self_node_id,
             onward_envelope: None,
+            onward_descriptor_hint: None,
         };
 
         match client.post(url).json(&request).send().await {
@@ -2728,6 +2729,7 @@ impl Server {
                     envelope: outer_envelope,
                     previous_hop_node_id: *self_node_id,
                     onward_envelope: Some(onward_envelope),
+                    onward_descriptor_hint: Some(terminal.clone()),
                 };
 
                 match client.post(&url).json(&request).send().await {
