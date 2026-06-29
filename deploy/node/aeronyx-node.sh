@@ -25,6 +25,10 @@
 #   and reports only aggregate counter deltas. The command also reports
 #   two-hop readiness separately so operators do not mistake a single-hop
 #   transport probe for a full multi-hop proof.
+# - Add a privacy-safe `fleet-smoke` command for three-or-more public Rust
+#   nodes. It verifies discovery status, signed snapshots, onion candidates,
+#   terminal BlindRelay acceptance, and one-hop forwarding with synthetic opaque
+#   blobs only. It is intended for release gates and post-restart checks.
 # - Add `healthcheck` as a command alias and summarize local health/operator
 #   JSON in `status` instead of printing full endpoint payloads. This keeps the
 #   one-command operator view readable for humans and AI assistants while
@@ -87,6 +91,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.15.0-node-entrypoint - Added fleet-smoke public mesh smoke test command.
 # v1.14.0-node-entrypoint - Added gated relay-probe --two-hop live probe mode.
 # v1.13.0-node-entrypoint - Updated relay-probe two-hop blocker wording after onward envelope support.
 # v1.12.0-node-entrypoint - Clarified relay-probe scope and added two-hop readiness output.
@@ -142,6 +147,8 @@ PEER_CACHE_FILE="${AERONYX_PEER_CACHE_FILE:-/var/lib/aeronyx/peers-cache.json}"
 SERVER_KEY_FILE="${AERONYX_SERVER_KEY_FILE:-/etc/aeronyx/server_key.json}"
 RELAY_PROBE_PEER_PREFIX=""
 RELAY_PROBE_TWO_HOP=0
+FLEET_SMOKE_ENDPOINTS="${AERONYX_FLEET_SMOKE_ENDPOINTS:-}"
+FLEET_SMOKE_INCLUDE_NEGATIVE=0
 YES=0
 EXTRA_ARGS=()
 
@@ -179,6 +186,7 @@ Commands:
   chat-relay Enable or disable blind ChatRelay capability in server.toml.
   onion-middle Enable or disable no-exit OnionMiddle capability in server.toml.
   relay-probe Send one synthetic BlindRelay route probe to a discovered peer.
+  fleet-smoke Verify a public multi-node discovery + blind relay mesh.
   promote-binary Promote a staged aeronyx-server binary with drain checks.
   logs       Show recent systemd logs. Use --follow to tail.
   network    Refresh forwarding/NAT or update the privacy protocol IP pool.
@@ -241,6 +249,13 @@ Command-specific options:
     --json                  Emit JSON result for nodeboard/automation.
     --json-only             Emit only JSON.
 
+  fleet-smoke:
+    --endpoints URLS         Comma-separated public discovery base URLs.
+    --endpoint URL           Add one public discovery base URL. Repeatable.
+    --include-negative       Also run an invalid-signature probe against the first endpoint.
+    --json                  Emit JSON result for nodeboard/automation.
+    --json-only             Emit only JSON.
+
   promote-binary:
     --binary PATH            Staged aeronyx-server binary to promote.
     --expected-sha256 HASH   Optional SHA-256 expected for the staged binary.
@@ -255,6 +270,7 @@ Examples:
   ./deploy/node/aeronyx-node.sh health --json
   ./deploy/node/aeronyx-node.sh status
   ./deploy/node/aeronyx-node.sh relay-probe --json
+  ./deploy/node/aeronyx-node.sh fleet-smoke --endpoints http://34.136.167.59:8422,http://8.213.146.244:8422,http://149.33.18.44:8422 --json
   sudo ./deploy/node/aeronyx-node.sh chat-relay --enable-chat-relay --restart
   sudo ./deploy/node/aeronyx-node.sh onion-middle --enable-onion-middle --restart
   sudo ./deploy/node/aeronyx-node.sh promote-binary --binary ./target/release/aeronyx-server.next --expected-sha256 HASH
@@ -333,6 +349,16 @@ parse_args() {
             --peer-prefix) RELAY_PROBE_PEER_PREFIX="${2:?missing value}"; shift 2 ;;
             --peer-cache) PEER_CACHE_FILE="${2:?missing value}"; shift 2 ;;
             --server-key) SERVER_KEY_FILE="${2:?missing value}"; shift 2 ;;
+            --endpoints) FLEET_SMOKE_ENDPOINTS="${2:?missing value}"; shift 2 ;;
+            --endpoint)
+                if [ -n "${FLEET_SMOKE_ENDPOINTS}" ]; then
+                    FLEET_SMOKE_ENDPOINTS="${FLEET_SMOKE_ENDPOINTS},${2:?missing value}"
+                else
+                    FLEET_SMOKE_ENDPOINTS="${2:?missing value}"
+                fi
+                shift 2
+                ;;
+            --include-negative) FLEET_SMOKE_INCLUDE_NEGATIVE=1; shift ;;
             --yes|-y) YES=1; shift ;;
             -h|--help) COMMAND="help"; shift ;;
             --quick|--start|--no-build|--no-network|--no-enable|--skip-package-install|--skip-rust-install|--allow-dirty|--skip-pull)
@@ -976,6 +1002,408 @@ except Exception:
     print("unknown")
 PY
     rm -f "${tmp}"
+}
+
+run_fleet_smoke() {
+    command -v python3 >/dev/null 2>&1 || die "fleet-smoke requires python3"
+    [ -n "${FLEET_SMOKE_ENDPOINTS}" ] || die "fleet-smoke requires --endpoints URL1,URL2,... or repeated --endpoint URL"
+
+    if [ "${JSON_ONLY}" -ne 1 ]; then
+        log "Running public AeroNyx fleet smoke test"
+        log "Endpoints: ${FLEET_SMOKE_ENDPOINTS}"
+        if [ "${FLEET_SMOKE_INCLUDE_NEGATIVE}" -eq 1 ]; then
+            warn "Negative invalid-signature probe is enabled; this intentionally increments aggregate rejection counters."
+        fi
+    fi
+
+    python3 - \
+        "${FLEET_SMOKE_ENDPOINTS}" \
+        "${FLEET_SMOKE_INCLUDE_NEGATIVE}" \
+        "${JSON}" \
+        "${JSON_ONLY}" <<'PY'
+import hashlib
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    def new_signing_key():
+        private_key = Ed25519PrivateKey.generate()
+        public_key = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        return private_key.sign, public_key, "cryptography"
+except Exception as crypto_exc:
+    try:
+        from nacl.signing import SigningKey
+
+        def new_signing_key():
+            private_key = SigningKey.generate()
+            public_key = bytes(private_key.verify_key)
+            return private_key.sign, public_key, "pynacl"
+    except Exception as nacl_exc:
+        print(json.dumps({
+            "status": "error",
+            "reason": "missing_ed25519_python_dependency",
+            "cryptography_error": str(crypto_exc)[:240],
+            "pynacl_error": str(nacl_exc)[:240],
+            "next_action": "Install python3-cryptography or python3-nacl on the operator host.",
+        }, sort_keys=True))
+        raise SystemExit(2)
+
+DOMAIN = b"AeroNyx-BlindRelay-v1"
+endpoints_arg, include_negative_arg, json_arg, json_only_arg = sys.argv[1:5]
+include_negative = include_negative_arg == "1"
+json_requested = json_arg == "1"
+json_only = json_only_arg == "1"
+endpoints = []
+for item in endpoints_arg.split(","):
+    endpoint = item.strip().rstrip("/")
+    if endpoint:
+        endpoints.append(endpoint)
+
+
+def fail(reason, detail=None):
+    result = {
+        "status": "error",
+        "reason": reason,
+        "detail": detail,
+        "source": "aeronyx-node.sh fleet-smoke",
+    }
+    print(json.dumps(result, sort_keys=True))
+    raise SystemExit(2)
+
+
+if len(endpoints) < 2:
+    fail("not_enough_endpoints", "fleet-smoke needs at least two public discovery endpoints")
+
+
+def request_json(url, method="GET", body=None, timeout=18):
+    started = time.perf_counter()
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={"content-type": "application/json"},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+            parsed = json.loads(raw)
+            return {
+                "ok": True,
+                "status_code": response.status,
+                "body": parsed,
+                "latency_ms": int(round((time.perf_counter() - started) * 1000)),
+            }
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = {"raw": raw[:500]}
+        return {
+            "ok": False,
+            "status_code": exc.code,
+            "body": parsed,
+            "latency_ms": int(round((time.perf_counter() - started) * 1000)),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status_code": None,
+            "body": {"error": str(exc)[:500]},
+            "latency_ms": int(round((time.perf_counter() - started) * 1000)),
+        }
+
+
+def as_bytes(value):
+    if isinstance(value, list):
+        return bytes(int(item) & 0xFF for item in value)
+    if isinstance(value, str):
+        return bytes.fromhex(value)
+    raise ValueError("unsupported byte value")
+
+
+def signature_tuple(signature):
+    signature = bytes(signature)
+    return [list(signature[:32]), list(signature[32:])]
+
+
+def sign_data(route_id, next_hop, ttl, timestamp, blob, sign):
+    payload = (
+        DOMAIN
+        + route_id
+        + next_hop
+        + bytes([ttl])
+        + int(timestamp).to_bytes(8, "little")
+        + hashlib.sha256(blob).digest()
+    )
+    signed = sign(payload)
+    if hasattr(signed, "signature"):
+        return bytes(signed.signature)
+    return bytes(signed)
+
+
+def public_endpoint(peer):
+    descriptor = peer.get("descriptor") if isinstance(peer, dict) else None
+    if not isinstance(descriptor, dict):
+        descriptor = peer if isinstance(peer, dict) else {}
+    return str(descriptor.get("public_endpoint") or "").rstrip("/")
+
+
+def descriptor_node_id(peer):
+    descriptor = peer.get("descriptor") if isinstance(peer, dict) else None
+    if not isinstance(descriptor, dict):
+        descriptor = peer if isinstance(peer, dict) else {}
+    return as_bytes(descriptor.get("node_id"))
+
+
+def find_self_peer(snapshot, endpoint):
+    peers = snapshot.get("peers") if isinstance(snapshot, dict) else []
+    for peer in peers if isinstance(peers, list) else []:
+        if public_endpoint(peer) == endpoint:
+            return peer
+    return None
+
+
+def first_candidate_node_id(candidates):
+    values = candidates.get("candidates") if isinstance(candidates, dict) else []
+    if not isinstance(values, list) or not values:
+        return None, None
+    candidate = values[0]
+    node_id = candidate.get("node_id")
+    return as_bytes(node_id), str(node_id)[:8]
+
+
+def build_envelope(next_hop, ttl, label, corrupt=False):
+    sign, previous_pub, signer = new_signing_key()
+    route_id = os.urandom(16)
+    timestamp = int(time.time())
+    blob = ("synthetic-fleet-smoke:%s:no-user-payload" % label).encode("utf-8")
+    signature = sign_data(route_id, next_hop, ttl, timestamp, blob, sign)
+    if corrupt:
+        signature = bytes([signature[0] ^ 1]) + signature[1:]
+    return {
+        "body": {
+            "envelope": {
+                "route_id": list(route_id),
+                "next_hop": list(next_hop),
+                "ttl": ttl,
+                "encrypted_blob": list(blob),
+                "timestamp": timestamp,
+                "signature": signature_tuple(signature),
+            },
+            "previous_hop_node_id": list(previous_pub),
+        },
+        "route_id_prefix": route_id.hex()[:8],
+        "signer": signer,
+    }
+
+
+endpoint_results = []
+terminal_results = []
+forward_results = []
+negative_result = None
+all_ok = True
+
+for endpoint in endpoints:
+    status_result = request_json(endpoint + "/api/discovery/status")
+    snapshot_result = request_json(endpoint + "/api/discovery/snapshot?limit=8")
+    candidate_result = request_json(endpoint + "/api/discovery/onion-candidates")
+    snapshot = snapshot_result.get("body") if snapshot_result.get("ok") else {}
+    peer = find_self_peer(snapshot, endpoint)
+    endpoint_ok = bool(
+        status_result.get("ok")
+        and snapshot_result.get("ok")
+        and candidate_result.get("ok")
+        and peer is not None
+    )
+    status_body = status_result.get("body") if isinstance(status_result.get("body"), dict) else {}
+    peer_store = status_body.get("peer_store") if isinstance(status_body, dict) else {}
+    snapshot_summary = peer_store.get("snapshot") if isinstance(peer_store, dict) else {}
+    readiness = status_body.get("discovery_readiness") if isinstance(status_body, dict) else {}
+    foundation = readiness.get("protocol_foundation") if isinstance(readiness, dict) else {}
+    endpoint_summary = {
+        "endpoint": endpoint,
+        "status": "ok" if endpoint_ok else "failed",
+        "status_latency_ms": status_result.get("latency_ms"),
+        "snapshot_latency_ms": snapshot_result.get("latency_ms"),
+        "candidate_latency_ms": candidate_result.get("latency_ms"),
+        "valid_peers": snapshot_summary.get("valid_peers"),
+        "public_peers": snapshot_summary.get("public_peers"),
+        "protocol_stage": foundation.get("stage"),
+        "protocol_status": foundation.get("status"),
+        "self_descriptor_found": peer is not None,
+        "status_code": status_result.get("status_code"),
+        "snapshot_status_code": snapshot_result.get("status_code"),
+        "candidate_status_code": candidate_result.get("status_code"),
+    }
+    endpoint_results.append(endpoint_summary)
+    all_ok = all_ok and endpoint_ok
+
+    if peer is None:
+        continue
+
+    self_node_id = descriptor_node_id(peer)
+    terminal_probe = build_envelope(self_node_id, 1, "terminal")
+    terminal_http = request_json(
+        endpoint + "/api/chat/peer/blind-relay",
+        method="POST",
+        body=terminal_probe["body"],
+    )
+    terminal_body = terminal_http.get("body") if isinstance(terminal_http.get("body"), dict) else {}
+    terminal_ok = bool(
+        terminal_http.get("status_code") == 200
+        and terminal_body.get("accepted") is True
+        and terminal_body.get("terminal") is True
+        and terminal_body.get("forwarded") is False
+    )
+    terminal_results.append({
+        "endpoint": endpoint,
+        "status": "ok" if terminal_ok else "failed",
+        "response_status": terminal_http.get("status_code"),
+        "latency_ms": terminal_http.get("latency_ms"),
+        "reason": terminal_body.get("reason"),
+        "route_id_prefix": terminal_probe["route_id_prefix"],
+    })
+    all_ok = all_ok and terminal_ok
+
+    candidate_body = candidate_result.get("body") if isinstance(candidate_result.get("body"), dict) else {}
+    next_hop, next_prefix = first_candidate_node_id(candidate_body)
+    if next_hop is None:
+        forward_results.append({
+            "endpoint": endpoint,
+            "status": "failed",
+            "reason": "no_onion_candidate",
+        })
+        all_ok = False
+        continue
+
+    forward_probe = build_envelope(next_hop, 1, "forward")
+    forward_http = request_json(
+        endpoint + "/api/chat/peer/blind-relay",
+        method="POST",
+        body=forward_probe["body"],
+    )
+    forward_body = forward_http.get("body") if isinstance(forward_http.get("body"), dict) else {}
+    forward_ok = bool(
+        forward_http.get("status_code") == 200
+        and forward_body.get("accepted") is True
+        and forward_body.get("forwarded") is True
+        and forward_body.get("terminal") is False
+    )
+    forward_results.append({
+        "endpoint": endpoint,
+        "status": "ok" if forward_ok else "failed",
+        "response_status": forward_http.get("status_code"),
+        "latency_ms": forward_http.get("latency_ms"),
+        "next_hop_prefix": next_prefix,
+        "reason": forward_body.get("reason"),
+        "route_id_prefix": forward_probe["route_id_prefix"],
+    })
+    all_ok = all_ok and forward_ok
+
+if include_negative and endpoint_results:
+    first_endpoint = endpoints[0]
+    snapshot_result = request_json(first_endpoint + "/api/discovery/snapshot?limit=8")
+    peer = find_self_peer(snapshot_result.get("body") or {}, first_endpoint)
+    if peer is not None:
+        invalid_probe = build_envelope(descriptor_node_id(peer), 1, "invalid-signature", corrupt=True)
+        invalid_http = request_json(
+            first_endpoint + "/api/chat/peer/blind-relay",
+            method="POST",
+            body=invalid_probe["body"],
+        )
+        invalid_body = invalid_http.get("body") if isinstance(invalid_http.get("body"), dict) else {}
+        negative_ok = bool(
+            invalid_http.get("status_code") in (400, 401, 403, 422)
+            and invalid_body.get("accepted") is not True
+        )
+        negative_result = {
+            "endpoint": first_endpoint,
+            "status": "ok" if negative_ok else "failed",
+            "response_status": invalid_http.get("status_code"),
+            "reason": invalid_body.get("reason"),
+            "route_id_prefix": invalid_probe["route_id_prefix"],
+        }
+        all_ok = all_ok and negative_ok
+    else:
+        negative_result = {
+            "endpoint": first_endpoint,
+            "status": "failed",
+            "reason": "self_descriptor_not_found",
+        }
+        all_ok = False
+
+result = {
+    "status": "ok" if all_ok else "failed",
+    "endpoint_count": len(endpoints),
+    "endpoints": endpoint_results,
+    "terminal_probes": terminal_results,
+    "forward_probes": forward_results,
+    "negative_probe": negative_result,
+    "source": "aeronyx-node.sh fleet-smoke",
+    "privacy_boundary": "synthetic opaque blobs only; no user messages, wallet ids, DNS contents, destinations, domains, URLs, packet payloads, client public IPs, or private keys",
+}
+
+if not json_only:
+    print("fleet_smoke_status={status} endpoints={count}".format(
+        status=result["status"],
+        count=result["endpoint_count"],
+    ))
+    for item in endpoint_results:
+        print(
+            "endpoint_status={status} url={endpoint} valid_peers={valid} stage={stage} latency_ms={latency}".format(
+                status=item["status"],
+                endpoint=item["endpoint"],
+                valid=item.get("valid_peers"),
+                stage=item.get("protocol_stage"),
+                latency=item.get("status_latency_ms"),
+            )
+        )
+    for item in terminal_results:
+        print(
+            "terminal_probe={status} url={endpoint} code={code} reason={reason}".format(
+                status=item["status"],
+                endpoint=item["endpoint"],
+                code=item.get("response_status"),
+                reason=item.get("reason"),
+            )
+        )
+    for item in forward_results:
+        print(
+            "forward_probe={status} url={endpoint} next={next_hop} code={code} reason={reason}".format(
+                status=item["status"],
+                endpoint=item["endpoint"],
+                next_hop=item.get("next_hop_prefix"),
+                code=item.get("response_status"),
+                reason=item.get("reason"),
+            )
+        )
+    if negative_result is not None:
+        print(
+            "negative_probe={status} url={endpoint} code={code} reason={reason}".format(
+                status=negative_result["status"],
+                endpoint=negative_result["endpoint"],
+                code=negative_result.get("response_status"),
+                reason=negative_result.get("reason"),
+            )
+        )
+
+if json_requested or json_only:
+    print(json.dumps(result, sort_keys=True))
+
+raise SystemExit(0 if all_ok else 3)
+PY
 }
 
 run_relay_probe() {
@@ -2040,6 +2468,9 @@ main() {
             ;;
         relay-probe)
             run_relay_probe
+            ;;
+        fleet-smoke)
+            run_fleet_smoke
             ;;
         promote-binary)
             run_promote_binary
