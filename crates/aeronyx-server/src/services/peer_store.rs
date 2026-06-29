@@ -79,6 +79,9 @@
 //!   message traffic totals
 //! - Blind relay evidence mode separates real relay traffic from synthetic
 //!   probes so public surfaces do not overstate user-message movement
+//! - Bounded two-hop path proof history records recent entry -> middle ->
+//!   terminal proof outcomes for nodeboard/public status without exposing node
+//!   IDs, route IDs, endpoints, payloads, or social graph metadata
 //! - Blind relay readiness reason gives operators a stable privacy-safe bucket
 //!   for why the relay path is ready, probe-only, degraded, protected, or idle
 //! - Blind relay timestamp freshness counters show stale/future route-frame
@@ -241,6 +244,7 @@ pub struct PeerStoreSnapshot {
 /// small operator nodes. It is diagnostic evidence, not a durable ledger.
 const MAX_AUDIT_EVENTS: usize = 64;
 const MAX_PEER_EVENTS: usize = 64;
+const MAX_TWO_HOP_PATH_PROOF_EVENTS: usize = 32;
 
 /// Privacy-safe discovery control-plane audit event.
 ///
@@ -258,6 +262,71 @@ pub struct PeerStoreAuditEvent {
     pub outcome: String,
     /// Human-readable aggregate detail with counts or policy scope only.
     pub detail: String,
+}
+
+/// Privacy-safe two-hop relay path proof event.
+///
+/// This is local protocol-health evidence for nodeboard, public website
+/// aggregation, and AI runbooks. It deliberately records only coarse proof
+/// outcome buckets. It must never include node ids, endpoint URLs, route ids,
+/// encrypted blobs, receiver identities, client IPs, DNS contents,
+/// destinations, Memory Chain plaintext, voucher secrets, wallet-level
+/// traffic, or social graph metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreTwoHopPathProofEvent {
+    /// Unix timestamp when the proof result was recorded.
+    pub at: u64,
+    /// Stable outcome bucket: accepted or rejected.
+    pub outcome: String,
+    /// Stable privacy-safe reason bucket.
+    pub reason_bucket: String,
+    /// Stable evidence mode for downstream status copy.
+    pub evidence_mode: String,
+    /// Planned relay path shape for this proof.
+    pub path_shape: String,
+    /// Number of relay hops proven by this event.
+    pub hop_count: u8,
+}
+
+/// Bounded privacy-safe history for recent two-hop relay path proofs.
+///
+/// This is not a durable ledger and not user traffic accounting. It is a
+/// rolling operator view over synthetic protocol-health probes so nodeboard and
+/// the public website can show whether the blind relay fabric is repeatedly
+/// proving entry -> middle -> terminal reachability while preserving the
+/// blind-node invariant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreTwoHopPathProofHistory {
+    /// Unix timestamp when this summary was generated.
+    pub generated_at: u64,
+    /// Maximum number of recent proof events retained by this process.
+    pub window_size: usize,
+    /// Number of retained proof events in this summary.
+    pub retained_events: usize,
+    /// Retained proof attempts in the bounded window.
+    pub attempted: u64,
+    /// Retained accepted proofs in the bounded window.
+    pub succeeded: u64,
+    /// Retained rejected proofs in the bounded window.
+    pub failed: u64,
+    /// Success percentage over retained events.
+    pub success_percent: u8,
+    /// Latest proof outcome, when any retained event exists.
+    pub latest_outcome: Option<String>,
+    /// Latest proof reason bucket, when any retained event exists.
+    pub latest_reason_bucket: Option<String>,
+    /// Seconds since the latest retained proof event.
+    pub latest_age_seconds: Option<u64>,
+    /// Consecutive accepted proofs ending at the latest event.
+    pub consecutive_successes: u64,
+    /// Consecutive rejected proofs ending at the latest event.
+    pub consecutive_failures: u64,
+    /// Retained events in chronological order.
+    pub events: Vec<PeerStoreTwoHopPathProofEvent>,
+    /// Explicit invariant for downstream UI and AI-agent consumers.
+    pub privacy_invariant: String,
+    /// Explicit privacy boundary for downstream UI and API consumers.
+    pub privacy_boundary: String,
 }
 
 /// Privacy-safe peer discovery lifecycle event.
@@ -716,6 +785,11 @@ pub struct PeerStoreStatus {
     pub runtime: PeerStoreRuntimeStats,
     /// Aggregate blind relay runtime quality for dashboards and runbooks.
     pub blind_relay_quality: PeerStoreBlindRelayQualityStatus,
+    /// Bounded privacy-safe proof history for recent two-hop relay checks.
+    ///
+    /// This lets dashboards show repeated protocol evidence instead of a
+    /// single ready bit, while preserving the blind relay privacy boundary.
+    pub two_hop_path_proof_history: PeerStoreTwoHopPathProofHistory,
     /// Configured maximum peer count.
     pub max_peers: Option<usize>,
     /// Recent privacy-safe discovery control-plane audit events.
@@ -1429,6 +1503,7 @@ pub struct PeerStore {
     counters: PeerStoreCounters,
     audit_events: RwLock<VecDeque<PeerStoreAuditEvent>>,
     peer_events: RwLock<VecDeque<PeerStorePeerEvent>>,
+    two_hop_path_proof_events: RwLock<VecDeque<PeerStoreTwoHopPathProofEvent>>,
     bootstrap_status: RwLock<PeerStoreBootstrapStatus>,
 }
 
@@ -1445,6 +1520,9 @@ impl PeerStore {
             counters: PeerStoreCounters::new(),
             audit_events: RwLock::new(VecDeque::with_capacity(MAX_AUDIT_EVENTS)),
             peer_events: RwLock::new(VecDeque::with_capacity(MAX_PEER_EVENTS)),
+            two_hop_path_proof_events: RwLock::new(VecDeque::with_capacity(
+                MAX_TWO_HOP_PATH_PROOF_EVENTS,
+            )),
             bootstrap_status: RwLock::new(PeerStoreBootstrapStatus::default()),
         }
     }
@@ -2313,6 +2391,7 @@ impl PeerStore {
             if accepted { "accepted" } else { "rejected" },
             format!("reason_bucket={reason}"),
         );
+        self.record_two_hop_path_proof_event(now, accepted, reason);
     }
 
     /// Records a blind relay rejection with a stable privacy-safe reason.
@@ -2574,6 +2653,89 @@ impl PeerStore {
             outcome: outcome.into(),
             detail: detail.into(),
         });
+    }
+
+    fn record_two_hop_path_proof_event(&self, now: u64, accepted: bool, reason: &str) {
+        let mut events = self.two_hop_path_proof_events.write();
+        if events.len() >= MAX_TWO_HOP_PATH_PROOF_EVENTS {
+            events.pop_front();
+        }
+        events.push_back(PeerStoreTwoHopPathProofEvent {
+            at: now,
+            outcome: if accepted { "accepted" } else { "rejected" }.to_string(),
+            reason_bucket: Self::two_hop_path_proof_reason_bucket(reason),
+            evidence_mode: "synthetic_two_hop_probe".to_string(),
+            path_shape: "entry_middle_terminal".to_string(),
+            hop_count: 2,
+        });
+    }
+
+    fn two_hop_path_proof_reason_bucket(reason: &str) -> String {
+        match reason {
+            "accepted" => "accepted".to_string(),
+            "ack_rejected" => "ack_rejected".to_string(),
+            "ack_decode" => "ack_decode".to_string(),
+            "no_distinct_path" => "no_distinct_path".to_string(),
+            "middle_missing_endpoint" => "middle_missing_endpoint".to_string(),
+            "middle_invalid_endpoint" => "middle_invalid_endpoint".to_string(),
+            value if value.starts_with("http_") => "http_error".to_string(),
+            value if value.starts_with("two_hop_blind_relay_probe_request_") => {
+                "request_error".to_string()
+            }
+            _ => "unknown".to_string(),
+        }
+    }
+
+    fn two_hop_path_proof_history(&self, now: u64) -> PeerStoreTwoHopPathProofHistory {
+        let events = self
+            .two_hop_path_proof_events
+            .read()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let attempted = events.len() as u64;
+        let succeeded = events
+            .iter()
+            .filter(|event| event.outcome == "accepted")
+            .count() as u64;
+        let failed = attempted.saturating_sub(succeeded);
+        let success_percent = if attempted == 0 {
+            0
+        } else {
+            ((succeeded.saturating_mul(100)) / attempted).min(100) as u8
+        };
+        let latest = events.last();
+        let consecutive_successes = Self::count_trailing_two_hop_outcomes(&events, "accepted");
+        let consecutive_failures = Self::count_trailing_two_hop_outcomes(&events, "rejected");
+
+        PeerStoreTwoHopPathProofHistory {
+            generated_at: now,
+            window_size: MAX_TWO_HOP_PATH_PROOF_EVENTS,
+            retained_events: events.len(),
+            attempted,
+            succeeded,
+            failed,
+            success_percent,
+            latest_outcome: latest.map(|event| event.outcome.clone()),
+            latest_reason_bucket: latest.map(|event| event.reason_bucket.clone()),
+            latest_age_seconds: latest.map(|event| now.saturating_sub(event.at)),
+            consecutive_successes,
+            consecutive_failures,
+            events,
+            privacy_invariant: "blind_nodes_route_only_opaque_ciphertext".to_string(),
+            privacy_boundary: "bounded synthetic two-hop proof history only; no node IDs, endpoints, route IDs, encrypted payloads, receiver identities, client IPs, DNS contents, domains, URLs, Memory Chain plaintext, voucher secrets, wallet-level traffic, or social graph edges".to_string(),
+        }
+    }
+
+    fn count_trailing_two_hop_outcomes(
+        events: &[PeerStoreTwoHopPathProofEvent],
+        outcome: &str,
+    ) -> u64 {
+        events
+            .iter()
+            .rev()
+            .take_while(|event| event.outcome == outcome)
+            .count() as u64
     }
 
     fn record_peer_event(
@@ -3103,6 +3265,7 @@ impl PeerStore {
         let bootstrap = self.bootstrap_status.read().clone();
         let runtime = self.counters.snapshot();
         let blind_relay_quality = Self::blind_relay_quality_status(now, &runtime.blind_relay);
+        let two_hop_path_proof_history = self.two_hop_path_proof_history(now);
         let stability = Self::stability(&snapshot, &bootstrap, now);
         let peer_summary = self.peer_summary(now);
         let route_candidates = self.route_candidate_status(now);
@@ -3116,6 +3279,7 @@ impl PeerStore {
             snapshot,
             runtime,
             blind_relay_quality,
+            two_hop_path_proof_history,
             max_peers: self.max_peers(),
             recent_audit_events: self.recent_audit_events(),
             recent_peer_events: self.recent_peer_events(),
@@ -5373,6 +5537,33 @@ mod tests {
         assert_eq!(quality.evidence_mode, "synthetic_two_hop_probe");
         assert_eq!(quality.readiness_reason, "synthetic_two_hop_probe_ready");
         assert_eq!(quality.last_two_hop_probe_age_seconds, Some(15));
+        assert_eq!(status.two_hop_path_proof_history.attempted, 1);
+        assert_eq!(status.two_hop_path_proof_history.succeeded, 1);
+        assert_eq!(status.two_hop_path_proof_history.failed, 0);
+        assert_eq!(status.two_hop_path_proof_history.success_percent, 100);
+        assert_eq!(
+            status.two_hop_path_proof_history.latest_outcome.as_deref(),
+            Some("accepted")
+        );
+        assert_eq!(
+            status
+                .two_hop_path_proof_history
+                .latest_reason_bucket
+                .as_deref(),
+            Some("accepted")
+        );
+        assert_eq!(
+            status.two_hop_path_proof_history.latest_age_seconds,
+            Some(15)
+        );
+        assert_eq!(status.two_hop_path_proof_history.consecutive_successes, 1);
+        assert_eq!(status.two_hop_path_proof_history.consecutive_failures, 0);
+        assert_eq!(status.two_hop_path_proof_history.events.len(), 1);
+        assert_eq!(
+            status.two_hop_path_proof_history.events[0].path_shape,
+            "entry_middle_terminal"
+        );
+        assert_eq!(status.two_hop_path_proof_history.events[0].hop_count, 2);
         assert!(status.recent_audit_events.iter().any(|event| {
             event.action == "blind_relay_two_hop_probe"
                 && event.outcome == "accepted"
@@ -5385,6 +5576,49 @@ mod tests {
         assert!(!quality.detail.contains("encrypted_blob"));
         assert!(!quality.detail.contains("payload"));
         assert!(!quality.detail.contains("client_ip"));
+        assert!(!status
+            .two_hop_path_proof_history
+            .privacy_boundary
+            .contains("route_id"));
+        assert!(status
+            .two_hop_path_proof_history
+            .privacy_boundary
+            .contains("no node IDs"));
+    }
+
+    #[test]
+    fn test_two_hop_path_proof_history_buckets_failures_without_private_metadata() {
+        let store = PeerStore::new();
+
+        store.record_blind_relay_two_hop_probe_result(1_700_000_010, false, "http_502");
+        store.record_blind_relay_two_hop_probe_result(1_700_000_020, false, "endpoint://leak");
+        store.record_blind_relay_two_hop_probe_result(1_700_000_030, true, "accepted");
+
+        let status = store.status(1_700_000_045);
+        let history = status.two_hop_path_proof_history;
+
+        assert_eq!(history.window_size, MAX_TWO_HOP_PATH_PROOF_EVENTS);
+        assert_eq!(history.retained_events, 3);
+        assert_eq!(history.attempted, 3);
+        assert_eq!(history.succeeded, 1);
+        assert_eq!(history.failed, 2);
+        assert_eq!(history.success_percent, 33);
+        assert_eq!(history.latest_outcome.as_deref(), Some("accepted"));
+        assert_eq!(history.latest_reason_bucket.as_deref(), Some("accepted"));
+        assert_eq!(history.latest_age_seconds, Some(15));
+        assert_eq!(history.consecutive_successes, 1);
+        assert_eq!(history.consecutive_failures, 0);
+        assert_eq!(history.events[0].reason_bucket, "http_error");
+        assert_eq!(history.events[1].reason_bucket, "unknown");
+        assert_eq!(history.events[2].reason_bucket, "accepted");
+
+        let serialized = serde_json::to_string(&history).expect("history serializes");
+        assert!(!serialized.contains("endpoint://leak"));
+        assert!(!serialized.contains("route_id"));
+        assert!(!serialized.contains("node_id"));
+        assert!(!serialized.contains("encrypted_blob"));
+        assert!(!serialized.contains("payload="));
+        assert!(!serialized.contains("client_ip"));
     }
 
     #[test]
