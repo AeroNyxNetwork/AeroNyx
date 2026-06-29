@@ -299,6 +299,14 @@ pub struct PeerStoreTwoHopPathProofEvent {
 pub struct PeerStoreTwoHopPathProofHistory {
     /// Unix timestamp when this summary was generated.
     pub generated_at: u64,
+    /// Stable readiness bucket: forming, ready, stale, attention, or idle.
+    pub status: String,
+    /// Whether the latest retained proof is a fresh accepted two-hop path.
+    pub proof_ready: bool,
+    /// Whether the latest proof success is still within the routeability window.
+    pub recent_success_ready: bool,
+    /// Whether the latest retained proof ended in one or more failures.
+    pub failure_streak_active: bool,
     /// Maximum number of recent proof events retained by this process.
     pub window_size: usize,
     /// Number of retained proof events in this summary.
@@ -321,6 +329,10 @@ pub struct PeerStoreTwoHopPathProofHistory {
     pub consecutive_successes: u64,
     /// Consecutive rejected proofs ending at the latest event.
     pub consecutive_failures: u64,
+    /// Seconds after which a retained successful proof is considered stale.
+    pub stale_after_seconds: u64,
+    /// Privacy-safe next action for nodeboard, website, and AI runbooks.
+    pub next_action: String,
     /// Retained events in chronological order.
     pub events: Vec<PeerStoreTwoHopPathProofEvent>,
     /// Explicit invariant for downstream UI and AI-agent consumers.
@@ -2705,11 +2717,54 @@ impl PeerStore {
             ((succeeded.saturating_mul(100)) / attempted).min(100) as u8
         };
         let latest = events.last();
+        let latest_age_seconds = latest.map(|event| now.saturating_sub(event.at));
         let consecutive_successes = Self::count_trailing_two_hop_outcomes(&events, "accepted");
         let consecutive_failures = Self::count_trailing_two_hop_outcomes(&events, "rejected");
+        let recent_success_ready = latest
+            .map(|event| {
+                event.outcome == "accepted"
+                    && now.saturating_sub(event.at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
+            })
+            .unwrap_or(false);
+        let failure_streak_active = consecutive_failures > 0;
+        let (status, proof_ready, next_action) = if attempted == 0 {
+            (
+                "forming",
+                false,
+                "wait for the first synthetic two-hop path proof",
+            )
+        } else if recent_success_ready {
+            (
+                "ready",
+                true,
+                "continue monitoring repeated two-hop path proof freshness",
+            )
+        } else if failure_streak_active {
+            (
+                "attention",
+                false,
+                "inspect recent routeability, middle-hop endpoint, and terminal-hop proof buckets",
+            )
+        } else if succeeded > 0 {
+            (
+                "stale",
+                false,
+                "wait for a fresh two-hop path proof or verify peer routeability gossip",
+            )
+        } else {
+            (
+                "idle",
+                false,
+                "wait for route candidates before advertising two-hop path proof readiness",
+            )
+        };
 
         PeerStoreTwoHopPathProofHistory {
             generated_at: now,
+            status: status.to_string(),
+            proof_ready,
+            recent_success_ready,
+            failure_streak_active,
             window_size: MAX_TWO_HOP_PATH_PROOF_EVENTS,
             retained_events: events.len(),
             attempted,
@@ -2718,9 +2773,11 @@ impl PeerStore {
             success_percent,
             latest_outcome: latest.map(|event| event.outcome.clone()),
             latest_reason_bucket: latest.map(|event| event.reason_bucket.clone()),
-            latest_age_seconds: latest.map(|event| now.saturating_sub(event.at)),
+            latest_age_seconds,
             consecutive_successes,
             consecutive_failures,
+            stale_after_seconds: PEER_ROUTEABILITY_STALE_AFTER_SECS,
+            next_action: next_action.to_string(),
             events,
             privacy_invariant: "blind_nodes_route_only_opaque_ciphertext".to_string(),
             privacy_boundary: "bounded synthetic two-hop proof history only; no node IDs, endpoints, route IDs, encrypted payloads, receiver identities, client IPs, DNS contents, domains, URLs, Memory Chain plaintext, voucher secrets, wallet-level traffic, or social graph edges".to_string(),
@@ -5540,6 +5597,14 @@ mod tests {
         assert_eq!(status.two_hop_path_proof_history.attempted, 1);
         assert_eq!(status.two_hop_path_proof_history.succeeded, 1);
         assert_eq!(status.two_hop_path_proof_history.failed, 0);
+        assert_eq!(status.two_hop_path_proof_history.status, "ready");
+        assert!(status.two_hop_path_proof_history.proof_ready);
+        assert!(status.two_hop_path_proof_history.recent_success_ready);
+        assert!(!status.two_hop_path_proof_history.failure_streak_active);
+        assert_eq!(
+            status.two_hop_path_proof_history.stale_after_seconds,
+            PEER_ROUTEABILITY_STALE_AFTER_SECS
+        );
         assert_eq!(status.two_hop_path_proof_history.success_percent, 100);
         assert_eq!(
             status.two_hop_path_proof_history.latest_outcome.as_deref(),
@@ -5602,6 +5667,10 @@ mod tests {
         assert_eq!(history.attempted, 3);
         assert_eq!(history.succeeded, 1);
         assert_eq!(history.failed, 2);
+        assert_eq!(history.status, "ready");
+        assert!(history.proof_ready);
+        assert!(history.recent_success_ready);
+        assert!(!history.failure_streak_active);
         assert_eq!(history.success_percent, 33);
         assert_eq!(history.latest_outcome.as_deref(), Some("accepted"));
         assert_eq!(history.latest_reason_bucket.as_deref(), Some("accepted"));
@@ -5619,6 +5688,36 @@ mod tests {
         assert!(!serialized.contains("encrypted_blob"));
         assert!(!serialized.contains("payload="));
         assert!(!serialized.contains("client_ip"));
+    }
+
+    #[test]
+    fn test_two_hop_path_proof_history_marks_attention_and_stale_states() {
+        let failing_store = PeerStore::new();
+        failing_store.record_blind_relay_two_hop_probe_result(1_700_000_010, false, "ack_rejected");
+
+        let failing_history = failing_store
+            .status(1_700_000_020)
+            .two_hop_path_proof_history;
+        assert_eq!(failing_history.status, "attention");
+        assert!(!failing_history.proof_ready);
+        assert!(!failing_history.recent_success_ready);
+        assert!(failing_history.failure_streak_active);
+        assert_eq!(failing_history.consecutive_failures, 1);
+        assert!(failing_history.next_action.contains("routeability"));
+
+        let stale_store = PeerStore::new();
+        stale_store.record_blind_relay_two_hop_probe_result(1_700_000_010, true, "accepted");
+        let stale_history = stale_store
+            .status(1_700_000_010 + PEER_ROUTEABILITY_STALE_AFTER_SECS + 1)
+            .two_hop_path_proof_history;
+        assert_eq!(stale_history.status, "stale");
+        assert!(!stale_history.proof_ready);
+        assert!(!stale_history.recent_success_ready);
+        assert!(!stale_history.failure_streak_active);
+        assert_eq!(stale_history.consecutive_successes, 1);
+        assert!(stale_history
+            .next_action
+            .contains("fresh two-hop path proof"));
     }
 
     #[test]
