@@ -2696,7 +2696,13 @@ impl Server {
                 };
 
                 let outer_envelope = BlindRelayEnvelope {
-                    route_id: Self::blind_relay_probe_route_id(now, self_node_id, &middle_node_id),
+                    route_id: Self::blind_relay_two_hop_probe_route_id(
+                        now,
+                        self_node_id,
+                        &middle_node_id,
+                        &terminal_node_id,
+                        b"outer",
+                    ),
                     next_hop: middle_node_id,
                     ttl: 2,
                     encrypted_blob: Self::blind_relay_probe_blob(
@@ -2709,10 +2715,12 @@ impl Server {
                 }
                 .sign_with(identity);
                 let onward_envelope = BlindRelayEnvelope {
-                    route_id: Self::blind_relay_probe_route_id(
+                    route_id: Self::blind_relay_two_hop_probe_route_id(
                         now,
                         self_node_id,
+                        &middle_node_id,
                         &terminal_node_id,
+                        b"onward",
                     ),
                     next_hop: terminal_node_id,
                     ttl: 1,
@@ -2819,6 +2827,26 @@ impl Server {
         hasher.update(now.to_le_bytes());
         hasher.update(&self_node_id[..]);
         hasher.update(&next_hop[..]);
+        let digest = hasher.finalize();
+        let mut route_id = [0u8; 16];
+        route_id.copy_from_slice(&digest[..16]);
+        route_id
+    }
+
+    fn blind_relay_two_hop_probe_route_id(
+        now: u64,
+        self_node_id: &[u8; 32],
+        middle_node_id: &[u8; 32],
+        terminal_node_id: &[u8; 32],
+        hop_label: &[u8],
+    ) -> [u8; 16] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"aeronyx:blind-relay-two-hop-probe:route-id:v1");
+        hasher.update(hop_label);
+        hasher.update(now.to_be_bytes());
+        hasher.update(self_node_id);
+        hasher.update(middle_node_id);
+        hasher.update(terminal_node_id);
         let digest = hasher.finalize();
         let mut route_id = [0u8; 16];
         route_id.copy_from_slice(&digest[..16]);
