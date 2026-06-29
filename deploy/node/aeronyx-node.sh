@@ -29,6 +29,9 @@
 #   nodes. It verifies discovery status, signed snapshots, onion candidates,
 #   terminal BlindRelay acceptance, and one-hop forwarding with synthetic opaque
 #   blobs only. It is intended for release gates and post-restart checks.
+# - Extend `fleet-smoke` with an optional `--two-hop` proof. The proof submits
+#   outer+onward opaque BlindRelay frames through entry -> middle -> terminal
+#   nodes and treats success as a privacy-safe multi-hop path proof.
 # - Add `healthcheck` as a command alias and summarize local health/operator
 #   JSON in `status` instead of printing full endpoint payloads. This keeps the
 #   one-command operator view readable for humans and AI assistants while
@@ -91,6 +94,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.16.0-node-entrypoint - Added fleet-smoke --two-hop multi-hop relay path proof.
 # v1.15.0-node-entrypoint - Added fleet-smoke public mesh smoke test command.
 # v1.14.0-node-entrypoint - Added gated relay-probe --two-hop live probe mode.
 # v1.13.0-node-entrypoint - Updated relay-probe two-hop blocker wording after onward envelope support.
@@ -149,6 +153,7 @@ RELAY_PROBE_PEER_PREFIX=""
 RELAY_PROBE_TWO_HOP=0
 FLEET_SMOKE_ENDPOINTS="${AERONYX_FLEET_SMOKE_ENDPOINTS:-}"
 FLEET_SMOKE_INCLUDE_NEGATIVE=0
+FLEET_SMOKE_TWO_HOP=0
 YES=0
 EXTRA_ARGS=()
 
@@ -252,6 +257,7 @@ Command-specific options:
   fleet-smoke:
     --endpoints URLS         Comma-separated public discovery base URLs.
     --endpoint URL           Add one public discovery base URL. Repeatable.
+    --two-hop                Prove entry -> middle -> terminal BlindRelay path.
     --include-negative       Also run an invalid-signature probe against the first endpoint.
     --json                  Emit JSON result for nodeboard/automation.
     --json-only             Emit only JSON.
@@ -345,7 +351,7 @@ parse_args() {
             --restart) RESTART_AFTER_CONFIG=1; shift ;;
             --binary|--staged-binary) PROMOTE_BINARY_PATH="${2:?missing value}"; shift 2 ;;
             --expected-sha256) EXPECTED_SHA256="${2:?missing value}"; shift 2 ;;
-            --two-hop) RELAY_PROBE_TWO_HOP=1; shift ;;
+            --two-hop) RELAY_PROBE_TWO_HOP=1; FLEET_SMOKE_TWO_HOP=1; shift ;;
             --peer-prefix) RELAY_PROBE_PEER_PREFIX="${2:?missing value}"; shift 2 ;;
             --peer-cache) PEER_CACHE_FILE="${2:?missing value}"; shift 2 ;;
             --server-key) SERVER_KEY_FILE="${2:?missing value}"; shift 2 ;;
@@ -1014,11 +1020,15 @@ run_fleet_smoke() {
         if [ "${FLEET_SMOKE_INCLUDE_NEGATIVE}" -eq 1 ]; then
             warn "Negative invalid-signature probe is enabled; this intentionally increments aggregate rejection counters."
         fi
+        if [ "${FLEET_SMOKE_TWO_HOP}" -eq 1 ]; then
+            log "Two-hop path proof enabled: entry -> middle -> terminal"
+        fi
     fi
 
     python3 - \
         "${FLEET_SMOKE_ENDPOINTS}" \
         "${FLEET_SMOKE_INCLUDE_NEGATIVE}" \
+        "${FLEET_SMOKE_TWO_HOP}" \
         "${JSON}" \
         "${JSON_ONLY}" <<'PY'
 import hashlib
@@ -1059,8 +1069,9 @@ except Exception as crypto_exc:
         raise SystemExit(2)
 
 DOMAIN = b"AeroNyx-BlindRelay-v1"
-endpoints_arg, include_negative_arg, json_arg, json_only_arg = sys.argv[1:5]
+endpoints_arg, include_negative_arg, two_hop_arg, json_arg, json_only_arg = sys.argv[1:6]
 include_negative = include_negative_arg == "1"
+two_hop_requested = two_hop_arg == "1"
 json_requested = json_arg == "1"
 json_only = json_only_arg == "1"
 endpoints = []
@@ -1083,6 +1094,8 @@ def fail(reason, detail=None):
 
 if len(endpoints) < 2:
     fail("not_enough_endpoints", "fleet-smoke needs at least two public discovery endpoints")
+if two_hop_requested and len(endpoints) < 3:
+    fail("not_enough_endpoints_for_two_hop", "fleet-smoke --two-hop needs at least three public discovery endpoints")
 
 
 def request_json(url, method="GET", body=None, timeout=18):
@@ -1184,6 +1197,21 @@ def first_candidate_node_id(candidates):
     return as_bytes(node_id), str(node_id)[:8]
 
 
+def candidate_node_ids(candidates):
+    values = candidates.get("candidates") if isinstance(candidates, dict) else []
+    out = []
+    for candidate in values if isinstance(values, list) else []:
+        node_id = candidate.get("node_id") if isinstance(candidate, dict) else None
+        if not node_id:
+            continue
+        try:
+            node_id_bytes = as_bytes(node_id)
+        except Exception:
+            continue
+        out.append((node_id_bytes, node_id_bytes.hex()[:8]))
+    return out
+
+
 def build_envelope(next_hop, ttl, label, corrupt=False):
     sign, previous_pub, signer = new_signing_key()
     route_id = os.urandom(16)
@@ -1212,8 +1240,12 @@ def build_envelope(next_hop, ttl, label, corrupt=False):
 endpoint_results = []
 terminal_results = []
 forward_results = []
+two_hop_results = []
 negative_result = None
 all_ok = True
+node_hex_by_endpoint = {}
+endpoint_by_node_hex = {}
+candidate_ids_by_endpoint = {}
 
 for endpoint in endpoints:
     status_result = request_json(endpoint + "/api/discovery/status")
@@ -1221,6 +1253,15 @@ for endpoint in endpoints:
     candidate_result = request_json(endpoint + "/api/discovery/onion-candidates")
     snapshot = snapshot_result.get("body") if snapshot_result.get("ok") else {}
     peer = find_self_peer(snapshot, endpoint)
+    if peer is not None:
+        try:
+            self_node_id_for_map = descriptor_node_id(peer)
+            node_hex_by_endpoint[endpoint] = self_node_id_for_map.hex()
+            endpoint_by_node_hex[self_node_id_for_map.hex()] = endpoint
+        except Exception:
+            pass
+    candidate_body = candidate_result.get("body") if isinstance(candidate_result.get("body"), dict) else {}
+    candidate_ids_by_endpoint[endpoint] = candidate_node_ids(candidate_body)
     endpoint_ok = bool(
         status_result.get("ok")
         and snapshot_result.get("ok")
@@ -1277,7 +1318,6 @@ for endpoint in endpoints:
     })
     all_ok = all_ok and terminal_ok
 
-    candidate_body = candidate_result.get("body") if isinstance(candidate_result.get("body"), dict) else {}
     next_hop, next_prefix = first_candidate_node_id(candidate_body)
     if next_hop is None:
         forward_results.append({
@@ -1311,6 +1351,76 @@ for endpoint in endpoints:
         "route_id_prefix": forward_probe["route_id_prefix"],
     })
     all_ok = all_ok and forward_ok
+
+if two_hop_requested:
+    for entry_endpoint in endpoints:
+        entry_hex = node_hex_by_endpoint.get(entry_endpoint)
+        selected = None
+        for middle_id, middle_prefix in candidate_ids_by_endpoint.get(entry_endpoint, []):
+            middle_hex = middle_id.hex()
+            middle_endpoint = endpoint_by_node_hex.get(middle_hex)
+            if not middle_endpoint or middle_endpoint == entry_endpoint:
+                continue
+            for terminal_id, terminal_prefix in candidate_ids_by_endpoint.get(middle_endpoint, []):
+                terminal_hex = terminal_id.hex()
+                terminal_endpoint = endpoint_by_node_hex.get(terminal_hex)
+                if not terminal_endpoint:
+                    continue
+                if terminal_endpoint in {entry_endpoint, middle_endpoint}:
+                    continue
+                selected = {
+                    "middle_id": middle_id,
+                    "middle_prefix": middle_prefix,
+                    "middle_endpoint": middle_endpoint,
+                    "terminal_id": terminal_id,
+                    "terminal_prefix": terminal_prefix,
+                    "terminal_endpoint": terminal_endpoint,
+                }
+                break
+            if selected is not None:
+                break
+
+        if selected is None:
+            two_hop_results.append({
+                "entry_endpoint": entry_endpoint,
+                "status": "failed",
+                "reason": "no_distinct_routeable_two_hop_path",
+            })
+            all_ok = False
+            continue
+
+        outer_probe = build_envelope(selected["middle_id"], 2, "two-hop-outer")
+        onward_probe = build_envelope(selected["terminal_id"], 1, "two-hop-onward")
+        body = dict(outer_probe["body"])
+        body["onward_envelope"] = onward_probe["body"]["envelope"]
+        proof_http = request_json(
+            entry_endpoint + "/api/chat/peer/blind-relay",
+            method="POST",
+            body=body,
+            timeout=24,
+        )
+        proof_body = proof_http.get("body") if isinstance(proof_http.get("body"), dict) else {}
+        proof_ok = bool(
+            proof_http.get("status_code") == 200
+            and proof_body.get("accepted") is True
+            and proof_body.get("forwarded") is True
+            and proof_body.get("terminal") is False
+            and proof_body.get("reason") in ("forwarded", "onion_middle_forwarded")
+        )
+        two_hop_results.append({
+            "entry_endpoint": entry_endpoint,
+            "middle_endpoint": selected["middle_endpoint"],
+            "terminal_endpoint": selected["terminal_endpoint"],
+            "middle_prefix": selected["middle_prefix"],
+            "terminal_prefix": selected["terminal_prefix"],
+            "status": "ok" if proof_ok else "failed",
+            "response_status": proof_http.get("status_code"),
+            "latency_ms": proof_http.get("latency_ms"),
+            "reason": proof_body.get("reason"),
+            "outer_route_id_prefix": outer_probe["route_id_prefix"],
+            "onward_route_id_prefix": onward_probe["route_id_prefix"],
+        })
+        all_ok = all_ok and proof_ok
 
 if include_negative and endpoint_results:
     first_endpoint = endpoints[0]
@@ -1350,6 +1460,8 @@ result = {
     "endpoints": endpoint_results,
     "terminal_probes": terminal_results,
     "forward_probes": forward_results,
+    "two_hop_requested": two_hop_requested,
+    "two_hop_proofs": two_hop_results,
     "negative_probe": negative_result,
     "source": "aeronyx-node.sh fleet-smoke",
     "privacy_boundary": "synthetic opaque blobs only; no user messages, wallet ids, DNS contents, destinations, domains, URLs, packet payloads, client public IPs, or private keys",
@@ -1385,6 +1497,17 @@ if not json_only:
                 status=item["status"],
                 endpoint=item["endpoint"],
                 next_hop=item.get("next_hop_prefix"),
+                code=item.get("response_status"),
+                reason=item.get("reason"),
+            )
+        )
+    for item in two_hop_results:
+        print(
+            "two_hop_proof={status} entry={entry} middle={middle} terminal={terminal} code={code} reason={reason}".format(
+                status=item["status"],
+                entry=item["entry_endpoint"],
+                middle=item.get("middle_prefix"),
+                terminal=item.get("terminal_prefix"),
                 code=item.get("response_status"),
                 reason=item.get("reason"),
             )
