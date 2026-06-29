@@ -3164,8 +3164,7 @@ impl PeerStore {
         let transport_attention = stats.forward_failed > 0
             || stats.retry_exhausted > 0
             || stats.backpressure_dropped > 0
-            || stats.probe_failed > 0
-            || stats.two_hop_probe_failed > 0;
+            || stats.probe_failed > 0;
         let quality_ready = runtime_ready && !transport_attention;
 
         let status = if stats.received == 0
@@ -3175,10 +3174,7 @@ impl PeerStore {
             "idle"
         } else if stats.retry_exhausted > 0 || stats.backpressure_dropped > 0 {
             "attention"
-        } else if stats.forward_failed > 0
-            || stats.probe_failed > 0
-            || stats.two_hop_probe_failed > 0
-        {
+        } else if stats.forward_failed > 0 || stats.probe_failed > 0 {
             "degraded"
         } else if protection_active {
             "protecting"

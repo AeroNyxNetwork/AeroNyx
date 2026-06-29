@@ -2641,109 +2641,155 @@ impl Server {
         self_node_id: &[u8; 32],
         now: u64,
     ) -> bool {
-        let Some(path) = peer_store.route_path_with_capabilities_excluding(
-            &[NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+        let middle_candidates = peer_store.route_candidates_with_capability_excluding(
+            NodeCapability::OnionMiddle,
             now,
+            4,
             &[*self_node_id],
-        ) else {
+        );
+        if middle_candidates.is_empty() {
             return false;
-        };
-        let [middle, terminal] = path.as_slice() else {
-            return false;
-        };
-
-        let middle_node_id = middle.node_id();
-        let terminal_node_id = terminal.node_id();
-        let Some(endpoint) = middle.descriptor.public_endpoint.as_deref() else {
-            peer_store.record_blind_relay_two_hop_probe_result(
-                now,
-                false,
-                "middle_missing_endpoint",
-            );
-            peer_store.record_route_forward_failure(&middle_node_id, now, "missing_endpoint");
-            return true;
-        };
-        let Some(url) = Self::blind_relay_probe_url(endpoint) else {
-            peer_store.record_blind_relay_two_hop_probe_result(
-                now,
-                false,
-                "middle_invalid_endpoint",
-            );
-            peer_store.record_route_forward_failure(&middle_node_id, now, "invalid_endpoint");
-            return true;
-        };
-
-        let outer_envelope = BlindRelayEnvelope {
-            route_id: Self::blind_relay_probe_route_id(now, self_node_id, &middle_node_id),
-            next_hop: middle_node_id,
-            ttl: 2,
-            encrypted_blob: Self::blind_relay_probe_blob(now, self_node_id, &middle_node_id),
-            timestamp: now,
-            signature: [0u8; 64],
         }
-        .sign_with(identity);
-        let onward_envelope = BlindRelayEnvelope {
-            route_id: Self::blind_relay_probe_route_id(now, self_node_id, &terminal_node_id),
-            next_hop: terminal_node_id,
-            ttl: 1,
-            encrypted_blob: Self::blind_relay_probe_blob(now, self_node_id, &terminal_node_id),
-            timestamp: now,
-            signature: [0u8; 64],
-        }
-        .sign_with(identity);
-        let request = PeerBlindRelayRequest {
-            envelope: outer_envelope,
-            previous_hop_node_id: *self_node_id,
-            onward_envelope: Some(onward_envelope),
-        };
 
-        match client.post(url).json(&request).send().await {
-            Ok(response) if response.status().is_success() => {
-                match response.json::<PeerBlindRelayResponse>().await {
-                    Ok(ack) if ack.accepted && ack.forwarded => {
-                        peer_store.record_blind_relay_two_hop_probe_result(now, true, "accepted");
-                        peer_store.record_route_forward_success(&middle_node_id, now);
+        let mut attempted = false;
+        for middle in middle_candidates {
+            let middle_node_id = middle.node_id();
+            let terminal_candidates = peer_store.route_candidates_with_capability_excluding(
+                NodeCapability::ChatRelay,
+                now,
+                4,
+                &[*self_node_id, middle_node_id],
+            );
+            if terminal_candidates.is_empty() {
+                continue;
+            }
+
+            for terminal in terminal_candidates {
+                attempted = true;
+                let terminal_node_id = terminal.node_id();
+                let Some(endpoint) = middle.descriptor.public_endpoint.as_deref() else {
+                    peer_store.record_blind_relay_two_hop_probe_result(
+                        now,
+                        false,
+                        "middle_missing_endpoint",
+                    );
+                    peer_store.record_route_forward_failure(
+                        &middle_node_id,
+                        now,
+                        "missing_endpoint",
+                    );
+                    continue;
+                };
+                let Some(url) = Self::blind_relay_probe_url(endpoint) else {
+                    peer_store.record_blind_relay_two_hop_probe_result(
+                        now,
+                        false,
+                        "middle_invalid_endpoint",
+                    );
+                    peer_store.record_route_forward_failure(
+                        &middle_node_id,
+                        now,
+                        "invalid_endpoint",
+                    );
+                    continue;
+                };
+
+                let outer_envelope = BlindRelayEnvelope {
+                    route_id: Self::blind_relay_probe_route_id(now, self_node_id, &middle_node_id),
+                    next_hop: middle_node_id,
+                    ttl: 2,
+                    encrypted_blob: Self::blind_relay_probe_blob(
+                        now,
+                        self_node_id,
+                        &middle_node_id,
+                    ),
+                    timestamp: now,
+                    signature: [0u8; 64],
+                }
+                .sign_with(identity);
+                let onward_envelope = BlindRelayEnvelope {
+                    route_id: Self::blind_relay_probe_route_id(
+                        now,
+                        self_node_id,
+                        &terminal_node_id,
+                    ),
+                    next_hop: terminal_node_id,
+                    ttl: 1,
+                    encrypted_blob: Self::blind_relay_probe_blob(
+                        now,
+                        self_node_id,
+                        &terminal_node_id,
+                    ),
+                    timestamp: now,
+                    signature: [0u8; 64],
+                }
+                .sign_with(identity);
+                let request = PeerBlindRelayRequest {
+                    envelope: outer_envelope,
+                    previous_hop_node_id: *self_node_id,
+                    onward_envelope: Some(onward_envelope),
+                };
+
+                match client.post(&url).json(&request).send().await {
+                    Ok(response) if response.status().is_success() => {
+                        match response.json::<PeerBlindRelayResponse>().await {
+                            Ok(ack) if ack.accepted && ack.forwarded => {
+                                peer_store
+                                    .record_blind_relay_two_hop_probe_result(now, true, "accepted");
+                                peer_store.record_route_forward_success(&middle_node_id, now);
+                                return true;
+                            }
+                            Ok(_ack) => {
+                                peer_store.record_blind_relay_two_hop_probe_result(
+                                    now,
+                                    false,
+                                    "ack_rejected",
+                                );
+                                peer_store.record_route_forward_failure(
+                                    &middle_node_id,
+                                    now,
+                                    "ack_rejected",
+                                );
+                            }
+                            Err(error) => {
+                                debug!(
+                                    error = %error,
+                                    "[DISCOVERY] Two-hop blind relay proof ACK decode failed"
+                                );
+                                peer_store.record_blind_relay_two_hop_probe_result(
+                                    now,
+                                    false,
+                                    "ack_decode",
+                                );
+                                peer_store.record_route_forward_failure(
+                                    &middle_node_id,
+                                    now,
+                                    "ack_decode",
+                                );
+                            }
+                        }
                     }
-                    Ok(_ack) => {
-                        peer_store.record_blind_relay_two_hop_probe_result(
-                            now,
-                            false,
-                            "ack_rejected",
-                        );
-                        peer_store.record_route_forward_failure(
-                            &middle_node_id,
-                            now,
-                            "ack_rejected",
-                        );
+                    Ok(response) => {
+                        let reason = format!("http_{}", response.status().as_u16());
+                        peer_store.record_blind_relay_two_hop_probe_result(now, false, &reason);
+                        peer_store.record_route_forward_failure(&middle_node_id, now, reason);
                     }
                     Err(error) => {
+                        let reason =
+                            Self::classify_reqwest_error("two_hop_blind_relay_probe", &error);
                         debug!(
-                            error = %error,
-                            "[DISCOVERY] Two-hop blind relay proof ACK decode failed"
+                            reason = %reason,
+                            "[DISCOVERY] Two-hop blind relay proof failed"
                         );
-                        peer_store.record_blind_relay_two_hop_probe_result(
-                            now,
-                            false,
-                            "ack_decode",
-                        );
-                        peer_store.record_route_forward_failure(&middle_node_id, now, "ack_decode");
+                        peer_store.record_blind_relay_two_hop_probe_result(now, false, &reason);
+                        peer_store.record_route_forward_failure(&middle_node_id, now, reason);
                     }
                 }
             }
-            Ok(response) => {
-                let reason = format!("http_{}", response.status().as_u16());
-                peer_store.record_blind_relay_two_hop_probe_result(now, false, &reason);
-                peer_store.record_route_forward_failure(&middle_node_id, now, reason);
-            }
-            Err(error) => {
-                let reason = Self::classify_reqwest_error("two_hop_blind_relay_probe", &error);
-                debug!(
-                    reason = %reason,
-                    "[DISCOVERY] Two-hop blind relay proof failed"
-                );
-                peer_store.record_blind_relay_two_hop_probe_result(now, false, &reason);
-                peer_store.record_route_forward_failure(&middle_node_id, now, reason);
-            }
+        }
+
+        if !attempted {
+            peer_store.record_blind_relay_two_hop_probe_result(now, false, "no_distinct_path");
         }
         true
     }
