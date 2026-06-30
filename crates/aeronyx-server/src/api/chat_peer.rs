@@ -91,8 +91,11 @@
 //!   the existing chat relay store-and-forward path before ACKing the previous
 //!   hop. A successful peel alone is not enough to claim real encrypted message
 //!   movement.
+//! - Duplicate route IDs are treated as idempotent replay drops, not previous-hop
+//!   abuse. Lost ACK retries must not quarantine an otherwise healthy relay.
 //!
 //! ## Last Modified
+//! v0.22.0-BlindRelayDuplicateIdempotence - Keep duplicate route drops out of previous-hop quarantine scoring
 //! v0.21.0-OnionMiddleRouteabilityRecovery - Allow true onion middle recovery through fresh signed descriptors unless route-quarantined
 //! v0.20.0-OnionTerminalDeliveryAck - Require terminal onion delivery before accepted ACK
 //! v0.19.0-BlindRelayDescriptorHint - Allow signed next-hop descriptor hints for controlled two-hop proofs
@@ -1475,12 +1478,7 @@ fn record_blind_relay_previous_hop_success(
 fn blind_relay_reason_counts_toward_quarantine(reason: &str) -> bool {
     matches!(
         reason,
-        "invalid_previous_hop"
-            | "invalid_signature"
-            | "self_loop"
-            | "route_loop"
-            | "duplicate_route"
-            | "ttl_exhausted"
+        "invalid_previous_hop" | "invalid_signature" | "self_loop" | "route_loop" | "ttl_exhausted"
     )
 }
 
@@ -1490,7 +1488,13 @@ fn duplicate_blind_relay_response(
     now: u64,
     ttl_remaining: u8,
 ) -> PeerBlindRelayResponse {
-    reject_blind_relay_previous_hop(state, previous_hop, now, "duplicate_route");
+    // Duplicate route IDs are idempotent replay drops. They are still counted
+    // in the aggregate blind relay replay bucket, but they must not poison the
+    // previous-hop health score: a healthy peer may retry after losing our ACK.
+    state
+        .peer_store
+        .record_blind_relay_rejected(now, "duplicate_route");
+    record_blind_relay_previous_hop_success(state, previous_hop, now);
     PeerBlindRelayResponse {
         accepted: true,
         terminal: false,
@@ -2563,6 +2567,9 @@ mod tests {
                 && event.outcome == "rejected"
                 && event.detail == "duplicate_route"
         }));
+        assert!(!blind_relay_reason_counts_toward_quarantine(
+            "duplicate_route"
+        ));
     }
 
     #[tokio::test]
