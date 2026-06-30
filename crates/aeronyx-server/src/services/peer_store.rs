@@ -110,6 +110,9 @@
 //! - Onion middle-hop recovery can distinguish route quarantine from ordinary
 //!   unknown routeability, allowing cold-start proof attempts without sending
 //!   through peers that are actively isolated by local route health policy
+//! - Network story readiness treats a fresh successful two-hop path proof as
+//!   onion-ready evidence, preventing proven delivery paths from being hidden by
+//!   conservative local route-candidate planning after restart
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -136,6 +139,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.47.0-TwoHopProofBackedStory - Let fresh two-hop path proof promote local network story to onion_ready
 //! v0.46.0-OnionMiddleRouteabilityRecovery - Exposed route quarantine checks for onion middle cold-start recovery
 //! v0.45.0-TwoHopMessageDeliveryReadiness - Added aggregate freshness/streak gates for message-delivery proof
 //! v0.44.0-TwoHopOnionDeliveryScope - Mark synthetic onion terminal delivery as message-delivery proof
@@ -3666,8 +3670,13 @@ impl PeerStore {
         let peer_health_summary = self.peer_health_summary(now);
         let peer_quorum =
             Self::peer_quorum_status(now, &stability, &peer_summary, &route_candidates);
-        let network_story =
-            Self::network_story_status(now, &stability, &peer_summary, &route_candidates);
+        let network_story = Self::network_story_status(
+            now,
+            &stability,
+            &peer_summary,
+            &route_candidates,
+            &two_hop_path_proof_history,
+        );
 
         PeerStoreStatus {
             snapshot,
@@ -3976,12 +3985,17 @@ impl PeerStore {
         stability: &PeerStoreStabilityStatus,
         peer_summary: &PeerStorePeerSummaryStatus,
         route_candidates: &PeerStoreRouteCandidateStatus,
+        two_hop_path_proof_history: &PeerStoreTwoHopPathProofHistory,
     ) -> PeerStoreNetworkStoryStatus {
         let chat_single_hop_ready = route_candidates.planned_paths.chat_single_hop.complete;
-        let chat_two_hop_onion_ready = route_candidates
+        let planned_two_hop_onion_ready = route_candidates
             .planned_paths
             .chat_two_hop_onion_ready
             .complete;
+        let proof_backed_two_hop_onion_ready = two_hop_path_proof_history.recent_success_ready
+            && !two_hop_path_proof_history.failure_streak_active;
+        let chat_two_hop_onion_ready =
+            planned_two_hop_onion_ready || proof_backed_two_hop_onion_ready;
         let routeable_chat_relays = route_candidates
             .chat_relay
             .iter()
@@ -4020,12 +4034,13 @@ impl PeerStore {
         };
 
         let detail = format!(
-            "valid_nodes={} chat_relay_nodes={} onion_middle_nodes={} routeable_chat_relays={} routeable_onion_middle_hops={} restart_recovery_configured={} relay_foundation_ready={}",
+            "valid_nodes={} chat_relay_nodes={} onion_middle_nodes={} routeable_chat_relays={} routeable_onion_middle_hops={} two_hop_path_proof_recent={} restart_recovery_configured={} relay_foundation_ready={}",
             peer_summary.valid_peers,
             peer_summary.chat_relay_peers,
             peer_summary.onion_middle_peers,
             routeable_chat_relays,
             routeable_onion_middle_hops,
+            proof_backed_two_hop_onion_ready,
             stability.restart_recovery_configured,
             stability.relay_foundation_ready
         );
@@ -5329,6 +5344,58 @@ mod tests {
         assert!(!story_json.contains(&hex::encode(relay_node_id)));
         assert!(!story_json.contains("encrypted_blob"));
         assert!(!story_json.contains("receiver_pubkey"));
+    }
+
+    #[test]
+    fn test_network_story_uses_fresh_two_hop_path_proof_as_onion_ready_evidence() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        store.configure_bootstrap_status(true, true, true, 2);
+        store.record_gossip_round(now + 20, 2, 2, 1, None);
+
+        let middle_kp = IdentityKeyPair::generate();
+        let relay_kp = IdentityKeyPair::generate();
+
+        let mut middle_descriptor = signed_descriptor_for(&middle_kp, 1, now + 2_000);
+        middle_descriptor.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        middle_descriptor.descriptor.public_endpoint =
+            Some("https://proof-middle.example".to_string());
+        middle_descriptor =
+            SignedNodeDescriptor::sign(middle_descriptor.descriptor, &middle_kp).unwrap();
+
+        let mut relay_descriptor = signed_descriptor_for(&relay_kp, 1, now + 2_000);
+        relay_descriptor.descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        relay_descriptor.descriptor.public_endpoint =
+            Some("https://proof-relay.example".to_string());
+        relay_descriptor =
+            SignedNodeDescriptor::sign(relay_descriptor.descriptor, &relay_kp).unwrap();
+
+        store
+            .upsert_verified_from_source(middle_descriptor, now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(relay_descriptor, now, "gossip_announce")
+            .unwrap();
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            now + 25,
+            true,
+            "onion_terminal_delivered",
+            1,
+            1,
+            2,
+            1,
+        );
+
+        let story = store.status(now + 30).network_story;
+
+        assert_eq!(story.status, "onion_ready");
+        assert!(story.chat_two_hop_onion_ready);
+        assert_eq!(story.routeable_chat_relays, 0);
+        assert_eq!(story.routeable_onion_middle_hops, 0);
+        assert!(story.detail.contains("two_hop_path_proof_recent=true"));
+        let story_json = serde_json::to_string(&story).unwrap();
+        assert!(!story_json.contains("proof-middle.example"));
+        assert!(!story_json.contains("proof-relay.example"));
     }
 
     #[test]
