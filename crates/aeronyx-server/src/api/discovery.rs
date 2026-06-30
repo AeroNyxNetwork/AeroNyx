@@ -485,10 +485,19 @@ pub fn discovery_readiness_status_value(
             "single_hop_relay_ready": network_story.chat_single_hop_ready,
             "two_hop_onion_ready": two_hop_path_ready,
             "two_hop_path_proof_ready": blind_relay_quality.two_hop_probe_ready,
+            "two_hop_message_delivery_ready": status
+                .two_hop_path_proof_history
+                .message_delivery_ready,
+            "two_hop_recent_message_delivery_ready": status
+                .two_hop_path_proof_history
+                .recent_message_delivery_ready,
             "two_hop_probe_attempted": blind_relay_quality.two_hop_probe_attempted,
             "two_hop_probe_succeeded": blind_relay_quality.two_hop_probe_succeeded,
             "two_hop_probe_failed": blind_relay_quality.two_hop_probe_failed,
             "last_two_hop_probe_age_seconds": blind_relay_quality.last_two_hop_probe_age_seconds,
+            "last_two_hop_message_delivery_age_seconds": status
+                .two_hop_path_proof_history
+                .latest_message_delivery_age_seconds,
             "verified_peer_count": peer_quorum.valid_peers,
             "routeable_relay_count": peer_quorum.routeable_chat_relays,
             "last_probe_age_seconds": blind_relay_quality.last_probe_age_seconds,
@@ -649,10 +658,13 @@ pub fn discovery_summary_response(
             "freshness_bucket": &two_hop_history.freshness_bucket,
             "proof_ready": two_hop_history.proof_ready,
             "recent_success_ready": two_hop_history.recent_success_ready,
+            "message_delivery_ready": two_hop_history.message_delivery_ready,
+            "recent_message_delivery_ready": two_hop_history.recent_message_delivery_ready,
             "failure_streak_active": two_hop_history.failure_streak_active,
             "retained_events": two_hop_history.retained_events,
             "attempted": two_hop_history.attempted,
             "succeeded": two_hop_history.succeeded,
+            "message_delivery_successes": two_hop_history.message_delivery_successes,
             "failed": two_hop_history.failed,
             "success_percent": two_hop_history.success_percent,
             "latest_outcome": &two_hop_history.latest_outcome,
@@ -660,11 +672,15 @@ pub fn discovery_summary_response(
             "latest_age_seconds": two_hop_history.latest_age_seconds,
             "latest_success_age_seconds": two_hop_history.latest_success_age_seconds,
             "latest_failure_age_seconds": two_hop_history.latest_failure_age_seconds,
+            "latest_message_delivery_age_seconds": two_hop_history.latest_message_delivery_age_seconds,
             "consecutive_successes": two_hop_history.consecutive_successes,
             "consecutive_failures": two_hop_history.consecutive_failures,
+            "consecutive_message_delivery_successes": two_hop_history.consecutive_message_delivery_successes,
             "path_shape_counts": &two_hop_history.path_shape_counts,
             "candidate_pool_counts": &two_hop_history.candidate_pool_counts,
             "ttl_shape_counts": &two_hop_history.ttl_shape_counts,
+            "proof_scope": &two_hop_history.proof_scope,
+            "proof_scope_counts": &two_hop_history.proof_scope_counts,
             "stale_after_seconds": two_hop_history.stale_after_seconds,
             "next_action": &two_hop_history.next_action,
         }),
@@ -1154,7 +1170,7 @@ mod tests {
     #[tokio::test]
     async fn test_status_endpoint_returns_compact_discovery_readiness_without_private_metadata() {
         let store = Arc::new(PeerStore::new());
-        store.record_blind_relay_forwarded(1_700_000_010, 1);
+        store.record_blind_relay_forwarded(now_secs(), 1);
         let app = build_discovery_router_with_local_status(
             store,
             DiscoveryApiPolicy::default(),
@@ -1286,7 +1302,13 @@ mod tests {
         let now = now_secs();
         store.record_blind_relay_forwarded(now, 1);
         store.record_blind_relay_two_hop_probe_result_with_context(
-            now, true, "accepted", 4, 3, 2, 1,
+            now,
+            true,
+            "onion_terminal_delivered",
+            4,
+            3,
+            2,
+            1,
         );
         let app = build_discovery_router_with_local_status(
             store,
@@ -1318,7 +1340,39 @@ mod tests {
             parsed["two_hop_path_proof"]["proof_ready"].as_bool(),
             Some(true)
         );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["message_delivery_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["recent_message_delivery_ready"].as_bool(),
+            Some(true)
+        );
         assert_eq!(parsed["two_hop_path_proof"]["succeeded"].as_u64(), Some(1));
+        assert_eq!(
+            parsed["two_hop_path_proof"]["message_delivery_successes"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["latest_reason_bucket"].as_str(),
+            Some("onion_terminal_delivered")
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["proof_scope"].as_str(),
+            Some("message_delivery")
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["proof_scope_counts"]["message_delivery"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["consecutive_message_delivery_successes"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["latest_message_delivery_age_seconds"].as_u64(),
+            Some(0)
+        );
         assert_eq!(
             parsed["two_hop_path_proof"]["path_shape_counts"]["entry_middle_terminal"].as_u64(),
             Some(1)
@@ -1331,6 +1385,7 @@ mod tests {
             parsed["two_hop_path_proof"]["ttl_shape_counts"]["entry_ttl_2_onward_ttl_1"].as_u64(),
             Some(1)
         );
+        assert_eq!(parsed["stage"].as_str(), Some("two_hop_path_ready"));
         assert_eq!(
             parsed["privacy_invariant"].as_str(),
             Some("blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status")
