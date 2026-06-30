@@ -104,6 +104,9 @@
 //! - Two-hop path proof scope separates synthetic control-plane reachability
 //!   from real message-delivery proof so public surfaces never overstate App
 //!   chat delivery before true terminal store-and-forward evidence exists
+//! - Two-hop message-delivery readiness exposes fresh terminal ChatRelay proof
+//!   as its own aggregate gate, so App/nodeboard/backend can distinguish
+//!   onion route reachability from actual store-and-forward delivery evidence
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -130,6 +133,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.45.0-TwoHopMessageDeliveryReadiness - Added aggregate freshness/streak gates for message-delivery proof
 //! v0.44.0-TwoHopOnionDeliveryScope - Mark synthetic onion terminal delivery as message-delivery proof
 //! v0.43.0-TwoHopProofScope - Added explicit control-plane proof scope for synthetic two-hop probes
 //! v0.42.0-TwoHopProofQualityContext - Added privacy-safe path/candidate/TTL buckets
@@ -344,6 +348,16 @@ pub struct PeerStoreTwoHopPathProofHistory {
     pub proof_ready: bool,
     /// Whether the latest proof success is still within the routeability window.
     pub recent_success_ready: bool,
+    /// Whether the latest retained proof is a fresh terminal message-delivery proof.
+    ///
+    /// This is stricter than `proof_ready`: control-plane probes can prove
+    /// entry -> middle -> terminal reachability, while this gate requires the
+    /// terminal hop to accept the opaque payload into ChatRelay store-and-forward.
+    #[serde(default)]
+    pub message_delivery_ready: bool,
+    /// Whether any retained terminal message-delivery proof is still fresh.
+    #[serde(default)]
+    pub recent_message_delivery_ready: bool,
     /// Whether the latest retained proof ended in one or more failures.
     pub failure_streak_active: bool,
     /// Maximum number of recent proof events retained by this process.
@@ -354,6 +368,9 @@ pub struct PeerStoreTwoHopPathProofHistory {
     pub attempted: u64,
     /// Retained accepted proofs in the bounded window.
     pub succeeded: u64,
+    /// Retained accepted proofs whose scope is terminal message delivery.
+    #[serde(default)]
+    pub message_delivery_successes: u64,
     /// Retained rejected proofs in the bounded window.
     pub failed: u64,
     /// Success percentage over retained events.
@@ -368,10 +385,16 @@ pub struct PeerStoreTwoHopPathProofHistory {
     pub latest_success_age_seconds: Option<u64>,
     /// Seconds since the latest retained rejected proof event.
     pub latest_failure_age_seconds: Option<u64>,
+    /// Seconds since the latest retained terminal message-delivery proof.
+    #[serde(default)]
+    pub latest_message_delivery_age_seconds: Option<u64>,
     /// Consecutive accepted proofs ending at the latest event.
     pub consecutive_successes: u64,
     /// Consecutive rejected proofs ending at the latest event.
     pub consecutive_failures: u64,
+    /// Consecutive accepted terminal message-delivery proofs ending at latest event.
+    #[serde(default)]
+    pub consecutive_message_delivery_successes: u64,
     /// Aggregate reason-bucket counts in the retained window.
     ///
     /// This exposes only stable buckets derived from
@@ -2887,6 +2910,10 @@ impl PeerStore {
             .iter()
             .filter(|event| event.outcome == "accepted")
             .count() as u64;
+        let message_delivery_successes = events
+            .iter()
+            .filter(|event| event.outcome == "accepted" && event.proof_scope == "message_delivery")
+            .count() as u64;
         let failed = attempted.saturating_sub(succeeded);
         let success_percent = if attempted == 0 {
             0
@@ -2905,8 +2932,15 @@ impl PeerStore {
             .rev()
             .find(|event| event.outcome == "rejected")
             .map(|event| now.saturating_sub(event.at));
+        let latest_message_delivery_age_seconds = events
+            .iter()
+            .rev()
+            .find(|event| event.outcome == "accepted" && event.proof_scope == "message_delivery")
+            .map(|event| now.saturating_sub(event.at));
         let consecutive_successes = Self::count_trailing_two_hop_outcomes(&events, "accepted");
         let consecutive_failures = Self::count_trailing_two_hop_outcomes(&events, "rejected");
+        let consecutive_message_delivery_successes =
+            Self::count_trailing_two_hop_message_delivery_successes(&events);
         let reason_bucket_counts =
             Self::count_two_hop_event_buckets(&events, |event| event.reason_bucket.as_str());
         let failure_events = events
@@ -2953,6 +2987,16 @@ impl PeerStore {
                 event.outcome == "accepted"
                     && now.saturating_sub(event.at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
             })
+            .unwrap_or(false);
+        let message_delivery_ready = latest
+            .map(|event| {
+                event.outcome == "accepted"
+                    && event.proof_scope == "message_delivery"
+                    && now.saturating_sub(event.at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
+            })
+            .unwrap_or(false);
+        let recent_message_delivery_ready = latest_message_delivery_age_seconds
+            .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
             .unwrap_or(false);
         let failure_streak_active = consecutive_failures > 0;
         let (status, proof_ready, next_action) = if attempted == 0 {
@@ -3004,11 +3048,14 @@ impl PeerStore {
             freshness_bucket: freshness_bucket.to_string(),
             proof_ready,
             recent_success_ready,
+            message_delivery_ready,
+            recent_message_delivery_ready,
             failure_streak_active,
             window_size: MAX_TWO_HOP_PATH_PROOF_EVENTS,
             retained_events: events.len(),
             attempted,
             succeeded,
+            message_delivery_successes,
             failed,
             success_percent,
             latest_outcome: latest.map(|event| event.outcome.clone()),
@@ -3016,8 +3063,10 @@ impl PeerStore {
             latest_age_seconds,
             latest_success_age_seconds,
             latest_failure_age_seconds,
+            latest_message_delivery_age_seconds,
             consecutive_successes,
             consecutive_failures,
+            consecutive_message_delivery_successes,
             reason_bucket_counts,
             failure_reason_bucket_counts,
             path_shape_counts,
@@ -3049,6 +3098,18 @@ impl PeerStore {
             .iter()
             .rev()
             .take_while(|event| event.outcome == outcome)
+            .count() as u64
+    }
+
+    fn count_trailing_two_hop_message_delivery_successes(
+        events: &[PeerStoreTwoHopPathProofEvent],
+    ) -> u64 {
+        events
+            .iter()
+            .rev()
+            .take_while(|event| {
+                event.outcome == "accepted" && event.proof_scope == "message_delivery"
+            })
             .count() as u64
     }
 
@@ -5906,6 +5967,28 @@ mod tests {
         );
         assert!(status.two_hop_path_proof_history.proof_ready);
         assert!(status.two_hop_path_proof_history.recent_success_ready);
+        assert!(!status.two_hop_path_proof_history.message_delivery_ready);
+        assert!(
+            !status
+                .two_hop_path_proof_history
+                .recent_message_delivery_ready
+        );
+        assert_eq!(
+            status.two_hop_path_proof_history.message_delivery_successes,
+            0
+        );
+        assert_eq!(
+            status
+                .two_hop_path_proof_history
+                .latest_message_delivery_age_seconds,
+            None
+        );
+        assert_eq!(
+            status
+                .two_hop_path_proof_history
+                .consecutive_message_delivery_successes,
+            0
+        );
         assert!(!status.two_hop_path_proof_history.failure_streak_active);
         assert_eq!(
             status.two_hop_path_proof_history.stale_after_seconds,
@@ -6057,12 +6140,66 @@ mod tests {
         );
         assert_eq!(history.proof_scope, "message_delivery");
         assert_eq!(history.proof_scope_counts.get("message_delivery"), Some(&1));
+        assert!(history.proof_ready);
+        assert!(history.recent_success_ready);
+        assert!(history.message_delivery_ready);
+        assert!(history.recent_message_delivery_ready);
+        assert_eq!(history.message_delivery_successes, 1);
+        assert_eq!(history.latest_message_delivery_age_seconds, Some(5));
+        assert_eq!(history.consecutive_message_delivery_successes, 1);
         assert_eq!(history.events.len(), 1);
         assert_eq!(history.events[0].evidence_mode, "real_relay_traffic");
         assert_eq!(history.events[0].proof_scope, "message_delivery");
         assert!(!history.privacy_boundary.contains("route_id="));
         assert!(!history.privacy_boundary.contains("receiver="));
         assert!(!history.privacy_boundary.contains("encrypted_blob="));
+    }
+
+    #[test]
+    fn test_two_hop_message_delivery_readiness_distinguishes_latest_from_recent() {
+        let store = PeerStore::new();
+
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_010,
+            true,
+            "onion_terminal_delivered",
+            3,
+            3,
+            2,
+            1,
+        );
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_020,
+            true,
+            "accepted",
+            3,
+            3,
+            2,
+            1,
+        );
+
+        let history = store.status(1_700_000_030).two_hop_path_proof_history;
+
+        assert!(history.proof_ready);
+        assert!(history.recent_success_ready);
+        assert!(!history.message_delivery_ready);
+        assert!(history.recent_message_delivery_ready);
+        assert_eq!(history.message_delivery_successes, 1);
+        assert_eq!(history.latest_message_delivery_age_seconds, Some(20));
+        assert_eq!(history.consecutive_successes, 2);
+        assert_eq!(history.consecutive_message_delivery_successes, 0);
+        assert_eq!(history.proof_scope, "control_plane");
+        assert_eq!(history.proof_scope_counts.get("message_delivery"), Some(&1));
+        assert_eq!(history.proof_scope_counts.get("control_plane"), Some(&1));
+
+        let serialized = serde_json::to_string(&history).expect("history serializes");
+        assert!(!serialized.contains("route_id"));
+        assert!(!serialized.contains("endpoint="));
+        assert!(!serialized.contains("https://"));
+        assert!(!serialized.contains("http://"));
+        assert!(!serialized.contains("receiver="));
+        assert!(!serialized.contains("payload="));
+        assert!(!serialized.contains("node_id"));
     }
 
     #[test]
@@ -6080,11 +6217,14 @@ mod tests {
         assert_eq!(history.retained_events, 3);
         assert_eq!(history.attempted, 3);
         assert_eq!(history.succeeded, 1);
+        assert_eq!(history.message_delivery_successes, 0);
         assert_eq!(history.failed, 2);
         assert_eq!(history.status, "ready");
         assert_eq!(history.freshness_bucket, "fresh_success");
         assert!(history.proof_ready);
         assert!(history.recent_success_ready);
+        assert!(!history.message_delivery_ready);
+        assert!(!history.recent_message_delivery_ready);
         assert!(!history.failure_streak_active);
         assert_eq!(history.success_percent, 33);
         assert_eq!(history.latest_outcome.as_deref(), Some("accepted"));
@@ -6092,8 +6232,10 @@ mod tests {
         assert_eq!(history.latest_age_seconds, Some(15));
         assert_eq!(history.latest_success_age_seconds, Some(15));
         assert_eq!(history.latest_failure_age_seconds, Some(25));
+        assert_eq!(history.latest_message_delivery_age_seconds, None);
         assert_eq!(history.consecutive_successes, 1);
         assert_eq!(history.consecutive_failures, 0);
+        assert_eq!(history.consecutive_message_delivery_successes, 0);
         assert_eq!(history.events[0].reason_bucket, "http_error");
         assert_eq!(history.events[1].reason_bucket, "unknown");
         assert_eq!(history.events[2].reason_bucket, "accepted");
