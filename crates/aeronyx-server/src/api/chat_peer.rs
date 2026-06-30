@@ -83,8 +83,13 @@
 //! - Blind relay forwards only to peers with fresh routeability evidence.
 //!   Signed descriptors prove identity/capability, but routeability probes
 //!   prove the next hop can actually receive encrypted relay work.
+//! - Onion terminal hops must successfully hand the peeled `ChatEnvelope` to
+//!   the existing chat relay store-and-forward path before ACKing the previous
+//!   hop. A successful peel alone is not enough to claim real encrypted message
+//!   movement.
 //!
 //! ## Last Modified
+//! v0.20.0-OnionTerminalDeliveryAck - Require terminal onion delivery before accepted ACK
 //! v0.19.0-BlindRelayDescriptorHint - Allow signed next-hop descriptor hints for controlled two-hop proofs
 //! v0.18.0-BlindRelayRouteabilityGate - Require fresh routeability evidence before next-hop forwarding
 //! v0.17.0-BlindRelayOnwardEnvelope - Add optional two-hop middle-hop forwarding
@@ -1017,9 +1022,24 @@ async fn process_onion_blind_relay(
             })?;
 
             // Deliver via the existing zero-knowledge chat relay store-and-forward.
-            // Best-effort: an offline receiver is handled by the relay's pending
-            // queue; a relay error must not leak onto the relay metadata path.
-            let _ = process_peer_relay(state.clone(), inner_envelope).await;
+            // This is a hard ACK boundary for Milestone 2: a terminal onion hop
+            // may only return accepted=true after the existing relay path has
+            // either delivered online or stored the encrypted envelope pending.
+            // The coarse rejection bucket avoids leaking payload or receiver data.
+            if let Err(error) = process_peer_relay(state.clone(), inner_envelope).await {
+                forget_blind_relay_route(&state, &envelope.route_id);
+                debug!(
+                    reason = error.reason_bucket(),
+                    "[BLIND_RELAY] Onion terminal delivery failed"
+                );
+                reject_blind_relay_previous_hop(
+                    &state,
+                    previous_hop_node_id,
+                    now,
+                    "onion_terminal_relay_failed",
+                );
+                return Err(BlindRelayError::ForwardFailed);
+            }
 
             record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
             state.peer_store.record_blind_relay_terminal(
@@ -1782,6 +1802,22 @@ mod tests {
         }
     }
 
+    fn temp_chat_relay(label: &str) -> (Arc<ChatRelayService>, std::path::PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("aeronyx-{label}-{unique}.db"));
+        let relay = Arc::new(
+            ChatRelayService::new(
+                test_chat_config(path.to_string_lossy().to_string()),
+                [7u8; 32],
+            )
+            .unwrap(),
+        );
+        (relay, path)
+    }
+
     fn signed_chat_relay_peer_descriptor_for(
         peer_identity: &IdentityKeyPair,
         endpoint: String,
@@ -1834,18 +1870,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_relay_endpoint_stores_offline_receiver_message() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("aeronyx-chat-peer-{unique}.db"));
-        let relay = Arc::new(
-            ChatRelayService::new(
-                test_chat_config(path.to_string_lossy().to_string()),
-                [7u8; 32],
-            )
-            .unwrap(),
-        );
+        let (relay, path) = temp_chat_relay("chat-peer");
         let sessions = Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60)));
         let udp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
         let peer_store = Arc::new(PeerStore::new());
@@ -2060,8 +2085,9 @@ mod tests {
         let source = IdentityKeyPair::generate();
         let node_identity = Arc::new(IdentityKeyPair::generate());
         let peer_store = Arc::new(PeerStore::new());
+        let (relay, path) = temp_chat_relay("onion-terminal");
         let state = ChatPeerState {
-            chat_relay: None,
+            chat_relay: Some(Arc::clone(&relay)),
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -2074,7 +2100,9 @@ mod tests {
         let now = now_secs();
 
         // Single-hop onion addressed to this node; inner payload is a ChatEnvelope.
-        let inner = encode_envelope(&signed_envelope()).unwrap();
+        let delivered_envelope = signed_envelope();
+        let receiver = delivered_envelope.receiver;
+        let inner = encode_envelope(&delivered_envelope).unwrap();
         let hop = OnionHop {
             node_id: node_identity.public_key_bytes(),
             // Build to the node's CURRENT rotating onion key — what the handler
@@ -2102,6 +2130,58 @@ mod tests {
         let blind_stats = peer_store.status(now + 1).runtime.blind_relay;
         assert_eq!(blind_stats.terminal, 1);
         assert_eq!(blind_stats.rejected, 0);
+        let (messages, has_more) = relay
+            .pull_pending(&receiver, 0, &[0u8; 16], 10)
+            .expect("terminal onion delivery should enter pending relay queue");
+        assert!(!has_more);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, delivered_envelope.message_id);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn onion_terminal_requires_chat_relay_delivery_before_ack() {
+        use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
+
+        let source = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let peer_store = Arc::new(PeerStore::new());
+        let state = ChatPeerState {
+            chat_relay: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&node_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let now = now_secs();
+
+        let inner = encode_envelope(&signed_envelope()).unwrap();
+        let hop = OnionHop {
+            node_id: node_identity.public_key_bytes(),
+            kem_pub: crate::services::onion_keys::current_public_key(),
+        };
+        let envelope = build_onion_envelope(&[hop], &inner, [0x56u8; 16], 4, now, &source).unwrap();
+
+        let result = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: source.public_key_bytes(),
+                onward_envelope: None,
+                onward_descriptor_hint: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(BlindRelayError::ForwardFailed)));
+        let blind_stats = peer_store.status(now + 1).runtime.blind_relay;
+        assert_eq!(blind_stats.terminal, 0);
+        assert_eq!(blind_stats.rejected, 1);
     }
 
     #[tokio::test]
