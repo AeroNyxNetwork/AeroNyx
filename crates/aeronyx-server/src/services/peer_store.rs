@@ -5348,6 +5348,72 @@ mod tests {
     }
 
     #[test]
+    fn test_route_quarantine_expiry_allows_reprobe_without_marking_ready() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let peer_kp = IdentityKeyPair::generate();
+        let mut descriptor = signed_descriptor_for(&peer_kp, 1, now + 2_000);
+        descriptor.descriptor.public_endpoint =
+            Some("https://reprobe-after-quarantine.example".to_string());
+        descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &peer_kp).unwrap();
+        let node_id = descriptor.node_id();
+        let node_prefix = hex::encode(&node_id[..4]);
+
+        store
+            .upsert_verified_from_source(descriptor.clone(), now, "gossip_announce")
+            .unwrap();
+
+        store.record_route_forward_success(&node_id, now + 1);
+        store.record_route_forward_failure(&node_id, now + 2, "request_failed");
+        store.record_route_forward_failure(&node_id, now + 3, "request_failed");
+        store.record_route_forward_failure(&node_id, now + 4, "http_502");
+
+        let quarantined_candidates =
+            store.route_candidates_with_capability(NodeCapability::ChatRelay, now + 5, 8);
+        assert!(quarantined_candidates.is_empty());
+
+        let after_quarantine = now + 4 + PEER_ROUTE_FAILURE_QUARANTINE_SECS + 1;
+        let reprobe_candidates =
+            store.route_candidates_with_capability(NodeCapability::ChatRelay, after_quarantine, 8);
+        assert_eq!(reprobe_candidates.len(), 1);
+        assert_eq!(reprobe_candidates[0].node_id(), descriptor.node_id());
+
+        let status = store.route_candidate_status(after_quarantine);
+        let row = status
+            .chat_relay
+            .iter()
+            .find(|candidate| candidate.node_id_prefix == node_prefix)
+            .expect("expired quarantine peer should be visible for reprobe");
+        assert_eq!(row.route_health, "failing");
+        assert_eq!(row.routeability_state, "unreachable");
+        assert!(!row.routeability_ready);
+        assert!(!row.route_quarantined);
+        assert_eq!(row.route_quarantine_remaining_seconds, None);
+        assert_eq!(row.route_quarantine_count, 1);
+
+        store.record_route_forward_success(&node_id, after_quarantine + 1);
+        let recovered = store.route_candidate_status(after_quarantine + 2);
+        let recovered_row = recovered
+            .chat_relay
+            .iter()
+            .find(|candidate| candidate.node_id_prefix == node_prefix)
+            .expect("successful reprobe should keep peer visible");
+        assert_eq!(recovered_row.route_health, "healthy");
+        assert_eq!(recovered_row.routeability_state, "reachable");
+        assert!(recovered_row.routeability_ready);
+        assert_eq!(
+            recovered_row.last_routeability_probe_at,
+            Some(after_quarantine + 1)
+        );
+
+        let status_json = serde_json::to_string(&recovered).unwrap();
+        assert!(!status_json.contains("reprobe-after-quarantine.example"));
+        assert!(!status_json.contains(&hex::encode(node_id)));
+        assert!(!status_json.contains("encrypted_blob"));
+        assert!(!status_json.contains("receiver_pubkey"));
+    }
+
+    #[test]
     fn test_network_story_reports_onion_ready_without_endpoint_or_full_node_id() {
         let store = PeerStore::new();
         let now = 1_700_000_100;
