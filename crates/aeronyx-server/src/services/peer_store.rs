@@ -5521,6 +5521,70 @@ mod tests {
     }
 
     #[test]
+    fn test_network_story_does_not_use_stale_two_hop_path_proof_as_onion_ready_evidence() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        store.configure_bootstrap_status(true, true, true, 2);
+        store.record_gossip_round(now + 20, 2, 2, 1, None);
+
+        let middle_kp = IdentityKeyPair::generate();
+        let relay_kp = IdentityKeyPair::generate();
+
+        let mut middle_descriptor = signed_descriptor_for(&middle_kp, 1, now + 4_000);
+        middle_descriptor.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        middle_descriptor.descriptor.public_endpoint =
+            Some("https://stale-proof-middle.example".to_string());
+        middle_descriptor =
+            SignedNodeDescriptor::sign(middle_descriptor.descriptor, &middle_kp).unwrap();
+        let middle_node_id = middle_descriptor.node_id();
+
+        let mut relay_descriptor = signed_descriptor_for(&relay_kp, 1, now + 4_000);
+        relay_descriptor.descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        relay_descriptor.descriptor.public_endpoint =
+            Some("https://stale-proof-relay.example".to_string());
+        relay_descriptor =
+            SignedNodeDescriptor::sign(relay_descriptor.descriptor, &relay_kp).unwrap();
+        let relay_node_id = relay_descriptor.node_id();
+
+        store
+            .upsert_verified_from_source(middle_descriptor, now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(relay_descriptor, now, "gossip_announce")
+            .unwrap();
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            now + 25,
+            true,
+            "onion_terminal_delivered",
+            1,
+            1,
+            2,
+            1,
+        );
+
+        let stale_now = now + 25 + PEER_ROUTEABILITY_STALE_AFTER_SECS + 1;
+        store.record_gossip_round(stale_now - 10, 2, 2, 1, None);
+        let status = store.status(stale_now);
+        let history = status.two_hop_path_proof_history;
+        let story = status.network_story;
+
+        assert_eq!(history.status, "stale");
+        assert_eq!(history.freshness_bucket, "stale_success");
+        assert!(!history.recent_success_ready);
+        assert_eq!(story.status, "peer_view_ready");
+        assert!(!story.chat_two_hop_onion_ready);
+        assert!(story.detail.contains("two_hop_path_proof_recent=false"));
+
+        let story_json = serde_json::to_string(&story).unwrap();
+        assert!(!story_json.contains("stale-proof-middle.example"));
+        assert!(!story_json.contains("stale-proof-relay.example"));
+        assert!(!story_json.contains(&hex::encode(middle_node_id)));
+        assert!(!story_json.contains(&hex::encode(relay_node_id)));
+        assert!(!story_json.contains("encrypted_blob"));
+        assert!(!story_json.contains("receiver_pubkey"));
+    }
+
+    #[test]
     fn test_network_story_attention_overrides_peer_view_when_recovery_is_missing() {
         let store = PeerStore::new();
         let now = 1_700_000_100;
