@@ -107,6 +107,9 @@
 //! - Two-hop message-delivery readiness exposes fresh terminal ChatRelay proof
 //!   as its own aggregate gate, so App/nodeboard/backend can distinguish
 //!   onion route reachability from actual store-and-forward delivery evidence
+//! - Onion middle-hop recovery can distinguish route quarantine from ordinary
+//!   unknown routeability, allowing cold-start proof attempts without sending
+//!   through peers that are actively isolated by local route health policy
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -133,6 +136,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.46.0-OnionMiddleRouteabilityRecovery - Exposed route quarantine checks for onion middle cold-start recovery
 //! v0.45.0-TwoHopMessageDeliveryReadiness - Added aggregate freshness/streak gates for message-delivery proof
 //! v0.44.0-TwoHopOnionDeliveryScope - Mark synthetic onion terminal delivery as message-delivery proof
 //! v0.43.0-TwoHopProofScope - Added explicit control-plane proof scope for synthetic two-hop probes
@@ -4210,6 +4214,21 @@ impl PeerStore {
         let route_health = self.route_health.read();
         let (_, ready) = Self::routeability_state_and_ready(route_health.get(node_id), now);
         ready
+    }
+
+    /// Returns whether a peer is currently isolated by route-health quarantine.
+    ///
+    /// This is narrower than `is_routeable_now`: unknown or stale peers return
+    /// false here. Onion middle recovery uses this helper to allow a fresh signed
+    /// descriptor to prove itself after restart while still refusing peers that
+    /// recently crossed the local failure threshold.
+    #[must_use]
+    pub fn is_route_quarantined_now(&self, node_id: &[u8; 32], now: u64) -> bool {
+        let route_health = self.route_health.read();
+        route_health
+            .get(node_id)
+            .and_then(|value| Self::route_quarantine_remaining_seconds(value, now))
+            .is_some()
     }
 
     fn route_quarantine_remaining_seconds(route_health: &PeerRouteHealth, now: u64) -> Option<u64> {

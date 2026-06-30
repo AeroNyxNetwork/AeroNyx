@@ -83,12 +83,17 @@
 //! - Blind relay forwards only to peers with fresh routeability evidence.
 //!   Signed descriptors prove identity/capability, but routeability probes
 //!   prove the next hop can actually receive encrypted relay work.
+//! - True onion middle-hop recovery may forward to a fresh signed terminal
+//!   descriptor before routeability is proven, but it still refuses route-health
+//!   quarantined peers. This breaks cold-start proof deadlocks without relaxing
+//!   the ordinary blind relay forwarding gate.
 //! - Onion terminal hops must successfully hand the peeled `ChatEnvelope` to
 //!   the existing chat relay store-and-forward path before ACKing the previous
 //!   hop. A successful peel alone is not enough to claim real encrypted message
 //!   movement.
 //!
 //! ## Last Modified
+//! v0.21.0-OnionMiddleRouteabilityRecovery - Allow true onion middle recovery through fresh signed descriptors unless route-quarantined
 //! v0.20.0-OnionTerminalDeliveryAck - Require terminal onion delivery before accepted ACK
 //! v0.19.0-BlindRelayDescriptorHint - Allow signed next-hop descriptor hints for controlled two-hop proofs
 //! v0.18.0-BlindRelayRouteabilityGate - Require fresh routeability evidence before next-hop forwarding
@@ -1097,12 +1102,15 @@ async fn process_onion_blind_relay(
                 reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
                 return Err(BlindRelayError::NoRoute);
             }
-            if !state.peer_store.is_routeable_now(&next_hop, now) {
-                state.peer_store.record_route_forward_failure(
-                    &next_hop,
-                    now,
-                    "routeability_not_ready",
-                );
+            // True onion routes are the recovery/proof path for a small mesh:
+            // after restart a fresh signed peer may not yet have routeability
+            // evidence, and refusing the proof attempt creates a deadlock. Keep
+            // the hard stop for peers under local route quarantine; forward
+            // errors below will still feed route health without logging payloads.
+            if state.peer_store.is_route_quarantined_now(&next_hop, now) {
+                state
+                    .peer_store
+                    .record_route_forward_failure(&next_hop, now, "route_quarantined");
                 forget_blind_relay_route(&state, &envelope.route_id);
                 reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
                 return Err(BlindRelayError::NoRoute);
@@ -2231,6 +2239,132 @@ mod tests {
         let blind_stats = peer_store.status(now + 1).runtime.blind_relay;
         assert_eq!(blind_stats.terminal, 0);
         assert_eq!(blind_stats.rejected, 1);
+    }
+
+    #[tokio::test]
+    async fn onion_middle_allows_fresh_signed_peer_before_routeability_probe() {
+        use aeronyx_core::protocol::onion::{build_onion_envelope, is_onion_blob, OnionHop};
+
+        let terminal_requests: Arc<Mutex<Vec<PeerBlindRelayRequest>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let terminal_requests_for_route = Arc::clone(&terminal_requests);
+        let terminal_app = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(move |Json(request): Json<PeerBlindRelayRequest>| {
+                let terminal_requests_for_request = Arc::clone(&terminal_requests_for_route);
+                async move {
+                    terminal_requests_for_request.lock().unwrap().push(request);
+                    Json(PeerBlindRelayResponse {
+                        accepted: true,
+                        terminal: true,
+                        forwarded: false,
+                        ttl_remaining: 2,
+                        reason: Some("terminal_next_hop".to_string()),
+                    })
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let terminal_endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, terminal_app).await.unwrap();
+        });
+
+        let now = now_secs();
+        let source = IdentityKeyPair::generate();
+        let middle_identity = Arc::new(IdentityKeyPair::generate());
+        let terminal_identity = IdentityKeyPair::generate();
+        let terminal_node_id = terminal_identity.public_key_bytes();
+        let peer_store = Arc::new(PeerStore::new());
+        peer_store
+            .upsert_verified_from_source(
+                signed_chat_relay_peer_descriptor_for(
+                    &terminal_identity,
+                    terminal_endpoint,
+                    now,
+                    now + 300,
+                ),
+                now,
+                "gossip_snapshot",
+            )
+            .unwrap();
+
+        let state = ChatPeerState {
+            chat_relay: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&middle_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+
+        // Build a true two-layer onion. The middle hop can peel only the outer
+        // layer and must forward the remaining opaque onion blob without knowing
+        // the final payload or the terminal's user-level receiver.
+        let inner = encode_envelope(&signed_envelope()).unwrap();
+        let middle_hop = OnionHop {
+            node_id: middle_identity.public_key_bytes(),
+            kem_pub: crate::services::onion_keys::current_public_key(),
+        };
+        let terminal_hop = OnionHop {
+            node_id: terminal_node_id,
+            kem_pub: terminal_identity.x25519_public_key_bytes(),
+        };
+        let envelope = build_onion_envelope(
+            &[middle_hop, terminal_hop],
+            &inner,
+            [0x66u8; 16],
+            4,
+            now,
+            &source,
+        )
+        .unwrap();
+
+        let response = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: source.public_key_bytes(),
+                onward_envelope: None,
+                onward_descriptor_hint: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        server.abort();
+
+        assert!(response.accepted);
+        assert!(response.forwarded);
+        assert!(!response.terminal);
+        assert_eq!(response.reason.as_deref(), Some("onion_forwarded"));
+
+        let terminal_requests = terminal_requests.lock().unwrap();
+        assert_eq!(terminal_requests.len(), 1);
+        let terminal_request = &terminal_requests[0];
+        assert_eq!(
+            terminal_request.previous_hop_node_id,
+            middle_identity.public_key_bytes()
+        );
+        assert_eq!(terminal_request.envelope.next_hop, terminal_node_id);
+        assert!(is_onion_blob(&terminal_request.envelope.encrypted_blob));
+        assert!(terminal_request.onward_envelope.is_none());
+
+        let route_status = peer_store.route_candidate_status(now + 5);
+        let route_row = route_status
+            .chat_relay
+            .iter()
+            .find(|row| row.node_id_prefix == hex::encode(&terminal_node_id[..4]))
+            .expect("terminal route row should remain visible");
+        assert!(route_row.routeability_ready);
+        assert_eq!(route_row.routeability_state, "reachable");
+        let blind_stats = peer_store.status(now + 5).runtime.blind_relay;
+        assert_eq!(blind_stats.forwarded, 1);
+        assert_eq!(blind_stats.rejected, 0);
     }
 
     #[tokio::test]
