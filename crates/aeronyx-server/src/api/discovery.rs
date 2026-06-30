@@ -16,6 +16,8 @@
 //!   request messages
 //! - `GET /api/discovery/status`: returns aggregate peer-store status, local
 //!   capability readiness, and compact discovery readiness for dashboards
+//! - `GET /api/discovery/summary`: returns a compact public-safe protocol
+//!   foundation summary for app, website, backend aggregation, and AI runbooks
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -44,8 +46,12 @@
 //!   wallet-level information.
 //! - `discovery_readiness_status_value()` is the shared compact status contract
 //!   used by both public/local discovery status and backend heartbeat reports.
+//! - `DiscoverySummaryResponse` is intentionally smaller than
+//!   `DiscoveryStatusResponse`; keep it aggregate-only so public/product
+//!   surfaces never need to parse full peer diagnostics.
 //!
 //! ## Last Modified
+//! v0.10.0-DiscoverySummaryEndpoint - Add compact privacy-safe protocol summary endpoint
 //! v0.9.3-OnionCandidatesRouteabilityGate - Only expose fresh routeable onion candidates to clients
 //! v0.9.2-BlindRelayFreshnessGuard - Expose timestamp rejection aggregate in compact readiness
 //! v0.9.1-BlindRelayReadinessReason - Expose privacy-safe relay readiness reason
@@ -241,6 +247,42 @@ pub struct DiscoveryStatusResponse {
     policy: DiscoveryPolicyStatus,
     local_capabilities: DiscoveryLocalCapabilityStatus,
     discovery_readiness: serde_json::Value,
+}
+
+/// Compact public-safe discovery summary.
+///
+/// This is the preferred response for app, website, backend aggregation, and
+/// AI-agent runbooks that only need protocol health storytelling. It must not
+/// include signed descriptors, full node ids, endpoint URLs, route ids,
+/// encrypted payloads, receiver identities, client public IPs, DNS contents,
+/// destinations, Memory Chain plaintext, voucher secrets, private keys,
+/// wallet-level traffic, or social graph metadata.
+#[derive(Debug, Serialize)]
+pub struct DiscoverySummaryResponse {
+    /// Unix timestamp when the summary was generated.
+    generated_at: u64,
+    /// Stable summary source label.
+    source: &'static str,
+    /// Product-facing current protocol status bucket.
+    status: String,
+    /// Product-facing current protocol stage bucket.
+    stage: String,
+    /// Short display headline safe for public surfaces.
+    headline: String,
+    /// Local capability readiness without route/user metadata.
+    local_capability: serde_json::Value,
+    /// Verified peer mesh aggregate without descriptors or endpoints.
+    peer_mesh: serde_json::Value,
+    /// Blind relay aggregate runtime/probe evidence without payload metadata.
+    blind_relay: serde_json::Value,
+    /// Bounded two-hop path proof aggregate without route reconstruction data.
+    two_hop_path_proof: serde_json::Value,
+    /// Actionable next step for operators and AI runbooks.
+    next_action: String,
+    /// Explicit invariant for downstream UI and AI-agent consumers.
+    privacy_invariant: &'static str,
+    /// Explicit privacy boundary for downstream UI/API consumers.
+    privacy_boundary: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -520,6 +562,114 @@ pub fn discovery_readiness_status_value(
     })
 }
 
+/// Builds the compact public-safe discovery summary response.
+///
+/// Keep this helper intentionally narrow. `/api/discovery/status` remains the
+/// operator/debug payload, while `/api/discovery/summary` is the small contract
+/// for product surfaces that should not receive descriptors, endpoints, full
+/// peer ids, route ids, or encrypted payload metadata.
+#[must_use]
+pub fn discovery_summary_response(
+    generated_at: u64,
+    status: &PeerStoreStatus,
+    local_capabilities: &DiscoveryLocalCapabilityStatus,
+) -> DiscoverySummaryResponse {
+    let readiness = discovery_readiness_status_value(status, local_capabilities);
+    let protocol_foundation = &readiness["protocol_foundation"];
+    let peer_quorum = &status.peer_quorum;
+    let network_story = &status.network_story;
+    let blind_relay_quality = &status.blind_relay_quality;
+    let two_hop_history = &status.two_hop_path_proof_history;
+
+    let status_bucket = protocol_foundation["status"]
+        .as_str()
+        .unwrap_or("forming")
+        .to_string();
+    let stage_bucket = protocol_foundation["stage"]
+        .as_str()
+        .unwrap_or("bootstrap")
+        .to_string();
+    let headline = protocol_foundation["headline"]
+        .as_str()
+        .unwrap_or("AeroNyx nodes are forming a verified relay mesh")
+        .to_string();
+    let next_action = protocol_foundation["next_action"]
+        .as_str()
+        .unwrap_or("monitor verified peer discovery and relay path proof freshness")
+        .to_string();
+
+    DiscoverySummaryResponse {
+        generated_at,
+        source: "rust_discovery_summary",
+        status: status_bucket,
+        stage: stage_bucket,
+        headline,
+        local_capability: serde_json::json!({
+            "status": local_capabilities.status,
+            "chat_relay_configured": local_capabilities.chat_relay_configured,
+            "blind_relay_endpoint_ready": local_capabilities.blind_relay_endpoint_ready,
+            "chat_relay_runtime_ready": local_capabilities.chat_relay_runtime_ready,
+            "safe_to_advertise_chat_relay": local_capabilities.safe_to_advertise_chat_relay,
+            "capability_config_consistent": local_capabilities.capability_config_consistent,
+            "advertisement_blockers": &local_capabilities.advertisement_blockers,
+        }),
+        peer_mesh: serde_json::json!({
+            "status": &peer_quorum.status,
+            "quorum_ready": peer_quorum.quorum_ready,
+            "valid_peers": peer_quorum.valid_peers,
+            "healthy_peers": peer_quorum.healthy_peers,
+            "stale_peers": peer_quorum.stale_peers,
+            "min_valid_peers": peer_quorum.min_valid_peers,
+            "routeable_chat_relays": peer_quorum.routeable_chat_relays,
+            "routeable_onion_middle_hops": peer_quorum.routeable_onion_middle_hops,
+            "restart_recovery_configured": peer_quorum.restart_recovery_configured,
+            "relay_foundation_ready": peer_quorum.relay_foundation_ready,
+            "network_story_status": &network_story.status,
+            "chat_single_hop_ready": network_story.chat_single_hop_ready,
+            "chat_two_hop_onion_ready": network_story.chat_two_hop_onion_ready,
+        }),
+        blind_relay: serde_json::json!({
+            "status": &blind_relay_quality.status,
+            "runtime_ready": blind_relay_quality.runtime_ready,
+            "quality_ready": blind_relay_quality.quality_ready,
+            "real_relay_ready": blind_relay_quality.real_relay_ready,
+            "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
+            "evidence_mode": &blind_relay_quality.evidence_mode,
+            "readiness_reason": &blind_relay_quality.readiness_reason,
+            "accepted_total": blind_relay_quality.accepted_total,
+            "forward_failed": blind_relay_quality.forward_failed,
+            "timestamp_rejected": blind_relay_quality.timestamp_rejected,
+            "last_event_age_seconds": blind_relay_quality.last_event_age_seconds,
+            "last_probe_age_seconds": blind_relay_quality.last_probe_age_seconds,
+            "next_action": &blind_relay_quality.next_action,
+        }),
+        two_hop_path_proof: serde_json::json!({
+            "status": &two_hop_history.status,
+            "freshness_bucket": &two_hop_history.freshness_bucket,
+            "proof_ready": two_hop_history.proof_ready,
+            "recent_success_ready": two_hop_history.recent_success_ready,
+            "failure_streak_active": two_hop_history.failure_streak_active,
+            "retained_events": two_hop_history.retained_events,
+            "attempted": two_hop_history.attempted,
+            "succeeded": two_hop_history.succeeded,
+            "failed": two_hop_history.failed,
+            "success_percent": two_hop_history.success_percent,
+            "latest_outcome": &two_hop_history.latest_outcome,
+            "latest_reason_bucket": &two_hop_history.latest_reason_bucket,
+            "latest_age_seconds": two_hop_history.latest_age_seconds,
+            "latest_success_age_seconds": two_hop_history.latest_success_age_seconds,
+            "latest_failure_age_seconds": two_hop_history.latest_failure_age_seconds,
+            "consecutive_successes": two_hop_history.consecutive_successes,
+            "consecutive_failures": two_hop_history.consecutive_failures,
+            "stale_after_seconds": two_hop_history.stale_after_seconds,
+            "next_action": &two_hop_history.next_action,
+        }),
+        next_action,
+        privacy_invariant: "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
+        privacy_boundary: "aggregate discovery summary only; no signed descriptors, full node ids, endpoint URLs, route ids, encrypted payloads, receiver identities, client public IPs, DNS contents, destinations, Memory Chain plaintext, voucher secrets, private keys, wallet-level traffic, or social graph metadata",
+    }
+}
+
 // ============================================
 // Router
 // ============================================
@@ -549,6 +699,7 @@ pub fn build_discovery_router_with_local_status(
         .route("/api/discovery/snapshot", get(snapshot_handler))
         .route("/api/discovery/gossip", post(gossip_handler))
         .route("/api/discovery/status", get(status_handler))
+        .route("/api/discovery/summary", get(summary_handler))
         .route(
             "/api/discovery/onion-candidates",
             get(onion_candidates_handler),
@@ -707,6 +858,17 @@ async fn status_handler(State(state): State<DiscoveryApiState>) -> Json<Discover
         local_capabilities,
         discovery_readiness,
     })
+}
+
+async fn summary_handler(State(state): State<DiscoveryApiState>) -> Json<DiscoverySummaryResponse> {
+    let now = now_secs();
+    let peer_store = state.peer_store.status(now);
+    let local_capabilities = state.local_capabilities;
+    Json(discovery_summary_response(
+        now,
+        &peer_store,
+        &local_capabilities,
+    ))
 }
 
 fn now_secs() -> u64 {
@@ -1112,6 +1274,57 @@ mod tests {
         assert!(!serialized.contains("encrypted_blob"));
         assert!(!serialized.contains("payload_b64"));
         assert!(!serialized.contains("client_ip"));
+    }
+
+    #[tokio::test]
+    async fn test_summary_endpoint_returns_public_safe_protocol_summary() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        store.record_blind_relay_forwarded(now, 1);
+        store.record_blind_relay_two_hop_probe_result(now, true, "accepted");
+        let app = build_discovery_router_with_local_status(
+            store,
+            DiscoveryApiPolicy::default(),
+            DiscoveryLocalCapabilityStatus::new(true, true, true, true),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed["source"].as_str(), Some("rust_discovery_summary"));
+        assert_eq!(parsed["local_capability"]["status"].as_str(), Some("ready"));
+        assert_eq!(parsed["blind_relay"]["runtime_ready"].as_bool(), Some(true));
+        assert_eq!(
+            parsed["two_hop_path_proof"]["proof_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(parsed["two_hop_path_proof"]["succeeded"].as_u64(), Some(1));
+        assert_eq!(
+            parsed["privacy_invariant"].as_str(),
+            Some("blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status")
+        );
+
+        let serialized = serde_json::to_string(&parsed).unwrap();
+        assert!(!serialized.contains("route_id"));
+        assert!(!serialized.contains("payload_b64"));
+        assert!(!serialized.contains("encrypted_blob"));
+        assert!(!serialized.contains("client_ip"));
+        assert!(!serialized.contains("receiver_pubkey"));
+        assert!(!serialized.contains("public_endpoint"));
     }
 
     #[tokio::test]
