@@ -360,6 +360,21 @@ pub struct PeerStoreTwoHopPathProofHistory {
     pub consecutive_successes: u64,
     /// Consecutive rejected proofs ending at the latest event.
     pub consecutive_failures: u64,
+    /// Aggregate reason-bucket counts in the retained window.
+    ///
+    /// This exposes only stable buckets derived from
+    /// `two_hop_path_proof_reason_bucket`; it must never include raw errors,
+    /// endpoints, route ids, node ids, encrypted blobs, receiver identities, or
+    /// other route metadata.
+    #[serde(default)]
+    pub reason_bucket_counts: BTreeMap<String, u64>,
+    /// Aggregate rejected proof reason-bucket counts in the retained window.
+    ///
+    /// Accepted proofs are intentionally excluded so nodeboard can explain
+    /// recent failures without parsing the retained event list or leaking
+    /// private route metadata.
+    #[serde(default)]
+    pub failure_reason_bucket_counts: BTreeMap<String, u64>,
     /// Aggregate proof path-shape counts in the retained window.
     pub path_shape_counts: BTreeMap<String, u64>,
     /// Aggregate candidate-pool quality buckets in the retained window.
@@ -2837,6 +2852,17 @@ impl PeerStore {
             .map(|event| now.saturating_sub(event.at));
         let consecutive_successes = Self::count_trailing_two_hop_outcomes(&events, "accepted");
         let consecutive_failures = Self::count_trailing_two_hop_outcomes(&events, "rejected");
+        let reason_bucket_counts =
+            Self::count_two_hop_event_buckets(&events, |event| event.reason_bucket.as_str());
+        let failure_events = events
+            .iter()
+            .filter(|event| event.outcome == "rejected")
+            .cloned()
+            .collect::<Vec<_>>();
+        let failure_reason_bucket_counts = Self::count_two_hop_event_buckets(
+            &failure_events,
+            |event| event.reason_bucket.as_str(),
+        );
         let path_shape_counts =
             Self::count_two_hop_event_buckets(&events, |event| event.path_shape.as_str());
         let candidate_pool_counts = Self::count_two_hop_event_buckets(&events, |event| {
@@ -2930,6 +2956,8 @@ impl PeerStore {
             latest_failure_age_seconds,
             consecutive_successes,
             consecutive_failures,
+            reason_bucket_counts,
+            failure_reason_bucket_counts,
             path_shape_counts,
             candidate_pool_counts,
             ttl_shape_counts,
@@ -5925,6 +5953,21 @@ mod tests {
         assert_eq!(history.events[0].reason_bucket, "http_error");
         assert_eq!(history.events[1].reason_bucket, "unknown");
         assert_eq!(history.events[2].reason_bucket, "accepted");
+        assert_eq!(history.reason_bucket_counts.get("http_error"), Some(&1));
+        assert_eq!(history.reason_bucket_counts.get("unknown"), Some(&1));
+        assert_eq!(history.reason_bucket_counts.get("accepted"), Some(&1));
+        assert_eq!(
+            history.failure_reason_bucket_counts.get("http_error"),
+            Some(&1)
+        );
+        assert_eq!(
+            history.failure_reason_bucket_counts.get("unknown"),
+            Some(&1)
+        );
+        assert_eq!(
+            history.failure_reason_bucket_counts.get("accepted"),
+            None
+        );
         assert_eq!(
             history.path_shape_counts.get("entry_middle_terminal"),
             Some(&3)
