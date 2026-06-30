@@ -2159,7 +2159,9 @@ mod tests {
         let source = IdentityKeyPair::generate();
         let node_identity = Arc::new(IdentityKeyPair::generate());
         let peer_store = Arc::new(PeerStore::new());
-        let state = ChatPeerState {
+        let seen_routes = Arc::new(Mutex::new(BlindRelayRouteReplayCache::default()));
+        let abuse_guard = Arc::new(Mutex::new(BlindRelayAbuseGuard::default()));
+        let failed_state = ChatPeerState {
             chat_relay: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
@@ -2167,12 +2169,14 @@ mod tests {
             node_identity: Arc::clone(&node_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_seen_routes: Arc::clone(&seen_routes),
+            blind_relay_abuse_guard: Arc::clone(&abuse_guard),
         };
         let now = now_secs();
 
-        let inner = encode_envelope(&signed_envelope()).unwrap();
+        let delivered_envelope = signed_envelope();
+        let receiver = delivered_envelope.receiver;
+        let inner = encode_envelope(&delivered_envelope).unwrap();
         let hop = OnionHop {
             node_id: node_identity.public_key_bytes(),
             kem_pub: crate::services::onion_keys::current_public_key(),
@@ -2180,9 +2184,9 @@ mod tests {
         let envelope = build_onion_envelope(&[hop], &inner, [0x56u8; 16], 4, now, &source).unwrap();
 
         let result = process_peer_blind_relay(
-            state,
+            failed_state,
             PeerBlindRelayRequest {
-                envelope,
+                envelope: envelope.clone(),
                 previous_hop_node_id: source.public_key_bytes(),
                 onward_envelope: None,
                 onward_descriptor_hint: None,
@@ -2194,6 +2198,46 @@ mod tests {
         let blind_stats = peer_store.status(now + 1).runtime.blind_relay;
         assert_eq!(blind_stats.terminal, 0);
         assert_eq!(blind_stats.rejected, 1);
+
+        let (relay, path) = temp_chat_relay("onion-terminal-retry-after-relay-failure");
+        let retry_state = ChatPeerState {
+            chat_relay: Some(Arc::clone(&relay)),
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&node_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::clone(&seen_routes),
+            blind_relay_abuse_guard: Arc::clone(&abuse_guard),
+        };
+
+        // A terminal delivery failure must release the route id from the
+        // replay cache. Otherwise a transient ChatRelay outage would make the
+        // sender's retry look like a duplicate replay and permanently strand
+        // the E2E-encrypted message.
+        let retry = process_peer_blind_relay(
+            retry_state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: source.public_key_bytes(),
+                onward_envelope: None,
+                onward_descriptor_hint: None,
+            },
+        )
+        .await
+        .expect("terminal delivery retry should not be blocked by replay cache");
+
+        assert!(retry.terminal);
+        assert_eq!(retry.reason.as_deref(), Some("onion_terminal_delivered"));
+        let (messages, has_more) = relay
+            .pull_pending(&receiver, 0, &[0u8; 16], 10)
+            .expect("retry should store the terminal onion payload");
+        assert!(!has_more);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, delivered_envelope.message_id);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
