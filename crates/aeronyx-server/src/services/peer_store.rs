@@ -130,6 +130,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.44.0-TwoHopOnionDeliveryScope - Mark synthetic onion terminal delivery as message-delivery proof
 //! v0.43.0-TwoHopProofScope - Added explicit control-plane proof scope for synthetic two-hop probes
 //! v0.42.0-TwoHopProofQualityContext - Added privacy-safe path/candidate/TTL buckets
 //! v0.41.0-TwoHopProofFreshness - Added freshness bucket and latest success/failure ages
@@ -2802,8 +2803,8 @@ impl PeerStore {
             at: now,
             outcome: if accepted { "accepted" } else { "rejected" }.to_string(),
             reason_bucket: Self::two_hop_path_proof_reason_bucket(reason),
-            evidence_mode: "synthetic_two_hop_control_probe".to_string(),
-            proof_scope: "control_plane".to_string(),
+            evidence_mode: Self::two_hop_path_proof_evidence_mode(reason).to_string(),
+            proof_scope: Self::two_hop_path_proof_scope(reason).to_string(),
             path_shape: "entry_middle_terminal".to_string(),
             hop_count: 2,
             path_policy: "distinct_middle_terminal".to_string(),
@@ -2815,6 +2816,22 @@ impl PeerStore {
             .to_string(),
             ttl_shape: Self::two_hop_ttl_shape(entry_ttl, onward_ttl),
         });
+    }
+
+    fn two_hop_path_proof_evidence_mode(reason: &str) -> &'static str {
+        let bucket = Self::two_hop_path_proof_reason_bucket(reason);
+        match bucket.as_str() {
+            "onion_terminal_delivered" => "real_relay_traffic",
+            _ => "synthetic_two_hop_control_probe",
+        }
+    }
+
+    fn two_hop_path_proof_scope(reason: &str) -> &'static str {
+        let bucket = Self::two_hop_path_proof_reason_bucket(reason);
+        match bucket.as_str() {
+            "onion_terminal_delivered" => "message_delivery",
+            _ => "control_plane",
+        }
     }
 
     fn two_hop_candidate_count_bucket(count: usize) -> &'static str {
@@ -2837,12 +2854,20 @@ impl PeerStore {
     fn two_hop_path_proof_reason_bucket(reason: &str) -> String {
         match reason {
             "accepted" => "accepted".to_string(),
+            "onion_terminal_delivered" => "onion_terminal_delivered".to_string(),
+            "onion_ack_rejected" => "onion_ack_rejected".to_string(),
+            "onion_ack_decode" => "onion_ack_decode".to_string(),
+            "onion_kem_unavailable" => "onion_kem_unavailable".to_string(),
             "ack_rejected" => "ack_rejected".to_string(),
             "ack_decode" => "ack_decode".to_string(),
             "no_distinct_path" => "no_distinct_path".to_string(),
             "middle_missing_endpoint" => "middle_missing_endpoint".to_string(),
             "middle_invalid_endpoint" => "middle_invalid_endpoint".to_string(),
+            value if value.starts_with("onion_http_") => "onion_http_error".to_string(),
             value if value.starts_with("http_") => "http_error".to_string(),
+            value if value.starts_with("two_hop_onion_delivery_probe_") => {
+                "onion_request_error".to_string()
+            }
             value if value.starts_with("two_hop_blind_relay_probe_request_") => {
                 "request_error".to_string()
             }
@@ -2889,10 +2914,10 @@ impl PeerStore {
             .filter(|event| event.outcome == "rejected")
             .cloned()
             .collect::<Vec<_>>();
-        let failure_reason_bucket_counts = Self::count_two_hop_event_buckets(
-            &failure_events,
-            |event| event.reason_bucket.as_str(),
-        );
+        let failure_reason_bucket_counts =
+            Self::count_two_hop_event_buckets(&failure_events, |event| {
+                event.reason_bucket.as_str()
+            });
         let path_shape_counts =
             Self::count_two_hop_event_buckets(&events, |event| event.path_shape.as_str());
         let candidate_pool_counts = Self::count_two_hop_event_buckets(&events, |event| {
@@ -5910,7 +5935,10 @@ mod tests {
             status.two_hop_path_proof_history.latest_failure_age_seconds,
             None
         );
-        assert_eq!(status.two_hop_path_proof_history.proof_scope, "control_plane");
+        assert_eq!(
+            status.two_hop_path_proof_history.proof_scope,
+            "control_plane"
+        );
         assert_eq!(
             status
                 .two_hop_path_proof_history
@@ -6007,6 +6035,37 @@ mod tests {
     }
 
     #[test]
+    fn test_two_hop_onion_delivery_probe_reports_message_delivery_scope() {
+        let store = PeerStore::new();
+
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_010,
+            true,
+            "onion_terminal_delivered",
+            3,
+            2,
+            2,
+            1,
+        );
+
+        let status = store.status(1_700_000_015);
+        let history = status.two_hop_path_proof_history;
+
+        assert_eq!(
+            history.latest_reason_bucket.as_deref(),
+            Some("onion_terminal_delivered")
+        );
+        assert_eq!(history.proof_scope, "message_delivery");
+        assert_eq!(history.proof_scope_counts.get("message_delivery"), Some(&1));
+        assert_eq!(history.events.len(), 1);
+        assert_eq!(history.events[0].evidence_mode, "real_relay_traffic");
+        assert_eq!(history.events[0].proof_scope, "message_delivery");
+        assert!(!history.privacy_boundary.contains("route_id="));
+        assert!(!history.privacy_boundary.contains("receiver="));
+        assert!(!history.privacy_boundary.contains("encrypted_blob="));
+    }
+
+    #[test]
     fn test_two_hop_path_proof_history_buckets_failures_without_private_metadata() {
         let store = PeerStore::new();
 
@@ -6049,10 +6108,7 @@ mod tests {
             history.failure_reason_bucket_counts.get("unknown"),
             Some(&1)
         );
-        assert_eq!(
-            history.failure_reason_bucket_counts.get("accepted"),
-            None
-        );
+        assert_eq!(history.failure_reason_bucket_counts.get("accepted"), None);
         assert_eq!(
             history.path_shape_counts.get("entry_middle_terminal"),
             Some(&3)

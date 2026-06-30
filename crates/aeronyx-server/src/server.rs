@@ -79,6 +79,9 @@
 //      without parsing full PeerStore internals or exposing private metadata.
 //  34. Runs low-frequency two-hop blind relay path proofs after successful
 //      discovery gossip and reports only aggregate counters/readiness.
+//  35. Prefers a real two-hop onion delivery probe before the legacy
+//      control-plane onward-envelope probe, proving middle-hop peel/forward
+//      and terminal ChatRelay store-and-forward without exposing payloads.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -98,6 +101,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.2.1-TwoHopOnionDeliveryProbe - Prefer synthetic onion delivery over control-plane proof
 //   v1.2.0-TwoHopRuntimeProof - Low-frequency aggregate two-hop blind relay path proof
 //   v1.1.9-BlindRelayProbeCooldown - Rate-limit synthetic relay probes so discovery health checks stay low-noise
 //   v1.1.8-BlindRelaySyntheticProbe - Low-frequency opaque route probes after successful discovery gossip
@@ -154,7 +158,9 @@ use aeronyx_core::protocol::auth::{
     verify_signed_message, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_DEVICE_REGISTER,
     DOMAIN_WALLET_PRESENCE,
 };
-use aeronyx_core::protocol::chat::{BlindRelayEnvelope, ChatEnvelope};
+use aeronyx_core::protocol::chat::{
+    encode_envelope, BlindRelayEnvelope, ChatContentType, ChatEnvelope,
+};
 use sha2::{Digest, Sha256};
 
 use aeronyx_common::types::SessionId;
@@ -169,8 +175,8 @@ use aeronyx_core::protocol::codec::{
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
 use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
 use aeronyx_core::protocol::{
-    DataPacket, MessageType, NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor,
-    NodeDiscoveryMessage, NodePolicy, SignedNodeDescriptor,
+    build_onion_envelope, DataPacket, MessageType, NodeBootstrapSnapshot, NodeCapability,
+    NodeCapacity, NodeDescriptor, NodeDiscoveryMessage, NodePolicy, OnionHop, SignedNodeDescriptor,
 };
 use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::UdpTransport;
@@ -2705,6 +2711,123 @@ impl Server {
                     continue;
                 };
 
+                // Milestone 2 probe: prefer a real onion-wrapped ChatEnvelope
+                // delivery over the older onward-envelope control-plane probe.
+                // The middle hop peels exactly one layer and forwards the next
+                // onion layer; the terminal hop must decode the final
+                // ChatEnvelope and hand it to ChatRelay store-and-forward before
+                // ACKing. The payload remains opaque and synthetic, and no
+                // route id, receiver, endpoint, or ciphertext is reported.
+                if let Some(request) = Self::build_two_hop_onion_delivery_probe_request(
+                    identity,
+                    self_node_id,
+                    &middle,
+                    &terminal,
+                    now,
+                ) {
+                    match client.post(&url).json(&request).send().await {
+                        Ok(response) if response.status().is_success() => {
+                            match response.json::<PeerBlindRelayResponse>().await {
+                                Ok(ack) if ack.accepted && ack.forwarded => {
+                                    peer_store
+                                        .record_blind_relay_two_hop_probe_result_with_context(
+                                            now,
+                                            true,
+                                            "onion_terminal_delivered",
+                                            middle_candidate_count,
+                                            terminal_candidate_count,
+                                            2,
+                                            1,
+                                        );
+                                    peer_store.record_route_forward_success(&middle_node_id, now);
+                                    return true;
+                                }
+                                Ok(_ack) => {
+                                    peer_store
+                                        .record_blind_relay_two_hop_probe_result_with_context(
+                                            now,
+                                            false,
+                                            "onion_ack_rejected",
+                                            middle_candidate_count,
+                                            terminal_candidate_count,
+                                            2,
+                                            1,
+                                        );
+                                    peer_store.record_route_forward_failure(
+                                        &middle_node_id,
+                                        now,
+                                        "onion_ack_rejected",
+                                    );
+                                }
+                                Err(error) => {
+                                    debug!(
+                                        error = %error,
+                                        "[DISCOVERY] Two-hop onion delivery probe ACK decode failed"
+                                    );
+                                    peer_store
+                                        .record_blind_relay_two_hop_probe_result_with_context(
+                                            now,
+                                            false,
+                                            "onion_ack_decode",
+                                            middle_candidate_count,
+                                            terminal_candidate_count,
+                                            2,
+                                            1,
+                                        );
+                                    peer_store.record_route_forward_failure(
+                                        &middle_node_id,
+                                        now,
+                                        "onion_ack_decode",
+                                    );
+                                }
+                            }
+                        }
+                        Ok(response) => {
+                            let reason = format!("onion_http_{}", response.status().as_u16());
+                            peer_store.record_blind_relay_two_hop_probe_result_with_context(
+                                now,
+                                false,
+                                &reason,
+                                middle_candidate_count,
+                                terminal_candidate_count,
+                                2,
+                                1,
+                            );
+                            peer_store.record_route_forward_failure(&middle_node_id, now, reason);
+                        }
+                        Err(error) => {
+                            let reason = Self::classify_reqwest_error(
+                                "two_hop_onion_delivery_probe",
+                                &error,
+                            );
+                            debug!(
+                                reason = %reason,
+                                "[DISCOVERY] Two-hop onion delivery probe failed"
+                            );
+                            peer_store.record_blind_relay_two_hop_probe_result_with_context(
+                                now,
+                                false,
+                                &reason,
+                                middle_candidate_count,
+                                terminal_candidate_count,
+                                2,
+                                1,
+                            );
+                            peer_store.record_route_forward_failure(&middle_node_id, now, reason);
+                        }
+                    }
+                } else {
+                    peer_store.record_blind_relay_two_hop_probe_result_with_context(
+                        now,
+                        false,
+                        "onion_kem_unavailable",
+                        middle_candidate_count,
+                        terminal_candidate_count,
+                        2,
+                        1,
+                    );
+                }
+
                 let outer_envelope = BlindRelayEnvelope {
                     route_id: Self::blind_relay_two_hop_probe_route_id(
                         now,
@@ -2851,6 +2974,117 @@ impl Server {
             );
         }
         true
+    }
+
+    fn build_two_hop_onion_delivery_probe_request(
+        identity: &IdentityKeyPair,
+        self_node_id: &[u8; 32],
+        middle: &SignedNodeDescriptor,
+        terminal: &SignedNodeDescriptor,
+        now: u64,
+    ) -> Option<PeerBlindRelayRequest> {
+        let middle_node_id = middle.node_id();
+        let terminal_node_id = terminal.node_id();
+        let middle_kem_pub = middle.descriptor.x25519_kem_public()?;
+        let terminal_kem_pub = terminal.descriptor.x25519_kem_public()?;
+        let route_id = Self::blind_relay_two_hop_probe_route_id(
+            now,
+            self_node_id,
+            &middle_node_id,
+            &terminal_node_id,
+            b"onion-delivery",
+        );
+        let chat_envelope = Self::synthetic_two_hop_probe_chat_envelope(
+            identity,
+            self_node_id,
+            &middle_node_id,
+            &terminal_node_id,
+            route_id,
+            now,
+        );
+        let encoded_chat = encode_envelope(&chat_envelope).ok()?;
+        let path = [
+            OnionHop {
+                node_id: middle_node_id,
+                kem_pub: middle_kem_pub,
+            },
+            OnionHop {
+                node_id: terminal_node_id,
+                kem_pub: terminal_kem_pub,
+            },
+        ];
+        let envelope =
+            build_onion_envelope(&path, &encoded_chat, route_id, 2, now, identity).ok()?;
+
+        Some(PeerBlindRelayRequest {
+            envelope,
+            previous_hop_node_id: *self_node_id,
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        })
+    }
+
+    fn synthetic_two_hop_probe_chat_envelope(
+        identity: &IdentityKeyPair,
+        self_node_id: &[u8; 32],
+        middle_node_id: &[u8; 32],
+        terminal_node_id: &[u8; 32],
+        route_id: [u8; 16],
+        now: u64,
+    ) -> ChatEnvelope {
+        let receiver = Self::synthetic_two_hop_probe_wallet_id(
+            now,
+            self_node_id,
+            middle_node_id,
+            terminal_node_id,
+            &route_id,
+            b"receiver",
+        );
+        let nonce_source = Self::synthetic_two_hop_probe_wallet_id(
+            now,
+            self_node_id,
+            middle_node_id,
+            terminal_node_id,
+            &route_id,
+            b"nonce",
+        );
+        let ciphertext = Self::blind_relay_probe_blob(now, self_node_id, terminal_node_id);
+        let mut nonce = [0u8; 24];
+        nonce.copy_from_slice(&nonce_source[..24]);
+        let mut envelope = ChatEnvelope {
+            message_id: route_id,
+            sender: identity.public_key_bytes(),
+            receiver,
+            timestamp: now,
+            ciphertext,
+            nonce,
+            content_type: ChatContentType::System,
+            signature: [0u8; 64],
+        };
+        envelope.signature = identity.sign(&envelope.sign_data());
+        envelope
+    }
+
+    fn synthetic_two_hop_probe_wallet_id(
+        now: u64,
+        self_node_id: &[u8; 32],
+        middle_node_id: &[u8; 32],
+        terminal_node_id: &[u8; 32],
+        route_id: &[u8; 16],
+        label: &[u8],
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"aeronyx:two-hop-onion-delivery-probe:v1");
+        hasher.update(label);
+        hasher.update(now.to_be_bytes());
+        hasher.update(self_node_id);
+        hasher.update(middle_node_id);
+        hasher.update(terminal_node_id);
+        hasher.update(route_id);
+        let digest = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest[..32]);
+        out
     }
 
     fn blind_relay_probe_url(endpoint: &str) -> Option<String> {
@@ -4272,8 +4506,9 @@ impl std::fmt::Debug for Server {
 #[cfg(test)]
 mod tests {
     use super::{prefix_to_netmask, unix_now_secs, Server, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS};
-    use aeronyx_core::crypto::IdentityKeyPair;
+    use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
     use aeronyx_core::protocol::chat::{ChatContentType, ChatEnvelope};
+    use aeronyx_core::protocol::onion::is_onion_blob;
     use aeronyx_core::protocol::{
         NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor, NodeDiscoveryMessage,
         SignedNodeDescriptor,
@@ -4327,6 +4562,120 @@ mod tests {
             max_pps: None,
         };
         SignedNodeDescriptor::sign(descriptor, &peer_identity).unwrap()
+    }
+
+    fn signed_probe_peer_descriptor(
+        endpoint: String,
+        sequence: u64,
+        expires_at: u64,
+        capabilities: Vec<NodeCapability>,
+        kem_public: [u8; 32],
+    ) -> SignedNodeDescriptor {
+        let peer_identity = IdentityKeyPair::generate();
+        let mut descriptor = NodeDescriptor::new(
+            peer_identity.public_key_bytes(),
+            sequence,
+            sequence,
+            expires_at,
+            "test-onion-peer",
+        )
+        .with_x25519_kem(kem_public);
+        descriptor.public_endpoint = Some(endpoint);
+        descriptor.capabilities = capabilities;
+        descriptor.capacity = NodeCapacity {
+            max_sessions: 32,
+            max_bps: None,
+            max_pps: None,
+        };
+        SignedNodeDescriptor::sign(descriptor, &peer_identity).unwrap()
+    }
+
+    #[test]
+    fn two_hop_onion_delivery_probe_request_uses_onion_blob_and_signed_probe_envelope() {
+        let source = IdentityKeyPair::generate();
+        let self_node_id = source.public_key_bytes();
+        let now = 1_800_000_000;
+        let middle = signed_probe_peer_descriptor(
+            "http://198.51.100.10:8422".to_string(),
+            now,
+            now + 300,
+            vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+            [0x21; 32],
+        );
+        let terminal = signed_probe_peer_descriptor(
+            "http://198.51.100.11:8422".to_string(),
+            now + 1,
+            now + 300,
+            vec![NodeCapability::ChatRelay],
+            [0x22; 32],
+        );
+
+        let request = Server::build_two_hop_onion_delivery_probe_request(
+            &source,
+            &self_node_id,
+            &middle,
+            &terminal,
+            now,
+        )
+        .expect("descriptors with KEM keys should build an onion delivery probe");
+        let source_public = IdentityPublicKey::from_bytes(&self_node_id).unwrap();
+
+        assert!(request.onward_envelope.is_none());
+        assert!(request.onward_descriptor_hint.is_none());
+        assert_eq!(request.previous_hop_node_id, self_node_id);
+        assert_eq!(request.envelope.next_hop, middle.node_id());
+        assert_eq!(request.envelope.ttl, 2);
+        assert!(is_onion_blob(&request.envelope.encrypted_blob));
+        request
+            .envelope
+            .verify_signature_from(&source_public)
+            .expect("entry node signs the outer blind relay envelope");
+
+        let synthetic_chat = Server::synthetic_two_hop_probe_chat_envelope(
+            &source,
+            &self_node_id,
+            &middle.node_id(),
+            &terminal.node_id(),
+            request.envelope.route_id,
+            now,
+        );
+        synthetic_chat
+            .verify_signature()
+            .expect("synthetic terminal ChatEnvelope must verify like user chat");
+        assert_eq!(synthetic_chat.message_id, request.envelope.route_id);
+        assert_eq!(synthetic_chat.sender, self_node_id);
+        assert_ne!(synthetic_chat.receiver, [0u8; 32]);
+        assert_eq!(synthetic_chat.content_type, ChatContentType::System);
+    }
+
+    #[test]
+    fn two_hop_onion_delivery_probe_request_requires_published_kem_keys() {
+        let source = IdentityKeyPair::generate();
+        let self_node_id = source.public_key_bytes();
+        let now = 1_800_000_000;
+        let middle = signed_probe_peer_descriptor(
+            "http://198.51.100.10:8422".to_string(),
+            now,
+            now + 300,
+            vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+            [0u8; 32],
+        );
+        let terminal = signed_probe_peer_descriptor(
+            "http://198.51.100.11:8422".to_string(),
+            now + 1,
+            now + 300,
+            vec![NodeCapability::ChatRelay],
+            [0x22; 32],
+        );
+
+        assert!(Server::build_two_hop_onion_delivery_probe_request(
+            &source,
+            &self_node_id,
+            &middle,
+            &terminal,
+            now,
+        )
+        .is_none());
     }
 
     #[test]
