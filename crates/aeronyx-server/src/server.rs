@@ -2652,6 +2652,7 @@ impl Server {
             return false;
         }
 
+        let middle_candidate_count = middle_candidates.len();
         let mut attempted = false;
         for middle in middle_candidates {
             let middle_node_id = middle.node_id();
@@ -2661,6 +2662,7 @@ impl Server {
                 4,
                 &[*self_node_id, middle_node_id],
             );
+            let terminal_candidate_count = terminal_candidates.len();
             if terminal_candidates.is_empty() {
                 continue;
             }
@@ -2669,10 +2671,14 @@ impl Server {
                 attempted = true;
                 let terminal_node_id = terminal.node_id();
                 let Some(endpoint) = middle.descriptor.public_endpoint.as_deref() else {
-                    peer_store.record_blind_relay_two_hop_probe_result(
+                    peer_store.record_blind_relay_two_hop_probe_result_with_context(
                         now,
                         false,
                         "middle_missing_endpoint",
+                        middle_candidate_count,
+                        terminal_candidate_count,
+                        2,
+                        1,
                     );
                     peer_store.record_route_forward_failure(
                         &middle_node_id,
@@ -2682,10 +2688,14 @@ impl Server {
                     continue;
                 };
                 let Some(url) = Self::blind_relay_probe_url(endpoint) else {
-                    peer_store.record_blind_relay_two_hop_probe_result(
+                    peer_store.record_blind_relay_two_hop_probe_result_with_context(
                         now,
                         false,
                         "middle_invalid_endpoint",
+                        middle_candidate_count,
+                        terminal_candidate_count,
+                        2,
+                        1,
                     );
                     peer_store.record_route_forward_failure(
                         &middle_node_id,
@@ -2744,16 +2754,27 @@ impl Server {
                     Ok(response) if response.status().is_success() => {
                         match response.json::<PeerBlindRelayResponse>().await {
                             Ok(ack) if ack.accepted && ack.forwarded => {
-                                peer_store
-                                    .record_blind_relay_two_hop_probe_result(now, true, "accepted");
+                                peer_store.record_blind_relay_two_hop_probe_result_with_context(
+                                    now,
+                                    true,
+                                    "accepted",
+                                    middle_candidate_count,
+                                    terminal_candidate_count,
+                                    2,
+                                    1,
+                                );
                                 peer_store.record_route_forward_success(&middle_node_id, now);
                                 return true;
                             }
                             Ok(_ack) => {
-                                peer_store.record_blind_relay_two_hop_probe_result(
+                                peer_store.record_blind_relay_two_hop_probe_result_with_context(
                                     now,
                                     false,
                                     "ack_rejected",
+                                    middle_candidate_count,
+                                    terminal_candidate_count,
+                                    2,
+                                    1,
                                 );
                                 peer_store.record_route_forward_failure(
                                     &middle_node_id,
@@ -2766,10 +2787,14 @@ impl Server {
                                     error = %error,
                                     "[DISCOVERY] Two-hop blind relay proof ACK decode failed"
                                 );
-                                peer_store.record_blind_relay_two_hop_probe_result(
+                                peer_store.record_blind_relay_two_hop_probe_result_with_context(
                                     now,
                                     false,
                                     "ack_decode",
+                                    middle_candidate_count,
+                                    terminal_candidate_count,
+                                    2,
+                                    1,
                                 );
                                 peer_store.record_route_forward_failure(
                                     &middle_node_id,
@@ -2781,7 +2806,15 @@ impl Server {
                     }
                     Ok(response) => {
                         let reason = format!("http_{}", response.status().as_u16());
-                        peer_store.record_blind_relay_two_hop_probe_result(now, false, &reason);
+                        peer_store.record_blind_relay_two_hop_probe_result_with_context(
+                            now,
+                            false,
+                            &reason,
+                            middle_candidate_count,
+                            terminal_candidate_count,
+                            2,
+                            1,
+                        );
                         peer_store.record_route_forward_failure(&middle_node_id, now, reason);
                     }
                     Err(error) => {
@@ -2791,7 +2824,15 @@ impl Server {
                             reason = %reason,
                             "[DISCOVERY] Two-hop blind relay proof failed"
                         );
-                        peer_store.record_blind_relay_two_hop_probe_result(now, false, &reason);
+                        peer_store.record_blind_relay_two_hop_probe_result_with_context(
+                            now,
+                            false,
+                            &reason,
+                            middle_candidate_count,
+                            terminal_candidate_count,
+                            2,
+                            1,
+                        );
                         peer_store.record_route_forward_failure(&middle_node_id, now, reason);
                     }
                 }
@@ -2799,7 +2840,15 @@ impl Server {
         }
 
         if !attempted {
-            peer_store.record_blind_relay_two_hop_probe_result(now, false, "no_distinct_path");
+            peer_store.record_blind_relay_two_hop_probe_result_with_context(
+                now,
+                false,
+                "no_distinct_path",
+                middle_candidate_count,
+                0,
+                2,
+                1,
+            );
         }
         true
     }

@@ -98,6 +98,9 @@
 //! - Two-hop path proof history exposes privacy-safe freshness buckets and
 //!   latest success/failure ages so UI surfaces can distinguish fresh,
 //!   stale, failed, and forming proof states without reconstructing routes
+//! - Two-hop path proof quality context records only coarse path/candidate/TTL
+//!   buckets so operators can verify relay maturity without seeing node IDs,
+//!   endpoints, route IDs, encrypted blobs, or social graph edges
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -124,6 +127,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.42.0-TwoHopProofQualityContext - Added privacy-safe path/candidate/TTL buckets
 //! v0.41.0-TwoHopProofFreshness - Added freshness bucket and latest success/failure ages
 //! v0.40.0-TwoHopPathProofCounters - Added aggregate two-hop blind relay path proof counters
 //! v0.39.0-SignedPeerRecordsHeartbeat - Added bounded verifiable peer-record snapshot for heartbeat
@@ -290,6 +294,18 @@ pub struct PeerStoreTwoHopPathProofEvent {
     pub path_shape: String,
     /// Number of relay hops proven by this event.
     pub hop_count: u8,
+    /// Stable route policy bucket used by the proof planner.
+    #[serde(default)]
+    pub path_policy: String,
+    /// Coarse count bucket for routeable middle-hop candidates.
+    #[serde(default)]
+    pub middle_candidate_bucket: String,
+    /// Coarse count bucket for routeable terminal-hop candidates.
+    #[serde(default)]
+    pub terminal_candidate_bucket: String,
+    /// Coarse TTL shape, never a route id or per-peer path.
+    #[serde(default)]
+    pub ttl_shape: String,
 }
 
 /// Bounded privacy-safe history for recent two-hop relay path proofs.
@@ -344,6 +360,12 @@ pub struct PeerStoreTwoHopPathProofHistory {
     pub consecutive_successes: u64,
     /// Consecutive rejected proofs ending at the latest event.
     pub consecutive_failures: u64,
+    /// Aggregate proof path-shape counts in the retained window.
+    pub path_shape_counts: BTreeMap<String, u64>,
+    /// Aggregate candidate-pool quality buckets in the retained window.
+    pub candidate_pool_counts: BTreeMap<String, u64>,
+    /// Aggregate TTL-shape counts in the retained window.
+    pub ttl_shape_counts: BTreeMap<String, u64>,
     /// Seconds after which a retained successful proof is considered stale.
     pub stale_after_seconds: u64,
     /// Privacy-safe next action for nodeboard, website, and AI runbooks.
@@ -2393,6 +2415,28 @@ impl PeerStore {
         accepted: bool,
         reason: impl AsRef<str>,
     ) {
+        self.record_blind_relay_two_hop_probe_result_with_context(
+            now, accepted, reason, 0, 0, 2, 1,
+        );
+    }
+
+    /// Records a two-hop synthetic proof with privacy-safe route quality context.
+    ///
+    /// The context is intentionally bucketed before it enters history or audit
+    /// output. It must never include node ids, endpoints, route ids, encrypted
+    /// blobs, receiver identities, client IPs, DNS contents, domains, URLs,
+    /// Memory Chain plaintext, voucher secrets, wallet-level traffic, or
+    /// social graph metadata.
+    pub fn record_blind_relay_two_hop_probe_result_with_context(
+        &self,
+        now: u64,
+        accepted: bool,
+        reason: impl AsRef<str>,
+        middle_candidate_count: usize,
+        terminal_candidate_count: usize,
+        entry_ttl: u8,
+        onward_ttl: u8,
+    ) {
         let reason = reason.as_ref();
         self.counters
             .blind_relay_two_hop_probe_attempted
@@ -2416,9 +2460,23 @@ impl PeerStore {
             now,
             "blind_relay_two_hop_probe",
             if accepted { "accepted" } else { "rejected" },
-            format!("reason_bucket={reason}"),
+            format!(
+                "reason_bucket={}; middle_candidates={}; terminal_candidates={}; ttl_shape={}",
+                Self::two_hop_path_proof_reason_bucket(reason),
+                Self::two_hop_candidate_count_bucket(middle_candidate_count),
+                Self::two_hop_candidate_count_bucket(terminal_candidate_count),
+                Self::two_hop_ttl_shape(entry_ttl, onward_ttl),
+            ),
         );
-        self.record_two_hop_path_proof_event(now, accepted, reason);
+        self.record_two_hop_path_proof_event(
+            now,
+            accepted,
+            reason,
+            middle_candidate_count,
+            terminal_candidate_count,
+            entry_ttl,
+            onward_ttl,
+        );
     }
 
     /// Records a blind relay rejection with a stable privacy-safe reason.
@@ -2682,7 +2740,16 @@ impl PeerStore {
         });
     }
 
-    fn record_two_hop_path_proof_event(&self, now: u64, accepted: bool, reason: &str) {
+    fn record_two_hop_path_proof_event(
+        &self,
+        now: u64,
+        accepted: bool,
+        reason: &str,
+        middle_candidate_count: usize,
+        terminal_candidate_count: usize,
+        entry_ttl: u8,
+        onward_ttl: u8,
+    ) {
         let mut events = self.two_hop_path_proof_events.write();
         if events.len() >= MAX_TWO_HOP_PATH_PROOF_EVENTS {
             events.pop_front();
@@ -2694,7 +2761,32 @@ impl PeerStore {
             evidence_mode: "synthetic_two_hop_probe".to_string(),
             path_shape: "entry_middle_terminal".to_string(),
             hop_count: 2,
+            path_policy: "distinct_middle_terminal".to_string(),
+            middle_candidate_bucket: Self::two_hop_candidate_count_bucket(middle_candidate_count)
+                .to_string(),
+            terminal_candidate_bucket: Self::two_hop_candidate_count_bucket(
+                terminal_candidate_count,
+            )
+            .to_string(),
+            ttl_shape: Self::two_hop_ttl_shape(entry_ttl, onward_ttl),
         });
+    }
+
+    fn two_hop_candidate_count_bucket(count: usize) -> &'static str {
+        match count {
+            0 => "none",
+            1 => "one",
+            2..=3 => "few",
+            4..=8 => "healthy",
+            _ => "deep",
+        }
+    }
+
+    fn two_hop_ttl_shape(entry_ttl: u8, onward_ttl: u8) -> String {
+        match (entry_ttl, onward_ttl) {
+            (2, 1) => "entry_ttl_2_onward_ttl_1".to_string(),
+            (entry, onward) => format!("entry_ttl_{entry}_onward_ttl_{onward}"),
+        }
     }
 
     fn two_hop_path_proof_reason_bucket(reason: &str) -> String {
@@ -2745,6 +2837,29 @@ impl PeerStore {
             .map(|event| now.saturating_sub(event.at));
         let consecutive_successes = Self::count_trailing_two_hop_outcomes(&events, "accepted");
         let consecutive_failures = Self::count_trailing_two_hop_outcomes(&events, "rejected");
+        let path_shape_counts =
+            Self::count_two_hop_event_buckets(&events, |event| event.path_shape.as_str());
+        let candidate_pool_counts = Self::count_two_hop_event_buckets(&events, |event| {
+            if event.middle_candidate_bucket.is_empty()
+                || event.terminal_candidate_bucket.is_empty()
+                || event.middle_candidate_bucket == "none"
+                || event.terminal_candidate_bucket == "none"
+            {
+                "incomplete"
+            } else if event.middle_candidate_bucket == "one"
+                || event.terminal_candidate_bucket == "one"
+            {
+                "thin"
+            } else if event.middle_candidate_bucket == "few"
+                || event.terminal_candidate_bucket == "few"
+            {
+                "forming"
+            } else {
+                "healthy"
+            }
+        });
+        let ttl_shape_counts =
+            Self::count_two_hop_event_buckets(&events, |event| event.ttl_shape.as_str());
         let recent_success_ready = latest
             .map(|event| {
                 event.outcome == "accepted"
@@ -2815,6 +2930,9 @@ impl PeerStore {
             latest_failure_age_seconds,
             consecutive_successes,
             consecutive_failures,
+            path_shape_counts,
+            candidate_pool_counts,
+            ttl_shape_counts,
             stale_after_seconds: PEER_ROUTEABILITY_STALE_AFTER_SECS,
             next_action: next_action.to_string(),
             events,
@@ -2832,6 +2950,21 @@ impl PeerStore {
             .rev()
             .take_while(|event| event.outcome == outcome)
             .count() as u64
+    }
+
+    fn count_two_hop_event_buckets<'a>(
+        events: &'a [PeerStoreTwoHopPathProofEvent],
+        bucket: impl Fn(&'a PeerStoreTwoHopPathProofEvent) -> &'a str,
+    ) -> BTreeMap<String, u64> {
+        let mut counts = BTreeMap::new();
+        for event in events {
+            let key = bucket(event);
+            if key.is_empty() {
+                continue;
+            }
+            *counts.entry(key.to_string()).or_insert(0) += 1;
+        }
+        counts
     }
 
     fn record_peer_event(
@@ -5614,7 +5747,15 @@ mod tests {
     fn test_two_hop_blind_relay_probe_reports_path_proof_without_private_metadata() {
         let store = PeerStore::new();
 
-        store.record_blind_relay_two_hop_probe_result(1_700_000_010, true, "accepted");
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_010,
+            true,
+            "accepted",
+            4,
+            3,
+            2,
+            1,
+        );
 
         let status = store.status(1_700_000_025);
         let stats = status.runtime.blind_relay;
@@ -5680,11 +5821,61 @@ mod tests {
             "entry_middle_terminal"
         );
         assert_eq!(status.two_hop_path_proof_history.events[0].hop_count, 2);
+        assert_eq!(
+            status.two_hop_path_proof_history.events[0].path_policy,
+            "distinct_middle_terminal"
+        );
+        assert_eq!(
+            status.two_hop_path_proof_history.events[0].middle_candidate_bucket,
+            "healthy"
+        );
+        assert_eq!(
+            status.two_hop_path_proof_history.events[0].terminal_candidate_bucket,
+            "few"
+        );
+        assert_eq!(
+            status.two_hop_path_proof_history.events[0].ttl_shape,
+            "entry_ttl_2_onward_ttl_1"
+        );
+        assert_eq!(
+            status
+                .two_hop_path_proof_history
+                .path_shape_counts
+                .get("entry_middle_terminal"),
+            Some(&1)
+        );
+        assert_eq!(
+            status
+                .two_hop_path_proof_history
+                .candidate_pool_counts
+                .get("forming"),
+            Some(&1)
+        );
+        assert_eq!(
+            status
+                .two_hop_path_proof_history
+                .ttl_shape_counts
+                .get("entry_ttl_2_onward_ttl_1"),
+            Some(&1)
+        );
         assert!(status.recent_audit_events.iter().any(|event| {
             event.action == "blind_relay_two_hop_probe"
                 && event.outcome == "accepted"
-                && event.detail == "reason_bucket=accepted"
+                && event.detail.contains("reason_bucket=accepted")
+                && event.detail.contains("middle_candidates=healthy")
+                && event.detail.contains("terminal_candidates=few")
+                && event.detail.contains("ttl_shape=entry_ttl_2_onward_ttl_1")
         }));
+        let audit_detail = status
+            .recent_audit_events
+            .iter()
+            .find(|event| event.action == "blind_relay_two_hop_probe")
+            .map(|event| event.detail.as_str())
+            .unwrap_or_default();
+        assert!(!audit_detail.contains("endpoint"));
+        assert!(!audit_detail.contains("node_id"));
+        assert!(!audit_detail.contains("route_id"));
+        assert!(!audit_detail.contains("payload"));
 
         assert!(!quality.detail.contains("route_id"));
         assert!(!quality.detail.contains("endpoint"));
@@ -5734,6 +5925,15 @@ mod tests {
         assert_eq!(history.events[0].reason_bucket, "http_error");
         assert_eq!(history.events[1].reason_bucket, "unknown");
         assert_eq!(history.events[2].reason_bucket, "accepted");
+        assert_eq!(
+            history.path_shape_counts.get("entry_middle_terminal"),
+            Some(&3)
+        );
+        assert_eq!(history.candidate_pool_counts.get("incomplete"), Some(&3));
+        assert_eq!(
+            history.ttl_shape_counts.get("entry_ttl_2_onward_ttl_1"),
+            Some(&3)
+        );
 
         let serialized = serde_json::to_string(&history).expect("history serializes");
         assert!(!serialized.contains("endpoint://leak"));
