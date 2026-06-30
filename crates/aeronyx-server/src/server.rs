@@ -82,6 +82,9 @@
 //  35. Prefers a real two-hop onion delivery probe before the legacy
 //      control-plane onward-envelope probe, proving middle-hop peel/forward
 //      and terminal ChatRelay store-and-forward without exposing payloads.
+//  36. Prioritizes unproven, non-quarantined route candidates during low-
+//      frequency synthetic probes so three-node meshes converge routeability
+//      coverage instead of repeatedly probing only the already-proven peer.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -101,6 +104,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.2.2-ProbeCoveragePriority - Probe unproven non-quarantined peers before already-proven peers
 //   v1.2.1-TwoHopOnionDeliveryProbe - Prefer synthetic onion delivery over control-plane proof
 //   v1.2.0-TwoHopRuntimeProof - Low-frequency aggregate two-hop blind relay path proof
 //   v1.1.9-BlindRelayProbeCooldown - Rate-limit synthetic relay probes so discovery health checks stay low-noise
@@ -2437,6 +2441,23 @@ impl Server {
             .max(BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS)
     }
 
+    fn prioritize_probe_candidates(
+        peer_store: &PeerStore,
+        now: u64,
+        candidates: &mut [SignedNodeDescriptor],
+    ) {
+        candidates.sort_by_key(|candidate| {
+            let node_id = candidate.node_id();
+            let route_quarantined = peer_store.is_route_quarantined_now(&node_id, now);
+            let routeable = peer_store.is_routeable_now(&node_id, now);
+            // Low-frequency probes should expand coverage first: fresh signed
+            // peers with unknown/stale routeability are tried before peers that
+            // are already proven. Quarantined peers stay last so local failure
+            // isolation remains stronger than coverage convergence.
+            (route_quarantined, routeable)
+        });
+    }
+
     fn discovery_gossip_backpressure_active(
         discovery: &DiscoveryConfig,
         consecutive_failures: u64,
@@ -2561,16 +2582,14 @@ impl Server {
         self_node_id: &[u8; 32],
         now: u64,
     ) -> bool {
-        let Some(candidate) = peer_store
-            .route_candidates_with_capability_excluding(
-                NodeCapability::ChatRelay,
-                now,
-                1,
-                &[*self_node_id],
-            )
-            .into_iter()
-            .next()
-        else {
+        let mut candidates = peer_store.route_candidates_with_capability_excluding(
+            NodeCapability::ChatRelay,
+            now,
+            8,
+            &[*self_node_id],
+        );
+        Self::prioritize_probe_candidates(peer_store, now, &mut candidates);
+        let Some(candidate) = candidates.into_iter().next() else {
             return false;
         };
 
@@ -2648,12 +2667,13 @@ impl Server {
         self_node_id: &[u8; 32],
         now: u64,
     ) -> bool {
-        let middle_candidates = peer_store.route_candidates_with_capability_excluding(
+        let mut middle_candidates = peer_store.route_candidates_with_capability_excluding(
             NodeCapability::OnionMiddle,
             now,
-            4,
+            8,
             &[*self_node_id],
         );
+        Self::prioritize_probe_candidates(peer_store, now, &mut middle_candidates);
         if middle_candidates.is_empty() {
             return false;
         }
@@ -2662,12 +2682,13 @@ impl Server {
         let mut attempted = false;
         for middle in middle_candidates {
             let middle_node_id = middle.node_id();
-            let terminal_candidates = peer_store.route_candidates_with_capability_excluding(
+            let mut terminal_candidates = peer_store.route_candidates_with_capability_excluding(
                 NodeCapability::ChatRelay,
                 now,
-                4,
+                8,
                 &[*self_node_id, middle_node_id],
             );
+            Self::prioritize_probe_candidates(peer_store, now, &mut terminal_candidates);
             let terminal_candidate_count = terminal_candidates.len();
             if terminal_candidates.is_empty() {
                 continue;
@@ -5054,6 +5075,52 @@ mod tests {
 
         discovery.gossip_interval_secs = 600;
         assert_eq!(Server::blind_relay_probe_cooldown_secs(&discovery), 1_800);
+    }
+
+    #[test]
+    fn blind_relay_probe_priority_prefers_unproven_non_quarantined_peer() {
+        let store = PeerStore::new();
+        let now = 1_800_000_000;
+
+        let proven = signed_probe_peer_descriptor(
+            "https://proven.example".to_string(),
+            1,
+            now + 300,
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
+            [0x31; 32],
+        );
+        let unproven = signed_probe_peer_descriptor(
+            "https://unproven.example".to_string(),
+            2,
+            now + 300,
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
+            [0x32; 32],
+        );
+        let quarantined = signed_probe_peer_descriptor(
+            "https://quarantined.example".to_string(),
+            3,
+            now + 300,
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle],
+            [0x33; 32],
+        );
+
+        let proven_id = proven.node_id();
+        let unproven_id = unproven.node_id();
+        let quarantined_id = quarantined.node_id();
+        store.upsert_verified(proven.clone(), now).unwrap();
+        store.upsert_verified(unproven.clone(), now).unwrap();
+        store.upsert_verified(quarantined.clone(), now).unwrap();
+        store.record_route_forward_success(&proven_id, now + 1);
+        store.record_route_forward_failure(&quarantined_id, now + 1, "request_failed");
+        store.record_route_forward_failure(&quarantined_id, now + 2, "request_failed");
+        store.record_route_forward_failure(&quarantined_id, now + 3, "request_failed");
+
+        let mut candidates = vec![proven, quarantined, unproven];
+        Server::prioritize_probe_candidates(&store, now + 4, &mut candidates);
+
+        assert_eq!(candidates[0].node_id(), unproven_id);
+        assert_eq!(candidates[1].node_id(), proven_id);
+        assert_eq!(candidates[2].node_id(), quarantined_id);
     }
 
     #[test]
