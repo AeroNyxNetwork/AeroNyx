@@ -74,7 +74,7 @@ use std::borrow::Cow;
 use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::config_chat_relay::ChatRelayConfig;
 use crate::config_saas::SaasConfig;
@@ -588,7 +588,11 @@ impl MemChainConfig {
                     "cannot be empty when ner_enabled = true",
                 ));
             }
-            info!(
+            // [M1-STABILITY-LOGGING 2026-06-30] `validate()` can run on
+            // runtime policy / heartbeat paths, not only at process startup.
+            // Keep the success case at debug so an enabled NER config does not
+            // look like repeated model initialization in production journals.
+            debug!(
                 "[MEMCHAIN] NER engine enabled (model: {}, threshold: {})",
                 self.ner_model_path, self.ner_confidence_threshold
             );
