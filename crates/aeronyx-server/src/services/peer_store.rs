@@ -5292,6 +5292,62 @@ mod tests {
     }
 
     #[test]
+    fn test_route_path_status_does_not_count_quarantined_peers_as_ready() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let middle_kp = IdentityKeyPair::generate();
+        let relay_kp = IdentityKeyPair::generate();
+
+        let mut middle_descriptor = signed_descriptor_for(&middle_kp, 1, now + 2_000);
+        middle_descriptor.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        middle_descriptor.descriptor.public_endpoint =
+            Some("https://quarantined-middle.example".to_string());
+        middle_descriptor =
+            SignedNodeDescriptor::sign(middle_descriptor.descriptor, &middle_kp).unwrap();
+        let middle_node_id = middle_descriptor.node_id();
+
+        let mut relay_descriptor = signed_descriptor_for(&relay_kp, 1, now + 2_000);
+        relay_descriptor.descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        relay_descriptor.descriptor.public_endpoint =
+            Some("https://quarantined-relay.example".to_string());
+        relay_descriptor =
+            SignedNodeDescriptor::sign(relay_descriptor.descriptor, &relay_kp).unwrap();
+        let relay_node_id = relay_descriptor.node_id();
+
+        store
+            .upsert_verified_from_source(middle_descriptor, now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(relay_descriptor, now, "gossip_announce")
+            .unwrap();
+
+        for node_id in [&middle_node_id, &relay_node_id] {
+            store.record_route_forward_success(node_id, now + 1);
+            store.record_route_forward_failure(node_id, now + 2, "request_failed");
+            store.record_route_forward_failure(node_id, now + 3, "request_failed");
+            store.record_route_forward_failure(node_id, now + 4, "http_502");
+        }
+
+        let status = store.route_candidate_status(now + 5);
+        assert!(!status.planned_paths.chat_single_hop.complete);
+        assert_eq!(status.planned_paths.chat_single_hop.hop_count, 0);
+        assert!(!status.planned_paths.chat_two_hop_onion_ready.complete);
+        assert_eq!(status.planned_paths.chat_two_hop_onion_ready.hop_count, 0);
+        assert_eq!(status.chat_relay[0].route_health, "quarantined");
+        assert!(status.chat_relay[0].route_quarantined);
+        assert_eq!(status.onion_middle[0].route_health, "quarantined");
+        assert!(status.onion_middle[0].route_quarantined);
+
+        let status_json = serde_json::to_string(&status).unwrap();
+        assert!(!status_json.contains("quarantined-middle.example"));
+        assert!(!status_json.contains("quarantined-relay.example"));
+        assert!(!status_json.contains(&hex::encode(middle_node_id)));
+        assert!(!status_json.contains(&hex::encode(relay_node_id)));
+        assert!(!status_json.contains("encrypted_blob"));
+        assert!(!status_json.contains("receiver_pubkey"));
+    }
+
+    #[test]
     fn test_network_story_reports_onion_ready_without_endpoint_or_full_node_id() {
         let store = PeerStore::new();
         let now = 1_700_000_100;
