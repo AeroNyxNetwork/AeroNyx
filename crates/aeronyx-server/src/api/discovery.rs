@@ -51,6 +51,7 @@
 //!   surfaces never need to parse full peer diagnostics.
 //!
 //! ## Last Modified
+//! v0.11.0-DiscoverySummaryProofQuality - Expose privacy-safe two-hop proof quality buckets
 //! v0.10.0-DiscoverySummaryEndpoint - Add compact privacy-safe protocol summary endpoint
 //! v0.9.3-OnionCandidatesRouteabilityGate - Only expose fresh routeable onion candidates to clients
 //! v0.9.2-BlindRelayFreshnessGuard - Expose timestamp rejection aggregate in compact readiness
@@ -661,6 +662,9 @@ pub fn discovery_summary_response(
             "latest_failure_age_seconds": two_hop_history.latest_failure_age_seconds,
             "consecutive_successes": two_hop_history.consecutive_successes,
             "consecutive_failures": two_hop_history.consecutive_failures,
+            "path_shape_counts": &two_hop_history.path_shape_counts,
+            "candidate_pool_counts": &two_hop_history.candidate_pool_counts,
+            "ttl_shape_counts": &two_hop_history.ttl_shape_counts,
             "stale_after_seconds": two_hop_history.stale_after_seconds,
             "next_action": &two_hop_history.next_action,
         }),
@@ -1281,7 +1285,9 @@ mod tests {
         let store = Arc::new(PeerStore::new());
         let now = now_secs();
         store.record_blind_relay_forwarded(now, 1);
-        store.record_blind_relay_two_hop_probe_result(now, true, "accepted");
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            now, true, "accepted", 4, 3, 2, 1,
+        );
         let app = build_discovery_router_with_local_status(
             store,
             DiscoveryApiPolicy::default(),
@@ -1313,6 +1319,18 @@ mod tests {
             Some(true)
         );
         assert_eq!(parsed["two_hop_path_proof"]["succeeded"].as_u64(), Some(1));
+        assert_eq!(
+            parsed["two_hop_path_proof"]["path_shape_counts"]["entry_middle_terminal"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["candidate_pool_counts"]["forming"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["ttl_shape_counts"]["entry_ttl_2_onward_ttl_1"].as_u64(),
+            Some(1)
+        );
         assert_eq!(
             parsed["privacy_invariant"].as_str(),
             Some("blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status")
