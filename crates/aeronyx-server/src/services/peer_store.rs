@@ -95,6 +95,9 @@
 //!   node-to-node encrypted routing tied to fresh probe/forward evidence
 //! - Heartbeat can export a bounded signed peer-record snapshot so centralized
 //!   coordination can verify peer records instead of trusting derived counters
+//! - Two-hop path proof history exposes privacy-safe freshness buckets and
+//!   latest success/failure ages so UI surfaces can distinguish fresh,
+//!   stale, failed, and forming proof states without reconstructing routes
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -121,6 +124,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.41.0-TwoHopProofFreshness - Added freshness bucket and latest success/failure ages
 //! v0.40.0-TwoHopPathProofCounters - Added aggregate two-hop blind relay path proof counters
 //! v0.39.0-SignedPeerRecordsHeartbeat - Added bounded verifiable peer-record snapshot for heartbeat
 //! v0.38.0-RouteabilityForwardGate - Exposed routeability readiness helper for blind relay next-hop selection
@@ -301,6 +305,13 @@ pub struct PeerStoreTwoHopPathProofHistory {
     pub generated_at: u64,
     /// Stable readiness bucket: forming, ready, stale, attention, or idle.
     pub status: String,
+    /// Stable freshness bucket for UI and runbooks: forming, fresh_success,
+    /// stale_success, recent_failure, or no_success.
+    ///
+    /// This is derived only from bounded local proof outcomes and coarse age
+    /// windows. It must never encode node IDs, route IDs, endpoints, payloads,
+    /// receiver identities, or social graph information.
+    pub freshness_bucket: String,
     /// Whether the latest retained proof is a fresh accepted two-hop path.
     pub proof_ready: bool,
     /// Whether the latest proof success is still within the routeability window.
@@ -325,6 +336,10 @@ pub struct PeerStoreTwoHopPathProofHistory {
     pub latest_reason_bucket: Option<String>,
     /// Seconds since the latest retained proof event.
     pub latest_age_seconds: Option<u64>,
+    /// Seconds since the latest retained accepted proof event.
+    pub latest_success_age_seconds: Option<u64>,
+    /// Seconds since the latest retained rejected proof event.
+    pub latest_failure_age_seconds: Option<u64>,
     /// Consecutive accepted proofs ending at the latest event.
     pub consecutive_successes: u64,
     /// Consecutive rejected proofs ending at the latest event.
@@ -2718,6 +2733,16 @@ impl PeerStore {
         };
         let latest = events.last();
         let latest_age_seconds = latest.map(|event| now.saturating_sub(event.at));
+        let latest_success_age_seconds = events
+            .iter()
+            .rev()
+            .find(|event| event.outcome == "accepted")
+            .map(|event| now.saturating_sub(event.at));
+        let latest_failure_age_seconds = events
+            .iter()
+            .rev()
+            .find(|event| event.outcome == "rejected")
+            .map(|event| now.saturating_sub(event.at));
         let consecutive_successes = Self::count_trailing_two_hop_outcomes(&events, "accepted");
         let consecutive_failures = Self::count_trailing_two_hop_outcomes(&events, "rejected");
         let recent_success_ready = latest
@@ -2758,10 +2783,22 @@ impl PeerStore {
                 "wait for route candidates before advertising two-hop path proof readiness",
             )
         };
+        let freshness_bucket = if attempted == 0 {
+            "forming"
+        } else if recent_success_ready {
+            "fresh_success"
+        } else if failure_streak_active {
+            "recent_failure"
+        } else if latest_success_age_seconds.is_some() {
+            "stale_success"
+        } else {
+            "no_success"
+        };
 
         PeerStoreTwoHopPathProofHistory {
             generated_at: now,
             status: status.to_string(),
+            freshness_bucket: freshness_bucket.to_string(),
             proof_ready,
             recent_success_ready,
             failure_streak_active,
@@ -2774,6 +2811,8 @@ impl PeerStore {
             latest_outcome: latest.map(|event| event.outcome.clone()),
             latest_reason_bucket: latest.map(|event| event.reason_bucket.clone()),
             latest_age_seconds,
+            latest_success_age_seconds,
+            latest_failure_age_seconds,
             consecutive_successes,
             consecutive_failures,
             stale_after_seconds: PEER_ROUTEABILITY_STALE_AFTER_SECS,
@@ -5598,6 +5637,10 @@ mod tests {
         assert_eq!(status.two_hop_path_proof_history.succeeded, 1);
         assert_eq!(status.two_hop_path_proof_history.failed, 0);
         assert_eq!(status.two_hop_path_proof_history.status, "ready");
+        assert_eq!(
+            status.two_hop_path_proof_history.freshness_bucket,
+            "fresh_success"
+        );
         assert!(status.two_hop_path_proof_history.proof_ready);
         assert!(status.two_hop_path_proof_history.recent_success_ready);
         assert!(!status.two_hop_path_proof_history.failure_streak_active);
@@ -5620,6 +5663,14 @@ mod tests {
         assert_eq!(
             status.two_hop_path_proof_history.latest_age_seconds,
             Some(15)
+        );
+        assert_eq!(
+            status.two_hop_path_proof_history.latest_success_age_seconds,
+            Some(15)
+        );
+        assert_eq!(
+            status.two_hop_path_proof_history.latest_failure_age_seconds,
+            None
         );
         assert_eq!(status.two_hop_path_proof_history.consecutive_successes, 1);
         assert_eq!(status.two_hop_path_proof_history.consecutive_failures, 0);
@@ -5668,6 +5719,7 @@ mod tests {
         assert_eq!(history.succeeded, 1);
         assert_eq!(history.failed, 2);
         assert_eq!(history.status, "ready");
+        assert_eq!(history.freshness_bucket, "fresh_success");
         assert!(history.proof_ready);
         assert!(history.recent_success_ready);
         assert!(!history.failure_streak_active);
@@ -5675,6 +5727,8 @@ mod tests {
         assert_eq!(history.latest_outcome.as_deref(), Some("accepted"));
         assert_eq!(history.latest_reason_bucket.as_deref(), Some("accepted"));
         assert_eq!(history.latest_age_seconds, Some(15));
+        assert_eq!(history.latest_success_age_seconds, Some(15));
+        assert_eq!(history.latest_failure_age_seconds, Some(25));
         assert_eq!(history.consecutive_successes, 1);
         assert_eq!(history.consecutive_failures, 0);
         assert_eq!(history.events[0].reason_bucket, "http_error");
@@ -5699,9 +5753,12 @@ mod tests {
             .status(1_700_000_020)
             .two_hop_path_proof_history;
         assert_eq!(failing_history.status, "attention");
+        assert_eq!(failing_history.freshness_bucket, "recent_failure");
         assert!(!failing_history.proof_ready);
         assert!(!failing_history.recent_success_ready);
         assert!(failing_history.failure_streak_active);
+        assert_eq!(failing_history.latest_success_age_seconds, None);
+        assert_eq!(failing_history.latest_failure_age_seconds, Some(10));
         assert_eq!(failing_history.consecutive_failures, 1);
         assert!(failing_history.next_action.contains("routeability"));
 
@@ -5711,9 +5768,15 @@ mod tests {
             .status(1_700_000_010 + PEER_ROUTEABILITY_STALE_AFTER_SECS + 1)
             .two_hop_path_proof_history;
         assert_eq!(stale_history.status, "stale");
+        assert_eq!(stale_history.freshness_bucket, "stale_success");
         assert!(!stale_history.proof_ready);
         assert!(!stale_history.recent_success_ready);
         assert!(!stale_history.failure_streak_active);
+        assert_eq!(
+            stale_history.latest_success_age_seconds,
+            Some(PEER_ROUTEABILITY_STALE_AFTER_SECS + 1)
+        );
+        assert_eq!(stale_history.latest_failure_age_seconds, None);
         assert_eq!(stale_history.consecutive_successes, 1);
         assert!(stale_history
             .next_action
