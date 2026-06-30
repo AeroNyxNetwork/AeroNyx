@@ -47,6 +47,7 @@
 //!   bytes, or raw public keys in production node logs.
 //!
 //! ## Last Modified
+//! v0.1.2 - Downgraded successful handshake diagnostic logs to debug level for production nodes
 //! v0.1.1 - Redacted sensitive handshake material from crypto logs
 //! v0.1.0 - Initial handshake crypto implementation
 
@@ -56,7 +57,7 @@ use crate::error::{CoreError, Result};
 use crate::protocol::{ClientHello, ServerHello};
 
 use aeronyx_common::time::Timestamp;
-use tracing::{debug, info, trace};
+use tracing::{debug, trace, warn};
 
 // ============================================
 // Helper function for privacy-safe diagnostics
@@ -144,7 +145,7 @@ impl DefaultHandshakeCrypto {
     /// * `identity` - Server's Ed25519 identity key pair
     #[must_use]
     pub fn new(identity: IdentityKeyPair) -> Self {
-        info!("[CRYPTO-DEBUG] DefaultHandshakeCrypto::new() - Creating handshake crypto instance");
+        debug!("[CRYPTO-DEBUG] DefaultHandshakeCrypto::new() - Creating handshake crypto instance");
         debug!(
             "[CRYPTO-DEBUG] Server Identity Public Key: {}",
             redacted_len(&identity.public_key_bytes())
@@ -232,7 +233,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
     }
 
     fn verify_client_hello(&self, msg: &ClientHello) -> Result<()> {
-        info!("[CRYPTO-DEBUG] ========== verify_client_hello START ==========");
+        debug!("[CRYPTO-DEBUG] ========== verify_client_hello START ==========");
 
         debug!("[CRYPTO-DEBUG] ClientHello contents:");
         debug!("[CRYPTO-DEBUG]   message_type: {}", msg.message_type);
@@ -263,7 +264,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         );
 
         if !timestamp.is_recent(self.max_timestamp_skew) {
-            info!("[CRYPTO-DEBUG] FAILED: Timestamp validation failed");
+            warn!("[CRYPTO-DEBUG] FAILED: Timestamp validation failed");
             return Err(CoreError::invalid_timestamp(format!(
                 "Timestamp {} is not recent (max skew: {}s)",
                 msg.timestamp, self.max_timestamp_skew
@@ -287,13 +288,13 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
 
         match client_public.verify(&sign_data, &msg.signature) {
             Ok(()) => {
-                info!("[CRYPTO-DEBUG] Signature verification: PASSED");
-                info!("[CRYPTO-DEBUG] ========== verify_client_hello SUCCESS ==========");
+                debug!("[CRYPTO-DEBUG] Signature verification: PASSED");
+                debug!("[CRYPTO-DEBUG] ========== verify_client_hello SUCCESS ==========");
                 Ok(())
             }
             Err(e) => {
-                info!("[CRYPTO-DEBUG] Signature verification: FAILED - {:?}", e);
-                info!("[CRYPTO-DEBUG] ========== verify_client_hello FAILED ==========");
+                warn!("[CRYPTO-DEBUG] Signature verification: FAILED - {:?}", e);
+                warn!("[CRYPTO-DEBUG] ========== verify_client_hello FAILED ==========");
                 Err(e)
             }
         }
@@ -305,7 +306,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         assigned_ip: [u8; 4],
         session_id: [u8; 16],
     ) -> Result<(ServerHello, SessionKey)> {
-        info!("[CRYPTO-DEBUG] ========== process_handshake START ==========");
+        debug!("[CRYPTO-DEBUG] ========== process_handshake START ==========");
 
         debug!(
             "[CRYPTO-DEBUG] Input - assigned_ip: {}.{}.{}.{}",
@@ -325,7 +326,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         );
 
         // 1. Generate ephemeral key pair for this session
-        info!("[CRYPTO-DEBUG] Step 1: Generating server ephemeral key pair...");
+        debug!("[CRYPTO-DEBUG] Step 1: Generating server ephemeral key pair...");
         let ephemeral = EphemeralKeyPair::generate();
         let server_ephemeral_public = ephemeral.public_key_bytes();
         debug!(
@@ -334,20 +335,20 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         );
 
         // 2. Perform key exchange
-        info!("[CRYPTO-DEBUG] Step 2: Performing X25519 key exchange...");
+        debug!("[CRYPTO-DEBUG] Step 2: Performing X25519 key exchange...");
         let shared_secret = ephemeral.exchange(&client_hello.client_ephemeral_key);
-        info!(
+        debug!(
             "[CRYPTO-DEBUG] *** Shared Secret: {} ***",
             redacted_len(&shared_secret)
         );
 
         // 3. Derive session key
-        info!("[CRYPTO-DEBUG] Step 3: Deriving session key...");
-        info!(
+        debug!("[CRYPTO-DEBUG] Step 3: Deriving session key...");
+        debug!(
             "[CRYPTO-DEBUG] *** Client Identity Public Key (for KDF): {} ***",
             redacted_len(&client_hello.client_public_key)
         );
-        info!(
+        debug!(
             "[CRYPTO-DEBUG] *** Server Identity Public Key (for KDF): {} ***",
             redacted_len(&self.identity.public_key_bytes())
         );
@@ -358,13 +359,13 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
             &self.identity.public_key_bytes(),
         )?;
 
-        info!(
+        debug!(
             "[CRYPTO-DEBUG] *** Derived Session Key: {} ***",
             redacted_len(session_key.as_bytes())
         );
 
         // 4. Build ServerHello (unsigned)
-        info!("[CRYPTO-DEBUG] Step 4: Building ServerHello message...");
+        debug!("[CRYPTO-DEBUG] Step 4: Building ServerHello message...");
         let mut server_hello = ServerHello {
             message_type: crate::protocol::MessageType::ServerHello as u8,
             version: client_hello.version,
@@ -402,7 +403,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
         );
 
         // 5. Sign ServerHello
-        info!("[CRYPTO-DEBUG] Step 5: Signing ServerHello...");
+        debug!("[CRYPTO-DEBUG] Step 5: Signing ServerHello...");
         let sign_data =
             Self::server_hello_sign_data(&server_hello, &client_hello.client_public_key);
         debug!(
@@ -420,21 +421,21 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
             redacted_len(&server_hello.signature)
         );
 
-        info!("[CRYPTO-DEBUG] ========== process_handshake SUCCESS ==========");
-        info!("[CRYPTO-DEBUG] Summary:");
-        info!(
+        debug!("[CRYPTO-DEBUG] ========== process_handshake SUCCESS ==========");
+        debug!("[CRYPTO-DEBUG] Summary:");
+        debug!(
             "[CRYPTO-DEBUG]   Shared Secret: {}",
             redacted_len(&shared_secret)
         );
-        info!(
+        debug!(
             "[CRYPTO-DEBUG]   Client Identity Public: {}",
             redacted_len(&client_hello.client_public_key)
         );
-        info!(
+        debug!(
             "[CRYPTO-DEBUG]   Server Identity Public: {}",
             redacted_len(&self.identity.public_key_bytes())
         );
-        info!(
+        debug!(
             "[CRYPTO-DEBUG]   Derived Session Key: {}",
             redacted_len(session_key.as_bytes())
         );
@@ -456,7 +457,7 @@ impl HandshakeCrypto for DefaultHandshakeCrypto {
 /// # Errors
 /// Returns `SignatureVerification` error if signature is invalid.
 pub fn verify_server_hello(server_hello: &ServerHello, client_public: &[u8; 32]) -> Result<()> {
-    info!("[CRYPTO-DEBUG] ========== verify_server_hello START ==========");
+    debug!("[CRYPTO-DEBUG] ========== verify_server_hello START ==========");
 
     debug!("[CRYPTO-DEBUG] ServerHello contents:");
     debug!(
@@ -507,16 +508,16 @@ pub fn verify_server_hello(server_hello: &ServerHello, client_public: &[u8; 32])
 
     match server_public.verify(&sign_data, &server_hello.signature) {
         Ok(()) => {
-            info!("[CRYPTO-DEBUG] ServerHello signature verification: PASSED");
-            info!("[CRYPTO-DEBUG] ========== verify_server_hello SUCCESS ==========");
+            debug!("[CRYPTO-DEBUG] ServerHello signature verification: PASSED");
+            debug!("[CRYPTO-DEBUG] ========== verify_server_hello SUCCESS ==========");
             Ok(())
         }
         Err(e) => {
-            info!(
+            warn!(
                 "[CRYPTO-DEBUG] ServerHello signature verification: FAILED - {:?}",
                 e
             );
-            info!("[CRYPTO-DEBUG] ========== verify_server_hello FAILED ==========");
+            warn!("[CRYPTO-DEBUG] ========== verify_server_hello FAILED ==========");
             Err(e)
         }
     }
@@ -536,7 +537,7 @@ pub fn create_client_hello(
     ephemeral_public: [u8; 32],
     version: u8,
 ) -> ClientHello {
-    info!("[CRYPTO-DEBUG] ========== create_client_hello START ==========");
+    debug!("[CRYPTO-DEBUG] ========== create_client_hello START ==========");
 
     let timestamp = Timestamp::now().as_secs();
 
@@ -577,7 +578,7 @@ pub fn create_client_hello(
         redacted_len(&msg.signature)
     );
 
-    info!("[CRYPTO-DEBUG] ========== create_client_hello SUCCESS ==========");
+    debug!("[CRYPTO-DEBUG] ========== create_client_hello SUCCESS ==========");
 
     msg
 }

@@ -33,12 +33,13 @@
 //! - Never log shared secrets, derived keys, HKDF info, or raw public keys.
 //!
 //! ## Last Modified
+//! v0.1.2 - Downgraded successful crypto diagnostic logs to debug level for production nodes
 //! v0.1.1 - Redacted sensitive key material from crypto logs
 //! v0.1.0 - Initial KDF implementation
 
 use hkdf::Hkdf;
 use sha2::Sha256;
-use tracing::{debug, info};
+use tracing::{debug, warn};
 use zeroize::Zeroize;
 
 use super::{CHACHA20_KEY_SIZE, ED25519_PUBLIC_KEY_SIZE, HKDF_INFO_PREFIX, HKDF_SALT};
@@ -93,18 +94,18 @@ pub fn derive_session_key(
     client_public: &[u8; ED25519_PUBLIC_KEY_SIZE],
     server_public: &[u8; ED25519_PUBLIC_KEY_SIZE],
 ) -> Result<SessionKey> {
-    info!("[CRYPTO-DEBUG] ========== derive_session_key START ==========");
+    debug!("[CRYPTO-DEBUG] ========== derive_session_key START ==========");
 
     // Log all inputs
-    info!(
+    debug!(
         "[CRYPTO-DEBUG] Input - Shared Secret: {}",
         redacted_len(shared_secret)
     );
-    info!(
+    debug!(
         "[CRYPTO-DEBUG] Input - Client Public Key: {}",
         redacted_len(client_public)
     );
-    info!(
+    debug!(
         "[CRYPTO-DEBUG] Input - Server Public Key: {}",
         redacted_len(server_public)
     );
@@ -159,7 +160,7 @@ pub fn derive_session_key(
             debug!("[CRYPTO-DEBUG] HKDF expansion successful");
         }
         Err(e) => {
-            info!("[CRYPTO-DEBUG] HKDF expansion FAILED: {:?}", e);
+            warn!("[CRYPTO-DEBUG] HKDF expansion FAILED: {:?}", e);
             info.zeroize();
             return Err(CoreError::KeyDerivation {
                 reason: "HKDF expansion failed".into(),
@@ -167,7 +168,7 @@ pub fn derive_session_key(
         }
     }
 
-    info!(
+    debug!(
         "[CRYPTO-DEBUG] Output - Derived Session Key (redacted): {}",
         redacted_len(&key_bytes)
     );
@@ -176,27 +177,27 @@ pub fn derive_session_key(
     info.zeroize();
     debug!("[CRYPTO-DEBUG] Cleared intermediate info buffer");
 
-    info!("[CRYPTO-DEBUG] ========== derive_session_key SUCCESS ==========");
+    debug!("[CRYPTO-DEBUG] ========== derive_session_key SUCCESS ==========");
 
     // Summary for easy comparison
-    info!("[CRYPTO-DEBUG] ====== KEY DERIVATION SUMMARY ======");
-    info!(
+    debug!("[CRYPTO-DEBUG] ====== KEY DERIVATION SUMMARY ======");
+    debug!(
         "[CRYPTO-DEBUG]   Shared Secret:     {}",
         redacted_len(shared_secret)
     );
-    info!(
+    debug!(
         "[CRYPTO-DEBUG]   Client Public:     {}",
         redacted_len(client_public)
     );
-    info!(
+    debug!(
         "[CRYPTO-DEBUG]   Server Public:     {}",
         redacted_len(server_public)
     );
-    info!(
+    debug!(
         "[CRYPTO-DEBUG]   Derived Key:       {}",
         redacted_len(&key_bytes)
     );
-    info!("[CRYPTO-DEBUG] ====================================");
+    debug!("[CRYPTO-DEBUG] ====================================");
 
     Ok(SessionKey::from_bytes(key_bytes))
 }
