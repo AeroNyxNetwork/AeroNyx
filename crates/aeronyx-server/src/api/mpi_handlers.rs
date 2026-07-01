@@ -277,6 +277,11 @@ pub struct SealedRememberRequest {
     pub embedding_model: String,
     /// Client Ed25519 signature over `record_id` (base64). Verified against `owner`.
     pub signature_b64: String,
+    /// Optional client-supplied keyed token-hashes (`HMAC(k_fts, token)` hex) for
+    /// node-blind full-text search. The node indexes these opaque terms into the
+    /// `blind_fts` index; it never sees plaintext tokens. Empty = no full-text.
+    #[serde(default)]
+    pub fts_terms: Vec<String>,
 }
 
 /// Store a node-blind record: the node verifies the client's signature and keeps
@@ -420,6 +425,14 @@ pub async fn mpi_remember_sealed(
             &owner,
             &rb.embedding_model,
         );
+    }
+
+    // Index client-supplied keyed token-hashes for node-blind full-text (BM25).
+    // The node stores opaque hashes only; it never sees plaintext tokens.
+    if !rb.fts_terms.is_empty() {
+        storage
+            .fts_index_blind_terms(&record.record_id, &owner, &rb.fts_terms)
+            .await;
     }
 
     let short = &owner_hex[..8.min(owner_hex.len())];

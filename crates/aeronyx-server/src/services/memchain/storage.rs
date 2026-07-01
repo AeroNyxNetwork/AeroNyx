@@ -595,6 +595,24 @@ impl MemoryStorage {
             Err(e) => warn!("[STORAGE] ⚠️ FTS5 creation failed (BM25 disabled): {}", e),
         }
 
+        // ── node-blind full-text: a SEPARATE FTS5 index over client-supplied
+        //    keyed token-hashes. NON-stemming (unicode61, NOT porter) — porter
+        //    would mangle hex token-hashes (e.g. a hash ending in "ed"). Created
+        //    idempotently on every open, so no schema-version bump is needed.
+        //   source_id: record_id hex; owner_hex: access control;
+        //   terms: space-joined HMAC(k_fts, token) hex hashes supplied by the client.
+        match conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS blind_fts USING fts5(
+                source_id,
+                owner_hex,
+                terms,
+                tokenize='unicode61'
+            );",
+        ) {
+            Ok(_) => info!("[STORAGE] ✅ blind FTS5 index ready"),
+            Err(e) => warn!("[STORAGE] ⚠️ blind FTS5 creation failed: {}", e),
+        }
+
         // ── v6 (v2.5.0-SuperNode): Cognitive task queue + LLM usage log ──
         // cognitive_tasks: async LLM task queue processed by TaskWorker
         // llm_usage_log: per-call token usage + latency for cost tracking
@@ -1932,6 +1950,52 @@ mod tests {
             got2.encrypted_content, plain,
             "sighted content round-trips to plaintext"
         );
+    }
+
+    #[tokio::test]
+    async fn test_blind_fts_index_and_search() {
+        let s = MemoryStorage::open(":memory:", Some([0x11u8; 32])).unwrap();
+        let owner = [0xBB; 32];
+        let mut rec = MemoryRecord::new(
+            owner,
+            300,
+            MemoryLayer::Knowledge,
+            vec![],
+            "client".into(),
+            b"opaque-ciphertext".to_vec(),
+            vec![],
+        );
+        rec.blind = true;
+        assert!(s.insert(&rec, "client").await);
+
+        // Client-supplied keyed token-hashes (hex). The node never sees plaintext.
+        let terms = vec!["a3f29c4d".to_string(), "9c4d2eb1".to_string()];
+        s.fts_index_blind_terms(&rec.record_id, &owner, &terms).await;
+
+        // Query by an indexed term-hash → finds the record.
+        let hits = s
+            .bm25_search_blind(&["a3f29c4d".to_string()], &owner, 10)
+            .await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, hex::encode(rec.record_id));
+
+        // Query by a non-indexed hash → no hits.
+        let none = s
+            .bm25_search_blind(&["deadbeef".to_string()], &owner, 10)
+            .await;
+        assert!(none.is_empty());
+
+        // Wrong owner → no hits (access scoping via owner_hex).
+        let other = s
+            .bm25_search_blind(&["a3f29c4d".to_string()], &[0xCC; 32], 10)
+            .await;
+        assert!(other.is_empty());
+
+        // Non-hex query terms are rejected (no FTS syntax injection).
+        let bad = s
+            .bm25_search_blind(&["a3f2 OR x".to_string()], &owner, 10)
+            .await;
+        assert!(bad.is_empty());
     }
 
     // ========================================

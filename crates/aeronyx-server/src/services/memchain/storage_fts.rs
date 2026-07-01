@@ -518,6 +518,81 @@ impl MemoryStorage {
             "DELETE FROM fts_index WHERE source_type = 'record' AND source_id = ?1",
             params![rid_hex],
         );
+        // Also drop any node-blind full-text entry for this record.
+        let _ = conn.execute("DELETE FROM blind_fts WHERE source_id = ?1", params![rid_hex]);
+    }
+
+    /// Index a node-blind record's client-supplied keyed token-hashes for BM25.
+    ///
+    /// The client tokenizes its own plaintext and sends `terms` = `HMAC(k_fts,
+    /// token)` hex hashes (repeats preserve term frequency); the node indexes these
+    /// opaque tokens into the dedicated non-stemming `blind_fts` table. The node
+    /// never sees plaintext tokens or `k_fts`; BM25 needs only term/doc frequencies,
+    /// which the hashes preserve. See `docs/memchain-blind-cognition-design.md`.
+    pub async fn fts_index_blind_terms(
+        &self,
+        record_id: &[u8; 32],
+        owner: &[u8; 32],
+        terms: &[String],
+    ) {
+        let joined = terms.join(" ");
+        if joined.trim().is_empty() {
+            return;
+        }
+        let rid_hex = hex::encode(record_id);
+        let owner_hex = hex::encode(owner);
+        let conn = self.conn.lock().await;
+        if let Err(e) = conn.execute(
+            "INSERT OR REPLACE INTO blind_fts (source_id, owner_hex, terms)
+             VALUES (?1, ?2, ?3)",
+            params![rid_hex, owner_hex, joined],
+        ) {
+            debug!("[FTS] Blind index failed (non-fatal): {}", e);
+        }
+    }
+
+    /// BM25 search over node-blind records using client-supplied query token-hashes.
+    ///
+    /// `query_terms` are `HMAC(k_fts, token)` hex hashes. Returns `(record_id_hex,
+    /// score)` for the owner's blind records matching ANY hashed term, BM25-ranked.
+    /// The node never sees plaintext.
+    pub async fn bm25_search_blind(
+        &self,
+        query_terms: &[String],
+        owner: &[u8; 32],
+        limit: usize,
+    ) -> Vec<(String, f64)> {
+        // Keep only well-formed hex token-hashes; OR them for any-term match.
+        let terms: Vec<&str> = query_terms
+            .iter()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect();
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let match_expr = terms.join(" OR ");
+        let owner_hex = hex::encode(owner);
+        let conn = self.conn.lock().await;
+        // blind_fts columns: source_id(0), owner_hex(1), terms(2) — score only terms.
+        let mut stmt = match conn.prepare(
+            "SELECT source_id, -bm25(blind_fts, 0, 0, 1) as score
+             FROM blind_fts
+             WHERE blind_fts MATCH ?1 AND owner_hex = ?2
+             ORDER BY score DESC
+             LIMIT ?3",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("[BM25] Blind query prepare failed: {}", e);
+                return Vec::new();
+            }
+        };
+        stmt.query_map(params![match_expr, owner_hex, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     }
 
     /// Full reindex: populate FTS5 from all active records, entities, and sessions.
