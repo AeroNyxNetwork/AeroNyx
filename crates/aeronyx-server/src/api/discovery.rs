@@ -51,6 +51,7 @@
 //!   surfaces never need to parse full peer diagnostics.
 //!
 //! ## Last Modified
+//! v0.13.0-OnionCandidatesContract - Add explicit client-facing onion candidate contract metadata
 //! v0.12.0-DiscoverySummaryContractVersion - Add explicit public summary contract version
 //! v0.11.0-DiscoverySummaryProofQuality - Expose privacy-safe two-hop proof quality buckets
 //! v0.10.0-DiscoverySummaryEndpoint - Add compact privacy-safe protocol summary endpoint
@@ -90,6 +91,13 @@ use crate::services::{PeerStore, PeerStoreImportReport, PeerStoreStatus};
 // ============================================
 // State / Request / Response Types
 // ============================================
+
+const ONION_CANDIDATES_CONTRACT_VERSION: &str = "onion_candidates.v1";
+const ONION_CANDIDATES_SOURCE: &str = "rust_discovery_onion_candidates";
+const ONION_CANDIDATES_SELECTION_POLICY: &str =
+    "fresh_routeable_signed_chat_relays_with_kem_public_key";
+const ONION_CANDIDATES_REFRESH_AFTER_SECONDS: u64 = 300;
+const ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS: u64 = 1_800;
 
 #[derive(Clone)]
 struct DiscoveryApiState {
@@ -227,8 +235,20 @@ pub struct OnionRelayCandidate {
 pub struct OnionCandidatesResponse {
     /// Unix timestamp when the candidate set was generated.
     pub generated_at: u64,
+    /// Stable JSON contract version for App, SDK, and AI-agent path builders.
+    pub contract_version: String,
+    /// Stable source label for downstream telemetry/runbooks.
+    pub source: String,
     /// Number of candidates returned.
     pub count: usize,
+    /// Privacy-safe route selection policy used to build this candidate set.
+    pub selection_policy: String,
+    /// Recommended client refresh interval for this candidate set.
+    pub refresh_after_seconds: u64,
+    /// Maximum routeability age accepted by this endpoint before a candidate is
+    /// hidden. Clients should refresh before this value and must tolerate an
+    /// empty candidate set by falling back to the standard relay path.
+    pub routeability_stale_after_seconds: u64,
     /// Health-ranked onion relay candidates; each advertises a KEM key and a
     /// reachable public endpoint.
     pub candidates: Vec<OnionRelayCandidate>,
@@ -791,7 +811,12 @@ async fn onion_candidates_handler(
 
     Json(OnionCandidatesResponse {
         generated_at: now,
+        contract_version: ONION_CANDIDATES_CONTRACT_VERSION.to_string(),
+        source: ONION_CANDIDATES_SOURCE.to_string(),
         count: candidates.len(),
+        selection_policy: ONION_CANDIDATES_SELECTION_POLICY.to_string(),
+        refresh_after_seconds: ONION_CANDIDATES_REFRESH_AFTER_SECONDS,
+        routeability_stale_after_seconds: ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS,
         candidates,
         privacy_boundary: "fresh routeable signed node discovery metadata only (node id, KEM public key, public endpoint, capabilities); no client IPs, route ids, encrypted payloads, receiver identities, DNS contents, destinations, voucher secrets, private keys, or wallet-level traffic".to_string(),
     })
@@ -1031,6 +1056,17 @@ mod tests {
         let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
 
         // Only the routeable KEM-bearing relay is exposed, with its KEM key for the client.
+        assert_eq!(parsed.contract_version, ONION_CANDIDATES_CONTRACT_VERSION);
+        assert_eq!(parsed.source, ONION_CANDIDATES_SOURCE);
+        assert_eq!(parsed.selection_policy, ONION_CANDIDATES_SELECTION_POLICY);
+        assert_eq!(
+            parsed.refresh_after_seconds,
+            ONION_CANDIDATES_REFRESH_AFTER_SECONDS
+        );
+        assert_eq!(
+            parsed.routeability_stale_after_seconds,
+            ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS
+        );
         assert_eq!(parsed.count, 1);
         assert_eq!(parsed.candidates.len(), 1);
         let candidate = &parsed.candidates[0];
