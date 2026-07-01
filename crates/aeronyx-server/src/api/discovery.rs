@@ -51,6 +51,7 @@
 //!   surfaces never need to parse full peer diagnostics.
 //!
 //! ## Last Modified
+//! v0.14.0-DiscoverySummaryRecoveredProofStatus - Treat recent message-delivery proof as recovered ready evidence
 //! v0.13.0-OnionCandidatesContract - Add explicit client-facing onion candidate contract metadata
 //! v0.12.0-DiscoverySummaryContractVersion - Add explicit public summary contract version
 //! v0.11.0-DiscoverySummaryProofQuality - Expose privacy-safe two-hop proof quality buckets
@@ -441,11 +442,17 @@ pub fn discovery_readiness_status_value(
     let peer_quorum = &status.peer_quorum;
     let network_story = &status.network_story;
     let blind_relay_quality = &status.blind_relay_quality;
+    let recent_message_delivery_ready = status
+        .two_hop_path_proof_history
+        .recent_message_delivery_ready
+        && !status.two_hop_path_proof_history.failure_streak_active;
     let local_relay_ready = local_capabilities.safe_to_advertise_chat_relay;
     let peer_mesh_ready = peer_quorum.quorum_ready;
-    let blind_relay_ready = blind_relay_quality.runtime_ready && blind_relay_quality.quality_ready;
-    let two_hop_path_ready =
-        network_story.chat_two_hop_onion_ready || blind_relay_quality.two_hop_probe_ready;
+    let blind_relay_ready = blind_relay_quality.runtime_ready
+        && (blind_relay_quality.quality_ready || recent_message_delivery_ready);
+    let two_hop_path_ready = network_story.chat_two_hop_onion_ready
+        || blind_relay_quality.two_hop_probe_ready
+        || recent_message_delivery_ready;
     let restart_recovery_ready = peer_quorum.restart_recovery_configured;
     let checks_total = 4u8;
     let checks_passed = [
@@ -936,7 +943,9 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use aeronyx_core::crypto::IdentityKeyPair;
-    use aeronyx_core::protocol::{NodeCapability, NodeCapacity, NodeDescriptor};
+    use aeronyx_core::protocol::{
+        NodeCapability, NodeCapacity, NodeDescriptor, NodePolicy, SignedNodeDescriptor,
+    };
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
@@ -958,6 +967,36 @@ mod tests {
             max_pps: None,
         };
         aeronyx_core::protocol::SignedNodeDescriptor::sign(descriptor, &kp).unwrap()
+    }
+
+    fn signed_routeable_chat_descriptor(
+        sequence: u64,
+        expires_at: u64,
+        endpoint: &str,
+    ) -> SignedNodeDescriptor {
+        let kp = IdentityKeyPair::generate();
+        let issued_at = now_secs().saturating_sub(1);
+        let mut descriptor = NodeDescriptor::new(
+            kp.public_key_bytes(),
+            sequence,
+            issued_at,
+            expires_at,
+            "test",
+        )
+        .with_x25519_kem(kp.x25519_public_key_bytes());
+        descriptor.public_endpoint = Some(endpoint.to_string());
+        descriptor.capabilities = vec![
+            NodeCapability::PrivacyRelay,
+            NodeCapability::ChatRelay,
+            NodeCapability::OnionMiddle,
+        ];
+        descriptor.capacity = NodeCapacity {
+            max_sessions: 128,
+            max_bps: Some(500_000_000),
+            max_pps: None,
+        };
+        descriptor.policy = NodePolicy::default();
+        SignedNodeDescriptor::sign(descriptor, &kp).unwrap()
     }
 
     #[tokio::test]
@@ -1434,6 +1473,94 @@ mod tests {
         assert_eq!(
             parsed["privacy_invariant"].as_str(),
             Some("blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status")
+        );
+
+        let serialized = serde_json::to_string(&parsed).unwrap();
+        assert!(!serialized.contains("route_id"));
+        assert!(!serialized.contains("payload_b64"));
+        assert!(!serialized.contains("encrypted_blob"));
+        assert!(!serialized.contains("client_ip"));
+        assert!(!serialized.contains("receiver_pubkey"));
+        assert!(!serialized.contains("public_endpoint"));
+    }
+
+    #[tokio::test]
+    async fn test_summary_status_recovers_when_latest_two_hop_message_delivery_is_ready() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let first = signed_routeable_chat_descriptor(1, now + 1_000, "https://peer-one.example");
+        let first_node_id = first.node_id();
+        let second = signed_routeable_chat_descriptor(1, now + 1_000, "https://peer-two.example");
+        let second_node_id = second.node_id();
+
+        store.configure_bootstrap_status(true, true, true, 2);
+        store
+            .upsert_verified_from_source(first, now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(second, now, "gossip_snapshot")
+            .unwrap();
+        store.record_gossip_round(now + 1, 2, 2, 2, None);
+        store.record_route_forward_success(&first_node_id, now + 2);
+        store.record_route_forward_success(&second_node_id, now + 3);
+
+        for offset in 4..10 {
+            store.record_blind_relay_two_hop_probe_result_with_context(
+                now + offset,
+                false,
+                "request_error",
+                2,
+                1,
+                2,
+                1,
+            );
+        }
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            now + 10,
+            true,
+            "onion_terminal_delivered",
+            2,
+            1,
+            2,
+            1,
+        );
+
+        let app = build_discovery_router_with_local_status(
+            store,
+            DiscoveryApiPolicy::default(),
+            DiscoveryLocalCapabilityStatus::new(true, true, true, true),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed["status"].as_str(), Some("ready"));
+        assert_eq!(parsed["stage"].as_str(), Some("two_hop_path_ready"));
+        assert_eq!(
+            parsed["two_hop_path_proof"]["latest_reason_bucket"].as_str(),
+            Some("onion_terminal_delivered")
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["recent_message_delivery_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["peer_mesh"]["chat_two_hop_onion_ready"].as_bool(),
+            Some(true)
         );
 
         let serialized = serde_json::to_string(&parsed).unwrap();
