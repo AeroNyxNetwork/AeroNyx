@@ -222,6 +222,7 @@ const PEER_ROUTE_RECENT_FAILURE_SECS: u64 = 600;
 const PEER_ROUTEABILITY_STALE_AFTER_SECS: u64 = 1_800;
 const PEER_ROUTE_FAILURE_QUARANTINE_THRESHOLD: u64 = 3;
 const PEER_ROUTE_FAILURE_QUARANTINE_SECS: u64 = 300;
+const PEER_ROUTE_RECOVERY_PROBE_AFTER_SECS: u64 = 60;
 const PEER_ROUTE_STATUS_LIMIT: usize = 8;
 const PEER_HEALTH_STATUS_LIMIT: usize = 64;
 const PEER_QUORUM_MIN_VALID_PEERS: usize = 2;
@@ -3642,6 +3643,47 @@ impl PeerStore {
             .collect()
     }
 
+    /// Returns probe-only route candidates, including cooled-down quarantines.
+    ///
+    /// This method is intentionally narrower than the normal route candidate
+    /// API: it exists only for local discovery probes that try to recover route
+    /// health after restart or transient endpoint failures. User traffic and
+    /// ordinary blind relay forwarding must continue using
+    /// `route_candidates_with_capability_excluding()` so quarantined peers do
+    /// not carry encrypted payloads until a successful probe clears quarantine.
+    ///
+    /// The recovery gate waits for a short cool-down inside the quarantine
+    /// window, then allows one signed descriptor to prove reachability again.
+    /// It still excludes self/already-used hops and never reads encrypted
+    /// blobs, plaintext, client IPs, destinations, DNS contents, route ids,
+    /// voucher secrets, private keys, or wallet-level traffic.
+    #[must_use]
+    pub fn route_probe_candidates_with_capability_excluding(
+        &self,
+        capability: NodeCapability,
+        now: u64,
+        limit: usize,
+        excluded_node_ids: &[[u8; 32]],
+    ) -> Vec<SignedNodeDescriptor> {
+        self.scored_route_candidates(capability, now, None, true)
+            .into_iter()
+            .filter(|candidate| {
+                let node_id = candidate.descriptor.node_id();
+                !excluded_node_ids
+                    .iter()
+                    .any(|excluded| *excluded == node_id)
+            })
+            .filter(|candidate| {
+                candidate.summary.routeability_ready
+                    || Self::route_quarantine_recovery_probe_ready(
+                        candidate.summary.route_quarantine_remaining_seconds,
+                    )
+            })
+            .take(limit)
+            .map(|candidate| candidate.descriptor)
+            .collect()
+    }
+
     /// Plans a complete controlled route for the requested capability sequence.
     ///
     /// The planner selects one unique healthy-ranked peer for each requested
@@ -4688,6 +4730,15 @@ impl PeerStore {
         route_health.quarantine_until.and_then(|quarantine_until| {
             (now < quarantine_until).then_some(quarantine_until.saturating_sub(now))
         })
+    }
+
+    fn route_quarantine_recovery_probe_ready(remaining_seconds: Option<u64>) -> bool {
+        let Some(remaining_seconds) = remaining_seconds else {
+            return false;
+        };
+        let max_remaining_after_cooldown =
+            PEER_ROUTE_FAILURE_QUARANTINE_SECS.saturating_sub(PEER_ROUTE_RECOVERY_PROBE_AFTER_SECS);
+        remaining_seconds <= max_remaining_after_cooldown
     }
 
     fn route_score(
@@ -5932,6 +5983,82 @@ mod tests {
 
         let status_json = serde_json::to_string(&recovered).unwrap();
         assert!(!status_json.contains("reprobe-after-quarantine.example"));
+        assert!(!status_json.contains(&hex::encode(node_id)));
+        assert!(!status_json.contains("encrypted_blob"));
+        assert!(!status_json.contains("receiver_pubkey"));
+    }
+
+    #[test]
+    fn test_route_probe_candidates_allow_cooled_down_quarantine_without_user_routeability() {
+        let store = PeerStore::new();
+        let now = 1_700_000_200;
+        let peer_kp = IdentityKeyPair::generate();
+        let mut descriptor = signed_descriptor_for(&peer_kp, 1, now + 2_000);
+        descriptor.descriptor.public_endpoint =
+            Some("https://probe-recovery-only.example".to_string());
+        descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &peer_kp).unwrap();
+        let node_id = descriptor.node_id();
+        let node_prefix = hex::encode(&node_id[..4]);
+
+        store
+            .upsert_verified_from_source(descriptor.clone(), now, "gossip_announce")
+            .unwrap();
+
+        store.record_route_forward_success(&node_id, now + 1);
+        store.record_route_forward_failure(&node_id, now + 2, "request_failed");
+        store.record_route_forward_failure(&node_id, now + 3, "request_failed");
+        store.record_route_forward_failure(&node_id, now + 4, "http_502");
+
+        let still_cooling_down_at = now + 4 + PEER_ROUTE_RECOVERY_PROBE_AFTER_SECS - 1;
+        let strict_during_cooldown = store.route_candidates_with_capability(
+            NodeCapability::ChatRelay,
+            still_cooling_down_at,
+            8,
+        );
+        let probe_during_cooldown = store.route_probe_candidates_with_capability_excluding(
+            NodeCapability::ChatRelay,
+            still_cooling_down_at,
+            8,
+            &[],
+        );
+        assert!(strict_during_cooldown.is_empty());
+        assert!(probe_during_cooldown.is_empty());
+
+        let recovery_probe_at = now + 4 + PEER_ROUTE_RECOVERY_PROBE_AFTER_SECS;
+        let strict_recovery_candidates =
+            store.route_candidates_with_capability(NodeCapability::ChatRelay, recovery_probe_at, 8);
+        let probe_recovery_candidates = store.route_probe_candidates_with_capability_excluding(
+            NodeCapability::ChatRelay,
+            recovery_probe_at,
+            8,
+            &[],
+        );
+        assert!(strict_recovery_candidates.is_empty());
+        assert_eq!(probe_recovery_candidates.len(), 1);
+        assert_eq!(probe_recovery_candidates[0].node_id(), node_id);
+
+        let status = store.route_candidate_status(recovery_probe_at);
+        let row = status
+            .chat_relay
+            .iter()
+            .find(|candidate| candidate.node_id_prefix == node_prefix)
+            .expect("cooled-down quarantined peer remains visible in status");
+        assert_eq!(row.route_health, "quarantined");
+        assert_eq!(row.routeability_state, "quarantined");
+        assert!(!row.routeability_ready);
+        assert!(row.route_quarantined);
+
+        store.record_route_forward_success(&node_id, recovery_probe_at + 1);
+        let recovered = store.route_candidates_with_capability(
+            NodeCapability::ChatRelay,
+            recovery_probe_at + 2,
+            8,
+        );
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].node_id(), node_id);
+
+        let status_json = serde_json::to_string(&status).unwrap();
+        assert!(!status_json.contains("probe-recovery-only.example"));
         assert!(!status_json.contains(&hex::encode(node_id)));
         assert!(!status_json.contains("encrypted_blob"));
         assert!(!status_json.contains("receiver_pubkey"));

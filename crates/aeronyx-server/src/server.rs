@@ -2696,7 +2696,7 @@ impl Server {
         self_node_id: &[u8; 32],
         now: u64,
     ) -> bool {
-        let mut candidates = peer_store.route_candidates_with_capability_excluding(
+        let mut candidates = peer_store.route_probe_candidates_with_capability_excluding(
             NodeCapability::ChatRelay,
             now,
             8,
@@ -2781,7 +2781,7 @@ impl Server {
         self_node_id: &[u8; 32],
         now: u64,
     ) -> bool {
-        let mut middle_candidates = peer_store.route_candidates_with_capability_excluding(
+        let mut middle_candidates = peer_store.route_probe_candidates_with_capability_excluding(
             NodeCapability::OnionMiddle,
             now,
             8,
@@ -2796,12 +2796,13 @@ impl Server {
         let mut attempted = false;
         for middle in middle_candidates {
             let middle_node_id = middle.node_id();
-            let mut terminal_candidates = peer_store.route_candidates_with_capability_excluding(
-                NodeCapability::ChatRelay,
-                now,
-                8,
-                &[*self_node_id, middle_node_id],
-            );
+            let mut terminal_candidates = peer_store
+                .route_probe_candidates_with_capability_excluding(
+                    NodeCapability::ChatRelay,
+                    now,
+                    8,
+                    &[*self_node_id, middle_node_id],
+                );
             Self::prioritize_probe_candidates(peer_store, now, &mut terminal_candidates);
             let terminal_candidate_count = terminal_candidates.len();
             if terminal_candidates.is_empty() {
