@@ -314,6 +314,24 @@ pub(crate) fn parse_layer(s: &str) -> Option<MemoryLayer> {
     }
 }
 
+/// Paths a node-blind remote client may reach under `blind_storage_enabled`
+/// alone (i.e. without `allow_remote_storage`). Each is content-blind: the
+/// sealed write stores opaque ciphertext the node cannot read; recall returns
+/// only the authenticated owner's own sealed ciphertext; forget deletes the
+/// owner's own records; status is aggregate metadata. Plaintext-bearing paths
+/// (e.g. `/api/mpi/remember`, `/api/mpi/embed`) are intentionally excluded so
+/// enabling blind storage never opens node-readable remote storage.
+fn is_blind_safe_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/mpi/remember_sealed"
+            | "/api/mpi/recall"
+            | "/api/mpi/recall/detail"
+            | "/api/mpi/forget"
+            | "/api/mpi/status"
+    )
+}
+
 pub(crate) fn estimate_tokens(text: &str) -> usize {
     let len = text.len();
     if len == 0 {
@@ -636,7 +654,14 @@ async fn handle_remote_auth(
             .into_response();
     }
 
-    if !state.allow_remote_storage {
+    // Node-blind sealed storage is a strictly safer subset of remote storage —
+    // the node cannot read the sealed content — so `blind_storage_enabled` may
+    // permit it on its own (as the config field documents), but ONLY for the
+    // blind read/write paths. Plaintext remote storage still requires the full
+    // `allow_remote_storage` opt-in.
+    let blind_path_ok =
+        state.blind_storage_enabled && is_blind_safe_path(req.uri().path());
+    if !(state.allow_remote_storage || blind_path_ok) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!(

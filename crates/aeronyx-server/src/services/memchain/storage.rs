@@ -1317,7 +1317,7 @@ impl MemoryStorage {
             &conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,signature,access_count,
-                    positive_feedback,negative_feedback,conflict_with
+                    positive_feedback,negative_feedback,conflict_with,blind
              FROM records
              WHERE session_id = ?1 AND owner = ?2 AND status = 0
              ORDER BY timestamp ASC",
@@ -1612,7 +1612,7 @@ impl MemoryStorage {
                 &conn,
                 "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                         status,supersedes,encrypted_content,embedding,signature,access_count,
-                        positive_feedback,negative_feedback,conflict_with
+                        positive_feedback,negative_feedback,conflict_with,blind
                  FROM records WHERE owner=?1 AND status=0 AND layer=?2
                  ORDER BY timestamp DESC LIMIT ?3",
                 params![owner.as_slice(), l as u8 as i64, limit as i64],
@@ -1622,7 +1622,7 @@ impl MemoryStorage {
                 &conn,
                 "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                         status,supersedes,encrypted_content,embedding,signature,access_count,
-                        positive_feedback,negative_feedback,conflict_with
+                        positive_feedback,negative_feedback,conflict_with,blind
                  FROM records WHERE owner=?1 AND status=0
                  ORDER BY timestamp DESC LIMIT ?2",
                 params![owner.as_slice(), limit as i64],
@@ -1640,7 +1640,7 @@ impl MemoryStorage {
             &conn,
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,signature,access_count,
-                    positive_feedback,negative_feedback,conflict_with
+                    positive_feedback,negative_feedback,conflict_with,blind
              FROM records WHERE owner=?1 AND timestamp>?2
              ORDER BY timestamp ASC LIMIT ?3",
             params![
@@ -1659,7 +1659,7 @@ impl MemoryStorage {
         let mut stmt = match conn.prepare(
             "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                     status,supersedes,encrypted_content,embedding,signature,access_count,
-                    positive_feedback,negative_feedback,conflict_with,embedding_model
+                    positive_feedback,negative_feedback,conflict_with,embedding_model,blind
              FROM records WHERE owner=?1 AND status=0 AND embedding IS NOT NULL
              ORDER BY timestamp DESC",
         ) {
