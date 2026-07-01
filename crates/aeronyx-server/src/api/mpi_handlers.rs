@@ -287,6 +287,11 @@ pub struct SealedRememberRequest {
     /// node stores opaque record_id edges in `memory_edges` (never learns why).
     #[serde(default)]
     pub related_records: Vec<RelatedEdge>,
+    /// Optional source record_ids (hex) this record was derived from (Brick 3d):
+    /// e.g. a client/LLM-produced summary lists the records it summarizes. Stored
+    /// as opaque provenance links; the node learns only the DAG shape.
+    #[serde(default)]
+    pub derived_from: Vec<String>,
 }
 
 /// A client-declared edge from this blind record to an existing one.
@@ -477,6 +482,14 @@ pub async fn mpi_remember_sealed(
                 now,
             );
         }
+    }
+
+    // Store derived-record provenance (node-blind): which source records this
+    // record (e.g. a client/LLM summary) was built from.
+    if !rb.derived_from.is_empty() {
+        storage
+            .insert_blind_provenance(&record.record_id, &owner, &rb.derived_from)
+            .await;
     }
 
     let short = &owner_hex[..8.min(owner_hex.len())];
@@ -949,6 +962,10 @@ pub struct RecordDetailResponse {
     /// node cannot decrypt); false when `content` is plaintext.
     #[serde(default)]
     pub sealed: bool,
+    /// Source record_ids (hex) this record was derived from (node-blind
+    /// provenance). Empty unless it is a derived record (e.g. a summary).
+    #[serde(default)]
+    pub derived_from: Vec<String>,
 }
 
 pub async fn mpi_get_record(
@@ -1010,6 +1027,11 @@ pub async fn mpi_get_record(
             false,
         )
     };
+    let derived_from = if record.blind {
+        storage.get_blind_provenance(&rid).await
+    } else {
+        Vec::new()
+    };
 
     (
         StatusCode::OK,
@@ -1033,6 +1055,7 @@ pub async fn mpi_get_record(
             }
             .into(),
             sealed,
+            derived_from,
         })),
     )
         .into_response()

@@ -613,6 +613,20 @@ impl MemoryStorage {
             Err(e) => warn!("[STORAGE] ⚠️ blind FTS5 creation failed: {}", e),
         }
 
+        // ── node-blind derived-record provenance (Brick 3d) ──
+        // Links a derived record (e.g. a client/LLM summary) to the source
+        // record_ids it was built from. Opaque hexes only — the node learns the
+        // provenance DAG shape, never the content. Idempotent, no version bump.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS blind_provenance (
+                record_id TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                owner_hex TEXT NOT NULL,
+                PRIMARY KEY (record_id, source_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_blind_prov_owner ON blind_provenance(owner_hex);",
+        );
+
         // ── v6 (v2.5.0-SuperNode): Cognitive task queue + LLM usage log ──
         // cognitive_tasks: async LLM task queue processed by TaskWorker
         // llm_usage_log: per-call token usage + latency for cost tracking
@@ -1685,6 +1699,48 @@ impl MemoryStorage {
         );
     }
 
+    /// Store node-blind derived-record provenance (Brick 3d): link a derived
+    /// record (e.g. a client/LLM-produced summary) to the source records it was
+    /// built from. `sources` are opaque record_id hexes; the node learns only the
+    /// provenance DAG shape, never the content. Self-links are ignored.
+    pub async fn insert_blind_provenance(
+        &self,
+        record_id: &[u8; 32],
+        owner: &[u8; 32],
+        sources: &[String],
+    ) {
+        if sources.is_empty() {
+            return;
+        }
+        let rid_hex = hex::encode(record_id);
+        let owner_hex = hex::encode(owner);
+        let conn = self.conn.lock().await;
+        for src in sources {
+            if src.is_empty() || src == &rid_hex {
+                continue;
+            }
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO blind_provenance (record_id, source_id, owner_hex)
+                 VALUES (?1, ?2, ?3)",
+                params![rid_hex, src, owner_hex],
+            );
+        }
+    }
+
+    /// Return the source record_id hexes a derived record was built from.
+    pub async fn get_blind_provenance(&self, record_id: &[u8; 32]) -> Vec<String> {
+        let rid_hex = hex::encode(record_id);
+        let conn = self.conn.lock().await;
+        let mut stmt =
+            match conn.prepare("SELECT source_id FROM blind_provenance WHERE record_id = ?1") {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+        stmt.query_map(params![rid_hex], |row| row.get::<_, String>(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
     /// Acquire the inner SQLite connection lock.
     ///
     /// ## P3 SecAudit: pub(crate) only
@@ -1996,6 +2052,41 @@ mod tests {
             .bm25_search_blind(&["a3f2 OR x".to_string()], &owner, 10)
             .await;
         assert!(bad.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_blind_provenance_roundtrip() {
+        let s = MemoryStorage::open(":memory:", Some([0x11u8; 32])).unwrap();
+        let owner = [0xBB; 32];
+        let derived = MemoryRecord::new(
+            owner,
+            400,
+            MemoryLayer::Knowledge,
+            vec![],
+            "summary".into(),
+            b"summary-ciphertext".to_vec(),
+            vec![],
+        );
+        let did = derived.record_id;
+        let src_a = hex::encode([0x01u8; 32]);
+        let src_b = hex::encode([0x02u8; 32]);
+
+        // Self-links and empties are ignored; sources are recorded.
+        s.insert_blind_provenance(
+            &did,
+            &owner,
+            &[src_a.clone(), src_b.clone(), hex::encode(did), String::new()],
+        )
+        .await;
+
+        let mut got = s.get_blind_provenance(&did).await;
+        got.sort();
+        let mut want = vec![src_a, src_b];
+        want.sort();
+        assert_eq!(got, want);
+
+        // A record with no provenance returns empty.
+        assert!(s.get_blind_provenance(&[0x09u8; 32]).await.is_empty());
     }
 
     // ========================================
