@@ -51,6 +51,7 @@
 //!   surfaces never need to parse full peer diagnostics.
 //!
 //! ## Last Modified
+//! v0.15.0-OnionCandidatesFallbackContract - Add explicit two-hop readiness and fallback fields
 //! v0.14.0-DiscoverySummaryRecoveredProofStatus - Treat recent message-delivery proof as recovered ready evidence
 //! v0.13.0-OnionCandidatesContract - Add explicit client-facing onion candidate contract metadata
 //! v0.12.0-DiscoverySummaryContractVersion - Add explicit public summary contract version
@@ -99,6 +100,7 @@ const ONION_CANDIDATES_SELECTION_POLICY: &str =
     "fresh_routeable_signed_chat_relays_with_kem_public_key";
 const ONION_CANDIDATES_REFRESH_AFTER_SECONDS: u64 = 300;
 const ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS: u64 = 1_800;
+const ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES: usize = 2;
 
 #[derive(Clone)]
 struct DiscoveryApiState {
@@ -242,6 +244,26 @@ pub struct OnionCandidatesResponse {
     pub source: String,
     /// Number of candidates returned.
     pub count: usize,
+    /// Minimum unique candidates required for a client-planned two-hop path.
+    ///
+    /// The entry node is the local node serving this endpoint, so clients need
+    /// at least two other fresh routeable relays: one middle hop and one
+    /// terminal hop. If fewer are available, clients should fall back to the
+    /// standard encrypted relay path.
+    pub min_candidates_for_two_hop: usize,
+    /// Whether this response contains enough fresh routeable candidates for a
+    /// controlled two-hop path attempt.
+    pub two_hop_ready: bool,
+    /// Whether the client should fall back to the standard encrypted relay path
+    /// before attempting to build an onion envelope.
+    pub fallback_required: bool,
+    /// Stable privacy-safe reason bucket for fallback decisions.
+    ///
+    /// This must never include node ids, endpoint URLs, route ids, receiver
+    /// identities, encrypted payloads, client IPs, DNS contents, destinations,
+    /// Memory Chain plaintext, voucher secrets, private keys, wallet-level
+    /// traffic, or social graph metadata.
+    pub fallback_reason: String,
     /// Privacy-safe route selection policy used to build this candidate set.
     pub selection_policy: String,
     /// Recommended client refresh interval for this candidate set.
@@ -815,18 +837,36 @@ async fn onion_candidates_handler(
             })
         })
         .collect();
+    let two_hop_ready = candidates.len() >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
+    let fallback_reason = onion_candidate_fallback_reason(candidates.len(), limit);
 
     Json(OnionCandidatesResponse {
         generated_at: now,
         contract_version: ONION_CANDIDATES_CONTRACT_VERSION.to_string(),
         source: ONION_CANDIDATES_SOURCE.to_string(),
         count: candidates.len(),
+        min_candidates_for_two_hop: ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+        two_hop_ready,
+        fallback_required: !two_hop_ready,
+        fallback_reason: fallback_reason.to_string(),
         selection_policy: ONION_CANDIDATES_SELECTION_POLICY.to_string(),
         refresh_after_seconds: ONION_CANDIDATES_REFRESH_AFTER_SECONDS,
         routeability_stale_after_seconds: ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS,
         candidates,
         privacy_boundary: "fresh routeable signed node discovery metadata only (node id, KEM public key, public endpoint, capabilities); no client IPs, route ids, encrypted payloads, receiver identities, DNS contents, destinations, voucher secrets, private keys, or wallet-level traffic".to_string(),
     })
+}
+
+fn onion_candidate_fallback_reason(candidate_count: usize, limit: usize) -> &'static str {
+    if candidate_count >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES {
+        "ready"
+    } else if limit < ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES {
+        "client_limit_below_two_hop_minimum"
+    } else if candidate_count == 0 {
+        "no_routeable_candidates"
+    } else {
+        "single_routeable_candidate"
+    }
 }
 
 async fn gossip_handler(
@@ -1107,6 +1147,13 @@ mod tests {
             ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS
         );
         assert_eq!(parsed.count, 1);
+        assert_eq!(
+            parsed.min_candidates_for_two_hop,
+            ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
+        );
+        assert!(!parsed.two_hop_ready);
+        assert!(parsed.fallback_required);
+        assert_eq!(parsed.fallback_reason, "single_routeable_candidate");
         assert_eq!(parsed.candidates.len(), 1);
         let candidate = &parsed.candidates[0];
         assert_eq!(candidate.node_id, want_node_id);
@@ -1115,6 +1162,86 @@ mod tests {
         assert_eq!(candidate.public_endpoint, "relay.example:443");
         assert!(candidate.capabilities.contains(&NodeCapability::ChatRelay));
         assert!(parsed.privacy_boundary.contains("fresh routeable"));
+    }
+
+    #[tokio::test]
+    async fn test_onion_candidates_endpoint_marks_two_hop_ready_when_pool_is_sufficient() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let first = signed_routeable_chat_descriptor(1, now + 300, "https://relay-one.example");
+        let first_node_id = first.node_id();
+        let second = signed_routeable_chat_descriptor(1, now + 300, "https://relay-two.example");
+        let second_node_id = second.node_id();
+
+        store.upsert_verified(first, now).unwrap();
+        store.upsert_verified(second, now).unwrap();
+        store.record_route_forward_success(&first_node_id, now);
+        store.record_route_forward_success(&second_node_id, now);
+
+        let app = build_discovery_router(store, DiscoveryApiPolicy::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed.count, 2);
+        assert_eq!(
+            parsed.min_candidates_for_two_hop,
+            ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
+        );
+        assert!(parsed.two_hop_ready);
+        assert!(!parsed.fallback_required);
+        assert_eq!(parsed.fallback_reason, "ready");
+    }
+
+    #[tokio::test]
+    async fn test_onion_candidates_endpoint_marks_client_limit_fallback() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let first = signed_routeable_chat_descriptor(1, now + 300, "https://relay-one.example");
+        let first_node_id = first.node_id();
+        let second = signed_routeable_chat_descriptor(1, now + 300, "https://relay-two.example");
+        let second_node_id = second.node_id();
+
+        store.upsert_verified(first, now).unwrap();
+        store.upsert_verified(second, now).unwrap();
+        store.record_route_forward_success(&first_node_id, now);
+        store.record_route_forward_success(&second_node_id, now);
+
+        let app = build_discovery_router(store, DiscoveryApiPolicy::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed.count, 1);
+        assert!(!parsed.two_hop_ready);
+        assert!(parsed.fallback_required);
+        assert_eq!(parsed.fallback_reason, "client_limit_below_two_hop_minimum");
     }
 
     #[tokio::test]
