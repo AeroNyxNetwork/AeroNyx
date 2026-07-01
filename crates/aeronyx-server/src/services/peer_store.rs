@@ -3095,10 +3095,22 @@ impl PeerStore {
         } else {
             ((succeeded.saturating_mul(100)) / attempted).min(100) as u8
         };
-        let stability_events = events
+        let message_delivery_events = events
+            .iter()
+            .filter(|event| event.proof_scope == "message_delivery")
+            .collect::<Vec<_>>();
+        let stability_source_events = if (message_delivery_events.len() as u64)
+            >= TWO_HOP_PATH_PROOF_STABILITY_MIN_ATTEMPTS
+        {
+            message_delivery_events
+        } else {
+            events.iter().collect::<Vec<_>>()
+        };
+        let stability_events = stability_source_events
             .iter()
             .rev()
             .take(TWO_HOP_PATH_PROOF_STABILITY_WINDOW_EVENTS)
+            .copied()
             .collect::<Vec<_>>();
         let stability_window_attempted = stability_events.len() as u64;
         let stability_window_succeeded = stability_events
@@ -7450,6 +7462,62 @@ mod tests {
         assert_eq!(circuit_history.latest_age_bucket, "fresh");
 
         let serialized = serde_json::to_string(&circuit_history).expect("history serializes");
+        assert!(!serialized.contains("route_id"));
+        assert!(!serialized.contains("endpoint="));
+        assert!(!serialized.contains("encrypted_blob"));
+        assert!(!serialized.contains("receiver="));
+        assert!(!serialized.contains("client_ip"));
+    }
+
+    #[test]
+    fn test_two_hop_stability_prefers_message_delivery_over_control_plane_fallback() {
+        let store = PeerStore::new();
+
+        store.record_blind_relay_two_hop_probe_result(1_700_000_010, false, "onion_ack_rejected");
+        store.record_blind_relay_two_hop_probe_result(1_700_000_020, true, "accepted");
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_030,
+            true,
+            "onion_terminal_delivered",
+            3,
+            3,
+            2,
+            1,
+        );
+        store.record_blind_relay_two_hop_probe_result(1_700_000_040, false, "onion_ack_rejected");
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_050,
+            true,
+            "onion_terminal_delivered",
+            3,
+            3,
+            2,
+            1,
+        );
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_060,
+            true,
+            "onion_terminal_delivered",
+            3,
+            3,
+            2,
+            1,
+        );
+
+        let history = store.status(1_700_000_070).two_hop_path_proof_history;
+
+        assert_eq!(history.proof_scope, "message_delivery");
+        assert_eq!(history.message_delivery_successes, 3);
+        assert_eq!(history.stability_window_attempted, 3);
+        assert_eq!(history.stability_window_succeeded, 3);
+        assert_eq!(history.stability_window_failed, 0);
+        assert_eq!(history.stability_success_percent, 100);
+        assert_eq!(history.stability_status, "stable");
+        assert!(history.stability_ready);
+        assert!(history.recent_message_delivery_ready);
+        assert!(!history.failure_circuit_breaker_active);
+
+        let serialized = serde_json::to_string(&history).expect("history serializes");
         assert!(!serialized.contains("route_id"));
         assert!(!serialized.contains("endpoint="));
         assert!(!serialized.contains("encrypted_blob"));
