@@ -1555,6 +1555,19 @@ impl MemoryStorage {
         }
     }
 
+    /// Store a node-blind record received from a peer as a **verbatim replica**
+    /// (replication receive path, Brick 4). The content is opaque to this node,
+    /// so it is stored exactly as received — the node **never** re-encrypts it
+    /// with its own key (which would double-wrap the origin's ciphertext and make
+    /// the replica unreadable). `insert()`'s `verify_id()` still guards content
+    /// integrity. The caller MUST have already verified the origin's Ed25519
+    /// signature (same as the P2P `BroadcastRecord` path). Returns true if stored.
+    pub async fn insert_blind_replica(&self, record: &MemoryRecord, embedding_model: &str) -> bool {
+        let mut replica = record.clone();
+        replica.blind = true;
+        self.insert(&replica, embedding_model).await
+    }
+
     // ========================================
     // Query
     // ========================================
@@ -2137,6 +2150,44 @@ mod tests {
             .get_active_records_by_context(&owner, "proj_other", None, 10)
             .await
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_insert_blind_replica_stored_verbatim() {
+        // This node has its OWN record_key (encrypted store).
+        let s = MemoryStorage::open(":memory:", Some([0x22u8; 32])).unwrap();
+
+        // A replica from ANOTHER owner: content is that owner's opaque ciphertext.
+        // blind is false on the incoming record (it is #[serde(skip)] over the wire).
+        let foreign_ct = b"another-owners-ciphertext-opaque".to_vec();
+        let replica = MemoryRecord::new(
+            [0xEE; 32],
+            700,
+            MemoryLayer::Knowledge,
+            vec![],
+            "peer".into(),
+            foreign_ct.clone(),
+            vec![0.3, 0.4],
+        );
+        let rid = replica.record_id;
+        assert!(!replica.blind);
+        assert!(s.insert_blind_replica(&replica, "peer-model").await);
+
+        // Read back: stored byte-for-byte (NOT re-encrypted with this node's key),
+        // blind marker set, foreign owner preserved.
+        s.cache.write().invalidate(&rid);
+        let got = s.get(&rid).await.unwrap();
+        assert!(got.blind);
+        assert_eq!(
+            got.encrypted_content, foreign_ct,
+            "replica must be stored verbatim, not re-encrypted"
+        );
+        assert_eq!(got.owner, [0xEE; 32]);
+
+        // A tampered record (content no longer matches record_id) is rejected.
+        let mut bad = replica.clone();
+        bad.encrypted_content = b"tampered".to_vec();
+        assert!(!s.insert_blind_replica(&bad, "peer-model").await);
     }
 
     // ========================================
