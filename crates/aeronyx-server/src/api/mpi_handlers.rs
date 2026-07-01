@@ -307,6 +307,11 @@ pub async fn mpi_remember_sealed(
         .get::<Arc<MemoryStorage>>()
         .expect("[BUG] MemoryStorage extension not set")
         .clone();
+    let vi = req
+        .extensions()
+        .get::<Arc<VectorIndex>>()
+        .expect("[BUG] VectorIndex extension not set")
+        .clone();
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024).await {
         Ok(b) => b,
@@ -403,6 +408,20 @@ pub async fn mpi_remember_sealed(
             .into_response();
     }
 
+    // Index the client-supplied embedding so blind records are vector-searchable.
+    // The node searches over opaque vectors; content stays sealed and recall
+    // returns it as ciphertext.
+    if !rb.embedding.is_empty() {
+        vi.upsert(
+            record.record_id,
+            rb.embedding,
+            layer,
+            rb.timestamp,
+            &owner,
+            &rb.embedding_model,
+        );
+    }
+
     let short = &owner_hex[..8.min(owner_hex.len())];
     info!(id = %rid_hex, owner = %short, "[MPI_SEALED] Stored node-blind record");
     (
@@ -480,6 +499,18 @@ pub struct RecalledMemory {
     pub proactive: bool,
 }
 
+/// A node-blind memory returned by recall: the node cannot read it, so it hands
+/// back the client ciphertext (base64) for the client to decrypt. Kept in a list
+/// separate from plaintext `RecalledMemory` so clients can tell the two apart.
+#[derive(Debug, Serialize)]
+pub struct SealedMemory {
+    pub record_id: String,
+    pub score: f64,
+    /// Client ciphertext, base64. Decrypt on the client.
+    pub ciphertext_b64: String,
+    pub timestamp: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RecallResponse {
     pub memories: Vec<RecalledMemory>,
@@ -487,6 +518,10 @@ pub struct RecallResponse {
     pub token_estimate: usize,
     pub query_type: Option<String>,
     pub matched_entities: Option<Vec<serde_json::Value>>,
+    /// Node-blind memories (ciphertext) matched by vector search. Empty unless
+    /// the owner uses node-blind storage.
+    #[serde(default)]
+    pub sealed: Vec<SealedMemory>,
 }
 
 // ============================================

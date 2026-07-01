@@ -82,7 +82,7 @@ use crate::services::memchain::{
 use super::mpi::{estimate_tokens, extract_owner, now_secs, parse_layer, MpiState};
 
 pub use super::mpi_handlers::{
-    RecallRequest, RecallResponse, RecalledMemory, TimeHint, TimeRangeParam,
+    RecallRequest, RecallResponse, RecalledMemory, SealedMemory, TimeHint, TimeRangeParam,
 };
 pub use crate::services::memchain::reranker::RERANK_TOP_N;
 
@@ -724,7 +724,27 @@ pub async fn mpi_recall(
 
     // ── Step 4: Token budget ──
     let mut returned_ids = seen_ids.clone();
+    let mut sealed_memories: Vec<SealedMemory> = Vec::new();
     for (r, score) in &scored {
+        if r.blind {
+            // Node-blind record: hand back the client ciphertext (base64) in a
+            // separate sealed list. The node cannot read it, and it does not
+            // consume the plaintext token budget.
+            use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+            returned_ids.push(r.record_id);
+            sealed_memories.push(SealedMemory {
+                record_id: r.id_hex(),
+                score: *score,
+                ciphertext_b64: BASE64.encode(&r.encrypted_content),
+                timestamp: r.timestamp,
+            });
+            let st = Arc::clone(&storage);
+            let rid = r.record_id;
+            tokio::spawn(async move {
+                st.increment_access(&rid).await;
+            });
+            continue;
+        }
         let content = String::from_utf8_lossy(&r.encrypted_content).to_string();
         let tokens = estimate_tokens(&content);
         if total_tokens + tokens > rb.token_budget && !memories.is_empty() {
@@ -824,6 +844,7 @@ pub async fn mpi_recall(
                 "token_estimate": token_estimate,
                 "query_type": query_type_str,
                 "matched_entities": matched_json,
+                "sealed": sealed_memories,
                 "hint": "Use POST /api/mpi/recall/detail with record_ids to fetch full content.",
             })),
         )
@@ -852,6 +873,7 @@ pub async fn mpi_recall(
             token_estimate: total_tokens,
             query_type: Some(query_type_str),
             matched_entities: matched_json,
+            sealed: sealed_memories,
         })),
     )
         .into_response()
