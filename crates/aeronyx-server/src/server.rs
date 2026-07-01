@@ -85,6 +85,9 @@
 //  36. Prioritizes unproven, non-quarantined route candidates during low-
 //      frequency synthetic probes so three-node meshes converge routeability
 //      coverage instead of repeatedly probing only the already-proven peer.
+//  37. Preserves an existing usable PeerStore cache when the current in-memory
+//      view is empty, preventing early-start/shutdown writes from erasing
+//      restart recovery evidence before gossip has recovered peers.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -104,6 +107,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.2.3-PeerCacheEmptyOverwriteGuard - Preserve usable cache when current PeerStore is empty
 //   v1.2.2-ProbeCoveragePriority - Probe unproven non-quarantined peers before already-proven peers
 //   v1.2.1-TwoHopOnionDeliveryProbe - Prefer synthetic onion delivery over control-plane proof
 //   v1.2.0-TwoHopRuntimeProof - Low-frequency aggregate two-hop blind relay path proof
@@ -3420,6 +3424,14 @@ impl Server {
         path: &str,
         now: u64,
     ) -> Result<()> {
+        let pending_snapshot = peer_store.export_bootstrap_snapshot(now, now, false, None);
+        if pending_snapshot.verified_count_at(now) == 0
+            && Self::peer_cache_has_usable_recovery_snapshot(path, now).await
+        {
+            peer_store.record_cache_save_status(now, "skipped", "preserved_existing_snapshot");
+            return Ok(());
+        }
+
         match Self::save_peer_store_cache_snapshot(peer_store, path, now).await {
             Ok(()) => {
                 peer_store.record_cache_save_status(now, "success", "snapshot_persisted");
@@ -3430,6 +3442,27 @@ impl Server {
                 Err(e)
             }
         }
+    }
+
+    async fn peer_cache_has_usable_recovery_snapshot(path: &str, now: u64) -> bool {
+        let primary = PathBuf::from(path);
+        if Self::cache_snapshot_file_has_usable_peers(&primary, now).await {
+            return true;
+        }
+
+        let backup = Self::peer_cache_backup_path(path);
+        Self::cache_snapshot_file_has_usable_peers(&backup, now).await
+    }
+
+    async fn cache_snapshot_file_has_usable_peers(path: &PathBuf, now: u64) -> bool {
+        let Ok(bytes) = tokio::fs::read(path).await else {
+            return false;
+        };
+        let Ok(snapshot) = NodeBootstrapSnapshot::from_json_bytes(&bytes) else {
+            return false;
+        };
+
+        snapshot.verified_count_at(now) > 0
     }
 
     fn build_self_discovery_descriptor(&self, now: u64) -> Result<SignedNodeDescriptor> {
@@ -5626,6 +5659,53 @@ mod tests {
         assert!(status.stability.restart_recovery_configured);
 
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_save_preserves_existing_recovery_snapshot_when_current_view_empty() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let now = 1_800_000_000;
+        let signed = server.build_self_discovery_descriptor(now).unwrap();
+        let recovery_store = Arc::new(PeerStore::new());
+        assert!(recovery_store.upsert_verified(signed.clone(), now).unwrap());
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-preserve-{unique}.json"));
+        let path_str = path.to_string_lossy().to_string();
+
+        Server::save_peer_store_cache_snapshot(&recovery_store, &path_str, now)
+            .await
+            .unwrap();
+
+        let empty_store = Arc::new(PeerStore::new());
+        Server::persist_peer_store_cache_once(&empty_store, &path_str, now + 1)
+            .await
+            .unwrap();
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let snapshot = NodeBootstrapSnapshot::from_json_bytes(&bytes).unwrap();
+        assert_eq!(snapshot.verified_count_at(now + 2), 1);
+        assert_eq!(snapshot.peers[0].node_id(), signed.node_id());
+
+        let status = empty_store.status(now + 2);
+        assert_eq!(
+            status.bootstrap.last_cache_save_status.as_deref(),
+            Some("skipped")
+        );
+        assert_eq!(
+            status.bootstrap.last_cache_save_detail.as_deref(),
+            Some("preserved_existing_snapshot")
+        );
+
+        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio::fs::remove_file(Server::peer_cache_backup_path(&path_str)).await;
     }
 
     #[tokio::test]
