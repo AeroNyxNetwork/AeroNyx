@@ -51,6 +51,7 @@
 //!   surfaces never need to parse full peer diagnostics.
 //!
 //! ## Last Modified
+//! v0.19.0-OnionRelayAdmissionContract - Add aggregate admission score and warmup contract
 //! v0.18.0-OnionCandidatePoolHealth - Expose aggregate onion candidate pool health for App/nodeboard decisions
 //! v0.17.0-DiscoverySummaryProofStabilityWindow - Expose two-hop proof stability and circuit-breaker fields
 //! v0.16.0-DiscoverySummaryRestartSurvivableProof - Expose strict restart-survivable two-hop proof readiness
@@ -345,6 +346,8 @@ pub struct DiscoverySummaryResponse {
     blind_relay: serde_json::Value,
     /// Bounded two-hop path proof aggregate without route reconstruction data.
     two_hop_path_proof: serde_json::Value,
+    /// Aggregate permissionless relay-pool admission gate without route data.
+    onion_relay_admission: serde_json::Value,
     /// Actionable next step for operators and AI runbooks.
     next_action: String,
     /// Explicit invariant for downstream UI and AI-agent consumers.
@@ -469,6 +472,117 @@ impl Default for DiscoveryLocalCapabilityStatus {
     }
 }
 
+/// Builds the aggregate relay-pool admission contract.
+///
+/// This is the Rust-side source of truth for nodeboard, backend aggregation,
+/// website counters, and AI runbooks that need to know whether this node is
+/// mature enough to participate in the permissionless onion relay pool. It is
+/// deliberately aggregate-only: it exposes gate booleans, counts, score, and
+/// stable reason buckets, but never endpoints, route IDs, selected hops,
+/// receiver keys, encrypted payloads, client IPs, DNS, Memory Chain plaintext,
+/// private keys, wallet-level traffic, or social graph metadata.
+#[must_use]
+pub fn onion_relay_admission_status_value(
+    status: &PeerStoreStatus,
+    local_capabilities: &DiscoveryLocalCapabilityStatus,
+) -> serde_json::Value {
+    let peer_quorum = &status.peer_quorum;
+    let network_story = &status.network_story;
+    let proof = &status.two_hop_path_proof_history;
+    let local_relay_ready = local_capabilities.safe_to_advertise_chat_relay;
+    let route_pool_ready = peer_quorum.routeable_chat_relays
+        >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
+        && peer_quorum.routeable_onion_middle_hops >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
+    let recent_path_proof_ready = proof.proof_ready && !proof.failure_streak_active;
+    let stable_path_proof_ready = proof.stability_ready && !proof.failure_circuit_breaker_active;
+    let restart_recovery_ready = peer_quorum.restart_recovery_configured;
+    let checks_total = 5u8;
+    let checks_passed = [
+        local_relay_ready,
+        route_pool_ready,
+        recent_path_proof_ready,
+        stable_path_proof_ready,
+        restart_recovery_ready,
+    ]
+    .into_iter()
+    .filter(|ready| *ready)
+    .count() as u8;
+    let admission_score_percent =
+        ((u16::from(checks_passed) * 100) / u16::from(checks_total)).min(100) as u8;
+    let admission_ready = checks_passed == checks_total;
+    let attention = proof.failure_circuit_breaker_active
+        || proof.failure_streak_active
+        || local_capabilities.status == "misconfigured";
+    let admission_status = if !local_capabilities.chat_relay_configured {
+        "disabled"
+    } else if admission_ready {
+        "eligible"
+    } else if attention {
+        "attention"
+    } else {
+        "warming"
+    };
+    let warmup_stage = if !local_relay_ready {
+        "local_relay"
+    } else if !route_pool_ready {
+        "route_pool"
+    } else if !recent_path_proof_ready {
+        "path_proof"
+    } else if !stable_path_proof_ready {
+        "stability_window"
+    } else if !restart_recovery_ready {
+        "restart_recovery"
+    } else {
+        "eligible"
+    };
+    let warmup_hint = match warmup_stage {
+        "eligible" => "node is eligible for client-selected two-hop onion relay paths",
+        "local_relay" => {
+            "align ChatRelay config, runtime, public peer API, and advertised capability"
+        }
+        "route_pool" => "wait for at least two fresh routeable ChatRelay and OnionMiddle peers",
+        "path_proof" => "wait for a fresh accepted entry-middle-terminal proof",
+        "stability_window" => {
+            "collect at least three recent two-hop proof samples with strong success rate"
+        }
+        "restart_recovery" => {
+            "configure peer cache or seed endpoints before treating admission as restart-resilient"
+        }
+        _ => "continue warming relay admission gates",
+    };
+
+    serde_json::json!({
+        "status": admission_status,
+        "eligible": admission_ready,
+        "permissionless": true,
+        "admission_score_percent": admission_score_percent,
+        "checks_passed": checks_passed,
+        "checks_total": checks_total,
+        "warmup_stage": warmup_stage,
+        "warmup_hint": warmup_hint,
+        "local_relay_ready": local_relay_ready,
+        "route_pool_ready": route_pool_ready,
+        "recent_path_proof_ready": recent_path_proof_ready,
+        "stable_path_proof_ready": stable_path_proof_ready,
+        "restart_recovery_ready": restart_recovery_ready,
+        "routeable_chat_relays": peer_quorum.routeable_chat_relays,
+        "routeable_onion_middle_hops": peer_quorum.routeable_onion_middle_hops,
+        "min_routeable_chat_relays": ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+        "min_routeable_onion_middle_hops": ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+        "two_hop_stability_status": &proof.stability_status,
+        "two_hop_stability_ready": proof.stability_ready,
+        "two_hop_stability_success_percent": proof.stability_success_percent,
+        "failure_circuit_breaker_active": proof.failure_circuit_breaker_active,
+        "failure_streak_active": proof.failure_streak_active,
+        "routeability_stale_after_seconds": ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS,
+        "refresh_after_seconds": ONION_CANDIDATES_REFRESH_AFTER_SECONDS,
+        "client_route_policy": "client_selected_two_hop_onion_when_eligible",
+        "network_story_status": &network_story.status,
+        "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
+        "privacy_boundary": "aggregate onion relay admission gates only; no node endpoints, route ids, selected hops, receiver keys, encrypted payloads, client IPs, DNS contents, destinations, Memory Chain plaintext, private keys, wallet-level traffic, or social graph metadata",
+    })
+}
+
 /// Builds the compact aggregate discovery readiness contract.
 ///
 /// This helper intentionally mirrors only privacy-safe, operator-facing fields
@@ -481,6 +595,7 @@ pub fn discovery_readiness_status_value(
     status: &PeerStoreStatus,
     local_capabilities: &DiscoveryLocalCapabilityStatus,
 ) -> serde_json::Value {
+    let onion_relay_admission = onion_relay_admission_status_value(status, local_capabilities);
     let peer_quorum = &status.peer_quorum;
     let network_story = &status.network_story;
     let blind_relay_quality = &status.blind_relay_quality;
@@ -613,6 +728,7 @@ pub fn discovery_readiness_status_value(
             "routeable_chat_relays": network_story.routeable_chat_relays,
             "routeable_onion_middle_hops": network_story.routeable_onion_middle_hops,
         },
+        "onion_relay_admission": onion_relay_admission,
         "blind_relay_runtime": {
             "status": &blind_relay_quality.status,
             "runtime_ready": blind_relay_quality.runtime_ready,
@@ -659,6 +775,7 @@ pub fn discovery_summary_response(
 ) -> DiscoverySummaryResponse {
     let readiness = discovery_readiness_status_value(status, local_capabilities);
     let protocol_foundation = &readiness["protocol_foundation"];
+    let onion_relay_admission = onion_relay_admission_status_value(status, local_capabilities);
     let peer_quorum = &status.peer_quorum;
     let network_story = &status.network_story;
     let blind_relay_quality = &status.blind_relay_quality;
@@ -913,6 +1030,7 @@ pub fn discovery_summary_response(
             "next_action": &blind_relay_quality.next_action,
         }),
         two_hop_path_proof: serde_json::Value::Object(two_hop_path_proof),
+        onion_relay_admission,
         next_action,
         privacy_invariant: "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
         privacy_boundary: "aggregate discovery summary only; no signed descriptors, full node ids, endpoint URLs, route ids, encrypted payloads, receiver identities, client public IPs, DNS contents, destinations, Memory Chain plaintext, voucher secrets, private keys, wallet-level traffic, or social graph metadata",
@@ -1792,6 +1910,30 @@ mod tests {
             Some("discovery_summary.v1")
         );
         assert_eq!(parsed["local_capability"]["status"].as_str(), Some("ready"));
+        assert_eq!(
+            parsed["onion_relay_admission"]["status"].as_str(),
+            Some("warming")
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["admission_score_percent"].as_u64(),
+            Some(40)
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["warmup_stage"].as_str(),
+            Some("route_pool")
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["local_relay_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["recent_path_proof_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["route_pool_ready"].as_bool(),
+            Some(false)
+        );
         assert_eq!(parsed["blind_relay"]["runtime_ready"].as_bool(), Some(true));
         assert_eq!(
             parsed["two_hop_path_proof"]["proof_ready"].as_bool(),
@@ -1903,6 +2045,7 @@ mod tests {
         assert!(!serialized.contains("client_ip"));
         assert!(!serialized.contains("receiver_pubkey"));
         assert!(!serialized.contains("public_endpoint"));
+        assert!(!serialized.contains("selected_hop"));
     }
 
     #[tokio::test]
@@ -1984,6 +2127,30 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            parsed["onion_relay_admission"]["status"].as_str(),
+            Some("warming")
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["admission_score_percent"].as_u64(),
+            Some(80)
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["warmup_stage"].as_str(),
+            Some("stability_window")
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["route_pool_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["restart_recovery_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["stable_path_proof_ready"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
             parsed["two_hop_path_proof"]["restart_recovery_configured"].as_bool(),
             Some(true)
         );
@@ -2035,6 +2202,7 @@ mod tests {
         assert!(!serialized.contains("client_ip"));
         assert!(!serialized.contains("receiver_pubkey"));
         assert!(!serialized.contains("public_endpoint"));
+        assert!(!serialized.contains("selected_hop"));
     }
 
     #[tokio::test]
