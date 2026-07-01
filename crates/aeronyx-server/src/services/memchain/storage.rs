@@ -1280,6 +1280,23 @@ impl MemoryStorage {
         );
     }
 
+    /// Tag a record with a project (node-blind grouping). For blind records the
+    /// client supplies `project_id` — a plaintext label or an opaque hash — so it
+    /// can archive and recall memories by project via the existing `context`
+    /// filter (`get_active_records_by_context`). Owner-scoped.
+    pub async fn set_record_project_id(
+        &self,
+        record_id: &[u8; 32],
+        owner: &[u8; 32],
+        project_id: &str,
+    ) {
+        let conn = self.conn.lock().await;
+        let _ = conn.execute(
+            "UPDATE records SET project_id = ?1 WHERE record_id = ?2 AND owner = ?3",
+            params![project_id, record_id.as_slice(), owner.as_slice()],
+        );
+    }
+
     // ========================================
     // Provenance: find records by session (v2.5.2+Provenance)
     // ========================================
@@ -2087,6 +2104,39 @@ mod tests {
 
         // A record with no provenance returns empty.
         assert!(s.get_blind_provenance(&[0x09u8; 32]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_blind_record_project_grouping() {
+        let s = MemoryStorage::open(":memory:", Some([0x11u8; 32])).unwrap();
+        let owner = [0xBB; 32];
+        let mut rec = MemoryRecord::new(
+            owner,
+            500,
+            MemoryLayer::Knowledge,
+            vec![],
+            "client".into(),
+            b"opaque".to_vec(),
+            vec![],
+        );
+        rec.blind = true;
+        assert!(s.insert(&rec, "client").await);
+
+        // Archive it under a project (a label or an opaque hash), then recall by it.
+        s.set_record_project_id(&rec.record_id, &owner, "proj_alpha")
+            .await;
+        let hits = s
+            .get_active_records_by_context(&owner, "proj_alpha", None, 10)
+            .await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record_id, rec.record_id);
+        assert!(hits[0].blind, "blind flag survives the project query");
+
+        // A different project returns nothing.
+        assert!(s
+            .get_active_records_by_context(&owner, "proj_other", None, 10)
+            .await
+            .is_empty());
     }
 
     // ========================================

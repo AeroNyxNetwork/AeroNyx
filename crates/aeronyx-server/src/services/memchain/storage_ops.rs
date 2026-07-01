@@ -809,7 +809,8 @@ impl MemoryStorage {
                 &conn,
                 "SELECT r.record_id, r.owner, r.timestamp, r.layer, r.topic_tags, r.source_ai,
                         r.status, r.supersedes, r.encrypted_content, r.embedding, r.signature,
-                        r.access_count, r.positive_feedback, r.negative_feedback, r.conflict_with
+                        r.access_count, r.positive_feedback, r.negative_feedback, r.conflict_with,
+                        r.blind
                  FROM records r
                  LEFT JOIN sessions s ON r.session_id = s.session_id
                  WHERE r.owner = ?1
@@ -825,7 +826,8 @@ impl MemoryStorage {
                 &conn,
                 "SELECT r.record_id, r.owner, r.timestamp, r.layer, r.topic_tags, r.source_ai,
                         r.status, r.supersedes, r.encrypted_content, r.embedding, r.signature,
-                        r.access_count, r.positive_feedback, r.negative_feedback, r.conflict_with
+                        r.access_count, r.positive_feedback, r.negative_feedback, r.conflict_with,
+                        r.blind
                  FROM records r
                  LEFT JOIN sessions s ON r.session_id = s.session_id
                  WHERE r.owner = ?1

@@ -292,6 +292,10 @@ pub struct SealedRememberRequest {
     /// as opaque provenance links; the node learns only the DAG shape.
     #[serde(default)]
     pub derived_from: Vec<String>,
+    /// Optional project to archive this memory under — a plaintext label or an
+    /// opaque hash. Recall with `context=<project>` then returns memories in it.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// A client-declared edge from this blind record to an existing one.
@@ -490,6 +494,16 @@ pub async fn mpi_remember_sealed(
         storage
             .insert_blind_provenance(&record.record_id, &owner, &rb.derived_from)
             .await;
+    }
+
+    // Archive under a project (node-blind grouping): a client label or opaque
+    // hash; recall with context=<project> then returns memories in it.
+    if let Some(ref project) = rb.project {
+        if !project.is_empty() {
+            storage
+                .set_record_project_id(&record.record_id, &owner, project)
+                .await;
+        }
     }
 
     let short = &owner_hex[..8.min(owner_hex.len())];
