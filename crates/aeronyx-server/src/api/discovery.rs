@@ -51,6 +51,7 @@
 //!   surfaces never need to parse full peer diagnostics.
 //!
 //! ## Last Modified
+//! v0.18.0-OnionCandidatePoolHealth - Expose aggregate onion candidate pool health for App/nodeboard decisions
 //! v0.17.0-DiscoverySummaryProofStabilityWindow - Expose two-hop proof stability and circuit-breaker fields
 //! v0.16.0-DiscoverySummaryRestartSurvivableProof - Expose strict restart-survivable two-hop proof readiness
 //! v0.15.0-OnionCandidatesFallbackContract - Add explicit two-hop readiness and fallback fields
@@ -259,6 +260,19 @@ pub struct OnionCandidatesResponse {
     /// Whether the client should fall back to the standard encrypted relay path
     /// before attempting to build an onion envelope.
     pub fallback_required: bool,
+    /// Aggregate candidate-pool maturity bucket.
+    ///
+    /// Stable values are `ready`, `warming`, `empty`, or `client_limited`.
+    /// This lets App, nodeboard, backend aggregation, and AI-agent runbooks
+    /// distinguish a usable pool from a partial pool without inspecting
+    /// individual relay metadata.
+    pub pool_status: String,
+    /// Privacy-safe route plan recommendation for clients.
+    ///
+    /// Stable values are `two_hop_onion_path` or `standard_relay_fallback`.
+    /// The server never returns route ids, selected path ids, receiver
+    /// identities, payload metadata, or client information here.
+    pub route_plan: String,
     /// Stable privacy-safe reason bucket for fallback decisions.
     ///
     /// This must never include node ids, endpoint URLs, route ids, receiver
@@ -266,6 +280,10 @@ pub struct OnionCandidatesResponse {
     /// Memory Chain plaintext, voucher secrets, private keys, wallet-level
     /// traffic, or social graph metadata.
     pub fallback_reason: String,
+    /// Stable privacy-safe readiness reason for product surfaces.
+    pub readiness_reason: String,
+    /// Short operator/client action that does not expose route metadata.
+    pub next_action: String,
     /// Privacy-safe route selection policy used to build this candidate set.
     pub selection_policy: String,
     /// Recommended client refresh interval for this candidate set.
@@ -996,6 +1014,10 @@ async fn onion_candidates_handler(
         .collect();
     let two_hop_ready = candidates.len() >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
     let fallback_reason = onion_candidate_fallback_reason(candidates.len(), limit);
+    let pool_status = onion_candidate_pool_status(candidates.len(), limit);
+    let route_plan = onion_candidate_route_plan(two_hop_ready);
+    let readiness_reason = onion_candidate_readiness_reason(candidates.len(), limit);
+    let next_action = onion_candidate_next_action(two_hop_ready, fallback_reason);
 
     Json(OnionCandidatesResponse {
         generated_at: now,
@@ -1005,13 +1027,37 @@ async fn onion_candidates_handler(
         min_candidates_for_two_hop: ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
         two_hop_ready,
         fallback_required: !two_hop_ready,
+        pool_status: pool_status.to_string(),
+        route_plan: route_plan.to_string(),
         fallback_reason: fallback_reason.to_string(),
+        readiness_reason: readiness_reason.to_string(),
+        next_action: next_action.to_string(),
         selection_policy: ONION_CANDIDATES_SELECTION_POLICY.to_string(),
         refresh_after_seconds: ONION_CANDIDATES_REFRESH_AFTER_SECONDS,
         routeability_stale_after_seconds: ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS,
         candidates,
         privacy_boundary: "fresh routeable signed node discovery metadata only (node id, KEM public key, public endpoint, capabilities); no client IPs, route ids, encrypted payloads, receiver identities, DNS contents, destinations, voucher secrets, private keys, or wallet-level traffic".to_string(),
     })
+}
+
+fn onion_candidate_pool_status(candidate_count: usize, limit: usize) -> &'static str {
+    if candidate_count >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES {
+        "ready"
+    } else if limit < ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES {
+        "client_limited"
+    } else if candidate_count == 0 {
+        "empty"
+    } else {
+        "warming"
+    }
+}
+
+fn onion_candidate_route_plan(two_hop_ready: bool) -> &'static str {
+    if two_hop_ready {
+        "two_hop_onion_path"
+    } else {
+        "standard_relay_fallback"
+    }
 }
 
 fn onion_candidate_fallback_reason(candidate_count: usize, limit: usize) -> &'static str {
@@ -1023,6 +1069,25 @@ fn onion_candidate_fallback_reason(candidate_count: usize, limit: usize) -> &'st
         "no_routeable_candidates"
     } else {
         "single_routeable_candidate"
+    }
+}
+
+fn onion_candidate_readiness_reason(candidate_count: usize, limit: usize) -> &'static str {
+    match onion_candidate_fallback_reason(candidate_count, limit) {
+        "ready" => "two_hop_candidate_pool_ready",
+        "client_limit_below_two_hop_minimum" => "client_limit_blocks_two_hop_pool",
+        "no_routeable_candidates" => "waiting_for_routeable_kem_relays",
+        _ => "waiting_for_second_routeable_kem_relay",
+    }
+}
+
+fn onion_candidate_next_action(two_hop_ready: bool, fallback_reason: &str) -> &'static str {
+    if two_hop_ready {
+        "build a controlled two-hop onion path with fresh candidates"
+    } else if fallback_reason == "client_limit_below_two_hop_minimum" {
+        "increase candidate limit or use standard encrypted relay fallback"
+    } else {
+        "use standard encrypted relay fallback and refresh candidate pool later"
     }
 }
 
@@ -1310,7 +1375,17 @@ mod tests {
         );
         assert!(!parsed.two_hop_ready);
         assert!(parsed.fallback_required);
+        assert_eq!(parsed.pool_status, "warming");
+        assert_eq!(parsed.route_plan, "standard_relay_fallback");
         assert_eq!(parsed.fallback_reason, "single_routeable_candidate");
+        assert_eq!(
+            parsed.readiness_reason,
+            "waiting_for_second_routeable_kem_relay"
+        );
+        assert_eq!(
+            parsed.next_action,
+            "use standard encrypted relay fallback and refresh candidate pool later"
+        );
         assert_eq!(parsed.candidates.len(), 1);
         let candidate = &parsed.candidates[0];
         assert_eq!(candidate.node_id, want_node_id);
@@ -1360,7 +1435,14 @@ mod tests {
         );
         assert!(parsed.two_hop_ready);
         assert!(!parsed.fallback_required);
+        assert_eq!(parsed.pool_status, "ready");
+        assert_eq!(parsed.route_plan, "two_hop_onion_path");
         assert_eq!(parsed.fallback_reason, "ready");
+        assert_eq!(parsed.readiness_reason, "two_hop_candidate_pool_ready");
+        assert_eq!(
+            parsed.next_action,
+            "build a controlled two-hop onion path with fresh candidates"
+        );
     }
 
     #[tokio::test]
@@ -1398,7 +1480,14 @@ mod tests {
         assert_eq!(parsed.count, 1);
         assert!(!parsed.two_hop_ready);
         assert!(parsed.fallback_required);
+        assert_eq!(parsed.pool_status, "client_limited");
+        assert_eq!(parsed.route_plan, "standard_relay_fallback");
         assert_eq!(parsed.fallback_reason, "client_limit_below_two_hop_minimum");
+        assert_eq!(parsed.readiness_reason, "client_limit_blocks_two_hop_pool");
+        assert_eq!(
+            parsed.next_action,
+            "increase candidate limit or use standard encrypted relay fallback"
+        );
     }
 
     #[tokio::test]
