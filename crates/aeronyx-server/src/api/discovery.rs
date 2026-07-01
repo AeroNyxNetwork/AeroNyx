@@ -51,6 +51,7 @@
 //!   surfaces never need to parse full peer diagnostics.
 //!
 //! ## Last Modified
+//! v0.12.0-DiscoverySummaryContractVersion - Add explicit public summary contract version
 //! v0.11.0-DiscoverySummaryProofQuality - Expose privacy-safe two-hop proof quality buckets
 //! v0.10.0-DiscoverySummaryEndpoint - Add compact privacy-safe protocol summary endpoint
 //! v0.9.3-OnionCandidatesRouteabilityGate - Only expose fresh routeable onion candidates to clients
@@ -262,6 +263,9 @@ pub struct DiscoveryStatusResponse {
 pub struct DiscoverySummaryResponse {
     /// Unix timestamp when the summary was generated.
     generated_at: u64,
+    /// Stable public JSON contract version for backend, nodeboard, website,
+    /// app, and AI-agent consumers.
+    contract_version: &'static str,
     /// Stable summary source label.
     source: &'static str,
     /// Product-facing current protocol status bucket.
@@ -610,6 +614,7 @@ pub fn discovery_summary_response(
 
     DiscoverySummaryResponse {
         generated_at,
+        contract_version: "discovery_summary.v1",
         source: "rust_discovery_summary",
         status: status_bucket,
         stage: stage_bucket,
@@ -1334,6 +1339,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(parsed["source"].as_str(), Some("rust_discovery_summary"));
+        assert_eq!(
+            parsed["contract_version"].as_str(),
+            Some("discovery_summary.v1")
+        );
         assert_eq!(parsed["local_capability"]["status"].as_str(), Some("ready"));
         assert_eq!(parsed["blind_relay"]["runtime_ready"].as_bool(), Some(true));
         assert_eq!(
