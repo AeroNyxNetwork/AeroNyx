@@ -94,6 +94,9 @@
 //  39. Promotes route governance to a top-level heartbeat discovery_status
 //      field so backend/nodeboard can read route-pool health without parsing
 //      the full internal PeerStore payload.
+//  40. Promotes blind relay runtime evidence to a top-level heartbeat
+//      discovery_status field so backend/nodeboard can track encrypted relay
+//      participation without parsing routes, endpoints, payloads, or peer ids.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -113,6 +116,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.2.6-BlindRelayRuntimeHeartbeat - Promote aggregate blind relay runtime evidence in discovery_status heartbeat
 //   v1.2.5-RouteGovernanceHeartbeat - Promote aggregate route governance in discovery_status heartbeat
 //   v1.2.4-BlindRelayProbeRecoveryCooldown - Reprobe faster until two-hop delivery proof is healthy
 //   v1.2.3-PeerCacheEmptyOverwriteGuard - Preserve usable cache when current PeerStore is empty
@@ -1750,6 +1754,8 @@ impl Server {
                 let discovery_readiness =
                     discovery_readiness_status_value(&status, &local_capabilities);
                 let route_governance = serde_json::json!(&status.route_governance);
+                let blind_relay_runtime =
+                    blind_relay_runtime_status_value(now, &status, &local_capabilities);
                 let signed_peer_records = peer_store.export_signed_peer_records_for_heartbeat(
                     now,
                     Some(config.discovery.max_snapshot_limit),
@@ -1758,6 +1764,7 @@ impl Server {
                     "generated_at": now,
                     "peer_store": status,
                     "route_governance": route_governance,
+                    "blind_relay_runtime": blind_relay_runtime,
                     "signed_peer_records": signed_peer_records,
                     "local_capabilities": local_capabilities,
                     "discovery_readiness": discovery_readiness,
