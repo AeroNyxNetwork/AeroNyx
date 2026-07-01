@@ -93,8 +93,12 @@
 //!   movement.
 //! - Duplicate route IDs are treated as idempotent replay drops, not previous-hop
 //!   abuse. Lost ACK retries must not quarantine an otherwise healthy relay.
+//! - Relay logs are route-safe: they must not include message IDs, receiver
+//!   prefixes, endpoint URLs, raw transport errors, route IDs, encrypted blobs,
+//!   or payload-derived strings. Use stable reason buckets only.
 //!
 //! ## Last Modified
+//! v0.23.0-RouteSafeRelayLogs - Remove user/route-adjacent values and raw transport errors from chat peer logs
 //! v0.22.0-BlindRelayDuplicateIdempotence - Keep duplicate route drops out of previous-hop quarantine scoring
 //! v0.21.0-OnionMiddleRouteabilityRecovery - Allow true onion middle recovery through fresh signed descriptors unless route-quarantined
 //! v0.20.0-OnionTerminalDeliveryAck - Require terminal onion delivery before accepted ACK
@@ -740,10 +744,7 @@ async fn process_peer_relay(
     };
 
     if relay.is_online_duplicate(&envelope.message_id) {
-        debug!(
-            id = %hex::encode(envelope.message_id),
-            "[CHAT_PEER] Duplicate peer envelope ignored"
-        );
+        debug!("[CHAT_PEER] Duplicate peer envelope ignored");
         relay.record_peer_relay_inbound_accepted(now, true, 0, false);
         return Ok(PeerChatRelayResponse {
             accepted: true,
@@ -763,10 +764,9 @@ async fn process_peer_relay(
     }
 
     let stored_pending = if delivered_online == 0 {
-        relay.store_pending(&envelope).map_err(|error| {
+        relay.store_pending(&envelope).map_err(|_error| {
             warn!(
-                receiver = %hex::encode(&envelope.receiver[..4]),
-                error = %error,
+                reason = "store_pending_failed",
                 "[CHAT_PEER] Failed to store peer envelope for offline receiver"
             );
             relay.record_peer_relay_inbound_rejected(now, "store_pending_failed");
@@ -1529,10 +1529,10 @@ async fn forward_blind_relay_with_retry(
                             "[BLIND_RELAY] Next-hop ACK rejected opaque relay envelope"
                         );
                     }
-                    Err(error) => {
+                    Err(_error) => {
                         debug!(
                             attempt,
-                            error = %error,
+                            reason = "ack_decode_failed",
                             "[BLIND_RELAY] Next-hop ACK decode failed"
                         );
                     }
@@ -1738,8 +1738,11 @@ async fn send_envelope_to_session(
     let msg = MemChainMessage::ChatRelay(envelope.clone());
     let plaintext = match encode_memchain(&msg) {
         Ok(plaintext) => plaintext,
-        Err(error) => {
-            warn!(error = %error, "[CHAT_PEER] Failed to encode client relay message");
+        Err(_error) => {
+            warn!(
+                reason = "encode_client_relay_message_failed",
+                "[CHAT_PEER] Failed to encode client relay message"
+            );
             return false;
         }
     };
@@ -1755,8 +1758,11 @@ async fn send_envelope_to_session(
         &mut encrypted,
     ) {
         Ok(len) => len,
-        Err(error) => {
-            warn!(error = %error, "[CHAT_PEER] Failed to encrypt client relay message");
+        Err(_error) => {
+            warn!(
+                reason = "encrypt_client_relay_message_failed",
+                "[CHAT_PEER] Failed to encrypt client relay message"
+            );
             return false;
         }
     };
@@ -1878,6 +1884,35 @@ mod tests {
             validate_peer_envelope(&envelope),
             Err(ChatPeerRelayError::InvalidSignature)
         ));
+    }
+
+    #[test]
+    fn chat_peer_logs_stay_route_safe() {
+        let source = include_str!("chat_peer.rs");
+        let message_id_log_pattern = concat!("id = %hex::encode(envelope.", "message_id)");
+        let receiver_log_pattern = concat!("receiver = %hex::encode(&envelope.", "receiver");
+        let raw_error_log_pattern = concat!("error = %", "error");
+
+        assert!(
+            !source.contains(message_id_log_pattern),
+            "message ids must not be logged by the relay"
+        );
+        assert!(
+            !source.contains(receiver_log_pattern),
+            "receiver prefixes must not be logged by the relay"
+        );
+        assert!(
+            !source.contains(raw_error_log_pattern),
+            "raw errors may contain endpoint URLs or route-adjacent context"
+        );
+        assert!(
+            source.contains("reason = \"ack_decode_failed\""),
+            "ACK decode failures should use a stable reason bucket"
+        );
+        assert!(
+            source.contains("reason = \"store_pending_failed\""),
+            "store failures should use a stable reason bucket"
+        );
     }
 
     #[tokio::test]
