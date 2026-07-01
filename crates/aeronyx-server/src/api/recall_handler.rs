@@ -642,7 +642,12 @@ pub async fn mpi_recall(
         }
     }
 
-    if search.is_empty() && bm25_results.is_empty() {
+    // Recent-records fallback: only when the client gave NO search signal at all.
+    // A node-blind client searches via `query_terms` (Step 4b, node-blind BM25);
+    // if it supplied them we must NOT fall back to recent records, otherwise an
+    // unmatched blind query returns recent memories as false positives and swamps
+    // the blind-FTS ranking (breaking disambiguation and precision).
+    if search.is_empty() && bm25_results.is_empty() && rb.query_terms.is_empty() {
         let recent = storage
             .get_active_records(&owner, layer_filter, top_k)
             .await;
