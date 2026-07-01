@@ -117,6 +117,7 @@
 //   v1.2.0-TwoHopRuntimeProof - Low-frequency aggregate two-hop blind relay path proof
 //   v1.1.9-BlindRelayProbeCooldown - Rate-limit synthetic relay probes so discovery health checks stay low-noise
 //   v1.1.8-BlindRelaySyntheticProbe - Low-frequency opaque route probes after successful discovery gossip
+//   v1.2.1-TwoHopSmokeTrigger - Add local-only operator smoke test for real two-hop onion delivery
 //   v1.1.7-BlindRelayQualityReadiness - Expose aggregate blind relay quality in discovery readiness
 //   v1.1.6-PeerRelayAckValidation - Require accepted peer relay ACK before route success
 //   v1.1.5-DiscoveryReadinessHeartbeat - Add compact ChatRelay/quorum readiness to heartbeat
@@ -204,8 +205,9 @@ use crate::api::chat_peer::{
     PeerChatRelayResponse,
 };
 use crate::api::discovery::{
-    build_discovery_router_with_local_status, discovery_readiness_status_value, DiscoveryApiPolicy,
-    DiscoveryLocalCapabilityStatus, GossipResponse,
+    blind_relay_runtime_status_value, build_discovery_router_with_local_status,
+    discovery_readiness_status_value, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
+    GossipResponse,
 };
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
 use crate::api::voice::build_voice_router;
@@ -1356,6 +1358,10 @@ impl Server {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         );
+        let smoke_peer_store = Arc::clone(&peer_store);
+        let smoke_node_identity = Arc::clone(&node_identity);
+        let smoke_peer_http_client = Arc::clone(&peer_http_client);
+        let smoke_local_capability_status = local_capability_status.clone();
 
         tokio::spawn(async move {
             if let Some(public_addr) = public_api_listen_addr {
@@ -1392,9 +1398,63 @@ impl Server {
                     Arc::clone(&sessions),
                     udp,
                     Arc::clone(&peer_store),
-                    node_identity,
-                    peer_http_client,
+                    Arc::clone(&node_identity),
+                    Arc::clone(&peer_http_client),
                 ))
+                // Local/VPN-only operator smoke trigger. The public discovery API
+                // intentionally does not expose this route; it actively sends a
+                // synthetic two-hop onion delivery probe and returns aggregate
+                // counters only, never route ids, selected hops, receiver keys,
+                // endpoints, encrypted payload bytes, or social graph metadata.
+                .route(
+                    "/api/discovery/smoke/two-hop",
+                    axum::routing::post(move || {
+                        let peer_store = Arc::clone(&smoke_peer_store);
+                        let identity = Arc::clone(&smoke_node_identity);
+                        let client = Arc::clone(&smoke_peer_http_client);
+                        let local_capabilities = smoke_local_capability_status.clone();
+                        async move {
+                            let before_at = unix_now_secs();
+                            let before_status = peer_store.status(before_at);
+                            let before_runtime = blind_relay_runtime_status_value(
+                                before_at,
+                                &before_status,
+                                &local_capabilities,
+                            );
+                            let self_node_id = identity.public_key_bytes();
+                            let accepted = Self::probe_two_hop_blind_relay_path(
+                                &client,
+                                &peer_store,
+                                &identity,
+                                &self_node_id,
+                                before_at,
+                            )
+                            .await;
+                            let after_at = unix_now_secs();
+                            let after_status = peer_store.status(after_at);
+                            let after_runtime = blind_relay_runtime_status_value(
+                                after_at,
+                                &after_status,
+                                &local_capabilities,
+                            );
+                            axum::Json(serde_json::json!({
+                                "success": accepted,
+                                "contract_version": "two_hop_smoke.v1",
+                                "source": "rust_local_operator_smoke",
+                                "scope": "local_or_vpn_operator_api_only",
+                                "probe": {
+                                    "type": "two_hop_onion_delivery",
+                                    "payload": "synthetic_opaque_ciphertext",
+                                    "ack_boundary": "terminal_chat_relay_store_or_online_delivery",
+                                },
+                                "before": before_runtime,
+                                "after": after_runtime,
+                                "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
+                                "privacy_boundary": "operator smoke returns aggregate counters only; no endpoints, route ids, selected hops, receiver keys, encrypted payloads, client IPs, destinations, DNS contents, private keys, wallet-level traffic, or social graph metadata",
+                            }))
+                        }
+                    }),
+                )
                 .merge(build_discovery_router_with_local_status(
                     peer_store,
                     discovery_api_policy,
