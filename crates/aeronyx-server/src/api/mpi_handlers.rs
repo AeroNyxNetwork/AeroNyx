@@ -65,6 +65,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use aeronyx_core::crypto::IdentityPublicKey;
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 
 use crate::services::memchain::LlmRouter;
@@ -229,6 +230,181 @@ pub async fn mpi_remember(
     }
 
     info!(id = %rid_hex, layer = %layer, owner = %&owner_hex[..8], "[MPI_REMEMBER] Stored");
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!(RememberResponse {
+            record_id: rid_hex,
+            status: "created".into(),
+            duplicate_of: None,
+        })),
+    )
+        .into_response()
+}
+
+// ============================================
+// POST /api/mpi/remember_sealed  (Brick 1 — node-blind storage)
+// ============================================
+
+/// Request body for a **node-blind** memory: the client has already encrypted
+/// the content with its own key and signed the record itself. The node stores
+/// it verbatim and can neither decrypt nor re-sign it.
+///
+/// The node recomputes `record_id` as
+/// `SHA-256(owner, timestamp, layer, topic_tags, source_ai, ciphertext)` — the
+/// same content-addressing as a sighted record, but over the client ciphertext —
+/// and verifies the client's Ed25519 `signature` against `owner`. `owner` comes
+/// from the authenticated request (the client's `X-MemChain-PublicKey`), so the
+/// caller must sign the record with the same key it authenticates with.
+#[derive(Debug, Deserialize)]
+pub struct SealedRememberRequest {
+    /// Client-side ciphertext (base64). Opaque to the node.
+    pub ciphertext_b64: String,
+    /// Client-supplied creation timestamp (Unix seconds). Part of `record_id`.
+    pub timestamp: u64,
+    #[serde(default = "default_layer")]
+    pub layer: String,
+    #[serde(default)]
+    pub topic_tags: Vec<String>,
+    #[serde(default = "default_source")]
+    pub source_ai: String,
+    /// Client-precomputed embedding (the node cannot embed ciphertext). Optional.
+    /// Stored with the record; server-side vector indexing of blind records is a
+    /// follow-up (kept out of this endpoint so blind records are not yet surfaced
+    /// by the plaintext recall path).
+    #[serde(default)]
+    pub embedding: Vec<f32>,
+    #[serde(default = "default_model")]
+    pub embedding_model: String,
+    /// Client Ed25519 signature over `record_id` (base64). Verified against `owner`.
+    pub signature_b64: String,
+}
+
+/// Store a node-blind record: the node verifies the client's signature and keeps
+/// the ciphertext verbatim — it never decrypts, re-encrypts, or re-signs it.
+pub async fn mpi_remember_sealed(
+    State(state): State<Arc<MpiState>>,
+    req: Request<axum::body::Body>,
+) -> impl IntoResponse {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+    // Node-blind storage is a remote-owner path: it requires the operator to have
+    // opted into remote storage (default off). A stricter, dedicated toggle can be
+    // added later; blind storage is a safer subset of remote storage.
+    if !state.allow_remote_storage {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"blind storage disabled (allow_remote_storage=false)"})),
+        )
+            .into_response();
+    }
+
+    let auth = extract_owner(&req).clone();
+    let owner = auth.owner_bytes();
+    let owner_hex = auth.owner_hex();
+
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"failed to read body"})),
+            )
+                .into_response()
+        }
+    };
+    let rb: SealedRememberRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid JSON: {}", e)})),
+            )
+                .into_response()
+        }
+    };
+
+    let ciphertext = match BASE64.decode(rb.ciphertext_b64.as_bytes()) {
+        Ok(c) if !c.is_empty() => c,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"invalid or empty ciphertext_b64"})),
+            )
+                .into_response()
+        }
+    };
+    let sig_bytes = match BASE64.decode(rb.signature_b64.as_bytes()) {
+        Ok(s) if s.len() == 64 => s,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"signature_b64 must decode to 64 bytes"})),
+            )
+                .into_response()
+        }
+    };
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&sig_bytes);
+
+    let layer = match parse_layer(&rb.layer) {
+        Some(l) => l,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":"invalid layer"})),
+            )
+                .into_response()
+        }
+    };
+
+    // Build the record over the CLIENT ciphertext. `new()` content-addresses
+    // record_id over exactly (owner, timestamp, layer, tags, source_ai, ciphertext),
+    // so the id is reproducible and the client signed the same value.
+    let mut record = MemoryRecord::new(
+        owner,
+        rb.timestamp,
+        layer,
+        rb.topic_tags.clone(),
+        rb.source_ai.clone(),
+        ciphertext,
+        rb.embedding.clone(),
+    );
+    record.blind = true;
+    record.signature = signature;
+
+    // Verify the client's signature over record_id — the node never re-signs.
+    // (Same check the P2P BroadcastRecord path uses.)
+    let sig_ok = match IdentityPublicKey::from_bytes(&owner) {
+        Ok(pk) => pk.verify(&record.record_id, &record.signature).is_ok(),
+        Err(_) => false,
+    };
+    if !sig_ok {
+        let short = &owner_hex[..8.min(owner_hex.len())];
+        warn!(owner = %short, "[MPI_SEALED] record signature verification failed");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error":"record signature invalid for owner"})),
+        )
+            .into_response();
+    }
+
+    let rid_hex = record.id_hex();
+    if !storage.insert(&record, &rb.embedding_model).await {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":"exists","record_id":rid_hex})),
+        )
+            .into_response();
+    }
+
+    let short = &owner_hex[..8.min(owner_hex.len())];
+    info!(id = %rid_hex, owner = %short, "[MPI_SEALED] Stored node-blind record");
     (
         StatusCode::CREATED,
         Json(serde_json::json!(RememberResponse {
@@ -672,6 +848,10 @@ pub struct RecordDetailResponse {
     pub embedding_model: String,
     pub has_embedding: bool,
     pub status: String,
+    /// True when `content` is base64 client ciphertext (a node-blind record the
+    /// node cannot decrypt); false when `content` is plaintext.
+    #[serde(default)]
+    pub sealed: bool,
 }
 
 pub async fn mpi_get_record(
@@ -722,7 +902,17 @@ pub async fn mpi_get_record(
     }
 
     let em = storage.get_embedding_model(&rid).await.unwrap_or_default();
-    let content = String::from_utf8_lossy(&record.encrypted_content).to_string();
+    // Node-blind records return their client ciphertext as base64 (the node
+    // cannot decrypt them); sighted records return plaintext.
+    let (content, sealed) = if record.blind {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        (BASE64.encode(&record.encrypted_content), true)
+    } else {
+        (
+            String::from_utf8_lossy(&record.encrypted_content).to_string(),
+            false,
+        )
+    };
 
     (
         StatusCode::OK,
@@ -745,6 +935,7 @@ pub async fn mpi_get_record(
                 "revoked"
             }
             .into(),
+            sealed,
         })),
     )
         .into_response()

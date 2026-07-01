@@ -904,6 +904,10 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
     let mpi_routes = Router::new()
         // Core endpoints (mpi_handlers.rs)
         .route("/api/mpi/remember", post(mpi_handlers::mpi_remember))
+        .route(
+            "/api/mpi/remember_sealed",
+            post(mpi_handlers::mpi_remember_sealed),
+        )
         .route("/api/mpi/recall", post(super::recall_handler::mpi_recall))
         .route(
             "/api/mpi/recall/detail",
