@@ -91,6 +91,9 @@
 //  38. Uses a shorter privacy-safe probe recovery cooldown while two-hop
 //      message-delivery proof is not ready, so transient restart failures do
 //      not keep healthy nodes in a forming state for a full low-noise cycle.
+//  39. Promotes route governance to a top-level heartbeat discovery_status
+//      field so backend/nodeboard can read route-pool health without parsing
+//      the full internal PeerStore payload.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -110,6 +113,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.2.5-RouteGovernanceHeartbeat - Promote aggregate route governance in discovery_status heartbeat
 //   v1.2.4-BlindRelayProbeRecoveryCooldown - Reprobe faster until two-hop delivery proof is healthy
 //   v1.2.3-PeerCacheEmptyOverwriteGuard - Preserve usable cache when current PeerStore is empty
 //   v1.2.2-ProbeCoveragePriority - Probe unproven non-quarantined peers before already-proven peers
@@ -1745,6 +1749,7 @@ impl Server {
                 );
                 let discovery_readiness =
                     discovery_readiness_status_value(&status, &local_capabilities);
+                let route_governance = serde_json::json!(&status.route_governance);
                 let signed_peer_records = peer_store.export_signed_peer_records_for_heartbeat(
                     now,
                     Some(config.discovery.max_snapshot_limit),
@@ -1752,6 +1757,7 @@ impl Server {
                 Some(serde_json::json!({
                     "generated_at": now,
                     "peer_store": status,
+                    "route_governance": route_governance,
                     "signed_peer_records": signed_peer_records,
                     "local_capabilities": local_capabilities,
                     "discovery_readiness": discovery_readiness,
@@ -5150,6 +5156,9 @@ mod tests {
         let blind_relay_runtime = readiness
             .get("blind_relay_runtime")
             .expect("blind relay runtime readiness object");
+        let route_governance = readiness
+            .get("route_governance")
+            .expect("route governance readiness object");
         let protocol_foundation = readiness
             .get("protocol_foundation")
             .expect("protocol foundation readiness object");
@@ -5171,6 +5180,12 @@ mod tests {
         assert_eq!(blind_relay_runtime["forward_failed"], 0);
         assert_eq!(blind_relay_runtime["last_event_age_seconds"], 10);
         assert!(blind_relay_runtime["last_probe_age_seconds"].is_null());
+        assert_eq!(route_governance["contract_version"], "route_governance.v1");
+        assert_eq!(route_governance["status"], "forming");
+        assert_eq!(route_governance["route_pool_ready"], false);
+        assert_eq!(route_governance["quality_ready"], false);
+        assert_eq!(route_governance["candidates_total"], 0);
+        assert!(route_governance["average_score"].is_null());
 
         let serialized = serde_json::to_string(&readiness).unwrap();
         assert!(!serialized.contains("https://node.example.com"));

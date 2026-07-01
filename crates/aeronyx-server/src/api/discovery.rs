@@ -52,6 +52,7 @@
 //!   surfaces never need to parse full peer diagnostics.
 //!
 //! ## Last Modified
+//! v0.23.0-RouteGovernanceHeartbeatReadiness - Add compact route governance to discovery readiness
 //! v0.22.0-RouteGovernanceSummary - Add compact route-quality governance to public summary
 //! v0.21.0-BlindRelayRuntimeObservability - Add unified blind relay runtime view for nodeboard/backend
 //! v0.20.0-OnionRelayAdmissionWarmupDetail - Expose stability-window progress without route metadata
@@ -650,6 +651,7 @@ pub fn discovery_readiness_status_value(
     let peer_quorum = &status.peer_quorum;
     let network_story = &status.network_story;
     let blind_relay_quality = &status.blind_relay_quality;
+    let route_governance = &status.route_governance;
     let recent_message_delivery_ready = status
         .two_hop_path_proof_history
         .recent_message_delivery_ready
@@ -778,6 +780,32 @@ pub fn discovery_readiness_status_value(
             "chat_two_hop_onion_ready": network_story.chat_two_hop_onion_ready,
             "routeable_chat_relays": network_story.routeable_chat_relays,
             "routeable_onion_middle_hops": network_story.routeable_onion_middle_hops,
+        },
+        "route_governance": {
+            "contract_version": &route_governance.contract_version,
+            "status": &route_governance.status,
+            "route_pool_ready": route_governance.route_pool_ready,
+            "quality_ready": route_governance.quality_ready,
+            "candidates_total": route_governance.candidates_total,
+            "routeable_total": route_governance.routeable_total,
+            "routeable_chat_relays": route_governance.routeable_chat_relays,
+            "routeable_onion_middle_hops": route_governance.routeable_onion_middle_hops,
+            "routeable_privacy_relays": route_governance.routeable_privacy_relays,
+            "quarantined_total": route_governance.quarantined_total,
+            "failing_total": route_governance.failing_total,
+            "degraded_total": route_governance.degraded_total,
+            "unknown_routeability_total": route_governance.unknown_routeability_total,
+            "stale_routeability_total": route_governance.stale_routeability_total,
+            "unreachable_total": route_governance.unreachable_total,
+            "best_score": route_governance.best_score,
+            "worst_score": route_governance.worst_score,
+            "average_score": route_governance.average_score,
+            "chat_single_hop_ready": route_governance.chat_single_hop_ready,
+            "chat_two_hop_onion_ready": route_governance.chat_two_hop_onion_ready,
+            "quarantine_threshold": route_governance.quarantine_threshold,
+            "quarantine_seconds": route_governance.quarantine_seconds,
+            "routeability_stale_after_seconds": route_governance.routeability_stale_after_seconds,
+            "next_action": &route_governance.next_action,
         },
         "onion_relay_admission": onion_relay_admission,
         "blind_relay_runtime": {
