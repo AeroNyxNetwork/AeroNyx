@@ -2466,12 +2466,16 @@ impl Server {
         now: u64,
     ) -> u64 {
         let status = peer_store.status(now);
-        let two_hop_delivery_ready = status
-            .two_hop_path_proof_history
-            .recent_message_delivery_ready
-            && !status.two_hop_path_proof_history.failure_streak_active;
+        let proof = &status.two_hop_path_proof_history;
+        let two_hop_delivery_ready =
+            proof.recent_message_delivery_ready && !proof.failure_streak_active;
+        let two_hop_stability_ready =
+            proof.stability_ready && !proof.failure_circuit_breaker_active;
 
-        if status.blind_relay_quality.quality_ready && two_hop_delivery_ready {
+        if status.blind_relay_quality.quality_ready
+            && two_hop_delivery_ready
+            && two_hop_stability_ready
+        {
             Self::blind_relay_probe_cooldown_secs(discovery)
         } else {
             Self::blind_relay_probe_recovery_cooldown_secs(discovery)
@@ -4802,7 +4806,7 @@ mod tests {
     }
 
     #[test]
-    fn blind_relay_probe_cooldown_uses_recovery_interval_until_delivery_proof_is_ready() {
+    fn blind_relay_probe_cooldown_uses_recovery_interval_until_stability_window_is_ready() {
         let mut discovery = DiscoveryConfig::default();
         discovery.gossip_interval_secs = 60;
 
@@ -4823,11 +4827,34 @@ mod tests {
         );
         assert_eq!(
             Server::blind_relay_probe_cooldown_secs_for_status(&discovery, &store, 1_700_000_020,),
-            BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS
+            super::BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS
         );
 
         store.record_blind_relay_two_hop_probe_result_with_context(
             1_700_000_030,
+            true,
+            "onion_terminal_delivered",
+            2,
+            1,
+            2,
+            1,
+        );
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_040,
+            true,
+            "onion_terminal_delivered",
+            2,
+            1,
+            2,
+            1,
+        );
+        assert_eq!(
+            Server::blind_relay_probe_cooldown_secs_for_status(&discovery, &store, 1_700_000_050,),
+            BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS
+        );
+
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_060,
             false,
             "request_error",
             2,
@@ -4836,7 +4863,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            Server::blind_relay_probe_cooldown_secs_for_status(&discovery, &store, 1_700_000_040,),
+            Server::blind_relay_probe_cooldown_secs_for_status(&discovery, &store, 1_700_000_070,),
             super::BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS
         );
     }

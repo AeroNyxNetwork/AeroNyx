@@ -51,6 +51,7 @@
 //!   surfaces never need to parse full peer diagnostics.
 //!
 //! ## Last Modified
+//! v0.20.0-OnionRelayAdmissionWarmupDetail - Expose stability-window progress without route metadata
 //! v0.19.0-OnionRelayAdmissionContract - Add aggregate admission score and warmup contract
 //! v0.18.0-OnionCandidatePoolHealth - Expose aggregate onion candidate pool health for App/nodeboard decisions
 //! v0.17.0-DiscoverySummaryProofStabilityWindow - Expose two-hop proof stability and circuit-breaker fields
@@ -105,6 +106,8 @@ const ONION_CANDIDATES_SELECTION_POLICY: &str =
 const ONION_CANDIDATES_REFRESH_AFTER_SECONDS: u64 = 300;
 const ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS: u64 = 1_800;
 const ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES: usize = 2;
+const ONION_RELAY_ADMISSION_STABILITY_MIN_PROOFS: u64 = 3;
+const ONION_RELAY_ADMISSION_STABILITY_SUCCESS_PERCENT: u8 = 80;
 
 #[derive(Clone)]
 struct DiscoveryApiState {
@@ -496,6 +499,8 @@ pub fn onion_relay_admission_status_value(
     let recent_path_proof_ready = proof.proof_ready && !proof.failure_streak_active;
     let stable_path_proof_ready = proof.stability_ready && !proof.failure_circuit_breaker_active;
     let restart_recovery_ready = peer_quorum.restart_recovery_configured;
+    let stability_remaining_attempts =
+        ONION_RELAY_ADMISSION_STABILITY_MIN_PROOFS.saturating_sub(proof.stability_window_attempted);
     let checks_total = 5u8;
     let checks_passed = [
         local_relay_ready,
@@ -535,20 +540,39 @@ pub fn onion_relay_admission_status_value(
     } else {
         "eligible"
     };
+    let mut admission_blockers = Vec::new();
+    if !local_relay_ready {
+        admission_blockers.push("local_relay_not_ready");
+    }
+    if !route_pool_ready {
+        admission_blockers.push("route_pool_not_ready");
+    }
+    if !recent_path_proof_ready {
+        admission_blockers.push("recent_path_proof_not_ready");
+    }
+    if !stable_path_proof_ready {
+        admission_blockers.push("stable_path_proof_not_ready");
+    }
+    if !restart_recovery_ready {
+        admission_blockers.push("restart_recovery_not_ready");
+    }
     let warmup_hint = match warmup_stage {
-        "eligible" => "node is eligible for client-selected two-hop onion relay paths",
+        "eligible" => "node is eligible for client-selected two-hop onion relay paths".to_string(),
         "local_relay" => {
-            "align ChatRelay config, runtime, public peer API, and advertised capability"
+            "align ChatRelay config, runtime, public peer API, and advertised capability".to_string()
         }
-        "route_pool" => "wait for at least two fresh routeable ChatRelay and OnionMiddle peers",
-        "path_proof" => "wait for a fresh accepted entry-middle-terminal proof",
-        "stability_window" => {
-            "collect at least three recent two-hop proof samples with strong success rate"
+        "route_pool" => {
+            "wait for at least two fresh routeable ChatRelay and OnionMiddle peers".to_string()
         }
+        "path_proof" => "wait for a fresh accepted entry-middle-terminal proof".to_string(),
+        "stability_window" => format!(
+            "collect {stability_remaining_attempts} more recent two-hop proof sample(s) and keep success rate at or above {ONION_RELAY_ADMISSION_STABILITY_SUCCESS_PERCENT}%"
+        ),
         "restart_recovery" => {
             "configure peer cache or seed endpoints before treating admission as restart-resilient"
+                .to_string()
         }
-        _ => "continue warming relay admission gates",
+        _ => "continue warming relay admission gates".to_string(),
     };
 
     serde_json::json!({
@@ -558,6 +582,7 @@ pub fn onion_relay_admission_status_value(
         "admission_score_percent": admission_score_percent,
         "checks_passed": checks_passed,
         "checks_total": checks_total,
+        "admission_blockers": admission_blockers,
         "warmup_stage": warmup_stage,
         "warmup_hint": warmup_hint,
         "local_relay_ready": local_relay_ready,
@@ -571,11 +596,22 @@ pub fn onion_relay_admission_status_value(
         "min_routeable_onion_middle_hops": ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
         "two_hop_stability_status": &proof.stability_status,
         "two_hop_stability_ready": proof.stability_ready,
+        "two_hop_stability_window_size": proof.stability_window_size,
+        "two_hop_stability_window_attempted": proof.stability_window_attempted,
+        "two_hop_stability_window_succeeded": proof.stability_window_succeeded,
+        "two_hop_stability_window_failed": proof.stability_window_failed,
+        "two_hop_stability_min_attempts": ONION_RELAY_ADMISSION_STABILITY_MIN_PROOFS,
+        "two_hop_stability_remaining_attempts": stability_remaining_attempts,
         "two_hop_stability_success_percent": proof.stability_success_percent,
+        "two_hop_stability_success_threshold_percent": ONION_RELAY_ADMISSION_STABILITY_SUCCESS_PERCENT,
+        "latest_path_proof_age_seconds": proof.latest_age_seconds,
+        "latest_success_age_seconds": proof.latest_success_age_seconds,
+        "latest_message_delivery_age_seconds": proof.latest_message_delivery_age_seconds,
         "failure_circuit_breaker_active": proof.failure_circuit_breaker_active,
         "failure_streak_active": proof.failure_streak_active,
         "routeability_stale_after_seconds": ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS,
         "refresh_after_seconds": ONION_CANDIDATES_REFRESH_AFTER_SECONDS,
+        "probe_cadence_policy": "recovery_cadence_until_stability_window_ready_then_low_frequency",
         "client_route_policy": "client_selected_two_hop_onion_when_eligible",
         "network_story_status": &network_story.status,
         "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
@@ -2139,6 +2175,10 @@ mod tests {
             Some("stability_window")
         );
         assert_eq!(
+            parsed["onion_relay_admission"]["admission_blockers"][0].as_str(),
+            Some("stable_path_proof_not_ready")
+        );
+        assert_eq!(
             parsed["onion_relay_admission"]["route_pool_ready"].as_bool(),
             Some(true)
         );
@@ -2149,6 +2189,30 @@ mod tests {
         assert_eq!(
             parsed["onion_relay_admission"]["stable_path_proof_ready"].as_bool(),
             Some(false)
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["two_hop_stability_window_attempted"].as_u64(),
+            Some(7)
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["two_hop_stability_window_succeeded"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["two_hop_stability_min_attempts"].as_u64(),
+            Some(3)
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["two_hop_stability_remaining_attempts"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["two_hop_stability_success_threshold_percent"].as_u64(),
+            Some(80)
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["probe_cadence_policy"].as_str(),
+            Some("recovery_cadence_until_stability_window_ready_then_low_frequency")
         );
         assert_eq!(
             parsed["two_hop_path_proof"]["restart_recovery_configured"].as_bool(),
