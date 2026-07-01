@@ -1,6 +1,6 @@
 # MemChain Blind Cognition — Design (relocating cognition off the node)
 
-> Status: **DESIGN (accepted direction, code not started).** Builds on the completed node-blind path (`docs/memchain-node-blind-refactor.md`, Brick 1). Verified against `main`.
+> Status: **IMPLEMENTED (node side) — all bricks landed on `main`.** Builds on the node-blind path (`docs/memchain-node-blind-refactor.md`, Brick 1). Bricks: 3a `0a04f59`, 3b `460dee2`, 3c `7534f11`+`a781f72`, 3d `382a47d`. (Client-side artifact production — tokenize/hash/extract/summarize — is separate and not yet built.)
 > Goal: give **node-blind** records the same retrieval quality as sighted ones — **full-text (BM25), graph, and summary** — while the node **still never reads plaintext**. Cognition (tokenize / extract / embed / summarize) moves to the **client** (which holds the plaintext) or a **user-chosen LLM**; the node stores and indexes only client-supplied, privacy-preserving artifacts.
 > Constraint: **additive, default-off, never touch the VPN core.**
 
@@ -44,12 +44,12 @@ Per-owner artifact keys (`k_fts`, `k_graph`, …) are derived from the P2P ident
 | Graph | entity-hashes + edges | `memory_edges` + BFS over hashes |
 | Summary | summary text (client / user-LLM) | store as a sealed **derived** record |
 
-## 6. Brick sequence
+## 6. Brick sequence — ✅ all landed on `main`
 
-- **3a — blind FTS (write + index):** `remember_sealed` accepts `fts_terms: Vec<String>` (hex token-hashes); the node indexes them into the new non-stemming `blind_fts` table. Storage-level test: index terms for a blind record, search by a term-hash, get the record. *(Node-side; testable with synthetic hashes.)*
-- **3b — recall by blind terms:** `recall` accepts `query_terms: Vec<String>` (hashed); `bm25_search_blind` surfaces blind records into the `sealed` list (alongside the vector matches from Brick 1). Fuse blind vector + blind BM25.
-- **3c — blind graph:** `remember_sealed` accepts entity-hashes + edges; store in `memory_edges`; recall graph-expands over hashes.
-- **3d — blind derived/summary records:** a sealed-record shape for client/LLM-produced summaries carrying `derived_from` provenance; surfaced in recall.
+- **3a — blind FTS (write + index): ✅ `0a04f59`.** `remember_sealed` accepts `fts_terms` (hex token-hashes); the node indexes them into the non-stemming `blind_fts` table. Storage test included.
+- **3b — recall by blind terms: ✅ `460dee2`.** `recall` accepts `query_terms` (hashed); `bm25_search_blind` surfaces blind records into the `sealed` list, deduped with the vector matches.
+- **3c — blind graph: ✅ `7534f11` (write) + `a781f72` (recall).** Implemented as **client-declared record↔record edges** — simpler than entity-hashes and reuses `memory_edges`: the client sends `related_records`; `recall` graph-expands via `get_neighbors` into the `sealed` list (gated by `include_graph`). *(Entity-hash graph per §3 remains a possible future refinement.)*
+- **3d — blind derived/summary records: ✅ `382a47d`.** `remember_sealed` accepts `derived_from` (source record_ids), stored in an idempotent `blind_provenance` table; record detail returns it. A summary is stored as an ordinary blind record.
 
 ## 7. Reuse (don't rebuild)
 

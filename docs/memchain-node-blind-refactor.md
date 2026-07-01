@@ -1,6 +1,6 @@
 # MemChain Node-Blind Refactor — Audit & Phased Plan
 
-> Status: **PLAN (accepted, brick 1 not yet implemented).** Investigation date 2026-07-01, verified against `main` (commit `ef564ad`).
+> Status: **Brick 1 IMPLEMENTED on `main`; blind cognition (full-text / graph / provenance) also landed.** Commits: storage foundation `6f49362`, sealed write `c2df34b`, vector recall `a126e37`; blind cognition `0a04f59`→`382a47d` (see `memchain-blind-cognition-design.md`). Remaining, later bricks: metadata minimization, node-to-node replication, encrypted-BM25 hardening. Investigation date 2026-07-01, verified against `main` (commit `ef564ad`).
 > Goal: make the node **blind** to user memory — E2E-encrypted, per-identity, content-addressed — the same "nodes can't read your data" property the rest of AeroNyx (VPN / chat / onion relay) already has. Today the MemChain node is **fully sighted**.
 > Method: **additive, default-off, brick-by-brick.** Each brick builds green (`cargo test`) and is pushed independently. **The VPN core flow is never touched** (see §5).
 
