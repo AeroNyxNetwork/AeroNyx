@@ -113,6 +113,10 @@
 //! - Network story readiness treats a fresh successful two-hop path proof as
 //!   onion-ready evidence, preventing proven delivery paths from being hidden by
 //!   conservative local route-candidate planning after restart
+//! - Two-hop path proof stability windows expose recent success rate, proof-age
+//!   buckets, and failure-circuit-breaker state so nodeboard/backend can
+//!   distinguish a single fresh proof from a repeated stable encrypted route
+//!   foundation without exposing route metadata
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -139,6 +143,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.50.0-TwoHopProofStabilityWindow - Added privacy-safe stability window and failure circuit breaker fields
 //! v0.49.0-TwoHopProbeReasonBuckets - Bucket runtime two-hop blind relay probe errors
 //! v0.48.0-BlindRelayFreshnessGate - Require fresh accepted/probe evidence before reporting blind relay ready
 //! v0.47.0-TwoHopProofBackedStory - Let fresh two-hop path proof promote local network story to onion_ready
@@ -272,6 +277,10 @@ pub struct PeerStoreSnapshot {
 const MAX_AUDIT_EVENTS: usize = 64;
 const MAX_PEER_EVENTS: usize = 64;
 const MAX_TWO_HOP_PATH_PROOF_EVENTS: usize = 32;
+const TWO_HOP_PATH_PROOF_STABILITY_WINDOW_EVENTS: usize = 8;
+const TWO_HOP_PATH_PROOF_STABILITY_MIN_ATTEMPTS: u64 = 3;
+const TWO_HOP_PATH_PROOF_STABILITY_SUCCESS_PERCENT: u8 = 80;
+const TWO_HOP_PATH_PROOF_FAILURE_CIRCUIT_BREAKER_THRESHOLD: u64 = 3;
 
 /// Privacy-safe discovery control-plane audit event.
 ///
@@ -385,6 +394,44 @@ pub struct PeerStoreTwoHopPathProofHistory {
     pub failed: u64,
     /// Success percentage over retained events.
     pub success_percent: u8,
+    /// Number of latest retained events considered for stability scoring.
+    ///
+    /// This window is intentionally aggregate-only. It must never expose
+    /// individual route ids, endpoint URLs, node ids, encrypted blobs, receiver
+    /// identities, client IPs, DNS contents, destinations, Memory Chain
+    /// plaintext, wallet traffic, or social graph edges.
+    #[serde(default)]
+    pub stability_window_size: usize,
+    /// Attempts in the stability scoring window.
+    #[serde(default)]
+    pub stability_window_attempted: u64,
+    /// Accepted proofs in the stability scoring window.
+    #[serde(default)]
+    pub stability_window_succeeded: u64,
+    /// Rejected proofs in the stability scoring window.
+    #[serde(default)]
+    pub stability_window_failed: u64,
+    /// Success percentage over the stability scoring window.
+    #[serde(default)]
+    pub stability_success_percent: u8,
+    /// Stable maturity bucket: forming, warming_up, stable, degraded, stale,
+    /// failing, or circuit_breaker.
+    #[serde(default)]
+    pub stability_status: String,
+    /// Whether the recent proof window is mature enough for product surfaces to
+    /// describe the route foundation as repeatedly stable.
+    #[serde(default)]
+    pub stability_ready: bool,
+    /// Consecutive rejected proof threshold for the local circuit-breaker bucket.
+    #[serde(default)]
+    pub failure_circuit_breaker_threshold: u64,
+    /// Whether recent consecutive proof failures crossed the local
+    /// circuit-breaker threshold.
+    #[serde(default)]
+    pub failure_circuit_breaker_active: bool,
+    /// Coarse latest proof age bucket: none, fresh, acceptable, aging, or stale.
+    #[serde(default)]
+    pub latest_age_bucket: String,
     /// Latest proof outcome, when any retained event exists.
     pub latest_outcome: Option<String>,
     /// Latest proof reason bucket, when any retained event exists.
@@ -2964,6 +3011,24 @@ impl PeerStore {
         } else {
             ((succeeded.saturating_mul(100)) / attempted).min(100) as u8
         };
+        let stability_events = events
+            .iter()
+            .rev()
+            .take(TWO_HOP_PATH_PROOF_STABILITY_WINDOW_EVENTS)
+            .collect::<Vec<_>>();
+        let stability_window_attempted = stability_events.len() as u64;
+        let stability_window_succeeded = stability_events
+            .iter()
+            .filter(|event| event.outcome == "accepted")
+            .count() as u64;
+        let stability_window_failed =
+            stability_window_attempted.saturating_sub(stability_window_succeeded);
+        let stability_success_percent = if stability_window_attempted == 0 {
+            0
+        } else {
+            ((stability_window_succeeded.saturating_mul(100)) / stability_window_attempted).min(100)
+                as u8
+        };
         let latest = events.last();
         let latest_age_seconds = latest.map(|event| now.saturating_sub(event.at));
         let latest_success_age_seconds = events
@@ -3043,6 +3108,31 @@ impl PeerStore {
             .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
             .unwrap_or(false);
         let failure_streak_active = consecutive_failures > 0;
+        let failure_circuit_breaker_active =
+            consecutive_failures >= TWO_HOP_PATH_PROOF_FAILURE_CIRCUIT_BREAKER_THRESHOLD;
+        let latest_age_bucket = Self::two_hop_path_proof_age_bucket(latest_age_seconds);
+        let stability_ready = stability_window_attempted
+            >= TWO_HOP_PATH_PROOF_STABILITY_MIN_ATTEMPTS
+            && stability_success_percent >= TWO_HOP_PATH_PROOF_STABILITY_SUCCESS_PERCENT
+            && recent_message_delivery_ready
+            && !failure_circuit_breaker_active;
+        let stability_status = if attempted == 0 {
+            "forming"
+        } else if failure_circuit_breaker_active {
+            "circuit_breaker"
+        } else if latest_age_bucket == "stale" {
+            "stale"
+        } else if stability_window_attempted < TWO_HOP_PATH_PROOF_STABILITY_MIN_ATTEMPTS {
+            "warming_up"
+        } else if stability_ready {
+            "stable"
+        } else if stability_success_percent >= TWO_HOP_PATH_PROOF_STABILITY_SUCCESS_PERCENT {
+            "route_stable_waiting_message_delivery"
+        } else if stability_window_succeeded > 0 {
+            "degraded"
+        } else {
+            "failing"
+        };
         let (status, proof_ready, next_action) = if attempted == 0 {
             (
                 "forming",
@@ -3102,6 +3192,17 @@ impl PeerStore {
             message_delivery_successes,
             failed,
             success_percent,
+            stability_window_size: TWO_HOP_PATH_PROOF_STABILITY_WINDOW_EVENTS,
+            stability_window_attempted,
+            stability_window_succeeded,
+            stability_window_failed,
+            stability_success_percent,
+            stability_status: stability_status.to_string(),
+            stability_ready,
+            failure_circuit_breaker_threshold:
+                TWO_HOP_PATH_PROOF_FAILURE_CIRCUIT_BREAKER_THRESHOLD,
+            failure_circuit_breaker_active,
+            latest_age_bucket: latest_age_bucket.to_string(),
             latest_outcome: latest.map(|event| event.outcome.clone()),
             latest_reason_bucket: latest.map(|event| event.reason_bucket.clone()),
             latest_age_seconds,
@@ -3131,6 +3232,16 @@ impl PeerStore {
             events,
             privacy_invariant: "blind_nodes_route_only_opaque_ciphertext".to_string(),
             privacy_boundary: "bounded synthetic two-hop proof history only; no node IDs, endpoints, route IDs, encrypted payloads, receiver identities, client IPs, DNS contents, domains, URLs, Memory Chain plaintext, voucher secrets, wallet-level traffic, or social graph edges".to_string(),
+        }
+    }
+
+    fn two_hop_path_proof_age_bucket(latest_age_seconds: Option<u64>) -> &'static str {
+        match latest_age_seconds {
+            None => "none",
+            Some(age) if age <= PEER_ROUTE_LAST_SEEN_FRESH_SECS => "fresh",
+            Some(age) if age <= PEER_ROUTE_LAST_SEEN_ACCEPTABLE_SECS => "acceptable",
+            Some(age) if age <= PEER_ROUTEABILITY_STALE_AFTER_SECS => "aging",
+            Some(_) => "stale",
         }
     }
 
@@ -6371,6 +6482,40 @@ mod tests {
         );
         assert_eq!(status.two_hop_path_proof_history.success_percent, 100);
         assert_eq!(
+            status.two_hop_path_proof_history.stability_window_size,
+            TWO_HOP_PATH_PROOF_STABILITY_WINDOW_EVENTS
+        );
+        assert_eq!(
+            status.two_hop_path_proof_history.stability_window_attempted,
+            1
+        );
+        assert_eq!(
+            status.two_hop_path_proof_history.stability_window_succeeded,
+            1
+        );
+        assert_eq!(status.two_hop_path_proof_history.stability_window_failed, 0);
+        assert_eq!(
+            status.two_hop_path_proof_history.stability_success_percent,
+            100
+        );
+        assert_eq!(
+            status.two_hop_path_proof_history.stability_status,
+            "warming_up"
+        );
+        assert!(!status.two_hop_path_proof_history.stability_ready);
+        assert_eq!(
+            status
+                .two_hop_path_proof_history
+                .failure_circuit_breaker_threshold,
+            TWO_HOP_PATH_PROOF_FAILURE_CIRCUIT_BREAKER_THRESHOLD
+        );
+        assert!(
+            !status
+                .two_hop_path_proof_history
+                .failure_circuit_breaker_active
+        );
+        assert_eq!(status.two_hop_path_proof_history.latest_age_bucket, "fresh");
+        assert_eq!(
             status.two_hop_path_proof_history.latest_outcome.as_deref(),
             Some("accepted")
         );
@@ -6556,6 +6701,13 @@ mod tests {
         assert_eq!(history.message_delivery_successes, 1);
         assert_eq!(history.latest_message_delivery_age_seconds, Some(5));
         assert_eq!(history.consecutive_message_delivery_successes, 1);
+        assert_eq!(history.stability_window_attempted, 1);
+        assert_eq!(history.stability_window_succeeded, 1);
+        assert_eq!(history.stability_success_percent, 100);
+        assert_eq!(history.stability_status, "warming_up");
+        assert!(!history.stability_ready);
+        assert!(!history.failure_circuit_breaker_active);
+        assert_eq!(history.latest_age_bucket, "fresh");
         assert_eq!(history.events.len(), 1);
         assert_eq!(history.events[0].evidence_mode, "real_relay_traffic");
         assert_eq!(history.events[0].proof_scope, "message_delivery");
@@ -6641,6 +6793,14 @@ mod tests {
         assert!(!history.recent_message_delivery_ready);
         assert!(!history.failure_streak_active);
         assert_eq!(history.success_percent, 25);
+        assert_eq!(history.stability_window_attempted, 4);
+        assert_eq!(history.stability_window_succeeded, 1);
+        assert_eq!(history.stability_window_failed, 3);
+        assert_eq!(history.stability_success_percent, 25);
+        assert_eq!(history.stability_status, "degraded");
+        assert!(!history.stability_ready);
+        assert!(!history.failure_circuit_breaker_active);
+        assert_eq!(history.latest_age_bucket, "fresh");
         assert_eq!(history.latest_outcome.as_deref(), Some("accepted"));
         assert_eq!(history.latest_reason_bucket.as_deref(), Some("accepted"));
         assert_eq!(history.latest_age_seconds, Some(15));
@@ -6706,6 +6866,13 @@ mod tests {
         assert_eq!(failing_history.latest_success_age_seconds, None);
         assert_eq!(failing_history.latest_failure_age_seconds, Some(10));
         assert_eq!(failing_history.consecutive_failures, 1);
+        assert_eq!(failing_history.stability_window_attempted, 1);
+        assert_eq!(failing_history.stability_window_succeeded, 0);
+        assert_eq!(failing_history.stability_success_percent, 0);
+        assert_eq!(failing_history.stability_status, "warming_up");
+        assert!(!failing_history.stability_ready);
+        assert!(!failing_history.failure_circuit_breaker_active);
+        assert_eq!(failing_history.latest_age_bucket, "fresh");
         assert!(failing_history.next_action.contains("routeability"));
 
         let stale_store = PeerStore::new();
@@ -6724,9 +6891,87 @@ mod tests {
         );
         assert_eq!(stale_history.latest_failure_age_seconds, None);
         assert_eq!(stale_history.consecutive_successes, 1);
+        assert_eq!(stale_history.stability_status, "stale");
+        assert!(!stale_history.stability_ready);
+        assert_eq!(stale_history.latest_age_bucket, "stale");
         assert!(stale_history
             .next_action
             .contains("fresh two-hop path proof"));
+    }
+
+    #[test]
+    fn test_two_hop_path_proof_stability_window_marks_stable_and_circuit_breaker() {
+        let stable_store = PeerStore::new();
+        stable_store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_010,
+            true,
+            "onion_terminal_delivered",
+            3,
+            3,
+            2,
+            1,
+        );
+        stable_store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_020,
+            true,
+            "onion_terminal_delivered",
+            3,
+            3,
+            2,
+            1,
+        );
+        stable_store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_030,
+            true,
+            "onion_terminal_delivered",
+            3,
+            3,
+            2,
+            1,
+        );
+
+        let stable_history = stable_store
+            .status(1_700_000_040)
+            .two_hop_path_proof_history;
+        assert_eq!(stable_history.stability_window_attempted, 3);
+        assert_eq!(stable_history.stability_window_succeeded, 3);
+        assert_eq!(stable_history.stability_window_failed, 0);
+        assert_eq!(stable_history.stability_success_percent, 100);
+        assert_eq!(stable_history.stability_status, "stable");
+        assert!(stable_history.stability_ready);
+        assert!(!stable_history.failure_circuit_breaker_active);
+        assert_eq!(stable_history.latest_age_bucket, "fresh");
+        assert_eq!(stable_history.consecutive_message_delivery_successes, 3);
+
+        let circuit_store = PeerStore::new();
+        circuit_store.record_blind_relay_two_hop_probe_result(1_700_000_010, false, "http_502");
+        circuit_store.record_blind_relay_two_hop_probe_result(1_700_000_020, false, "ack_rejected");
+        circuit_store.record_blind_relay_two_hop_probe_result(
+            1_700_000_030,
+            false,
+            "request_error",
+        );
+
+        let circuit_history = circuit_store
+            .status(1_700_000_040)
+            .two_hop_path_proof_history;
+        assert_eq!(circuit_history.status, "attention");
+        assert_eq!(circuit_history.stability_window_attempted, 3);
+        assert_eq!(circuit_history.stability_window_succeeded, 0);
+        assert_eq!(circuit_history.stability_window_failed, 3);
+        assert_eq!(circuit_history.stability_success_percent, 0);
+        assert_eq!(circuit_history.consecutive_failures, 3);
+        assert_eq!(circuit_history.stability_status, "circuit_breaker");
+        assert!(!circuit_history.stability_ready);
+        assert!(circuit_history.failure_circuit_breaker_active);
+        assert_eq!(circuit_history.latest_age_bucket, "fresh");
+
+        let serialized = serde_json::to_string(&circuit_history).expect("history serializes");
+        assert!(!serialized.contains("route_id"));
+        assert!(!serialized.contains("endpoint="));
+        assert!(!serialized.contains("encrypted_blob"));
+        assert!(!serialized.contains("receiver="));
+        assert!(!serialized.contains("client_ip"));
     }
 
     #[test]

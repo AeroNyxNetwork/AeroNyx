@@ -51,6 +51,7 @@
 //!   surfaces never need to parse full peer diagnostics.
 //!
 //! ## Last Modified
+//! v0.17.0-DiscoverySummaryProofStabilityWindow - Expose two-hop proof stability and circuit-breaker fields
 //! v0.16.0-DiscoverySummaryRestartSurvivableProof - Expose strict restart-survivable two-hop proof readiness
 //! v0.15.0-OnionCandidatesFallbackContract - Add explicit two-hop readiness and fallback fields
 //! v0.14.0-DiscoverySummaryRecoveredProofStatus - Treat recent message-delivery proof as recovered ready evidence
@@ -673,6 +674,179 @@ pub fn discovery_summary_response(
         .as_str()
         .unwrap_or("monitor verified peer discovery and relay path proof freshness")
         .to_string();
+    let mut two_hop_path_proof = serde_json::Map::new();
+    two_hop_path_proof.insert(
+        "status".to_string(),
+        serde_json::json!(&two_hop_history.status),
+    );
+    two_hop_path_proof.insert(
+        "freshness_bucket".to_string(),
+        serde_json::json!(&two_hop_history.freshness_bucket),
+    );
+    two_hop_path_proof.insert(
+        "proof_ready".to_string(),
+        serde_json::json!(two_hop_history.proof_ready),
+    );
+    two_hop_path_proof.insert(
+        "recent_success_ready".to_string(),
+        serde_json::json!(two_hop_history.recent_success_ready),
+    );
+    two_hop_path_proof.insert(
+        "message_delivery_ready".to_string(),
+        serde_json::json!(two_hop_history.message_delivery_ready),
+    );
+    two_hop_path_proof.insert(
+        "recent_message_delivery_ready".to_string(),
+        serde_json::json!(two_hop_history.recent_message_delivery_ready),
+    );
+    two_hop_path_proof.insert(
+        "failure_streak_active".to_string(),
+        serde_json::json!(two_hop_history.failure_streak_active),
+    );
+    two_hop_path_proof.insert(
+        "retained_events".to_string(),
+        serde_json::json!(two_hop_history.retained_events),
+    );
+    two_hop_path_proof.insert(
+        "attempted".to_string(),
+        serde_json::json!(two_hop_history.attempted),
+    );
+    two_hop_path_proof.insert(
+        "succeeded".to_string(),
+        serde_json::json!(two_hop_history.succeeded),
+    );
+    two_hop_path_proof.insert(
+        "message_delivery_successes".to_string(),
+        serde_json::json!(two_hop_history.message_delivery_successes),
+    );
+    two_hop_path_proof.insert(
+        "failed".to_string(),
+        serde_json::json!(two_hop_history.failed),
+    );
+    two_hop_path_proof.insert(
+        "success_percent".to_string(),
+        serde_json::json!(two_hop_history.success_percent),
+    );
+    two_hop_path_proof.insert(
+        "stability_window_size".to_string(),
+        serde_json::json!(two_hop_history.stability_window_size),
+    );
+    two_hop_path_proof.insert(
+        "stability_window_attempted".to_string(),
+        serde_json::json!(two_hop_history.stability_window_attempted),
+    );
+    two_hop_path_proof.insert(
+        "stability_window_succeeded".to_string(),
+        serde_json::json!(two_hop_history.stability_window_succeeded),
+    );
+    two_hop_path_proof.insert(
+        "stability_window_failed".to_string(),
+        serde_json::json!(two_hop_history.stability_window_failed),
+    );
+    two_hop_path_proof.insert(
+        "stability_success_percent".to_string(),
+        serde_json::json!(two_hop_history.stability_success_percent),
+    );
+    two_hop_path_proof.insert(
+        "stability_status".to_string(),
+        serde_json::json!(&two_hop_history.stability_status),
+    );
+    two_hop_path_proof.insert(
+        "stability_ready".to_string(),
+        serde_json::json!(two_hop_history.stability_ready),
+    );
+    two_hop_path_proof.insert(
+        "failure_circuit_breaker_threshold".to_string(),
+        serde_json::json!(two_hop_history.failure_circuit_breaker_threshold),
+    );
+    two_hop_path_proof.insert(
+        "failure_circuit_breaker_active".to_string(),
+        serde_json::json!(two_hop_history.failure_circuit_breaker_active),
+    );
+    two_hop_path_proof.insert(
+        "latest_age_bucket".to_string(),
+        serde_json::json!(&two_hop_history.latest_age_bucket),
+    );
+    two_hop_path_proof.insert(
+        "latest_outcome".to_string(),
+        serde_json::json!(&two_hop_history.latest_outcome),
+    );
+    two_hop_path_proof.insert(
+        "latest_reason_bucket".to_string(),
+        serde_json::json!(&two_hop_history.latest_reason_bucket),
+    );
+    two_hop_path_proof.insert(
+        "latest_age_seconds".to_string(),
+        serde_json::json!(two_hop_history.latest_age_seconds),
+    );
+    two_hop_path_proof.insert(
+        "latest_success_age_seconds".to_string(),
+        serde_json::json!(two_hop_history.latest_success_age_seconds),
+    );
+    two_hop_path_proof.insert(
+        "latest_failure_age_seconds".to_string(),
+        serde_json::json!(two_hop_history.latest_failure_age_seconds),
+    );
+    two_hop_path_proof.insert(
+        "latest_message_delivery_age_seconds".to_string(),
+        serde_json::json!(two_hop_history.latest_message_delivery_age_seconds),
+    );
+    two_hop_path_proof.insert(
+        "consecutive_successes".to_string(),
+        serde_json::json!(two_hop_history.consecutive_successes),
+    );
+    two_hop_path_proof.insert(
+        "consecutive_failures".to_string(),
+        serde_json::json!(two_hop_history.consecutive_failures),
+    );
+    two_hop_path_proof.insert(
+        "consecutive_message_delivery_successes".to_string(),
+        serde_json::json!(two_hop_history.consecutive_message_delivery_successes),
+    );
+    two_hop_path_proof.insert(
+        "path_shape_counts".to_string(),
+        serde_json::json!(&two_hop_history.path_shape_counts),
+    );
+    two_hop_path_proof.insert(
+        "candidate_pool_counts".to_string(),
+        serde_json::json!(&two_hop_history.candidate_pool_counts),
+    );
+    two_hop_path_proof.insert(
+        "ttl_shape_counts".to_string(),
+        serde_json::json!(&two_hop_history.ttl_shape_counts),
+    );
+    two_hop_path_proof.insert(
+        "proof_scope".to_string(),
+        serde_json::json!(&two_hop_history.proof_scope),
+    );
+    two_hop_path_proof.insert(
+        "proof_scope_counts".to_string(),
+        serde_json::json!(&two_hop_history.proof_scope_counts),
+    );
+    two_hop_path_proof.insert(
+        "restart_recovery_configured".to_string(),
+        serde_json::json!(peer_quorum.restart_recovery_configured),
+    );
+    two_hop_path_proof.insert(
+        "peer_quorum_ready".to_string(),
+        serde_json::json!(peer_quorum.quorum_ready),
+    );
+    two_hop_path_proof.insert(
+        "restart_survivable_ready".to_string(),
+        serde_json::json!(two_hop_restart_survivable_ready),
+    );
+    two_hop_path_proof.insert(
+        "restart_recovery_basis".to_string(),
+        serde_json::json!(two_hop_restart_recovery_basis),
+    );
+    two_hop_path_proof.insert(
+        "stale_after_seconds".to_string(),
+        serde_json::json!(two_hop_history.stale_after_seconds),
+    );
+    two_hop_path_proof.insert(
+        "next_action".to_string(),
+        serde_json::json!(&two_hop_history.next_action),
+    );
 
     DiscoverySummaryResponse {
         generated_at,
@@ -720,41 +894,7 @@ pub fn discovery_summary_response(
             "last_probe_age_seconds": blind_relay_quality.last_probe_age_seconds,
             "next_action": &blind_relay_quality.next_action,
         }),
-        two_hop_path_proof: serde_json::json!({
-            "status": &two_hop_history.status,
-            "freshness_bucket": &two_hop_history.freshness_bucket,
-            "proof_ready": two_hop_history.proof_ready,
-            "recent_success_ready": two_hop_history.recent_success_ready,
-            "message_delivery_ready": two_hop_history.message_delivery_ready,
-            "recent_message_delivery_ready": two_hop_history.recent_message_delivery_ready,
-            "failure_streak_active": two_hop_history.failure_streak_active,
-            "retained_events": two_hop_history.retained_events,
-            "attempted": two_hop_history.attempted,
-            "succeeded": two_hop_history.succeeded,
-            "message_delivery_successes": two_hop_history.message_delivery_successes,
-            "failed": two_hop_history.failed,
-            "success_percent": two_hop_history.success_percent,
-            "latest_outcome": &two_hop_history.latest_outcome,
-            "latest_reason_bucket": &two_hop_history.latest_reason_bucket,
-            "latest_age_seconds": two_hop_history.latest_age_seconds,
-            "latest_success_age_seconds": two_hop_history.latest_success_age_seconds,
-            "latest_failure_age_seconds": two_hop_history.latest_failure_age_seconds,
-            "latest_message_delivery_age_seconds": two_hop_history.latest_message_delivery_age_seconds,
-            "consecutive_successes": two_hop_history.consecutive_successes,
-            "consecutive_failures": two_hop_history.consecutive_failures,
-            "consecutive_message_delivery_successes": two_hop_history.consecutive_message_delivery_successes,
-            "path_shape_counts": &two_hop_history.path_shape_counts,
-            "candidate_pool_counts": &two_hop_history.candidate_pool_counts,
-            "ttl_shape_counts": &two_hop_history.ttl_shape_counts,
-            "proof_scope": &two_hop_history.proof_scope,
-            "proof_scope_counts": &two_hop_history.proof_scope_counts,
-            "restart_recovery_configured": peer_quorum.restart_recovery_configured,
-            "peer_quorum_ready": peer_quorum.quorum_ready,
-            "restart_survivable_ready": two_hop_restart_survivable_ready,
-            "restart_recovery_basis": two_hop_restart_recovery_basis,
-            "stale_after_seconds": two_hop_history.stale_after_seconds,
-            "next_action": &two_hop_history.next_action,
-        }),
+        two_hop_path_proof: serde_json::Value::Object(two_hop_path_proof),
         next_action,
         privacy_invariant: "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
         privacy_boundary: "aggregate discovery summary only; no signed descriptors, full node ids, endpoint URLs, route ids, encrypted payloads, receiver identities, client public IPs, DNS contents, destinations, Memory Chain plaintext, voucher secrets, private keys, wallet-level traffic, or social graph metadata",
@@ -1582,6 +1722,38 @@ mod tests {
             Some(1)
         );
         assert_eq!(
+            parsed["two_hop_path_proof"]["stability_window_attempted"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["stability_window_succeeded"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["stability_window_failed"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["stability_success_percent"].as_u64(),
+            Some(100)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["stability_status"].as_str(),
+            Some("warming_up")
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["stability_ready"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["failure_circuit_breaker_active"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["latest_age_bucket"].as_str(),
+            Some("fresh")
+        );
+        assert_eq!(
             parsed["two_hop_path_proof"]["latest_reason_bucket"].as_str(),
             Some("onion_terminal_delivered")
         );
@@ -1737,6 +1909,34 @@ mod tests {
         assert_eq!(
             parsed["two_hop_path_proof"]["restart_recovery_basis"].as_str(),
             Some("message_delivery_proof_with_restart_recovery")
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["stability_window_attempted"].as_u64(),
+            Some(7)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["stability_window_succeeded"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["stability_window_failed"].as_u64(),
+            Some(6)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["stability_status"].as_str(),
+            Some("degraded")
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["stability_ready"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["failure_circuit_breaker_active"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["latest_age_bucket"].as_str(),
+            Some("fresh")
         );
 
         let serialized = serde_json::to_string(&parsed).unwrap();
