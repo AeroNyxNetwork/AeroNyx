@@ -110,6 +110,7 @@ const ONION_CANDIDATES_SELECTION_POLICY: &str =
 const ONION_CANDIDATES_REFRESH_AFTER_SECONDS: u64 = 300;
 const ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS: u64 = 1_800;
 const ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES: usize = 2;
+const ONION_CANDIDATES_MAX_CLIENT_HOPS: u8 = 3;
 const ONION_RELAY_ADMISSION_STABILITY_MIN_PROOFS: u64 = 3;
 const ONION_RELAY_ADMISSION_STABILITY_SUCCESS_PERCENT: u8 = 80;
 
@@ -226,6 +227,56 @@ struct SnapshotQuery {
 #[derive(Debug, Deserialize)]
 struct OnionCandidatesQuery {
     limit: Option<usize>,
+    /// Optional product privacy mode requested by the client.
+    ///
+    /// Stable values are `standard`, `enhanced`, and `high`. Unknown values
+    /// fall back to `enhanced` so older clients and AI agents get the existing
+    /// two-hop behavior instead of accidentally downgrading privacy.
+    privacy_mode: Option<String>,
+    /// Optional explicit relay-hop count requested by advanced clients.
+    ///
+    /// Values are clamped to 1..=3. The local node serving this endpoint is the
+    /// entry context, so this count means remote relay hops returned from the
+    /// candidate pool, not total network nodes.
+    hops: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnionPrivacyMode {
+    Standard,
+    Enhanced,
+    High,
+}
+
+impl OnionPrivacyMode {
+    fn from_query(value: Option<&str>) -> Self {
+        match value
+            .unwrap_or("enhanced")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "standard" | "fast" | "low_latency" | "low-latency" => Self::Standard,
+            "high" | "maximum" | "max" => Self::High,
+            _ => Self::Enhanced,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Enhanced => "enhanced",
+            Self::High => "high",
+        }
+    }
+
+    fn default_hops(self) -> u8 {
+        match self {
+            Self::Standard => 1,
+            Self::Enhanced => 2,
+            Self::High => 3,
+        }
+    }
 }
 
 /// One onion-routing relay candidate: the signed, public node discovery
@@ -242,6 +293,20 @@ pub struct OnionRelayCandidate {
     pub public_endpoint: String,
     /// Advertised capability flags (lets the client pick middle vs exit hops).
     pub capabilities: Vec<NodeCapability>,
+    /// Relative selection weight for client-side weighted random path building.
+    ///
+    /// Higher-ranked, healthier candidates receive a higher bucket. Clients
+    /// should still sample randomly within the eligible pool so traffic does
+    /// not collapse onto the first listed relay.
+    pub selection_weight: u16,
+    /// Optional public region hint from the signed descriptor.
+    pub region: Option<String>,
+    /// Coarse max session capacity advertised by the peer.
+    pub max_sessions: u32,
+    /// Optional bandwidth policy advertised by the peer.
+    pub max_bps: Option<u64>,
+    /// Optional packet-rate policy advertised by the peer.
+    pub max_pps: Option<u64>,
 }
 
 /// Response for `GET /api/discovery/onion-candidates`.
@@ -265,6 +330,16 @@ pub struct OnionCandidatesResponse {
     /// Whether this response contains enough fresh routeable candidates for a
     /// controlled two-hop path attempt.
     pub two_hop_ready: bool,
+    /// Product privacy mode requested by the client after normalization.
+    pub requested_privacy_mode: String,
+    /// Number of remote relay hops requested after normalization.
+    pub requested_hops: u8,
+    /// Number of fresh routeable candidates required for the requested hop count.
+    pub min_candidates_for_requested_hops: usize,
+    /// Whether this candidate set can satisfy the requested hop count.
+    pub requested_path_ready: bool,
+    /// Best hop count the client can safely attempt from this response.
+    pub recommended_hops: u8,
     /// Whether the client should fall back to the standard encrypted relay path
     /// before attempting to build an onion envelope.
     pub fallback_required: bool,
@@ -294,6 +369,12 @@ pub struct OnionCandidatesResponse {
     pub next_action: String,
     /// Privacy-safe route selection policy used to build this candidate set.
     pub selection_policy: String,
+    /// Stable strategy clients should use when choosing among candidates.
+    pub path_selection_strategy: String,
+    /// Privacy-safe region diversity policy for client-side path builders.
+    pub region_diversity_policy: String,
+    /// Product-facing rule: users choose a privacy level, not raw node ids.
+    pub user_choice_policy: String,
     /// Recommended client refresh interval for this candidate set.
     pub refresh_after_seconds: u64,
     /// Maximum routeability age accepted by this endpoint before a candidate is
@@ -1332,32 +1413,51 @@ async fn onion_candidates_handler(
 ) -> Json<OnionCandidatesResponse> {
     let now = now_secs();
     let limit = state.policy.snapshot_limit(query.limit);
+    let requested_privacy_mode = OnionPrivacyMode::from_query(query.privacy_mode.as_deref());
+    let requested_hops = normalize_requested_hops(requested_privacy_mode, query.hops);
     let candidates: Vec<OnionRelayCandidate> = state
         .peer_store
         .route_candidates_with_capability(NodeCapability::ChatRelay, now, limit)
         .into_iter()
+        .enumerate()
         .filter_map(|descriptor| {
+            let (rank, descriptor) = descriptor;
             let node_id = descriptor.node_id();
             if !state.peer_store.is_routeable_now(&node_id, now) {
                 return None;
             }
             let kem_public = descriptor.descriptor.x25519_kem_public()?;
             let public_endpoint = descriptor.descriptor.public_endpoint.clone()?;
+            let capacity = descriptor.descriptor.capacity.clone();
             Some(OnionRelayCandidate {
                 node_id: hex::encode(node_id),
                 kem_alg: descriptor.descriptor.kem_alg,
                 kem_public: hex::encode(kem_public),
                 public_endpoint,
                 capabilities: descriptor.descriptor.capabilities.clone(),
+                selection_weight: onion_candidate_selection_weight(rank),
+                region: descriptor.descriptor.policy.region.clone(),
+                max_sessions: capacity.max_sessions,
+                max_bps: capacity.max_bps,
+                max_pps: capacity.max_pps,
             })
         })
         .collect();
     let two_hop_ready = candidates.len() >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
-    let fallback_reason = onion_candidate_fallback_reason(candidates.len(), limit);
-    let pool_status = onion_candidate_pool_status(candidates.len(), limit);
-    let route_plan = onion_candidate_route_plan(two_hop_ready);
-    let readiness_reason = onion_candidate_readiness_reason(candidates.len(), limit);
-    let next_action = onion_candidate_next_action(two_hop_ready, fallback_reason);
+    let min_candidates_for_requested_hops = requested_hops as usize;
+    let requested_path_ready = candidates.len() >= min_candidates_for_requested_hops;
+    let recommended_hops = recommended_onion_hops(candidates.len(), requested_hops);
+    let fallback_reason =
+        onion_candidate_fallback_reason(candidates.len(), limit, min_candidates_for_requested_hops);
+    let pool_status =
+        onion_candidate_pool_status(candidates.len(), limit, min_candidates_for_requested_hops);
+    let route_plan = onion_candidate_route_plan(requested_path_ready, recommended_hops);
+    let readiness_reason = onion_candidate_readiness_reason(
+        candidates.len(),
+        limit,
+        min_candidates_for_requested_hops,
+    );
+    let next_action = onion_candidate_next_action(requested_path_ready, fallback_reason);
 
     Json(OnionCandidatesResponse {
         generated_at: now,
@@ -1366,13 +1466,24 @@ async fn onion_candidates_handler(
         count: candidates.len(),
         min_candidates_for_two_hop: ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
         two_hop_ready,
-        fallback_required: !two_hop_ready,
+        requested_privacy_mode: requested_privacy_mode.as_str().to_string(),
+        requested_hops,
+        min_candidates_for_requested_hops,
+        requested_path_ready,
+        recommended_hops,
+        fallback_required: !requested_path_ready,
         pool_status: pool_status.to_string(),
         route_plan: route_plan.to_string(),
         fallback_reason: fallback_reason.to_string(),
         readiness_reason: readiness_reason.to_string(),
         next_action: next_action.to_string(),
         selection_policy: ONION_CANDIDATES_SELECTION_POLICY.to_string(),
+        path_selection_strategy: "weighted_random_health_ranked_distinct_hops".to_string(),
+        region_diversity_policy:
+            "prefer_distinct_regions_when_available_without_exposing_selected_route".to_string(),
+        user_choice_policy:
+            "users_choose_privacy_mode; clients select distinct routeable relays automatically"
+                .to_string(),
         refresh_after_seconds: ONION_CANDIDATES_REFRESH_AFTER_SECONDS,
         routeability_stale_after_seconds: ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS,
         candidates,
@@ -1380,10 +1491,30 @@ async fn onion_candidates_handler(
     })
 }
 
-fn onion_candidate_pool_status(candidate_count: usize, limit: usize) -> &'static str {
-    if candidate_count >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES {
+fn normalize_requested_hops(mode: OnionPrivacyMode, requested: Option<u8>) -> u8 {
+    requested
+        .unwrap_or_else(|| mode.default_hops())
+        .clamp(1, ONION_CANDIDATES_MAX_CLIENT_HOPS)
+}
+
+fn recommended_onion_hops(candidate_count: usize, requested_hops: u8) -> u8 {
+    (candidate_count.min(requested_hops as usize) as u8).min(ONION_CANDIDATES_MAX_CLIENT_HOPS)
+}
+
+fn onion_candidate_selection_weight(rank: usize) -> u16 {
+    1_000u16
+        .saturating_sub((rank as u16).saturating_mul(100))
+        .max(100)
+}
+
+fn onion_candidate_pool_status(
+    candidate_count: usize,
+    limit: usize,
+    required_candidates: usize,
+) -> &'static str {
+    if candidate_count >= required_candidates {
         "ready"
-    } else if limit < ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES {
+    } else if limit < required_candidates {
         "client_limited"
     } else if candidate_count == 0 {
         "empty"
@@ -1392,39 +1523,70 @@ fn onion_candidate_pool_status(candidate_count: usize, limit: usize) -> &'static
     }
 }
 
-fn onion_candidate_route_plan(two_hop_ready: bool) -> &'static str {
-    if two_hop_ready {
+fn onion_candidate_route_plan(requested_path_ready: bool, recommended_hops: u8) -> &'static str {
+    if !requested_path_ready {
+        "standard_relay_fallback"
+    } else if recommended_hops >= 3 {
+        "three_hop_onion_path"
+    } else if recommended_hops == 2 {
         "two_hop_onion_path"
+    } else if recommended_hops == 1 {
+        "single_hop_encrypted_relay"
     } else {
         "standard_relay_fallback"
     }
 }
 
-fn onion_candidate_fallback_reason(candidate_count: usize, limit: usize) -> &'static str {
-    if candidate_count >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES {
+fn onion_candidate_fallback_reason(
+    candidate_count: usize,
+    limit: usize,
+    required_candidates: usize,
+) -> &'static str {
+    if candidate_count >= required_candidates {
         "ready"
-    } else if limit < ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES {
-        "client_limit_below_two_hop_minimum"
+    } else if limit < required_candidates {
+        if required_candidates == ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES {
+            "client_limit_below_two_hop_minimum"
+        } else {
+            "client_limit_below_requested_hops"
+        }
     } else if candidate_count == 0 {
         "no_routeable_candidates"
-    } else {
+    } else if candidate_count == 1 && required_candidates == ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
+    {
         "single_routeable_candidate"
+    } else {
+        "insufficient_routeable_candidates"
     }
 }
 
-fn onion_candidate_readiness_reason(candidate_count: usize, limit: usize) -> &'static str {
-    match onion_candidate_fallback_reason(candidate_count, limit) {
-        "ready" => "two_hop_candidate_pool_ready",
+fn onion_candidate_readiness_reason(
+    candidate_count: usize,
+    limit: usize,
+    required_candidates: usize,
+) -> &'static str {
+    match onion_candidate_fallback_reason(candidate_count, limit, required_candidates) {
+        "ready" => {
+            if required_candidates == ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES {
+                "two_hop_candidate_pool_ready"
+            } else {
+                "requested_onion_candidate_pool_ready"
+            }
+        }
         "client_limit_below_two_hop_minimum" => "client_limit_blocks_two_hop_pool",
+        "client_limit_below_requested_hops" => "client_limit_blocks_requested_hops",
         "no_routeable_candidates" => "waiting_for_routeable_kem_relays",
-        _ => "waiting_for_second_routeable_kem_relay",
+        "single_routeable_candidate" => "waiting_for_second_routeable_kem_relay",
+        _ => "waiting_for_more_routeable_kem_relays",
     }
 }
 
-fn onion_candidate_next_action(two_hop_ready: bool, fallback_reason: &str) -> &'static str {
-    if two_hop_ready {
-        "build a controlled two-hop onion path with fresh candidates"
-    } else if fallback_reason == "client_limit_below_two_hop_minimum" {
+fn onion_candidate_next_action(requested_path_ready: bool, fallback_reason: &str) -> &'static str {
+    if requested_path_ready {
+        "build a weighted-random onion path with fresh distinct candidates"
+    } else if fallback_reason == "client_limit_below_requested_hops"
+        || fallback_reason == "client_limit_below_two_hop_minimum"
+    {
         "increase candidate limit or use standard encrypted relay fallback"
     } else {
         "use standard encrypted relay fallback and refresh candidate pool later"
@@ -1716,6 +1878,11 @@ mod tests {
             parsed.min_candidates_for_two_hop,
             ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
         );
+        assert_eq!(parsed.requested_privacy_mode, "enhanced");
+        assert_eq!(parsed.requested_hops, 2);
+        assert_eq!(parsed.min_candidates_for_requested_hops, 2);
+        assert!(!parsed.requested_path_ready);
+        assert_eq!(parsed.recommended_hops, 1);
         assert!(!parsed.two_hop_ready);
         assert!(parsed.fallback_required);
         assert_eq!(parsed.pool_status, "warming");
@@ -1729,6 +1896,15 @@ mod tests {
             parsed.next_action,
             "use standard encrypted relay fallback and refresh candidate pool later"
         );
+        assert_eq!(
+            parsed.path_selection_strategy,
+            "weighted_random_health_ranked_distinct_hops"
+        );
+        assert_eq!(
+            parsed.region_diversity_policy,
+            "prefer_distinct_regions_when_available_without_exposing_selected_route"
+        );
+        assert!(parsed.user_choice_policy.contains("privacy_mode"));
         assert_eq!(parsed.candidates.len(), 1);
         let candidate = &parsed.candidates[0];
         assert_eq!(candidate.node_id, want_node_id);
@@ -1736,6 +1912,9 @@ mod tests {
         assert_eq!(candidate.kem_public, hex::encode(kem));
         assert_eq!(candidate.public_endpoint, "relay.example:443");
         assert!(candidate.capabilities.contains(&NodeCapability::ChatRelay));
+        assert_eq!(candidate.selection_weight, 1_000);
+        assert_eq!(candidate.region, None);
+        assert_eq!(candidate.max_sessions, 0);
         assert!(parsed.privacy_boundary.contains("fresh routeable"));
     }
 
@@ -1776,6 +1955,11 @@ mod tests {
             parsed.min_candidates_for_two_hop,
             ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
         );
+        assert_eq!(parsed.requested_privacy_mode, "enhanced");
+        assert_eq!(parsed.requested_hops, 2);
+        assert_eq!(parsed.min_candidates_for_requested_hops, 2);
+        assert!(parsed.requested_path_ready);
+        assert_eq!(parsed.recommended_hops, 2);
         assert!(parsed.two_hop_ready);
         assert!(!parsed.fallback_required);
         assert_eq!(parsed.pool_status, "ready");
@@ -1784,8 +1968,10 @@ mod tests {
         assert_eq!(parsed.readiness_reason, "two_hop_candidate_pool_ready");
         assert_eq!(
             parsed.next_action,
-            "build a controlled two-hop onion path with fresh candidates"
+            "build a weighted-random onion path with fresh distinct candidates"
         );
+        assert_eq!(parsed.candidates[0].selection_weight, 1_000);
+        assert_eq!(parsed.candidates[1].selection_weight, 900);
     }
 
     #[tokio::test]
@@ -1821,6 +2007,11 @@ mod tests {
         let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(parsed.count, 1);
+        assert_eq!(parsed.requested_privacy_mode, "enhanced");
+        assert_eq!(parsed.requested_hops, 2);
+        assert_eq!(parsed.min_candidates_for_requested_hops, 2);
+        assert!(!parsed.requested_path_ready);
+        assert_eq!(parsed.recommended_hops, 1);
         assert!(!parsed.two_hop_ready);
         assert!(parsed.fallback_required);
         assert_eq!(parsed.pool_status, "client_limited");
@@ -1831,6 +2022,66 @@ mod tests {
             parsed.next_action,
             "increase candidate limit or use standard encrypted relay fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn test_onion_candidates_endpoint_supports_high_privacy_three_hop_policy() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let first = signed_routeable_chat_descriptor(1, now + 300, "https://relay-one.example");
+        let first_node_id = first.node_id();
+        let second = signed_routeable_chat_descriptor(1, now + 300, "https://relay-two.example");
+        let second_node_id = second.node_id();
+        let third = signed_routeable_chat_descriptor(1, now + 300, "https://relay-three.example");
+        let third_node_id = third.node_id();
+
+        store.upsert_verified(first, now).unwrap();
+        store.upsert_verified(second, now).unwrap();
+        store.upsert_verified(third, now).unwrap();
+        store.record_route_forward_success(&first_node_id, now);
+        store.record_route_forward_success(&second_node_id, now);
+        store.record_route_forward_success(&third_node_id, now);
+
+        let app = build_discovery_router(store, DiscoveryApiPolicy::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates?privacy_mode=high&limit=3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed.requested_privacy_mode, "high");
+        assert_eq!(parsed.requested_hops, 3);
+        assert_eq!(parsed.min_candidates_for_requested_hops, 3);
+        assert!(parsed.requested_path_ready);
+        assert_eq!(parsed.recommended_hops, 3);
+        assert!(parsed.two_hop_ready);
+        assert!(!parsed.fallback_required);
+        assert_eq!(parsed.pool_status, "ready");
+        assert_eq!(parsed.route_plan, "three_hop_onion_path");
+        assert_eq!(parsed.fallback_reason, "ready");
+        assert_eq!(
+            parsed.readiness_reason,
+            "requested_onion_candidate_pool_ready"
+        );
+        assert_eq!(
+            parsed.next_action,
+            "build a weighted-random onion path with fresh distinct candidates"
+        );
+        assert_eq!(parsed.candidates.len(), 3);
+        assert_eq!(parsed.candidates[0].selection_weight, 1_000);
+        assert_eq!(parsed.candidates[1].selection_weight, 900);
+        assert_eq!(parsed.candidates[2].selection_weight, 800);
     }
 
     #[tokio::test]
