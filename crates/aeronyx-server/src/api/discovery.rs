@@ -51,6 +51,7 @@
 //!   surfaces never need to parse full peer diagnostics.
 //!
 //! ## Last Modified
+//! v0.16.0-DiscoverySummaryRestartSurvivableProof - Expose strict restart-survivable two-hop proof readiness
 //! v0.15.0-OnionCandidatesFallbackContract - Add explicit two-hop readiness and fallback fields
 //! v0.14.0-DiscoverySummaryRecoveredProofStatus - Treat recent message-delivery proof as recovered ready evidence
 //! v0.13.0-OnionCandidatesContract - Add explicit client-facing onion candidate contract metadata
@@ -643,6 +644,18 @@ pub fn discovery_summary_response(
     let network_story = &status.network_story;
     let blind_relay_quality = &status.blind_relay_quality;
     let two_hop_history = &status.two_hop_path_proof_history;
+    let two_hop_restart_survivable_ready = two_hop_history.recent_message_delivery_ready
+        && peer_quorum.quorum_ready
+        && peer_quorum.restart_recovery_configured;
+    let two_hop_restart_recovery_basis = if two_hop_restart_survivable_ready {
+        "message_delivery_proof_with_restart_recovery"
+    } else if !two_hop_history.recent_message_delivery_ready {
+        "waiting_for_fresh_message_delivery_proof"
+    } else if !peer_quorum.quorum_ready {
+        "waiting_for_peer_quorum"
+    } else {
+        "restart_recovery_not_configured"
+    };
 
     let status_bucket = protocol_foundation["status"]
         .as_str()
@@ -735,6 +748,10 @@ pub fn discovery_summary_response(
             "ttl_shape_counts": &two_hop_history.ttl_shape_counts,
             "proof_scope": &two_hop_history.proof_scope,
             "proof_scope_counts": &two_hop_history.proof_scope_counts,
+            "restart_recovery_configured": peer_quorum.restart_recovery_configured,
+            "peer_quorum_ready": peer_quorum.quorum_ready,
+            "restart_survivable_ready": two_hop_restart_survivable_ready,
+            "restart_recovery_basis": two_hop_restart_recovery_basis,
             "stale_after_seconds": two_hop_history.stale_after_seconds,
             "next_action": &two_hop_history.next_action,
         }),
@@ -1585,6 +1602,22 @@ mod tests {
             Some(0)
         );
         assert_eq!(
+            parsed["two_hop_path_proof"]["restart_recovery_configured"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["peer_quorum_ready"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["restart_survivable_ready"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["restart_recovery_basis"].as_str(),
+            Some("waiting_for_peer_quorum")
+        );
+        assert_eq!(
             parsed["two_hop_path_proof"]["path_shape_counts"]["entry_middle_terminal"].as_u64(),
             Some(1)
         );
@@ -1688,6 +1721,22 @@ mod tests {
         assert_eq!(
             parsed["peer_mesh"]["chat_two_hop_onion_ready"].as_bool(),
             Some(true)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["restart_recovery_configured"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["peer_quorum_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["restart_survivable_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["restart_recovery_basis"].as_str(),
+            Some("message_delivery_proof_with_restart_recovery")
         );
 
         let serialized = serde_json::to_string(&parsed).unwrap();
