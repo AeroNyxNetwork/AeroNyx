@@ -826,6 +826,55 @@ pub async fn mpi_recall(
         }
     }
 
+    // ── Step 4c: node-blind graph expansion ──
+    // Pull records the client declared related to any blind hit so far into the
+    // sealed list (opaque record_id edges only; the node never learns why).
+    if rb.include_graph && !sealed_memories.is_empty() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        let seeds: Vec<[u8; 32]> = sealed_memories
+            .iter()
+            .filter_map(|m| {
+                hex::decode(&m.record_id).ok().and_then(|b| {
+                    if b.len() == 32 {
+                        let mut a = [0u8; 32];
+                        a.copy_from_slice(&b);
+                        Some(a)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        // Gather neighbours UNDER the connection lock, then release it before any
+        // storage.get() below (which re-locks the same connection — holding both
+        // would deadlock).
+        let neighbors: Vec<([u8; 32], f32)> = {
+            let conn = storage.conn_lock().await;
+            let mut acc = Vec::new();
+            for seed in &seeds {
+                acc.extend(graph::get_neighbors(&conn, seed, 10));
+            }
+            acc
+        };
+        for (nid, weight) in neighbors {
+            if returned_ids.contains(&nid) {
+                continue;
+            }
+            if let Some(record) = storage.get(&nid).await {
+                if !record.is_active() || record.owner != owner || !record.blind {
+                    continue;
+                }
+                returned_ids.push(nid);
+                sealed_memories.push(SealedMemory {
+                    record_id: hex::encode(nid),
+                    score: weight as f64 * 0.5,
+                    ciphertext_b64: BASE64.encode(&record.encrypted_content),
+                    timestamp: record.timestamp,
+                });
+            }
+        }
+    }
+
     memories.sort_unstable_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
