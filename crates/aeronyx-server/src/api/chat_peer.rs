@@ -2451,6 +2451,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_hop_onion_relay_delivers_real_ciphertext_payload_to_terminal_store() {
+        use aeronyx_core::protocol::onion::{build_onion_envelope, open_onion_layer, OnionHop};
+
+        let now = now_secs();
+        let source = IdentityKeyPair::generate();
+        let middle_identity = Arc::new(IdentityKeyPair::generate());
+        let terminal_identity = IdentityKeyPair::generate();
+        let terminal_node_id = terminal_identity.public_key_bytes();
+        let terminal_secret = terminal_identity.to_x25519().0;
+
+        let chat_sender = IdentityKeyPair::generate();
+        let route_id = [0x7au8; 16];
+        let receiver = [0x8bu8; 32];
+        let mut delivered_envelope = ChatEnvelope {
+            message_id: route_id,
+            sender: chat_sender.public_key_bytes(),
+            receiver,
+            timestamp: now,
+            ciphertext: b"real e2e ciphertext payload carried through two hops".to_vec(),
+            nonce: [0x9cu8; 24],
+            content_type: ChatContentType::Text,
+            signature: [0u8; 64],
+        };
+        delivered_envelope.signature = chat_sender.sign(&delivered_envelope.sign_data());
+        let encoded_chat = encode_envelope(&delivered_envelope).unwrap();
+
+        let (terminal_relay, terminal_db_path) = temp_chat_relay("two-hop-onion-terminal-store");
+        let terminal_relay_for_route = Arc::clone(&terminal_relay);
+        let terminal_previous_hops: Arc<Mutex<Vec<[u8; 32]>>> = Arc::new(Mutex::new(Vec::new()));
+        let terminal_previous_hops_for_route = Arc::clone(&terminal_previous_hops);
+
+        let terminal_app = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(move |Json(request): Json<PeerBlindRelayRequest>| {
+                let terminal_relay_for_request = Arc::clone(&terminal_relay_for_route);
+                let terminal_previous_hops_for_request =
+                    Arc::clone(&terminal_previous_hops_for_route);
+                async move {
+                    if validate_blind_relay_envelope(
+                        &request.envelope,
+                        &request.previous_hop_node_id,
+                        now_secs(),
+                    )
+                    .is_err()
+                    {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+
+                    let peel = match open_onion_layer(
+                        &request.envelope.encrypted_blob,
+                        &terminal_secret,
+                    ) {
+                        Ok(peel) => peel,
+                        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+                    };
+                    if peel.next_hop.is_some() {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+
+                    let inner = match decode_envelope(&peel.inner) {
+                        Ok(envelope) => envelope,
+                        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+                    };
+                    if validate_peer_envelope(&inner).is_err() {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    if terminal_relay_for_request.store_pending(&inner).is_err() {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    terminal_previous_hops_for_request
+                        .lock()
+                        .unwrap()
+                        .push(request.previous_hop_node_id);
+
+                    Json(PeerBlindRelayResponse {
+                        accepted: true,
+                        terminal: true,
+                        forwarded: false,
+                        ttl_remaining: request.envelope.ttl,
+                        reason: Some("onion_terminal_delivered".to_string()),
+                    })
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let terminal_endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, terminal_app).await.unwrap();
+        });
+
+        let mut terminal_descriptor = NodeDescriptor::new(
+            terminal_node_id,
+            now,
+            now,
+            now + 300,
+            "test-terminal-onion-peer",
+        )
+        .with_x25519_kem(terminal_identity.x25519_public_key_bytes());
+        terminal_descriptor.public_endpoint = Some(terminal_endpoint);
+        terminal_descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        terminal_descriptor.capacity = NodeCapacity {
+            max_sessions: 32,
+            max_bps: None,
+            max_pps: None,
+        };
+        let terminal_descriptor =
+            SignedNodeDescriptor::sign(terminal_descriptor, &terminal_identity).unwrap();
+
+        let peer_store = Arc::new(PeerStore::new());
+        peer_store
+            .upsert_verified_from_source(terminal_descriptor, now, "gossip_snapshot")
+            .unwrap();
+
+        let state = ChatPeerState {
+            chat_relay: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&middle_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+
+        let middle_hop = OnionHop {
+            node_id: middle_identity.public_key_bytes(),
+            kem_pub: crate::services::onion_keys::current_public_key(),
+        };
+        let terminal_hop = OnionHop {
+            node_id: terminal_node_id,
+            kem_pub: terminal_identity.x25519_public_key_bytes(),
+        };
+        let envelope = build_onion_envelope(
+            &[middle_hop, terminal_hop],
+            &encoded_chat,
+            route_id,
+            2,
+            now,
+            &source,
+        )
+        .unwrap();
+
+        let response = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: source.public_key_bytes(),
+                onward_envelope: None,
+                onward_descriptor_hint: None,
+            },
+        )
+        .await
+        .expect("middle hop should forward real onion payload to terminal");
+
+        server.abort();
+
+        assert!(response.accepted);
+        assert!(response.forwarded);
+        assert!(!response.terminal);
+        assert_eq!(response.ttl_remaining, 1);
+        assert_eq!(response.reason.as_deref(), Some("onion_forwarded"));
+
+        let previous_hops = terminal_previous_hops.lock().unwrap();
+        assert_eq!(
+            previous_hops.as_slice(),
+            &[middle_identity.public_key_bytes()]
+        );
+        drop(previous_hops);
+
+        let (messages, has_more) = terminal_relay
+            .pull_pending(&receiver, 0, &[0u8; 16], 10)
+            .expect("terminal should store the delivered E2E envelope");
+        assert!(!has_more);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, delivered_envelope.message_id);
+        assert_eq!(
+            messages[0].envelope.ciphertext,
+            delivered_envelope.ciphertext
+        );
+        assert_eq!(messages[0].envelope.nonce, delivered_envelope.nonce);
+        assert_eq!(messages[0].envelope.sender, delivered_envelope.sender);
+        assert_eq!(messages[0].envelope.receiver, delivered_envelope.receiver);
+
+        let blind_stats = peer_store.status(now + 5).runtime.blind_relay;
+        assert_eq!(blind_stats.forwarded, 1);
+        assert_eq!(blind_stats.rejected, 0);
+
+        let _ = std::fs::remove_file(terminal_db_path);
+    }
+
+    #[tokio::test]
     async fn blind_relay_in_flight_guard_enforces_backpressure_limit() {
         let peer_store = Arc::new(PeerStore::new());
         let state = ChatPeerState {
