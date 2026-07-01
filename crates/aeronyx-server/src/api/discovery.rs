@@ -17,7 +17,8 @@
 //! - `GET /api/discovery/status`: returns aggregate peer-store status, local
 //!   capability readiness, and compact discovery readiness for dashboards
 //! - `GET /api/discovery/summary`: returns a compact public-safe protocol
-//!   foundation summary for app, website, backend aggregation, and AI runbooks
+//!   foundation summary for app, website, backend aggregation, and AI runbooks,
+//!   including aggregate route-governance readiness without route metadata
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -51,6 +52,7 @@
 //!   surfaces never need to parse full peer diagnostics.
 //!
 //! ## Last Modified
+//! v0.22.0-RouteGovernanceSummary - Add compact route-quality governance to public summary
 //! v0.21.0-BlindRelayRuntimeObservability - Add unified blind relay runtime view for nodeboard/backend
 //! v0.20.0-OnionRelayAdmissionWarmupDetail - Expose stability-window progress without route metadata
 //! v0.19.0-OnionRelayAdmissionContract - Add aggregate admission score and warmup contract
@@ -354,6 +356,8 @@ pub struct DiscoverySummaryResponse {
     local_capability: serde_json::Value,
     /// Verified peer mesh aggregate without descriptors or endpoints.
     peer_mesh: serde_json::Value,
+    /// Route governance aggregate without endpoints, selected paths, or payload data.
+    route_governance: serde_json::Value,
     /// Blind relay aggregate runtime/probe evidence without payload metadata.
     blind_relay: serde_json::Value,
     /// Product-facing blind relay runtime counters and last safe event buckets.
@@ -1202,6 +1206,7 @@ pub fn discovery_summary_response(
             "chat_single_hop_ready": network_story.chat_single_hop_ready,
             "chat_two_hop_onion_ready": network_story.chat_two_hop_onion_ready,
         }),
+        route_governance: serde_json::json!(&status.route_governance),
         blind_relay: serde_json::json!({
             "status": &blind_relay_quality.status,
             "runtime_ready": blind_relay_quality.runtime_ready,
@@ -2223,6 +2228,26 @@ mod tests {
         assert_eq!(
             parsed["two_hop_path_proof"]["ttl_shape_counts"]["entry_ttl_2_onward_ttl_1"].as_u64(),
             Some(1)
+        );
+        assert_eq!(
+            parsed["route_governance"]["contract_version"].as_str(),
+            Some("route_governance.v1")
+        );
+        assert_eq!(
+            parsed["route_governance"]["status"].as_str(),
+            Some("forming")
+        );
+        assert_eq!(
+            parsed["route_governance"]["route_pool_ready"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["route_governance"]["quality_ready"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["route_governance"]["candidates_total"].as_u64(),
+            Some(0)
         );
         assert_eq!(parsed["stage"].as_str(), Some("two_hop_path_ready"));
         assert_eq!(

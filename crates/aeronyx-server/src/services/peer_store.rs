@@ -117,6 +117,9 @@
 //!   buckets, and failure-circuit-breaker state so nodeboard/backend can
 //!   distinguish a single fresh proof from a repeated stable encrypted route
 //!   foundation without exposing route metadata
+//! - Route governance summary condenses routeability, scoring, quarantine,
+//!   and degradation state into one aggregate nodeboard/backend contract
+//!   without exposing endpoints, route IDs, payloads, or peer graph data
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -143,6 +146,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.51.0-RouteGovernanceSummary - Added aggregate route-quality governance contract
 //! v0.50.0-TwoHopProofStabilityWindow - Added privacy-safe stability window and failure circuit breaker fields
 //! v0.49.0-TwoHopProbeReasonBuckets - Bucket runtime two-hop blind relay probe errors
 //! v0.48.0-BlindRelayFreshnessGate - Require fresh accepted/probe evidence before reporting blind relay ready
@@ -1009,6 +1013,14 @@ pub struct PeerStoreStatus {
     /// Server internals can use `route_candidates_with_capability()` when they
     /// need signed descriptors for actual node-to-node transport.
     pub route_candidates: PeerStoreRouteCandidateStatus,
+    /// Aggregate route governance summary for nodeboard/backend health cards.
+    ///
+    /// This compresses candidate lists, routeability evidence, and quarantine
+    /// state into one public-safe contract. It intentionally does not expose
+    /// endpoint URLs, full node IDs, route IDs, selected paths, encrypted
+    /// payloads, receiver identities, client IPs, DNS, destinations, voucher
+    /// secrets, private keys, wallet-level traffic, or social graph metadata.
+    pub route_governance: PeerStoreRouteGovernanceStatus,
     /// Privacy-safe per-peer health summary for nodeboard security panels.
     ///
     /// Rows use only node-level descriptor/runtime buckets and short prefixes.
@@ -1416,6 +1428,77 @@ pub struct PeerStoreRouteCandidateStatus {
     pub onion_middle: Vec<PeerStoreRouteCandidate>,
     /// Privacy-safe previews for controlled routes that future relay layers can use.
     pub planned_paths: PeerStoreRoutePathStatus,
+}
+
+// ============================================
+// Route governance summary
+// ============================================
+
+/// Aggregate route governance summary for nodeboard, backend, and AI runbooks.
+///
+/// This is a compact product contract built from route candidates and opaque
+/// node-to-node route health evidence. It deliberately avoids exposing full
+/// node IDs, endpoint URLs, route IDs, selected paths, encrypted payloads,
+/// receiver identities, client IPs, DNS, destinations, voucher secrets,
+/// private keys, wallet-level traffic, plaintext, or social graph metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreRouteGovernanceStatus {
+    /// Unix timestamp when this summary was generated.
+    pub generated_at: u64,
+    /// Stable JSON contract version for dashboards and backend ingestion.
+    pub contract_version: String,
+    /// Stable source label for downstream schema routing.
+    pub source: String,
+    /// Stable status bucket: forming, healthy, or attention.
+    pub status: String,
+    /// Whether this node has a complete candidate pool for a two-hop privacy path.
+    pub route_pool_ready: bool,
+    /// Whether the route pool is ready and has no local quality attention buckets.
+    pub quality_ready: bool,
+    /// Total candidate rows considered across privacy, chat, and onion roles.
+    pub candidates_total: usize,
+    /// Candidates with fresh routeability evidence and no active route quarantine.
+    pub routeable_total: usize,
+    /// Routeable candidates that can receive encrypted chat relay traffic.
+    pub routeable_chat_relays: usize,
+    /// Routeable candidates that can act as onion middle hops.
+    pub routeable_onion_middle_hops: usize,
+    /// Routeable candidates that can relay privacy protocol packets.
+    pub routeable_privacy_relays: usize,
+    /// Candidates currently suppressed by local route-health quarantine.
+    pub quarantined_total: usize,
+    /// Candidates with repeated opaque route failures but no active quarantine.
+    pub failing_total: usize,
+    /// Candidates with some opaque route failures but not enough to be failing.
+    pub degraded_total: usize,
+    /// Candidates that advertise an endpoint but have no fresh routeability evidence yet.
+    pub unknown_routeability_total: usize,
+    /// Candidates whose last successful routeability evidence is stale.
+    pub stale_routeability_total: usize,
+    /// Candidates whose latest routeability state is unreachable.
+    pub unreachable_total: usize,
+    /// Best candidate score observed in the bounded candidate summary.
+    pub best_score: Option<i64>,
+    /// Worst candidate score observed in the bounded candidate summary.
+    pub worst_score: Option<i64>,
+    /// Average candidate score rounded toward zero.
+    pub average_score: Option<i64>,
+    /// Whether the planned one-hop chat relay path is complete.
+    pub chat_single_hop_ready: bool,
+    /// Whether the planned two-hop onion-shaped path is complete.
+    pub chat_two_hop_onion_ready: bool,
+    /// Consecutive opaque route failures needed before local quarantine starts.
+    pub quarantine_threshold: u64,
+    /// Local route quarantine window in seconds.
+    pub quarantine_seconds: u64,
+    /// Fresh routeability evidence window in seconds.
+    pub routeability_stale_after_seconds: u64,
+    /// Human-readable aggregate detail for logs and runbooks.
+    pub detail: String,
+    /// Operator or automation next action.
+    pub next_action: String,
+    /// Explicit privacy boundary for downstream consumers.
+    pub privacy_boundary: String,
 }
 
 // ============================================
@@ -3814,6 +3897,7 @@ impl PeerStore {
         let stability = Self::stability(&snapshot, &bootstrap, now);
         let peer_summary = self.peer_summary(now);
         let route_candidates = self.route_candidate_status(now);
+        let route_governance = Self::route_governance_status(now, &route_candidates);
         let peer_health_summary = self.peer_health_summary(now);
         let peer_quorum =
             Self::peer_quorum_status(now, &stability, &peer_summary, &route_candidates);
@@ -3837,6 +3921,7 @@ impl PeerStore {
             stability,
             peer_summary,
             route_candidates,
+            route_governance,
             peer_health_summary,
             peer_quorum,
             network_story,
@@ -4067,6 +4152,161 @@ impl PeerStore {
             detail,
             next_action: next_action.to_string(),
             privacy_boundary: "aggregate blind relay runtime counters only; no full node ids, endpoint URLs, route ids, encrypted payloads, receiver identities, client IPs, DNS contents, destinations, voucher secrets, private keys, wallet-level traffic, or plaintext".to_string(),
+        }
+    }
+
+    fn route_governance_status(
+        now: u64,
+        route_candidates: &PeerStoreRouteCandidateStatus,
+    ) -> PeerStoreRouteGovernanceStatus {
+        let mut candidates_total = 0usize;
+        let mut routeable_total = 0usize;
+        let mut routeable_privacy_relays = 0usize;
+        let mut routeable_chat_relays = 0usize;
+        let mut routeable_onion_middle_hops = 0usize;
+        let mut quarantined_total = 0usize;
+        let mut failing_total = 0usize;
+        let mut degraded_total = 0usize;
+        let mut unknown_routeability_total = 0usize;
+        let mut stale_routeability_total = 0usize;
+        let mut unreachable_total = 0usize;
+        let mut best_score: Option<i64> = None;
+        let mut worst_score: Option<i64> = None;
+        let mut score_sum = 0i64;
+
+        for candidates in [
+            &route_candidates.privacy_relay,
+            &route_candidates.chat_relay,
+            &route_candidates.onion_middle,
+        ] {
+            for candidate in candidates.iter() {
+                candidates_total = candidates_total.saturating_add(1);
+                score_sum = score_sum.saturating_add(candidate.score);
+                best_score = Some(
+                    best_score
+                        .map(|score| score.max(candidate.score))
+                        .unwrap_or(candidate.score),
+                );
+                worst_score = Some(
+                    worst_score
+                        .map(|score| score.min(candidate.score))
+                        .unwrap_or(candidate.score),
+                );
+
+                if candidate.routeability_ready && !candidate.route_quarantined {
+                    routeable_total = routeable_total.saturating_add(1);
+                    match candidate.capability.as_str() {
+                        "privacy_relay" => {
+                            routeable_privacy_relays = routeable_privacy_relays.saturating_add(1);
+                        }
+                        "chat_relay" => {
+                            routeable_chat_relays = routeable_chat_relays.saturating_add(1);
+                        }
+                        "onion_middle" => {
+                            routeable_onion_middle_hops =
+                                routeable_onion_middle_hops.saturating_add(1);
+                        }
+                        _ => {}
+                    }
+                }
+
+                match candidate.route_health.as_str() {
+                    "quarantined" => {
+                        quarantined_total = quarantined_total.saturating_add(1);
+                    }
+                    "failing" => {
+                        failing_total = failing_total.saturating_add(1);
+                    }
+                    "degraded" => {
+                        degraded_total = degraded_total.saturating_add(1);
+                    }
+                    _ => {}
+                }
+
+                match candidate.routeability_state.as_str() {
+                    "unknown" => {
+                        unknown_routeability_total = unknown_routeability_total.saturating_add(1);
+                    }
+                    "stale" => {
+                        stale_routeability_total = stale_routeability_total.saturating_add(1);
+                    }
+                    "unreachable" => {
+                        unreachable_total = unreachable_total.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let chat_single_hop_ready = route_candidates.planned_paths.chat_single_hop.complete;
+        let chat_two_hop_onion_ready = route_candidates
+            .planned_paths
+            .chat_two_hop_onion_ready
+            .complete;
+        let route_pool_ready = chat_two_hop_onion_ready;
+        let attention_active = quarantined_total > 0
+            || failing_total > 0
+            || degraded_total > 0
+            || unreachable_total > 0;
+        let quality_ready = route_pool_ready && !attention_active;
+        let status = if attention_active {
+            "attention"
+        } else if route_pool_ready {
+            "healthy"
+        } else {
+            "forming"
+        };
+        let average_score = if candidates_total == 0 {
+            None
+        } else {
+            Some(score_sum / (candidates_total as i64))
+        };
+        let next_action = match status {
+            "attention" if quarantined_total > 0 => {
+                "wait for quarantined peers to recover or add more routeable nodes before increasing relay traffic"
+            }
+            "attention" => {
+                "watch degraded routeability evidence and prefer peers with fresh successful opaque forwards"
+            }
+            "healthy" => "route governance is healthy for controlled encrypted relay experiments",
+            _ if candidates_total == 0 => {
+                "publish signed descriptors and seed peers before planning multi-hop relay paths"
+            }
+            _ => "wait for fresh routeability probes to complete the two-hop privacy path pool",
+        };
+        let detail = format!(
+            "candidates_total={candidates_total} routeable_total={routeable_total} routeable_chat_relays={routeable_chat_relays} routeable_onion_middle_hops={routeable_onion_middle_hops} quarantined_total={quarantined_total} failing_total={failing_total} degraded_total={degraded_total} unreachable_total={unreachable_total}"
+        );
+
+        PeerStoreRouteGovernanceStatus {
+            generated_at: now,
+            contract_version: "route_governance.v1".to_string(),
+            source: "peer_store_route_candidates".to_string(),
+            status: status.to_string(),
+            route_pool_ready,
+            quality_ready,
+            candidates_total,
+            routeable_total,
+            routeable_chat_relays,
+            routeable_onion_middle_hops,
+            routeable_privacy_relays,
+            quarantined_total,
+            failing_total,
+            degraded_total,
+            unknown_routeability_total,
+            stale_routeability_total,
+            unreachable_total,
+            best_score,
+            worst_score,
+            average_score,
+            chat_single_hop_ready,
+            chat_two_hop_onion_ready,
+            quarantine_threshold: PEER_ROUTE_FAILURE_QUARANTINE_THRESHOLD,
+            quarantine_seconds: PEER_ROUTE_FAILURE_QUARANTINE_SECS,
+            routeability_stale_after_seconds: PEER_ROUTEABILITY_STALE_AFTER_SECS,
+            detail,
+            next_action: next_action.to_string(),
+            privacy_boundary: "aggregate route governance only; no full node ids, endpoint URLs, selected paths, route ids, encrypted payloads, receiver identities, client IPs, DNS contents, destinations, voucher secrets, private keys, wallet-level traffic, plaintext, or social graph metadata".to_string(),
         }
     }
 
@@ -5268,6 +5508,92 @@ mod tests {
         assert_eq!(recovered_row.route_quarantine_remaining_seconds, None);
         assert_eq!(recovered_row.route_consecutive_failures, 0);
         assert_eq!(recovered_row.last_route_success_at, Some(now + 5));
+    }
+
+    #[test]
+    fn test_route_governance_summarizes_quality_without_route_metadata() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let relay_kp = IdentityKeyPair::generate();
+        let middle_kp = IdentityKeyPair::generate();
+        let failing_kp = IdentityKeyPair::generate();
+
+        let mut relay = signed_descriptor_for(&relay_kp, 1, now + 2_000);
+        relay.descriptor.public_endpoint = Some("https://relay.example".to_string());
+        relay = SignedNodeDescriptor::sign(relay.descriptor, &relay_kp).unwrap();
+        let relay_node_id = relay.node_id();
+
+        let mut middle = signed_descriptor_for(&middle_kp, 1, now + 2_000);
+        middle.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        middle.descriptor.public_endpoint = Some("https://middle.example".to_string());
+        middle = SignedNodeDescriptor::sign(middle.descriptor, &middle_kp).unwrap();
+        let middle_node_id = middle.node_id();
+
+        let mut failing = signed_descriptor_for(&failing_kp, 1, now + 2_000);
+        failing.descriptor.public_endpoint = Some("https://failing.example".to_string());
+        failing = SignedNodeDescriptor::sign(failing.descriptor, &failing_kp).unwrap();
+        let failing_node_id = failing.node_id();
+
+        store
+            .upsert_verified_from_source(relay, now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(middle, now, "gossip_snapshot")
+            .unwrap();
+        store
+            .upsert_verified_from_source(failing, now, "gossip_announce")
+            .unwrap();
+
+        store.record_route_forward_success(&relay_node_id, now + 1);
+        store.record_route_forward_success(&middle_node_id, now + 2);
+        store.record_route_forward_failure(&failing_node_id, now + 3, "request_failed");
+        store.record_route_forward_failure(&failing_node_id, now + 4, "request_failed");
+        store.record_route_forward_failure(&failing_node_id, now + 5, "http_502");
+
+        let governance = store.status(now + 6).route_governance;
+        assert_eq!(governance.contract_version, "route_governance.v1");
+        assert_eq!(governance.source, "peer_store_route_candidates");
+        assert_eq!(governance.status, "attention");
+        assert!(governance.route_pool_ready);
+        assert!(!governance.quality_ready);
+        assert!(governance.chat_single_hop_ready);
+        assert!(governance.chat_two_hop_onion_ready);
+        assert_eq!(governance.candidates_total, 5);
+        assert_eq!(governance.routeable_total, 3);
+        assert_eq!(governance.routeable_privacy_relays, 1);
+        assert_eq!(governance.routeable_chat_relays, 1);
+        assert_eq!(governance.routeable_onion_middle_hops, 1);
+        assert_eq!(governance.quarantined_total, 2);
+        assert_eq!(governance.failing_total, 0);
+        assert_eq!(governance.degraded_total, 0);
+        assert_eq!(governance.unreachable_total, 0);
+        assert_eq!(
+            governance.quarantine_threshold,
+            PEER_ROUTE_FAILURE_QUARANTINE_THRESHOLD
+        );
+        assert_eq!(
+            governance.quarantine_seconds,
+            PEER_ROUTE_FAILURE_QUARANTINE_SECS
+        );
+        assert_eq!(
+            governance.routeability_stale_after_seconds,
+            PEER_ROUTEABILITY_STALE_AFTER_SECS
+        );
+        assert!(governance.best_score.is_some());
+        assert!(governance.worst_score.is_some());
+        assert!(governance.average_score.is_some());
+
+        let governance_json = serde_json::to_string(&governance).unwrap();
+        assert!(!governance_json.contains("relay.example"));
+        assert!(!governance_json.contains("middle.example"));
+        assert!(!governance_json.contains("failing.example"));
+        assert!(!governance_json.contains(&hex::encode(relay_node_id)));
+        assert!(!governance_json.contains(&hex::encode(middle_node_id)));
+        assert!(!governance_json.contains(&hex::encode(failing_node_id)));
+        assert!(!governance_json.contains("route_id"));
+        assert!(!governance_json.contains("encrypted_blob"));
+        assert!(!governance_json.contains("receiver_pubkey"));
+        assert!(!governance_json.contains("payload_b64"));
     }
 
     #[test]
