@@ -138,7 +138,7 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 /// in maybe_migrate(). The migrate block MUST use a hardcoded integer
 /// (not this constant) for UPDATE schema_version, to prevent skipping
 /// intermediate migrations on multi-version upgrades.
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -367,7 +367,8 @@ impl MemoryStorage {
                 conflict_with       BLOB,
                 project_id          TEXT,
                 session_id          TEXT,
-                episode_id          TEXT
+                episode_id          TEXT,
+                blind               INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_owner ON records(owner);
             CREATE INDEX IF NOT EXISTS idx_owner_layer_status ON records(owner, layer, status);
@@ -1034,6 +1035,40 @@ impl MemoryStorage {
             info!("[STORAGE] ✅ Migration to v6 (SuperNode) complete");
         }
 
+        // v6 → v7: node-blind storage marker (Brick 1)
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(6);
+
+        if current < 7 {
+            info!("[STORAGE] Migrating schema v{} → v7 (node-blind)", current);
+            // Additive column: 1 = client-sealed record the node stores but cannot
+            // decrypt or read; 0 = normal node-encrypted record. Guard on the table
+            // existing first — some migration unit tests set up a minimal DB without
+            // the `records` table (matches the v6 cognitive_tasks existence check).
+            let records_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='records'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if records_exists && conn.prepare("SELECT blind FROM records LIMIT 0").is_err() {
+                conn.execute_batch(
+                    "ALTER TABLE records ADD COLUMN blind INTEGER NOT NULL DEFAULT 0;",
+                )
+                .map_err(|e| format!("v7 migration: add records.blind: {}", e))?;
+                info!("[STORAGE] Added `blind` column");
+            }
+            // ⚠️ hardcoded 7, not SCHEMA_VERSION — matches the existing pattern.
+            conn.execute("UPDATE schema_version SET version = 7", [])
+                .map_err(|e| format!("Update schema version to v7: {}", e))?;
+            info!("[STORAGE] ✅ Migration to v7 (node-blind) complete");
+        }
+
         Ok(())
     }
 
@@ -1389,7 +1424,12 @@ impl MemoryStorage {
         let embedding_dim = record.embedding_dim() as i64;
         let conflict_with_blob: Option<Vec<u8>> = record.conflict_with.map(|c| c.to_vec());
 
-        let stored_content: Vec<u8> = if let Some(ref key) = self.record_key {
+        let stored_content: Vec<u8> = if record.blind {
+            // Node-blind (Brick 1): the client already sealed this content with its
+            // own key. Store it verbatim — the node must never encrypt it (it cannot
+            // decrypt it back, and doing so would double-wrap the client ciphertext).
+            record.encrypted_content.clone()
+        } else if let Some(ref key) = self.record_key {
             let key: &[u8; 32] = &**key;
             if record.encrypted_content.is_empty() {
                 record.encrypted_content.clone()
@@ -1419,8 +1459,8 @@ impl MemoryStorage {
                 record_id, owner, timestamp, layer, topic_tags, source_ai,
                 status, supersedes, encrypted_content, embedding,
                 embedding_model, embedding_dim, signature, access_count, created_at,
-                positive_feedback, negative_feedback, conflict_with
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                positive_feedback, negative_feedback, conflict_with, blind
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 record.record_id.as_slice(),
                 record.owner.as_slice(),
@@ -1440,6 +1480,7 @@ impl MemoryStorage {
                 record.positive_feedback as i64,
                 record.negative_feedback as i64,
                 conflict_with_blob.as_deref(),
+                record.blind as i64,
             ],
         );
 
@@ -1649,7 +1690,7 @@ impl MemoryStorage {
     const SELECT_RECORD_COLS: &'static str =
         "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
                 status,supersedes,encrypted_content,embedding,signature,access_count,
-                positive_feedback,negative_feedback,conflict_with
+                positive_feedback,negative_feedback,conflict_with,blind
          FROM records WHERE record_id = ?1";
 
     pub(crate) fn query_rows(
@@ -1686,7 +1727,16 @@ impl MemoryStorage {
         let encrypted_content: Vec<u8> = row.get(8)?;
         let embedding_blob: Option<Vec<u8>> = row.get(9)?;
 
-        let decrypted_content = if let Some(key) = record_key {
+        // Node-blind marker (Brick 1). Read BY NAME so it is robust to column
+        // position across the various record SELECTs; if the column is not in the
+        // result set, default to 0 (sighted).
+        let blind: bool = row.get::<&str, i64>("blind").unwrap_or(0) != 0;
+
+        let decrypted_content = if blind {
+            // Node-blind record: client-sealed with a key the node does not have.
+            // Return the ciphertext verbatim — never attempt to decrypt it.
+            encrypted_content
+        } else if let Some(key) = record_key {
             if encrypted_content.len() >= 28 {
                 match decrypt_record_content(key, &encrypted_content) {
                     Ok(plain) => plain,
@@ -1777,6 +1827,7 @@ impl MemoryStorage {
             positive_feedback: positive_feedback as u32,
             negative_feedback: negative_feedback as u32,
             conflict_with,
+            blind,
         })
     }
 }
@@ -1821,6 +1872,66 @@ mod tests {
             format!("content_{}", ts).into_bytes(),
             vec![0.5; 4],
         )
+    }
+
+    // ========================================
+    // v2.6.0+NodeBlind (Brick 1) — node-blind storage round-trip
+    // ========================================
+
+    #[tokio::test]
+    async fn test_blind_record_stored_and_read_verbatim() {
+        // Encrypted store: the node holds a record_key. A blind record must
+        // still be stored/returned verbatim — never encrypted or decrypted by
+        // the node — while a normal record is encrypted at rest as usual.
+        let s = MemoryStorage::open(":memory:", Some([0x11u8; 32])).unwrap();
+
+        // Node-blind record: content is the CLIENT's own ciphertext (opaque to
+        // the node); blind = true.
+        let sealed = b"client-sealed-ciphertext-opaque-to-node".to_vec();
+        let mut blind_rec = MemoryRecord::new(
+            [0xBB; 32],
+            200,
+            MemoryLayer::Knowledge,
+            vec!["sealed".into()],
+            "client".into(),
+            sealed.clone(),
+            vec![0.9, 0.8],
+        );
+        blind_rec.blind = true;
+        let bid = blind_rec.record_id;
+        assert!(s.insert(&blind_rec, "client-embed").await);
+
+        // Force a real DB read (bypass the write-through cache) to exercise
+        // row_to_record's blind branch.
+        s.cache.write().invalidate(&bid);
+        let got = s.get(&bid).await.unwrap();
+        assert!(got.blind, "blind flag must survive the DB round-trip");
+        assert_eq!(
+            got.encrypted_content, sealed,
+            "blind content must be stored and returned byte-for-byte (no node crypto)"
+        );
+
+        // Sanity: a normal (sighted) record in the SAME encrypted store is
+        // encrypted at rest and decrypted back to plaintext on read.
+        let plain = b"node-visible-plaintext".to_vec();
+        let sighted = MemoryRecord::new(
+            [0xBB; 32],
+            201,
+            MemoryLayer::Knowledge,
+            vec!["plain".into()],
+            "node".into(),
+            plain.clone(),
+            vec![0.1],
+        );
+        let sid = sighted.record_id;
+        assert!(s.insert(&sighted, "minilm").await);
+        s.cache.write().invalidate(&sid);
+        let got2 = s.get(&sid).await.unwrap();
+        assert!(!got2.blind);
+        assert_eq!(
+            got2.encrypted_content, plain,
+            "sighted content round-trips to plaintext"
+        );
     }
 
     // ========================================
@@ -2515,7 +2626,11 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, 6);
+        // maybe_migrate() runs through to the latest schema version: v6 added the
+        // SuperNode tables (asserted above); v7 (node-blind) then bumps to 7. The
+        // v7 records.blind ALTER is skipped here (this minimal DB has no `records`
+        // table) but the version still advances.
+        assert_eq!(v, 7);
     }
 
     // ========================================

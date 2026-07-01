@@ -27,8 +27,11 @@
 //! ## ⚠️ Important Note for Next Developer
 //! - `compute_record_id()` is an IMMUTABLE CONTRACT. Changing it breaks all existing records.
 //! - Fields NOT in hash: embedding, positive_feedback, negative_feedback, conflict_with,
-//!   access_count, status, supersedes, signature — these are mutable runtime metadata.
+//!   access_count, status, supersedes, signature, blind — these are mutable runtime metadata.
 //! - `conflict_with` stores the record_id of a conflicting memory (for MVF φ₈ feature).
+//! - `blind` is a `#[serde(skip)]` runtime marker (node-blind storage); it is NEVER
+//!   serialized, so the bincode / AOF / P2P wire is byte-for-byte identical with or
+//!   without it. It is persisted only in the SQLite `blind` column.
 //!
 //! ## Version History
 //! v1.0.0 - Initial MemoryRecord with 4-layer cognitive model
@@ -37,6 +40,9 @@
 //!   for MVF φ₄ (feedback score) and φ₈ (conflict penalty) features.
 //!   These fields enable the Memory Value Function to learn from user corrections
 //!   and down-rank conflicting or negatively-received memories via SGD online learning.
+//! v2.6.0+NodeBlind (Brick 1) - 🌟 Added `blind` (#[serde(skip)]) runtime marker for
+//!   node-blind storage: a client-sealed record the node stores verbatim but cannot
+//!   decrypt or re-sign. Not content-addressed, not serialized — wire format unchanged.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -259,6 +265,20 @@ pub struct MemoryRecord {
     /// Used in MVF feature: φ₈ = -𝟙(has_conflict) → penalty of -1.0
     #[serde(default)]
     pub conflict_with: Option<[u8; 32]>,
+
+    // ========================================
+    // v2.6.0+NodeBlind (Brick 1) — Node-Blind Marker
+    // ========================================
+    /// Runtime-only marker: `true` means this is a **node-blind** record — the
+    /// client sealed `encrypted_content` with its own key and signed `record_id`
+    /// itself, so the node stores it verbatim and can neither decrypt nor re-sign it.
+    ///
+    /// This field is **NOT** part of `record_id` (not content-addressed) and is
+    /// **NOT** serialized: `#[serde(skip)]` keeps the bincode / AOF / P2P wire
+    /// byte-for-byte identical to pre-Brick-1 records. It is persisted only in the
+    /// SQLite `blind` column and repopulated by `row_to_record` on read.
+    #[serde(skip)]
+    pub blind: bool,
 }
 
 impl MemoryRecord {
@@ -360,6 +380,9 @@ impl MemoryRecord {
             positive_feedback: 0,
             negative_feedback: 0,
             conflict_with: None,
+            // Node-blind marker defaults to false: records created via new()
+            // are node-authored/sighted. The blind ingest path sets this true.
+            blind: false,
         }
     }
 
@@ -501,6 +524,24 @@ mod tests {
         r.conflict_with = Some([0xBB; 32]);
         // Feedback and conflict fields are NOT in the hash
         assert_eq!(r.record_id, r2.record_id);
+    }
+
+    #[test]
+    fn test_blind_marker_not_in_hash_and_wire_unchanged() {
+        // `blind` is a #[serde(skip)] runtime marker: it must NOT affect record_id
+        // and must NOT change the bincode wire (backward + P2P/AOF compatibility).
+        let mut r = make(100, MemoryLayer::Episode);
+        let r2 = make(100, MemoryLayer::Episode);
+        let wire_before = bincode::serialize(&r).unwrap();
+        r.blind = true;
+        // record_id unchanged (blind is not content-addressed).
+        assert_eq!(r.record_id, r2.record_id);
+        // bincode wire byte-for-byte unchanged (serde skip) — no format drift.
+        let wire_after = bincode::serialize(&r).unwrap();
+        assert_eq!(wire_before, wire_after);
+        // a deserialized record defaults blind to false.
+        let restored: MemoryRecord = bincode::deserialize(&wire_after).unwrap();
+        assert!(!restored.blind);
     }
 
     #[test]
