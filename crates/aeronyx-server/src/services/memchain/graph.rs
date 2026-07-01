@@ -110,6 +110,38 @@ pub fn update_cooccurrence(conn: &Connection, memory_ids: &[[u8; 32]], now: i64)
     );
 }
 
+/// Insert client-declared "related" edges for a node-blind record (Brick 3c).
+///
+/// The client — which holds the plaintext — decides which records are related
+/// and sends peer `record_id`s + weights; the node stores opaque
+/// `record_id`↔`record_id` edges in `memory_edges` and never learns *why* they
+/// relate. Edges are bidirectional and weight-accumulating, like
+/// [`update_cooccurrence`]. Self-edges are ignored. See
+/// `docs/memchain-blind-cognition-design.md`.
+pub fn insert_related_edges(
+    conn: &Connection,
+    record_id: &[u8; 32],
+    edges: &[([u8; 32], f64)],
+    now: i64,
+) {
+    let a = record_id.as_slice();
+    for (peer, weight) in edges {
+        if peer == record_id {
+            continue;
+        }
+        let b = peer.as_slice();
+        for (src, dst) in [(a, b), (b, a)] {
+            let _ = conn.execute(
+                "INSERT INTO memory_edges (source_id, target_id, edge_type, weight, created_at)
+                 VALUES (?1, ?2, 'client_related', ?3, ?4)
+                 ON CONFLICT(source_id, target_id)
+                 DO UPDATE SET weight = weight + ?3",
+                params![src, dst, weight, now],
+            );
+        }
+    }
+}
+
 /// Get neighbors of a memory node, sorted by edge weight descending.
 pub fn get_neighbors(
     conn: &Connection,
@@ -642,6 +674,32 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM memory_edges", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 6);
+    }
+
+    #[test]
+    fn test_insert_related_edges_bidirectional() {
+        let conn = setup_db();
+        let a = [0xA1u8; 32];
+        let b = [0xB2u8; 32];
+
+        insert_related_edges(&conn, &a, &[(b, 2.0)], 1000);
+        let na = get_neighbors(&conn, &a, 10);
+        assert_eq!(na.len(), 1);
+        assert_eq!(na[0].0, b);
+        assert!((na[0].1 - 2.0).abs() < 1e-6);
+        // Bidirectional: b also links back to a.
+        let nb = get_neighbors(&conn, &b, 10);
+        assert_eq!(nb.len(), 1);
+        assert_eq!(nb[0].0, a);
+
+        // Weight accumulates on repeat.
+        insert_related_edges(&conn, &a, &[(b, 3.0)], 1001);
+        let na2 = get_neighbors(&conn, &a, 10);
+        assert!((na2[0].1 - 5.0).abs() < 1e-6);
+
+        // Self-edges are ignored.
+        insert_related_edges(&conn, &a, &[(a, 1.0)], 1002);
+        assert_eq!(get_neighbors(&conn, &a, 10).len(), 1);
     }
 
     #[test]

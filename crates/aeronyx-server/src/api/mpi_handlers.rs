@@ -282,6 +282,24 @@ pub struct SealedRememberRequest {
     /// `blind_fts` index; it never sees plaintext tokens. Empty = no full-text.
     #[serde(default)]
     pub fts_terms: Vec<String>,
+    /// Optional client-declared related records (Brick 3c, node-blind graph): the
+    /// client decides relatedness from plaintext and sends peer record_ids; the
+    /// node stores opaque record_id edges in `memory_edges` (never learns why).
+    #[serde(default)]
+    pub related_records: Vec<RelatedEdge>,
+}
+
+/// A client-declared edge from this blind record to an existing one.
+#[derive(Debug, Deserialize)]
+pub struct RelatedEdge {
+    /// Peer record_id (hex) this record is related to.
+    pub record_id: String,
+    #[serde(default = "default_edge_weight")]
+    pub weight: f64,
+}
+
+fn default_edge_weight() -> f64 {
+    1.0
 }
 
 /// Store a node-blind record: the node verifies the client's signature and keeps
@@ -433,6 +451,32 @@ pub async fn mpi_remember_sealed(
         storage
             .fts_index_blind_terms(&record.record_id, &owner, &rb.fts_terms)
             .await;
+    }
+
+    // Store client-declared related-record edges (node-blind graph). The client
+    // decides relatedness from plaintext; the node keeps only opaque record_id
+    // edges and never learns why they relate.
+    if !rb.related_records.is_empty() {
+        let mut edges: Vec<([u8; 32], f64)> = Vec::new();
+        for e in &rb.related_records {
+            if let Ok(b) = hex::decode(&e.record_id) {
+                if b.len() == 32 {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&b);
+                    edges.push((a, e.weight));
+                }
+            }
+        }
+        if !edges.is_empty() {
+            let now = now_secs() as i64;
+            let conn = storage.conn_lock().await;
+            crate::services::memchain::graph::insert_related_edges(
+                &conn,
+                &record.record_id,
+                &edges,
+                now,
+            );
+        }
     }
 
     let short = &owner_hex[..8.min(owner_hex.len())];
