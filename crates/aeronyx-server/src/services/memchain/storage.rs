@@ -1297,6 +1297,35 @@ impl MemoryStorage {
         );
     }
 
+    /// Node-blind project scope: the set of the owner's active record_ids
+    /// archived under `project_id`. Cheap ids-only lookup (served by
+    /// `idx_records_project`) used by recall to constrain node-blind FTS / graph
+    /// hits to a project, since `MemoryRecord` does not carry `project_id`.
+    pub async fn project_record_ids(
+        &self,
+        owner: &[u8; 32],
+        project_id: &str,
+    ) -> std::collections::HashSet<[u8; 32]> {
+        let mut set = std::collections::HashSet::new();
+        let conn = self.conn.lock().await;
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT record_id FROM records WHERE owner=?1 AND project_id=?2 AND status=0",
+        ) {
+            if let Ok(rows) = stmt.query_map(params![owner.as_slice(), project_id], |row| {
+                row.get::<_, Vec<u8>>(0)
+            }) {
+                for r in rows.flatten() {
+                    if r.len() == 32 {
+                        let mut a = [0u8; 32];
+                        a.copy_from_slice(&r);
+                        set.insert(a);
+                    }
+                }
+            }
+        }
+        set
+    }
+
     // ========================================
     // Provenance: find records by session (v2.5.2+Provenance)
     // ========================================

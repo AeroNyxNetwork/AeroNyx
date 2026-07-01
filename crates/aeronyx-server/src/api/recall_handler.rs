@@ -108,6 +108,36 @@ fn get_vector_index(req: &Request<axum::body::Body>, state: &MpiState) -> Option
         .or_else(|| state.vector_index.clone())
 }
 
+/// Whether a node-blind record passes the client-requested recall scope:
+/// cognitive `layer`, `time_range` window, and `project` id-set. Applied to
+/// blind FTS and graph hits so `layer` / `time_range` / `context` scope blind
+/// recall exactly as they scope the plaintext path. `None` filters are no-ops,
+/// so unscoped recall is unchanged.
+fn blind_scope_ok(
+    record: &MemoryRecord,
+    layer: Option<MemoryLayer>,
+    time_range: Option<&TimeRangeParam>,
+    project_scope: Option<&std::collections::HashSet<[u8; 32]>>,
+) -> bool {
+    if let Some(l) = layer {
+        if record.layer != l {
+            return false;
+        }
+    }
+    if let Some(tr) = time_range {
+        let ts = record.timestamp as i64;
+        if ts < tr.start || ts > tr.end {
+            return false;
+        }
+    }
+    if let Some(ids) = project_scope {
+        if !ids.contains(&record.record_id) {
+            return false;
+        }
+    }
+    true
+}
+
 // ============================================
 // Constants
 // ============================================
@@ -704,26 +734,26 @@ pub async fn mpi_recall(
         }
     }
 
-    // ── Step 4.1: Context filter (v2.5.3+Isolation) ──
+    // ── Step 4.1: Context / project scope (v2.5.3+Isolation) ──
+    // Resolve the project id-set ONCE. It scopes BOTH the plaintext `scored`
+    // path (below) and the node-blind FTS / graph hits (Step 4b/4c) — a single
+    // source of project scoping so blind recall honors `context` too.
     let context_project_id: Option<String> = match rb.context.as_deref() {
         None | Some("all") | Some("") => None,
         Some(ctx) => Some(ctx.to_string()),
     };
+    let project_scope: Option<HashSet<[u8; 32]>> = match context_project_id {
+        Some(ref pid) => Some(storage.project_record_ids(&owner, pid).await),
+        None => None,
+    };
 
-    if let Some(ref pid) = context_project_id {
-        let ctx_records = storage
-            .get_active_records_by_context(&owner, pid, layer_filter, top_k * 10)
-            .await;
-        let ctx_ids: HashSet<[u8; 32]> = ctx_records.iter().map(|r| r.record_id).collect();
-
+    if let Some(ref ids) = project_scope {
         let before = scored.len();
-        scored.retain(|(r, _)| ctx_ids.contains(&r.record_id));
-
+        scored.retain(|(r, _)| ids.contains(&r.record_id));
         debug!(
-            context = %pid,
             before = before,
             after = scored.len(),
-            "[RECALL] Step 4.1 context filter applied"
+            "[RECALL] Step 4.1 project scope applied"
         );
     }
 
@@ -731,6 +761,13 @@ pub async fn mpi_recall(
     let mut returned_ids = seen_ids.clone();
     let mut sealed_memories: Vec<SealedMemory> = Vec::new();
     for (r, score) in &scored {
+        // Time-range scope also applies to the scored (vector / recent) path.
+        if let Some(ref tr) = rb.time_range {
+            let ts = r.timestamp as i64;
+            if ts < tr.start || ts > tr.end {
+                continue;
+            }
+        }
         if r.blind {
             // Node-blind record: hand back the client ciphertext (base64) in a
             // separate sealed list. The node cannot read it, and it does not
@@ -820,6 +857,15 @@ pub async fn mpi_recall(
                 if !record.is_active() || record.owner != owner || !record.blind {
                     continue;
                 }
+                // Honor the client recall scope (layer / time_range / project).
+                if !blind_scope_ok(
+                    &record,
+                    layer_filter,
+                    rb.time_range.as_ref(),
+                    project_scope.as_ref(),
+                ) {
+                    continue;
+                }
                 returned_ids.push(rid);
                 sealed_memories.push(SealedMemory {
                     record_id: rid_hex,
@@ -867,6 +913,15 @@ pub async fn mpi_recall(
             }
             if let Some(record) = storage.get(&nid).await {
                 if !record.is_active() || record.owner != owner || !record.blind {
+                    continue;
+                }
+                // Blind graph neighbours honor the same recall scope.
+                if !blind_scope_ok(
+                    &record,
+                    layer_filter,
+                    rb.time_range.as_ref(),
+                    project_scope.as_ref(),
+                ) {
                     continue;
                 }
                 returned_ids.push(nid);
