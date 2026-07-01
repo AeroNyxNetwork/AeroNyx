@@ -791,12 +791,53 @@ pub async fn mpi_recall(
         memories.push(bm);
     }
 
+    // ── Step 4b: node-blind full-text (BM25 over client-hashed query terms) ──
+    // Blind records surfaced by keyword join the sealed list (ciphertext), deduped
+    // against blind records already returned via the vector path (returned_ids).
+    if !rb.query_terms.is_empty() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        let blind_hits = storage
+            .bm25_search_blind(&rb.query_terms, &owner, top_k * 3)
+            .await;
+        for (rid_hex, score) in blind_hits {
+            let rid = match hex::decode(&rid_hex) {
+                Ok(b) if b.len() == 32 => {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&b);
+                    a
+                }
+                _ => continue,
+            };
+            if returned_ids.contains(&rid) {
+                continue;
+            }
+            if let Some(record) = storage.get(&rid).await {
+                if !record.is_active() || record.owner != owner || !record.blind {
+                    continue;
+                }
+                returned_ids.push(rid);
+                sealed_memories.push(SealedMemory {
+                    record_id: rid_hex,
+                    score,
+                    ciphertext_b64: BASE64.encode(&record.encrypted_content),
+                    timestamp: record.timestamp,
+                });
+            }
+        }
+    }
+
     memories.sort_unstable_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     memories.truncate(top_k);
+    sealed_memories.sort_unstable_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    sealed_memories.truncate(top_k);
 
     // Compute matched_json BEFORE index-mode branch (avoid borrow-after-move)
     let matched_json: Option<Vec<serde_json::Value>> = analysis.as_ref().map(|qa| {

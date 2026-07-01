@@ -480,6 +480,11 @@ pub struct RecallRequest {
     /// v2.5.3+Isolation: None/"all" = no filter; other = project_id filter.
     #[serde(default)]
     pub context: Option<String>,
+    /// Brick 3b node-blind: client-hashed query token-hashes (`HMAC(k_fts, token)`
+    /// hex) for blind full-text. Matching blind records are returned as ciphertext
+    /// in the `sealed` list. Empty = no blind full-text search.
+    #[serde(default)]
+    pub query_terms: Vec<String>,
 }
 
 pub(crate) fn default_recall_mode() -> String {
