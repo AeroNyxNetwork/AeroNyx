@@ -3643,7 +3643,7 @@ impl PeerStore {
             .collect()
     }
 
-    /// Returns probe-only route candidates, including cooled-down quarantines.
+    /// Returns probe-only route candidates with cooled-down quarantine recovery.
     ///
     /// This method is intentionally narrower than the normal route candidate
     /// API: it exists only for local discovery probes that try to recover route
@@ -3652,11 +3652,13 @@ impl PeerStore {
     /// `route_candidates_with_capability_excluding()` so quarantined peers do
     /// not carry encrypted payloads until a successful probe clears quarantine.
     ///
-    /// The recovery gate waits for a short cool-down inside the quarantine
-    /// window, then allows one signed descriptor to prove reachability again.
-    /// It still excludes self/already-used hops and never reads encrypted
-    /// blobs, plaintext, client IPs, destinations, DNS contents, route ids,
-    /// voucher secrets, private keys, or wallet-level traffic.
+    /// Normal unknown/stale candidates are intentionally allowed so cold-start
+    /// probes can establish fresh routeability after restart. The recovery gate
+    /// applies only to quarantined peers: it waits for a short cool-down inside
+    /// the quarantine window, then allows one signed descriptor to prove
+    /// reachability again. It still excludes self/already-used hops and never
+    /// reads encrypted blobs, plaintext, client IPs, destinations, DNS contents,
+    /// route ids, voucher secrets, private keys, or wallet-level traffic.
     #[must_use]
     pub fn route_probe_candidates_with_capability_excluding(
         &self,
@@ -3674,7 +3676,7 @@ impl PeerStore {
                     .any(|excluded| *excluded == node_id)
             })
             .filter(|candidate| {
-                candidate.summary.routeability_ready
+                !candidate.summary.route_quarantined
                     || Self::route_quarantine_recovery_probe_ready(
                         candidate.summary.route_quarantine_remaining_seconds,
                     )
@@ -5937,6 +5939,15 @@ mod tests {
         store
             .upsert_verified_from_source(descriptor.clone(), now, "gossip_announce")
             .unwrap();
+
+        let cold_start_probe_candidates = store.route_probe_candidates_with_capability_excluding(
+            NodeCapability::ChatRelay,
+            now + 1,
+            8,
+            &[],
+        );
+        assert_eq!(cold_start_probe_candidates.len(), 1);
+        assert_eq!(cold_start_probe_candidates[0].node_id(), node_id);
 
         store.record_route_forward_success(&node_id, now + 1);
         store.record_route_forward_failure(&node_id, now + 2, "request_failed");
