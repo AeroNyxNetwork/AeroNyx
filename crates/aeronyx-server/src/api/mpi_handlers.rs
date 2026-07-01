@@ -322,10 +322,10 @@ pub async fn mpi_remember_sealed(
     // Node-blind storage is a remote-owner path: it requires the operator to have
     // opted into remote storage (default off). A stricter, dedicated toggle can be
     // added later; blind storage is a safer subset of remote storage.
-    if !state.allow_remote_storage {
+    if !(state.blind_storage_enabled || state.allow_remote_storage) {
         return (
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error":"blind storage disabled (allow_remote_storage=false)"})),
+            Json(serde_json::json!({"error":"blind storage disabled (set blind_storage_enabled or allow_remote_storage)"})),
         )
             .into_response();
     }

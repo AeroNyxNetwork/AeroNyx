@@ -203,6 +203,12 @@ pub struct MemChainConfig {
     #[serde(default)]
     pub allow_remote_storage: bool,
 
+    /// When true, accepts node-blind sealed records (POST /api/mpi/remember_sealed)
+    /// even if `allow_remote_storage` is off. Blind storage is a strictly safer
+    /// subset — the node cannot read the content — so it can be enabled on its own.
+    #[serde(default)]
+    pub blind_storage_enabled: bool,
+
     /// Maximum number of distinct remote owners this node will serve.
     #[serde(default = "default_max_remote_owners")]
     pub max_remote_owners: usize,
@@ -839,6 +845,7 @@ impl Default for MemChainConfig {
             embed_output_dim: default_embed_output_dim(),
             api_secret: None,
             allow_remote_storage: false,
+            blind_storage_enabled: false,
             max_remote_owners: default_max_remote_owners(),
             ner_enabled: false,
             ner_model_path: default_ner_model_path(),

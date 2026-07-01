@@ -890,6 +890,7 @@ mod tests {
             api_secret: None,
             embed_engine: None,
             allow_remote_storage: false,
+            blind_storage_enabled: false,
             max_remote_owners: 0,
             ner_engine: None,
             graph_enabled: false,
