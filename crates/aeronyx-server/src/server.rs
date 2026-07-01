@@ -88,6 +88,9 @@
 //  37. Preserves an existing usable PeerStore cache when the current in-memory
 //      view is empty, preventing early-start/shutdown writes from erasing
 //      restart recovery evidence before gossip has recovered peers.
+//  38. Uses a shorter privacy-safe probe recovery cooldown while two-hop
+//      message-delivery proof is not ready, so transient restart failures do
+//      not keep healthy nodes in a forming state for a full low-noise cycle.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -107,6 +110,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.2.4-BlindRelayProbeRecoveryCooldown - Reprobe faster until two-hop delivery proof is healthy
 //   v1.2.3-PeerCacheEmptyOverwriteGuard - Preserve usable cache when current PeerStore is empty
 //   v1.2.2-ProbeCoveragePriority - Probe unproven non-quarantined peers before already-proven peers
 //   v1.2.1-TwoHopOnionDeliveryProbe - Prefer synthetic onion delivery over control-plane proof
@@ -256,6 +260,7 @@ const KEEPALIVE_PROBE_INTERVAL_SECS: u64 = 60;
 const KEEPALIVE_ACK_TIMEOUT_SECS: u64 = 90;
 const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
 const BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS: u64 = 15 * 60;
+const BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS: u64 = 60;
 
 // ============================================
 // Server
@@ -2382,8 +2387,11 @@ impl Server {
                 );
                 if chat_relay_runtime_ready && succeeded > 0 {
                     let probe_now = unix_now_secs();
-                    let probe_cooldown_secs =
-                        Self::blind_relay_probe_cooldown_secs(&config.discovery);
+                    let probe_cooldown_secs = Self::blind_relay_probe_cooldown_secs_for_status(
+                        &config.discovery,
+                        &peer_store,
+                        probe_now,
+                    );
                     let probe_due = last_blind_relay_probe_at == 0
                         || probe_now.saturating_sub(last_blind_relay_probe_at)
                             >= probe_cooldown_secs;
@@ -2443,6 +2451,31 @@ impl Server {
             .gossip_interval_secs
             .saturating_mul(3)
             .max(BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS)
+    }
+
+    fn blind_relay_probe_recovery_cooldown_secs(discovery: &DiscoveryConfig) -> u64 {
+        discovery.gossip_interval_secs.clamp(
+            BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS,
+            BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
+        )
+    }
+
+    fn blind_relay_probe_cooldown_secs_for_status(
+        discovery: &DiscoveryConfig,
+        peer_store: &PeerStore,
+        now: u64,
+    ) -> u64 {
+        let status = peer_store.status(now);
+        let two_hop_delivery_ready = status
+            .two_hop_path_proof_history
+            .recent_message_delivery_ready
+            && !status.two_hop_path_proof_history.failure_streak_active;
+
+        if status.blind_relay_quality.quality_ready && two_hop_delivery_ready {
+            Self::blind_relay_probe_cooldown_secs(discovery)
+        } else {
+            Self::blind_relay_probe_recovery_cooldown_secs(discovery)
+        }
     }
 
     fn prioritize_probe_candidates(
@@ -4769,6 +4802,45 @@ mod tests {
     }
 
     #[test]
+    fn blind_relay_probe_cooldown_uses_recovery_interval_until_delivery_proof_is_ready() {
+        let mut discovery = DiscoveryConfig::default();
+        discovery.gossip_interval_secs = 60;
+
+        let store = PeerStore::new();
+        assert_eq!(
+            Server::blind_relay_probe_cooldown_secs_for_status(&discovery, &store, 1_700_000_000,),
+            super::BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS
+        );
+
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_010,
+            true,
+            "onion_terminal_delivered",
+            2,
+            1,
+            2,
+            1,
+        );
+        assert_eq!(
+            Server::blind_relay_probe_cooldown_secs_for_status(&discovery, &store, 1_700_000_020,),
+            BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS
+        );
+
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_030,
+            false,
+            "request_error",
+            2,
+            1,
+            2,
+            1,
+        );
+        assert_eq!(
+            Server::blind_relay_probe_cooldown_secs_for_status(&discovery, &store, 1_700_000_040,),
+            super::BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS
+        );
+    }
+
     fn self_discovery_descriptor_uses_privacy_safe_public_metadata() {
         let mut config = ServerConfig::default();
         config.discovery.enabled = true;
