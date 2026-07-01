@@ -51,6 +51,7 @@
 //!   surfaces never need to parse full peer diagnostics.
 //!
 //! ## Last Modified
+//! v0.21.0-BlindRelayRuntimeObservability - Add unified blind relay runtime view for nodeboard/backend
 //! v0.20.0-OnionRelayAdmissionWarmupDetail - Expose stability-window progress without route metadata
 //! v0.19.0-OnionRelayAdmissionContract - Add aggregate admission score and warmup contract
 //! v0.18.0-OnionCandidatePoolHealth - Expose aggregate onion candidate pool health for App/nodeboard decisions
@@ -316,6 +317,14 @@ pub struct DiscoveryStatusResponse {
     policy: DiscoveryPolicyStatus,
     local_capabilities: DiscoveryLocalCapabilityStatus,
     discovery_readiness: serde_json::Value,
+    /// Unified privacy-safe runtime view for nodeboard/backend.
+    ///
+    /// This duplicates selected aggregate counters from `peer_store` into a
+    /// stable product-facing shape. It must not include endpoints, route IDs,
+    /// encrypted payloads, receiver identities, client IPs, DNS contents,
+    /// destinations, Memory Chain plaintext, private keys, wallet-level
+    /// traffic, or social graph metadata.
+    blind_relay_runtime: serde_json::Value,
 }
 
 /// Compact public-safe discovery summary.
@@ -347,6 +356,8 @@ pub struct DiscoverySummaryResponse {
     peer_mesh: serde_json::Value,
     /// Blind relay aggregate runtime/probe evidence without payload metadata.
     blind_relay: serde_json::Value,
+    /// Product-facing blind relay runtime counters and last safe event buckets.
+    blind_relay_runtime: serde_json::Value,
     /// Bounded two-hop path proof aggregate without route reconstruction data.
     two_hop_path_proof: serde_json::Value,
     /// Aggregate permissionless relay-pool admission gate without route data.
@@ -797,6 +808,145 @@ pub fn discovery_readiness_status_value(
     })
 }
 
+/// Builds the product-facing blind relay runtime observability contract.
+///
+/// This view intentionally mirrors only aggregate counters and stable event
+/// buckets from `PeerStoreStatus`. It exists so nodeboard, backend aggregation,
+/// public website status, and AI runbooks can show whether a node is actually
+/// participating in the encrypted relay network without reconstructing routes.
+/// Never add endpoints, full node IDs, route IDs, encrypted blobs, receiver
+/// identities, client IPs, DNS contents, destinations, Memory Chain plaintext,
+/// private keys, wallet-level traffic, or social graph metadata here.
+#[must_use]
+pub fn blind_relay_runtime_status_value(
+    generated_at: u64,
+    status: &PeerStoreStatus,
+    local_capabilities: &DiscoveryLocalCapabilityStatus,
+) -> serde_json::Value {
+    let stats = &status.runtime.blind_relay;
+    let quality = &status.blind_relay_quality;
+    let proof = &status.two_hop_path_proof_history;
+    let peer_quorum = &status.peer_quorum;
+    let route_pool_ready = peer_quorum.routeable_chat_relays
+        >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
+        && peer_quorum.routeable_onion_middle_hops >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
+
+    serde_json::json!({
+        "generated_at": generated_at,
+        "contract_version": "blind_relay_runtime.v1",
+        "source": "rust_blind_relay_runtime",
+        "status": &quality.status,
+        "runtime_ready": quality.runtime_ready,
+        "quality_ready": quality.quality_ready,
+        "real_relay_ready": quality.real_relay_ready,
+        "synthetic_probe_ready": quality.synthetic_probe_ready,
+        "evidence_mode": &quality.evidence_mode,
+        "readiness_reason": &quality.readiness_reason,
+        "onion_candidates": {
+            "two_hop_ready": route_pool_ready,
+            "routeable_chat_relays": peer_quorum.routeable_chat_relays,
+            "routeable_onion_middle_hops": peer_quorum.routeable_onion_middle_hops,
+            "min_candidates_for_two_hop": ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+            "selection_policy": ONION_CANDIDATES_SELECTION_POLICY,
+            "refresh_after_seconds": ONION_CANDIDATES_REFRESH_AFTER_SECONDS,
+            "routeability_stale_after_seconds": ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS,
+        },
+        "relay_counters": {
+            "received": stats.received,
+            "accepted_total": quality.accepted_total,
+            "terminal_delivered_count": stats.terminal,
+            "middle_forwarded_count": stats.forwarded,
+            "rejected": stats.rejected,
+            "route_ttl_exhausted": stats.ttl_exhausted,
+            "forward_failed": stats.forward_failed,
+            "retry_attempted": stats.retry_attempted,
+            "retry_succeeded": stats.retry_succeeded,
+            "retry_exhausted": stats.retry_exhausted,
+            "backpressure_dropped": stats.backpressure_dropped,
+            "timestamp_rejected": stats.timestamp_rejected,
+            "replay_dropped": stats.replay_dropped,
+            "loop_detected": stats.loop_detected,
+            "rate_limited": stats.rate_limited,
+            "quarantined": stats.quarantined,
+        },
+        "proof_counters": {
+            "proof_ready": proof.proof_ready,
+            "message_delivery_ready": proof.message_delivery_ready,
+            "recent_message_delivery_ready": proof.recent_message_delivery_ready,
+            "proof_accepted": proof.succeeded,
+            "proof_rejected": proof.failed,
+            "proof_attempted": proof.attempted,
+            "message_delivery_successes": proof.message_delivery_successes,
+            "success_percent": proof.success_percent,
+            "stability_ready": proof.stability_ready,
+            "stability_status": &proof.stability_status,
+            "stability_window_attempted": proof.stability_window_attempted,
+            "stability_window_succeeded": proof.stability_window_succeeded,
+            "stability_window_failed": proof.stability_window_failed,
+            "failure_streak_active": proof.failure_streak_active,
+            "failure_circuit_breaker_active": proof.failure_circuit_breaker_active,
+            "latest_outcome": &proof.latest_outcome,
+            "latest_reason_bucket": &proof.latest_reason_bucket,
+            "latest_age_seconds": proof.latest_age_seconds,
+            "latest_success_age_seconds": proof.latest_success_age_seconds,
+            "latest_failure_age_seconds": proof.latest_failure_age_seconds,
+            "latest_message_delivery_age_seconds": proof.latest_message_delivery_age_seconds,
+            "proof_scope": &proof.proof_scope,
+        },
+        "probe_counters": {
+            "single_hop_attempted": stats.probe_attempted,
+            "single_hop_succeeded": stats.probe_succeeded,
+            "single_hop_failed": stats.probe_failed,
+            "two_hop_attempted": stats.two_hop_probe_attempted,
+            "two_hop_succeeded": stats.two_hop_probe_succeeded,
+            "two_hop_failed": stats.two_hop_probe_failed,
+            "last_probe_age_seconds": quality.last_probe_age_seconds,
+            "last_two_hop_probe_age_seconds": quality.last_two_hop_probe_age_seconds,
+        },
+        "last_successful_blind_relay": latest_blind_relay_event_value(status, generated_at, true),
+        "last_failed_blind_relay": latest_blind_relay_event_value(status, generated_at, false),
+        "local_capability": {
+            "status": local_capabilities.status,
+            "chat_relay_configured": local_capabilities.chat_relay_configured,
+            "blind_relay_endpoint_ready": local_capabilities.blind_relay_endpoint_ready,
+            "chat_relay_runtime_ready": local_capabilities.chat_relay_runtime_ready,
+            "safe_to_advertise_chat_relay": local_capabilities.safe_to_advertise_chat_relay,
+        },
+        "last_event_age_seconds": quality.last_event_age_seconds,
+        "last_accepted_age_seconds": quality.last_accepted_age_seconds,
+        "accepted_percent": quality.accepted_percent,
+        "next_action": &quality.next_action,
+        "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
+        "privacy_boundary": "aggregate blind relay runtime counters only; no node endpoints, route ids, selected hops, receiver keys, encrypted payloads, client IPs, DNS contents, destinations, Memory Chain plaintext, private keys, wallet-level traffic, or social graph metadata",
+    })
+}
+
+fn latest_blind_relay_event_value(
+    status: &PeerStoreStatus,
+    generated_at: u64,
+    successful: bool,
+) -> serde_json::Value {
+    let event = status.recent_audit_events.iter().rev().find(|event| {
+        event.action.starts_with("blind_relay")
+            && if successful {
+                event.outcome == "accepted"
+            } else {
+                event.outcome == "rejected" || event.outcome == "limited"
+            }
+    });
+
+    match event {
+        Some(event) => serde_json::json!({
+            "at": event.at,
+            "age_seconds": generated_at.saturating_sub(event.at),
+            "action": &event.action,
+            "outcome": &event.outcome,
+            "reason_bucket": &event.detail,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// Builds the compact public-safe discovery summary response.
 ///
 /// Keep this helper intentionally narrow. `/api/discovery/status` remains the
@@ -812,6 +962,8 @@ pub fn discovery_summary_response(
     let readiness = discovery_readiness_status_value(status, local_capabilities);
     let protocol_foundation = &readiness["protocol_foundation"];
     let onion_relay_admission = onion_relay_admission_status_value(status, local_capabilities);
+    let blind_relay_runtime =
+        blind_relay_runtime_status_value(generated_at, status, local_capabilities);
     let peer_quorum = &status.peer_quorum;
     let network_story = &status.network_story;
     let blind_relay_quality = &status.blind_relay_quality;
@@ -1065,6 +1217,7 @@ pub fn discovery_summary_response(
             "last_probe_age_seconds": blind_relay_quality.last_probe_age_seconds,
             "next_action": &blind_relay_quality.next_action,
         }),
+        blind_relay_runtime,
         two_hop_path_proof: serde_json::Value::Object(two_hop_path_proof),
         onion_relay_admission,
         next_action,
@@ -1316,6 +1469,8 @@ async fn status_handler(State(state): State<DiscoveryApiState>) -> Json<Discover
     let peer_store = state.peer_store.status(now);
     let local_capabilities = state.local_capabilities;
     let discovery_readiness = discovery_readiness_status_value(&peer_store, &local_capabilities);
+    let blind_relay_runtime =
+        blind_relay_runtime_status_value(now, &peer_store, &local_capabilities);
     Json(DiscoveryStatusResponse {
         generated_at: now,
         peer_store,
@@ -1330,6 +1485,7 @@ async fn status_handler(State(state): State<DiscoveryApiState>) -> Json<Discover
         },
         local_capabilities,
         discovery_readiness,
+        blind_relay_runtime,
     })
 }
 
