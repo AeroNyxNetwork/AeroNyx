@@ -139,6 +139,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.49.0-TwoHopProbeReasonBuckets - Bucket runtime two-hop blind relay probe errors
 //! v0.48.0-BlindRelayFreshnessGate - Require fresh accepted/probe evidence before reporting blind relay ready
 //! v0.47.0-TwoHopProofBackedStory - Let fresh two-hop path proof promote local network story to onion_ready
 //! v0.46.0-OnionMiddleRouteabilityRecovery - Exposed route quarantine checks for onion middle cold-start recovery
@@ -2933,6 +2934,7 @@ impl PeerStore {
             value if value.starts_with("two_hop_onion_delivery_probe_") => {
                 "onion_request_error".to_string()
             }
+            value if value.starts_with("two_hop_blind_relay_probe_") => "request_error".to_string(),
             value if value.starts_with("two_hop_blind_relay_probe_request_") => {
                 "request_error".to_string()
             }
@@ -6615,17 +6617,22 @@ mod tests {
 
         store.record_blind_relay_two_hop_probe_result(1_700_000_010, false, "http_502");
         store.record_blind_relay_two_hop_probe_result(1_700_000_020, false, "endpoint://leak");
-        store.record_blind_relay_two_hop_probe_result(1_700_000_030, true, "accepted");
+        store.record_blind_relay_two_hop_probe_result(
+            1_700_000_030,
+            false,
+            "two_hop_blind_relay_probe_timeout",
+        );
+        store.record_blind_relay_two_hop_probe_result(1_700_000_040, true, "accepted");
 
-        let status = store.status(1_700_000_045);
+        let status = store.status(1_700_000_055);
         let history = status.two_hop_path_proof_history;
 
         assert_eq!(history.window_size, MAX_TWO_HOP_PATH_PROOF_EVENTS);
-        assert_eq!(history.retained_events, 3);
-        assert_eq!(history.attempted, 3);
+        assert_eq!(history.retained_events, 4);
+        assert_eq!(history.attempted, 4);
         assert_eq!(history.succeeded, 1);
         assert_eq!(history.message_delivery_successes, 0);
-        assert_eq!(history.failed, 2);
+        assert_eq!(history.failed, 3);
         assert_eq!(history.status, "ready");
         assert_eq!(history.freshness_bucket, "fresh_success");
         assert!(history.proof_ready);
@@ -6633,7 +6640,7 @@ mod tests {
         assert!(!history.message_delivery_ready);
         assert!(!history.recent_message_delivery_ready);
         assert!(!history.failure_streak_active);
-        assert_eq!(history.success_percent, 33);
+        assert_eq!(history.success_percent, 25);
         assert_eq!(history.latest_outcome.as_deref(), Some("accepted"));
         assert_eq!(history.latest_reason_bucket.as_deref(), Some("accepted"));
         assert_eq!(history.latest_age_seconds, Some(15));
@@ -6645,9 +6652,11 @@ mod tests {
         assert_eq!(history.consecutive_message_delivery_successes, 0);
         assert_eq!(history.events[0].reason_bucket, "http_error");
         assert_eq!(history.events[1].reason_bucket, "unknown");
-        assert_eq!(history.events[2].reason_bucket, "accepted");
+        assert_eq!(history.events[2].reason_bucket, "request_error");
+        assert_eq!(history.events[3].reason_bucket, "accepted");
         assert_eq!(history.reason_bucket_counts.get("http_error"), Some(&1));
         assert_eq!(history.reason_bucket_counts.get("unknown"), Some(&1));
+        assert_eq!(history.reason_bucket_counts.get("request_error"), Some(&1));
         assert_eq!(history.reason_bucket_counts.get("accepted"), Some(&1));
         assert_eq!(
             history.failure_reason_bucket_counts.get("http_error"),
@@ -6657,15 +6666,19 @@ mod tests {
             history.failure_reason_bucket_counts.get("unknown"),
             Some(&1)
         );
+        assert_eq!(
+            history.failure_reason_bucket_counts.get("request_error"),
+            Some(&1)
+        );
         assert_eq!(history.failure_reason_bucket_counts.get("accepted"), None);
         assert_eq!(
             history.path_shape_counts.get("entry_middle_terminal"),
-            Some(&3)
+            Some(&4)
         );
-        assert_eq!(history.candidate_pool_counts.get("incomplete"), Some(&3));
+        assert_eq!(history.candidate_pool_counts.get("incomplete"), Some(&4));
         assert_eq!(
             history.ttl_shape_counts.get("entry_ttl_2_onward_ttl_1"),
-            Some(&3)
+            Some(&4)
         );
 
         let serialized = serde_json::to_string(&history).expect("history serializes");
