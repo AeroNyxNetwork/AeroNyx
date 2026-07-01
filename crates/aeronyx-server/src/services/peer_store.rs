@@ -3891,9 +3891,13 @@ impl PeerStore {
     pub fn status(&self, now: u64) -> PeerStoreStatus {
         let snapshot = self.snapshot(now);
         let bootstrap = self.bootstrap_status.read().clone();
-        let runtime = self.counters.snapshot();
-        let blind_relay_quality = Self::blind_relay_quality_status(now, &runtime.blind_relay);
         let two_hop_path_proof_history = self.two_hop_path_proof_history(now);
+        let runtime = self.counters.snapshot();
+        let blind_relay_quality = Self::blind_relay_quality_status(
+            now,
+            &runtime.blind_relay,
+            &two_hop_path_proof_history,
+        );
         let stability = Self::stability(&snapshot, &bootstrap, now);
         let peer_summary = self.peer_summary(now);
         let route_candidates = self.route_candidate_status(now);
@@ -3931,6 +3935,7 @@ impl PeerStore {
     fn blind_relay_quality_status(
         now: u64,
         stats: &PeerStoreBlindRelayStats,
+        two_hop_path_proof_history: &PeerStoreTwoHopPathProofHistory,
     ) -> PeerStoreBlindRelayQualityStatus {
         let accepted_total = stats.terminal.saturating_add(stats.forwarded);
         let last_event_age_seconds = stats
@@ -4002,16 +4007,27 @@ impl PeerStore {
             || stats.retry_exhausted > 0
             || stats.backpressure_dropped > 0
             || stats.probe_failed > 0;
-        let quality_ready = runtime_ready && !transport_attention;
+        let transport_attention_recovered_by_stable_message_delivery = transport_attention
+            && real_relay_ready
+            && two_hop_path_proof_history.stability_ready
+            && two_hop_path_proof_history.recent_message_delivery_ready
+            && !two_hop_path_proof_history.failure_streak_active
+            && !two_hop_path_proof_history.failure_circuit_breaker_active;
+        let active_transport_attention =
+            transport_attention && !transport_attention_recovered_by_stable_message_delivery;
+        let quality_ready = runtime_ready && !active_transport_attention;
 
         let status = if stats.received == 0
             && stats.probe_attempted == 0
             && stats.two_hop_probe_attempted == 0
         {
             "idle"
-        } else if stats.retry_exhausted > 0 || stats.backpressure_dropped > 0 {
+        } else if active_transport_attention
+            && (stats.retry_exhausted > 0 || stats.backpressure_dropped > 0)
+        {
             "attention"
-        } else if stats.forward_failed > 0 || stats.probe_failed > 0 {
+        } else if active_transport_attention && (stats.forward_failed > 0 || stats.probe_failed > 0)
+        {
             "degraded"
         } else if protection_active {
             "protecting"
@@ -4023,35 +4039,36 @@ impl PeerStore {
             "observing"
         };
 
-        let readiness_reason = if real_relay_ready && !transport_attention && !protection_active {
-            "real_relay_observed"
-        } else if real_relay_ready && transport_attention {
-            "real_relay_transport_attention"
-        } else if real_relay_ready && protection_active {
-            "real_relay_protection_active"
-        } else if two_hop_probe_ready && !transport_attention && !protection_active {
-            "synthetic_two_hop_control_probe_ready"
-        } else if synthetic_probe_ready && !transport_attention && !protection_active {
-            "synthetic_probe_ready"
-        } else if stats.two_hop_probe_attempted > 0 && stats.two_hop_probe_succeeded == 0 {
-            "synthetic_two_hop_control_probe_failed"
-        } else if stats.probe_attempted > 0 && stats.probe_succeeded == 0 {
-            "synthetic_probe_failed"
-        } else if transport_attention {
-            "transport_attention"
-        } else if protection_active {
-            "protection_active"
-        } else if accepted_evidence_seen && !real_relay_ready {
-            "real_relay_stale"
-        } else if two_hop_probe_evidence_seen && !two_hop_probe_ready {
-            "synthetic_two_hop_control_probe_stale"
-        } else if probe_evidence_seen && !probe_ready {
-            "synthetic_probe_stale"
-        } else if stats.received > 0 {
-            "real_relay_attempted"
-        } else {
-            "idle_waiting_for_relay"
-        };
+        let readiness_reason =
+            if real_relay_ready && !active_transport_attention && !protection_active {
+                "real_relay_observed"
+            } else if real_relay_ready && active_transport_attention {
+                "real_relay_transport_attention"
+            } else if real_relay_ready && protection_active {
+                "real_relay_protection_active"
+            } else if two_hop_probe_ready && !active_transport_attention && !protection_active {
+                "synthetic_two_hop_control_probe_ready"
+            } else if synthetic_probe_ready && !active_transport_attention && !protection_active {
+                "synthetic_probe_ready"
+            } else if stats.two_hop_probe_attempted > 0 && stats.two_hop_probe_succeeded == 0 {
+                "synthetic_two_hop_control_probe_failed"
+            } else if stats.probe_attempted > 0 && stats.probe_succeeded == 0 {
+                "synthetic_probe_failed"
+            } else if active_transport_attention {
+                "transport_attention"
+            } else if protection_active {
+                "protection_active"
+            } else if accepted_evidence_seen && !real_relay_ready {
+                "real_relay_stale"
+            } else if two_hop_probe_evidence_seen && !two_hop_probe_ready {
+                "synthetic_two_hop_control_probe_stale"
+            } else if probe_evidence_seen && !probe_ready {
+                "synthetic_probe_stale"
+            } else if stats.received > 0 {
+                "real_relay_attempted"
+            } else {
+                "idle_waiting_for_relay"
+            };
 
         let accepted_percent = if stats.received == 0 {
             0
@@ -4079,7 +4096,7 @@ impl PeerStore {
         };
 
         let detail = format!(
-            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} two_hop_probe_attempted={} two_hop_probe_succeeded={} two_hop_probe_failed={} timestamp_rejected={} real_relay_ready={} synthetic_probe_ready={} two_hop_probe_ready={} evidence_mode={} proof_scope={} readiness_reason={} protection_active={} accepted_percent={} stale_after_seconds={} last_event_age_seconds={} last_accepted_age_seconds={} last_probe_age_seconds={} last_two_hop_probe_age_seconds={}",
+            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} two_hop_probe_attempted={} two_hop_probe_succeeded={} two_hop_probe_failed={} timestamp_rejected={} real_relay_ready={} synthetic_probe_ready={} two_hop_probe_ready={} evidence_mode={} proof_scope={} readiness_reason={} protection_active={} accepted_percent={} transport_attention_recovered={} proof_stability_status={} stale_after_seconds={} last_event_age_seconds={} last_accepted_age_seconds={} last_probe_age_seconds={} last_two_hop_probe_age_seconds={}",
             stats.received,
             accepted_total,
             stats.terminal,
@@ -4105,6 +4122,8 @@ impl PeerStore {
             readiness_reason,
             protection_active,
             accepted_percent,
+            transport_attention_recovered_by_stable_message_delivery,
+            two_hop_path_proof_history.stability_status,
             PEER_ROUTEABILITY_STALE_AFTER_SECS,
             last_event_age_seconds
                 .map(|age| age.to_string())
@@ -7348,6 +7367,60 @@ mod tests {
         assert_eq!(quality.retry_exhausted, 1);
         assert_eq!(quality.last_event_age_seconds, Some(5));
         assert!(quality.next_action.contains("next-hop reachability"));
+        assert!(!quality.detail.contains("https://"));
+        assert!(!quality.detail.contains("endpoint"));
+        assert!(!quality.detail.contains("route_id"));
+        assert!(!quality.detail.contains("encrypted_blob"));
+        assert!(!quality.detail.contains("payload"));
+    }
+
+    #[test]
+    fn test_blind_relay_quality_recovers_after_stable_message_delivery_window() {
+        let store = PeerStore::new();
+
+        store.record_blind_relay_forwarded(1_700_000_010, 1);
+        store.record_blind_relay_retry_attempt(1_700_000_011, "blind_relay_request_timeout");
+        store.record_blind_relay_retry_exhausted(1_700_000_012, 2, "blind_relay_request_timeout");
+        store.record_blind_relay_rejected(1_700_000_013, "blind_relay_request_timeout");
+
+        for at in [1_700_000_020, 1_700_000_030, 1_700_000_040] {
+            store.record_blind_relay_two_hop_probe_result_with_context(
+                at,
+                true,
+                "onion_terminal_delivered",
+                3,
+                3,
+                2,
+                1,
+            );
+        }
+
+        let status = store.status(1_700_000_050);
+        let quality = status.blind_relay_quality;
+        let history = status.two_hop_path_proof_history;
+
+        assert_eq!(history.stability_status, "stable");
+        assert!(history.stability_ready);
+        assert!(history.recent_message_delivery_ready);
+        assert!(!history.failure_streak_active);
+        assert!(!history.failure_circuit_breaker_active);
+
+        assert_eq!(quality.status, "ready");
+        assert!(quality.runtime_ready);
+        assert!(quality.quality_ready);
+        assert!(quality.real_relay_ready);
+        assert_eq!(quality.evidence_mode, "real_relay_traffic");
+        assert_eq!(quality.proof_scope, "message_delivery");
+        assert_eq!(quality.readiness_reason, "real_relay_observed");
+        assert_eq!(quality.forward_failed, 1);
+        assert_eq!(quality.retry_exhausted, 1);
+        assert!(quality
+            .detail
+            .contains("transport_attention_recovered=true"));
+        assert!(quality.detail.contains("proof_stability_status=stable"));
+        assert!(quality
+            .next_action
+            .contains("accepted encrypted relay work"));
         assert!(!quality.detail.contains("https://"));
         assert!(!quality.detail.contains("endpoint"));
         assert!(!quality.detail.contains("route_id"));
