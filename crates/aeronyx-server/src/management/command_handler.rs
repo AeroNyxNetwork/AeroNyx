@@ -19,6 +19,9 @@
 //! - Maintains an internal log of received command IDs to avoid
 //!   re-executing duplicate commands (CMS may resend until acknowledged).
 //! - Reports execution status back to CMS via `ManagementClient`.
+//! - Runs the operator two-hop smoke command through the local-only Rust API
+//!   and reports aggregate proof counters without route IDs, endpoints,
+//!   payloads, receiver keys, client IPs, or social graph metadata.
 //!
 //! ## Main Logical Flow
 //! 1. `HeartbeatReporter` receives `HeartbeatResponse` with `commands`
@@ -46,6 +49,7 @@
 //! ## Last Modified
 //! v1.3.0 - Initial command pipeline
 //! v1.5.0 - VPN-only operations dispatch
+//! v1.6.0 - Added two_hop_smoke aggregate relay proof command
 //! ============================================
 
 use std::collections::HashSet;
@@ -72,6 +76,8 @@ use aeronyx_common::types::SessionId;
 /// When this limit is reached, the oldest half is evicted.
 const MAX_PROCESSED_IDS: usize = 1000;
 const VPN_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const TWO_HOP_SMOKE_TIMEOUT: Duration = Duration::from_secs(20);
+const TWO_HOP_SMOKE_URL: &str = "http://127.0.0.1:8421/api/discovery/smoke/two-hop";
 const MAX_DIAGNOSTIC_MESSAGE: usize = 3800;
 
 fn session_quality_from_stats(snap: &crate::services::session::StatsSnapshot) -> SessionQuality {
@@ -118,6 +124,7 @@ fn session_quality_from_stats(snap: &crate::services::session::StatsSnapshot) ->
 ///       │     ├── "collect_logs"    → collect bounded service logs
 ///       │     ├── "refresh_config"  → validate management config
 ///       │     ├── "kick_session"    → disconnect one active tunnel
+///       │     ├── "two_hop_smoke"   → local aggregate relay proof trigger
 ///       │     ├── "ban_wallet"      → block a wallet on this node
 ///       │     ├── "unban_wallet"    → remove a wallet block
 ///       │     ├── "restart_service" → restart the fixed VPN service
@@ -271,6 +278,9 @@ impl CommandHandler {
             }
             "refresh_config" => {
                 self.handle_refresh_config(&command).await;
+            }
+            "two_hop_smoke" => {
+                self.handle_two_hop_smoke(&command).await;
             }
             "ban_wallet" => {
                 self.handle_ban_wallet(&command).await;
@@ -602,6 +612,57 @@ impl CommandHandler {
             &message,
         )
         .await;
+    }
+
+    /// Handles `two_hop_smoke` command.
+    ///
+    /// This is a read-only operator proof trigger. It calls the local-only
+    /// Rust API that sends one synthetic opaque two-hop onion delivery probe
+    /// and returns aggregate counters. The command deliberately does not
+    /// accept an arbitrary URL from CMS, so it cannot be turned into an SSRF
+    /// primitive or a remote shell.
+    async fn handle_two_hop_smoke(&self, command: &Command) {
+        info!(
+            command_id = %command.id,
+            "[CMD_HANDLER] 🧪 two_hop_smoke"
+        );
+
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::InProgress,
+            35,
+            "Triggering local two-hop encrypted relay smoke check",
+        )
+        .await;
+
+        match run_local_two_hop_smoke().await {
+            Ok(value) => {
+                let success = value
+                    .get("success")
+                    .and_then(|item| item.as_bool())
+                    .unwrap_or(false);
+                let message = sanitize_and_truncate(&two_hop_smoke_summary(&value));
+                let status = if success {
+                    CommandExecutionStatus::Completed
+                } else {
+                    CommandExecutionStatus::Failed
+                };
+                let progress = if success { 100 } else { 0 };
+                self.report_status_for_agent_type("vpn", &command.id, status, progress, &message)
+                    .await;
+            }
+            Err(message) => {
+                self.report_status_for_agent_type(
+                    "vpn",
+                    &command.id,
+                    CommandExecutionStatus::Failed,
+                    0,
+                    &sanitize_and_truncate(&message),
+                )
+                .await;
+            }
+        }
     }
 
     /// Handles `apply_policy` command.
@@ -957,6 +1018,88 @@ impl CommandHandler {
         self.processed_ids.insert(id.clone());
         self.processed_ids_order.push(id);
     }
+}
+
+async fn run_local_two_hop_smoke() -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(TWO_HOP_SMOKE_TIMEOUT)
+        .build()
+        .map_err(|error| format!("two_hop_smoke client build failed: {}", error))?;
+
+    let response = timeout(TWO_HOP_SMOKE_TIMEOUT, client.post(TWO_HOP_SMOKE_URL).send())
+        .await
+        .map_err(|_| "two_hop_smoke timed out before local Rust API responded".to_string())?
+        .map_err(|error| format!("two_hop_smoke request failed: {}", error))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("two_hop_smoke response read failed: {}", error))?;
+    if !status.is_success() {
+        return Err(format!(
+            "two_hop_smoke local API returned status={} body={}",
+            status,
+            collapse_lines(&body, 8)
+        ));
+    }
+
+    serde_json::from_str(&body)
+        .map_err(|error| format!("two_hop_smoke response JSON decode failed: {}", error))
+}
+
+fn two_hop_smoke_summary(value: &serde_json::Value) -> String {
+    let success = value
+        .get("success")
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false);
+    let before_attempted = json_u64(value, &["before", "proof_counters", "proof_attempted"]);
+    let after_attempted = json_u64(value, &["after", "proof_counters", "proof_attempted"]);
+    let before_accepted = json_u64(value, &["before", "proof_counters", "proof_accepted"]);
+    let after_accepted = json_u64(value, &["after", "proof_counters", "proof_accepted"]);
+    let before_two_hop = json_u64(value, &["before", "probe_counters", "two_hop_succeeded"]);
+    let after_two_hop = json_u64(value, &["after", "probe_counters", "two_hop_succeeded"]);
+    let reason =
+        json_str(value, &["after", "proof_counters", "latest_reason_bucket"]).unwrap_or("unknown");
+    let status = json_str(value, &["after", "status"]).unwrap_or("unknown");
+    let evidence = json_str(value, &["after", "evidence_mode"]).unwrap_or("unknown");
+    let boundary = json_str(value, &["privacy_boundary"])
+        .or_else(|| json_str(value, &["after", "privacy_boundary"]))
+        .unwrap_or("aggregate smoke result only");
+
+    format!(
+        "two_hop_smoke success={}; status={}; evidence={}; proof_attempted {}→{}; proof_accepted {}→{}; two_hop_succeeded {}→{}; latest_reason={}; privacy_boundary={}",
+        success,
+        status,
+        evidence,
+        before_attempted,
+        after_attempted,
+        before_accepted,
+        after_accepted,
+        before_two_hop,
+        after_two_hop,
+        reason,
+        boundary
+    )
+}
+
+fn json_u64(value: &serde_json::Value, path: &[&str]) -> u64 {
+    let mut cursor = value;
+    for key in path {
+        let Some(next) = cursor.get(*key) else {
+            return 0;
+        };
+        cursor = next;
+    }
+    cursor.as_u64().unwrap_or(0)
+}
+
+fn json_str<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
+    let mut cursor = value;
+    for key in path {
+        cursor = cursor.get(*key)?;
+    }
+    cursor.as_str()
 }
 
 async fn run_readonly_command(program: &str, args: &[&str]) -> String {

@@ -483,6 +483,7 @@ pub struct NodePolicy {
 /// - `"ban_wallet"` / `"unban_wallet"` — Update the operator deny list
 /// - `"restart_service"` — Restart the fixed VPN service after audit reporting
 /// - `"apply_policy"` — Acknowledge and report the current runtime policy snapshot
+/// - `"two_hop_smoke"` — Trigger the local aggregate two-hop relay smoke check
 ///
 /// ⚠️ `id` MUST be included in all status reports back to CMS.
 /// Unknown actions should be logged and reported as `failed`, never panic.
