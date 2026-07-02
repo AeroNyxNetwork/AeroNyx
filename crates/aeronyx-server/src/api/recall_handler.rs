@@ -57,9 +57,13 @@
 //! v2.4.0+Progressive   - 🌟 mode="index" branch + mpi_recall_detail handler
 //! v2.5.3+Isolation     - 🌟 Step 4.1 context filter; RecallRequest.context field
 //! v1.0.1-SaaSFix       - 🔧 Extract storage/vector_index from Extensions
+//! v2.5.4+BlindRRF      - 🔧 Step 4b hybrid rank fusion (RRF) for node-blind
+//!                          recall: keyword evidence was dropped for records
+//!                          already surfaced by the vector path, and BM25 vs
+//!                          vector scores are incommensurable → fuse by rank
 //!
 //! ## Last Modified
-//! v1.0.1-SaaSFix - 🔧 Extension extraction for SaaS compatibility
+//! v2.5.4+BlindRRF - 🔧 blind hybrid recall rank fusion (vector ⊕ keyword)
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -834,14 +838,35 @@ pub async fn mpi_recall(
     }
 
     // ── Step 4b: node-blind full-text (BM25 over client-hashed query terms) ──
-    // Blind records surfaced by keyword join the sealed list (ciphertext), deduped
-    // against blind records already returned via the vector path (returned_ids).
+    // Blind records surfaced by keyword join the sealed list (ciphertext) and are
+    // RANK-FUSED with the blind records already returned via the vector path.
     if !rb.query_terms.is_empty() {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
         let blind_hits = storage
             .bm25_search_blind(&rb.query_terms, &owner, top_k * 3)
             .await;
-        for (rid_hex, score) in blind_hits {
+        // ── Hybrid rank fusion (RRF) over the node-blind results ──
+        // Vector-path scores (compute_recall_score, ~0..1.3) and blind-keyword
+        // BM25 (unbounded) are incommensurable, and the previous dedup DROPPED
+        // the keyword evidence for records already surfaced by the vector path
+        // — hybrid recall degenerated to vector-only whenever the vector
+        // candidate pool covered the keyword hits (and raw-score sorting let
+        // keyword drown vector otherwise). Fuse by rank instead:
+        // score = Σ_src 61/(60 + rank_src + 1), scale-free across sources.
+        // Single-source entries land in ~0.73..1.0 — above graph expansion's
+        // ≤0.5, matching the old ordering semantics — and entries confirmed by
+        // BOTH sources rank on top (up to 2.0).
+        let vec_rank: std::collections::HashMap<String, usize> = sealed_memories
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.record_id.clone(), i))
+            .collect();
+        let mut kw_rank: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (i, (rid_hex, _)) in blind_hits.iter().enumerate() {
+            kw_rank.entry(rid_hex.clone()).or_insert(i);
+        }
+        for (rid_hex, _bm25) in blind_hits {
             let rid = match hex::decode(&rid_hex) {
                 Ok(b) if b.len() == 32 => {
                     let mut a = [0u8; 32];
@@ -851,7 +876,7 @@ pub async fn mpi_recall(
                 _ => continue,
             };
             if returned_ids.contains(&rid) {
-                continue;
+                continue; // already sealed via the vector path — fused below
             }
             if let Some(record) = storage.get(&rid).await {
                 if !record.is_active() || record.owner != owner || !record.blind {
@@ -869,10 +894,24 @@ pub async fn mpi_recall(
                 returned_ids.push(rid);
                 sealed_memories.push(SealedMemory {
                     record_id: rid_hex,
-                    score,
+                    score: 0.0, // fused right below
                     ciphertext_b64: BASE64.encode(&record.encrypted_content),
                     timestamp: record.timestamp,
                 });
+            }
+        }
+        for m in sealed_memories.iter_mut() {
+            let v = vec_rank.get(&m.record_id);
+            let k = kw_rank.get(&m.record_id);
+            if v.is_some() || k.is_some() {
+                let mut s = 0.0f64;
+                if let Some(r) = v {
+                    s += 61.0 / (60.0 + *r as f64 + 1.0);
+                }
+                if let Some(r) = k {
+                    s += 61.0 / (60.0 + *r as f64 + 1.0);
+                }
+                m.score = s;
             }
         }
     }
