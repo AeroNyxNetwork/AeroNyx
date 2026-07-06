@@ -1326,6 +1326,33 @@ impl MemoryStorage {
         set
     }
 
+    /// [D6 ATTEST] Node-blind: all of the owner's ACTIVE record_ids (status=0),
+    /// returned SORTED for a deterministic storage-root commitment. The node
+    /// reads only opaque content-address hashes here (never plaintext), so
+    /// signing a root over this set preserves blindness while giving the client
+    /// verifiable, tamper-evident proof of exactly which records the node holds.
+    pub async fn owner_record_ids(&self, owner: &[u8; 32]) -> Vec<[u8; 32]> {
+        let mut ids: Vec<[u8; 32]> = Vec::new();
+        let conn = self.conn.lock().await;
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT record_id FROM records WHERE owner=?1 AND status=0")
+        {
+            if let Ok(rows) =
+                stmt.query_map(params![owner.as_slice()], |row| row.get::<_, Vec<u8>>(0))
+            {
+                for r in rows.flatten() {
+                    if r.len() == 32 {
+                        let mut a = [0u8; 32];
+                        a.copy_from_slice(&r);
+                        ids.push(a);
+                    }
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
     // ========================================
     // Provenance: find records by session (v2.5.2+Provenance)
     // ========================================

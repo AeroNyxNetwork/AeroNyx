@@ -944,6 +944,8 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
         .route("/api/mpi/forget", post(mpi_handlers::mpi_forget))
         .route("/api/mpi/status", get(mpi_handlers::mpi_status))
         .route("/api/mpi/embed", post(mpi_handlers::mpi_embed))
+        // [D6 ATTEST] node signs a blind storage-root commitment for the owner
+        .route("/api/mpi/attest", post(mpi_handlers::mpi_attest))
         // v2.5.2+Provenance: GET + PATCH; provenance AFTER plain :record_id
         // ⚠️ /record/:id/provenance MUST be registered after /record/:id
         .route(

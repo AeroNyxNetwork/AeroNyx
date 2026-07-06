@@ -67,6 +67,7 @@ use tracing::{debug, info, warn};
 
 use aeronyx_core::crypto::IdentityPublicKey;
 use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
+use sha2::{Digest, Sha256};
 
 use crate::services::memchain::LlmRouter;
 use crate::services::memchain::{MemoryStorage, VectorIndex};
@@ -517,6 +518,96 @@ pub async fn mpi_remember_sealed(
         })),
     )
         .into_response()
+}
+
+// ============================================
+// D6: Storage-root attestation (verifiable node-blind memory)
+// ============================================
+//
+// The node signs a commitment to the SET of sealed records it holds for an
+// owner WITHOUT reading any plaintext (record_ids are content-address hashes
+// over ciphertext). The client verifies the node's Ed25519 signature and
+// compares the root across devices/time to detect dropped, stale, or
+// equivocated record sets — blindness-preserving, verifiable proof of held
+// state ("verifiable personal memory without a blockchain"). Records are
+// themselves owner-signed, so the node cannot forge membership; this closes
+// the remaining gap (silent loss / equivocation) that pure signing left open.
+
+/// Canonical storage-root over the owner's SORTED record_ids.
+/// `root = SHA256( DOMAIN ‖ u32_le(count) ‖ id_0 ‖ … ‖ id_{n-1} )`.
+/// A flat sorted commitment (not a Merkle tree): v1 needs only tamper-evidence
+/// of the whole SET; per-record inclusion proofs are the v2 upgrade.
+fn attest_storage_root(ids: &[[u8; 32]]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"AERONYX-MEM-ATTEST-ROOT-v1");
+    h.update((ids.len() as u32).to_le_bytes());
+    for id in ids {
+        h.update(id);
+    }
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&h.finalize());
+    root
+}
+
+/// Message the node signs. Binds owner+root+count+epoch under a distinct domain
+/// tag so an attestation signature can never be replayed as another kind.
+fn attest_signing_message(owner: &[u8; 32], root: &[u8; 32], count: u64, epoch: u64) -> [u8; 32] {
+    let mut m = Sha256::new();
+    m.update(b"AERONYX-MEM-ATTEST-SIG-v1");
+    m.update(owner);
+    m.update(root);
+    m.update(count.to_le_bytes());
+    m.update(epoch.to_le_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&m.finalize());
+    out
+}
+
+/// `POST /api/mpi/attest` — owner-authenticated storage-root attestation.
+/// Owner auth is required so no one can probe another owner's set size.
+pub async fn mpi_attest(
+    State(state): State<Arc<MpiState>>,
+    req: Request<axum::body::Body>,
+) -> impl IntoResponse {
+    if !(state.blind_storage_enabled || state.allow_remote_storage) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"blind storage disabled"})),
+        )
+            .into_response();
+    }
+
+    let auth = extract_owner(&req).clone();
+    let owner = auth.owner_bytes();
+
+    let storage = req
+        .extensions()
+        .get::<Arc<MemoryStorage>>()
+        .expect("[BUG] MemoryStorage extension not set")
+        .clone();
+
+    let ids = storage.owner_record_ids(&owner).await;
+    let count = ids.len() as u64;
+    let root = attest_storage_root(&ids);
+    let epoch = now_secs();
+
+    let msg = attest_signing_message(&owner, &root, count, epoch);
+    let signature = state.identity.sign(&msg);
+    let node_pk = state.identity.public_key_bytes();
+
+    let short = &auth.owner_hex()[..8.min(auth.owner_hex().len())];
+    info!(owner = %short, count, "[MPI_ATTEST] Signed node-blind storage root");
+
+    Json(serde_json::json!({
+        "scheme": "aeronyx-mem-attest-v1",
+        "owner": hex::encode(owner),
+        "root": hex::encode(root),
+        "count": count,
+        "epoch": epoch,
+        "node_public_key": hex::encode(node_pk),
+        "signature": hex::encode(signature),
+    }))
+    .into_response()
 }
 
 // ============================================
@@ -1426,6 +1517,50 @@ pub async fn mpi_record_provenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_attest_root_deterministic_order_independent_and_membership_sensitive() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
+        // Order independence: the handler sorts, so callers pass sorted sets;
+        // the root function itself is stable for the same slice, and the sort
+        // guarantees {a,b,c} and {c,b,a} yield identical roots after sorting.
+        let mut set1 = vec![a, b, c];
+        let mut set2 = vec![c, a, b];
+        set1.sort_unstable();
+        set2.sort_unstable();
+        assert_eq!(attest_storage_root(&set1), attest_storage_root(&set2));
+        // Membership sensitivity: dropping a record changes the root.
+        assert_ne!(attest_storage_root(&set1), attest_storage_root(&[a, b]));
+        // Count binding: empty set has its own stable root, != any non-empty.
+        assert_ne!(attest_storage_root(&[]), attest_storage_root(&[a]));
+    }
+
+    #[test]
+    fn test_attest_signature_verifies_and_binds_fields() {
+        use aeronyx_core::crypto::IdentityKeyPair;
+        let node = IdentityKeyPair::generate();
+        let owner = [7u8; 32];
+        let ids = {
+            let mut v = vec![[9u8; 32], [4u8; 32]];
+            v.sort_unstable();
+            v
+        };
+        let root = attest_storage_root(&ids);
+        let count = ids.len() as u64;
+        let epoch = 1_783_000_000u64;
+
+        let msg = attest_signing_message(&owner, &root, count, epoch);
+        let sig = node.sign(&msg);
+        // The node's public key verifies its own attestation.
+        assert!(node.public_key().verify(&msg, &sig).is_ok());
+        // Tampering any bound field breaks verification.
+        let tampered_count = attest_signing_message(&owner, &root, count + 1, epoch);
+        assert!(node.public_key().verify(&tampered_count, &sig).is_err());
+        let tampered_root = attest_signing_message(&owner, &[0u8; 32], count, epoch);
+        assert!(node.public_key().verify(&tampered_root, &sig).is_err());
+    }
 
     #[test]
     fn test_provenance_null_fields_serialize_as_null() {
