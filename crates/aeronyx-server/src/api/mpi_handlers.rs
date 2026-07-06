@@ -1562,6 +1562,29 @@ mod tests {
         assert!(node.public_key().verify(&tampered_root, &sig).is_err());
     }
 
+    /// Emits a deterministic cross-language test vector (fixed node seed) that
+    /// the Dart client test verifies, locking the Rust↔Dart signing contract.
+    /// Run: cargo test -p aeronyx-server emit_d6_attest_test_vector -- --nocapture
+    #[test]
+    fn emit_d6_attest_test_vector() {
+        use aeronyx_core::crypto::IdentityKeyPair;
+        let node = IdentityKeyPair::from_bytes(&[42u8; 32]).unwrap();
+        let owner = [7u8; 32];
+        let mut ids = vec![[9u8; 32], [4u8; 32]];
+        ids.sort_unstable();
+        let root = attest_storage_root(&ids);
+        let count = ids.len() as u64;
+        let epoch = 1_783_000_000u64;
+        let msg = attest_signing_message(&owner, &root, count, epoch);
+        let sig = node.sign(&msg);
+        eprintln!("D6VEC owner={}", hex::encode(owner));
+        eprintln!("D6VEC root={}", hex::encode(root));
+        eprintln!("D6VEC count={}", count);
+        eprintln!("D6VEC epoch={}", epoch);
+        eprintln!("D6VEC node_pk={}", hex::encode(node.public_key_bytes()));
+        eprintln!("D6VEC sig={}", hex::encode(sig));
+    }
+
     #[test]
     fn test_provenance_null_fields_serialize_as_null() {
         let prov = RecordProvenance {
