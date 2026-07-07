@@ -19,6 +19,8 @@
 //! - `GET /api/discovery/summary`: returns a compact public-safe protocol
 //!   foundation summary for app, website, backend aggregation, and AI runbooks,
 //!   including aggregate route-governance readiness without route metadata
+//! - `GET /api/discovery/public-card`: returns the smallest product-facing
+//!   protocol health card for website, Nodeboard first-level views, and apps
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -50,8 +52,12 @@
 //! - `DiscoverySummaryResponse` is intentionally smaller than
 //!   `DiscoveryStatusResponse`; keep it aggregate-only so public/product
 //!   surfaces never need to parse full peer diagnostics.
+//! - `DiscoveryPublicCardResponse` is smaller again. It is the contract for
+//!   top-level UX surfaces that should show confidence and readiness, not raw
+//!   engineering diagnostics.
 //!
 //! ## Last Modified
+//! v0.24.0-DiscoveryPublicCard - Add product-facing public protocol card endpoint
 //! v0.23.0-RouteGovernanceHeartbeatReadiness - Add compact route governance to discovery readiness
 //! v0.22.0-RouteGovernanceSummary - Add compact route-quality governance to public summary
 //! v0.21.0-BlindRelayRuntimeObservability - Add unified blind relay runtime view for nodeboard/backend
@@ -88,11 +94,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aeronyx_core::protocol::{NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage};
 use axum::{
+    Json, Router,
     extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 
@@ -113,6 +119,8 @@ const ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES: usize = 2;
 const ONION_CANDIDATES_MAX_CLIENT_HOPS: u8 = 3;
 const ONION_RELAY_ADMISSION_STABILITY_MIN_PROOFS: u64 = 3;
 const ONION_RELAY_ADMISSION_STABILITY_SUCCESS_PERCENT: u8 = 80;
+const DISCOVERY_PUBLIC_CARD_CONTRACT_VERSION: &str = "discovery_public_card.v1";
+const DISCOVERY_PUBLIC_CARD_SOURCE: &str = "rust_discovery_public_card";
 
 #[derive(Clone)]
 struct DiscoveryApiState {
@@ -456,6 +464,50 @@ pub struct DiscoverySummaryResponse {
     privacy_boundary: &'static str,
 }
 
+/// Minimal product-facing protocol card.
+///
+/// This response is intentionally smaller than `DiscoverySummaryResponse`.
+/// Use it for website home modules, Nodeboard first-level cards, App "Privacy
+/// Network" surfaces, and AI-agent runbooks that need a quick answer to:
+/// "Is this node participating in the blind AeroNyx privacy protocol right
+/// now?" It exposes only aggregate readiness and counters. Do not add peer
+/// endpoints, full node ids, route ids, selected hops, receiver identifiers,
+/// encrypted payload metadata, DNS contents, destinations, client public IPs,
+/// Memory Chain plaintext, private keys, wallet-level traffic, or social graph
+/// metadata.
+#[derive(Debug, Serialize)]
+pub struct DiscoveryPublicCardResponse {
+    /// Unix timestamp when the card was generated.
+    generated_at: u64,
+    /// Stable public JSON contract version for website, Nodeboard, app, and
+    /// AI-agent consumers.
+    contract_version: &'static str,
+    /// Stable source label for downstream aggregation.
+    source: &'static str,
+    /// Product-facing protocol health bucket.
+    status: String,
+    /// Product-facing protocol stage bucket.
+    stage: String,
+    /// Short display headline safe for public surfaces.
+    headline: String,
+    /// Human-readable health label for first-level UI cards.
+    health_label: &'static str,
+    /// Compact confidence score derived from aggregate readiness checks.
+    confidence_percent: u8,
+    /// Three top-level cards intended for primary product surfaces.
+    cards: serde_json::Value,
+    /// Additional compact readiness signals for badges and detail links.
+    signals: serde_json::Value,
+    /// UI guidance that keeps first-level pages focused and avoids diagnostic overload.
+    display_policy: serde_json::Value,
+    /// Actionable next step for operators and AI runbooks.
+    next_action: String,
+    /// Explicit invariant for downstream UI and AI-agent consumers.
+    privacy_invariant: &'static str,
+    /// Explicit privacy boundary for downstream UI/API consumers.
+    privacy_boundary: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 struct DiscoveryPolicyStatus {
     max_snapshot_limit: usize,
@@ -656,7 +708,8 @@ pub fn onion_relay_admission_status_value(
     let warmup_hint = match warmup_stage {
         "eligible" => "node is eligible for client-selected two-hop onion relay paths".to_string(),
         "local_relay" => {
-            "align ChatRelay config, runtime, public peer API, and advertised capability".to_string()
+            "align ChatRelay config, runtime, public peer API, and advertised capability"
+                .to_string()
         }
         "route_pool" => {
             "wait for at least two fresh routeable ChatRelay and OnionMiddle peers".to_string()
@@ -789,7 +842,9 @@ pub fn discovery_readiness_status_value(
         }
         "live" => "wait for peer quorum to become fully ready",
         "forming" => "add or recover verified peers and routeable relay candidates",
-        "disabled" => "enable discovery and chat relay capability before advertising protocol readiness",
+        "disabled" => {
+            "enable discovery and chat relay capability before advertising protocol readiness"
+        }
         _ => "wait for verified peer discovery and the first blind relay runtime check",
     };
 
@@ -1340,6 +1395,144 @@ pub fn discovery_summary_response(
     }
 }
 
+/// Builds the smallest product-facing discovery card response.
+///
+/// `/api/discovery/public-card` is for first-level UX surfaces: website home
+/// cards, Nodeboard overview, App status modules, and AI-agent quick health
+/// checks. It intentionally compresses detailed route governance into a few
+/// stable readiness signals so product surfaces can feel trustworthy without
+/// leaking route metadata or overwhelming users with raw diagnostics.
+#[must_use]
+pub fn discovery_public_card_response(
+    generated_at: u64,
+    status: &PeerStoreStatus,
+    local_capabilities: &DiscoveryLocalCapabilityStatus,
+) -> DiscoveryPublicCardResponse {
+    let readiness = discovery_readiness_status_value(status, local_capabilities);
+    let protocol_foundation = &readiness["protocol_foundation"];
+    let onion_relay_admission = onion_relay_admission_status_value(status, local_capabilities);
+    let peer_quorum = &status.peer_quorum;
+    let blind_relay_quality = &status.blind_relay_quality;
+    let relay_stats = &status.runtime.blind_relay;
+    let two_hop_history = &status.two_hop_path_proof_history;
+
+    let status_bucket = protocol_foundation["status"]
+        .as_str()
+        .unwrap_or("forming")
+        .to_string();
+    let stage_bucket = protocol_foundation["stage"]
+        .as_str()
+        .unwrap_or("bootstrap")
+        .to_string();
+    let headline = protocol_foundation["headline"]
+        .as_str()
+        .unwrap_or("AeroNyx nodes are forming a verified relay mesh")
+        .to_string();
+    let next_action = protocol_foundation["next_action"]
+        .as_str()
+        .unwrap_or("monitor verified peer discovery and relay path proof freshness")
+        .to_string();
+    let checks_passed = protocol_foundation["checks_passed"].as_u64().unwrap_or(0);
+    let checks_total = protocol_foundation["checks_total"]
+        .as_u64()
+        .unwrap_or(4)
+        .max(1);
+    let foundation_confidence = ((checks_passed * 100) / checks_total).min(100) as u8;
+    let admission_score = onion_relay_admission["admission_score_percent"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(100) as u8;
+    let confidence_percent =
+        ((u16::from(foundation_confidence) * 2 + u16::from(admission_score)) / 3).min(100) as u8;
+    let health_label = match status_bucket.as_str() {
+        "ready" => "Live protocol",
+        "live" => "Relay evidence live",
+        "forming" => "Mesh forming",
+        "disabled" => "Not advertising",
+        "pending" => "Waiting for peers",
+        _ => "Protocol warming",
+    };
+    let two_hop_ready = protocol_foundation["two_hop_onion_ready"]
+        .as_bool()
+        .unwrap_or(false);
+
+    DiscoveryPublicCardResponse {
+        generated_at,
+        contract_version: DISCOVERY_PUBLIC_CARD_CONTRACT_VERSION,
+        source: DISCOVERY_PUBLIC_CARD_SOURCE,
+        status: status_bucket,
+        stage: stage_bucket,
+        headline,
+        health_label,
+        confidence_percent,
+        cards: serde_json::json!({
+            "protocol_health": {
+                "label": "AeroNyx Privacy Protocol",
+                "status": protocol_foundation["status"],
+                "stage": protocol_foundation["stage"],
+                "confidence_percent": confidence_percent,
+                "checks_passed": checks_passed,
+                "checks_total": checks_total,
+                "two_hop_onion_ready": two_hop_ready,
+                "restart_recovery_ready": protocol_foundation["restart_recovery_ready"],
+            },
+            "verified_mesh": {
+                "label": "Verified Node Mesh",
+                "status": &peer_quorum.status,
+                "healthy_peers": peer_quorum.healthy_peers,
+                "valid_peers": peer_quorum.valid_peers,
+                "routeable_relays": peer_quorum.routeable_chat_relays,
+                "routeable_onion_middle_hops": peer_quorum.routeable_onion_middle_hops,
+                "restart_recovery_configured": peer_quorum.restart_recovery_configured,
+            },
+            "blind_relay": {
+                "label": "Blind Relay",
+                "status": &blind_relay_quality.status,
+                "runtime_ready": blind_relay_quality.runtime_ready,
+                "real_relay_ready": blind_relay_quality.real_relay_ready,
+                "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
+                "proof_ready": two_hop_history.proof_ready,
+                "message_delivery_ready": two_hop_history.message_delivery_ready,
+                "latest_proof_age_seconds": two_hop_history.latest_age_seconds,
+                "terminal_delivered_count": relay_stats.terminal,
+                "middle_forwarded_count": relay_stats.forwarded,
+            }
+        }),
+        signals: serde_json::json!({
+            "local_relay_ready": protocol_foundation["local_relay_ready"],
+            "peer_mesh_ready": protocol_foundation["peer_mesh_ready"],
+            "blind_relay_ready": protocol_foundation["blind_relay_ready"],
+            "two_hop_onion_ready": two_hop_ready,
+            "onion_admission_status": onion_relay_admission["status"],
+            "onion_admission_eligible": onion_relay_admission["eligible"],
+            "onion_admission_score_percent": admission_score,
+            "onion_warmup_stage": onion_relay_admission["warmup_stage"],
+            "stable_path_proof_ready": onion_relay_admission["stable_path_proof_ready"],
+            "failure_circuit_breaker_active": two_hop_history.failure_circuit_breaker_active,
+            "failure_streak_active": two_hop_history.failure_streak_active,
+            "latest_path_proof_outcome": &two_hop_history.latest_outcome,
+            "latest_path_proof_reason_bucket": &two_hop_history.latest_reason_bucket,
+            "latest_path_proof_age_bucket": &two_hop_history.latest_age_bucket,
+            "permissionless_node_admission": true,
+        }),
+        display_policy: serde_json::json!({
+            "primary_surface": "show_protocol_health_verified_mesh_and_blind_relay",
+            "detail_surface": "link_to_discovery_summary_or_nodeboard_detail_for_diagnostics",
+            "recommended_cards": ["protocol_health", "verified_mesh", "blind_relay"],
+            "avoid_first_level_fields": [
+                "signed_descriptors",
+                "raw_route_metadata",
+                "raw_audit_events",
+                "raw_peer_diagnostics",
+                "path_selection_details"
+            ],
+        }),
+        next_action,
+        privacy_invariant: "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
+        privacy_boundary: "public protocol card aggregates only; no signed descriptors, full node ids, endpoint URLs, route ids, selected hops, encrypted payloads, receiver identities, client public IPs, DNS contents, destinations, Memory Chain plaintext, voucher secrets, private keys, wallet-level traffic, or social graph metadata",
+    }
+}
+
 // ============================================
 // Router
 // ============================================
@@ -1370,6 +1563,7 @@ pub fn build_discovery_router_with_local_status(
         .route("/api/discovery/gossip", post(gossip_handler))
         .route("/api/discovery/status", get(status_handler))
         .route("/api/discovery/summary", get(summary_handler))
+        .route("/api/discovery/public-card", get(public_card_handler))
         .route(
             "/api/discovery/onion-candidates",
             get(onion_candidates_handler),
@@ -1689,6 +1883,19 @@ async fn summary_handler(State(state): State<DiscoveryApiState>) -> Json<Discove
     let peer_store = state.peer_store.status(now);
     let local_capabilities = state.local_capabilities;
     Json(discovery_summary_response(
+        now,
+        &peer_store,
+        &local_capabilities,
+    ))
+}
+
+async fn public_card_handler(
+    State(state): State<DiscoveryApiState>,
+) -> Json<DiscoveryPublicCardResponse> {
+    let now = now_secs();
+    let peer_store = state.peer_store.status(now);
+    let local_capabilities = state.local_capabilities;
+    Json(discovery_public_card_response(
         now,
         &peer_store,
         &local_capabilities,
@@ -2529,6 +2736,99 @@ mod tests {
             Some(0)
         );
         assert_eq!(parsed["stage"].as_str(), Some("two_hop_path_ready"));
+        assert_eq!(
+            parsed["privacy_invariant"].as_str(),
+            Some("blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status")
+        );
+
+        let serialized = serde_json::to_string(&parsed).unwrap();
+        assert!(!serialized.contains("route_id"));
+        assert!(!serialized.contains("payload_b64"));
+        assert!(!serialized.contains("encrypted_blob"));
+        assert!(!serialized.contains("client_ip"));
+        assert!(!serialized.contains("receiver_pubkey"));
+        assert!(!serialized.contains("public_endpoint"));
+        assert!(!serialized.contains("selected_hop"));
+    }
+
+    #[tokio::test]
+    async fn test_public_card_endpoint_returns_minimal_product_protocol_card() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        store.record_blind_relay_terminal(now, 2, 128);
+        store.record_blind_relay_forwarded(now + 1, 1);
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            now + 2,
+            true,
+            "onion_terminal_delivered",
+            4,
+            3,
+            2,
+            1,
+        );
+        let app = build_discovery_router_with_local_status(
+            store,
+            DiscoveryApiPolicy::default(),
+            DiscoveryLocalCapabilityStatus::new(true, true, true, true),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/public-card")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            parsed["source"].as_str(),
+            Some(DISCOVERY_PUBLIC_CARD_SOURCE)
+        );
+        assert_eq!(
+            parsed["contract_version"].as_str(),
+            Some(DISCOVERY_PUBLIC_CARD_CONTRACT_VERSION)
+        );
+        assert_eq!(
+            parsed["cards"]["protocol_health"]["label"].as_str(),
+            Some("AeroNyx Privacy Protocol")
+        );
+        assert_eq!(
+            parsed["cards"]["verified_mesh"]["label"].as_str(),
+            Some("Verified Node Mesh")
+        );
+        assert_eq!(
+            parsed["cards"]["blind_relay"]["label"].as_str(),
+            Some("Blind Relay")
+        );
+        assert_eq!(
+            parsed["cards"]["blind_relay"]["terminal_delivered_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["cards"]["blind_relay"]["middle_forwarded_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["signals"]["permissionless_node_admission"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["signals"]["latest_path_proof_reason_bucket"].as_str(),
+            Some("onion_terminal_delivered")
+        );
+        assert_eq!(
+            parsed["display_policy"]["primary_surface"].as_str(),
+            Some("show_protocol_health_verified_mesh_and_blind_relay")
+        );
         assert_eq!(
             parsed["privacy_invariant"].as_str(),
             Some("blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status")
