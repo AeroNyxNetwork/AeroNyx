@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- Document the `aeronyx-node.sh refresh-bootstrap` and `fleet-drift-check`
+  commands so production nodes can refresh signed discovery bootstrap
+  snapshots and audit seed/binary/config drift without exposing user data.
 - Document the gated `aeronyx-node.sh relay-probe --two-hop` operator command,
   which attempts an outer+onward live middle-hop proof only when three distinct
   routeable nodes exist.
@@ -85,6 +88,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.41.0-node-deploy - Documented bootstrap refresh and fleet drift check commands.
 v1.40.0-node-deploy - Documented gated relay-probe --two-hop live proof mode.
 v1.39.0-node-deploy - Documented optional onward envelope support for controlled
                      two-hop middle-hop forwarding.
@@ -523,6 +527,59 @@ path would need to return to the previous hop (`A -> B -> A`), and the loop
 guard correctly rejects that shape. A complete production probe should use a
 path-aware encrypted route envelope where each hop learns only the next routing
 step, never plaintext or the user social graph.
+
+## Discovery Bootstrap And Drift Control
+
+Discovery bootstrap snapshots contain signed node descriptors. Operators must
+not hand-edit descriptor endpoints inside `bootstrap-peers.json`; changing the
+JSON by hand invalidates the signature relationship that Rust verifies. Use the
+repository-local entrypoint to fetch a fresh signed snapshot from a live
+discovery node:
+
+```bash
+sudo ./deploy/node/aeronyx-node.sh refresh-bootstrap \
+  --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422
+```
+
+Preview without writing the target file:
+
+```bash
+./deploy/node/aeronyx-node.sh refresh-bootstrap \
+  --dry-run \
+  --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 \
+  --json
+```
+
+The command reads `[discovery].bootstrap_snapshot_path` from `server.toml`
+unless `--bootstrap-path` is provided. It backs up the existing snapshot before
+writing the replacement. The output contains only signed discovery endpoints,
+snapshot hash, peer count, backup path, and status. It must not include
+registration codes, API secrets, private keys, user messages, DNS contents,
+destinations, packet payloads, client public IPs, wallet-level traffic, or
+social graph metadata.
+
+Use `fleet-drift-check` as the read-only preflight before upgrades, restarts,
+or new region rollout:
+
+```bash
+./deploy/node/aeronyx-node.sh fleet-drift-check \
+  --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 \
+  --json
+```
+
+For exact release audits, add the currently expected binary hash and bootstrap
+snapshot hash:
+
+```bash
+./deploy/node/aeronyx-node.sh fleet-drift-check \
+  --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 \
+  --expected-binary-sha256 6d4c382907011d8da0adb7038fdb62d2bc5af859aff2ddd6d43d785462af6184 \
+  --json
+```
+
+Bootstrap snapshot hashes can legitimately change as descriptors rotate, so
+`--expected-bootstrap-sha256` is best for a just-distributed maintenance window,
+while endpoint-set checks are better for normal daily drift monitoring.
 
 Run preflight only:
 

@@ -32,6 +32,9 @@
 # - Extend `fleet-smoke` with an optional `--two-hop` proof. The proof submits
 #   outer+onward opaque BlindRelay frames through entry -> middle -> terminal
 #   nodes and treats success as a privacy-safe multi-hop path proof.
+# - Add `refresh-bootstrap` and `fleet-drift-check` so operators and AI
+#   assistants can keep discovery seeds, signed bootstrap snapshots, and
+#   deployed binary hashes consistent across a commercial node fleet.
 # - Add `healthcheck` as a command alias and summarize local health/operator
 #   JSON in `status` instead of printing full endpoint payloads. This keeps the
 #   one-command operator view readable for humans and AI assistants while
@@ -94,6 +97,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.17.0-node-entrypoint - Added bootstrap snapshot refresh and fleet drift check commands.
 # v1.16.0-node-entrypoint - Added fleet-smoke --two-hop multi-hop relay path proof.
 # v1.15.0-node-entrypoint - Added fleet-smoke public mesh smoke test command.
 # v1.14.0-node-entrypoint - Added gated relay-probe --two-hop live probe mode.
@@ -154,6 +158,11 @@ RELAY_PROBE_TWO_HOP=0
 FLEET_SMOKE_ENDPOINTS="${AERONYX_FLEET_SMOKE_ENDPOINTS:-}"
 FLEET_SMOKE_INCLUDE_NEGATIVE=0
 FLEET_SMOKE_TWO_HOP=0
+BOOTSTRAP_SOURCE_ENDPOINT="${AERONYX_BOOTSTRAP_SOURCE_ENDPOINT:-}"
+BOOTSTRAP_SNAPSHOT_PATH="${AERONYX_BOOTSTRAP_SNAPSHOT_PATH:-}"
+EXPECTED_DISCOVERY_ENDPOINTS="${AERONYX_EXPECTED_DISCOVERY_ENDPOINTS:-}"
+EXPECTED_BOOTSTRAP_SHA256="${AERONYX_EXPECTED_BOOTSTRAP_SHA256:-}"
+EXPECTED_BINARY_SHA256="${AERONYX_EXPECTED_BINARY_SHA256:-}"
 YES=0
 EXTRA_ARGS=()
 
@@ -192,6 +201,8 @@ Commands:
   onion-middle Enable or disable no-exit OnionMiddle capability in server.toml.
   relay-probe Send one synthetic BlindRelay route probe to a discovered peer.
   fleet-smoke Verify a public multi-node discovery + blind relay mesh.
+  refresh-bootstrap Refresh the signed discovery bootstrap snapshot.
+  fleet-drift-check Read-only check for seed/snapshot/binary drift.
   promote-binary Promote a staged aeronyx-server binary with drain checks.
   logs       Show recent systemd logs. Use --follow to tail.
   network    Refresh forwarding/NAT or update the privacy protocol IP pool.
@@ -262,6 +273,24 @@ Command-specific options:
     --json                  Emit JSON result for nodeboard/automation.
     --json-only             Emit only JSON.
 
+  refresh-bootstrap:
+    --source-endpoint URL     Discovery base URL to fetch /api/discovery/snapshot from.
+                              Default: local 127.0.0.1 discovery API from --config.
+    --bootstrap-path PATH     Target bootstrap snapshot path. Default: config value
+                              or /etc/aeronyx/bootstrap-peers.json.
+    --expected-endpoints URLS Comma-separated endpoints that must be present.
+    --dry-run                Validate and preview without writing the snapshot.
+    --json                  Emit JSON result for nodeboard/automation.
+    --json-only             Emit only JSON.
+
+  fleet-drift-check:
+    --expected-endpoints URLS        Comma-separated expected discovery endpoints.
+    --expected-bootstrap-sha256 HASH Expected bootstrap snapshot SHA-256.
+    --expected-binary-sha256 HASH    Expected aeronyx-server binary SHA-256.
+    --bootstrap-path PATH            Bootstrap snapshot path override.
+    --json                           Emit JSON result for nodeboard/automation.
+    --json-only                      Emit only JSON.
+
   promote-binary:
     --binary PATH            Staged aeronyx-server binary to promote.
     --expected-sha256 HASH   Optional SHA-256 expected for the staged binary.
@@ -276,7 +305,9 @@ Examples:
   ./deploy/node/aeronyx-node.sh health --json
   ./deploy/node/aeronyx-node.sh status
   ./deploy/node/aeronyx-node.sh relay-probe --json
-  ./deploy/node/aeronyx-node.sh fleet-smoke --endpoints http://34.136.167.59:8422,http://8.213.146.244:8422,http://149.33.18.44:8422 --json
+  ./deploy/node/aeronyx-node.sh fleet-smoke --endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 --two-hop --json
+  sudo ./deploy/node/aeronyx-node.sh refresh-bootstrap --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422
+  ./deploy/node/aeronyx-node.sh fleet-drift-check --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 --json
   sudo ./deploy/node/aeronyx-node.sh chat-relay --enable-chat-relay --restart
   sudo ./deploy/node/aeronyx-node.sh onion-middle --enable-onion-middle --restart
   sudo ./deploy/node/aeronyx-node.sh promote-binary --binary ./target/release/aeronyx-server.next --expected-sha256 HASH
@@ -365,6 +396,11 @@ parse_args() {
                 shift 2
                 ;;
             --include-negative) FLEET_SMOKE_INCLUDE_NEGATIVE=1; shift ;;
+            --source-endpoint) BOOTSTRAP_SOURCE_ENDPOINT="${2:?missing value}"; shift 2 ;;
+            --bootstrap-path) BOOTSTRAP_SNAPSHOT_PATH="${2:?missing value}"; shift 2 ;;
+            --expected-endpoints) EXPECTED_DISCOVERY_ENDPOINTS="${2:?missing value}"; shift 2 ;;
+            --expected-bootstrap-sha256) EXPECTED_BOOTSTRAP_SHA256="${2:?missing value}"; shift 2 ;;
+            --expected-binary-sha256) EXPECTED_BINARY_SHA256="${2:?missing value}"; shift 2 ;;
             --yes|-y) YES=1; shift ;;
             -h|--help) COMMAND="help"; shift ;;
             --quick|--start|--no-build|--no-network|--no-enable|--skip-package-install|--skip-rust-install|--allow-dirty|--skip-pull)
@@ -1009,6 +1045,551 @@ except Exception:
 PY
     rm -f "${tmp}"
 }
+
+run_refresh_bootstrap() {
+    command -v python3 >/dev/null 2>&1 || die "refresh-bootstrap requires python3"
+
+    if [ "${JSON_ONLY}" -ne 1 ]; then
+        log "Refreshing signed AeroNyx discovery bootstrap snapshot"
+        log "Config: ${CONFIG_FILE}"
+        if [ -n "${BOOTSTRAP_SOURCE_ENDPOINT}" ]; then
+            log "Source endpoint: ${BOOTSTRAP_SOURCE_ENDPOINT}"
+        else
+            log "Source endpoint: local discovery API derived from config"
+        fi
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            warn "Dry run enabled; no bootstrap snapshot will be written."
+        fi
+    fi
+
+    python3 - \
+        "${CONFIG_FILE}" \
+        "${BOOTSTRAP_SOURCE_ENDPOINT}" \
+        "${BOOTSTRAP_SNAPSHOT_PATH}" \
+        "${EXPECTED_DISCOVERY_ENDPOINTS}" \
+        "${DRY_RUN}" \
+        "${JSON}" \
+        "${JSON_ONLY}" <<'PY'
+import ast
+import hashlib
+import json
+import os
+import shutil
+import sys
+import time
+import urllib.error
+import urllib.request
+
+config_path, source_endpoint, bootstrap_path, expected_endpoints_raw, dry_run_raw, json_raw, json_only_raw = sys.argv[1:8]
+dry_run = dry_run_raw == "1"
+emit_json = json_raw == "1"
+json_only = json_only_raw == "1"
+
+
+def clean(value, limit=320):
+    text = str(value or "").replace("\x00", "").replace("\n", " ").replace("\r", " ").strip()
+    return text[:limit]
+
+
+def parse_scalar(value):
+    value = value.strip()
+    if not value:
+        return ""
+    lowered = value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    try:
+        return ast.literal_eval(value)
+    except Exception:
+        return value.strip('"').strip("'")
+
+
+def parse_config(path):
+    section = None
+    parsed = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    section = line.strip("[]").strip()
+                    parsed.setdefault(section, {})
+                    continue
+                if "=" not in line or not section:
+                    continue
+                key, value = line.split("=", 1)
+                parsed.setdefault(section, {})[key.strip()] = parse_scalar(value)
+    except FileNotFoundError:
+        pass
+    return parsed
+
+
+def expected_endpoints():
+    return [item.strip().rstrip("/") for item in expected_endpoints_raw.split(",") if item.strip()]
+
+
+def local_discovery_base(config):
+    listen = str(config.get("discovery", {}).get("public_api_listen_addr") or "127.0.0.1:8422")
+    port = "8422"
+    if ":" in listen:
+        port = listen.rsplit(":", 1)[-1].strip()
+    if not port.isdigit():
+        port = "8422"
+    return f"http://127.0.0.1:{port}"
+
+
+def snapshot_url(base):
+    base = (base or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("missing discovery source endpoint")
+    if "/api/discovery/snapshot" in base:
+        return base
+    return f"{base}/api/discovery/snapshot?limit=64"
+
+
+def fetch_snapshot(url):
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=8) as response:
+        raw = response.read(1024 * 1024)
+    return json.loads(raw.decode("utf-8"))
+
+
+def snapshot_endpoints(snapshot):
+    endpoints = []
+    for peer in snapshot.get("peers") or []:
+        if not isinstance(peer, dict):
+            continue
+        descriptor = peer.get("descriptor")
+        if not isinstance(descriptor, dict):
+            continue
+        endpoint = descriptor.get("public_endpoint")
+        if isinstance(endpoint, str) and endpoint.strip():
+            endpoints.append(endpoint.strip().rstrip("/"))
+    return endpoints
+
+
+def validate_snapshot(snapshot, expected):
+    if not isinstance(snapshot, dict):
+        raise ValueError("snapshot is not a JSON object")
+    peers = snapshot.get("peers")
+    if not isinstance(peers, list) or not peers:
+        raise ValueError("snapshot has no peers")
+
+    endpoints = snapshot_endpoints(snapshot)
+    if not endpoints:
+        raise ValueError("snapshot contains no public endpoints")
+    for index, peer in enumerate(peers):
+        if not isinstance(peer, dict):
+            raise ValueError(f"peer[{index}] is not an object")
+        if not isinstance(peer.get("descriptor"), dict):
+            raise ValueError(f"peer[{index}] missing descriptor")
+        if "signature" not in peer:
+            raise ValueError(f"peer[{index}] missing signature")
+
+    missing = sorted(set(expected) - set(endpoints))
+    if missing:
+        raise ValueError("snapshot missing expected endpoints: " + ",".join(missing))
+    return endpoints
+
+
+def write_snapshot(target_path, snapshot):
+    directory = os.path.dirname(os.path.abspath(target_path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    backup_path = None
+    if os.path.exists(target_path):
+        backup_path = f"{target_path}.backup.refresh-bootstrap-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}"
+        shutil.copy2(target_path, backup_path)
+    temp_path = f"{target_path}.tmp.{os.getpid()}"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle, ensure_ascii=False, separators=(",", ":"))
+        handle.write("\n")
+    os.chmod(temp_path, 0o644)
+    os.replace(temp_path, target_path)
+    return backup_path
+
+
+config = parse_config(config_path)
+target_path = (
+    bootstrap_path
+    or str(config.get("discovery", {}).get("bootstrap_snapshot_path") or "")
+    or "/etc/aeronyx/bootstrap-peers.json"
+)
+source_base = source_endpoint or local_discovery_base(config)
+url = snapshot_url(source_base)
+expected = expected_endpoints()
+
+result = {
+    "source": "aeronyx-node.sh refresh-bootstrap",
+    "status": "unknown",
+    "config_path": config_path,
+    "source_url": url,
+    "target_path": target_path,
+    "dry_run": dry_run,
+    "expected_endpoints": expected,
+    "privacy_boundary": (
+        "signed node discovery descriptors only; no user messages, DNS contents, "
+        "destinations, packet payloads, client public IPs, private keys, voucher "
+        "secrets, wallet-level traffic, or social graph metadata"
+    ),
+}
+
+try:
+    snapshot = fetch_snapshot(url)
+    endpoints = validate_snapshot(snapshot, expected)
+    encoded = (json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    sha256 = hashlib.sha256(encoded).hexdigest()
+    backup_path = None
+    if not dry_run:
+        backup_path = write_snapshot(target_path, snapshot)
+    result.update({
+        "status": "ok",
+        "peer_count": len(snapshot.get("peers") or []),
+        "endpoints": sorted(endpoints),
+        "sha256": sha256,
+        "wrote": not dry_run,
+        "backup_path": backup_path,
+    })
+except Exception as exc:
+    result.update({
+        "status": "error",
+        "reason": clean(exc),
+    })
+
+if not json_only:
+    print(
+        "refresh_bootstrap_status={status} peers={peers} wrote={wrote} sha256={sha}".format(
+            status=result.get("status"),
+            peers=result.get("peer_count", 0),
+            wrote=str(result.get("wrote", False)).lower(),
+            sha=result.get("sha256", "none"),
+        )
+    )
+    if result.get("backup_path"):
+        print("refresh_bootstrap_backup=" + clean(result.get("backup_path")))
+    for endpoint in result.get("endpoints") or []:
+        print("refresh_bootstrap_endpoint=" + clean(endpoint, 180))
+    if result.get("status") != "ok":
+        print("refresh_bootstrap_reason=" + clean(result.get("reason")))
+
+if emit_json or json_only:
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+
+if result.get("status") != "ok":
+    raise SystemExit(1)
+PY
+}
+
+
+run_fleet_drift_check() {
+    command -v python3 >/dev/null 2>&1 || die "fleet-drift-check requires python3"
+
+    if [ "${JSON_ONLY}" -ne 1 ]; then
+        log "Checking local AeroNyx node fleet drift"
+        log "Config: ${CONFIG_FILE}"
+    fi
+
+    python3 - \
+        "${CONFIG_FILE}" \
+        "${BOOTSTRAP_SNAPSHOT_PATH}" \
+        "${EXPECTED_DISCOVERY_ENDPOINTS}" \
+        "${EXPECTED_BOOTSTRAP_SHA256}" \
+        "${EXPECTED_BINARY_SHA256}" \
+        "${SERVICE_NAME}" \
+        "${REPO_DIR}" \
+        "${JSON}" \
+        "${JSON_ONLY}" <<'PY'
+import ast
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+(
+    config_path,
+    bootstrap_path_override,
+    expected_endpoints_raw,
+    expected_bootstrap_sha256,
+    expected_binary_sha256,
+    service_name,
+    repo_dir,
+    json_raw,
+    json_only_raw,
+) = sys.argv[1:10]
+emit_json = json_raw == "1"
+json_only = json_only_raw == "1"
+
+
+def clean(value, limit=320):
+    text = str(value or "").replace("\x00", "").replace("\n", " ").replace("\r", " ").strip()
+    return text[:limit]
+
+
+def parse_scalar(value):
+    value = value.strip()
+    if not value:
+        return ""
+    lowered = value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    try:
+        return ast.literal_eval(value)
+    except Exception:
+        return value.strip('"').strip("'")
+
+
+def parse_config(path):
+    section = None
+    parsed = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    section = line.strip("[]").strip()
+                    parsed.setdefault(section, {})
+                    continue
+                if "=" not in line or not section:
+                    continue
+                key, value = line.split("=", 1)
+                parsed.setdefault(section, {})[key.strip()] = parse_scalar(value)
+    except FileNotFoundError:
+        pass
+    return parsed
+
+
+def normalize_endpoints(values):
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        return []
+    return sorted({str(item).strip().rstrip("/") for item in values if str(item).strip()})
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def service_binary_path(service):
+    if not service:
+        return None
+    unit = service if service.endswith(".service") else f"{service}.service"
+    try:
+        output = subprocess.check_output(
+            ["systemctl", "show", unit, "-p", "ExecStart", "--value"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+        ).strip()
+    except Exception:
+        return None
+    if not output:
+        return None
+    path_match = re.search(r"(?:^|\s)path=([^ ;]+)", output)
+    if path_match and os.path.exists(path_match.group(1)):
+        return path_match.group(1)
+    try:
+        parts = shlex.split(output)
+    except ValueError:
+        return None
+    for part in parts:
+        if part.endswith("aeronyx-server") and os.path.exists(part):
+            return part
+    return None
+
+
+def local_discovery_base(discovery):
+    listen = str(discovery.get("public_api_listen_addr") or "127.0.0.1:8422")
+    port = "8422"
+    if ":" in listen:
+        port = listen.rsplit(":", 1)[-1].strip()
+    if not port.isdigit():
+        port = "8422"
+    return f"http://127.0.0.1:{port}"
+
+
+def fetch_public_card(discovery):
+    base = local_discovery_base(discovery)
+    request = urllib.request.Request(
+        f"{base}/api/discovery/public-card",
+        headers={"Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=3) as response:
+        return json.loads(response.read(128 * 1024).decode("utf-8"))
+
+
+def bootstrap_endpoints(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return []
+    endpoints = []
+    for peer in payload.get("peers") or []:
+        if not isinstance(peer, dict):
+            continue
+        descriptor = peer.get("descriptor")
+        if not isinstance(descriptor, dict):
+            continue
+        endpoint = descriptor.get("public_endpoint")
+        if isinstance(endpoint, str) and endpoint:
+            endpoints.append(endpoint)
+    return normalize_endpoints(endpoints)
+
+
+def endpoint_comparison(actual, expected):
+    actual_set = set(actual)
+    expected_set = set(expected)
+    return {
+        "matches": bool(expected) and actual_set == expected_set,
+        "missing": sorted(expected_set - actual_set),
+        "extra": sorted(actual_set - expected_set),
+    }
+
+
+config = parse_config(config_path)
+discovery = config.get("discovery") or {}
+memchain = config.get("memchain") or {}
+expected_endpoints = normalize_endpoints(
+    [item.strip() for item in expected_endpoints_raw.split(",") if item.strip()]
+)
+seed_endpoints = normalize_endpoints(discovery.get("seed_endpoints"))
+public_endpoint = clean(discovery.get("public_endpoint"), 200)
+bootstrap_path = (
+    bootstrap_path_override
+    or str(discovery.get("bootstrap_snapshot_path") or "")
+    or "/etc/aeronyx/bootstrap-peers.json"
+)
+bootstrap_sha256 = sha256_file(bootstrap_path) if os.path.exists(bootstrap_path) else None
+bootstrap_peers = bootstrap_endpoints(bootstrap_path)
+
+binary_path = service_binary_path(service_name)
+if not binary_path:
+    candidate = os.path.join(repo_dir, "target", "release", "aeronyx-server")
+    binary_path = candidate if os.path.exists(candidate) else None
+binary_sha256 = sha256_file(binary_path) if binary_path and os.path.exists(binary_path) else None
+
+public_card = {}
+public_card_error = None
+try:
+    public_card = fetch_public_card(discovery)
+except Exception as exc:
+    public_card_error = clean(exc)
+
+issues = []
+seed_cmp = endpoint_comparison(seed_endpoints, expected_endpoints) if expected_endpoints else None
+bootstrap_cmp = endpoint_comparison(bootstrap_peers, expected_endpoints) if expected_endpoints else None
+if expected_endpoints and not seed_cmp["matches"]:
+    issues.append("seed_endpoints_drift")
+if expected_endpoints and not bootstrap_cmp["matches"]:
+    issues.append("bootstrap_snapshot_drift")
+if expected_bootstrap_sha256 and bootstrap_sha256 != expected_bootstrap_sha256:
+    issues.append("bootstrap_sha256_mismatch")
+if expected_binary_sha256 and binary_sha256 != expected_binary_sha256:
+    issues.append("binary_sha256_mismatch")
+if not public_card or public_card.get("status") not in ("ready", "live"):
+    issues.append("public_card_not_ready")
+
+status = "ok" if not issues else "attention"
+result = {
+    "source": "aeronyx-node.sh fleet-drift-check",
+    "status": status,
+    "issues": issues,
+    "config_path": config_path,
+    "service": service_name,
+    "public_endpoint": public_endpoint,
+    "seed_endpoints": {
+        "actual": seed_endpoints,
+        "expected": expected_endpoints,
+        "matches_expected": None if seed_cmp is None else seed_cmp["matches"],
+        "missing": [] if seed_cmp is None else seed_cmp["missing"],
+        "extra": [] if seed_cmp is None else seed_cmp["extra"],
+    },
+    "bootstrap_snapshot": {
+        "path": bootstrap_path,
+        "exists": os.path.exists(bootstrap_path),
+        "sha256": bootstrap_sha256,
+        "expected_sha256": expected_bootstrap_sha256 or None,
+        "sha256_matches_expected": (
+            None if not expected_bootstrap_sha256 else bootstrap_sha256 == expected_bootstrap_sha256
+        ),
+        "endpoints": bootstrap_peers,
+        "matches_expected_endpoints": None if bootstrap_cmp is None else bootstrap_cmp["matches"],
+        "missing": [] if bootstrap_cmp is None else bootstrap_cmp["missing"],
+        "extra": [] if bootstrap_cmp is None else bootstrap_cmp["extra"],
+    },
+    "binary": {
+        "path": binary_path,
+        "sha256": binary_sha256,
+        "expected_sha256": expected_binary_sha256 or None,
+        "sha256_matches_expected": (
+            None if not expected_binary_sha256 else binary_sha256 == expected_binary_sha256
+        ),
+    },
+    "memchain": {
+        "mode": clean(memchain.get("mode"), 80),
+        "embed_enabled": memchain.get("embed_enabled") if "embed_enabled" in memchain else None,
+    },
+    "public_card": {
+        "reachable": bool(public_card),
+        "error": public_card_error,
+        "status": public_card.get("status") if isinstance(public_card, dict) else None,
+        "stage": public_card.get("stage") if isinstance(public_card, dict) else None,
+        "contract_version": public_card.get("contract_version") if isinstance(public_card, dict) else None,
+        "ready_nodes_view": (public_card.get("cards") or {}).get("verified_mesh") if isinstance(public_card, dict) else None,
+    },
+    "privacy_boundary": (
+        "node configuration and aggregate discovery health only; no registration "
+        "codes, API secrets, private keys, user messages, DNS contents, destinations, "
+        "packet payloads, client public IPs, wallet-level traffic, or social graph metadata"
+    ),
+}
+
+if not json_only:
+    print(f"fleet_drift_status={result['status']} issues={','.join(issues) if issues else 'none'}")
+    print("seed_endpoints_match=" + str(result["seed_endpoints"]["matches_expected"]).lower())
+    print("bootstrap_endpoints_match=" + str(result["bootstrap_snapshot"]["matches_expected_endpoints"]).lower())
+    print("bootstrap_sha256=" + clean(bootstrap_sha256 or "missing", 96))
+    if expected_bootstrap_sha256:
+        print("bootstrap_sha256_match=" + str(result["bootstrap_snapshot"]["sha256_matches_expected"]).lower())
+    print("binary_sha256=" + clean(binary_sha256 or "missing", 96))
+    if expected_binary_sha256:
+        print("binary_sha256_match=" + str(result["binary"]["sha256_matches_expected"]).lower())
+    print(
+        "public_card_status={status} stage={stage}".format(
+            status=clean(result["public_card"].get("status")),
+            stage=clean(result["public_card"].get("stage")),
+        )
+    )
+    if result["memchain"].get("embed_enabled") is None:
+        print("memchain_embed_enabled=default")
+    else:
+        print("memchain_embed_enabled=" + str(result["memchain"].get("embed_enabled")).lower())
+
+if emit_json or json_only:
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+
+if status != "ok":
+    raise SystemExit(2)
+PY
+}
+
 
 run_fleet_smoke() {
     command -v python3 >/dev/null 2>&1 || die "fleet-smoke requires python3"
@@ -2594,6 +3175,12 @@ main() {
             ;;
         fleet-smoke)
             run_fleet_smoke
+            ;;
+        refresh-bootstrap)
+            run_refresh_bootstrap
+            ;;
+        fleet-drift-check)
+            run_fleet_drift_check
             ;;
         promote-binary)
             run_promote_binary
