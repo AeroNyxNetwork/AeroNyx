@@ -1027,6 +1027,11 @@ impl Server {
     // ============================================
 
     fn init_embed_engine(&self) -> Option<Arc<EmbedEngine>> {
+        if !self.config.memchain.embed_enabled {
+            info!("[EMBED] Local embedding engine disabled by memchain.embed_enabled=false");
+            return None;
+        }
+
         let model_path = &self.config.memchain.embed_model_path;
         match EmbedEngine::load(
             model_path,

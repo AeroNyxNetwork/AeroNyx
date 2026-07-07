@@ -1205,4 +1205,17 @@ embed_output_dim = 384
         assert_eq!(mc.embed_output_dim, 384);
         assert!(config.validate().is_ok());
     }
+
+    #[test]
+    fn test_embed_engine_can_be_disabled_for_protocol_nodes() {
+        let toml_str = r#"
+[memchain]
+mode = "local"
+embed_enabled = false
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        let mc = &config.memchain;
+        assert!(!mc.embed_enabled);
+        assert!(config.validate().is_ok());
+    }
 }

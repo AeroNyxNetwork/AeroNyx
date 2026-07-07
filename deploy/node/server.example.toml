@@ -135,6 +135,10 @@ api_listen_addr = "127.0.0.1:8421"
 db_path = "/var/lib/aeronyx/memchain.db"
 aof_path = "/var/lib/aeronyx/.memchain"
 miner_interval_secs = 60
+# Set to false on protocol-only relay nodes that do not install local ONNX
+# embedding models. This keeps encrypted storage, public discovery, and
+# ChatRelay routes available without noisy model-missing warnings.
+embed_enabled = true
 
 # ChatRelay is a blind store-and-forward relay for E2E-encrypted chat and
 # media envelopes. It is intentionally disabled by default. To advertise this

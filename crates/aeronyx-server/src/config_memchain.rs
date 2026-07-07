@@ -165,6 +165,14 @@ pub struct MemChainConfig {
     pub rawlog_batch_threshold: usize,
 
     // ── Embedding Engine (v2.1.0) ──────────────────────────────────────
+    /// Enable local embedding inference for MemChain semantic recall.
+    ///
+    /// Protocol-only nodes may set this to `false` to keep encrypted storage,
+    /// public discovery, and ChatRelay available without requiring a local ONNX
+    /// model bundle. The default remains `true` for backward compatibility.
+    #[serde(default = "default_embed_enabled")]
+    pub embed_enabled: bool,
+
     /// Path to the local embedding model directory.
     /// Must contain `model.onnx` and `tokenizer.json` for MiniLM-L6-v2.
     #[serde(default = "default_embed_model_path")]
@@ -409,6 +417,9 @@ fn default_cold_start_until() -> usize {
 }
 fn default_rawlog_batch_threshold() -> usize {
     100
+}
+fn default_embed_enabled() -> bool {
+    true
 }
 fn default_embed_model_path() -> String {
     "models/minilm-l6-v2".into()
@@ -839,6 +850,7 @@ impl Default for MemChainConfig {
             cold_start_threshold: default_cold_start_threshold(),
             cold_start_until: default_cold_start_until(),
             rawlog_batch_threshold: default_rawlog_batch_threshold(),
+            embed_enabled: default_embed_enabled(),
             embed_model_path: default_embed_model_path(),
             embed_dim: default_embed_dim(),
             embed_max_tokens: default_embed_max_tokens(),
@@ -901,6 +913,7 @@ mod tests {
         assert_eq!(mc.cold_start_threshold, 10);
         assert_eq!(mc.cold_start_until, 200);
         assert_eq!(mc.rawlog_batch_threshold, 100);
+        assert!(mc.embed_enabled);
         assert_eq!(mc.embed_model_path, "models/minilm-l6-v2");
         assert_eq!(mc.embed_dim, 384);
         assert_eq!(mc.embed_max_tokens, 128);
