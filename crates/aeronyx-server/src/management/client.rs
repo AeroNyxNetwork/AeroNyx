@@ -174,6 +174,16 @@ pub struct RecordCommitmentCheckpointHeartbeatStatus {
     pub divergences_total: u64,
     /// Authenticated checkpoint requests served since process start.
     pub requests_served_total: u64,
+    /// `not_audited`, `verified`, or `invalid` for the local durable vault.
+    pub evidence_state: String,
+    /// Current bounded durable proof count; raw frames never leave the node.
+    pub evidence_records: u64,
+    /// Durable proof count classified as divergence.
+    pub divergence_evidence_records: u64,
+    /// Most recent durable evidence observation time.
+    pub last_evidence_at: Option<u64>,
+    /// Local persistence failures since process start.
+    pub evidence_persistence_failures_total: u64,
 }
 
 // ============================================
@@ -688,6 +698,11 @@ mod tests {
                 proofs_failed_total: 1,
                 divergences_total: 0,
                 requests_served_total: 2,
+                evidence_state: "verified".to_string(),
+                evidence_records: 3,
+                divergence_evidence_records: 0,
+                last_evidence_at: Some(120),
+                evidence_persistence_failures_total: 0,
             }),
         };
         let value = serde_json::to_value(status).unwrap();
@@ -705,6 +720,8 @@ mod tests {
         assert_eq!(checkpoint["state"], "converged");
         assert_eq!(checkpoint["proofs_verified_total"], 4);
         assert_eq!(checkpoint["requests_served_total"], 2);
+        assert_eq!(checkpoint["evidence_state"], "verified");
+        assert_eq!(checkpoint["evidence_records"], 3);
         for section in [integrity, sync, checkpoint] {
             for forbidden in [
                 "coordinator_node_id",
@@ -717,6 +734,10 @@ mod tests {
                 "recent_events",
                 "owner",
                 "payload",
+                "signed_response",
+                "evidence_digest",
+                "signature",
+                "request_id",
                 "peer",
                 "route",
                 "client",

@@ -41,6 +41,9 @@
 //! - v8 (v2.7.0-BlockSync): Authoritative commitment chain tables:
 //!   - record_commitment_blocks: signed block payload and verified chain data
 //!   - record_block_commitments: unique record ID to block-height membership
+//! - v9 (v2.7.6-EvidenceVault): Bounded local checkpoint proof evidence:
+//!   - record_checkpoint_evidence: exact signature-verified peer response frames
+//!     retained locally for restart-safe operator audit; never exposed raw
 //! - v2.7.4-BlockIntegrityStatus: Runtime-only evidence for the most recent
 //!   complete persisted-chain audit and subsequently verified appends.
 //! - v2.7.5-CheckpointProof: Runtime-only signed checkpoint reconciliation
@@ -96,7 +99,8 @@
 //! - commitment_integrity is runtime-only. It may contain aggregate counts and
 //!   heights, but never hashes, proposer identity, commitments, or user data.
 //! - commitment_checkpoint is aggregate reconciliation telemetry only. Signed
-//!   evidence stays inside the node-peer protocol and must not enter heartbeat.
+//!   evidence stays in the bounded local evidence vault and must not enter APIs,
+//!   heartbeat, or logs.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
@@ -123,6 +127,8 @@
 //!   P2: find_records_by_content → pub(crate), hard-cap limit at 100.
 //! v2.7.4-BlockIntegrityStatus - Added runtime-only verified-chain baseline.
 //! v2.7.5-CheckpointProof - Added privacy-safe reconciliation runtime evidence.
+//! v2.7.6-EvidenceVault - Schema v9: bounded durable signed checkpoint evidence
+//!   with aggregate-only runtime/API reporting.
 //!   P2: record_key wrapped in Zeroizing<[u8;32]>.
 //!   P3: conn_lock() → pub(crate). row_to_record returns Err on bad BLOB length.
 //! v2.6.1+BlindVectorRecovery - Added all-owner active embedding enumeration so
@@ -159,12 +165,13 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 /// v4 → v5: cognitive graph tables
 /// v5 → v6: SuperNode cognitive_tasks + llm_usage_log + sessions.title
 /// v7 → v8: signed node-blind commitment chain + membership index
+/// v8 → v9: bounded local signed checkpoint evidence vault
 ///
 /// ⚠️ CRITICAL: When bumping this, you MUST also add a new migrate block
 /// in maybe_migrate(). The migrate block MUST use a hardcoded integer
 /// (not this constant) for UPDATE schema_version, to prevent skipping
 /// intermediate migrations on multi-version upgrades.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -350,11 +357,28 @@ pub struct RecordCommitmentCheckpointStatus {
     pub divergences_total: u64,
     /// Authenticated checkpoint responses served since process start.
     pub requests_served_total: u64,
+    /// Startup audit state for durable proof frames: `not_audited`, `verified`,
+    /// or `invalid`. Raw proof material is never returned.
+    pub evidence_state: String,
+    /// Signature-verified proof frames currently retained in the bounded vault.
+    pub evidence_records: u64,
+    /// Retained proofs that established a shared-prefix mismatch.
+    pub divergence_evidence_records: u64,
+    /// Most recent durable evidence observation time.
+    pub last_evidence_at: Option<u64>,
+    /// Local SQLite persistence failures observed since process start.
+    pub evidence_persistence_failures_total: u64,
     /// Explicit privacy boundary for operators and API consumers.
     pub privacy_policy: &'static str,
 }
 
 pub(crate) const COMMITMENT_SYNC_EVENT_CAPACITY: usize = 16;
+/// Maximum signed checkpoint frames retained locally. Divergence evidence is
+/// pruned last so normal convergence checks cannot erase the most useful proof.
+pub(crate) const CHECKPOINT_EVIDENCE_CAPACITY: usize = 256;
+/// Defensive bound for one stored proof frame. Increasing this requires an
+/// explicit wire and startup-memory review.
+pub(crate) const MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RecordCommitmentSyncRuntime {
@@ -415,6 +439,11 @@ pub(crate) struct RecordCommitmentCheckpointRuntime {
     pub(crate) proofs_failed_total: u64,
     pub(crate) divergences_total: u64,
     pub(crate) requests_served_total: u64,
+    pub(crate) evidence_state: &'static str,
+    pub(crate) evidence_records: u64,
+    pub(crate) divergence_evidence_records: u64,
+    pub(crate) last_evidence_at: Option<u64>,
+    pub(crate) evidence_persistence_failures_total: u64,
 }
 
 impl Default for RecordCommitmentCheckpointRuntime {
@@ -432,6 +461,11 @@ impl Default for RecordCommitmentCheckpointRuntime {
             proofs_failed_total: 0,
             divergences_total: 0,
             requests_served_total: 0,
+            evidence_state: "not_audited",
+            evidence_records: 0,
+            divergence_evidence_records: 0,
+            last_evidence_at: None,
+            evidence_persistence_failures_total: 0,
         }
     }
 }
@@ -642,6 +676,24 @@ impl MemoryStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_record_block_commitments_height
                 ON record_block_commitments(block_height);
+
+            -- v9: bounded local proof evidence. The exact signed peer frame is
+            -- retained for operator-side verification, but never leaves the
+            -- node through status, heartbeat, logs, or public protocol APIs.
+            CREATE TABLE IF NOT EXISTS record_checkpoint_evidence (
+                evidence_digest    BLOB PRIMARY KEY CHECK(length(evidence_digest) = 32),
+                observed_at        INTEGER NOT NULL CHECK(observed_at >= 0),
+                relation           TEXT NOT NULL CHECK(relation IN
+                    ('converged','remote_ahead','remote_behind','diverged')),
+                local_tip_height   INTEGER NOT NULL CHECK(local_tip_height >= 0),
+                remote_tip_height  INTEGER NOT NULL CHECK(remote_tip_height >= 0),
+                checkpoint_height  INTEGER NOT NULL CHECK(checkpoint_height >= 0),
+                signed_response    BLOB NOT NULL CHECK(length(signed_response) > 0
+                    AND length(signed_response) <= 4096),
+                created_at         INTEGER NOT NULL CHECK(created_at >= 0)
+            );
+            CREATE INDEX IF NOT EXISTS idx_record_checkpoint_evidence_observed
+                ON record_checkpoint_evidence(observed_at);
 
             CREATE TABLE IF NOT EXISTS raw_logs (
                 log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1433,6 +1485,57 @@ impl MemoryStorage {
             conn.execute("UPDATE schema_version SET version = 8", [])
                 .map_err(|e| format!("Update schema version to v8: {}", e))?;
             info!("[STORAGE] ✅ Migration to v8 (commitment blocks) complete");
+        }
+
+        // v8 → v9: bounded durable checkpoint evidence. This table deliberately
+        // stores no memory content, commitment IDs, owners, routes, or endpoints.
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(8);
+
+        if current < 9 {
+            info!(
+                "[STORAGE] Migrating schema v{} → v9 (checkpoint evidence vault)",
+                current
+            );
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS record_checkpoint_evidence (
+                    evidence_digest    BLOB PRIMARY KEY CHECK(length(evidence_digest) = 32),
+                    observed_at        INTEGER NOT NULL CHECK(observed_at >= 0),
+                    relation           TEXT NOT NULL CHECK(relation IN
+                        ('converged','remote_ahead','remote_behind','diverged')),
+                    local_tip_height   INTEGER NOT NULL CHECK(local_tip_height >= 0),
+                    remote_tip_height  INTEGER NOT NULL CHECK(remote_tip_height >= 0),
+                    checkpoint_height  INTEGER NOT NULL CHECK(checkpoint_height >= 0),
+                    signed_response    BLOB NOT NULL CHECK(length(signed_response) > 0
+                        AND length(signed_response) <= 4096),
+                    created_at         INTEGER NOT NULL CHECK(created_at >= 0)
+                );
+                CREATE INDEX IF NOT EXISTS idx_record_checkpoint_evidence_observed
+                    ON record_checkpoint_evidence(observed_at);",
+            )
+            .map_err(|error| format!("v9 migration: create checkpoint evidence: {error}"))?;
+            let exists = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='record_checkpoint_evidence'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if !exists {
+                return Err(
+                    "v9 migration: required table 'record_checkpoint_evidence' was not created"
+                        .to_string(),
+                );
+            }
+            // ⚠️ hardcoded 9, not SCHEMA_VERSION — preserves sequential upgrades.
+            conn.execute("UPDATE schema_version SET version = 9", [])
+                .map_err(|error| format!("Update schema version to v9: {error}"))?;
+            info!("[STORAGE] ✅ Migration to v9 (checkpoint evidence vault) complete");
         }
 
         Ok(())
@@ -3376,10 +3479,14 @@ mod tests {
             })
             .unwrap();
         // maybe_migrate() runs through the latest schema: v6 adds SuperNode,
-        // v7 adds the blind marker, and v8 independently creates commitment
-        // tables even when create_schema() was not called by the migration tool.
-        assert_eq!(v, 8);
-        for table in ["record_commitment_blocks", "record_block_commitments"] {
+        // v7 adds the blind marker, v8 creates commitment tables, and v9 adds
+        // the bounded proof vault even when create_schema() was not called.
+        assert_eq!(v, 9);
+        for table in [
+            "record_commitment_blocks",
+            "record_block_commitments",
+            "record_checkpoint_evidence",
+        ] {
             let exists: bool = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",

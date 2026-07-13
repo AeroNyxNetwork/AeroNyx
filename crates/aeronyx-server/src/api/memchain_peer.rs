@@ -20,6 +20,8 @@
 //! - Whole-page signature, proposer, continuity, fork, and rollback validation
 //!   before any block is appended to the local ledger.
 //! - Signed tip/checkpoint comparison that distinguishes lag from a fork.
+//! - Durable bounded storage of the exact verified checkpoint response before
+//!   follower convergence can be reported.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` on the public node peer listener and local operator
@@ -46,6 +48,7 @@
 //!
 //! ## Last Modified
 //! v2.7.5-CheckpointProof - Signed cross-node checkpoint reconciliation.
+//! v2.7.6-EvidenceVault - Fail-closed durable verified checkpoint evidence.
 //! v2.7.1-BlockFollower - Pinned coordinator pull and fail-closed page verification.
 //! v2.7.0-BlockSync - Initial signed node-blind block range protocol.
 
@@ -278,15 +281,29 @@ pub async fn pull_record_commitment_checkpoint(
         ));
     }
     let body = read_bounded_response(response).await?;
-    verify_record_commitment_checkpoint(
+    let observed_at = now_secs();
+    let outcome = verify_record_commitment_checkpoint(
         storage,
         &body,
         &request_id,
         coordinator_node_id,
         (known_tip_height, known_tip_hash),
-        now_secs(),
+        observed_at,
     )
-    .await
+    .await?;
+    storage
+        .persist_record_commitment_checkpoint_evidence(
+            observed_at,
+            outcome.relation.as_str(),
+            outcome.local_tip_height,
+            outcome.remote_tip_height,
+            outcome.checkpoint_height,
+            &outcome.evidence_digest,
+            &body,
+        )
+        .await
+        .map_err(|_| "checkpoint_evidence_persist_failed".to_string())?;
+    Ok(outcome)
 }
 
 /// Pulls, verifies, and atomically appends one bounded commitment-block page.

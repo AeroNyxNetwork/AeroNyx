@@ -30,6 +30,8 @@
 //!   evidence that advances only with transactionally verified appends
 //! - v2.7.5-CheckpointProof: atomic verified-tip checkpoint reads and
 //!   privacy-safe signed reconciliation runtime evidence
+//! - v2.7.6-EvidenceVault: bounded durable proof frames, fail-closed persistence,
+//!   and complete restart-time cryptographic evidence audit
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -73,6 +75,7 @@
 //! v2.7.3-BlockAudit    - Added fail-closed startup audit for the complete chain.
 //! v2.7.4-BlockIntegrityStatus - Added privacy-safe verified-chain evidence.
 //! v2.7.5-CheckpointProof - Added signed checkpoint reconciliation evidence.
+//! v2.7.6-EvidenceVault - Added durable bounded proof storage and startup audit.
 //!
 //! ## Last Modified
 //! v2.7.4-BlockIntegrityStatus - Report and maintain the verified-chain baseline.
@@ -85,17 +88,24 @@ use std::collections::HashMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, OptionalExtension};
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
+use aeronyx_core::crypto::IdentityPublicKey;
 use aeronyx_core::ledger::{
     MemoryLayer, MemoryRecord, RecordCommitmentBlockV1, AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
     GENESIS_PREV_HASH,
+};
+use aeronyx_core::protocol::memchain::{
+    decode_memchain, encode_memchain, record_chain_checkpoint_response_signing_bytes,
+    MemChainMessage, MEMCHAIN_MAGIC,
 };
 
 use super::storage::{
     LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentCheckpointStatus,
     RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime,
-    RecordCommitmentSyncStatus, StorageStats, COMMITMENT_SYNC_EVENT_CAPACITY,
+    RecordCommitmentSyncStatus, StorageStats, CHECKPOINT_EVIDENCE_CAPACITY,
+    COMMITMENT_SYNC_EVENT_CAPACITY, MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES,
 };
 use super::storage_crypto::{
     decrypt_rawlog_content, decrypt_record_content, encrypt_rawlog_content, encrypt_record_content,
@@ -199,6 +209,17 @@ pub struct RecordCommitmentChainAudit {
     pub tip_height: u64,
 }
 
+/// Aggregate result of a complete local checkpoint-evidence vault audit.
+///
+/// Raw frames, peer identities, hashes, signatures, request IDs, and endpoints
+/// are intentionally absent so this report is safe for startup logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordCommitmentCheckpointEvidenceAudit {
+    pub evidence_records: u64,
+    pub divergence_evidence_records: u64,
+    pub last_evidence_at: Option<u64>,
+}
+
 struct StoredRecordCommitmentBlockRow {
     height: i64,
     block_hash: Vec<u8>,
@@ -217,6 +238,184 @@ struct StoredRecordCommitmentBlockRow {
 // below 9 KiB. Keep startup decoding bounded even if the SQLite file was
 // replaced or modified outside the process.
 const MAX_STORED_COMMITMENT_BLOCK_BYTES: usize = 16 * 1024;
+
+fn audit_checkpoint_evidence_connection(
+    conn: &mut rusqlite::Connection,
+) -> Result<RecordCommitmentCheckpointEvidenceAudit, String> {
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+        .map_err(|error| format!("begin checkpoint evidence audit snapshot: {error}"))?;
+    let current_tip_height_i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(height), 0) FROM record_commitment_blocks",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("read checkpoint evidence local tip: {error}"))?;
+    let current_tip_height = u64::try_from(current_tip_height_i64)
+        .map_err(|_| "checkpoint evidence local tip is invalid".to_string())?;
+
+    let mut evidence_records = 0u64;
+    let mut divergence_evidence_records = 0u64;
+    let mut last_evidence_at = None;
+    {
+        let mut statement = transaction
+            .prepare(
+                "SELECT evidence_digest,observed_at,relation,local_tip_height,
+                        remote_tip_height,checkpoint_height,signed_response
+                 FROM record_checkpoint_evidence
+                 ORDER BY observed_at ASC,evidence_digest ASC",
+            )
+            .map_err(|error| format!("prepare checkpoint evidence audit: {error}"))?;
+        let mut rows = statement
+            .query([])
+            .map_err(|error| format!("query checkpoint evidence audit: {error}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("read checkpoint evidence row: {error}"))?
+        {
+            let digest: Vec<u8> = row
+                .get(0)
+                .map_err(|error| format!("read checkpoint evidence digest: {error}"))?;
+            let observed_at_i64: i64 = row
+                .get(1)
+                .map_err(|error| format!("read checkpoint evidence time: {error}"))?;
+            let relation: String = row
+                .get(2)
+                .map_err(|error| format!("read checkpoint evidence relation: {error}"))?;
+            let local_tip_i64: i64 = row
+                .get(3)
+                .map_err(|error| format!("read checkpoint evidence local height: {error}"))?;
+            let remote_tip_i64: i64 = row
+                .get(4)
+                .map_err(|error| format!("read checkpoint evidence remote height: {error}"))?;
+            let stored_checkpoint_i64: i64 = row
+                .get(5)
+                .map_err(|error| format!("read checkpoint evidence height: {error}"))?;
+            let frame: Vec<u8> = row
+                .get(6)
+                .map_err(|error| format!("read checkpoint evidence frame: {error}"))?;
+
+            let observed_at = u64::try_from(observed_at_i64)
+                .map_err(|_| "checkpoint evidence time is invalid".to_string())?;
+            let local_tip_height = u64::try_from(local_tip_i64)
+                .map_err(|_| "checkpoint evidence local height is invalid".to_string())?;
+            let stored_remote_tip = u64::try_from(remote_tip_i64)
+                .map_err(|_| "checkpoint evidence remote height is invalid".to_string())?;
+            let stored_checkpoint_height = u64::try_from(stored_checkpoint_i64)
+                .map_err(|_| "checkpoint evidence height is invalid".to_string())?;
+            if local_tip_height > current_tip_height {
+                return Err("checkpoint evidence references an unavailable local tip".to_string());
+            }
+            if digest.len() != 32 || Sha256::digest(&frame).as_slice() != digest.as_slice() {
+                return Err("checkpoint evidence digest mismatch".to_string());
+            }
+            if frame.is_empty()
+                || frame.len() > MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES
+                || frame.first().copied() != Some(MEMCHAIN_MAGIC)
+            {
+                return Err("checkpoint evidence frame violates bounds".to_string());
+            }
+            let message = decode_memchain(&frame[1..])
+                .map_err(|_| "checkpoint evidence frame decode failed".to_string())?;
+            let canonical = encode_memchain(&message)
+                .map_err(|_| "checkpoint evidence canonical encode failed".to_string())?;
+            if canonical != frame {
+                return Err("checkpoint evidence frame is non-canonical".to_string());
+            }
+            let MemChainMessage::RecordChainCheckpointResponseV1 {
+                chain_id,
+                request_id,
+                responder,
+                response_timestamp,
+                checkpoint_height,
+                checkpoint_hash,
+                tip_height,
+                tip_hash,
+                signature,
+            } = message
+            else {
+                return Err("checkpoint evidence contains an unexpected frame".to_string());
+            };
+            if chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID {
+                return Err("checkpoint evidence chain mismatch".to_string());
+            }
+            if observed_at.abs_diff(response_timestamp) > 60 {
+                return Err("checkpoint evidence observation time mismatch".to_string());
+            }
+            let signing_bytes = record_chain_checkpoint_response_signing_bytes(
+                &chain_id,
+                &request_id,
+                &responder,
+                response_timestamp,
+                checkpoint_height,
+                &checkpoint_hash,
+                tip_height,
+                &tip_hash,
+            );
+            IdentityPublicKey::from_bytes(&responder)
+                .and_then(|key| key.verify(&signing_bytes, &signature))
+                .map_err(|_| "checkpoint evidence signature is invalid".to_string())?;
+            if tip_height == 0 && tip_hash != GENESIS_PREV_HASH {
+                return Err("checkpoint evidence genesis tip is invalid".to_string());
+            }
+            if tip_height != stored_remote_tip
+                || checkpoint_height != stored_checkpoint_height
+                || checkpoint_height != local_tip_height.min(tip_height)
+            {
+                return Err("checkpoint evidence height relation mismatch".to_string());
+            }
+            if checkpoint_height == tip_height && checkpoint_hash != tip_hash {
+                return Err("checkpoint evidence tip hash is inconsistent".to_string());
+            }
+            let local_checkpoint_hash: Vec<u8> = if checkpoint_height == 0 {
+                GENESIS_PREV_HASH.to_vec()
+            } else {
+                transaction
+                    .query_row(
+                        "SELECT block_hash FROM record_commitment_blocks WHERE height=?1",
+                        params![i64::try_from(checkpoint_height).map_err(|_| {
+                            "checkpoint evidence height exceeds SQLite range".to_string()
+                        })?],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("read checkpoint evidence local block: {error}"))?
+                    .ok_or_else(|| "checkpoint evidence local block is unavailable".to_string())?
+            };
+            let expected_relation = if local_checkpoint_hash.as_slice() != checkpoint_hash {
+                "diverged"
+            } else if local_tip_height == tip_height {
+                "converged"
+            } else if local_tip_height < tip_height {
+                "remote_ahead"
+            } else {
+                "remote_behind"
+            };
+            if relation != expected_relation {
+                return Err("checkpoint evidence classification mismatch".to_string());
+            }
+
+            evidence_records = evidence_records.saturating_add(1);
+            if relation == "diverged" {
+                divergence_evidence_records = divergence_evidence_records.saturating_add(1);
+            }
+            last_evidence_at =
+                Some(last_evidence_at.map_or(observed_at, |last: u64| last.max(observed_at)));
+        }
+    }
+    if evidence_records > CHECKPOINT_EVIDENCE_CAPACITY as u64 {
+        return Err("checkpoint evidence vault exceeds its configured capacity".to_string());
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("finish checkpoint evidence audit snapshot: {error}"))?;
+    Ok(RecordCommitmentCheckpointEvidenceAudit {
+        evidence_records,
+        divergence_evidence_records,
+        last_evidence_at,
+    })
+}
 
 // ============================================
 // impl MemoryStorage — RawLog Operations
@@ -548,6 +747,7 @@ fn privacy_safe_sync_error_code(reason: &str) -> String {
         | "checkpoint_height_mismatch"
         | "checkpoint_tip_inconsistent"
         | "local_checkpoint_height_mismatch"
+        | "checkpoint_evidence_persist_failed"
         | "signed_checkpoint_remote_behind"
         | "signed_checkpoint_divergence" => reason.to_string(),
         // Exact status codes are useful in process logs but add needless
@@ -612,7 +812,13 @@ impl MemoryStorage {
             proofs_failed_total: runtime.proofs_failed_total,
             divergences_total: runtime.divergences_total,
             requests_served_total: runtime.requests_served_total,
-            privacy_policy: "aggregate signed checkpoint outcomes only; no peer identities, block hashes, signatures, request ids, commitments, owners, payloads, endpoints, routes, or client metadata",
+            evidence_state: runtime.evidence_state.to_string(),
+            evidence_records: runtime.evidence_records,
+            divergence_evidence_records: runtime.divergence_evidence_records,
+            last_evidence_at: runtime.last_evidence_at,
+            evidence_persistence_failures_total: runtime
+                .evidence_persistence_failures_total,
+            privacy_policy: "aggregate signed checkpoint outcomes and local evidence-vault health only; raw frames, peer identities, block hashes, signatures, request ids, commitments, owners, payloads, endpoints, routes, and client metadata never leave the node",
         }
     }
 
@@ -666,6 +872,215 @@ impl MemoryStorage {
         } else if relation == "diverged" {
             runtime.last_divergence_at = Some(now);
             runtime.divergences_total = runtime.divergences_total.saturating_add(1);
+        }
+    }
+
+    /// Persists the exact response frame after the node-peer verifier has
+    /// completed chain, freshness, identity, signature, and relation checks.
+    ///
+    /// This method independently rechecks the digest and storage bounds, writes
+    /// in one immediate transaction, and prunes the oldest non-divergence proof
+    /// first. A failure is returned to the follower so convergence cannot be
+    /// declared without durable evidence.
+    pub async fn persist_record_commitment_checkpoint_evidence(
+        &self,
+        observed_at: u64,
+        relation: &str,
+        local_tip_height: u64,
+        remote_tip_height: u64,
+        checkpoint_height: u64,
+        evidence_digest: &[u8; 32],
+        signed_response: &[u8],
+    ) -> Result<(), String> {
+        let failure = |message: String| {
+            let mut runtime = self.commitment_checkpoint.write();
+            runtime.evidence_persistence_failures_total = runtime
+                .evidence_persistence_failures_total
+                .saturating_add(1);
+            Err(message)
+        };
+        if !matches!(
+            relation,
+            "converged" | "remote_ahead" | "remote_behind" | "diverged"
+        ) {
+            return failure("checkpoint evidence relation is invalid".to_string());
+        }
+        if signed_response.is_empty() || signed_response.len() > MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES
+        {
+            return failure("checkpoint evidence frame violates bounds".to_string());
+        }
+        let computed_digest: [u8; 32] = Sha256::digest(signed_response).into();
+        if &computed_digest != evidence_digest {
+            return failure("checkpoint evidence digest mismatch".to_string());
+        }
+        let observed_at = match i64::try_from(observed_at) {
+            Ok(value) => value,
+            Err(_) => return failure("checkpoint evidence time exceeds SQLite range".to_string()),
+        };
+        let local_tip_height = match i64::try_from(local_tip_height) {
+            Ok(value) => value,
+            Err(_) => {
+                return failure("checkpoint evidence local height exceeds SQLite range".to_string())
+            }
+        };
+        let remote_tip_height = match i64::try_from(remote_tip_height) {
+            Ok(value) => value,
+            Err(_) => {
+                return failure(
+                    "checkpoint evidence remote height exceeds SQLite range".to_string(),
+                )
+            }
+        };
+        let checkpoint_height = match i64::try_from(checkpoint_height) {
+            Ok(value) => value,
+            Err(_) => {
+                return failure("checkpoint evidence height exceeds SQLite range".to_string())
+            }
+        };
+
+        let result = {
+            let mut conn = self.conn.lock().await;
+            (|| -> Result<(u64, u64, Option<u64>), String> {
+                let transaction = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| format!("begin checkpoint evidence transaction: {error}"))?;
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO record_checkpoint_evidence
+                         (evidence_digest,observed_at,relation,local_tip_height,
+                          remote_tip_height,checkpoint_height,signed_response,created_at)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?2)",
+                        params![
+                            evidence_digest.as_slice(),
+                            observed_at,
+                            relation,
+                            local_tip_height,
+                            remote_tip_height,
+                            checkpoint_height,
+                            signed_response,
+                        ],
+                    )
+                    .map_err(|error| format!("insert checkpoint evidence: {error}"))?;
+                let stored = transaction
+                    .query_row(
+                        "SELECT observed_at,relation,local_tip_height,remote_tip_height,
+                                checkpoint_height,signed_response
+                         FROM record_checkpoint_evidence WHERE evidence_digest=?1",
+                        params![evidence_digest.as_slice()],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, i64>(4)?,
+                                row.get::<_, Vec<u8>>(5)?,
+                            ))
+                        },
+                    )
+                    .map_err(|error| format!("read inserted checkpoint evidence: {error}"))?;
+                if stored.0 != observed_at
+                    || stored.1 != relation
+                    || stored.2 != local_tip_height
+                    || stored.3 != remote_tip_height
+                    || stored.4 != checkpoint_height
+                    || stored.5.as_slice() != signed_response
+                {
+                    return Err(
+                        "existing checkpoint evidence conflicts with verified frame".to_string()
+                    );
+                }
+                let count_i64 = transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM record_checkpoint_evidence",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|error| format!("count checkpoint evidence: {error}"))?;
+                let excess = count_i64.saturating_sub(CHECKPOINT_EVIDENCE_CAPACITY as i64);
+                if excess > 0 {
+                    transaction
+                        .execute(
+                            "DELETE FROM record_checkpoint_evidence WHERE rowid IN (
+                                SELECT rowid FROM record_checkpoint_evidence
+                                ORDER BY CASE WHEN relation='diverged' THEN 1 ELSE 0 END ASC,
+                                         observed_at ASC,rowid ASC
+                                LIMIT ?1
+                            )",
+                            params![excess],
+                        )
+                        .map_err(|error| format!("prune checkpoint evidence: {error}"))?;
+                }
+                let summary = transaction
+                    .query_row(
+                        "SELECT COUNT(*),
+                                COALESCE(SUM(CASE WHEN relation='diverged' THEN 1 ELSE 0 END),0),
+                                MAX(observed_at)
+                         FROM record_checkpoint_evidence",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Option<i64>>(2)?,
+                            ))
+                        },
+                    )
+                    .map_err(|error| format!("summarize checkpoint evidence: {error}"))?;
+                transaction
+                    .commit()
+                    .map_err(|error| format!("commit checkpoint evidence: {error}"))?;
+                Ok((
+                    u64::try_from(summary.0)
+                        .map_err(|_| "checkpoint evidence count is invalid".to_string())?,
+                    u64::try_from(summary.1).map_err(|_| {
+                        "checkpoint divergence evidence count is invalid".to_string()
+                    })?,
+                    summary
+                        .2
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(|_| "checkpoint evidence time is invalid".to_string())?,
+                ))
+            })()
+        };
+
+        match result {
+            Ok((evidence_records, divergence_records, last_evidence_at)) => {
+                let mut runtime = self.commitment_checkpoint.write();
+                runtime.evidence_records = evidence_records;
+                runtime.divergence_evidence_records = divergence_records;
+                runtime.last_evidence_at = last_evidence_at;
+                Ok(())
+            }
+            Err(error) => failure(error),
+        }
+    }
+
+    /// Re-verifies every durable checkpoint frame before networking starts.
+    /// Any malformed digest, non-canonical frame, invalid signature, impossible
+    /// height relation, or local historical-hash mismatch fails startup closed.
+    pub async fn audit_record_commitment_checkpoint_evidence(
+        &self,
+    ) -> Result<RecordCommitmentCheckpointEvidenceAudit, String> {
+        self.commitment_checkpoint.write().evidence_state = "not_audited";
+        let result = {
+            let mut conn = self.conn.lock().await;
+            audit_checkpoint_evidence_connection(&mut conn)
+        };
+        match result {
+            Ok(report) => {
+                let mut runtime = self.commitment_checkpoint.write();
+                runtime.evidence_state = "verified";
+                runtime.evidence_records = report.evidence_records;
+                runtime.divergence_evidence_records = report.divergence_evidence_records;
+                runtime.last_evidence_at = report.last_evidence_at;
+                Ok(report)
+            }
+            Err(error) => {
+                self.commitment_checkpoint.write().evidence_state = "invalid";
+                Err(error)
+            }
         }
     }
 
@@ -1895,6 +2310,40 @@ mod tests {
         )
     }
 
+    fn signed_checkpoint_response_frame(
+        identity: &IdentityKeyPair,
+        request_id: [u8; 16],
+        timestamp: u64,
+        checkpoint_height: u64,
+        checkpoint_hash: [u8; 32],
+        tip_height: u64,
+        tip_hash: [u8; 32],
+    ) -> Vec<u8> {
+        let responder = identity.public_key_bytes();
+        let signing_bytes = record_chain_checkpoint_response_signing_bytes(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            &request_id,
+            &responder,
+            timestamp,
+            checkpoint_height,
+            &checkpoint_hash,
+            tip_height,
+            &tip_hash,
+        );
+        encode_memchain(&MemChainMessage::RecordChainCheckpointResponseV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            request_id,
+            responder,
+            response_timestamp: timestamp,
+            checkpoint_height,
+            checkpoint_hash,
+            tip_height,
+            tip_hash,
+            signature: identity.sign(&signing_bytes),
+        })
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn test_has_active_content() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
@@ -2570,6 +3019,245 @@ mod tests {
         ] {
             assert!(value.get(forbidden).is_none(), "unexpected {forbidden}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_evidence_persists_and_reaudits_signed_frame() {
+        let (storage, block) = commitment_audit_fixture().await;
+        let responder = IdentityKeyPair::generate();
+        let observed_at = 1_700_500_001;
+        let frame = signed_checkpoint_response_frame(
+            &responder,
+            [0x31; 16],
+            observed_at,
+            1,
+            block.hash(),
+            1,
+            block.hash(),
+        );
+        let digest: [u8; 32] = Sha256::digest(&frame).into();
+        storage
+            .persist_record_commitment_checkpoint_evidence(
+                observed_at,
+                "converged",
+                1,
+                1,
+                1,
+                &digest,
+                &frame,
+            )
+            .await
+            .unwrap();
+
+        let audit = storage
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(audit.evidence_records, 1);
+        assert_eq!(audit.divergence_evidence_records, 0);
+        assert_eq!(audit.last_evidence_at, Some(observed_at));
+        let status = storage.record_commitment_checkpoint_status();
+        assert_eq!(status.evidence_state, "verified");
+        assert_eq!(status.evidence_records, 1);
+        assert_eq!(status.last_evidence_at, Some(observed_at));
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_evidence_audit_fails_closed_after_sqlite_tampering() {
+        let (storage, block) = commitment_audit_fixture().await;
+        let responder = IdentityKeyPair::generate();
+        let observed_at = 1_700_500_010;
+        let frame = signed_checkpoint_response_frame(
+            &responder,
+            [0x32; 16],
+            observed_at,
+            1,
+            block.hash(),
+            1,
+            block.hash(),
+        );
+        let digest: [u8; 32] = Sha256::digest(&frame).into();
+        storage
+            .persist_record_commitment_checkpoint_evidence(
+                observed_at,
+                "converged",
+                1,
+                1,
+                1,
+                &digest,
+                &frame,
+            )
+            .await
+            .unwrap();
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute(
+                "UPDATE record_checkpoint_evidence SET signed_response=?1",
+                params![vec![MEMCHAIN_MAGIC, 0x00]],
+            )
+            .unwrap();
+        }
+        assert!(storage
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap_err()
+            .contains("digest mismatch"));
+        assert_eq!(
+            storage.record_commitment_checkpoint_status().evidence_state,
+            "invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_evidence_duplicate_conflict_fails_closed() {
+        let (storage, block) = commitment_audit_fixture().await;
+        let responder = IdentityKeyPair::generate();
+        let observed_at = 1_700_500_020;
+        let frame = signed_checkpoint_response_frame(
+            &responder,
+            [0x33; 16],
+            observed_at,
+            1,
+            block.hash(),
+            1,
+            block.hash(),
+        );
+        let digest: [u8; 32] = Sha256::digest(&frame).into();
+        storage
+            .persist_record_commitment_checkpoint_evidence(
+                observed_at,
+                "converged",
+                1,
+                1,
+                1,
+                &digest,
+                &frame,
+            )
+            .await
+            .unwrap();
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute(
+                "UPDATE record_checkpoint_evidence SET relation='remote_ahead'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(storage
+            .persist_record_commitment_checkpoint_evidence(
+                observed_at,
+                "converged",
+                1,
+                1,
+                1,
+                &digest,
+                &frame,
+            )
+            .await
+            .unwrap_err()
+            .contains("conflicts with verified frame"));
+        assert_eq!(
+            storage
+                .record_commitment_checkpoint_status()
+                .evidence_persistence_failures_total,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_evidence_rejects_invalid_input_and_tracks_failure() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let frame = vec![MEMCHAIN_MAGIC, 0x01];
+        let wrong_digest = [0u8; 32];
+        assert!(storage
+            .persist_record_commitment_checkpoint_evidence(
+                1,
+                "converged",
+                0,
+                0,
+                0,
+                &wrong_digest,
+                &frame,
+            )
+            .await
+            .unwrap_err()
+            .contains("digest mismatch"));
+        let digest: [u8; 32] = Sha256::digest(&frame).into();
+        assert!(storage
+            .persist_record_commitment_checkpoint_evidence(1, "unknown", 0, 0, 0, &digest, &frame,)
+            .await
+            .unwrap_err()
+            .contains("relation is invalid"));
+        assert_eq!(
+            storage
+                .record_commitment_checkpoint_status()
+                .evidence_persistence_failures_total,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_evidence_capacity_preserves_divergence() {
+        let (storage, block) = commitment_audit_fixture().await;
+        let responder = IdentityKeyPair::generate();
+        let diverged_at = 1_700_510_000;
+        let fork_hash = [0xE7; 32];
+        let divergent = signed_checkpoint_response_frame(
+            &responder,
+            [0x40; 16],
+            diverged_at,
+            1,
+            fork_hash,
+            1,
+            fork_hash,
+        );
+        let divergent_digest: [u8; 32] = Sha256::digest(&divergent).into();
+        storage
+            .persist_record_commitment_checkpoint_evidence(
+                diverged_at,
+                "diverged",
+                1,
+                1,
+                1,
+                &divergent_digest,
+                &divergent,
+            )
+            .await
+            .unwrap();
+
+        for index in 0..CHECKPOINT_EVIDENCE_CAPACITY + 8 {
+            let observed_at = diverged_at + 1 + index as u64;
+            let mut request_id = [0u8; 16];
+            request_id[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            let frame = signed_checkpoint_response_frame(
+                &responder,
+                request_id,
+                observed_at,
+                1,
+                block.hash(),
+                1,
+                block.hash(),
+            );
+            let digest: [u8; 32] = Sha256::digest(&frame).into();
+            storage
+                .persist_record_commitment_checkpoint_evidence(
+                    observed_at,
+                    "converged",
+                    1,
+                    1,
+                    1,
+                    &digest,
+                    &frame,
+                )
+                .await
+                .unwrap();
+        }
+        let audit = storage
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(audit.evidence_records, CHECKPOINT_EVIDENCE_CAPACITY as u64);
+        assert_eq!(audit.divergence_evidence_records, 1);
     }
 
     #[tokio::test]

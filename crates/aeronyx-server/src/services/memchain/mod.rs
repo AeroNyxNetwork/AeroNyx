@@ -136,6 +136,7 @@ pub use storage_crypto::{decrypt_rawlog_content_pub, derive_rawlog_key, derive_r
 pub use storage_ops::{
     OverviewData, OverviewRecord, RecordCommitmentAppendOutcome, RecordCommitmentChainAudit,
     RecordCommitmentChainIntegrityStatus, RecordCommitmentChainStatus,
+    RecordCommitmentCheckpointEvidenceAudit,
 };
 
 // ── Storage graph types (v2.4.0+Search) ──

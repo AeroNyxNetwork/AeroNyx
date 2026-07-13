@@ -120,6 +120,8 @@
 //      it current after transactionally verified appends.
 //  50. Requires a signed shared-prefix checkpoint before follower catch-up may
 //      declare convergence and reports only aggregate proof outcomes.
+//  51. Audits a bounded local vault of exact signature-verified checkpoint
+//      response frames before networking and exposes only aggregate vault health.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -143,6 +145,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.6-EvidenceVault - Durable bounded checkpoint proofs and startup audit
 //   v2.7.5-CheckpointProof - Signed cross-node tip reconciliation and convergence gate
 //   v2.7.4-BlockIntegrityStatus - Privacy-safe verified chain evidence in status and heartbeat
 //   v2.7.3-BlockAudit - Fail-closed startup verification for persisted commitment chains
@@ -1324,6 +1327,17 @@ impl Server {
             duration_ms = commitment_integrity.verification_duration_ms.unwrap_or(0),
             "[MEMCHAIN_BLOCK] Persisted commitment chain audit passed"
         );
+        let checkpoint_evidence_audit = storage
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .map_err(|error| {
+                ServerError::startup_failed(format!("MemChain checkpoint evidence audit: {error}"))
+            })?;
+        info!(
+            evidence_records = checkpoint_evidence_audit.evidence_records,
+            divergence_records = checkpoint_evidence_audit.divergence_evidence_records,
+            "[MEMCHAIN_BLOCK] Persisted checkpoint evidence audit passed"
+        );
 
         let quantization_enabled =
             self.config.memchain.vector_quantization == VectorQuantizationMode::ScalarUint8;
@@ -1880,6 +1894,12 @@ impl Server {
                             proofs_failed_total: status.proofs_failed_total,
                             divergences_total: status.divergences_total,
                             requests_served_total: status.requests_served_total,
+                            evidence_state: status.evidence_state,
+                            evidence_records: status.evidence_records,
+                            divergence_evidence_records: status.divergence_evidence_records,
+                            last_evidence_at: status.last_evidence_at,
+                            evidence_persistence_failures_total: status
+                                .evidence_persistence_failures_total,
                         }
                     });
                     Some(crate::management::client::MemChainHeartbeatStatus {
