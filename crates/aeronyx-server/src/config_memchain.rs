@@ -71,8 +71,12 @@
 //! - commitment_coordinator_enabled must remain default-off. Until a
 //!   consensus protocol exists, exactly one configured coordinator may append
 //!   the canonical commitment chain; all other nodes are verifier/followers.
+//! - commitment_sync_enabled must remain default-off. A follower accepts
+//!   blocks only from the explicitly pinned coordinator node identity and
+//!   fails closed on rollback, fork, signature, or continuity errors.
 //!
 //! ## Last Modified
+//! v2.7.1-BlockFollower — Added default-off pinned coordinator follower settings.
 //! v2.7.0-BlockSync — Added default-off commitment coordinator role.
 
 use std::borrow::Cow;
@@ -230,6 +234,27 @@ pub struct MemChainConfig {
     /// Follower nodes still verify and serve already-synchronised blocks.
     #[serde(default)]
     pub commitment_coordinator_enabled: bool,
+
+    /// Pull and verify canonical commitment blocks from one pinned coordinator.
+    ///
+    /// This is deliberately `false` by default. The pinned Ed25519 node id is
+    /// the trust root for Block Sync v1; discovery supplies only its current
+    /// signed endpoint. This is authenticated replication, not consensus.
+    #[serde(default)]
+    pub commitment_sync_enabled: bool,
+
+    /// Hex-encoded Ed25519 identity of the only accepted block coordinator.
+    ///
+    /// Required when `commitment_sync_enabled=true`. An empty value is inert
+    /// while sync is disabled so existing configurations remain compatible.
+    #[serde(default)]
+    pub commitment_coordinator_node_id: String,
+
+    /// Base interval between successful follower catch-up rounds.
+    ///
+    /// Failures use bounded exponential backoff independently of this value.
+    #[serde(default = "default_commitment_sync_interval_secs")]
+    pub commitment_sync_interval_secs: u64,
 
     /// Maximum number of distinct remote owners this node will serve.
     #[serde(default = "default_max_remote_owners")]
@@ -450,6 +475,9 @@ fn default_embed_output_dim() -> usize {
 fn default_max_remote_owners() -> usize {
     100
 }
+fn default_commitment_sync_interval_secs() -> u64 {
+    30
+}
 fn default_ner_model_path() -> String {
     "models/gliner".into()
 }
@@ -618,6 +646,52 @@ impl MemChainConfig {
                 ));
             }
             debug!("[MEMCHAIN_BLOCK] Canonical commitment coordinator enabled");
+        }
+
+        // A Block Sync v1 follower has exactly one trust root. It never falls
+        // back to an arbitrary discovered peer and never produces blocks.
+        if self.commitment_sync_enabled {
+            if self.mode != MemChainMode::Local {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_sync_enabled",
+                    "requires memchain.mode = 'local'",
+                ));
+            }
+            if !self.blind_storage_enabled {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_sync_enabled",
+                    "requires memchain.blind_storage_enabled = true",
+                ));
+            }
+            if self.commitment_coordinator_enabled {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_sync_enabled",
+                    "cannot be enabled on the commitment coordinator",
+                ));
+            }
+            let coordinator = self.commitment_coordinator_node_id.trim();
+            let decoded = hex::decode(coordinator).map_err(|_| {
+                ServerError::config_invalid(
+                    "memchain.commitment_coordinator_node_id",
+                    "must be a 64-character Ed25519 public key in hexadecimal",
+                )
+            })?;
+            if coordinator.len() != 64
+                || decoded.len() != 32
+                || decoded.iter().all(|byte| *byte == 0)
+            {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_coordinator_node_id",
+                    "must be a non-zero 64-character Ed25519 public key in hexadecimal",
+                ));
+            }
+            if !(5..=3_600).contains(&self.commitment_sync_interval_secs) {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_sync_interval_secs",
+                    "must be between 5 and 3600 seconds",
+                ));
+            }
+            debug!("[MEMCHAIN_BLOCK] Pinned coordinator follower sync enabled");
         }
 
         // ── v2.4.0: NER Engine ────────────────────────────────────────
@@ -800,6 +874,20 @@ impl MemChainConfig {
         self.allow_remote_storage
     }
 
+    /// Returns the validated Block Sync v1 coordinator identity.
+    ///
+    /// `None` means follower sync is disabled or the caller bypassed config
+    /// validation. Runtime code must fail closed when sync is enabled and this
+    /// method returns `None`.
+    #[must_use]
+    pub fn commitment_sync_coordinator_node_id(&self) -> Option<[u8; 32]> {
+        if !self.commitment_sync_enabled {
+            return None;
+        }
+        let bytes = hex::decode(self.commitment_coordinator_node_id.trim()).ok()?;
+        bytes.try_into().ok()
+    }
+
     /// v2.4.0: Check whether the cognitive graph pipeline is fully enabled.
     ///
     /// Requires both NER and graph to be enabled. If NER is disabled,
@@ -891,6 +979,9 @@ impl Default for MemChainConfig {
             allow_remote_storage: false,
             blind_storage_enabled: false,
             commitment_coordinator_enabled: false,
+            commitment_sync_enabled: false,
+            commitment_coordinator_node_id: String::new(),
+            commitment_sync_interval_secs: default_commitment_sync_interval_secs(),
             max_remote_owners: default_max_remote_owners(),
             ner_enabled: false,
             ner_model_path: default_ner_model_path(),
@@ -956,6 +1047,9 @@ mod tests {
         assert!(!mc.allow_remote_storage);
         assert!(!mc.is_remote_storage_enabled());
         assert!(!mc.commitment_coordinator_enabled);
+        assert!(!mc.commitment_sync_enabled);
+        assert!(mc.commitment_coordinator_node_id.is_empty());
+        assert_eq!(mc.commitment_sync_interval_secs, 30);
         assert_eq!(mc.max_remote_owners, 100);
         assert!(!mc.ner_enabled);
         assert_eq!(mc.ner_model_path, "models/gliner");
@@ -1177,6 +1271,59 @@ mod tests {
         }
         .validate()
         .is_ok());
+    }
+
+    #[test]
+    fn test_commitment_follower_requires_pinned_coordinator_and_safe_role() {
+        let pinned = "11".repeat(32);
+        let valid = MemChainConfig {
+            blind_storage_enabled: true,
+            commitment_sync_enabled: true,
+            commitment_coordinator_node_id: pinned.clone(),
+            ..Default::default()
+        };
+        assert!(valid.validate().is_ok());
+        assert_eq!(
+            valid.commitment_sync_coordinator_node_id(),
+            Some([0x11; 32])
+        );
+
+        for invalid in [
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                ..Default::default()
+            },
+            MemChainConfig {
+                mode: MemChainMode::P2p,
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: pinned.clone(),
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_coordinator_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: pinned.clone(),
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: "00".repeat(32),
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: pinned,
+                commitment_sync_interval_secs: 4,
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
     }
 
     // ── NER ───────────────────────────────────────────────────────────────

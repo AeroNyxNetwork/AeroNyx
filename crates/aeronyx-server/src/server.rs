@@ -109,6 +109,9 @@
 //      announcements contain headers only and never memory payload metadata.
 //  45. Gates commitment production behind a default-off coordinator role so
 //      follower nodes cannot create independent forks before consensus exists.
+//  46. Runs default-off follower catch-up against one pinned coordinator,
+//      verifies each complete signed page before append, and backs off on any
+//      rollback, fork, signature, continuity, endpoint, or transport failure.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -132,6 +135,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.1-BlockFollower - Pinned coordinator catch-up with bounded retry/backoff
 //   v2.7.0-BlockSync - Node-blind commitment packing, peer range API, coordinator fork guard
 //   v1.2.8-MemChainStartupIntegrity - Reject tampered records during vector index recovery
 //   v1.2.7-MemChainBlindVectorRecovery - Restore all owner/model vector partitions on blind storage nodes
@@ -237,7 +241,7 @@ use crate::api::discovery::{
     discovery_readiness_status_value, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
     GossipResponse,
 };
-use crate::api::memchain_peer::build_memchain_peer_router;
+use crate::api::memchain_peer::{build_memchain_peer_router, pull_record_commitment_page};
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
 use crate::api::voice::build_voice_router;
 use crate::api::vpn_health::{
@@ -757,6 +761,12 @@ impl Server {
                 Arc::clone(&udp),
             );
             tasks.push(("memchain-api", api_task));
+
+            if let Some(sync_task) =
+                self.spawn_memchain_commitment_sync_task(Arc::clone(st), Arc::clone(&peer_store))
+            {
+                tasks.push(("memchain-block-sync", sync_task));
+            }
 
             if let Some(ref router) = llm_router {
                 let worker = TaskWorker::new(
@@ -2391,6 +2401,146 @@ impl Server {
                     }
                 }
             }
+        }))
+    }
+
+    /// Starts the default-off Block Sync v1 follower.
+    ///
+    /// The configured coordinator identity is the sole trust root. Discovery
+    /// resolves only that identity's signed endpoint, while the pull helper
+    /// verifies the response signer, every block proposer, and full chain
+    /// continuity before SQLite is changed. There is deliberately no peer
+    /// fallback or longest-chain selection in this pre-consensus phase.
+    fn spawn_memchain_commitment_sync_task(
+        &self,
+        storage: Arc<MemoryStorage>,
+        peer_store: Arc<PeerStore>,
+    ) -> Option<JoinHandle<()>> {
+        if !self.config.memchain.commitment_sync_enabled {
+            return None;
+        }
+        let Some(coordinator_node_id) = self.config.memchain.commitment_sync_coordinator_node_id()
+        else {
+            error!(
+                "[MEMCHAIN_BLOCK] Follower sync disabled at runtime: invalid pinned coordinator"
+            );
+            return None;
+        };
+        if self.identity.public_key_bytes() == coordinator_node_id {
+            error!(
+                "[MEMCHAIN_BLOCK] Follower sync disabled at runtime: coordinator cannot follow itself"
+            );
+            return None;
+        }
+
+        let client = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(1)
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => {
+                error!(
+                    "[MEMCHAIN_BLOCK] Follower sync disabled at runtime: HTTP client init failed"
+                );
+                return None;
+            }
+        };
+        let identity = self.identity.clone();
+        let base_interval_secs = self.config.memchain.commitment_sync_interval_secs;
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        Some(tokio::spawn(async move {
+            const MAX_PAGES_PER_ROUND: usize = 8;
+            const MAX_BACKOFF_SECS: u64 = 600;
+
+            let mut consecutive_failures = 0u32;
+            let mut next_delay = Duration::from_secs(0);
+            info!(
+                interval_secs = base_interval_secs,
+                max_pages_per_round = MAX_PAGES_PER_ROUND,
+                "[MEMCHAIN_BLOCK] Pinned coordinator follower started"
+            );
+
+            loop {
+                if !next_delay.is_zero() {
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => break,
+                        _ = tokio::time::sleep(next_delay) => {}
+                    }
+                }
+
+                let round_future = async {
+                    let mut inserted = 0usize;
+                    let mut remote_tip_height = 0u64;
+                    for _ in 0..MAX_PAGES_PER_ROUND {
+                        let outcome = pull_record_commitment_page(
+                            &storage,
+                            &peer_store,
+                            &identity,
+                            &coordinator_node_id,
+                            &client,
+                        )
+                        .await?;
+                        inserted = inserted.saturating_add(outcome.inserted);
+                        remote_tip_height = outcome.remote_tip_height;
+                        if !outcome.has_more {
+                            return Ok((inserted, remote_tip_height, false));
+                        }
+                    }
+                    Ok((inserted, remote_tip_height, true))
+                };
+                let round: std::result::Result<(usize, u64, bool), String> = tokio::select! {
+                    _ = shutdown_rx.recv() => break,
+                    result = round_future => result,
+                };
+
+                match round {
+                    Ok((inserted, remote_tip_height, backlog_remaining)) => {
+                        consecutive_failures = 0;
+                        if inserted > 0 {
+                            info!(
+                                blocks = inserted,
+                                tip_height = remote_tip_height,
+                                backlog_remaining,
+                                "[MEMCHAIN_BLOCK] Follower catch-up advanced"
+                            );
+                        } else {
+                            debug!(
+                                tip_height = remote_tip_height,
+                                "[MEMCHAIN_BLOCK] Follower is current"
+                            );
+                        }
+                        // Keep each round bounded but drain a verified backlog
+                        // promptly without turning the normal loop into polling.
+                        next_delay = Duration::from_secs(if backlog_remaining {
+                            1
+                        } else {
+                            base_interval_secs
+                        });
+                    }
+                    Err(reason) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        let shift = consecutive_failures.saturating_sub(1).min(5);
+                        let multiplier = 1u64 << shift;
+                        let retry_secs = base_interval_secs
+                            .saturating_mul(multiplier)
+                            .min(MAX_BACKOFF_SECS);
+                        next_delay = Duration::from_secs(retry_secs);
+                        if consecutive_failures == 1 || consecutive_failures.is_power_of_two() {
+                            warn!(
+                                consecutive_failures,
+                                retry_secs,
+                                reason = %reason,
+                                "[MEMCHAIN_BLOCK] Follower catch-up failed closed"
+                            );
+                        }
+                    }
+                }
+            }
+            info!("[MEMCHAIN_BLOCK] Pinned coordinator follower stopped");
         }))
     }
 
