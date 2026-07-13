@@ -32,6 +32,8 @@
 //!   privacy-safe signed reconciliation runtime evidence
 //! - v2.7.6-EvidenceVault: bounded durable proof frames, fail-closed persistence,
 //!   and complete restart-time cryptographic evidence audit
+//! - v2.7.7-EvidenceRestartRecovery: file-backed WAL visibility, clean reopen,
+//!   v8-to-v9 preservation, and tampered-disk restart regression coverage
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -76,6 +78,7 @@
 //! v2.7.4-BlockIntegrityStatus - Added privacy-safe verified-chain evidence.
 //! v2.7.5-CheckpointProof - Added signed checkpoint reconciliation evidence.
 //! v2.7.6-EvidenceVault - Added durable bounded proof storage and startup audit.
+//! v2.7.7-EvidenceRestartRecovery - Added real SQLite restart/migration tests.
 //!
 //! ## Last Modified
 //! v2.7.4-BlockIntegrityStatus - Report and maintain the verified-chain baseline.
@@ -2297,6 +2300,7 @@ mod tests {
     use super::*;
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::ledger::MemoryRecord;
+    use tempfile::TempDir;
 
     fn make_rec_owner(ts: u64, owner: [u8; 32], layer: MemoryLayer) -> MemoryRecord {
         MemoryRecord::new(
@@ -2342,6 +2346,54 @@ mod tests {
             signature: identity.sign(&signing_bytes),
         })
         .unwrap()
+    }
+
+    async fn seed_checkpoint_evidence(
+        storage: &MemoryStorage,
+        observed_at: u64,
+    ) -> (RecordCommitmentBlockV1, Vec<u8>, [u8; 32]) {
+        let proposer = IdentityKeyPair::generate();
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            observed_at.saturating_sub(1),
+            GENESIS_PREV_HASH,
+            vec![[0xA7; 32]],
+            &proposer,
+        );
+        storage
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+
+        let responder = IdentityKeyPair::generate();
+        let frame = signed_checkpoint_response_frame(
+            &responder,
+            [0xA8; 16],
+            observed_at,
+            1,
+            block.hash(),
+            1,
+            block.hash(),
+        );
+        let digest: [u8; 32] = Sha256::digest(&frame).into();
+        storage
+            .persist_record_commitment_checkpoint_evidence(
+                observed_at,
+                "converged",
+                1,
+                1,
+                1,
+                &digest,
+                &frame,
+            )
+            .await
+            .unwrap();
+        storage
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        (block, frame, digest)
     }
 
     #[tokio::test]
@@ -3161,6 +3213,129 @@ mod tests {
                 .record_commitment_checkpoint_status()
                 .evidence_persistence_failures_total,
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_evidence_is_visible_through_wal_and_survives_restart() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("checkpoint-restart.db");
+        let writer = MemoryStorage::open(&path, None).unwrap();
+        let observed_at = 1_700_500_100;
+        let (block, _, _) = seed_checkpoint_evidence(&writer, observed_at).await;
+
+        // Open a second storage while the writer connection remains alive. This
+        // proves the committed proof is visible through SQLite WAL, not merely
+        // flushed as a side effect of closing the first process.
+        let wal_reader = MemoryStorage::open(&path, None).unwrap();
+        let chain = wal_reader.audit_record_commitment_chain().await.unwrap();
+        assert_eq!(chain.block_count, 1);
+        assert_eq!(chain.tip_height, 1);
+        assert_eq!(
+            wal_reader.record_commitment_chain_tip().await.1,
+            block.hash()
+        );
+        let wal_audit = wal_reader
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(wal_audit.evidence_records, 1);
+        assert_eq!(wal_audit.last_evidence_at, Some(observed_at));
+        drop(wal_reader);
+        drop(writer);
+
+        // A later clean process must independently re-establish both audit
+        // baselines instead of trusting runtime state from the prior process.
+        let reopened = MemoryStorage::open(&path, None).unwrap();
+        assert_eq!(
+            reopened.record_commitment_chain_integrity_status().state,
+            "not_verified"
+        );
+        assert_eq!(
+            reopened
+                .record_commitment_checkpoint_status()
+                .evidence_state,
+            "not_audited"
+        );
+        reopened.audit_record_commitment_chain().await.unwrap();
+        let reopened_audit = reopened
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(reopened_audit.evidence_records, 1);
+        assert_eq!(
+            reopened
+                .record_commitment_checkpoint_status()
+                .evidence_state,
+            "verified"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v8_to_v9_file_migration_preserves_commitment_chain() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("checkpoint-migration.db");
+        let original = MemoryStorage::open(&path, None).unwrap();
+        let (block, _, _) = seed_checkpoint_evidence(&original, 1_700_500_200).await;
+        drop(original);
+
+        // Reconstruct the exact relevant v8 boundary: the commitment chain is
+        // present, but the v9 evidence table does not yet exist.
+        let legacy = rusqlite::Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "DROP TABLE record_checkpoint_evidence;
+                 UPDATE schema_version SET version=8;",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let migrated = MemoryStorage::open(&path, None).unwrap();
+        let version: u32 = {
+            let conn = migrated.conn_lock().await;
+            conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(version, 9);
+        let chain = migrated.audit_record_commitment_chain().await.unwrap();
+        assert_eq!(chain.block_count, 1);
+        assert_eq!(migrated.record_commitment_chain_tip().await.1, block.hash());
+        let evidence = migrated
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(evidence.evidence_records, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reopened_checkpoint_evidence_rejects_disk_tampering() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("checkpoint-tamper.db");
+        let original = MemoryStorage::open(&path, None).unwrap();
+        seed_checkpoint_evidence(&original, 1_700_500_300).await;
+        drop(original);
+
+        let tamper = rusqlite::Connection::open(&path).unwrap();
+        tamper
+            .execute(
+                "UPDATE record_checkpoint_evidence SET signed_response=?1",
+                params![vec![MEMCHAIN_MAGIC, 0x00]],
+            )
+            .unwrap();
+        drop(tamper);
+
+        let reopened = MemoryStorage::open(&path, None).unwrap();
+        reopened.audit_record_commitment_chain().await.unwrap();
+        assert!(reopened
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap_err()
+            .contains("digest mismatch"));
+        assert_eq!(
+            reopened
+                .record_commitment_checkpoint_status()
+                .evidence_state,
+            "invalid"
         );
     }
 
