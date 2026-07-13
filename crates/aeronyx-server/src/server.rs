@@ -103,6 +103,12 @@
 //  42. Verifies content-address integrity for every MemChain record restored
 //      into the vector index and additionally verifies the owner's Ed25519
 //      signature for node-blind records.
+//  43. Mounts the authenticated commitment block range API on node-peer
+//      surfaces and rejects range sync frames from ordinary client tunnels.
+//  44. Reconciles bounded node-blind commitment blocks at Local-mode startup;
+//      announcements contain headers only and never memory payload metadata.
+//  45. Gates commitment production behind a default-off coordinator role so
+//      follower nodes cannot create independent forks before consensus exists.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -112,7 +118,11 @@
 //   - remove_wallet() is called AFTER sessions.remove() (inside
 //     cleanup_expired). Order matters: session must be gone first.
 //   - All other logic (VPN, MemChain, ChatRelay, Voice, SuperNode,
-//     SaaS pool, Miner) is unchanged from the previous version.
+//     SaaS pool) remains backward-compatible with the previous version.
+//   - Commitment block range frames are node-peer control traffic. Never route
+//     them through a client session or add full memory records to the response.
+//   - Block Sync v1 is single-writer: only an explicitly configured Local-mode
+//     blind coordinator may pack blocks; all other nodes remain followers.
 //   - encrypted_message_counter is aggregate only and never stores payload,
 //     destination, DNS, URL, voucher, wallet, or client public IP details.
 //   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
@@ -122,6 +132,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.0-BlockSync - Node-blind commitment packing, peer range API, coordinator fork guard
 //   v1.2.8-MemChainStartupIntegrity - Reject tampered records during vector index recovery
 //   v1.2.7-MemChainBlindVectorRecovery - Restore all owner/model vector partitions on blind storage nodes
 //   v1.2.6-BlindRelayRuntimeHeartbeat - Promote aggregate blind relay runtime evidence in discovery_status heartbeat
@@ -226,6 +237,7 @@ use crate::api::discovery::{
     discovery_readiness_status_value, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
     GossipResponse,
 };
+use crate::api::memchain_peer::build_memchain_peer_router;
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
 use crate::api::voice::build_voice_router;
 use crate::api::vpn_health::{
@@ -862,7 +874,10 @@ impl Server {
                         Arc::clone(&udp),
                     )
                     .with_compaction_threshold(self.config.memchain.compaction_threshold)
-                    .with_mvf(self.config.memchain.mvf_enabled, Arc::clone(&user_weights));
+                    .with_mvf(self.config.memchain.mvf_enabled, Arc::clone(&user_weights))
+                    .with_commitment_coordinator(
+                        self.config.memchain.commitment_coordinator_enabled,
+                    );
 
                     let miner = if let Some(ref ee) = embed_engine {
                         miner.with_embed_engine(Arc::clone(ee))
@@ -879,6 +894,18 @@ impl Server {
                     } else {
                         miner
                     };
+
+                    // Reconcile a bounded backlog before announcing startup.
+                    // This packs only verified opaque commitments; it never
+                    // copies memory payloads to peers. Remaining backlog, if
+                    // any, is drained by the normal bounded miner tick.
+                    let bootstrap_blocks = miner.pack_commitment_blocks(64).await;
+                    if bootstrap_blocks > 0 {
+                        info!(
+                            blocks = bootstrap_blocks,
+                            "[MEMCHAIN_BLOCK] Startup commitment backlog reconciled"
+                        );
+                    }
 
                     let miner_shutdown = self.shutdown_tx.subscribe();
                     tasks.push((
@@ -1457,6 +1484,7 @@ impl Server {
         let smoke_node_identity = Arc::clone(&node_identity);
         let smoke_peer_http_client = Arc::clone(&peer_http_client);
         let smoke_local_capability_status = local_capability_status.clone();
+        let commitment_storage = mpi_state.storage.clone();
 
         tokio::spawn(async move {
             if let Some(public_addr) = public_api_listen_addr {
@@ -1469,6 +1497,7 @@ impl Server {
                     Arc::clone(&node_identity),
                     Arc::clone(&peer_http_client),
                     local_capability_status.clone(),
+                    commitment_storage.clone(),
                 );
                 tokio::spawn(async move {
                     Self::serve_public_discovery_api(public_addr, public_app, shutdown_rx_public)
@@ -1551,10 +1580,19 @@ impl Server {
                     }),
                 )
                 .merge(build_discovery_router_with_local_status(
-                    peer_store,
+                    Arc::clone(&peer_store),
                     discovery_api_policy,
                     local_capability_status,
                 ));
+            let app = if let Some(storage) = commitment_storage {
+                app.merge(build_memchain_peer_router(
+                    storage,
+                    peer_store,
+                    node_identity,
+                ))
+            } else {
+                app
+            };
 
             let listener = match tokio::net::TcpListener::bind(listen_addr).await {
                 Ok(l) => {
@@ -1637,8 +1675,11 @@ impl Server {
         node_identity: Arc<IdentityKeyPair>,
         peer_http_client: Arc<reqwest::Client>,
         local_capability_status: DiscoveryLocalCapabilityStatus,
+        commitment_storage: Option<Arc<MemoryStorage>>,
     ) -> axum::Router {
-        build_discovery_router_with_local_status(
+        let block_peer_store = Arc::clone(&peer_store);
+        let block_identity = Arc::clone(&node_identity);
+        let app = build_discovery_router_with_local_status(
             Arc::clone(&peer_store),
             discovery_api_policy,
             local_capability_status,
@@ -1647,10 +1688,19 @@ impl Server {
             chat_relay,
             sessions,
             udp,
-            peer_store,
+            Arc::clone(&peer_store),
             node_identity,
             peer_http_client,
-        ))
+        ));
+        if let Some(storage) = commitment_storage {
+            app.merge(build_memchain_peer_router(
+                storage,
+                block_peer_store,
+                block_identity,
+            ))
+        } else {
+            app
+        }
     }
 
     async fn serve_public_discovery_api(
@@ -1661,7 +1711,7 @@ impl Server {
         let listener = match tokio::net::TcpListener::bind(listen_addr).await {
             Ok(listener) => {
                 info!(
-                    "[DISCOVERY] Public discovery API on http://{} (routes: /api/discovery/*, /api/chat/peer/relay, /api/chat/peer/blind-relay)",
+                    "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/chat/peer/*, /api/memchain/peer/block-range)",
                     listen_addr
                 );
                 listener
@@ -4234,6 +4284,40 @@ impl Server {
                     height = header.height,
                     hash = hex::encode(header.hash()),
                     "[MEMCHAIN] BlockAnnounce received"
+                );
+            }
+            MemChainMessage::RecordBlockAnnounceV1 {
+                header,
+                proposer_signature,
+            } => {
+                let now = unix_now_secs();
+                let session_key = session.client_public_key.to_bytes();
+                let signature_valid = IdentityPublicKey::from_bytes(&header.proposer)
+                    .and_then(|key| key.verify(&header.hash(), &proposer_signature))
+                    .is_ok();
+                let known_peer = peer_store.get_valid(&header.proposer, now).is_some();
+                if !signature_valid || !known_peer || session_key != header.proposer {
+                    warn!(
+                        signature_valid,
+                        known_peer,
+                        session_binding_valid = session_key == header.proposer,
+                        "[MEMCHAIN_BLOCK] Rejected announcement outside authenticated node peer boundary"
+                    );
+                    return;
+                }
+                info!(
+                    height = header.height,
+                    hash = %header.hash_hex(),
+                    "[MEMCHAIN_BLOCK] Authenticated peer tip announcement received"
+                );
+            }
+            MemChainMessage::RecordBlockRangeRequestV1 { .. }
+            | MemChainMessage::RecordBlockRangeResponseV1 { .. } => {
+                // Range sync is intentionally unavailable on the VPN/client
+                // DataPacket path. It belongs to the signed node-to-node peer
+                // API so ordinary clients cannot enumerate commitments.
+                warn!(
+                    "[MEMCHAIN_BLOCK] Rejected range sync on client tunnel; node peer API required"
                 );
             }
             MemChainMessage::ChatRelay(envelope) => {

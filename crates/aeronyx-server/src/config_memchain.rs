@@ -25,6 +25,8 @@
 //!                     token_ttl_secs, SaaS-gated validate() checks
 //! v1.1.0-ChatRelay  — 🌟 Added ChatRelayConfig (chat_relay field),
 //!                     is_chat_relay_enabled(), extracted to config_memchain.rs
+//! v2.7.0-BlockSync  — Added an explicit, default-off commitment coordinator
+//!                     role so independent nodes cannot accidentally fork.
 //!
 //! ## Main Functionality
 //! - `MemChainMode`   — Off / Local / P2p / Saas
@@ -66,9 +68,12 @@
 //! - effective_saas_config() returns Cow; cache result in hot paths.
 //! - chat_relay.db_path and saas.data_root share "data/" prefix by
 //!   convention but are NOT linked — must be updated independently.
+//! - commitment_coordinator_enabled must remain default-off. Until a
+//!   consensus protocol exists, exactly one configured coordinator may append
+//!   the canonical commitment chain; all other nodes are verifier/followers.
 //!
 //! ## Last Modified
-//! v1.1.0-ChatRelay — Extracted from config.rs; added chat_relay field.
+//! v2.7.0-BlockSync — Added default-off commitment coordinator role.
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
@@ -216,6 +221,15 @@ pub struct MemChainConfig {
     /// subset — the node cannot read the content — so it can be enabled on its own.
     #[serde(default)]
     pub blind_storage_enabled: bool,
+
+    /// Allows this node to append canonical record commitment blocks.
+    ///
+    /// This is deliberately `false` by default. Block Sync v1 has signed
+    /// ordering but no distributed fork-choice/consensus protocol, so enabling
+    /// more than one independent writer would create divergent height chains.
+    /// Follower nodes still verify and serve already-synchronised blocks.
+    #[serde(default)]
+    pub commitment_coordinator_enabled: bool,
 
     /// Maximum number of distinct remote owners this node will serve.
     #[serde(default = "default_max_remote_owners")]
@@ -588,6 +602,24 @@ impl MemChainConfig {
             }
         }
 
+        // Block Sync v1 deliberately uses a single blind coordinator. This is
+        // a safety boundary, not a claim of distributed consensus.
+        if self.commitment_coordinator_enabled {
+            if self.mode != MemChainMode::Local {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_coordinator_enabled",
+                    "requires memchain.mode = 'local' until fork choice is implemented",
+                ));
+            }
+            if !self.blind_storage_enabled {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_coordinator_enabled",
+                    "requires memchain.blind_storage_enabled = true",
+                ));
+            }
+            debug!("[MEMCHAIN_BLOCK] Canonical commitment coordinator enabled");
+        }
+
         // ── v2.4.0: NER Engine ────────────────────────────────────────
         if self.ner_enabled {
             if self.ner_confidence_threshold <= 0.0 || self.ner_confidence_threshold >= 1.0 {
@@ -858,6 +890,7 @@ impl Default for MemChainConfig {
             api_secret: None,
             allow_remote_storage: false,
             blind_storage_enabled: false,
+            commitment_coordinator_enabled: false,
             max_remote_owners: default_max_remote_owners(),
             ner_enabled: false,
             ner_model_path: default_ner_model_path(),
@@ -922,6 +955,7 @@ mod tests {
         assert!(mc.effective_api_secret().is_none());
         assert!(!mc.allow_remote_storage);
         assert!(!mc.is_remote_storage_enabled());
+        assert!(!mc.commitment_coordinator_enabled);
         assert_eq!(mc.max_remote_owners, 100);
         assert!(!mc.ner_enabled);
         assert_eq!(mc.ner_model_path, "models/gliner");
@@ -1116,6 +1150,33 @@ mod tests {
             ..Default::default()
         };
         assert!(mc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_commitment_coordinator_requires_local_blind_storage() {
+        assert!(MemChainConfig {
+            commitment_coordinator_enabled: true,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+
+        assert!(MemChainConfig {
+            mode: MemChainMode::P2p,
+            blind_storage_enabled: true,
+            commitment_coordinator_enabled: true,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+
+        assert!(MemChainConfig {
+            blind_storage_enabled: true,
+            commitment_coordinator_enabled: true,
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
     }
 
     // ── NER ───────────────────────────────────────────────────────────────

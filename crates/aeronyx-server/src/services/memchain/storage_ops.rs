@@ -22,6 +22,8 @@
 //! - v2.2.0: get_embedding_model, get_overview
 //! - v2.3.0: count_distinct_owners, owner_exists (Phase 1 remote storage capacity check)
 //! - v2.5.3+Isolation: get_active_records_by_context (project_id context filter for /recall)
+//! - v2.7.0-BlockSync: atomic commitment append, bounded range reads, authoritative
+//!   tip recovery, aggregate status, and uncommitted blind-record selection
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -49,6 +51,9 @@
 //! - get_active_records_by_context() uses LEFT JOIN records→sessions to check
 //!   project_id on EITHER the record directly OR via its session. Records inserted
 //!   via /remember directly (no session) are matched by records.project_id only.
+//! - `append_record_commitment_block` is the only authoritative tip advance for
+//!   the new chain. Never update its tip independently of the block transaction.
+//! - Peer range reads return commitments only; full records remain owner-scoped.
 //!
 //! ## Modification History
 //! v2.2.0               - 🌟 Extracted from storage.rs; added get_embedding_model, get_overview
@@ -57,9 +62,10 @@
 //!   (now in storage_graph.rs) + Miner Step support (now in storage_miner.rs)
 //! v2.4.0+Search        - 🌟 Split into storage_ops.rs / storage_graph.rs / storage_miner.rs
 //! v2.5.3+Isolation     - 🌟 Added get_active_records_by_context() for /recall context filter
+//! v2.7.0-BlockSync     - Added transactional signed commitment chain storage.
 //!
 //! ## Last Modified
-//! v2.5.3+Isolation - 🌟 get_active_records_by_context() + 2 tests
+//! v2.7.0-BlockSync - Transactional commitment chain, ranges, and safe status.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,7 +73,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, OptionalExtension};
 use tracing::{debug, error, info, warn};
 
-use aeronyx_core::ledger::{MemoryLayer, MemoryRecord, RecordStatus};
+use aeronyx_core::ledger::{
+    MemoryLayer, MemoryRecord, RecordCommitmentBlockV1, AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+    GENESIS_PREV_HASH,
+};
 
 use super::storage::{embedding_to_bytes, LayerCounts, MemoryStorage, RawLogRow, StorageStats};
 use super::storage_crypto::{
@@ -95,6 +104,34 @@ pub struct OverviewData {
     pub by_layer: HashMap<String, u64>,
     pub recent_by_layer: HashMap<String, Vec<OverviewRecord>>,
     pub last_memory_at: u64,
+}
+
+/// Result of atomically appending a V1 commitment block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordCommitmentAppendOutcome {
+    /// The block extended the local verified tip.
+    Inserted,
+    /// The exact same block was already stored at that height.
+    AlreadyPresent,
+}
+
+/// Aggregate local state for the node-blind commitment chain.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecordCommitmentChainStatus {
+    /// Stable wire contract name.
+    pub contract_version: &'static str,
+    /// Production chain identifier as lowercase hexadecimal.
+    pub chain_id: String,
+    /// Number of verified blocks stored locally.
+    pub block_count: u64,
+    /// Number of opaque record commitments represented by those blocks.
+    pub commitment_count: u64,
+    /// Current one-based tip height, or zero when empty.
+    pub tip_height: u64,
+    /// Current tip hash as lowercase hexadecimal, or `None` when empty.
+    pub tip_hash: Option<String>,
+    /// Privacy contract exposed to operators and API consumers.
+    pub payload_policy: &'static str,
 }
 
 // ============================================
@@ -371,6 +408,236 @@ impl MemoryStorage {
 // ============================================
 
 impl MemoryStorage {
+    /// Atomically verifies and appends one node-blind commitment block.
+    ///
+    /// Height uniqueness, previous-hash continuity, proposer signature,
+    /// Merkle integrity, commitment uniqueness, block persistence, membership
+    /// indexing, and tip updates share one SQLite transaction. A crash or
+    /// validation failure therefore cannot leave a partially advanced chain.
+    pub async fn append_record_commitment_block(
+        &self,
+        block: &RecordCommitmentBlockV1,
+        received_from: Option<&[u8; 32]>,
+    ) -> Result<RecordCommitmentAppendOutcome, String> {
+        let mut conn = self.conn.lock().await;
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("begin commitment block transaction: {error}"))?;
+
+        let existing_hash: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT block_hash FROM record_commitment_blocks WHERE height=?1",
+                params![block.header.height as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("read existing commitment block: {error}"))?;
+        if let Some(existing_hash) = existing_hash {
+            if existing_hash.as_slice() == block.hash().as_slice() {
+                return Ok(RecordCommitmentAppendOutcome::AlreadyPresent);
+            }
+            return Err(format!(
+                "commitment chain fork at height {}",
+                block.header.height
+            ));
+        }
+
+        let tip: Option<(u64, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT height,block_hash FROM record_commitment_blocks
+                 ORDER BY height DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("read commitment chain tip: {error}"))?;
+        let (expected_height, expected_prev_hash) = match tip {
+            Some((height, hash)) => {
+                let hash: [u8; 32] = hash.try_into().map_err(|value: Vec<u8>| {
+                    format!("stored tip hash has invalid length {}", value.len())
+                })?;
+                (height.saturating_add(1), hash)
+            }
+            None => (1, GENESIS_PREV_HASH),
+        };
+
+        block
+            .verify(
+                &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                expected_height,
+                &expected_prev_hash,
+            )
+            .map_err(|error| format!("commitment block validation failed: {error}"))?;
+
+        let payload = bincode::serialize(block)
+            .map_err(|error| format!("serialize commitment block: {error}"))?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        transaction
+            .execute(
+                "INSERT INTO record_commitment_blocks
+                 (height,block_hash,chain_id,protocol_version,timestamp,
+                  prev_block_hash,merkle_root,record_count,proposer,
+                  proposer_signature,payload,received_from,created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![
+                    block.header.height as i64,
+                    block.hash().as_slice(),
+                    block.header.chain_id.as_slice(),
+                    block.header.protocol_version as i64,
+                    block.header.timestamp as i64,
+                    block.header.prev_block_hash.as_slice(),
+                    block.header.merkle_root.as_slice(),
+                    block.header.record_count as i64,
+                    block.header.proposer.as_slice(),
+                    block.proposer_signature.as_slice(),
+                    payload,
+                    received_from.map(|peer| peer.as_slice()),
+                    now,
+                ],
+            )
+            .map_err(|error| format!("persist commitment block: {error}"))?;
+
+        for record_id in &block.record_ids {
+            transaction
+                .execute(
+                    "INSERT INTO record_block_commitments (record_id,block_height)
+                     VALUES (?1,?2)",
+                    params![record_id.as_slice(), block.header.height as i64],
+                )
+                .map_err(|error| {
+                    format!(
+                        "persist commitment membership at height {}: {error}",
+                        block.header.height
+                    )
+                })?;
+        }
+
+        for (key, value) in [
+            ("record_block_tip_hash", block.hash().to_vec()),
+            (
+                "record_block_tip_height",
+                block.header.height.to_le_bytes().to_vec(),
+            ),
+            (
+                "record_block_chain_id",
+                AERONYX_MEMCHAIN_MAINNET_CHAIN_ID.to_vec(),
+            ),
+        ] {
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO chain_state (key,value) VALUES (?1,?2)",
+                    params![key, value],
+                )
+                .map_err(|error| format!("update commitment chain state: {error}"))?;
+        }
+
+        transaction
+            .commit()
+            .map_err(|error| format!("commit commitment block transaction: {error}"))?;
+        info!(
+            height = block.header.height,
+            commitments = block.record_ids.len(),
+            hash = %block.header.hash_hex(),
+            source = if received_from.is_some() { "peer" } else { "local" },
+            "[MEMCHAIN_BLOCK] Verified commitment block appended"
+        );
+        Ok(RecordCommitmentAppendOutcome::Inserted)
+    }
+
+    /// Reads a bounded, height-ordered range for peer catch-up.
+    pub async fn get_record_commitment_block_range(
+        &self,
+        from_height: u64,
+        limit: usize,
+    ) -> Result<Vec<RecordCommitmentBlockV1>, String> {
+        let from_height = from_height.max(1);
+        let limit = limit.clamp(1, 32);
+        let conn = self.conn.lock().await;
+        let mut statement = conn
+            .prepare(
+                "SELECT payload FROM record_commitment_blocks
+                 WHERE height>=?1 ORDER BY height ASC LIMIT ?2",
+            )
+            .map_err(|error| format!("prepare commitment range query: {error}"))?;
+        let rows = statement
+            .query_map(params![from_height as i64, limit as i64], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .map_err(|error| format!("query commitment block range: {error}"))?;
+
+        let mut blocks = Vec::new();
+        for row in rows {
+            let payload = row.map_err(|error| format!("read commitment block payload: {error}"))?;
+            let block = bincode::deserialize::<RecordCommitmentBlockV1>(&payload)
+                .map_err(|error| format!("decode stored commitment block: {error}"))?;
+            blocks.push(block);
+        }
+        Ok(blocks)
+    }
+
+    /// Returns the verified commitment chain tip from the authoritative block
+    /// table rather than trusting mutable key/value state.
+    pub async fn record_commitment_chain_tip(&self) -> (u64, [u8; 32]) {
+        let conn = self.conn.lock().await;
+        let tip: Option<(u64, Vec<u8>)> = conn
+            .query_row(
+                "SELECT height,block_hash FROM record_commitment_blocks
+                 ORDER BY height DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
+            )
+            .optional()
+            .unwrap_or(None);
+        match tip {
+            Some((height, hash)) if hash.len() == 32 => {
+                let mut value = [0u8; 32];
+                value.copy_from_slice(&hash);
+                (height, value)
+            }
+            _ => (0, GENESIS_PREV_HASH),
+        }
+    }
+
+    /// Returns aggregate chain health without exposing record commitments,
+    /// proposer identities, or peer metadata.
+    pub async fn record_commitment_chain_status(&self) -> RecordCommitmentChainStatus {
+        let conn = self.conn.lock().await;
+        let (block_count, commitment_count): (u64, u64) = conn
+            .query_row(
+                "SELECT COUNT(*),COALESCE(SUM(record_count),0)
+                 FROM record_commitment_blocks",
+                [],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+            )
+            .unwrap_or((0, 0));
+        let tip: Option<(u64, Vec<u8>)> = conn
+            .query_row(
+                "SELECT height,block_hash FROM record_commitment_blocks
+                 ORDER BY height DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
+            )
+            .optional()
+            .unwrap_or(None);
+        let (tip_height, tip_hash) = match tip {
+            Some((height, hash)) if hash.len() == 32 => (height, Some(hex::encode(hash))),
+            _ => (0, None),
+        };
+        RecordCommitmentChainStatus {
+            contract_version: "record_commitment_chain.v1",
+            chain_id: hex::encode(AERONYX_MEMCHAIN_MAINNET_CHAIN_ID),
+            block_count,
+            commitment_count,
+            tip_height,
+            tip_hash,
+            payload_policy: "opaque_record_commitments_only_no_memory_payload_or_owner_metadata",
+        }
+    }
+
+    /// Legacy mutable chain-state setter retained for old Fact blocks only.
     pub async fn set_chain_state(&self, block_hash: &[u8; 32], height: u64) {
         let conn = self.conn.lock().await;
         let _ = conn.execute(
@@ -384,6 +651,10 @@ impl MemoryStorage {
     }
 
     pub async fn last_block_hash(&self) -> [u8; 32] {
+        let (commitment_height, commitment_hash) = self.record_commitment_chain_tip().await;
+        if commitment_height > 0 {
+            return commitment_hash;
+        }
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT value FROM chain_state WHERE key='last_block_hash'",
@@ -401,6 +672,10 @@ impl MemoryStorage {
     }
 
     pub async fn last_block_height(&self) -> u64 {
+        let (commitment_height, _) = self.record_commitment_chain_tip().await;
+        if commitment_height > 0 {
+            return commitment_height;
+        }
         let conn = self.conn.lock().await;
         conn.query_row(
             "SELECT value FROM chain_state WHERE key='last_block_height'",
@@ -850,6 +1125,7 @@ impl MemoryStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::ledger::MemoryRecord;
 
     fn make_rec_owner(ts: u64, owner: [u8; 32], layer: MemoryLayer) -> MemoryRecord {
@@ -1072,5 +1348,149 @@ mod tests {
             .get_active_records_by_context(&owner_b, "work", None, 100)
             .await;
         assert!(results.is_empty(), "Cross-owner isolation must be enforced");
+    }
+
+    #[tokio::test]
+    async fn test_commitment_chain_append_range_and_status() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let identity = IdentityKeyPair::generate();
+        let first = RecordCommitmentBlockV1::new_signed(
+            1,
+            1_700_200_001,
+            GENESIS_PREV_HASH,
+            vec![[0x01; 32], [0x02; 32]],
+            &identity,
+        );
+        assert_eq!(
+            storage
+                .append_record_commitment_block(&first, None)
+                .await
+                .unwrap(),
+            RecordCommitmentAppendOutcome::Inserted
+        );
+        assert_eq!(
+            storage
+                .append_record_commitment_block(&first, None)
+                .await
+                .unwrap(),
+            RecordCommitmentAppendOutcome::AlreadyPresent
+        );
+
+        let second = RecordCommitmentBlockV1::new_signed(
+            2,
+            1_700_200_002,
+            first.hash(),
+            vec![[0x03; 32]],
+            &identity,
+        );
+        storage
+            .append_record_commitment_block(&second, Some(&identity.public_key_bytes()))
+            .await
+            .unwrap();
+
+        let range = storage
+            .get_record_commitment_block_range(1, 10)
+            .await
+            .unwrap();
+        assert_eq!(range, vec![first.clone(), second.clone()]);
+        assert_eq!(
+            storage.record_commitment_chain_tip().await,
+            (2, second.hash())
+        );
+        assert_eq!(storage.last_block_height().await, 2);
+        assert_eq!(storage.last_block_hash().await, second.hash());
+
+        let status = storage.record_commitment_chain_status().await;
+        assert_eq!(status.block_count, 2);
+        assert_eq!(status.commitment_count, 3);
+        assert_eq!(status.tip_height, 2);
+        assert_eq!(status.tip_hash, Some(hex::encode(second.hash())));
+    }
+
+    #[tokio::test]
+    async fn test_commitment_chain_rejects_fork_and_rolls_back_duplicate() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let identity = IdentityKeyPair::generate();
+        let first = RecordCommitmentBlockV1::new_signed(
+            1,
+            1_700_300_001,
+            GENESIS_PREV_HASH,
+            vec![[0x11; 32]],
+            &identity,
+        );
+        storage
+            .append_record_commitment_block(&first, None)
+            .await
+            .unwrap();
+
+        let fork = RecordCommitmentBlockV1::new_signed(
+            1,
+            1_700_300_002,
+            GENESIS_PREV_HASH,
+            vec![[0x22; 32]],
+            &identity,
+        );
+        assert!(storage
+            .append_record_commitment_block(&fork, None)
+            .await
+            .unwrap_err()
+            .contains("fork"));
+
+        let duplicate = RecordCommitmentBlockV1::new_signed(
+            2,
+            1_700_300_003,
+            first.hash(),
+            vec![[0x11; 32]],
+            &identity,
+        );
+        assert!(storage
+            .append_record_commitment_block(&duplicate, None)
+            .await
+            .is_err());
+        assert_eq!(
+            storage.record_commitment_chain_tip().await,
+            (1, first.hash())
+        );
+        assert_eq!(
+            storage
+                .get_record_commitment_block_range(1, 10)
+                .await
+                .unwrap(),
+            vec![first]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_block_packer_source_is_active_blind_and_uncommitted_only() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let owner = IdentityKeyPair::generate();
+        let mut blind = make_rec_owner(
+            1_700_400_001,
+            owner.public_key_bytes(),
+            MemoryLayer::Episode,
+        );
+        blind.blind = true;
+        blind.signature = owner.sign(&blind.record_id);
+        assert!(storage.insert_blind_replica(&blind, "sealed").await);
+
+        let local = make_rec_owner(1_700_400_002, [0x55; 32], MemoryLayer::Episode);
+        assert!(storage.insert(&local, "local").await);
+        let pending = storage.get_uncommitted_blind_records(32).await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].record_id, blind.record_id);
+
+        let proposer = IdentityKeyPair::generate();
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            1_700_400_003,
+            GENESIS_PREV_HASH,
+            vec![blind.record_id],
+            &proposer,
+        );
+        storage
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        assert!(storage.get_uncommitted_blind_records(32).await.is_empty());
     }
 }

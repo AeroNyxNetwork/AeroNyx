@@ -34,6 +34,7 @@
 //! - [`voice`]: v1.0.0-Voice Peer virtual IP resolution for UDP direct-connect
 //! - [`discovery`]: v0.1.0 Discovery snapshot/gossip endpoints
 //! - [`chat_peer`]: v0.1.0 node-to-node encrypted chat envelope relay
+//! - [`memchain_peer`]: v2.7.0 signed node-to-node commitment block ranges
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - When adding new ORIGINAL-style endpoints → add to mpi_handlers.rs
@@ -47,6 +48,8 @@
 //!   The routes are conditionally registered in build_mpi_router() based on mode.
 //! - voice.rs injects its own Arc<SessionManager> State independently of MpiState.
 //!   It is merged into the combined API router in server.rs::start_combined_api().
+//! - memchain_peer.rs is a public node-peer surface, not a client memory API.
+//!   It must keep PeerStore admission and return commitments only.
 //!
 //! ## Last Modified
 //! v0.3.0 - Initial Agent API for MemChain Phase 1
@@ -66,6 +69,7 @@
 //!   GET /api/discovery/snapshot and POST /api/discovery/gossip.
 //! v0.1.0-ChatPeerRelay - Added chat_peer submodule:
 //!   POST /api/chat/peer/relay for inter-node encrypted envelope relay.
+//! v2.7.0-BlockSync - Added authenticated `/api/memchain/peer/block-range`.
 
 // ── Core MPI module (state, auth, router) ──
 pub mod mpi;
@@ -86,6 +90,7 @@ pub mod local;
 // ── v1.0.0-Voice: Peer virtual IP resolution for UDP direct-connect routing ──
 pub mod chat_peer;
 pub mod discovery;
+pub mod memchain_peer;
 pub mod voice;
 pub mod vpn_health;
 

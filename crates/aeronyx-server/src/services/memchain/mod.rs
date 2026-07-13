@@ -27,6 +27,7 @@
 //! - [`volume_router`]: Per-user disk volume routing + hot-reload (v1.0.0-MultiTenant)
 //! - [`mempool`]: In-memory Fact buffer (legacy/deprecated)
 //! - [`aof`]: Append-Only File persistence (legacy/deprecated)
+//! - `storage_ops`: v2.7.0 atomic commitment-chain append/range/status methods
 //!
 //! ## Storage Split History
 //! v2.2.0: storage.rs → storage.rs + storage_crypto.rs + storage_ops.rs
@@ -44,6 +45,8 @@
 //! - PrivacyLevel is defined in config_supernode.rs and re-exported through prompts.rs.
 //! - SystemDb::open() returns Arc<SystemDb> — callers should not re-wrap in Arc.
 //! - VolumeRouter::new() returns Arc<VolumeRouter> — same pattern.
+//! - The commitment chain stores opaque record IDs only. Sealed payload
+//!   replication and owner recovery must remain separate and authorised.
 //!
 //! ## Last Modified
 //! v0.2.0 - Initial MemChain storage engine
@@ -62,6 +65,7 @@
 //!   re-exports (LlmUsageStats, ProviderUsage, TaskTypeUsage) that were never
 //!   defined in storage_supernode.rs.
 //! v1.0.0-MultiTenant - Added system_db + volume_router for SaaS multi-tenant mode
+//! v2.7.0-BlockSync - Re-exported commitment append outcomes and safe status.
 
 // ── Storage engine ──
 pub mod storage;
@@ -124,7 +128,9 @@ pub mod mempool;
 // ── Storage core ──
 pub use storage::{LayerCounts, MemoryStorage, RawLogRow, StorageStats};
 pub use storage_crypto::{decrypt_rawlog_content_pub, derive_rawlog_key, derive_record_key};
-pub use storage_ops::{OverviewData, OverviewRecord};
+pub use storage_ops::{
+    OverviewData, OverviewRecord, RecordCommitmentAppendOutcome, RecordCommitmentChainStatus,
+};
 
 // ── Storage graph types (v2.4.0+Search) ──
 pub use storage_graph::{

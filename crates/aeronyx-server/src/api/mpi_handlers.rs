@@ -17,6 +17,8 @@
 //!                          Extension instead of state.storage (was panicking
 //!                          in SaaS mode). conn_lock() query moved behind a
 //!                          Local-mode guard.
+//! v2.7.0-BlockSync       - Added aggregate commitment-chain status to the
+//!                          local operator status response.
 //!
 //! ## Main Functionality
 //! - POST /api/mpi/remember    - store a new memory record
@@ -50,6 +52,8 @@
 //! - RecallRequest.context is passed to recall_handler for project isolation.
 //! - revoke_owned() enforces owner in SQL (fix TOCTOU in mpi_forget).
 //! - PATCH clears embedding on content change; Miner re-embeds (~60s).
+//! - record_commitment_chain is aggregate and privacy-safe. Do not expose
+//!   record IDs, proposer IDs, peer IDs, owners, or payloads in MPI status.
 //!
 //! ## Last Modified
 //! v1.0.1-SaaSFix - Replaced all direct state.storage/vector_index accesses
@@ -58,6 +62,8 @@
 //!                  persisted-vector coverage to `/api/mpi/status`.
 //! v1.0.3-MemChainStartupIntegrity - Expose startup integrity rejection count
 //!                  and the validation policy applied before recall indexing.
+//! v2.7.0-BlockSync - Expose local block/commitment count, tip, chain ID, and
+//!                  payload policy without record-level metadata.
 // ============================================
 
 use std::sync::Arc;
@@ -871,6 +877,7 @@ pub struct MpiStatusResponse {
     pub vector_index_rejected_records: usize,
     pub vector_index_integrity_policy: String,
     pub last_block_height: u64,
+    pub record_commitment_chain: crate::services::memchain::RecordCommitmentChainStatus,
     pub index_ready: bool,
     pub embed_ready: bool,
     pub embed_dim: Option<usize>,
@@ -919,6 +926,7 @@ pub async fn mpi_status(
 
     let stats = storage.stats().await;
     let height = storage.last_block_height().await;
+    let record_commitment_chain = storage.record_commitment_chain_status().await;
     let wv = {
         state
             .user_weights
@@ -1051,6 +1059,7 @@ pub async fn mpi_status(
             vector_index_integrity_policy:
                 "content_address_all_records_and_owner_signature_for_blind_records".into(),
             last_block_height: height,
+            record_commitment_chain,
             index_ready: state.index_ready.load(std::sync::atomic::Ordering::Relaxed),
             embed_ready: state.embed_engine.is_some(),
             embed_dim: state.embed_engine.as_ref().map(|e| e.dim()),

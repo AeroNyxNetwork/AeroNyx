@@ -37,6 +37,10 @@
 //!   - cognitive_tasks: SuperNode async LLM task queue
 //!   - llm_usage_log: Per-call token counts and latency log
 //!   - sessions ALTER: added title column (SuperNode-generated session title)
+//! - v7: Added the node-blind marker to client-sealed records.
+//! - v8 (v2.7.0-BlockSync): Authoritative commitment chain tables:
+//!   - record_commitment_blocks: signed block payload and verified chain data
+//!   - record_block_commitments: unique record ID to block-height membership
 //!
 //! ## Thread Safety
 //! `rusqlite::Connection` behind `tokio::sync::Mutex`. Phase 2+ can use r2d2 pooling.
@@ -83,6 +87,8 @@
 //! - row_to_record returns rusqlite::Error on malformed BLOB length — no silent
 //!   zero-ID records that corrupt cache / search results.
 //! - complete_task enforces AND status='processing' guard (storage_supernode.rs).
+//! - v8 tables are integrity commitments, not replicated memory storage. Never
+//!   add owner, tags, embeddings, or decrypted content columns to them.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
@@ -112,6 +118,7 @@
 //! v2.6.1+BlindVectorRecovery - Added all-owner active embedding enumeration so
 //!   node-blind/remote Local-mode nodes can rebuild every isolated vector
 //!   partition after restart without weakening owner-scoped recall.
+//! v2.7.0-BlockSync - Schema v8 commitment blocks and unique membership index.
 // ============================================
 
 use std::collections::HashMap;
@@ -124,7 +131,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, error, info, warn};
 
-use aeronyx_core::ledger::{MemoryLayer, MemoryRecord, RecordStatus};
+use aeronyx_core::ledger::{
+    MemoryLayer, MemoryRecord, RecordStatus, MAX_RECORD_COMMITMENTS_PER_BLOCK,
+};
 use zeroize::Zeroizing;
 
 use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
@@ -136,12 +145,13 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 /// Current schema version.
 /// v4 → v5: cognitive graph tables
 /// v5 → v6: SuperNode cognitive_tasks + llm_usage_log + sessions.title
+/// v7 → v8: signed node-blind commitment chain + membership index
 ///
 /// ⚠️ CRITICAL: When bumping this, you MUST also add a new migrate block
 /// in maybe_migrate(). The migrate block MUST use a hardcoded integer
 /// (not this constant) for UPDATE schema_version, to prevent skipping
 /// intermediate migrations on multi-version upgrades.
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -377,6 +387,36 @@ impl MemoryStorage {
             CREATE INDEX IF NOT EXISTS idx_owner_layer_status ON records(owner, layer, status);
             CREATE INDEX IF NOT EXISTS idx_status_layer ON records(status, layer);
             CREATE INDEX IF NOT EXISTS idx_timestamp ON records(timestamp);
+
+            -- v8: node-blind commitment chain. Blocks intentionally contain
+            -- only opaque record ids; memory owners and ciphertext payloads
+            -- remain in the separately authorised records table.
+            CREATE TABLE IF NOT EXISTS record_commitment_blocks (
+                height              INTEGER PRIMARY KEY CHECK(height > 0),
+                block_hash          BLOB NOT NULL UNIQUE CHECK(length(block_hash) = 32),
+                chain_id            BLOB NOT NULL CHECK(length(chain_id) = 32),
+                protocol_version    INTEGER NOT NULL,
+                timestamp           INTEGER NOT NULL,
+                prev_block_hash     BLOB NOT NULL CHECK(length(prev_block_hash) = 32),
+                merkle_root         BLOB NOT NULL CHECK(length(merkle_root) = 32),
+                record_count        INTEGER NOT NULL,
+                proposer            BLOB NOT NULL CHECK(length(proposer) = 32),
+                proposer_signature  BLOB NOT NULL CHECK(length(proposer_signature) = 64),
+                payload             BLOB NOT NULL,
+                received_from       BLOB,
+                created_at          INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_record_blocks_hash
+                ON record_commitment_blocks(block_hash);
+
+            CREATE TABLE IF NOT EXISTS record_block_commitments (
+                record_id       BLOB PRIMARY KEY CHECK(length(record_id) = 32),
+                block_height    INTEGER NOT NULL,
+                FOREIGN KEY(block_height) REFERENCES record_commitment_blocks(height)
+                    ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_record_block_commitments_height
+                ON record_block_commitments(block_height);
 
             CREATE TABLE IF NOT EXISTS raw_logs (
                 log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1104,6 +1144,44 @@ impl MemoryStorage {
             info!("[STORAGE] ✅ Migration to v7 (node-blind) complete");
         }
 
+        // v7 → v8: node-blind commitment block persistence.
+        // create_schema() runs before migrations and creates these tables with
+        // IF NOT EXISTS. The explicit migration still verifies their presence
+        // before advancing the version, preventing a partially-created schema
+        // from being reported as healthy.
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(7);
+
+        if current < 8 {
+            info!(
+                "[STORAGE] Migrating schema v{} → v8 (commitment blocks)",
+                current
+            );
+            for table in ["record_commitment_blocks", "record_block_commitments"] {
+                let exists = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                        params![table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    > 0;
+                if !exists {
+                    return Err(format!(
+                        "v8 migration: required table '{}' was not created",
+                        table
+                    ));
+                }
+            }
+            // ⚠️ hardcoded 8, not SCHEMA_VERSION — preserves sequential upgrades.
+            conn.execute("UPDATE schema_version SET version = 8", [])
+                .map_err(|e| format!("Update schema version to v8: {}", e))?;
+            info!("[STORAGE] ✅ Migration to v8 (commitment blocks) complete");
+        }
+
         Ok(())
     }
 
@@ -1311,9 +1389,9 @@ impl MemoryStorage {
     ) -> std::collections::HashSet<[u8; 32]> {
         let mut set = std::collections::HashSet::new();
         let conn = self.conn.lock().await;
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT record_id FROM records WHERE owner=?1 AND project_id=?2 AND status=0",
-        ) {
+        if let Ok(mut stmt) = conn
+            .prepare("SELECT record_id FROM records WHERE owner=?1 AND project_id=?2 AND status=0")
+        {
             if let Ok(rows) = stmt.query_map(params![owner.as_slice(), project_id], |row| {
                 row.get::<_, Vec<u8>>(0)
             }) {
@@ -1707,6 +1785,30 @@ impl MemoryStorage {
                 after_timestamp as i64,
                 DEFAULT_PAGE_SIZE as i64
             ],
+        )
+    }
+
+    /// Returns active node-blind records not yet represented in the local
+    /// commitment chain.
+    ///
+    /// This is the only source used by the V1 block packer. Node-readable
+    /// records are deliberately excluded so block production cannot turn the
+    /// synchronised ledger into a plaintext or owner-metadata replication
+    /// channel. The caller must still verify each record's content address and
+    /// Ed25519 owner signature before building a block.
+    pub async fn get_uncommitted_blind_records(&self, limit: usize) -> Vec<MemoryRecord> {
+        let limit = limit.clamp(1, MAX_RECORD_COMMITMENTS_PER_BLOCK);
+        let conn = self.conn.lock().await;
+        self.query_rows(
+            &conn,
+            "SELECT r.record_id,r.owner,r.timestamp,r.layer,r.topic_tags,r.source_ai,
+                    r.status,r.supersedes,r.encrypted_content,r.embedding,r.signature,r.access_count,
+                    r.positive_feedback,r.negative_feedback,r.conflict_with,r.blind
+             FROM records r
+             LEFT JOIN record_block_commitments c ON c.record_id = r.record_id
+             WHERE r.blind=1 AND r.status=0 AND c.record_id IS NULL
+             ORDER BY r.record_id ASC LIMIT ?1",
+            params![limit as i64],
         )
     }
 
@@ -2153,7 +2255,8 @@ mod tests {
 
         // Client-supplied keyed token-hashes (hex). The node never sees plaintext.
         let terms = vec!["a3f29c4d".to_string(), "9c4d2eb1".to_string()];
-        s.fts_index_blind_terms(&rec.record_id, &owner, &terms).await;
+        s.fts_index_blind_terms(&rec.record_id, &owner, &terms)
+            .await;
 
         // Query by an indexed term-hash → finds the record.
         let hits = s
@@ -2202,7 +2305,12 @@ mod tests {
         s.insert_blind_provenance(
             &did,
             &owner,
-            &[src_a.clone(), src_b.clone(), hex::encode(did), String::new()],
+            &[
+                src_a.clone(),
+                src_b.clone(),
+                hex::encode(did),
+                String::new(),
+            ],
         )
         .await;
 

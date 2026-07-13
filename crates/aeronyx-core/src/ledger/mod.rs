@@ -18,6 +18,8 @@
 //!   the new primary data model replacing `Fact` for the intelligent
 //!   AI memory engine. `Fact` is preserved for backward compatibility
 //!   with existing P2P messages.
+//! - v2.7.0-BlockSync: Exported the signed node-blind record commitment
+//!   chain contract used by Rust peers for integrity synchronisation.
 //!
 //! ## Main Functionality
 //!
@@ -54,11 +56,14 @@
 //! - `merkle_root()` duplication-of-odd-leaf matches Bitcoin's design.
 //! - `Fact` MUST remain available for backward compatibility — do not
 //!   remove it even though new code uses `MemoryRecord`.
+//! - Commitment blocks expose only opaque IDs. Never extend their public
+//!   payload with owner identity, tags, embeddings, or decrypted content.
 //!
 //! ## Last Modified
 //! v0.2.0 - Initial ledger module for MemChain integration
 //! v0.5.0 - Added block and merkle submodules for Miner
 //! v1.0.0 - 🌟 Added record submodule (MemoryRecord MRS-1)
+//! v2.7.0-BlockSync - Re-exported commitment block contracts and limits.
 
 pub mod block;
 pub mod fact;
@@ -73,8 +78,10 @@ pub use fact::Fact;
 pub use block::Block;
 
 pub use block::{
-    BlockHeader, RecordBlock, BLOCK_TYPE_CHECKPOINT, BLOCK_TYPE_MEMORY, BLOCK_TYPE_NORMAL,
-    GENESIS_PREV_HASH,
+    BlockHeader, RecordBlock, RecordCommitmentBlockV1, RecordCommitmentHeaderV1,
+    RecordCommitmentValidationError, AERONYX_MEMCHAIN_MAINNET_CHAIN_ID, BLOCK_TYPE_CHECKPOINT,
+    BLOCK_TYPE_MEMORY, BLOCK_TYPE_NORMAL, GENESIS_PREV_HASH, MAX_RECORD_COMMITMENTS_PER_BLOCK,
+    RECORD_COMMITMENT_BLOCK_VERSION_V1,
 };
 pub use merkle::merkle_root;
 

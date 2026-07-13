@@ -35,6 +35,12 @@
 //! ## MVF Integration
 //! Step 0 produces training data for SGD (positive samples y=1).
 //!
+//! ## v2.7.0-BlockSync: Commitment Packing
+//! Before cognitive compaction, verified active blind records not already in
+//! the commitment chain are packed into bounded signed commitment blocks.
+//! Only record IDs enter this chain; local cognitive compaction does not move
+//! the distributed tip or broadcast a synthetic block.
+//!
 //! ⚠️ Important Note for Next Developer:
 //! - derive_rawlog_key MUST use identity.to_bytes() (PRIVATE key)
 //! - ner_engine is Option<Arc<NerEngine>> — when None, Steps 7-11 are skipped
@@ -46,6 +52,11 @@
 //!   per code block in the loop. For sessions with many code blocks this can
 //!   be slow; batch lookup is a future optimization (Phase E).
 //! - The core logic of this file cannot be deleted or significantly modified.
+//! - Never put full MemoryRecord values, owner identifiers, tags, embeddings,
+//!   or plaintext into `RecordCommitmentBlockV1` or its announcement.
+//! - Block Sync v1 has no fork-choice protocol. Keep commitment production
+//!   disabled on follower nodes; only the explicitly configured coordinator
+//!   may call the packing path.
 //!
 //! ## Modification History
 //! v0.5.0                   - Initial timer-based block packer
@@ -60,9 +71,11 @@
 //! v2.5.0+SuperNode         - 🌟 llm_router + enqueue helpers Steps 8/9/10
 //! v2.5.3+ArtifactChain     - 🌟 Step 10: filename inference + version chain +
 //!   content-hash dedup. Added infer_filename() + extract_filename_from_line().
+//! v2.7.0-BlockSync         - Added bounded commitment packing; removed the
+//!   false chain-tip mutation from local-only cognitive compaction.
 //!
 //! ## Last Modified
-//! v2.5.3+ArtifactChain - 🌟 DEV-TASK-001 Step 10 artifact chain fix
+//! v2.7.0-BlockSync - Signed node-blind commitment block production.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -74,11 +87,11 @@ use tracing::{debug, error, info, warn};
 use aeronyx_core::crypto::transport::{
     DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD,
 };
-use aeronyx_core::crypto::IdentityKeyPair;
+use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 #[allow(deprecated)]
 use aeronyx_core::ledger::{
-    merkle_root, Block, BlockHeader, MemoryLayer, MemoryRecord, BLOCK_TYPE_MEMORY,
-    BLOCK_TYPE_NORMAL,
+    merkle_root, Block, BlockHeader, MemoryLayer, MemoryRecord, RecordCommitmentBlockV1,
+    BLOCK_TYPE_NORMAL, MAX_RECORD_COMMITMENTS_PER_BLOCK,
 };
 use aeronyx_core::protocol::codec::encode_data_packet;
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
@@ -102,6 +115,8 @@ use crate::services::SessionManager;
 const DEFAULT_COMPACTION_THRESHOLD: u64 = 500;
 const MAX_COMPACTION_BATCH: usize = 200;
 const EMBEDDING_BACKFILL_BATCH: usize = 50;
+/// Bounds startup/tick work so block production cannot starve VPN or relay IO.
+const RECORD_COMMITMENT_BLOCKS_PER_TICK: usize = 8;
 
 const DEFAULT_ENTITY_LABELS: &[&str] = &[
     "project",
@@ -182,6 +197,7 @@ pub struct ReflectionMiner {
     embed_engine: Option<Arc<EmbedEngine>>,
     ner_engine: Option<Arc<NerEngine>>,
     llm_router: Option<Arc<LlmRouter>>,
+    commitment_coordinator_enabled: bool,
 }
 
 impl ReflectionMiner {
@@ -211,6 +227,7 @@ impl ReflectionMiner {
             embed_engine: None,
             ner_engine: None,
             llm_router: None,
+            commitment_coordinator_enabled: false,
         }
     }
 
@@ -249,6 +266,14 @@ impl ReflectionMiner {
         self
     }
 
+    /// Enables canonical commitment production on the one configured v1
+    /// coordinator. The default is follower/verifier mode.
+    #[must_use]
+    pub const fn with_commitment_coordinator(mut self, enabled: bool) -> Self {
+        self.commitment_coordinator_enabled = enabled;
+        self
+    }
+
     pub async fn run(self, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
         info!(
             interval = self.interval.as_secs(),
@@ -256,6 +281,7 @@ impl ReflectionMiner {
             mvf = self.mvf_enabled,
             ner = self.ner_engine.is_some(),
             supernode = self.llm_router.is_some(),
+            commitment_coordinator = self.commitment_coordinator_enabled,
             "[MINER] Started"
         );
 
@@ -269,6 +295,7 @@ impl ReflectionMiner {
                     self.step_0_positive_feedback().await;
                     self.step_05_backfill_embeddings().await;
                     self.step_06_correction_chaining().await;
+                    self.pack_commitment_blocks(RECORD_COMMITMENT_BLOCKS_PER_TICK).await;
                     self.step_1_5_legacy_compaction().await;
 
                     if self.ner_engine.is_some() {
@@ -287,6 +314,8 @@ impl ReflectionMiner {
         self.step_0_positive_feedback().await;
         self.step_05_backfill_embeddings().await;
         self.step_06_correction_chaining().await;
+        self.pack_commitment_blocks(RECORD_COMMITMENT_BLOCKS_PER_TICK)
+            .await;
         self.step_1_5_legacy_compaction().await;
 
         if self.ner_engine.is_some() {
@@ -598,6 +627,104 @@ impl ReflectionMiner {
     }
 
     // ============================================
+    // Node-Blind Commitment Block Packing
+    // ============================================
+
+    /// Packs verified node-blind records into signed commitment-only blocks.
+    ///
+    /// Full records, owners, timestamps, tags, embeddings, and ciphertext never
+    /// enter the block payload. The commitment chain proves ordering and
+    /// integrity; separately authorised storage remains responsible for sealed
+    /// payload replication. Returns the number of blocks appended this round.
+    pub async fn pack_commitment_blocks(&self, max_blocks: usize) -> usize {
+        if !self.commitment_coordinator_enabled {
+            return 0;
+        }
+        let max_blocks = max_blocks.clamp(1, 64);
+        let mut appended = 0usize;
+
+        for _ in 0..max_blocks {
+            let records = self
+                .storage
+                .get_uncommitted_blind_records(MAX_RECORD_COMMITMENTS_PER_BLOCK)
+                .await;
+            if records.is_empty() {
+                break;
+            }
+
+            let mut record_ids = Vec::with_capacity(records.len());
+            let mut rejected = 0usize;
+            for record in records {
+                let signature_valid = IdentityPublicKey::from_bytes(&record.owner)
+                    .and_then(|key| key.verify(&record.record_id, &record.signature))
+                    .is_ok();
+                if record.verify_id() && signature_valid {
+                    record_ids.push(record.record_id);
+                } else {
+                    rejected += 1;
+                }
+            }
+            if rejected > 0 {
+                warn!(
+                    rejected,
+                    "[MEMCHAIN_BLOCK] Rejected invalid node-blind records before packing"
+                );
+            }
+            if record_ids.is_empty() {
+                break;
+            }
+
+            let (tip_height, tip_hash) = self.storage.record_commitment_chain_tip().await;
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let block = RecordCommitmentBlockV1::new_signed(
+                tip_height.saturating_add(1),
+                timestamp,
+                tip_hash,
+                record_ids,
+                &self.identity,
+            );
+
+            match self
+                .storage
+                .append_record_commitment_block(&block, None)
+                .await
+            {
+                Ok(crate::services::memchain::RecordCommitmentAppendOutcome::Inserted) => {
+                    appended += 1;
+                    let _ = self
+                        .broadcast_header(MemChainMessage::RecordBlockAnnounceV1 {
+                            header: block.header.clone(),
+                            proposer_signature: block.proposer_signature,
+                        })
+                        .await;
+                }
+                Ok(crate::services::memchain::RecordCommitmentAppendOutcome::AlreadyPresent) => {
+                    debug!(
+                        height = block.header.height,
+                        "[MEMCHAIN_BLOCK] Block already present"
+                    );
+                }
+                Err(error) => {
+                    warn!(error = %error, "[MEMCHAIN_BLOCK] Block append stopped");
+                    break;
+                }
+            }
+        }
+
+        if appended > 0 {
+            let (tip_height, _) = self.storage.record_commitment_chain_tip().await;
+            info!(
+                blocks = appended,
+                tip_height, "[MEMCHAIN_BLOCK] Commitment packing round complete"
+            );
+        }
+        appended
+    }
+
+    // ============================================
     // Step 1-5: Legacy Compaction
     // ============================================
 
@@ -656,33 +783,9 @@ impl ReflectionMiner {
             return;
         }
 
-        let prev_hash = self.storage.last_block_hash().await;
-        let prev_height = self.storage.last_block_height().await;
-        let new_height = if prev_hash == [0u8; 32] {
-            1
-        } else {
-            prev_height + 1
-        };
-        let root = merkle_root(&[knowledge.record_id]);
-
-        let header = BlockHeader {
-            height: new_height,
-            timestamp: now_ts,
-            prev_block_hash: prev_hash,
-            merkle_root: root,
-            block_type: BLOCK_TYPE_MEMORY,
-        };
-
-        self.storage
-            .set_chain_state(&header.hash(), new_height)
-            .await;
-        let _ = self
-            .broadcast_header(MemChainMessage::BlockAnnounce(header))
-            .await;
         info!(
-            height = new_height,
             episodes = episodes.len(),
-            "[MINER] Compaction complete"
+            "[MINER] Local cognitive compaction complete"
         );
     }
 

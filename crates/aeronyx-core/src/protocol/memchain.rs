@@ -8,6 +8,8 @@
 //   derived from the session key. Each sensitive message now carries an explicit
 //   wallet_pubkey + timestamp + Ed25519 signature, allowing the server to verify
 //   wallet ownership per-message without trusting the session binding.
+//   v2.7.0-BlockSync — Appended signed commitment announcement and bounded
+//   peer range request/response variants. Existing discriminants are unchanged.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -32,6 +34,10 @@
 //   - v1.3.0 is a BREAKING CHANGE: DeviceRegister, ChatPull, ChatAck wire
 //     format changed — old clients cannot talk to new servers and vice versa
 //   - WalletPresence (17) is a lightweight heartbeat — node never replies
+//   - Record block range frames (19-20) are node-peer control messages and
+//     MUST NOT be accepted from ordinary VPN/client tunnel sessions
+//   - Commitment blocks contain opaque record IDs only; sealed memory payload
+//     replication requires a separate owner-authorised protocol
 //   - serde_bytes64 is defined in chat.rs; the [u8;64] signature fields here
 //     use the same two-[u8;32] trick for bincode compatibility
 //
@@ -39,6 +45,8 @@
 //   v1.2.0-MultiDevice — Added DeviceRegister (index 16)
 //   v1.3.0-Sovereign   — Added wallet_pubkey/timestamp/signature to
 //                        DeviceRegister, ChatPull, ChatAck; added WalletPresence (17)
+//   v2.7.0-BlockSync   — Appended variants 18-20 and canonical request/response
+//                        signing bytes for node-blind commitment sync
 // ============================================================================
 
 use bincode::Options;
@@ -46,7 +54,7 @@ use serde::{Deserialize, Serialize};
 
 #[allow(deprecated)]
 use crate::ledger::Fact;
-use crate::ledger::{BlockHeader, MemoryRecord};
+use crate::ledger::{BlockHeader, MemoryRecord, RecordCommitmentBlockV1, RecordCommitmentHeaderV1};
 use crate::protocol::chat::ChatEnvelope;
 
 // ============================================
@@ -127,6 +135,9 @@ mod serde_bytes64 {
 /// | 15    | ChatExpired          | v1.1.0-ChatRelay       |
 /// | 16    | DeviceRegister       | v1.2.0-MultiDevice     |
 /// | 17    | WalletPresence       | v1.3.0-Sovereign       |
+/// | 18    | RecordBlockAnnounceV1| v2.7.0-BlockSync       |
+/// | 19    | RecordBlockRangeRequestV1 | v2.7.0-BlockSync  |
+/// | 20    | RecordBlockRangeResponseV1| v2.7.0-BlockSync  |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(deprecated)]
 pub enum MemChainMessage {
@@ -293,6 +304,117 @@ pub enum MemChainMessage {
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
+
+    // ── v2.7.0-BlockSync: Node-blind commitment chain (indices 18-20) ──
+    /// [index 18] Announces a signed commitment header without memory payload.
+    RecordBlockAnnounceV1 {
+        /// Versioned node-blind commitment header.
+        header: RecordCommitmentHeaderV1,
+        /// Proposer signature over `header.hash()`.
+        #[serde(with = "serde_bytes64")]
+        proposer_signature: [u8; 64],
+    },
+
+    /// [index 19] Requests a bounded contiguous range of commitment blocks.
+    ///
+    /// Signature coverage is returned by
+    /// [`record_block_range_request_signing_bytes`]. The requester must be a
+    /// currently valid signed discovery peer; arbitrary clients cannot use
+    /// this message to enumerate ledger commitments.
+    RecordBlockRangeRequestV1 {
+        /// Expected production/private chain identifier.
+        chain_id: [u8; 32],
+        /// First one-based height requested.
+        from_height: u64,
+        /// Requested block count; servers enforce their own lower cap.
+        limit: u16,
+        /// Per-request random identifier used to bind the response.
+        request_id: [u8; 16],
+        /// Requesting node's Ed25519 public key.
+        requester: [u8; 32],
+        /// Unix epoch seconds; peers reject stale requests.
+        request_timestamp: u64,
+        /// Requester signature over the canonical request fields.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+
+    /// [index 20] Returns a bounded, contiguous page of commitment blocks.
+    ///
+    /// Each block is independently proposer-signed. The response signature
+    /// additionally binds page ordering, pagination state, and request id.
+    RecordBlockRangeResponseV1 {
+        /// Request identifier copied from the request.
+        request_id: [u8; 16],
+        /// Responding node's Ed25519 public key.
+        responder: [u8; 32],
+        /// Unix epoch seconds when this page was constructed.
+        response_timestamp: u64,
+        /// Contiguous commitment blocks beginning at the requested height.
+        blocks: Vec<RecordCommitmentBlockV1>,
+        /// Whether another page exists after this response.
+        has_more: bool,
+        /// Responder's current verified tip height.
+        tip_height: u64,
+        /// Responder's current verified tip hash, or zero at height zero.
+        tip_hash: [u8; 32],
+        /// Responder signature over canonical response fields and block hashes.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+}
+
+/// Canonical bytes signed by `RecordBlockRangeRequestV1.requester`.
+#[must_use]
+pub fn record_block_range_request_signing_bytes(
+    chain_id: &[u8; 32],
+    from_height: u64,
+    limit: u16,
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(140);
+    bytes.extend_from_slice(b"AeroNyx-RecordBlockRangeRequest-v1");
+    bytes.extend_from_slice(chain_id);
+    bytes.extend_from_slice(&from_height.to_le_bytes());
+    bytes.extend_from_slice(&limit.to_le_bytes());
+    bytes.extend_from_slice(request_id);
+    bytes.extend_from_slice(requester);
+    bytes.extend_from_slice(&request_timestamp.to_le_bytes());
+    bytes
+}
+
+/// Canonical bytes signed by `RecordBlockRangeResponseV1.responder`.
+#[must_use]
+pub fn record_block_range_response_signing_bytes(
+    request_id: &[u8; 16],
+    responder: &[u8; 32],
+    response_timestamp: u64,
+    blocks: &[RecordCommitmentBlockV1],
+    has_more: bool,
+    tip_height: u64,
+    tip_hash: &[u8; 32],
+) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for block in blocks {
+        hasher.update(block.hash());
+    }
+    let block_hashes_digest: [u8; 32] = hasher.finalize().into();
+
+    let mut bytes = Vec::with_capacity(170);
+    bytes.extend_from_slice(b"AeroNyx-RecordBlockRangeResponse-v1");
+    bytes.extend_from_slice(request_id);
+    bytes.extend_from_slice(responder);
+    bytes.extend_from_slice(&response_timestamp.to_le_bytes());
+    bytes.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&block_hashes_digest);
+    bytes.push(u8::from(has_more));
+    bytes.extend_from_slice(&tip_height.to_le_bytes());
+    bytes.extend_from_slice(tip_hash);
+    bytes
 }
 
 // ============================================
@@ -330,7 +452,10 @@ mod tests {
     use super::*;
     use crate::crypto::IdentityKeyPair;
     #[allow(deprecated)]
-    use crate::ledger::{MemoryLayer, BLOCK_TYPE_NORMAL, GENESIS_PREV_HASH};
+    use crate::ledger::{
+        MemoryLayer, RecordCommitmentBlockV1, AERONYX_MEMCHAIN_MAINNET_CHAIN_ID, BLOCK_TYPE_NORMAL,
+        GENESIS_PREV_HASH,
+    };
     use crate::protocol::chat::{encode_envelope, ChatContentType};
 
     // ── Existing tests (preserved verbatim) ─────────────────────────────
@@ -596,6 +721,166 @@ mod tests {
         })
         .unwrap();
         assert_eq!(disc(&b), 17, "WalletPresence must be discriminant 17");
+
+        let identity = IdentityKeyPair::generate();
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            1_700_000_001,
+            GENESIS_PREV_HASH,
+            vec![[0x11; 32]],
+            &identity,
+        );
+        let b = bincode::serialize(&MemChainMessage::RecordBlockAnnounceV1 {
+            header: block.header.clone(),
+            proposer_signature: block.proposer_signature,
+        })
+        .unwrap();
+        assert_eq!(
+            disc(&b),
+            18,
+            "RecordBlockAnnounceV1 must be discriminant 18"
+        );
+
+        let b = bincode::serialize(&MemChainMessage::RecordBlockRangeRequestV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            from_height: 1,
+            limit: 16,
+            request_id: [0x22; 16],
+            requester: identity.public_key_bytes(),
+            request_timestamp: 1_700_000_002,
+            signature: [0u8; 64],
+        })
+        .unwrap();
+        assert_eq!(
+            disc(&b),
+            19,
+            "RecordBlockRangeRequestV1 must be discriminant 19"
+        );
+
+        let b = bincode::serialize(&MemChainMessage::RecordBlockRangeResponseV1 {
+            request_id: [0x22; 16],
+            responder: identity.public_key_bytes(),
+            response_timestamp: 1_700_000_003,
+            blocks: vec![block],
+            has_more: false,
+            tip_height: 1,
+            tip_hash: [0x33; 32],
+            signature: [0u8; 64],
+        })
+        .unwrap();
+        assert_eq!(
+            disc(&b),
+            20,
+            "RecordBlockRangeResponseV1 must be discriminant 20"
+        );
+    }
+
+    #[test]
+    fn test_record_block_range_messages_roundtrip_and_signatures() {
+        let requester = IdentityKeyPair::generate();
+        let request_id = [0xA1; 16];
+        let request_timestamp = 1_700_100_000;
+        let request_bytes = record_block_range_request_signing_bytes(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            1,
+            8,
+            &request_id,
+            &requester.public_key_bytes(),
+            request_timestamp,
+        );
+        let request = MemChainMessage::RecordBlockRangeRequestV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            from_height: 1,
+            limit: 8,
+            request_id,
+            requester: requester.public_key_bytes(),
+            request_timestamp,
+            signature: requester.sign(&request_bytes),
+        };
+        let encoded = encode_memchain(&request).expect("encode block range request");
+        let decoded = decode_memchain(&encoded[1..]).expect("decode block range request");
+        match decoded {
+            MemChainMessage::RecordBlockRangeRequestV1 {
+                chain_id,
+                from_height,
+                limit,
+                request_id,
+                requester: requester_key,
+                request_timestamp,
+                signature,
+            } => {
+                let signed = record_block_range_request_signing_bytes(
+                    &chain_id,
+                    from_height,
+                    limit,
+                    &request_id,
+                    &requester_key,
+                    request_timestamp,
+                );
+                requester
+                    .verify(&signed, &signature)
+                    .expect("request signature");
+            }
+            other => panic!("Expected RecordBlockRangeRequestV1, got {other:?}"),
+        }
+
+        let responder = IdentityKeyPair::generate();
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            request_timestamp,
+            GENESIS_PREV_HASH,
+            vec![[0x42; 32]],
+            &responder,
+        );
+        let response_timestamp = request_timestamp + 1;
+        let response_bytes = record_block_range_response_signing_bytes(
+            &request_id,
+            &responder.public_key_bytes(),
+            response_timestamp,
+            std::slice::from_ref(&block),
+            false,
+            1,
+            &block.hash(),
+        );
+        let response = MemChainMessage::RecordBlockRangeResponseV1 {
+            request_id,
+            responder: responder.public_key_bytes(),
+            response_timestamp,
+            blocks: vec![block.clone()],
+            has_more: false,
+            tip_height: 1,
+            tip_hash: block.hash(),
+            signature: responder.sign(&response_bytes),
+        };
+        let encoded = encode_memchain(&response).expect("encode block range response");
+        let decoded = decode_memchain(&encoded[1..]).expect("decode block range response");
+        match decoded {
+            MemChainMessage::RecordBlockRangeResponseV1 {
+                request_id,
+                responder: responder_key,
+                response_timestamp,
+                blocks,
+                has_more,
+                tip_height,
+                tip_hash,
+                signature,
+            } => {
+                let signed = record_block_range_response_signing_bytes(
+                    &request_id,
+                    &responder_key,
+                    response_timestamp,
+                    &blocks,
+                    has_more,
+                    tip_height,
+                    &tip_hash,
+                );
+                responder
+                    .verify(&signed, &signature)
+                    .expect("response signature");
+                assert_eq!(blocks, vec![block]);
+            }
+            other => panic!("Expected RecordBlockRangeResponseV1, got {other:?}"),
+        }
     }
 
     // ── Chat Relay variant roundtrip tests ───────────────────────────────
