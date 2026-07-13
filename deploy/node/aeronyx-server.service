@@ -8,6 +8,8 @@
 # Modification Reason:
 # - Add production systemd hardening while preserving TUN/VPN runtime access.
 # - Make restart rate limiting explicit for production incident behavior.
+# - Keep the configuration directory private because it can contain node
+#   identity material, API credentials, and registration settings.
 #
 # Main Functionality:
 # - Runs the Rust aeronyx-server binary under systemd.
@@ -16,6 +18,8 @@
 # - Restricts process privileges with capability and filesystem boundaries.
 # - Lets systemd create the state/config/log directories before namespace
 #   hardening is applied.
+# - Pins `/etc/aeronyx` to mode 0700 so existing secure installations do not
+#   produce a systemd directory-mode mismatch warning on every restart.
 # - Uses explicit restart limits so transient failures can self-heal without
 #   uncontrolled restart storms.
 #
@@ -37,8 +41,11 @@
 # - install.sh replaces @REPO_DIR@ and @CONFIG_FILE@ before installation.
 # - Do not enable PrivateDevices or ProtectHome here; production nodes need
 #   /dev/net/tun and many current deployments place the repository under /root.
+# - Do not relax ConfigurationDirectoryMode without a secrets migration and
+#   an explicit review of every file written below `/etc/aeronyx`.
 #
 # Last Modified:
+# v1.2.1-node-deploy - Pin private configuration directory mode to 0700.
 # v1.2.0-node-deploy - Added explicit start-rate limits and start timeout.
 # v1.1.1-node-deploy - Added systemd-managed state/config/log directories so
 #                      ReadWritePaths cannot fail on missing paths.
@@ -66,6 +73,7 @@ TimeoutStartSec=60
 TimeoutStopSec=30
 LimitNOFILE=1048576
 ConfigurationDirectory=aeronyx
+ConfigurationDirectoryMode=0700
 StateDirectory=aeronyx
 LogsDirectory=aeronyx
 
