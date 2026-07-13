@@ -63,8 +63,10 @@
 //! v2.4.0+Search        - 🌟 Split into storage_ops.rs / storage_graph.rs / storage_miner.rs
 //! v2.5.3+Isolation     - 🌟 Added get_active_records_by_context() for /recall context filter
 //! v2.7.0-BlockSync     - Added transactional signed commitment chain storage.
+//! v2.7.1-BlockSyncStatus - Added bounded runtime follower lifecycle evidence.
 //!
 //! ## Last Modified
+//! v2.7.1-BlockSyncStatus - Privacy-safe follower status, failures, and recovery.
 //! v2.7.0-BlockSync - Transactional commitment chain, ranges, and safe status.
 
 use std::collections::HashMap;
@@ -78,7 +80,11 @@ use aeronyx_core::ledger::{
     GENESIS_PREV_HASH,
 };
 
-use super::storage::{embedding_to_bytes, LayerCounts, MemoryStorage, RawLogRow, StorageStats};
+use super::storage::{
+    embedding_to_bytes, LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentSyncEvent,
+    RecordCommitmentSyncRuntime, RecordCommitmentSyncStatus, StorageStats,
+    COMMITMENT_SYNC_EVENT_CAPACITY,
+};
 use super::storage_crypto::{
     decrypt_rawlog_content, decrypt_record_content, encrypt_rawlog_content, encrypt_record_content,
 };
@@ -407,7 +413,215 @@ impl MemoryStorage {
 // impl MemoryStorage — Chain State
 // ============================================
 
+fn privacy_safe_sync_error_code(reason: &str) -> String {
+    match reason {
+        "invalid_pinned_coordinator"
+        | "coordinator_self_reference"
+        | "http_client_init_failed"
+        | "pinned_coordinator_unavailable"
+        | "pinned_coordinator_missing_endpoint"
+        | "pinned_coordinator_invalid_endpoint"
+        | "request_encode_failed"
+        | "request_timeout"
+        | "request_connect"
+        | "request_body"
+        | "request_decode"
+        | "request_request"
+        | "request_unknown"
+        | "response_body_timeout"
+        | "response_body_connect"
+        | "response_body_body"
+        | "response_body_decode"
+        | "response_body_request"
+        | "response_body_unknown"
+        | "response_too_large"
+        | "invalid_response_frame"
+        | "unexpected_response_message"
+        | "response_request_mismatch"
+        | "response_responder_mismatch"
+        | "stale_response"
+        | "response_page_too_large"
+        | "invalid_response_signature"
+        | "invalid_local_genesis"
+        | "coordinator_rollback_detected"
+        | "empty_page_tip_mismatch"
+        | "unexpected_blocks_at_current_tip"
+        | "unexpected_block_proposer"
+        | "commitment_chain_verification_failed"
+        | "pagination_state_mismatch"
+        | "terminal_tip_mismatch"
+        | "storage_append_rejected" => reason.to_string(),
+        // Exact status codes are useful in process logs but add needless
+        // cardinality to public health data, so all 3-digit responses collapse
+        // to one stable evidence code.
+        _ if reason.strip_prefix("http_status_").is_some_and(|status| {
+            status.len() == 3 && status.bytes().all(|byte| byte.is_ascii_digit())
+        }) =>
+        {
+            "http_status_error".to_string()
+        }
+        _ => "internal_sync_error".to_string(),
+    }
+}
+
+fn push_commitment_sync_event(
+    runtime: &mut RecordCommitmentSyncRuntime,
+    timestamp: u64,
+    kind: &'static str,
+    error_code: Option<String>,
+    next_poll_at: Option<u64>,
+) {
+    let event = RecordCommitmentSyncEvent {
+        sequence: runtime.next_event_sequence,
+        timestamp,
+        kind: kind.to_string(),
+        error_code,
+        consecutive_failures: runtime.consecutive_failures,
+        next_poll_at,
+    };
+    runtime.next_event_sequence = runtime.next_event_sequence.saturating_add(1);
+    if runtime.recent_events.len() == COMMITMENT_SYNC_EVENT_CAPACITY {
+        runtime.recent_events.pop_front();
+    }
+    runtime.recent_events.push_back(event);
+}
+
 impl MemoryStorage {
+    /// Configures the process-local Block Sync role once startup validation has
+    /// completed. This does not alter SQLite or the canonical block chain.
+    pub fn configure_record_commitment_sync(&self, coordinator: bool, follower: bool) {
+        let mut runtime = self.commitment_sync.write();
+        *runtime = RecordCommitmentSyncRuntime::default();
+        match (coordinator, follower) {
+            (true, false) => {
+                runtime.role = "coordinator";
+                runtime.state = "producing";
+            }
+            (false, true) => {
+                runtime.role = "follower";
+                runtime.state = "starting";
+                runtime.enabled = true;
+            }
+            (false, false) => {}
+            (true, true) => {
+                runtime.state = "configuration_error";
+                runtime.last_error_code = Some("role_conflict".to_string());
+            }
+        }
+    }
+
+    /// Marks the start of one bounded follower pull round.
+    pub fn record_commitment_sync_attempt(&self, now: u64) {
+        let mut runtime = self.commitment_sync.write();
+        if !runtime.enabled {
+            return;
+        }
+        runtime.state = "syncing";
+        runtime.last_attempt_at = Some(now);
+        runtime.next_poll_at = None;
+    }
+
+    /// Records one fully verified response page after all included blocks have
+    /// been accepted by the local transactional chain store.
+    pub fn record_commitment_sync_page_success(
+        &self,
+        now: u64,
+        verified_blocks: u64,
+        remote_tip_height: u64,
+        has_more: bool,
+    ) {
+        let mut runtime = self.commitment_sync.write();
+        if !runtime.enabled {
+            return;
+        }
+        let recovered = runtime.consecutive_failures > 0;
+        runtime.state = if has_more { "catching_up" } else { "current" };
+        runtime.last_success_at = Some(now);
+        runtime.remote_tip_height = Some(remote_tip_height);
+        runtime.pages_received_total = runtime.pages_received_total.saturating_add(1);
+        runtime.blocks_received_total = runtime
+            .blocks_received_total
+            .saturating_add(verified_blocks);
+        runtime.consecutive_failures = 0;
+        if recovered {
+            runtime.last_recovered_at = Some(now);
+            runtime.recovery_events_total = runtime.recovery_events_total.saturating_add(1);
+            push_commitment_sync_event(&mut runtime, now, "recovered", None, None);
+        }
+    }
+
+    /// Records a fail-closed follower error using only a stable allow-listed
+    /// code. Free text, URLs, identities, and endpoints are never retained.
+    pub fn record_commitment_sync_failure(
+        &self,
+        now: u64,
+        reason: &str,
+        consecutive_failures: u32,
+        next_poll_at: u64,
+    ) {
+        let mut runtime = self.commitment_sync.write();
+        if !runtime.enabled {
+            return;
+        }
+        let error_code = privacy_safe_sync_error_code(reason);
+        runtime.state = "backoff";
+        runtime.last_failure_at = Some(now);
+        runtime.next_poll_at = Some(next_poll_at);
+        runtime.consecutive_failures = consecutive_failures;
+        runtime.last_error_code = Some(error_code.clone());
+        runtime.failure_events_total = runtime.failure_events_total.saturating_add(1);
+        push_commitment_sync_event(
+            &mut runtime,
+            now,
+            "failure",
+            Some(error_code),
+            Some(next_poll_at),
+        );
+    }
+
+    /// Records the next normal poll time after a successful bounded round.
+    pub fn schedule_next_commitment_sync_poll(&self, next_poll_at: u64) {
+        let mut runtime = self.commitment_sync.write();
+        if runtime.enabled {
+            runtime.next_poll_at = Some(next_poll_at);
+        }
+    }
+
+    /// Marks follower shutdown without fabricating a failure event.
+    pub fn stop_record_commitment_sync(&self) {
+        let mut runtime = self.commitment_sync.write();
+        if runtime.enabled {
+            runtime.state = "stopped";
+            runtime.next_poll_at = None;
+        }
+    }
+
+    /// Returns a privacy-safe snapshot for local APIs and heartbeat reporting.
+    pub fn record_commitment_sync_status(&self) -> RecordCommitmentSyncStatus {
+        let runtime = self.commitment_sync.read();
+        RecordCommitmentSyncStatus {
+            contract_version: "record_commitment_sync.v1",
+            role: runtime.role.to_string(),
+            state: runtime.state.to_string(),
+            enabled: runtime.enabled,
+            last_attempt_at: runtime.last_attempt_at,
+            last_success_at: runtime.last_success_at,
+            last_failure_at: runtime.last_failure_at,
+            last_recovered_at: runtime.last_recovered_at,
+            next_poll_at: runtime.next_poll_at,
+            consecutive_failures: runtime.consecutive_failures,
+            last_error_code: runtime.last_error_code.clone(),
+            remote_tip_height: runtime.remote_tip_height,
+            pages_received_total: runtime.pages_received_total,
+            blocks_received_total: runtime.blocks_received_total,
+            failure_events_total: runtime.failure_events_total,
+            recovery_events_total: runtime.recovery_events_total,
+            recent_events: runtime.recent_events.iter().cloned().collect(),
+            privacy_policy:
+                "aggregate runtime only; no coordinator identity, endpoint, block hash, record commitment, owner, payload, route, or client metadata",
+        }
+    }
+
     /// Atomically verifies and appends one node-blind commitment block.
     ///
     /// Height uniqueness, previous-hash continuity, proposer signature,
@@ -1457,6 +1671,101 @@ mod tests {
                 .await
                 .unwrap(),
             vec![first]
+        );
+    }
+
+    #[test]
+    fn test_commitment_sync_runtime_tracks_failure_recovery_and_bounds_events() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let initial = storage.record_commitment_sync_status();
+        assert_eq!(initial.role, "verifier");
+        assert_eq!(initial.state, "disabled");
+        assert!(!initial.enabled);
+
+        storage.configure_record_commitment_sync(false, true);
+        storage.record_commitment_sync_attempt(100);
+        storage.record_commitment_sync_failure(
+            101,
+            "request timeout https://private.example",
+            1,
+            131,
+        );
+        let failed = storage.record_commitment_sync_status();
+        assert_eq!(failed.role, "follower");
+        assert_eq!(failed.state, "backoff");
+        assert_eq!(failed.last_attempt_at, Some(100));
+        assert_eq!(failed.last_failure_at, Some(101));
+        assert_eq!(failed.next_poll_at, Some(131));
+        assert_eq!(
+            failed.last_error_code.as_deref(),
+            Some("internal_sync_error")
+        );
+        assert_eq!(failed.recent_events.len(), 1);
+        assert_eq!(failed.recent_events[0].kind, "failure");
+
+        storage.record_commitment_sync_attempt(132);
+        storage.record_commitment_sync_page_success(133, 3, 9, false);
+        storage.schedule_next_commitment_sync_poll(163);
+        let recovered = storage.record_commitment_sync_status();
+        assert_eq!(recovered.state, "current");
+        assert_eq!(recovered.last_success_at, Some(133));
+        assert_eq!(recovered.last_recovered_at, Some(133));
+        assert_eq!(recovered.remote_tip_height, Some(9));
+        assert_eq!(recovered.pages_received_total, 1);
+        assert_eq!(recovered.blocks_received_total, 3);
+        assert_eq!(recovered.consecutive_failures, 0);
+        assert_eq!(recovered.next_poll_at, Some(163));
+        assert_eq!(recovered.failure_events_total, 1);
+        assert_eq!(recovered.recovery_events_total, 1);
+        assert_eq!(recovered.recent_events.len(), 2);
+        assert_eq!(recovered.recent_events[1].kind, "recovered");
+
+        for failure in 1..=20u32 {
+            storage.record_commitment_sync_failure(
+                200 + u64::from(failure),
+                "request_timeout",
+                failure,
+                500 + u64::from(failure),
+            );
+        }
+        let bounded = storage.record_commitment_sync_status();
+        assert_eq!(bounded.recent_events.len(), COMMITMENT_SYNC_EVENT_CAPACITY);
+        assert_eq!(bounded.recent_events.first().unwrap().sequence, 7);
+        assert_eq!(bounded.recent_events.last().unwrap().sequence, 22);
+        assert_eq!(bounded.failure_events_total, 21);
+
+        storage.stop_record_commitment_sync();
+        assert_eq!(storage.record_commitment_sync_status().state, "stopped");
+    }
+
+    #[test]
+    fn test_commitment_sync_runtime_reports_coordinator_without_polling() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        storage.configure_record_commitment_sync(true, false);
+        let status = storage.record_commitment_sync_status();
+        assert_eq!(status.role, "coordinator");
+        assert_eq!(status.state, "producing");
+        assert!(!status.enabled);
+        assert!(status.recent_events.is_empty());
+    }
+
+    #[test]
+    fn test_commitment_sync_error_codes_are_explicitly_allow_listed() {
+        assert_eq!(
+            privacy_safe_sync_error_code("request_timeout"),
+            "request_timeout"
+        );
+        assert_eq!(
+            privacy_safe_sync_error_code("http_status_503"),
+            "http_status_error"
+        );
+        assert_eq!(
+            privacy_safe_sync_error_code("unknown_but_well_formed"),
+            "internal_sync_error"
+        );
+        assert_eq!(
+            privacy_safe_sync_error_code("http_status_50x"),
+            "internal_sync_error"
         );
     }
 

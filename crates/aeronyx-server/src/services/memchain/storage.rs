@@ -118,10 +118,11 @@
 //! v2.6.1+BlindVectorRecovery - Added all-owner active embedding enumeration so
 //!   node-blind/remote Local-mode nodes can rebuild every isolated vector
 //!   partition after restart without weakening owner-scoped recall.
+//! v2.7.1-BlockSyncStatus - Runtime-only bounded follower status and fault evidence.
 //! v2.7.0-BlockSync - Schema v8 commitment blocks and unique membership index.
 // ============================================
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -242,6 +243,119 @@ pub struct RecordProvenance {
 }
 
 // ============================================
+// Commitment Sync Runtime Evidence (v2.7.1)
+// ============================================
+
+/// One privacy-safe follower lifecycle event.
+///
+/// Events contain no node identity, endpoint, block hash, record commitment,
+/// owner, payload, route, or client metadata. The in-memory ring is capped by
+/// `COMMITMENT_SYNC_EVENT_CAPACITY` and is never written to SQLite.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RecordCommitmentSyncEvent {
+    /// Monotonic process-local event sequence.
+    pub sequence: u64,
+    /// Unix timestamp in seconds.
+    pub timestamp: u64,
+    /// Stable lifecycle kind: `failure` or `recovered`.
+    pub kind: String,
+    /// Stable allow-listed failure code; absent for recovery events.
+    pub error_code: Option<String>,
+    /// Failure streak after this event.
+    pub consecutive_failures: u32,
+    /// Scheduled retry time for a failure event.
+    pub next_poll_at: Option<u64>,
+}
+
+/// Privacy-safe runtime status for commitment block replication.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RecordCommitmentSyncStatus {
+    /// Stable API contract name.
+    pub contract_version: &'static str,
+    /// Node role: `coordinator`, `follower`, or `verifier`.
+    pub role: String,
+    /// Runtime state such as `current`, `catching_up`, or `backoff`.
+    pub state: String,
+    /// Whether active follower polling is configured.
+    pub enabled: bool,
+    /// Most recent pull attempt time.
+    pub last_attempt_at: Option<u64>,
+    /// Most recent successfully verified page time.
+    pub last_success_at: Option<u64>,
+    /// Most recent failed pull time.
+    pub last_failure_at: Option<u64>,
+    /// Most recent transition from a failure streak back to success.
+    pub last_recovered_at: Option<u64>,
+    /// Next scheduled poll or retry time.
+    pub next_poll_at: Option<u64>,
+    /// Current consecutive failure count.
+    pub consecutive_failures: u32,
+    /// Last stable allow-listed failure code.
+    pub last_error_code: Option<String>,
+    /// Last coordinator tip height observed in a verified response.
+    pub remote_tip_height: Option<u64>,
+    /// Number of successfully verified response pages this process received.
+    pub pages_received_total: u64,
+    /// Number of verified blocks represented by those pages.
+    pub blocks_received_total: u64,
+    /// Number of failure events observed by this process.
+    pub failure_events_total: u64,
+    /// Number of failure-to-success recoveries observed by this process.
+    pub recovery_events_total: u64,
+    /// Most recent bounded lifecycle events, oldest first.
+    pub recent_events: Vec<RecordCommitmentSyncEvent>,
+    /// Explicit privacy boundary for operators and API consumers.
+    pub privacy_policy: &'static str,
+}
+
+pub(crate) const COMMITMENT_SYNC_EVENT_CAPACITY: usize = 16;
+
+#[derive(Debug, Clone)]
+pub(crate) struct RecordCommitmentSyncRuntime {
+    pub(crate) role: &'static str,
+    pub(crate) state: &'static str,
+    pub(crate) enabled: bool,
+    pub(crate) last_attempt_at: Option<u64>,
+    pub(crate) last_success_at: Option<u64>,
+    pub(crate) last_failure_at: Option<u64>,
+    pub(crate) last_recovered_at: Option<u64>,
+    pub(crate) next_poll_at: Option<u64>,
+    pub(crate) consecutive_failures: u32,
+    pub(crate) last_error_code: Option<String>,
+    pub(crate) remote_tip_height: Option<u64>,
+    pub(crate) pages_received_total: u64,
+    pub(crate) blocks_received_total: u64,
+    pub(crate) failure_events_total: u64,
+    pub(crate) recovery_events_total: u64,
+    pub(crate) next_event_sequence: u64,
+    pub(crate) recent_events: VecDeque<RecordCommitmentSyncEvent>,
+}
+
+impl Default for RecordCommitmentSyncRuntime {
+    fn default() -> Self {
+        Self {
+            role: "verifier",
+            state: "disabled",
+            enabled: false,
+            last_attempt_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            last_recovered_at: None,
+            next_poll_at: None,
+            consecutive_failures: 0,
+            last_error_code: None,
+            remote_tip_height: None,
+            pages_received_total: 0,
+            blocks_received_total: 0,
+            failure_events_total: 0,
+            recovery_events_total: 0,
+            next_event_sequence: 1,
+            recent_events: VecDeque::with_capacity(COMMITMENT_SYNC_EVENT_CAPACITY),
+        }
+    }
+}
+
+// ============================================
 // LRU Cache
 // ============================================
 
@@ -303,6 +417,9 @@ pub struct MemoryStorage {
     /// Wrapped in Zeroizing so the key bytes are wiped from memory on drop.
     /// (P2 SecAudit: prevents key exposure in core dumps / process memory scans)
     pub(crate) record_key: Option<Zeroizing<[u8; 32]>>,
+    /// Runtime-only Block Sync status. Never persisted and never stores peer
+    /// identity, endpoint, block hash, commitment, owner, or payload metadata.
+    pub(crate) commitment_sync: RwLock<RecordCommitmentSyncRuntime>,
 }
 
 impl MemoryStorage {
@@ -352,6 +469,7 @@ impl MemoryStorage {
             total_rejected: AtomicU64::new(0),
             cache: RwLock::new(LruCache::new(LRU_CACHE_CAPACITY)),
             record_key: record_key.map(Zeroizing::new),
+            commitment_sync: RwLock::new(RecordCommitmentSyncRuntime::default()),
         })
     }
 

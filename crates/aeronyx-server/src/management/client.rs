@@ -22,6 +22,8 @@
 //   - HeartbeatResponse new fields use #[serde(default)] — old CMS
 //     responses without these fields deserialize cleanly.
 //   - wallet_hex keys must be lowercase (hex::encode output).
+//   - record_commitment_sync is aggregate runtime health only. Never add
+//     coordinator identity, endpoint, block hashes, owners, or payload data.
 //   - The body used for signing MUST be the same as what is sent.
 //     Do NOT add fields after signing.
 //
@@ -31,6 +33,7 @@
 //   v1.3.0         - Added report_command_status(), fixed eprintln!
 //   v2.4.0         - Added chat_relay_status to heartbeat system_stats
 //   v2.3.0         - Added memchain_status to heartbeat system_stats
+//   v2.7.1         - Added compact privacy-safe commitment sync evidence
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -60,6 +63,49 @@ pub struct MemChainHeartbeatStatus {
     pub allow_remote_storage: bool,
     pub max_remote_owners: usize,
     pub current_remote_owners: usize,
+    /// Compact privacy-safe Block Sync runtime evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_commitment_sync: Option<RecordCommitmentSyncHeartbeatStatus>,
+}
+
+/// Compact commitment follower status sent to the central health plane.
+///
+/// This intentionally excludes recent event history, coordinator identity,
+/// endpoint, block hashes, record commitments, owners, and payload metadata.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecordCommitmentSyncHeartbeatStatus {
+    /// Stable heartbeat contract name.
+    pub contract_version: &'static str,
+    /// `coordinator`, `follower`, or `verifier`.
+    pub role: String,
+    /// Current runtime state.
+    pub state: String,
+    /// Whether active follower polling is configured.
+    pub enabled: bool,
+    /// Most recent follower pull attempt.
+    pub last_attempt_at: Option<u64>,
+    /// Most recent successful verified response page.
+    pub last_success_at: Option<u64>,
+    /// Most recent fail-closed pull event.
+    pub last_failure_at: Option<u64>,
+    /// Most recent recovery after a failure streak.
+    pub last_recovered_at: Option<u64>,
+    /// Next scheduled poll or backoff retry.
+    pub next_poll_at: Option<u64>,
+    /// Current consecutive failure count.
+    pub consecutive_failures: u32,
+    /// Stable allow-listed last error code.
+    pub last_error_code: Option<String>,
+    /// Last verified remote tip height.
+    pub remote_tip_height: Option<u64>,
+    /// Verified pages received since process start.
+    pub pages_received_total: u64,
+    /// Verified blocks received since process start.
+    pub blocks_received_total: u64,
+    /// Failure events observed since process start.
+    pub failure_events_total: u64,
+    /// Recovery events observed since process start.
+    pub recovery_events_total: u64,
 }
 
 // ============================================
@@ -518,5 +564,58 @@ impl std::fmt::Debug for ManagementClient {
         f.debug_struct("ManagementClient")
             .field("cms_url", &self.config.cms_url)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commitment_sync_heartbeat_contract_excludes_sensitive_fields() {
+        let status = MemChainHeartbeatStatus {
+            enabled: true,
+            allow_remote_storage: false,
+            max_remote_owners: 100,
+            current_remote_owners: 0,
+            record_commitment_sync: Some(RecordCommitmentSyncHeartbeatStatus {
+                contract_version: "record_commitment_sync.v1",
+                role: "follower".to_string(),
+                state: "backoff".to_string(),
+                enabled: true,
+                last_attempt_at: Some(99),
+                last_success_at: Some(100),
+                last_failure_at: Some(110),
+                last_recovered_at: None,
+                next_poll_at: Some(140),
+                consecutive_failures: 1,
+                last_error_code: Some("request_timeout".to_string()),
+                remote_tip_height: Some(9),
+                pages_received_total: 3,
+                blocks_received_total: 27,
+                failure_events_total: 1,
+                recovery_events_total: 0,
+            }),
+        };
+        let value = serde_json::to_value(status).unwrap();
+        let sync = &value["record_commitment_sync"];
+        assert_eq!(sync["state"], "backoff");
+        assert_eq!(sync["enabled"], true);
+        assert_eq!(sync["last_attempt_at"], 99);
+        assert_eq!(sync["last_error_code"], "request_timeout");
+        for forbidden in [
+            "coordinator_node_id",
+            "endpoint",
+            "tip_hash",
+            "record_ids",
+            "recent_events",
+            "owner",
+            "payload",
+        ] {
+            assert!(
+                sync.get(forbidden).is_none(),
+                "unexpected field: {forbidden}"
+            );
+        }
     }
 }

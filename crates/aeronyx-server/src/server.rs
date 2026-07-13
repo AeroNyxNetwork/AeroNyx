@@ -112,6 +112,8 @@
 //  46. Runs default-off follower catch-up against one pinned coordinator,
 //      verifies each complete signed page before append, and backs off on any
 //      rollback, fork, signature, continuity, endpoint, or transport failure.
+//  47. Publishes bounded privacy-safe commitment sync lifecycle evidence to
+//      the local status API and heartbeat without peer or payload metadata.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -135,6 +137,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.2-BlockSyncStatus - Runtime sync state, fault evidence, and heartbeat
 //   v2.7.1-BlockFollower - Pinned coordinator catch-up with bounded retry/backoff
 //   v2.7.0-BlockSync - Node-blind commitment packing, peer range API, coordinator fork guard
 //   v1.2.8-MemChainStartupIntegrity - Reject tampered records during vector index recovery
@@ -411,6 +414,12 @@ impl Server {
             info!("[MEMCHAIN] Disabled (mode=off)");
             (None, None, None, None)
         };
+        if let Some(ref commitment_storage) = storage {
+            commitment_storage.configure_record_commitment_sync(
+                self.config.memchain.commitment_coordinator_enabled,
+                self.config.memchain.commitment_sync_enabled,
+            );
+        }
 
         let chat_relay_enabled = self.config.memchain.is_chat_relay_enabled();
         let chat_relay: Option<Arc<ChatRelayService>> = if chat_relay_enabled {
@@ -514,6 +523,7 @@ impl Server {
                 Arc::clone(&encrypted_message_counter),
                 Arc::clone(&packet_handler),
                 Arc::clone(&peer_store),
+                storage.clone(),
                 chat_relay.clone(),
                 chat_relay_enabled,
             )
@@ -1761,6 +1771,7 @@ impl Server {
         encrypted_message_counter: Arc<AtomicU64>,
         packet_handler: Arc<PacketHandler>,
         peer_store: Arc<PeerStore>,
+        memchain_storage: Option<Arc<MemoryStorage>>,
         chat_relay: Option<Arc<ChatRelayService>>,
         chat_relay_enabled: bool,
     ) -> SessionEventSender {
@@ -1791,12 +1802,35 @@ impl Server {
             if self.config.memchain.is_enabled() {
                 let allow_remote = self.config.memchain.allow_remote_storage;
                 let max_owners = self.config.memchain.max_remote_owners;
+                let commitment_storage = memchain_storage.clone();
                 Some(Box::new(move || {
+                    let record_commitment_sync = commitment_storage.as_ref().map(|storage| {
+                        let status = storage.record_commitment_sync_status();
+                        crate::management::client::RecordCommitmentSyncHeartbeatStatus {
+                            contract_version: status.contract_version,
+                            role: status.role,
+                            state: status.state,
+                            enabled: status.enabled,
+                            last_attempt_at: status.last_attempt_at,
+                            last_success_at: status.last_success_at,
+                            last_failure_at: status.last_failure_at,
+                            last_recovered_at: status.last_recovered_at,
+                            next_poll_at: status.next_poll_at,
+                            consecutive_failures: status.consecutive_failures,
+                            last_error_code: status.last_error_code,
+                            remote_tip_height: status.remote_tip_height,
+                            pages_received_total: status.pages_received_total,
+                            blocks_received_total: status.blocks_received_total,
+                            failure_events_total: status.failure_events_total,
+                            recovery_events_total: status.recovery_events_total,
+                        }
+                    });
                     Some(crate::management::client::MemChainHeartbeatStatus {
                         enabled: true,
                         allow_remote_storage: allow_remote,
                         max_remote_owners: max_owners,
                         current_remote_owners: 0,
+                        record_commitment_sync,
                     })
                 }))
             } else {
@@ -2421,12 +2455,26 @@ impl Server {
         }
         let Some(coordinator_node_id) = self.config.memchain.commitment_sync_coordinator_node_id()
         else {
+            let now = unix_now_secs();
+            storage.record_commitment_sync_failure(
+                now,
+                "invalid_pinned_coordinator",
+                1,
+                now.saturating_add(600),
+            );
             error!(
                 "[MEMCHAIN_BLOCK] Follower sync disabled at runtime: invalid pinned coordinator"
             );
             return None;
         };
         if self.identity.public_key_bytes() == coordinator_node_id {
+            let now = unix_now_secs();
+            storage.record_commitment_sync_failure(
+                now,
+                "coordinator_self_reference",
+                1,
+                now.saturating_add(600),
+            );
             error!(
                 "[MEMCHAIN_BLOCK] Follower sync disabled at runtime: coordinator cannot follow itself"
             );
@@ -2442,6 +2490,13 @@ impl Server {
         {
             Ok(client) => client,
             Err(_) => {
+                let now = unix_now_secs();
+                storage.record_commitment_sync_failure(
+                    now,
+                    "http_client_init_failed",
+                    1,
+                    now.saturating_add(600),
+                );
                 error!(
                     "[MEMCHAIN_BLOCK] Follower sync disabled at runtime: HTTP client init failed"
                 );
@@ -2472,6 +2527,7 @@ impl Server {
                     }
                 }
 
+                storage.record_commitment_sync_attempt(unix_now_secs());
                 let round_future = async {
                     let mut inserted = 0usize;
                     let mut remote_tip_height = 0u64;
@@ -2484,6 +2540,18 @@ impl Server {
                             &client,
                         )
                         .await?;
+                        let verified_blocks = outcome
+                            .inserted
+                            .saturating_add(outcome.already_present)
+                            .try_into()
+                            .unwrap_or(u64::MAX);
+                        storage.record_commitment_sync_page_success(
+                            unix_now_secs(),
+                            verified_blocks,
+                            outcome.remote_tip_height,
+                            outcome.has_more,
+                        );
+                        consecutive_failures = 0;
                         inserted = inserted.saturating_add(outcome.inserted);
                         remote_tip_height = outcome.remote_tip_height;
                         if !outcome.has_more {
@@ -2520,6 +2588,9 @@ impl Server {
                         } else {
                             base_interval_secs
                         });
+                        storage.schedule_next_commitment_sync_poll(
+                            unix_now_secs().saturating_add(next_delay.as_secs()),
+                        );
                     }
                     Err(reason) => {
                         consecutive_failures = consecutive_failures.saturating_add(1);
@@ -2529,6 +2600,13 @@ impl Server {
                             .saturating_mul(multiplier)
                             .min(MAX_BACKOFF_SECS);
                         next_delay = Duration::from_secs(retry_secs);
+                        let failed_at = unix_now_secs();
+                        storage.record_commitment_sync_failure(
+                            failed_at,
+                            &reason,
+                            consecutive_failures,
+                            failed_at.saturating_add(retry_secs),
+                        );
                         if consecutive_failures == 1 || consecutive_failures.is_power_of_two() {
                             warn!(
                                 consecutive_failures,
@@ -2540,6 +2618,7 @@ impl Server {
                     }
                 }
             }
+            storage.stop_record_commitment_sync();
             info!("[MEMCHAIN_BLOCK] Pinned coordinator follower stopped");
         }))
     }

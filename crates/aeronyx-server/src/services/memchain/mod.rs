@@ -65,6 +65,7 @@
 //!   re-exports (LlmUsageStats, ProviderUsage, TaskTypeUsage) that were never
 //!   defined in storage_supernode.rs.
 //! v1.0.0-MultiTenant - Added system_db + volume_router for SaaS multi-tenant mode
+//! v2.7.1-BlockSyncStatus - Re-exported privacy-safe follower runtime evidence.
 //! v2.7.0-BlockSync - Re-exported commitment append outcomes and safe status.
 
 // ── Storage engine ──
@@ -126,7 +127,10 @@ pub mod mempool;
 // ============================================
 
 // ── Storage core ──
-pub use storage::{LayerCounts, MemoryStorage, RawLogRow, StorageStats};
+pub use storage::{
+    LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentSyncEvent, RecordCommitmentSyncStatus,
+    StorageStats,
+};
 pub use storage_crypto::{decrypt_rawlog_content_pub, derive_rawlog_key, derive_record_key};
 pub use storage_ops::{
     OverviewData, OverviewRecord, RecordCommitmentAppendOutcome, RecordCommitmentChainStatus,

@@ -54,6 +54,8 @@
 //! - PATCH clears embedding on content change; Miner re-embeds (~60s).
 //! - record_commitment_chain is aggregate and privacy-safe. Do not expose
 //!   record IDs, proposer IDs, peer IDs, owners, or payloads in MPI status.
+//! - record_commitment_sync is bounded runtime evidence. Error codes are
+//!   allow-listed and events never contain endpoints or node identities.
 //!
 //! ## Last Modified
 //! v1.0.1-SaaSFix - Replaced all direct state.storage/vector_index accesses
@@ -64,6 +66,7 @@
 //!                  and the validation policy applied before recall indexing.
 //! v2.7.0-BlockSync - Expose local block/commitment count, tip, chain ID, and
 //!                  payload policy without record-level metadata.
+//! v2.7.1-BlockSyncStatus - Expose bounded runtime sync and fault evidence.
 // ============================================
 
 use std::sync::Arc;
@@ -878,6 +881,7 @@ pub struct MpiStatusResponse {
     pub vector_index_integrity_policy: String,
     pub last_block_height: u64,
     pub record_commitment_chain: crate::services::memchain::RecordCommitmentChainStatus,
+    pub record_commitment_sync: crate::services::memchain::RecordCommitmentSyncStatus,
     pub index_ready: bool,
     pub embed_ready: bool,
     pub embed_dim: Option<usize>,
@@ -927,6 +931,7 @@ pub async fn mpi_status(
     let stats = storage.stats().await;
     let height = storage.last_block_height().await;
     let record_commitment_chain = storage.record_commitment_chain_status().await;
+    let record_commitment_sync = storage.record_commitment_sync_status();
     let wv = {
         state
             .user_weights
@@ -1060,6 +1065,7 @@ pub async fn mpi_status(
                 "content_address_all_records_and_owner_signature_for_blind_records".into(),
             last_block_height: height,
             record_commitment_chain,
+            record_commitment_sync,
             index_ready: state.index_ready.load(std::sync::atomic::Ordering::Relaxed),
             embed_ready: state.embed_engine.is_some(),
             embed_dim: state.embed_engine.as_ref().map(|e| e.dim()),
