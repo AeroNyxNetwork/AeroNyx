@@ -56,6 +56,8 @@
 //!                  with Extension extraction throughout all handlers.
 //! v1.0.2-BlindVectorRecovery - Added blind-storage mode, rebuild scope, and
 //!                  persisted-vector coverage to `/api/mpi/status`.
+//! v1.0.3-MemChainStartupIntegrity - Expose startup integrity rejection count
+//!                  and the validation policy applied before recall indexing.
 // ============================================
 
 use std::sync::Arc;
@@ -866,6 +868,8 @@ pub struct MpiStatusResponse {
     pub vector_index_rebuild_scope: String,
     pub vector_index_coverage_percent: f64,
     pub vector_index_healthy: bool,
+    pub vector_index_rejected_records: usize,
+    pub vector_index_integrity_policy: String,
     pub last_block_height: u64,
     pub index_ready: bool,
     pub embed_ready: bool,
@@ -1018,6 +1022,7 @@ pub async fn mpi_status(
     };
     let vector_index_total = vi.total_vectors();
     let persisted_vectors = stats.records_with_embedding as usize;
+    let vector_index_rejected_records = persisted_vectors.saturating_sub(vector_index_total);
     let vector_index_coverage_percent = if persisted_vectors == 0 {
         100.0
     } else {
@@ -1041,7 +1046,10 @@ pub async fn mpi_status(
             vector_partitions: vi.partition_count(),
             vector_index_rebuild_scope: vector_index_rebuild_scope.into(),
             vector_index_coverage_percent,
-            vector_index_healthy: vector_index_total == persisted_vectors,
+            vector_index_healthy: vector_index_rejected_records == 0,
+            vector_index_rejected_records,
+            vector_index_integrity_policy:
+                "content_address_all_records_and_owner_signature_for_blind_records".into(),
             last_block_height: height,
             index_ready: state.index_ready.load(std::sync::atomic::Ordering::Relaxed),
             embed_ready: state.embed_engine.is_some(),

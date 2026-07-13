@@ -100,6 +100,9 @@
 //  41. Rebuilds every authenticated owner's isolated vector partition on
 //      node-blind/remote MemChain nodes after restart; local-only nodes retain
 //      the historical single-owner startup path.
+//  42. Verifies content-address integrity for every MemChain record restored
+//      into the vector index and additionally verifies the owner's Ed25519
+//      signature for node-blind records.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -119,6 +122,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.2.8-MemChainStartupIntegrity - Reject tampered records during vector index recovery
 //   v1.2.7-MemChainBlindVectorRecovery - Restore all owner/model vector partitions on blind storage nodes
 //   v1.2.6-BlindRelayRuntimeHeartbeat - Promote aggregate blind relay runtime evidence in discovery_status heartbeat
 //   v1.2.5-RouteGovernanceHeartbeat - Promote aggregate route governance in discovery_status heartbeat
@@ -194,6 +198,7 @@ use aeronyx_core::crypto::transport::{
     DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD,
 };
 use aeronyx_core::crypto::IdentityKeyPair;
+use aeronyx_core::ledger::MemoryRecord;
 use aeronyx_core::protocol::codec::{
     decode_client_hello, encode_data_packet, encode_server_hello, ProtocolCodec,
 };
@@ -275,6 +280,34 @@ const KEEPALIVE_ACK_TIMEOUT_SECS: u64 = 90;
 const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
 const BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS: u64 = 15 * 60;
 const BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS: u64 = 60;
+
+/// Return the privacy-safe reason a persisted MemChain record must not enter
+/// the in-memory recall index.
+///
+/// Sighted records retain backward compatibility: their content-addressed ID
+/// is required, but legacy zero signatures remain accepted. Node-blind records
+/// additionally require the authenticated owner's Ed25519 signature because
+/// the node is not allowed to re-sign client ciphertext.
+fn memchain_index_rejection_reason(record: &MemoryRecord) -> Option<&'static str> {
+    if !record.verify_id() {
+        return Some("record_id_mismatch");
+    }
+
+    if record.blind {
+        let owner_key = match IdentityPublicKey::from_bytes(&record.owner) {
+            Ok(key) => key,
+            Err(_) => return Some("owner_key_invalid"),
+        };
+        if owner_key
+            .verify(&record.record_id, &record.signature)
+            .is_err()
+        {
+            return Some("owner_signature_invalid");
+        }
+    }
+
+    None
+}
 
 // ============================================
 // Server
@@ -1246,8 +1279,18 @@ impl Server {
         };
         let mut rebuilt_owners = std::collections::HashSet::new();
         let mut rebuilt_partitions = std::collections::HashSet::new();
+        let mut integrity_rejected = 0usize;
         for (r, model) in records_with_model {
             if r.has_embedding() {
+                if let Some(reason) = memchain_index_rejection_reason(&r) {
+                    integrity_rejected += 1;
+                    warn!(
+                        reason,
+                        blind = r.blind,
+                        "[MEMCHAIN] Persisted record rejected from vector rebuild"
+                    );
+                    continue;
+                }
                 rebuilt_owners.insert(r.owner);
                 rebuilt_partitions.insert((r.owner, model.clone()));
                 vector_index.upsert(
@@ -1268,9 +1311,16 @@ impl Server {
             vectors = rebuild_count,
             owners = rebuilt_owners.len(),
             partitions = rebuilt_partitions.len(),
+            integrity_rejected,
             rebuild_scope = if rebuild_all_owners { "all_active_owners" } else { "local_owner" },
             "[MEMCHAIN] SQLite + VectorIndex initialized"
         );
+        if integrity_rejected > 0 {
+            warn!(
+                integrity_rejected,
+                "[MEMCHAIN] Integrity audit quarantined persisted records from recall"
+            );
+        }
 
         if quantization_enabled && rebuild_count > 0 {
             // Each owner/model pair is an independent security partition. A
@@ -4707,8 +4757,12 @@ impl std::fmt::Debug for Server {
 
 #[cfg(test)]
 mod tests {
-    use super::{prefix_to_netmask, unix_now_secs, Server, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS};
+    use super::{
+        memchain_index_rejection_reason, prefix_to_netmask, unix_now_secs, Server,
+        BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
+    };
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
+    use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
     use aeronyx_core::protocol::chat::{ChatContentType, ChatEnvelope};
     use aeronyx_core::protocol::onion::is_onion_blob;
     use aeronyx_core::protocol::{
@@ -4741,6 +4795,60 @@ mod tests {
         };
         envelope.signature = sender.sign(&envelope.sign_data());
         envelope
+    }
+
+    #[test]
+    fn memchain_startup_integrity_accepts_valid_sighted_and_blind_records() {
+        let sighted = MemoryRecord::new(
+            [0x11; 32],
+            1_700_000_000,
+            MemoryLayer::Knowledge,
+            vec!["compatibility".into()],
+            "legacy".into(),
+            b"node-visible-content".to_vec(),
+            vec![0.1, 0.2],
+        );
+        assert_eq!(memchain_index_rejection_reason(&sighted), None);
+
+        let owner = IdentityKeyPair::generate();
+        let mut blind = MemoryRecord::new(
+            owner.public_key_bytes(),
+            1_700_000_001,
+            MemoryLayer::Episode,
+            vec!["sealed".into()],
+            "client".into(),
+            b"opaque-client-ciphertext".to_vec(),
+            vec![0.3, 0.4],
+        );
+        blind.blind = true;
+        blind.signature = owner.sign(&blind.record_id);
+        assert_eq!(memchain_index_rejection_reason(&blind), None);
+    }
+
+    #[test]
+    fn memchain_startup_integrity_rejects_tampering_and_bad_blind_signature() {
+        let owner = IdentityKeyPair::generate();
+        let mut blind = MemoryRecord::new(
+            owner.public_key_bytes(),
+            1_700_000_002,
+            MemoryLayer::Episode,
+            vec![],
+            "client".into(),
+            b"opaque-client-ciphertext".to_vec(),
+            vec![0.5, 0.6],
+        );
+        blind.blind = true;
+        assert_eq!(
+            memchain_index_rejection_reason(&blind),
+            Some("owner_signature_invalid")
+        );
+
+        blind.signature = owner.sign(&blind.record_id);
+        blind.encrypted_content.push(0xFF);
+        assert_eq!(
+            memchain_index_rejection_reason(&blind),
+            Some("record_id_mismatch")
+        );
     }
 
     fn signed_chat_relay_peer_descriptor(
