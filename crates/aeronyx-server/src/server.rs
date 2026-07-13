@@ -118,6 +118,8 @@
 //      index before any network listener or follower task can start.
 //  49. Publishes the runtime-only verified commitment-chain baseline and keeps
 //      it current after transactionally verified appends.
+//  50. Requires a signed shared-prefix checkpoint before follower catch-up may
+//      declare convergence and reports only aggregate proof outcomes.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -141,6 +143,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.5-CheckpointProof - Signed cross-node tip reconciliation and convergence gate
 //   v2.7.4-BlockIntegrityStatus - Privacy-safe verified chain evidence in status and heartbeat
 //   v2.7.3-BlockAudit - Fail-closed startup verification for persisted commitment chains
 //   v2.7.2-BlockSyncStatus - Runtime sync state, fault evidence, and heartbeat
@@ -250,7 +253,10 @@ use crate::api::discovery::{
     discovery_readiness_status_value, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
     GossipResponse,
 };
-use crate::api::memchain_peer::{build_memchain_peer_router, pull_record_commitment_page};
+use crate::api::memchain_peer::{
+    build_memchain_peer_router, pull_record_commitment_checkpoint, pull_record_commitment_page,
+    CommitmentCheckpointRelation,
+};
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
 use crate::api::voice::build_voice_router;
 use crate::api::vpn_health::{
@@ -1858,6 +1864,24 @@ impl Server {
                             recovery_events_total: status.recovery_events_total,
                         }
                     });
+                    let record_commitment_checkpoint = commitment_storage.as_ref().map(|storage| {
+                        let status = storage.record_commitment_checkpoint_status();
+                        crate::management::client::RecordCommitmentCheckpointHeartbeatStatus {
+                            contract_version: status.contract_version,
+                            state: status.state,
+                            last_checked_at: status.last_checked_at,
+                            last_converged_at: status.last_converged_at,
+                            last_divergence_at: status.last_divergence_at,
+                            last_failure_at: status.last_failure_at,
+                            last_served_at: status.last_served_at,
+                            local_tip_height: status.local_tip_height,
+                            remote_tip_height: status.remote_tip_height,
+                            proofs_verified_total: status.proofs_verified_total,
+                            proofs_failed_total: status.proofs_failed_total,
+                            divergences_total: status.divergences_total,
+                            requests_served_total: status.requests_served_total,
+                        }
+                    });
                     Some(crate::management::client::MemChainHeartbeatStatus {
                         enabled: true,
                         allow_remote_storage: allow_remote,
@@ -1865,6 +1889,7 @@ impl Server {
                         current_remote_owners: 0,
                         record_commitment_integrity,
                         record_commitment_sync,
+                        record_commitment_checkpoint,
                     })
                 }))
             } else {
@@ -2585,11 +2610,50 @@ impl Server {
                             outcome.remote_tip_height,
                             outcome.has_more,
                         );
-                        consecutive_failures = 0;
                         inserted = inserted.saturating_add(outcome.inserted);
                         remote_tip_height = outcome.remote_tip_height;
                         if !outcome.has_more {
-                            return Ok((inserted, remote_tip_height, false));
+                            let checkpoint = match pull_record_commitment_checkpoint(
+                                &storage,
+                                &peer_store,
+                                &identity,
+                                &coordinator_node_id,
+                                &client,
+                            )
+                            .await
+                            {
+                                Ok(checkpoint) => checkpoint,
+                                Err(reason) => {
+                                    storage.record_commitment_checkpoint_failure(unix_now_secs());
+                                    return Err(reason);
+                                }
+                            };
+                            let checked_at = unix_now_secs();
+                            storage.record_commitment_checkpoint_verified(
+                                checked_at,
+                                checkpoint.relation.as_str(),
+                                checkpoint.local_tip_height,
+                                checkpoint.remote_tip_height,
+                            );
+                            match checkpoint.relation {
+                                CommitmentCheckpointRelation::Converged => {
+                                    storage.record_commitment_sync_checkpoint_success(
+                                        checked_at,
+                                        checkpoint.remote_tip_height,
+                                    );
+                                    return Ok((inserted, checkpoint.remote_tip_height, false));
+                                }
+                                CommitmentCheckpointRelation::RemoteAhead => {
+                                    remote_tip_height = checkpoint.remote_tip_height;
+                                    continue;
+                                }
+                                CommitmentCheckpointRelation::RemoteBehind => {
+                                    return Err("signed_checkpoint_remote_behind".to_string());
+                                }
+                                CommitmentCheckpointRelation::Diverged => {
+                                    return Err("signed_checkpoint_divergence".to_string());
+                                }
+                            }
                         }
                     }
                     Ok((inserted, remote_tip_height, true))
@@ -4575,12 +4639,15 @@ impl Server {
                 );
             }
             MemChainMessage::RecordBlockRangeRequestV1 { .. }
-            | MemChainMessage::RecordBlockRangeResponseV1 { .. } => {
-                // Range sync is intentionally unavailable on the VPN/client
-                // DataPacket path. It belongs to the signed node-to-node peer
-                // API so ordinary clients cannot enumerate commitments.
+            | MemChainMessage::RecordBlockRangeResponseV1 { .. }
+            | MemChainMessage::RecordChainCheckpointRequestV1 { .. }
+            | MemChainMessage::RecordChainCheckpointResponseV1 { .. } => {
+                // Ledger sync and checkpoint proofs are intentionally
+                // unavailable on the VPN/client DataPacket path. They belong
+                // to the signed node-to-node peer API so ordinary clients
+                // cannot enumerate commitments or probe peer chain tips.
                 warn!(
-                    "[MEMCHAIN_BLOCK] Rejected range sync on client tunnel; node peer API required"
+                    "[MEMCHAIN_BLOCK] Rejected ledger sync on client tunnel; node peer API required"
                 );
             }
             MemChainMessage::ChatRelay(envelope) => {

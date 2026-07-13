@@ -28,6 +28,8 @@
 //!   denormalized rows, signatures, continuity, and membership indexes
 //! - v2.7.4-BlockIntegrityStatus: snapshot-consistent audits plus runtime/API
 //!   evidence that advances only with transactionally verified appends
+//! - v2.7.5-CheckpointProof: atomic verified-tip checkpoint reads and
+//!   privacy-safe signed reconciliation runtime evidence
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -70,9 +72,11 @@
 //! v2.7.1-BlockSyncStatus - Added bounded runtime follower lifecycle evidence.
 //! v2.7.3-BlockAudit    - Added fail-closed startup audit for the complete chain.
 //! v2.7.4-BlockIntegrityStatus - Added privacy-safe verified-chain evidence.
+//! v2.7.5-CheckpointProof - Added signed checkpoint reconciliation evidence.
 //!
 //! ## Last Modified
 //! v2.7.4-BlockIntegrityStatus - Report and maintain the verified-chain baseline.
+//! v2.7.5-CheckpointProof - Serve only audit-backed checkpoints and report outcomes.
 //! v2.7.3-BlockAudit - Verify persisted blocks and indexes before networking starts.
 //! v2.7.1-BlockSyncStatus - Privacy-safe follower status, failures, and recovery.
 //! v2.7.0-BlockSync - Transactional commitment chain, ranges, and safe status.
@@ -89,9 +93,9 @@ use aeronyx_core::ledger::{
 };
 
 use super::storage::{
-    embedding_to_bytes, LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentIntegrityRuntime,
-    RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime, RecordCommitmentSyncStatus,
-    StorageStats, COMMITMENT_SYNC_EVENT_CAPACITY,
+    LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentCheckpointStatus,
+    RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime,
+    RecordCommitmentSyncStatus, StorageStats, COMMITMENT_SYNC_EVENT_CAPACITY,
 };
 use super::storage_crypto::{
     decrypt_rawlog_content, decrypt_record_content, encrypt_rawlog_content, encrypt_record_content,
@@ -148,6 +152,8 @@ pub struct RecordCommitmentChainStatus {
     pub payload_policy: &'static str,
     /// Runtime evidence for the last complete chain audit and verified appends.
     pub integrity: RecordCommitmentChainIntegrityStatus,
+    /// Aggregate signed checkpoint reconciliation evidence.
+    pub checkpoint: RecordCommitmentCheckpointStatus,
 }
 
 /// Privacy-safe runtime integrity evidence for the commitment chain.
@@ -522,7 +528,28 @@ fn privacy_safe_sync_error_code(reason: &str) -> String {
         | "commitment_chain_verification_failed"
         | "pagination_state_mismatch"
         | "terminal_tip_mismatch"
-        | "storage_append_rejected" => reason.to_string(),
+        | "storage_append_rejected"
+        | "checkpoint_request_timeout"
+        | "checkpoint_request_connect"
+        | "checkpoint_request_body"
+        | "checkpoint_request_decode"
+        | "checkpoint_request_request"
+        | "checkpoint_request_unknown"
+        | "local_checkpoint_unavailable"
+        | "local_checkpoint_tip_mismatch"
+        | "invalid_checkpoint_frame"
+        | "unexpected_checkpoint_message"
+        | "checkpoint_chain_mismatch"
+        | "checkpoint_request_mismatch"
+        | "checkpoint_responder_mismatch"
+        | "stale_checkpoint_response"
+        | "invalid_checkpoint_signature"
+        | "invalid_checkpoint_genesis"
+        | "checkpoint_height_mismatch"
+        | "checkpoint_tip_inconsistent"
+        | "local_checkpoint_height_mismatch"
+        | "signed_checkpoint_remote_behind"
+        | "signed_checkpoint_divergence" => reason.to_string(),
         // Exact status codes are useful in process logs but add needless
         // cardinality to public health data, so all 3-digit responses collapse
         // to one stable evidence code.
@@ -531,6 +558,14 @@ fn privacy_safe_sync_error_code(reason: &str) -> String {
         }) =>
         {
             "http_status_error".to_string()
+        }
+        _ if reason
+            .strip_prefix("checkpoint_http_status_")
+            .is_some_and(|status| {
+                status.len() == 3 && status.bytes().all(|byte| byte.is_ascii_digit())
+            }) =>
+        {
+            "checkpoint_http_status_error".to_string()
         }
         _ => "internal_sync_error".to_string(),
     }
@@ -559,6 +594,81 @@ fn push_commitment_sync_event(
 }
 
 impl MemoryStorage {
+    /// Returns aggregate signed checkpoint evidence without peer, hash,
+    /// signature, endpoint, or user metadata.
+    pub fn record_commitment_checkpoint_status(&self) -> RecordCommitmentCheckpointStatus {
+        let runtime = self.commitment_checkpoint.read();
+        RecordCommitmentCheckpointStatus {
+            contract_version: "record_commitment_checkpoint.v1",
+            state: runtime.state.to_string(),
+            last_checked_at: runtime.last_checked_at,
+            last_converged_at: runtime.last_converged_at,
+            last_divergence_at: runtime.last_divergence_at,
+            last_failure_at: runtime.last_failure_at,
+            last_served_at: runtime.last_served_at,
+            local_tip_height: runtime.local_tip_height,
+            remote_tip_height: runtime.remote_tip_height,
+            proofs_verified_total: runtime.proofs_verified_total,
+            proofs_failed_total: runtime.proofs_failed_total,
+            divergences_total: runtime.divergences_total,
+            requests_served_total: runtime.requests_served_total,
+            privacy_policy: "aggregate signed checkpoint outcomes only; no peer identities, block hashes, signatures, request ids, commitments, owners, payloads, endpoints, routes, or client metadata",
+        }
+    }
+
+    /// Records one outbound, signature-verified checkpoint comparison.
+    pub fn record_commitment_checkpoint_verified(
+        &self,
+        now: u64,
+        relation: &'static str,
+        local_tip_height: u64,
+        remote_tip_height: u64,
+    ) {
+        let mut runtime = self.commitment_checkpoint.write();
+        runtime.state = relation;
+        runtime.last_checked_at = Some(now);
+        runtime.local_tip_height = Some(local_tip_height);
+        runtime.remote_tip_height = Some(remote_tip_height);
+        runtime.proofs_verified_total = runtime.proofs_verified_total.saturating_add(1);
+        if relation == "converged" {
+            runtime.last_converged_at = Some(now);
+        } else if relation == "diverged" {
+            runtime.last_divergence_at = Some(now);
+            runtime.divergences_total = runtime.divergences_total.saturating_add(1);
+        }
+    }
+
+    /// Records a checkpoint attempt that did not establish signed evidence.
+    pub fn record_commitment_checkpoint_failure(&self, now: u64) {
+        let mut runtime = self.commitment_checkpoint.write();
+        runtime.state = "proof_failed";
+        runtime.last_checked_at = Some(now);
+        runtime.last_failure_at = Some(now);
+        runtime.proofs_failed_total = runtime.proofs_failed_total.saturating_add(1);
+    }
+
+    /// Records an authenticated checkpoint response served to another node.
+    pub fn record_commitment_checkpoint_served(
+        &self,
+        now: u64,
+        relation: &'static str,
+        local_tip_height: u64,
+        requester_tip_height: u64,
+    ) {
+        let mut runtime = self.commitment_checkpoint.write();
+        runtime.state = relation;
+        runtime.last_served_at = Some(now);
+        runtime.local_tip_height = Some(local_tip_height);
+        runtime.remote_tip_height = Some(requester_tip_height);
+        runtime.requests_served_total = runtime.requests_served_total.saturating_add(1);
+        if relation == "converged" {
+            runtime.last_converged_at = Some(now);
+        } else if relation == "diverged" {
+            runtime.last_divergence_at = Some(now);
+            runtime.divergences_total = runtime.divergences_total.saturating_add(1);
+        }
+    }
+
     /// Configures the process-local Block Sync role once startup validation has
     /// completed. This does not alter SQLite or the canonical block chain.
     pub fn configure_record_commitment_sync(&self, coordinator: bool, follower: bool) {
@@ -606,15 +716,36 @@ impl MemoryStorage {
         if !runtime.enabled {
             return;
         }
-        let recovered = runtime.consecutive_failures > 0;
-        runtime.state = if has_more { "catching_up" } else { "current" };
+        runtime.state = if has_more {
+            "catching_up"
+        } else {
+            "checkpointing"
+        };
         runtime.last_success_at = Some(now);
         runtime.remote_tip_height = Some(remote_tip_height);
         runtime.pages_received_total = runtime.pages_received_total.saturating_add(1);
         runtime.blocks_received_total = runtime
             .blocks_received_total
             .saturating_add(verified_blocks);
+    }
+
+    /// Marks a follower current only after a signed equal-tip checkpoint.
+    ///
+    /// A terminal block-range page alone is insufficient because the remote
+    /// tip may move between page construction and local append. This explicit
+    /// gate keeps `current` equivalent to a signature-verified convergence
+    /// observation.
+    pub fn record_commitment_sync_checkpoint_success(&self, now: u64, remote_tip_height: u64) {
+        let mut runtime = self.commitment_sync.write();
+        if !runtime.enabled {
+            return;
+        }
+        let recovered = runtime.consecutive_failures > 0;
+        runtime.state = "current";
+        runtime.last_success_at = Some(now);
+        runtime.remote_tip_height = Some(remote_tip_height);
         runtime.consecutive_failures = 0;
+        runtime.last_error_code = None;
         if recovered {
             runtime.last_recovered_at = Some(now);
             runtime.recovery_events_total = runtime.recovery_events_total.saturating_add(1);
@@ -932,6 +1063,7 @@ impl MemoryStorage {
             verified_block_count: report.block_count,
             verified_commitment_count: report.commitment_count,
             verified_tip_height: report.tip_height,
+            verified_tip_hash: expected_prev_hash,
         });
         drop(conn);
         Ok(report)
@@ -1083,6 +1215,7 @@ impl MemoryStorage {
             .map(|runtime| {
                 runtime.verified_tip_height.saturating_add(1) == block.header.height
                     && runtime.verified_block_count.saturating_add(1) == block.header.height
+                    && runtime.verified_tip_hash == block.header.prev_block_hash
             })
             .unwrap_or(false);
         if can_advance {
@@ -1093,6 +1226,7 @@ impl MemoryStorage {
                     .verified_commitment_count
                     .saturating_add(block.record_ids.len() as u64);
                 runtime.verified_tip_height = block.header.height;
+                runtime.verified_tip_hash = block.hash();
             }
         } else if integrity.is_some() {
             *integrity = None;
@@ -1164,6 +1298,59 @@ impl MemoryStorage {
         }
     }
 
+    /// Returns one audit-backed comparison checkpoint and the current tip from
+    /// a single SQLite view. Height zero uses the protocol genesis hash.
+    pub async fn record_commitment_chain_checkpoint(
+        &self,
+        requested_height: u64,
+    ) -> Result<(u64, [u8; 32], u64, [u8; 32]), String> {
+        let conn = self.conn.lock().await;
+        let integrity = (*self.commitment_integrity.read())
+            .ok_or_else(|| "commitment chain is not fully audited".to_string())?;
+        let tip: Option<(i64, Vec<u8>)> = conn
+            .query_row(
+                "SELECT height,block_hash FROM record_commitment_blocks
+                 ORDER BY height DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("read commitment checkpoint tip: {error}"))?;
+        let (tip_height, tip_hash) = match tip {
+            Some((height, hash)) => {
+                let height = u64::try_from(height)
+                    .map_err(|_| "commitment checkpoint tip height is invalid".to_string())?;
+                let hash: [u8; 32] = hash.try_into().map_err(|hash: Vec<u8>| {
+                    format!("commitment checkpoint tip hash length {}", hash.len())
+                })?;
+                (height, hash)
+            }
+            None => (0, GENESIS_PREV_HASH),
+        };
+        if integrity.verified_tip_height != tip_height || integrity.verified_tip_hash != tip_hash {
+            return Err("commitment chain audit baseline is stale".to_string());
+        }
+
+        let checkpoint_height = requested_height.min(tip_height);
+        let checkpoint_hash = if checkpoint_height == 0 {
+            GENESIS_PREV_HASH
+        } else {
+            let height = i64::try_from(checkpoint_height)
+                .map_err(|_| "commitment checkpoint height exceeds SQLite range".to_string())?;
+            let hash: Vec<u8> = conn
+                .query_row(
+                    "SELECT block_hash FROM record_commitment_blocks WHERE height=?1",
+                    params![height],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("read commitment checkpoint hash: {error}"))?;
+            hash.try_into().map_err(|hash: Vec<u8>| {
+                format!("commitment checkpoint hash length {}", hash.len())
+            })?
+        };
+        Ok((checkpoint_height, checkpoint_hash, tip_height, tip_hash))
+    }
+
     /// Returns aggregate chain health without exposing record commitments,
     /// proposer identities, or peer metadata.
     pub async fn record_commitment_chain_status(&self) -> RecordCommitmentChainStatus {
@@ -1190,6 +1377,7 @@ impl MemoryStorage {
             _ => (0, None),
         };
         let integrity = self.record_commitment_chain_integrity_status();
+        let checkpoint = self.record_commitment_checkpoint_status();
         drop(conn);
         RecordCommitmentChainStatus {
             contract_version: "record_commitment_chain.v1",
@@ -1200,6 +1388,7 @@ impl MemoryStorage {
             tip_hash,
             payload_policy: "opaque_record_commitments_only_no_memory_payload_or_owner_metadata",
             integrity,
+            checkpoint,
         }
     }
 
@@ -1919,6 +2108,11 @@ mod tests {
     #[tokio::test]
     async fn test_commitment_chain_append_range_and_status() {
         let storage = MemoryStorage::open(":memory:", None).unwrap();
+        assert!(storage
+            .record_commitment_chain_checkpoint(0)
+            .await
+            .unwrap_err()
+            .contains("not fully audited"));
         assert_eq!(
             storage.audit_record_commitment_chain().await.unwrap(),
             RecordCommitmentChainAudit {
@@ -1934,6 +2128,10 @@ mod tests {
         assert_eq!(empty_integrity.verified_tip_height, 0);
         assert!(empty_integrity.baseline_verified_at.is_some());
         assert!(empty_integrity.verification_duration_ms.is_some());
+        assert_eq!(
+            storage.record_commitment_chain_checkpoint(0).await.unwrap(),
+            (0, GENESIS_PREV_HASH, 0, GENESIS_PREV_HASH)
+        );
         let identity = IdentityKeyPair::generate();
         let first = RecordCommitmentBlockV1::new_signed(
             1,
@@ -1980,6 +2178,17 @@ mod tests {
         );
         assert_eq!(storage.last_block_height().await, 2);
         assert_eq!(storage.last_block_hash().await, second.hash());
+        assert_eq!(
+            storage.record_commitment_chain_checkpoint(1).await.unwrap(),
+            (1, first.hash(), 2, second.hash())
+        );
+        assert_eq!(
+            storage
+                .record_commitment_chain_checkpoint(u64::MAX)
+                .await
+                .unwrap(),
+            (2, second.hash(), 2, second.hash())
+        );
 
         let status = storage.record_commitment_chain_status().await;
         assert_eq!(status.block_count, 2);
@@ -2080,6 +2289,30 @@ mod tests {
             .await
             .unwrap_err()
             .contains("stored row mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_refuses_same_height_tip_tampering_after_audit() {
+        let (storage, _) = commitment_audit_fixture().await;
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute(
+                "UPDATE record_commitment_blocks SET block_hash=?1 WHERE height=1",
+                params![[0xE7u8; 32].as_slice()],
+            )
+            .unwrap();
+        }
+        assert!(storage
+            .record_commitment_chain_checkpoint(1)
+            .await
+            .unwrap_err()
+            .contains("audit baseline is stale"));
+        // Public integrity evidence remains hash-free even though the private
+        // runtime baseline retains the value needed for this fail-closed gate.
+        let value =
+            serde_json::to_value(storage.record_commitment_chain_integrity_status()).unwrap();
+        assert!(value.get("verified_tip_hash").is_none());
+        assert!(value.get("tip_hash").is_none());
     }
 
     #[tokio::test]
@@ -2223,11 +2456,15 @@ mod tests {
 
         storage.record_commitment_sync_attempt(132);
         storage.record_commitment_sync_page_success(133, 3, 9, false);
+        let awaiting_proof = storage.record_commitment_sync_status();
+        assert_eq!(awaiting_proof.state, "checkpointing");
+        assert_eq!(awaiting_proof.consecutive_failures, 1);
+        storage.record_commitment_sync_checkpoint_success(134, 9);
         storage.schedule_next_commitment_sync_poll(163);
         let recovered = storage.record_commitment_sync_status();
         assert_eq!(recovered.state, "current");
-        assert_eq!(recovered.last_success_at, Some(133));
-        assert_eq!(recovered.last_recovered_at, Some(133));
+        assert_eq!(recovered.last_success_at, Some(134));
+        assert_eq!(recovered.last_recovered_at, Some(134));
         assert_eq!(recovered.remote_tip_height, Some(9));
         assert_eq!(recovered.pages_received_total, 1);
         assert_eq!(recovered.blocks_received_total, 3);
@@ -2278,6 +2515,14 @@ mod tests {
             "http_status_error"
         );
         assert_eq!(
+            privacy_safe_sync_error_code("checkpoint_http_status_503"),
+            "checkpoint_http_status_error"
+        );
+        assert_eq!(
+            privacy_safe_sync_error_code("signed_checkpoint_divergence"),
+            "signed_checkpoint_divergence"
+        );
+        assert_eq!(
             privacy_safe_sync_error_code("unknown_but_well_formed"),
             "internal_sync_error"
         );
@@ -2285,6 +2530,46 @@ mod tests {
             privacy_safe_sync_error_code("http_status_50x"),
             "internal_sync_error"
         );
+    }
+
+    #[test]
+    fn test_checkpoint_runtime_is_aggregate_and_tracks_proof_lifecycle() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let initial = storage.record_commitment_checkpoint_status();
+        assert_eq!(initial.state, "not_checked");
+        assert_eq!(initial.proofs_verified_total, 0);
+
+        storage.record_commitment_checkpoint_failure(100);
+        storage.record_commitment_checkpoint_verified(110, "remote_ahead", 3, 4);
+        storage.record_commitment_checkpoint_verified(120, "converged", 4, 4);
+        storage.record_commitment_checkpoint_served(130, "diverged", 4, 4);
+        let status = storage.record_commitment_checkpoint_status();
+        assert_eq!(status.state, "diverged");
+        assert_eq!(status.last_checked_at, Some(120));
+        assert_eq!(status.last_converged_at, Some(120));
+        assert_eq!(status.last_divergence_at, Some(130));
+        assert_eq!(status.last_failure_at, Some(100));
+        assert_eq!(status.last_served_at, Some(130));
+        assert_eq!(status.local_tip_height, Some(4));
+        assert_eq!(status.remote_tip_height, Some(4));
+        assert_eq!(status.proofs_verified_total, 2);
+        assert_eq!(status.proofs_failed_total, 1);
+        assert_eq!(status.divergences_total, 1);
+        assert_eq!(status.requests_served_total, 1);
+        let value = serde_json::to_value(status).unwrap();
+        for forbidden in [
+            "peer",
+            "block_hash",
+            "tip_hash",
+            "signature",
+            "request_id",
+            "evidence_digest",
+            "endpoint",
+            "owner",
+            "payload",
+        ] {
+            assert!(value.get(forbidden).is_none(), "unexpected {forbidden}");
+        }
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@
 //!
 //! ## Main Functionality
 //! - `POST /api/memchain/peer/block-range`
+//! - `POST /api/memchain/peer/checkpoint`
 //! - Bincode `MemChainMessage` request/response with the existing magic byte.
 //! - Signed discovery-peer admission, timestamp freshness, replay protection,
 //!   per-peer rate limiting, and bounded pagination.
@@ -18,6 +19,7 @@
 //! - Default-off follower pull from one configured coordinator identity.
 //! - Whole-page signature, proposer, continuity, fork, and rollback validation
 //!   before any block is appended to the local ledger.
+//! - Signed tip/checkpoint comparison that distinguishes lag from a fork.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` on the public node peer listener and local operator
@@ -39,8 +41,11 @@
 //! - Sealed payload replication requires a separate owner-authorised protocol.
 //! - Never fall back from the pinned coordinator to an arbitrary discovered
 //!   peer. Block Sync v1 is authenticated replication, not consensus.
+//! - Checkpoint proof establishes what a peer signed; it is not a majority,
+//!   finality, leader-election, or longest-chain consensus rule.
 //!
 //! ## Last Modified
+//! v2.7.5-CheckpointProof - Signed cross-node checkpoint reconciliation.
 //! v2.7.1-BlockFollower - Pinned coordinator pull and fail-closed page verification.
 //! v2.7.0-BlockSync - Initial signed node-blind block range protocol.
 
@@ -66,8 +71,10 @@ use aeronyx_core::ledger::{
 };
 use aeronyx_core::protocol::memchain::{
     decode_memchain, encode_memchain, record_block_range_request_signing_bytes,
-    record_block_range_response_signing_bytes, MemChainMessage, MEMCHAIN_MAGIC,
+    record_block_range_response_signing_bytes, record_chain_checkpoint_request_signing_bytes,
+    record_chain_checkpoint_response_signing_bytes, MemChainMessage, MEMCHAIN_MAGIC,
 };
+use sha2::{Digest, Sha256};
 
 use crate::services::memchain::{MemoryStorage, RecordCommitmentAppendOutcome};
 use crate::services::PeerStore;
@@ -93,6 +100,51 @@ pub struct CommitmentSyncPageOutcome {
     pub has_more: bool,
     /// Privacy-safe height of the coordinator's signed chain tip.
     pub remote_tip_height: u64,
+}
+
+/// Relationship proven by one valid signed checkpoint response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitmentCheckpointRelation {
+    /// Both peers signed the same tip height and hash.
+    Converged,
+    /// The responder extends the requester's verified chain prefix.
+    RemoteAhead,
+    /// The responder is behind but shares its full verified prefix.
+    RemoteBehind,
+    /// The signed chains disagree at the shorter peer's tip.
+    Diverged,
+}
+
+impl CommitmentCheckpointRelation {
+    /// Stable privacy-safe status value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Converged => "converged",
+            Self::RemoteAhead => "remote_ahead",
+            Self::RemoteBehind => "remote_behind",
+            Self::Diverged => "diverged",
+        }
+    }
+}
+
+/// Aggregate result of a cryptographically verified checkpoint response.
+///
+/// The evidence digest identifies the exact signed response for an operator
+/// evidence vault without putting peer identities, hashes, or signatures into
+/// logs, status APIs, or heartbeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitmentCheckpointOutcome {
+    /// Proven relationship between the two verified chains.
+    pub relation: CommitmentCheckpointRelation,
+    /// Requester's tip height at proof construction.
+    pub local_tip_height: u64,
+    /// Responder's signed tip height.
+    pub remote_tip_height: u64,
+    /// Height at which the shared-prefix comparison was made.
+    pub checkpoint_height: u64,
+    /// SHA-256 digest of the complete signed response frame.
+    pub evidence_digest: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -159,8 +211,82 @@ pub fn build_memchain_peer_router(
     };
     Router::new()
         .route("/api/memchain/peer/block-range", post(block_range_handler))
+        .route("/api/memchain/peer/checkpoint", post(checkpoint_handler))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
+}
+
+/// Obtains and verifies one signed chain-checkpoint comparison from the pinned
+/// coordinator. The response proves peer attestation, not network consensus.
+pub async fn pull_record_commitment_checkpoint(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    coordinator_node_id: &[u8; 32],
+    client: &reqwest::Client,
+) -> Result<CommitmentCheckpointOutcome, String> {
+    let request_timestamp = now_secs();
+    let coordinator = peer_store
+        .get_valid(coordinator_node_id, request_timestamp)
+        .ok_or_else(|| "pinned_coordinator_unavailable".to_string())?;
+    let endpoint = coordinator
+        .descriptor
+        .public_endpoint
+        .as_deref()
+        .ok_or_else(|| "pinned_coordinator_missing_endpoint".to_string())?;
+    let url = commitment_checkpoint_url(endpoint)?;
+
+    let (_, known_tip_hash, known_tip_height, current_tip_hash) = storage
+        .record_commitment_chain_checkpoint(u64::MAX)
+        .await
+        .map_err(|_| "local_checkpoint_unavailable".to_string())?;
+    if known_tip_hash != current_tip_hash {
+        return Err("local_checkpoint_tip_mismatch".to_string());
+    }
+    let mut request_id = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut request_id);
+    let requester = identity.public_key_bytes();
+    let signing_bytes = record_chain_checkpoint_request_signing_bytes(
+        &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+        known_tip_height,
+        &known_tip_hash,
+        &request_id,
+        &requester,
+        request_timestamp,
+    );
+    let request = MemChainMessage::RecordChainCheckpointRequestV1 {
+        chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+        known_tip_height,
+        known_tip_hash,
+        request_id,
+        requester,
+        request_timestamp,
+        signature: identity.sign(&signing_bytes),
+    };
+    let frame = encode_memchain(&request).map_err(|_| "request_encode_failed".to_string())?;
+    let response = client
+        .post(url)
+        .header("content-type", "application/octet-stream")
+        .body(frame)
+        .send()
+        .await
+        .map_err(|error| classify_http_error("checkpoint_request", &error))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "checkpoint_http_status_{}",
+            response.status().as_u16()
+        ));
+    }
+    let body = read_bounded_response(response).await?;
+    verify_record_commitment_checkpoint(
+        storage,
+        &body,
+        &request_id,
+        coordinator_node_id,
+        (known_tip_height, known_tip_hash),
+        now_secs(),
+    )
+    .await
 }
 
 /// Pulls, verifies, and atomically appends one bounded commitment-block page.
@@ -251,6 +377,14 @@ pub async fn pull_record_commitment_page(
 }
 
 fn commitment_block_range_url(endpoint: &str) -> Result<Url, String> {
+    commitment_peer_url(endpoint, "/api/memchain/peer/block-range")
+}
+
+fn commitment_checkpoint_url(endpoint: &str) -> Result<Url, String> {
+    commitment_peer_url(endpoint, "/api/memchain/peer/checkpoint")
+}
+
+fn commitment_peer_url(endpoint: &str, path: &str) -> Result<Url, String> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
         return Err("pinned_coordinator_missing_endpoint".to_string());
@@ -274,10 +408,99 @@ fn commitment_block_range_url(endpoint: &str) -> Result<Url, String> {
     {
         return Err("pinned_coordinator_invalid_endpoint".to_string());
     }
-    url.set_path("/api/memchain/peer/block-range");
+    url.set_path(path);
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
+}
+
+async fn verify_record_commitment_checkpoint(
+    storage: &MemoryStorage,
+    body: &[u8],
+    expected_request_id: &[u8; 16],
+    expected_responder: &[u8; 32],
+    local_tip: (u64, [u8; 32]),
+    now: u64,
+) -> Result<CommitmentCheckpointOutcome, String> {
+    if body.first().copied() != Some(MEMCHAIN_MAGIC) {
+        return Err("invalid_checkpoint_frame".to_string());
+    }
+    let response = decode_memchain(&body[1..]).map_err(|_| "invalid_checkpoint_frame")?;
+    let MemChainMessage::RecordChainCheckpointResponseV1 {
+        chain_id,
+        request_id,
+        responder,
+        response_timestamp,
+        checkpoint_height,
+        checkpoint_hash,
+        tip_height,
+        tip_hash,
+        signature,
+    } = response
+    else {
+        return Err("unexpected_checkpoint_message".to_string());
+    };
+    if chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID {
+        return Err("checkpoint_chain_mismatch".to_string());
+    }
+    if request_id != *expected_request_id {
+        return Err("checkpoint_request_mismatch".to_string());
+    }
+    if responder != *expected_responder {
+        return Err("checkpoint_responder_mismatch".to_string());
+    }
+    if now.abs_diff(response_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
+        return Err("stale_checkpoint_response".to_string());
+    }
+    let response_signing_bytes = record_chain_checkpoint_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &responder,
+        response_timestamp,
+        checkpoint_height,
+        &checkpoint_hash,
+        tip_height,
+        &tip_hash,
+    );
+    IdentityPublicKey::from_bytes(&responder)
+        .and_then(|key| key.verify(&response_signing_bytes, &signature))
+        .map_err(|_| "invalid_checkpoint_signature".to_string())?;
+
+    if tip_height == 0 && tip_hash != GENESIS_PREV_HASH {
+        return Err("invalid_checkpoint_genesis".to_string());
+    }
+    let expected_checkpoint_height = local_tip.0.min(tip_height);
+    if checkpoint_height != expected_checkpoint_height {
+        return Err("checkpoint_height_mismatch".to_string());
+    }
+    if checkpoint_height == tip_height && checkpoint_hash != tip_hash {
+        return Err("checkpoint_tip_inconsistent".to_string());
+    }
+    let (resolved_height, local_checkpoint_hash, _, _) = storage
+        .record_commitment_chain_checkpoint(checkpoint_height)
+        .await
+        .map_err(|_| "local_checkpoint_unavailable".to_string())?;
+    if resolved_height != checkpoint_height {
+        return Err("local_checkpoint_height_mismatch".to_string());
+    }
+
+    let relation = if local_checkpoint_hash != checkpoint_hash {
+        CommitmentCheckpointRelation::Diverged
+    } else if local_tip.0 == tip_height {
+        CommitmentCheckpointRelation::Converged
+    } else if local_tip.0 < tip_height {
+        CommitmentCheckpointRelation::RemoteAhead
+    } else {
+        CommitmentCheckpointRelation::RemoteBehind
+    };
+    let evidence_digest: [u8; 32] = Sha256::digest(body).into();
+    Ok(CommitmentCheckpointOutcome {
+        relation,
+        local_tip_height: local_tip.0,
+        remote_tip_height: tip_height,
+        checkpoint_height,
+        evidence_digest,
+    })
 }
 
 async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, String> {
@@ -419,6 +642,123 @@ fn classify_http_error(phase: &str, error: &reqwest::Error) -> String {
         "unknown"
     };
     format!("{phase}_{kind}")
+}
+
+async fn checkpoint_handler(State(state): State<MemChainPeerState>, body: Bytes) -> Response {
+    if body.first().copied() != Some(MEMCHAIN_MAGIC) {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame");
+    }
+    let message = match decode_memchain(&body[1..]) {
+        Ok(message) => message,
+        Err(_) => return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame"),
+    };
+    let MemChainMessage::RecordChainCheckpointRequestV1 {
+        chain_id,
+        known_tip_height,
+        known_tip_hash,
+        request_id,
+        requester,
+        request_timestamp,
+        signature,
+    } = message
+    else {
+        return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
+    };
+
+    let now = now_secs();
+    if chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID
+        || (known_tip_height == 0 && known_tip_hash != GENESIS_PREV_HASH)
+    {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_checkpoint_request");
+    }
+    if now.abs_diff(request_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
+        return protocol_error(StatusCode::UNAUTHORIZED, "stale_request");
+    }
+    if state.peer_store.get_valid(&requester, now).is_none() {
+        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
+    }
+    let signing_bytes = record_chain_checkpoint_request_signing_bytes(
+        &chain_id,
+        known_tip_height,
+        &known_tip_hash,
+        &request_id,
+        &requester,
+        request_timestamp,
+    );
+    let signature_valid = IdentityPublicKey::from_bytes(&requester)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .is_ok();
+    if !signature_valid {
+        return protocol_error(StatusCode::UNAUTHORIZED, "invalid_signature");
+    }
+    if !state.guard.lock().await.admit(requester, request_id, now) {
+        return protocol_error(StatusCode::TOO_MANY_REQUESTS, "rate_or_replay_limited");
+    }
+
+    let (checkpoint_height, checkpoint_hash, tip_height, tip_hash) = match state
+        .storage
+        .record_commitment_chain_checkpoint(known_tip_height)
+        .await
+    {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            warn!(error = %error, "[MEMCHAIN_BLOCK] Refused unaudited checkpoint proof");
+            return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "chain_not_verified");
+        }
+    };
+    let relation = if known_tip_height > tip_height {
+        "served"
+    } else if known_tip_hash != checkpoint_hash {
+        "diverged"
+    } else if known_tip_height == tip_height {
+        "converged"
+    } else {
+        "remote_behind"
+    };
+    state
+        .storage
+        .record_commitment_checkpoint_served(now, relation, tip_height, known_tip_height);
+
+    let responder = state.identity.public_key_bytes();
+    let response_timestamp = now_secs();
+    let response_signing_bytes = record_chain_checkpoint_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &responder,
+        response_timestamp,
+        checkpoint_height,
+        &checkpoint_hash,
+        tip_height,
+        &tip_hash,
+    );
+    let response = MemChainMessage::RecordChainCheckpointResponseV1 {
+        chain_id,
+        request_id,
+        responder,
+        response_timestamp,
+        checkpoint_height,
+        checkpoint_hash,
+        tip_height,
+        tip_hash,
+        signature: state.identity.sign(&response_signing_bytes),
+    };
+    let encoded = match encode_memchain(&response) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            warn!(error = %error, "[MEMCHAIN_BLOCK] Failed to encode checkpoint response");
+            return protocol_error(StatusCode::INTERNAL_SERVER_ERROR, "encode_error");
+        }
+    };
+    debug!(
+        relation,
+        checkpoint_height, tip_height, "[MEMCHAIN_BLOCK] Served authenticated chain checkpoint"
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        encoded,
+    )
+        .into_response()
 }
 
 async fn block_range_handler(State(state): State<MemChainPeerState>, body: Bytes) -> Response {
@@ -597,6 +937,55 @@ mod tests {
         );
         assert!(commitment_block_range_url("ftp://node.example").is_err());
         assert!(commitment_block_range_url("https://user@node.example").is_err());
+        assert_eq!(
+            commitment_checkpoint_url("node.example:9281/path")
+                .unwrap()
+                .as_str(),
+            "http://node.example:9281/api/memchain/peer/checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_endpoint_refuses_to_sign_an_unaudited_chain() {
+        let now = now_secs();
+        let responder_identity = Arc::new(IdentityKeyPair::generate());
+        let requester_identity = IdentityKeyPair::generate();
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let peer_store = Arc::new(PeerStore::new());
+        admit_peer(&peer_store, &requester_identity, None, now);
+
+        let request_id = [0x91; 16];
+        let requester = requester_identity.public_key_bytes();
+        let signing_bytes = record_chain_checkpoint_request_signing_bytes(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            0,
+            &GENESIS_PREV_HASH,
+            &request_id,
+            &requester,
+            now,
+        );
+        let frame = encode_memchain(&MemChainMessage::RecordChainCheckpointRequestV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            known_tip_height: 0,
+            known_tip_hash: GENESIS_PREV_HASH,
+            request_id,
+            requester,
+            request_timestamp: now,
+            signature: requester_identity.sign(&signing_bytes),
+        })
+        .unwrap();
+        let response = build_memchain_peer_router(storage, peer_store, responder_identity)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/checkpoint")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(frame))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
@@ -717,6 +1106,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signed_checkpoint_distinguishes_remote_lag_from_divergence() {
+        let now = now_secs();
+        let responder = IdentityKeyPair::generate();
+        let local_writer = IdentityKeyPair::generate();
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+        let first = RecordCommitmentBlockV1::new_signed(
+            1,
+            now.saturating_sub(2),
+            GENESIS_PREV_HASH,
+            vec![[0x31; 32]],
+            &local_writer,
+        );
+        storage
+            .append_record_commitment_block(&first, None)
+            .await
+            .unwrap();
+        let second = RecordCommitmentBlockV1::new_signed(
+            2,
+            now.saturating_sub(1),
+            first.hash(),
+            vec![[0x32; 32]],
+            &local_writer,
+        );
+        storage
+            .append_record_commitment_block(&second, None)
+            .await
+            .unwrap();
+
+        let request_id = [0xA2; 16];
+        let responder_key = responder.public_key_bytes();
+        let lagging_signing_bytes = record_chain_checkpoint_response_signing_bytes(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            &request_id,
+            &responder_key,
+            now,
+            1,
+            &first.hash(),
+            1,
+            &first.hash(),
+        );
+        let lagging_frame = encode_memchain(&MemChainMessage::RecordChainCheckpointResponseV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            request_id,
+            responder: responder_key,
+            response_timestamp: now,
+            checkpoint_height: 1,
+            checkpoint_hash: first.hash(),
+            tip_height: 1,
+            tip_hash: first.hash(),
+            signature: responder.sign(&lagging_signing_bytes),
+        })
+        .unwrap();
+        let lagging = verify_record_commitment_checkpoint(
+            &storage,
+            &lagging_frame,
+            &request_id,
+            &responder_key,
+            (2, second.hash()),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(lagging.relation, CommitmentCheckpointRelation::RemoteBehind);
+
+        let fork_hash = [0xF1; 32];
+        let fork_signing_bytes = record_chain_checkpoint_response_signing_bytes(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            &request_id,
+            &responder_key,
+            now,
+            2,
+            &fork_hash,
+            2,
+            &fork_hash,
+        );
+        let fork_frame = encode_memchain(&MemChainMessage::RecordChainCheckpointResponseV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            request_id,
+            responder: responder_key,
+            response_timestamp: now,
+            checkpoint_height: 2,
+            checkpoint_hash: fork_hash,
+            tip_height: 2,
+            tip_hash: fork_hash,
+            signature: responder.sign(&fork_signing_bytes),
+        })
+        .unwrap();
+        let diverged = verify_record_commitment_checkpoint(
+            &storage,
+            &fork_frame,
+            &request_id,
+            &responder_key,
+            (2, second.hash()),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(diverged.relation, CommitmentCheckpointRelation::Diverged);
+    }
+
+    #[tokio::test]
     async fn authenticated_range_sync_converges_two_commitment_ledgers() {
         let now = now_secs();
         let responder_identity = Arc::new(IdentityKeyPair::generate());
@@ -746,6 +1237,8 @@ mod tests {
             .append_record_commitment_block(&second, None)
             .await
             .unwrap();
+        source.audit_record_commitment_chain().await.unwrap();
+        destination.audit_record_commitment_chain().await.unwrap();
 
         let peer_store = Arc::new(PeerStore::new());
         let descriptor = NodeDescriptor::new(
@@ -882,6 +1375,8 @@ mod tests {
             .append_record_commitment_block(&second, None)
             .await
             .unwrap();
+        source.audit_record_commitment_chain().await.unwrap();
+        destination.audit_record_commitment_chain().await.unwrap();
 
         let source_peers = Arc::new(PeerStore::new());
         admit_peer(&source_peers, &requester_identity, None, now);
@@ -907,6 +1402,21 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
+        let before_pull = pull_record_commitment_checkpoint(
+            &destination,
+            &follower_peers,
+            &requester_identity,
+            &responder_identity.public_key_bytes(),
+            &client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            before_pull.relation,
+            CommitmentCheckpointRelation::RemoteAhead
+        );
+        assert_eq!(before_pull.local_tip_height, 0);
+        assert_eq!(before_pull.remote_tip_height, 2);
         let outcome = pull_record_commitment_page(
             &destination,
             &follower_peers,
@@ -925,6 +1435,23 @@ mod tests {
             destination.record_commitment_chain_tip().await,
             source.record_commitment_chain_tip().await
         );
+        let checkpoint = pull_record_commitment_checkpoint(
+            &destination,
+            &follower_peers,
+            &requester_identity,
+            &responder_identity.public_key_bytes(),
+            &client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(checkpoint.relation, CommitmentCheckpointRelation::Converged);
+        assert_eq!(checkpoint.local_tip_height, 2);
+        assert_eq!(checkpoint.remote_tip_height, 2);
+        assert_eq!(checkpoint.checkpoint_height, 2);
+        assert_ne!(checkpoint.evidence_digest, [0u8; 32]);
+        let served = source.record_commitment_checkpoint_status();
+        assert_eq!(served.requests_served_total, 2);
+        assert_eq!(served.state, "converged");
         server.abort();
         let _ = server.await;
     }

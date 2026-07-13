@@ -72,6 +72,9 @@ pub struct MemChainHeartbeatStatus {
     /// Compact privacy-safe Block Sync runtime evidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record_commitment_sync: Option<RecordCommitmentSyncHeartbeatStatus>,
+    /// Compact privacy-safe signed checkpoint reconciliation evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_commitment_checkpoint: Option<RecordCommitmentCheckpointHeartbeatStatus>,
 }
 
 /// Compact verified-chain evidence sent to the central health plane.
@@ -136,6 +139,41 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub failure_events_total: u64,
     /// Recovery events observed since process start.
     pub recovery_events_total: u64,
+}
+
+/// Compact signed-checkpoint evidence sent to the central health plane.
+///
+/// This deliberately excludes the evidence digest, peer identities, chain or
+/// block hashes, signatures, request IDs, endpoints, and user metadata. The
+/// central plane can monitor convergence but cannot reconstruct the ledger.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecordCommitmentCheckpointHeartbeatStatus {
+    /// Stable heartbeat contract name.
+    pub contract_version: &'static str,
+    /// Latest aggregate relation or proof lifecycle state.
+    pub state: String,
+    /// Most recent outbound checkpoint verification attempt.
+    pub last_checked_at: Option<u64>,
+    /// Most recent verified equal-tip comparison.
+    pub last_converged_at: Option<u64>,
+    /// Most recent verified shared-prefix mismatch.
+    pub last_divergence_at: Option<u64>,
+    /// Most recent failed proof attempt.
+    pub last_failure_at: Option<u64>,
+    /// Most recent authenticated checkpoint response served.
+    pub last_served_at: Option<u64>,
+    /// Local verified tip height from the latest observation.
+    pub local_tip_height: Option<u64>,
+    /// Remote verified tip height from the latest observation.
+    pub remote_tip_height: Option<u64>,
+    /// Signature-verified checkpoint responses since process start.
+    pub proofs_verified_total: u64,
+    /// Proof attempts rejected or unavailable since process start.
+    pub proofs_failed_total: u64,
+    /// Verified shared-prefix mismatches since process start.
+    pub divergences_total: u64,
+    /// Authenticated checkpoint requests served since process start.
+    pub requests_served_total: u64,
 }
 
 // ============================================
@@ -636,6 +674,21 @@ mod tests {
                 failure_events_total: 1,
                 recovery_events_total: 0,
             }),
+            record_commitment_checkpoint: Some(RecordCommitmentCheckpointHeartbeatStatus {
+                contract_version: "record_commitment_checkpoint.v1",
+                state: "converged".to_string(),
+                last_checked_at: Some(120),
+                last_converged_at: Some(120),
+                last_divergence_at: None,
+                last_failure_at: None,
+                last_served_at: Some(118),
+                local_tip_height: Some(9),
+                remote_tip_height: Some(9),
+                proofs_verified_total: 4,
+                proofs_failed_total: 1,
+                divergences_total: 0,
+                requests_served_total: 2,
+            }),
         };
         let value = serde_json::to_value(status).unwrap();
         let integrity = &value["record_commitment_integrity"];
@@ -648,7 +701,11 @@ mod tests {
         assert_eq!(sync["enabled"], true);
         assert_eq!(sync["last_attempt_at"], 99);
         assert_eq!(sync["last_error_code"], "request_timeout");
-        for section in [integrity, sync] {
+        let checkpoint = &value["record_commitment_checkpoint"];
+        assert_eq!(checkpoint["state"], "converged");
+        assert_eq!(checkpoint["proofs_verified_total"], 4);
+        assert_eq!(checkpoint["requests_served_total"], 2);
+        for section in [integrity, sync, checkpoint] {
             for forbidden in [
                 "coordinator_node_id",
                 "endpoint",
@@ -663,6 +720,9 @@ mod tests {
                 "peer",
                 "route",
                 "client",
+                "evidence_digest",
+                "request_id",
+                "signature",
             ] {
                 assert!(
                     section.get(forbidden).is_none(),

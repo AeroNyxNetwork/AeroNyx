@@ -129,8 +129,8 @@ pub mod mempool;
 
 // ── Storage core ──
 pub use storage::{
-    LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentSyncEvent, RecordCommitmentSyncStatus,
-    StorageStats,
+    LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentCheckpointStatus,
+    RecordCommitmentSyncEvent, RecordCommitmentSyncStatus, StorageStats,
 };
 pub use storage_crypto::{decrypt_rawlog_content_pub, derive_rawlog_key, derive_record_key};
 pub use storage_ops::{

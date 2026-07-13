@@ -10,6 +10,8 @@
 //   wallet ownership per-message without trusting the session binding.
 //   v2.7.0-BlockSync — Appended signed commitment announcement and bounded
 //   peer range request/response variants. Existing discriminants are unchanged.
+//   v2.7.5-CheckpointProof — Appended signed chain-checkpoint reconciliation
+//   variants. Existing discriminants remain unchanged.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -34,7 +36,7 @@
 //   - v1.3.0 is a BREAKING CHANGE: DeviceRegister, ChatPull, ChatAck wire
 //     format changed — old clients cannot talk to new servers and vice versa
 //   - WalletPresence (17) is a lightweight heartbeat — node never replies
-//   - Record block range frames (19-20) are node-peer control messages and
+//   - Record block range/checkpoint frames (19-22) are node-peer control messages and
 //     MUST NOT be accepted from ordinary VPN/client tunnel sessions
 //   - Commitment blocks contain opaque record IDs only; sealed memory payload
 //     replication requires a separate owner-authorised protocol
@@ -47,6 +49,8 @@
 //                        DeviceRegister, ChatPull, ChatAck; added WalletPresence (17)
 //   v2.7.0-BlockSync   — Appended variants 18-20 and canonical request/response
 //                        signing bytes for node-blind commitment sync
+//   v2.7.5-CheckpointProof — Appended variants 21-22 and canonical signed
+//                        checkpoint reconciliation bytes
 // ============================================================================
 
 use bincode::Options;
@@ -138,6 +142,8 @@ mod serde_bytes64 {
 /// | 18    | RecordBlockAnnounceV1| v2.7.0-BlockSync       |
 /// | 19    | RecordBlockRangeRequestV1 | v2.7.0-BlockSync  |
 /// | 20    | RecordBlockRangeResponseV1| v2.7.0-BlockSync  |
+/// | 21    | RecordChainCheckpointRequestV1 | v2.7.5-CheckpointProof |
+/// | 22    | RecordChainCheckpointResponseV1| v2.7.5-CheckpointProof |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(deprecated)]
 pub enum MemChainMessage {
@@ -362,6 +368,53 @@ pub enum MemChainMessage {
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
+
+    /// [index 21] Requests a signed comparison checkpoint from a node peer.
+    ///
+    /// The requester attests to its current fully verified local tip. The
+    /// responder returns its own tip plus the block hash at the shorter tip,
+    /// allowing both sides to distinguish lag from an actual fork without
+    /// exposing record commitments or memory payloads.
+    RecordChainCheckpointRequestV1 {
+        /// Expected production/private chain identifier.
+        chain_id: [u8; 32],
+        /// Requester's current fully verified local tip height.
+        known_tip_height: u64,
+        /// Requester's current tip hash, or genesis previous hash at height 0.
+        known_tip_hash: [u8; 32],
+        /// Per-request random identifier used to bind the response.
+        request_id: [u8; 16],
+        /// Requesting node's Ed25519 public key.
+        requester: [u8; 32],
+        /// Unix epoch seconds; peers reject stale requests.
+        request_timestamp: u64,
+        /// Requester signature over the canonical request fields.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+
+    /// [index 22] Returns a signed chain tip and shared-prefix checkpoint.
+    RecordChainCheckpointResponseV1 {
+        /// Chain identifier copied into the signed response.
+        chain_id: [u8; 32],
+        /// Request identifier copied from the request.
+        request_id: [u8; 16],
+        /// Responding node's Ed25519 public key.
+        responder: [u8; 32],
+        /// Unix epoch seconds when this checkpoint was constructed.
+        response_timestamp: u64,
+        /// Height selected as `min(requester_tip, responder_tip)`.
+        checkpoint_height: u64,
+        /// Responder's verified block hash at `checkpoint_height`.
+        checkpoint_hash: [u8; 32],
+        /// Responder's current fully verified tip height.
+        tip_height: u64,
+        /// Responder's current fully verified tip hash.
+        tip_hash: [u8; 32],
+        /// Responder signature over all canonical response fields.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
 }
 
 /// Canonical bytes signed by `RecordBlockRangeRequestV1.requester`.
@@ -412,6 +465,52 @@ pub fn record_block_range_response_signing_bytes(
     bytes.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&block_hashes_digest);
     bytes.push(u8::from(has_more));
+    bytes.extend_from_slice(&tip_height.to_le_bytes());
+    bytes.extend_from_slice(tip_hash);
+    bytes
+}
+
+/// Canonical bytes signed by `RecordChainCheckpointRequestV1.requester`.
+#[must_use]
+pub fn record_chain_checkpoint_request_signing_bytes(
+    chain_id: &[u8; 32],
+    known_tip_height: u64,
+    known_tip_hash: &[u8; 32],
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(166);
+    bytes.extend_from_slice(b"AeroNyx-RecordChainCheckpointRequest-v1");
+    bytes.extend_from_slice(chain_id);
+    bytes.extend_from_slice(&known_tip_height.to_le_bytes());
+    bytes.extend_from_slice(known_tip_hash);
+    bytes.extend_from_slice(request_id);
+    bytes.extend_from_slice(requester);
+    bytes.extend_from_slice(&request_timestamp.to_le_bytes());
+    bytes
+}
+
+/// Canonical bytes signed by `RecordChainCheckpointResponseV1.responder`.
+#[must_use]
+pub fn record_chain_checkpoint_response_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    responder: &[u8; 32],
+    response_timestamp: u64,
+    checkpoint_height: u64,
+    checkpoint_hash: &[u8; 32],
+    tip_height: u64,
+    tip_hash: &[u8; 32],
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(214);
+    bytes.extend_from_slice(b"AeroNyx-RecordChainCheckpointResponse-v1");
+    bytes.extend_from_slice(chain_id);
+    bytes.extend_from_slice(request_id);
+    bytes.extend_from_slice(responder);
+    bytes.extend_from_slice(&response_timestamp.to_le_bytes());
+    bytes.extend_from_slice(&checkpoint_height.to_le_bytes());
+    bytes.extend_from_slice(checkpoint_hash);
     bytes.extend_from_slice(&tip_height.to_le_bytes());
     bytes.extend_from_slice(tip_hash);
     bytes
@@ -773,6 +872,40 @@ mod tests {
             20,
             "RecordBlockRangeResponseV1 must be discriminant 20"
         );
+
+        let b = bincode::serialize(&MemChainMessage::RecordChainCheckpointRequestV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            known_tip_height: 1,
+            known_tip_hash: [0x33; 32],
+            request_id: [0x44; 16],
+            requester: identity.public_key_bytes(),
+            request_timestamp: 1_700_000_004,
+            signature: [0u8; 64],
+        })
+        .unwrap();
+        assert_eq!(
+            disc(&b),
+            21,
+            "RecordChainCheckpointRequestV1 must be discriminant 21"
+        );
+
+        let b = bincode::serialize(&MemChainMessage::RecordChainCheckpointResponseV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            request_id: [0x44; 16],
+            responder: identity.public_key_bytes(),
+            response_timestamp: 1_700_000_005,
+            checkpoint_height: 1,
+            checkpoint_hash: [0x33; 32],
+            tip_height: 1,
+            tip_hash: [0x33; 32],
+            signature: [0u8; 64],
+        })
+        .unwrap();
+        assert_eq!(
+            disc(&b),
+            22,
+            "RecordChainCheckpointResponseV1 must be discriminant 22"
+        );
     }
 
     #[test]
@@ -881,6 +1014,111 @@ mod tests {
             }
             other => panic!("Expected RecordBlockRangeResponseV1, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_record_chain_checkpoint_messages_roundtrip_and_signatures() {
+        let requester = IdentityKeyPair::generate();
+        let responder = IdentityKeyPair::generate();
+        let request_id = [0xB1; 16];
+        let known_tip_hash = [0xB2; 32];
+        let request_timestamp = 1_700_200_000;
+        let request_bytes = record_chain_checkpoint_request_signing_bytes(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            7,
+            &known_tip_hash,
+            &request_id,
+            &requester.public_key_bytes(),
+            request_timestamp,
+        );
+        let request = MemChainMessage::RecordChainCheckpointRequestV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            known_tip_height: 7,
+            known_tip_hash,
+            request_id,
+            requester: requester.public_key_bytes(),
+            request_timestamp,
+            signature: requester.sign(&request_bytes),
+        };
+        let encoded = encode_memchain(&request).expect("encode checkpoint request");
+        let decoded = decode_memchain(&encoded[1..]).expect("decode checkpoint request");
+        let MemChainMessage::RecordChainCheckpointRequestV1 {
+            chain_id,
+            known_tip_height,
+            known_tip_hash,
+            request_id,
+            requester: requester_key,
+            request_timestamp,
+            signature,
+        } = decoded
+        else {
+            panic!("expected checkpoint request");
+        };
+        let signed = record_chain_checkpoint_request_signing_bytes(
+            &chain_id,
+            known_tip_height,
+            &known_tip_hash,
+            &request_id,
+            &requester_key,
+            request_timestamp,
+        );
+        requester
+            .verify(&signed, &signature)
+            .expect("checkpoint request signature");
+
+        let response_timestamp = request_timestamp + 1;
+        let checkpoint_hash = [0xC1; 32];
+        let tip_hash = [0xC2; 32];
+        let response_bytes = record_chain_checkpoint_response_signing_bytes(
+            &chain_id,
+            &request_id,
+            &responder.public_key_bytes(),
+            response_timestamp,
+            7,
+            &checkpoint_hash,
+            9,
+            &tip_hash,
+        );
+        let response = MemChainMessage::RecordChainCheckpointResponseV1 {
+            chain_id,
+            request_id,
+            responder: responder.public_key_bytes(),
+            response_timestamp,
+            checkpoint_height: 7,
+            checkpoint_hash,
+            tip_height: 9,
+            tip_hash,
+            signature: responder.sign(&response_bytes),
+        };
+        let encoded = encode_memchain(&response).expect("encode checkpoint response");
+        let decoded = decode_memchain(&encoded[1..]).expect("decode checkpoint response");
+        let MemChainMessage::RecordChainCheckpointResponseV1 {
+            chain_id,
+            request_id,
+            responder: responder_key,
+            response_timestamp,
+            checkpoint_height,
+            checkpoint_hash,
+            tip_height,
+            tip_hash,
+            signature,
+        } = decoded
+        else {
+            panic!("expected checkpoint response");
+        };
+        let signed = record_chain_checkpoint_response_signing_bytes(
+            &chain_id,
+            &request_id,
+            &responder_key,
+            response_timestamp,
+            checkpoint_height,
+            &checkpoint_hash,
+            tip_height,
+            &tip_hash,
+        );
+        responder
+            .verify(&signed, &signature)
+            .expect("checkpoint response signature");
     }
 
     // ── Chat Relay variant roundtrip tests ───────────────────────────────

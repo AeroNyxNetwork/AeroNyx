@@ -43,6 +43,8 @@
 //!   - record_block_commitments: unique record ID to block-height membership
 //! - v2.7.4-BlockIntegrityStatus: Runtime-only evidence for the most recent
 //!   complete persisted-chain audit and subsequently verified appends.
+//! - v2.7.5-CheckpointProof: Runtime-only signed checkpoint reconciliation
+//!   evidence without peer identities, hashes, signatures, or user metadata.
 //!
 //! ## Thread Safety
 //! `rusqlite::Connection` behind `tokio::sync::Mutex`. Phase 2+ can use r2d2 pooling.
@@ -93,6 +95,8 @@
 //!   add owner, tags, embeddings, or decrypted content columns to them.
 //! - commitment_integrity is runtime-only. It may contain aggregate counts and
 //!   heights, but never hashes, proposer identity, commitments, or user data.
+//! - commitment_checkpoint is aggregate reconciliation telemetry only. Signed
+//!   evidence stays inside the node-peer protocol and must not enter heartbeat.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
@@ -118,6 +122,7 @@
 //!   P1: complete_task adds AND status='processing' guard (storage_supernode.rs).
 //!   P2: find_records_by_content → pub(crate), hard-cap limit at 100.
 //! v2.7.4-BlockIntegrityStatus - Added runtime-only verified-chain baseline.
+//! v2.7.5-CheckpointProof - Added privacy-safe reconciliation runtime evidence.
 //!   P2: record_key wrapped in Zeroizing<[u8;32]>.
 //!   P3: conn_lock() → pub(crate). row_to_record returns Err on bad BLOB length.
 //! v2.6.1+BlindVectorRecovery - Added all-owner active embedding enumeration so
@@ -315,6 +320,40 @@ pub struct RecordCommitmentSyncStatus {
     pub privacy_policy: &'static str,
 }
 
+/// Privacy-safe runtime status for signed chain-checkpoint reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RecordCommitmentCheckpointStatus {
+    /// Stable API contract name.
+    pub contract_version: &'static str,
+    /// Last observed relation: `not_checked`, `served`, `converged`,
+    /// `remote_ahead`, `remote_behind`, `diverged`, or `proof_failed`.
+    pub state: String,
+    /// Most recent outbound checkpoint verification attempt.
+    pub last_checked_at: Option<u64>,
+    /// Most recent cryptographically verified equal tip.
+    pub last_converged_at: Option<u64>,
+    /// Most recent signed shared-prefix mismatch.
+    pub last_divergence_at: Option<u64>,
+    /// Most recent invalid or unavailable checkpoint proof.
+    pub last_failure_at: Option<u64>,
+    /// Most recent authenticated checkpoint response served to a peer.
+    pub last_served_at: Option<u64>,
+    /// Local height used by the most recent observation.
+    pub local_tip_height: Option<u64>,
+    /// Remote height used by the most recent observation.
+    pub remote_tip_height: Option<u64>,
+    /// Signed checkpoint responses verified since process start.
+    pub proofs_verified_total: u64,
+    /// Checkpoint attempts rejected before a valid proof was established.
+    pub proofs_failed_total: u64,
+    /// Signed shared-prefix mismatches observed since process start.
+    pub divergences_total: u64,
+    /// Authenticated checkpoint responses served since process start.
+    pub requests_served_total: u64,
+    /// Explicit privacy boundary for operators and API consumers.
+    pub privacy_policy: &'static str,
+}
+
 pub(crate) const COMMITMENT_SYNC_EVENT_CAPACITY: usize = 16;
 
 #[derive(Debug, Clone)]
@@ -362,12 +401,49 @@ impl Default for RecordCommitmentSyncRuntime {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RecordCommitmentCheckpointRuntime {
+    pub(crate) state: &'static str,
+    pub(crate) last_checked_at: Option<u64>,
+    pub(crate) last_converged_at: Option<u64>,
+    pub(crate) last_divergence_at: Option<u64>,
+    pub(crate) last_failure_at: Option<u64>,
+    pub(crate) last_served_at: Option<u64>,
+    pub(crate) local_tip_height: Option<u64>,
+    pub(crate) remote_tip_height: Option<u64>,
+    pub(crate) proofs_verified_total: u64,
+    pub(crate) proofs_failed_total: u64,
+    pub(crate) divergences_total: u64,
+    pub(crate) requests_served_total: u64,
+}
+
+impl Default for RecordCommitmentCheckpointRuntime {
+    fn default() -> Self {
+        Self {
+            state: "not_checked",
+            last_checked_at: None,
+            last_converged_at: None,
+            last_divergence_at: None,
+            last_failure_at: None,
+            last_served_at: None,
+            local_tip_height: None,
+            remote_tip_height: None,
+            proofs_verified_total: 0,
+            proofs_failed_total: 0,
+            divergences_total: 0,
+            requests_served_total: 0,
+        }
+    }
+}
+
 /// Last complete commitment-chain verification known to this process.
 ///
 /// This state is deliberately runtime-only: a restart must independently
-/// re-audit SQLite before it can claim a verified baseline. The structure
-/// carries aggregate evidence only and must never gain hashes, identities,
-/// commitment IDs, owner information, payloads, peers, or endpoints.
+/// re-audit SQLite before it can claim a verified baseline. The tip hash is
+/// retained only inside this process so proof serving can detect same-height
+/// SQLite tampering; it is never serialized, logged, or reported. The
+/// structure must never gain identities, commitment IDs, owner information,
+/// payloads, peers, or endpoints.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RecordCommitmentIntegrityRuntime {
     pub(crate) baseline_verified_at: u64,
@@ -376,6 +452,7 @@ pub(crate) struct RecordCommitmentIntegrityRuntime {
     pub(crate) verified_block_count: u64,
     pub(crate) verified_commitment_count: u64,
     pub(crate) verified_tip_height: u64,
+    pub(crate) verified_tip_hash: [u8; 32],
 }
 
 // ============================================
@@ -446,6 +523,8 @@ pub struct MemoryStorage {
     /// Runtime-only complete-chain audit baseline. Cleared before every audit
     /// and advanced only after an atomic, fully validated block append.
     pub(crate) commitment_integrity: RwLock<Option<RecordCommitmentIntegrityRuntime>>,
+    /// Runtime-only aggregate signed-checkpoint reconciliation evidence.
+    pub(crate) commitment_checkpoint: RwLock<RecordCommitmentCheckpointRuntime>,
 }
 
 impl MemoryStorage {
@@ -497,6 +576,7 @@ impl MemoryStorage {
             record_key: record_key.map(Zeroizing::new),
             commitment_sync: RwLock::new(RecordCommitmentSyncRuntime::default()),
             commitment_integrity: RwLock::new(None),
+            commitment_checkpoint: RwLock::new(RecordCommitmentCheckpointRuntime::default()),
         })
     }
 
