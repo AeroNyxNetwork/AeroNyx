@@ -41,6 +41,8 @@
 //! - v8 (v2.7.0-BlockSync): Authoritative commitment chain tables:
 //!   - record_commitment_blocks: signed block payload and verified chain data
 //!   - record_block_commitments: unique record ID to block-height membership
+//! - v2.7.4-BlockIntegrityStatus: Runtime-only evidence for the most recent
+//!   complete persisted-chain audit and subsequently verified appends.
 //!
 //! ## Thread Safety
 //! `rusqlite::Connection` behind `tokio::sync::Mutex`. Phase 2+ can use r2d2 pooling.
@@ -89,6 +91,8 @@
 //! - complete_task enforces AND status='processing' guard (storage_supernode.rs).
 //! - v8 tables are integrity commitments, not replicated memory storage. Never
 //!   add owner, tags, embeddings, or decrypted content columns to them.
+//! - commitment_integrity is runtime-only. It may contain aggregate counts and
+//!   heights, but never hashes, proposer identity, commitments, or user data.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
@@ -113,6 +117,7 @@
 //!   silent plaintext fallback). P1: FTS5 backfill skips encrypted DB.
 //!   P1: complete_task adds AND status='processing' guard (storage_supernode.rs).
 //!   P2: find_records_by_content → pub(crate), hard-cap limit at 100.
+//! v2.7.4-BlockIntegrityStatus - Added runtime-only verified-chain baseline.
 //!   P2: record_key wrapped in Zeroizing<[u8;32]>.
 //!   P3: conn_lock() → pub(crate). row_to_record returns Err on bad BLOB length.
 //! v2.6.1+BlindVectorRecovery - Added all-owner active embedding enumeration so
@@ -357,6 +362,22 @@ impl Default for RecordCommitmentSyncRuntime {
     }
 }
 
+/// Last complete commitment-chain verification known to this process.
+///
+/// This state is deliberately runtime-only: a restart must independently
+/// re-audit SQLite before it can claim a verified baseline. The structure
+/// carries aggregate evidence only and must never gain hashes, identities,
+/// commitment IDs, owner information, payloads, peers, or endpoints.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecordCommitmentIntegrityRuntime {
+    pub(crate) baseline_verified_at: u64,
+    pub(crate) last_verified_at: u64,
+    pub(crate) verification_duration_ms: u64,
+    pub(crate) verified_block_count: u64,
+    pub(crate) verified_commitment_count: u64,
+    pub(crate) verified_tip_height: u64,
+}
+
 // ============================================
 // LRU Cache
 // ============================================
@@ -422,6 +443,9 @@ pub struct MemoryStorage {
     /// Runtime-only Block Sync status. Never persisted and never stores peer
     /// identity, endpoint, block hash, commitment, owner, or payload metadata.
     pub(crate) commitment_sync: RwLock<RecordCommitmentSyncRuntime>,
+    /// Runtime-only complete-chain audit baseline. Cleared before every audit
+    /// and advanced only after an atomic, fully validated block append.
+    pub(crate) commitment_integrity: RwLock<Option<RecordCommitmentIntegrityRuntime>>,
 }
 
 impl MemoryStorage {
@@ -472,6 +496,7 @@ impl MemoryStorage {
             cache: RwLock::new(LruCache::new(LRU_CACHE_CAPACITY)),
             record_key: record_key.map(Zeroizing::new),
             commitment_sync: RwLock::new(RecordCommitmentSyncRuntime::default()),
+            commitment_integrity: RwLock::new(None),
         })
     }
 

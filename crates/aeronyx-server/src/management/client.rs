@@ -24,6 +24,8 @@
 //   - wallet_hex keys must be lowercase (hex::encode output).
 //   - record_commitment_sync is aggregate runtime health only. Never add
 //     coordinator identity, endpoint, block hashes, owners, or payload data.
+//   - record_commitment_integrity reports aggregate verification evidence only.
+//     Never add hashes, proposer identity, commitment IDs, or user metadata.
 //   - The body used for signing MUST be the same as what is sent.
 //     Do NOT add fields after signing.
 //
@@ -34,6 +36,7 @@
 //   v2.4.0         - Added chat_relay_status to heartbeat system_stats
 //   v2.3.0         - Added memchain_status to heartbeat system_stats
 //   v2.7.1         - Added compact privacy-safe commitment sync evidence
+//   v2.7.4         - Added compact verified commitment-chain integrity evidence
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -63,9 +66,36 @@ pub struct MemChainHeartbeatStatus {
     pub allow_remote_storage: bool,
     pub max_remote_owners: usize,
     pub current_remote_owners: usize,
+    /// Compact privacy-safe persisted-chain verification evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_commitment_integrity: Option<RecordCommitmentIntegrityHeartbeatStatus>,
     /// Compact privacy-safe Block Sync runtime evidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record_commitment_sync: Option<RecordCommitmentSyncHeartbeatStatus>,
+}
+
+/// Compact verified-chain evidence sent to the central health plane.
+///
+/// This intentionally excludes block hashes, proposer identities, commitment
+/// IDs, owners, payloads, peers, endpoints, routes, and client metadata.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecordCommitmentIntegrityHeartbeatStatus {
+    /// Stable heartbeat contract name.
+    pub contract_version: &'static str,
+    /// `verified` or `not_verified`.
+    pub state: String,
+    /// Time the complete persisted-chain baseline was established.
+    pub baseline_verified_at: Option<u64>,
+    /// Time of the most recent full audit or verified append.
+    pub last_verified_at: Option<u64>,
+    /// Wall-clock duration of the complete baseline audit.
+    pub verification_duration_ms: Option<u64>,
+    /// Blocks covered by the current verified baseline.
+    pub verified_block_count: u64,
+    /// Opaque commitments covered by the current verified baseline.
+    pub verified_commitment_count: u64,
+    /// Last verified one-based height, or zero for an empty chain.
+    pub verified_tip_height: u64,
 }
 
 /// Compact commitment follower status sent to the central health plane.
@@ -572,12 +602,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn commitment_sync_heartbeat_contract_excludes_sensitive_fields() {
+    fn commitment_heartbeat_contracts_exclude_sensitive_fields() {
         let status = MemChainHeartbeatStatus {
             enabled: true,
             allow_remote_storage: false,
             max_remote_owners: 100,
             current_remote_owners: 0,
+            record_commitment_integrity: Some(RecordCommitmentIntegrityHeartbeatStatus {
+                contract_version: "record_commitment_integrity.v1",
+                state: "verified".to_string(),
+                baseline_verified_at: Some(90),
+                last_verified_at: Some(100),
+                verification_duration_ms: Some(7),
+                verified_block_count: 9,
+                verified_commitment_count: 27,
+                verified_tip_height: 9,
+            }),
             record_commitment_sync: Some(RecordCommitmentSyncHeartbeatStatus {
                 contract_version: "record_commitment_sync.v1",
                 role: "follower".to_string(),
@@ -598,24 +638,37 @@ mod tests {
             }),
         };
         let value = serde_json::to_value(status).unwrap();
+        let integrity = &value["record_commitment_integrity"];
+        assert_eq!(integrity["state"], "verified");
+        assert_eq!(integrity["verified_block_count"], 9);
+        assert_eq!(integrity["verified_commitment_count"], 27);
+        assert_eq!(integrity["verified_tip_height"], 9);
         let sync = &value["record_commitment_sync"];
         assert_eq!(sync["state"], "backoff");
         assert_eq!(sync["enabled"], true);
         assert_eq!(sync["last_attempt_at"], 99);
         assert_eq!(sync["last_error_code"], "request_timeout");
-        for forbidden in [
-            "coordinator_node_id",
-            "endpoint",
-            "tip_hash",
-            "record_ids",
-            "recent_events",
-            "owner",
-            "payload",
-        ] {
-            assert!(
-                sync.get(forbidden).is_none(),
-                "unexpected field: {forbidden}"
-            );
+        for section in [integrity, sync] {
+            for forbidden in [
+                "coordinator_node_id",
+                "endpoint",
+                "tip_hash",
+                "block_hash",
+                "proposer",
+                "commitment_ids",
+                "record_ids",
+                "recent_events",
+                "owner",
+                "payload",
+                "peer",
+                "route",
+                "client",
+            ] {
+                assert!(
+                    section.get(forbidden).is_none(),
+                    "unexpected field: {forbidden}"
+                );
+            }
         }
     }
 }

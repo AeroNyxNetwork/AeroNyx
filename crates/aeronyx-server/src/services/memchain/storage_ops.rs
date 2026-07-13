@@ -26,6 +26,8 @@
 //!   tip recovery, aggregate status, and uncommitted blind-record selection
 //! - v2.7.3-BlockAudit: full startup verification of persisted commitment blocks,
 //!   denormalized rows, signatures, continuity, and membership indexes
+//! - v2.7.4-BlockIntegrityStatus: snapshot-consistent audits plus runtime/API
+//!   evidence that advances only with transactionally verified appends
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -67,14 +69,16 @@
 //! v2.7.0-BlockSync     - Added transactional signed commitment chain storage.
 //! v2.7.1-BlockSyncStatus - Added bounded runtime follower lifecycle evidence.
 //! v2.7.3-BlockAudit    - Added fail-closed startup audit for the complete chain.
+//! v2.7.4-BlockIntegrityStatus - Added privacy-safe verified-chain evidence.
 //!
 //! ## Last Modified
+//! v2.7.4-BlockIntegrityStatus - Report and maintain the verified-chain baseline.
 //! v2.7.3-BlockAudit - Verify persisted blocks and indexes before networking starts.
 //! v2.7.1-BlockSyncStatus - Privacy-safe follower status, failures, and recovery.
 //! v2.7.0-BlockSync - Transactional commitment chain, ranges, and safe status.
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, OptionalExtension};
 use tracing::{debug, error, info, warn};
@@ -85,9 +89,9 @@ use aeronyx_core::ledger::{
 };
 
 use super::storage::{
-    embedding_to_bytes, LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentSyncEvent,
-    RecordCommitmentSyncRuntime, RecordCommitmentSyncStatus, StorageStats,
-    COMMITMENT_SYNC_EVENT_CAPACITY,
+    embedding_to_bytes, LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentIntegrityRuntime,
+    RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime, RecordCommitmentSyncStatus,
+    StorageStats, COMMITMENT_SYNC_EVENT_CAPACITY,
 };
 use super::storage_crypto::{
     decrypt_rawlog_content, decrypt_record_content, encrypt_rawlog_content, encrypt_record_content,
@@ -142,6 +146,36 @@ pub struct RecordCommitmentChainStatus {
     pub tip_hash: Option<String>,
     /// Privacy contract exposed to operators and API consumers.
     pub payload_policy: &'static str,
+    /// Runtime evidence for the last complete chain audit and verified appends.
+    pub integrity: RecordCommitmentChainIntegrityStatus,
+}
+
+/// Privacy-safe runtime integrity evidence for the commitment chain.
+///
+/// `verified` means this process completed a full snapshot-consistent audit
+/// and every later tip advance used the same atomic validation path. A process
+/// restart, failed re-audit, or unexpected tip transition resets the state to
+/// `not_verified`; persisted data is never silently repaired.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RecordCommitmentChainIntegrityStatus {
+    /// Stable API/heartbeat contract name.
+    pub contract_version: &'static str,
+    /// `verified` or `not_verified`.
+    pub state: &'static str,
+    /// Time the complete persisted-chain baseline was established.
+    pub baseline_verified_at: Option<u64>,
+    /// Time of the most recent full audit or verified atomic append.
+    pub last_verified_at: Option<u64>,
+    /// Wall-clock duration of the baseline audit.
+    pub verification_duration_ms: Option<u64>,
+    /// Number of blocks covered by the current verified baseline.
+    pub verified_block_count: u64,
+    /// Number of opaque commitments covered by the current verified baseline.
+    pub verified_commitment_count: u64,
+    /// Last verified one-based height, or zero for an empty verified chain.
+    pub verified_tip_height: u64,
+    /// Explicit scope and privacy boundary for operators.
+    pub verification_policy: &'static str,
 }
 
 /// Result of a complete persisted commitment-chain integrity audit.
@@ -660,6 +694,39 @@ impl MemoryStorage {
         }
     }
 
+    /// Returns the privacy-safe chain-integrity baseline for this process.
+    ///
+    /// A persisted flag is intentionally not used: every process lifetime must
+    /// re-establish the baseline from the complete SQLite chain before it may
+    /// report `verified`.
+    pub fn record_commitment_chain_integrity_status(&self) -> RecordCommitmentChainIntegrityStatus {
+        const POLICY: &str = "full snapshot-consistent startup audit plus transactionally verified appends; no block hashes, proposer identities, commitment ids, owners, payloads, peers, endpoints, routes, or client metadata";
+        match *self.commitment_integrity.read() {
+            Some(runtime) => RecordCommitmentChainIntegrityStatus {
+                contract_version: "record_commitment_integrity.v1",
+                state: "verified",
+                baseline_verified_at: Some(runtime.baseline_verified_at),
+                last_verified_at: Some(runtime.last_verified_at),
+                verification_duration_ms: Some(runtime.verification_duration_ms),
+                verified_block_count: runtime.verified_block_count,
+                verified_commitment_count: runtime.verified_commitment_count,
+                verified_tip_height: runtime.verified_tip_height,
+                verification_policy: POLICY,
+            },
+            None => RecordCommitmentChainIntegrityStatus {
+                contract_version: "record_commitment_integrity.v1",
+                state: "not_verified",
+                baseline_verified_at: None,
+                last_verified_at: None,
+                verification_duration_ms: None,
+                verified_block_count: 0,
+                verified_commitment_count: 0,
+                verified_tip_height: 0,
+                verification_policy: POLICY,
+            },
+        }
+    }
+
     /// Re-verifies the complete persisted commitment chain before networking.
     ///
     /// The audit treats the signed payload as canonical, verifies every block
@@ -669,8 +736,15 @@ impl MemoryStorage {
     pub async fn audit_record_commitment_chain(
         &self,
     ) -> Result<RecordCommitmentChainAudit, String> {
-        let conn = self.conn.lock().await;
-        let mut block_statement = conn
+        // Clear first so a failed re-audit can never leave stale `verified`
+        // evidence visible to operators or the central health plane.
+        *self.commitment_integrity.write() = None;
+        let started = Instant::now();
+        let mut conn = self.conn.lock().await;
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| format!("begin commitment audit snapshot: {error}"))?;
+        let mut block_statement = transaction
             .prepare(
                 "SELECT height,block_hash,chain_id,protocol_version,timestamp,
                         prev_block_hash,merkle_root,record_count,proposer,
@@ -678,7 +752,7 @@ impl MemoryStorage {
                  FROM record_commitment_blocks ORDER BY height ASC",
             )
             .map_err(|error| format!("prepare commitment audit blocks: {error}"))?;
-        let mut membership_statement = conn
+        let mut membership_statement = transaction
             .prepare(
                 "SELECT record_id FROM record_block_commitments
                  WHERE block_height=?1 ORDER BY record_id ASC",
@@ -826,7 +900,7 @@ impl MemoryStorage {
         drop(rows);
         drop(block_statement);
         drop(membership_statement);
-        let indexed_total: i64 = conn
+        let indexed_total: i64 = transaction
             .query_row("SELECT COUNT(*) FROM record_block_commitments", [], |row| {
                 row.get(0)
             })
@@ -836,12 +910,31 @@ impl MemoryStorage {
         if indexed_total != commitment_count {
             return Err("commitment audit contains orphaned membership rows".to_string());
         }
+        transaction
+            .commit()
+            .map_err(|error| format!("commit commitment audit snapshot: {error}"))?;
 
-        Ok(RecordCommitmentChainAudit {
+        let report = RecordCommitmentChainAudit {
             block_count,
             commitment_count,
             tip_height: expected_height.saturating_sub(1),
-        })
+        };
+        let verified_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let verification_duration_ms =
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        *self.commitment_integrity.write() = Some(RecordCommitmentIntegrityRuntime {
+            baseline_verified_at: verified_at,
+            last_verified_at: verified_at,
+            verification_duration_ms,
+            verified_block_count: report.block_count,
+            verified_commitment_count: report.commitment_count,
+            verified_tip_height: report.tip_height,
+        });
+        drop(conn);
+        Ok(report)
     }
 
     /// Atomically verifies and appends one node-blind commitment block.
@@ -979,6 +1072,33 @@ impl MemoryStorage {
         transaction
             .commit()
             .map_err(|error| format!("commit commitment block transaction: {error}"))?;
+
+        // Preserve the full-audit guarantee across normal operation. If the
+        // runtime baseline and committed append ever disagree on continuity,
+        // discard the claim and require another complete audit.
+        let appended_at = u64::try_from(now).unwrap_or_default();
+        let mut integrity = self.commitment_integrity.write();
+        let can_advance = integrity
+            .as_ref()
+            .map(|runtime| {
+                runtime.verified_tip_height.saturating_add(1) == block.header.height
+                    && runtime.verified_block_count.saturating_add(1) == block.header.height
+            })
+            .unwrap_or(false);
+        if can_advance {
+            if let Some(runtime) = integrity.as_mut() {
+                runtime.last_verified_at = appended_at;
+                runtime.verified_block_count = runtime.verified_block_count.saturating_add(1);
+                runtime.verified_commitment_count = runtime
+                    .verified_commitment_count
+                    .saturating_add(block.record_ids.len() as u64);
+                runtime.verified_tip_height = block.header.height;
+            }
+        } else if integrity.is_some() {
+            *integrity = None;
+        }
+        drop(integrity);
+        drop(conn);
         info!(
             height = block.header.height,
             commitments = block.record_ids.len(),
@@ -1069,6 +1189,8 @@ impl MemoryStorage {
             Some((height, hash)) if hash.len() == 32 => (height, Some(hex::encode(hash))),
             _ => (0, None),
         };
+        let integrity = self.record_commitment_chain_integrity_status();
+        drop(conn);
         RecordCommitmentChainStatus {
             contract_version: "record_commitment_chain.v1",
             chain_id: hex::encode(AERONYX_MEMCHAIN_MAINNET_CHAIN_ID),
@@ -1077,6 +1199,7 @@ impl MemoryStorage {
             tip_height,
             tip_hash,
             payload_policy: "opaque_record_commitments_only_no_memory_payload_or_owner_metadata",
+            integrity,
         }
     }
 
@@ -1804,6 +1927,13 @@ mod tests {
                 tip_height: 0,
             }
         );
+        let empty_integrity = storage.record_commitment_chain_integrity_status();
+        assert_eq!(empty_integrity.state, "verified");
+        assert_eq!(empty_integrity.verified_block_count, 0);
+        assert_eq!(empty_integrity.verified_commitment_count, 0);
+        assert_eq!(empty_integrity.verified_tip_height, 0);
+        assert!(empty_integrity.baseline_verified_at.is_some());
+        assert!(empty_integrity.verification_duration_ms.is_some());
         let identity = IdentityKeyPair::generate();
         let first = RecordCommitmentBlockV1::new_signed(
             1,
@@ -1856,6 +1986,11 @@ mod tests {
         assert_eq!(status.commitment_count, 3);
         assert_eq!(status.tip_height, 2);
         assert_eq!(status.tip_hash, Some(hex::encode(second.hash())));
+        assert_eq!(status.integrity.state, "verified");
+        assert_eq!(status.integrity.verified_block_count, 2);
+        assert_eq!(status.integrity.verified_commitment_count, 3);
+        assert_eq!(status.integrity.verified_tip_height, 2);
+        assert!(status.integrity.last_verified_at >= status.integrity.baseline_verified_at);
         assert_eq!(
             storage.audit_record_commitment_chain().await.unwrap(),
             RecordCommitmentChainAudit {
@@ -1880,12 +2015,17 @@ mod tests {
             .append_record_commitment_block(&block, None)
             .await
             .unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
         (storage, block)
     }
 
     #[tokio::test]
     async fn test_commitment_chain_audit_rejects_payload_corruption() {
         let (storage, _) = commitment_audit_fixture().await;
+        assert_eq!(
+            storage.record_commitment_chain_integrity_status().state,
+            "verified"
+        );
         {
             let conn = storage.conn_lock().await;
             conn.execute(
@@ -1899,6 +2039,11 @@ mod tests {
             .await
             .unwrap_err()
             .contains("payload decode failed"));
+        let integrity = storage.record_commitment_chain_integrity_status();
+        assert_eq!(integrity.state, "not_verified");
+        assert_eq!(integrity.verified_block_count, 0);
+        assert_eq!(integrity.verified_commitment_count, 0);
+        assert_eq!(integrity.verified_tip_height, 0);
     }
 
     #[tokio::test]

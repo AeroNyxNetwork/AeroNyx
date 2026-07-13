@@ -116,6 +116,8 @@
 //      the local status API and heartbeat without peer or payload metadata.
 //  48. Re-verifies the complete persisted commitment chain and membership
 //      index before any network listener or follower task can start.
+//  49. Publishes the runtime-only verified commitment-chain baseline and keeps
+//      it current after transactionally verified appends.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -139,6 +141,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.4-BlockIntegrityStatus - Privacy-safe verified chain evidence in status and heartbeat
 //   v2.7.3-BlockAudit - Fail-closed startup verification for persisted commitment chains
 //   v2.7.2-BlockSyncStatus - Runtime sync state, fault evidence, and heartbeat
 //   v2.7.1-BlockFollower - Pinned coordinator catch-up with bounded retry/backoff
@@ -1307,10 +1310,12 @@ impl Server {
             .map_err(|error| {
                 ServerError::startup_failed(format!("MemChain commitment integrity audit: {error}"))
             })?;
+        let commitment_integrity = storage.record_commitment_chain_integrity_status();
         info!(
             blocks = commitment_audit.block_count,
             commitments = commitment_audit.commitment_count,
             tip_height = commitment_audit.tip_height,
+            duration_ms = commitment_integrity.verification_duration_ms.unwrap_or(0),
             "[MEMCHAIN_BLOCK] Persisted commitment chain audit passed"
         );
 
@@ -1819,6 +1824,19 @@ impl Server {
                 let max_owners = self.config.memchain.max_remote_owners;
                 let commitment_storage = memchain_storage.clone();
                 Some(Box::new(move || {
+                    let record_commitment_integrity = commitment_storage.as_ref().map(|storage| {
+                        let status = storage.record_commitment_chain_integrity_status();
+                        crate::management::client::RecordCommitmentIntegrityHeartbeatStatus {
+                            contract_version: status.contract_version,
+                            state: status.state.to_string(),
+                            baseline_verified_at: status.baseline_verified_at,
+                            last_verified_at: status.last_verified_at,
+                            verification_duration_ms: status.verification_duration_ms,
+                            verified_block_count: status.verified_block_count,
+                            verified_commitment_count: status.verified_commitment_count,
+                            verified_tip_height: status.verified_tip_height,
+                        }
+                    });
                     let record_commitment_sync = commitment_storage.as_ref().map(|storage| {
                         let status = storage.record_commitment_sync_status();
                         crate::management::client::RecordCommitmentSyncHeartbeatStatus {
@@ -1845,6 +1863,7 @@ impl Server {
                         allow_remote_storage: allow_remote,
                         max_remote_owners: max_owners,
                         current_remote_owners: 0,
+                        record_commitment_integrity,
                         record_commitment_sync,
                     })
                 }))
