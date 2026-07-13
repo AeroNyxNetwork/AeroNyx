@@ -118,6 +118,8 @@
 //! v2.6.1+BlindVectorRecovery - Added all-owner active embedding enumeration so
 //!   node-blind/remote Local-mode nodes can rebuild every isolated vector
 //!   partition after restart without weakening owner-scoped recall.
+//! v2.7.3-BlockAudit - Made v8 commitment tables self-creating for direct
+//!   legacy migration callers before startup integrity verification.
 //! v2.7.1-BlockSyncStatus - Runtime-only bounded follower status and fault evidence.
 //! v2.7.0-BlockSync - Schema v8 commitment blocks and unique membership index.
 // ============================================
@@ -1263,10 +1265,10 @@ impl MemoryStorage {
         }
 
         // v7 → v8: node-blind commitment block persistence.
-        // create_schema() runs before migrations and creates these tables with
-        // IF NOT EXISTS. The explicit migration still verifies their presence
-        // before advancing the version, preventing a partially-created schema
-        // from being reported as healthy.
+        // Normal startup runs create_schema() first, but migration tooling and
+        // compatibility tests may call maybe_migrate() directly against a
+        // minimal legacy database. Keep this migration independently complete
+        // and idempotent instead of depending on caller order.
         let current: u32 = conn
             .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
                 r.get(0)
@@ -1278,6 +1280,34 @@ impl MemoryStorage {
                 "[STORAGE] Migrating schema v{} → v8 (commitment blocks)",
                 current
             );
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS record_commitment_blocks (
+                    height              INTEGER PRIMARY KEY CHECK(height > 0),
+                    block_hash          BLOB NOT NULL UNIQUE CHECK(length(block_hash) = 32),
+                    chain_id            BLOB NOT NULL CHECK(length(chain_id) = 32),
+                    protocol_version    INTEGER NOT NULL,
+                    timestamp           INTEGER NOT NULL,
+                    prev_block_hash     BLOB NOT NULL CHECK(length(prev_block_hash) = 32),
+                    merkle_root         BLOB NOT NULL CHECK(length(merkle_root) = 32),
+                    record_count        INTEGER NOT NULL,
+                    proposer            BLOB NOT NULL CHECK(length(proposer) = 32),
+                    proposer_signature  BLOB NOT NULL CHECK(length(proposer_signature) = 64),
+                    payload             BLOB NOT NULL,
+                    received_from       BLOB,
+                    created_at          INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_record_blocks_hash
+                    ON record_commitment_blocks(block_hash);
+                CREATE TABLE IF NOT EXISTS record_block_commitments (
+                    record_id       BLOB PRIMARY KEY CHECK(length(record_id) = 32),
+                    block_height    INTEGER NOT NULL,
+                    FOREIGN KEY(block_height) REFERENCES record_commitment_blocks(height)
+                        ON DELETE RESTRICT
+                );
+                CREATE INDEX IF NOT EXISTS idx_record_block_commitments_height
+                    ON record_block_commitments(block_height);",
+            )
+            .map_err(|error| format!("v8 migration: create commitment tables: {error}"))?;
             for table in ["record_commitment_blocks", "record_block_commitments"] {
                 let exists = conn
                     .query_row(
@@ -3240,11 +3270,21 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        // maybe_migrate() runs through to the latest schema version: v6 added the
-        // SuperNode tables (asserted above); v7 (node-blind) then bumps to 7. The
-        // v7 records.blind ALTER is skipped here (this minimal DB has no `records`
-        // table) but the version still advances.
-        assert_eq!(v, 7);
+        // maybe_migrate() runs through the latest schema: v6 adds SuperNode,
+        // v7 adds the blind marker, and v8 independently creates commitment
+        // tables even when create_schema() was not called by the migration tool.
+        assert_eq!(v, 8);
+        for table in ["record_commitment_blocks", "record_block_commitments"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                > 0;
+            assert!(exists, "missing migrated table: {table}");
+        }
     }
 
     // ========================================

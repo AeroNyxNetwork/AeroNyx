@@ -24,6 +24,8 @@
 //! - v2.5.3+Isolation: get_active_records_by_context (project_id context filter for /recall)
 //! - v2.7.0-BlockSync: atomic commitment append, bounded range reads, authoritative
 //!   tip recovery, aggregate status, and uncommitted blind-record selection
+//! - v2.7.3-BlockAudit: full startup verification of persisted commitment blocks,
+//!   denormalized rows, signatures, continuity, and membership indexes
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -64,8 +66,10 @@
 //! v2.5.3+Isolation     - 🌟 Added get_active_records_by_context() for /recall context filter
 //! v2.7.0-BlockSync     - Added transactional signed commitment chain storage.
 //! v2.7.1-BlockSyncStatus - Added bounded runtime follower lifecycle evidence.
+//! v2.7.3-BlockAudit    - Added fail-closed startup audit for the complete chain.
 //!
 //! ## Last Modified
+//! v2.7.3-BlockAudit - Verify persisted blocks and indexes before networking starts.
 //! v2.7.1-BlockSyncStatus - Privacy-safe follower status, failures, and recovery.
 //! v2.7.0-BlockSync - Transactional commitment chain, ranges, and safe status.
 
@@ -139,6 +143,40 @@ pub struct RecordCommitmentChainStatus {
     /// Privacy contract exposed to operators and API consumers.
     pub payload_policy: &'static str,
 }
+
+/// Result of a complete persisted commitment-chain integrity audit.
+///
+/// The report is aggregate and contains no commitment, owner, peer, endpoint,
+/// payload, or routing metadata. Audit failures identify only the block height
+/// and violated invariant so startup logs cannot become a privacy side channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordCommitmentChainAudit {
+    /// Number of fully verified persisted blocks.
+    pub block_count: u64,
+    /// Number of commitments verified against the membership index.
+    pub commitment_count: u64,
+    /// Last verified height, or zero for an empty chain.
+    pub tip_height: u64,
+}
+
+struct StoredRecordCommitmentBlockRow {
+    height: i64,
+    block_hash: Vec<u8>,
+    chain_id: Vec<u8>,
+    protocol_version: i64,
+    timestamp: i64,
+    prev_block_hash: Vec<u8>,
+    merkle_root: Vec<u8>,
+    record_count: i64,
+    proposer: Vec<u8>,
+    proposer_signature: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+// A valid V1 block contains at most 256 fixed-size commitments and serializes
+// below 9 KiB. Keep startup decoding bounded even if the SQLite file was
+// replaced or modified outside the process.
+const MAX_STORED_COMMITMENT_BLOCK_BYTES: usize = 16 * 1024;
 
 // ============================================
 // impl MemoryStorage — RawLog Operations
@@ -622,6 +660,190 @@ impl MemoryStorage {
         }
     }
 
+    /// Re-verifies the complete persisted commitment chain before networking.
+    ///
+    /// The audit treats the signed payload as canonical, verifies every block
+    /// from genesis, and requires the denormalized SQL row plus membership
+    /// index to describe that exact payload. Any mismatch fails closed; this
+    /// method never repairs, truncates, or rewrites evidence automatically.
+    pub async fn audit_record_commitment_chain(
+        &self,
+    ) -> Result<RecordCommitmentChainAudit, String> {
+        let conn = self.conn.lock().await;
+        let mut block_statement = conn
+            .prepare(
+                "SELECT height,block_hash,chain_id,protocol_version,timestamp,
+                        prev_block_hash,merkle_root,record_count,proposer,
+                        proposer_signature,payload
+                 FROM record_commitment_blocks ORDER BY height ASC",
+            )
+            .map_err(|error| format!("prepare commitment audit blocks: {error}"))?;
+        let mut membership_statement = conn
+            .prepare(
+                "SELECT record_id FROM record_block_commitments
+                 WHERE block_height=?1 ORDER BY record_id ASC",
+            )
+            .map_err(|error| format!("prepare commitment audit memberships: {error}"))?;
+        let mut rows = block_statement
+            .query([])
+            .map_err(|error| format!("query commitment audit blocks: {error}"))?;
+
+        let mut expected_height = 1u64;
+        let mut expected_prev_hash = GENESIS_PREV_HASH;
+        let mut block_count = 0u64;
+        let mut commitment_count = 0u64;
+
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("read commitment audit block: {error}"))?
+        {
+            let stored = StoredRecordCommitmentBlockRow {
+                height: row
+                    .get(0)
+                    .map_err(|error| format!("read commitment audit height: {error}"))?,
+                block_hash: row
+                    .get(1)
+                    .map_err(|error| format!("read commitment audit hash: {error}"))?,
+                chain_id: row
+                    .get(2)
+                    .map_err(|error| format!("read commitment audit chain: {error}"))?,
+                protocol_version: row
+                    .get(3)
+                    .map_err(|error| format!("read commitment audit version: {error}"))?,
+                timestamp: row
+                    .get(4)
+                    .map_err(|error| format!("read commitment audit timestamp: {error}"))?,
+                prev_block_hash: row
+                    .get(5)
+                    .map_err(|error| format!("read commitment audit previous hash: {error}"))?,
+                merkle_root: row
+                    .get(6)
+                    .map_err(|error| format!("read commitment audit merkle root: {error}"))?,
+                record_count: row
+                    .get(7)
+                    .map_err(|error| format!("read commitment audit count: {error}"))?,
+                proposer: row
+                    .get(8)
+                    .map_err(|error| format!("read commitment audit proposer: {error}"))?,
+                proposer_signature: row
+                    .get(9)
+                    .map_err(|error| format!("read commitment audit signature: {error}"))?,
+                payload: row
+                    .get(10)
+                    .map_err(|error| format!("read commitment audit payload: {error}"))?,
+            };
+
+            let stored_height = u64::try_from(stored.height)
+                .map_err(|_| "commitment audit found an invalid stored height".to_string())?;
+            if stored.payload.len() > MAX_STORED_COMMITMENT_BLOCK_BYTES {
+                return Err(format!(
+                    "commitment audit payload exceeds bound at height {stored_height}"
+                ));
+            }
+            let block =
+                bincode::deserialize::<RecordCommitmentBlockV1>(&stored.payload).map_err(|_| {
+                    format!("commitment audit payload decode failed at height {stored_height}")
+                })?;
+            let canonical_payload = bincode::serialize(&block).map_err(|_| {
+                format!("commitment audit payload encode failed at height {stored_height}")
+            })?;
+            if canonical_payload != stored.payload {
+                return Err(format!(
+                    "commitment audit payload is non-canonical at height {stored_height}"
+                ));
+            }
+
+            block
+                .verify(
+                    &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                    expected_height,
+                    &expected_prev_hash,
+                )
+                .map_err(|error| {
+                    format!(
+                        "commitment audit block validation failed at height {stored_height}: {error}"
+                    )
+                })?;
+
+            let block_height = i64::try_from(block.header.height).map_err(|_| {
+                format!("commitment audit height overflow at height {stored_height}")
+            })?;
+            let block_timestamp = i64::try_from(block.header.timestamp).map_err(|_| {
+                format!("commitment audit timestamp overflow at height {stored_height}")
+            })?;
+            let block_hash = block.hash();
+            if stored.height != block_height
+                || stored.block_hash.as_slice() != block_hash.as_slice()
+                || stored.chain_id.as_slice() != block.header.chain_id.as_slice()
+                || stored.protocol_version != i64::from(block.header.protocol_version)
+                || stored.timestamp != block_timestamp
+                || stored.prev_block_hash.as_slice() != block.header.prev_block_hash.as_slice()
+                || stored.merkle_root.as_slice() != block.header.merkle_root.as_slice()
+                || stored.record_count != i64::from(block.header.record_count)
+                || stored.proposer.as_slice() != block.header.proposer.as_slice()
+                || stored.proposer_signature.as_slice() != block.proposer_signature.as_slice()
+            {
+                return Err(format!(
+                    "commitment audit stored row mismatch at height {stored_height}"
+                ));
+            }
+
+            let mut membership_rows =
+                membership_statement
+                    .query(params![stored.height])
+                    .map_err(|error| {
+                        format!(
+                            "query commitment audit memberships at height {stored_height}: {error}"
+                        )
+                    })?;
+            let mut indexed_record_ids = Vec::with_capacity(block.record_ids.len());
+            while let Some(membership_row) = membership_rows.next().map_err(|error| {
+                format!("read commitment audit membership at height {stored_height}: {error}")
+            })? {
+                let bytes: Vec<u8> = membership_row.get(0).map_err(|error| {
+                    format!("decode commitment audit membership at height {stored_height}: {error}")
+                })?;
+                let record_id: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+                    format!(
+                        "commitment audit membership length {} at height {stored_height}",
+                        bytes.len()
+                    )
+                })?;
+                indexed_record_ids.push(record_id);
+            }
+            if indexed_record_ids != block.record_ids {
+                return Err(format!(
+                    "commitment audit membership index mismatch at height {stored_height}"
+                ));
+            }
+
+            block_count = block_count.saturating_add(1);
+            commitment_count = commitment_count.saturating_add(block.record_ids.len() as u64);
+            expected_height = expected_height.saturating_add(1);
+            expected_prev_hash = block_hash;
+        }
+
+        drop(rows);
+        drop(block_statement);
+        drop(membership_statement);
+        let indexed_total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM record_block_commitments", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| format!("count commitment audit memberships: {error}"))?;
+        let indexed_total = u64::try_from(indexed_total)
+            .map_err(|_| "commitment audit found an invalid membership count".to_string())?;
+        if indexed_total != commitment_count {
+            return Err("commitment audit contains orphaned membership rows".to_string());
+        }
+
+        Ok(RecordCommitmentChainAudit {
+            block_count,
+            commitment_count,
+            tip_height: expected_height.saturating_sub(1),
+        })
+    }
+
     /// Atomically verifies and appends one node-blind commitment block.
     ///
     /// Height uniqueness, previous-hash continuity, proposer signature,
@@ -633,6 +855,10 @@ impl MemoryStorage {
         block: &RecordCommitmentBlockV1,
         received_from: Option<&[u8; 32]>,
     ) -> Result<RecordCommitmentAppendOutcome, String> {
+        let block_height = i64::try_from(block.header.height)
+            .map_err(|_| "commitment block height exceeds SQLite range".to_string())?;
+        let block_timestamp = i64::try_from(block.header.timestamp)
+            .map_err(|_| "commitment block timestamp exceeds SQLite range".to_string())?;
         let mut conn = self.conn.lock().await;
         let transaction = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -641,7 +867,7 @@ impl MemoryStorage {
         let existing_hash: Option<Vec<u8>> = transaction
             .query_row(
                 "SELECT block_hash FROM record_commitment_blocks WHERE height=?1",
-                params![block.header.height as i64],
+                params![block_height],
                 |row| row.get(0),
             )
             .optional()
@@ -656,17 +882,19 @@ impl MemoryStorage {
             ));
         }
 
-        let tip: Option<(u64, Vec<u8>)> = transaction
+        let tip: Option<(i64, Vec<u8>)> = transaction
             .query_row(
                 "SELECT height,block_hash FROM record_commitment_blocks
                  ORDER BY height DESC LIMIT 1",
                 [],
-                |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|error| format!("read commitment chain tip: {error}"))?;
         let (expected_height, expected_prev_hash) = match tip {
             Some((height, hash)) => {
+                let height = u64::try_from(height)
+                    .map_err(|_| "stored commitment tip has invalid height".to_string())?;
                 let hash: [u8; 32] = hash.try_into().map_err(|value: Vec<u8>| {
                     format!("stored tip hash has invalid length {}", value.len())
                 })?;
@@ -697,11 +925,11 @@ impl MemoryStorage {
                   proposer_signature,payload,received_from,created_at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                 params![
-                    block.header.height as i64,
+                    block_height,
                     block.hash().as_slice(),
                     block.header.chain_id.as_slice(),
                     block.header.protocol_version as i64,
-                    block.header.timestamp as i64,
+                    block_timestamp,
                     block.header.prev_block_hash.as_slice(),
                     block.header.merkle_root.as_slice(),
                     block.header.record_count as i64,
@@ -719,7 +947,7 @@ impl MemoryStorage {
                 .execute(
                     "INSERT INTO record_block_commitments (record_id,block_height)
                      VALUES (?1,?2)",
-                    params![record_id.as_slice(), block.header.height as i64],
+                    params![record_id.as_slice(), block_height],
                 )
                 .map_err(|error| {
                     format!(
@@ -768,6 +996,7 @@ impl MemoryStorage {
         limit: usize,
     ) -> Result<Vec<RecordCommitmentBlockV1>, String> {
         let from_height = from_height.max(1);
+        let from_height = i64::try_from(from_height).unwrap_or(i64::MAX);
         let limit = limit.clamp(1, 32);
         let conn = self.conn.lock().await;
         let mut statement = conn
@@ -777,7 +1006,7 @@ impl MemoryStorage {
             )
             .map_err(|error| format!("prepare commitment range query: {error}"))?;
         let rows = statement
-            .query_map(params![from_height as i64, limit as i64], |row| {
+            .query_map(params![from_height, limit as i64], |row| {
                 row.get::<_, Vec<u8>>(0)
             })
             .map_err(|error| format!("query commitment block range: {error}"))?;
@@ -1567,6 +1796,14 @@ mod tests {
     #[tokio::test]
     async fn test_commitment_chain_append_range_and_status() {
         let storage = MemoryStorage::open(":memory:", None).unwrap();
+        assert_eq!(
+            storage.audit_record_commitment_chain().await.unwrap(),
+            RecordCommitmentChainAudit {
+                block_count: 0,
+                commitment_count: 0,
+                tip_height: 0,
+            }
+        );
         let identity = IdentityKeyPair::generate();
         let first = RecordCommitmentBlockV1::new_signed(
             1,
@@ -1619,6 +1856,142 @@ mod tests {
         assert_eq!(status.commitment_count, 3);
         assert_eq!(status.tip_height, 2);
         assert_eq!(status.tip_hash, Some(hex::encode(second.hash())));
+        assert_eq!(
+            storage.audit_record_commitment_chain().await.unwrap(),
+            RecordCommitmentChainAudit {
+                block_count: 2,
+                commitment_count: 3,
+                tip_height: 2,
+            }
+        );
+    }
+
+    async fn commitment_audit_fixture() -> (MemoryStorage, RecordCommitmentBlockV1) {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let identity = IdentityKeyPair::generate();
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            1_700_250_001,
+            GENESIS_PREV_HASH,
+            vec![[0x41; 32], [0x42; 32]],
+            &identity,
+        );
+        storage
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        (storage, block)
+    }
+
+    #[tokio::test]
+    async fn test_commitment_chain_audit_rejects_payload_corruption() {
+        let (storage, _) = commitment_audit_fixture().await;
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute(
+                "UPDATE record_commitment_blocks SET payload=?1 WHERE height=1",
+                params![vec![0xFFu8]],
+            )
+            .unwrap();
+        }
+        assert!(storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap_err()
+            .contains("payload decode failed"));
+    }
+
+    #[tokio::test]
+    async fn test_commitment_chain_audit_bounds_persisted_payload_before_decode() {
+        let (storage, _) = commitment_audit_fixture().await;
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute(
+                "UPDATE record_commitment_blocks SET payload=?1 WHERE height=1",
+                params![vec![0u8; MAX_STORED_COMMITMENT_BLOCK_BYTES + 1]],
+            )
+            .unwrap();
+        }
+        assert!(storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap_err()
+            .contains("payload exceeds bound"));
+    }
+
+    #[tokio::test]
+    async fn test_commitment_chain_audit_rejects_denormalized_row_tampering() {
+        let (storage, _) = commitment_audit_fixture().await;
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute(
+                "UPDATE record_commitment_blocks SET merkle_root=?1 WHERE height=1",
+                params![[0xEEu8; 32].as_slice()],
+            )
+            .unwrap();
+        }
+        assert!(storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap_err()
+            .contains("stored row mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_commitment_chain_audit_rejects_membership_index_tampering() {
+        let (storage, block) = commitment_audit_fixture().await;
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute(
+                "DELETE FROM record_block_commitments WHERE record_id=?1",
+                params![block.record_ids[0].as_slice()],
+            )
+            .unwrap();
+        }
+        assert!(storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap_err()
+            .contains("membership index mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_commitment_chain_audit_reverifies_persisted_signature() {
+        let (storage, mut block) = commitment_audit_fixture().await;
+        block.proposer_signature[0] ^= 0x01;
+        let payload = bincode::serialize(&block).unwrap();
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute(
+                "UPDATE record_commitment_blocks
+                 SET proposer_signature=?1,payload=?2 WHERE height=1",
+                params![block.proposer_signature.as_slice(), payload],
+            )
+            .unwrap();
+        }
+        assert!(storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap_err()
+            .contains("proposer signature is invalid"));
+    }
+
+    #[tokio::test]
+    async fn test_commitment_chain_append_rejects_sqlite_integer_overflow() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let identity = IdentityKeyPair::generate();
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            u64::MAX,
+            GENESIS_PREV_HASH,
+            vec![[0x55; 32]],
+            &identity,
+        );
+        assert!(storage
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap_err()
+            .contains("timestamp exceeds SQLite range"));
     }
 
     #[tokio::test]

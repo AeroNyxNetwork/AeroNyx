@@ -114,6 +114,8 @@
 //      rollback, fork, signature, continuity, endpoint, or transport failure.
 //  47. Publishes bounded privacy-safe commitment sync lifecycle evidence to
 //      the local status API and heartbeat without peer or payload metadata.
+//  48. Re-verifies the complete persisted commitment chain and membership
+//      index before any network listener or follower task can start.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -137,6 +139,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.3-BlockAudit - Fail-closed startup verification for persisted commitment chains
 //   v2.7.2-BlockSyncStatus - Runtime sync state, fault evidence, and heartbeat
 //   v2.7.1-BlockFollower - Pinned coordinator catch-up with bounded retry/backoff
 //   v2.7.0-BlockSync - Node-blind commitment packing, peer range API, coordinator fork guard
@@ -1297,6 +1300,18 @@ impl Server {
         let storage = Arc::new(
             MemoryStorage::open(db_path, Some(record_key))
                 .map_err(|e| ServerError::startup_failed(format!("SQLite: {}", e)))?,
+        );
+        let commitment_audit = storage
+            .audit_record_commitment_chain()
+            .await
+            .map_err(|error| {
+                ServerError::startup_failed(format!("MemChain commitment integrity audit: {error}"))
+            })?;
+        info!(
+            blocks = commitment_audit.block_count,
+            commitments = commitment_audit.commitment_count,
+            tip_height = commitment_audit.tip_height,
+            "[MEMCHAIN_BLOCK] Persisted commitment chain audit passed"
         );
 
         let quantization_enabled =
