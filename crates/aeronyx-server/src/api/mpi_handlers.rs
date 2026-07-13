@@ -54,6 +54,8 @@
 //! ## Last Modified
 //! v1.0.1-SaaSFix - Replaced all direct state.storage/vector_index accesses
 //!                  with Extension extraction throughout all handlers.
+//! v1.0.2-BlindVectorRecovery - Added blind-storage mode, rebuild scope, and
+//!                  persisted-vector coverage to `/api/mpi/status`.
 // ============================================
 
 use std::sync::Arc;
@@ -861,12 +863,16 @@ pub struct MpiStatusResponse {
     pub stats: crate::services::memchain::StorageStats,
     pub vector_index_total: usize,
     pub vector_partitions: usize,
+    pub vector_index_rebuild_scope: String,
+    pub vector_index_coverage_percent: f64,
+    pub vector_index_healthy: bool,
     pub last_block_height: u64,
     pub index_ready: bool,
     pub embed_ready: bool,
     pub embed_dim: Option<usize>,
     pub mvf: MvfMetrics,
     pub remote_storage_enabled: bool,
+    pub blind_storage_enabled: bool,
     pub ner_ready: bool,
     pub graph_enabled: bool,
     pub graph_stats: Option<crate::services::memchain::storage_graph::GraphStats>,
@@ -1010,6 +1016,20 @@ pub async fn mpi_status(
         Mode::Local => "local",
         Mode::Saas => "saas",
     };
+    let vector_index_total = vi.total_vectors();
+    let persisted_vectors = stats.records_with_embedding as usize;
+    let vector_index_coverage_percent = if persisted_vectors == 0 {
+        100.0
+    } else {
+        (vector_index_total.min(persisted_vectors) as f64 / persisted_vectors as f64) * 100.0
+    };
+    let vector_index_rebuild_scope = if state.mode == Mode::Saas {
+        "authenticated_owner_pool"
+    } else if state.blind_storage_enabled || state.allow_remote_storage {
+        "all_active_owners"
+    } else {
+        "local_owner"
+    };
 
     (
         StatusCode::OK,
@@ -1017,8 +1037,11 @@ pub async fn mpi_status(
             memchain_enabled: true,
             mode: mode_str.into(),
             stats,
-            vector_index_total: vi.total_vectors(),
+            vector_index_total,
             vector_partitions: vi.partition_count(),
+            vector_index_rebuild_scope: vector_index_rebuild_scope.into(),
+            vector_index_coverage_percent,
+            vector_index_healthy: vector_index_total == persisted_vectors,
             last_block_height: height,
             index_ready: state.index_ready.load(std::sync::atomic::Ordering::Relaxed),
             embed_ready: state.embed_engine.is_some(),
@@ -1036,6 +1059,7 @@ pub async fn mpi_status(
                 weights_version: wv,
             },
             remote_storage_enabled: state.allow_remote_storage,
+            blind_storage_enabled: state.blind_storage_enabled,
             ner_ready: state.ner_engine.is_some(),
             graph_enabled: state.graph_enabled,
             graph_stats: gs,

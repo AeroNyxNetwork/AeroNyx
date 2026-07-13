@@ -97,6 +97,9 @@
 //  40. Promotes blind relay runtime evidence to a top-level heartbeat
 //      discovery_status field so backend/nodeboard can track encrypted relay
 //      participation without parsing routes, endpoints, payloads, or peer ids.
+//  41. Rebuilds every authenticated owner's isolated vector partition on
+//      node-blind/remote MemChain nodes after restart; local-only nodes retain
+//      the historical single-owner startup path.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -116,6 +119,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v1.2.7-MemChainBlindVectorRecovery - Restore all owner/model vector partitions on blind storage nodes
 //   v1.2.6-BlindRelayRuntimeHeartbeat - Promote aggregate blind relay runtime evidence in discovery_status heartbeat
 //   v1.2.5-RouteGovernanceHeartbeat - Promote aggregate route governance in discovery_status heartbeat
 //   v1.2.4-BlindRelayProbeRecoveryCooldown - Reprobe faster until two-hop delivery proof is healthy
@@ -1233,10 +1237,19 @@ impl Server {
         });
 
         let owner = self.identity.public_key_bytes();
-        let records_with_model = storage.get_records_with_embedding(&owner).await;
-        let rebuild_count = records_with_model.len();
+        let rebuild_all_owners =
+            self.config.memchain.blind_storage_enabled || self.config.memchain.allow_remote_storage;
+        let records_with_model = if rebuild_all_owners {
+            storage.get_all_records_with_embedding().await
+        } else {
+            storage.get_records_with_embedding(&owner).await
+        };
+        let mut rebuilt_owners = std::collections::HashSet::new();
+        let mut rebuilt_partitions = std::collections::HashSet::new();
         for (r, model) in records_with_model {
             if r.has_embedding() {
+                rebuilt_owners.insert(r.owner);
+                rebuilt_partitions.insert((r.owner, model.clone()));
                 vector_index.upsert(
                     r.record_id,
                     r.embedding.clone(),
@@ -1247,42 +1260,58 @@ impl Server {
                 );
             }
         }
+        let rebuild_count = vector_index.total_vectors();
 
-        info!(db = %db_path, records = storage.count().await, vectors = rebuild_count, "[MEMCHAIN] SQLite + VectorIndex initialized");
+        info!(
+            db = %db_path,
+            records = storage.count().await,
+            vectors = rebuild_count,
+            owners = rebuilt_owners.len(),
+            partitions = rebuilt_partitions.len(),
+            rebuild_scope = if rebuild_all_owners { "all_active_owners" } else { "local_owner" },
+            "[MEMCHAIN] SQLite + VectorIndex initialized"
+        );
 
         if quantization_enabled && rebuild_count > 0 {
-            let owner_hex = hex::encode(owner);
-            let model_name = std::path::Path::new(&self.config.memchain.embed_model_path)
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or("minilm-l6-v2");
-            let cal_key = format!("{}:{}:{}", QUANTIZER_CAL_KEY_PREFIX, owner_hex, model_name);
+            // Each owner/model pair is an independent security partition. A
+            // blind storage node may host many such partitions, so restoring
+            // only the node identity's quantizer would silently degrade remote
+            // recall after restart.
+            for (partition_owner, model_name) in rebuilt_partitions {
+                let owner_hex = hex::encode(partition_owner);
+                let cal_key = format!("{}:{}:{}", QUANTIZER_CAL_KEY_PREFIX, owner_hex, model_name);
 
-            let restored = {
-                let conn = storage.conn_lock().await;
-                let cal_data: Option<Vec<u8>> = conn
-                    .query_row(
-                        "SELECT value FROM chain_state WHERE key = ?1",
-                        rusqlite::params![cal_key],
-                        |row| row.get::<_, Vec<u8>>(0),
-                    )
-                    .optional()
-                    .unwrap_or(None);
-                drop(conn);
-                if let Some(data) = cal_data {
-                    let ok = vector_index.restore_quantizer(&owner, model_name, &data);
-                    if ok {
-                        info!(model = model_name, "[VECTOR] Quantizer restored");
+                let restored = {
+                    let conn = storage.conn_lock().await;
+                    let cal_data: Option<Vec<u8>> = conn
+                        .query_row(
+                            "SELECT value FROM chain_state WHERE key = ?1",
+                            rusqlite::params![cal_key],
+                            |row| row.get::<_, Vec<u8>>(0),
+                        )
+                        .optional()
+                        .unwrap_or(None);
+                    drop(conn);
+                    if let Some(data) = cal_data {
+                        vector_index.restore_quantizer(&partition_owner, &model_name, &data)
+                    } else {
+                        false
                     }
-                    ok
-                } else {
-                    false
-                }
-            };
+                };
 
-            if !restored {
-                vector_index.calibrate_partition(&owner, model_name);
-                if let Some(cal_bytes) = vector_index.get_quantizer_bytes(&owner, model_name) {
+                if restored {
+                    info!(
+                        owner = %owner_hex,
+                        model = %model_name,
+                        "[VECTOR] Quantizer restored"
+                    );
+                    continue;
+                }
+
+                vector_index.calibrate_partition(&partition_owner, &model_name);
+                if let Some(cal_bytes) =
+                    vector_index.get_quantizer_bytes(&partition_owner, &model_name)
+                {
                     let conn = storage.conn_lock().await;
                     let _ = conn.execute(
                         "INSERT OR REPLACE INTO chain_state (key, value) VALUES (?1, ?2)",
@@ -1290,7 +1319,8 @@ impl Server {
                     );
                     drop(conn);
                     info!(
-                        model = model_name,
+                        owner = %owner_hex,
+                        model = %model_name,
                         "[VECTOR] Quantizer calibrated and persisted"
                     );
                 }

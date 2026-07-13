@@ -109,6 +109,9 @@
 //!   P2: find_records_by_content → pub(crate), hard-cap limit at 100.
 //!   P2: record_key wrapped in Zeroizing<[u8;32]>.
 //!   P3: conn_lock() → pub(crate). row_to_record returns Err on bad BLOB length.
+//! v2.6.1+BlindVectorRecovery - Added all-owner active embedding enumeration so
+//!   node-blind/remote Local-mode nodes can rebuild every isolated vector
+//!   partition after restart without weakening owner-scoped recall.
 // ============================================
 
 use std::collections::HashMap;
@@ -1735,6 +1738,44 @@ impl MemoryStorage {
         .unwrap_or_default()
     }
 
+    /// Return every active record that has a persisted embedding.
+    ///
+    /// This is intentionally separate from `get_records_with_embedding(owner)`:
+    /// normal Local-mode nodes must keep the historical single-owner rebuild,
+    /// while node-blind/remote storage nodes share one SQLite database across
+    /// authenticated owners and therefore need to restore every owner/model
+    /// partition after process restart.
+    ///
+    /// # Security
+    /// The returned records remain partitioned by `record.owner` when inserted
+    /// into `VectorIndex`; recall still supplies an authenticated owner and can
+    /// never search another owner's partition. Blind record content also stays
+    /// opaque because `row_to_record` never decrypts rows marked `blind`.
+    pub async fn get_all_records_with_embedding(&self) -> Vec<(MemoryRecord, String)> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT record_id,owner,timestamp,layer,topic_tags,source_ai,
+                    status,supersedes,encrypted_content,embedding,signature,access_count,
+                    positive_feedback,negative_feedback,conflict_with,embedding_model,blind
+             FROM records WHERE status=0 AND embedding IS NOT NULL
+             ORDER BY owner ASC, timestamp DESC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error=%e, "[STORAGE] Prepare all-owner embedding rebuild failed");
+                return Vec::new();
+            }
+        };
+        let rk = self.record_key.as_ref().map(|v| &**v);
+        stmt.query_map([], |row| {
+            let record = Self::row_to_record(row, rk)?;
+            let model: String = row.get(15)?;
+            Ok((record, model))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
     // ========================================
     // Lifecycle
     // ========================================
@@ -2295,6 +2336,41 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn test_all_owner_embedding_rebuild_preserves_owner_and_status_scope() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let owner_a = [0xA1; 32];
+        let owner_b = [0xB2; 32];
+        let active_a = make_rec_owner(100, owner_a, MemoryLayer::Episode);
+        let active_b = make_rec_owner(200, owner_b, MemoryLayer::Knowledge);
+        let revoked_b = make_rec_owner(300, owner_b, MemoryLayer::Archive);
+
+        assert!(s.insert(&active_a, "model-a").await);
+        assert!(s.insert(&active_b, "model-b").await);
+        assert!(s.insert(&revoked_b, "model-b").await);
+        assert!(s.revoke(&revoked_b.record_id).await);
+
+        let local_only = s.get_records_with_embedding(&owner_a).await;
+        assert_eq!(
+            local_only.len(),
+            1,
+            "legacy owner-scoped rebuild is unchanged"
+        );
+        assert_eq!(local_only[0].0.owner, owner_a);
+
+        let all = s.get_all_records_with_embedding().await;
+        assert_eq!(all.len(), 2, "revoked records must not re-enter the index");
+        assert!(all.iter().any(|(record, model)| {
+            record.record_id == active_a.record_id && record.owner == owner_a && model == "model-a"
+        }));
+        assert!(all.iter().any(|(record, model)| {
+            record.record_id == active_b.record_id && record.owner == owner_b && model == "model-b"
+        }));
+        assert!(!all
+            .iter()
+            .any(|(record, _)| record.record_id == revoked_b.record_id));
     }
 
     #[tokio::test]
