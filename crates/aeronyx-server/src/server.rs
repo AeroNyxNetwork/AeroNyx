@@ -144,6 +144,9 @@
 //      relay logs so node operators cannot reconstruct a social graph.
 //  61. Mounts the signature-authenticated encrypted blob API on loopback/VPN
 //      client listeners only; the public node-peer listener remains unchanged.
+//  62. Delivers bounded expiry notifications during authenticated chat pulls,
+//      retains failed writes for retry, and treats UDP write failure as an
+//      offline delivery failure instead of a successful route.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -182,6 +185,9 @@
 //   - Chat relay logs and heartbeat capacity telemetry are aggregate-only.
 //     Never add message IDs, wallet prefixes, sender/receiver keys, blob IDs,
 //     session IDs, payload data, or endpoint values to those surfaces.
+//   - Chat expiry notifications are bounded durable control events. Mark them
+//     pushed only after a successful transport write and preserve `has_more`
+//     whenever a page remains or delivery/marking fails.
 //   - Voice relay logs follow the same blind-node boundary: no wallet target,
 //     virtual IP, session ID, endpoint, or raw cryptographic error values.
 //   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
@@ -191,6 +197,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.21-OfflineControlReliability - Bounded ChatExpired pull delivery
 //   v2.7.20-ChatRelayStorageGuard - Global durable quotas and route-safe telemetry
 //   v2.7.19-PublicApiBounds - Shared peer decoder and pre-parse request ceilings
 //   v2.7.18-BoundedPeerReads - Bounded untrusted peer responses and recovery files
@@ -339,7 +346,9 @@ use crate::management::{
     CommandHandler, HeartbeatReporter, ManagementClient, SessionReporter,
 };
 use crate::miner::ReflectionMiner;
-use crate::services::chat_relay::{derive_node_secret, ChatRelayService};
+use crate::services::chat_relay::{
+    derive_node_secret, ChatRelayService, ExpiredNotification, MAX_CHAT_ACK_MESSAGE_IDS,
+};
 use crate::services::memchain::derive_rawlog_key;
 use crate::services::memchain::derive_record_key;
 use crate::services::memchain::EmbedEngine;
@@ -5230,14 +5239,21 @@ impl Server {
                     let device_count = target_routes.len();
                     for (target_sid, _endpoint) in &target_routes {
                         if let Some(target_session) = sessions.get(target_sid) {
-                            Self::send_to_session(
+                            if Self::send_to_session(
                                 &MemChainMessage::ChatRelay(envelope.clone()),
                                 &target_session,
                                 udp,
                                 crypto,
                             )
-                            .await;
-                            all_failed = false;
+                            .await
+                            {
+                                all_failed = false;
+                            } else {
+                                warn!(
+                                    reason = "transport_write_failed",
+                                    "[CHAT_RELAY] Online delivery failed"
+                                );
+                            }
                         } else {
                             relay.wallet_routes.remove_session(target_sid);
                             debug!("[CHAT_RELAY] Pruned stale route during delivery");
@@ -5319,8 +5335,28 @@ impl Server {
                     .wallet_routes
                     .announce(&wallet, session.id.clone(), session.client_endpoint);
                 match relay.pull_pending(&wallet, after_timestamp, &cursor, limit) {
-                    Ok((messages, has_more)) => {
+                    Ok((messages, message_has_more)) => {
                         let envelopes: Vec<_> = messages.into_iter().map(|m| m.envelope).collect();
+                        let mut has_more = message_has_more;
+                        match relay.pull_pending_notifications(&wallet) {
+                            Ok((notifications, notification_has_more)) => {
+                                let delivery_complete = Self::push_expired_notifications(
+                                    relay,
+                                    notifications,
+                                    session,
+                                    udp,
+                                    crypto,
+                                )
+                                .await;
+                                has_more |= notification_has_more || !delivery_complete;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    reason = e.reason_bucket(),
+                                    "[CHAT_RELAY] Expiry notification pull failed"
+                                );
+                            }
+                        }
                         let resp = MemChainMessage::ChatPullResponse {
                             envelopes,
                             has_more,
@@ -5345,6 +5381,13 @@ impl Server {
                     return;
                 };
                 if message_ids.is_empty() {
+                    return;
+                }
+                if message_ids.len() > MAX_CHAT_ACK_MESSAGE_IDS {
+                    warn!(
+                        reason = "ack_batch_too_large",
+                        "[CHAT_RELAY] ChatAck rejected"
+                    );
                     return;
                 }
                 let mut id_hasher = Sha256::new();
@@ -5479,17 +5522,75 @@ impl Server {
         }
     }
 
+    /// Sends one bounded page of durable `ChatExpired` control events.
+    ///
+    /// Successfully written rows are marked in one atomic database batch.
+    /// Unsent or unmarkable rows remain pending and are retried on a later
+    /// authenticated pull. Payloads and routing identifiers never enter logs.
+    async fn push_expired_notifications(
+        relay: &ChatRelayService,
+        notifications: Vec<ExpiredNotification>,
+        session: &Arc<crate::services::Session>,
+        udp: &Arc<UdpTransport>,
+        crypto: &DefaultTransportCrypto,
+    ) -> bool {
+        let offered = notifications.len();
+        if offered == 0 {
+            return true;
+        }
+
+        let mut pushed_ids = Vec::with_capacity(offered);
+        for notification in notifications {
+            let message_ids = match notification.message_ids() {
+                Ok(message_ids) => message_ids,
+                Err(e) => {
+                    warn!(
+                        reason = e.reason_bucket(),
+                        "[CHAT_RELAY] Expiry notification decode failed"
+                    );
+                    break;
+                }
+            };
+            let frame = MemChainMessage::ChatExpired {
+                message_ids,
+                receiver: notification.receiver,
+            };
+            if !Self::send_to_session(&frame, session, udp, crypto).await {
+                break;
+            }
+            pushed_ids.push(notification.id);
+        }
+
+        let pushed = pushed_ids.len();
+        if pushed > 0 {
+            if let Err(e) = relay.mark_notifications_pushed(&pushed_ids) {
+                warn!(
+                    reason = e.reason_bucket(),
+                    "[CHAT_RELAY] Expiry notification mark failed"
+                );
+                return false;
+            }
+            debug!(offered, pushed, "[CHAT_RELAY] Expiry notifications written");
+        }
+
+        pushed == offered
+    }
+
+    /// Writes one encrypted MemChain frame to a client session.
+    ///
+    /// The boolean reports only local encode/encrypt/socket-write success; it
+    /// is not an application-level delivery receipt.
     async fn send_to_session(
         msg: &MemChainMessage,
         session: &Arc<crate::services::Session>,
         udp: &Arc<UdpTransport>,
         crypto: &DefaultTransportCrypto,
-    ) {
+    ) -> bool {
         let plaintext = match encode_memchain(msg) {
             Ok(p) => p,
-            Err(e) => {
-                error!("[MEMCHAIN_TX] Encode: {}", e);
-                return;
+            Err(_) => {
+                error!(reason = "encode_failed", "[MEMCHAIN_TX] Frame write failed");
+                return false;
             }
         };
         let counter = session.next_tx_counter();
@@ -5502,15 +5603,27 @@ impl Server {
             &mut encrypted,
         ) {
             Ok(l) => l,
-            Err(e) => {
-                error!("[MEMCHAIN_TX] Encrypt: {}", e);
-                return;
+            Err(_) => {
+                error!(
+                    reason = "encrypt_failed",
+                    "[MEMCHAIN_TX] Frame write failed"
+                );
+                return false;
             }
         };
         encrypted.truncate(len);
         let pkt = DataPacket::new(*session.id.as_bytes(), counter, encrypted);
         let bytes = encode_data_packet(&pkt).to_vec();
-        let _ = udp.send(&bytes, &session.client_endpoint).await;
+        match udp.send(&bytes, &session.client_endpoint).await {
+            Ok(_) => true,
+            Err(_) => {
+                warn!(
+                    reason = "socket_write_failed",
+                    "[MEMCHAIN_TX] Frame write failed"
+                );
+                false
+            }
+        }
     }
 
     // ============================================
