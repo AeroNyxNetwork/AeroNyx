@@ -137,6 +137,8 @@
 //  58. Bounds every discovery, relay-ACK, public-IP, bootstrap, and peer-cache
 //      read so an untrusted HTTP peer or oversized local recovery file cannot
 //      grow node memory without a protocol-defined ceiling.
+//  59. Uses the shared API-layer bounded decoder for every peer acknowledgement
+//      and applies route-specific public request ceilings before JSON parsing.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -166,9 +168,10 @@
 //     may rotate their signed endpoints, but unpinned peers stay evidence-only.
 //   - The minimum verified witness count is an operator startup threshold over
 //     distinct pins. It is not consensus, quorum, finality, or fork choice.
-//   - Outbound peer HTTP responses and discovery recovery files must pass the
-//     bounded readers in this file. Never reintroduce response.json(),
-//     response.bytes(), response.text(), or tokio::fs::read() on these paths.
+//   - Outbound peer HTTP responses must pass the shared bounded readers in
+//     api/mod.rs; discovery recovery files use this file's bounded file reader.
+//     Never reintroduce response.json(), response.bytes(), response.text(), or
+//     tokio::fs::read() on these paths.
 //   - encrypted_message_counter is aggregate only and never stores payload,
 //     destination, DNS, URL, voucher, wallet, or client public IP details.
 //   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
@@ -178,6 +181,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.19-PublicApiBounds - Shared peer decoder and pre-parse request ceilings
 //   v2.7.18-BoundedPeerReads - Bounded untrusted peer responses and recovery files
 //   v2.7.17-SectionSafeAuth - Resolve API secrets before Server construction
 //   v2.7.16-WitnessThreshold - Enforced an operator-defined strict witness threshold
@@ -251,7 +255,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
@@ -309,6 +312,9 @@ use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
 use crate::api::voice::build_voice_router;
 use crate::api::vpn_health::{
     build_vpn_health_router, collect_node_operator_status_value, collect_vpn_health_value,
+};
+use crate::api::{
+    decode_bounded_json_response, read_bounded_http_response, PEER_ACK_RESPONSE_MAX_BYTES,
 };
 use crate::config::{
     DiscoveryConfig, MemChainConfig, MemChainMode, ServerConfig, VectorQuantizationMode,
@@ -368,9 +374,6 @@ const DISCOVERY_GOSSIP_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 
 /// Bootstrap/cache snapshots may contain thousands of signed descriptors.
 const DISCOVERY_SNAPSHOT_MAX_BYTES: usize = 8 * 1024 * 1024;
-
-/// Relay acknowledgements contain only a few booleans and identifiers.
-const PEER_ACK_RESPONSE_MAX_BYTES: usize = 16 * 1024;
 
 /// Return the privacy-safe reason a persisted MemChain record must not enter
 /// the in-memory recall index.
@@ -464,34 +467,6 @@ enum CommitmentWitnessStartupBlockReason {
     RemoteAhead,
     Unavailable,
     ThresholdUnmet,
-}
-
-/// Privacy-safe failure classes for bounded responses from untrusted peers.
-///
-/// Deliberately avoid carrying response bodies or parser details: callers may
-/// expose these reasons through health telemetry, and peer-controlled content
-/// must never become an accidental logging channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BoundedHttpResponseError {
-    TooLarge,
-    BodyRead,
-    JsonDecode,
-}
-
-impl BoundedHttpResponseError {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::TooLarge => "response_too_large",
-            Self::BodyRead => "response_body_read_failed",
-            Self::JsonDecode => "response_json_decode_failed",
-        }
-    }
-}
-
-impl std::fmt::Display for BoundedHttpResponseError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
 }
 
 impl CommitmentWitnessStartupBlockReason {
@@ -2343,9 +2318,7 @@ impl Server {
                 }
                 if let Ok(resp) = req.send().await {
                     if resp.status().is_success() {
-                        match Self::read_bounded_http_response(resp, PUBLIC_IP_RESPONSE_MAX_BYTES)
-                            .await
-                        {
+                        match read_bounded_http_response(resp, PUBLIC_IP_RESPONSE_MAX_BYTES).await {
                             Ok(body) => {
                                 let Ok(ip_str) = std::str::from_utf8(&body) else {
                                     debug!(source = %url, "[NET] Public IP response was not UTF-8");
@@ -2457,11 +2430,8 @@ impl Server {
                     Ok(response) => {
                         let status = response.status();
                         if status.is_success() {
-                            match Self::read_bounded_http_response(
-                                response,
-                                DISCOVERY_SNAPSHOT_MAX_BYTES,
-                            )
-                            .await
+                            match read_bounded_http_response(response, DISCOVERY_SNAPSHOT_MAX_BYTES)
+                                .await
                             {
                                 Ok(bytes) => {
                                     Self::import_bootstrap_snapshot_bytes(
@@ -3638,7 +3608,7 @@ impl Server {
         let snapshot_response = snapshot_response
             .error_for_status()
             .map_err(|e| Self::classify_reqwest_error("snapshot_status", &e))?;
-        let response = Self::decode_bounded_json_response::<GossipResponse>(
+        let response = decode_bounded_json_response::<GossipResponse>(
             snapshot_response,
             DISCOVERY_GOSSIP_RESPONSE_MAX_BYTES,
         )
@@ -3701,7 +3671,7 @@ impl Server {
 
         match client.post(url).json(&request).send().await {
             Ok(response) if response.status().is_success() => {
-                match Self::decode_bounded_json_response::<PeerBlindRelayResponse>(
+                match decode_bounded_json_response::<PeerBlindRelayResponse>(
                     response,
                     PEER_ACK_RESPONSE_MAX_BYTES,
                 )
@@ -3833,7 +3803,7 @@ impl Server {
                 ) {
                     match client.post(&url).json(&request).send().await {
                         Ok(response) if response.status().is_success() => {
-                            match Self::decode_bounded_json_response::<PeerBlindRelayResponse>(
+                            match decode_bounded_json_response::<PeerBlindRelayResponse>(
                                 response,
                                 PEER_ACK_RESPONSE_MAX_BYTES,
                             )
@@ -3987,7 +3957,7 @@ impl Server {
 
                 match client.post(&url).json(&request).send().await {
                     Ok(response) if response.status().is_success() => {
-                        match Self::decode_bounded_json_response::<PeerBlindRelayResponse>(
+                        match decode_bounded_json_response::<PeerBlindRelayResponse>(
                             response,
                             PEER_ACK_RESPONSE_MAX_BYTES,
                         )
@@ -4263,47 +4233,6 @@ impl Server {
         hasher.finalize().to_vec()
     }
 
-    /// Read an untrusted HTTP response without allowing a peer to grow the
-    /// process heap without bound. `Content-Length` is only an early reject;
-    /// the streaming check remains authoritative because the header may be
-    /// absent, incorrect, or refer to compressed bytes.
-    async fn read_bounded_http_response(
-        mut response: reqwest::Response,
-        max_bytes: usize,
-    ) -> std::result::Result<Vec<u8>, BoundedHttpResponseError> {
-        if response
-            .content_length()
-            .is_some_and(|length| length > max_bytes as u64)
-        {
-            return Err(BoundedHttpResponseError::TooLarge);
-        }
-
-        let initial_capacity = response
-            .content_length()
-            .unwrap_or_default()
-            .min(max_bytes as u64) as usize;
-        let mut body = Vec::with_capacity(initial_capacity);
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| BoundedHttpResponseError::BodyRead)?
-        {
-            if chunk.len() > max_bytes.saturating_sub(body.len()) {
-                return Err(BoundedHttpResponseError::TooLarge);
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(body)
-    }
-
-    async fn decode_bounded_json_response<T: DeserializeOwned>(
-        response: reqwest::Response,
-        max_bytes: usize,
-    ) -> std::result::Result<T, BoundedHttpResponseError> {
-        let body = Self::read_bounded_http_response(response, max_bytes).await?;
-        serde_json::from_slice(&body).map_err(|_| BoundedHttpResponseError::JsonDecode)
-    }
-
     /// Read a recovery snapshot through a fixed-length view of the file.
     /// Metadata provides an inexpensive rejection, while `take(max + 1)` also
     /// catches a file that grows after the metadata check.
@@ -4428,7 +4357,7 @@ impl Server {
 
             match response {
                 Ok(response) if response.status().is_success() => {
-                    match Self::decode_bounded_json_response::<PeerChatRelayResponse>(
+                    match decode_bounded_json_response::<PeerChatRelayResponse>(
                         response,
                         PEER_ACK_RESPONSE_MAX_BYTES,
                     )
@@ -5771,10 +5700,13 @@ impl std::fmt::Debug for Server {
 mod tests {
     use super::{
         commitment_witness_startup_decision, memchain_index_rejection_reason, prefix_to_netmask,
-        unix_now_secs, BoundedHttpResponseError, CommitmentWitnessStartupBlockReason,
-        CommitmentWitnessStartupDecision, Server, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
+        unix_now_secs, CommitmentWitnessStartupBlockReason, CommitmentWitnessStartupDecision,
+        Server, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
     };
     use crate::api::memchain_peer::CommitmentReconciliationOutcome;
+    use crate::api::{
+        decode_bounded_json_response, read_bounded_http_response, BoundedHttpResponseError,
+    };
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
     use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
     use aeronyx_core::protocol::chat::{ChatContentType, ChatEnvelope};
@@ -6485,7 +6417,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let decoded = Server::decode_bounded_json_response::<serde_json::Value>(small, 256)
+        let decoded = decode_bounded_json_response::<serde_json::Value>(small, 256)
             .await
             .unwrap();
         assert_eq!(decoded["accepted"], true);
@@ -6496,7 +6428,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            Server::read_bounded_http_response(oversized, 256)
+            read_bounded_http_response(oversized, 256)
                 .await
                 .unwrap_err(),
             BoundedHttpResponseError::TooLarge
@@ -6508,7 +6440,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            Server::decode_bounded_json_response::<serde_json::Value>(malformed, 256)
+            decode_bounded_json_response::<serde_json::Value>(malformed, 256)
                 .await
                 .unwrap_err(),
             BoundedHttpResponseError::JsonDecode

@@ -50,6 +50,9 @@
 //!   It is merged into the combined API router in server.rs::start_combined_api().
 //! - memchain_peer.rs is a public node-peer surface, not a client memory API.
 //!   It must keep PeerStore admission and return commitments only.
+//! - Every outbound peer response must be read through the bounded helpers in
+//!   this module. `Content-Length` is advisory; the streaming byte count is the
+//!   authoritative memory boundary and peer-controlled bodies are never logged.
 //!
 //! ## Last Modified
 //! v0.3.0 - Initial Agent API for MemChain Phase 1
@@ -70,6 +73,88 @@
 //! v0.1.0-ChatPeerRelay - Added chat_peer submodule:
 //!   POST /api/chat/peer/relay for inter-node encrypted envelope relay.
 //! v2.7.0-BlockSync - Added authenticated `/api/memchain/peer/block-range`.
+//! v2.7.19-PublicApiBounds - Centralized bounded peer HTTP response decoding.
+
+use serde::de::DeserializeOwned;
+
+/// Privacy-safe failure classes for bounded responses from untrusted peers.
+///
+/// Deliberately avoid carrying response bodies or parser details: callers may
+/// expose these reasons through health telemetry, and peer-controlled content
+/// must never become an accidental logging channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundedHttpResponseError {
+    /// The declared or streamed response exceeded its protocol ceiling.
+    TooLarge,
+    /// The response stream failed before a complete bounded body was read.
+    BodyRead,
+    /// The bounded body did not match the expected JSON response schema.
+    JsonDecode,
+}
+
+impl BoundedHttpResponseError {
+    /// Returns a stable privacy-safe telemetry bucket.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::TooLarge => "response_too_large",
+            Self::BodyRead => "response_body_read_failed",
+            Self::JsonDecode => "response_json_decode_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for BoundedHttpResponseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Relay acknowledgements contain only booleans, counters, and reason codes.
+pub(crate) const PEER_ACK_RESPONSE_MAX_BYTES: usize = 16 * 1024;
+
+/// Reads an untrusted HTTP response without allowing a peer to grow the
+/// process heap without bound.
+///
+/// `Content-Length` is only an early rejection. The streaming check remains
+/// authoritative because the header may be absent, incorrect, or refer to
+/// compressed bytes.
+pub(crate) async fn read_bounded_http_response(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, BoundedHttpResponseError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(BoundedHttpResponseError::TooLarge);
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .unwrap_or_default()
+        .min(max_bytes as u64) as usize;
+    let mut body = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| BoundedHttpResponseError::BodyRead)?
+    {
+        if chunk.len() > max_bytes.saturating_sub(body.len()) {
+            return Err(BoundedHttpResponseError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Decodes one schema-checked JSON response after enforcing its byte ceiling.
+pub(crate) async fn decode_bounded_json_response<T: DeserializeOwned>(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<T, BoundedHttpResponseError> {
+    let body = read_bounded_http_response(response, max_bytes).await?;
+    serde_json::from_slice(&body).map_err(|_| BoundedHttpResponseError::JsonDecode)
+}
 
 // ── Core MPI module (state, auth, router) ──
 pub mod mpi;

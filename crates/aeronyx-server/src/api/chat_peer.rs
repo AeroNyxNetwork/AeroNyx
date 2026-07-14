@@ -96,8 +96,14 @@
 //! - Relay logs are route-safe: they must not include message IDs, receiver
 //!   prefixes, endpoint URLs, raw transport errors, route IDs, encrypted blobs,
 //!   or payload-derived strings. Use stable reason buckets only.
+//! - Route-specific request ceilings and concurrency gates must wrap the Axum
+//!   handlers. Putting them inside a `Json<T>` handler is too late because an
+//!   attacker can consume memory and parser work before the guard executes.
+//! - Next-hop acknowledgement bodies are untrusted and must use the shared
+//!   bounded decoder. Never call `Response::json()` directly on peer traffic.
 //!
 //! ## Last Modified
+//! v0.24.0-PublicRequestBounds - Bound peer bodies and concurrency before JSON extraction
 //! v0.23.0-RouteSafeRelayLogs - Remove user/route-adjacent values and raw transport errors from chat peer logs
 //! v0.22.0-BlindRelayDuplicateIdempotence - Keep duplicate route drops out of previous-hop quarantine scoring
 //! v0.21.0-OnionMiddleRouteabilityRecovery - Allow true onion middle recovery through fresh signed descriptors unless route-quarantined
@@ -146,11 +152,19 @@ use aeronyx_core::protocol::onion::{is_onion_blob, try_open_onion_layer};
 use aeronyx_core::protocol::{DataPacket, NodeCapability};
 use aeronyx_transport::traits::Transport;
 use aeronyx_transport::UdpTransport;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+use axum::{
+    extract::{DefaultBodyLimit, Request, State},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
+use crate::api::{decode_bounded_json_response, PEER_ACK_RESPONSE_MAX_BYTES};
 use crate::services::peer_store::PeerStore;
 use crate::services::{ChatRelayService, Session, SessionManager};
 
@@ -164,6 +178,23 @@ use crate::services::{ChatRelayService, Session, SessionManager};
 /// carrying huge opaque payloads. Encrypted files should use blob storage, not
 /// the peer envelope relay path.
 const MAX_PEER_CHAT_ENVELOPE_BYTES: usize = 128 * 1024;
+
+/// Maximum ordinary peer-relay JSON body accepted before deserialization.
+///
+/// `ChatEnvelope` has a 128 KiB binary ceiling, while JSON byte arrays are
+/// substantially larger. This transport allowance preserves valid envelopes
+/// without allowing an untrusted peer to allocate an unbounded request body.
+const PEER_CHAT_REQUEST_BODY_MAX_BYTES: usize = 768 * 1024;
+
+/// Maximum blind-relay JSON body accepted before deserialization.
+///
+/// A two-hop request can contain two independently bounded 192 KiB opaque
+/// blobs plus a signed descriptor. JSON byte arrays can expand to roughly four
+/// characters per byte, so 2 MiB is the narrow safe ceiling for that contract.
+const PEER_BLIND_RELAY_REQUEST_BODY_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum ordinary peer-relay requests allowed in parser/handler execution.
+const MAX_IN_FLIGHT_PEER_CHAT_REQUESTS: usize = 64;
 
 /// Maximum concurrent blind relay requests handled by this process.
 ///
@@ -629,16 +660,86 @@ pub fn build_chat_peer_router(
         blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
         blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
     };
+    let peer_relay_in_flight = Arc::new(AtomicUsize::new(0));
 
-    Router::new()
+    let peer_relay_router = Router::new()
         .route("/api/chat/peer/relay", post(peer_relay_handler))
+        .route_layer(middleware::from_fn_with_state(
+            peer_relay_in_flight,
+            peer_relay_request_gate,
+        ))
+        .layer(DefaultBodyLimit::max(PEER_CHAT_REQUEST_BODY_MAX_BYTES));
+    let blind_relay_router = Router::new()
         .route("/api/chat/peer/blind-relay", post(peer_blind_relay_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            peer_blind_relay_request_gate,
+        ))
+        .layer(DefaultBodyLimit::max(
+            PEER_BLIND_RELAY_REQUEST_BODY_MAX_BYTES,
+        ));
+
+    peer_relay_router
+        .merge(blind_relay_router)
         .with_state(state)
 }
 
 // ============================================
 // Handlers
 // ============================================
+
+/// Applies ordinary peer-relay backpressure before Axum reads a JSON body.
+async fn peer_relay_request_gate(
+    State(counter): State<Arc<AtomicUsize>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(_in_flight) =
+        PeerRequestInFlightGuard::try_acquire(&counter, MAX_IN_FLIGHT_PEER_CHAT_REQUESTS)
+    else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(PeerChatRelayResponse {
+                accepted: false,
+                duplicate: false,
+                delivered_online: 0,
+                stored_pending: false,
+            }),
+        )
+            .into_response();
+    };
+
+    next.run(request).await
+}
+
+/// Applies blind-relay backpressure before Axum reads a JSON body.
+async fn peer_blind_relay_request_gate(
+    State(state): State<ChatPeerState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(_in_flight) = PeerRequestInFlightGuard::try_acquire(
+        &state.blind_relay_in_flight,
+        MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS,
+    ) else {
+        state
+            .peer_store
+            .record_blind_relay_rejected(now_secs(), "backpressure");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(PeerBlindRelayResponse {
+                accepted: false,
+                terminal: false,
+                forwarded: false,
+                ttl_remaining: 0,
+                reason: Some("backpressure".to_string()),
+            }),
+        )
+            .into_response();
+    };
+
+    next.run(request).await
+}
 
 async fn peer_relay_handler(
     State(state): State<ChatPeerState>,
@@ -663,23 +764,6 @@ async fn peer_blind_relay_handler(
     State(state): State<ChatPeerState>,
     Json(request): Json<PeerBlindRelayRequest>,
 ) -> impl IntoResponse {
-    let Some(_in_flight) = BlindRelayInFlightGuard::try_acquire(&state) else {
-        state
-            .peer_store
-            .record_blind_relay_rejected(now_secs(), "backpressure");
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(PeerBlindRelayResponse {
-                accepted: false,
-                terminal: false,
-                forwarded: false,
-                ttl_remaining: 0,
-                reason: Some("backpressure".to_string()),
-            }),
-        )
-            .into_response();
-    };
-
     match process_peer_blind_relay(state, request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => (
@@ -696,23 +780,23 @@ async fn peer_blind_relay_handler(
     }
 }
 
-struct BlindRelayInFlightGuard {
+struct PeerRequestInFlightGuard {
     counter: Arc<AtomicUsize>,
 }
 
-impl BlindRelayInFlightGuard {
-    fn try_acquire(state: &ChatPeerState) -> Option<Self> {
-        let counter = Arc::clone(&state.blind_relay_in_flight);
-        let mut current = counter.load(Ordering::Relaxed);
+impl PeerRequestInFlightGuard {
+    fn try_acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        let counter = Arc::clone(counter);
+        let mut current = counter.load(Ordering::Acquire);
         loop {
-            if current >= MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS {
+            if current >= limit {
                 return None;
             }
             match counter.compare_exchange_weak(
                 current,
                 current + 1,
                 Ordering::AcqRel,
-                Ordering::Relaxed,
+                Ordering::Acquire,
             ) {
                 Ok(_) => return Some(Self { counter }),
                 Err(observed) => current = observed,
@@ -721,7 +805,7 @@ impl BlindRelayInFlightGuard {
     }
 }
 
-impl Drop for BlindRelayInFlightGuard {
+impl Drop for PeerRequestInFlightGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::AcqRel);
     }
@@ -1514,7 +1598,12 @@ async fn forward_blind_relay_with_retry(
     for attempt in 1..=MAX_BLIND_RELAY_FORWARD_ATTEMPTS {
         match state.http_client.post(url).json(&request).send().await {
             Ok(response) if response.status().is_success() => {
-                match response.json::<PeerBlindRelayResponse>().await {
+                match decode_bounded_json_response::<PeerBlindRelayResponse>(
+                    response,
+                    PEER_ACK_RESPONSE_MAX_BYTES,
+                )
+                .await
+                {
                     Ok(ack) if ack.accepted => {
                         if attempt > 1 {
                             state
@@ -1529,10 +1618,10 @@ async fn forward_blind_relay_with_retry(
                             "[BLIND_RELAY] Next-hop ACK rejected opaque relay envelope"
                         );
                     }
-                    Err(_error) => {
+                    Err(error) => {
                         debug!(
                             attempt,
-                            reason = "ack_decode_failed",
+                            reason = error.as_str(),
                             "[BLIND_RELAY] Next-hop ACK decode failed"
                         );
                     }
@@ -1906,8 +1995,8 @@ mod tests {
             "raw errors may contain endpoint URLs or route-adjacent context"
         );
         assert!(
-            source.contains("reason = \"ack_decode_failed\""),
-            "ACK decode failures should use a stable reason bucket"
+            source.contains("reason = error.as_str()"),
+            "ACK decode failures should use bounded stable reason buckets"
         );
         assert!(
             source.contains("reason = \"store_pending_failed\""),
@@ -1955,6 +2044,54 @@ mod tests {
         assert_eq!(messages.len(), 1);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn peer_routes_reject_oversized_bodies_before_json_deserialization() {
+        let sessions = Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60)));
+        let udp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let peer_store = Arc::new(PeerStore::new());
+        let app = build_chat_peer_router(
+            None,
+            sessions,
+            udp,
+            Arc::clone(&peer_store),
+            Arc::new(IdentityKeyPair::generate()),
+            Arc::new(reqwest::Client::new()),
+        );
+
+        let peer_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/relay")
+                    .header("content-type", "application/json")
+                    .body(Body::from(vec![b' '; PEER_CHAT_REQUEST_BODY_MAX_BYTES + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let blind_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/blind-relay")
+                    .header("content-type", "application/json")
+                    .body(Body::from(vec![
+                        b' ';
+                        PEER_BLIND_RELAY_REQUEST_BODY_MAX_BYTES + 1
+                    ]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(peer_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(blind_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let blind_stats = peer_store.status(now_secs()).runtime.blind_relay;
+        assert_eq!(blind_stats.received, 0, "oversized body reached handler");
+        assert_eq!(blind_stats.rejected, 0, "oversized body reached handler");
     }
 
     #[tokio::test]
@@ -2644,7 +2781,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blind_relay_in_flight_guard_enforces_backpressure_limit() {
+    async fn peer_request_in_flight_guard_enforces_backpressure_limit() {
         let peer_store = Arc::new(PeerStore::new());
         let state = ChatPeerState {
             chat_relay: None,
@@ -2658,7 +2795,32 @@ mod tests {
             blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
         };
 
-        assert!(BlindRelayInFlightGuard::try_acquire(&state).is_none());
+        assert!(PeerRequestInFlightGuard::try_acquire(
+            &state.blind_relay_in_flight,
+            MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS,
+        )
+        .is_none());
+
+        let app = Router::new()
+            .route("/api/chat/peer/blind-relay", post(peer_blind_relay_handler))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                peer_blind_relay_request_gate,
+            ))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/blind-relay")
+                    .header("content-type", "application/json")
+                    .body(Body::from("not-json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

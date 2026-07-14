@@ -55,8 +55,12 @@
 //! - `DiscoveryPublicCardResponse` is smaller again. It is the contract for
 //!   top-level UX surfaces that should show confidence and readiness, not raw
 //!   engineering diagnostics.
+//! - The gossip request body ceiling must remain outside the JSON handler so
+//!   oversized untrusted input is rejected before allocation/deserialization.
+//!   Keep `DISCOVERY_REQUEST_BODY_MAX_BYTES` aligned with protocol limits.
 //!
 //! ## Last Modified
+//! v0.25.0-BoundedGossipBody - Reject oversized gossip before JSON deserialization
 //! v0.24.0-DiscoveryPublicCard - Add product-facing public protocol card endpoint
 //! v0.23.0-RouteGovernanceHeartbeatReadiness - Add compact route governance to discovery readiness
 //! v0.22.0-RouteGovernanceSummary - Add compact route-quality governance to public summary
@@ -94,11 +98,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aeronyx_core::protocol::{NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage};
 use axum::{
-    Json, Router,
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
+    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 
@@ -110,6 +114,12 @@ use crate::services::{PeerStore, PeerStoreImportReport, PeerStoreStatus};
 // ============================================
 
 const ONION_CANDIDATES_CONTRACT_VERSION: &str = "onion_candidates.v1";
+/// Maximum JSON gossip request accepted before Axum deserializes it.
+///
+/// The signed discovery protocol has a 512 KiB binary/message ceiling. JSON
+/// encoding adds overhead, so this public HTTP boundary deliberately allows
+/// 1 MiB while still preventing unbounded allocation from untrusted peers.
+const DISCOVERY_REQUEST_BODY_MAX_BYTES: usize = 1024 * 1024;
 const ONION_CANDIDATES_SOURCE: &str = "rust_discovery_onion_candidates";
 const ONION_CANDIDATES_SELECTION_POLICY: &str =
     "fresh_routeable_signed_chat_relays_with_kem_public_key";
@@ -1568,6 +1578,7 @@ pub fn build_discovery_router_with_local_status(
             "/api/discovery/onion-candidates",
             get(onion_candidates_handler),
         )
+        .layer(DefaultBodyLimit::max(DISCOVERY_REQUEST_BODY_MAX_BYTES))
         .with_state(state)
 }
 
@@ -2317,6 +2328,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn gossip_rejects_oversized_body_before_deserialization() {
+        let store = Arc::new(PeerStore::new());
+        let app = build_discovery_router(Arc::clone(&store), DiscoveryApiPolicy::default());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/discovery/gossip")
+                    .header("content-type", "application/json")
+                    .body(Body::from(vec![b' '; DISCOVERY_REQUEST_BODY_MAX_BYTES + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(store.len(), 0, "oversized gossip must not reach PeerStore");
     }
 
     #[tokio::test]
