@@ -28,9 +28,10 @@
 //!   Response 200: { "blob_id": "...", "expires_in_secs": 259200 }
 //!   Response 400: { "error": "..." }
 //!   Response 413: { "error": "blob too large: ..." }
+//!   Response 429: { "error": "receiver blob quota exceeded: ..." }
+//!   Response 503: { "error": "blob store temporarily at capacity" }
 //!
 //! GET /api/chat/blob/{blob_id}
-//!   Header: X-Wallet: <64-hex> (optional, for logging only)
 //!   Response 200: raw bytes (application/octet-stream)
 //!   Response 404: { "error": "blob not found" }
 //!
@@ -74,8 +75,11 @@
 //!   returns 400 immediately without touching the database.
 //! - `X-File-Hash` must be SHA-256 of the ENCRYPTED bytes (not plaintext).
 //!   This is used for blob_id derivation — the node never sees plaintext.
+//! - Logs must not include wallet prefixes, blob IDs, payload bytes, client
+//!   addresses, or raw crypto/database errors. Use aggregate reason buckets.
 //!
 //! ## Last Modified
+//! v1.2.0-StorageAdmission — Global capacity responses and route-safe logging
 //! v1.1.0-ChatRelay — Initial implementation
 
 use std::sync::Arc;
@@ -173,11 +177,10 @@ async fn handle_blob_upload(
 
     // ── Verify signature: sig covers SHA256(body) ──
     let body_hash: [u8; 32] = Sha256::digest(&body).into();
-    if let Err(e) = verify_sig(&sender, &body_hash, &signature) {
+    if verify_sig(&sender, &body_hash, &signature).is_err() {
         warn!(
-            sender = %hex::encode(&sender[..4]),
-            error = %e,
-            "[CHAT_BLOB] Upload signature verification failed"
+            reason = "invalid_signature",
+            "[CHAT_BLOB] Upload authentication rejected"
         );
         return error_response(StatusCode::UNAUTHORIZED, "signature verification failed");
     }
@@ -193,11 +196,7 @@ async fn handle_blob_upload(
     match state.relay.put_blob(&sender, &receiver, &body, &file_hash) {
         Ok(blob_id) => {
             let expires_in = state.relay.config().offline_ttl_secs;
-            debug!(
-                blob_id = %blob_id,
-                size = body.len(),
-                "[CHAT_BLOB] Upload accepted"
-            );
+            debug!(size = body.len(), "[CHAT_BLOB] Upload accepted");
             (
                 StatusCode::OK,
                 Json(json!({
@@ -215,14 +214,27 @@ async fn handle_blob_upload(
             )
         }
         Err(ChatRelayError::BlobQuotaExceeded { current, limit }) => {
-            warn!(current, limit, "[CHAT_BLOB] Upload rejected: quota exceeded");
+            warn!(
+                current,
+                limit, "[CHAT_BLOB] Upload rejected: quota exceeded"
+            );
             error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 format!("receiver blob quota exceeded: {}/{}", current, limit),
             )
         }
+        Err(error) if error.is_capacity_exhausted() => {
+            warn!(
+                reason = error.reason_bucket(),
+                "[CHAT_BLOB] Upload rejected: node capacity exhausted"
+            );
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "blob store temporarily at capacity",
+            )
+        }
         Err(e) => {
-            warn!(error = %e, "[CHAT_BLOB] Upload failed");
+            warn!(reason = e.reason_bucket(), "[CHAT_BLOB] Upload failed");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }
     }
@@ -237,24 +249,11 @@ async fn handle_blob_upload(
 /// No authentication required — the blob is encrypted and the `blob_id`
 /// is HMAC-derived (unguessable without the node secret).
 ///
-/// Optional header:
-/// - `X-Wallet`: requester wallet, used for logging only (not enforced)
-///
 /// Returns raw bytes (`application/octet-stream`) on success.
 async fn handle_blob_download(
     State(state): State<ChatBlobState>,
     Path(blob_id): Path<String>,
-    headers: HeaderMap,
 ) -> Response {
-    // Log requester wallet if provided (best-effort, not enforced)
-    if let Some(wallet_hex) = headers.get("x-wallet").and_then(|v| v.to_str().ok()) {
-        debug!(
-            blob_id = %blob_id,
-            wallet = %wallet_hex.get(..8).unwrap_or(wallet_hex),
-            "[CHAT_BLOB] Download request"
-        );
-    }
-
     match state.relay.get_blob(&blob_id) {
         Ok(data) => {
             use axum::http::header;
@@ -269,7 +268,7 @@ async fn handle_blob_download(
             error_response(StatusCode::NOT_FOUND, "blob not found or expired")
         }
         Err(e) => {
-            warn!(error = %e, blob_id = %blob_id, "[CHAT_BLOB] Download error");
+            warn!(reason = e.reason_bucket(), "[CHAT_BLOB] Download error");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }
     }
@@ -302,18 +301,17 @@ async fn handle_blob_delete(
 
     // Verify signature: sig covers SHA256(blob_id bytes)
     let id_hash: [u8; 32] = Sha256::digest(blob_id.as_bytes()).into();
-    if let Err(e) = verify_sig(&sender, &id_hash, &signature) {
+    if verify_sig(&sender, &id_hash, &signature).is_err() {
         warn!(
-            sender = %hex::encode(&sender[..4]),
-            error = %e,
-            "[CHAT_BLOB] Delete signature verification failed"
+            reason = "invalid_signature",
+            "[CHAT_BLOB] Delete authentication rejected"
         );
         return error_response(StatusCode::UNAUTHORIZED, "signature verification failed");
     }
 
     match state.relay.delete_blob(&blob_id, &sender) {
         Ok(()) => {
-            debug!(blob_id = %blob_id, "[CHAT_BLOB] Deleted by sender");
+            debug!("[CHAT_BLOB] Deleted by sender");
             (StatusCode::OK, Json(json!({ "status": "deleted" }))).into_response()
         }
         Err(ChatRelayError::BlobNotFound { .. }) => {
@@ -323,7 +321,7 @@ async fn handle_blob_delete(
             error_response(StatusCode::UNAUTHORIZED, "unauthorized")
         }
         Err(e) => {
-            warn!(error = %e, "[CHAT_BLOB] Delete error");
+            warn!(reason = e.reason_bucket(), "[CHAT_BLOB] Delete error");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }
     }
@@ -340,8 +338,7 @@ fn parse_wallet_header(headers: &HeaderMap, name: &str) -> Result<[u8; 32], Stri
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| format!("missing header: {}", name))?;
 
-    let bytes = hex::decode(val)
-        .map_err(|_| format!("invalid hex in header {}", name))?;
+    let bytes = hex::decode(val).map_err(|_| format!("invalid hex in header {}", name))?;
 
     if bytes.len() != 32 {
         return Err(format!("header {} must be 64 hex chars (32 bytes)", name));
@@ -359,8 +356,7 @@ fn parse_signature_header(headers: &HeaderMap, name: &str) -> Result<[u8; 64], S
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| format!("missing header: {}", name))?;
 
-    let bytes = hex::decode(val)
-        .map_err(|_| format!("invalid hex in header {}", name))?;
+    let bytes = hex::decode(val).map_err(|_| format!("invalid hex in header {}", name))?;
 
     if bytes.len() != 64 {
         return Err(format!("header {} must be 128 hex chars (64 bytes)", name));
@@ -420,19 +416,30 @@ mod tests {
     use crate::config::ChatRelayConfig;
     use crate::services::chat_relay::derive_node_secret;
 
-    fn make_relay() -> Arc<ChatRelayService> {
-        let config = ChatRelayConfig {
+    fn test_config() -> ChatRelayConfig {
+        ChatRelayConfig {
             enabled: true,
             db_path: ":memory:".to_string(),
             offline_ttl_secs: 259_200,
             max_pending_per_wallet: 500,
+            max_pending_messages_total: 100_000,
+            max_pending_message_bytes_total: 512 * 1024 * 1024,
             max_message_size: 65_536,
             max_blob_size: 1_024,
             max_blobs_per_receiver: 50,
+            max_pending_blobs_total: 5_000,
+            max_pending_blob_bytes_total: 2 * 1024 * 1024 * 1024,
             cleanup_interval_secs: 60,
             dedup_lru_capacity: 10_000,
             expired_notification_ttl_secs: 604_800,
-        };
+        }
+    }
+
+    fn make_relay() -> Arc<ChatRelayService> {
+        make_relay_with_config(test_config())
+    }
+
+    fn make_relay_with_config(config: ChatRelayConfig) -> Arc<ChatRelayService> {
         let secret = derive_node_secret(&[0x42u8; 32]);
         Arc::new(ChatRelayService::new(config, secret).expect("init"))
     }
@@ -440,6 +447,24 @@ mod tests {
     fn sign_bytes(kp: &IdentityKeyPair, data: &[u8]) -> String {
         let hash: [u8; 32] = Sha256::digest(data).into();
         hex::encode(kp.sign(&hash))
+    }
+
+    #[test]
+    fn chat_blob_logs_stay_free_of_routing_identifiers() {
+        let source = include_str!("chat_handlers.rs");
+        let forbidden = [
+            concat!("blob_id", " = %"),
+            concat!("sender = %hex::", "encode"),
+            concat!("wallet = %", "wallet_hex"),
+            concat!("error = %", "e"),
+        ];
+
+        for pattern in forbidden {
+            assert!(
+                !source.contains(pattern),
+                "blob logs must not expose routing identifiers or raw errors: {pattern}"
+            );
+        }
     }
 
     // ── Upload ──
@@ -471,7 +496,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["blob_id"].is_string());
         assert_eq!(json["blob_id"].as_str().unwrap().len(), 32);
@@ -548,6 +575,36 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    #[tokio::test]
+    async fn test_upload_global_capacity_returns_service_unavailable() {
+        let mut config = test_config();
+        config.max_blobs_per_receiver = 1;
+        config.max_pending_blobs_total = 1;
+        let relay = make_relay_with_config(config);
+        let existing = b"existing encrypted blob";
+        let existing_hash: [u8; 32] = Sha256::digest(existing).into();
+        relay
+            .put_blob(&[0x11; 32], &[0x12; 32], existing, &existing_hash)
+            .expect("fill global blob capacity");
+
+        let app = build_chat_router(Arc::clone(&relay));
+        let kp = IdentityKeyPair::generate();
+        let body_bytes = b"another encrypted blob";
+        let file_hash: [u8; 32] = Sha256::digest(body_bytes).into();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/chat/blob")
+            .header("x-sender-wallet", hex::encode(kp.public_key_bytes()))
+            .header("x-receiver-wallet", hex::encode([0x22; 32]))
+            .header("x-signature", sign_bytes(&kp, body_bytes))
+            .header("x-file-hash", hex::encode(file_hash))
+            .body(Body::from(body_bytes.as_slice()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     // ── Download ──
 
     #[tokio::test]
@@ -559,7 +616,9 @@ mod tests {
         let receiver = [0xBBu8; 32];
         let data = b"blob_content";
         let file_hash: [u8; 32] = Sha256::digest(data).into();
-        let blob_id = relay.put_blob(&sender, &receiver, data, &file_hash).unwrap();
+        let blob_id = relay
+            .put_blob(&sender, &receiver, data, &file_hash)
+            .unwrap();
 
         let app = build_chat_router(Arc::clone(&relay));
         let req = Request::builder()
@@ -571,7 +630,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(body.as_ref(), data);
     }
 
@@ -600,7 +661,9 @@ mod tests {
         let receiver = [0xBBu8; 32];
         let data = b"to_delete";
         let file_hash: [u8; 32] = Sha256::digest(data).into();
-        let blob_id = relay.put_blob(&sender, &receiver, data, &file_hash).unwrap();
+        let blob_id = relay
+            .put_blob(&sender, &receiver, data, &file_hash)
+            .unwrap();
 
         let app = build_chat_router(Arc::clone(&relay));
 
@@ -636,7 +699,9 @@ mod tests {
         let receiver = [0xBBu8; 32];
         let data = b"protected";
         let file_hash: [u8; 32] = Sha256::digest(data).into();
-        let blob_id = relay.put_blob(&sender, &receiver, data, &file_hash).unwrap();
+        let blob_id = relay
+            .put_blob(&sender, &receiver, data, &file_hash)
+            .unwrap();
 
         let app = build_chat_router(Arc::clone(&relay));
 
@@ -647,7 +712,10 @@ mod tests {
         let req = Request::builder()
             .method(Method::DELETE)
             .uri(format!("/api/chat/blob/{}", blob_id))
-            .header("x-sender-wallet", hex::encode(kp_attacker.public_key_bytes()))
+            .header(
+                "x-sender-wallet",
+                hex::encode(kp_attacker.public_key_bytes()),
+            )
             .header("x-signature", sig)
             .body(Body::empty())
             .unwrap();

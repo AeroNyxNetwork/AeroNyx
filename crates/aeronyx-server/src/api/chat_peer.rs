@@ -101,8 +101,12 @@
 //!   attacker can consume memory and parser work before the guard executes.
 //! - Next-hop acknowledgement bodies are untrusted and must use the shared
 //!   bounded decoder. Never call `Response::json()` directly on peer traffic.
+//! - Durable queue count/byte exhaustion is a retryable capacity condition,
+//!   not an internal server fault. Preserve the service's privacy-safe reason
+//!   bucket while returning HTTP 503 to the previous hop.
 //!
 //! ## Last Modified
+//! v0.25.0-DurableQueueCapacity - Classify global pending-store quota exhaustion
 //! v0.24.0-PublicRequestBounds - Bound peer bodies and concurrency before JSON extraction
 //! v0.23.0-RouteSafeRelayLogs - Remove user/route-adjacent values and raw transport errors from chat peer logs
 //! v0.22.0-BlindRelayDuplicateIdempotence - Keep duplicate route drops out of previous-hop quarantine scoring
@@ -165,6 +169,7 @@ use tokio::time::sleep;
 use tracing::{debug, warn};
 
 use crate::api::{decode_bounded_json_response, PEER_ACK_RESPONSE_MAX_BYTES};
+use crate::services::chat_relay::ChatRelayError;
 use crate::services::peer_store::PeerStore;
 use crate::services::{ChatRelayService, Session, SessionManager};
 
@@ -534,6 +539,9 @@ enum ChatPeerRelayError {
 
     #[error("pending store failed")]
     StoreFailed,
+
+    #[error("pending store capacity exhausted")]
+    PendingCapacity,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -621,6 +629,7 @@ impl ChatPeerRelayError {
             Self::InvalidSignature | Self::EnvelopeTooLarge { .. } | Self::Serialization => {
                 StatusCode::BAD_REQUEST
             }
+            Self::PendingCapacity => StatusCode::SERVICE_UNAVAILABLE,
             Self::StoreFailed => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -631,6 +640,7 @@ impl ChatPeerRelayError {
             Self::InvalidSignature => "invalid_signature",
             Self::EnvelopeTooLarge { .. } => "envelope_too_large",
             Self::Serialization => "envelope_serialization_failed",
+            Self::PendingCapacity => "pending_capacity_exhausted",
             Self::StoreFailed => "store_pending_failed",
         }
     }
@@ -848,13 +858,14 @@ async fn process_peer_relay(
     }
 
     let stored_pending = if delivered_online == 0 {
-        relay.store_pending(&envelope).map_err(|_error| {
+        relay.store_pending(&envelope).map_err(|error| {
+            let reason = error.reason_bucket();
             warn!(
-                reason = "store_pending_failed",
+                reason,
                 "[CHAT_PEER] Failed to store peer envelope for offline receiver"
             );
-            relay.record_peer_relay_inbound_rejected(now, "store_pending_failed");
-            ChatPeerRelayError::StoreFailed
+            relay.record_peer_relay_inbound_rejected(now, reason);
+            map_pending_store_error(&error)
         })?;
         true
     } else {
@@ -869,6 +880,16 @@ async fn process_peer_relay(
         delivered_online,
         stored_pending,
     })
+}
+
+fn map_pending_store_error(error: &ChatRelayError) -> ChatPeerRelayError {
+    match error {
+        ChatRelayError::MessageTooLarge { size, .. } => {
+            ChatPeerRelayError::EnvelopeTooLarge { size: *size }
+        }
+        error if error.is_capacity_exhausted() => ChatPeerRelayError::PendingCapacity,
+        _ => ChatPeerRelayError::StoreFailed,
+    }
 }
 
 fn now_secs() -> u64 {
@@ -1999,9 +2020,37 @@ mod tests {
             "ACK decode failures should use bounded stable reason buckets"
         );
         assert!(
-            source.contains("reason = \"store_pending_failed\""),
-            "store failures should use a stable reason bucket"
+            source.contains("let reason = error.reason_bucket()"),
+            "store failures should use service-owned stable reason buckets"
         );
+    }
+
+    #[test]
+    fn pending_store_capacity_maps_to_retryable_service_unavailable() {
+        let capacity = ChatRelayError::PendingMessageQueueFull {
+            current: 100,
+            limit: 100,
+        };
+        let mapped = map_pending_store_error(&capacity);
+
+        assert!(matches!(mapped, ChatPeerRelayError::PendingCapacity));
+        assert_eq!(mapped.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.reason_bucket(), "pending_capacity_exhausted");
+
+        let storage = ChatRelayError::Sqlite(rusqlite::Error::InvalidQuery);
+        assert!(matches!(
+            map_pending_store_error(&storage),
+            ChatPeerRelayError::StoreFailed
+        ));
+
+        let oversized = ChatRelayError::MessageTooLarge {
+            size: 65_537,
+            limit: 65_536,
+        };
+        assert!(matches!(
+            map_pending_store_error(&oversized),
+            ChatPeerRelayError::EnvelopeTooLarge { size: 65_537 }
+        ));
     }
 
     #[tokio::test]

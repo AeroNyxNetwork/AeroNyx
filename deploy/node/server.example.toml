@@ -155,10 +155,17 @@ embed_enabled = true
 enabled = false
 offline_ttl_secs = 259200
 max_pending_per_wallet = 500
+# Node-wide ceilings prevent synthetic receiver identities from bypassing the
+# per-wallet mailbox quota. Existing configs may omit these fields and use the
+# backward-compatible defaults shown here.
+max_pending_messages_total = 100000
+max_pending_message_bytes_total = 536870912
 db_path = "/var/lib/aeronyx/chat_pending.db"
 max_message_size = 65536
 max_blob_size = 10485760
 max_blobs_per_receiver = 50
+max_pending_blobs_total = 5000
+max_pending_blob_bytes_total = 2147483648
 cleanup_interval_secs = 60
 dedup_lru_capacity = 10000
 expired_notification_ttl_secs = 604800

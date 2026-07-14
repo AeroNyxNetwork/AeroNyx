@@ -139,6 +139,9 @@
 //      grow node memory without a protocol-defined ceiling.
 //  59. Uses the shared API-layer bounded decoder for every peer acknowledgement
 //      and applies route-specific public request ceilings before JSON parsing.
+//  60. Reports aggregate durable chat queue usage/capacity, while removing
+//      stable message, wallet, receiver, blob, and session identifiers from
+//      relay logs so node operators cannot reconstruct a social graph.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -174,6 +177,11 @@
 //     tokio::fs::read() on these paths.
 //   - encrypted_message_counter is aggregate only and never stores payload,
 //     destination, DNS, URL, voucher, wallet, or client public IP details.
+//   - Chat relay logs and heartbeat capacity telemetry are aggregate-only.
+//     Never add message IDs, wallet prefixes, sender/receiver keys, blob IDs,
+//     session IDs, payload data, or endpoint values to those surfaces.
+//   - Voice relay logs follow the same blind-node boundary: no wallet target,
+//     virtual IP, session ID, endpoint, or raw cryptographic error values.
 //   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
 //     log, store, or report queried domains.
 //   - If vpn.dns_proxy_enabled=false, an external gateway DNS listener such as
@@ -181,6 +189,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.20-ChatRelayStorageGuard - Global durable quotas and route-safe telemetry
 //   v2.7.19-PublicApiBounds - Shared peer decoder and pre-parse request ceilings
 //   v2.7.18-BoundedPeerReads - Bounded untrusted peer responses and recovery files
 //   v2.7.17-SectionSafeAuth - Resolve API secrets before Server construction
@@ -2229,11 +2238,20 @@ impl Server {
                 let relay = Arc::clone(&chat_relay_status);
                 Box::pin(async move {
                     let now = unix_now_secs();
+                    let storage_usage = relay.storage_usage().ok();
+                    let config = relay.config();
                     Some(serde_json::json!({
                         "generated_at": now,
                         "peer_relay": relay.peer_status(),
+                        "storage_usage": storage_usage,
+                        "storage_capacity": {
+                            "max_pending_messages_total": config.max_pending_messages_total,
+                            "max_pending_message_bytes_total": config.max_pending_message_bytes_total,
+                            "max_pending_blobs_total": config.max_pending_blobs_total,
+                            "max_pending_blob_bytes_total": config.max_pending_blob_bytes_total
+                        },
                         "source": "rust_chat_relay_service",
-                        "privacy_boundary": "aggregate encrypted chat peer relay counters only; no message ids, wallet ids, client IPs, destinations, DNS contents, packet payloads, chat plaintext, ciphertext, private keys, voucher secrets, or per-user traffic"
+                        "privacy_boundary": "aggregate encrypted chat relay counters and node-wide storage capacity only; no message ids, wallet ids, sender/receiver keys, blob ids, session ids, client IPs, destinations, DNS contents, packet payloads, chat plaintext, ciphertext, private keys, voucher secrets, or per-user traffic"
                     }))
                 })
             }));
@@ -2266,8 +2284,10 @@ impl Server {
                             "last_inbound_failure_reason": null,
                             "last_inbound_at": null
                         },
+                        "storage_usage": null,
+                        "storage_capacity": null,
                         "source": "rust_chat_relay_disabled_config",
-                        "privacy_boundary": "aggregate encrypted chat peer relay counters only; no message ids, wallet ids, client IPs, destinations, DNS contents, packet payloads, chat plaintext, ciphertext, private keys, voucher secrets, or per-user traffic"
+                        "privacy_boundary": "aggregate encrypted chat relay counters and node-wide storage capacity only; no message ids, wallet ids, sender/receiver keys, blob ids, session ids, client IPs, destinations, DNS contents, packet payloads, chat plaintext, ciphertext, private keys, voucher secrets, or per-user traffic"
                     }))
                 })
             }));
@@ -3365,10 +3385,8 @@ impl Server {
                         Err(e) => {
                             last_failure_reason = Some(e.clone());
                             debug!(
-                                peer = %url,
-                                error = %e,
-                                backpressure_active,
-                                "[DISCOVERY] Outbound gossip peer sync failed"
+                                reason = e.as_str(),
+                                backpressure_active, "[DISCOVERY] Outbound gossip peer sync failed"
                             );
                         }
                     }
@@ -4375,10 +4393,7 @@ impl Server {
                                 reason.clone(),
                             );
                             last_failure_reason = Some(reason);
-                            debug!(
-                                peer = %url,
-                                "[CHAT_RELAY] Peer relay ACK rejected encrypted envelope"
-                            );
+                            debug!("[CHAT_RELAY] Peer relay ACK rejected encrypted envelope");
                         }
                         Err(error) => {
                             let reason = format!("peer_relay_ack_{}", error.as_str());
@@ -4389,7 +4404,6 @@ impl Server {
                             );
                             last_failure_reason = Some(reason);
                             debug!(
-                                peer = %url,
                                 reason = error.as_str(),
                                 "[CHAT_RELAY] Peer relay ACK rejected"
                             );
@@ -4401,7 +4415,6 @@ impl Server {
                     peer_store.record_route_forward_failure(&peer_node_id, now, reason.clone());
                     last_failure_reason = Some(reason);
                     debug!(
-                        peer = %url,
                         status = %response.status(),
                         "[CHAT_RELAY] Peer relay rejected encrypted envelope"
                     );
@@ -4411,8 +4424,7 @@ impl Server {
                     peer_store.record_route_forward_failure(&peer_node_id, now, reason.clone());
                     last_failure_reason = Some(reason);
                     debug!(
-                        peer = %url,
-                        error = %error,
+                        reason = Self::classify_reqwest_error("peer_relay_request", &error),
                         "[CHAT_RELAY] Peer relay request failed"
                     );
                 }
@@ -4426,9 +4438,7 @@ impl Server {
         if attempted > 0 {
             debug!(
                 attempted,
-                accepted,
-                id = %hex::encode(envelope.message_id),
-                "[CHAT_RELAY] Peer relay fanout complete"
+                accepted, "[CHAT_RELAY] Peer relay fanout complete"
             );
         }
 
@@ -4914,22 +4924,22 @@ impl Server {
                                                 debug!(src = %source.addr, "[SESSION] Sent RESET to stale client");
                                             }
                                             Err(_) => {}
-                                            Ok((session, DecryptedPayload::VoiceSignal { discriminant, target_wallet, payload })) => {
+                                            Ok((_session, DecryptedPayload::VoiceSignal { discriminant, target_wallet, payload })) => {
                                                 let signal_name = match discriminant { 31 => "Offer", 32 => "Answer", 33 => "End", _ => "Unknown" };
                                                 match target_wallet {
-                                                    None => { warn!(src = %session.virtual_ip, disc = discriminant, "[VOICE_SIGNAL] {} — missing 'to' field, dropped", signal_name); }
+                                                    None => { warn!(reason = "missing_target", signal = signal_name, "[VOICE_SIGNAL] Dropped"); }
                                                     Some(ref wallet_hex) => {
                                                         let target_bytes = hex::decode(wallet_hex).ok().and_then(|b| {
                                                             if b.len() == 32 { let mut arr = [0u8; 32]; arr.copy_from_slice(&b); Some(arr) } else { None }
                                                         });
                                                         match target_bytes {
-                                                            None => { warn!(wallet = %wallet_hex, "[VOICE_SIGNAL] {} — invalid pubkey hex, dropped", signal_name); }
+                                                            None => { warn!(reason = "invalid_target", signal = signal_name, "[VOICE_SIGNAL] Dropped"); }
                                                             Some(pk) => {
                                                                 let target = sessions.get_by_wallet(&pk).or_else(|| {
                                                                     sessions.all_sessions().into_iter().find(|s| s.client_public_key.to_bytes() == pk)
                                                                 });
                                                                 match target {
-                                                                    None => { debug!(wallet = %&wallet_hex[..8], "[VOICE_SIGNAL] {} — target offline, dropped", signal_name); }
+                                                                    None => { debug!(reason = "target_offline", signal = signal_name, "[VOICE_SIGNAL] Dropped"); }
                                                                     Some(target_session) => {
                                                                         let counter = target_session.next_tx_counter();
                                                                         let mut encrypted = vec![0u8; payload.len() + ENCRYPTION_OVERHEAD];
@@ -4939,9 +4949,9 @@ impl Server {
                                                                                 let pkt   = aeronyx_core::protocol::DataPacket::new(*target_session.id.as_bytes(), counter, encrypted);
                                                                                 let bytes = aeronyx_core::protocol::codec::encode_data_packet(&pkt).to_vec();
                                                                                 let _ = udp_reply.send(&bytes, &target_session.client_endpoint).await;
-                                                                                debug!(src = %session.virtual_ip, dst = %target_session.virtual_ip, signal = signal_name, "[VOICE_SIGNAL] Forwarded");
+                                                                                debug!(signal = signal_name, "[VOICE_SIGNAL] Forwarded");
                                                                             }
-                                                                            Err(e) => { warn!(error = %e, "[VOICE_SIGNAL] Re-encrypt failed"); }
+                                                                            Err(_) => { warn!(reason = "encryption_failed", signal = signal_name, "[VOICE_SIGNAL] Forward failed"); }
                                                                         }
                                                                     }
                                                                 }
@@ -4950,7 +4960,7 @@ impl Server {
                                                     }
                                                 }
                                             }
-                                            Ok((session, DecryptedPayload::Voice { dst_ip, payload })) => {
+                                            Ok((_session, DecryptedPayload::Voice { dst_ip, payload })) => {
                                                 if let Some(target_sid) = routing.lookup(dst_ip) {
                                                     if let Some(target) = sessions.get(&target_sid) {
                                                         let counter = target.next_tx_counter();
@@ -4961,15 +4971,15 @@ impl Server {
                                                                 let pkt   = aeronyx_core::protocol::DataPacket::new(*target.id.as_bytes(), counter, encrypted);
                                                                 let bytes = aeronyx_core::protocol::codec::encode_data_packet(&pkt).to_vec();
                                                                 let _ = udp_reply.send(&bytes, &target.client_endpoint).await;
-                                                                trace!(src = %session.virtual_ip, dst = %dst_ip, "[VOICE] Relayed voice packet");
+                                                                trace!("[VOICE] Relayed voice packet");
                                                             }
-                                                            Err(e) => { warn!(dst_ip = %dst_ip, "[VOICE] Re-encrypt failed: {}", e); }
+                                                            Err(_) => { warn!(reason = "encryption_failed", "[VOICE] Relay failed"); }
                                                         }
                                                     } else {
-                                                        debug!(dst_ip = %dst_ip, "[VOICE] Target session not found (disconnected?)");
+                                                        debug!(reason = "target_disconnected", "[VOICE] Relay dropped");
                                                     }
                                                 } else {
-                                                    debug!(dst_ip = %dst_ip, "[VOICE] No route to dst_ip (peer offline)");
+                                                    debug!(reason = "no_route", "[VOICE] Relay dropped");
                                                 }
                                             }
                                             Ok((session, DecryptedPayload::MemChain(msg))) => {
@@ -5179,15 +5189,21 @@ impl Server {
             }
             MemChainMessage::ChatRelay(envelope) => {
                 if envelope.verify_signature().is_err() {
-                    warn!(receiver = %hex::encode(&envelope.receiver[..4]), "[CHAT_RELAY] Envelope sig failed — dropped");
+                    warn!(
+                        reason = "invalid_signature",
+                        "[CHAT_RELAY] Envelope dropped"
+                    );
                     return;
                 }
                 let Some(ref relay) = chat_relay else {
-                    warn!(receiver = %hex::encode(&envelope.receiver[..4]), "[CHAT_RELAY] Relay unavailable — dropped");
+                    warn!(
+                        reason = "relay_unavailable",
+                        "[CHAT_RELAY] Envelope dropped"
+                    );
                     return;
                 };
                 if relay.is_online_duplicate(&envelope.message_id) {
-                    debug!(id = %hex::encode(envelope.message_id), "[CHAT_RELAY] Online duplicate — dropped");
+                    debug!(reason = "duplicate", "[CHAT_RELAY] Envelope dropped");
                     return;
                 }
                 relay.wallet_routes.announce(
@@ -5213,7 +5229,7 @@ impl Server {
                             all_failed = false;
                         } else {
                             relay.wallet_routes.remove_session(target_sid);
-                            debug!(session = %target_sid, "[CHAT_RELAY] Pruned stale route during delivery");
+                            debug!("[CHAT_RELAY] Pruned stale route during delivery");
                         }
                     }
                     if all_failed {
@@ -5226,12 +5242,18 @@ impl Server {
                         )
                         .await;
                         if let Err(e) = relay.store_pending(&envelope) {
-                            warn!(error = %e, receiver = %hex::encode(&receiver[..4]), "[CHAT_RELAY] Fallback store_pending failed");
+                            warn!(
+                                reason = e.reason_bucket(),
+                                "[CHAT_RELAY] Fallback store failed"
+                            );
                         } else {
-                            debug!(receiver = %hex::encode(&receiver[..4]), "[CHAT_RELAY] All routes stale — stored for offline delivery");
+                            debug!("[CHAT_RELAY] All routes stale; stored for offline delivery");
                         }
                     } else {
-                        debug!(receiver = %hex::encode(&receiver[..4]), devices = device_count, "[CHAT_RELAY] Online delivery to {} device(s)", device_count);
+                        debug!(
+                            devices = device_count,
+                            "[CHAT_RELAY] Online delivery complete"
+                        );
                     }
                 } else {
                     Self::relay_chat_envelope_to_discovered_peers(
@@ -5243,9 +5265,12 @@ impl Server {
                     )
                     .await;
                     if let Err(e) = relay.store_pending(&envelope) {
-                        warn!(error = %e, receiver = %hex::encode(&receiver[..4]), "[CHAT_RELAY] store_pending failed");
+                        warn!(
+                            reason = e.reason_bucket(),
+                            "[CHAT_RELAY] Pending store failed"
+                        );
                     } else {
-                        debug!(receiver = %hex::encode(&receiver[..4]), id = %hex::encode(envelope.message_id), "[CHAT_RELAY] Stored for offline delivery");
+                        debug!("[CHAT_RELAY] Stored for offline delivery");
                     }
                 }
             }
@@ -5292,7 +5317,10 @@ impl Server {
                         Self::send_to_session(&resp, session, udp, crypto).await;
                     }
                     Err(e) => {
-                        warn!(error = %e, wallet = %hex::encode(&wallet[..4]), "[CHAT_RELAY] pull_pending failed");
+                        warn!(
+                            reason = e.reason_bucket(),
+                            "[CHAT_RELAY] pull_pending failed"
+                        );
                     }
                 }
             }
@@ -5321,22 +5349,28 @@ impl Server {
                     &signature,
                     ack_timestamp,
                 );
-                if let Err(e) = verify_result {
-                    warn!(wallet = %hex::encode(&wallet[..4]), error = %e, "[CHAT_RELAY] ChatAck sig failed");
+                if verify_result.is_err() {
+                    warn!(
+                        reason = "invalid_signature",
+                        "[CHAT_RELAY] ChatAck rejected"
+                    );
                     return;
                 }
                 match relay.ack_messages(&message_ids, &wallet) {
                     Ok(deleted) => {
-                        debug!(deleted, wallet = %hex::encode(&wallet[..4]), "[CHAT_RELAY] ChatAck processed");
+                        debug!(deleted, "[CHAT_RELAY] ChatAck processed");
                     }
                     Err(e) => {
-                        warn!(error = %e, wallet = %hex::encode(&wallet[..4]), "[CHAT_RELAY] ack_messages failed");
+                        warn!(
+                            reason = e.reason_bucket(),
+                            "[CHAT_RELAY] ack_messages failed"
+                        );
                     }
                 }
             }
             MemChainMessage::DeviceRegister {
                 device_id,
-                device_name,
+                device_name: _,
                 wallet_pubkey,
                 timestamp,
                 signature,
@@ -5354,19 +5388,13 @@ impl Server {
                     &signature,
                     timestamp,
                 );
-                if let Err(e) = verify_result {
-                    warn!(session = %session.id, wallet = %hex::encode(&wallet_pubkey[..4]), error = %e, "[CHAT_RELAY] DeviceRegister sig failed");
+                if verify_result.is_err() {
+                    warn!(
+                        reason = "invalid_signature",
+                        "[CHAT_RELAY] DeviceRegister rejected"
+                    );
                     return;
                 }
-                let name_display = if device_name.len() > 64 {
-                    let mut end = 64;
-                    while !device_name.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    &device_name[..end]
-                } else {
-                    &device_name
-                };
                 let Some(ref relay) = chat_relay else {
                     return;
                 };
@@ -5376,7 +5404,7 @@ impl Server {
                     session.client_endpoint,
                 );
                 sessions.register_device(&wallet_pubkey, device_id, session.id.clone());
-                info!(session_id = %session.id, wallet = %hex::encode(&wallet_pubkey[..4]), device_id = %hex::encode(device_id), device_name = %name_display, "[CHAT_RELAY] Device registered");
+                info!("[CHAT_RELAY] Device registered");
                 match relay.pull_pending(&wallet_pubkey, 0, &[0u8; 16], 100) {
                     Ok((messages, _has_more)) if !messages.is_empty() => {
                         let count = messages.len();
@@ -5389,11 +5417,14 @@ impl Server {
                             )
                             .await;
                         }
-                        info!(count, wallet = %hex::encode(&wallet_pubkey[..4]), "[CHAT_RELAY] Delivered pending messages on register");
+                        info!(count, "[CHAT_RELAY] Delivered pending messages on register");
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        warn!(error = %e, wallet = %hex::encode(&wallet_pubkey[..4]), "[CHAT_RELAY] pull_pending on register failed");
+                        warn!(
+                            reason = e.reason_bucket(),
+                            "[CHAT_RELAY] pull_pending on register failed"
+                        );
                     }
                 }
             }
@@ -5417,8 +5448,11 @@ impl Server {
                     &signature,
                     timestamp,
                 );
-                if let Err(e) = verify_result {
-                    debug!(wallet = %hex::encode(&wallet_pubkey[..4]), error = %e, "[CHAT_RELAY] WalletPresence sig failed");
+                if verify_result.is_err() {
+                    debug!(
+                        reason = "invalid_signature",
+                        "[CHAT_RELAY] WalletPresence rejected"
+                    );
                     return;
                 }
                 relay.wallet_routes.announce(
@@ -5426,7 +5460,7 @@ impl Server {
                     session.id.clone(),
                     session.client_endpoint,
                 );
-                debug!(wallet = %hex::encode(&wallet_pubkey[..4]), "[CHAT_RELAY] WalletPresence: route refreshed");
+                debug!("[CHAT_RELAY] WalletPresence route refreshed");
             }
             _ => {
                 debug!("[MEMCHAIN] Unhandled message variant");
@@ -6575,6 +6609,39 @@ mod tests {
             Some("https://node.example.com/api/chat/peer/relay")
         );
         assert_eq!(Server::chat_peer_relay_url("   "), None);
+    }
+
+    #[test]
+    fn encrypted_relay_and_discovery_logs_stay_route_safe() {
+        let source = include_str!("server.rs");
+        let forbidden = [
+            concat!("peer = %", "url"),
+            concat!(
+                "warn!(session = %",
+                "session.id, wallet = %hex::encode(&wallet_pubkey"
+            ),
+            concat!(
+                "info!(session_id = %",
+                "session.id, wallet = %hex::encode(&wallet_pubkey"
+            ),
+            concat!("wallet = %hex::encode(&wallet[..4]), ", "\"[CHAT_RELAY]"),
+            concat!("device_id = %hex::", "encode(device_id)"),
+            concat!("device_name = %", "name_display"),
+            concat!("id = %hex::", "encode(envelope.message_id)"),
+            concat!("receiver = %hex::", "encode(&envelope.receiver"),
+            concat!("warn!(wallet = %", "wallet_hex"),
+            concat!("debug!(wallet = %&", "wallet_hex"),
+            concat!("src = %", "session.virtual_ip"),
+            concat!("dst = %", "target_session.virtual_ip"),
+            concat!("dst_ip = %", "dst_ip"),
+        ];
+
+        for pattern in forbidden {
+            assert!(
+                !source.contains(pattern),
+                "relay/discovery logs must not expose stable routing identifiers: {pattern}"
+            );
+        }
     }
 
     #[tokio::test]

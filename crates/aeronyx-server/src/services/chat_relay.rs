@@ -13,6 +13,8 @@
 //   wallet-route integration stabilized. No database schema or API behavior changed.
 //   v1.4.0-PeerRelayHealth — Added privacy-safe node-to-node relay health
 //   counters for heartbeat/nodeboard diagnostics.
+//   v1.5.0-GlobalStorageQuotas — Added transactionally maintained node-wide
+//   message/blob usage and hard count/byte ceilings.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -23,10 +25,11 @@
 //   - Online deduplication: LRU cache prevents duplicate delivery (online path)
 //   - WalletRouteCache: In-memory wallet → session routing (v1.3.0-Sovereign)
 //   - Peer relay health: aggregate outbound/inbound node-to-node relay status
+//   - Durable queue quotas: per-receiver and node-wide count/byte ceilings
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
-//   - aeronyx-server/src/config.rs: ChatRelayConfig
+//   - aeronyx-server/src/config_chat_relay.rs: ChatRelayConfig
 //   - crates/aeronyx-server/src/services/chat_relay/wallet_routes.rs: WalletRouteCache
 //
 // Main Logical Flow:
@@ -45,8 +48,14 @@
 //   - ack_messages deletes only WHERE receiver = receiver_wallet.
 //   - run_cleanup is synchronous — call from spawn_blocking or a sync task.
 //   - node_secret is HKDF-derived from Ed25519 private key; stable across restarts.
+//   - `relay_storage_usage` is rebuilt from canonical rows at startup, then
+//     maintained only by SQLite triggers in the same write transaction.
+//   - Logs must remain aggregate-only. Do not log message IDs, wallet prefixes,
+//     blob IDs, sender/receiver keys, payload bytes, or endpoint/session IDs.
 //
 // Last Modified:
+//   v1.5.0-GlobalStorageQuotas — Durable global quotas, enforced message size,
+//     and route-safe logging
 //   v1.4.0-PeerRelayHealth — Added node-to-node relay health status snapshot
 //   v1.1.0-ChatRelay — Initial implementation
 //   v1.3.0-Sovereign — Added wallet_routes: Arc<WalletRouteCache> field
@@ -60,7 +69,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use parking_lot::{Mutex, RwLock};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
@@ -168,29 +177,151 @@ impl ChatRelayPeerStatus {
 /// Errors produced by `ChatRelayService`.
 #[derive(Debug, thiserror::Error)]
 pub enum ChatRelayError {
+    /// SQLite schema, query, transaction, or persistence failure.
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    /// Envelope or notification serialization failure.
     #[error("Serialization error: {0}")]
     Serialize(#[from] bincode::Error),
 
+    /// Encrypted message ciphertext exceeds the configured item ceiling.
+    #[error("Message too large: {size} bytes (limit {limit})")]
+    MessageTooLarge {
+        /// Incoming ciphertext bytes.
+        size: usize,
+        /// Configured ciphertext byte ceiling.
+        limit: usize,
+    },
+
+    /// One receiver already holds the configured maximum pending messages.
     #[error("Mailbox full: receiver has {current} pending messages (limit {limit})")]
-    MailboxFull { current: usize, limit: usize },
+    MailboxFull {
+        /// Current pending rows for the receiver.
+        current: usize,
+        /// Configured per-receiver row ceiling.
+        limit: usize,
+    },
 
+    /// Node-wide pending message count is at capacity.
+    #[error("Pending message queue full: {current} messages (limit {limit})")]
+    PendingMessageQueueFull {
+        /// Current active pending rows on the node.
+        current: usize,
+        /// Configured node-wide pending row ceiling.
+        limit: usize,
+    },
+
+    /// Adding a message would exceed node-wide pending encoded bytes.
+    #[error("Pending message byte quota exceeded: {current} + {incoming} bytes (limit {limit})")]
+    PendingMessageBytesExceeded {
+        /// Current encoded pending bytes.
+        current: u64,
+        /// Encoded bytes required by the incoming envelope.
+        incoming: u64,
+        /// Configured node-wide encoded byte ceiling.
+        limit: u64,
+    },
+
+    /// One receiver already holds the configured maximum encrypted blobs.
     #[error("Blob quota exceeded: receiver has {current} pending blobs (limit {limit})")]
-    BlobQuotaExceeded { current: usize, limit: usize },
+    BlobQuotaExceeded {
+        /// Current blob rows for the receiver.
+        current: usize,
+        /// Configured per-receiver blob ceiling.
+        limit: usize,
+    },
 
+    /// Node-wide encrypted blob count is at capacity.
+    #[error("Pending blob store full: {current} blobs (limit {limit})")]
+    PendingBlobStoreFull {
+        /// Current retained blob rows on the node.
+        current: usize,
+        /// Configured node-wide blob row ceiling.
+        limit: usize,
+    },
+
+    /// Adding an encrypted blob would exceed node-wide retained blob bytes.
+    #[error("Pending blob byte quota exceeded: {current} + {incoming} bytes (limit {limit})")]
+    PendingBlobBytesExceeded {
+        /// Current retained encrypted blob bytes.
+        current: u64,
+        /// Incoming encrypted blob bytes.
+        incoming: u64,
+        /// Configured node-wide encrypted blob byte ceiling.
+        limit: u64,
+    },
+
+    /// One encrypted blob exceeds the configured item ceiling.
     #[error("Blob too large: {size} bytes (limit {limit})")]
-    BlobTooLarge { size: usize, limit: usize },
+    BlobTooLarge {
+        /// Incoming encrypted blob bytes.
+        size: usize,
+        /// Configured encrypted blob byte ceiling.
+        limit: usize,
+    },
 
+    /// The opaque blob identifier does not resolve to a retained object.
     #[error("Blob not found: {blob_id}")]
-    BlobNotFound { blob_id: String },
+    BlobNotFound {
+        /// Opaque HMAC-derived identifier supplied by the caller.
+        blob_id: String,
+    },
 
+    /// The authenticated caller is not allowed to mutate the object.
     #[error("Unauthorized: sender mismatch")]
     Unauthorized,
 }
 
+impl ChatRelayError {
+    /// Returns a stable aggregate-only diagnostics bucket.
+    #[must_use]
+    pub const fn reason_bucket(&self) -> &'static str {
+        match self {
+            Self::Sqlite(_) => "sqlite_error",
+            Self::Serialize(_) => "serialization_error",
+            Self::MessageTooLarge { .. } => "message_too_large",
+            Self::MailboxFull { .. } => "mailbox_full",
+            Self::PendingMessageQueueFull { .. } => "pending_message_count_quota",
+            Self::PendingMessageBytesExceeded { .. } => "pending_message_byte_quota",
+            Self::BlobQuotaExceeded { .. } => "receiver_blob_quota",
+            Self::PendingBlobStoreFull { .. } => "pending_blob_count_quota",
+            Self::PendingBlobBytesExceeded { .. } => "pending_blob_byte_quota",
+            Self::BlobTooLarge { .. } => "blob_too_large",
+            Self::BlobNotFound { .. } => "blob_not_found",
+            Self::Unauthorized => "unauthorized",
+        }
+    }
+
+    /// Whether retrying without queue cleanup or operator action cannot help.
+    #[must_use]
+    pub const fn is_capacity_exhausted(&self) -> bool {
+        matches!(
+            self,
+            Self::MailboxFull { .. }
+                | Self::PendingMessageQueueFull { .. }
+                | Self::PendingMessageBytesExceeded { .. }
+                | Self::BlobQuotaExceeded { .. }
+                | Self::PendingBlobStoreFull { .. }
+                | Self::PendingBlobBytesExceeded { .. }
+        )
+    }
+}
+
 pub type ChatRelayResult<T> = Result<T, ChatRelayError>;
+
+/// Aggregate durable relay usage with no user or routing identifiers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatRelayStorageUsage {
+    /// Active pending message rows.
+    pub pending_messages: u64,
+    /// Encoded bytes held by active pending messages.
+    pub pending_message_bytes: u64,
+    /// Pending encrypted blob rows.
+    pub pending_blobs: u64,
+    /// Encrypted blob bytes retained by the node.
+    pub pending_blob_bytes: u64,
+}
 
 // ============================================
 // Pending message row (returned from pull)
@@ -199,7 +330,9 @@ pub type ChatRelayResult<T> = Result<T, ChatRelayError>;
 /// A pending offline message retrieved from the store.
 #[derive(Debug)]
 pub struct PendingMessage {
+    /// Opaque client-generated message identifier used for ACK pagination.
     pub message_id: [u8; 16],
+    /// Signed end-to-end encrypted envelope; relay code must not inspect its ciphertext.
     pub envelope: ChatEnvelope,
 }
 
@@ -210,8 +343,11 @@ pub struct PendingMessage {
 /// A queued `ChatExpired` notification for an offline sender.
 #[derive(Debug)]
 pub struct ExpiredNotification {
+    /// Local notification row identifier.
     pub id: i64,
+    /// Original sender public key used only for authenticated delivery lookup.
     pub sender: [u8; 32],
+    /// Original receiver public key returned inside the encrypted client flow.
     pub receiver: [u8; 32],
     /// bincode-serialised `Vec<[u8; 16]>`
     pub message_ids_raw: Vec<u8>,
@@ -368,8 +504,106 @@ impl ChatRelayService {
             );
             CREATE INDEX IF NOT EXISTS idx_en_sender_pushed
                 ON expired_notifications(sender, pushed);
+
+            CREATE TABLE IF NOT EXISTS relay_storage_usage (
+                singleton              INTEGER PRIMARY KEY CHECK(singleton = 1),
+                pending_message_count  INTEGER NOT NULL CHECK(pending_message_count >= 0),
+                pending_message_bytes  INTEGER NOT NULL CHECK(pending_message_bytes >= 0),
+                pending_blob_count     INTEGER NOT NULL CHECK(pending_blob_count >= 0),
+                pending_blob_bytes     INTEGER NOT NULL CHECK(pending_blob_bytes >= 0)
+            );
+
+            CREATE TRIGGER IF NOT EXISTS trg_relay_message_usage_insert
+            AFTER INSERT ON pending_messages
+            WHEN NEW.status = 0
+            BEGIN
+                UPDATE relay_storage_usage
+                SET pending_message_count = pending_message_count + 1,
+                    pending_message_bytes = pending_message_bytes + LENGTH(NEW.envelope)
+                WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_relay_message_usage_delete
+            AFTER DELETE ON pending_messages
+            WHEN OLD.status = 0
+            BEGIN
+                UPDATE relay_storage_usage
+                SET pending_message_count = MAX(0, pending_message_count - 1),
+                    pending_message_bytes = MAX(
+                        0,
+                        pending_message_bytes - LENGTH(OLD.envelope)
+                    )
+                WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_relay_message_usage_status
+            AFTER UPDATE OF status ON pending_messages
+            WHEN OLD.status != NEW.status
+            BEGIN
+                UPDATE relay_storage_usage
+                SET pending_message_count = MAX(
+                        0,
+                        pending_message_count
+                        + CASE
+                            WHEN OLD.status = 0 AND NEW.status != 0 THEN -1
+                            WHEN OLD.status != 0 AND NEW.status = 0 THEN 1
+                            ELSE 0
+                          END
+                    ),
+                    pending_message_bytes = MAX(
+                        0,
+                        pending_message_bytes
+                        + CASE
+                            WHEN OLD.status = 0 AND NEW.status != 0
+                                THEN -LENGTH(OLD.envelope)
+                            WHEN OLD.status != 0 AND NEW.status = 0
+                                THEN LENGTH(NEW.envelope)
+                            ELSE 0
+                          END
+                    )
+                WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_relay_blob_usage_insert
+            AFTER INSERT ON pending_blobs
+            BEGIN
+                UPDATE relay_storage_usage
+                SET pending_blob_count = pending_blob_count + 1,
+                    pending_blob_bytes = pending_blob_bytes + NEW.size
+                WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_relay_blob_usage_delete
+            AFTER DELETE ON pending_blobs
+            BEGIN
+                UPDATE relay_storage_usage
+                SET pending_blob_count = MAX(0, pending_blob_count - 1),
+                    pending_blob_bytes = MAX(0, pending_blob_bytes - OLD.size)
+                WHERE singleton = 1;
+            END;
         ",
         )?;
+        // Reconcile from canonical rows at every startup. This makes upgrades
+        // and restored databases deterministic even if an older process never
+        // maintained the aggregate usage row.
+        conn.execute(
+            "INSERT OR REPLACE INTO relay_storage_usage (
+                singleton,
+                pending_message_count,
+                pending_message_bytes,
+                pending_blob_count,
+                pending_blob_bytes
+             )
+             SELECT
+                1,
+                (SELECT COUNT(*) FROM pending_messages WHERE status = 0),
+                (SELECT COALESCE(SUM(LENGTH(envelope)), 0)
+                   FROM pending_messages WHERE status = 0),
+                (SELECT COUNT(*) FROM pending_blobs),
+                (SELECT COALESCE(SUM(size), 0) FROM pending_blobs)",
+            [],
+        )?;
+        drop(conn);
         Ok(())
     }
 
@@ -406,18 +640,88 @@ impl ChatRelayService {
     // Message store / pull / ack
     // ============================================
 
+    fn read_storage_usage(conn: &Connection) -> ChatRelayResult<ChatRelayStorageUsage> {
+        conn.query_row(
+            "SELECT
+                pending_message_count,
+                pending_message_bytes,
+                pending_blob_count,
+                pending_blob_bytes
+             FROM relay_storage_usage
+             WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(ChatRelayStorageUsage {
+                    pending_messages: nonnegative_sqlite_counter(row.get(0)?),
+                    pending_message_bytes: nonnegative_sqlite_counter(row.get(1)?),
+                    pending_blobs: nonnegative_sqlite_counter(row.get(2)?),
+                    pending_blob_bytes: nonnegative_sqlite_counter(row.get(3)?),
+                })
+            },
+        )
+        .map_err(ChatRelayError::from)
+    }
+
     /// Stores a pending offline message for a receiver that is not currently online.
+    ///
+    /// # Errors
+    ///
+    /// Returns an item-size or durable-capacity error before insertion, or a
+    /// serialization/SQLite error if encoding or the atomic write fails.
     pub fn store_pending(&self, envelope: &ChatEnvelope) -> ChatRelayResult<()> {
+        if envelope.ciphertext.len() > self.config.max_message_size {
+            return Err(ChatRelayError::MessageTooLarge {
+                size: envelope.ciphertext.len(),
+                limit: self.config.max_message_size,
+            });
+        }
+
         let now = now_secs();
         let receiver = envelope.receiver;
+        let envelope_bytes = encode_envelope(envelope)?;
+        let incoming_bytes = envelope_bytes.len() as u64;
 
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let count: usize = conn.query_row(
+        // Idempotence is checked before every quota. A retry of an already
+        // durable message must succeed even while the queue is at capacity.
+        let duplicate = tx
+            .query_row(
+                "SELECT 1 FROM pending_messages WHERE message_id = ?1",
+                params![envelope.message_id.as_slice()],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if duplicate {
+            tx.commit()?;
+            return Ok(());
+        }
+
+        let usage = Self::read_storage_usage(&tx)?;
+        if usage.pending_messages >= self.config.max_pending_messages_total as u64 {
+            return Err(ChatRelayError::PendingMessageQueueFull {
+                current: usize::try_from(usage.pending_messages).unwrap_or(usize::MAX),
+                limit: self.config.max_pending_messages_total,
+            });
+        }
+        if usage.pending_message_bytes.saturating_add(incoming_bytes)
+            > self.config.max_pending_message_bytes_total
+        {
+            return Err(ChatRelayError::PendingMessageBytesExceeded {
+                current: usage.pending_message_bytes,
+                incoming: incoming_bytes,
+                limit: self.config.max_pending_message_bytes_total,
+            });
+        }
+
+        let count = tx.query_row(
             "SELECT COUNT(*) FROM pending_messages WHERE receiver = ? AND status = 0",
             params![receiver.as_slice()],
             |row| row.get::<_, i64>(0),
-        )? as usize;
+        )?;
+        let count = usize::try_from(count.max(0)).unwrap_or(usize::MAX);
 
         if count >= self.config.max_pending_per_wallet {
             return Err(ChatRelayError::MailboxFull {
@@ -426,9 +730,7 @@ impl ChatRelayService {
             });
         }
 
-        let envelope_bytes = encode_envelope(envelope)?;
-
-        conn.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO pending_messages
              (message_id, sender, receiver, timestamp, envelope, received_at, status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
@@ -441,11 +743,12 @@ impl ChatRelayService {
                 now as i64,
             ],
         )?;
+        tx.commit()?;
+        drop(conn);
 
         debug!(
-            id = %hex::encode(envelope.message_id),
-            receiver = %hex::encode(&receiver[..4]),
-            "[CHAT_RELAY] Message stored (pending)"
+            encoded_bytes = incoming_bytes,
+            "[CHAT_RELAY] Message stored pending"
         );
         Ok(())
     }
@@ -483,6 +786,8 @@ impl ChatRelayService {
             )?
             .filter_map(|r| r.ok())
             .collect();
+        drop(stmt);
+        drop(conn);
 
         let has_more = rows.len() == effective_limit;
         let page = &rows[..rows.len().min(effective_limit - 1)];
@@ -526,12 +831,9 @@ impl ChatRelayService {
             )?;
             deleted += n;
         }
+        drop(conn);
 
-        debug!(
-            count = deleted,
-            receiver = %hex::encode(&receiver_wallet[..4]),
-            "[CHAT_RELAY] Messages ACKed and deleted"
-        );
+        debug!(count = deleted, "[CHAT_RELAY] Messages ACKed and deleted");
         Ok(deleted)
     }
 
@@ -553,13 +855,50 @@ impl ChatRelayService {
             });
         }
 
-        let conn = self.conn.lock();
+        let blob_id = self.compute_blob_id(sender, receiver, file_hash);
+        let incoming_bytes = data.len() as u64;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let count: usize = conn.query_row(
+        // Return the stable content-derived ID before quota checks when the
+        // encrypted object is already present. Retries remain idempotent even
+        // while the blob store is full.
+        let duplicate = tx
+            .query_row(
+                "SELECT 1 FROM pending_blobs WHERE blob_id = ?1",
+                params![&blob_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if duplicate {
+            tx.commit()?;
+            return Ok(blob_id);
+        }
+
+        let usage = Self::read_storage_usage(&tx)?;
+        if usage.pending_blobs >= self.config.max_pending_blobs_total as u64 {
+            return Err(ChatRelayError::PendingBlobStoreFull {
+                current: usize::try_from(usage.pending_blobs).unwrap_or(usize::MAX),
+                limit: self.config.max_pending_blobs_total,
+            });
+        }
+        if usage.pending_blob_bytes.saturating_add(incoming_bytes)
+            > self.config.max_pending_blob_bytes_total
+        {
+            return Err(ChatRelayError::PendingBlobBytesExceeded {
+                current: usage.pending_blob_bytes,
+                incoming: incoming_bytes,
+                limit: self.config.max_pending_blob_bytes_total,
+            });
+        }
+
+        let count = tx.query_row(
             "SELECT COUNT(*) FROM pending_blobs WHERE receiver = ?",
             params![receiver.as_slice()],
             |row| row.get::<_, i64>(0),
-        )? as usize;
+        )?;
+        let count = usize::try_from(count.max(0)).unwrap_or(usize::MAX);
 
         if count >= self.config.max_blobs_per_receiver {
             return Err(ChatRelayError::BlobQuotaExceeded {
@@ -568,10 +907,9 @@ impl ChatRelayService {
             });
         }
 
-        let blob_id = self.compute_blob_id(sender, receiver, file_hash);
         let now = now_secs();
 
-        conn.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO pending_blobs
              (blob_id, sender, receiver, data, size, received_at, downloaded)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
@@ -584,13 +922,10 @@ impl ChatRelayService {
                 now as i64,
             ],
         )?;
+        tx.commit()?;
+        drop(conn);
 
-        info!(
-            blob_id = %blob_id,
-            size = data.len(),
-            sender = %hex::encode(&sender[..4]),
-            "[CHAT_RELAY] Blob stored"
-        );
+        info!(size = data.len(), "[CHAT_RELAY] Encrypted blob stored");
         Ok(blob_id)
     }
 
@@ -606,15 +941,19 @@ impl ChatRelayService {
             .optional()?;
 
         match data {
-            None => Err(ChatRelayError::BlobNotFound {
-                blob_id: blob_id.to_string(),
-            }),
+            None => {
+                drop(conn);
+                Err(ChatRelayError::BlobNotFound {
+                    blob_id: blob_id.to_string(),
+                })
+            }
             Some(bytes) => {
                 let _ = conn.execute(
                     "UPDATE pending_blobs SET downloaded = 1 WHERE blob_id = ?",
                     params![blob_id],
                 );
-                debug!(blob_id = %blob_id, "[CHAT_RELAY] Blob retrieved");
+                drop(conn);
+                debug!(size = bytes.len(), "[CHAT_RELAY] Encrypted blob retrieved");
                 Ok(bytes)
             }
         }
@@ -629,7 +968,8 @@ impl ChatRelayService {
         )?;
 
         if deleted == 1 {
-            info!(blob_id = %blob_id, "[CHAT_RELAY] Blob deleted by sender");
+            drop(conn);
+            info!("[CHAT_RELAY] Encrypted blob deleted by authorized sender");
             return Ok(());
         }
 
@@ -641,6 +981,7 @@ impl ChatRelayService {
             )
             .optional()?
             .unwrap_or(false);
+        drop(conn);
 
         if exists {
             Err(ChatRelayError::Unauthorized)
@@ -688,6 +1029,8 @@ impl ChatRelayService {
             })?
             .filter_map(|r| r.ok())
             .collect();
+        drop(stmt);
+        drop(conn);
 
         Ok(rows)
     }
@@ -703,6 +1046,7 @@ impl ChatRelayService {
                 params![id],
             )?;
         }
+        drop(conn);
         Ok(())
     }
 
@@ -818,6 +1162,7 @@ impl ChatRelayService {
                 let _ = conn.execute_batch("ROLLBACK");
             }
         }
+        drop(conn);
 
         if let Ok((expired_message_count, expired_blobs)) = &result {
             if *expired_message_count > 0 || *expired_blobs > 0 {
@@ -941,6 +1286,24 @@ impl ChatRelayService {
     pub fn peer_status(&self) -> ChatRelayPeerStatus {
         self.peer_status.read().clone()
     }
+
+    /// Returns aggregate durable queue usage maintained by `SQLite` triggers.
+    ///
+    /// The result contains no message, wallet, sender, receiver, route, or
+    /// payload identifiers and is safe for operator-capacity telemetry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQLite error if the reconciled singleton usage row cannot be
+    /// read. Callers must treat that as unavailable telemetry, not zero usage.
+    pub fn storage_usage(&self) -> ChatRelayResult<ChatRelayStorageUsage> {
+        let conn = self.conn.lock();
+        Self::read_storage_usage(&conn)
+    }
+}
+
+fn nonnegative_sqlite_counter(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or_default()
 }
 
 // ============================================
@@ -983,9 +1346,13 @@ mod tests {
             db_path: ":memory:".to_string(),
             offline_ttl_secs: 259_200,
             max_pending_per_wallet: 5,
+            max_pending_messages_total: 100,
+            max_pending_message_bytes_total: 1024 * 1024,
             max_message_size: 65_536,
             max_blob_size: 1_024,
             max_blobs_per_receiver: 3,
+            max_pending_blobs_total: 10,
+            max_pending_blob_bytes_total: 10 * 1024,
             cleanup_interval_secs: 60,
             dedup_lru_capacity: 10,
             expired_notification_ttl_secs: 604_800,
@@ -993,8 +1360,12 @@ mod tests {
     }
 
     fn make_service() -> ChatRelayService {
+        make_service_with_config(test_config())
+    }
+
+    fn make_service_with_config(config: ChatRelayConfig) -> ChatRelayService {
         let secret = derive_node_secret(&[0x42u8; 32]);
-        ChatRelayService::new(test_config(), secret).expect("init")
+        ChatRelayService::new(config, secret).expect("init")
     }
 
     #[test]
@@ -1099,6 +1470,22 @@ mod tests {
         assert_eq!(b, 0);
     }
 
+    #[test]
+    fn chat_relay_logs_stay_free_of_routing_identifiers() {
+        let source = include_str!("chat_relay.rs");
+        let message_log = concat!("id = %hex::", "encode(envelope.message_id)");
+        let receiver_log = concat!("receiver = %hex::", "encode");
+        let sender_log = concat!("sender = %hex::", "encode");
+        let blob_log = concat!("blob_id", " = %");
+
+        for forbidden in [message_log, receiver_log, sender_log, blob_log] {
+            assert!(
+                !source.contains(forbidden),
+                "relay logs must not expose stable routing identifiers"
+            );
+        }
+    }
+
     // ── v1.3.0: wallet_routes field accessible ───────────────────────────
 
     #[test]
@@ -1148,6 +1535,9 @@ mod tests {
         let mid = env.message_id;
 
         svc.store_pending(&env).expect("store");
+        let usage = svc.storage_usage().expect("usage after store");
+        assert_eq!(usage.pending_messages, 1);
+        assert!(usage.pending_message_bytes > 0);
 
         let (msgs, has_more) = svc
             .pull_pending(&receiver, 0, &[0u8; 16], 50)
@@ -1158,6 +1548,9 @@ mod tests {
 
         let deleted = svc.ack_messages(&[mid], &receiver).expect("ack");
         assert_eq!(deleted, 1);
+        let usage = svc.storage_usage().expect("usage after ack");
+        assert_eq!(usage.pending_messages, 0);
+        assert_eq!(usage.pending_message_bytes, 0);
 
         let (msgs2, _) = svc
             .pull_pending(&receiver, 0, &[0u8; 16], 50)
@@ -1180,6 +1573,101 @@ mod tests {
             .pull_pending(&receiver, 0, &[0u8; 16], 50)
             .expect("pull");
         assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn test_store_enforces_configured_ciphertext_size_limit() {
+        let mut config = test_config();
+        config.max_message_size = 4;
+        let svc = make_service_with_config(config);
+        let kp = IdentityKeyPair::generate();
+        let envelope = make_envelope(&kp, [0x10; 32]);
+
+        assert!(matches!(
+            svc.store_pending(&envelope),
+            Err(ChatRelayError::MessageTooLarge { size: 9, limit: 4 })
+        ));
+        assert_eq!(
+            svc.storage_usage().unwrap(),
+            ChatRelayStorageUsage::default()
+        );
+    }
+
+    #[test]
+    fn test_global_message_count_quota_preserves_duplicate_idempotence() {
+        let mut config = test_config();
+        config.max_pending_messages_total = 1;
+        let svc = make_service_with_config(config);
+        let kp = IdentityKeyPair::generate();
+        let first = make_envelope(&kp, [0x11; 32]);
+
+        svc.store_pending(&first).expect("first store");
+        svc.store_pending(&first)
+            .expect("duplicate remains successful at global capacity");
+
+        let second = make_envelope(&kp, [0x22; 32]);
+        assert!(matches!(
+            svc.store_pending(&second),
+            Err(ChatRelayError::PendingMessageQueueFull { .. })
+        ));
+        assert_eq!(svc.storage_usage().unwrap().pending_messages, 1);
+    }
+
+    #[test]
+    fn test_global_message_byte_quota_spans_distinct_receivers() {
+        let kp = IdentityKeyPair::generate();
+        let first = make_envelope(&kp, [0x31; 32]);
+        let encoded_bytes = encode_envelope(&first).unwrap().len() as u64;
+        let mut config = test_config();
+        config.max_pending_message_bytes_total = encoded_bytes;
+        let svc = make_service_with_config(config);
+
+        svc.store_pending(&first).expect("first store");
+        let second = make_envelope(&kp, [0x32; 32]);
+        assert!(matches!(
+            svc.store_pending(&second),
+            Err(ChatRelayError::PendingMessageBytesExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn test_storage_usage_reconciles_from_canonical_rows_on_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "aeronyx-chat-relay-usage-{}.db",
+            rand::random::<u64>()
+        ));
+        let mut config = test_config();
+        config.db_path = path.to_string_lossy().into_owned();
+        let kp = IdentityKeyPair::generate();
+        let envelope = make_envelope(&kp, [0x61; 32]);
+
+        {
+            let svc = make_service_with_config(config.clone());
+            svc.store_pending(&envelope).expect("store before restart");
+        }
+        {
+            let conn = Connection::open(&path).expect("open usage database");
+            conn.execute(
+                "UPDATE relay_storage_usage
+                 SET pending_message_count = 0, pending_message_bytes = 0
+                 WHERE singleton = 1",
+                [],
+            )
+            .expect("tamper derived usage row");
+        }
+
+        let restarted = make_service_with_config(config);
+        let usage = restarted.storage_usage().expect("reconciled usage");
+        assert_eq!(usage.pending_messages, 1);
+        assert_eq!(
+            usage.pending_message_bytes,
+            encode_envelope(&envelope).unwrap().len() as u64
+        );
+        drop(restarted);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     #[test]
@@ -1255,11 +1743,17 @@ mod tests {
             .put_blob(&sender, &receiver, data, &file_hash)
             .expect("put");
         assert_eq!(blob_id.len(), 32);
+        let usage = svc.storage_usage().expect("usage after blob put");
+        assert_eq!(usage.pending_blobs, 1);
+        assert_eq!(usage.pending_blob_bytes, data.len() as u64);
 
         let fetched = svc.get_blob(&blob_id).expect("get");
         assert_eq!(fetched, data);
 
         svc.delete_blob(&blob_id, &sender).expect("delete");
+        let usage = svc.storage_usage().expect("usage after blob delete");
+        assert_eq!(usage.pending_blobs, 0);
+        assert_eq!(usage.pending_blob_bytes, 0);
         assert!(matches!(
             svc.get_blob(&blob_id),
             Err(ChatRelayError::BlobNotFound { .. })
@@ -1276,6 +1770,51 @@ mod tests {
 
         let result = svc.put_blob(&sender, &receiver, &data, &file_hash);
         assert!(matches!(result, Err(ChatRelayError::BlobTooLarge { .. })));
+    }
+
+    #[test]
+    fn test_global_blob_count_quota_preserves_duplicate_idempotence() {
+        let mut config = test_config();
+        config.max_pending_blobs_total = 1;
+        let svc = make_service_with_config(config);
+        let sender = [0x41; 32];
+        let first_receiver = [0x42; 32];
+        let first_data = b"first encrypted blob";
+        let first_hash: [u8; 32] = Sha256::digest(first_data).into();
+
+        let first_id = svc
+            .put_blob(&sender, &first_receiver, first_data, &first_hash)
+            .expect("first put");
+        let duplicate_id = svc
+            .put_blob(&sender, &first_receiver, first_data, &first_hash)
+            .expect("duplicate remains successful at global capacity");
+        assert_eq!(duplicate_id, first_id);
+
+        let second_data = b"second encrypted blob";
+        let second_hash: [u8; 32] = Sha256::digest(second_data).into();
+        assert!(matches!(
+            svc.put_blob(&sender, &[0x43; 32], second_data, &second_hash),
+            Err(ChatRelayError::PendingBlobStoreFull { .. })
+        ));
+        assert_eq!(svc.storage_usage().unwrap().pending_blobs, 1);
+    }
+
+    #[test]
+    fn test_global_blob_byte_quota_spans_distinct_receivers() {
+        let data = b"bounded encrypted blob";
+        let mut config = test_config();
+        config.max_pending_blob_bytes_total = data.len() as u64;
+        let svc = make_service_with_config(config);
+        let sender = [0x51; 32];
+        let first_hash: [u8; 32] = Sha256::digest(data).into();
+
+        svc.put_blob(&sender, &[0x52; 32], data, &first_hash)
+            .expect("first put");
+        let second_hash: [u8; 32] = Sha256::digest(b"different hash").into();
+        assert!(matches!(
+            svc.put_blob(&sender, &[0x53; 32], data, &second_hash),
+            Err(ChatRelayError::PendingBlobBytesExceeded { .. })
+        ));
     }
 
     #[test]

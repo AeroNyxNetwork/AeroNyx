@@ -9,6 +9,8 @@
 //!
 //! ## Modification Reason
 //! v1.1.0-ChatRelay — 🌟 Initial implementation.
+//! v1.2.0-GlobalStorageQuotas — Added node-wide message/blob count and byte
+//! ceilings so many synthetic receivers cannot bypass per-mailbox limits.
 //!
 //! ## Main Functionality
 //! - `ChatRelayConfig` — all knobs for the zero-knowledge P2P chat relay
@@ -17,7 +19,7 @@
 //!
 //! ## Dependencies
 //! - `config_memchain.rs` — embeds `ChatRelayConfig` as `chat_relay` field
-//! - `chat_relay_service.rs` — consumes this config at startup
+//! - `services/chat_relay.rs` — consumes this config at startup
 //! - `api/chat.rs`           — reads size limits at request time
 //!
 //! ## Main Logical Flow
@@ -31,10 +33,15 @@
 //!   create parent directories before opening (see `ChatRelayService::new()`).
 //! - `max_pending_per_wallet` is enforced at write time — a "mailbox full"
 //!   error is sent back to the sender when the limit is reached.
+//! - Node-wide message/blob count and byte ceilings are mandatory when the
+//!   relay is enabled. Keep them at least as large as their per-wallet/single
+//!   item limits so one valid mailbox or object remains usable.
 //! - `dedup_lru_capacity` is node-wide (not per-wallet). ~64 bytes/entry;
 //!   10 000 entries ≈ 640 KB RAM.
 //! - `max_message_size`: values > 64 KB emit a warn (UDP fragmentation risk)
-//!   AND are now hard-rejected (> MAX_MESSAGE_SIZE_HARD_LIMIT = 1 MB).
+//!   and are hard-rejected above `MAX_MESSAGE_SIZE_HARD_LIMIT` (1 MB).
+//!   `ChatRelayService::store_pending()` enforces the configured ciphertext
+//!   ceiling before any durable write.
 //!   Rationale: text chat envelopes should never approach 1 MB; if they do,
 //!   it indicates a misconfiguration rather than a legitimate use-case.
 //! - `expired_notification_ttl_secs`: after this TTL, undelivered expiry
@@ -45,6 +52,7 @@
 //!   update `chat_relay.db_path` explicitly in your config file.
 //!
 //! ## Last Modified
+//! v1.2.0-GlobalStorageQuotas — Added backward-compatible global disk ceilings.
 //! v1.1.0-ChatRelay — Initial implementation.
 
 use serde::{Deserialize, Serialize};
@@ -85,16 +93,21 @@ const MAX_MESSAGE_SIZE_HARD_LIMIT: usize = 1_048_576; // 1 MB
 /// enabled = true
 /// offline_ttl_secs = 259200       # 72 hours
 /// max_pending_per_wallet = 500
+/// max_pending_messages_total = 100000
+/// max_pending_message_bytes_total = 536870912  # 512 MiB
 /// db_path = "data/chat_pending.db"
 /// max_message_size = 65536        # 64 KB (text envelope)
 /// max_blob_size = 10485760        # 10 MB (encrypted media)
 /// max_blobs_per_receiver = 50
+/// max_pending_blobs_total = 5000
+/// max_pending_blob_bytes_total = 2147483648    # 2 GiB
 /// cleanup_interval_secs = 60
 /// dedup_lru_capacity = 10000
 /// expired_notification_ttl_secs = 604800  # 7 days
 /// ```
 ///
 /// ## Last Modified
+/// v1.2.0-GlobalStorageQuotas — Added node-wide durable queue ceilings.
 /// v1.1.0-ChatRelay — Initial implementation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRelayConfig {
@@ -119,6 +132,20 @@ pub struct ChatRelayConfig {
     /// Default: 500.
     #[serde(default = "default_max_pending_per_wallet")]
     pub max_pending_per_wallet: usize,
+
+    /// Maximum pending messages across every receiver on this node.
+    ///
+    /// This closes the synthetic-receiver bypass of the per-wallet mailbox
+    /// limit. Default: 100 000.
+    #[serde(default = "default_max_pending_messages_total")]
+    pub max_pending_messages_total: usize,
+
+    /// Maximum encoded pending-message bytes across the node.
+    ///
+    /// Count limits alone do not bound disk use because encrypted envelopes
+    /// vary in size. Default: 536 870 912 (512 MiB).
+    #[serde(default = "default_max_pending_message_bytes_total")]
+    pub max_pending_message_bytes_total: u64,
 
     /// Path to the SQLite database file for chat relay storage.
     ///
@@ -158,6 +185,16 @@ pub struct ChatRelayConfig {
     /// Default: 50.
     #[serde(default = "default_max_blobs_per_receiver")]
     pub max_blobs_per_receiver: usize,
+
+    /// Maximum encrypted blobs retained across every receiver.
+    /// Default: 5 000.
+    #[serde(default = "default_max_pending_blobs_total")]
+    pub max_pending_blobs_total: usize,
+
+    /// Maximum encrypted blob bytes retained across the node.
+    /// Default: 2 147 483 648 (2 GiB).
+    #[serde(default = "default_max_pending_blob_bytes_total")]
+    pub max_pending_blob_bytes_total: u64,
 
     /// Interval in seconds between TTL cleanup runs.
     ///
@@ -201,6 +238,12 @@ fn default_chat_ttl() -> u64 {
 fn default_max_pending_per_wallet() -> usize {
     500
 }
+fn default_max_pending_messages_total() -> usize {
+    100_000
+}
+fn default_max_pending_message_bytes_total() -> u64 {
+    512 * 1024 * 1024
+}
 fn default_chat_db_path() -> String {
     "data/chat_pending.db".into()
 }
@@ -212,6 +255,12 @@ fn default_max_blob_size() -> usize {
 } // 10 MB
 fn default_max_blobs_per_receiver() -> usize {
     50
+}
+fn default_max_pending_blobs_total() -> usize {
+    5_000
+}
+fn default_max_pending_blob_bytes_total() -> u64 {
+    2 * 1024 * 1024 * 1024
 }
 fn default_cleanup_interval() -> u64 {
     60
@@ -229,10 +278,14 @@ impl Default for ChatRelayConfig {
             enabled: false,
             offline_ttl_secs: default_chat_ttl(),
             max_pending_per_wallet: default_max_pending_per_wallet(),
+            max_pending_messages_total: default_max_pending_messages_total(),
+            max_pending_message_bytes_total: default_max_pending_message_bytes_total(),
             db_path: default_chat_db_path(),
             max_message_size: default_max_message_size(),
             max_blob_size: default_max_blob_size(),
             max_blobs_per_receiver: default_max_blobs_per_receiver(),
+            max_pending_blobs_total: default_max_pending_blobs_total(),
+            max_pending_blob_bytes_total: default_max_pending_blob_bytes_total(),
             cleanup_interval_secs: default_cleanup_interval(),
             dedup_lru_capacity: default_dedup_lru_capacity(),
             expired_notification_ttl_secs: default_expired_notification_ttl(),
@@ -265,6 +318,20 @@ impl ChatRelayConfig {
             return Err(ServerError::config_invalid(
                 "memchain.chat_relay.max_pending_per_wallet",
                 "must be > 0",
+            ));
+        }
+
+        if self.max_pending_messages_total < self.max_pending_per_wallet {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.max_pending_messages_total",
+                "must be >= max_pending_per_wallet",
+            ));
+        }
+
+        if self.max_pending_message_bytes_total < self.max_message_size as u64 {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.max_pending_message_bytes_total",
+                "must be >= max_message_size",
             ));
         }
 
@@ -315,6 +382,20 @@ impl ChatRelayConfig {
             ));
         }
 
+        if self.max_pending_blobs_total < self.max_blobs_per_receiver {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.max_pending_blobs_total",
+                "must be >= max_blobs_per_receiver",
+            ));
+        }
+
+        if self.max_pending_blob_bytes_total < self.max_blob_size as u64 {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.max_pending_blob_bytes_total",
+                "must be >= max_blob_size",
+            ));
+        }
+
         if self.cleanup_interval_secs == 0 {
             return Err(ServerError::config_invalid(
                 "memchain.chat_relay.cleanup_interval_secs",
@@ -359,10 +440,14 @@ mod tests {
         let cr = ChatRelayConfig::default();
         assert_eq!(cr.offline_ttl_secs, 259_200);
         assert_eq!(cr.max_pending_per_wallet, 500);
+        assert_eq!(cr.max_pending_messages_total, 100_000);
+        assert_eq!(cr.max_pending_message_bytes_total, 536_870_912);
         assert_eq!(cr.db_path, "data/chat_pending.db");
         assert_eq!(cr.max_message_size, 65_536);
         assert_eq!(cr.max_blob_size, 10_485_760);
         assert_eq!(cr.max_blobs_per_receiver, 50);
+        assert_eq!(cr.max_pending_blobs_total, 5_000);
+        assert_eq!(cr.max_pending_blob_bytes_total, 2_147_483_648);
         assert_eq!(cr.cleanup_interval_secs, 60);
         assert_eq!(cr.dedup_lru_capacity, 10_000);
         assert_eq!(cr.expired_notification_ttl_secs, 604_800);
@@ -375,10 +460,14 @@ mod tests {
             enabled: false,
             offline_ttl_secs: 0,
             max_pending_per_wallet: 0,
+            max_pending_messages_total: 0,
+            max_pending_message_bytes_total: 0,
             db_path: String::new(),
             max_message_size: 0,
             max_blob_size: 0,
             max_blobs_per_receiver: 0,
+            max_pending_blobs_total: 0,
+            max_pending_blob_bytes_total: 0,
             cleanup_interval_secs: 0,
             dedup_lru_capacity: 0,
             expired_notification_ttl_secs: 0,
@@ -410,6 +499,28 @@ mod tests {
         let cr = ChatRelayConfig {
             enabled: true,
             db_path: String::new(),
+            ..Default::default()
+        };
+        assert!(cr.validate().is_err());
+    }
+
+    #[test]
+    fn test_chat_relay_global_message_count_below_mailbox_limit_rejected() {
+        let cr = ChatRelayConfig {
+            enabled: true,
+            max_pending_per_wallet: 501,
+            max_pending_messages_total: 500,
+            ..Default::default()
+        };
+        assert!(cr.validate().is_err());
+    }
+
+    #[test]
+    fn test_chat_relay_global_message_bytes_below_single_message_rejected() {
+        let cr = ChatRelayConfig {
+            enabled: true,
+            max_message_size: 65_536,
+            max_pending_message_bytes_total: 65_535,
             ..Default::default()
         };
         assert!(cr.validate().is_err());
@@ -466,6 +577,28 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_relay_global_blob_count_below_receiver_limit_rejected() {
+        let cr = ChatRelayConfig {
+            enabled: true,
+            max_blobs_per_receiver: 51,
+            max_pending_blobs_total: 50,
+            ..Default::default()
+        };
+        assert!(cr.validate().is_err());
+    }
+
+    #[test]
+    fn test_chat_relay_global_blob_bytes_below_single_blob_rejected() {
+        let cr = ChatRelayConfig {
+            enabled: true,
+            max_blob_size: 1_024,
+            max_pending_blob_bytes_total: 1_023,
+            ..Default::default()
+        };
+        assert!(cr.validate().is_err());
+    }
+
+    #[test]
     fn test_chat_relay_zero_cleanup_interval_rejected() {
         let cr = ChatRelayConfig {
             enabled: true,
@@ -503,10 +636,14 @@ mod tests {
 enabled = true
 offline_ttl_secs = 86400
 max_pending_per_wallet = 200
+max_pending_messages_total = 40000
+max_pending_message_bytes_total = 268435456
 db_path = "data/chat_test.db"
 max_message_size = 32768
 max_blob_size = 5242880
 max_blobs_per_receiver = 20
+max_pending_blobs_total = 2000
+max_pending_blob_bytes_total = 1073741824
 cleanup_interval_secs = 30
 dedup_lru_capacity = 5000
 expired_notification_ttl_secs = 172800
@@ -515,10 +652,14 @@ expired_notification_ttl_secs = 172800
         assert!(cr.enabled);
         assert_eq!(cr.offline_ttl_secs, 86_400);
         assert_eq!(cr.max_pending_per_wallet, 200);
+        assert_eq!(cr.max_pending_messages_total, 40_000);
+        assert_eq!(cr.max_pending_message_bytes_total, 268_435_456);
         assert_eq!(cr.db_path, "data/chat_test.db");
         assert_eq!(cr.max_message_size, 32_768);
         assert_eq!(cr.max_blob_size, 5_242_880);
         assert_eq!(cr.max_blobs_per_receiver, 20);
+        assert_eq!(cr.max_pending_blobs_total, 2_000);
+        assert_eq!(cr.max_pending_blob_bytes_total, 1_073_741_824);
         assert_eq!(cr.cleanup_interval_secs, 30);
         assert_eq!(cr.dedup_lru_capacity, 5_000);
         assert_eq!(cr.expired_notification_ttl_secs, 172_800);
