@@ -24,6 +24,8 @@
 //!   follower convergence can be reported.
 //! - Bounded coordinator witness rounds that collect signed peer checkpoints
 //!   as evidence without treating peer count as consensus or fork choice.
+//! - Direction-isolated checkpoint telemetry: serving a requester updates only
+//!   service counters and cannot manufacture local convergence or divergence.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` on the public node peer listener and local operator
@@ -50,11 +52,14 @@
 //!   finality, leader-election, or longest-chain consensus rule.
 //! - Coordinator witness failures or divergence evidence must never mutate the
 //!   canonical chain; they are operator evidence until consensus is designed.
+//! - Never derive outbound checkpoint state from an inbound request. The peer
+//!   controls its requested height/hash, so those values are not local evidence.
 //!
 //! ## Last Modified
 //! v2.7.5-CheckpointProof - Signed cross-node checkpoint reconciliation.
 //! v2.7.6-EvidenceVault - Fail-closed durable verified checkpoint evidence.
 //! v2.7.8-CoordinatorWitness - Bounded non-consensus witness reconciliation.
+//! v2.7.10-CheckpointDirectionIsolation - Isolated inbound service telemetry.
 //! v2.7.1-BlockFollower - Pinned coordinator pull and fail-closed page verification.
 //! v2.7.0-BlockSync - Initial signed node-blind block range protocol.
 
@@ -956,10 +961,6 @@ async fn checkpoint_handler(State(state): State<MemChainPeerState>, body: Bytes)
     } else {
         "remote_behind"
     };
-    state
-        .storage
-        .record_commitment_checkpoint_served(now, relation, tip_height, known_tip_height);
-
     let responder = state.identity.public_key_bytes();
     let response_timestamp = now_secs();
     let response_signing_bytes = record_chain_checkpoint_response_signing_bytes(
@@ -990,6 +991,10 @@ async fn checkpoint_handler(State(state): State<MemChainPeerState>, body: Bytes)
             return protocol_error(StatusCode::INTERNAL_SERVER_ERROR, "encode_error");
         }
     };
+    // Count only a response that was successfully constructed. The inbound
+    // request's relation/heights remain requester-controlled debug context and
+    // cannot overwrite this node's outbound checkpoint evidence.
+    state.storage.record_commitment_checkpoint_served(now);
     debug!(
         relation,
         checkpoint_height, tip_height, "[MEMCHAIN_BLOCK] Served authenticated chain checkpoint"
@@ -1721,7 +1726,12 @@ mod tests {
         assert_ne!(checkpoint.evidence_digest, [0u8; 32]);
         let served = source.record_commitment_checkpoint_status();
         assert_eq!(served.requests_served_total, 2);
-        assert_eq!(served.state, "converged");
+        assert!(served.last_served_at.is_some());
+        assert_eq!(served.state, "not_checked");
+        assert_eq!(served.last_checked_at, None);
+        assert_eq!(served.last_divergence_at, None);
+        assert_eq!(served.proofs_verified_total, 0);
+        assert_eq!(served.divergences_total, 0);
         server.abort();
         let _ = server.await;
     }

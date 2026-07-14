@@ -34,6 +34,8 @@
 //!   and complete restart-time cryptographic evidence audit
 //! - v2.7.7-EvidenceRestartRecovery: file-backed WAL visibility, clean reopen,
 //!   v8-to-v9 preservation, and tampered-disk restart regression coverage
+//! - v2.7.10-CheckpointDirectionIsolation: inbound proof serving counters no
+//!   longer overwrite outbound convergence, divergence, or height evidence
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -64,6 +66,9 @@
 //! - `append_record_commitment_block` is the only authoritative tip advance for
 //!   the new chain. Never update its tip independently of the block transaction.
 //! - Peer range reads return commitments only; full records remain owner-scoped.
+//! - An inbound checkpoint request describes the requester's state, not this
+//!   node's observation of the network. Serving it must never mutate outbound
+//!   checkpoint relation, heights, or divergence counters.
 //!
 //! ## Modification History
 //! v2.2.0               - 🌟 Extracted from storage.rs; added get_embedding_model, get_overview
@@ -79,8 +84,10 @@
 //! v2.7.5-CheckpointProof - Added signed checkpoint reconciliation evidence.
 //! v2.7.6-EvidenceVault - Added durable bounded proof storage and startup audit.
 //! v2.7.7-EvidenceRestartRecovery - Added real SQLite restart/migration tests.
+//! v2.7.10-CheckpointDirectionIsolation - Isolated inbound service telemetry.
 //!
 //! ## Last Modified
+//! v2.7.10-CheckpointDirectionIsolation - Prevent requester-driven status pollution.
 //! v2.7.4-BlockIntegrityStatus - Report and maintain the verified-chain baseline.
 //! v2.7.5-CheckpointProof - Serve only audit-backed checkpoints and report outcomes.
 //! v2.7.3-BlockAudit - Verify persisted blocks and indexes before networking starts.
@@ -857,25 +864,14 @@ impl MemoryStorage {
     }
 
     /// Records an authenticated checkpoint response served to another node.
-    pub fn record_commitment_checkpoint_served(
-        &self,
-        now: u64,
-        relation: &'static str,
-        local_tip_height: u64,
-        requester_tip_height: u64,
-    ) {
+    ///
+    /// The requester's claimed height and hash are untrusted inbound context.
+    /// They may influence the signed response but must never overwrite this
+    /// node's outbound convergence/divergence evidence or observed heights.
+    pub fn record_commitment_checkpoint_served(&self, now: u64) {
         let mut runtime = self.commitment_checkpoint.write();
-        runtime.state = relation;
         runtime.last_served_at = Some(now);
-        runtime.local_tip_height = Some(local_tip_height);
-        runtime.remote_tip_height = Some(requester_tip_height);
         runtime.requests_served_total = runtime.requests_served_total.saturating_add(1);
-        if relation == "converged" {
-            runtime.last_converged_at = Some(now);
-        } else if relation == "diverged" {
-            runtime.last_divergence_at = Some(now);
-            runtime.divergences_total = runtime.divergences_total.saturating_add(1);
-        }
     }
 
     /// Persists the exact response frame after the node-peer verifier has
@@ -3043,19 +3039,19 @@ mod tests {
         storage.record_commitment_checkpoint_failure(100);
         storage.record_commitment_checkpoint_verified(110, "remote_ahead", 3, 4);
         storage.record_commitment_checkpoint_verified(120, "converged", 4, 4);
-        storage.record_commitment_checkpoint_served(130, "diverged", 4, 4);
+        storage.record_commitment_checkpoint_served(130);
         let status = storage.record_commitment_checkpoint_status();
-        assert_eq!(status.state, "diverged");
+        assert_eq!(status.state, "converged");
         assert_eq!(status.last_checked_at, Some(120));
         assert_eq!(status.last_converged_at, Some(120));
-        assert_eq!(status.last_divergence_at, Some(130));
+        assert_eq!(status.last_divergence_at, None);
         assert_eq!(status.last_failure_at, Some(100));
         assert_eq!(status.last_served_at, Some(130));
         assert_eq!(status.local_tip_height, Some(4));
         assert_eq!(status.remote_tip_height, Some(4));
         assert_eq!(status.proofs_verified_total, 2);
         assert_eq!(status.proofs_failed_total, 1);
-        assert_eq!(status.divergences_total, 1);
+        assert_eq!(status.divergences_total, 0);
         assert_eq!(status.requests_served_total, 1);
         let value = serde_json::to_value(status).unwrap();
         for forbidden in [
@@ -3071,6 +3067,27 @@ mod tests {
         ] {
             assert!(value.get(forbidden).is_none(), "unexpected {forbidden}");
         }
+    }
+
+    #[test]
+    fn test_checkpoint_serving_cannot_create_outbound_evidence() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+
+        storage.record_commitment_checkpoint_served(50);
+
+        let status = storage.record_commitment_checkpoint_status();
+        assert_eq!(status.state, "not_checked");
+        assert_eq!(status.last_checked_at, None);
+        assert_eq!(status.last_converged_at, None);
+        assert_eq!(status.last_divergence_at, None);
+        assert_eq!(status.last_failure_at, None);
+        assert_eq!(status.last_served_at, Some(50));
+        assert_eq!(status.local_tip_height, None);
+        assert_eq!(status.remote_tip_height, None);
+        assert_eq!(status.proofs_verified_total, 0);
+        assert_eq!(status.proofs_failed_total, 0);
+        assert_eq!(status.divergences_total, 0);
+        assert_eq!(status.requests_served_total, 1);
     }
 
     #[tokio::test]

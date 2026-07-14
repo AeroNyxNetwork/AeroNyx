@@ -48,6 +48,8 @@
 //!   complete persisted-chain audit and subsequently verified appends.
 //! - v2.7.5-CheckpointProof: Runtime-only signed checkpoint reconciliation
 //!   evidence without peer identities, hashes, signatures, or user metadata.
+//! - v2.7.10-CheckpointDirectionIsolation: Inbound checkpoint serving updates
+//!   service counters only and cannot overwrite outbound verification evidence.
 //!
 //! ## Thread Safety
 //! `rusqlite::Connection` behind `tokio::sync::Mutex`. Phase 2+ can use r2d2 pooling.
@@ -101,6 +103,9 @@
 //! - commitment_checkpoint is aggregate reconciliation telemetry only. Signed
 //!   evidence stays in the bounded local evidence vault and must not enter APIs,
 //!   heartbeat, or logs.
+//! - Inbound checkpoint requests are requester-controlled observations. Serving
+//!   one may update only `last_served_at` and `requests_served_total`; it must
+//!   never set convergence, divergence, failure, or observed peer heights.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
@@ -131,6 +136,8 @@
 //!   with aggregate-only runtime/API reporting.
 //!   P2: record_key wrapped in Zeroizing<[u8;32]>.
 //!   P3: conn_lock() → pub(crate). row_to_record returns Err on bad BLOB length.
+//! v2.7.10-CheckpointDirectionIsolation - Separated inbound service counters
+//!   from outbound signed checkpoint verification state.
 //! v2.6.1+BlindVectorRecovery - Added all-owner active embedding enumeration so
 //!   node-blind/remote Local-mode nodes can rebuild every isolated vector
 //!   partition after restart without weakening owner-scoped recall.
@@ -332,8 +339,9 @@ pub struct RecordCommitmentSyncStatus {
 pub struct RecordCommitmentCheckpointStatus {
     /// Stable API contract name.
     pub contract_version: &'static str,
-    /// Last observed relation: `not_checked`, `served`, `converged`,
-    /// `remote_ahead`, `remote_behind`, `diverged`, or `proof_failed`.
+    /// Last outbound observation: `not_checked`, `converged`, `remote_ahead`,
+    /// `remote_behind`, `diverged`, or `proof_failed`. Inbound requests cannot
+    /// change this field.
     pub state: String,
     /// Most recent outbound checkpoint verification attempt.
     pub last_checked_at: Option<u64>,
@@ -345,9 +353,9 @@ pub struct RecordCommitmentCheckpointStatus {
     pub last_failure_at: Option<u64>,
     /// Most recent authenticated checkpoint response served to a peer.
     pub last_served_at: Option<u64>,
-    /// Local height used by the most recent observation.
+    /// Local height used by the most recent outbound verified observation.
     pub local_tip_height: Option<u64>,
-    /// Remote height used by the most recent observation.
+    /// Remote height used by the most recent outbound verified observation.
     pub remote_tip_height: Option<u64>,
     /// Signed checkpoint responses verified since process start.
     pub proofs_verified_total: u64,
