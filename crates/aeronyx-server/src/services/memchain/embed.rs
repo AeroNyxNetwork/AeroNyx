@@ -135,12 +135,16 @@
 //! - Run `scripts/download_models.sh` before first build/run to fetch model files
 //!   AND libonnxruntime.so.
 //! - ort::init_from() MUST be called exactly once before any Session is created.
-//!   We use std::sync::Once to guarantee this even if load() is called multiple times.
+//!   `OnceLock<Result<(), String>>` safely publishes the first success or error
+//!   to every caller, even when multiple requests race during startup.
 //! - Session::run() takes &mut self in ort rc.11. The Mutex wrapper handles
 //!   this transparently. Do NOT remove the Mutex or change &self to &mut self
 //!   on public methods — that would break concurrent access from HTTP handlers.
 //!
 //! ## Last Modified
+//! v2.7.15-EmbedInitSafety - Replaced unsynchronised `static mut` ORT error
+//!   state with `OnceLock<Result<(), String>>` and added concurrent regression
+//!   coverage. Public APIs and first-initializer semantics are unchanged.
 //! v2.1.0+Embed - 🌟 Initial implementation
 //! v2.1.0+Embed-fix - 🔧 Fixed ort rc.12 API compatibility
 //! v2.1.0+Embed-fix2 - 🔧 Switched to load-dynamic for glibc compat;
@@ -151,7 +155,7 @@
 //!   configurable embed_output_dim. Interface unchanged for all callers.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, OnceLock};
 
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
@@ -323,25 +327,32 @@ fn detect_model_type(session: &Session) -> (EmbedModelType, Option<usize>) {
 // ORT Runtime Initialization (once per process)
 // ============================================
 
-/// Ensures ort::init_from() is called exactly once per process.
-static ORT_INIT: Once = Once::new();
+/// Safely publishes the first ORT initialization result to every caller.
+///
+/// The first model directory still determines the runtime library, matching
+/// the prior `Once` behavior. A failure is intentionally sticky because ORT
+/// cannot be safely reconfigured after another thread starts session setup.
+static ORT_INIT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 
-/// Result of the one-time ORT initialization.
-static mut ORT_INIT_ERROR: Option<String> = None;
+fn initialize_once<F>(result: &OnceLock<Result<(), String>>, initialize: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    result.get_or_init(initialize).clone()
+}
 
 /// Initialize ONNX Runtime by loading libonnxruntime.so from the given path.
 ///
 /// This MUST be called before creating any ort::Session.
-/// Uses std::sync::Once to ensure it runs exactly once per process.
+/// Uses `OnceLock` to ensure it runs exactly once per process and to publish
+/// the same immutable result to every concurrent caller.
 ///
 /// ## Search Order for libonnxruntime.so
 /// 1. `{model_dir}/libonnxruntime.so` (co-located with model, preferred)
 /// 2. `ORT_DYLIB_PATH` environment variable (user override)
 /// 3. System library paths (`/usr/lib`, `/usr/local/lib`)
 pub(crate) fn init_ort_runtime(model_dir: &Path) -> Result<(), String> {
-    let mut init_error: Option<String> = None;
-
-    ORT_INIT.call_once(|| {
+    initialize_once(&ORT_INIT_RESULT, || {
         let colocated = model_dir.join(ORT_LIB_FILENAME);
         let env_path = std::env::var("ORT_DYLIB_PATH").ok().map(PathBuf::from);
         let system_paths = [
@@ -365,42 +376,32 @@ pub(crate) fn init_ort_runtime(model_dir: &Path) -> Result<(), String> {
                     Ok(builder) => {
                         builder.commit();
                         info!(path = %path.display(), "[EMBED] ✅ ONNX Runtime initialized (load-dynamic)");
+                        Ok(())
                     }
                     Err(e) => {
                         let msg = format!(
                             "ort::init_from({}) failed: {} — run scripts/download_models.sh",
-                            path.display(), e
+                            path.display(),
+                            e
                         );
                         warn!("{}", msg);
-                        unsafe { ORT_INIT_ERROR = Some(msg.clone()); }
-                        init_error = Some(msg);
+                        Err(msg)
                     }
                 }
             }
             None => {
-                let searched: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
+                let searched: Vec<String> =
+                    candidates.iter().map(|p| p.display().to_string()).collect();
                 let msg = format!(
                     "ONNX Runtime library ({}) not found in: [{}] — run scripts/download_models.sh",
                     ORT_LIB_FILENAME,
                     searched.join(", ")
                 );
                 warn!("{}", msg);
-                unsafe { ORT_INIT_ERROR = Some(msg.clone()); }
-                init_error = Some(msg);
+                Err(msg)
             }
         }
-    });
-
-    if init_error.is_some() {
-        return Err(init_error.unwrap());
-    }
-
-    let prev_error = unsafe { ORT_INIT_ERROR.as_ref() };
-    if let Some(e) = prev_error {
-        return Err(e.clone());
-    }
-
-    Ok(())
+    })
 }
 
 // ============================================
@@ -932,11 +933,48 @@ impl std::fmt::Debug for EmbedEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
 
     /// Resolve model directory from env or default.
     fn model_dir() -> String {
         std::env::var("MEMCHAIN_EMBED_MODEL_PATH")
             .unwrap_or_else(|_| "models/minilm-l6-v2".to_string())
+    }
+
+    #[test]
+    fn test_initialize_once_is_thread_safe_and_failure_is_sticky() {
+        const THREADS: usize = 16;
+        let result = Arc::new(OnceLock::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let result = Arc::clone(&result);
+                let calls = Arc::clone(&calls);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    initialize_once(&result, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        Err("deterministic ORT init failure".to_string())
+                    })
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            assert_eq!(
+                worker.join().unwrap().unwrap_err(),
+                "deterministic ORT init failure"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            initialize_once(&result, || Ok(())).unwrap_err(),
+            "deterministic ORT init failure"
+        );
     }
 
     /// Helper: skip test if model files are not downloaded.
