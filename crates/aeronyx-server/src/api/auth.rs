@@ -4,6 +4,9 @@
 //! # Auth — JWT Token Issuance for SaaS Mode
 //!
 //! ## Modification History
+//! v1.1.1-CrashSafe   - Replace secret-bearing configuration through a synced
+//!                      same-directory temporary file and atomic rename while
+//!                      preserving permissions and valid platform file names.
 //! v1.1.0-SectionSafe - Persist generated secrets under `[memchain]`, migrate
 //!                      compatible legacy `[auth]` values, and validate the
 //!                      resulting TOML before replacing the configuration.
@@ -67,17 +70,23 @@
 //!   Server startup should fail loudly in this case.
 //! - `write_secret_to_config` is `pub` for compatibility. It now writes only
 //!   inside `[memchain]`; never reintroduce global first-key replacement.
+//! - Secret persistence must remain a same-directory, synced atomic replace.
+//!   Directly truncating the live TOML can make the node unbootable after a
+//!   crash and can expose a partially written credential.
 //! - Comment-line guard: lines whose first non-whitespace char is '#' are
 //!   never modified, preventing false replacement of commented-out examples.
 //!
 //! ## Last Modified
+//! v1.1.1-CrashSafe - Made secret configuration replacement durable and atomic.
 //! v1.1.0-SectionSafe - Fixed cross-section secret replacement and first-start
 //!                      runtime authentication gap; added legacy migration.
 //! v1.0.1-Fix - Promoted write_secret_to_config to pub; added _pub alias;
 //!              added comment-line guard in write_secret_to_config.
 // ============================================
 
-use std::io::{Error as IoError, ErrorKind as IoErrorKind};
+use std::ffi::OsString;
+use std::fs::OpenOptions;
+use std::io::{Error as IoError, ErrorKind as IoErrorKind, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -529,7 +538,67 @@ fn write_secret_to_config_section(
         output.push('\n');
     }
     parse_toml_document(&output)?;
-    std::fs::write(path, output)
+    atomic_replace_preserving_permissions(path, output.as_bytes())
+}
+
+/// Durably replace a configuration file without exposing a truncated state.
+///
+/// The temporary file lives beside the destination so the final rename stays
+/// on one filesystem. Existing permissions are copied before the rename; the
+/// file and parent directory are synced to make the replacement crash-safe on
+/// filesystems that honor `fsync` durability guarantees.
+fn atomic_replace_preserving_permissions(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = normalized_parent(path);
+    let file_name = path.file_name().ok_or_else(|| {
+        IoError::new(
+            IoErrorKind::InvalidInput,
+            "configuration path has no file name",
+        )
+    })?;
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut temporary_name = OsString::from(".");
+    temporary_name.push(file_name);
+    temporary_name.push(format!(".aeronyx.{}.{}.tmp", std::process::id(), unique));
+    let temporary_path = parent.join(temporary_name);
+    let permissions = std::fs::metadata(path)?.permissions();
+
+    let result = (|| {
+        let mut temporary = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)?;
+        temporary.set_permissions(permissions)?;
+        temporary.write_all(bytes)?;
+        temporary.sync_all()?;
+        drop(temporary);
+
+        std::fs::rename(&temporary_path, path)?;
+        #[cfg(unix)]
+        {
+            let directory = std::fs::File::open(parent)?;
+            directory.sync_all()?;
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+/// Return a directory suitable for sibling temporary files and `fsync`.
+///
+/// `Path::parent()` returns an empty path for a relative file such as
+/// `server.toml`; treating that as the current directory keeps relative
+/// command-line configuration paths fully supported.
+fn normalized_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn line_assigns_key(line: &str, key: &str) -> bool {
@@ -872,6 +941,65 @@ mod tests {
         let child = content.find("[memchain.saas]").unwrap();
         assert!(parent < child);
         let parsed: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["memchain"]["api_secret"].as_str(),
+            Some("canonical_value")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_secret_atomic_replace_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[memchain]\nmode = \"local\"\n").unwrap();
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_secret_to_config(&config_path, "api_secret", "canonical_value").unwrap();
+
+        let mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let temporary_files = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".aeronyx."))
+            .count();
+        assert_eq!(temporary_files, 0);
+    }
+
+    #[test]
+    fn test_atomic_replace_normalizes_relative_parent() {
+        assert_eq!(normalized_parent(Path::new("server.toml")), Path::new("."));
+        assert_eq!(
+            normalized_parent(Path::new("config/server.toml")),
+            Path::new("config")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_replace_accepts_non_utf8_file_name() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = TempDir::new().unwrap();
+        let mut name = b"server-".to_vec();
+        name.push(0xFF);
+        name.extend_from_slice(b".toml");
+        let config_path = dir.path().join(OsString::from_vec(name));
+        std::fs::write(&config_path, "[memchain]\nmode = \"local\"\n").unwrap();
+
+        write_secret_to_config(&config_path, "api_secret", "canonical_value").unwrap();
+
+        let parsed: toml::Value = toml::from_str(
+            &std::fs::read_to_string(&config_path).expect("updated config remains readable"),
+        )
+        .unwrap();
         assert_eq!(
             parsed["memchain"]["api_secret"].as_str(),
             Some("canonical_value")
