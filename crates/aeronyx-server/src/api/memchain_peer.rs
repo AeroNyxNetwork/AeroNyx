@@ -35,6 +35,8 @@
 //! - Uses canonical signing bytes from `aeronyx_core::protocol::memchain`.
 //! - `server.rs` runs the optional low-frequency follower and coordinator
 //!   witness schedulers.
+//! - Coordinator startup may restrict reconciliation to explicit operator-
+//!   pinned witness identities before opening transport/API listeners.
 //!
 //! ## Privacy Invariant
 //! This API returns only signed commitment blocks. It never returns memory
@@ -54,10 +56,13 @@
 //!   its counts must never become voting weight or a fork-choice input.
 //! - Coordinator witness failures or divergence evidence must never mutate the
 //!   canonical chain; they are operator evidence until consensus is designed.
+//! - Only explicit operator pins may turn signed checkpoint evidence into a
+//!   startup gate. Permissionless discovery peers remain evidence-only.
 //! - Never derive outbound checkpoint state from an inbound request. The peer
 //!   controls its requested height/hash, so those values are not local evidence.
 //!
 //! ## Last Modified
+//! v2.7.15-ExternalWitnessGuard - Added identity-pinned reconciliation.
 //! v2.7.5-CheckpointProof - Signed cross-node checkpoint reconciliation.
 //! v2.7.6-EvidenceVault - Fail-closed durable verified checkpoint evidence.
 //! v2.7.8-CoordinatorWitness - Bounded non-consensus witness reconciliation.
@@ -104,6 +109,7 @@ const MAX_BLOCKS_PER_RESPONSE: usize = 16;
 const MAX_REQUESTS_PER_PEER_PER_MINUTE: u32 = 30;
 const REQUEST_TIMESTAMP_SKEW_SECS: u64 = 60;
 const REPLAY_RETENTION_SECS: u64 = 120;
+const MAX_PINNED_WITNESSES_PER_ROUND: usize = 3;
 
 /// Aggregate result of one bounded follower pull.
 ///
@@ -374,6 +380,29 @@ pub async fn reconcile_record_commitment_witnesses(
     .await
 }
 
+/// Collects checkpoints only from explicit operator-pinned identities.
+///
+/// This is the trust boundary used by the coordinator startup guard. Signed
+/// discovery still resolves endpoint rotation, but no unpinned permissionless
+/// peer can become startup authority merely by advertising a capability.
+pub async fn reconcile_record_commitment_pinned_witnesses(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    witness_node_ids: &[[u8; 32]],
+) -> CommitmentReconciliationOutcome {
+    reconcile_record_commitment_pinned_witnesses_with_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        client,
+        witness_node_ids,
+        checkpoint_witness_endpoint_is_public,
+    )
+    .await
+}
+
 async fn reconcile_record_commitment_witnesses_with_endpoint_policy<F>(
     storage: &MemoryStorage,
     peer_store: &PeerStore,
@@ -414,9 +443,74 @@ where
         candidates.rotate_left(offset);
     }
 
-    let eligible_witnesses = candidates.len();
-    candidates.truncate(max_witnesses);
-    let attempted = candidates.len();
+    let candidate_ids = candidates
+        .into_iter()
+        .map(|candidate| candidate.descriptor.node_id)
+        .collect();
+    reconcile_record_commitment_candidate_ids(
+        storage,
+        peer_store,
+        identity,
+        client,
+        candidate_ids,
+        max_witnesses,
+    )
+    .await
+}
+
+async fn reconcile_record_commitment_pinned_witnesses_with_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    witness_node_ids: &[[u8; 32]],
+    endpoint_allowed: F,
+) -> CommitmentReconciliationOutcome
+where
+    F: Fn(&str) -> bool + Send + Sync,
+{
+    let now = now_secs();
+    let self_node_id = identity.public_key_bytes();
+    let mut candidate_ids = Vec::with_capacity(witness_node_ids.len());
+    for node_id in witness_node_ids {
+        if *node_id == self_node_id || candidate_ids.contains(node_id) {
+            continue;
+        }
+        let Some(peer) = peer_store.get_valid(node_id, now) else {
+            continue;
+        };
+        if peer
+            .descriptor
+            .public_endpoint
+            .as_deref()
+            .is_some_and(&endpoint_allowed)
+        {
+            candidate_ids.push(*node_id);
+        }
+    }
+
+    reconcile_record_commitment_candidate_ids(
+        storage,
+        peer_store,
+        identity,
+        client,
+        candidate_ids,
+        witness_node_ids.len().min(MAX_PINNED_WITNESSES_PER_ROUND),
+    )
+    .await
+}
+
+async fn reconcile_record_commitment_candidate_ids(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    mut candidate_ids: Vec<[u8; 32]>,
+    max_witnesses: usize,
+) -> CommitmentReconciliationOutcome {
+    let eligible_witnesses = candidate_ids.len();
+    candidate_ids.truncate(max_witnesses);
+    let attempted = candidate_ids.len();
     let mut outcome = CommitmentReconciliationOutcome {
         eligible_witnesses,
         attempted,
@@ -424,12 +518,12 @@ where
     };
     let mut verified = Vec::with_capacity(attempted);
 
-    for candidate in candidates {
+    for candidate_node_id in candidate_ids {
         match pull_record_commitment_checkpoint(
             storage,
             peer_store,
             identity,
-            &candidate.descriptor.node_id,
+            &candidate_node_id,
             client,
         )
         .await
@@ -1874,5 +1968,77 @@ mod tests {
         lagging_server.abort();
         let _ = converged_server.await;
         let _ = lagging_server.await;
+    }
+
+    #[tokio::test]
+    async fn pinned_witness_round_excludes_unpinned_permissionless_peers() {
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let pinned_witness = Arc::new(IdentityKeyPair::generate());
+        let unpinned_peer = IdentityKeyPair::generate();
+        let local = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let witness_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        local.audit_record_commitment_chain().await.unwrap();
+        local
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        witness_storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+
+        let witness_peers = Arc::new(PeerStore::new());
+        admit_peer(&witness_peers, &coordinator, None, now);
+        let router = build_memchain_peer_router(
+            Arc::clone(&witness_storage),
+            witness_peers,
+            Arc::clone(&pinned_witness),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let coordinator_peers = PeerStore::new();
+        admit_peer(
+            &coordinator_peers,
+            &pinned_witness,
+            Some(format!("http://{address}")),
+            now,
+        );
+        admit_peer(
+            &coordinator_peers,
+            &unpinned_peer,
+            Some("https://[invalid".to_string()),
+            now,
+        );
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let round = reconcile_record_commitment_pinned_witnesses_with_endpoint_policy(
+            &local,
+            &coordinator_peers,
+            &coordinator,
+            &client,
+            &[pinned_witness.public_key_bytes()],
+            |_| true,
+        )
+        .await;
+
+        assert_eq!(round.eligible_witnesses, 1);
+        assert_eq!(round.attempted, 1);
+        assert_eq!(round.verified, 1);
+        assert_eq!(round.converged, 1);
+        assert_eq!(round.failed, 0);
+        assert_eq!(
+            local.record_commitment_checkpoint_status().evidence_records,
+            1
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 }

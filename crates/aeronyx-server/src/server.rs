@@ -132,6 +132,8 @@
 //      evidence without turning peer count into consensus or fork choice.
 //  56. Verifies or initializes a signed coordinator-local commitment tip anchor
 //      after full chain audit and before any block producer can start.
+//  57. Checks only operator-pinned external checkpoint witnesses before opening
+//      listeners, so permissionless peers cannot manufacture startup authority.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -157,6 +159,8 @@
 //   - The signed commitment tip anchor detects an older/replaced SQLite chain
 //     only while the host-side anchor remains current. It does not detect a
 //     whole-host snapshot rollback and is not consensus, quorum, or finality.
+//   - External startup witnesses are explicit identity trust pins. Discovery
+//     may rotate their signed endpoints, but unpinned peers stay evidence-only.
 //   - encrypted_message_counter is aggregate only and never stores payload,
 //     destination, DNS, URL, voucher, wallet, or client public IP details.
 //   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
@@ -166,6 +170,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.15-ExternalWitnessGuard - Pinned pre-listener checkpoint startup gate
 //   v2.7.14-CommitmentTipAnchor - Signed local high-water rollback guard
 //   v2.7.11-CheckpointFreshness - Durable proof recency in status and heartbeat
 //   v2.7.12-WitnessRoundEvidence - Privacy-safe bounded witness round coverage
@@ -285,7 +290,8 @@ use crate::api::discovery::{
 };
 use crate::api::memchain_peer::{
     build_memchain_peer_router, pull_record_commitment_checkpoint, pull_record_commitment_page,
-    reconcile_record_commitment_witnesses, CommitmentCheckpointRelation,
+    reconcile_record_commitment_pinned_witnesses, reconcile_record_commitment_witnesses,
+    CommitmentCheckpointRelation, CommitmentReconciliationOutcome,
 };
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
 use crate::api::voice::build_voice_router;
@@ -406,6 +412,26 @@ fn unix_now_secs() -> u64 {
         .as_secs()
 }
 
+fn commitment_witness_startup_decision(
+    round: &CommitmentReconciliationOutcome,
+    signed_evidence_required: bool,
+) -> std::result::Result<&'static str, &'static str> {
+    if round.diverged > 0 {
+        return Err("signed_checkpoint_divergence");
+    }
+    if round.remote_ahead > 0 {
+        return Err("signed_checkpoint_remote_ahead");
+    }
+    if signed_evidence_required && round.verified == 0 {
+        return Err("signed_checkpoint_unavailable");
+    }
+    if round.verified == 0 {
+        Ok("degraded_unverified")
+    } else {
+        Ok("verified")
+    }
+}
+
 pub struct Server {
     config: ServerConfig,
     identity: IdentityKeyPair,
@@ -487,6 +513,10 @@ impl Server {
         let chat_relay_runtime_ready = chat_relay.is_some();
 
         let peer_store = self.init_peer_store(chat_relay_runtime_ready).await;
+        if let Some(ref commitment_storage) = storage {
+            self.verify_memchain_commitment_startup_witnesses(commitment_storage, &peer_store)
+                .await?;
+        }
         let _peer_store_persistence_task =
             self.spawn_peer_store_persistence_task(Arc::clone(&peer_store));
         let _discovery_gossip_task =
@@ -1907,6 +1937,17 @@ impl Server {
             if self.config.memchain.is_enabled() {
                 let allow_remote = self.config.memchain.allow_remote_storage;
                 let max_owners = self.config.memchain.max_remote_owners;
+                let pinned_witnesses_configured =
+                    self.config.memchain.commitment_witness_node_ids.len();
+                let witness_scope = if pinned_witnesses_configured == 0 {
+                    "permissionless_evidence"
+                } else {
+                    "operator_pinned"
+                };
+                let startup_evidence_required = self
+                    .config
+                    .memchain
+                    .commitment_witness_startup_required;
                 let commitment_storage = memchain_storage.clone();
                 Some(Box::new(move || {
                     let record_commitment_integrity = commitment_storage.as_ref().map(|storage| {
@@ -1955,6 +1996,9 @@ impl Server {
                         let status = storage.record_commitment_checkpoint_status();
                         crate::management::client::RecordCommitmentCheckpointHeartbeatStatus {
                             contract_version: status.contract_version,
+                            witness_scope,
+                            pinned_witnesses_configured,
+                            startup_evidence_required,
                             state: status.state,
                             last_checked_at: status.last_checked_at,
                             last_converged_at: status.last_converged_at,
@@ -2603,6 +2647,83 @@ impl Server {
         }))
     }
 
+    /// Verifies operator-pinned external checkpoint evidence before listeners.
+    ///
+    /// A pinned audited follower may attest that its canonical chain copy is
+    /// beyond, or inconsistent with, the local audited tip. Such positive
+    /// evidence fails closed. Network absence fails open unless the operator
+    /// explicitly enables `commitment_witness_startup_required`, preserving
+    /// backward-compatible availability while allowing strict deployments.
+    async fn verify_memchain_commitment_startup_witnesses(
+        &self,
+        storage: &MemoryStorage,
+        peer_store: &PeerStore,
+    ) -> Result<()> {
+        if !self.config.memchain.commitment_coordinator_enabled {
+            return Ok(());
+        }
+
+        let witness_node_ids = self.config.memchain.commitment_witness_node_id_bytes();
+        if witness_node_ids.is_empty() {
+            info!(
+                "[MEMCHAIN_BLOCK] External startup witness guard not configured; local signed tip guard remains active"
+            );
+            return Ok(());
+        }
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(1)
+            .build()
+            .map_err(|_| {
+                ServerError::startup_failed(
+                    "MemChain external witness rollback guard: HTTP client init failed",
+                )
+            })?;
+        let round = reconcile_record_commitment_pinned_witnesses(
+            storage,
+            peer_store,
+            &self.identity,
+            &client,
+            &witness_node_ids,
+        )
+        .await;
+        let decision = commitment_witness_startup_decision(
+            &round,
+            self.config.memchain.commitment_witness_startup_required,
+        )
+        .map_err(|reason| {
+            ServerError::startup_failed(format!(
+                "MemChain external witness rollback guard: {reason}"
+            ))
+        })?;
+
+        if decision == "degraded_unverified" {
+            warn!(
+                configured = witness_node_ids.len(),
+                eligible = round.eligible_witnesses,
+                attempted = round.attempted,
+                failed = round.failed,
+                strict = self.config.memchain.commitment_witness_startup_required,
+                "[MEMCHAIN_BLOCK] External startup witness guard has no signed evidence; continuing in availability mode"
+            );
+        } else {
+            info!(
+                configured = witness_node_ids.len(),
+                eligible = round.eligible_witnesses,
+                attempted = round.attempted,
+                verified = round.verified,
+                converged = round.converged,
+                remote_behind = round.remote_behind,
+                strict = self.config.memchain.commitment_witness_startup_required,
+                "[MEMCHAIN_BLOCK] External startup witness rollback guard passed"
+            );
+        }
+        Ok(())
+    }
+
     /// Starts low-frequency signed checkpoint evidence collection on the
     /// configured Block Sync v1 coordinator.
     ///
@@ -2644,6 +2765,12 @@ impl Server {
             .memchain
             .commitment_sync_interval_secs
             .max(MIN_INTERVAL_SECS);
+        let pinned_witness_node_ids = self.config.memchain.commitment_witness_node_id_bytes();
+        let witness_scope = if pinned_witness_node_ids.is_empty() {
+            "permissionless_evidence"
+        } else {
+            "operator_pinned"
+        };
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         Some(tokio::spawn(async move {
@@ -2652,6 +2779,7 @@ impl Server {
             info!(
                 interval_secs,
                 max_witnesses = MAX_WITNESSES_PER_ROUND,
+                witness_scope,
                 "[MEMCHAIN_BLOCK] Coordinator witness reconciliation started"
             );
 
@@ -2663,13 +2791,27 @@ impl Server {
 
                 let round = tokio::select! {
                     _ = shutdown_rx.recv() => break,
-                    outcome = reconcile_record_commitment_witnesses(
-                        &storage,
-                        &peer_store,
-                        &identity,
-                        &client,
-                        MAX_WITNESSES_PER_ROUND,
-                    ) => outcome,
+                    outcome = async {
+                        if pinned_witness_node_ids.is_empty() {
+                            reconcile_record_commitment_witnesses(
+                                &storage,
+                                &peer_store,
+                                &identity,
+                                &client,
+                                MAX_WITNESSES_PER_ROUND,
+                            )
+                            .await
+                        } else {
+                            reconcile_record_commitment_pinned_witnesses(
+                                &storage,
+                                &peer_store,
+                                &identity,
+                                &client,
+                                &pinned_witness_node_ids,
+                            )
+                            .await
+                        }
+                    } => outcome,
                 };
                 next_delay = Duration::from_secs(interval_secs);
 
@@ -5399,9 +5541,10 @@ impl std::fmt::Debug for Server {
 #[cfg(test)]
 mod tests {
     use super::{
-        memchain_index_rejection_reason, prefix_to_netmask, unix_now_secs, Server,
-        BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
+        commitment_witness_startup_decision, memchain_index_rejection_reason, prefix_to_netmask,
+        unix_now_secs, Server, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
     };
+    use crate::api::memchain_peer::CommitmentReconciliationOutcome;
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
     use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
     use aeronyx_core::protocol::chat::{ChatContentType, ChatEnvelope};
@@ -5421,6 +5564,49 @@ mod tests {
     use crate::api::discovery::GossipResponse;
     use crate::config::{DiscoveryConfig, ServerConfig};
     use crate::services::{PeerStore, PeerStoreImportReport};
+
+    #[test]
+    fn commitment_witness_startup_gate_fails_only_on_authoritative_evidence() {
+        let unavailable = CommitmentReconciliationOutcome::default();
+        assert_eq!(
+            commitment_witness_startup_decision(&unavailable, false),
+            Ok("degraded_unverified")
+        );
+        assert_eq!(
+            commitment_witness_startup_decision(&unavailable, true),
+            Err("signed_checkpoint_unavailable")
+        );
+
+        let converged = CommitmentReconciliationOutcome {
+            verified: 1,
+            converged: 1,
+            ..CommitmentReconciliationOutcome::default()
+        };
+        assert_eq!(
+            commitment_witness_startup_decision(&converged, true),
+            Ok("verified")
+        );
+
+        let remote_ahead = CommitmentReconciliationOutcome {
+            verified: 1,
+            remote_ahead: 1,
+            ..CommitmentReconciliationOutcome::default()
+        };
+        assert_eq!(
+            commitment_witness_startup_decision(&remote_ahead, false),
+            Err("signed_checkpoint_remote_ahead")
+        );
+
+        let diverged = CommitmentReconciliationOutcome {
+            verified: 1,
+            diverged: 1,
+            ..CommitmentReconciliationOutcome::default()
+        };
+        assert_eq!(
+            commitment_witness_startup_decision(&diverged, false),
+            Err("signed_checkpoint_divergence")
+        );
+    }
 
     fn signed_test_chat_envelope(now: u64) -> ChatEnvelope {
         let sender = IdentityKeyPair::generate();

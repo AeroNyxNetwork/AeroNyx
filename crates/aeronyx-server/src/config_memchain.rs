@@ -77,8 +77,12 @@
 //! - commitment_tip_anchor_path is a coordinator-local rollback guard outside
 //!   SQLite. An empty value derives a sibling file beside db_path. Never point
 //!   it at the SQLite database itself.
+//! - commitment_witness_node_ids are explicit operator trust pins. Automatic
+//!   discovery may supply endpoints, but an unpinned permissionless peer must
+//!   never gain authority to block coordinator startup.
 //!
 //! ## Last Modified
+//! v2.7.15-ExternalWitnessGuard - Added pinned startup checkpoint witnesses.
 //! v2.7.14-CommitmentTipAnchor - Added the coordinator-local signed tip anchor.
 //! v2.7.1-BlockFollower — Added default-off pinned coordinator follower settings.
 //! v2.7.0-BlockSync — Added default-off commitment coordinator role.
@@ -269,6 +273,24 @@ pub struct MemChainConfig {
     /// is not a whole-machine snapshot rollback or distributed-consensus proof.
     #[serde(default)]
     pub commitment_tip_anchor_path: String,
+
+    /// Ed25519 node identities trusted as external startup witnesses.
+    ///
+    /// Discovery resolves each pinned identity's current signed endpoint. A
+    /// valid `remote_ahead` or `diverged` checkpoint from a pin blocks the
+    /// coordinator before its transport/API listeners start. Empty preserves
+    /// the previous permissionless evidence-only behavior. Pin only audited
+    /// followers of this coordinator; an unrelated chain is not a witness.
+    #[serde(default)]
+    pub commitment_witness_node_ids: Vec<String>,
+
+    /// Require at least one pinned witness to return valid signed evidence.
+    ///
+    /// This is default-off for availability and backward compatibility. When
+    /// false, positive rollback/divergence evidence still blocks startup, but
+    /// a temporary absence of every pin is reported as degraded and allowed.
+    #[serde(default)]
+    pub commitment_witness_startup_required: bool,
 
     /// Maximum number of distinct remote owners this node will serve.
     #[serde(default = "default_max_remote_owners")]
@@ -492,6 +514,8 @@ fn default_max_remote_owners() -> usize {
 fn default_commitment_sync_interval_secs() -> u64 {
     30
 }
+
+const MAX_COMMITMENT_WITNESS_NODE_IDS: usize = 3;
 fn default_ner_model_path() -> String {
     "models/gliner".into()
 }
@@ -666,6 +690,59 @@ impl MemChainConfig {
                 ));
             }
             debug!("[MEMCHAIN_BLOCK] Canonical commitment coordinator enabled");
+        }
+
+        if !self.commitment_witness_node_ids.is_empty() || self.commitment_witness_startup_required
+        {
+            if !self.commitment_coordinator_enabled {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_witness_node_ids",
+                    "requires memchain.commitment_coordinator_enabled = true",
+                ));
+            }
+            if self.commitment_witness_node_ids.is_empty() {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_witness_startup_required",
+                    "requires at least one memchain.commitment_witness_node_ids entry",
+                ));
+            }
+            if self.commitment_witness_node_ids.len() > MAX_COMMITMENT_WITNESS_NODE_IDS {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_witness_node_ids",
+                    format!("supports at most {MAX_COMMITMENT_WITNESS_NODE_IDS} pinned witnesses"),
+                ));
+            }
+
+            let mut validated =
+                Vec::<[u8; 32]>::with_capacity(self.commitment_witness_node_ids.len());
+            for configured in &self.commitment_witness_node_ids {
+                let value = configured.trim();
+                let decoded = hex::decode(value).map_err(|_| {
+                    ServerError::config_invalid(
+                        "memchain.commitment_witness_node_ids",
+                        "each entry must be a 64-character Ed25519 public key in hexadecimal",
+                    )
+                })?;
+                let node_id: [u8; 32] = decoded.try_into().map_err(|_| {
+                    ServerError::config_invalid(
+                        "memchain.commitment_witness_node_ids",
+                        "each entry must decode to exactly 32 bytes",
+                    )
+                })?;
+                if value.len() != 64 || node_id.iter().all(|byte| *byte == 0) {
+                    return Err(ServerError::config_invalid(
+                        "memchain.commitment_witness_node_ids",
+                        "each entry must be a non-zero 64-character Ed25519 public key",
+                    ));
+                }
+                if validated.contains(&node_id) {
+                    return Err(ServerError::config_invalid(
+                        "memchain.commitment_witness_node_ids",
+                        "duplicate witness identities are not allowed",
+                    ));
+                }
+                validated.push(node_id);
+            }
         }
 
         // A Block Sync v1 follower has exactly one trust root. It never falls
@@ -908,6 +985,21 @@ impl MemChainConfig {
         bytes.try_into().ok()
     }
 
+    /// Returns validated pinned witness identities in operator order.
+    ///
+    /// Config validation rejects malformed values. `filter_map` keeps this
+    /// helper panic-free for tests or callers that deliberately bypass it.
+    #[must_use]
+    pub fn commitment_witness_node_id_bytes(&self) -> Vec<[u8; 32]> {
+        self.commitment_witness_node_ids
+            .iter()
+            .filter_map(|value| {
+                let decoded = hex::decode(value.trim()).ok()?;
+                decoded.try_into().ok()
+            })
+            .collect()
+    }
+
     /// Resolves the coordinator-local signed tip anchor without changing old
     /// configurations. Relative explicit paths remain relative to the process
     /// working directory, matching the existing database path behavior.
@@ -1022,6 +1114,8 @@ impl Default for MemChainConfig {
             commitment_coordinator_node_id: String::new(),
             commitment_sync_interval_secs: default_commitment_sync_interval_secs(),
             commitment_tip_anchor_path: String::new(),
+            commitment_witness_node_ids: Vec::new(),
+            commitment_witness_startup_required: false,
             max_remote_owners: default_max_remote_owners(),
             ner_enabled: false,
             ner_model_path: default_ner_model_path(),
@@ -1091,6 +1185,8 @@ mod tests {
         assert!(mc.commitment_coordinator_node_id.is_empty());
         assert_eq!(mc.commitment_sync_interval_secs, 30);
         assert!(mc.commitment_tip_anchor_path.is_empty());
+        assert!(mc.commitment_witness_node_ids.is_empty());
+        assert!(!mc.commitment_witness_startup_required);
         assert_eq!(
             mc.effective_commitment_tip_anchor_path(),
             PathBuf::from("record-commitment-tip-v1.json")
@@ -1336,6 +1432,62 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn test_commitment_witness_pins_require_valid_coordinator_configuration() {
+        let first = "11".repeat(32);
+        let second = "22".repeat(32);
+        let valid = MemChainConfig {
+            blind_storage_enabled: true,
+            commitment_coordinator_enabled: true,
+            commitment_witness_node_ids: vec![first.clone(), second.clone()],
+            commitment_witness_startup_required: true,
+            ..Default::default()
+        };
+        assert!(valid.validate().is_ok());
+        assert_eq!(
+            valid.commitment_witness_node_id_bytes(),
+            vec![[0x11; 32], [0x22; 32]]
+        );
+
+        for invalid in [
+            MemChainConfig {
+                commitment_witness_node_ids: vec![first.clone()],
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_coordinator_enabled: true,
+                commitment_witness_startup_required: true,
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_coordinator_enabled: true,
+                commitment_witness_node_ids: vec!["00".repeat(32)],
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_coordinator_enabled: true,
+                commitment_witness_node_ids: vec![first.clone(), first.clone()],
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_coordinator_enabled: true,
+                commitment_witness_node_ids: vec![
+                    first.clone(),
+                    second,
+                    "33".repeat(32),
+                    "44".repeat(32),
+                ],
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
     }
 
     #[test]

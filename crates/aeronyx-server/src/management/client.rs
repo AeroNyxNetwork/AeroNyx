@@ -30,6 +30,8 @@
 //     attempts and inbound served responses must never refresh it.
 //   - witness round counts are aggregate operational evidence only. They are
 //     not votes, quorum, finality, or a fork-choice input.
+//   - pinned witness reporting exposes only scope, count, and strict-policy
+//     state. Never report pinned node identities or resolved endpoints.
 //   - commitment durability reports only SQLite's aggregate synchronous mode;
 //     never add database paths, host details, block hashes, or user data.
 //   - rollback guard reporting is aggregate only. Never send the sidecar path,
@@ -49,6 +51,7 @@
 //   v2.7.12        - Added privacy-safe witness round coverage evidence
 //   v2.7.13        - Added aggregate commitment durability evidence
 //   v2.7.14        - Added aggregate signed tip rollback-guard evidence
+//   v2.7.15        - Added privacy-safe pinned witness policy evidence
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -174,6 +177,12 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
 pub struct RecordCommitmentCheckpointHeartbeatStatus {
     /// Stable heartbeat contract name.
     pub contract_version: &'static str,
+    /// `operator_pinned` or `permissionless_evidence`; never a peer identity.
+    pub witness_scope: &'static str,
+    /// Number of configured pinned identities without revealing those pins.
+    pub pinned_witnesses_configured: usize,
+    /// Whether startup requires at least one valid pinned signed response.
+    pub startup_evidence_required: bool,
     /// Latest aggregate relation or proof lifecycle state.
     pub state: String,
     /// Most recent outbound checkpoint verification attempt.
@@ -742,6 +751,9 @@ mod tests {
             }),
             record_commitment_checkpoint: Some(RecordCommitmentCheckpointHeartbeatStatus {
                 contract_version: "record_commitment_checkpoint.v1",
+                witness_scope: "operator_pinned",
+                pinned_witnesses_configured: 3,
+                startup_evidence_required: true,
                 state: "converged".to_string(),
                 last_checked_at: Some(120),
                 last_converged_at: Some(120),
@@ -791,6 +803,9 @@ mod tests {
         assert_eq!(sync["last_error_code"], "request_timeout");
         let checkpoint = &value["record_commitment_checkpoint"];
         assert_eq!(checkpoint["state"], "converged");
+        assert_eq!(checkpoint["witness_scope"], "operator_pinned");
+        assert_eq!(checkpoint["pinned_witnesses_configured"], 3);
+        assert_eq!(checkpoint["startup_evidence_required"], true);
         assert_eq!(checkpoint["proofs_verified_total"], 4);
         assert_eq!(checkpoint["requests_served_total"], 2);
         assert_eq!(checkpoint["evidence_state"], "verified");
