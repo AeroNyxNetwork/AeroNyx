@@ -31,9 +31,9 @@
 //! - Used by MinerScheduler (Task 4) during cognitive step execution
 //!
 //! ## Thread Safety
-//! DashMap provides concurrent safe access. The `entry().or_try_insert_with()`
-//! pattern ensures that for any given owner, at most one MemoryStorage
-//! instance is created even under concurrent requests.
+//! DashMap provides concurrent cache access. Fixed owner-keyed lock shards
+//! single-flight first-open work for the same owner without an unbounded lock
+//! map, while a short capacity lock serializes only final eviction/insertion.
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - MemoryStorage::open() is SYNCHRONOUS — always call via spawn_blocking.
@@ -45,11 +45,15 @@
 //! - cached_owners() returns only in-memory cached owners, NOT all users.
 //!   For Miner scheduling, use system_db.get_active_owners() instead.
 //! - When max_connections is reached during get_or_create(), the oldest
-//!   cached entry is evicted BEFORE opening the new connection, to avoid
-//!   briefly exceeding the cap.
+//!   cached entry is evicted immediately before the new cache insertion.
+//!   Parallel SQLite opens do not count as cached connections.
+//! - Never remove the second cache check after acquiring the owner lock shard;
+//!   it prevents duplicate SQLite opens and concurrent PRAGMA lock failures.
 //!
 //! ## Last Modified
 //! v1.0.0-MultiTenant - Initial implementation (Task 1b)
+//! v1.0.1-OwnerOpenSingleFlight - Prevent same-owner concurrent SQLite opens
+//!   and serialize cache-capacity insertion without blocking unrelated I/O.
 // ============================================
 
 use std::sync::Arc;
@@ -57,6 +61,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
+use tokio::sync::Mutex as TokioMutex;
 use tokio::task;
 use tracing::{info, warn};
 
@@ -90,6 +95,10 @@ struct PoolEntry {
     last_accessed: Instant,
 }
 
+/// Fixed shard count bounds synchronization memory while preserving parallel
+/// cold opens for unrelated owners. Ed25519 public keys are uniformly spread.
+const CREATION_LOCK_SHARDS: usize = 64;
+
 // ============================================
 // StoragePool
 // ============================================
@@ -102,6 +111,12 @@ struct PoolEntry {
 pub struct StoragePool {
     /// Active connection cache: owner pubkey → PoolEntry.
     stores: DashMap<[u8; 32], PoolEntry>,
+
+    /// Owner-keyed single-flight locks for first database open.
+    creation_locks: [TokioMutex<()>; CREATION_LOCK_SHARDS],
+
+    /// Serializes only final capacity check, eviction, and cache insertion.
+    capacity_lock: TokioMutex<()>,
 
     /// Routes owner pubkeys to their volume and DB file path.
     volume_router: Arc<VolumeRouter>,
@@ -136,6 +151,8 @@ impl StoragePool {
     ) -> Arc<Self> {
         Arc::new(Self {
             stores: DashMap::new(),
+            creation_locks: std::array::from_fn(|_| TokioMutex::new(())),
+            capacity_lock: TokioMutex::new(()),
             volume_router,
             system_db,
             max_connections,
@@ -155,13 +172,12 @@ impl StoragePool {
     /// DashMap entry for only the duration of the `last_accessed` update.
     ///
     /// ## Slow path (cache miss)
-    /// 1. If cache is at max capacity, evict the oldest entry first.
+    /// 1. Acquire the owner's fixed lock shard and recheck the cache.
     /// 2. Resolve or assign the owner's volume via VolumeRouter.
     /// 3. Derive the user's encryption key from their public key.
     /// 4. Open MemoryStorage via spawn_blocking (SQLite is synchronous).
-    /// 5. Insert into DashMap using `entry().or_insert()` to handle the
-    ///    race where two concurrent requests create the same user's storage.
-    ///    The first writer wins; the second discards its newly-opened instance.
+    /// 5. Under the short capacity lock, evict if needed and insert exactly one
+    ///    cached instance. Other owners may perform SQLite I/O concurrently.
     ///
     /// # SECURITY
     /// Assumes `owner` has already been authenticated by the auth middleware.
@@ -178,9 +194,14 @@ impl StoragePool {
 
         // ── Slow path ──────────────────────────────────────────────────
 
-        // If at capacity, evict the oldest entry to make room.
-        if self.stores.len() >= self.max_connections {
-            self.evict_oldest_one();
+        let creation_shard = creation_lock_shard(owner);
+        let _creation_guard = self.creation_locks[creation_shard].lock().await;
+
+        // Another same-owner request may have populated the cache while this
+        // task waited on the shard. Rechecking here is the single-flight gate.
+        if let Some(mut entry) = self.stores.get_mut(owner) {
+            entry.last_accessed = Instant::now();
+            return Ok(Arc::clone(&entry.storage));
         }
 
         // Resolve or assign the owner's volume.
@@ -212,20 +233,25 @@ impl StoragePool {
 
         let storage = Arc::new(storage);
 
-        // Insert into cache. Use entry() to handle the concurrent-creation race:
-        // if another task raced us and already inserted, we use its instance
-        // and discard our newly-opened one (it will be dropped here).
-        let final_storage = self
-            .stores
-            .entry(*owner)
-            .or_insert_with(|| PoolEntry {
+        // A separate short lock makes the max_connections contract exact even
+        // when unrelated owners finish their parallel SQLite opens together.
+        let _capacity_guard = self.capacity_lock.lock().await;
+        if let Some(mut entry) = self.stores.get_mut(owner) {
+            entry.last_accessed = Instant::now();
+            return Ok(Arc::clone(&entry.storage));
+        }
+        if self.stores.len() >= self.max_connections {
+            self.evict_oldest_one();
+        }
+        self.stores.insert(
+            *owner,
+            PoolEntry {
                 storage: Arc::clone(&storage),
                 last_accessed: Instant::now(),
-            })
-            .storage
-            .clone();
+            },
+        );
 
-        Ok(final_storage)
+        Ok(storage)
     }
 
     // ============================================
@@ -245,6 +271,7 @@ impl StoragePool {
     ///
     /// Returns the number of evicted connections (for logging).
     pub async fn evict_idle(&self) -> usize {
+        let _capacity_guard = self.capacity_lock.lock().await;
         let now = Instant::now();
         let mut evicted = 0usize;
 
@@ -315,6 +342,16 @@ impl StoragePool {
     }
 }
 
+/// Selects the bounded single-flight lock for an authenticated owner.
+fn creation_lock_shard(owner: &[u8; 32]) -> usize {
+    let prefix = u64::from_le_bytes(
+        owner[..8]
+            .try_into()
+            .expect("fixed owner public-key prefix length"),
+    );
+    usize::try_from(prefix % CREATION_LOCK_SHARDS as u64).unwrap_or(0)
+}
+
 // ============================================
 // Key Derivation
 // ============================================
@@ -382,7 +419,7 @@ mod tests {
     }
 
     /// Create a fully initialized test environment.
-    async fn setup() -> (TempDir, Arc<StoragePool>) {
+    async fn setup_with_max_connections(max_connections: usize) -> (TempDir, Arc<StoragePool>) {
         let dir = TempDir::new().unwrap();
         let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
         let config_path = write_volumes_toml(dir.path());
@@ -393,11 +430,15 @@ mod tests {
         let pool = StoragePool::new(
             Arc::clone(&router),
             Arc::clone(&db),
-            /* max_connections */ 10,
+            max_connections,
             /* idle_timeout */ Duration::from_secs(3600),
         );
 
         (dir, pool)
+    }
+
+    async fn setup() -> (TempDir, Arc<StoragePool>) {
+        setup_with_max_connections(10).await
     }
 
     // ── get_or_create ─────────────────────────────────────────────────
@@ -549,7 +590,7 @@ mod tests {
 
     // ── Concurrent access ─────────────────────────────────────────────
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_get_or_create_same_owner() {
         let (_dir, pool) = setup().await;
         let pool = Arc::clone(&pool);
@@ -580,5 +621,25 @@ mod tests {
 
         // Only one connection should be in the pool.
         assert_eq!(pool.active_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_new_owners_respect_cache_capacity() {
+        let (_dir, pool) = setup_with_max_connections(3).await;
+
+        let handles: Vec<_> = (1u8..=12)
+            .map(|seed| {
+                let pool = Arc::clone(&pool);
+                tokio::spawn(async move {
+                    let storage = pool.get_or_create(&make_owner(seed)).await.unwrap();
+                    assert_eq!(storage.count().await, 0);
+                })
+            })
+            .collect();
+
+        for result in futures::future::join_all(handles).await {
+            result.unwrap();
+        }
+        assert_eq!(pool.active_count(), 3);
     }
 }
