@@ -4,6 +4,9 @@
 //! # Auth — JWT Token Issuance for SaaS Mode
 //!
 //! ## Modification History
+//! v2.0.0-ServerNonce - Add a stateless, HMAC-authenticated server nonce flow
+//!                      for fresh Ed25519 token challenges while retaining the
+//!                      v1 timestamp endpoint for backward compatibility.
 //! v1.2.0-ReplayGuard - Reject repeated use of an already verified v1 token
 //!                      challenge through a bounded, expiring replay cache.
 //! v1.1.1-CrashSafe   - Replace secret-bearing configuration through a synced
@@ -21,23 +24,26 @@
 //!                      to prevent false replacement of commented-out keys.
 //!
 //! ## Main Functionality
-//! - `POST /api/auth/token`: Verify Ed25519 challenge signature, issue JWT
+//! - `POST /api/auth/challenge`: Issue a stateless v2 server nonce challenge
+//! - `POST /api/auth/token/v2`: Verify and consume a signed v2 challenge
+//! - `POST /api/auth/token`: Verify legacy v1 timestamp challenge, issue JWT
+//! - `build_auth_router()`: Own all anonymous auth routes and body limits
 //! - `issue_jwt()`: Sign a JWT with HS256 using the configured secret
 //! - `verify_jwt()`: Validate JWT signature + expiry, extract Claims
-//! - `TokenReplayGuard`: Bound and expire accepted v1 token challenges
+//! - `TokenReplayGuard`: Bound and expire accepted v1/v2 token challenges
 //! - `ensure_jwt_secret()`: Auto-generate and persist the JWT secret
 //! - `ensure_api_secret()`: Resolve, migrate, or generate the MPI admin secret
 //! - `write_secret_to_config_pub()`: Section-safe config persistence alias
 //!
-//! ## Authentication Flow
-//! 1. Client signs `"{pubkey_hex}:{unix_timestamp}"` with their Ed25519 private key
-//! 2. Server verifies signature using the pubkey in the request body
-//! 3. Timestamp must be within +/-60 seconds of server time
-//! 4. The verified pubkey/timestamp challenge is claimed once in a bounded
-//!    replay cache; duplicate submissions are rejected
-//! 5. On success, server issues a JWT where `sub = pubkey_hex`
-//! 6. All subsequent API requests include `Authorization: Bearer <jwt>`
-//! 7. `unified_auth_middleware` (in mpi.rs) verifies JWT + extracts owner
+//! ## Authentication Flow (v2)
+//! 1. Client posts its Ed25519 public key to `/api/auth/challenge`.
+//! 2. Server returns an OS-random nonce, canonical message, timestamps, and a
+//!    domain-separated HMAC that binds every challenge field.
+//! 3. Client signs the canonical message and posts the signed fields to
+//!    `/api/auth/token/v2`.
+//! 4. Server verifies HMAC, validity window, Ed25519 signature, and one-time
+//!    replay claim before issuing a JWT where `sub = pubkey_hex`.
+//! 5. Subsequent MPI requests include `Authorization: Bearer <jwt>`.
 //!
 //! ## JWT Format
 //! - Algorithm: HS256
@@ -60,6 +66,14 @@
 //!   capacity-bounded to resist memory exhaustion. It cannot prevent a stolen
 //!   signature from winning a first-use race; a server-issued nonce protocol
 //!   remains the required v2 design for complete challenge freshness.
+//! - v2 challenge issuance is stateless. The node does not retain unverified
+//!   nonces, so anonymous challenge requests cannot grow server memory.
+//! - v2 HMAC uses a domain-separated key derived from the JWT secret. This
+//!   prevents challenge MACs from becoming valid JWT signatures or vice versa.
+//! - Successful challenge and token responses set `Cache-Control: no-store`.
+//! - One-time replay claims are process-local. A future horizontally scaled
+//!   SaaS deployment that shares one JWT secret across instances MUST use a
+//!   shared atomic replay store (or issuer-affine routing) before enabling v2.
 //!
 //! ## Dependencies
 //! - `jsonwebtoken` crate for HS256 JWT sign/verify
@@ -75,6 +89,10 @@
 //!   `IdentityPublicKey::verify()` from aeronyx-core, which abstracts the
 //!   version difference — do NOT call dalek directly.
 //! - JWT secret minimum length: 32 bytes. Auto-generated secrets are 64 chars.
+//! - The v2 canonical message is a protocol surface. Keep field order, labels,
+//!   newline separators, URL-safe unpadded base64, and domain text stable.
+//! - Do not move anonymous auth routes behind a shared cluster load balancer
+//!   without preserving the process-local one-time claim invariant above.
 //! - `ensure_jwt_secret()` returns Err if the config file cannot be written.
 //!   Server startup should fail loudly in this case.
 //! - `write_secret_to_config` is `pub` for compatibility. It now writes only
@@ -86,6 +104,7 @@
 //!   never modified, preventing false replacement of commented-out examples.
 //!
 //! ## Last Modified
+//! v2.0.0-ServerNonce - Added stateless signed challenges and v2 token issuance.
 //! v1.2.0-ReplayGuard - Added bounded one-time claims for verified v1 requests.
 //! v1.1.1-CrashSafe - Made secret configuration replacement durable and atomic.
 //! v1.1.0-SectionSafe - Fixed cross-section secret replacement and first-start
@@ -102,12 +121,21 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::extract::DefaultBodyLimit;
+use axum::http::header::{CACHE_CONTROL, PRAGMA};
+use axum::http::HeaderValue;
+use axum::response::Response;
+use axum::routing::post;
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json, Router};
+use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64URL};
+use base64::Engine as _;
+use hmac::{Hmac, Mac};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use parking_lot::Mutex;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use aeronyx_core::crypto::keys::IdentityPublicKey;
 
@@ -120,6 +148,21 @@ pub const JWT_ISSUER: &str = "memchain";
 
 /// Maximum allowed clock skew for token request timestamps (seconds).
 const TIMESTAMP_TOLERANCE_SECS: u64 = 60;
+
+/// Server nonce lifetime. Client wall-clock time is not part of v2 validity.
+const TOKEN_CHALLENGE_V2_TTL_SECS: u64 = 120;
+
+/// Tolerate a small backward clock adjustment between challenge and exchange.
+const TOKEN_CHALLENGE_V2_CLOCK_SKEW_SECS: u64 = 5;
+
+/// OS-random nonce size for v2 challenges.
+const TOKEN_CHALLENGE_V2_NONCE_BYTES: usize = 32;
+
+/// Stable protocol domain used in the exact client-signed v2 message.
+const TOKEN_CHALLENGE_V2_DOMAIN: &str = "AeroNyx Auth Token v2";
+
+/// Domain used when deriving the challenge HMAC subkey from the JWT secret.
+const TOKEN_CHALLENGE_V2_KEY_DOMAIN: &[u8] = b"aeronyx-auth-token-v2-hmac-key\0";
 
 /// Maximum verified challenges retained during the replay window.
 const TOKEN_REPLAY_CACHE_MAX_ENTRIES: usize = 65_536;
@@ -135,6 +178,8 @@ const LEGACY_AUTH_CONFIG_SECTION: &str = "auth";
 
 /// Process-wide guard shared by every SaaS auth router in this node process.
 static TOKEN_REPLAY_GUARD: OnceLock<TokenReplayGuard> = OnceLock::new();
+
+type HmacSha256 = Hmac<Sha256>;
 
 // ============================================
 // Token Replay Guard
@@ -153,11 +198,12 @@ struct TokenReplayCache {
     next_cleanup_at: u64,
 }
 
-/// Bounded one-time claim store for verified v1 token challenges.
+/// Bounded one-time claim store for verified token challenges.
 ///
-/// The cache stores only a domain-separated digest of pubkey + timestamp, not
-/// the signature or any issued token. Expiry is tied to the same acceptance
-/// window used by the endpoint. Capacity exhaustion fails closed.
+/// The cache stores only a domain-separated digest of the challenge identity,
+/// never the signature, nonce, canonical message, or an issued token. Expiry
+/// is tied to the corresponding endpoint's acceptance window. Capacity
+/// exhaustion fails closed.
 #[derive(Debug)]
 struct TokenReplayGuard {
     cache: Mutex<TokenReplayCache>,
@@ -203,6 +249,107 @@ fn token_challenge_fingerprint(pubkey: &[u8; 32], timestamp: u64) -> [u8; 32] {
     digest.finalize().into()
 }
 
+fn token_challenge_v2_fingerprint(challenge: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"aeronyx-auth-token-v2-replay\0");
+    digest.update(challenge.as_bytes());
+    digest.finalize().into()
+}
+
+/// Build the byte-exact, domain-separated message that v2 clients sign.
+fn token_challenge_v2_message(
+    canonical_pubkey: &str,
+    nonce_b64: &str,
+    issued_at: u64,
+    expires_at: u64,
+) -> String {
+    format!(
+        "{}\npubkey={}\nnonce={}\nissued_at={}\nexpires_at={}",
+        TOKEN_CHALLENGE_V2_DOMAIN, canonical_pubkey, nonce_b64, issued_at, expires_at
+    )
+}
+
+fn derive_token_challenge_v2_key(jwt_secret: &str) -> Result<[u8; 32], &'static str> {
+    let mut derivation = HmacSha256::new_from_slice(jwt_secret.as_bytes())
+        .map_err(|_| "invalid JWT secret for challenge key derivation")?;
+    derivation.update(TOKEN_CHALLENGE_V2_KEY_DOMAIN);
+    Ok(derivation.finalize().into_bytes().into())
+}
+
+fn token_challenge_v2_mac(jwt_secret: &str, challenge: &str) -> Result<[u8; 32], &'static str> {
+    let derived_key = derive_token_challenge_v2_key(jwt_secret)?;
+    let mut mac =
+        HmacSha256::new_from_slice(&derived_key).map_err(|_| "invalid derived challenge key")?;
+    mac.update(challenge.as_bytes());
+    Ok(mac.finalize().into_bytes().into())
+}
+
+fn verify_token_challenge_v2_mac(
+    jwt_secret: &str,
+    challenge: &str,
+    expected_mac: &[u8; 32],
+) -> bool {
+    let Ok(derived_key) = derive_token_challenge_v2_key(jwt_secret) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(&derived_key) else {
+        return false;
+    };
+    mac.update(challenge.as_bytes());
+    mac.verify_slice(expected_mac).is_ok()
+}
+
+fn generate_token_challenge_v2_nonce() -> Result<[u8; TOKEN_CHALLENGE_V2_NONCE_BYTES], String> {
+    let mut nonce = [0u8; TOKEN_CHALLENGE_V2_NONCE_BYTES];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|error| format!("operating-system randomness unavailable: {}", error))?;
+    Ok(nonce)
+}
+
+fn parse_base64url_32(value: &str, label: &str) -> Result<[u8; 32], String> {
+    let decoded = BASE64URL
+        .decode(value)
+        .map_err(|_| format!("{} is not valid URL-safe unpadded base64", label))?;
+    if decoded.len() != 32 {
+        return Err(format!("{} must decode to exactly 32 bytes", label));
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&decoded);
+    Ok(bytes)
+}
+
+fn auth_response_no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+}
+
+fn auth_error_response(status: StatusCode, error: &str, code: &str) -> Response {
+    auth_response_no_store(
+        (
+            status,
+            Json(serde_json::json!({
+                "error": error,
+                "code": code,
+            })),
+        )
+            .into_response(),
+    )
+}
+
+/// Preserve the legacy v1 JSON contract while applying the shared cache policy.
+///
+/// v1 clients historically receive only `{ "error": ... }`; adding the v2
+/// machine-readable `code` field here could break strict response decoders.
+fn legacy_auth_error_response(status: StatusCode, error: &str) -> Response {
+    auth_response_no_store((status, Json(serde_json::json!({ "error": error }))).into_response())
+}
+
 // ============================================
 // Public Types
 // ============================================
@@ -234,6 +381,49 @@ pub struct TokenRequest {
     pub signature: String,
 }
 
+/// Request body for `POST /api/auth/challenge`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TokenChallengeV2Request {
+    /// Ed25519 public key as 64 hex chars. The response canonicalizes case.
+    pub pubkey: String,
+}
+
+/// Stateless challenge returned by `POST /api/auth/challenge`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TokenChallengeV2Response {
+    /// Protocol version for explicit client dispatch.
+    pub version: u8,
+    /// Canonical lower-case Ed25519 public key.
+    pub pubkey: String,
+    /// 32-byte nonce encoded as URL-safe unpadded base64.
+    pub nonce: String,
+    /// Server issue time in Unix seconds.
+    pub issued_at: u64,
+    /// Server expiry time in Unix seconds.
+    pub expires_at: u64,
+    /// Exact UTF-8 message the client must sign.
+    pub challenge: String,
+    /// HMAC-SHA256 binding all canonical challenge fields.
+    pub challenge_mac: String,
+}
+
+/// Request body for `POST /api/auth/token/v2`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TokenV2Request {
+    /// Ed25519 public key as 64 hex chars.
+    pub pubkey: String,
+    /// Nonce copied from the server challenge response.
+    pub nonce: String,
+    /// Server issue time copied from the challenge response.
+    pub issued_at: u64,
+    /// Server expiry time copied from the challenge response.
+    pub expires_at: u64,
+    /// Server HMAC copied from the challenge response.
+    pub challenge_mac: String,
+    /// Ed25519 signature of the exact canonical challenge, standard base64.
+    pub signature: String,
+}
+
 /// Successful response from `POST /api/auth/token`.
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
@@ -257,9 +447,227 @@ pub struct AuthState {
     pub token_ttl_secs: u64,
 }
 
+/// Build the complete anonymous SaaS authentication router.
+///
+/// Keeping route registration and request-size policy beside the handlers
+/// prevents callers from accidentally exposing an auth endpoint without the
+/// same 16 KiB body limit. The returned router is merged into MPI only in SaaS
+/// mode; Local mode never registers these routes.
+pub fn build_auth_router(state: AuthState) -> Router {
+    Router::new()
+        .route("/api/auth/challenge", post(issue_token_challenge_v2))
+        .route("/api/auth/token/v2", post(issue_token_v2))
+        .route("/api/auth/token", post(issue_token))
+        .layer(DefaultBodyLimit::max(16 * 1024))
+        .with_state(state)
+}
+
 // ============================================
 // Endpoint Handler
 // ============================================
+
+/// `POST /api/auth/challenge`
+///
+/// Issues a stateless v2 challenge bound to the requested public key. The
+/// response HMAC allows `/api/auth/token/v2` to authenticate every challenge
+/// field without retaining anonymous pending requests in server memory.
+pub async fn issue_token_challenge_v2(
+    State(state): State<AuthState>,
+    Json(req): Json<TokenChallengeV2Request>,
+) -> Response {
+    let pubkey_bytes = match parse_pubkey_hex(&req.pubkey) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return auth_error_response(StatusCode::BAD_REQUEST, message, "invalid_public_key");
+        }
+    };
+    if state.jwt_secret.len() < 32 {
+        tracing::error!("[AUTH_V2] Refusing challenge issuance with invalid JWT secret");
+        return auth_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authentication service is not configured",
+            "auth_service_misconfigured",
+        );
+    }
+
+    let issued_at = now_secs();
+    let Some(expires_at) = issued_at.checked_add(TOKEN_CHALLENGE_V2_TTL_SECS) else {
+        tracing::error!("[AUTH_V2] Challenge expiry overflow");
+        return auth_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authentication service clock is invalid",
+            "auth_clock_invalid",
+        );
+    };
+    let nonce = match generate_token_challenge_v2_nonce() {
+        Ok(nonce) => nonce,
+        Err(error) => {
+            tracing::error!(error = %error, "[AUTH_V2] Secure nonce generation failed");
+            return auth_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "secure randomness is unavailable",
+                "auth_randomness_unavailable",
+            );
+        }
+    };
+
+    let canonical_pubkey = hex::encode(pubkey_bytes);
+    let nonce_b64 = BASE64URL.encode(nonce);
+    let challenge =
+        token_challenge_v2_message(&canonical_pubkey, &nonce_b64, issued_at, expires_at);
+    let challenge_mac = match token_challenge_v2_mac(&state.jwt_secret, &challenge) {
+        Ok(mac) => BASE64URL.encode(mac),
+        Err(error) => {
+            tracing::error!(error = %error, "[AUTH_V2] Challenge MAC generation failed");
+            return auth_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "authentication service is not configured",
+                "auth_service_misconfigured",
+            );
+        }
+    };
+
+    debug!(
+        pubkey = &canonical_pubkey[..8],
+        expires_at, "[AUTH_V2] Stateless token challenge issued"
+    );
+    auth_response_no_store(
+        (
+            StatusCode::OK,
+            Json(TokenChallengeV2Response {
+                version: 2,
+                pubkey: canonical_pubkey,
+                nonce: nonce_b64,
+                issued_at,
+                expires_at,
+                challenge,
+                challenge_mac,
+            }),
+        )
+            .into_response(),
+    )
+}
+
+/// `POST /api/auth/token/v2`
+///
+/// Verifies a server-issued stateless challenge and consumes it once before
+/// issuing a JWT. HMAC verification happens before Ed25519 verification so
+/// arbitrary attacker-controlled requests cannot force expensive public-key
+/// work without first presenting a challenge created by this node.
+pub async fn issue_token_v2(
+    State(state): State<AuthState>,
+    Json(req): Json<TokenV2Request>,
+) -> Response {
+    let pubkey_bytes = match parse_pubkey_hex(&req.pubkey) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return auth_error_response(StatusCode::BAD_REQUEST, message, "invalid_public_key");
+        }
+    };
+    let nonce = match parse_base64url_32(&req.nonce, "nonce") {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return auth_error_response(StatusCode::BAD_REQUEST, &message, "invalid_nonce");
+        }
+    };
+    let challenge_mac = match parse_base64url_32(&req.challenge_mac, "challenge_mac") {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return auth_error_response(StatusCode::BAD_REQUEST, &message, "invalid_challenge_mac");
+        }
+    };
+
+    let now = now_secs();
+    let valid_duration = req
+        .issued_at
+        .checked_add(TOKEN_CHALLENGE_V2_TTL_SECS)
+        .is_some_and(|expected| expected == req.expires_at);
+    let issued_too_far_ahead =
+        req.issued_at > now.saturating_add(TOKEN_CHALLENGE_V2_CLOCK_SKEW_SECS);
+    if !valid_duration || issued_too_far_ahead || now > req.expires_at {
+        debug!(
+            pubkey = &req.pubkey[..8],
+            issued_at = req.issued_at,
+            expires_at = req.expires_at,
+            "[AUTH_V2] Token request rejected: challenge timing invalid"
+        );
+        return auth_error_response(
+            StatusCode::UNAUTHORIZED,
+            "token challenge is invalid or expired",
+            "token_challenge_expired",
+        );
+    }
+
+    let canonical_pubkey = hex::encode(pubkey_bytes);
+    let nonce_b64 = BASE64URL.encode(nonce);
+    let challenge =
+        token_challenge_v2_message(&canonical_pubkey, &nonce_b64, req.issued_at, req.expires_at);
+    if !verify_token_challenge_v2_mac(&state.jwt_secret, &challenge, &challenge_mac) {
+        debug!(
+            pubkey = &canonical_pubkey[..8],
+            "[AUTH_V2] Token request rejected: challenge MAC invalid"
+        );
+        return auth_error_response(
+            StatusCode::UNAUTHORIZED,
+            "token challenge authentication failed",
+            "invalid_token_challenge",
+        );
+    }
+
+    let signature = match parse_signature_base64(&req.signature) {
+        Ok(signature) => signature,
+        Err(message) => {
+            return auth_error_response(
+                StatusCode::BAD_REQUEST,
+                message,
+                "invalid_signature_encoding",
+            );
+        }
+    };
+    let identity = match IdentityPublicKey::from_bytes(&pubkey_bytes) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return auth_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid Ed25519 public key",
+                "invalid_public_key",
+            );
+        }
+    };
+    if identity.verify(challenge.as_bytes(), &signature).is_err() {
+        debug!(
+            pubkey = &canonical_pubkey[..8],
+            "[AUTH_V2] Token request rejected: signature verification failed"
+        );
+        return auth_error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid signature",
+            "invalid_signature",
+        );
+    }
+
+    let jwt_expires_at = match checked_jwt_expiry(&state, now) {
+        Ok(expires_at) => expires_at,
+        Err(response) => return response,
+    };
+    if let Err(response) = claim_token_challenge(
+        token_challenge_v2_fingerprint(&challenge),
+        req.expires_at,
+        now,
+        &canonical_pubkey,
+        "v2",
+    ) {
+        return response;
+    }
+
+    issue_jwt_response(
+        &canonical_pubkey,
+        now,
+        jwt_expires_at,
+        &state.jwt_secret,
+        "v2",
+    )
+}
 
 /// `POST /api/auth/token`
 ///
@@ -279,13 +687,7 @@ pub async fn issue_token(
     // Validate pubkey format.
     let pubkey_bytes = match parse_pubkey_hex(&req.pubkey) {
         Ok(b) => b,
-        Err(msg) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": msg })),
-            )
-                .into_response();
-        }
+        Err(msg) => return legacy_auth_error_response(StatusCode::BAD_REQUEST, msg),
     };
 
     // Validate timestamp (replay protection).
@@ -297,28 +699,21 @@ pub async fn issue_token(
     };
 
     if drift > TIMESTAMP_TOLERANCE_SECS {
-        warn!(
+        debug!(
             drift_secs = drift,
             pubkey = &req.pubkey[..8],
             "[AUTH] Token request rejected: timestamp drift too large"
         );
-        return (
+        return legacy_auth_error_response(
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "timestamp expired or clock drift too large" })),
-        )
-            .into_response();
+            "timestamp expired or clock drift too large",
+        );
     }
 
     // Parse Ed25519 signature.
     let sig_bytes = match parse_signature_base64(&req.signature) {
         Ok(b) => b,
-        Err(msg) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": msg })),
-            )
-                .into_response();
-        }
+        Err(msg) => return legacy_auth_error_response(StatusCode::BAD_REQUEST, msg),
     };
 
     // Verify Ed25519 signature.
@@ -327,11 +722,10 @@ pub async fn issue_token(
     let identity_pubkey = match IdentityPublicKey::from_bytes(&pubkey_bytes) {
         Ok(pk) => pk,
         Err(_) => {
-            return (
+            return legacy_auth_error_response(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid Ed25519 public key" })),
-            )
-                .into_response();
+                "invalid Ed25519 public key",
+            );
         }
     };
 
@@ -339,76 +733,115 @@ pub async fn issue_token(
         .verify(challenge.as_bytes(), &sig_bytes)
         .is_err()
     {
-        warn!(
+        debug!(
             pubkey = &req.pubkey[..8],
             "[AUTH] Token request rejected: signature verification failed"
         );
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "invalid signature" })),
-        )
-            .into_response();
+        return legacy_auth_error_response(StatusCode::UNAUTHORIZED, "invalid signature");
     }
 
+    let jwt_expires_at = match checked_jwt_expiry(&state, now) {
+        Ok(expires_at) => expires_at,
+        Err(response) => return response,
+    };
     let replay_expires_at = req.timestamp.saturating_add(TIMESTAMP_TOLERANCE_SECS);
-    match token_replay_guard().claim(
+    if let Err(response) = claim_token_challenge(
         token_challenge_fingerprint(&pubkey_bytes, req.timestamp),
         replay_expires_at,
         now,
+        &req.pubkey,
+        "v1",
     ) {
-        TokenReplayDecision::Accepted => {}
+        return response;
+    }
+
+    issue_jwt_response(&req.pubkey, now, jwt_expires_at, &state.jwt_secret, "v1")
+}
+
+fn checked_jwt_expiry(state: &AuthState, now: u64) -> Result<u64, Response> {
+    if state.jwt_secret.len() < 32 {
+        tracing::error!("[AUTH] Refusing JWT issuance with invalid signing secret");
+        return Err(auth_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authentication service is not configured",
+            "auth_service_misconfigured",
+        ));
+    }
+    now.checked_add(state.token_ttl_secs).ok_or_else(|| {
+        tracing::error!(
+            ttl_secs = state.token_ttl_secs,
+            "[AUTH] JWT expiry overflow"
+        );
+        auth_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authentication token lifetime is invalid",
+            "auth_token_lifetime_invalid",
+        )
+    })
+}
+
+fn claim_token_challenge(
+    fingerprint: [u8; 32],
+    challenge_expires_at: u64,
+    now: u64,
+    canonical_pubkey: &str,
+    protocol: &'static str,
+) -> Result<(), Response> {
+    match token_replay_guard().claim(fingerprint, challenge_expires_at, now) {
+        TokenReplayDecision::Accepted => Ok(()),
         TokenReplayDecision::Duplicate => {
             warn!(
-                pubkey = &req.pubkey[..8],
-                "[AUTH] Token request rejected: verified challenge replayed"
+                pubkey = &canonical_pubkey[..8],
+                protocol, "[AUTH] Token request rejected: verified challenge replayed"
             );
-            return (
+            Err(auth_error_response(
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "token challenge has already been used",
-                    "code": "token_challenge_replayed"
-                })),
-            )
-                .into_response();
+                "token challenge has already been used",
+                "token_challenge_replayed",
+            ))
         }
         TokenReplayDecision::Saturated => {
             tracing::error!(
                 capacity = TOKEN_REPLAY_CACHE_MAX_ENTRIES,
+                protocol,
                 "[AUTH] Token request rejected: replay guard saturated"
             );
-            return (
+            Err(auth_error_response(
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "error": "token service is temporarily busy",
-                    "code": "token_replay_guard_saturated"
-                })),
-            )
-                .into_response();
+                "token service is temporarily busy",
+                "token_replay_guard_saturated",
+            ))
         }
     }
+}
 
-    // Issue JWT.
-    let expires_at = now + state.token_ttl_secs;
-    match issue_jwt(&req.pubkey, now, expires_at, &state.jwt_secret) {
+fn issue_jwt_response(
+    pubkey: &str,
+    issued_at: u64,
+    expires_at: u64,
+    jwt_secret: &str,
+    protocol: &'static str,
+) -> Response {
+    match issue_jwt(pubkey, issued_at, expires_at, jwt_secret) {
         Ok(token) => {
-            info!(pubkey = &req.pubkey[..8], expires_at, "[AUTH] JWT issued");
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "token": token,
-                    "expires_at": expires_at,
-                })),
+            info!(
+                pubkey = &pubkey[..8],
+                expires_at, protocol, "[AUTH] JWT issued"
+            );
+            auth_response_no_store(
+                (StatusCode::OK, Json(TokenResponse { token, expires_at })).into_response(),
             )
-                .into_response()
         }
-        Err(e) => {
+        Err(error) => {
             // JWT signing failure is an internal error — do not expose details.
-            tracing::error!(error = %e, "[AUTH] JWT signing failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal error" })),
+            tracing::error!(error = %error, protocol, "[AUTH] JWT signing failed");
+            auth_response_no_store(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "internal error" })),
+                )
+                    .into_response(),
             )
-                .into_response()
         }
     }
 }
@@ -571,7 +1004,6 @@ pub fn parse_pubkey_hex(hex_str: &str) -> Result<[u8; 32], &'static str> {
 
 /// Parse a base64-encoded Ed25519 signature into a 64-byte array.
 pub fn parse_signature_base64(b64: &str) -> Result<[u8; 64], &'static str> {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     let bytes = BASE64
         .decode(b64)
         .map_err(|_| "signature is not valid base64")?;
@@ -801,12 +1233,56 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aeronyx_core::crypto::keys::IdentityKeyPair;
     use tempfile::TempDir;
 
     const TEST_SECRET: &str = "test-secret-that-is-at-least-32-chars-long-for-safety";
 
     fn make_test_secret() -> String {
         TEST_SECRET.to_string()
+    }
+
+    fn make_auth_state() -> AuthState {
+        AuthState {
+            jwt_secret: make_test_secret(),
+            token_ttl_secs: 3_600,
+        }
+    }
+
+    async fn request_v2_challenge(
+        identity: &IdentityKeyPair,
+        state: &AuthState,
+    ) -> TokenChallengeV2Response {
+        let response = issue_token_challenge_v2(
+            State(state.clone()),
+            Json(TokenChallengeV2Request {
+                pubkey: hex::encode(identity.public_key_bytes()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static("no-store")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn signed_v2_request(
+        identity: &IdentityKeyPair,
+        challenge: &TokenChallengeV2Response,
+    ) -> TokenV2Request {
+        TokenV2Request {
+            pubkey: challenge.pubkey.clone(),
+            nonce: challenge.nonce.clone(),
+            issued_at: challenge.issued_at,
+            expires_at: challenge.expires_at,
+            challenge_mac: challenge.challenge_mac.clone(),
+            signature: BASE64.encode(identity.sign(challenge.challenge.as_bytes())),
+        }
     }
 
     // -- JWT round-trip ---------------------------------------------------
@@ -1165,7 +1641,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_issue_token_rejects_replayed_verified_challenge() {
-        use aeronyx_core::crypto::keys::IdentityKeyPair;
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
         let identity = IdentityKeyPair::generate();
@@ -1192,6 +1667,223 @@ mod tests {
             .await
             .into_response();
         assert_eq!(replay.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_v1_error_preserves_contract_and_disables_caching() {
+        let identity = IdentityKeyPair::generate();
+        let attacker = IdentityKeyPair::generate();
+        let pubkey = hex::encode(identity.public_key_bytes());
+        let timestamp = now_secs();
+        let challenge = format!("{}:{}", pubkey, timestamp);
+        let response = issue_token(
+            State(make_auth_state()),
+            Json(TokenRequest {
+                pubkey,
+                timestamp,
+                signature: BASE64.encode(attacker.sign(challenge.as_bytes())),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static("no-store")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({ "error": "invalid signature" })
+        );
+    }
+
+    #[test]
+    fn test_v2_canonical_challenge_format_is_stable() {
+        assert_eq!(
+            token_challenge_v2_message("aabb", "bm9uY2U", 100, 220),
+            "AeroNyx Auth Token v2\npubkey=aabb\nnonce=bm9uY2U\nissued_at=100\nexpires_at=220"
+        );
+    }
+
+    #[test]
+    fn test_v2_challenge_mac_rejects_tampering() {
+        let challenge = token_challenge_v2_message("aabb", "bm9uY2U", 100, 220);
+        let mac = token_challenge_v2_mac(TEST_SECRET, &challenge).unwrap();
+        assert!(verify_token_challenge_v2_mac(TEST_SECRET, &challenge, &mac));
+        assert!(!verify_token_challenge_v2_mac(
+            TEST_SECRET,
+            &format!("{}x", challenge),
+            &mac
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_v2_token_round_trip_and_replay_rejection() {
+        let identity = IdentityKeyPair::generate();
+        let state = make_auth_state();
+        let challenge = request_v2_challenge(&identity, &state).await;
+        let first = issue_token_v2(
+            State(state.clone()),
+            Json(signed_v2_request(&identity, &challenge)),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static("no-store")
+        );
+
+        let replay =
+            issue_token_v2(State(state), Json(signed_v2_request(&identity, &challenge))).await;
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_auth_router_wires_v2_and_enforces_body_limit() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let identity = IdentityKeyPair::generate();
+        let router = build_auth_router(make_auth_state());
+        let challenge_body = serde_json::to_vec(&TokenChallengeV2Request {
+            pubkey: hex::encode(identity.public_key_bytes()),
+        })
+        .unwrap();
+        let challenge_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(challenge_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(challenge_response.status(), StatusCode::OK);
+        let challenge_bytes = axum::body::to_bytes(challenge_response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let challenge: TokenChallengeV2Response = serde_json::from_slice(&challenge_bytes).unwrap();
+
+        let token_body = serde_json::to_vec(&signed_v2_request(&identity, &challenge)).unwrap();
+        let token_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/token/v2")
+                    .header("content-type", "application/json")
+                    .body(Body::from(token_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(token_response.status(), StatusCode::OK);
+
+        let oversized = serde_json::json!({ "pubkey": "a".repeat(17 * 1024) }).to_string();
+        let oversized_response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(oversized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_v2_wrong_signature_does_not_consume_challenge() {
+        let identity = IdentityKeyPair::generate();
+        let attacker = IdentityKeyPair::generate();
+        let state = make_auth_state();
+        let challenge = request_v2_challenge(&identity, &state).await;
+
+        let invalid = issue_token_v2(
+            State(state.clone()),
+            Json(signed_v2_request(&attacker, &challenge)),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+
+        let valid =
+            issue_token_v2(State(state), Json(signed_v2_request(&identity, &challenge))).await;
+        assert_eq!(valid.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_v2_tampered_nonce_is_rejected_before_replay_claim() {
+        let identity = IdentityKeyPair::generate();
+        let state = make_auth_state();
+        let challenge = request_v2_challenge(&identity, &state).await;
+        let mut tampered_nonce = parse_base64url_32(&challenge.nonce, "nonce").unwrap();
+        tampered_nonce[0] ^= 0x80;
+        let tampered_nonce_b64 = BASE64URL.encode(tampered_nonce);
+        let tampered_message = token_challenge_v2_message(
+            &challenge.pubkey,
+            &tampered_nonce_b64,
+            challenge.issued_at,
+            challenge.expires_at,
+        );
+        let tampered = TokenV2Request {
+            pubkey: challenge.pubkey.clone(),
+            nonce: tampered_nonce_b64,
+            issued_at: challenge.issued_at,
+            expires_at: challenge.expires_at,
+            challenge_mac: challenge.challenge_mac.clone(),
+            signature: BASE64.encode(identity.sign(tampered_message.as_bytes())),
+        };
+
+        let invalid = issue_token_v2(State(state.clone()), Json(tampered)).await;
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+
+        let valid =
+            issue_token_v2(State(state), Json(signed_v2_request(&identity, &challenge))).await;
+        assert_eq!(valid.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_v2_expired_challenge_is_rejected() {
+        let identity = IdentityKeyPair::generate();
+        let state = make_auth_state();
+        let now = now_secs();
+        let issued_at = now - TOKEN_CHALLENGE_V2_TTL_SECS - 1;
+        let expires_at = issued_at + TOKEN_CHALLENGE_V2_TTL_SECS;
+        let nonce = [0x42; TOKEN_CHALLENGE_V2_NONCE_BYTES];
+        let nonce_b64 = BASE64URL.encode(nonce);
+        let pubkey = hex::encode(identity.public_key_bytes());
+        let challenge = token_challenge_v2_message(&pubkey, &nonce_b64, issued_at, expires_at);
+        let request = TokenV2Request {
+            pubkey,
+            nonce: nonce_b64,
+            issued_at,
+            expires_at,
+            challenge_mac: BASE64URL
+                .encode(token_challenge_v2_mac(&state.jwt_secret, &challenge).unwrap()),
+            signature: BASE64.encode(identity.sign(challenge.as_bytes())),
+        };
+
+        let response = issue_token_v2(State(state), Json(request)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_checked_jwt_expiry_rejects_overflow() {
+        let state = AuthState {
+            jwt_secret: make_test_secret(),
+            token_ttl_secs: u64::MAX,
+        };
+        assert!(checked_jwt_expiry(&state, 1).is_err());
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //! - `mpi_graph_handlers.rs` — v2.4.0 cognitive graph endpoints
 //! - `log_handler.rs`        — /log ingestion
 //! - `supernode_handlers.rs` — v2.5.0 SuperNode management
-//! - `auth.rs`               — v1.0.0-MultiTenant JWT token issuance
+//! - `auth.rs`               — SaaS JWT issuance (v1 timestamp + v2 server nonce)
 //! - `admin_handlers.rs`     — v1.0.0-MultiTenant Admin endpoints
 //!
 //! ## Modification History
@@ -33,6 +33,9 @@
 //!                            registered BEFORE middleware layer).
 //!                            Admin routes registered in SaaS mode.
 //!                            32 endpoints total (SaaS) / 31 (Local).
+//! v2.0.0-AuthServerNonce   - Added stateless `/api/auth/challenge` and
+//!                            replay-safe `/api/auth/token/v2`; legacy token
+//!                            endpoint and Local mode remain unchanged.
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - unified_auth_middleware MUST be applied to all routes via route_layer.
@@ -41,8 +44,11 @@
 //!   middleware from StoragePool / VectorIndexPool. Handlers use Extension<>
 //!   extractors to get them — they do NOT access MpiState.storage directly.
 //! - In Local mode, storage + vector_index come from MpiState directly (unchanged).
-//! - /api/auth/token is registered OUTSIDE the middleware layer — it is the
-//!   auth entry point and cannot require a JWT to issue a JWT.
+//! - All `/api/auth/*` issuance routes are registered OUTSIDE the middleware
+//!   layer; they cannot require a JWT before issuing a JWT. The v2 handlers
+//!   authenticate their own server-issued challenge before token issuance.
+//! - Anonymous auth JSON bodies are intentionally capped at 16 KiB. Do not
+//!   widen this limit without a protocol field that demonstrably requires it.
 //! - Mode::Local storage/vector_index fields remain Some(). In Mode::Saas they
 //!   are None. Handlers that use Extension<Arc<MemoryStorage>> work in both modes.
 //! - Route registration order: /record/:id/provenance AFTER /record/:id.
@@ -55,6 +61,7 @@
 //! ## Last Modified
 //! v2.5.2+Provenance  - +2 routes (patch record, provenance); 29→31
 //! v2.5.3+ArtifactChain - +1 route (/artifacts/search); 31→32
+//! v2.0.0-AuthServerNonce - +2 SaaS-only auth routes; Local mode unchanged
 //! v1.0.0-MultiTenant - MpiState SaaS fields; SaaS auth branch; auth + admin routes
 
 use std::collections::{HashMap, VecDeque};
@@ -84,7 +91,7 @@ use crate::services::memchain::{MemoryStorage, VectorIndex};
 // v1.0.0-MultiTenant: SaaS mode pools and infrastructure
 use crate::services::memchain::{StoragePool, SystemDb, VectorIndexPool, VolumeRouter};
 
-use super::auth::{issue_token, parse_pubkey_hex, verify_jwt, AuthState};
+use super::auth::{build_auth_router, parse_pubkey_hex, verify_jwt, AuthState};
 use super::mpi_graph_handlers;
 use super::mpi_handlers;
 use super::supernode_handlers;
@@ -659,8 +666,7 @@ async fn handle_remote_auth(
     // permit it on its own (as the config field documents), but ONLY for the
     // blind read/write paths. Plaintext remote storage still requires the full
     // `allow_remote_storage` opt-in.
-    let blind_path_ok =
-        state.blind_storage_enabled && is_blind_safe_path(req.uri().path());
+    let blind_path_ok = state.blind_storage_enabled && is_blind_safe_path(req.uri().path());
     if !(state.allow_remote_storage || blind_path_ok) {
         return (
             StatusCode::FORBIDDEN,
@@ -918,13 +924,17 @@ async fn admin_auth_middleware(
 
 /// Build the complete MPI router.
 ///
-/// ## Local mode (31 endpoints)
+/// ## Local mode
 /// All existing routes unchanged. Auth endpoint NOT registered.
 ///
-/// ## SaaS mode (32 MPI endpoints + 1 auth + 4 admin = 37 total)
-/// - `POST /api/auth/token`: registered OUTSIDE the auth middleware layer
+/// ## SaaS mode
+/// All MPI routes plus 3 anonymous auth routes and 4 separately authenticated
+/// admin routes. Route totals are intentionally not duplicated here because
+/// they become stale whenever the protocol surface grows.
+/// - `POST /api/auth/challenge`, `/api/auth/token/v2`, and legacy
+///   `/api/auth/token`: registered OUTSIDE the auth middleware layer
 /// - Admin routes: registered under separate admin_auth_middleware
-/// - All 31 existing MPI routes unchanged (now use Extension<> for storage)
+/// - All existing MPI routes unchanged (now use Extension<> for storage)
 pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
     let is_saas = state.mode == Mode::Saas;
 
@@ -1069,9 +1079,7 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
             }
         };
 
-        let auth_routes = Router::new()
-            .route("/api/auth/token", post(issue_token))
-            .with_state(auth_state);
+        let auth_routes = build_auth_router(auth_state);
 
         // Admin routes: separate admin_auth_middleware (api_secret, not JWT).
         let admin_routes = Router::new()
@@ -1101,7 +1109,7 @@ pub fn build_mpi_router(state: Arc<MpiState>) -> Router {
 
     info!(
         mode = ?state.mode,
-        endpoints = if is_saas { "32 MPI + 1 auth + 4 admin" } else { "31 MPI" },
+        route_groups = if is_saas { "MPI + 3 auth + 4 admin" } else { "MPI" },
         bearer = state.api_secret.as_ref().map_or(false, |s| !s.is_empty()),
         remote = state.allow_remote_storage,
         ner = state.ner_engine.is_some(),
