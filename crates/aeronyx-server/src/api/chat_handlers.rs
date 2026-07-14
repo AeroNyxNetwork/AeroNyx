@@ -7,7 +7,7 @@
 //! Provides the HTTP API for encrypted media blob upload/download/delete,
 //! complementing the UDP-based `ChatRelay` message path. Large files
 //! (images, documents) travel via HTTP while the small `ChatEnvelope`
-//! (containing an encrypted `MediaPointer`) travels via UDP MemChain.
+//! (containing an encrypted `MediaPointer`) travels via UDP `MemChain`.
 //!
 //! ## Main Functionality
 //! - `POST /api/chat/blob` — Upload an encrypted blob (Alice → Node)
@@ -78,7 +78,7 @@
 //! - Hex-decoding headers is intentionally strict: any malformed header
 //!   returns 400 immediately without touching the database.
 //! - `X-File-Hash` must be SHA-256 of the ENCRYPTED bytes (not plaintext).
-//!   This is used for blob_id derivation — the node never sees plaintext.
+//!   This is used for `blob_id` derivation — the node never sees plaintext.
 //! - Logs must not include wallet prefixes, blob IDs, payload bytes, client
 //!   addresses, or raw crypto/database errors. Use aggregate reason buckets.
 //!
@@ -128,10 +128,10 @@ const MAX_IN_FLIGHT_BLOB_ACCESSES: usize = 32;
 /// Axum state for the chat blob API.
 ///
 /// Wraps `ChatRelayService` in an `Arc` for cheap cloning across handler calls.
-/// The service itself uses internal `Mutex<Connection>` for SQLite access.
+/// The service itself uses internal `Mutex<Connection>` for `SQLite` access.
 #[derive(Clone)]
-pub struct ChatBlobState {
-    pub relay: Arc<ChatRelayService>,
+struct ChatBlobState {
+    relay: Arc<ChatRelayService>,
     upload_in_flight: Arc<AtomicUsize>,
     access_in_flight: Arc<AtomicUsize>,
 }
@@ -287,7 +287,7 @@ async fn handle_blob_upload(
             warn!(size, limit, "[CHAT_BLOB] Upload rejected: too large");
             error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                format!("blob too large: {} bytes (limit {})", size, limit),
+                format!("blob too large: {size} bytes (limit {limit})"),
             )
         }
         Err(ChatRelayError::BlobQuotaExceeded { current, limit }) => {
@@ -297,7 +297,7 @@ async fn handle_blob_upload(
             );
             error_response(
                 StatusCode::TOO_MANY_REQUESTS,
-                format!("receiver blob quota exceeded: {}/{}", current, limit),
+                format!("receiver blob quota exceeded: {current}/{limit}"),
             )
         }
         Err(error) if error.is_capacity_exhausted() => {
@@ -413,12 +413,12 @@ fn parse_wallet_header(headers: &HeaderMap, name: &str) -> Result<[u8; 32], Stri
     let val = headers
         .get(name)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| format!("missing header: {}", name))?;
+        .ok_or_else(|| format!("missing header: {name}"))?;
 
-    let bytes = hex::decode(val).map_err(|_| format!("invalid hex in header {}", name))?;
+    let bytes = hex::decode(val).map_err(|_| format!("invalid hex in header {name}"))?;
 
     if bytes.len() != 32 {
-        return Err(format!("header {} must be 64 hex chars (32 bytes)", name));
+        return Err(format!("header {name} must be 64 hex chars (32 bytes)"));
     }
 
     let mut arr = [0u8; 32];
@@ -431,12 +431,12 @@ fn parse_signature_header(headers: &HeaderMap, name: &str) -> Result<[u8; 64], S
     let val = headers
         .get(name)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| format!("missing header: {}", name))?;
+        .ok_or_else(|| format!("missing header: {name}"))?;
 
-    let bytes = hex::decode(val).map_err(|_| format!("invalid hex in header {}", name))?;
+    let bytes = hex::decode(val).map_err(|_| format!("invalid hex in header {name}"))?;
 
     if bytes.len() != 64 {
-        return Err(format!("header {} must be 128 hex chars (64 bytes)", name));
+        return Err(format!("header {name} must be 128 hex chars (64 bytes)"));
     }
 
     let mut arr = [0u8; 64];
@@ -566,6 +566,23 @@ mod tests {
     fn blob_request_limits_match_memory_budget() {
         assert_eq!(MAX_IN_FLIGHT_BLOB_UPLOADS, 16);
         assert_eq!(MAX_IN_FLIGHT_BLOB_ACCESSES, 32);
+    }
+
+    #[test]
+    fn blob_router_wiring_stays_on_client_surface() {
+        let server_source = include_str!("../server.rs");
+        assert!(server_source.contains(".merge(chat_blob_router)"));
+
+        let public_router_start = server_source
+            .find("fn build_public_discovery_router(")
+            .expect("public router builder");
+        let public_router_end = server_source[public_router_start..]
+            .find("async fn serve_public_discovery_api(")
+            .map(|offset| public_router_start + offset)
+            .expect("public router builder boundary");
+        let public_router_source = &server_source[public_router_start..public_router_end];
+        assert!(!public_router_source.contains("build_chat_router"));
+        assert!(!public_router_source.contains("chat_blob_router"));
     }
 
     #[tokio::test]
@@ -799,7 +816,7 @@ mod tests {
         let app = build_chat_router(Arc::clone(&relay));
         let req = Request::builder()
             .method(Method::GET)
-            .uri(format!("/api/chat/blob/{}", blob_id))
+            .uri(format!("/api/chat/blob/{blob_id}"))
             .body(Body::empty())
             .unwrap();
 
@@ -849,7 +866,7 @@ mod tests {
 
         let req = Request::builder()
             .method(Method::DELETE)
-            .uri(format!("/api/chat/blob/{}", blob_id))
+            .uri(format!("/api/chat/blob/{blob_id}"))
             .header("x-sender-wallet", hex::encode(sender))
             .header("x-signature", sig)
             .body(Body::empty())
@@ -887,7 +904,7 @@ mod tests {
 
         let req = Request::builder()
             .method(Method::DELETE)
-            .uri(format!("/api/chat/blob/{}", blob_id))
+            .uri(format!("/api/chat/blob/{blob_id}"))
             .header(
                 "x-sender-wallet",
                 hex::encode(kp_attacker.public_key_bytes()),

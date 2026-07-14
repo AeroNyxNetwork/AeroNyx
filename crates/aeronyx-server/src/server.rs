@@ -142,6 +142,8 @@
 //  60. Reports aggregate durable chat queue usage/capacity, while removing
 //      stable message, wallet, receiver, blob, and session identifiers from
 //      relay logs so node operators cannot reconstruct a social graph.
+//  61. Mounts the signature-authenticated encrypted blob API on loopback/VPN
+//      client listeners only; the public node-peer listener remains unchanged.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -303,6 +305,7 @@ use aeronyx_transport::LinuxTun;
 use rusqlite::OptionalExtension;
 
 use crate::api::auth::ensure_jwt_secret;
+use crate::api::chat_handlers::build_chat_router;
 use crate::api::chat_peer::{
     build_chat_peer_router, PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayRequest,
     PeerChatRelayResponse,
@@ -1728,8 +1731,16 @@ impl Server {
                 });
             }
 
+            // Encrypted media is a client surface. Keep it on the combined
+            // loopback/VPN app and out of `build_public_discovery_router()` so
+            // Internet peers cannot use the node-peer listener as a blob host.
+            let chat_blob_router = chat_relay
+                .as_ref()
+                .map(|relay| build_chat_router(Arc::clone(relay)))
+                .unwrap_or_else(axum::Router::new);
             let app = build_mpi_router(mpi_state)
                 .merge(build_voice_router(Arc::clone(&sessions)))
+                .merge(chat_blob_router)
                 .merge(build_vpn_health_router(
                     vpn_health_config,
                     Arc::clone(&ip_pool),
@@ -1831,7 +1842,7 @@ impl Server {
             match tokio::net::TcpListener::bind(vpn_listen_addr).await {
                 Ok(vpn_listener) => {
                     info!(
-                        "[API] Voice API also available on http://{} (VPN clients only)",
+                        "[API] Client API also available on http://{} (VPN clients only)",
                         vpn_listen_addr
                     );
                     let app_clone = app.clone();

@@ -32,6 +32,7 @@
 //! - [`admin_handlers`]: v1.0.0-MultiTenant Admin endpoints (volumes, pool, usage)
 //! - [`local`]: Legacy Axum router (deprecated)
 //! - [`voice`]: v1.0.0-Voice Peer virtual IP resolution for UDP direct-connect
+//! - [`chat_handlers`]: client/VPN-only encrypted media blob transfer
 //! - [`discovery`]: v0.1.0 Discovery snapshot/gossip endpoints
 //! - [`chat_peer`]: v0.1.0 node-to-node encrypted chat envelope relay
 //! - [`memchain_peer`]: v2.7.0 signed node-to-node commitment block ranges
@@ -50,6 +51,8 @@
 //!   It is merged into the combined API router in server.rs::start_combined_api().
 //! - memchain_peer.rs is a public node-peer surface, not a client memory API.
 //!   It must keep PeerStore admission and return commitments only.
+//! - chat_handlers.rs is a client media surface. Mount it only on loopback/VPN
+//!   listeners; never merge it into the public node-peer router.
 //! - Every outbound peer response must be read through the bounded helpers in
 //!   this module. `Content-Length` is advisory; the streaming byte count is the
 //!   authoritative memory boundary and peer-controlled bodies are never logged.
@@ -78,6 +81,7 @@
 //! v2.7.0-BlockSync - Added authenticated `/api/memchain/peer/block-range`.
 //! v2.7.19-PublicApiBounds - Centralized bounded peer HTTP response decoding.
 //! v2.7.20-PublicApiBackpressure - Centralized lock-free RAII request permits.
+//! v2.7.21-ChatBlobWiring - Compile the encrypted client blob API module.
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -250,6 +254,7 @@ pub mod admin_handlers;
 // ── Legacy API (deprecated) ──
 pub mod local;
 // ── v1.0.0-Voice: Peer virtual IP resolution for UDP direct-connect routing ──
+pub mod chat_handlers;
 pub mod chat_peer;
 pub mod discovery;
 pub mod memchain_peer;
