@@ -122,6 +122,8 @@
 //      declare convergence and reports only aggregate proof outcomes.
 //  51. Audits a bounded local vault of exact signature-verified checkpoint
 //      response frames before networking and exposes only aggregate vault health.
+//  52. Runs bounded low-frequency coordinator witness reconciliation, storing
+//      signed peer observations without treating witness count as consensus.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -136,6 +138,8 @@
 //     them through a client session or add full memory records to the response.
 //   - Block Sync v1 is single-writer: only an explicitly configured Local-mode
 //     blind coordinator may pack blocks; all other nodes remain followers.
+//   - Coordinator witness reconciliation is evidence collection only. It must
+//     never mutate the canonical chain, elect a leader, or infer fork choice.
 //   - encrypted_message_counter is aggregate only and never stores payload,
 //     destination, DNS, URL, voucher, wallet, or client public IP details.
 //   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
@@ -145,6 +149,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.8-CoordinatorWitness - Low-frequency signed peer checkpoint evidence
 //   v2.7.6-EvidenceVault - Durable bounded checkpoint proofs and startup audit
 //   v2.7.5-CheckpointProof - Signed cross-node tip reconciliation and convergence gate
 //   v2.7.4-BlockIntegrityStatus - Privacy-safe verified chain evidence in status and heartbeat
@@ -258,7 +263,7 @@ use crate::api::discovery::{
 };
 use crate::api::memchain_peer::{
     build_memchain_peer_router, pull_record_commitment_checkpoint, pull_record_commitment_page,
-    CommitmentCheckpointRelation,
+    reconcile_record_commitment_witnesses, CommitmentCheckpointRelation,
 };
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
 use crate::api::voice::build_voice_router;
@@ -791,6 +796,12 @@ impl Server {
                 self.spawn_memchain_commitment_sync_task(Arc::clone(st), Arc::clone(&peer_store))
             {
                 tasks.push(("memchain-block-sync", sync_task));
+            }
+            if let Some(reconciliation_task) = self.spawn_memchain_commitment_reconciliation_task(
+                Arc::clone(st),
+                Arc::clone(&peer_store),
+            ) {
+                tasks.push(("memchain-checkpoint-witness", reconciliation_task));
             }
 
             if let Some(ref router) = llm_router {
@@ -2514,6 +2525,127 @@ impl Server {
                     }
                 }
             }
+        }))
+    }
+
+    /// Starts low-frequency signed checkpoint evidence collection on the
+    /// configured Block Sync v1 coordinator.
+    ///
+    /// Discovered encrypted-storage peers act only as witnesses. Their signed
+    /// observations are independently verified and stored, but peer count is
+    /// never interpreted as votes, quorum, finality, or fork choice. A remote
+    /// ahead/diverged result is operator evidence and cannot mutate the local
+    /// canonical chain.
+    fn spawn_memchain_commitment_reconciliation_task(
+        &self,
+        storage: Arc<MemoryStorage>,
+        peer_store: Arc<PeerStore>,
+    ) -> Option<JoinHandle<()>> {
+        if !self.config.memchain.commitment_coordinator_enabled {
+            return None;
+        }
+
+        const INITIAL_DELAY_SECS: u64 = 15;
+        const MIN_INTERVAL_SECS: u64 = 300;
+        const MAX_WITNESSES_PER_ROUND: usize = 3;
+        let client = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(1)
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => {
+                error!(
+                    "[MEMCHAIN_BLOCK] Coordinator witness reconciliation disabled: HTTP client init failed"
+                );
+                return None;
+            }
+        };
+        let identity = self.identity.clone();
+        let interval_secs = self
+            .config
+            .memchain
+            .commitment_sync_interval_secs
+            .max(MIN_INTERVAL_SECS);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        Some(tokio::spawn(async move {
+            let mut next_delay = Duration::from_secs(INITIAL_DELAY_SECS);
+            let mut consecutive_unverified_rounds = 0u32;
+            info!(
+                interval_secs,
+                max_witnesses = MAX_WITNESSES_PER_ROUND,
+                "[MEMCHAIN_BLOCK] Coordinator witness reconciliation started"
+            );
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.recv() => break,
+                    _ = tokio::time::sleep(next_delay) => {}
+                }
+
+                let round = tokio::select! {
+                    _ = shutdown_rx.recv() => break,
+                    outcome = reconcile_record_commitment_witnesses(
+                        &storage,
+                        &peer_store,
+                        &identity,
+                        &client,
+                        MAX_WITNESSES_PER_ROUND,
+                    ) => outcome,
+                };
+                next_delay = Duration::from_secs(interval_secs);
+
+                if round.attempted == 0 {
+                    consecutive_unverified_rounds = 0;
+                    debug!(
+                        eligible_witnesses = round.eligible_witnesses,
+                        "[MEMCHAIN_BLOCK] Coordinator witness round waiting for eligible peers"
+                    );
+                    continue;
+                }
+                if round.verified == 0 {
+                    consecutive_unverified_rounds = consecutive_unverified_rounds.saturating_add(1);
+                    if consecutive_unverified_rounds == 1
+                        || consecutive_unverified_rounds.is_power_of_two()
+                    {
+                        warn!(
+                            attempted = round.attempted,
+                            failed = round.failed,
+                            consecutive_unverified_rounds,
+                            "[MEMCHAIN_BLOCK] Coordinator witness round established no signed evidence"
+                        );
+                    }
+                    continue;
+                }
+
+                consecutive_unverified_rounds = 0;
+                if round.diverged > 0 || round.remote_ahead > 0 {
+                    warn!(
+                        attempted = round.attempted,
+                        verified = round.verified,
+                        converged = round.converged,
+                        remote_ahead = round.remote_ahead,
+                        remote_behind = round.remote_behind,
+                        diverged = round.diverged,
+                        failed = round.failed,
+                        "[MEMCHAIN_BLOCK] Coordinator witness round found signed chain attention evidence"
+                    );
+                } else {
+                    debug!(
+                        attempted = round.attempted,
+                        verified = round.verified,
+                        converged = round.converged,
+                        remote_behind = round.remote_behind,
+                        failed = round.failed,
+                        "[MEMCHAIN_BLOCK] Coordinator witness round complete"
+                    );
+                }
+            }
+
+            info!("[MEMCHAIN_BLOCK] Coordinator witness reconciliation stopped");
         }))
     }
 

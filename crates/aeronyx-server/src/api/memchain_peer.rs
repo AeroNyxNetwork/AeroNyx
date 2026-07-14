@@ -22,6 +22,8 @@
 //! - Signed tip/checkpoint comparison that distinguishes lag from a fork.
 //! - Durable bounded storage of the exact verified checkpoint response before
 //!   follower convergence can be reported.
+//! - Bounded coordinator witness rounds that collect signed peer checkpoints
+//!   as evidence without treating peer count as consensus or fork choice.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` on the public node peer listener and local operator
@@ -29,7 +31,8 @@
 //! - Reads verified blocks through `MemoryStorage::get_record_commitment_block_range`.
 //! - Uses `PeerStore::get_valid` as the node admission boundary.
 //! - Uses canonical signing bytes from `aeronyx_core::protocol::memchain`.
-//! - `server.rs` runs the optional low-frequency follower scheduler.
+//! - `server.rs` runs the optional low-frequency follower and coordinator
+//!   witness schedulers.
 //!
 //! ## Privacy Invariant
 //! This API returns only signed commitment blocks. It never returns memory
@@ -45,14 +48,18 @@
 //!   peer. Block Sync v1 is authenticated replication, not consensus.
 //! - Checkpoint proof establishes what a peer signed; it is not a majority,
 //!   finality, leader-election, or longest-chain consensus rule.
+//! - Coordinator witness failures or divergence evidence must never mutate the
+//!   canonical chain; they are operator evidence until consensus is designed.
 //!
 //! ## Last Modified
 //! v2.7.5-CheckpointProof - Signed cross-node checkpoint reconciliation.
 //! v2.7.6-EvidenceVault - Fail-closed durable verified checkpoint evidence.
+//! v2.7.8-CoordinatorWitness - Bounded non-consensus witness reconciliation.
 //! v2.7.1-BlockFollower - Pinned coordinator pull and fail-closed page verification.
 //! v2.7.0-BlockSync - Initial signed node-blind block range protocol.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,6 +84,7 @@ use aeronyx_core::protocol::memchain::{
     record_block_range_response_signing_bytes, record_chain_checkpoint_request_signing_bytes,
     record_chain_checkpoint_response_signing_bytes, MemChainMessage, MEMCHAIN_MAGIC,
 };
+use aeronyx_core::protocol::NodeCapability;
 use sha2::{Digest, Sha256};
 
 use crate::services::memchain::{MemoryStorage, RecordCommitmentAppendOutcome};
@@ -148,6 +156,32 @@ pub struct CommitmentCheckpointOutcome {
     pub checkpoint_height: u64,
     /// SHA-256 digest of the complete signed response frame.
     pub evidence_digest: [u8; 32],
+}
+
+/// Privacy-safe aggregate result of one bounded coordinator witness round.
+///
+/// Counts establish only how many signed observations were collected. They do
+/// not represent votes, quorum, finality, peer trust weight, or fork choice.
+/// Peer identities, endpoints, hashes, signatures, and request ids remain in
+/// the local evidence vault and are deliberately absent from this structure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommitmentReconciliationOutcome {
+    /// Valid discovered peers eligible for checkpoint observation.
+    pub eligible_witnesses: usize,
+    /// Peers contacted after applying the per-round bound.
+    pub attempted: usize,
+    /// Responses that passed identity, freshness, signature, and chain checks.
+    pub verified: usize,
+    /// Verified peers at the same height and hash.
+    pub converged: usize,
+    /// Verified peers extending the local chain prefix.
+    pub remote_ahead: usize,
+    /// Verified peers behind the local tip on the same prefix.
+    pub remote_behind: usize,
+    /// Verified peers signing a different hash at the shared height.
+    pub diverged: usize,
+    /// Attempts that did not establish durable signed evidence.
+    pub failed: usize,
 }
 
 #[derive(Debug)]
@@ -304,6 +338,196 @@ pub async fn pull_record_commitment_checkpoint(
         .await
         .map_err(|_| "checkpoint_evidence_persist_failed".to_string())?;
     Ok(outcome)
+}
+
+/// Collects a bounded set of signed checkpoint observations from discovered
+/// encrypted-storage peers.
+///
+/// This is evidence collection for the current single-writer Block Sync v1
+/// architecture, not distributed consensus. The function never adopts a
+/// remote chain, changes the coordinator, selects a longest chain, or derives
+/// truth from peer count. Every accepted response is independently verified
+/// and durably stored by `pull_record_commitment_checkpoint`.
+pub async fn reconcile_record_commitment_witnesses(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    max_witnesses: usize,
+) -> CommitmentReconciliationOutcome {
+    reconcile_record_commitment_witnesses_with_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        client,
+        max_witnesses,
+        checkpoint_witness_endpoint_is_public,
+    )
+    .await
+}
+
+async fn reconcile_record_commitment_witnesses_with_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    max_witnesses: usize,
+    endpoint_allowed: F,
+) -> CommitmentReconciliationOutcome
+where
+    F: Fn(&str) -> bool + Send + Sync,
+{
+    let now = now_secs();
+    let self_node_id = identity.public_key_bytes();
+    let mut candidates: Vec<_> = peer_store
+        .peers_with_capability(NodeCapability::EncryptedStorage, now)
+        .into_iter()
+        .filter(|candidate| candidate.descriptor.node_id != self_node_id)
+        .filter(|candidate| {
+            candidate
+                .descriptor
+                .public_endpoint
+                .as_deref()
+                .is_some_and(&endpoint_allowed)
+        })
+        .collect();
+    candidates.sort_by_key(|candidate| candidate.descriptor.node_id);
+    if !candidates.is_empty() {
+        // Rotate the deterministic signed-descriptor order so a larger network
+        // does not permanently starve peers beyond the per-round fan-out cap.
+        // The selector is local scheduling state only and is never reported.
+        let node_selector = u64::from_be_bytes(
+            self_node_id[..8]
+                .try_into()
+                .expect("fixed identity prefix length"),
+        );
+        let offset =
+            usize::try_from((node_selector ^ (now / 300)) % candidates.len() as u64).unwrap_or(0);
+        candidates.rotate_left(offset);
+    }
+
+    let eligible_witnesses = candidates.len();
+    candidates.truncate(max_witnesses);
+    let attempted = candidates.len();
+    let mut outcome = CommitmentReconciliationOutcome {
+        eligible_witnesses,
+        attempted,
+        ..CommitmentReconciliationOutcome::default()
+    };
+    let mut verified = Vec::with_capacity(attempted);
+
+    for candidate in candidates {
+        match pull_record_commitment_checkpoint(
+            storage,
+            peer_store,
+            identity,
+            &candidate.descriptor.node_id,
+            client,
+        )
+        .await
+        {
+            Ok(proof) => {
+                outcome.verified = outcome.verified.saturating_add(1);
+                match proof.relation {
+                    CommitmentCheckpointRelation::Converged => {
+                        outcome.converged = outcome.converged.saturating_add(1);
+                    }
+                    CommitmentCheckpointRelation::RemoteAhead => {
+                        outcome.remote_ahead = outcome.remote_ahead.saturating_add(1);
+                    }
+                    CommitmentCheckpointRelation::RemoteBehind => {
+                        outcome.remote_behind = outcome.remote_behind.saturating_add(1);
+                    }
+                    CommitmentCheckpointRelation::Diverged => {
+                        outcome.diverged = outcome.diverged.saturating_add(1);
+                    }
+                }
+                verified.push(proof);
+            }
+            Err(_) => {
+                outcome.failed = outcome.failed.saturating_add(1);
+            }
+        }
+    }
+
+    let completed_at = now_secs();
+    for _ in 0..outcome.failed {
+        storage.record_commitment_checkpoint_failure(completed_at);
+    }
+    // Record valid proofs after failures and from least to most severe. A
+    // partial transport failure must not hide valid evidence, while a signed
+    // divergence must remain the final operator-visible state for the round.
+    verified.sort_by_key(|proof| checkpoint_relation_priority(proof.relation));
+    for proof in verified {
+        storage.record_commitment_checkpoint_verified(
+            completed_at,
+            proof.relation.as_str(),
+            proof.local_tip_height,
+            proof.remote_tip_height,
+        );
+    }
+
+    outcome
+}
+
+/// Accepts only public IP literals for permissionless witness traffic.
+///
+/// A signed descriptor proves who advertised an endpoint, not that the target
+/// is safe for this host to contact. Domain names are deliberately excluded to
+/// prevent DNS rebinding; loopback, private, link-local, CGNAT, benchmark,
+/// documentation, multicast, and reserved ranges are also rejected.
+fn checkpoint_witness_endpoint_is_public(endpoint: &str) -> bool {
+    let Ok(url) = commitment_checkpoint_url(endpoint) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let Ok(address) = host.parse::<IpAddr>() else {
+        return false;
+    };
+    match address {
+        IpAddr::V4(address) => ipv4_is_public_unicast(address),
+        IpAddr::V6(address) => ipv6_is_public_unicast(address),
+    }
+}
+
+fn ipv4_is_public_unicast(address: Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
+}
+
+fn ipv6_is_public_unicast(address: Ipv6Addr) -> bool {
+    if let Some(mapped) = address.to_ipv4() {
+        return ipv4_is_public_unicast(mapped);
+    }
+    let segments = address.segments();
+    (segments[0] & 0xe000) == 0x2000 && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+}
+
+const fn checkpoint_relation_priority(relation: CommitmentCheckpointRelation) -> u8 {
+    match relation {
+        CommitmentCheckpointRelation::RemoteBehind => 0,
+        CommitmentCheckpointRelation::Converged => 1,
+        CommitmentCheckpointRelation::RemoteAhead => 2,
+        CommitmentCheckpointRelation::Diverged => 3,
+    }
 }
 
 /// Pulls, verifies, and atomically appends one bounded commitment-block page.
@@ -921,6 +1145,7 @@ mod tests {
             "memchain-sync-test",
         );
         descriptor.public_endpoint = endpoint;
+        descriptor.capabilities = vec![NodeCapability::EncryptedStorage];
         let descriptor = SignedNodeDescriptor::sign(descriptor, identity).unwrap();
         let import = peer_store.apply_discovery_message(
             &NodeDiscoveryMessage::DescriptorAnnounce { descriptor },
@@ -960,6 +1185,34 @@ mod tests {
                 .as_str(),
             "http://node.example:9281/api/memchain/peer/checkpoint"
         );
+    }
+
+    #[test]
+    fn checkpoint_witness_endpoint_rejects_ssrf_targets() {
+        assert!(checkpoint_witness_endpoint_is_public("http://8.8.8.8:8422"));
+        assert!(checkpoint_witness_endpoint_is_public(
+            "https://[2606:4700:4700::1111]:8422"
+        ));
+        for endpoint in [
+            "http://127.0.0.1:8422",
+            "http://10.0.0.1:8422",
+            "http://100.64.0.1:8422",
+            "http://169.254.1.1:8422",
+            "http://172.16.0.1:8422",
+            "http://192.168.1.1:8422",
+            "http://198.18.0.1:8422",
+            "http://203.0.113.1:8422",
+            "http://node.example:8422",
+            "http://[::1]:8422",
+            "http://[fc00::1]:8422",
+            "http://[fe80::1]:8422",
+            "http://[2001:db8::1]:8422",
+        ] {
+            assert!(
+                !checkpoint_witness_endpoint_is_public(endpoint),
+                "unexpectedly accepted {endpoint}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1471,5 +1724,121 @@ mod tests {
         assert_eq!(served.state, "converged");
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_witness_round_keeps_valid_proof_over_partial_failure() {
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let converged_witness = Arc::new(IdentityKeyPair::generate());
+        let lagging_witness = Arc::new(IdentityKeyPair::generate());
+        let unavailable_witness = IdentityKeyPair::generate();
+        let local = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let converged = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let lagging = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now.saturating_sub(1),
+            GENESIS_PREV_HASH,
+            vec![[0x71; 32]],
+            &coordinator,
+        );
+        local
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        converged
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        local.audit_record_commitment_chain().await.unwrap();
+        local
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        converged.audit_record_commitment_chain().await.unwrap();
+        lagging.audit_record_commitment_chain().await.unwrap();
+
+        let converged_peers = Arc::new(PeerStore::new());
+        admit_peer(&converged_peers, &coordinator, None, now);
+        let converged_router = build_memchain_peer_router(
+            Arc::clone(&converged),
+            converged_peers,
+            Arc::clone(&converged_witness),
+        );
+        let converged_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let converged_address = converged_listener.local_addr().unwrap();
+        let converged_server = tokio::spawn(async move {
+            axum::serve(converged_listener, converged_router)
+                .await
+                .unwrap();
+        });
+
+        let lagging_peers = Arc::new(PeerStore::new());
+        admit_peer(&lagging_peers, &coordinator, None, now);
+        let lagging_router = build_memchain_peer_router(
+            Arc::clone(&lagging),
+            lagging_peers,
+            Arc::clone(&lagging_witness),
+        );
+        let lagging_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lagging_address = lagging_listener.local_addr().unwrap();
+        let lagging_server = tokio::spawn(async move {
+            axum::serve(lagging_listener, lagging_router).await.unwrap();
+        });
+
+        let coordinator_peers = PeerStore::new();
+        admit_peer(
+            &coordinator_peers,
+            &converged_witness,
+            Some(format!("http://{converged_address}")),
+            now,
+        );
+        admit_peer(
+            &coordinator_peers,
+            &lagging_witness,
+            Some(format!("http://{lagging_address}")),
+            now,
+        );
+        admit_peer(
+            &coordinator_peers,
+            &unavailable_witness,
+            Some("https://[invalid".to_string()),
+            now,
+        );
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let round = reconcile_record_commitment_witnesses_with_endpoint_policy(
+            &local,
+            &coordinator_peers,
+            &coordinator,
+            &client,
+            3,
+            |_| true,
+        )
+        .await;
+
+        assert_eq!(round.eligible_witnesses, 3);
+        assert_eq!(round.attempted, 3);
+        assert_eq!(round.verified, 2);
+        assert_eq!(round.converged, 1);
+        assert_eq!(round.remote_behind, 1);
+        assert_eq!(round.remote_ahead, 0);
+        assert_eq!(round.diverged, 0);
+        assert_eq!(round.failed, 1);
+        let status = local.record_commitment_checkpoint_status();
+        assert_eq!(status.state, "converged");
+        assert_eq!(status.proofs_verified_total, 2);
+        assert_eq!(status.proofs_failed_total, 1);
+        assert_eq!(status.evidence_records, 2);
+        assert_eq!(status.evidence_state, "verified");
+
+        converged_server.abort();
+        lagging_server.abort();
+        let _ = converged_server.await;
+        let _ = lagging_server.await;
     }
 }
