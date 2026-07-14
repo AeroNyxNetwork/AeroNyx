@@ -53,6 +53,8 @@
 //!   — it breaks axum's Clone requirement on Router::layer.
 //!
 //! ## Last Modified
+//! v2.7.14-RustdocQuality - Marked router composition pseudocode as a
+//!   non-standalone Rustdoc example.
 //! v1.0.0 - Initial implementation for AeroNyx Voice UDP direct-connect routing.
 //!   Two-pass lookup: wallet_index O(1) + all_sessions O(n) fallback.
 //!   DashMap-based global rate limiter (30 req / 60 s).
@@ -296,7 +298,7 @@ pub async fn peer_virtual_ip_handler(
 /// Does NOT share `MpiState` — the two routers are fully isolated.
 ///
 /// Called from `server.rs::start_combined_api()`:
-/// ```rust
+/// ```rust,ignore
 /// let app = build_mpi_router(mpi_state)
 ///     .merge(build_voice_router(sessions));
 /// ```

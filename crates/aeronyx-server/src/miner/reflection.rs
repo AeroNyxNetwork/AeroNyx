@@ -73,8 +73,11 @@
 //!   content-hash dedup. Added infer_filename() + extract_filename_from_line().
 //! v2.7.0-BlockSync         - Added bounded commitment packing; removed the
 //!   false chain-tip mutation from local-only cognitive compaction.
+//! v2.7.14-RustdocQuality   - Corrected nested Markdown filename example so
+//!   Rustdoc treats it as documentation rather than two Rust test programs.
 //!
 //! ## Last Modified
+//! v2.7.14-RustdocQuality - Corrected filename example fence semantics.
 //! v2.7.0-BlockSync - Signed node-blind commitment block production.
 
 use std::collections::{HashMap, HashSet};
@@ -2191,12 +2194,12 @@ fn is_stopword_entity(name_normalized: &str, original_text: &str, entity_label: 
 ///
 /// ## Usage
 /// Producers can improve accuracy by prefixing code blocks with a filename comment:
-/// ```
+/// ````text
 /// // auth.rs
 /// ```rust
 /// fn verify_jwt(...) { ... }
 /// ```
-/// ```
+/// ````
 ///
 /// v2.5.3+ArtifactChain
 fn infer_filename(

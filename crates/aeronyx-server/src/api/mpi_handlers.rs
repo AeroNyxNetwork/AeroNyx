@@ -19,6 +19,8 @@
 //!                          Local-mode guard.
 //! v2.7.0-BlockSync       - Added aggregate commitment-chain status to the
 //!                          local operator status response.
+//! v2.7.14-RustdocQuality - Marked request-context extraction pseudocode as a
+//!                          non-standalone Rustdoc example.
 //!
 //! ## Main Functionality
 //! - POST /api/mpi/remember    - store a new memory record
@@ -32,7 +34,7 @@
 //!
 //! ## SaaS Compatibility (v1.0.1-SaaSFix)
 //! All handlers now extract storage and vector_index from Extensions:
-//! ```
+//! ```rust,ignore
 //! let storage = req.extensions().get::<Arc<MemoryStorage>>()
 //!     .expect("[BUG] MemoryStorage extension not set").clone();
 //! let vi = req.extensions().get::<Arc<VectorIndex>>()
@@ -58,6 +60,7 @@
 //!   allow-listed and events never contain endpoints or node identities.
 //!
 //! ## Last Modified
+//! v2.7.14-RustdocQuality - Corrected executable-example classification.
 //! v1.0.1-SaaSFix - Replaced all direct state.storage/vector_index accesses
 //!                  with Extension extraction throughout all handlers.
 //! v1.0.2-BlindVectorRecovery - Added blind-storage mode, rebuild scope, and

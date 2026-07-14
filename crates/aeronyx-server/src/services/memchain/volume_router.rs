@@ -30,7 +30,7 @@
 //! If collision detected at open time, fallback to full 64-char hex.
 //!
 //! ## Volume State Machine
-//! ```
+//! ```text
 //! read-write ──(capacity)──→ read-only ──(future draining)──→ removed
 //! ```
 //! Only read-write and read-only are implemented in this version.
@@ -53,6 +53,7 @@
 //!   not from VolumeRouter::new() — keep them separate for testability.
 //!
 //! ## Last Modified
+//! v2.7.14-RustdocQuality - Classified the volume lifecycle diagram as text.
 //! v1.0.0-MultiTenant - Initial implementation (Task 1a)
 // ============================================
 

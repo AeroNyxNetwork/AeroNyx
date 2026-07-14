@@ -85,6 +85,9 @@
 //!   comparison because any real counter value can be a valid "first packet".
 //!
 //! ## Last Modified
+//! v2.7.14-RustdocQuality
+//!   - Marked cooldown caller pseudocode as a non-standalone Rustdoc example.
+//!
 //! v1.2.2-PrivacyLogs
 //!   - Redacted local session lifecycle logs to avoid persisting client IPs,
 //!     session IDs, wallet prefixes, device IDs, or virtual IP assignments.
@@ -1153,7 +1156,7 @@ impl SessionManager {
     /// any new session can claim the address.
     ///
     /// ## Caller responsibility
-    /// ```rust
+    /// ```rust,ignore
     /// for ip in sessions.drain_cooldown_pool() {
     ///     ip_pool.release(ip);
     /// }

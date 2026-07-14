@@ -19,6 +19,8 @@
 //!                      Extension<Arc<VectorIndex>> extracted from the request.
 //!                      This makes the handler work in both Local and SaaS modes.
 //!                      unified_auth_middleware injects these extensions in both modes.
+//! v2.7.14-RustdocQuality - Marked the handler-context extraction pattern as a
+//!                      non-standalone Rustdoc example so standard doc tests pass.
 //!
 //! ## Main Functionality
 //! - Local-only access gate (remote -> 403)
@@ -37,7 +39,7 @@
 //! state.storage is None in SaaS mode — any direct access would panic.
 //!
 //! Extraction pattern used throughout:
-//! ```
+//! ```rust,ignore
 //! let storage = req.extensions().get::<Arc<MemoryStorage>>()
 //!     .expect("[BUG] MemoryStorage extension not set by middleware")
 //!     .clone();
@@ -56,6 +58,7 @@
 //! - Privacy stripping runs on turn.content; entropy filter uses original content
 //!
 //! ## Last Modified
+//! v2.7.14-RustdocQuality - Corrected executable-example classification.
 //! v1.0.1-SaaSFix - Replaced all state.storage accesses with Extension extraction
 // ============================================
 
