@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 1.8.0-BoundedMaintenance
+// Version: 1.9.0-DurableQuarantine
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -22,6 +22,9 @@
 //   and aligned durable pull ordering with the existing message-id cursor.
 //   v1.8.0-BoundedMaintenance — Split retention cleanup into bounded SQLite
 //   transactions and exposed deferred-backlog evidence.
+//   v1.9.0-DurableQuarantine — Added privacy-minimised corrupt-row tombstones,
+//   poison-row isolation, complete durable-envelope consistency checks, and
+//   atomic concurrent online deduplication.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -34,6 +37,7 @@
 //   - Peer relay health: aggregate outbound/inbound node-to-node relay status
 //   - Durable queue quotas: per-receiver and node-wide count/byte ceilings
 //   - Maintenance telemetry: aggregate TTL cleanup, batch, and backlog evidence
+//   - Durable quarantine: bounded de-identified evidence for corrupt relay rows
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -60,14 +64,19 @@
 //     maintained only by SQLite triggers in the same write transaction.
 //   - Logs must remain aggregate-only. Do not log message IDs, wallet prefixes,
 //     blob IDs, sender/receiver keys, payload bytes, or endpoint/session IDs.
-//   - Offline control batches are protocol-bounded. Do not remove their limits
-//     or silently skip malformed SQLite rows; fail the operation and retain data.
+//   - Offline control batches are protocol-bounded. Do not remove their limits.
+//     Malformed rows must be atomically replaced by de-identified quarantine
+//     evidence; never silently skip them or copy raw routing metadata.
 //   - Pending-message pages are ordered by message_id because the v1 wire
 //     cursor contains only message_id. Chronological display belongs client-side.
 //   - Retention cleanup is batch-bounded. Do not replace it with an unbounded
 //     SELECT/DELETE or hold the SQLite connection across multiple batches.
+//   - Quarantine events must remain de-identified. Never persist message IDs,
+//     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v1.9.0-DurableQuarantine — Poison-row isolation, private tombstones,
+//     durable metadata/signature validation, and atomic live-path deduplication
 //   v1.8.0-BoundedMaintenance — Bounded transactions and backlog observability
 //   v1.7.0-MaintenanceRuntime — Runtime cleanup evidence and cursor-safe paging
 //   v1.6.0-OfflineControlReliability — Atomic bounded ACK/expiry control flow
@@ -84,14 +93,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use hmac::{Hmac, Mac};
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use aeronyx_core::protocol::chat::{decode_envelope, encode_envelope, ChatEnvelope};
 
@@ -118,8 +127,14 @@ const CLEANUP_MESSAGE_BATCH_SIZE: usize = 1024;
 const CLEANUP_BLOB_BATCH_SIZE: usize = 128;
 /// Maximum delivered/stale notification rows deleted by one transaction.
 const CLEANUP_NOTIFICATION_BATCH_SIZE: usize = 1024;
+/// Maximum privacy-minimised quarantine events removed by one transaction.
+const CLEANUP_QUARANTINE_EVENT_BATCH_SIZE: usize = 1024;
 /// Maximum cleanup transactions executed by one scheduled maintenance run.
 const CLEANUP_MAX_BATCHES_PER_RUN: usize = 8;
+/// Maximum retained de-identified corruption events.
+const MAX_QUARANTINE_EVENTS: usize = 4096;
+const QUARANTINE_SOURCE_PENDING_MESSAGE: &str = "pending_message";
+const QUARANTINE_SOURCE_EXPIRED_NOTIFICATION: &str = "expired_notification";
 
 // ============================================
 // Peer relay health status
@@ -240,6 +255,10 @@ pub enum ChatRelayError {
     #[error("Message timestamp is outside the supported range")]
     TimestampOutOfRange,
 
+    /// An existing durable row uses the same ID for a different signed envelope.
+    #[error("Message ID conflicts with an existing durable envelope")]
+    MessageIdConflict,
+
     /// Encrypted message ciphertext exceeds the configured item ceiling.
     #[error("Message too large: {size} bytes (limit {limit})")]
     MessageTooLarge {
@@ -338,6 +357,7 @@ impl ChatRelayError {
             Self::AckBatchTooLarge { .. } => "ack_batch_too_large",
             Self::CorruptStoredData { .. } => "corrupt_stored_data",
             Self::TimestampOutOfRange => "timestamp_out_of_range",
+            Self::MessageIdConflict => "message_id_conflict",
             Self::MessageTooLarge { .. } => "message_too_large",
             Self::MailboxFull { .. } => "mailbox_full",
             Self::PendingMessageQueueFull { .. } => "pending_message_count_quota",
@@ -402,6 +422,16 @@ pub struct ChatRelayMaintenanceStatus {
     pub expired_blobs_total: u64,
     /// Delivered or stale expiry-notification rows removed by committed batches.
     pub expired_notifications_removed_total: u64,
+    /// Corrupt pending-message rows atomically isolated from active delivery.
+    pub quarantined_pending_messages_total: u64,
+    /// Corrupt expiry-notification rows atomically isolated from delivery.
+    pub quarantined_expired_notifications_total: u64,
+    /// De-identified quarantine event rows removed by bounded retention.
+    pub quarantine_events_removed_total: u64,
+    /// Current durable de-identified quarantine event rows.
+    pub quarantine_events_retained: u64,
+    /// Unix timestamp of the most recent poison-row isolation.
+    pub last_quarantine_at: Option<u64>,
     /// Unix timestamp of the most recent cleanup attempt.
     pub last_cleanup_at: Option<u64>,
     /// Stable state bucket: `succeeded` or `failed`.
@@ -412,6 +442,8 @@ pub struct ChatRelayMaintenanceStatus {
     pub last_cleanup_batches: u64,
     /// Whether the latest run deferred remaining work to the next timer tick.
     pub last_cleanup_backlog_deferred: bool,
+    /// Corrupt pending-message rows isolated by the latest cleanup run.
+    pub last_cleanup_quarantined_pending_messages: u64,
 }
 
 // ============================================
@@ -435,14 +467,57 @@ struct ExpiredMessageRow {
 }
 
 type ExpiredMessagesBySender = HashMap<[u8; 32], HashMap<[u8; 32], Vec<[u8; 16]>>>;
-type StoredExpiredMessageRow = (Vec<u8>, Vec<u8>, Vec<u8>);
-type StoredExpiredNotificationRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
+#[derive(Debug)]
+struct StoredExpiredNotificationRow {
+    id: i64,
+    sender: Vec<u8>,
+    receiver: Vec<u8>,
+    message_ids_raw: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct StoredPendingMessageRow {
+    rowid: i64,
+    message_id: Vec<u8>,
+    sender: Vec<u8>,
+    receiver: Vec<u8>,
+    timestamp: i64,
+    envelope: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct StoredExpiredMessageRow {
+    rowid: i64,
+    message_id: Vec<u8>,
+    sender: Vec<u8>,
+    receiver: Vec<u8>,
+    timestamp: i64,
+    envelope: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CorruptDurableRow {
+    row_key: i64,
+    source_kind: &'static str,
+    reason: &'static str,
+    encoded_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct ValidatedExpiredMessageBatch {
+    valid_rows: Vec<ExpiredMessageRow>,
+    corrupt_rows: Vec<CorruptDurableRow>,
+    selected_rowids: Vec<i64>,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CleanupBatchOutcome {
     expired_messages: usize,
     expired_blobs: usize,
     removed_notifications: usize,
+    quarantined_pending_messages: usize,
+    removed_quarantine_events: usize,
+    retained_quarantine_events: usize,
     has_more: bool,
 }
 
@@ -451,6 +526,9 @@ struct CleanupRunSummary {
     expired_messages: usize,
     expired_blobs: usize,
     removed_notifications: usize,
+    quarantined_pending_messages: usize,
+    removed_quarantine_events: usize,
+    retained_quarantine_events: usize,
     successful_batches: usize,
     backlog_deferred: bool,
 }
@@ -462,11 +540,22 @@ impl CleanupRunSummary {
         self.removed_notifications = self
             .removed_notifications
             .saturating_add(batch.removed_notifications);
+        self.quarantined_pending_messages = self
+            .quarantined_pending_messages
+            .saturating_add(batch.quarantined_pending_messages);
+        self.removed_quarantine_events = self
+            .removed_quarantine_events
+            .saturating_add(batch.removed_quarantine_events);
+        self.retained_quarantine_events = batch.retained_quarantine_events;
         self.successful_batches = self.successful_batches.saturating_add(1);
     }
 
     fn removed_anything(self) -> bool {
-        self.expired_messages > 0 || self.expired_blobs > 0 || self.removed_notifications > 0
+        self.expired_messages > 0
+            || self.expired_blobs > 0
+            || self.removed_notifications > 0
+            || self.quarantined_pending_messages > 0
+            || self.removed_quarantine_events > 0
     }
 }
 
@@ -505,12 +594,6 @@ impl ExpiredNotification {
     }
 }
 
-fn fixed_bytes<const N: usize>(bytes: Vec<u8>, field: &'static str) -> ChatRelayResult<[u8; N]> {
-    bytes
-        .try_into()
-        .map_err(|_| ChatRelayError::CorruptStoredData { field })
-}
-
 // ============================================
 // Minimal LRU for online-path deduplication
 // ============================================
@@ -533,11 +616,13 @@ impl MessageDedup {
 
     /// Returns `true` if the message_id was already seen (duplicate).
     fn check_and_insert(&self, message_id: &[u8; 16]) -> bool {
-        if self.map.contains_key(message_id) {
-            return true;
-        }
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        self.map.insert(*message_id, seq);
+        match self.map.entry(*message_id) {
+            Entry::Occupied(_) => return true,
+            Entry::Vacant(entry) => {
+                entry.insert(seq);
+            }
+        }
 
         if self.map.len() > self.capacity {
             let oldest_key = self.map.iter().min_by_key(|e| *e.value()).map(|e| *e.key());
@@ -620,6 +705,22 @@ impl ChatRelayService {
 
     fn init_schema(&self) -> ChatRelayResult<()> {
         let conn = self.conn.lock();
+        Self::init_pending_message_schema(&conn)?;
+        Self::init_blob_and_notification_schema(&conn)?;
+        Self::init_quarantine_schema(&conn)?;
+        Self::init_usage_schema(&conn)?;
+        Self::reconcile_storage_usage(&conn)?;
+        let retained_quarantine_events =
+            conn.query_row("SELECT COUNT(*) FROM relay_quarantine_events", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        drop(conn);
+        self.maintenance_status.write().quarantine_events_retained =
+            nonnegative_sqlite_counter(retained_quarantine_events);
+        Ok(())
+    }
+
+    fn init_pending_message_schema(conn: &Connection) -> ChatRelayResult<()> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS pending_messages (
@@ -639,7 +740,14 @@ impl ChatRelayService {
                 ON pending_messages(received_at);
             CREATE INDEX IF NOT EXISTS idx_pm_cleanup
                 ON pending_messages(status, received_at, message_id);
+            ",
+        )?;
+        Ok(())
+    }
 
+    fn init_blob_and_notification_schema(conn: &Connection) -> ChatRelayResult<()> {
+        conn.execute_batch(
+            "
             CREATE TABLE IF NOT EXISTS pending_blobs (
                 blob_id      TEXT PRIMARY KEY,
                 sender       BLOB(32) NOT NULL,
@@ -668,7 +776,32 @@ impl ChatRelayService {
                 ON expired_notifications(sender, pushed, created_at, id);
             CREATE INDEX IF NOT EXISTS idx_en_cleanup
                 ON expired_notifications(pushed, created_at, id);
+            ",
+        )?;
+        Ok(())
+    }
 
+    fn init_quarantine_schema(conn: &Connection) -> ChatRelayResult<()> {
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS relay_quarantine_events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_kind     TEXT    NOT NULL,
+                reason          TEXT    NOT NULL,
+                row_count       INTEGER NOT NULL CHECK(row_count > 0),
+                encoded_bytes   INTEGER NOT NULL CHECK(encoded_bytes >= 0),
+                quarantined_at  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_rqe_retention
+                ON relay_quarantine_events(quarantined_at, id);
+            ",
+        )?;
+        Ok(())
+    }
+
+    fn init_usage_schema(conn: &Connection) -> ChatRelayResult<()> {
+        conn.execute_batch(
+            "
             CREATE TABLE IF NOT EXISTS relay_storage_usage (
                 singleton              INTEGER PRIMARY KEY CHECK(singleton = 1),
                 pending_message_count  INTEGER NOT NULL CHECK(pending_message_count >= 0),
@@ -745,8 +878,12 @@ impl ChatRelayService {
                     pending_blob_bytes = MAX(0, pending_blob_bytes - OLD.size)
                 WHERE singleton = 1;
             END;
-        ",
+            ",
         )?;
+        Ok(())
+    }
+
+    fn reconcile_storage_usage(conn: &Connection) -> ChatRelayResult<()> {
         // Reconcile from canonical rows at every startup. This makes upgrades
         // and restored databases deterministic even if an older process never
         // maintained the aggregate usage row.
@@ -767,7 +904,6 @@ impl ChatRelayService {
                 (SELECT COALESCE(SUM(size), 0) FROM pending_blobs)",
             [],
         )?;
-        drop(conn);
         Ok(())
     }
 
@@ -826,6 +962,129 @@ impl ChatRelayService {
         .map_err(ChatRelayError::from)
     }
 
+    fn quarantine_retention_cutoff(&self, now: i64) -> i64 {
+        let ttl = i64::try_from(self.config.expired_notification_ttl_secs).unwrap_or(i64::MAX);
+        now.saturating_sub(ttl)
+    }
+
+    fn insert_quarantine_events(
+        tx: &Transaction<'_>,
+        now: i64,
+        rows: &[CorruptDurableRow],
+    ) -> ChatRelayResult<()> {
+        let mut aggregates: HashMap<(&'static str, &'static str), (u64, u64)> = HashMap::new();
+        for row in rows {
+            let aggregate = aggregates
+                .entry((row.source_kind, row.reason))
+                .or_insert((0, 0));
+            aggregate.0 = aggregate.0.saturating_add(1);
+            aggregate.1 = aggregate.1.saturating_add(row.encoded_bytes);
+        }
+
+        let mut stmt = tx.prepare(
+            "INSERT INTO relay_quarantine_events
+             (source_kind, reason, row_count, encoded_bytes, quarantined_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for ((source_kind, reason), (row_count, encoded_bytes)) in aggregates {
+            stmt.execute(params![
+                source_kind,
+                reason,
+                i64::try_from(row_count).unwrap_or(i64::MAX),
+                i64::try_from(encoded_bytes).unwrap_or(i64::MAX),
+                now,
+            ])?;
+        }
+        Ok(())
+    }
+
+    fn delete_pending_rows_by_rowid(
+        tx: &Transaction<'_>,
+        rows: &[CorruptDurableRow],
+    ) -> ChatRelayResult<()> {
+        let mut stmt = tx.prepare("DELETE FROM pending_messages WHERE rowid = ?1")?;
+        for row in rows {
+            if stmt.execute(params![row.row_key])? != 1 {
+                return Err(ChatRelayError::CorruptStoredData {
+                    field: "pending_message_quarantine_delete_count",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_notification_rows_by_id(
+        tx: &Transaction<'_>,
+        rows: &[CorruptDurableRow],
+    ) -> ChatRelayResult<()> {
+        let mut stmt = tx.prepare("DELETE FROM expired_notifications WHERE id = ?1")?;
+        for row in rows {
+            if stmt.execute(params![row.row_key])? != 1 {
+                return Err(ChatRelayError::CorruptStoredData {
+                    field: "expired_notification_quarantine_delete_count",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn trim_quarantine_events(
+        tx: &Transaction<'_>,
+        retention_cutoff: i64,
+    ) -> ChatRelayResult<usize> {
+        let cleanup_limit = i64::try_from(CLEANUP_QUARANTINE_EVENT_BATCH_SIZE).unwrap_or(i64::MAX);
+        let max_events = i64::try_from(MAX_QUARANTINE_EVENTS).unwrap_or(i64::MAX);
+        let removed_stale = tx.execute(
+            "DELETE FROM relay_quarantine_events
+             WHERE id IN (
+                 SELECT id FROM relay_quarantine_events
+                 WHERE quarantined_at < ?1
+                 ORDER BY quarantined_at ASC, id ASC
+                 LIMIT ?2
+             )",
+            params![retention_cutoff, cleanup_limit],
+        )?;
+        let removed_overflow = tx.execute(
+            "DELETE FROM relay_quarantine_events
+             WHERE id IN (
+                 SELECT id FROM relay_quarantine_events
+                 ORDER BY quarantined_at DESC, id DESC
+                 LIMIT ?1 OFFSET ?2
+             )",
+            params![cleanup_limit, max_events],
+        )?;
+        Ok(removed_stale.saturating_add(removed_overflow))
+    }
+
+    fn quarantine_event_count(tx: &Transaction<'_>) -> ChatRelayResult<usize> {
+        let count = tx.query_row("SELECT COUNT(*) FROM relay_quarantine_events", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX))
+    }
+
+    fn record_pull_quarantine(
+        &self,
+        now: u64,
+        pending_messages: usize,
+        expired_notifications: usize,
+        removed_events: usize,
+        retained_events: usize,
+    ) {
+        let mut status = self.maintenance_status.write();
+        status.quarantined_pending_messages_total = status
+            .quarantined_pending_messages_total
+            .saturating_add(u64::try_from(pending_messages).unwrap_or(u64::MAX));
+        status.quarantined_expired_notifications_total = status
+            .quarantined_expired_notifications_total
+            .saturating_add(u64::try_from(expired_notifications).unwrap_or(u64::MAX));
+        status.quarantine_events_removed_total = status
+            .quarantine_events_removed_total
+            .saturating_add(u64::try_from(removed_events).unwrap_or(u64::MAX));
+        status.quarantine_events_retained = u64::try_from(retained_events).unwrap_or(u64::MAX);
+        status.last_quarantine_at = Some(now);
+    }
+
     /// Stores a pending offline message for a receiver that is not currently online.
     ///
     /// # Errors
@@ -853,17 +1112,19 @@ impl ChatRelayService {
 
         // Idempotence is checked before every quota. A retry of an already
         // durable message must succeed even while the queue is at capacity.
-        let duplicate = tx
+        let existing_envelope = tx
             .query_row(
-                "SELECT 1 FROM pending_messages WHERE message_id = ?1",
+                "SELECT envelope FROM pending_messages WHERE message_id = ?1",
                 params![envelope.message_id.as_slice()],
-                |_| Ok(true),
+                |row| row.get::<_, Vec<u8>>(0),
             )
-            .optional()?
-            .unwrap_or(false);
-        if duplicate {
-            tx.commit()?;
-            return Ok(());
+            .optional()?;
+        if let Some(existing_envelope) = existing_envelope {
+            if existing_envelope == envelope_bytes {
+                tx.commit()?;
+                return Ok(());
+            }
+            return Err(ChatRelayError::MessageIdConflict);
         }
 
         let usage = Self::read_storage_usage(&tx)?;
@@ -922,6 +1183,57 @@ impl ChatRelayService {
         Ok(())
     }
 
+    fn validate_pending_message_row(
+        row: StoredPendingMessageRow,
+        expected_receiver: &[u8; 32],
+    ) -> Result<PendingMessage, CorruptDurableRow> {
+        let encoded_bytes = u64::try_from(row.envelope.len()).unwrap_or(u64::MAX);
+        let corrupt = |reason| CorruptDurableRow {
+            row_key: row.rowid,
+            source_kind: QUARANTINE_SOURCE_PENDING_MESSAGE,
+            reason,
+            encoded_bytes,
+        };
+        let message_id: [u8; 16] = row
+            .message_id
+            .try_into()
+            .map_err(|_| corrupt("pending_message_id"))?;
+        let stored_sender: [u8; 32] = row
+            .sender
+            .try_into()
+            .map_err(|_| corrupt("pending_message_sender"))?;
+        let stored_receiver: [u8; 32] = row
+            .receiver
+            .try_into()
+            .map_err(|_| corrupt("pending_message_receiver"))?;
+        let stored_timestamp =
+            u64::try_from(row.timestamp).map_err(|_| corrupt("pending_message_timestamp"))?;
+        if stored_receiver != *expected_receiver {
+            return Err(corrupt("pending_message_receiver_mismatch"));
+        }
+        let envelope =
+            decode_envelope(&row.envelope).map_err(|_| corrupt("pending_message_envelope"))?;
+        if envelope.message_id != message_id {
+            return Err(corrupt("pending_message_id_mismatch"));
+        }
+        if envelope.receiver != *expected_receiver {
+            return Err(corrupt("pending_message_envelope_receiver_mismatch"));
+        }
+        if envelope.sender != stored_sender {
+            return Err(corrupt("pending_message_sender_mismatch"));
+        }
+        if envelope.timestamp != stored_timestamp {
+            return Err(corrupt("pending_message_timestamp_mismatch"));
+        }
+        envelope
+            .verify_signature()
+            .map_err(|_| corrupt("pending_message_signature"))?;
+        Ok(PendingMessage {
+            message_id,
+            envelope,
+        })
+    }
+
     /// Retrieves a page of pending messages for the given receiver wallet.
     ///
     /// The v1 wire cursor contains only `message_id`, so rows must be ordered
@@ -930,7 +1242,9 @@ impl ChatRelayService {
     ///
     /// # Errors
     ///
-    /// Returns a storage, envelope-decoding, or durable-data integrity error.
+    /// Corrupt rows are atomically replaced by de-identified quarantine events
+    /// so one poison row cannot permanently block a receiver's mailbox.
+    /// Returns a storage error if reading or quarantine persistence fails.
     pub fn pull_pending(
         &self,
         receiver: &[u8; 32],
@@ -938,13 +1252,15 @@ impl ChatRelayService {
         cursor: &[u8; 16],
         limit: u32,
     ) -> ChatRelayResult<(Vec<PendingMessage>, bool)> {
-        let effective_limit = usize::try_from(limit.min(100)).unwrap_or(100) + 1;
+        let page_limit = usize::try_from(limit.clamp(1, 100)).unwrap_or(100);
+        let effective_limit = page_limit.saturating_add(1);
         let query_after_timestamp = i64::try_from(after_timestamp).unwrap_or(i64::MAX);
         let query_limit = i64::try_from(effective_limit).unwrap_or(i64::MAX);
 
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT message_id, envelope FROM pending_messages
+            "SELECT rowid, message_id, sender, receiver, timestamp, envelope
+             FROM pending_messages
              WHERE receiver = ?1
                AND status = 0
                AND timestamp > ?2
@@ -953,7 +1269,7 @@ impl ChatRelayService {
              LIMIT ?4",
         )?;
 
-        let rows: Vec<(Vec<u8>, Vec<u8>)> = stmt
+        let rows: Vec<StoredPendingMessageRow> = stmt
             .query_map(
                 params![
                     receiver.as_slice(),
@@ -961,25 +1277,58 @@ impl ChatRelayService {
                     cursor.as_slice(),
                     query_limit,
                 ],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                |row| {
+                    Ok(StoredPendingMessageRow {
+                        rowid: row.get(0)?,
+                        message_id: row.get(1)?,
+                        sender: row.get(2)?,
+                        receiver: row.get(3)?,
+                        timestamp: row.get(4)?,
+                        envelope: row.get(5)?,
+                    })
+                },
             )?
             .collect::<Result<Vec<_>, rusqlite::Error>>()?;
         drop(stmt);
-        drop(conn);
-
-        let has_more = rows.len() == effective_limit;
-        let page = &rows[..rows.len().min(effective_limit - 1)];
-
-        let mut messages = Vec::with_capacity(page.len());
-        for (id_bytes, env_bytes) in page {
-            let message_id = fixed_bytes(id_bytes.clone(), "pending_message_id")?;
-            let envelope = decode_envelope(env_bytes)?;
-            messages.push(PendingMessage {
-                message_id,
-                envelope,
-            });
+        let raw_has_more = rows.len() == effective_limit;
+        let mut messages = Vec::with_capacity(rows.len().min(page_limit));
+        let mut corrupt_rows = Vec::new();
+        for row in rows {
+            match Self::validate_pending_message_row(row, receiver) {
+                Ok(message) => messages.push(message),
+                Err(corrupt) => corrupt_rows.push(corrupt),
+            }
         }
 
+        if corrupt_rows.is_empty() {
+            drop(conn);
+        } else {
+            let quarantine_now = now_secs();
+            let quarantine_now_i64 = i64::try_from(quarantine_now).unwrap_or(i64::MAX);
+            let retention_cutoff = self.quarantine_retention_cutoff(quarantine_now_i64);
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            Self::insert_quarantine_events(&tx, quarantine_now_i64, &corrupt_rows)?;
+            Self::delete_pending_rows_by_rowid(&tx, &corrupt_rows)?;
+            let removed_events = Self::trim_quarantine_events(&tx, retention_cutoff)?;
+            let retained_events = Self::quarantine_event_count(&tx)?;
+            tx.commit()?;
+            drop(conn);
+
+            self.record_pull_quarantine(
+                quarantine_now,
+                corrupt_rows.len(),
+                0,
+                removed_events,
+                retained_events,
+            );
+            warn!(
+                quarantined_pending_messages = corrupt_rows.len(),
+                "[CHAT_RELAY] Corrupt pending rows isolated during pull"
+            );
+        }
+
+        let has_more = raw_has_more || messages.len() > page_limit;
+        messages.truncate(page_limit);
         Ok((messages, has_more))
     }
 
@@ -1211,22 +1560,59 @@ impl ChatRelayService {
     // Expired notifications
     // ============================================
 
+    fn validate_expired_notification_row(
+        row: StoredExpiredNotificationRow,
+        expected_sender: &[u8; 32],
+    ) -> Result<ExpiredNotification, CorruptDurableRow> {
+        let encoded_bytes = u64::try_from(row.message_ids_raw.len()).unwrap_or(u64::MAX);
+        let corrupt = |reason| CorruptDurableRow {
+            row_key: row.id,
+            source_kind: QUARANTINE_SOURCE_EXPIRED_NOTIFICATION,
+            reason,
+            encoded_bytes,
+        };
+        if row.message_ids_raw.len() > MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES {
+            return Err(corrupt("expired_notification_payload_size"));
+        }
+        let stored_sender: [u8; 32] = row
+            .sender
+            .try_into()
+            .map_err(|_| corrupt("expired_notification_sender"))?;
+        if stored_sender != *expected_sender {
+            return Err(corrupt("expired_notification_sender_mismatch"));
+        }
+        let receiver: [u8; 32] = row
+            .receiver
+            .try_into()
+            .map_err(|_| corrupt("expired_notification_receiver"))?;
+        let notification = ExpiredNotification {
+            id: row.id,
+            sender: stored_sender,
+            receiver,
+            message_ids_raw: row.message_ids_raw,
+        };
+        notification
+            .message_ids()
+            .map_err(|_| corrupt("expired_notification_message_ids"))?;
+        Ok(notification)
+    }
+
     /// Retrieves one bounded page of expiry notifications for a sender.
     ///
     /// The extra row is used only to compute `has_more`; it is never returned.
-    /// Invalid durable rows fail the full operation so operators can detect and
-    /// repair corruption instead of silently losing delivery state.
+    /// Invalid durable rows are atomically replaced by de-identified quarantine
+    /// evidence so one poison row cannot permanently block sender control flow.
     ///
     /// # Errors
     ///
-    /// Returns a storage or durable-data integrity error.
+    /// Returns a storage error if reading or quarantine persistence fails.
     pub fn pull_pending_notifications(
         &self,
         sender: &[u8; 32],
     ) -> ChatRelayResult<(Vec<ExpiredNotification>, bool)> {
         let effective_limit = MAX_EXPIRED_NOTIFICATIONS_PER_PULL + 1;
         let query_limit = i64::try_from(effective_limit).unwrap_or(i64::MAX);
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, sender, receiver, message_ids
              FROM expired_notifications
@@ -1237,35 +1623,56 @@ impl ChatRelayService {
 
         let rows: Vec<StoredExpiredNotificationRow> = stmt
             .query_map(params![sender.as_slice(), query_limit], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok(StoredExpiredNotificationRow {
+                    id: row.get(0)?,
+                    sender: row.get(1)?,
+                    receiver: row.get(2)?,
+                    message_ids_raw: row.get(3)?,
+                })
             })?
             .collect::<Result<Vec<_>, rusqlite::Error>>()?;
         drop(stmt);
-        drop(conn);
 
-        let has_more = rows.len() == effective_limit;
-        let page_len = rows.len().min(MAX_EXPIRED_NOTIFICATIONS_PER_PULL);
-        let mut notifications = Vec::with_capacity(page_len);
-        for (id, stored_sender, receiver, message_ids_raw) in rows.into_iter().take(page_len) {
-            if message_ids_raw.len() > MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "expired_notification_payload_size",
-                });
+        let raw_has_more = rows.len() == effective_limit;
+        let mut notifications =
+            Vec::with_capacity(rows.len().min(MAX_EXPIRED_NOTIFICATIONS_PER_PULL));
+        let mut corrupt_rows = Vec::new();
+        for row in rows {
+            match Self::validate_expired_notification_row(row, sender) {
+                Ok(notification) => notifications.push(notification),
+                Err(corrupt) => corrupt_rows.push(corrupt),
             }
-            let stored_sender = fixed_bytes(stored_sender, "expired_notification_sender")?;
-            if stored_sender != *sender {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "expired_notification_sender_mismatch",
-                });
-            }
-            notifications.push(ExpiredNotification {
-                id,
-                sender: stored_sender,
-                receiver: fixed_bytes(receiver, "expired_notification_receiver")?,
-                message_ids_raw,
-            });
         }
 
+        if corrupt_rows.is_empty() {
+            drop(conn);
+        } else {
+            let quarantine_now = now_secs();
+            let quarantine_now_i64 = i64::try_from(quarantine_now).unwrap_or(i64::MAX);
+            let retention_cutoff = self.quarantine_retention_cutoff(quarantine_now_i64);
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            Self::insert_quarantine_events(&tx, quarantine_now_i64, &corrupt_rows)?;
+            Self::delete_notification_rows_by_id(&tx, &corrupt_rows)?;
+            let removed_events = Self::trim_quarantine_events(&tx, retention_cutoff)?;
+            let retained_events = Self::quarantine_event_count(&tx)?;
+            tx.commit()?;
+            drop(conn);
+
+            self.record_pull_quarantine(
+                quarantine_now,
+                0,
+                corrupt_rows.len(),
+                removed_events,
+                retained_events,
+            );
+            warn!(
+                quarantined_expired_notifications = corrupt_rows.len(),
+                "[CHAT_RELAY] Corrupt expiry notifications isolated during pull"
+            );
+        }
+
+        let has_more = raw_has_more || notifications.len() > MAX_EXPIRED_NOTIFICATIONS_PER_PULL;
+        notifications.truncate(MAX_EXPIRED_NOTIFICATIONS_PER_PULL);
         Ok((notifications, has_more))
     }
 
@@ -1369,9 +1776,25 @@ impl ChatRelayService {
         status.expired_notifications_removed_total = status
             .expired_notifications_removed_total
             .saturating_add(u64::try_from(summary.removed_notifications).unwrap_or(u64::MAX));
+        status.quarantined_pending_messages_total =
+            status.quarantined_pending_messages_total.saturating_add(
+                u64::try_from(summary.quarantined_pending_messages).unwrap_or(u64::MAX),
+            );
+        status.quarantine_events_removed_total = status
+            .quarantine_events_removed_total
+            .saturating_add(u64::try_from(summary.removed_quarantine_events).unwrap_or(u64::MAX));
+        if summary.successful_batches > 0 {
+            status.quarantine_events_retained =
+                u64::try_from(summary.retained_quarantine_events).unwrap_or(u64::MAX);
+        }
+        if summary.quarantined_pending_messages > 0 {
+            status.last_quarantine_at = Some(now);
+        }
         status.last_cleanup_at = Some(now);
         status.last_cleanup_batches = u64::try_from(summary.successful_batches).unwrap_or(u64::MAX);
         status.last_cleanup_backlog_deferred = summary.backlog_deferred;
+        status.last_cleanup_quarantined_pending_messages =
+            u64::try_from(summary.quarantined_pending_messages).unwrap_or(u64::MAX);
         match failure {
             None => {
                 status.last_cleanup_status = Some("succeeded".to_string());
@@ -1429,6 +1852,9 @@ impl ChatRelayService {
                 expired_messages = summary.expired_messages,
                 expired_blobs = summary.expired_blobs,
                 removed_notifications = summary.removed_notifications,
+                quarantined_pending_messages = summary.quarantined_pending_messages,
+                removed_quarantine_events = summary.removed_quarantine_events,
+                retained_quarantine_events = summary.retained_quarantine_events,
                 committed_batches = summary.successful_batches,
                 backlog_deferred = summary.backlog_deferred,
                 cleanup_failed = failure.is_some(),
@@ -1438,6 +1864,12 @@ impl ChatRelayService {
             debug!(
                 cleanup_failed = failure.is_some(),
                 "[CHAT_RELAY] Cleanup: nothing to expire"
+            );
+        }
+        if summary.quarantined_pending_messages > 0 {
+            warn!(
+                quarantined_pending_messages = summary.quarantined_pending_messages,
+                "[CHAT_RELAY] Corrupt pending rows isolated during cleanup"
             );
         }
 
@@ -1456,19 +1888,26 @@ impl ChatRelayService {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let transaction_result: ChatRelayResult<CleanupBatchOutcome> = (|| {
-            let expired_rows = Self::load_expired_message_batch(&tx, cutoff, message_limit)?;
-            let expired_message_count = expired_rows.len();
-            Self::queue_expiry_notifications(&tx, now, &expired_rows)?;
-            Self::delete_expired_message_batch(&tx, cutoff, message_limit, expired_message_count)?;
+            let expired_batch = Self::load_expired_message_batch(&tx, cutoff, message_limit)?;
+            let expired_message_count = expired_batch.valid_rows.len();
+            let quarantined_pending_messages = expired_batch.corrupt_rows.len();
+            Self::queue_expiry_notifications(&tx, now, &expired_batch.valid_rows)?;
+            Self::insert_quarantine_events(&tx, now, &expired_batch.corrupt_rows)?;
+            Self::delete_expired_message_batch(&tx, &expired_batch.selected_rowids)?;
             let expired_blobs = Self::delete_expired_blob_batch(&tx, cutoff, blob_limit)?;
             let removed_notifications =
                 Self::delete_stale_notification_batch(&tx, notif_cutoff, notification_limit)?;
+            let removed_quarantine_events = Self::trim_quarantine_events(&tx, notif_cutoff)?;
+            let retained_quarantine_events = Self::quarantine_event_count(&tx)?;
             let has_more = Self::cleanup_backlog_exists(&tx, cutoff, notif_cutoff)?;
 
             Ok(CleanupBatchOutcome {
                 expired_messages: expired_message_count,
                 expired_blobs,
                 removed_notifications,
+                quarantined_pending_messages,
+                removed_quarantine_events,
+                retained_quarantine_events,
                 has_more,
             })
         })();
@@ -1486,30 +1925,83 @@ impl ChatRelayService {
         tx: &Transaction<'_>,
         cutoff: i64,
         limit: i64,
-    ) -> ChatRelayResult<Vec<ExpiredMessageRow>> {
+    ) -> ChatRelayResult<ValidatedExpiredMessageBatch> {
         let mut stmt = tx.prepare(
-            "SELECT message_id, sender, receiver FROM pending_messages
+            "SELECT rowid, message_id, sender, receiver, timestamp, envelope
+             FROM pending_messages
              WHERE status = 0 AND received_at < ?1
              ORDER BY received_at ASC, message_id ASC
              LIMIT ?2",
         )?;
         let stored_rows: Vec<StoredExpiredMessageRow> = stmt
             .query_map(params![cutoff, limit], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok(StoredExpiredMessageRow {
+                    rowid: row.get(0)?,
+                    message_id: row.get(1)?,
+                    sender: row.get(2)?,
+                    receiver: row.get(3)?,
+                    timestamp: row.get(4)?,
+                    envelope: row.get(5)?,
+                })
             })?
             .collect::<Result<Vec<_>, rusqlite::Error>>()?;
         drop(stmt);
 
-        stored_rows
-            .into_iter()
-            .map(|(message_id, sender, receiver)| {
-                Ok(ExpiredMessageRow {
-                    message_id: fixed_bytes(message_id, "expired_message_id")?,
-                    sender: fixed_bytes(sender, "expired_message_sender")?,
-                    receiver: fixed_bytes(receiver, "expired_message_receiver")?,
+        let mut batch = ValidatedExpiredMessageBatch {
+            valid_rows: Vec::with_capacity(stored_rows.len()),
+            corrupt_rows: Vec::new(),
+            selected_rowids: Vec::with_capacity(stored_rows.len()),
+        };
+        for row in stored_rows {
+            batch.selected_rowids.push(row.rowid);
+            let encoded_bytes = u64::try_from(row.envelope.len()).unwrap_or(u64::MAX);
+            let corrupt = |reason| CorruptDurableRow {
+                row_key: row.rowid,
+                source_kind: QUARANTINE_SOURCE_PENDING_MESSAGE,
+                reason,
+                encoded_bytes,
+            };
+            let parsed = (|| {
+                let message_id: [u8; 16] = row
+                    .message_id
+                    .try_into()
+                    .map_err(|_| corrupt("expired_message_id"))?;
+                let sender: [u8; 32] = row
+                    .sender
+                    .try_into()
+                    .map_err(|_| corrupt("expired_message_sender"))?;
+                let receiver: [u8; 32] = row
+                    .receiver
+                    .try_into()
+                    .map_err(|_| corrupt("expired_message_receiver"))?;
+                let timestamp = u64::try_from(row.timestamp)
+                    .map_err(|_| corrupt("expired_message_timestamp"))?;
+                let envelope = decode_envelope(&row.envelope)
+                    .map_err(|_| corrupt("expired_message_envelope"))?;
+                if envelope.message_id != message_id {
+                    return Err(corrupt("expired_message_id_mismatch"));
+                }
+                if envelope.sender != sender {
+                    return Err(corrupt("expired_message_sender_mismatch"));
+                }
+                if envelope.receiver != receiver {
+                    return Err(corrupt("expired_message_receiver_mismatch"));
+                }
+                if envelope.timestamp != timestamp {
+                    return Err(corrupt("expired_message_timestamp_mismatch"));
+                }
+                Ok::<ExpiredMessageRow, CorruptDurableRow>(ExpiredMessageRow {
+                    message_id,
+                    sender,
+                    receiver,
                 })
-            })
-            .collect()
+            })();
+            match parsed {
+                Ok(valid) => batch.valid_rows.push(valid),
+                Err(corrupt) => batch.corrupt_rows.push(corrupt),
+            }
+        }
+        Ok(batch)
     }
 
     fn queue_expiry_notifications(
@@ -1550,21 +2042,14 @@ impl ChatRelayService {
 
     fn delete_expired_message_batch(
         tx: &Transaction<'_>,
-        cutoff: i64,
-        limit: i64,
-        expected_count: usize,
+        selected_rowids: &[i64],
     ) -> ChatRelayResult<()> {
-        let deleted = tx.execute(
-            "DELETE FROM pending_messages
-             WHERE message_id IN (
-                 SELECT message_id FROM pending_messages
-                 WHERE status = 0 AND received_at < ?1
-                 ORDER BY received_at ASC, message_id ASC
-                 LIMIT ?2
-             )",
-            params![cutoff, limit],
-        )?;
-        if deleted != expected_count {
+        let mut stmt = tx.prepare("DELETE FROM pending_messages WHERE rowid = ?1")?;
+        let mut deleted = 0usize;
+        for rowid in selected_rowids {
+            deleted = deleted.saturating_add(stmt.execute(params![rowid])?);
+        }
+        if deleted != selected_rowids.len() {
             return Err(ChatRelayError::CorruptStoredData {
                 field: "expired_message_cleanup_count",
             });
@@ -1634,8 +2119,19 @@ impl ChatRelayService {
             params![notif_cutoff],
             |row| row.get::<_, i64>(0),
         )? != 0;
+        let max_quarantine_events = i64::try_from(MAX_QUARANTINE_EVENTS).unwrap_or(i64::MAX);
+        let quarantine_has_more = tx.query_row(
+            "SELECT
+                 EXISTS(
+                     SELECT 1 FROM relay_quarantine_events
+                     WHERE quarantined_at < ?1
+                 )
+                 OR (SELECT COUNT(*) FROM relay_quarantine_events) > ?2",
+            params![notif_cutoff, max_quarantine_events],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
 
-        Ok(message_has_more || blob_has_more || notification_has_more)
+        Ok(message_has_more || blob_has_more || notification_has_more || quarantine_has_more)
     }
 
     // ============================================
@@ -1819,6 +2315,7 @@ mod tests {
     use aeronyx_core::protocol::chat::ChatContentType;
     use sha2::{Digest, Sha256};
     use std::net::SocketAddr;
+    use std::sync::Barrier;
 
     fn test_config() -> ChatRelayConfig {
         ChatRelayConfig {
@@ -1866,11 +2363,22 @@ mod tests {
                 message_id[0] = prefix;
                 message_id[8..]
                     .copy_from_slice(&u64::try_from(sequence).unwrap_or(u64::MAX).to_be_bytes());
+                let envelope = ChatEnvelope {
+                    message_id,
+                    sender: [0xA2u8; 32],
+                    receiver: [0xA3u8; 32],
+                    timestamp: 0,
+                    ciphertext: vec![0xA4],
+                    nonce: [0u8; 24],
+                    content_type: ChatContentType::System,
+                    signature: [0u8; 64],
+                };
+                let encoded_envelope = encode_envelope(&envelope).expect("encode expired envelope");
                 stmt.execute(params![
                     message_id.as_slice(),
-                    [0xA2u8; 32].as_slice(),
-                    [0xA3u8; 32].as_slice(),
-                    [0xA4u8].as_slice(),
+                    envelope.sender.as_slice(),
+                    envelope.receiver.as_slice(),
+                    encoded_envelope,
                 ])
                 .expect("insert expired pending row");
             }
@@ -2069,6 +2577,153 @@ mod tests {
     }
 
     #[test]
+    fn test_pull_isolates_malformed_row_and_delivers_valid_message() {
+        let svc = make_service();
+        let kp = IdentityKeyPair::generate();
+        let receiver = [0xBEu8; 32];
+        let envelope = make_envelope(&kp, receiver);
+        let expected_message_id = envelope.message_id;
+        svc.store_pending(&envelope).expect("store valid message");
+        svc.conn
+            .lock()
+            .execute(
+                "INSERT INTO pending_messages
+                 (message_id, sender, receiver, timestamp, envelope, received_at, status)
+                 VALUES (?1, ?2, ?3, 1, ?4, 1, 0)",
+                params![
+                    [0x01u8; 15].as_slice(),
+                    kp.public_key_bytes().as_slice(),
+                    receiver.as_slice(),
+                    [0xFFu8].as_slice(),
+                ],
+            )
+            .expect("insert malformed pending row");
+
+        let (messages, has_more) = svc
+            .pull_pending(&receiver, 0, &[0u8; 16], 50)
+            .expect("pull with poison-row isolation");
+        assert_eq!(messages.len(), 1);
+        assert!(!has_more);
+        assert_eq!(messages[0].message_id, expected_message_id);
+        assert_eq!(svc.storage_usage().expect("usage").pending_messages, 1);
+
+        let status = svc.maintenance_status();
+        assert_eq!(status.quarantined_pending_messages_total, 1);
+        assert_eq!(status.quarantine_events_retained, 1);
+        let event: (String, String, i64) = svc
+            .conn
+            .lock()
+            .query_row(
+                "SELECT source_kind, reason, row_count FROM relay_quarantine_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read pending quarantine event");
+        assert_eq!(event.0, QUARANTINE_SOURCE_PENDING_MESSAGE);
+        assert_eq!(event.1, "pending_message_id");
+        assert_eq!(event.2, 1);
+    }
+
+    #[test]
+    fn test_pull_quarantines_message_id_envelope_mismatch() {
+        let svc = make_service();
+        let kp = IdentityKeyPair::generate();
+        let receiver = [0xBFu8; 32];
+        let envelope = make_envelope(&kp, receiver);
+        svc.store_pending(&envelope).expect("store valid message");
+        svc.conn
+            .lock()
+            .execute(
+                "UPDATE pending_messages SET message_id = ?1 WHERE message_id = ?2",
+                params![[0xFEu8; 16].as_slice(), envelope.message_id.as_slice()],
+            )
+            .expect("tamper durable message id");
+
+        let (messages, has_more) = svc
+            .pull_pending(&receiver, 0, &[0u8; 16], 50)
+            .expect("pull mismatched durable row");
+        assert!(messages.is_empty());
+        assert!(!has_more);
+        assert_eq!(svc.storage_usage().expect("usage").pending_messages, 0);
+
+        let reason: String = svc
+            .conn
+            .lock()
+            .query_row("SELECT reason FROM relay_quarantine_events", [], |row| {
+                row.get(0)
+            })
+            .expect("read mismatch reason");
+        assert_eq!(reason, "pending_message_id_mismatch");
+    }
+
+    #[test]
+    fn test_pull_quarantines_stored_sender_mismatch_before_delivery() {
+        let svc = make_service();
+        let kp = IdentityKeyPair::generate();
+        let receiver = [0xC2u8; 32];
+        let envelope = make_envelope(&kp, receiver);
+        svc.store_pending(&envelope).expect("store valid message");
+        svc.conn
+            .lock()
+            .execute(
+                "UPDATE pending_messages SET sender = ?1 WHERE message_id = ?2",
+                params![[0xF1u8; 32].as_slice(), envelope.message_id.as_slice()],
+            )
+            .expect("tamper durable sender");
+
+        let (messages, has_more) = svc
+            .pull_pending(&receiver, 0, &[0u8; 16], 50)
+            .expect("pull mismatched durable sender");
+        assert!(messages.is_empty());
+        assert!(!has_more);
+        assert_eq!(svc.storage_usage().expect("usage").pending_messages, 0);
+
+        let reason: String = svc
+            .conn
+            .lock()
+            .query_row("SELECT reason FROM relay_quarantine_events", [], |row| {
+                row.get(0)
+            })
+            .expect("read mismatch reason");
+        assert_eq!(reason, "pending_message_sender_mismatch");
+    }
+
+    #[test]
+    fn test_pull_quarantines_invalid_durable_signature() {
+        let svc = make_service();
+        let kp = IdentityKeyPair::generate();
+        let receiver = [0xC3u8; 32];
+        let envelope = make_envelope(&kp, receiver);
+        svc.store_pending(&envelope).expect("store valid message");
+        let mut tampered = envelope.clone();
+        tampered.signature[0] ^= 0xFF;
+        let tampered_bytes = encode_envelope(&tampered).expect("encode tampered envelope");
+        svc.conn
+            .lock()
+            .execute(
+                "UPDATE pending_messages SET envelope = ?1 WHERE message_id = ?2",
+                params![tampered_bytes, envelope.message_id.as_slice()],
+            )
+            .expect("tamper durable signature");
+
+        let (messages, has_more) = svc
+            .pull_pending(&receiver, 0, &[0u8; 16], 50)
+            .expect("pull invalid durable signature");
+        assert!(messages.is_empty());
+        assert!(!has_more);
+        assert_eq!(svc.storage_usage().expect("usage").pending_messages, 0);
+
+        let reason: String = svc
+            .conn
+            .lock()
+            .query_row("SELECT reason FROM relay_quarantine_events", [], |row| {
+                row.get(0)
+            })
+            .expect("read signature reason");
+        assert_eq!(reason, "pending_message_signature");
+    }
+
+    #[test]
     fn test_store_rejects_timestamp_outside_sqlite_domain() {
         let svc = make_service();
         let kp = IdentityKeyPair::generate();
@@ -2117,6 +2772,48 @@ mod tests {
             .pull_pending(&receiver, 0, &[0u8; 16], 50)
             .expect("pull");
         assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn test_store_rejects_message_id_conflict_without_replacing_original() {
+        let svc = make_service();
+        let kp = IdentityKeyPair::generate();
+        let receiver = [0xC0u8; 32];
+        let original = make_envelope(&kp, receiver);
+        let mut conflict = make_envelope(&kp, receiver);
+        conflict.message_id = original.message_id;
+        conflict.ciphertext = b"different ciphertext".to_vec();
+        conflict.signature = kp.sign(&conflict.sign_data());
+
+        svc.store_pending(&original).expect("store original");
+        let error = svc
+            .store_pending(&conflict)
+            .expect_err("conflicting message id must fail");
+        assert!(matches!(error, ChatRelayError::MessageIdConflict));
+        assert_eq!(error.reason_bucket(), "message_id_conflict");
+        assert_eq!(svc.storage_usage().expect("usage").pending_messages, 1);
+
+        let (messages, has_more) = svc
+            .pull_pending(&receiver, 0, &[0u8; 16], 50)
+            .expect("pull original");
+        assert_eq!(messages.len(), 1);
+        assert!(!has_more);
+        assert_eq!(messages[0].envelope.ciphertext, original.ciphertext);
+    }
+
+    #[test]
+    fn test_pull_zero_limit_makes_progress_with_minimum_page() {
+        let svc = make_service();
+        let kp = IdentityKeyPair::generate();
+        let receiver = [0xC1u8; 32];
+        let envelope = make_envelope(&kp, receiver);
+        svc.store_pending(&envelope).expect("store message");
+
+        let (messages, has_more) = svc
+            .pull_pending(&receiver, 0, &[0u8; 16], 0)
+            .expect("zero limit pull");
+        assert_eq!(messages.len(), 1);
+        assert!(!has_more);
     }
 
     #[test]
@@ -2472,6 +3169,37 @@ mod tests {
         assert!(svc.is_online_duplicate(&id));
     }
 
+    #[test]
+    fn test_online_dedup_is_atomic_under_concurrency() {
+        const WORKERS: usize = 16;
+        let dedup = Arc::new(MessageDedup::new(32));
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let id = [0x02u8; 16];
+        let handles: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let dedup = Arc::clone(&dedup);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    dedup.check_and_insert(&id)
+                })
+            })
+            .collect();
+
+        let duplicate_results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("dedup worker must not panic"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            duplicate_results
+                .iter()
+                .filter(|is_duplicate| !**is_duplicate)
+                .count(),
+            1,
+            "exactly one concurrent caller must win first delivery"
+        );
+    }
+
     // ── TTL cleanup (preserved) ──────────────────────────────────────────
 
     #[test]
@@ -2551,7 +3279,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_maintenance_status_tracks_failure_and_recovery() {
+    fn test_cleanup_quarantines_malformed_row_without_blocking() {
         let svc = make_service();
         svc.conn
             .lock()
@@ -2568,35 +3296,89 @@ mod tests {
             )
             .expect("insert malformed durable row");
 
-        assert!(matches!(
-            svc.run_cleanup(),
-            Err(ChatRelayError::CorruptStoredData {
-                field: "expired_message_id"
-            })
-        ));
-        let failed = svc.maintenance_status();
-        assert_eq!(failed.cleanup_runs_total, 1);
-        assert_eq!(failed.cleanup_failures_total, 1);
-        assert_eq!(failed.cleanup_batches_total, 0);
-        assert_eq!(failed.last_cleanup_batches, 0);
-        assert_eq!(failed.last_cleanup_status.as_deref(), Some("failed"));
+        assert_eq!(svc.run_cleanup().expect("quarantine cleanup"), (0, 0));
         assert_eq!(
-            failed.last_cleanup_failure_reason.as_deref(),
-            Some("corrupt_stored_data")
+            svc.storage_usage().expect("usage after quarantine"),
+            ChatRelayStorageUsage::default()
         );
 
+        let status = svc.maintenance_status();
+        assert_eq!(status.cleanup_runs_total, 1);
+        assert_eq!(status.cleanup_failures_total, 0);
+        assert_eq!(status.cleanup_batches_total, 1);
+        assert_eq!(status.quarantined_pending_messages_total, 1);
+        assert_eq!(status.quarantine_events_retained, 1);
+        assert_eq!(status.last_cleanup_quarantined_pending_messages, 1);
+        assert!(status.last_quarantine_at.is_some());
+        assert_eq!(status.last_cleanup_status.as_deref(), Some("succeeded"));
+
+        let conn = svc.conn.lock();
+        let pending_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
+                row.get(0)
+            })
+            .expect("count pending rows");
+        assert_eq!(pending_rows, 0);
+        let event: (String, String, i64, i64) = conn
+            .query_row(
+                "SELECT source_kind, reason, row_count, encoded_bytes
+                 FROM relay_quarantine_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read de-identified quarantine event");
+        assert_eq!(event.0, QUARANTINE_SOURCE_PENDING_MESSAGE);
+        assert_eq!(event.1, "expired_message_id");
+        assert_eq!(event.2, 1);
+        assert!(event.3 > 0);
+
+        let mut schema_stmt = conn
+            .prepare("PRAGMA table_info(relay_quarantine_events)")
+            .expect("prepare quarantine schema query");
+        let columns: Vec<String> = schema_stmt
+            .query_map([], |row| row.get(1))
+            .expect("query quarantine columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect quarantine columns");
+        for forbidden in ["message_id", "sender", "receiver", "envelope", "ciphertext"] {
+            assert!(!columns.iter().any(|column| column == forbidden));
+        }
+    }
+
+    #[test]
+    fn test_cleanup_does_not_notify_tampered_stored_sender() {
+        let svc = make_service();
+        let kp = IdentityKeyPair::generate();
+        let receiver = [0xD4u8; 32];
+        let envelope = make_envelope(&kp, receiver);
+        let tampered_sender = [0xD5u8; 32];
+        svc.store_pending(&envelope).expect("store valid message");
         svc.conn
             .lock()
-            .execute("DELETE FROM pending_messages", [])
-            .expect("remove malformed row");
-        svc.run_cleanup().expect("cleanup recovery");
-        let recovered = svc.maintenance_status();
-        assert_eq!(recovered.cleanup_runs_total, 2);
-        assert_eq!(recovered.cleanup_failures_total, 1);
-        assert_eq!(recovered.cleanup_batches_total, 1);
-        assert_eq!(recovered.last_cleanup_batches, 1);
-        assert_eq!(recovered.last_cleanup_status.as_deref(), Some("succeeded"));
-        assert_eq!(recovered.last_cleanup_failure_reason, None);
+            .execute(
+                "UPDATE pending_messages
+                 SET sender = ?1, received_at = 0
+                 WHERE message_id = ?2",
+                params![tampered_sender.as_slice(), envelope.message_id.as_slice()],
+            )
+            .expect("tamper expired message sender");
+
+        assert_eq!(svc.run_cleanup().expect("cleanup tampered sender"), (0, 0));
+        let (notifications, has_more) = svc
+            .pull_pending_notifications(&tampered_sender)
+            .expect("pull attacker notifications");
+        assert!(notifications.is_empty());
+        assert!(!has_more);
+        assert_eq!(svc.storage_usage().expect("usage").pending_messages, 0);
+
+        let reason: String = svc
+            .conn
+            .lock()
+            .query_row("SELECT reason FROM relay_quarantine_events", [], |row| {
+                row.get(0)
+            })
+            .expect("read cleanup mismatch reason");
+        assert_eq!(reason, "expired_message_sender_mismatch");
     }
 
     #[test]
@@ -2647,7 +3429,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_counts_committed_batches_before_later_failure() {
+    fn test_cleanup_isolates_trailing_poison_row_after_committed_batch() {
         let svc = make_service();
         insert_expired_pending_rows(&svc, CLEANUP_MESSAGE_BATCH_SIZE, 0x10);
         svc.conn
@@ -2665,29 +3447,111 @@ mod tests {
             )
             .expect("insert malformed trailing row");
 
-        assert!(matches!(
-            svc.run_cleanup_with_batch_budget(2),
-            Err(ChatRelayError::CorruptStoredData {
-                field: "expired_message_id"
-            })
-        ));
+        let (expired, blobs) = svc
+            .run_cleanup_with_batch_budget(2)
+            .expect("bounded cleanup with poison-row isolation");
+        assert_eq!(expired, CLEANUP_MESSAGE_BATCH_SIZE);
+        assert_eq!(blobs, 0);
 
         let status = svc.maintenance_status();
         assert_eq!(status.cleanup_runs_total, 1);
-        assert_eq!(status.cleanup_failures_total, 1);
-        assert_eq!(status.cleanup_batches_total, 1);
+        assert_eq!(status.cleanup_failures_total, 0);
+        assert_eq!(status.cleanup_batches_total, 2);
         assert_eq!(
             status.expired_messages_total,
             u64::try_from(CLEANUP_MESSAGE_BATCH_SIZE).unwrap_or(u64::MAX)
         );
-        assert_eq!(status.last_cleanup_batches, 1);
-        assert_eq!(status.last_cleanup_status.as_deref(), Some("failed"));
+        assert_eq!(status.quarantined_pending_messages_total, 1);
+        assert_eq!(status.last_cleanup_batches, 2);
+        assert_eq!(status.last_cleanup_status.as_deref(), Some("succeeded"));
         assert_eq!(
             svc.storage_usage()
                 .expect("remaining usage")
                 .pending_messages,
-            1
+            0
         );
+    }
+
+    #[test]
+    fn test_quarantine_persistence_failure_rolls_back_source_deletion() {
+        let svc = make_service();
+        svc.conn
+            .lock()
+            .execute(
+                "INSERT INTO pending_messages
+                 (message_id, sender, receiver, timestamp, envelope, received_at, status)
+                 VALUES (?1, ?2, ?3, 0, ?4, 0, 0)",
+                params![
+                    [0xA1u8; 15].as_slice(),
+                    [0xA2u8; 32].as_slice(),
+                    [0xA3u8; 32].as_slice(),
+                    [0xA4u8].as_slice(),
+                ],
+            )
+            .expect("insert malformed durable row");
+        svc.conn
+            .lock()
+            .execute("DROP TABLE relay_quarantine_events", [])
+            .expect("simulate quarantine persistence failure");
+
+        assert!(matches!(svc.run_cleanup(), Err(ChatRelayError::Sqlite(_))));
+        assert_eq!(svc.storage_usage().expect("usage").pending_messages, 1);
+        let pending_rows: i64 = svc
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM pending_messages", [], |row| {
+                row.get(0)
+            })
+            .expect("count retained source rows");
+        assert_eq!(pending_rows, 1);
+        let status = svc.maintenance_status();
+        assert_eq!(status.cleanup_failures_total, 1);
+        assert_eq!(status.quarantined_pending_messages_total, 0);
+    }
+
+    #[test]
+    fn test_quarantine_event_store_enforces_hard_retention_cap() {
+        let svc = make_service();
+        {
+            let mut conn = svc.conn.lock();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("start quarantine event insert");
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO relay_quarantine_events
+                     (source_kind, reason, row_count, encoded_bytes, quarantined_at)
+                     VALUES (?1, 'test_reason', 1, 1, ?2)",
+                )
+                .expect("prepare quarantine event insert");
+            for _ in 0..=MAX_QUARANTINE_EVENTS {
+                stmt.execute(params![QUARANTINE_SOURCE_PENDING_MESSAGE, i64::MAX])
+                    .expect("insert quarantine event");
+            }
+            drop(stmt);
+            tx.commit().expect("commit quarantine events");
+        }
+
+        svc.run_cleanup_with_batch_budget(1)
+            .expect("trim quarantine event overflow");
+        let retained: i64 = svc
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM relay_quarantine_events", [], |row| {
+                row.get(0)
+            })
+            .expect("count bounded quarantine events");
+        assert_eq!(
+            retained,
+            i64::try_from(MAX_QUARANTINE_EVENTS).unwrap_or(i64::MAX)
+        );
+        let status = svc.maintenance_status();
+        assert_eq!(status.quarantine_events_removed_total, 1);
+        assert_eq!(
+            status.quarantine_events_retained,
+            u64::try_from(MAX_QUARANTINE_EVENTS).unwrap_or(u64::MAX)
+        );
+        assert!(!status.last_cleanup_backlog_deferred);
     }
 
     #[test]
@@ -2719,6 +3583,8 @@ mod tests {
 
         assert_eq!(status.cleanup_runs_total, 7);
         assert_eq!(status.cleanup_batches_total, 0);
+        assert_eq!(status.quarantined_pending_messages_total, 0);
+        assert_eq!(status.quarantine_events_retained, 0);
         assert!(!status.last_cleanup_backlog_deferred);
     }
 
@@ -2766,26 +3632,64 @@ mod tests {
     }
 
     #[test]
-    fn test_malformed_expiry_notification_fails_without_panicking() {
+    fn test_malformed_expiry_notification_isolated_without_blocking_valid_rows() {
         let svc = make_service();
         let sender = [0xE1; 32];
+        let valid_receiver = [0xE4; 32];
         let ids = bincode::serialize(&vec![[0xE2; 16]]).expect("serialize notification");
-        svc.conn
-            .lock()
-            .execute(
+        {
+            let mut conn = svc.conn.lock();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("start mixed notification transaction");
+            tx.execute(
                 "INSERT INTO expired_notifications
                  (sender, receiver, message_ids, created_at, pushed)
                  VALUES (?1, ?2, ?3, 0, 0)",
-                params![sender.as_slice(), [0xE3u8; 31].as_slice(), ids],
+                params![sender.as_slice(), [0xE3u8; 31].as_slice(), &ids],
             )
             .expect("insert malformed notification");
+            tx.execute(
+                "INSERT INTO expired_notifications
+                 (sender, receiver, message_ids, created_at, pushed)
+                 VALUES (?1, ?2, ?3, 1, 0)",
+                params![sender.as_slice(), valid_receiver.as_slice(), ids],
+            )
+            .expect("insert valid notification");
+            tx.commit().expect("commit mixed notifications");
+        }
 
-        assert!(matches!(
-            svc.pull_pending_notifications(&sender),
-            Err(ChatRelayError::CorruptStoredData {
-                field: "expired_notification_receiver"
-            })
-        ));
+        let (notifications, has_more) = svc
+            .pull_pending_notifications(&sender)
+            .expect("pull must isolate poison row");
+        assert_eq!(notifications.len(), 1);
+        assert!(!has_more);
+        assert_eq!(notifications[0].receiver, valid_receiver);
+
+        let status = svc.maintenance_status();
+        assert_eq!(status.quarantined_expired_notifications_total, 1);
+        assert_eq!(status.quarantine_events_retained, 1);
+        assert!(status.last_quarantine_at.is_some());
+
+        let conn = svc.conn.lock();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM expired_notifications WHERE pushed = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count valid notification");
+        assert_eq!(remaining, 1);
+        let event: (String, String, i64) = conn
+            .query_row(
+                "SELECT source_kind, reason, row_count FROM relay_quarantine_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read notification quarantine event");
+        assert_eq!(event.0, QUARANTINE_SOURCE_EXPIRED_NOTIFICATION);
+        assert_eq!(event.1, "expired_notification_receiver");
+        assert_eq!(event.2, 1);
     }
 
     #[test]
