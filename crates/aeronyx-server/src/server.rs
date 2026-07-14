@@ -415,33 +415,80 @@ fn unix_now_secs() -> u64 {
         .as_secs()
 }
 
+/// Typed startup outcomes keep security policy branches exhaustive.
+///
+/// These variants describe an operator-pinned evidence policy. They are not
+/// network votes, consensus, quorum, finality, leader election, or fork choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitmentWitnessStartupDecision {
+    Verified,
+    DegradedUnverified,
+    DegradedBelowThreshold,
+}
+
+impl CommitmentWitnessStartupDecision {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::DegradedUnverified => "degraded_unverified",
+            Self::DegradedBelowThreshold => "degraded_below_threshold",
+        }
+    }
+}
+
+/// Fail-closed reasons produced by authenticated witness evidence or policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitmentWitnessStartupBlockReason {
+    Divergence,
+    RemoteAhead,
+    Unavailable,
+    ThresholdUnmet,
+}
+
+impl CommitmentWitnessStartupBlockReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Divergence => "signed_checkpoint_divergence",
+            Self::RemoteAhead => "signed_checkpoint_remote_ahead",
+            Self::Unavailable => "signed_checkpoint_unavailable",
+            Self::ThresholdUnmet => "signed_checkpoint_threshold_unmet",
+        }
+    }
+}
+
+impl std::fmt::Display for CommitmentWitnessStartupBlockReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 fn commitment_witness_startup_decision(
     round: &CommitmentReconciliationOutcome,
     signed_evidence_required: bool,
     minimum_verified_witnesses: usize,
-) -> std::result::Result<&'static str, &'static str> {
+) -> std::result::Result<CommitmentWitnessStartupDecision, CommitmentWitnessStartupBlockReason> {
     if round.diverged > 0 {
-        return Err("signed_checkpoint_divergence");
+        return Err(CommitmentWitnessStartupBlockReason::Divergence);
     }
     if round.remote_ahead > 0 {
-        return Err("signed_checkpoint_remote_ahead");
+        return Err(CommitmentWitnessStartupBlockReason::RemoteAhead);
     }
     let minimum_verified_witnesses = minimum_verified_witnesses.max(1);
     if round.verified < minimum_verified_witnesses {
         if signed_evidence_required {
             return if round.verified == 0 {
-                Err("signed_checkpoint_unavailable")
+                Err(CommitmentWitnessStartupBlockReason::Unavailable)
             } else {
-                Err("signed_checkpoint_threshold_unmet")
+                Err(CommitmentWitnessStartupBlockReason::ThresholdUnmet)
             };
         }
         return if round.verified == 0 {
-            Ok("degraded_unverified")
+            Ok(CommitmentWitnessStartupDecision::DegradedUnverified)
         } else {
-            Ok("degraded_below_threshold")
+            Ok(CommitmentWitnessStartupDecision::DegradedBelowThreshold)
         };
     }
-    Ok("verified")
+    Ok(CommitmentWitnessStartupDecision::Verified)
 }
 
 pub struct Server {
@@ -2713,30 +2760,34 @@ impl Server {
             ))
         })?;
 
-        if decision.starts_with("degraded_") {
-            warn!(
-                configured = witness_node_ids.len(),
-                eligible = round.eligible_witnesses,
-                attempted = round.attempted,
-                verified = round.verified,
-                failed = round.failed,
-                minimum_verified = self.config.memchain.commitment_witness_min_verified,
-                strict = self.config.memchain.commitment_witness_startup_required,
-                decision,
-                "[MEMCHAIN_BLOCK] External startup witness guard is below the configured evidence threshold; continuing in availability mode"
-            );
-        } else {
-            info!(
-                configured = witness_node_ids.len(),
-                eligible = round.eligible_witnesses,
-                attempted = round.attempted,
-                verified = round.verified,
-                converged = round.converged,
-                remote_behind = round.remote_behind,
-                minimum_verified = self.config.memchain.commitment_witness_min_verified,
-                strict = self.config.memchain.commitment_witness_startup_required,
-                "[MEMCHAIN_BLOCK] External startup witness rollback guard passed"
-            );
+        match decision {
+            CommitmentWitnessStartupDecision::DegradedUnverified
+            | CommitmentWitnessStartupDecision::DegradedBelowThreshold => {
+                warn!(
+                    configured = witness_node_ids.len(),
+                    eligible = round.eligible_witnesses,
+                    attempted = round.attempted,
+                    verified = round.verified,
+                    failed = round.failed,
+                    minimum_verified = self.config.memchain.commitment_witness_min_verified,
+                    strict = self.config.memchain.commitment_witness_startup_required,
+                    decision = decision.as_str(),
+                    "[MEMCHAIN_BLOCK] External startup witness guard is below the configured evidence threshold; continuing in availability mode"
+                );
+            }
+            CommitmentWitnessStartupDecision::Verified => {
+                info!(
+                    configured = witness_node_ids.len(),
+                    eligible = round.eligible_witnesses,
+                    attempted = round.attempted,
+                    verified = round.verified,
+                    converged = round.converged,
+                    remote_behind = round.remote_behind,
+                    minimum_verified = self.config.memchain.commitment_witness_min_verified,
+                    strict = self.config.memchain.commitment_witness_startup_required,
+                    "[MEMCHAIN_BLOCK] External startup witness rollback guard passed"
+                );
+            }
         }
         Ok(())
     }
@@ -5559,7 +5610,8 @@ impl std::fmt::Debug for Server {
 mod tests {
     use super::{
         commitment_witness_startup_decision, memchain_index_rejection_reason, prefix_to_netmask,
-        unix_now_secs, Server, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
+        unix_now_secs, CommitmentWitnessStartupBlockReason, CommitmentWitnessStartupDecision,
+        Server, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
     };
     use crate::api::memchain_peer::CommitmentReconciliationOutcome;
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
@@ -5587,11 +5639,11 @@ mod tests {
         let unavailable = CommitmentReconciliationOutcome::default();
         assert_eq!(
             commitment_witness_startup_decision(&unavailable, false, 1),
-            Ok("degraded_unverified")
+            Ok(CommitmentWitnessStartupDecision::DegradedUnverified)
         );
         assert_eq!(
             commitment_witness_startup_decision(&unavailable, true, 1),
-            Err("signed_checkpoint_unavailable")
+            Err(CommitmentWitnessStartupBlockReason::Unavailable)
         );
 
         let converged = CommitmentReconciliationOutcome {
@@ -5601,15 +5653,15 @@ mod tests {
         };
         assert_eq!(
             commitment_witness_startup_decision(&converged, true, 1),
-            Ok("verified")
+            Ok(CommitmentWitnessStartupDecision::Verified)
         );
         assert_eq!(
             commitment_witness_startup_decision(&converged, false, 2),
-            Ok("degraded_below_threshold")
+            Ok(CommitmentWitnessStartupDecision::DegradedBelowThreshold)
         );
         assert_eq!(
             commitment_witness_startup_decision(&converged, true, 2),
-            Err("signed_checkpoint_threshold_unmet")
+            Err(CommitmentWitnessStartupBlockReason::ThresholdUnmet)
         );
 
         let two_converged = CommitmentReconciliationOutcome {
@@ -5619,7 +5671,7 @@ mod tests {
         };
         assert_eq!(
             commitment_witness_startup_decision(&two_converged, true, 2),
-            Ok("verified")
+            Ok(CommitmentWitnessStartupDecision::Verified)
         );
 
         let remote_ahead = CommitmentReconciliationOutcome {
@@ -5629,7 +5681,7 @@ mod tests {
         };
         assert_eq!(
             commitment_witness_startup_decision(&remote_ahead, false, 2),
-            Err("signed_checkpoint_remote_ahead")
+            Err(CommitmentWitnessStartupBlockReason::RemoteAhead)
         );
 
         let diverged = CommitmentReconciliationOutcome {
@@ -5639,7 +5691,7 @@ mod tests {
         };
         assert_eq!(
             commitment_witness_startup_decision(&diverged, false, 2),
-            Err("signed_checkpoint_divergence")
+            Err(CommitmentWitnessStartupBlockReason::Divergence)
         );
     }
 
