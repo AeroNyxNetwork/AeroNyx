@@ -161,6 +161,8 @@
 //     whole-host snapshot rollback and is not consensus, quorum, or finality.
 //   - External startup witnesses are explicit identity trust pins. Discovery
 //     may rotate their signed endpoints, but unpinned peers stay evidence-only.
+//   - The minimum verified witness count is an operator startup threshold over
+//     distinct pins. It is not consensus, quorum, finality, or fork choice.
 //   - encrypted_message_counter is aggregate only and never stores payload,
 //     destination, DNS, URL, voucher, wallet, or client public IP details.
 //   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
@@ -170,6 +172,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.16-WitnessThreshold - Enforced an operator-defined strict witness threshold
 //   v2.7.15-ExternalWitnessGuard - Pinned pre-listener checkpoint startup gate
 //   v2.7.14-CommitmentTipAnchor - Signed local high-water rollback guard
 //   v2.7.11-CheckpointFreshness - Durable proof recency in status and heartbeat
@@ -415,6 +418,7 @@ fn unix_now_secs() -> u64 {
 fn commitment_witness_startup_decision(
     round: &CommitmentReconciliationOutcome,
     signed_evidence_required: bool,
+    minimum_verified_witnesses: usize,
 ) -> std::result::Result<&'static str, &'static str> {
     if round.diverged > 0 {
         return Err("signed_checkpoint_divergence");
@@ -422,14 +426,22 @@ fn commitment_witness_startup_decision(
     if round.remote_ahead > 0 {
         return Err("signed_checkpoint_remote_ahead");
     }
-    if signed_evidence_required && round.verified == 0 {
-        return Err("signed_checkpoint_unavailable");
+    let minimum_verified_witnesses = minimum_verified_witnesses.max(1);
+    if round.verified < minimum_verified_witnesses {
+        if signed_evidence_required {
+            return if round.verified == 0 {
+                Err("signed_checkpoint_unavailable")
+            } else {
+                Err("signed_checkpoint_threshold_unmet")
+            };
+        }
+        return if round.verified == 0 {
+            Ok("degraded_unverified")
+        } else {
+            Ok("degraded_below_threshold")
+        };
     }
-    if round.verified == 0 {
-        Ok("degraded_unverified")
-    } else {
-        Ok("verified")
-    }
+    Ok("verified")
 }
 
 pub struct Server {
@@ -1944,10 +1956,9 @@ impl Server {
                 } else {
                     "operator_pinned"
                 };
-                let startup_evidence_required = self
-                    .config
-                    .memchain
-                    .commitment_witness_startup_required;
+                let startup_evidence_required =
+                    self.config.memchain.commitment_witness_startup_required;
+                let startup_minimum_verified = self.config.memchain.commitment_witness_min_verified;
                 let commitment_storage = memchain_storage.clone();
                 Some(Box::new(move || {
                     let record_commitment_integrity = commitment_storage.as_ref().map(|storage| {
@@ -1999,6 +2010,7 @@ impl Server {
                             witness_scope,
                             pinned_witnesses_configured,
                             startup_evidence_required,
+                            startup_minimum_verified,
                             state: status.state,
                             last_checked_at: status.last_checked_at,
                             last_converged_at: status.last_converged_at,
@@ -2693,6 +2705,7 @@ impl Server {
         let decision = commitment_witness_startup_decision(
             &round,
             self.config.memchain.commitment_witness_startup_required,
+            self.config.memchain.commitment_witness_min_verified,
         )
         .map_err(|reason| {
             ServerError::startup_failed(format!(
@@ -2700,14 +2713,17 @@ impl Server {
             ))
         })?;
 
-        if decision == "degraded_unverified" {
+        if decision.starts_with("degraded_") {
             warn!(
                 configured = witness_node_ids.len(),
                 eligible = round.eligible_witnesses,
                 attempted = round.attempted,
+                verified = round.verified,
                 failed = round.failed,
+                minimum_verified = self.config.memchain.commitment_witness_min_verified,
                 strict = self.config.memchain.commitment_witness_startup_required,
-                "[MEMCHAIN_BLOCK] External startup witness guard has no signed evidence; continuing in availability mode"
+                decision,
+                "[MEMCHAIN_BLOCK] External startup witness guard is below the configured evidence threshold; continuing in availability mode"
             );
         } else {
             info!(
@@ -2717,6 +2733,7 @@ impl Server {
                 verified = round.verified,
                 converged = round.converged,
                 remote_behind = round.remote_behind,
+                minimum_verified = self.config.memchain.commitment_witness_min_verified,
                 strict = self.config.memchain.commitment_witness_startup_required,
                 "[MEMCHAIN_BLOCK] External startup witness rollback guard passed"
             );
@@ -5566,14 +5583,14 @@ mod tests {
     use crate::services::{PeerStore, PeerStoreImportReport};
 
     #[test]
-    fn commitment_witness_startup_gate_fails_only_on_authoritative_evidence() {
+    fn commitment_witness_startup_gate_enforces_threshold_and_conflicts() {
         let unavailable = CommitmentReconciliationOutcome::default();
         assert_eq!(
-            commitment_witness_startup_decision(&unavailable, false),
+            commitment_witness_startup_decision(&unavailable, false, 1),
             Ok("degraded_unverified")
         );
         assert_eq!(
-            commitment_witness_startup_decision(&unavailable, true),
+            commitment_witness_startup_decision(&unavailable, true, 1),
             Err("signed_checkpoint_unavailable")
         );
 
@@ -5583,7 +5600,25 @@ mod tests {
             ..CommitmentReconciliationOutcome::default()
         };
         assert_eq!(
-            commitment_witness_startup_decision(&converged, true),
+            commitment_witness_startup_decision(&converged, true, 1),
+            Ok("verified")
+        );
+        assert_eq!(
+            commitment_witness_startup_decision(&converged, false, 2),
+            Ok("degraded_below_threshold")
+        );
+        assert_eq!(
+            commitment_witness_startup_decision(&converged, true, 2),
+            Err("signed_checkpoint_threshold_unmet")
+        );
+
+        let two_converged = CommitmentReconciliationOutcome {
+            verified: 2,
+            converged: 2,
+            ..CommitmentReconciliationOutcome::default()
+        };
+        assert_eq!(
+            commitment_witness_startup_decision(&two_converged, true, 2),
             Ok("verified")
         );
 
@@ -5593,7 +5628,7 @@ mod tests {
             ..CommitmentReconciliationOutcome::default()
         };
         assert_eq!(
-            commitment_witness_startup_decision(&remote_ahead, false),
+            commitment_witness_startup_decision(&remote_ahead, false, 2),
             Err("signed_checkpoint_remote_ahead")
         );
 
@@ -5603,7 +5638,7 @@ mod tests {
             ..CommitmentReconciliationOutcome::default()
         };
         assert_eq!(
-            commitment_witness_startup_decision(&diverged, false),
+            commitment_witness_startup_decision(&diverged, false, 2),
             Err("signed_checkpoint_divergence")
         );
     }

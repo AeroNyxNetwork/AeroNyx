@@ -80,8 +80,12 @@
 //! - commitment_witness_node_ids are explicit operator trust pins. Automatic
 //!   discovery may supply endpoints, but an unpinned permissionless peer must
 //!   never gain authority to block coordinator startup.
+//! - commitment_witness_min_verified defaults to one for compatibility. It is
+//!   an operator startup threshold over distinct pinned identities, not network
+//!   consensus, quorum, finality, leader election, or fork choice.
 //!
 //! ## Last Modified
+//! v2.7.16-WitnessThreshold - Added a configurable pinned-witness startup threshold.
 //! v2.7.15-ExternalWitnessGuard - Added pinned startup checkpoint witnesses.
 //! v2.7.14-CommitmentTipAnchor - Added the coordinator-local signed tip anchor.
 //! v2.7.1-BlockFollower — Added default-off pinned coordinator follower settings.
@@ -291,6 +295,15 @@ pub struct MemChainConfig {
     /// a temporary absence of every pin is reported as degraded and allowed.
     #[serde(default)]
     pub commitment_witness_startup_required: bool,
+
+    /// Minimum distinct pinned witnesses required by strict startup.
+    ///
+    /// The default of one preserves existing strict deployments. Operators
+    /// can stage a higher value while strict mode is disabled, verify repeated
+    /// signed responses, and then enable strict startup. This is an explicit
+    /// trust policy over pinned identities, not a consensus quorum.
+    #[serde(default = "default_commitment_witness_min_verified")]
+    pub commitment_witness_min_verified: usize,
 
     /// Maximum number of distinct remote owners this node will serve.
     #[serde(default = "default_max_remote_owners")]
@@ -514,6 +527,9 @@ fn default_max_remote_owners() -> usize {
 fn default_commitment_sync_interval_secs() -> u64 {
     30
 }
+fn default_commitment_witness_min_verified() -> usize {
+    1
+}
 
 const MAX_COMMITMENT_WITNESS_NODE_IDS: usize = 3;
 fn default_ner_model_path() -> String {
@@ -692,7 +708,16 @@ impl MemChainConfig {
             debug!("[MEMCHAIN_BLOCK] Canonical commitment coordinator enabled");
         }
 
-        if !self.commitment_witness_node_ids.is_empty() || self.commitment_witness_startup_required
+        if self.commitment_witness_min_verified == 0 {
+            return Err(ServerError::config_invalid(
+                "memchain.commitment_witness_min_verified",
+                "must be at least one",
+            ));
+        }
+
+        if !self.commitment_witness_node_ids.is_empty()
+            || self.commitment_witness_startup_required
+            || self.commitment_witness_min_verified != default_commitment_witness_min_verified()
         {
             if !self.commitment_coordinator_enabled {
                 return Err(ServerError::config_invalid(
@@ -742,6 +767,12 @@ impl MemChainConfig {
                     ));
                 }
                 validated.push(node_id);
+            }
+            if self.commitment_witness_min_verified > validated.len() {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_witness_min_verified",
+                    "cannot exceed the number of configured pinned witnesses",
+                ));
             }
         }
 
@@ -1116,6 +1147,7 @@ impl Default for MemChainConfig {
             commitment_tip_anchor_path: String::new(),
             commitment_witness_node_ids: Vec::new(),
             commitment_witness_startup_required: false,
+            commitment_witness_min_verified: default_commitment_witness_min_verified(),
             max_remote_owners: default_max_remote_owners(),
             ner_enabled: false,
             ner_model_path: default_ner_model_path(),
@@ -1187,6 +1219,7 @@ mod tests {
         assert!(mc.commitment_tip_anchor_path.is_empty());
         assert!(mc.commitment_witness_node_ids.is_empty());
         assert!(!mc.commitment_witness_startup_required);
+        assert_eq!(mc.commitment_witness_min_verified, 1);
         assert_eq!(
             mc.effective_commitment_tip_anchor_path(),
             PathBuf::from("record-commitment-tip-v1.json")
@@ -1443,6 +1476,7 @@ mod tests {
             commitment_coordinator_enabled: true,
             commitment_witness_node_ids: vec![first.clone(), second.clone()],
             commitment_witness_startup_required: true,
+            commitment_witness_min_verified: 2,
             ..Default::default()
         };
         assert!(valid.validate().is_ok());
@@ -1460,6 +1494,20 @@ mod tests {
                 blind_storage_enabled: true,
                 commitment_coordinator_enabled: true,
                 commitment_witness_startup_required: true,
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_coordinator_enabled: true,
+                commitment_witness_node_ids: vec![first.clone()],
+                commitment_witness_min_verified: 0,
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_coordinator_enabled: true,
+                commitment_witness_node_ids: vec![first.clone(), second.clone()],
+                commitment_witness_min_verified: 3,
                 ..Default::default()
             },
             MemChainConfig {
