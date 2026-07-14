@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 1.7.0-MaintenanceRuntime
+// Version: 1.8.0-BoundedMaintenance
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -20,6 +20,8 @@
 //   panicking, and split expiry notifications into transport-safe chunks.
 //   v1.7.0-MaintenanceRuntime — Added aggregate cleanup execution evidence
 //   and aligned durable pull ordering with the existing message-id cursor.
+//   v1.8.0-BoundedMaintenance — Split retention cleanup into bounded SQLite
+//   transactions and exposed deferred-backlog evidence.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -31,7 +33,7 @@
 //   - WalletRouteCache: In-memory wallet → session routing (v1.3.0-Sovereign)
 //   - Peer relay health: aggregate outbound/inbound node-to-node relay status
 //   - Durable queue quotas: per-receiver and node-wide count/byte ceilings
-//   - Maintenance telemetry: aggregate TTL cleanup success/failure evidence
+//   - Maintenance telemetry: aggregate TTL cleanup, batch, and backlog evidence
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -62,8 +64,11 @@
 //     or silently skip malformed SQLite rows; fail the operation and retain data.
 //   - Pending-message pages are ordered by message_id because the v1 wire
 //     cursor contains only message_id. Chronological display belongs client-side.
+//   - Retention cleanup is batch-bounded. Do not replace it with an unbounded
+//     SELECT/DELETE or hold the SQLite connection across multiple batches.
 //
 // Last Modified:
+//   v1.8.0-BoundedMaintenance — Bounded transactions and backlog observability
 //   v1.7.0-MaintenanceRuntime — Runtime cleanup evidence and cursor-safe paging
 //   v1.6.0-OfflineControlReliability — Atomic bounded ACK/expiry control flow
 //   v1.5.0-GlobalStorageQuotas — Durable global quotas, enforced message size,
@@ -82,7 +87,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use parking_lot::{Mutex, RwLock};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
@@ -107,6 +112,14 @@ const MAX_EXPIRED_MESSAGE_IDS_PER_NOTIFICATION: usize = 32;
 const MAX_EXPIRED_NOTIFICATIONS_PER_PULL: usize = 16;
 /// Defensive ceiling for one persisted bincode notification payload.
 const MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES: usize = 1024;
+/// Maximum expired message rows processed by one `SQLite` transaction.
+const CLEANUP_MESSAGE_BATCH_SIZE: usize = 1024;
+/// Maximum expired encrypted blobs deleted by one `SQLite` transaction.
+const CLEANUP_BLOB_BATCH_SIZE: usize = 128;
+/// Maximum delivered/stale notification rows deleted by one transaction.
+const CLEANUP_NOTIFICATION_BATCH_SIZE: usize = 1024;
+/// Maximum cleanup transactions executed by one scheduled maintenance run.
+const CLEANUP_MAX_BATCHES_PER_RUN: usize = 8;
 
 // ============================================
 // Peer relay health status
@@ -223,6 +236,10 @@ pub enum ChatRelayError {
         field: &'static str,
     },
 
+    /// A client-supplied timestamp cannot be represented by SQLite INTEGER.
+    #[error("Message timestamp is outside the supported range")]
+    TimestampOutOfRange,
+
     /// Encrypted message ciphertext exceeds the configured item ceiling.
     #[error("Message too large: {size} bytes (limit {limit})")]
     MessageTooLarge {
@@ -320,6 +337,7 @@ impl ChatRelayError {
             Self::Serialize(_) => "serialization_error",
             Self::AckBatchTooLarge { .. } => "ack_batch_too_large",
             Self::CorruptStoredData { .. } => "corrupt_stored_data",
+            Self::TimestampOutOfRange => "timestamp_out_of_range",
             Self::MessageTooLarge { .. } => "message_too_large",
             Self::MailboxFull { .. } => "mailbox_full",
             Self::PendingMessageQueueFull { .. } => "pending_message_count_quota",
@@ -368,21 +386,32 @@ pub struct ChatRelayStorageUsage {
 /// This snapshot intentionally excludes message IDs, wallet keys, routes,
 /// endpoints, payloads, and per-user counts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ChatRelayMaintenanceStatus {
     /// Total cleanup attempts, including failed transactions.
     pub cleanup_runs_total: u64,
     /// Cleanup attempts that returned an error.
     pub cleanup_failures_total: u64,
-    /// Pending message rows removed by successful cleanup cycles.
+    /// Successfully committed bounded cleanup transactions.
+    pub cleanup_batches_total: u64,
+    /// Runs that reached their transaction budget with work still pending.
+    pub cleanup_backlog_deferred_total: u64,
+    /// Pending message rows removed by successfully committed batches.
     pub expired_messages_total: u64,
-    /// Encrypted blob rows removed by successful cleanup cycles.
+    /// Encrypted blob rows removed by successfully committed batches.
     pub expired_blobs_total: u64,
+    /// Delivered or stale expiry-notification rows removed by committed batches.
+    pub expired_notifications_removed_total: u64,
     /// Unix timestamp of the most recent cleanup attempt.
     pub last_cleanup_at: Option<u64>,
     /// Stable state bucket: `succeeded` or `failed`.
     pub last_cleanup_status: Option<String>,
     /// Stable aggregate failure bucket from [`ChatRelayError::reason_bucket`].
     pub last_cleanup_failure_reason: Option<String>,
+    /// Number of successfully committed transactions in the latest run.
+    pub last_cleanup_batches: u64,
+    /// Whether the latest run deferred remaining work to the next timer tick.
+    pub last_cleanup_backlog_deferred: bool,
 }
 
 // ============================================
@@ -406,6 +435,40 @@ struct ExpiredMessageRow {
 }
 
 type ExpiredMessagesBySender = HashMap<[u8; 32], HashMap<[u8; 32], Vec<[u8; 16]>>>;
+type StoredExpiredMessageRow = (Vec<u8>, Vec<u8>, Vec<u8>);
+type StoredExpiredNotificationRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CleanupBatchOutcome {
+    expired_messages: usize,
+    expired_blobs: usize,
+    removed_notifications: usize,
+    has_more: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CleanupRunSummary {
+    expired_messages: usize,
+    expired_blobs: usize,
+    removed_notifications: usize,
+    successful_batches: usize,
+    backlog_deferred: bool,
+}
+
+impl CleanupRunSummary {
+    fn absorb(&mut self, batch: CleanupBatchOutcome) {
+        self.expired_messages = self.expired_messages.saturating_add(batch.expired_messages);
+        self.expired_blobs = self.expired_blobs.saturating_add(batch.expired_blobs);
+        self.removed_notifications = self
+            .removed_notifications
+            .saturating_add(batch.removed_notifications);
+        self.successful_batches = self.successful_batches.saturating_add(1);
+    }
+
+    fn removed_anything(self) -> bool {
+        self.expired_messages > 0 || self.expired_blobs > 0 || self.removed_notifications > 0
+    }
+}
 
 // ============================================
 // Expired notification row
@@ -574,6 +637,8 @@ impl ChatRelayService {
                 ON pending_messages(receiver, status, message_id);
             CREATE INDEX IF NOT EXISTS idx_pm_received_at
                 ON pending_messages(received_at);
+            CREATE INDEX IF NOT EXISTS idx_pm_cleanup
+                ON pending_messages(status, received_at, message_id);
 
             CREATE TABLE IF NOT EXISTS pending_blobs (
                 blob_id      TEXT PRIMARY KEY,
@@ -601,6 +666,8 @@ impl ChatRelayService {
                 ON expired_notifications(sender, pushed);
             CREATE INDEX IF NOT EXISTS idx_en_sender_pull_order
                 ON expired_notifications(sender, pushed, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_en_cleanup
+                ON expired_notifications(pushed, created_at, id);
 
             CREATE TABLE IF NOT EXISTS relay_storage_usage (
                 singleton              INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -774,9 +841,12 @@ impl ChatRelayService {
         }
 
         let now = now_secs();
+        let received_at = i64::try_from(now).unwrap_or(i64::MAX);
+        let envelope_timestamp =
+            i64::try_from(envelope.timestamp).map_err(|_| ChatRelayError::TimestampOutOfRange)?;
         let receiver = envelope.receiver;
         let envelope_bytes = encode_envelope(envelope)?;
-        let incoming_bytes = envelope_bytes.len() as u64;
+        let incoming_bytes = u64::try_from(envelope_bytes.len()).unwrap_or(u64::MAX);
 
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -797,7 +867,9 @@ impl ChatRelayService {
         }
 
         let usage = Self::read_storage_usage(&tx)?;
-        if usage.pending_messages >= self.config.max_pending_messages_total as u64 {
+        if usage.pending_messages
+            >= u64::try_from(self.config.max_pending_messages_total).unwrap_or(u64::MAX)
+        {
             return Err(ChatRelayError::PendingMessageQueueFull {
                 current: usize::try_from(usage.pending_messages).unwrap_or(usize::MAX),
                 limit: self.config.max_pending_messages_total,
@@ -835,9 +907,9 @@ impl ChatRelayService {
                 envelope.message_id.as_slice(),
                 envelope.sender.as_slice(),
                 envelope.receiver.as_slice(),
-                envelope.timestamp as i64,
+                envelope_timestamp,
                 envelope_bytes,
-                now as i64,
+                received_at,
             ],
         )?;
         tx.commit()?;
@@ -855,6 +927,10 @@ impl ChatRelayService {
     /// The v1 wire cursor contains only `message_id`, so rows must be ordered
     /// by that same key. Ordering by timestamp first can permanently skip a
     /// later row whose random ID sorts below the previous page's cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage, envelope-decoding, or durable-data integrity error.
     pub fn pull_pending(
         &self,
         receiver: &[u8; 32],
@@ -862,7 +938,9 @@ impl ChatRelayService {
         cursor: &[u8; 16],
         limit: u32,
     ) -> ChatRelayResult<(Vec<PendingMessage>, bool)> {
-        let effective_limit = (limit.min(100) as usize) + 1;
+        let effective_limit = usize::try_from(limit.min(100)).unwrap_or(100) + 1;
+        let query_after_timestamp = i64::try_from(after_timestamp).unwrap_or(i64::MAX);
+        let query_limit = i64::try_from(effective_limit).unwrap_or(i64::MAX);
 
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
@@ -879,9 +957,9 @@ impl ChatRelayService {
             .query_map(
                 params![
                     receiver.as_slice(),
-                    after_timestamp as i64,
+                    query_after_timestamp,
                     cursor.as_slice(),
-                    effective_limit as i64,
+                    query_limit,
                 ],
                 |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
             )?
@@ -908,6 +986,10 @@ impl ChatRelayService {
     /// Acknowledges delivery of a batch of messages, deleting them from the store.
     ///
     /// Only deletes rows where `receiver = receiver_wallet`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an oversized-batch or `SQLite` error. The transaction is atomic.
     pub fn ack_messages(
         &self,
         message_ids: &[[u8; 16]],
@@ -924,7 +1006,18 @@ impl ChatRelayService {
         }
 
         let unique_ids: HashSet<[u8; 16]> = message_ids.iter().copied().collect();
-        let mut conn = self.conn.lock();
+        let deleted =
+            Self::ack_messages_transaction(&mut self.conn.lock(), &unique_ids, receiver_wallet)?;
+
+        debug!(count = deleted, "[CHAT_RELAY] Messages ACKed and deleted");
+        Ok(deleted)
+    }
+
+    fn ack_messages_transaction(
+        conn: &mut Connection,
+        unique_ids: &HashSet<[u8; 16]>,
+        receiver_wallet: &[u8; 32],
+    ) -> ChatRelayResult<usize> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut deleted = 0usize;
 
@@ -937,8 +1030,6 @@ impl ChatRelayService {
             deleted += n;
         }
         tx.commit()?;
-
-        debug!(count = deleted, "[CHAT_RELAY] Messages ACKed and deleted");
         Ok(deleted)
     }
 
@@ -946,6 +1037,11 @@ impl ChatRelayService {
     // Blob store / get / delete
     // ============================================
 
+    /// Stores one opaque encrypted blob under node-wide and receiver quotas.
+    ///
+    /// # Errors
+    ///
+    /// Returns an item-size, capacity, serialization, or `SQLite` error.
     pub fn put_blob(
         &self,
         sender: &[u8; 32],
@@ -961,7 +1057,7 @@ impl ChatRelayService {
         }
 
         let blob_id = self.compute_blob_id(sender, receiver, file_hash);
-        let incoming_bytes = data.len() as u64;
+        let incoming_bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -982,7 +1078,9 @@ impl ChatRelayService {
         }
 
         let usage = Self::read_storage_usage(&tx)?;
-        if usage.pending_blobs >= self.config.max_pending_blobs_total as u64 {
+        if usage.pending_blobs
+            >= u64::try_from(self.config.max_pending_blobs_total).unwrap_or(u64::MAX)
+        {
             return Err(ChatRelayError::PendingBlobStoreFull {
                 current: usize::try_from(usage.pending_blobs).unwrap_or(usize::MAX),
                 limit: self.config.max_pending_blobs_total,
@@ -1013,6 +1111,8 @@ impl ChatRelayService {
         }
 
         let now = now_secs();
+        let received_at = i64::try_from(now).unwrap_or(i64::MAX);
+        let stored_size = i64::try_from(data.len()).unwrap_or(i64::MAX);
 
         tx.execute(
             "INSERT OR IGNORE INTO pending_blobs
@@ -1023,8 +1123,8 @@ impl ChatRelayService {
                 sender.as_slice(),
                 receiver.as_slice(),
                 data,
-                data.len() as i64,
-                now as i64,
+                stored_size,
+                received_at,
             ],
         )?;
         tx.commit()?;
@@ -1034,6 +1134,11 @@ impl ChatRelayService {
         Ok(blob_id)
     }
 
+    /// Retrieves an opaque encrypted blob by its HMAC-derived identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error or [`ChatRelayError::BlobNotFound`].
     pub fn get_blob(&self, blob_id: &str) -> ChatRelayResult<Vec<u8>> {
         let conn = self.conn.lock();
 
@@ -1064,6 +1169,11 @@ impl ChatRelayService {
         }
     }
 
+    /// Deletes an encrypted blob when requested by its original sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite`, not-found, or authorization error.
     pub fn delete_blob(&self, blob_id: &str, requester: &[u8; 32]) -> ChatRelayResult<()> {
         let conn = self.conn.lock();
 
@@ -1106,11 +1216,16 @@ impl ChatRelayService {
     /// The extra row is used only to compute `has_more`; it is never returned.
     /// Invalid durable rows fail the full operation so operators can detect and
     /// repair corruption instead of silently losing delivery state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or durable-data integrity error.
     pub fn pull_pending_notifications(
         &self,
         sender: &[u8; 32],
     ) -> ChatRelayResult<(Vec<ExpiredNotification>, bool)> {
         let effective_limit = MAX_EXPIRED_NOTIFICATIONS_PER_PULL + 1;
+        let query_limit = i64::try_from(effective_limit).unwrap_or(i64::MAX);
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, sender, receiver, message_ids
@@ -1120,8 +1235,8 @@ impl ChatRelayService {
              LIMIT ?2",
         )?;
 
-        let rows: Vec<(i64, Vec<u8>, Vec<u8>, Vec<u8>)> = stmt
-            .query_map(params![sender.as_slice(), effective_limit as i64], |row| {
+        let rows: Vec<StoredExpiredNotificationRow> = stmt
+            .query_map(params![sender.as_slice(), query_limit], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
             .collect::<Result<Vec<_>, rusqlite::Error>>()?;
@@ -1158,6 +1273,10 @@ impl ChatRelayService {
     ///
     /// New runtime code should use [`Self::pull_pending_notifications`] and
     /// propagate its `has_more` flag.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage, decoding, or durable-data integrity error.
     pub fn get_pending_notifications(
         &self,
         sender: &[u8; 32],
@@ -1167,12 +1286,22 @@ impl ChatRelayService {
     }
 
     /// Atomically marks a successfully written notification page as pushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error and rolls back the whole page on failure.
     pub fn mark_notifications_pushed(&self, ids: &[i64]) -> ChatRelayResult<()> {
         if ids.is_empty() {
             return Ok(());
         }
         let unique_ids: HashSet<i64> = ids.iter().copied().collect();
-        let mut conn = self.conn.lock();
+        Self::mark_notifications_pushed_transaction(&mut self.conn.lock(), &unique_ids)
+    }
+
+    fn mark_notifications_pushed_transaction(
+        conn: &mut Connection,
+        unique_ids: &HashSet<i64>,
+    ) -> ChatRelayResult<()> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for id in unique_ids {
             tx.execute(
@@ -1190,44 +1319,77 @@ impl ChatRelayService {
 
     /// Runs one TTL cleanup cycle (synchronous — call from `spawn_blocking`).
     ///
-    /// All mutations run inside a single `SQLite` IMMEDIATE transaction.
+    /// Mutations run in a bounded sequence of `SQLite` IMMEDIATE transactions.
+    /// Each committed batch releases the connection before the next begins.
     /// Returns `(expired_messages, expired_blobs)`.
     ///
     /// # Errors
     ///
     /// Returns a storage, serialization, or durable-data integrity error. A
-    /// failed transaction is rolled back and counted in maintenance evidence.
+    /// failed batch is rolled back and counted in maintenance evidence. Earlier
+    /// committed batches remain durable and are included in aggregate counters.
     pub fn run_cleanup(&self) -> ChatRelayResult<(usize, usize)> {
+        self.run_cleanup_with_batch_budget(CLEANUP_MAX_BATCHES_PER_RUN)
+    }
+
+    fn run_cleanup_with_batch_budget(&self, max_batches: usize) -> ChatRelayResult<(usize, usize)> {
         let now = now_secs();
         let cleanup_now = i64::try_from(now).unwrap_or(i64::MAX);
-        let result = self.run_cleanup_at(cleanup_now);
+        let (summary, failure) = self.run_cleanup_at(cleanup_now, max_batches.max(1));
 
+        self.record_cleanup_run(now, summary, failure.as_ref());
+
+        let Some(error) = failure else {
+            return Ok((summary.expired_messages, summary.expired_blobs));
+        };
+        Err(error)
+    }
+
+    fn record_cleanup_run(
+        &self,
+        now: u64,
+        summary: CleanupRunSummary,
+        failure: Option<&ChatRelayError>,
+    ) {
         let mut status = self.maintenance_status.write();
         status.cleanup_runs_total = status.cleanup_runs_total.saturating_add(1);
+        status.cleanup_batches_total = status
+            .cleanup_batches_total
+            .saturating_add(u64::try_from(summary.successful_batches).unwrap_or(u64::MAX));
+        if summary.backlog_deferred {
+            status.cleanup_backlog_deferred_total =
+                status.cleanup_backlog_deferred_total.saturating_add(1);
+        }
+        status.expired_messages_total = status
+            .expired_messages_total
+            .saturating_add(u64::try_from(summary.expired_messages).unwrap_or(u64::MAX));
+        status.expired_blobs_total = status
+            .expired_blobs_total
+            .saturating_add(u64::try_from(summary.expired_blobs).unwrap_or(u64::MAX));
+        status.expired_notifications_removed_total = status
+            .expired_notifications_removed_total
+            .saturating_add(u64::try_from(summary.removed_notifications).unwrap_or(u64::MAX));
         status.last_cleanup_at = Some(now);
-        match &result {
-            Ok((expired_messages, expired_blobs)) => {
-                status.expired_messages_total = status
-                    .expired_messages_total
-                    .saturating_add(u64::try_from(*expired_messages).unwrap_or(u64::MAX));
-                status.expired_blobs_total = status
-                    .expired_blobs_total
-                    .saturating_add(u64::try_from(*expired_blobs).unwrap_or(u64::MAX));
+        status.last_cleanup_batches = u64::try_from(summary.successful_batches).unwrap_or(u64::MAX);
+        status.last_cleanup_backlog_deferred = summary.backlog_deferred;
+        match failure {
+            None => {
                 status.last_cleanup_status = Some("succeeded".to_string());
                 status.last_cleanup_failure_reason = None;
             }
-            Err(error) => {
+            Some(error) => {
                 status.cleanup_failures_total = status.cleanup_failures_total.saturating_add(1);
                 status.last_cleanup_status = Some("failed".to_string());
                 status.last_cleanup_failure_reason = Some(error.reason_bucket().to_string());
             }
         }
-        drop(status);
-
-        result
     }
 
-    fn run_cleanup_at(&self, now: i64) -> ChatRelayResult<(usize, usize)> {
+    fn run_cleanup_at(
+        &self,
+        now: i64,
+        max_batches: usize,
+    ) -> (CleanupRunSummary, Option<ChatRelayError>) {
         // Configuration validation rejects values above i64::MAX. These
         // fallbacks keep direct service construction fail-closed as well:
         // an out-of-range TTL retains data instead of expiring fresh rows.
@@ -1237,22 +1399,49 @@ impl ChatRelayService {
         let cutoff = now.saturating_sub(ttl);
         let notif_cutoff = now.saturating_sub(notif_ttl);
 
-        let result =
-            Self::run_cleanup_transaction(&mut self.conn.lock(), now, cutoff, notif_cutoff);
-
-        if let Ok((expired_message_count, expired_blobs)) = &result {
-            if *expired_message_count > 0 || *expired_blobs > 0 {
-                info!(
-                    expired_messages = expired_message_count,
-                    expired_blobs = expired_blobs,
-                    "[CHAT_RELAY] Cleanup complete"
-                );
-            } else {
-                debug!("[CHAT_RELAY] Cleanup: nothing to expire");
+        let mut summary = CleanupRunSummary::default();
+        let mut failure = None;
+        for batch_index in 0..max_batches {
+            let batch_result = {
+                let mut conn = self.conn.lock();
+                Self::run_cleanup_transaction(&mut conn, now, cutoff, notif_cutoff)
+            };
+            match batch_result {
+                Ok(batch) => {
+                    let has_more = batch.has_more;
+                    summary.absorb(batch);
+                    if !has_more {
+                        break;
+                    }
+                    if batch_index + 1 == max_batches {
+                        summary.backlog_deferred = true;
+                    }
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
             }
         }
 
-        result
+        if summary.removed_anything() || summary.backlog_deferred {
+            info!(
+                expired_messages = summary.expired_messages,
+                expired_blobs = summary.expired_blobs,
+                removed_notifications = summary.removed_notifications,
+                committed_batches = summary.successful_batches,
+                backlog_deferred = summary.backlog_deferred,
+                cleanup_failed = failure.is_some(),
+                "[CHAT_RELAY] Bounded cleanup run complete"
+            );
+        } else {
+            debug!(
+                cleanup_failed = failure.is_some(),
+                "[CHAT_RELAY] Cleanup: nothing to expire"
+            );
+        }
+
+        (summary, failure)
     }
 
     fn run_cleanup_transaction(
@@ -1260,86 +1449,28 @@ impl ChatRelayService {
         now: i64,
         cutoff: i64,
         notif_cutoff: i64,
-    ) -> ChatRelayResult<(usize, usize)> {
+    ) -> ChatRelayResult<CleanupBatchOutcome> {
+        let message_limit = i64::try_from(CLEANUP_MESSAGE_BATCH_SIZE).unwrap_or(i64::MAX);
+        let blob_limit = i64::try_from(CLEANUP_BLOB_BATCH_SIZE).unwrap_or(i64::MAX);
+        let notification_limit = i64::try_from(CLEANUP_NOTIFICATION_BATCH_SIZE).unwrap_or(i64::MAX);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let transaction_result: ChatRelayResult<(usize, usize)> = (|| {
-            let mut stmt = tx.prepare(
-                "SELECT message_id, sender, receiver FROM pending_messages
-                 WHERE status = 0 AND received_at < ?",
-            )?;
-
-            let stored_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = stmt
-                .query_map(params![cutoff], |row| {
-                    let mid_b: Vec<u8> = row.get(0)?;
-                    let sender_b: Vec<u8> = row.get(1)?;
-                    let receiver_b: Vec<u8> = row.get(2)?;
-                    Ok((mid_b, sender_b, receiver_b))
-                })?
-                .collect::<Result<Vec<_>, rusqlite::Error>>()?;
-            drop(stmt);
-
-            let expired_rows: Vec<ExpiredMessageRow> = stored_rows
-                .into_iter()
-                .map(|(message_id, sender, receiver)| {
-                    Ok(ExpiredMessageRow {
-                        message_id: fixed_bytes(message_id, "expired_message_id")?,
-                        sender: fixed_bytes(sender, "expired_message_sender")?,
-                        receiver: fixed_bytes(receiver, "expired_message_receiver")?,
-                    })
-                })
-                .collect::<ChatRelayResult<Vec<_>>>()?;
-
+        let transaction_result: ChatRelayResult<CleanupBatchOutcome> = (|| {
+            let expired_rows = Self::load_expired_message_batch(&tx, cutoff, message_limit)?;
             let expired_message_count = expired_rows.len();
-            let mut by_sender = ExpiredMessagesBySender::new();
-            for row in &expired_rows {
-                by_sender
-                    .entry(row.sender)
-                    .or_default()
-                    .entry(row.receiver)
-                    .or_default()
-                    .push(row.message_id);
-            }
+            Self::queue_expiry_notifications(&tx, now, &expired_rows)?;
+            Self::delete_expired_message_batch(&tx, cutoff, message_limit, expired_message_count)?;
+            let expired_blobs = Self::delete_expired_blob_batch(&tx, cutoff, blob_limit)?;
+            let removed_notifications =
+                Self::delete_stale_notification_batch(&tx, notif_cutoff, notification_limit)?;
+            let has_more = Self::cleanup_backlog_exists(&tx, cutoff, notif_cutoff)?;
 
-            for (sender, by_receiver) in &by_sender {
-                for (receiver, ids) in by_receiver {
-                    for ids_chunk in ids.chunks(MAX_EXPIRED_MESSAGE_IDS_PER_NOTIFICATION) {
-                        let ids_bytes = bincode::serialize(ids_chunk)?;
-                        if ids_bytes.len() > MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES {
-                            return Err(ChatRelayError::CorruptStoredData {
-                                field: "generated_expired_notification_payload_size",
-                            });
-                        }
-                        tx.execute(
-                            "INSERT INTO expired_notifications
-                             (sender, receiver, message_ids, created_at, pushed)
-                             VALUES (?1, ?2, ?3, ?4, 0)",
-                            params![sender.as_slice(), receiver.as_slice(), ids_bytes, now],
-                        )?;
-                    }
-                }
-            }
-
-            let deleted_messages = tx.execute(
-                "DELETE FROM pending_messages WHERE status = 0 AND received_at < ?",
-                params![cutoff],
-            )?;
-            if deleted_messages != expired_message_count {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "expired_message_cleanup_count",
-                });
-            }
-
-            let expired_blobs = tx.execute(
-                "DELETE FROM pending_blobs WHERE received_at < ?",
-                params![cutoff],
-            )?;
-            tx.execute(
-                "DELETE FROM expired_notifications WHERE pushed = 1 OR created_at < ?",
-                params![notif_cutoff],
-            )?;
-
-            Ok((expired_message_count, expired_blobs))
+            Ok(CleanupBatchOutcome {
+                expired_messages: expired_message_count,
+                expired_blobs,
+                removed_notifications,
+                has_more,
+            })
         })();
 
         match transaction_result {
@@ -1349,6 +1480,162 @@ impl ChatRelayService {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn load_expired_message_batch(
+        tx: &Transaction<'_>,
+        cutoff: i64,
+        limit: i64,
+    ) -> ChatRelayResult<Vec<ExpiredMessageRow>> {
+        let mut stmt = tx.prepare(
+            "SELECT message_id, sender, receiver FROM pending_messages
+             WHERE status = 0 AND received_at < ?1
+             ORDER BY received_at ASC, message_id ASC
+             LIMIT ?2",
+        )?;
+        let stored_rows: Vec<StoredExpiredMessageRow> = stmt
+            .query_map(params![cutoff, limit], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+        drop(stmt);
+
+        stored_rows
+            .into_iter()
+            .map(|(message_id, sender, receiver)| {
+                Ok(ExpiredMessageRow {
+                    message_id: fixed_bytes(message_id, "expired_message_id")?,
+                    sender: fixed_bytes(sender, "expired_message_sender")?,
+                    receiver: fixed_bytes(receiver, "expired_message_receiver")?,
+                })
+            })
+            .collect()
+    }
+
+    fn queue_expiry_notifications(
+        tx: &Transaction<'_>,
+        now: i64,
+        expired_rows: &[ExpiredMessageRow],
+    ) -> ChatRelayResult<()> {
+        let mut by_sender = ExpiredMessagesBySender::new();
+        for row in expired_rows {
+            by_sender
+                .entry(row.sender)
+                .or_default()
+                .entry(row.receiver)
+                .or_default()
+                .push(row.message_id);
+        }
+
+        for (sender, by_receiver) in &by_sender {
+            for (receiver, ids) in by_receiver {
+                for ids_chunk in ids.chunks(MAX_EXPIRED_MESSAGE_IDS_PER_NOTIFICATION) {
+                    let ids_bytes = bincode::serialize(ids_chunk)?;
+                    if ids_bytes.len() > MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES {
+                        return Err(ChatRelayError::CorruptStoredData {
+                            field: "generated_expired_notification_payload_size",
+                        });
+                    }
+                    tx.execute(
+                        "INSERT INTO expired_notifications
+                         (sender, receiver, message_ids, created_at, pushed)
+                         VALUES (?1, ?2, ?3, ?4, 0)",
+                        params![sender.as_slice(), receiver.as_slice(), ids_bytes, now],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_expired_message_batch(
+        tx: &Transaction<'_>,
+        cutoff: i64,
+        limit: i64,
+        expected_count: usize,
+    ) -> ChatRelayResult<()> {
+        let deleted = tx.execute(
+            "DELETE FROM pending_messages
+             WHERE message_id IN (
+                 SELECT message_id FROM pending_messages
+                 WHERE status = 0 AND received_at < ?1
+                 ORDER BY received_at ASC, message_id ASC
+                 LIMIT ?2
+             )",
+            params![cutoff, limit],
+        )?;
+        if deleted != expected_count {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "expired_message_cleanup_count",
+            });
+        }
+        Ok(())
+    }
+
+    fn delete_expired_blob_batch(
+        tx: &Transaction<'_>,
+        cutoff: i64,
+        limit: i64,
+    ) -> ChatRelayResult<usize> {
+        Ok(tx.execute(
+            "DELETE FROM pending_blobs
+             WHERE rowid IN (
+                 SELECT rowid FROM pending_blobs
+                 WHERE received_at < ?1
+                 ORDER BY received_at ASC, rowid ASC
+                 LIMIT ?2
+             )",
+            params![cutoff, limit],
+        )?)
+    }
+
+    fn delete_stale_notification_batch(
+        tx: &Transaction<'_>,
+        notif_cutoff: i64,
+        limit: i64,
+    ) -> ChatRelayResult<usize> {
+        Ok(tx.execute(
+            "DELETE FROM expired_notifications
+             WHERE id IN (
+                 SELECT id FROM expired_notifications
+                 WHERE pushed = 1 OR created_at < ?1
+                 ORDER BY id ASC
+                 LIMIT ?2
+             )",
+            params![notif_cutoff, limit],
+        )?)
+    }
+
+    fn cleanup_backlog_exists(
+        tx: &Transaction<'_>,
+        cutoff: i64,
+        notif_cutoff: i64,
+    ) -> ChatRelayResult<bool> {
+        let message_has_more = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pending_messages
+                 WHERE status = 0 AND received_at < ?1
+             )",
+            params![cutoff],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        let blob_has_more = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pending_blobs WHERE received_at < ?1
+             )",
+            params![cutoff],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        let notification_has_more = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM expired_notifications
+                 WHERE pushed = 1 OR created_at < ?1
+             )",
+            params![notif_cutoff],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+
+        Ok(message_has_more || blob_has_more || notification_has_more)
     }
 
     // ============================================
@@ -1476,6 +1763,8 @@ impl ChatRelayService {
         status.last_cleanup_at = Some(now_secs());
         status.last_cleanup_status = Some("failed".to_string());
         status.last_cleanup_failure_reason = Some(reason.to_string());
+        status.last_cleanup_batches = 0;
+        status.last_cleanup_backlog_deferred = false;
     }
 
     /// Returns aggregate durable queue usage maintained by `SQLite` triggers.
@@ -1557,6 +1846,36 @@ mod tests {
     fn make_service_with_config(config: ChatRelayConfig) -> ChatRelayService {
         let secret = derive_node_secret(&[0x42u8; 32]);
         ChatRelayService::new(config, secret).expect("init")
+    }
+
+    fn insert_expired_pending_rows(svc: &ChatRelayService, count: usize, prefix: u8) {
+        let mut conn = svc.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("start bulk pending insert");
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO pending_messages
+                     (message_id, sender, receiver, timestamp, envelope, received_at, status)
+                     VALUES (?1, ?2, ?3, 0, ?4, 0, 0)",
+                )
+                .expect("prepare bulk pending insert");
+            for sequence in 0..count {
+                let mut message_id = [0u8; 16];
+                message_id[0] = prefix;
+                message_id[8..]
+                    .copy_from_slice(&u64::try_from(sequence).unwrap_or(u64::MAX).to_be_bytes());
+                stmt.execute(params![
+                    message_id.as_slice(),
+                    [0xA2u8; 32].as_slice(),
+                    [0xA3u8; 32].as_slice(),
+                    [0xA4u8].as_slice(),
+                ])
+                .expect("insert expired pending row");
+            }
+        }
+        tx.commit().expect("commit bulk pending insert");
     }
 
     #[test]
@@ -1747,6 +2066,40 @@ mod tests {
             .pull_pending(&receiver, 0, &[0u8; 16], 50)
             .expect("pull2");
         assert!(msgs2.is_empty());
+    }
+
+    #[test]
+    fn test_store_rejects_timestamp_outside_sqlite_domain() {
+        let svc = make_service();
+        let kp = IdentityKeyPair::generate();
+        let receiver = [0xBCu8; 32];
+        let mut envelope = make_envelope(&kp, receiver);
+        envelope.timestamp = u64::MAX;
+        envelope.signature = kp.sign(&envelope.sign_data());
+
+        let error = svc
+            .store_pending(&envelope)
+            .expect_err("out-of-range timestamp must be rejected");
+        assert!(matches!(error, ChatRelayError::TimestampOutOfRange));
+        assert_eq!(error.reason_bucket(), "timestamp_out_of_range");
+        assert_eq!(svc.storage_usage().expect("usage").pending_messages, 0);
+    }
+
+    #[test]
+    fn test_pull_out_of_range_timestamp_fails_closed() {
+        let svc = make_service();
+        let kp = IdentityKeyPair::generate();
+        let receiver = [0xBDu8; 32];
+        let mut envelope = make_envelope(&kp, receiver);
+        envelope.timestamp = 1;
+        envelope.signature = kp.sign(&envelope.sign_data());
+        svc.store_pending(&envelope).expect("store pending message");
+
+        let (messages, has_more) = svc
+            .pull_pending(&receiver, u64::MAX, &[0u8; 16], 50)
+            .expect("bounded pull");
+        assert!(messages.is_empty());
+        assert!(!has_more);
     }
 
     #[test]
@@ -2224,6 +2577,8 @@ mod tests {
         let failed = svc.maintenance_status();
         assert_eq!(failed.cleanup_runs_total, 1);
         assert_eq!(failed.cleanup_failures_total, 1);
+        assert_eq!(failed.cleanup_batches_total, 0);
+        assert_eq!(failed.last_cleanup_batches, 0);
         assert_eq!(failed.last_cleanup_status.as_deref(), Some("failed"));
         assert_eq!(
             failed.last_cleanup_failure_reason.as_deref(),
@@ -2238,8 +2593,101 @@ mod tests {
         let recovered = svc.maintenance_status();
         assert_eq!(recovered.cleanup_runs_total, 2);
         assert_eq!(recovered.cleanup_failures_total, 1);
+        assert_eq!(recovered.cleanup_batches_total, 1);
+        assert_eq!(recovered.last_cleanup_batches, 1);
         assert_eq!(recovered.last_cleanup_status.as_deref(), Some("succeeded"));
         assert_eq!(recovered.last_cleanup_failure_reason, None);
+    }
+
+    #[test]
+    fn test_cleanup_defers_backlog_at_batch_budget_and_recovers_next_run() {
+        let svc = make_service();
+        insert_expired_pending_rows(&svc, CLEANUP_MESSAGE_BATCH_SIZE + 1, 0x10);
+
+        let (first_expired, first_blobs) = svc
+            .run_cleanup_with_batch_budget(1)
+            .expect("first bounded cleanup");
+        assert_eq!(first_expired, CLEANUP_MESSAGE_BATCH_SIZE);
+        assert_eq!(first_blobs, 0);
+        assert_eq!(
+            svc.storage_usage().expect("first usage").pending_messages,
+            1
+        );
+
+        let deferred = svc.maintenance_status();
+        assert_eq!(deferred.cleanup_runs_total, 1);
+        assert_eq!(deferred.cleanup_batches_total, 1);
+        assert_eq!(deferred.cleanup_backlog_deferred_total, 1);
+        assert_eq!(
+            deferred.expired_messages_total,
+            u64::try_from(CLEANUP_MESSAGE_BATCH_SIZE).unwrap_or(u64::MAX)
+        );
+        assert_eq!(deferred.last_cleanup_batches, 1);
+        assert!(deferred.last_cleanup_backlog_deferred);
+
+        let (second_expired, second_blobs) = svc
+            .run_cleanup_with_batch_budget(1)
+            .expect("second bounded cleanup");
+        assert_eq!(second_expired, 1);
+        assert_eq!(second_blobs, 0);
+        assert_eq!(
+            svc.storage_usage().expect("second usage").pending_messages,
+            0
+        );
+
+        let recovered = svc.maintenance_status();
+        assert_eq!(recovered.cleanup_runs_total, 2);
+        assert_eq!(recovered.cleanup_batches_total, 2);
+        assert_eq!(recovered.cleanup_backlog_deferred_total, 1);
+        assert_eq!(
+            recovered.expired_messages_total,
+            u64::try_from(CLEANUP_MESSAGE_BATCH_SIZE + 1).unwrap_or(u64::MAX)
+        );
+        assert!(!recovered.last_cleanup_backlog_deferred);
+    }
+
+    #[test]
+    fn test_cleanup_counts_committed_batches_before_later_failure() {
+        let svc = make_service();
+        insert_expired_pending_rows(&svc, CLEANUP_MESSAGE_BATCH_SIZE, 0x10);
+        svc.conn
+            .lock()
+            .execute(
+                "INSERT INTO pending_messages
+                 (message_id, sender, receiver, timestamp, envelope, received_at, status)
+                 VALUES (?1, ?2, ?3, 0, ?4, 0, 0)",
+                params![
+                    [0xF0u8; 15].as_slice(),
+                    [0xA2u8; 32].as_slice(),
+                    [0xA3u8; 32].as_slice(),
+                    [0xA4u8].as_slice(),
+                ],
+            )
+            .expect("insert malformed trailing row");
+
+        assert!(matches!(
+            svc.run_cleanup_with_batch_budget(2),
+            Err(ChatRelayError::CorruptStoredData {
+                field: "expired_message_id"
+            })
+        ));
+
+        let status = svc.maintenance_status();
+        assert_eq!(status.cleanup_runs_total, 1);
+        assert_eq!(status.cleanup_failures_total, 1);
+        assert_eq!(status.cleanup_batches_total, 1);
+        assert_eq!(
+            status.expired_messages_total,
+            u64::try_from(CLEANUP_MESSAGE_BATCH_SIZE).unwrap_or(u64::MAX)
+        );
+        assert_eq!(status.last_cleanup_batches, 1);
+        assert_eq!(status.last_cleanup_status.as_deref(), Some("failed"));
+        assert_eq!(
+            svc.storage_usage()
+                .expect("remaining usage")
+                .pending_messages,
+            1
+        );
     }
 
     #[test]
@@ -2252,13 +2700,26 @@ mod tests {
         let envelope = make_envelope(&kp, receiver);
 
         svc.store_pending(&envelope).expect("store pending message");
-        let (expired, _) = svc.run_cleanup_at(i64::MAX).expect("cleanup");
+        let (expired, _) = svc.run_cleanup().expect("cleanup");
 
         assert_eq!(expired, 0);
         assert_eq!(
             svc.storage_usage().expect("storage usage").pending_messages,
             1
         );
+    }
+
+    #[test]
+    fn test_maintenance_status_deserializes_older_snapshot() {
+        let status: ChatRelayMaintenanceStatus = serde_json::from_value(serde_json::json!({
+            "cleanup_runs_total": 7,
+            "last_cleanup_status": "succeeded"
+        }))
+        .expect("deserialize backward-compatible maintenance snapshot");
+
+        assert_eq!(status.cleanup_runs_total, 7);
+        assert_eq!(status.cleanup_batches_total, 0);
+        assert!(!status.last_cleanup_backlog_deferred);
     }
 
     #[test]
