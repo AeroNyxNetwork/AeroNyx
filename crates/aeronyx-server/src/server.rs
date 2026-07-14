@@ -134,6 +134,9 @@
 //      after full chain audit and before any block producer can start.
 //  57. Checks only operator-pinned external checkpoint witnesses before opening
 //      listeners, so permissionless peers cannot manufacture startup authority.
+//  58. Bounds every discovery, relay-ACK, public-IP, bootstrap, and peer-cache
+//      read so an untrusted HTTP peer or oversized local recovery file cannot
+//      grow node memory without a protocol-defined ceiling.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -163,6 +166,9 @@
 //     may rotate their signed endpoints, but unpinned peers stay evidence-only.
 //   - The minimum verified witness count is an operator startup threshold over
 //     distinct pins. It is not consensus, quorum, finality, or fork choice.
+//   - Outbound peer HTTP responses and discovery recovery files must pass the
+//     bounded readers in this file. Never reintroduce response.json(),
+//     response.bytes(), response.text(), or tokio::fs::read() on these paths.
 //   - encrypted_message_counter is aggregate only and never stores payload,
 //     destination, DNS, URL, voucher, wallet, or client public IP details.
 //   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
@@ -172,6 +178,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.18-BoundedPeerReads - Bounded untrusted peer responses and recovery files
 //   v2.7.17-SectionSafeAuth - Resolve API secrets before Server construction
 //   v2.7.16-WitnessThreshold - Enforced an operator-defined strict witness threshold
 //   v2.7.15-ExternalWitnessGuard - Pinned pre-listener checkpoint startup gate
@@ -238,13 +245,14 @@
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use tokio::io::AsyncWriteExt;
+use serde::de::DeserializeOwned;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
@@ -352,6 +360,18 @@ const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
 const BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS: u64 = 15 * 60;
 const BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS: u64 = 60;
 
+/// Public IP services should return one textual IP address and whitespace.
+const PUBLIC_IP_RESPONSE_MAX_BYTES: usize = 256;
+
+/// Gossip is bounded independently from the operator's peer-store capacity.
+const DISCOVERY_GOSSIP_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
+
+/// Bootstrap/cache snapshots may contain thousands of signed descriptors.
+const DISCOVERY_SNAPSHOT_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Relay acknowledgements contain only a few booleans and identifiers.
+const PEER_ACK_RESPONSE_MAX_BYTES: usize = 16 * 1024;
+
 /// Return the privacy-safe reason a persisted MemChain record must not enter
 /// the in-memory recall index.
 ///
@@ -444,6 +464,34 @@ enum CommitmentWitnessStartupBlockReason {
     RemoteAhead,
     Unavailable,
     ThresholdUnmet,
+}
+
+/// Privacy-safe failure classes for bounded responses from untrusted peers.
+///
+/// Deliberately avoid carrying response bodies or parser details: callers may
+/// expose these reasons through health telemetry, and peer-controlled content
+/// must never become an accidental logging channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedHttpResponseError {
+    TooLarge,
+    BodyRead,
+    JsonDecode,
+}
+
+impl BoundedHttpResponseError {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TooLarge => "response_too_large",
+            Self::BodyRead => "response_body_read_failed",
+            Self::JsonDecode => "response_json_decode_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for BoundedHttpResponseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 impl CommitmentWitnessStartupBlockReason {
@@ -2295,26 +2343,41 @@ impl Server {
                 }
                 if let Ok(resp) = req.send().await {
                     if resp.status().is_success() {
-                        if let Ok(body) = resp.text().await {
-                            let ip_str = body.trim();
-                            if ip_str.len() <= 45 {
-                                if let Ok(addr) = ip_str.parse::<std::net::IpAddr>() {
-                                    let is_private = match addr {
-                                        std::net::IpAddr::V4(v4) => {
-                                            v4.is_loopback()
-                                                || v4.is_private()
-                                                || v4.is_unspecified()
+                        match Self::read_bounded_http_response(resp, PUBLIC_IP_RESPONSE_MAX_BYTES)
+                            .await
+                        {
+                            Ok(body) => {
+                                let Ok(ip_str) = std::str::from_utf8(&body) else {
+                                    debug!(source = %url, "[NET] Public IP response was not UTF-8");
+                                    continue;
+                                };
+                                let ip_str = ip_str.trim();
+                                if ip_str.len() <= 45 {
+                                    if let Ok(addr) = ip_str.parse::<std::net::IpAddr>() {
+                                        let is_private = match addr {
+                                            std::net::IpAddr::V4(v4) => {
+                                                v4.is_loopback()
+                                                    || v4.is_private()
+                                                    || v4.is_unspecified()
+                                            }
+                                            std::net::IpAddr::V6(v6) => {
+                                                v6.is_loopback() || v6.is_unspecified()
+                                            }
+                                        };
+                                        if !is_private {
+                                            info!(ip = %addr, source = %url, "[NET] Public IP detected");
+                                            return addr.to_string();
                                         }
-                                        std::net::IpAddr::V6(v6) => {
-                                            v6.is_loopback() || v6.is_unspecified()
-                                        }
-                                    };
-                                    if !is_private {
-                                        info!(ip = %addr, source = %url, "[NET] Public IP detected");
-                                        return addr.to_string();
+                                        warn!(ip = %addr, source = %url, "[NET] Ignoring private/loopback IP");
                                     }
-                                    warn!(ip = %addr, source = %url, "[NET] Ignoring private/loopback IP");
                                 }
+                            }
+                            Err(error) => {
+                                debug!(
+                                    source = %url,
+                                    reason = error.as_str(),
+                                    "[NET] Public IP response rejected"
+                                );
                             }
                         }
                     }
@@ -2363,12 +2426,17 @@ impl Server {
         }
 
         if let Some(path) = &self.config.discovery.bootstrap_snapshot_path {
-            match tokio::fs::read(path).await {
+            match Self::read_bounded_file(Path::new(path), DISCOVERY_SNAPSHOT_MAX_BYTES).await {
                 Ok(bytes) => {
                     Self::import_bootstrap_snapshot_bytes(&peer_store, "file", path, &bytes, now);
                 }
                 Err(e) => {
-                    peer_store.record_bootstrap_source(now, "file", "failed", "read_failed");
+                    peer_store.record_bootstrap_source(
+                        now,
+                        "file",
+                        "failed",
+                        Self::bounded_file_error_reason(&e),
+                    );
                     warn!(
                         source = %path,
                         error = %e,
@@ -2389,13 +2457,18 @@ impl Server {
                     Ok(response) => {
                         let status = response.status();
                         if status.is_success() {
-                            match response.bytes().await {
+                            match Self::read_bounded_http_response(
+                                response,
+                                DISCOVERY_SNAPSHOT_MAX_BYTES,
+                            )
+                            .await
+                            {
                                 Ok(bytes) => {
                                     Self::import_bootstrap_snapshot_bytes(
                                         &peer_store,
                                         "url",
                                         url,
-                                        bytes.as_ref(),
+                                        &bytes,
                                         now,
                                     );
                                 }
@@ -2404,12 +2477,12 @@ impl Server {
                                         now,
                                         "url",
                                         "failed",
-                                        "body_read_failed",
+                                        e.as_str(),
                                     );
                                     warn!(
                                         source = %url,
-                                        error = %e,
-                                        "[DISCOVERY] Failed to read bootstrap response body"
+                                        reason = e.as_str(),
+                                        "[DISCOVERY] Bootstrap response rejected"
                                     );
                                 }
                             }
@@ -2563,7 +2636,7 @@ impl Server {
     }
 
     async fn load_peer_cache(&self, peer_store: &PeerStore, path: &str, now: u64) {
-        match tokio::fs::read(path).await {
+        match Self::read_bounded_file(Path::new(path), DISCOVERY_SNAPSHOT_MAX_BYTES).await {
             Ok(bytes) => {
                 if !Self::import_bootstrap_snapshot_bytes(peer_store, "cache", path, &bytes, now) {
                     self.load_peer_cache_backup(peer_store, path, now).await;
@@ -2578,7 +2651,12 @@ impl Server {
                 self.load_peer_cache_backup(peer_store, path, now).await;
             }
             Err(e) => {
-                peer_store.record_bootstrap_source(now, "cache", "failed", "read_failed");
+                peer_store.record_bootstrap_source(
+                    now,
+                    "cache",
+                    "failed",
+                    Self::bounded_file_error_reason(&e),
+                );
                 warn!(
                     source = %path,
                     error = %e,
@@ -2592,7 +2670,7 @@ impl Server {
     async fn load_peer_cache_backup(&self, peer_store: &PeerStore, path: &str, now: u64) {
         let backup_path = Self::peer_cache_backup_path(path);
         let backup_source = backup_path.to_string_lossy().to_string();
-        match tokio::fs::read(&backup_path).await {
+        match Self::read_bounded_file(&backup_path, DISCOVERY_SNAPSHOT_MAX_BYTES).await {
             Ok(bytes) => {
                 if Self::import_bootstrap_snapshot_bytes(
                     peer_store,
@@ -2616,7 +2694,12 @@ impl Server {
                 );
             }
             Err(e) => {
-                peer_store.record_bootstrap_source(now, "cache_backup", "failed", "read_failed");
+                peer_store.record_bootstrap_source(
+                    now,
+                    "cache_backup",
+                    "failed",
+                    Self::bounded_file_error_reason(&e),
+                );
                 warn!(
                     source = %backup_source,
                     error = %e,
@@ -3552,12 +3635,15 @@ impl Server {
             .await
             .map_err(|e| Self::classify_reqwest_error("snapshot_request", &e))?;
 
-        let response = snapshot_response
+        let snapshot_response = snapshot_response
             .error_for_status()
-            .map_err(|e| Self::classify_reqwest_error("snapshot_status", &e))?
-            .json::<GossipResponse>()
-            .await
-            .map_err(|e| Self::classify_reqwest_error("snapshot_decode", &e))?;
+            .map_err(|e| Self::classify_reqwest_error("snapshot_status", &e))?;
+        let response = Self::decode_bounded_json_response::<GossipResponse>(
+            snapshot_response,
+            DISCOVERY_GOSSIP_RESPONSE_MAX_BYTES,
+        )
+        .await
+        .map_err(|error| format!("snapshot_{}", error.as_str()))?;
 
         if let Some(message) = response.response {
             peer_store.apply_discovery_message(&message, now);
@@ -3615,7 +3701,12 @@ impl Server {
 
         match client.post(url).json(&request).send().await {
             Ok(response) if response.status().is_success() => {
-                match response.json::<PeerBlindRelayResponse>().await {
+                match Self::decode_bounded_json_response::<PeerBlindRelayResponse>(
+                    response,
+                    PEER_ACK_RESPONSE_MAX_BYTES,
+                )
+                .await
+                {
                     Ok(ack) if ack.accepted => {
                         peer_store.record_blind_relay_probe_result(now, true, "accepted");
                         peer_store.record_route_forward_success(&next_hop, now);
@@ -3626,11 +3717,12 @@ impl Server {
                     }
                     Err(error) => {
                         debug!(
-                            error = %error,
-                            "[DISCOVERY] Blind relay probe ACK decode failed"
+                            reason = error.as_str(),
+                            "[DISCOVERY] Blind relay probe ACK rejected"
                         );
-                        peer_store.record_blind_relay_probe_result(now, false, "ack_decode");
-                        peer_store.record_route_forward_failure(&next_hop, now, "ack_decode");
+                        let reason = format!("ack_{}", error.as_str());
+                        peer_store.record_blind_relay_probe_result(now, false, &reason);
+                        peer_store.record_route_forward_failure(&next_hop, now, &reason);
                     }
                 }
             }
@@ -3741,7 +3833,12 @@ impl Server {
                 ) {
                     match client.post(&url).json(&request).send().await {
                         Ok(response) if response.status().is_success() => {
-                            match response.json::<PeerBlindRelayResponse>().await {
+                            match Self::decode_bounded_json_response::<PeerBlindRelayResponse>(
+                                response,
+                                PEER_ACK_RESPONSE_MAX_BYTES,
+                            )
+                            .await
+                            {
                                 Ok(ack) if ack.accepted && ack.forwarded => {
                                     peer_store
                                         .record_blind_relay_two_hop_probe_result_with_context(
@@ -3774,15 +3871,16 @@ impl Server {
                                     );
                                 }
                                 Err(error) => {
+                                    let reason = format!("onion_ack_{}", error.as_str());
                                     debug!(
-                                        error = %error,
-                                        "[DISCOVERY] Two-hop onion delivery probe ACK decode failed"
+                                        reason = %reason,
+                                        "[DISCOVERY] Two-hop onion delivery probe ACK rejected"
                                     );
                                     peer_store
                                         .record_blind_relay_two_hop_probe_result_with_context(
                                             now,
                                             false,
-                                            "onion_ack_decode",
+                                            &reason,
                                             middle_candidate_count,
                                             terminal_candidate_count,
                                             2,
@@ -3791,7 +3889,7 @@ impl Server {
                                     peer_store.record_route_forward_failure(
                                         &middle_node_id,
                                         now,
-                                        "onion_ack_decode",
+                                        &reason,
                                     );
                                 }
                             }
@@ -3889,7 +3987,12 @@ impl Server {
 
                 match client.post(&url).json(&request).send().await {
                     Ok(response) if response.status().is_success() => {
-                        match response.json::<PeerBlindRelayResponse>().await {
+                        match Self::decode_bounded_json_response::<PeerBlindRelayResponse>(
+                            response,
+                            PEER_ACK_RESPONSE_MAX_BYTES,
+                        )
+                        .await
+                        {
                             Ok(ack) if ack.accepted && ack.forwarded => {
                                 peer_store.record_blind_relay_two_hop_probe_result_with_context(
                                     now,
@@ -3920,14 +4023,15 @@ impl Server {
                                 );
                             }
                             Err(error) => {
+                                let reason = format!("ack_{}", error.as_str());
                                 debug!(
-                                    error = %error,
-                                    "[DISCOVERY] Two-hop blind relay proof ACK decode failed"
+                                    reason = %reason,
+                                    "[DISCOVERY] Two-hop blind relay proof ACK rejected"
                                 );
                                 peer_store.record_blind_relay_two_hop_probe_result_with_context(
                                     now,
                                     false,
-                                    "ack_decode",
+                                    &reason,
                                     middle_candidate_count,
                                     terminal_candidate_count,
                                     2,
@@ -3936,7 +4040,7 @@ impl Server {
                                 peer_store.record_route_forward_failure(
                                     &middle_node_id,
                                     now,
-                                    "ack_decode",
+                                    &reason,
                                 );
                             }
                         }
@@ -4159,6 +4263,81 @@ impl Server {
         hasher.finalize().to_vec()
     }
 
+    /// Read an untrusted HTTP response without allowing a peer to grow the
+    /// process heap without bound. `Content-Length` is only an early reject;
+    /// the streaming check remains authoritative because the header may be
+    /// absent, incorrect, or refer to compressed bytes.
+    async fn read_bounded_http_response(
+        mut response: reqwest::Response,
+        max_bytes: usize,
+    ) -> std::result::Result<Vec<u8>, BoundedHttpResponseError> {
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Err(BoundedHttpResponseError::TooLarge);
+        }
+
+        let initial_capacity = response
+            .content_length()
+            .unwrap_or_default()
+            .min(max_bytes as u64) as usize;
+        let mut body = Vec::with_capacity(initial_capacity);
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| BoundedHttpResponseError::BodyRead)?
+        {
+            if chunk.len() > max_bytes.saturating_sub(body.len()) {
+                return Err(BoundedHttpResponseError::TooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    async fn decode_bounded_json_response<T: DeserializeOwned>(
+        response: reqwest::Response,
+        max_bytes: usize,
+    ) -> std::result::Result<T, BoundedHttpResponseError> {
+        let body = Self::read_bounded_http_response(response, max_bytes).await?;
+        serde_json::from_slice(&body).map_err(|_| BoundedHttpResponseError::JsonDecode)
+    }
+
+    /// Read a recovery snapshot through a fixed-length view of the file.
+    /// Metadata provides an inexpensive rejection, while `take(max + 1)` also
+    /// catches a file that grows after the metadata check.
+    async fn read_bounded_file(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+        let file = tokio::fs::File::open(path).await?;
+        let declared_length = file.metadata().await?.len();
+        if declared_length > max_bytes as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file exceeds configured recovery limit",
+            ));
+        }
+
+        let initial_capacity = declared_length.min(max_bytes as u64) as usize;
+        let mut reader = file.take(max_bytes.saturating_add(1) as u64);
+        let mut body = Vec::with_capacity(initial_capacity);
+        reader.read_to_end(&mut body).await?;
+        if body.len() > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file grew beyond configured recovery limit",
+            ));
+        }
+        Ok(body)
+    }
+
+    fn bounded_file_error_reason(error: &std::io::Error) -> &'static str {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            "file_too_large"
+        } else {
+            "read_failed"
+        }
+    }
+
     fn classify_reqwest_error(phase: &str, error: &reqwest::Error) -> String {
         if error.is_timeout() {
             return format!("{phase}_timeout");
@@ -4249,7 +4428,12 @@ impl Server {
 
             match response {
                 Ok(response) if response.status().is_success() => {
-                    match response.json::<PeerChatRelayResponse>().await {
+                    match Self::decode_bounded_json_response::<PeerChatRelayResponse>(
+                        response,
+                        PEER_ACK_RESPONSE_MAX_BYTES,
+                    )
+                    .await
+                    {
                         Ok(ack) if ack.accepted => {
                             accepted += 1;
                             peer_store.record_route_forward_success(&peer_node_id, now);
@@ -4268,7 +4452,7 @@ impl Server {
                             );
                         }
                         Err(error) => {
-                            let reason = Self::classify_reqwest_error("peer_relay_ack", &error);
+                            let reason = format!("peer_relay_ack_{}", error.as_str());
                             peer_store.record_route_forward_failure(
                                 &peer_node_id,
                                 now,
@@ -4277,8 +4461,8 @@ impl Server {
                             last_failure_reason = Some(reason);
                             debug!(
                                 peer = %url,
-                                error = %error,
-                                "[CHAT_RELAY] Peer relay ACK decode failed"
+                                reason = error.as_str(),
+                                "[CHAT_RELAY] Peer relay ACK rejected"
                             );
                         }
                     }
@@ -4444,7 +4628,7 @@ impl Server {
     }
 
     async fn cache_snapshot_file_has_usable_peers(path: &PathBuf, now: u64) -> bool {
-        let Ok(bytes) = tokio::fs::read(path).await else {
+        let Ok(bytes) = Self::read_bounded_file(path, DISCOVERY_SNAPSHOT_MAX_BYTES).await else {
             return false;
         };
         let Ok(snapshot) = NodeBootstrapSnapshot::from_json_bytes(&bytes) else {
@@ -5587,8 +5771,8 @@ impl std::fmt::Debug for Server {
 mod tests {
     use super::{
         commitment_witness_startup_decision, memchain_index_rejection_reason, prefix_to_netmask,
-        unix_now_secs, CommitmentWitnessStartupBlockReason, CommitmentWitnessStartupDecision,
-        Server, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
+        unix_now_secs, BoundedHttpResponseError, CommitmentWitnessStartupBlockReason,
+        CommitmentWitnessStartupDecision, Server, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
     };
     use crate::api::memchain_peer::CommitmentReconciliationOutcome;
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
@@ -6278,6 +6462,80 @@ mod tests {
             Some("https://node.example.com/api/discovery/gossip")
         );
         assert_eq!(Server::discovery_gossip_url("   "), None);
+    }
+
+    #[tokio::test]
+    async fn bounded_peer_response_accepts_small_json_and_rejects_unsafe_bodies() {
+        let app = Router::new()
+            .route(
+                "/small",
+                post(|| async { Json(serde_json::json!({ "accepted": true })) }),
+            )
+            .route("/oversized", post(|| async { "x".repeat(257) }))
+            .route("/malformed", post(|| async { "{not-json" }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mock_peer = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+
+        let small = client
+            .post(format!("{endpoint}/small"))
+            .send()
+            .await
+            .unwrap();
+        let decoded = Server::decode_bounded_json_response::<serde_json::Value>(small, 256)
+            .await
+            .unwrap();
+        assert_eq!(decoded["accepted"], true);
+
+        let oversized = client
+            .post(format!("{endpoint}/oversized"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            Server::read_bounded_http_response(oversized, 256)
+                .await
+                .unwrap_err(),
+            BoundedHttpResponseError::TooLarge
+        );
+
+        let malformed = client
+            .post(format!("{endpoint}/malformed"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            Server::decode_bounded_json_response::<serde_json::Value>(malformed, 256)
+                .await
+                .unwrap_err(),
+            BoundedHttpResponseError::JsonDecode
+        );
+        mock_peer.abort();
+    }
+
+    #[tokio::test]
+    async fn bounded_recovery_file_accepts_exact_limit_and_rejects_oversize() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("aeronyx-bounded-read-{unique}.json"));
+
+        tokio::fs::write(&path, [0x5a; 32]).await.unwrap();
+        assert_eq!(
+            Server::read_bounded_file(&path, 32).await.unwrap().len(),
+            32
+        );
+
+        tokio::fs::write(&path, [0x5a; 33]).await.unwrap();
+        let error = Server::read_bounded_file(&path, 32).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(Server::bounded_file_error_reason(&error), "file_too_large");
+
+        let _ = tokio::fs::remove_file(path).await;
     }
 
     #[test]
