@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 1.3.0-Sovereign
+// Version: 2.8.0-ChatPullV2
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -12,6 +12,8 @@
 //   peer range request/response variants. Existing discriminants are unchanged.
 //   v2.7.5-CheckpointProof — Appended signed chain-checkpoint reconciliation
 //   variants. Existing discriminants remain unchanged.
+//   v2.8.0-ChatPullV2 — Appended authenticated opaque-cursor request/response
+//   variants. Existing v1 chat pull discriminants and wire bytes are unchanged.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -44,6 +46,7 @@
 //     use the same two-[u8;32] trick for bincode compatibility
 //
 // Last Modified:
+//   v2.8.0-ChatPullV2 — Appended variants 23-24 for monotonic mailbox paging
 //   v1.2.0-MultiDevice — Added DeviceRegister (index 16)
 //   v1.3.0-Sovereign   — Added wallet_pubkey/timestamp/signature to
 //                        DeviceRegister, ChatPull, ChatAck; added WalletPresence (17)
@@ -54,7 +57,7 @@
 // ============================================================================
 
 use bincode::Options;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 
 #[allow(deprecated)]
 use crate::ledger::Fact;
@@ -78,6 +81,13 @@ const MAX_ENVELOPE_BYTES: u64 = 128 * 1024; // 128 KB
 /// Magic byte prepended to every MemChain plaintext payload.
 /// `0xAE` = first byte of "**AE**ronyx".
 pub const MEMCHAIN_MAGIC: u8 = 0xAE;
+
+/// Maximum accepted opaque cursor bytes in a `ChatPullV2` request.
+///
+/// The current server token is smaller; this protocol ceiling leaves room for
+/// versioned authenticated-encryption formats without permitting large
+/// attacker-controlled allocations before wallet signature verification.
+pub const MAX_CHAT_PULL_CURSOR_V2_BYTES: usize = 128;
 
 // ============================================
 // Internal serde helper for [u8; 64]
@@ -144,6 +154,8 @@ mod serde_bytes64 {
 /// | 20    | RecordBlockRangeResponseV1| v2.7.0-BlockSync  |
 /// | 21    | RecordChainCheckpointRequestV1 | v2.7.5-CheckpointProof |
 /// | 22    | RecordChainCheckpointResponseV1| v2.7.5-CheckpointProof |
+/// | 23    | ChatPullV2          | v2.8.0-ChatPullV2       |
+/// | 24    | ChatPullResponseV2  | v2.8.0-ChatPullV2       |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(deprecated)]
 pub enum MemChainMessage {
@@ -415,6 +427,92 @@ pub enum MemChainMessage {
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
+
+    // ── v2.8.0-ChatPullV2: monotonic opaque mailbox cursor (indices 23-24) ──
+    /// [index 23] Pulls one stable snapshot page using a server-issued cursor.
+    ///
+    /// An empty cursor begins a new snapshot. A non-empty cursor is an opaque,
+    /// AEAD-protected token bound to this wallet and `after_timestamp`; clients
+    /// must not parse or modify it. Existing clients continue using
+    /// [`Self::ChatPull`] and remain wire-compatible.
+    ///
+    /// ## Signature Coverage
+    /// domain="AeroNyx-ChatPull-v2" || wallet(32) ||
+    /// after_timestamp(8,LE) || cursor_len(2,LE) || cursor || limit(4,LE) ||
+    /// request_timestamp(8,LE)
+    ChatPullV2 {
+        /// Wallet requesting its own offline mailbox.
+        wallet: [u8; 32],
+        /// Optional client timestamp floor; use zero to include all pending rows.
+        after_timestamp: u64,
+        /// Empty for a new snapshot, otherwise the exact token from the prior response.
+        #[serde(deserialize_with = "deserialize_chat_pull_cursor_v2")]
+        cursor: Vec<u8>,
+        /// Maximum envelopes per page; the server clamps this to 1..=100.
+        limit: u32,
+        /// Unix epoch seconds when this request was constructed.
+        request_timestamp: u64,
+        /// Wallet signature over the canonical fields documented above.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+
+    /// [index 24] Stable snapshot page returned for [`Self::ChatPullV2`].
+    ChatPullResponseV2 {
+        /// Valid signed E2E envelopes in monotonic durable queue order.
+        envelopes: Vec<ChatEnvelope>,
+        /// Opaque cursor to echo in the next v2 request.
+        next_cursor: Vec<u8>,
+        /// Whether the current snapshot still contains another page.
+        has_more: bool,
+    },
+}
+
+fn deserialize_chat_pull_cursor_v2<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedCursorVisitor;
+
+    impl<'de> de::Visitor<'de> for BoundedCursorVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "an opaque ChatPullV2 cursor no larger than {} bytes",
+                MAX_CHAT_PULL_CURSOR_V2_BYTES
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            if sequence.size_hint().unwrap_or(0) > MAX_CHAT_PULL_CURSOR_V2_BYTES {
+                return Err(de::Error::custom(
+                    "ChatPullV2 cursor exceeds protocol limit",
+                ));
+            }
+            let mut cursor = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or(0)
+                    .min(MAX_CHAT_PULL_CURSOR_V2_BYTES),
+            );
+            while let Some(byte) = sequence.next_element::<u8>()? {
+                if cursor.len() == MAX_CHAT_PULL_CURSOR_V2_BYTES {
+                    return Err(de::Error::custom(
+                        "ChatPullV2 cursor exceeds protocol limit",
+                    ));
+                }
+                cursor.push(byte);
+            }
+            Ok(cursor)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedCursorVisitor)
 }
 
 /// Canonical bytes signed by `RecordBlockRangeRequestV1.requester`.
@@ -906,6 +1004,90 @@ mod tests {
             22,
             "RecordChainCheckpointResponseV1 must be discriminant 22"
         );
+
+        let b = bincode::serialize(&MemChainMessage::ChatPullV2 {
+            wallet: [0x55; 32],
+            after_timestamp: 0,
+            cursor: vec![],
+            limit: 100,
+            request_timestamp: 1_700_000_006,
+            signature: [0u8; 64],
+        })
+        .unwrap();
+        assert_eq!(disc(&b), 23, "ChatPullV2 must be discriminant 23");
+
+        let b = bincode::serialize(&MemChainMessage::ChatPullResponseV2 {
+            envelopes: vec![],
+            next_cursor: vec![0x77; 57],
+            has_more: true,
+        })
+        .unwrap();
+        assert_eq!(disc(&b), 24, "ChatPullResponseV2 must be discriminant 24");
+    }
+
+    #[test]
+    fn test_chat_pull_v2_roundtrip_and_cursor_bound() {
+        let request = MemChainMessage::ChatPullV2 {
+            wallet: [0x51; 32],
+            after_timestamp: 1_700_100_000,
+            cursor: vec![0xA5; 57],
+            limit: 25,
+            request_timestamp: 1_700_100_001,
+            signature: [0x7C; 64],
+        };
+        let encoded = encode_memchain(&request).expect("encode bounded ChatPullV2");
+        let decoded = decode_memchain(&encoded[1..]).expect("decode bounded ChatPullV2");
+        match decoded {
+            MemChainMessage::ChatPullV2 {
+                wallet,
+                after_timestamp,
+                cursor,
+                limit,
+                request_timestamp,
+                signature,
+            } => {
+                assert_eq!(wallet, [0x51; 32]);
+                assert_eq!(after_timestamp, 1_700_100_000);
+                assert_eq!(cursor, vec![0xA5; 57]);
+                assert_eq!(limit, 25);
+                assert_eq!(request_timestamp, 1_700_100_001);
+                assert_eq!(signature, [0x7C; 64]);
+            }
+            other => panic!("Expected ChatPullV2, got {:?}", other),
+        }
+
+        let oversized = MemChainMessage::ChatPullV2 {
+            wallet: [0x51; 32],
+            after_timestamp: 0,
+            cursor: vec![0xA5; MAX_CHAT_PULL_CURSOR_V2_BYTES + 1],
+            limit: 25,
+            request_timestamp: 1_700_100_001,
+            signature: [0x7C; 64],
+        };
+        let encoded = encode_memchain(&oversized).expect("serialization remains infallible");
+        assert!(
+            decode_memchain(&encoded[1..]).is_err(),
+            "oversized ChatPullV2 cursor must be rejected during decode"
+        );
+
+        let response = MemChainMessage::ChatPullResponseV2 {
+            envelopes: vec![],
+            next_cursor: vec![0x42; 57],
+            has_more: false,
+        };
+        let encoded = encode_memchain(&response).expect("encode ChatPullResponseV2");
+        match decode_memchain(&encoded[1..]).expect("decode ChatPullResponseV2") {
+            MemChainMessage::ChatPullResponseV2 {
+                envelopes,
+                next_cursor,
+                has_more,
+            } => {
+                assert!(envelopes.is_empty());
+                assert_eq!(next_cursor, vec![0x42; 57]);
+                assert!(!has_more);
+            }
+            other => panic!("Expected ChatPullResponseV2, got {:?}", other),
+        }
     }
 
     #[test]

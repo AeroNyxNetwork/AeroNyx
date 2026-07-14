@@ -11,6 +11,8 @@
 //   unchanged; sensitive sign input/hash/pubkey material is no longer emitted.
 //   Also corrected the non-matching-public-key rejection test so it remains
 //   stable across Ed25519 dependency versions.
+//   v1.4.0-ChatPullV2 — Added a separate domain for monotonic opaque-cursor
+//   mailbox pagination without changing the deployed v1 signature contract.
 //
 // Main Functionality:
 //   - verify_signed_message(): canonical Ed25519 verification with:
@@ -46,6 +48,7 @@
 //     accidental leakage of internal crypto error detail to callers.
 //
 // Last Modified:
+//   v1.4.0-ChatPullV2 — Added DOMAIN_CHAT_PULL_V2
 //   v1.3.0-Sovereign — Initial implementation
 //   v1.3.1-PrivacyHardening — Removed sensitive verification logs and fixed
 //                              non-matching-public-key rejection test
@@ -66,6 +69,9 @@ pub const DOMAIN_DEVICE_REGISTER: &str = "AeroNyx-DeviceRegister-v1";
 
 /// Domain separator for ChatPull messages.
 pub const DOMAIN_CHAT_PULL: &str = "AeroNyx-ChatPull-v1";
+
+/// Domain separator for monotonic opaque-cursor `ChatPullV2` messages.
+pub const DOMAIN_CHAT_PULL_V2: &str = "AeroNyx-ChatPull-v2";
 
 /// Domain separator for ChatAck messages.
 pub const DOMAIN_CHAT_ACK: &str = "AeroNyx-ChatAck-v1";

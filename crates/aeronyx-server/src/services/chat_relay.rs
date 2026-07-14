@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 1.9.0-DurableQuarantine
+// Version: 2.0.0-SnapshotPull
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -25,6 +25,8 @@
 //   v1.9.0-DurableQuarantine — Added privacy-minimised corrupt-row tombstones,
 //   poison-row isolation, complete durable-envelope consistency checks, and
 //   atomic concurrent online deduplication.
+//   v2.0.0-SnapshotPull — Added a durable monotonic queue sequence and an
+//   authenticated opaque cursor for stable ChatPullV2 snapshot pagination.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -38,6 +40,7 @@
 //   - Durable queue quotas: per-receiver and node-wide count/byte ceilings
 //   - Maintenance telemetry: aggregate TTL cleanup, batch, and backlog evidence
 //   - Durable quarantine: bounded de-identified evidence for corrupt relay rows
+//   - Snapshot pull: restart-stable pagination that excludes concurrent inserts
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -69,12 +72,16 @@
 //     evidence; never silently skip them or copy raw routing metadata.
 //   - Pending-message pages are ordered by message_id because the v1 wire
 //     cursor contains only message_id. Chronological display belongs client-side.
+//   - ChatPullV2 queue_sequence is an internal ordering primitive. Never expose
+//     it on the wire or in logs; only issue the AEAD-protected opaque cursor.
 //   - Retention cleanup is batch-bounded. Do not replace it with an unbounded
 //     SELECT/DELETE or hold the SQLite connection across multiple batches.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v2.0.0-SnapshotPull — Monotonic queue sequence, atomic legacy backfill,
+//     and wallet-bound XChaCha20-Poly1305 snapshot cursors
 //   v1.9.0-DurableQuarantine — Poison-row isolation, private tombstones,
 //     durable metadata/signature validation, and atomic live-path deduplication
 //   v1.8.0-BoundedMaintenance — Bounded transactions and backlog observability
@@ -93,9 +100,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chacha20poly1305::{
+    aead::{Aead, NewAead, Payload},
+    Key, XChaCha20Poly1305, XNonce,
+};
 use dashmap::{mapref::entry::Entry, DashMap};
 use hmac::{Hmac, Mac};
 use parking_lot::{Mutex, RwLock};
+use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -135,6 +147,18 @@ const CLEANUP_MAX_BATCHES_PER_RUN: usize = 8;
 const MAX_QUARANTINE_EVENTS: usize = 4096;
 const QUARANTINE_SOURCE_PENDING_MESSAGE: &str = "pending_message";
 const QUARANTINE_SOURCE_EXPIRED_NOTIFICATION: &str = "expired_notification";
+/// Current binary format for an opaque ChatPullV2 cursor.
+const CHAT_PULL_CURSOR_V2_VERSION: u8 = 1;
+const CHAT_PULL_CURSOR_V2_NONCE_BYTES: usize = 24;
+const CHAT_PULL_CURSOR_V2_PAYLOAD_BYTES: usize = 16;
+const CHAT_PULL_CURSOR_V2_TAG_BYTES: usize = 16;
+const CHAT_PULL_CURSOR_V2_BYTES: usize = 1
+    + CHAT_PULL_CURSOR_V2_NONCE_BYTES
+    + CHAT_PULL_CURSOR_V2_PAYLOAD_BYTES
+    + CHAT_PULL_CURSOR_V2_TAG_BYTES;
+const CHAT_PULL_CURSOR_V2_AAD_DOMAIN: &[u8] = b"AeroNyx-ChatPullCursor-v2";
+const CHAT_PULL_CURSOR_V2_HKDF_SALT: &[u8] = b"AeroNyx-ChatPullCursor-v2-key";
+const CHAT_PULL_CURSOR_V2_HKDF_INFO: &[u8] = b"XChaCha20-Poly1305";
 
 // ============================================
 // Peer relay health status
@@ -259,6 +283,18 @@ pub enum ChatRelayError {
     #[error("Message ID conflicts with an existing durable envelope")]
     MessageIdConflict,
 
+    /// A ChatPullV2 cursor has an invalid length, version, binding, or tag.
+    #[error("Invalid or expired opaque pull cursor")]
+    InvalidPullCursor,
+
+    /// The node could not derive or encrypt an opaque ChatPullV2 cursor.
+    #[error("Unable to protect opaque pull cursor")]
+    PullCursorEncryptionFailed,
+
+    /// The durable monotonic queue sequence reached SQLite INTEGER capacity.
+    #[error("Durable relay queue sequence exhausted")]
+    QueueSequenceExhausted,
+
     /// Encrypted message ciphertext exceeds the configured item ceiling.
     #[error("Message too large: {size} bytes (limit {limit})")]
     MessageTooLarge {
@@ -358,6 +394,9 @@ impl ChatRelayError {
             Self::CorruptStoredData { .. } => "corrupt_stored_data",
             Self::TimestampOutOfRange => "timestamp_out_of_range",
             Self::MessageIdConflict => "message_id_conflict",
+            Self::InvalidPullCursor => "invalid_pull_cursor",
+            Self::PullCursorEncryptionFailed => "pull_cursor_encryption_failed",
+            Self::QueueSequenceExhausted => "queue_sequence_exhausted",
             Self::MessageTooLarge { .. } => "message_too_large",
             Self::MailboxFull { .. } => "mailbox_full",
             Self::PendingMessageQueueFull { .. } => "pending_message_count_quota",
@@ -459,6 +498,23 @@ pub struct PendingMessage {
     pub envelope: ChatEnvelope,
 }
 
+/// One stable ChatPullV2 page and the opaque continuation state for it.
+#[derive(Debug)]
+pub struct PendingMessagePageV2 {
+    /// Valid signed envelopes returned to the authenticated receiver.
+    pub messages: Vec<PendingMessage>,
+    /// AEAD-protected continuation cursor. An empty request cursor starts a new snapshot.
+    pub next_cursor: Vec<u8>,
+    /// Whether the caller should continue the current snapshot with `next_cursor`.
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PullCursorV2 {
+    position: u64,
+    ceiling: u64,
+}
+
 #[derive(Debug)]
 struct ExpiredMessageRow {
     message_id: [u8; 16],
@@ -486,6 +542,12 @@ struct StoredPendingMessageRow {
 }
 
 #[derive(Debug)]
+struct StoredSequencedPendingMessageRow {
+    queue_sequence: i64,
+    row: StoredPendingMessageRow,
+}
+
+#[derive(Debug)]
 struct StoredExpiredMessageRow {
     rowid: i64,
     message_id: Vec<u8>,
@@ -493,6 +555,7 @@ struct StoredExpiredMessageRow {
     receiver: Vec<u8>,
     timestamp: i64,
     envelope: Vec<u8>,
+    queue_sequence: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -648,6 +711,8 @@ pub struct ChatRelayService {
     config: ChatRelayConfig,
     conn: Mutex<Connection>,
     node_secret: [u8; 32],
+    /// Stable node-local AEAD key for opaque v2 pull cursors.
+    pull_cursor_key: [u8; 32],
     dedup: MessageDedup,
     peer_status: RwLock<ChatRelayPeerStatus>,
     maintenance_status: RwLock<ChatRelayMaintenanceStatus>,
@@ -680,10 +745,12 @@ impl ChatRelayService {
 
         let dedup_capacity = config.dedup_lru_capacity;
         let relay_enabled = config.enabled;
+        let pull_cursor_key = Self::derive_pull_cursor_key(&node_secret)?;
         let svc = Self {
             config,
             conn: Mutex::new(conn),
             node_secret,
+            pull_cursor_key,
             dedup: MessageDedup::new(dedup_capacity),
             peer_status: RwLock::new(ChatRelayPeerStatus::new(relay_enabled)),
             maintenance_status: RwLock::new(ChatRelayMaintenanceStatus::default()),
@@ -704,8 +771,8 @@ impl ChatRelayService {
     // ============================================
 
     fn init_schema(&self) -> ChatRelayResult<()> {
-        let conn = self.conn.lock();
-        Self::init_pending_message_schema(&conn)?;
+        let mut conn = self.conn.lock();
+        Self::init_pending_message_schema(&mut conn)?;
         Self::init_blob_and_notification_schema(&conn)?;
         Self::init_quarantine_schema(&conn)?;
         Self::init_usage_schema(&conn)?;
@@ -720,7 +787,7 @@ impl ChatRelayService {
         Ok(())
     }
 
-    fn init_pending_message_schema(conn: &Connection) -> ChatRelayResult<()> {
+    fn init_pending_message_schema(conn: &mut Connection) -> ChatRelayResult<()> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS pending_messages (
@@ -730,7 +797,8 @@ impl ChatRelayService {
                 timestamp    INTEGER  NOT NULL,
                 envelope     BLOB     NOT NULL,
                 received_at  INTEGER  NOT NULL,
-                status       INTEGER  NOT NULL DEFAULT 0
+                status       INTEGER  NOT NULL DEFAULT 0,
+                queue_sequence INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_pm_receiver_status
                 ON pending_messages(receiver, status);
@@ -742,7 +810,130 @@ impl ChatRelayService {
                 ON pending_messages(status, received_at, message_id);
             ",
         )?;
+
+        // Upgrade legacy queues atomically. Existing positive unique sequence
+        // values are stable across restarts; only missing/invalid/duplicate
+        // values are assigned above the current maximum. No routing metadata
+        // leaves SQLite during this migration.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Self::pending_message_column_exists(&tx, "queue_sequence")? {
+            tx.execute(
+                "ALTER TABLE pending_messages ADD COLUMN queue_sequence INTEGER",
+                [],
+            )?;
+        }
+        tx.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS relay_queue_sequence (
+                singleton     INTEGER PRIMARY KEY CHECK(singleton = 1),
+                last_sequence INTEGER NOT NULL CHECK(last_sequence >= 0)
+            );
+            INSERT OR IGNORE INTO relay_queue_sequence (singleton, last_sequence)
+            VALUES (1, 0);
+            ",
+        )?;
+
+        let mut seen_sequences = HashSet::new();
+        let mut max_sequence = 0_i64;
+        let mut rowids_to_assign = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT rowid, queue_sequence
+                 FROM pending_messages
+                 ORDER BY rowid ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            })?;
+            for row in rows {
+                let (rowid, sequence) = row?;
+                match sequence {
+                    Some(sequence) if sequence > 0 && seen_sequences.insert(sequence) => {
+                        max_sequence = max_sequence.max(sequence);
+                    }
+                    _ => rowids_to_assign.push(rowid),
+                }
+            }
+        }
+
+        let persisted_last = tx.query_row(
+            "SELECT last_sequence FROM relay_queue_sequence WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if persisted_last < 0 {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "relay_queue_sequence_negative",
+            });
+        }
+        max_sequence = max_sequence.max(persisted_last);
+        for rowid in rowids_to_assign {
+            max_sequence = max_sequence
+                .checked_add(1)
+                .ok_or(ChatRelayError::QueueSequenceExhausted)?;
+            if tx.execute(
+                "UPDATE pending_messages SET queue_sequence = ?1 WHERE rowid = ?2",
+                params![max_sequence, rowid],
+            )? != 1
+            {
+                return Err(ChatRelayError::CorruptStoredData {
+                    field: "pending_message_sequence_backfill_count",
+                });
+            }
+        }
+        tx.execute(
+            "UPDATE relay_queue_sequence
+             SET last_sequence = ?1
+             WHERE singleton = 1",
+            params![max_sequence],
+        )?;
+        tx.execute_batch(
+            "
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pm_queue_sequence
+                ON pending_messages(queue_sequence);
+            CREATE INDEX IF NOT EXISTS idx_pm_receiver_snapshot_v2
+                ON pending_messages(receiver, status, queue_sequence, timestamp);
+            ",
+        )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    fn pending_message_column_exists(
+        tx: &Transaction<'_>,
+        expected_column: &str,
+    ) -> ChatRelayResult<bool> {
+        let mut stmt = tx.prepare("PRAGMA table_info(pending_messages)")?;
+        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for column in columns {
+            if column? == expected_column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn allocate_queue_sequence(tx: &Transaction<'_>) -> ChatRelayResult<i64> {
+        let updated = tx.execute(
+            "UPDATE relay_queue_sequence
+             SET last_sequence = last_sequence + 1
+             WHERE singleton = 1 AND last_sequence < ?1",
+            params![i64::MAX],
+        )?;
+        if updated != 1 {
+            return Err(ChatRelayError::QueueSequenceExhausted);
+        }
+        let sequence = tx.query_row(
+            "SELECT last_sequence FROM relay_queue_sequence WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if sequence <= 0 {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "relay_queue_sequence_nonpositive",
+            });
+        }
+        Ok(sequence)
     }
 
     fn init_blob_and_notification_schema(conn: &Connection) -> ChatRelayResult<()> {
@@ -905,6 +1096,109 @@ impl ChatRelayService {
             [],
         )?;
         Ok(())
+    }
+
+    // ============================================
+    // Opaque ChatPullV2 cursor protection
+    // ============================================
+
+    fn derive_pull_cursor_key(node_secret: &[u8; 32]) -> ChatRelayResult<[u8; 32]> {
+        let hkdf = hkdf::Hkdf::<Sha256>::new(Some(CHAT_PULL_CURSOR_V2_HKDF_SALT), node_secret);
+        let mut key = [0_u8; 32];
+        hkdf.expand(CHAT_PULL_CURSOR_V2_HKDF_INFO, &mut key)
+            .map_err(|_| ChatRelayError::PullCursorEncryptionFailed)?;
+        Ok(key)
+    }
+
+    fn pull_cursor_v2_aad(receiver: &[u8; 32], after_timestamp: u64) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(
+            CHAT_PULL_CURSOR_V2_AAD_DOMAIN.len() + receiver.len() + std::mem::size_of::<u64>(),
+        );
+        aad.extend_from_slice(CHAT_PULL_CURSOR_V2_AAD_DOMAIN);
+        aad.extend_from_slice(receiver);
+        aad.extend_from_slice(&after_timestamp.to_le_bytes());
+        aad
+    }
+
+    fn encode_pull_cursor_v2(
+        &self,
+        receiver: &[u8; 32],
+        after_timestamp: u64,
+        cursor: PullCursorV2,
+    ) -> ChatRelayResult<Vec<u8>> {
+        if cursor.position > cursor.ceiling {
+            return Err(ChatRelayError::PullCursorEncryptionFailed);
+        }
+
+        let mut plaintext = [0_u8; CHAT_PULL_CURSOR_V2_PAYLOAD_BYTES];
+        plaintext[..8].copy_from_slice(&cursor.position.to_le_bytes());
+        plaintext[8..].copy_from_slice(&cursor.ceiling.to_le_bytes());
+
+        let mut nonce_bytes = [0_u8; CHAT_PULL_CURSOR_V2_NONCE_BYTES];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&self.pull_cursor_key));
+        let aad = Self::pull_cursor_v2_aad(receiver, after_timestamp);
+        let ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: &plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| ChatRelayError::PullCursorEncryptionFailed)?;
+        if ciphertext.len() != CHAT_PULL_CURSOR_V2_PAYLOAD_BYTES + CHAT_PULL_CURSOR_V2_TAG_BYTES {
+            return Err(ChatRelayError::PullCursorEncryptionFailed);
+        }
+
+        let mut encoded = Vec::with_capacity(CHAT_PULL_CURSOR_V2_BYTES);
+        encoded.push(CHAT_PULL_CURSOR_V2_VERSION);
+        encoded.extend_from_slice(&nonce_bytes);
+        encoded.extend_from_slice(&ciphertext);
+        Ok(encoded)
+    }
+
+    fn decode_pull_cursor_v2(
+        &self,
+        receiver: &[u8; 32],
+        after_timestamp: u64,
+        encoded: &[u8],
+    ) -> ChatRelayResult<PullCursorV2> {
+        if encoded.len() != CHAT_PULL_CURSOR_V2_BYTES
+            || encoded.first().copied() != Some(CHAT_PULL_CURSOR_V2_VERSION)
+        {
+            return Err(ChatRelayError::InvalidPullCursor);
+        }
+
+        let nonce_start = 1;
+        let ciphertext_start = nonce_start + CHAT_PULL_CURSOR_V2_NONCE_BYTES;
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&self.pull_cursor_key));
+        let aad = Self::pull_cursor_v2_aad(receiver, after_timestamp);
+        let plaintext = cipher
+            .decrypt(
+                XNonce::from_slice(&encoded[nonce_start..ciphertext_start]),
+                Payload {
+                    msg: &encoded[ciphertext_start..],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| ChatRelayError::InvalidPullCursor)?;
+        if plaintext.len() != CHAT_PULL_CURSOR_V2_PAYLOAD_BYTES {
+            return Err(ChatRelayError::InvalidPullCursor);
+        }
+
+        let mut position_bytes = [0_u8; 8];
+        position_bytes.copy_from_slice(&plaintext[..8]);
+        let mut ceiling_bytes = [0_u8; 8];
+        ceiling_bytes.copy_from_slice(&plaintext[8..]);
+        let cursor = PullCursorV2 {
+            position: u64::from_le_bytes(position_bytes),
+            ceiling: u64::from_le_bytes(ceiling_bytes),
+        };
+        if cursor.position > cursor.ceiling || cursor.ceiling > i64::MAX as u64 {
+            return Err(ChatRelayError::InvalidPullCursor);
+        }
+        Ok(cursor)
     }
 
     // ============================================
@@ -1160,10 +1454,15 @@ impl ChatRelayService {
             });
         }
 
+        // Allocate only after idempotence and all quotas pass. The sequence
+        // update and row insert share this transaction, so failed inserts do
+        // not consume observable ordering state.
+        let queue_sequence = Self::allocate_queue_sequence(&tx)?;
         tx.execute(
-            "INSERT OR IGNORE INTO pending_messages
-             (message_id, sender, receiver, timestamp, envelope, received_at, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            "INSERT INTO pending_messages
+             (message_id, sender, receiver, timestamp, envelope, received_at, status,
+              queue_sequence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
             params![
                 envelope.message_id.as_slice(),
                 envelope.sender.as_slice(),
@@ -1171,6 +1470,7 @@ impl ChatRelayService {
                 envelope_timestamp,
                 envelope_bytes,
                 received_at,
+                queue_sequence,
             ],
         )?;
         tx.commit()?;
@@ -1232,6 +1532,39 @@ impl ChatRelayService {
             message_id,
             envelope,
         })
+    }
+
+    fn quarantine_pending_pull_rows(
+        &self,
+        conn: &mut Connection,
+        corrupt_rows: &[CorruptDurableRow],
+    ) -> ChatRelayResult<()> {
+        if corrupt_rows.is_empty() {
+            return Ok(());
+        }
+
+        let quarantine_now = now_secs();
+        let quarantine_now_i64 = i64::try_from(quarantine_now).unwrap_or(i64::MAX);
+        let retention_cutoff = self.quarantine_retention_cutoff(quarantine_now_i64);
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::insert_quarantine_events(&tx, quarantine_now_i64, corrupt_rows)?;
+        Self::delete_pending_rows_by_rowid(&tx, corrupt_rows)?;
+        let removed_events = Self::trim_quarantine_events(&tx, retention_cutoff)?;
+        let retained_events = Self::quarantine_event_count(&tx)?;
+        tx.commit()?;
+
+        self.record_pull_quarantine(
+            quarantine_now,
+            corrupt_rows.len(),
+            0,
+            removed_events,
+            retained_events,
+        );
+        warn!(
+            quarantined_pending_messages = corrupt_rows.len(),
+            "[CHAT_RELAY] Corrupt pending rows isolated during pull"
+        );
+        Ok(())
     }
 
     /// Retrieves a page of pending messages for the given receiver wallet.
@@ -1300,36 +1633,163 @@ impl ChatRelayService {
             }
         }
 
-        if corrupt_rows.is_empty() {
-            drop(conn);
-        } else {
-            let quarantine_now = now_secs();
-            let quarantine_now_i64 = i64::try_from(quarantine_now).unwrap_or(i64::MAX);
-            let retention_cutoff = self.quarantine_retention_cutoff(quarantine_now_i64);
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            Self::insert_quarantine_events(&tx, quarantine_now_i64, &corrupt_rows)?;
-            Self::delete_pending_rows_by_rowid(&tx, &corrupt_rows)?;
-            let removed_events = Self::trim_quarantine_events(&tx, retention_cutoff)?;
-            let retained_events = Self::quarantine_event_count(&tx)?;
-            tx.commit()?;
-            drop(conn);
-
-            self.record_pull_quarantine(
-                quarantine_now,
-                corrupt_rows.len(),
-                0,
-                removed_events,
-                retained_events,
-            );
-            warn!(
-                quarantined_pending_messages = corrupt_rows.len(),
-                "[CHAT_RELAY] Corrupt pending rows isolated during pull"
-            );
-        }
+        self.quarantine_pending_pull_rows(&mut conn, &corrupt_rows)?;
+        drop(conn);
 
         let has_more = raw_has_more || messages.len() > page_limit;
         messages.truncate(page_limit);
         Ok((messages, has_more))
+    }
+
+    /// Retrieves one stable monotonic snapshot page for ChatPullV2.
+    ///
+    /// An empty cursor captures the current receiver-specific sequence ceiling.
+    /// Later inserts receive larger sequences and cannot move into that snapshot,
+    /// preventing duplicate/skip behavior while the client paginates. The
+    /// sequence and ceiling remain node-internal inside an AEAD-protected cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatRelayError::InvalidPullCursor`] for tampered, cross-wallet,
+    /// cross-filter, malformed, or foreign-node cursors. Corrupt durable rows are
+    /// atomically quarantined using the same path as v1 pulls.
+    pub fn pull_pending_v2(
+        &self,
+        receiver: &[u8; 32],
+        after_timestamp: u64,
+        encoded_cursor: &[u8],
+        limit: u32,
+    ) -> ChatRelayResult<PendingMessagePageV2> {
+        let page_limit = usize::try_from(limit.clamp(1, 100)).unwrap_or(100);
+        let effective_limit = page_limit.saturating_add(1);
+        let query_after_timestamp = i64::try_from(after_timestamp).unwrap_or(i64::MAX);
+        let query_limit = i64::try_from(effective_limit).unwrap_or(i64::MAX);
+
+        let mut conn = self.conn.lock();
+        let cursor = if encoded_cursor.is_empty() {
+            let ceiling = conn.query_row(
+                "SELECT COALESCE(MAX(queue_sequence), 0)
+                 FROM pending_messages
+                 WHERE receiver = ?1
+                   AND status = 0
+                   AND timestamp > ?2
+                   AND queue_sequence > 0",
+                params![receiver.as_slice(), query_after_timestamp],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if ceiling < 0 {
+                return Err(ChatRelayError::CorruptStoredData {
+                    field: "pending_message_snapshot_ceiling",
+                });
+            }
+            PullCursorV2 {
+                position: 0,
+                ceiling: u64::try_from(ceiling).unwrap_or(0),
+            }
+        } else {
+            self.decode_pull_cursor_v2(receiver, after_timestamp, encoded_cursor)?
+        };
+
+        let query_position =
+            i64::try_from(cursor.position).map_err(|_| ChatRelayError::InvalidPullCursor)?;
+        let query_ceiling =
+            i64::try_from(cursor.ceiling).map_err(|_| ChatRelayError::InvalidPullCursor)?;
+        let mut stmt = conn.prepare(
+            "SELECT queue_sequence, rowid, message_id, sender, receiver, timestamp, envelope
+             FROM pending_messages
+             WHERE receiver = ?1
+               AND status = 0
+               AND timestamp > ?2
+               AND queue_sequence > ?3
+               AND queue_sequence <= ?4
+             ORDER BY queue_sequence ASC
+             LIMIT ?5",
+        )?;
+        let rows: Vec<StoredSequencedPendingMessageRow> = stmt
+            .query_map(
+                params![
+                    receiver.as_slice(),
+                    query_after_timestamp,
+                    query_position,
+                    query_ceiling,
+                    query_limit,
+                ],
+                |row| {
+                    Ok(StoredSequencedPendingMessageRow {
+                        queue_sequence: row.get(0)?,
+                        row: StoredPendingMessageRow {
+                            rowid: row.get(1)?,
+                            message_id: row.get(2)?,
+                            sender: row.get(3)?,
+                            receiver: row.get(4)?,
+                            timestamp: row.get(5)?,
+                            envelope: row.get(6)?,
+                        },
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+        drop(stmt);
+
+        let raw_has_more = rows.len() == effective_limit;
+        let raw_max_sequence = rows
+            .last()
+            .and_then(|row| u64::try_from(row.queue_sequence).ok());
+        let mut valid_messages = Vec::with_capacity(rows.len().min(page_limit));
+        let mut corrupt_rows = Vec::new();
+        for stored in rows {
+            let sequence = match u64::try_from(stored.queue_sequence) {
+                Ok(sequence) if sequence > 0 => sequence,
+                _ => {
+                    corrupt_rows.push(CorruptDurableRow {
+                        row_key: stored.row.rowid,
+                        source_kind: QUARANTINE_SOURCE_PENDING_MESSAGE,
+                        reason: "pending_message_queue_sequence",
+                        encoded_bytes: u64::try_from(stored.row.envelope.len()).unwrap_or(u64::MAX),
+                    });
+                    continue;
+                }
+            };
+            match Self::validate_pending_message_row(stored.row, receiver) {
+                Ok(message) => valid_messages.push((sequence, message)),
+                Err(corrupt) => corrupt_rows.push(corrupt),
+            }
+        }
+
+        self.quarantine_pending_pull_rows(&mut conn, &corrupt_rows)?;
+        drop(conn);
+
+        let valid_overflow = valid_messages.len() > page_limit;
+        let has_more = raw_has_more || valid_overflow;
+        let next_position = if valid_overflow {
+            valid_messages
+                .get(page_limit.saturating_sub(1))
+                .map(|(sequence, _)| *sequence)
+                .unwrap_or(cursor.position)
+        } else if has_more {
+            raw_max_sequence.unwrap_or(cursor.position)
+        } else {
+            cursor.ceiling
+        };
+        valid_messages.truncate(page_limit);
+        let messages = valid_messages
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect();
+        let next_cursor = self.encode_pull_cursor_v2(
+            receiver,
+            after_timestamp,
+            PullCursorV2 {
+                position: next_position,
+                ceiling: cursor.ceiling,
+            },
+        )?;
+
+        Ok(PendingMessagePageV2 {
+            messages,
+            next_cursor,
+            has_more,
+        })
     }
 
     /// Acknowledges delivery of a batch of messages, deleting them from the store.
@@ -1927,7 +2387,7 @@ impl ChatRelayService {
         limit: i64,
     ) -> ChatRelayResult<ValidatedExpiredMessageBatch> {
         let mut stmt = tx.prepare(
-            "SELECT rowid, message_id, sender, receiver, timestamp, envelope
+            "SELECT rowid, message_id, sender, receiver, timestamp, envelope, queue_sequence
              FROM pending_messages
              WHERE status = 0 AND received_at < ?1
              ORDER BY received_at ASC, message_id ASC
@@ -1942,6 +2402,7 @@ impl ChatRelayService {
                     receiver: row.get(3)?,
                     timestamp: row.get(4)?,
                     envelope: row.get(5)?,
+                    queue_sequence: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, rusqlite::Error>>()?;
@@ -1989,6 +2450,13 @@ impl ChatRelayService {
                 }
                 if envelope.timestamp != timestamp {
                     return Err(corrupt("expired_message_timestamp_mismatch"));
+                }
+                envelope
+                    .verify_signature()
+                    .map_err(|_| corrupt("expired_message_signature"))?;
+                match row.queue_sequence {
+                    Some(sequence) if sequence > 0 => {}
+                    _ => return Err(corrupt("expired_message_queue_sequence")),
                 }
                 Ok::<ExpiredMessageRow, CorruptDurableRow>(ExpiredMessageRow {
                     message_id,
@@ -2315,6 +2783,7 @@ mod tests {
     use aeronyx_core::protocol::chat::ChatContentType;
     use sha2::{Digest, Sha256};
     use std::net::SocketAddr;
+    use std::path::{Path, PathBuf};
     use std::sync::Barrier;
 
     fn test_config() -> ChatRelayConfig {
@@ -2345,7 +2814,23 @@ mod tests {
         ChatRelayService::new(config, secret).expect("init")
     }
 
+    fn unique_test_db_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aeronyx-chat-relay-{}-{}-{}.sqlite",
+            label,
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
+
+    fn remove_test_db(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     fn insert_expired_pending_rows(svc: &ChatRelayService, count: usize, prefix: u8) {
+        let identity = IdentityKeyPair::generate();
         let mut conn = svc.conn.lock();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2354,8 +2839,9 @@ mod tests {
             let mut stmt = tx
                 .prepare(
                     "INSERT INTO pending_messages
-                     (message_id, sender, receiver, timestamp, envelope, received_at, status)
-                     VALUES (?1, ?2, ?3, 0, ?4, 0, 0)",
+                     (message_id, sender, receiver, timestamp, envelope, received_at, status,
+                      queue_sequence)
+                     VALUES (?1, ?2, ?3, 0, ?4, 0, 0, ?5)",
                 )
                 .expect("prepare bulk pending insert");
             for sequence in 0..count {
@@ -2363,9 +2849,9 @@ mod tests {
                 message_id[0] = prefix;
                 message_id[8..]
                     .copy_from_slice(&u64::try_from(sequence).unwrap_or(u64::MAX).to_be_bytes());
-                let envelope = ChatEnvelope {
+                let mut envelope = ChatEnvelope {
                     message_id,
-                    sender: [0xA2u8; 32],
+                    sender: identity.public_key_bytes(),
                     receiver: [0xA3u8; 32],
                     timestamp: 0,
                     ciphertext: vec![0xA4],
@@ -2373,12 +2859,16 @@ mod tests {
                     content_type: ChatContentType::System,
                     signature: [0u8; 64],
                 };
+                envelope.signature = identity.sign(&envelope.sign_data());
                 let encoded_envelope = encode_envelope(&envelope).expect("encode expired envelope");
+                let queue_sequence = ChatRelayService::allocate_queue_sequence(&tx)
+                    .expect("allocate test queue sequence");
                 stmt.execute(params![
                     message_id.as_slice(),
                     envelope.sender.as_slice(),
                     envelope.receiver.as_slice(),
                     encoded_envelope,
+                    queue_sequence,
                 ])
                 .expect("insert expired pending row");
             }
@@ -2486,6 +2976,79 @@ mod tests {
         let (m, b) = svc.run_cleanup().expect("cleanup");
         assert_eq!(m, 0);
         assert_eq!(b, 0);
+    }
+
+    #[test]
+    fn test_legacy_queue_sequence_migration_is_atomic_and_restart_stable() {
+        let path = unique_test_db_path("sequence-migration");
+        {
+            let conn = Connection::open(&path).expect("open legacy database");
+            conn.execute_batch(
+                "CREATE TABLE pending_messages (
+                    message_id  BLOB(16) PRIMARY KEY,
+                    sender      BLOB(32) NOT NULL,
+                    receiver    BLOB(32) NOT NULL,
+                    timestamp   INTEGER NOT NULL,
+                    envelope    BLOB NOT NULL,
+                    received_at INTEGER NOT NULL,
+                    status      INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .expect("create legacy pending schema");
+            for marker in [0x11_u8, 0x22] {
+                conn.execute(
+                    "INSERT INTO pending_messages
+                     (message_id, sender, receiver, timestamp, envelope, received_at, status)
+                     VALUES (?1, ?2, ?3, 1, ?4, 1, 0)",
+                    params![
+                        [marker; 16].as_slice(),
+                        [0x31_u8; 32].as_slice(),
+                        [0x41_u8; 32].as_slice(),
+                        [0x51_u8].as_slice(),
+                    ],
+                )
+                .expect("insert legacy row");
+            }
+        }
+
+        let mut config = test_config();
+        config.db_path = path.to_string_lossy().into_owned();
+        let secret = derive_node_secret(&[0x42; 32]);
+        {
+            let svc = ChatRelayService::new(config.clone(), secret).expect("migrate legacy queue");
+            let conn = svc.conn.lock();
+            let mut stmt = conn
+                .prepare("SELECT queue_sequence FROM pending_messages ORDER BY rowid")
+                .expect("prepare migrated sequence query");
+            let sequences: Vec<i64> = stmt
+                .query_map([], |row| row.get(0))
+                .expect("query migrated sequences")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect migrated sequences");
+            assert_eq!(sequences, vec![1, 2]);
+            let last: i64 = conn
+                .query_row(
+                    "SELECT last_sequence FROM relay_queue_sequence WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read migrated high-water mark");
+            assert_eq!(last, 2);
+        }
+        {
+            let svc = ChatRelayService::new(config, secret).expect("reopen migrated queue");
+            let conn = svc.conn.lock();
+            let mut stmt = conn
+                .prepare("SELECT queue_sequence FROM pending_messages ORDER BY rowid")
+                .expect("prepare restart sequence query");
+            let sequences: Vec<i64> = stmt
+                .query_map([], |row| row.get(0))
+                .expect("query restart sequences")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect restart sequences");
+            assert_eq!(sequences, vec![1, 2]);
+        }
+        remove_test_db(&path);
     }
 
     #[test]
@@ -3051,6 +3614,226 @@ mod tests {
             .map(|(_, message_id)| message_id)
             .collect();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_queue_sequence_is_monotonic_and_idempotent_retries_do_not_consume_it() {
+        let svc = make_service();
+        let identity = IdentityKeyPair::generate();
+        let receiver = [0xC4; 32];
+        let first = make_envelope(&identity, receiver);
+        let second = make_envelope(&identity, receiver);
+        let third = make_envelope(&identity, receiver);
+
+        svc.store_pending(&first).expect("store first");
+        svc.store_pending(&second).expect("store second");
+        svc.store_pending(&first).expect("retry first idempotently");
+        svc.store_pending(&third).expect("store third");
+
+        let conn = svc.conn.lock();
+        let sequences: Vec<i64> = conn
+            .prepare("SELECT queue_sequence FROM pending_messages ORDER BY queue_sequence")
+            .expect("prepare sequence query")
+            .query_map([], |row| row.get(0))
+            .expect("query sequences")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect sequences");
+        assert_eq!(sequences, vec![1, 2, 3]);
+        let last: i64 = conn
+            .query_row(
+                "SELECT last_sequence FROM relay_queue_sequence WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read sequence high-water mark");
+        assert_eq!(last, 3);
+    }
+
+    #[test]
+    fn test_pull_v2_snapshot_excludes_concurrent_inserts_without_skipping() {
+        let svc = make_service();
+        let identity = IdentityKeyPair::generate();
+        let receiver = [0xC5; 32];
+        let initial: Vec<ChatEnvelope> =
+            (0..3).map(|_| make_envelope(&identity, receiver)).collect();
+        for envelope in &initial {
+            svc.store_pending(envelope).expect("store snapshot fixture");
+        }
+
+        let first_page = svc
+            .pull_pending_v2(&receiver, 0, &[], 2)
+            .expect("first v2 snapshot page");
+        assert_eq!(first_page.messages.len(), 2);
+        assert!(first_page.has_more);
+        assert_eq!(first_page.next_cursor.len(), CHAT_PULL_CURSOR_V2_BYTES);
+
+        let concurrent = make_envelope(&identity, receiver);
+        svc.store_pending(&concurrent)
+            .expect("store concurrent post-snapshot message");
+        let second_page = svc
+            .pull_pending_v2(&receiver, 0, &first_page.next_cursor, 2)
+            .expect("second v2 snapshot page");
+        assert_eq!(second_page.messages.len(), 1);
+        assert!(!second_page.has_more);
+
+        let delivered: HashSet<[u8; 16]> = first_page
+            .messages
+            .iter()
+            .chain(&second_page.messages)
+            .map(|message| message.message_id)
+            .collect();
+        let expected: HashSet<[u8; 16]> =
+            initial.iter().map(|envelope| envelope.message_id).collect();
+        assert_eq!(delivered, expected);
+        assert!(!delivered.contains(&concurrent.message_id));
+
+        let delivered_ids: Vec<[u8; 16]> = delivered.into_iter().collect();
+        svc.ack_messages(&delivered_ids, &receiver)
+            .expect("ack completed snapshot");
+        let fresh_snapshot = svc
+            .pull_pending_v2(&receiver, 0, &[], 10)
+            .expect("start fresh snapshot");
+        assert_eq!(fresh_snapshot.messages.len(), 1);
+        assert_eq!(fresh_snapshot.messages[0].message_id, concurrent.message_id);
+    }
+
+    #[test]
+    fn test_pull_v2_cursor_rejects_tampering_and_binding_replay() {
+        let svc = make_service();
+        let identity = IdentityKeyPair::generate();
+        let receiver = [0xC6; 32];
+        for _ in 0..2 {
+            svc.store_pending(&make_envelope(&identity, receiver))
+                .expect("store cursor fixture");
+        }
+        let page = svc
+            .pull_pending_v2(&receiver, 0, &[], 1)
+            .expect("issue cursor");
+        let decoded = svc
+            .decode_pull_cursor_v2(&receiver, 0, &page.next_cursor)
+            .expect("decode server-owned cursor in test");
+        assert_eq!(
+            decoded,
+            PullCursorV2 {
+                position: 1,
+                ceiling: 2
+            }
+        );
+        assert!(!page
+            .next_cursor
+            .windows(8)
+            .any(|window| window == decoded.position.to_le_bytes()));
+        assert!(!page
+            .next_cursor
+            .windows(8)
+            .any(|window| window == decoded.ceiling.to_le_bytes()));
+
+        let mut tampered = page.next_cursor.clone();
+        let last = tampered.last_mut().expect("non-empty cursor");
+        *last ^= 0x01;
+        assert!(matches!(
+            svc.pull_pending_v2(&receiver, 0, &tampered, 1),
+            Err(ChatRelayError::InvalidPullCursor)
+        ));
+        assert!(matches!(
+            svc.pull_pending_v2(&[0xC7; 32], 0, &page.next_cursor, 1),
+            Err(ChatRelayError::InvalidPullCursor)
+        ));
+        assert!(matches!(
+            svc.pull_pending_v2(&receiver, 1, &page.next_cursor, 1),
+            Err(ChatRelayError::InvalidPullCursor)
+        ));
+
+        let foreign =
+            ChatRelayService::new(test_config(), [0x91; 32]).expect("create foreign-key relay");
+        assert!(matches!(
+            foreign.pull_pending_v2(&receiver, 0, &page.next_cursor, 1),
+            Err(ChatRelayError::InvalidPullCursor)
+        ));
+    }
+
+    #[test]
+    fn test_pull_v2_cursor_survives_restart_with_same_node_secret() {
+        let path = unique_test_db_path("cursor-restart");
+        let mut config = test_config();
+        config.db_path = path.to_string_lossy().into_owned();
+        let secret = derive_node_secret(&[0x62; 32]);
+        let identity = IdentityKeyPair::generate();
+        let receiver = [0xC8; 32];
+        let cursor = {
+            let svc = ChatRelayService::new(config.clone(), secret).expect("create relay");
+            for _ in 0..3 {
+                svc.store_pending(&make_envelope(&identity, receiver))
+                    .expect("store restart fixture");
+            }
+            let page = svc
+                .pull_pending_v2(&receiver, 0, &[], 2)
+                .expect("issue pre-restart cursor");
+            assert!(page.has_more);
+            page.next_cursor
+        };
+        {
+            let svc = ChatRelayService::new(config, secret).expect("restart relay");
+            let page = svc
+                .pull_pending_v2(&receiver, 0, &cursor, 2)
+                .expect("resume cursor after restart");
+            assert_eq!(page.messages.len(), 1);
+            assert!(!page.has_more);
+        }
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn test_pull_v2_quarantines_poison_row_and_advances_snapshot() {
+        let svc = make_service();
+        let identity = IdentityKeyPair::generate();
+        let receiver = [0xC9; 32];
+        let poison = make_envelope(&identity, receiver);
+        let valid = make_envelope(&identity, receiver);
+        svc.store_pending(&poison).expect("store poison fixture");
+        svc.store_pending(&valid).expect("store valid fixture");
+        svc.conn
+            .lock()
+            .execute(
+                "UPDATE pending_messages SET envelope = ?1 WHERE message_id = ?2",
+                params![[0xFF_u8].as_slice(), poison.message_id.as_slice()],
+            )
+            .expect("corrupt first sequence row");
+
+        let first = svc
+            .pull_pending_v2(&receiver, 0, &[], 1)
+            .expect("pull through poison row");
+        assert_eq!(first.messages.len(), 1);
+        assert_eq!(first.messages[0].message_id, valid.message_id);
+        assert!(first.has_more);
+        let second = svc
+            .pull_pending_v2(&receiver, 0, &first.next_cursor, 1)
+            .expect("complete snapshot after poison quarantine");
+        assert!(second.messages.is_empty());
+        assert!(!second.has_more);
+        assert_eq!(
+            svc.maintenance_status().quarantined_pending_messages_total,
+            1
+        );
+    }
+
+    #[test]
+    fn test_queue_sequence_exhaustion_rolls_back_message_insert() {
+        let svc = make_service();
+        svc.conn
+            .lock()
+            .execute(
+                "UPDATE relay_queue_sequence SET last_sequence = ?1 WHERE singleton = 1",
+                params![i64::MAX],
+            )
+            .expect("force sequence exhaustion");
+        let identity = IdentityKeyPair::generate();
+        let envelope = make_envelope(&identity, [0xCA; 32]);
+        assert!(matches!(
+            svc.store_pending(&envelope),
+            Err(ChatRelayError::QueueSequenceExhausted)
+        ));
+        assert_eq!(svc.storage_usage().expect("usage").pending_messages, 0);
     }
 
     // ── Blob (preserved) ─────────────────────────────────────────────────

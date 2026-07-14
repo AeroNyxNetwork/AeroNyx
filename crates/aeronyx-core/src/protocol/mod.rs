@@ -68,8 +68,8 @@ pub mod version;
 
 // Re-export primary types
 pub use auth::{
-    verify_signed_message, AuthError, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_DEVICE_REGISTER,
-    DOMAIN_WALLET_PRESENCE,
+    verify_signed_message, AuthError, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_CHAT_PULL_V2,
+    DOMAIN_DEVICE_REGISTER, DOMAIN_WALLET_PRESENCE,
 };
 pub use chat::{decode_envelope, encode_envelope, ChatContentType, ChatEnvelope, MediaPointer};
 pub use codec::{Codec, ProtocolCodec};
@@ -78,7 +78,10 @@ pub use discovery::{
     NodeCapacity, NodeDescriptor, NodeDiscoveryMessage, NodePolicy, SignedNodeDescriptor,
     NODE_BOOTSTRAP_SNAPSHOT_SCHEMA_VERSION, NODE_DESCRIPTOR_SCHEMA_VERSION,
 };
-pub use memchain::{decode_memchain, encode_memchain, MemChainMessage, MEMCHAIN_MAGIC};
+pub use memchain::{
+    decode_memchain, encode_memchain, MemChainMessage, MAX_CHAT_PULL_CURSOR_V2_BYTES,
+    MEMCHAIN_MAGIC,
+};
 pub use messages::{ClientHello, DataPacket, MessageType, ServerHello};
 pub use onion::{
     build_onion_envelope, is_onion_blob, open_onion_layer, OnionHop, OnionPeel, KEM_ALG_X25519,

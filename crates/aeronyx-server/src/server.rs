@@ -149,6 +149,8 @@
 //      offline delivery failure instead of a successful route.
 //  63. Schedules the configured ChatRelay TTL cleanup on Tokio's blocking
 //      pool, exposes aggregate execution evidence, and skips missed-tick bursts.
+//  64. Adds backward-compatible ChatPullV2 dispatch with a signed bounded
+//      opaque cursor and stable monotonic mailbox snapshot pagination.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -202,6 +204,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.8.0-ChatPullV2 - Signed opaque-cursor stable mailbox snapshots
 //   v2.7.22-ChatRelayMaintenance - Scheduled TTL cleanup with health evidence
 //   v2.7.21-OfflineControlReliability - Bounded ChatExpired pull delivery
 //   v2.7.20-ChatRelayStorageGuard - Global durable quotas and route-safe telemetry
@@ -285,8 +288,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
 use aeronyx_core::protocol::auth::{
-    verify_signed_message, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_DEVICE_REGISTER,
-    DOMAIN_WALLET_PRESENCE,
+    verify_signed_message, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_CHAT_PULL_V2,
+    DOMAIN_DEVICE_REGISTER, DOMAIN_WALLET_PRESENCE,
 };
 use aeronyx_core::protocol::chat::{
     encode_envelope, BlindRelayEnvelope, ChatContentType, ChatEnvelope,
@@ -303,7 +306,9 @@ use aeronyx_core::ledger::MemoryRecord;
 use aeronyx_core::protocol::codec::{
     decode_client_hello, encode_data_packet, encode_server_hello, ProtocolCodec,
 };
-use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
+use aeronyx_core::protocol::memchain::{
+    encode_memchain, MemChainMessage, MAX_CHAT_PULL_CURSOR_V2_BYTES,
+};
 use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
 use aeronyx_core::protocol::{
     build_onion_envelope, DataPacket, MessageType, NodeBootstrapSnapshot, NodeCapability,
@@ -5378,6 +5383,97 @@ impl Server {
                         warn!(
                             reason = e.reason_bucket(),
                             "[CHAT_RELAY] pull_pending failed"
+                        );
+                    }
+                }
+            }
+            MemChainMessage::ChatPullV2 {
+                wallet,
+                after_timestamp,
+                cursor,
+                limit,
+                request_timestamp,
+                signature,
+            } => {
+                let Some(ref relay) = chat_relay else {
+                    return;
+                };
+                if cursor.len() > MAX_CHAT_PULL_CURSOR_V2_BYTES {
+                    warn!(
+                        reason = "pull_cursor_too_large",
+                        "[CHAT_RELAY] ChatPullV2 rejected"
+                    );
+                    return;
+                }
+                let Ok(cursor_len) = u16::try_from(cursor.len()) else {
+                    return;
+                };
+                let at_bytes = after_timestamp.to_le_bytes();
+                let cursor_len_bytes = cursor_len.to_le_bytes();
+                let limit_bytes = limit.to_le_bytes();
+                let rts_bytes = request_timestamp.to_le_bytes();
+                let verify_result = verify_signed_message(
+                    DOMAIN_CHAT_PULL_V2,
+                    &[
+                        wallet.as_ref(),
+                        at_bytes.as_ref(),
+                        cursor_len_bytes.as_ref(),
+                        cursor.as_slice(),
+                        limit_bytes.as_ref(),
+                        rts_bytes.as_ref(),
+                    ],
+                    &wallet,
+                    &signature,
+                    request_timestamp,
+                );
+                if verify_result.is_err() {
+                    debug!(
+                        reason = "invalid_signature",
+                        "[CHAT_RELAY] ChatPullV2 rejected"
+                    );
+                    return;
+                }
+                relay
+                    .wallet_routes
+                    .announce(&wallet, session.id.clone(), session.client_endpoint);
+                match relay.pull_pending_v2(&wallet, after_timestamp, &cursor, limit) {
+                    Ok(page) => {
+                        let envelopes: Vec<_> = page
+                            .messages
+                            .into_iter()
+                            .map(|message| message.envelope)
+                            .collect();
+                        let mut has_more = page.has_more;
+                        match relay.pull_pending_notifications(&wallet) {
+                            Ok((notifications, notification_has_more)) => {
+                                let delivery_complete = Self::push_expired_notifications(
+                                    relay,
+                                    notifications,
+                                    session,
+                                    udp,
+                                    crypto,
+                                )
+                                .await;
+                                has_more |= notification_has_more || !delivery_complete;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    reason = e.reason_bucket(),
+                                    "[CHAT_RELAY] Expiry notification pull failed"
+                                );
+                            }
+                        }
+                        let response = MemChainMessage::ChatPullResponseV2 {
+                            envelopes,
+                            next_cursor: page.next_cursor,
+                            has_more,
+                        };
+                        Self::send_to_session(&response, session, udp, crypto).await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            reason = e.reason_bucket(),
+                            "[CHAT_RELAY] pull_pending_v2 failed"
                         );
                     }
                 }
