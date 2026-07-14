@@ -53,6 +53,9 @@
 //! - Every outbound peer response must be read through the bounded helpers in
 //!   this module. `Content-Length` is advisory; the streaming byte count is the
 //!   authoritative memory boundary and peer-controlled bodies are never logged.
+//! - Public request handlers that buffer or hash attacker-controlled bodies
+//!   must acquire `InFlightRequestGuard` before extraction. Keep independent
+//!   counters for workloads that should not starve each other.
 //!
 //! ## Last Modified
 //! v0.3.0 - Initial Agent API for MemChain Phase 1
@@ -74,8 +77,53 @@
 //!   POST /api/chat/peer/relay for inter-node encrypted envelope relay.
 //! v2.7.0-BlockSync - Added authenticated `/api/memchain/peer/block-range`.
 //! v2.7.19-PublicApiBounds - Centralized bounded peer HTTP response decoding.
+//! v2.7.20-PublicApiBackpressure - Centralized lock-free RAII request permits.
+
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use serde::de::DeserializeOwned;
+
+/// One lock-free permit for a bounded class of in-flight public requests.
+///
+/// The counter is shared by cloned Axum state. Acquisition uses
+/// compare-and-exchange so concurrent requests never overshoot the limit,
+/// and `Drop` releases the permit on every return path. This type deliberately
+/// does not own a semaphore wait queue: public callers receive immediate
+/// backpressure instead of retaining request bodies while waiting for memory.
+pub(crate) struct InFlightRequestGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl InFlightRequestGuard {
+    /// Attempts to reserve one in-flight slot without blocking.
+    pub(crate) fn try_acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        let counter = Arc::clone(counter);
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self { counter }),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for InFlightRequestGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Privacy-safe failure classes for bounded responses from untrusted peers.
 ///
@@ -154,6 +202,35 @@ pub(crate) async fn decode_bounded_json_response<T: DeserializeOwned>(
 ) -> Result<T, BoundedHttpResponseError> {
     let body = read_bounded_http_response(response, max_bytes).await?;
     serde_json::from_slice(&body).map_err(|_| BoundedHttpResponseError::JsonDecode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_flight_request_guard_is_bounded_and_releases_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let first = InFlightRequestGuard::try_acquire(&counter, 2).expect("first permit");
+        let second = InFlightRequestGuard::try_acquire(&counter, 2).expect("second permit");
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        assert!(InFlightRequestGuard::try_acquire(&counter, 2).is_none());
+
+        drop(first);
+        assert_eq!(counter.load(Ordering::Acquire), 1);
+        let replacement =
+            InFlightRequestGuard::try_acquire(&counter, 2).expect("replacement permit");
+        drop((second, replacement));
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn in_flight_request_guard_rejects_zero_capacity() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        assert!(InFlightRequestGuard::try_acquire(&counter, 0).is_none());
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
 }
 
 // ── Core MPI module (state, auth, router) ──

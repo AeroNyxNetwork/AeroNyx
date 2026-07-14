@@ -135,10 +135,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
+    sync::{atomic::AtomicUsize, Arc, Mutex},
     time::Duration,
 };
 
@@ -168,7 +165,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
-use crate::api::{decode_bounded_json_response, PEER_ACK_RESPONSE_MAX_BYTES};
+use crate::api::{decode_bounded_json_response, InFlightRequestGuard, PEER_ACK_RESPONSE_MAX_BYTES};
 use crate::services::chat_relay::ChatRelayError;
 use crate::services::peer_store::PeerStore;
 use crate::services::{ChatRelayService, Session, SessionManager};
@@ -705,7 +702,7 @@ async fn peer_relay_request_gate(
     next: Next,
 ) -> Response {
     let Some(_in_flight) =
-        PeerRequestInFlightGuard::try_acquire(&counter, MAX_IN_FLIGHT_PEER_CHAT_REQUESTS)
+        InFlightRequestGuard::try_acquire(&counter, MAX_IN_FLIGHT_PEER_CHAT_REQUESTS)
     else {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -728,7 +725,7 @@ async fn peer_blind_relay_request_gate(
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(_in_flight) = PeerRequestInFlightGuard::try_acquire(
+    let Some(_in_flight) = InFlightRequestGuard::try_acquire(
         &state.blind_relay_in_flight,
         MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS,
     ) else {
@@ -787,37 +784,6 @@ async fn peer_blind_relay_handler(
             }),
         )
             .into_response(),
-    }
-}
-
-struct PeerRequestInFlightGuard {
-    counter: Arc<AtomicUsize>,
-}
-
-impl PeerRequestInFlightGuard {
-    fn try_acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
-        let counter = Arc::clone(counter);
-        let mut current = counter.load(Ordering::Acquire);
-        loop {
-            if current >= limit {
-                return None;
-            }
-            match counter.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(Self { counter }),
-                Err(observed) => current = observed,
-            }
-        }
-    }
-}
-
-impl Drop for PeerRequestInFlightGuard {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -2844,7 +2810,7 @@ mod tests {
             blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
         };
 
-        assert!(PeerRequestInFlightGuard::try_acquire(
+        assert!(InFlightRequestGuard::try_acquire(
             &state.blind_relay_in_flight,
             MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS,
         )

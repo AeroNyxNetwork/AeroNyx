@@ -29,6 +29,7 @@
 //!   Response 400: { "error": "..." }
 //!   Response 413: { "error": "blob too large: ..." }
 //!   Response 429: { "error": "receiver blob quota exceeded: ..." }
+//!   Response 429: { "error": "blob service busy", "code": "blob_backpressure" }
 //!   Response 503: { "error": "blob store temporarily at capacity" }
 //!
 //! GET /api/chat/blob/{blob_id}
@@ -71,6 +72,9 @@
 //!   `build_chat_router()`. This is a hard limit enforced BEFORE the
 //!   handler runs, so `max_blob_size` in `ChatRelayConfig` is a second
 //!   defence-in-depth check inside `put_blob()`.
+//! - Upload and access requests use separate lock-free in-flight counters.
+//!   The route middleware must remain outside body extraction so unauthenticated
+//!   floods cannot retain many full blob bodies or starve legitimate downloads.
 //! - Hex-decoding headers is intentionally strict: any malformed header
 //!   returns 400 immediately without touching the database.
 //! - `X-File-Hash` must be SHA-256 of the ENCRYPTED bytes (not plaintext).
@@ -79,15 +83,17 @@
 //!   addresses, or raw crypto/database errors. Use aggregate reason buckets.
 //!
 //! ## Last Modified
+//! v1.3.0-PublicBackpressure — Bound pre-extraction upload and access concurrency
 //! v1.2.0-StorageAdmission — Global capacity responses and route-safe logging
 //! v1.1.0-ChatRelay — Initial implementation
 
-use std::sync::Arc;
+use std::sync::{atomic::AtomicUsize, Arc};
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{DefaultBodyLimit, Path, Request, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -98,7 +104,22 @@ use tracing::{debug, warn};
 
 use aeronyx_core::crypto::keys::IdentityPublicKey;
 
-use crate::services::chat_relay::{ChatRelayError, ChatRelayService};
+use crate::{
+    api::InFlightRequestGuard,
+    services::chat_relay::{ChatRelayError, ChatRelayService},
+};
+
+/// Maximum uploads allowed to retain and hash encrypted blob bodies at once.
+///
+/// With the production 10 MiB per-blob ceiling, this bounds the upload body's
+/// principal heap exposure to roughly 160 MiB before allocator/HTTP overhead.
+const MAX_IN_FLIGHT_BLOB_UPLOADS: usize = 16;
+
+/// Maximum concurrent blob fetch/delete requests.
+///
+/// Downloads have their own pool so a large upload wave cannot prevent an
+/// intended recipient from fetching an already stored encrypted attachment.
+const MAX_IN_FLIGHT_BLOB_ACCESSES: usize = 32;
 
 // ============================================
 // Shared state
@@ -111,6 +132,18 @@ use crate::services::chat_relay::{ChatRelayError, ChatRelayService};
 #[derive(Clone)]
 pub struct ChatBlobState {
     pub relay: Arc<ChatRelayService>,
+    upload_in_flight: Arc<AtomicUsize>,
+    access_in_flight: Arc<AtomicUsize>,
+}
+
+impl ChatBlobState {
+    fn new(relay: Arc<ChatRelayService>) -> Self {
+        Self {
+            relay,
+            upload_in_flight: Arc::new(AtomicUsize::new(0)),
+            access_in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 // ============================================
@@ -125,18 +158,62 @@ pub struct ChatBlobState {
 ///     .merge(build_chat_router(Arc::clone(&chat_relay)));
 /// ```
 ///
-/// Body size limit is set to `max_blob_size + 4096` (extra headroom for
-/// multipart boundaries; the service enforces the exact limit internally).
+/// Body size limit is set to `max_blob_size + 4096` for backward-compatible
+/// transport headroom; the service enforces the exact limit internally.
 pub fn build_chat_router(relay: Arc<ChatRelayService>) -> Router {
-    let max_body = relay.config().max_blob_size + 4096;
-    let state = ChatBlobState { relay };
+    build_chat_router_with_state(ChatBlobState::new(relay))
+}
 
-    Router::new()
+/// Builds the routes from explicit state so concurrency behavior can be tested
+/// without exposing admission counters through the production API.
+fn build_chat_router_with_state(state: ChatBlobState) -> Router {
+    let max_body = state.relay.config().max_blob_size + 4096;
+    let upload_router = Router::new()
         .route("/api/chat/blob", post(handle_blob_upload))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            blob_upload_request_gate,
+        ))
+        .layer(DefaultBodyLimit::max(max_body));
+    let access_router = Router::new()
         .route("/api/chat/blob/:blob_id", get(handle_blob_download))
         .route("/api/chat/blob/:blob_id", delete(handle_blob_delete))
-        .layer(axum::extract::DefaultBodyLimit::max(max_body))
-        .with_state(state)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            blob_access_request_gate,
+        ));
+
+    upload_router.merge(access_router).with_state(state)
+}
+
+/// Rejects excess uploads before Axum materializes `Bytes` or computes SHA-256.
+async fn blob_upload_request_gate(
+    State(state): State<ChatBlobState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(_in_flight) =
+        InFlightRequestGuard::try_acquire(&state.upload_in_flight, MAX_IN_FLIGHT_BLOB_UPLOADS)
+    else {
+        return blob_backpressure_response();
+    };
+
+    next.run(request).await
+}
+
+/// Keeps full-blob reads bounded independently from uploads.
+async fn blob_access_request_gate(
+    State(state): State<ChatBlobState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(_in_flight) =
+        InFlightRequestGuard::try_acquire(&state.access_in_flight, MAX_IN_FLIGHT_BLOB_ACCESSES)
+    else {
+        return blob_backpressure_response();
+    };
+
+    next.run(request).await
 }
 
 // ============================================
@@ -399,6 +476,22 @@ fn error_response(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(json!({ "error": msg.into() }))).into_response()
 }
 
+/// Returns a stable transient-overload response without route identifiers.
+fn blob_backpressure_response() -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({
+            "error": "blob service busy",
+            "code": "blob_backpressure",
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
 // ============================================
 // Tests
 // ============================================
@@ -406,6 +499,8 @@ fn error_response(status: StatusCode, msg: impl Into<String>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
     use aeronyx_core::crypto::IdentityKeyPair;
     use axum::{
         body::Body,
@@ -465,6 +560,87 @@ mod tests {
                 "blob logs must not expose routing identifiers or raw errors: {pattern}"
             );
         }
+    }
+
+    #[test]
+    fn blob_request_limits_match_memory_budget() {
+        assert_eq!(MAX_IN_FLIGHT_BLOB_UPLOADS, 16);
+        assert_eq!(MAX_IN_FLIGHT_BLOB_ACCESSES, 32);
+    }
+
+    #[tokio::test]
+    async fn upload_gate_rejects_before_header_and_body_processing() {
+        let state = ChatBlobState::new(make_relay());
+        state
+            .upload_in_flight
+            .store(MAX_IN_FLIGHT_BLOB_UPLOADS, Ordering::Release);
+        let app = build_chat_router_with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/chat/blob")
+                    .body(Body::from("untrusted body"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "blob_backpressure");
+    }
+
+    #[tokio::test]
+    async fn access_gate_has_an_independent_backpressure_pool() {
+        let state = ChatBlobState::new(make_relay());
+        state
+            .access_in_flight
+            .store(MAX_IN_FLIGHT_BLOB_ACCESSES, Ordering::Release);
+        let app = build_chat_router_with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/chat/blob/nonexistentblobid00000000000000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn request_gates_release_permits_after_handler_returns() {
+        let state = ChatBlobState::new(make_relay());
+        let observed_state = state.clone();
+        let app = build_chat_router_with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/chat/blob")
+                    .body(Body::from("missing headers"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(observed_state.upload_in_flight.load(Ordering::Acquire), 0);
+        assert_eq!(observed_state.access_in_flight.load(Ordering::Acquire), 0);
     }
 
     // ── Upload ──
