@@ -11,6 +11,8 @@
 //!   argument `config_path: Option<PathBuf>` for auto-generated secret
 //!   persistence. cmd_start passes Some(config_path.clone()) so that
 //!   api_secret and jwt_secret are written back to disk on first startup.
+//! - v1.1.0-SectionSafeAuth: resolve and inject `memchain.api_secret` before
+//!   constructing Server, closing the first-start unauthenticated window.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -18,6 +20,7 @@
 //! v0.3.0 - Added MemChain status and config display
 //! v1.0.0-MultiTenant - Pass config_path to Server::new() (3rd argument)
 //! v0.3.0-DiscoveryBootstrap - Show discovery bootstrap config in validate
+//! v1.1.0-SectionSafeAuth - Resolve/migrate API secret before server startup
 
 use std::path::PathBuf;
 
@@ -26,6 +29,7 @@ use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use aeronyx_core::crypto::IdentityKeyPair;
+use aeronyx_server::api::auth::ensure_api_secret;
 use aeronyx_server::management::models::StoredNodeInfo;
 use aeronyx_server::{ManagementClient, Server, ServerConfig};
 
@@ -219,7 +223,7 @@ async fn cmd_register(
 async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
     info!("Starting AeroNyx server...");
 
-    let config = if config_path.exists() {
+    let mut config = if config_path.exists() {
         ServerConfig::load(&config_path).await?
     } else {
         info!("Config file not found, using defaults");
@@ -227,6 +231,16 @@ async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
     };
 
     init_logging(&config.logging.level);
+
+    // Resolve before constructing Server so first-start admin routes receive
+    // the same secret that is persisted to `[memchain]`. The legacy writer ran
+    // after config loading and left the current process unauthenticated.
+    if config.memchain.is_enabled() {
+        let persisted_path = config_path.exists().then_some(config_path.as_path());
+        let api_secret = ensure_api_secret(config.memchain.effective_api_secret(), persisted_path)
+            .map_err(anyhow::Error::msg)?;
+        config.memchain.api_secret = Some(api_secret);
+    }
 
     let key_path = PathBuf::from(&config.server_key.key_file);
     let node_info_path = &config.management.node_info_path;

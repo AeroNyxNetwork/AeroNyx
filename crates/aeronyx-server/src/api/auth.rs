@@ -4,6 +4,9 @@
 //! # Auth — JWT Token Issuance for SaaS Mode
 //!
 //! ## Modification History
+//! v1.1.0-SectionSafe - Persist generated secrets under `[memchain]`, migrate
+//!                      compatible legacy `[auth]` values, and validate the
+//!                      resulting TOML before replacing the configuration.
 //! v1.0.0-MultiTenant - Initial implementation (Task 2)
 //! v1.0.1-Fix         - write_secret_to_config promoted to `pub`.
 //!                      Added `write_secret_to_config_pub` as an explicit
@@ -17,7 +20,8 @@
 //! - `issue_jwt()`: Sign a JWT with HS256 using the configured secret
 //! - `verify_jwt()`: Validate JWT signature + expiry, extract Claims
 //! - `ensure_jwt_secret()`: Auto-generate and persist the JWT secret
-//! - `write_secret_to_config_pub()`: Public alias for config file writes
+//! - `ensure_api_secret()`: Resolve, migrate, or generate the MPI admin secret
+//! - `write_secret_to_config_pub()`: Section-safe config persistence alias
 //!
 //! ## Authentication Flow
 //! 1. Client signs `"{pubkey_hex}:{unix_timestamp}"` with their Ed25519 private key
@@ -40,6 +44,8 @@
 //!   request headers or body fields.
 //! - JWT secret auto-generation: 64-char alphanumeric random string,
 //!   written back to config.toml on first SaaS startup.
+//! - Generated API and JWT secrets belong to `[memchain]`. Legacy values under
+//!   `[auth]` are migrated once so upgrades do not rotate working credentials.
 //! - Timestamp window is +/-60 seconds (not 300s like the remote storage path)
 //!   because token issuance is more sensitive than request signing.
 //!
@@ -48,7 +54,7 @@
 //! - `ed25519-dalek` via `aeronyx_core::crypto` for signature verification
 //! - Used by `mpi.rs` router (SaaS mode only, excluded from local mode)
 //! - `ensure_jwt_secret()` called from `server.rs` during SaaS init
-//! - `write_secret_to_config_pub()` called from `server.rs` for api_secret
+//! - `ensure_api_secret()` called from `main.rs` before Server construction
 //!
 //! ⚠️ Important Notes for Next Developer:
 //! - This endpoint is EXCLUDED from `unified_auth_middleware` — it must be
@@ -59,17 +65,19 @@
 //! - JWT secret minimum length: 32 bytes. Auto-generated secrets are 64 chars.
 //! - `ensure_jwt_secret()` returns Err if the config file cannot be written.
 //!   Server startup should fail loudly in this case.
-//! - `write_secret_to_config` is `pub` (v1.0.1 fix) so that `server.rs` can
-//!   call it for both api_secret and jwt_secret persistence. Use the
-//!   `write_secret_to_config_pub` alias at call sites for clarity.
+//! - `write_secret_to_config` is `pub` for compatibility. It now writes only
+//!   inside `[memchain]`; never reintroduce global first-key replacement.
 //! - Comment-line guard: lines whose first non-whitespace char is '#' are
 //!   never modified, preventing false replacement of commented-out examples.
 //!
 //! ## Last Modified
+//! v1.1.0-SectionSafe - Fixed cross-section secret replacement and first-start
+//!                      runtime authentication gap; added legacy migration.
 //! v1.0.1-Fix - Promoted write_secret_to_config to pub; added _pub alias;
 //!              added comment-line guard in write_secret_to_config.
 // ============================================
 
+use std::io::{Error as IoError, ErrorKind as IoErrorKind};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -89,6 +97,12 @@ pub const JWT_ISSUER: &str = "memchain";
 
 /// Maximum allowed clock skew for token request timestamps (seconds).
 const TIMESTAMP_TOLERANCE_SECS: u64 = 60;
+
+/// Canonical TOML section for MemChain API and JWT secrets.
+const MEMCHAIN_CONFIG_SECTION: &str = "memchain";
+
+/// Historical section used by the pre-v1.1.0 text writer.
+const LEGACY_AUTH_CONFIG_SECTION: &str = "auth";
 
 // ============================================
 // Public Types
@@ -311,6 +325,18 @@ pub fn verify_jwt(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::err
 // JWT Secret Management
 // ============================================
 
+/// Ensure an MPI API secret exists in memory and in `[memchain]` on disk.
+///
+/// A valid legacy `[auth].api_secret` is migrated without rotation. When no
+/// reusable value exists, a new 64-character secret is generated. The returned
+/// value must be injected into the runtime configuration before listeners open.
+pub fn ensure_api_secret(
+    current_secret: Option<&str>,
+    config_path: Option<&Path>,
+) -> Result<String, String> {
+    ensure_memchain_secret(current_secret, config_path, "api_secret", 16)
+}
+
 /// Ensure a JWT secret exists, generating and persisting one if needed.
 ///
 /// If `current_secret` is non-empty and >= 32 chars, it is returned as-is.
@@ -324,30 +350,52 @@ pub fn ensure_jwt_secret(
     current_secret: Option<&str>,
     config_path: Option<&Path>,
 ) -> Result<String, String> {
-    if let Some(s) = current_secret {
-        if !s.is_empty() {
-            if s.len() < 32 {
-                return Err(format!(
-                    "jwt_secret is too short ({} chars, minimum 32)",
-                    s.len()
-                ));
-            }
-            return Ok(s.to_string());
+    ensure_memchain_secret(current_secret, config_path, "jwt_secret", 32)
+}
+
+/// Resolve one secret through existing config, legacy migration, or generation.
+fn ensure_memchain_secret(
+    current_secret: Option<&str>,
+    config_path: Option<&Path>,
+    key: &str,
+    minimum_len: usize,
+) -> Result<String, String> {
+    if let Some(secret) = current_secret.filter(|secret| !secret.is_empty()) {
+        if secret.len() < minimum_len {
+            return Err(format!(
+                "{} is too short ({} chars, minimum {})",
+                key,
+                secret.len(),
+                minimum_len
+            ));
+        }
+        return Ok(secret.to_string());
+    }
+
+    if let Some(path) = config_path {
+        let legacy = read_secret_from_section(path, LEGACY_AUTH_CONFIG_SECTION, key)
+            .map_err(|error| format!("Failed to inspect {}: {}", path.display(), error))?;
+        if let Some(secret) = legacy.filter(|secret| secret.len() >= minimum_len) {
+            write_secret_to_config(path, key, &secret).map_err(|error| {
+                format!("Failed to migrate {} in {}: {}", key, path.display(), error)
+            })?;
+            info!(
+                path = %path.display(),
+                key,
+                "[AUTH] Migrated legacy secret into the canonical memchain section"
+            );
+            return Ok(secret);
         }
     }
 
     let secret = generate_secret();
-    info!("[AUTH] Generated new JWT secret (64 chars alphanumeric)");
+    info!(key, "[AUTH] Generated new secret (64 chars alphanumeric)");
 
     if let Some(path) = config_path {
-        if let Err(e) = write_secret_to_config(path, "jwt_secret", &secret) {
-            return Err(format!(
-                "Failed to persist jwt_secret to {}: {}",
-                path.display(),
-                e
-            ));
-        }
-        info!(path = %path.display(), "[AUTH] JWT secret written to config file");
+        write_secret_to_config(path, key, &secret).map_err(|error| {
+            format!("Failed to persist {} to {}: {}", key, path.display(), error)
+        })?;
+        info!(path = %path.display(), key, "[AUTH] Secret written to config file");
     }
 
     Ok(secret)
@@ -403,84 +451,136 @@ pub fn parse_signature_base64(b64: &str) -> Result<[u8; 64], &'static str> {
 // Config File Write Helpers
 // ============================================
 
-/// Write a `key = "value"` line into an existing TOML config file.
+/// Write a `key = "value"` line into `[memchain]` in an existing TOML file.
 ///
-/// Scans the file line by line and replaces the first non-comment line
-/// that starts with `key =` or `key=`. If no such line is found, appends
-/// the entry under the `[auth]` section (creating the section if absent).
+/// The writer is deliberately section-aware. A same-named key in `[auth]` or
+/// another section is never replaced. This preserves backward compatibility
+/// with comments and formatting without reserializing the complete document.
 ///
-/// This is a best-effort text replacement — it does NOT parse/re-serialize
-/// the full TOML document. Suitable for the simple flat configs used here.
+/// The complete TOML document is parsed before and after editing, so malformed
+/// input or an invalid generated document fails before disk replacement.
 ///
 /// # Comment-line guard
 /// Lines whose first non-whitespace character is `#` are never replaced.
 /// This prevents false matches against commented-out example values like:
 ///   `# jwt_secret = "example_do_not_use"`
 ///
-/// `pub` since v1.0.1: required by server.rs for api_secret persistence.
+/// `pub` since v1.0.1; retained as a section-safe compatibility surface.
 pub fn write_secret_to_config(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+    write_secret_to_config_section(path, MEMCHAIN_CONFIG_SECTION, key, value)
+}
+
+fn write_secret_to_config_section(
+    path: &Path,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> std::io::Result<()> {
+    validate_toml_identifier(section, "section")?;
+    validate_toml_identifier(key, "key")?;
+
     let content = std::fs::read_to_string(path)?;
-    let new_line = format!("{} = \"{}\"", key, value);
+    parse_toml_document(&content)?;
+    let encoded_value = toml::Value::String(value.to_string()).to_string();
+    let new_line = format!("{} = {}", key, encoded_value);
 
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-    let mut replaced = false;
+    let section_header = format!("[{}]", section);
+    let descendant_prefix = format!("[{}.", section);
+    let section_start = lines.iter().position(|line| line.trim() == section_header);
 
-    for line in lines.iter_mut() {
-        let trimmed = line.trim_start();
-        // Skip comment lines — never replace `# key = "example"`.
-        if trimmed.starts_with('#') {
-            continue;
-        }
-        if trimmed.starts_with(&format!("{} =", key)) || trimmed.starts_with(&format!("{}=", key)) {
-            *line = new_line.clone();
-            replaced = true;
-            break;
-        }
-    }
+    if let Some(section_start) = section_start {
+        let section_end = lines
+            .iter()
+            .enumerate()
+            .skip(section_start + 1)
+            .find_map(|(index, line)| line.trim().starts_with('[').then_some(index))
+            .unwrap_or(lines.len());
+        let key_line = lines
+            .iter()
+            .enumerate()
+            .take(section_end)
+            .skip(section_start + 1)
+            .find_map(|(index, line)| line_assigns_key(line, key).then_some(index));
 
-    if !replaced {
-        // Append under [auth] section, or at end of file if section absent.
-        let mut in_auth = false;
-        let mut insert_pos = lines.len();
-
-        for (i, line) in lines.iter().enumerate() {
-            let t = line.trim();
-            if t == "[auth]" {
-                in_auth = true;
-                continue;
-            }
-            if in_auth {
-                if t.starts_with('[') {
-                    insert_pos = i;
-                    break;
-                }
-                if !t.is_empty() {
-                    insert_pos = i + 1;
-                }
-            }
-        }
-
-        if !in_auth {
-            lines.push(String::new());
-            lines.push("[auth]".to_string());
-            lines.push(new_line);
+        if let Some(key_line) = key_line {
+            lines[key_line] = new_line;
         } else {
-            lines.insert(insert_pos, new_line);
+            lines.insert(section_end, new_line);
         }
+    } else if let Some(first_descendant) = lines
+        .iter()
+        .position(|line| line.trim().starts_with(&descendant_prefix))
+    {
+        lines.splice(
+            first_descendant..first_descendant,
+            [section_header, new_line, String::new()],
+        );
+    } else {
+        if lines.last().is_some_and(|line| !line.is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push(section_header);
+        lines.push(new_line);
     }
 
     let mut output = lines.join("\n");
     if content.ends_with('\n') {
         output.push('\n');
     }
+    parse_toml_document(&output)?;
     std::fs::write(path, output)
+}
+
+fn line_assigns_key(line: &str, key: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return false;
+    }
+    trimmed
+        .split_once('=')
+        .is_some_and(|(candidate, _)| candidate.trim() == key)
+}
+
+fn validate_toml_identifier(value: &str, label: &str) -> std::io::Result<()> {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Ok(());
+    }
+    Err(IoError::new(
+        IoErrorKind::InvalidInput,
+        format!("invalid TOML {} identifier", label),
+    ))
+}
+
+fn parse_toml_document(content: &str) -> std::io::Result<toml::Value> {
+    toml::from_str(content)
+        .map_err(|error| IoError::new(IoErrorKind::InvalidData, error.to_string()))
+}
+
+fn read_secret_from_section(
+    path: &Path,
+    section: &str,
+    key: &str,
+) -> std::io::Result<Option<String>> {
+    let content = std::fs::read_to_string(path)?;
+    let document = parse_toml_document(&content)?;
+    Ok(document
+        .get(section)
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get(key))
+        .and_then(toml::Value::as_str)
+        .map(str::to_string))
 }
 
 /// Public alias for `write_secret_to_config`.
 ///
-/// Used by `server.rs::ensure_api_secret_on_disk()` to persist the
-/// auto-generated api_secret. The `_pub` suffix makes the cross-module
-/// call site self-documenting without changing the underlying function.
+/// Retained for source compatibility with older internal call sites. New code
+/// should normally use `ensure_api_secret()` or `ensure_jwt_secret()` so the
+/// persisted value is also returned for immediate runtime injection.
 #[inline(always)]
 pub fn write_secret_to_config_pub(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
     write_secret_to_config(path, key, value)
@@ -643,7 +743,7 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         std::fs::write(
             &config_path,
-            "[memchain]\nmode = \"saas\"\n\n[auth]\njwt_secret = \"\"\ntoken_ttl_secs = 86400\n",
+            "[memchain]\nmode = \"saas\"\n\n[auth]\ntoken_ttl_secs = 86400\n",
         )
         .unwrap();
 
@@ -653,18 +753,64 @@ mod tests {
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(content.contains(&secret));
         assert!(content.contains("jwt_secret ="));
+        let parsed: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["memchain"]["jwt_secret"].as_str(),
+            Some(secret.as_str())
+        );
+        assert!(parsed["auth"].get("jwt_secret").is_none());
     }
 
     #[test]
-    fn test_ensure_jwt_secret_creates_auth_section_if_missing() {
+    fn test_ensure_jwt_secret_uses_memchain_section() {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, "[memchain]\nmode = \"saas\"\n").unwrap();
 
         let secret = ensure_jwt_secret(None, Some(&config_path)).unwrap();
         let content = std::fs::read_to_string(&config_path).unwrap();
-        assert!(content.contains("[auth]"));
+        assert!(!content.contains("[auth]"));
         assert!(content.contains(&secret));
+    }
+
+    #[test]
+    fn test_ensure_api_secret_migrates_legacy_auth_value_without_rotation() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let legacy = "legacy-api-secret-that-clients-already-use";
+        std::fs::write(
+            &config_path,
+            format!(
+                "[memchain]\nmode = \"local\"\n\n[auth]\napi_secret = \"{}\"\n",
+                legacy
+            ),
+        )
+        .unwrap();
+
+        let resolved = ensure_api_secret(None, Some(&config_path)).unwrap();
+        assert_eq!(resolved, legacy);
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(parsed["memchain"]["api_secret"].as_str(), Some(legacy));
+        assert_eq!(parsed["auth"]["api_secret"].as_str(), Some(legacy));
+    }
+
+    #[test]
+    fn test_ensure_api_secret_generates_and_persists_first_start_value() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[memchain]\nmode = \"local\"\n").unwrap();
+
+        let resolved = ensure_api_secret(None, Some(&config_path)).unwrap();
+        assert_eq!(resolved.len(), 64);
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["memchain"]["api_secret"].as_str(),
+            Some(resolved.as_str())
+        );
     }
 
     // -- write_secret_to_config comment-line guard ------------------------
@@ -675,7 +821,7 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         std::fs::write(
             &config_path,
-            "[auth]\n# jwt_secret = \"example_do_not_use\"\njwt_secret = \"\"\n",
+            "[memchain]\n# jwt_secret = \"example_do_not_use\"\njwt_secret = \"\"\n",
         )
         .unwrap();
 
@@ -686,6 +832,50 @@ mod tests {
         assert!(content.contains("# jwt_secret = \"example_do_not_use\""));
         // Real key line must be replaced.
         assert!(content.contains("jwt_secret = \"real_value\""));
+    }
+
+    #[test]
+    fn test_write_secret_never_replaces_same_key_in_another_section() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[memchain]\nmode = \"local\"\n\n[auth]\napi_secret = \"legacy_value\"\n",
+        )
+        .unwrap();
+
+        write_secret_to_config(&config_path, "api_secret", "canonical_value").unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["memchain"]["api_secret"].as_str(),
+            Some("canonical_value")
+        );
+        assert_eq!(parsed["auth"]["api_secret"].as_str(), Some("legacy_value"));
+    }
+
+    #[test]
+    fn test_write_secret_inserts_parent_before_existing_child_section() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[server]\nname = \"node\"\n\n[memchain.saas]\ndata_root = \"data\"\n",
+        )
+        .unwrap();
+
+        write_secret_to_config(&config_path, "api_secret", "canonical_value").unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let parent = content.find("[memchain]\n").unwrap();
+        let child = content.find("[memchain.saas]").unwrap();
+        assert!(parent < child);
+        let parsed: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["memchain"]["api_secret"].as_str(),
+            Some("canonical_value")
+        );
     }
 
     // -- write_secret_to_config_pub alias ---------------------------------

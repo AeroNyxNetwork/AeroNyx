@@ -172,6 +172,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.17-SectionSafeAuth - Resolve API secrets before Server construction
 //   v2.7.16-WitnessThreshold - Enforced an operator-defined strict witness threshold
 //   v2.7.15-ExternalWitnessGuard - Pinned pre-listener checkpoint startup gate
 //   v2.7.14-CommitmentTipAnchor - Signed local high-water rollback guard
@@ -281,7 +282,7 @@ use aeronyx_transport::LinuxTun;
 
 use rusqlite::OptionalExtension;
 
-use crate::api::auth::{ensure_jwt_secret, generate_secret};
+use crate::api::auth::ensure_jwt_secret;
 use crate::api::chat_peer::{
     build_chat_peer_router, PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayRequest,
     PeerChatRelayResponse,
@@ -527,10 +528,6 @@ impl Server {
             unix_now_secs(),
             self.config.discovery.descriptor_ttl_secs,
         );
-
-        if self.config.memchain.is_enabled() {
-            self.ensure_api_secret_on_disk().await;
-        }
 
         let (ip_pool, sessions, routing) = self.init_services()?;
 
@@ -1108,26 +1105,6 @@ impl Server {
         }
 
         Ok(())
-    }
-
-    // ============================================
-    // Auto-generate api_secret
-    // ============================================
-
-    async fn ensure_api_secret_on_disk(&self) {
-        if self.config.memchain.effective_api_secret().is_some() {
-            return;
-        }
-        let Some(ref path) = self.config_path else {
-            return;
-        };
-        let secret = generate_secret();
-        match crate::api::auth::write_secret_to_config_pub(path, "api_secret", &secret) {
-            Ok(()) => {
-                info!(path = %path.display(), "[SECURITY] Auto-generated api_secret written to config")
-            }
-            Err(e) => warn!(error = %e, "[SECURITY] Failed to persist api_secret"),
-        }
     }
 
     // ============================================
