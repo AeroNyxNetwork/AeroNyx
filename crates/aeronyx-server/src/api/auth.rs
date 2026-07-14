@@ -4,6 +4,8 @@
 //! # Auth — JWT Token Issuance for SaaS Mode
 //!
 //! ## Modification History
+//! v1.2.0-ReplayGuard - Reject repeated use of an already verified v1 token
+//!                      challenge through a bounded, expiring replay cache.
 //! v1.1.1-CrashSafe   - Replace secret-bearing configuration through a synced
 //!                      same-directory temporary file and atomic rename while
 //!                      preserving permissions and valid platform file names.
@@ -22,6 +24,7 @@
 //! - `POST /api/auth/token`: Verify Ed25519 challenge signature, issue JWT
 //! - `issue_jwt()`: Sign a JWT with HS256 using the configured secret
 //! - `verify_jwt()`: Validate JWT signature + expiry, extract Claims
+//! - `TokenReplayGuard`: Bound and expire accepted v1 token challenges
 //! - `ensure_jwt_secret()`: Auto-generate and persist the JWT secret
 //! - `ensure_api_secret()`: Resolve, migrate, or generate the MPI admin secret
 //! - `write_secret_to_config_pub()`: Section-safe config persistence alias
@@ -30,9 +33,11 @@
 //! 1. Client signs `"{pubkey_hex}:{unix_timestamp}"` with their Ed25519 private key
 //! 2. Server verifies signature using the pubkey in the request body
 //! 3. Timestamp must be within +/-60 seconds of server time
-//! 4. On success, server issues a JWT where `sub = pubkey_hex`
-//! 5. All subsequent API requests include `Authorization: Bearer <jwt>`
-//! 6. `unified_auth_middleware` (in mpi.rs) verifies JWT + extracts owner
+//! 4. The verified pubkey/timestamp challenge is claimed once in a bounded
+//!    replay cache; duplicate submissions are rejected
+//! 5. On success, server issues a JWT where `sub = pubkey_hex`
+//! 6. All subsequent API requests include `Authorization: Bearer <jwt>`
+//! 7. `unified_auth_middleware` (in mpi.rs) verifies JWT + extracts owner
 //!
 //! ## JWT Format
 //! - Algorithm: HS256
@@ -51,6 +56,10 @@
 //!   `[auth]` are migrated once so upgrades do not rotate working credentials.
 //! - Timestamp window is +/-60 seconds (not 300s like the remote storage path)
 //!   because token issuance is more sensitive than request signing.
+//! - The v1 replay guard blocks reuse after the first accepted request and is
+//!   capacity-bounded to resist memory exhaustion. It cannot prevent a stolen
+//!   signature from winning a first-use race; a server-issued nonce protocol
+//!   remains the required v2 design for complete challenge freshness.
 //!
 //! ## Dependencies
 //! - `jsonwebtoken` crate for HS256 JWT sign/verify
@@ -77,6 +86,7 @@
 //!   never modified, preventing false replacement of commented-out examples.
 //!
 //! ## Last Modified
+//! v1.2.0-ReplayGuard - Added bounded one-time claims for verified v1 requests.
 //! v1.1.1-CrashSafe - Made secret configuration replacement durable and atomic.
 //! v1.1.0-SectionSafe - Fixed cross-section secret replacement and first-start
 //!                      runtime authentication gap; added legacy migration.
@@ -84,15 +94,19 @@
 //!              added comment-line guard in write_secret_to_config.
 // ============================================
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{Error as IoError, ErrorKind as IoErrorKind, Write};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use aeronyx_core::crypto::keys::IdentityPublicKey;
@@ -107,11 +121,87 @@ pub const JWT_ISSUER: &str = "memchain";
 /// Maximum allowed clock skew for token request timestamps (seconds).
 const TIMESTAMP_TOLERANCE_SECS: u64 = 60;
 
+/// Maximum verified challenges retained during the replay window.
+const TOKEN_REPLAY_CACHE_MAX_ENTRIES: usize = 65_536;
+
+/// Avoid an O(n) expiry scan on every token request.
+const TOKEN_REPLAY_CLEANUP_INTERVAL_SECS: u64 = 10;
+
 /// Canonical TOML section for MemChain API and JWT secrets.
 const MEMCHAIN_CONFIG_SECTION: &str = "memchain";
 
 /// Historical section used by the pre-v1.1.0 text writer.
 const LEGACY_AUTH_CONFIG_SECTION: &str = "auth";
+
+/// Process-wide guard shared by every SaaS auth router in this node process.
+static TOKEN_REPLAY_GUARD: OnceLock<TokenReplayGuard> = OnceLock::new();
+
+// ============================================
+// Token Replay Guard
+// ============================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenReplayDecision {
+    Accepted,
+    Duplicate,
+    Saturated,
+}
+
+#[derive(Debug, Default)]
+struct TokenReplayCache {
+    entries: HashMap<[u8; 32], u64>,
+    next_cleanup_at: u64,
+}
+
+/// Bounded one-time claim store for verified v1 token challenges.
+///
+/// The cache stores only a domain-separated digest of pubkey + timestamp, not
+/// the signature or any issued token. Expiry is tied to the same acceptance
+/// window used by the endpoint. Capacity exhaustion fails closed.
+#[derive(Debug)]
+struct TokenReplayGuard {
+    cache: Mutex<TokenReplayCache>,
+    capacity: usize,
+}
+
+impl TokenReplayGuard {
+    fn new(capacity: usize) -> Self {
+        Self {
+            cache: Mutex::new(TokenReplayCache::default()),
+            capacity,
+        }
+    }
+
+    fn claim(&self, fingerprint: [u8; 32], expires_at: u64, now: u64) -> TokenReplayDecision {
+        let mut cache = self.cache.lock();
+        if now >= cache.next_cleanup_at {
+            cache.entries.retain(|_, expiry| *expiry >= now);
+            cache.next_cleanup_at = now.saturating_add(TOKEN_REPLAY_CLEANUP_INTERVAL_SECS);
+        }
+
+        if cache.entries.contains_key(&fingerprint) {
+            return TokenReplayDecision::Duplicate;
+        }
+        if cache.entries.len() >= self.capacity {
+            return TokenReplayDecision::Saturated;
+        }
+
+        cache.entries.insert(fingerprint, expires_at);
+        TokenReplayDecision::Accepted
+    }
+}
+
+fn token_replay_guard() -> &'static TokenReplayGuard {
+    TOKEN_REPLAY_GUARD.get_or_init(|| TokenReplayGuard::new(TOKEN_REPLAY_CACHE_MAX_ENTRIES))
+}
+
+fn token_challenge_fingerprint(pubkey: &[u8; 32], timestamp: u64) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"aeronyx-auth-token-v1\0");
+    digest.update(pubkey);
+    digest.update(timestamp.to_be_bytes());
+    digest.finalize().into()
+}
 
 // ============================================
 // Public Types
@@ -258,6 +348,43 @@ pub async fn issue_token(
             Json(serde_json::json!({ "error": "invalid signature" })),
         )
             .into_response();
+    }
+
+    let replay_expires_at = req.timestamp.saturating_add(TIMESTAMP_TOLERANCE_SECS);
+    match token_replay_guard().claim(
+        token_challenge_fingerprint(&pubkey_bytes, req.timestamp),
+        replay_expires_at,
+        now,
+    ) {
+        TokenReplayDecision::Accepted => {}
+        TokenReplayDecision::Duplicate => {
+            warn!(
+                pubkey = &req.pubkey[..8],
+                "[AUTH] Token request rejected: verified challenge replayed"
+            );
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "token challenge has already been used",
+                    "code": "token_challenge_replayed"
+                })),
+            )
+                .into_response();
+        }
+        TokenReplayDecision::Saturated => {
+            tracing::error!(
+                capacity = TOKEN_REPLAY_CACHE_MAX_ENTRIES,
+                "[AUTH] Token request rejected: replay guard saturated"
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "token service is temporarily busy",
+                    "code": "token_replay_guard_saturated"
+                })),
+            )
+                .into_response();
+        }
     }
 
     // Issue JWT.
@@ -1034,5 +1161,83 @@ mod tests {
     #[test]
     fn test_generate_secret_is_random() {
         assert_ne!(generate_secret(), generate_secret());
+    }
+
+    #[tokio::test]
+    async fn test_issue_token_rejects_replayed_verified_challenge() {
+        use aeronyx_core::crypto::keys::IdentityKeyPair;
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+        let identity = IdentityKeyPair::generate();
+        let pubkey = hex::encode(identity.public_key_bytes());
+        let timestamp = now_secs();
+        let challenge = format!("{}:{}", pubkey, timestamp);
+        let signature = BASE64.encode(identity.sign(challenge.as_bytes()));
+        let state = AuthState {
+            jwt_secret: make_test_secret(),
+            token_ttl_secs: 3_600,
+        };
+        let request = || TokenRequest {
+            pubkey: pubkey.clone(),
+            timestamp,
+            signature: signature.clone(),
+        };
+
+        let first = issue_token(State(state.clone()), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let replay = issue_token(State(state), Json(request()))
+            .await
+            .into_response();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn test_token_replay_guard_rejects_duplicate_challenge() {
+        let guard = TokenReplayGuard::new(8);
+        let fingerprint = token_challenge_fingerprint(&[0x11; 32], 1_000);
+
+        assert_eq!(
+            guard.claim(fingerprint, 1_060, 1_000),
+            TokenReplayDecision::Accepted
+        );
+        assert_eq!(
+            guard.claim(fingerprint, 1_060, 1_001),
+            TokenReplayDecision::Duplicate
+        );
+    }
+
+    #[test]
+    fn test_token_replay_guard_expires_old_claims() {
+        let guard = TokenReplayGuard::new(1);
+        let first = token_challenge_fingerprint(&[0x11; 32], 1_000);
+        let second = token_challenge_fingerprint(&[0x22; 32], 1_100);
+
+        assert_eq!(
+            guard.claim(first, 1_060, 1_000),
+            TokenReplayDecision::Accepted
+        );
+        assert_eq!(
+            guard.claim(second, 1_160, 1_061),
+            TokenReplayDecision::Accepted
+        );
+    }
+
+    #[test]
+    fn test_token_replay_guard_fails_closed_at_capacity() {
+        let guard = TokenReplayGuard::new(1);
+        let first = token_challenge_fingerprint(&[0x11; 32], 1_000);
+        let second = token_challenge_fingerprint(&[0x22; 32], 1_001);
+
+        assert_eq!(
+            guard.claim(first, 1_060, 1_000),
+            TokenReplayDecision::Accepted
+        );
+        assert_eq!(
+            guard.claim(second, 1_061, 1_001),
+            TokenReplayDecision::Saturated
+        );
     }
 }
