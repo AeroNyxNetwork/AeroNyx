@@ -11,6 +11,8 @@
 //! v1.1.0-ChatRelay — 🌟 Initial implementation.
 //! v1.2.0-GlobalStorageQuotas — Added node-wide message/blob count and byte
 //! ceilings so many synthetic receivers cannot bypass per-mailbox limits.
+//! v1.3.0-MaintenanceBounds — Rejected TTL values that cannot be represented
+//! safely by SQLite's signed timestamp domain.
 //!
 //! ## Main Functionality
 //! - `ChatRelayConfig` — all knobs for the zero-knowledge P2P chat relay
@@ -52,6 +54,7 @@
 //!   update `chat_relay.db_path` explicitly in your config file.
 //!
 //! ## Last Modified
+//! v1.3.0-MaintenanceBounds — Added signed timestamp boundary validation.
 //! v1.2.0-GlobalStorageQuotas — Added backward-compatible global disk ceilings.
 //! v1.1.0-ChatRelay — Initial implementation.
 
@@ -64,6 +67,9 @@ use crate::error::{Result, ServerError};
 /// Text chat envelopes should never legitimately exceed 1 MB.
 /// Values above this indicate misconfiguration and are rejected.
 const MAX_MESSAGE_SIZE_HARD_LIMIT: usize = 1_048_576; // 1 MB
+
+/// SQLite INTEGER and cleanup timestamp arithmetic use signed 64-bit values.
+const MAX_SQLITE_TTL_SECS: u64 = i64::MAX as u64;
 
 // ============================================
 // ChatRelayConfig
@@ -314,6 +320,13 @@ impl ChatRelayConfig {
             ));
         }
 
+        if self.offline_ttl_secs > MAX_SQLITE_TTL_SECS {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.offline_ttl_secs",
+                "must fit SQLite's signed 64-bit timestamp domain",
+            ));
+        }
+
         if self.max_pending_per_wallet == 0 {
             return Err(ServerError::config_invalid(
                 "memchain.chat_relay.max_pending_per_wallet",
@@ -417,6 +430,13 @@ impl ChatRelayConfig {
             ));
         }
 
+        if self.expired_notification_ttl_secs > MAX_SQLITE_TTL_SECS {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.expired_notification_ttl_secs",
+                "must fit SQLite's signed 64-bit timestamp domain",
+            ));
+        }
+
         Ok(())
     }
 }
@@ -489,6 +509,16 @@ mod tests {
         let cr = ChatRelayConfig {
             enabled: true,
             offline_ttl_secs: 0,
+            ..Default::default()
+        };
+        assert!(cr.validate().is_err());
+    }
+
+    #[test]
+    fn test_chat_relay_ttl_above_sqlite_integer_rejected() {
+        let cr = ChatRelayConfig {
+            enabled: true,
+            offline_ttl_secs: u64::MAX,
             ..Default::default()
         };
         assert!(cr.validate().is_err());
@@ -623,6 +653,16 @@ mod tests {
         let cr = ChatRelayConfig {
             enabled: true,
             expired_notification_ttl_secs: 0,
+            ..Default::default()
+        };
+        assert!(cr.validate().is_err());
+    }
+
+    #[test]
+    fn test_chat_relay_expired_notification_ttl_above_sqlite_integer_rejected() {
+        let cr = ChatRelayConfig {
+            enabled: true,
+            expired_notification_ttl_secs: u64::MAX,
             ..Default::default()
         };
         assert!(cr.validate().is_err());

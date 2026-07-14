@@ -147,6 +147,8 @@
 //  62. Delivers bounded expiry notifications during authenticated chat pulls,
 //      retains failed writes for retry, and treats UDP write failure as an
 //      offline delivery failure instead of a successful route.
+//  63. Schedules the configured ChatRelay TTL cleanup on Tokio's blocking
+//      pool, exposes aggregate execution evidence, and skips missed-tick bursts.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -188,6 +190,9 @@
 //   - Chat expiry notifications are bounded durable control events. Mark them
 //     pushed only after a successful transport write and preserve `has_more`
 //     whenever a page remains or delivery/marking fails.
+//   - ChatRelay SQLite cleanup is synchronous and must remain inside
+//     spawn_blocking. The dedicated timer uses the configured interval and
+//     MissedTickBehavior::Skip to prevent catch-up storms after a slow cycle.
 //   - Voice relay logs follow the same blind-node boundary: no wallet target,
 //     virtual IP, session ID, endpoint, or raw cryptographic error values.
 //   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
@@ -197,6 +202,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.22-ChatRelayMaintenance - Scheduled TTL cleanup with health evidence
 //   v2.7.21-OfflineControlReliability - Bounded ChatExpired pull delivery
 //   v2.7.20-ChatRelayStorageGuard - Global durable quotas and route-safe telemetry
 //   v2.7.19-PublicApiBounds - Shared peer decoder and pre-parse request ceilings
@@ -759,6 +765,9 @@ impl Server {
         tasks.push(("vpn-keepalive", keepalive_task));
 
         if let Some(ref relay) = chat_relay {
+            let relay_cleanup_task = self.spawn_chat_relay_cleanup_task(Arc::clone(relay));
+            tasks.push(("chat-relay-cleanup", relay_cleanup_task));
+
             let routes = Arc::clone(&relay.wallet_routes);
             let mut rx = self.shutdown_tx.subscribe();
             tasks.push((
@@ -2263,6 +2272,7 @@ impl Server {
                     Some(serde_json::json!({
                         "generated_at": now,
                         "peer_relay": relay.peer_status(),
+                        "maintenance": relay.maintenance_status(),
                         "storage_usage": storage_usage,
                         "storage_capacity": {
                             "max_pending_messages_total": config.max_pending_messages_total,
@@ -2304,6 +2314,7 @@ impl Server {
                             "last_inbound_failure_reason": null,
                             "last_inbound_at": null
                         },
+                        "maintenance": null,
                         "storage_usage": null,
                         "storage_capacity": null,
                         "source": "rust_chat_relay_disabled_config",
@@ -5768,6 +5779,52 @@ impl Server {
     // ============================================
     // Cleanup Task
     // ============================================
+
+    /// Schedules durable `ChatRelay` TTL cleanup without blocking Tokio workers.
+    ///
+    /// The first interval tick runs immediately so a restarted node enforces
+    /// retention before waiting a full interval. Slow cycles never overlap;
+    /// missed ticks are skipped instead of replayed in a burst.
+    fn spawn_chat_relay_cleanup_task(&self, relay: Arc<ChatRelayService>) -> JoinHandle<()> {
+        let interval_secs = relay.config().cleanup_interval_secs;
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(interval_secs));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            info!(
+                interval_secs,
+                "[CHAT_RELAY] Durable TTL cleanup task started"
+            );
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.recv() => break,
+                    _ = timer.tick() => {
+                        let cleanup_relay = Arc::clone(&relay);
+                        match tokio::task::spawn_blocking(move || cleanup_relay.run_cleanup()).await {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                warn!(
+                                    reason = error.reason_bucket(),
+                                    "[CHAT_RELAY] Durable TTL cleanup failed"
+                                );
+                            }
+                            Err(join_error) => {
+                                let reason = if join_error.is_panic() {
+                                    "cleanup_worker_panicked"
+                                } else {
+                                    "cleanup_worker_cancelled"
+                                };
+                                relay.record_maintenance_worker_failure(reason);
+                                error!(reason, "[CHAT_RELAY] Durable TTL cleanup worker failed");
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
 
     fn spawn_cleanup_task(
         &self,

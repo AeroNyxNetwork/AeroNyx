@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 1.6.0-OfflineControlReliability
+// Version: 1.7.0-MaintenanceRuntime
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -18,6 +18,8 @@
 //   v1.6.0-OfflineControlReliability — Made ACK and notification batches
 //   bounded and atomic, surfaced corrupt durable rows instead of skipping or
 //   panicking, and split expiry notifications into transport-safe chunks.
+//   v1.7.0-MaintenanceRuntime — Added aggregate cleanup execution evidence
+//   and aligned durable pull ordering with the existing message-id cursor.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -29,6 +31,7 @@
 //   - WalletRouteCache: In-memory wallet → session routing (v1.3.0-Sovereign)
 //   - Peer relay health: aggregate outbound/inbound node-to-node relay status
 //   - Durable queue quotas: per-receiver and node-wide count/byte ceilings
+//   - Maintenance telemetry: aggregate TTL cleanup success/failure evidence
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -57,8 +60,11 @@
 //     blob IDs, sender/receiver keys, payload bytes, or endpoint/session IDs.
 //   - Offline control batches are protocol-bounded. Do not remove their limits
 //     or silently skip malformed SQLite rows; fail the operation and retain data.
+//   - Pending-message pages are ordered by message_id because the v1 wire
+//     cursor contains only message_id. Chronological display belongs client-side.
 //
 // Last Modified:
+//   v1.7.0-MaintenanceRuntime — Runtime cleanup evidence and cursor-safe paging
 //   v1.6.0-OfflineControlReliability — Atomic bounded ACK/expiry control flow
 //   v1.5.0-GlobalStorageQuotas — Durable global quotas, enforced message size,
 //     and route-safe logging
@@ -71,7 +77,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
@@ -357,6 +363,28 @@ pub struct ChatRelayStorageUsage {
     pub pending_blob_bytes: u64,
 }
 
+/// Aggregate TTL maintenance evidence safe for heartbeat and node health APIs.
+///
+/// This snapshot intentionally excludes message IDs, wallet keys, routes,
+/// endpoints, payloads, and per-user counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatRelayMaintenanceStatus {
+    /// Total cleanup attempts, including failed transactions.
+    pub cleanup_runs_total: u64,
+    /// Cleanup attempts that returned an error.
+    pub cleanup_failures_total: u64,
+    /// Pending message rows removed by successful cleanup cycles.
+    pub expired_messages_total: u64,
+    /// Encrypted blob rows removed by successful cleanup cycles.
+    pub expired_blobs_total: u64,
+    /// Unix timestamp of the most recent cleanup attempt.
+    pub last_cleanup_at: Option<u64>,
+    /// Stable state bucket: `succeeded` or `failed`.
+    pub last_cleanup_status: Option<String>,
+    /// Stable aggregate failure bucket from [`ChatRelayError::reason_bucket`].
+    pub last_cleanup_failure_reason: Option<String>,
+}
+
 // ============================================
 // Pending message row (returned from pull)
 // ============================================
@@ -369,6 +397,15 @@ pub struct PendingMessage {
     /// Signed end-to-end encrypted envelope; relay code must not inspect its ciphertext.
     pub envelope: ChatEnvelope,
 }
+
+#[derive(Debug)]
+struct ExpiredMessageRow {
+    message_id: [u8; 16],
+    sender: [u8; 32],
+    receiver: [u8; 32],
+}
+
+type ExpiredMessagesBySender = HashMap<[u8; 32], HashMap<[u8; 32], Vec<[u8; 16]>>>;
 
 // ============================================
 // Expired notification row
@@ -465,6 +502,7 @@ pub struct ChatRelayService {
     node_secret: [u8; 32],
     dedup: MessageDedup,
     peer_status: RwLock<ChatRelayPeerStatus>,
+    maintenance_status: RwLock<ChatRelayMaintenanceStatus>,
     /// In-memory wallet → session routing table.
     ///
     /// Arc so the cleanup task and each handler can hold independent references
@@ -487,6 +525,9 @@ impl ChatRelayService {
         }
 
         let conn = Connection::open(&config.db_path)?;
+        // A short bounded wait absorbs transient locks from an operator backup
+        // or diagnostic reader without allowing relay requests to hang forever.
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
 
         let dedup_capacity = config.dedup_lru_capacity;
@@ -497,6 +538,7 @@ impl ChatRelayService {
             node_secret,
             dedup: MessageDedup::new(dedup_capacity),
             peer_status: RwLock::new(ChatRelayPeerStatus::new(relay_enabled)),
+            maintenance_status: RwLock::new(ChatRelayMaintenanceStatus::default()),
             // v1.3.0-Sovereign: initialise empty route cache
             wallet_routes: Arc::new(WalletRouteCache::new()),
         };
@@ -528,6 +570,8 @@ impl ChatRelayService {
             );
             CREATE INDEX IF NOT EXISTS idx_pm_receiver_status
                 ON pending_messages(receiver, status);
+            CREATE INDEX IF NOT EXISTS idx_pm_receiver_status_message_id
+                ON pending_messages(receiver, status, message_id);
             CREATE INDEX IF NOT EXISTS idx_pm_received_at
                 ON pending_messages(received_at);
 
@@ -807,6 +851,10 @@ impl ChatRelayService {
     }
 
     /// Retrieves a page of pending messages for the given receiver wallet.
+    ///
+    /// The v1 wire cursor contains only `message_id`, so rows must be ordered
+    /// by that same key. Ordering by timestamp first can permanently skip a
+    /// later row whose random ID sorts below the previous page's cursor.
     pub fn pull_pending(
         &self,
         receiver: &[u8; 32],
@@ -823,7 +871,7 @@ impl ChatRelayService {
                AND status = 0
                AND timestamp > ?2
                AND message_id > ?3
-             ORDER BY timestamp ASC, message_id ASC
+             ORDER BY message_id ASC
              LIMIT ?4",
         )?;
 
@@ -1140,32 +1188,86 @@ impl ChatRelayService {
     // TTL cleanup
     // ============================================
 
-    /// Runs one TTL cleanup cycle (synchronous — call from spawn_blocking).
+    /// Runs one TTL cleanup cycle (synchronous — call from `spawn_blocking`).
     ///
-    /// All mutations run inside a single SQLite IMMEDIATE transaction.
+    /// All mutations run inside a single `SQLite` IMMEDIATE transaction.
     /// Returns `(expired_messages, expired_blobs)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage, serialization, or durable-data integrity error. A
+    /// failed transaction is rolled back and counted in maintenance evidence.
     pub fn run_cleanup(&self) -> ChatRelayResult<(usize, usize)> {
-        let now = now_secs() as i64;
-        let ttl = self.config.offline_ttl_secs as i64;
-        let notif_ttl = self.config.expired_notification_ttl_secs as i64;
-        let cutoff = now - ttl;
-        let notif_cutoff = now - notif_ttl;
+        let now = now_secs();
+        let cleanup_now = i64::try_from(now).unwrap_or(i64::MAX);
+        let result = self.run_cleanup_at(cleanup_now);
 
-        let mut conn = self.conn.lock();
+        let mut status = self.maintenance_status.write();
+        status.cleanup_runs_total = status.cleanup_runs_total.saturating_add(1);
+        status.last_cleanup_at = Some(now);
+        match &result {
+            Ok((expired_messages, expired_blobs)) => {
+                status.expired_messages_total = status
+                    .expired_messages_total
+                    .saturating_add(u64::try_from(*expired_messages).unwrap_or(u64::MAX));
+                status.expired_blobs_total = status
+                    .expired_blobs_total
+                    .saturating_add(u64::try_from(*expired_blobs).unwrap_or(u64::MAX));
+                status.last_cleanup_status = Some("succeeded".to_string());
+                status.last_cleanup_failure_reason = None;
+            }
+            Err(error) => {
+                status.cleanup_failures_total = status.cleanup_failures_total.saturating_add(1);
+                status.last_cleanup_status = Some("failed".to_string());
+                status.last_cleanup_failure_reason = Some(error.reason_bucket().to_string());
+            }
+        }
+        drop(status);
+
+        result
+    }
+
+    fn run_cleanup_at(&self, now: i64) -> ChatRelayResult<(usize, usize)> {
+        // Configuration validation rejects values above i64::MAX. These
+        // fallbacks keep direct service construction fail-closed as well:
+        // an out-of-range TTL retains data instead of expiring fresh rows.
+        let ttl = i64::try_from(self.config.offline_ttl_secs).unwrap_or(i64::MAX);
+        let notif_ttl =
+            i64::try_from(self.config.expired_notification_ttl_secs).unwrap_or(i64::MAX);
+        let cutoff = now.saturating_sub(ttl);
+        let notif_cutoff = now.saturating_sub(notif_ttl);
+
+        let result =
+            Self::run_cleanup_transaction(&mut self.conn.lock(), now, cutoff, notif_cutoff);
+
+        if let Ok((expired_message_count, expired_blobs)) = &result {
+            if *expired_message_count > 0 || *expired_blobs > 0 {
+                info!(
+                    expired_messages = expired_message_count,
+                    expired_blobs = expired_blobs,
+                    "[CHAT_RELAY] Cleanup complete"
+                );
+            } else {
+                debug!("[CHAT_RELAY] Cleanup: nothing to expire");
+            }
+        }
+
+        result
+    }
+
+    fn run_cleanup_transaction(
+        conn: &mut Connection,
+        now: i64,
+        cutoff: i64,
+        notif_cutoff: i64,
+    ) -> ChatRelayResult<(usize, usize)> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let result: ChatRelayResult<(usize, usize)> = (|| {
+        let transaction_result: ChatRelayResult<(usize, usize)> = (|| {
             let mut stmt = tx.prepare(
                 "SELECT message_id, sender, receiver FROM pending_messages
                  WHERE status = 0 AND received_at < ?",
             )?;
-
-            #[derive(Debug)]
-            struct ExpiredRow {
-                message_id: [u8; 16],
-                sender: [u8; 32],
-                receiver: [u8; 32],
-            }
 
             let stored_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = stmt
                 .query_map(params![cutoff], |row| {
@@ -1177,10 +1279,10 @@ impl ChatRelayService {
                 .collect::<Result<Vec<_>, rusqlite::Error>>()?;
             drop(stmt);
 
-            let expired_rows: Vec<ExpiredRow> = stored_rows
+            let expired_rows: Vec<ExpiredMessageRow> = stored_rows
                 .into_iter()
                 .map(|(message_id, sender, receiver)| {
-                    Ok(ExpiredRow {
+                    Ok(ExpiredMessageRow {
                         message_id: fixed_bytes(message_id, "expired_message_id")?,
                         sender: fixed_bytes(sender, "expired_message_sender")?,
                         receiver: fixed_bytes(receiver, "expired_message_receiver")?,
@@ -1189,8 +1291,7 @@ impl ChatRelayService {
                 .collect::<ChatRelayResult<Vec<_>>>()?;
 
             let expired_message_count = expired_rows.len();
-
-            let mut by_sender: HashMap<[u8; 32], HashMap<[u8; 32], Vec<[u8; 16]>>> = HashMap::new();
+            let mut by_sender = ExpiredMessagesBySender::new();
             for row in &expired_rows {
                 by_sender
                     .entry(row.sender)
@@ -1233,7 +1334,6 @@ impl ChatRelayService {
                 "DELETE FROM pending_blobs WHERE received_at < ?",
                 params![cutoff],
             )?;
-
             tx.execute(
                 "DELETE FROM expired_notifications WHERE pushed = 1 OR created_at < ?",
                 params![notif_cutoff],
@@ -1242,23 +1342,13 @@ impl ChatRelayService {
             Ok((expired_message_count, expired_blobs))
         })();
 
-        if result.is_ok() {
-            tx.commit()?;
-        }
-
-        if let Ok((expired_message_count, expired_blobs)) = &result {
-            if *expired_message_count > 0 || *expired_blobs > 0 {
-                info!(
-                    expired_messages = expired_message_count,
-                    expired_blobs = expired_blobs,
-                    "[CHAT_RELAY] Cleanup complete"
-                );
-            } else {
-                debug!("[CHAT_RELAY] Cleanup: nothing to expire");
+        match transaction_result {
+            Ok(counts) => {
+                tx.commit()?;
+                Ok(counts)
             }
+            Err(error) => Err(error),
         }
-
-        result
     }
 
     // ============================================
@@ -1367,6 +1457,25 @@ impl ChatRelayService {
     #[must_use]
     pub fn peer_status(&self) -> ChatRelayPeerStatus {
         self.peer_status.read().clone()
+    }
+
+    /// Returns aggregate TTL cleanup execution evidence.
+    #[must_use]
+    pub fn maintenance_status(&self) -> ChatRelayMaintenanceStatus {
+        self.maintenance_status.read().clone()
+    }
+
+    /// Records a blocking-worker failure that occurred outside `run_cleanup`.
+    ///
+    /// Tokio join failures are deliberately converted to stable buckets so a
+    /// heartbeat never exposes panic payloads or other runtime internals.
+    pub(crate) fn record_maintenance_worker_failure(&self, reason: &'static str) {
+        let mut status = self.maintenance_status.write();
+        status.cleanup_runs_total = status.cleanup_runs_total.saturating_add(1);
+        status.cleanup_failures_total = status.cleanup_failures_total.saturating_add(1);
+        status.last_cleanup_at = Some(now_secs());
+        status.last_cleanup_status = Some("failed".to_string());
+        status.last_cleanup_failure_reason = Some(reason.to_string());
     }
 
     /// Returns aggregate durable queue usage maintained by `SQLite` triggers.
@@ -1849,6 +1958,51 @@ mod tests {
         assert!(!has_more2);
     }
 
+    #[test]
+    fn test_pull_cursor_does_not_skip_rows_across_timestamps() {
+        let svc = make_service();
+        let kp = IdentityKeyPair::generate();
+        let receiver = [0xBC; 32];
+        let fixtures = [
+            (100, [0xF0; 16]),
+            (200, [0xE0; 16]),
+            (300, [0xD0; 16]),
+            (400, [0xC0; 16]),
+        ];
+
+        for (timestamp, message_id) in fixtures {
+            let mut envelope = make_envelope(&kp, receiver);
+            envelope.timestamp = timestamp;
+            envelope.message_id = message_id;
+            envelope.signature = kp.sign(&envelope.sign_data());
+            svc.store_pending(&envelope).expect("store ordered fixture");
+        }
+
+        let (first_page, first_has_more) = svc
+            .pull_pending(&receiver, 0, &[0u8; 16], 2)
+            .expect("first cursor page");
+        assert_eq!(first_page.len(), 2);
+        assert!(first_has_more);
+
+        let cursor = first_page.last().expect("first page cursor").message_id;
+        let (second_page, second_has_more) = svc
+            .pull_pending(&receiver, 0, &cursor, 2)
+            .expect("second cursor page");
+        assert_eq!(second_page.len(), 2);
+        assert!(!second_has_more);
+
+        let actual: HashSet<[u8; 16]> = first_page
+            .iter()
+            .chain(&second_page)
+            .map(|message| message.message_id)
+            .collect();
+        let expected: HashSet<[u8; 16]> = fixtures
+            .into_iter()
+            .map(|(_, message_id)| message_id)
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
     // ── Blob (preserved) ─────────────────────────────────────────────────
 
     #[test]
@@ -2044,6 +2198,70 @@ mod tests {
     }
 
     #[test]
+    fn test_cleanup_maintenance_status_tracks_failure_and_recovery() {
+        let svc = make_service();
+        svc.conn
+            .lock()
+            .execute(
+                "INSERT INTO pending_messages
+                 (message_id, sender, receiver, timestamp, envelope, received_at, status)
+                 VALUES (?1, ?2, ?3, 0, ?4, 0, 0)",
+                params![
+                    [0xA1u8; 15].as_slice(),
+                    [0xA2u8; 32].as_slice(),
+                    [0xA3u8; 32].as_slice(),
+                    [0xA4u8].as_slice(),
+                ],
+            )
+            .expect("insert malformed durable row");
+
+        assert!(matches!(
+            svc.run_cleanup(),
+            Err(ChatRelayError::CorruptStoredData {
+                field: "expired_message_id"
+            })
+        ));
+        let failed = svc.maintenance_status();
+        assert_eq!(failed.cleanup_runs_total, 1);
+        assert_eq!(failed.cleanup_failures_total, 1);
+        assert_eq!(failed.last_cleanup_status.as_deref(), Some("failed"));
+        assert_eq!(
+            failed.last_cleanup_failure_reason.as_deref(),
+            Some("corrupt_stored_data")
+        );
+
+        svc.conn
+            .lock()
+            .execute("DELETE FROM pending_messages", [])
+            .expect("remove malformed row");
+        svc.run_cleanup().expect("cleanup recovery");
+        let recovered = svc.maintenance_status();
+        assert_eq!(recovered.cleanup_runs_total, 2);
+        assert_eq!(recovered.cleanup_failures_total, 1);
+        assert_eq!(recovered.last_cleanup_status.as_deref(), Some("succeeded"));
+        assert_eq!(recovered.last_cleanup_failure_reason, None);
+    }
+
+    #[test]
+    fn test_cleanup_out_of_range_ttl_fails_closed() {
+        let mut config = test_config();
+        config.offline_ttl_secs = u64::MAX;
+        let svc = ChatRelayService::new(config, [0x42; 32]).expect("service");
+        let kp = IdentityKeyPair::generate();
+        let receiver = [0xB4; 32];
+        let envelope = make_envelope(&kp, receiver);
+
+        svc.store_pending(&envelope).expect("store pending message");
+        let (expired, _) = svc.run_cleanup_at(i64::MAX).expect("cleanup");
+
+        assert_eq!(expired, 0);
+        assert_eq!(
+            svc.storage_usage().expect("storage usage").pending_messages,
+            1
+        );
+    }
+
+    #[test]
     fn test_expiry_notification_pull_is_bounded_and_pageable() {
         let svc = make_service();
         let sender = [0xD1; 32];
@@ -2115,6 +2333,11 @@ mod tests {
         assert!(source.contains("relay.pull_pending_notifications(&wallet)"));
         assert!(source.contains("Self::push_expired_notifications("));
         assert!(source.contains("has_more |= notification_has_more || !delivery_complete"));
+        assert!(source.contains("self.spawn_chat_relay_cleanup_task(Arc::clone(relay))"));
+        assert!(source.contains("tokio::task::spawn_blocking(move || cleanup_relay.run_cleanup())"));
+        assert!(source.contains("tokio::time::MissedTickBehavior::Skip"));
+        assert!(source.contains("relay.record_maintenance_worker_failure(reason)"));
+        assert!(source.contains("\"maintenance\": relay.maintenance_status()"));
     }
 
     // ── node_secret derivation (preserved) ───────────────────────────────
