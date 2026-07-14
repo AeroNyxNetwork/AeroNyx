@@ -74,13 +74,18 @@
 //! - commitment_sync_enabled must remain default-off. A follower accepts
 //!   blocks only from the explicitly pinned coordinator node identity and
 //!   fails closed on rollback, fork, signature, or continuity errors.
+//! - commitment_tip_anchor_path is a coordinator-local rollback guard outside
+//!   SQLite. An empty value derives a sibling file beside db_path. Never point
+//!   it at the SQLite database itself.
 //!
 //! ## Last Modified
+//! v2.7.14-CommitmentTipAnchor - Added the coordinator-local signed tip anchor.
 //! v2.7.1-BlockFollower — Added default-off pinned coordinator follower settings.
 //! v2.7.0-BlockSync — Added default-off commitment coordinator role.
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -255,6 +260,15 @@ pub struct MemChainConfig {
     /// Failures use bounded exponential backoff independently of this value.
     #[serde(default = "default_commitment_sync_interval_secs")]
     pub commitment_sync_interval_secs: u64,
+
+    /// Optional path for the coordinator's signed commitment-tip high-water mark.
+    ///
+    /// Empty (the backward-compatible default) derives
+    /// `record-commitment-tip-v1.json` beside `db_path`. The sidecar detects a
+    /// valid but older SQLite file after restart while host state remains. It
+    /// is not a whole-machine snapshot rollback or distributed-consensus proof.
+    #[serde(default)]
+    pub commitment_tip_anchor_path: String,
 
     /// Maximum number of distinct remote owners this node will serve.
     #[serde(default = "default_max_remote_owners")]
@@ -645,6 +659,12 @@ impl MemChainConfig {
                     "requires memchain.blind_storage_enabled = true",
                 ));
             }
+            if self.effective_commitment_tip_anchor_path() == Path::new(&self.db_path) {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_tip_anchor_path",
+                    "must not resolve to memchain.db_path",
+                ));
+            }
             debug!("[MEMCHAIN_BLOCK] Canonical commitment coordinator enabled");
         }
 
@@ -888,6 +908,25 @@ impl MemChainConfig {
         bytes.try_into().ok()
     }
 
+    /// Resolves the coordinator-local signed tip anchor without changing old
+    /// configurations. Relative explicit paths remain relative to the process
+    /// working directory, matching the existing database path behavior.
+    #[must_use]
+    pub fn effective_commitment_tip_anchor_path(&self) -> PathBuf {
+        let configured = self.commitment_tip_anchor_path.trim();
+        if !configured.is_empty() {
+            return PathBuf::from(configured);
+        }
+
+        let db_path = Path::new(&self.db_path);
+        match db_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                parent.join("record-commitment-tip-v1.json")
+            }
+            _ => PathBuf::from("record-commitment-tip-v1.json"),
+        }
+    }
+
     /// v2.4.0: Check whether the cognitive graph pipeline is fully enabled.
     ///
     /// Requires both NER and graph to be enabled. If NER is disabled,
@@ -982,6 +1021,7 @@ impl Default for MemChainConfig {
             commitment_sync_enabled: false,
             commitment_coordinator_node_id: String::new(),
             commitment_sync_interval_secs: default_commitment_sync_interval_secs(),
+            commitment_tip_anchor_path: String::new(),
             max_remote_owners: default_max_remote_owners(),
             ner_enabled: false,
             ner_model_path: default_ner_model_path(),
@@ -1050,6 +1090,11 @@ mod tests {
         assert!(!mc.commitment_sync_enabled);
         assert!(mc.commitment_coordinator_node_id.is_empty());
         assert_eq!(mc.commitment_sync_interval_secs, 30);
+        assert!(mc.commitment_tip_anchor_path.is_empty());
+        assert_eq!(
+            mc.effective_commitment_tip_anchor_path(),
+            PathBuf::from("record-commitment-tip-v1.json")
+        );
         assert_eq!(mc.max_remote_owners, 100);
         assert!(!mc.ner_enabled);
         assert_eq!(mc.ner_model_path, "models/gliner");
@@ -1271,6 +1316,26 @@ mod tests {
         }
         .validate()
         .is_ok());
+
+        let explicit = MemChainConfig {
+            db_path: "/var/lib/aeronyx/memchain.db".into(),
+            commitment_tip_anchor_path: "/var/lib/aeronyx/tip.json".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            explicit.effective_commitment_tip_anchor_path(),
+            PathBuf::from("/var/lib/aeronyx/tip.json")
+        );
+
+        assert!(MemChainConfig {
+            blind_storage_enabled: true,
+            commitment_coordinator_enabled: true,
+            db_path: "/var/lib/aeronyx/memchain.db".into(),
+            commitment_tip_anchor_path: "/var/lib/aeronyx/memchain.db".into(),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

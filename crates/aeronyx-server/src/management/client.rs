@@ -32,6 +32,8 @@
 //     not votes, quorum, finality, or a fork-choice input.
 //   - commitment durability reports only SQLite's aggregate synchronous mode;
 //     never add database paths, host details, block hashes, or user data.
+//   - rollback guard reporting is aggregate only. Never send the sidecar path,
+//     signer, signature, identity material, or anchored block hash.
 //   - The body used for signing MUST be the same as what is sent.
 //     Do NOT add fields after signing.
 //
@@ -46,6 +48,7 @@
 //   v2.7.11        - Added durable checkpoint observation freshness evidence
 //   v2.7.12        - Added privacy-safe witness round coverage evidence
 //   v2.7.13        - Added aggregate commitment durability evidence
+//   v2.7.14        - Added aggregate signed tip rollback-guard evidence
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -110,6 +113,16 @@ pub struct RecordCommitmentIntegrityHeartbeatStatus {
     pub verified_tip_height: u64,
     /// Effective SQLite mode: `off`, `normal`, `full`, or `extra`.
     pub durability_mode: &'static str,
+    /// Signed local high-water guard state.
+    pub rollback_guard_state: &'static str,
+    /// Highest height covered by the local guard.
+    pub rollback_guard_height: u64,
+    /// Last signature/ancestry verification time.
+    pub rollback_guard_last_verified_at: Option<u64>,
+    /// Last successful atomic sidecar write time.
+    pub rollback_guard_last_persisted_at: Option<u64>,
+    /// Process-lifetime atomic sidecar write failures.
+    pub rollback_guard_write_failures_total: u64,
 }
 
 /// Compact commitment follower status sent to the central health plane.
@@ -703,6 +716,11 @@ mod tests {
                 verified_commitment_count: 27,
                 verified_tip_height: 9,
                 durability_mode: "full",
+                rollback_guard_state: "verified",
+                rollback_guard_height: 9,
+                rollback_guard_last_verified_at: Some(100),
+                rollback_guard_last_persisted_at: Some(100),
+                rollback_guard_write_failures_total: 0,
             }),
             record_commitment_sync: Some(RecordCommitmentSyncHeartbeatStatus {
                 contract_version: "record_commitment_sync.v1",
@@ -763,6 +781,9 @@ mod tests {
         assert_eq!(integrity["verified_commitment_count"], 27);
         assert_eq!(integrity["verified_tip_height"], 9);
         assert_eq!(integrity["durability_mode"], "full");
+        assert_eq!(integrity["rollback_guard_state"], "verified");
+        assert_eq!(integrity["rollback_guard_height"], 9);
+        assert_eq!(integrity["rollback_guard_write_failures_total"], 0);
         let sync = &value["record_commitment_sync"];
         assert_eq!(sync["state"], "backoff");
         assert_eq!(sync["enabled"], true);
@@ -797,6 +818,9 @@ mod tests {
                 "signed_response",
                 "evidence_digest",
                 "signature",
+                "signer",
+                "anchor_path",
+                "rollback_guard_path",
                 "request_id",
                 "peer",
                 "route",

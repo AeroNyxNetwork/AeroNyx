@@ -120,6 +120,9 @@
 //! - commitment_durability is process-local SQLite configuration evidence.
 //!   A coordinator must configure FULL-or-stronger before startup audit; never
 //!   silently downgrade it while the process is serving commitment traffic.
+//! - commitment_tip_anchor keeps its path and signing identity process-local.
+//!   Public status may expose only aggregate state, height, timestamps, and
+//!   failure counts; never expose its path, signature, signer, or tip hash.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
@@ -155,6 +158,7 @@
 //! v2.7.11-CheckpointFreshness - Added age-bounded verified observation status.
 //! v2.7.12-WitnessRoundEvidence - Added privacy-safe bounded round coverage.
 //! v2.7.13-CommitmentDurability - Added coordinator fail-closed durability state.
+//! v2.7.14-CommitmentTipAnchor - Added a signed local high-water rollback guard.
 //! v2.6.1+BlindVectorRecovery - Added all-owner active embedding enumeration so
 //!   node-blind/remote Local-mode nodes can rebuild every isolated vector
 //!   partition after restart without weakening owner-scoped recall.
@@ -165,7 +169,7 @@
 // ============================================
 
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -174,6 +178,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, error, info, warn};
 
+use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::ledger::{
     MemoryLayer, MemoryRecord, RecordStatus, MAX_RECORD_COMMITMENTS_PER_BLOCK,
 };
@@ -566,6 +571,42 @@ pub(crate) struct RecordCommitmentIntegrityRuntime {
     pub(crate) verified_tip_hash: [u8; 32],
 }
 
+/// Private coordinator material required to advance the local signed anchor.
+///
+/// The identity is cloned only while writing a new anchor, then dropped. This
+/// object must never derive `Debug`, serialize, enter logs, or cross an API.
+pub(crate) struct RecordCommitmentTipAnchorConfig {
+    pub(crate) path: PathBuf,
+    pub(crate) identity: IdentityKeyPair,
+}
+
+/// Runtime-only state for the cross-restart commitment-tip rollback guard.
+///
+/// The persisted sidecar contains a signed tip, but public runtime reporting is
+/// intentionally aggregate. `config` is private key material and must remain
+/// excluded from every API/heartbeat status structure.
+pub(crate) struct RecordCommitmentTipAnchorRuntime {
+    pub(crate) config: Option<RecordCommitmentTipAnchorConfig>,
+    pub(crate) state: &'static str,
+    pub(crate) anchored_height: u64,
+    pub(crate) last_verified_at: Option<u64>,
+    pub(crate) last_persisted_at: Option<u64>,
+    pub(crate) write_failures_total: u64,
+}
+
+impl Default for RecordCommitmentTipAnchorRuntime {
+    fn default() -> Self {
+        Self {
+            config: None,
+            state: "disabled",
+            anchored_height: 0,
+            last_verified_at: None,
+            last_persisted_at: None,
+            write_failures_total: 0,
+        }
+    }
+}
+
 // ============================================
 // LRU Cache
 // ============================================
@@ -637,6 +678,9 @@ pub struct MemoryStorage {
     /// Effective SQLite `PRAGMA synchronous` level for this process. This is
     /// aggregate configuration evidence only and never contains chain data.
     pub(crate) commitment_durability: AtomicU64,
+    /// Signed local high-water mark outside SQLite. The private config never
+    /// leaves this process; only aggregate status is reportable.
+    pub(crate) commitment_tip_anchor: RwLock<RecordCommitmentTipAnchorRuntime>,
     /// Runtime-only aggregate signed-checkpoint reconciliation evidence.
     pub(crate) commitment_checkpoint: RwLock<RecordCommitmentCheckpointRuntime>,
 }
@@ -693,6 +737,7 @@ impl MemoryStorage {
             // `open` explicitly configures NORMAL. A coordinator upgrades this
             // to FULL and verifies the effective value before startup audit.
             commitment_durability: AtomicU64::new(1),
+            commitment_tip_anchor: RwLock::new(RecordCommitmentTipAnchorRuntime::default()),
             commitment_checkpoint: RwLock::new(RecordCommitmentCheckpointRuntime::default()),
         })
     }

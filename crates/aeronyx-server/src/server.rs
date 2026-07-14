@@ -130,6 +130,8 @@
 //      from local evidence-vault integrity and request-attempt counters.
 //  55. Reports each bounded coordinator witness round as privacy-safe aggregate
 //      evidence without turning peer count into consensus or fork choice.
+//  56. Verifies or initializes a signed coordinator-local commitment tip anchor
+//      after full chain audit and before any block producer can start.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -152,6 +154,9 @@
 //     as votes, quorum, finality, leader election, or fork choice.
 //   - Commitment coordinators must confirm SQLite FULL-or-stronger durability
 //     before startup audit and before any block producer can start.
+//   - The signed commitment tip anchor detects an older/replaced SQLite chain
+//     only while the host-side anchor remains current. It does not detect a
+//     whole-host snapshot rollback and is not consensus, quorum, or finality.
 //   - encrypted_message_counter is aggregate only and never stores payload,
 //     destination, DNS, URL, voucher, wallet, or client public IP details.
 //   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
@@ -161,6 +166,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.14-CommitmentTipAnchor - Signed local high-water rollback guard
 //   v2.7.11-CheckpointFreshness - Durable proof recency in status and heartbeat
 //   v2.7.12-WitnessRoundEvidence - Privacy-safe bounded witness round coverage
 //   v2.7.13-CommitmentDurability - Fail-closed coordinator SQLite durability
@@ -1367,6 +1373,25 @@ impl Server {
             duration_ms = commitment_integrity.verification_duration_ms.unwrap_or(0),
             "[MEMCHAIN_BLOCK] Persisted commitment chain audit passed"
         );
+        if self.config.memchain.commitment_coordinator_enabled {
+            let anchor_state = storage
+                .configure_record_commitment_tip_anchor(
+                    self.config.memchain.effective_commitment_tip_anchor_path(),
+                    &self.identity,
+                )
+                .await
+                .map_err(|error| {
+                    ServerError::startup_failed(format!(
+                        "MemChain commitment tip rollback guard: {error}"
+                    ))
+                })?;
+            info!(
+                state = anchor_state,
+                tip_height = commitment_audit.tip_height,
+                scope = "local_db_file_rollback_only",
+                "[MEMCHAIN_BLOCK] Signed commitment tip rollback guard passed"
+            );
+        }
         let checkpoint_evidence_audit = storage
             .audit_record_commitment_checkpoint_evidence()
             .await
@@ -1896,6 +1921,13 @@ impl Server {
                             verified_commitment_count: status.verified_commitment_count,
                             verified_tip_height: status.verified_tip_height,
                             durability_mode: status.durability_mode,
+                            rollback_guard_state: status.rollback_guard_state,
+                            rollback_guard_height: status.rollback_guard_height,
+                            rollback_guard_last_verified_at: status.rollback_guard_last_verified_at,
+                            rollback_guard_last_persisted_at: status
+                                .rollback_guard_last_persisted_at,
+                            rollback_guard_write_failures_total: status
+                                .rollback_guard_write_failures_total,
                         }
                     });
                     let record_commitment_sync = commitment_storage.as_ref().map(|storage| {
