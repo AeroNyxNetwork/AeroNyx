@@ -150,6 +150,8 @@
 //     Failed attempts and inbound served requests cannot refresh it.
 //   - Witness round states are operator evidence only. Never use their counts
 //     as votes, quorum, finality, leader election, or fork choice.
+//   - Commitment coordinators must confirm SQLite FULL-or-stronger durability
+//     before startup audit and before any block producer can start.
 //   - encrypted_message_counter is aggregate only and never stores payload,
 //     destination, DNS, URL, voucher, wallet, or client public IP details.
 //   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
@@ -161,6 +163,7 @@
 // Last Modified:
 //   v2.7.11-CheckpointFreshness - Durable proof recency in status and heartbeat
 //   v2.7.12-WitnessRoundEvidence - Privacy-safe bounded witness round coverage
+//   v2.7.13-CommitmentDurability - Fail-closed coordinator SQLite durability
 //   v2.7.9-CheckpointRouteInventory - Advertise checkpoint in startup route inventory
 //   v2.7.8-CoordinatorWitness - Low-frequency signed peer checkpoint evidence
 //   v2.7.6-EvidenceVault - Durable bounded checkpoint proofs and startup audit
@@ -1337,6 +1340,19 @@ impl Server {
             MemoryStorage::open(db_path, Some(record_key))
                 .map_err(|e| ServerError::startup_failed(format!("SQLite: {}", e)))?,
         );
+        let commitment_durability = storage
+            .configure_record_commitment_durability(
+                self.config.memchain.commitment_coordinator_enabled,
+            )
+            .await
+            .map_err(|error| {
+                ServerError::startup_failed(format!("MemChain commitment durability: {error}"))
+            })?;
+        info!(
+            durability_mode = commitment_durability,
+            coordinator = self.config.memchain.commitment_coordinator_enabled,
+            "[MEMCHAIN_BLOCK] Commitment durability gate passed"
+        );
         let commitment_audit = storage
             .audit_record_commitment_chain()
             .await
@@ -1879,6 +1895,7 @@ impl Server {
                             verified_block_count: status.verified_block_count,
                             verified_commitment_count: status.verified_commitment_count,
                             verified_tip_height: status.verified_tip_height,
+                            durability_mode: status.durability_mode,
                         }
                     });
                     let record_commitment_sync = commitment_storage.as_ref().map(|storage| {

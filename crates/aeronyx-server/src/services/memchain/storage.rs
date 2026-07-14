@@ -54,6 +54,9 @@
 //!   age of the most recent signature-verified outbound observation.
 //! - v2.7.12-WitnessRoundEvidence: Reports the latest bounded witness-round
 //!   coverage and result without treating peer count as consensus.
+//! - v2.7.13-CommitmentDurability: Tracks the effective SQLite synchronous
+//!   level so a commitment coordinator can fail closed unless WAL commits use
+//!   FULL-or-stronger durability before startup audit and block production.
 //!
 //! ## Thread Safety
 //! `rusqlite::Connection` behind `tokio::sync::Mutex`. Phase 2+ can use r2d2 pooling.
@@ -114,6 +117,9 @@
 //!   vault audit. Attempts, failures, and inbound serving never refresh it.
 //! - Witness-round fields are process-local aggregate observations. They must
 //!   never be interpreted as votes, quorum, finality, or fork choice.
+//! - commitment_durability is process-local SQLite configuration evidence.
+//!   A coordinator must configure FULL-or-stronger before startup audit; never
+//!   silently downgrade it while the process is serving commitment traffic.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
@@ -148,6 +154,7 @@
 //!   from outbound signed checkpoint verification state.
 //! v2.7.11-CheckpointFreshness - Added age-bounded verified observation status.
 //! v2.7.12-WitnessRoundEvidence - Added privacy-safe bounded round coverage.
+//! v2.7.13-CommitmentDurability - Added coordinator fail-closed durability state.
 //! v2.6.1+BlindVectorRecovery - Added all-owner active embedding enumeration so
 //!   node-blind/remote Local-mode nodes can rebuild every isolated vector
 //!   partition after restart without weakening owner-scoped recall.
@@ -627,6 +634,9 @@ pub struct MemoryStorage {
     /// Runtime-only complete-chain audit baseline. Cleared before every audit
     /// and advanced only after an atomic, fully validated block append.
     pub(crate) commitment_integrity: RwLock<Option<RecordCommitmentIntegrityRuntime>>,
+    /// Effective SQLite `PRAGMA synchronous` level for this process. This is
+    /// aggregate configuration evidence only and never contains chain data.
+    pub(crate) commitment_durability: AtomicU64,
     /// Runtime-only aggregate signed-checkpoint reconciliation evidence.
     pub(crate) commitment_checkpoint: RwLock<RecordCommitmentCheckpointRuntime>,
 }
@@ -680,6 +690,9 @@ impl MemoryStorage {
             record_key: record_key.map(Zeroizing::new),
             commitment_sync: RwLock::new(RecordCommitmentSyncRuntime::default()),
             commitment_integrity: RwLock::new(None),
+            // `open` explicitly configures NORMAL. A coordinator upgrades this
+            // to FULL and verifies the effective value before startup audit.
+            commitment_durability: AtomicU64::new(1),
             commitment_checkpoint: RwLock::new(RecordCommitmentCheckpointRuntime::default()),
         })
     }

@@ -40,6 +40,8 @@
 //!   remains independent from vault integrity and transport attempts
 //! - v2.7.12-WitnessRoundEvidence: explicit bounded-round coverage and result
 //!   that remains evidence only and never becomes a consensus rule
+//! - v2.7.13-CommitmentDurability: coordinator-only SQLite FULL durability,
+//!   startup fail-closed verification, and aggregate durability evidence
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -77,6 +79,9 @@
 //!   failed attempt or served response must never make stale evidence fresh.
 //! - Witness round state is process-local aggregate telemetry. Do not use its
 //!   counts as votes, quorum, finality, leader election, or fork choice.
+//! - A coordinator must call `configure_record_commitment_durability(true)`
+//!   before startup audit. Failure to confirm FULL-or-stronger is fatal; this
+//!   protects acknowledged commitment tips from ordinary host power loss.
 //!
 //! ## Modification History
 //! v2.2.0               - 🌟 Extracted from storage.rs; added get_embedding_model, get_overview
@@ -95,6 +100,7 @@
 //! v2.7.10-CheckpointDirectionIsolation - Isolated inbound service telemetry.
 //! v2.7.11-CheckpointFreshness - Added durable proof age classification.
 //! v2.7.12-WitnessRoundEvidence - Added bounded round evidence classification.
+//! v2.7.13-CommitmentDurability - Enforced coordinator FULL SQLite commits.
 //!
 //! ## Last Modified
 //! v2.7.11-CheckpointFreshness - Distinguish vault integrity from proof recency.
@@ -107,6 +113,7 @@
 //! v2.7.0-BlockSync - Transactional commitment chain, ranges, and safe status.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, OptionalExtension};
@@ -213,6 +220,8 @@ pub struct RecordCommitmentChainIntegrityStatus {
     pub verified_commitment_count: u64,
     /// Last verified one-based height, or zero for an empty verified chain.
     pub verified_tip_height: u64,
+    /// Effective SQLite durability mode: `off`, `normal`, `full`, or `extra`.
+    pub durability_mode: &'static str,
     /// Explicit scope and privacy boundary for operators.
     pub verification_policy: &'static str,
 }
@@ -1219,6 +1228,52 @@ impl MemoryStorage {
         }
     }
 
+    /// Configures and verifies SQLite commit durability before chain audit.
+    ///
+    /// WAL + `NORMAL` preserves database consistency but may lose a recently
+    /// acknowledged transaction after host power failure. The single-writer
+    /// coordinator therefore upgrades the shared connection to `FULL` and
+    /// refuses startup unless SQLite reports FULL-or-stronger. Followers keep
+    /// the existing mode to avoid imposing coordinator write latency on every
+    /// verifier. This setting contains no chain or user data.
+    pub async fn configure_record_commitment_durability(
+        &self,
+        coordinator: bool,
+    ) -> Result<&'static str, String> {
+        let conn = self.conn.lock().await;
+        if coordinator {
+            conn.pragma_update(None, "synchronous", "FULL")
+                .map_err(|error| format!("set coordinator SQLite durability: {error}"))?;
+        }
+        let level: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .map_err(|error| format!("read SQLite durability: {error}"))?;
+        let mode = match level {
+            0 => "off",
+            1 => "normal",
+            2 => "full",
+            3 => "extra",
+            _ => return Err(format!("unsupported SQLite synchronous level {level}")),
+        };
+        if coordinator && level < 2 {
+            return Err(format!(
+                "commitment coordinator requires SQLite FULL durability; effective mode is {mode}"
+            ));
+        }
+        self.commitment_durability
+            .store(level as u64, Ordering::Release);
+        info!(
+            role = if coordinator {
+                "coordinator"
+            } else {
+                "non_coordinator"
+            },
+            durability_mode = mode,
+            "[MEMCHAIN_BLOCK] SQLite commitment durability configured"
+        );
+        Ok(mode)
+    }
+
     /// Marks the start of one bounded follower pull round.
     pub fn record_commitment_sync_attempt(&self, now: u64) {
         let mut runtime = self.commitment_sync.write();
@@ -1358,7 +1413,14 @@ impl MemoryStorage {
     /// re-establish the baseline from the complete SQLite chain before it may
     /// report `verified`.
     pub fn record_commitment_chain_integrity_status(&self) -> RecordCommitmentChainIntegrityStatus {
-        const POLICY: &str = "full snapshot-consistent startup audit plus transactionally verified appends; no block hashes, proposer identities, commitment ids, owners, payloads, peers, endpoints, routes, or client metadata";
+        const POLICY: &str = "full snapshot-consistent startup audit plus transactionally verified appends; coordinator requires SQLite FULL-or-stronger commit durability; no block hashes, proposer identities, commitment ids, owners, payloads, peers, endpoints, routes, or client metadata";
+        let durability_mode = match self.commitment_durability.load(Ordering::Acquire) {
+            0 => "off",
+            1 => "normal",
+            2 => "full",
+            3 => "extra",
+            _ => "unknown",
+        };
         match *self.commitment_integrity.read() {
             Some(runtime) => RecordCommitmentChainIntegrityStatus {
                 contract_version: "record_commitment_integrity.v1",
@@ -1369,6 +1431,7 @@ impl MemoryStorage {
                 verified_block_count: runtime.verified_block_count,
                 verified_commitment_count: runtime.verified_commitment_count,
                 verified_tip_height: runtime.verified_tip_height,
+                durability_mode,
                 verification_policy: POLICY,
             },
             None => RecordCommitmentChainIntegrityStatus {
@@ -1380,6 +1443,7 @@ impl MemoryStorage {
                 verified_block_count: 0,
                 verified_commitment_count: 0,
                 verified_tip_height: 0,
+                durability_mode,
                 verification_policy: POLICY,
             },
         }
@@ -2713,6 +2777,119 @@ mod tests {
             .get_active_records_by_context(&owner_b, "work", None, 100)
             .await;
         assert!(results.is_empty(), "Cross-owner isolation must be enforced");
+    }
+
+    #[tokio::test]
+    async fn test_commitment_coordinator_upgrades_sqlite_durability() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        assert_eq!(
+            storage
+                .record_commitment_chain_integrity_status()
+                .durability_mode,
+            "normal"
+        );
+        assert_eq!(
+            storage
+                .configure_record_commitment_durability(false)
+                .await
+                .unwrap(),
+            "normal"
+        );
+        assert_eq!(
+            storage
+                .configure_record_commitment_durability(true)
+                .await
+                .unwrap(),
+            "full"
+        );
+        let effective_level: i64 = {
+            let conn = storage.conn_lock().await;
+            conn.query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert!(effective_level >= 2);
+        assert_eq!(
+            storage
+                .record_commitment_chain_integrity_status()
+                .durability_mode,
+            "full"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commitment_append_failure_rolls_back_entire_block_after_reopen() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("commitment-atomicity.db");
+        let storage = MemoryStorage::open(&path, None).unwrap();
+        storage
+            .configure_record_commitment_durability(true)
+            .await
+            .unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+
+        // Inject a deterministic storage failure after the first membership
+        // row. The block row, both memberships, and chain_state tip must remain
+        // one atomic unit even when the transaction aborts mid-append.
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute_batch(
+                "CREATE TEMP TRIGGER fail_second_commitment_membership
+                 BEFORE INSERT ON record_block_commitments
+                 WHEN (SELECT COUNT(*) FROM record_block_commitments) = 1
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected membership failure');
+                 END;",
+            )
+            .unwrap();
+        }
+        let identity = IdentityKeyPair::generate();
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            1_700_190_001,
+            GENESIS_PREV_HASH,
+            vec![[0x91; 32], [0x92; 32]],
+            &identity,
+        );
+        assert!(storage
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap_err()
+            .contains("injected membership failure"));
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute_batch("DROP TRIGGER fail_second_commitment_membership;")
+                .unwrap();
+            let (blocks, memberships, tip_keys): (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM record_commitment_blocks),
+                         (SELECT COUNT(*) FROM record_block_commitments),
+                         (SELECT COUNT(*) FROM chain_state WHERE key IN
+                            ('record_block_tip_hash','record_block_tip_height',
+                             'record_block_chain_id'))",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!((blocks, memberships, tip_keys), (0, 0, 0));
+        }
+        drop(storage);
+
+        // A fresh process must see the same empty, valid chain. This catches
+        // accidental reliance on connection-local rollback visibility.
+        let reopened = MemoryStorage::open(&path, None).unwrap();
+        reopened
+            .configure_record_commitment_durability(true)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.audit_record_commitment_chain().await.unwrap(),
+            RecordCommitmentChainAudit {
+                block_count: 0,
+                commitment_count: 0,
+                tip_height: 0,
+            }
+        );
     }
 
     #[tokio::test]

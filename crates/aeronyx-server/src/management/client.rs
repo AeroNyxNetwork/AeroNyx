@@ -30,6 +30,8 @@
 //     attempts and inbound served responses must never refresh it.
 //   - witness round counts are aggregate operational evidence only. They are
 //     not votes, quorum, finality, or a fork-choice input.
+//   - commitment durability reports only SQLite's aggregate synchronous mode;
+//     never add database paths, host details, block hashes, or user data.
 //   - The body used for signing MUST be the same as what is sent.
 //     Do NOT add fields after signing.
 //
@@ -43,6 +45,7 @@
 //   v2.7.4         - Added compact verified commitment-chain integrity evidence
 //   v2.7.11        - Added durable checkpoint observation freshness evidence
 //   v2.7.12        - Added privacy-safe witness round coverage evidence
+//   v2.7.13        - Added aggregate commitment durability evidence
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -105,6 +108,8 @@ pub struct RecordCommitmentIntegrityHeartbeatStatus {
     pub verified_commitment_count: u64,
     /// Last verified one-based height, or zero for an empty chain.
     pub verified_tip_height: u64,
+    /// Effective SQLite mode: `off`, `normal`, `full`, or `extra`.
+    pub durability_mode: &'static str,
 }
 
 /// Compact commitment follower status sent to the central health plane.
@@ -697,6 +702,7 @@ mod tests {
                 verified_block_count: 9,
                 verified_commitment_count: 27,
                 verified_tip_height: 9,
+                durability_mode: "full",
             }),
             record_commitment_sync: Some(RecordCommitmentSyncHeartbeatStatus {
                 contract_version: "record_commitment_sync.v1",
@@ -756,6 +762,7 @@ mod tests {
         assert_eq!(integrity["verified_block_count"], 9);
         assert_eq!(integrity["verified_commitment_count"], 27);
         assert_eq!(integrity["verified_tip_height"], 9);
+        assert_eq!(integrity["durability_mode"], "full");
         let sync = &value["record_commitment_sync"];
         assert_eq!(sync["state"], "backoff");
         assert_eq!(sync["enabled"], true);
