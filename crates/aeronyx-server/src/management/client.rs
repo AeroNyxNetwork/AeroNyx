@@ -26,6 +26,8 @@
 //     coordinator identity, endpoint, block hashes, owners, or payload data.
 //   - record_commitment_integrity reports aggregate verification evidence only.
 //     Never add hashes, proposer identity, commitment IDs, or user metadata.
+//   - checkpoint observation freshness derives from durable signed proof time;
+//     attempts and inbound served responses must never refresh it.
 //   - The body used for signing MUST be the same as what is sent.
 //     Do NOT add fields after signing.
 //
@@ -37,6 +39,7 @@
 //   v2.3.0         - Added memchain_status to heartbeat system_stats
 //   v2.7.1         - Added compact privacy-safe commitment sync evidence
 //   v2.7.4         - Added compact verified commitment-chain integrity evidence
+//   v2.7.11        - Added durable checkpoint observation freshness evidence
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -182,6 +185,12 @@ pub struct RecordCommitmentCheckpointHeartbeatStatus {
     pub divergence_evidence_records: u64,
     /// Most recent durable evidence observation time.
     pub last_evidence_at: Option<u64>,
+    /// `unavailable`, `fresh`, or `stale` for durable signed observations.
+    pub observation_freshness: String,
+    /// Age of the latest durable observation; absent when unavailable.
+    pub observation_age_seconds: Option<u64>,
+    /// Maximum age still classified as fresh.
+    pub freshness_window_seconds: u64,
     /// Local persistence failures since process start.
     pub evidence_persistence_failures_total: u64,
 }
@@ -702,6 +711,9 @@ mod tests {
                 evidence_records: 3,
                 divergence_evidence_records: 0,
                 last_evidence_at: Some(120),
+                observation_freshness: "fresh".to_string(),
+                observation_age_seconds: Some(5),
+                freshness_window_seconds: 900,
                 evidence_persistence_failures_total: 0,
             }),
         };
@@ -722,6 +734,9 @@ mod tests {
         assert_eq!(checkpoint["requests_served_total"], 2);
         assert_eq!(checkpoint["evidence_state"], "verified");
         assert_eq!(checkpoint["evidence_records"], 3);
+        assert_eq!(checkpoint["observation_freshness"], "fresh");
+        assert_eq!(checkpoint["observation_age_seconds"], 5);
+        assert_eq!(checkpoint["freshness_window_seconds"], 900);
         for section in [integrity, sync, checkpoint] {
             for forbidden in [
                 "coordinator_node_id",

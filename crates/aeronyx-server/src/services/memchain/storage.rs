@@ -50,6 +50,8 @@
 //!   evidence without peer identities, hashes, signatures, or user metadata.
 //! - v2.7.10-CheckpointDirectionIsolation: Inbound checkpoint serving updates
 //!   service counters only and cannot overwrite outbound verification evidence.
+//! - v2.7.11-CheckpointFreshness: Separates durable vault integrity from the
+//!   age of the most recent signature-verified outbound observation.
 //!
 //! ## Thread Safety
 //! `rusqlite::Connection` behind `tokio::sync::Mutex`. Phase 2+ can use r2d2 pooling.
@@ -106,6 +108,8 @@
 //! - Inbound checkpoint requests are requester-controlled observations. Serving
 //!   one may update only `last_served_at` and `requests_served_total`; it must
 //!   never set convergence, divergence, failure, or observed peer heights.
+//! - Checkpoint freshness is derived only from `last_evidence_at` after a valid
+//!   vault audit. Attempts, failures, and inbound serving never refresh it.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
@@ -138,6 +142,7 @@
 //!   P3: conn_lock() → pub(crate). row_to_record returns Err on bad BLOB length.
 //! v2.7.10-CheckpointDirectionIsolation - Separated inbound service counters
 //!   from outbound signed checkpoint verification state.
+//! v2.7.11-CheckpointFreshness - Added age-bounded verified observation status.
 //! v2.6.1+BlindVectorRecovery - Added all-owner active embedding enumeration so
 //!   node-blind/remote Local-mode nodes can rebuild every isolated vector
 //!   partition after restart without weakening owner-scoped recall.
@@ -374,6 +379,13 @@ pub struct RecordCommitmentCheckpointStatus {
     pub divergence_evidence_records: u64,
     /// Most recent durable evidence observation time.
     pub last_evidence_at: Option<u64>,
+    /// `unavailable`, `fresh`, or `stale` for the most recent durable signed
+    /// outbound observation. Vault integrity is reported separately.
+    pub observation_freshness: String,
+    /// Age of the latest durable signed observation; absent when unavailable.
+    pub observation_age_seconds: Option<u64>,
+    /// Maximum observation age still classified as `fresh`.
+    pub freshness_window_seconds: u64,
     /// Local SQLite persistence failures observed since process start.
     pub evidence_persistence_failures_total: u64,
     /// Explicit privacy boundary for operators and API consumers.
@@ -387,6 +399,10 @@ pub(crate) const CHECKPOINT_EVIDENCE_CAPACITY: usize = 256;
 /// Defensive bound for one stored proof frame. Increasing this requires an
 /// explicit wire and startup-memory review.
 pub(crate) const MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES: usize = 4 * 1024;
+/// A coordinator witness round has a minimum five-minute interval. Three
+/// missed rounds make the last durable signed observation stale without
+/// overreacting to one transient transport failure.
+pub(crate) const CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS: u64 = 15 * 60;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RecordCommitmentSyncRuntime {

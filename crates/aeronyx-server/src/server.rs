@@ -126,6 +126,8 @@
 //      signed peer observations without treating witness count as consensus.
 //  53. Keeps the public API startup route inventory aligned with the signed
 //      checkpoint witness endpoint used by coordinator reconciliation.
+//  54. Reports durable signed checkpoint observation freshness independently
+//      from local evidence-vault integrity and request-attempt counters.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -142,6 +144,8 @@
 //     blind coordinator may pack blocks; all other nodes remain followers.
 //   - Coordinator witness reconciliation is evidence collection only. It must
 //     never mutate the canonical chain, elect a leader, or infer fork choice.
+//   - Checkpoint freshness comes only from audited durable signed evidence.
+//     Failed attempts and inbound served requests cannot refresh it.
 //   - encrypted_message_counter is aggregate only and never stores payload,
 //     destination, DNS, URL, voucher, wallet, or client public IP details.
 //   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
@@ -151,6 +155,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.11-CheckpointFreshness - Durable proof recency in status and heartbeat
 //   v2.7.9-CheckpointRouteInventory - Advertise checkpoint in startup route inventory
 //   v2.7.8-CoordinatorWitness - Low-frequency signed peer checkpoint evidence
 //   v2.7.6-EvidenceVault - Durable bounded checkpoint proofs and startup audit
@@ -1912,6 +1917,9 @@ impl Server {
                             evidence_records: status.evidence_records,
                             divergence_evidence_records: status.divergence_evidence_records,
                             last_evidence_at: status.last_evidence_at,
+                            observation_freshness: status.observation_freshness,
+                            observation_age_seconds: status.observation_age_seconds,
+                            freshness_window_seconds: status.freshness_window_seconds,
                             evidence_persistence_failures_total: status
                                 .evidence_persistence_failures_total,
                         }

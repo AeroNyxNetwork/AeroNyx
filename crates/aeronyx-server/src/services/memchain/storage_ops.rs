@@ -36,6 +36,8 @@
 //!   v8-to-v9 preservation, and tampered-disk restart regression coverage
 //! - v2.7.10-CheckpointDirectionIsolation: inbound proof serving counters no
 //!   longer overwrite outbound convergence, divergence, or height evidence
+//! - v2.7.11-CheckpointFreshness: age-bounded durable observation state that
+//!   remains independent from vault integrity and transport attempts
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -69,6 +71,8 @@
 //! - An inbound checkpoint request describes the requester's state, not this
 //!   node's observation of the network. Serving it must never mutate outbound
 //!   checkpoint relation, heights, or divergence counters.
+//! - Freshness derives only from an audited, durable `last_evidence_at`; a
+//!   failed attempt or served response must never make stale evidence fresh.
 //!
 //! ## Modification History
 //! v2.2.0               - 🌟 Extracted from storage.rs; added get_embedding_model, get_overview
@@ -85,8 +89,10 @@
 //! v2.7.6-EvidenceVault - Added durable bounded proof storage and startup audit.
 //! v2.7.7-EvidenceRestartRecovery - Added real SQLite restart/migration tests.
 //! v2.7.10-CheckpointDirectionIsolation - Isolated inbound service telemetry.
+//! v2.7.11-CheckpointFreshness - Added durable proof age classification.
 //!
 //! ## Last Modified
+//! v2.7.11-CheckpointFreshness - Distinguish vault integrity from proof recency.
 //! v2.7.10-CheckpointDirectionIsolation - Prevent requester-driven status pollution.
 //! v2.7.4-BlockIntegrityStatus - Report and maintain the verified-chain baseline.
 //! v2.7.5-CheckpointProof - Serve only audit-backed checkpoints and report outcomes.
@@ -115,7 +121,8 @@ use super::storage::{
     LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentCheckpointStatus,
     RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime,
     RecordCommitmentSyncStatus, StorageStats, CHECKPOINT_EVIDENCE_CAPACITY,
-    COMMITMENT_SYNC_EVENT_CAPACITY, MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES,
+    CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS, COMMITMENT_SYNC_EVENT_CAPACITY,
+    MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES,
 };
 use super::storage_crypto::{
     decrypt_rawlog_content, decrypt_record_content, encrypt_rawlog_content, encrypt_record_content,
@@ -803,11 +810,40 @@ fn push_commitment_sync_event(
     runtime.recent_events.push_back(event);
 }
 
+fn checkpoint_observation_freshness(
+    last_evidence_at: Option<u64>,
+    now: u64,
+) -> (&'static str, Option<u64>) {
+    let Some(observed_at) = last_evidence_at else {
+        return ("unavailable", None);
+    };
+    let Some(age) = now.checked_sub(observed_at) else {
+        // A wall-clock rollback must not make future-dated evidence appear
+        // fresh. The signed frame remains in the audited local vault.
+        return ("unavailable", None);
+    };
+    if age <= CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS {
+        ("fresh", Some(age))
+    } else {
+        ("stale", Some(age))
+    }
+}
+
 impl MemoryStorage {
     /// Returns aggregate signed checkpoint evidence without peer, hash,
     /// signature, endpoint, or user metadata.
     pub fn record_commitment_checkpoint_status(&self) -> RecordCommitmentCheckpointStatus {
         let runtime = self.commitment_checkpoint.read();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let (observation_freshness, observation_age_seconds) =
+            if runtime.evidence_state == "verified" {
+                checkpoint_observation_freshness(runtime.last_evidence_at, now)
+            } else {
+                ("unavailable", None)
+            };
         RecordCommitmentCheckpointStatus {
             contract_version: "record_commitment_checkpoint.v1",
             state: runtime.state.to_string(),
@@ -826,9 +862,12 @@ impl MemoryStorage {
             evidence_records: runtime.evidence_records,
             divergence_evidence_records: runtime.divergence_evidence_records,
             last_evidence_at: runtime.last_evidence_at,
+            observation_freshness: observation_freshness.to_string(),
+            observation_age_seconds,
+            freshness_window_seconds: CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS,
             evidence_persistence_failures_total: runtime
                 .evidence_persistence_failures_total,
-            privacy_policy: "aggregate signed checkpoint outcomes and local evidence-vault health only; raw frames, peer identities, block hashes, signatures, request ids, commitments, owners, payloads, endpoints, routes, and client metadata never leave the node",
+            privacy_policy: "aggregate signed checkpoint outcomes, durable observation freshness, and local evidence-vault health only; raw frames, peer identities, block hashes, signatures, request ids, commitments, owners, payloads, endpoints, routes, and client metadata never leave the node",
         }
     }
 
@@ -3088,6 +3127,42 @@ mod tests {
         assert_eq!(status.proofs_failed_total, 0);
         assert_eq!(status.divergences_total, 0);
         assert_eq!(status.requests_served_total, 1);
+        assert_eq!(status.observation_freshness, "unavailable");
+        assert_eq!(status.observation_age_seconds, None);
+        assert_eq!(
+            status.freshness_window_seconds,
+            CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_observation_freshness_is_age_bounded() {
+        assert_eq!(
+            checkpoint_observation_freshness(None, 1_000),
+            ("unavailable", None)
+        );
+        assert_eq!(
+            checkpoint_observation_freshness(Some(1_001), 1_000),
+            ("unavailable", None)
+        );
+        assert_eq!(
+            checkpoint_observation_freshness(Some(1_000), 1_000),
+            ("fresh", Some(0))
+        );
+        assert_eq!(
+            checkpoint_observation_freshness(
+                Some(1_000),
+                1_000 + CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS,
+            ),
+            ("fresh", Some(CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS))
+        );
+        assert_eq!(
+            checkpoint_observation_freshness(
+                Some(1_000),
+                1_001 + CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS,
+            ),
+            ("stale", Some(CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS + 1))
+        );
     }
 
     #[tokio::test]
