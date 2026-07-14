@@ -28,6 +28,8 @@
 //     Never add hashes, proposer identity, commitment IDs, or user metadata.
 //   - checkpoint observation freshness derives from durable signed proof time;
 //     attempts and inbound served responses must never refresh it.
+//   - witness round counts are aggregate operational evidence only. They are
+//     not votes, quorum, finality, or a fork-choice input.
 //   - The body used for signing MUST be the same as what is sent.
 //     Do NOT add fields after signing.
 //
@@ -40,6 +42,7 @@
 //   v2.7.1         - Added compact privacy-safe commitment sync evidence
 //   v2.7.4         - Added compact verified commitment-chain integrity evidence
 //   v2.7.11        - Added durable checkpoint observation freshness evidence
+//   v2.7.12        - Added privacy-safe witness round coverage evidence
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -191,6 +194,26 @@ pub struct RecordCommitmentCheckpointHeartbeatStatus {
     pub observation_age_seconds: Option<u64>,
     /// Maximum age still classified as fresh.
     pub freshness_window_seconds: u64,
+    /// Latest bounded witness-round classification.
+    pub last_round_state: String,
+    /// Completion time of the latest bounded witness round.
+    pub last_round_at: Option<u64>,
+    /// Eligible witnesses before the per-round cap.
+    pub last_round_eligible: usize,
+    /// Witnesses contacted after the per-round cap.
+    pub last_round_attempted: usize,
+    /// Responses that established durable signed evidence.
+    pub last_round_verified: usize,
+    /// Attempts that established no durable signed evidence.
+    pub last_round_failed: usize,
+    /// Same-tip signed observations in the latest round.
+    pub last_round_converged: usize,
+    /// Signed remote-ahead observations in the latest round.
+    pub last_round_remote_ahead: usize,
+    /// Signed remote-behind observations in the latest round.
+    pub last_round_remote_behind: usize,
+    /// Signed shared-prefix mismatches in the latest round.
+    pub last_round_diverged: usize,
     /// Local persistence failures since process start.
     pub evidence_persistence_failures_total: u64,
 }
@@ -714,6 +737,16 @@ mod tests {
                 observation_freshness: "fresh".to_string(),
                 observation_age_seconds: Some(5),
                 freshness_window_seconds: 900,
+                last_round_state: "partial".to_string(),
+                last_round_at: Some(120),
+                last_round_eligible: 4,
+                last_round_attempted: 3,
+                last_round_verified: 2,
+                last_round_failed: 1,
+                last_round_converged: 1,
+                last_round_remote_ahead: 0,
+                last_round_remote_behind: 1,
+                last_round_diverged: 0,
                 evidence_persistence_failures_total: 0,
             }),
         };
@@ -737,6 +770,11 @@ mod tests {
         assert_eq!(checkpoint["observation_freshness"], "fresh");
         assert_eq!(checkpoint["observation_age_seconds"], 5);
         assert_eq!(checkpoint["freshness_window_seconds"], 900);
+        assert_eq!(checkpoint["last_round_state"], "partial");
+        assert_eq!(checkpoint["last_round_eligible"], 4);
+        assert_eq!(checkpoint["last_round_attempted"], 3);
+        assert_eq!(checkpoint["last_round_verified"], 2);
+        assert_eq!(checkpoint["last_round_failed"], 1);
         for section in [integrity, sync, checkpoint] {
             for forbidden in [
                 "coordinator_node_id",

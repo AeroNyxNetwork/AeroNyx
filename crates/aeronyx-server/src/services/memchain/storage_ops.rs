@@ -38,6 +38,8 @@
 //!   longer overwrite outbound convergence, divergence, or height evidence
 //! - v2.7.11-CheckpointFreshness: age-bounded durable observation state that
 //!   remains independent from vault integrity and transport attempts
+//! - v2.7.12-WitnessRoundEvidence: explicit bounded-round coverage and result
+//!   that remains evidence only and never becomes a consensus rule
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -73,6 +75,8 @@
 //!   checkpoint relation, heights, or divergence counters.
 //! - Freshness derives only from an audited, durable `last_evidence_at`; a
 //!   failed attempt or served response must never make stale evidence fresh.
+//! - Witness round state is process-local aggregate telemetry. Do not use its
+//!   counts as votes, quorum, finality, leader election, or fork choice.
 //!
 //! ## Modification History
 //! v2.2.0               - 🌟 Extracted from storage.rs; added get_embedding_model, get_overview
@@ -90,9 +94,11 @@
 //! v2.7.7-EvidenceRestartRecovery - Added real SQLite restart/migration tests.
 //! v2.7.10-CheckpointDirectionIsolation - Isolated inbound service telemetry.
 //! v2.7.11-CheckpointFreshness - Added durable proof age classification.
+//! v2.7.12-WitnessRoundEvidence - Added bounded round evidence classification.
 //!
 //! ## Last Modified
 //! v2.7.11-CheckpointFreshness - Distinguish vault integrity from proof recency.
+//! v2.7.12-WitnessRoundEvidence - Report bounded witness round coverage.
 //! v2.7.10-CheckpointDirectionIsolation - Prevent requester-driven status pollution.
 //! v2.7.4-BlockIntegrityStatus - Report and maintain the verified-chain baseline.
 //! v2.7.5-CheckpointProof - Serve only audit-backed checkpoints and report outcomes.
@@ -829,6 +835,32 @@ fn checkpoint_observation_freshness(
     }
 }
 
+/// Classifies one bounded coordinator witness round without implying consensus.
+///
+/// `attention` is reserved for signed evidence that the coordinator may be
+/// behind or that a shared prefix diverged. `shared_prefix` means every
+/// attempted witness produced valid evidence compatible with the local chain;
+/// it is deliberately not named quorum, finality, or consensus.
+fn checkpoint_witness_round_state(
+    attempted: usize,
+    verified: usize,
+    failed: usize,
+    remote_ahead: usize,
+    diverged: usize,
+) -> &'static str {
+    if attempted == 0 {
+        "unavailable"
+    } else if verified == 0 {
+        "unverified"
+    } else if remote_ahead > 0 || diverged > 0 {
+        "attention"
+    } else if failed > 0 || verified < attempted {
+        "partial"
+    } else {
+        "shared_prefix"
+    }
+}
+
 impl MemoryStorage {
     /// Returns aggregate signed checkpoint evidence without peer, hash,
     /// signature, endpoint, or user metadata.
@@ -865,10 +897,52 @@ impl MemoryStorage {
             observation_freshness: observation_freshness.to_string(),
             observation_age_seconds,
             freshness_window_seconds: CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS,
+            last_round_state: runtime.last_round_state.to_string(),
+            last_round_at: runtime.last_round_at,
+            last_round_eligible: runtime.last_round_eligible,
+            last_round_attempted: runtime.last_round_attempted,
+            last_round_verified: runtime.last_round_verified,
+            last_round_failed: runtime.last_round_failed,
+            last_round_converged: runtime.last_round_converged,
+            last_round_remote_ahead: runtime.last_round_remote_ahead,
+            last_round_remote_behind: runtime.last_round_remote_behind,
+            last_round_diverged: runtime.last_round_diverged,
             evidence_persistence_failures_total: runtime
                 .evidence_persistence_failures_total,
-            privacy_policy: "aggregate signed checkpoint outcomes, durable observation freshness, and local evidence-vault health only; raw frames, peer identities, block hashes, signatures, request ids, commitments, owners, payloads, endpoints, routes, and client metadata never leave the node",
+            privacy_policy: "aggregate signed checkpoint outcomes, bounded witness-round coverage, durable observation freshness, and local evidence-vault health only; counts are not consensus; raw frames, peer identities, block hashes, signatures, request ids, commitments, owners, payloads, endpoints, routes, and client metadata never leave the node",
         }
+    }
+
+    /// Records the aggregate result of one completed bounded witness round.
+    ///
+    /// This method intentionally stores no peer identity, endpoint, hash,
+    /// signature, or request id. It cannot alter the canonical commitment
+    /// chain and its counts must never be interpreted as consensus.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_commitment_checkpoint_witness_round(
+        &self,
+        now: u64,
+        eligible: usize,
+        attempted: usize,
+        verified: usize,
+        failed: usize,
+        converged: usize,
+        remote_ahead: usize,
+        remote_behind: usize,
+        diverged: usize,
+    ) {
+        let mut runtime = self.commitment_checkpoint.write();
+        runtime.last_round_state =
+            checkpoint_witness_round_state(attempted, verified, failed, remote_ahead, diverged);
+        runtime.last_round_at = Some(now);
+        runtime.last_round_eligible = eligible;
+        runtime.last_round_attempted = attempted;
+        runtime.last_round_verified = verified;
+        runtime.last_round_failed = failed;
+        runtime.last_round_converged = converged;
+        runtime.last_round_remote_ahead = remote_ahead;
+        runtime.last_round_remote_behind = remote_behind;
+        runtime.last_round_diverged = diverged;
     }
 
     /// Records one outbound, signature-verified checkpoint comparison.
@@ -3074,11 +3148,14 @@ mod tests {
         let initial = storage.record_commitment_checkpoint_status();
         assert_eq!(initial.state, "not_checked");
         assert_eq!(initial.proofs_verified_total, 0);
+        assert_eq!(initial.last_round_state, "not_checked");
+        assert_eq!(initial.last_round_at, None);
 
         storage.record_commitment_checkpoint_failure(100);
         storage.record_commitment_checkpoint_verified(110, "remote_ahead", 3, 4);
         storage.record_commitment_checkpoint_verified(120, "converged", 4, 4);
         storage.record_commitment_checkpoint_served(130);
+        storage.record_commitment_checkpoint_witness_round(140, 4, 3, 2, 1, 1, 0, 1, 0);
         let status = storage.record_commitment_checkpoint_status();
         assert_eq!(status.state, "converged");
         assert_eq!(status.last_checked_at, Some(120));
@@ -3092,6 +3169,16 @@ mod tests {
         assert_eq!(status.proofs_failed_total, 1);
         assert_eq!(status.divergences_total, 0);
         assert_eq!(status.requests_served_total, 1);
+        assert_eq!(status.last_round_state, "partial");
+        assert_eq!(status.last_round_at, Some(140));
+        assert_eq!(status.last_round_eligible, 4);
+        assert_eq!(status.last_round_attempted, 3);
+        assert_eq!(status.last_round_verified, 2);
+        assert_eq!(status.last_round_failed, 1);
+        assert_eq!(status.last_round_converged, 1);
+        assert_eq!(status.last_round_remote_ahead, 0);
+        assert_eq!(status.last_round_remote_behind, 1);
+        assert_eq!(status.last_round_diverged, 0);
         let value = serde_json::to_value(status).unwrap();
         for forbidden in [
             "peer",
@@ -3133,6 +3220,21 @@ mod tests {
             status.freshness_window_seconds,
             CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS
         );
+        assert_eq!(status.last_round_state, "not_checked");
+        assert_eq!(status.last_round_at, None);
+    }
+
+    #[test]
+    fn test_checkpoint_witness_round_state_never_overclaims_consensus() {
+        assert_eq!(checkpoint_witness_round_state(0, 0, 0, 0, 0), "unavailable");
+        assert_eq!(checkpoint_witness_round_state(3, 0, 3, 0, 0), "unverified");
+        assert_eq!(checkpoint_witness_round_state(3, 2, 1, 0, 0), "partial");
+        assert_eq!(
+            checkpoint_witness_round_state(3, 3, 0, 0, 0),
+            "shared_prefix"
+        );
+        assert_eq!(checkpoint_witness_round_state(3, 3, 0, 1, 0), "attention");
+        assert_eq!(checkpoint_witness_round_state(3, 3, 0, 0, 1), "attention");
     }
 
     #[test]

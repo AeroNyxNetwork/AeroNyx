@@ -52,6 +52,8 @@
 //!   service counters only and cannot overwrite outbound verification evidence.
 //! - v2.7.11-CheckpointFreshness: Separates durable vault integrity from the
 //!   age of the most recent signature-verified outbound observation.
+//! - v2.7.12-WitnessRoundEvidence: Reports the latest bounded witness-round
+//!   coverage and result without treating peer count as consensus.
 //!
 //! ## Thread Safety
 //! `rusqlite::Connection` behind `tokio::sync::Mutex`. Phase 2+ can use r2d2 pooling.
@@ -110,6 +112,8 @@
 //!   never set convergence, divergence, failure, or observed peer heights.
 //! - Checkpoint freshness is derived only from `last_evidence_at` after a valid
 //!   vault audit. Attempts, failures, and inbound serving never refresh it.
+//! - Witness-round fields are process-local aggregate observations. They must
+//!   never be interpreted as votes, quorum, finality, or fork choice.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
@@ -143,6 +147,7 @@
 //! v2.7.10-CheckpointDirectionIsolation - Separated inbound service counters
 //!   from outbound signed checkpoint verification state.
 //! v2.7.11-CheckpointFreshness - Added age-bounded verified observation status.
+//! v2.7.12-WitnessRoundEvidence - Added privacy-safe bounded round coverage.
 //! v2.6.1+BlindVectorRecovery - Added all-owner active embedding enumeration so
 //!   node-blind/remote Local-mode nodes can rebuild every isolated vector
 //!   partition after restart without weakening owner-scoped recall.
@@ -386,6 +391,27 @@ pub struct RecordCommitmentCheckpointStatus {
     pub observation_age_seconds: Option<u64>,
     /// Maximum observation age still classified as `fresh`.
     pub freshness_window_seconds: u64,
+    /// Latest coordinator witness-round result: `not_checked`, `unavailable`,
+    /// `unverified`, `partial`, `shared_prefix`, or `attention`.
+    pub last_round_state: String,
+    /// Completion time of the latest bounded witness round.
+    pub last_round_at: Option<u64>,
+    /// Valid discovered witnesses eligible before the per-round cap.
+    pub last_round_eligible: usize,
+    /// Witnesses contacted after the per-round cap.
+    pub last_round_attempted: usize,
+    /// Responses that established durable signed evidence.
+    pub last_round_verified: usize,
+    /// Attempts that established no durable signed evidence.
+    pub last_round_failed: usize,
+    /// Verified witnesses at the same signed tip.
+    pub last_round_converged: usize,
+    /// Verified witnesses extending the local signed prefix.
+    pub last_round_remote_ahead: usize,
+    /// Verified witnesses behind on the same signed prefix.
+    pub last_round_remote_behind: usize,
+    /// Verified witnesses signing a different shared-height hash.
+    pub last_round_diverged: usize,
     /// Local SQLite persistence failures observed since process start.
     pub evidence_persistence_failures_total: u64,
     /// Explicit privacy boundary for operators and API consumers.
@@ -467,6 +493,16 @@ pub(crate) struct RecordCommitmentCheckpointRuntime {
     pub(crate) evidence_records: u64,
     pub(crate) divergence_evidence_records: u64,
     pub(crate) last_evidence_at: Option<u64>,
+    pub(crate) last_round_state: &'static str,
+    pub(crate) last_round_at: Option<u64>,
+    pub(crate) last_round_eligible: usize,
+    pub(crate) last_round_attempted: usize,
+    pub(crate) last_round_verified: usize,
+    pub(crate) last_round_failed: usize,
+    pub(crate) last_round_converged: usize,
+    pub(crate) last_round_remote_ahead: usize,
+    pub(crate) last_round_remote_behind: usize,
+    pub(crate) last_round_diverged: usize,
     pub(crate) evidence_persistence_failures_total: u64,
 }
 
@@ -489,6 +525,16 @@ impl Default for RecordCommitmentCheckpointRuntime {
             evidence_records: 0,
             divergence_evidence_records: 0,
             last_evidence_at: None,
+            last_round_state: "not_checked",
+            last_round_at: None,
+            last_round_eligible: 0,
+            last_round_attempted: 0,
+            last_round_verified: 0,
+            last_round_failed: 0,
+            last_round_converged: 0,
+            last_round_remote_ahead: 0,
+            last_round_remote_behind: 0,
+            last_round_diverged: 0,
             evidence_persistence_failures_total: 0,
         }
     }

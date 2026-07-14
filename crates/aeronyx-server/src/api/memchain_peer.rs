@@ -50,6 +50,8 @@
 //!   peer. Block Sync v1 is authenticated replication, not consensus.
 //! - Checkpoint proof establishes what a peer signed; it is not a majority,
 //!   finality, leader-election, or longest-chain consensus rule.
+//! - The latest bounded round summary is aggregate operational evidence only;
+//!   its counts must never become voting weight or a fork-choice input.
 //! - Coordinator witness failures or divergence evidence must never mutate the
 //!   canonical chain; they are operator evidence until consensus is designed.
 //! - Never derive outbound checkpoint state from an inbound request. The peer
@@ -60,6 +62,7 @@
 //! v2.7.6-EvidenceVault - Fail-closed durable verified checkpoint evidence.
 //! v2.7.8-CoordinatorWitness - Bounded non-consensus witness reconciliation.
 //! v2.7.10-CheckpointDirectionIsolation - Isolated inbound service telemetry.
+//! v2.7.12-WitnessRoundEvidence - Persist aggregate bounded-round runtime state.
 //! v2.7.1-BlockFollower - Pinned coordinator pull and fail-closed page verification.
 //! v2.7.0-BlockSync - Initial signed node-blind block range protocol.
 
@@ -471,6 +474,17 @@ where
             proof.remote_tip_height,
         );
     }
+    storage.record_commitment_checkpoint_witness_round(
+        completed_at,
+        outcome.eligible_witnesses,
+        outcome.attempted,
+        outcome.verified,
+        outcome.failed,
+        outcome.converged,
+        outcome.remote_ahead,
+        outcome.remote_behind,
+        outcome.diverged,
+    );
 
     outcome
 }
@@ -1845,6 +1859,16 @@ mod tests {
         assert_eq!(status.proofs_failed_total, 1);
         assert_eq!(status.evidence_records, 2);
         assert_eq!(status.evidence_state, "verified");
+        assert_eq!(status.last_round_state, "partial");
+        assert_eq!(status.last_round_eligible, 3);
+        assert_eq!(status.last_round_attempted, 3);
+        assert_eq!(status.last_round_verified, 2);
+        assert_eq!(status.last_round_failed, 1);
+        assert_eq!(status.last_round_converged, 1);
+        assert_eq!(status.last_round_remote_ahead, 0);
+        assert_eq!(status.last_round_remote_behind, 1);
+        assert_eq!(status.last_round_diverged, 0);
+        assert!(status.last_round_at.is_some());
 
         converged_server.abort();
         lagging_server.abort();

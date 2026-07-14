@@ -128,6 +128,8 @@
 //      checkpoint witness endpoint used by coordinator reconciliation.
 //  54. Reports durable signed checkpoint observation freshness independently
 //      from local evidence-vault integrity and request-attempt counters.
+//  55. Reports each bounded coordinator witness round as privacy-safe aggregate
+//      evidence without turning peer count into consensus or fork choice.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -146,6 +148,8 @@
 //     never mutate the canonical chain, elect a leader, or infer fork choice.
 //   - Checkpoint freshness comes only from audited durable signed evidence.
 //     Failed attempts and inbound served requests cannot refresh it.
+//   - Witness round states are operator evidence only. Never use their counts
+//     as votes, quorum, finality, leader election, or fork choice.
 //   - encrypted_message_counter is aggregate only and never stores payload,
 //     destination, DNS, URL, voucher, wallet, or client public IP details.
 //   - dns_proxy forwards opaque DNS UDP payloads only; it does not parse,
@@ -156,6 +160,7 @@
 //
 // Last Modified:
 //   v2.7.11-CheckpointFreshness - Durable proof recency in status and heartbeat
+//   v2.7.12-WitnessRoundEvidence - Privacy-safe bounded witness round coverage
 //   v2.7.9-CheckpointRouteInventory - Advertise checkpoint in startup route inventory
 //   v2.7.8-CoordinatorWitness - Low-frequency signed peer checkpoint evidence
 //   v2.7.6-EvidenceVault - Durable bounded checkpoint proofs and startup audit
@@ -1920,6 +1925,16 @@ impl Server {
                             observation_freshness: status.observation_freshness,
                             observation_age_seconds: status.observation_age_seconds,
                             freshness_window_seconds: status.freshness_window_seconds,
+                            last_round_state: status.last_round_state,
+                            last_round_at: status.last_round_at,
+                            last_round_eligible: status.last_round_eligible,
+                            last_round_attempted: status.last_round_attempted,
+                            last_round_verified: status.last_round_verified,
+                            last_round_failed: status.last_round_failed,
+                            last_round_converged: status.last_round_converged,
+                            last_round_remote_ahead: status.last_round_remote_ahead,
+                            last_round_remote_behind: status.last_round_remote_behind,
+                            last_round_diverged: status.last_round_diverged,
                             evidence_persistence_failures_total: status
                                 .evidence_persistence_failures_total,
                         }
