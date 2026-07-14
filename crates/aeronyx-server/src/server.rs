@@ -124,6 +124,8 @@
 //      response frames before networking and exposes only aggregate vault health.
 //  52. Runs bounded low-frequency coordinator witness reconciliation, storing
 //      signed peer observations without treating witness count as consensus.
+//  53. Keeps the public API startup route inventory aligned with the signed
+//      checkpoint witness endpoint used by coordinator reconciliation.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -149,6 +151,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.7.9-CheckpointRouteInventory - Advertise checkpoint in startup route inventory
 //   v2.7.8-CoordinatorWitness - Low-frequency signed peer checkpoint evidence
 //   v2.7.6-EvidenceVault - Durable bounded checkpoint proofs and startup audit
 //   v2.7.5-CheckpointProof - Signed cross-node tip reconciliation and convergence gate
@@ -1782,7 +1785,7 @@ impl Server {
         let listener = match tokio::net::TcpListener::bind(listen_addr).await {
             Ok(listener) => {
                 info!(
-                    "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/chat/peer/*, /api/memchain/peer/block-range)",
+                    "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/chat/peer/*, /api/memchain/peer/block-range, /api/memchain/peer/checkpoint)",
                     listen_addr
                 );
                 listener
