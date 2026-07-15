@@ -67,6 +67,7 @@
 //!   missing/stale process audit baseline.
 //!
 //! ## Last Modified
+//! v2.8.2-AdversarialFollower - Added signed malicious-page regression coverage.
 //! v2.7.18-VerifiedRangeSnapshot - Sign only snapshot-consistent audited pages.
 //! v2.7.17-AtomicBlockPage - Commit each verified follower page atomically.
 //! v2.7.15-ExternalWitnessGuard - Added identity-pinned reconciliation.
@@ -1287,6 +1288,38 @@ mod tests {
         assert_eq!(import.inserted, 1);
     }
 
+    fn signed_block_page_frame(
+        signer: &IdentityKeyPair,
+        request_id: [u8; 16],
+        response_timestamp: u64,
+        blocks: Vec<RecordCommitmentBlockV1>,
+        has_more: bool,
+        tip_height: u64,
+        tip_hash: [u8; 32],
+    ) -> Vec<u8> {
+        let responder = signer.public_key_bytes();
+        let signing_bytes = record_block_range_response_signing_bytes(
+            &request_id,
+            &responder,
+            response_timestamp,
+            &blocks,
+            has_more,
+            tip_height,
+            &tip_hash,
+        );
+        encode_memchain(&MemChainMessage::RecordBlockRangeResponseV1 {
+            request_id,
+            responder,
+            response_timestamp,
+            blocks,
+            has_more,
+            tip_height,
+            tip_hash,
+            signature: signer.sign(&signing_bytes),
+        })
+        .unwrap()
+    }
+
     #[test]
     fn peer_guard_rejects_replay_and_enforces_rate_limit() {
         let peer = [0x11; 32];
@@ -1548,6 +1581,131 @@ mod tests {
             verify_record_commitment_page(&fork_frame, &request_id, &responder, local_tip, now,)
                 .unwrap_err(),
             "commitment_chain_verification_failed"
+        );
+    }
+
+    #[test]
+    fn response_verification_binds_signature_request_and_pagination_metadata() {
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let responder = coordinator.public_key_bytes();
+        let request_id = [0x81; 16];
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now,
+            GENESIS_PREV_HASH,
+            vec![[0x82; 32]],
+            &coordinator,
+        );
+        let valid = signed_block_page_frame(
+            &coordinator,
+            request_id,
+            now,
+            vec![block.clone()],
+            false,
+            1,
+            block.hash(),
+        );
+        verify_record_commitment_page(&valid, &request_id, &responder, (0, GENESIS_PREV_HASH), now)
+            .unwrap();
+
+        let invalid_signature_bytes = record_block_range_response_signing_bytes(
+            &request_id,
+            &responder,
+            now,
+            std::slice::from_ref(&block),
+            false,
+            1,
+            &block.hash(),
+        );
+        let mut invalid_signature = coordinator.sign(&invalid_signature_bytes);
+        invalid_signature[0] ^= 0x01;
+        let invalid_signature_frame =
+            encode_memchain(&MemChainMessage::RecordBlockRangeResponseV1 {
+                request_id,
+                responder,
+                response_timestamp: now,
+                blocks: vec![block.clone()],
+                has_more: false,
+                tip_height: 1,
+                tip_hash: block.hash(),
+                signature: invalid_signature,
+            })
+            .unwrap();
+        assert_eq!(
+            verify_record_commitment_page(
+                &invalid_signature_frame,
+                &request_id,
+                &responder,
+                (0, GENESIS_PREV_HASH),
+                now,
+            )
+            .unwrap_err(),
+            "invalid_response_signature"
+        );
+        assert_eq!(
+            verify_record_commitment_page(
+                &valid,
+                &[0x83; 16],
+                &responder,
+                (0, GENESIS_PREV_HASH),
+                now,
+            )
+            .unwrap_err(),
+            "response_request_mismatch"
+        );
+        assert_eq!(
+            verify_record_commitment_page(
+                &valid,
+                &request_id,
+                &responder,
+                (0, GENESIS_PREV_HASH),
+                now.saturating_add(REQUEST_TIMESTAMP_SKEW_SECS + 1),
+            )
+            .unwrap_err(),
+            "stale_response"
+        );
+
+        let inconsistent_tip = signed_block_page_frame(
+            &coordinator,
+            request_id,
+            now,
+            vec![block.clone()],
+            false,
+            1,
+            [0x84; 32],
+        );
+        assert_eq!(
+            verify_record_commitment_page(
+                &inconsistent_tip,
+                &request_id,
+                &responder,
+                (0, GENESIS_PREV_HASH),
+                now,
+            )
+            .unwrap_err(),
+            "terminal_tip_mismatch"
+        );
+
+        let inconsistent_pagination = signed_block_page_frame(
+            &coordinator,
+            request_id,
+            now,
+            vec![block],
+            true,
+            1,
+            [0x85; 32],
+        );
+        assert_eq!(
+            verify_record_commitment_page(
+                &inconsistent_pagination,
+                &request_id,
+                &responder,
+                (0, GENESIS_PREV_HASH),
+                now,
+            )
+            .unwrap_err(),
+            "pagination_state_mismatch"
         );
     }
 
@@ -1903,6 +2061,87 @@ mod tests {
         assert_eq!(served.last_divergence_at, None);
         assert_eq!(served.proofs_verified_total, 0);
         assert_eq!(served.divergences_total, 0);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn live_http_follower_rejects_signed_malicious_page_without_mutation() {
+        let now = now_secs();
+        let coordinator = Arc::new(IdentityKeyPair::generate());
+        let requester = IdentityKeyPair::generate();
+        let destination = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        destination.audit_record_commitment_chain().await.unwrap();
+
+        // The pinned coordinator signs both layers, but the block deliberately
+        // forks before genesis. Envelope authenticity must never replace chain
+        // continuity verification.
+        let malicious_block =
+            RecordCommitmentBlockV1::new_signed(1, now, [0xF1; 32], vec![[0xF2; 32]], &coordinator);
+        let router = Router::new().route(
+            "/api/memchain/peer/block-range",
+            post({
+                let coordinator = Arc::clone(&coordinator);
+                move |body: Bytes| {
+                    let coordinator = Arc::clone(&coordinator);
+                    let malicious_block = malicious_block.clone();
+                    async move {
+                        assert_eq!(body.first().copied(), Some(MEMCHAIN_MAGIC));
+                        let request = decode_memchain(&body[1..]).unwrap();
+                        let MemChainMessage::RecordBlockRangeRequestV1 { request_id, .. } = request
+                        else {
+                            panic!("expected commitment block range request");
+                        };
+                        let tip_hash = malicious_block.hash();
+                        let frame = signed_block_page_frame(
+                            &coordinator,
+                            request_id,
+                            now_secs(),
+                            vec![malicious_block],
+                            false,
+                            1,
+                            tip_hash,
+                        );
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/octet-stream")],
+                            frame,
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let peers = PeerStore::new();
+        admit_peer(&peers, &coordinator, Some(format!("http://{address}")), now);
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let error = pull_record_commitment_page(
+            &destination,
+            &peers,
+            &requester,
+            &coordinator.public_key_bytes(),
+            &client,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "commitment_chain_verification_failed");
+        assert_eq!(
+            destination.record_commitment_chain_tip().await,
+            (0, GENESIS_PREV_HASH)
+        );
+        let status = destination.record_commitment_chain_status().await;
+        assert_eq!(status.block_count, 0);
+        assert_eq!(status.commitment_count, 0);
+
         server.abort();
         let _ = server.await;
     }
