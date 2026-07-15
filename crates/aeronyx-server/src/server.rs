@@ -166,6 +166,8 @@
 //      imported bundles cannot replace the live pinned-witness startup gate.
 //  71. Requires one fresh, signed coordinator lease from every configured
 //      witness before startup and renewal may authorize local block production.
+//  72. Releases the exact process lease from every witness after SIGINT/SIGTERM
+//      so planned restarts hand over immediately without weakening crash TTLs.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -203,6 +205,8 @@
 //   - Coordinator leases are a short-lived duplicate-writer safety control,
 //     not consensus, leader election, finality, or fork choice. A partial
 //     witness round must never extend the local production deadline.
+//   - Graceful lease release must run only after an in-flight renewal finishes.
+//     Never cancel a renewal request and race a release against its late grant.
 //   - Outbound peer HTTP responses must pass the shared bounded readers in
 //     api/mod.rs; discovery recovery files use this file's bounded file reader.
 //     Never reintroduce response.json(), response.bytes(), response.text(), or
@@ -227,6 +231,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.8.11-CoordinatorLeaseRelease - Signed graceful lease handover on SIGINT/SIGTERM
 //   v2.8.10-CoordinatorLease - Strict all-witness short-lived production authority
 //   v2.8.9-CoordinatorProductionFence - Reject duplicate local block producers
 //   v2.8.8-CertificateRollbackGuard - Signed local certificate-vault high-water gate
@@ -350,8 +355,8 @@ use aeronyx_transport::UdpTransport;
 #[cfg(target_os = "linux")]
 use aeronyx_transport::LinuxTun;
 
-use rusqlite::OptionalExtension;
 use rand::RngCore;
+use rusqlite::OptionalExtension;
 
 use crate::api::auth::ensure_jwt_secret;
 use crate::api::chat_handlers::build_chat_router;
@@ -367,9 +372,10 @@ use crate::api::discovery::{
 use crate::api::memchain_peer::{
     build_memchain_peer_router, build_memchain_peer_router_with_coordinator_lease,
     pull_record_commitment_checkpoint, pull_record_commitment_checkpoint_certificate,
-    pull_record_commitment_page, request_record_commitment_coordinator_lease,
+    pull_record_commitment_page,
     reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
-    reconcile_record_commitment_witnesses, CommitmentCheckpointRelation,
+    reconcile_record_commitment_witnesses, release_record_commitment_coordinator_lease,
+    request_record_commitment_coordinator_lease, CommitmentCheckpointRelation,
     CommitmentReconciliationOutcome,
 };
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
@@ -598,6 +604,14 @@ struct CommitmentCoordinatorLeaseRound {
     minimum_valid_for_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct CommitmentCoordinatorLeaseReleaseRound {
+    attempted: usize,
+    released: usize,
+    not_holder: usize,
+    failed: usize,
+}
+
 async fn collect_commitment_coordinator_lease_round(
     storage: &MemoryStorage,
     peer_store: &PeerStore,
@@ -639,6 +653,44 @@ async fn collect_commitment_coordinator_lease_round(
     }
     if round.granted == 0 {
         round.minimum_valid_for_secs = 0;
+    }
+    round
+}
+
+/// Releases one process instance from every configured witness concurrently.
+///
+/// The aggregate deliberately omits witness identities and endpoints. A
+/// partial release remains safe because any unreleased grant expires at its
+/// original signed deadline and cannot authorize the next random instance.
+async fn collect_commitment_coordinator_lease_release_round(
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    witness_node_ids: &[[u8; 32]],
+    instance_id: &[u8; 32],
+) -> CommitmentCoordinatorLeaseReleaseRound {
+    let requests = witness_node_ids.iter().map(|witness_node_id| {
+        release_record_commitment_coordinator_lease(
+            peer_store,
+            identity,
+            witness_node_id,
+            instance_id,
+            client,
+        )
+    });
+    let results = futures::future::join_all(requests).await;
+    let mut round = CommitmentCoordinatorLeaseReleaseRound {
+        attempted: witness_node_ids.len(),
+        ..Default::default()
+    };
+    for result in results {
+        match result {
+            Ok(_) => round.released = round.released.saturating_add(1),
+            Err(error) if error == "lease_release_not_holder" => {
+                round.not_holder = round.not_holder.saturating_add(1);
+            }
+            Err(_) => round.failed = round.failed.saturating_add(1),
+        }
     }
     round
 }
@@ -753,10 +805,7 @@ impl Server {
                 .await?;
         }
         let commitment_coordinator_lease_instance = if let Some(ref commitment_storage) = storage {
-            self.acquire_memchain_commitment_coordinator_lease(
-                commitment_storage,
-                &peer_store,
-            )
+            self.acquire_memchain_commitment_coordinator_lease(commitment_storage, &peer_store)
             .await?
         } else {
             None
@@ -1280,7 +1329,15 @@ impl Server {
         let _ = self.shutdown_tx.send(());
 
         for (name, task) in tasks {
-            match tokio::time::timeout(Duration::from_secs(5), task).await {
+            // The lease task may finish one bounded renewal and one bounded
+            // release round before exit. Other tasks retain the historical
+            // five-second shutdown budget.
+            let shutdown_timeout_secs = if name == "memchain-coordinator-lease" {
+                12
+            } else {
+                5
+            };
+            match tokio::time::timeout(Duration::from_secs(shutdown_timeout_secs), task).await {
                 Ok(Ok(())) => debug!("Task '{}' completed", name),
                 Ok(Err(e)) => warn!("Task '{}' failed: {}", name, e),
                 Err(_) => warn!("Task '{}' timed out", name),
@@ -1906,10 +1963,8 @@ impl Server {
         let smoke_peer_http_client = Arc::clone(&peer_http_client);
         let smoke_local_capability_status = local_capability_status.clone();
         let commitment_storage = mpi_state.storage.clone();
-        let commitment_lease_authorized_coordinator = self
-            .config
-            .memchain
-            .commitment_sync_coordinator_node_id();
+        let commitment_lease_authorized_coordinator =
+            self.config.memchain.commitment_sync_coordinator_node_id();
 
         tokio::spawn(async move {
             if let Some(public_addr) = public_api_listen_addr {
@@ -2215,8 +2270,11 @@ impl Server {
             cmd_handler.run(cmd_shutdown).await;
         });
 
-        let memchain_status_fn: Option<crate::management::reporter::MemChainStatusFn> =
-            if self.config.memchain.is_enabled() {
+        let memchain_status_fn: Option<crate::management::reporter::MemChainStatusFn> = if self
+            .config
+            .memchain
+            .is_enabled()
+        {
                 let allow_remote = self.config.memchain.allow_remote_storage;
                 let max_owners = self.config.memchain.max_remote_owners;
                 let pinned_witnesses_configured =
@@ -2254,16 +2312,14 @@ impl Server {
                             coordinator_lease_required_witnesses: status
                                 .coordinator_lease_required_witnesses,
                             coordinator_lease_expires_at: status.coordinator_lease_expires_at,
-                            coordinator_lease_last_renewed_at: status
-                                .coordinator_lease_last_renewed_at,
+                        coordinator_lease_last_renewed_at: status.coordinator_lease_last_renewed_at,
                             coordinator_lease_renewal_failures_total: status
                                 .coordinator_lease_renewal_failures_total,
                             coordinator_lease_scope: status.coordinator_lease_scope,
                             rollback_guard_state: status.rollback_guard_state,
                             rollback_guard_height: status.rollback_guard_height,
                             rollback_guard_last_verified_at: status.rollback_guard_last_verified_at,
-                            rollback_guard_last_persisted_at: status
-                                .rollback_guard_last_persisted_at,
+                        rollback_guard_last_persisted_at: status.rollback_guard_last_persisted_at,
                             rollback_guard_write_failures_total: status
                                 .rollback_guard_write_failures_total,
                         }
@@ -2321,18 +2377,15 @@ impl Server {
                             latest_certificate_signers: status.latest_certificate_signers,
                             latest_certificate_required_signers: status
                                 .latest_certificate_required_signers,
-                            certificate_rollback_guard_state: status
-                                .certificate_rollback_guard_state,
-                            certificate_rollback_guard_height: status
-                                .certificate_rollback_guard_height,
+                        certificate_rollback_guard_state: status.certificate_rollback_guard_state,
+                        certificate_rollback_guard_height: status.certificate_rollback_guard_height,
                             certificate_rollback_guard_last_verified_at: status
                                 .certificate_rollback_guard_last_verified_at,
                             certificate_rollback_guard_last_persisted_at: status
                                 .certificate_rollback_guard_last_persisted_at,
                             certificate_rollback_guard_write_failures_total: status
                                 .certificate_rollback_guard_write_failures_total,
-                            certificate_rollback_guard_scope: status
-                                .certificate_rollback_guard_scope,
+                        certificate_rollback_guard_scope: status.certificate_rollback_guard_scope,
                             production_halted: status.production_halted,
                             last_evidence_at: status.last_evidence_at,
                             observation_freshness: status.observation_freshness,
@@ -3066,8 +3119,8 @@ impl Server {
         }
 
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(1)
             .build()
@@ -3197,8 +3250,8 @@ impl Server {
             rand::rngs::OsRng.fill_bytes(&mut instance_id);
         }
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(1)
             .build()
@@ -3215,10 +3268,9 @@ impl Server {
             self.config.memchain.commitment_coordinator_lease_ttl_secs,
         )
         .await;
-        let Some(valid_for_secs) = commitment_coordinator_lease_production_valid_for(
-            &round,
-            witness_node_ids.len(),
-        ) else {
+        let Some(valid_for_secs) =
+            commitment_coordinator_lease_production_valid_for(&round, witness_node_ids.len())
+        else {
             storage.record_commitment_coordinator_lease_failure(round.granted);
             return Err(ServerError::startup_failed(format!(
                 "MemChain coordinator lease: all-witness grant unavailable (configured={}, attempted={}, granted={}, contended={}, failed={})",
@@ -3263,8 +3315,8 @@ impl Server {
         let identity = self.identity.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let client = match reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(1)
             .build()
@@ -3284,22 +3336,27 @@ impl Server {
                 "[MEMCHAIN_BLOCK] Coordinator lease renewal started"
             );
             loop {
-                tokio::select! {
-                    _ = shutdown_rx.recv() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(renewal_interval_secs)) => {}
-                }
-                let round = tokio::select! {
-                    _ = shutdown_rx.recv() => break,
-                    round = collect_commitment_coordinator_lease_round(
-                        &storage,
-                        &peer_store,
-                        &identity,
-                        &client,
-                        &witness_node_ids,
-                        &instance_id,
-                        requested_ttl_secs,
-                    ) => round,
+                let shutdown_requested = tokio::select! {
+                    _ = shutdown_rx.recv() => true,
+                    _ = tokio::time::sleep(Duration::from_secs(renewal_interval_secs)) => false,
                 };
+                if shutdown_requested {
+                    break;
+                }
+
+                // Once started, a renewal round must finish before release.
+                // Cancelling HTTP futures here could let a witness persist a
+                // late grant after the shutdown path has already released it.
+                let round = collect_commitment_coordinator_lease_round(
+                    &storage,
+                    &peer_store,
+                    &identity,
+                    &client,
+                    &witness_node_ids,
+                    &instance_id,
+                    requested_ttl_secs,
+                )
+                .await;
                 if let Some(valid_for_secs) = commitment_coordinator_lease_production_valid_for(
                     &round,
                     witness_node_ids.len(),
@@ -3329,6 +3386,30 @@ impl Server {
                         "[MEMCHAIN_BLOCK] Coordinator lease renewal incomplete"
                     );
                 }
+            }
+
+            let release_round = collect_commitment_coordinator_lease_release_round(
+                &peer_store,
+                &identity,
+                &client,
+                &witness_node_ids,
+                &instance_id,
+            )
+            .await;
+            if release_round.released == release_round.attempted {
+                info!(
+                    attempted = release_round.attempted,
+                    released = release_round.released,
+                    "[MEMCHAIN_BLOCK] Coordinator leases released for graceful shutdown"
+                );
+            } else {
+                warn!(
+                    attempted = release_round.attempted,
+                    released = release_round.released,
+                    not_holder = release_round.not_holder,
+                    failed = release_round.failed,
+                    "[MEMCHAIN_BLOCK] Coordinator lease release incomplete; remaining grants retain bounded expiry"
+                );
             }
             info!("[MEMCHAIN_BLOCK] Coordinator lease renewal stopped");
         }))
@@ -6498,10 +6579,30 @@ impl Server {
     // ============================================
 
     async fn wait_for_shutdown(&self) {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+
+            let mut terminate =
+                signal(SignalKind::terminate()).expect("SIGTERM listener initialization failed");
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    result.expect("Ctrl+C listener failed");
+                    info!(signal = "SIGINT", "Shutdown signal received");
+                }
+                _ = terminate.recv() => {
+                    info!(signal = "SIGTERM", "Shutdown signal received");
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
         tokio::signal::ctrl_c()
             .await
             .expect("Ctrl+C listener failed");
-        info!("Shutdown signal received");
+            info!(signal = "CTRL_C", "Shutdown signal received");
+        }
     }
 
     pub fn shutdown(&self) {

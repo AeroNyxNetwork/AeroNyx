@@ -61,6 +61,10 @@
 //!   sidecar with serialized DB/sidecar commits and fail-closed recovery
 //! - v2.7.25-CoordinatorProductionFence: process-lifetime OS lock that rejects
 //!   duplicate local coordinators before audit, listeners, or block production
+//! - v2.8.10-CoordinatorLease: durable short-lived witness grants that fence
+//!   duplicate cross-host coordinator process instances
+//! - v2.8.11-CoordinatorLeaseRelease: exact-instance graceful release that
+//!   preserves monotonic epochs and immediate planned-restart handover
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -108,6 +112,11 @@
 //! - A coordinator must configure the signed tip anchor after the full startup
 //!   audit and before mining. It detects an older/replaced SQLite chain while
 //!   the host-side anchor remains, but not rollback of the entire host/disk.
+//! - A released coordinator lease row must be retained. Its expiry/update
+//!   sentinel prevents delayed renewal by the old process while allowing only
+//!   a different random instance to advance the durable epoch immediately.
+//! - Coordinator leases are duplicate-writer fencing, not consensus, leader
+//!   election, finality, quorum, or fork choice.
 //!
 //! ## Modification History
 //! v2.2.0               - 🌟 Extracted from storage.rs; added get_embedding_model, get_overview
@@ -137,8 +146,12 @@
 //! v2.7.22-CheckpointCertificate - Added immutable threshold certificates.
 //! v2.7.23-CertificateExchange - Added snapshot-audited bundle export.
 //! v2.7.24-CertificateRollbackGuard - Detect local certificate-vault rollback.
+//! v2.8.10-CoordinatorLease - Added durable exclusive witness lease grants.
+//! v2.8.11-CoordinatorLeaseRelease - Added exact-instance graceful handover.
 //!
 //! ## Last Modified
+//! v2.8.11-CoordinatorLeaseRelease - Retain epochs while releasing planned restarts.
+//! v2.8.10-CoordinatorLease - Fence duplicate coordinators across witness hosts.
 //! v2.7.23-CertificateExchange - Export only fully re-audited certificate frames.
 //! v2.7.21-TrustedDivergenceHalt - Freeze production after trusted fork evidence.
 //! v2.7.20-WitnessEquivocation - Retain trusted signed conflicts across restart and rotation.
@@ -175,8 +188,8 @@ use aeronyx_core::ledger::{
 };
 use aeronyx_core::protocol::memchain::{
     decode_memchain, encode_memchain, record_chain_checkpoint_response_signing_bytes,
-    record_checkpoint_certificate_digest_v1, MemChainMessage,
-    MAX_COORDINATOR_LEASE_TTL_SECS_V1, MEMCHAIN_MAGIC, MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+    record_checkpoint_certificate_digest_v1, MemChainMessage, MAX_COORDINATOR_LEASE_TTL_SECS_V1,
+    MEMCHAIN_MAGIC, MIN_COORDINATOR_LEASE_TTL_SECS_V1,
 };
 
 use super::storage::{
@@ -240,6 +253,20 @@ pub enum RecordCoordinatorLeaseGrantOutcome {
     TipMismatch,
     /// A different process instance still owns the durable lease.
     Contended,
+}
+
+/// Result of one authenticated durable lease release decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordCoordinatorLeaseReleaseOutcome {
+    /// The matching process lease is durably marked released.
+    Released {
+        /// Lease generation released by this witness.
+        lease_epoch: u64,
+        /// Witness wall-clock release time.
+        released_at: u64,
+    },
+    /// No matching instance currently owns the coordinator row.
+    NotHolder,
 }
 
 /// Aggregate result of one atomic bounded commitment-block append.
@@ -3471,7 +3498,7 @@ impl MemoryStorage {
         }
         let existing = tx
             .query_row(
-                "SELECT chain_id, instance_id, lease_epoch, lease_expires_at
+                "SELECT chain_id, instance_id, lease_epoch, lease_expires_at, updated_at
                  FROM record_coordinator_leases WHERE coordinator=?1",
                 params![coordinator.as_slice()],
                 |row| {
@@ -3480,13 +3507,15 @@ impl MemoryStorage {
                         row.get::<_, Vec<u8>>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| format!("read coordinator lease: {error}"))?;
 
-        let lease_epoch = if let Some((stored_chain, stored_instance, epoch, stored_expiry)) =
+        let lease_epoch =
+            if let Some((stored_chain, stored_instance, epoch, stored_expiry, stored_updated_at)) =
             existing
         {
             if stored_chain.as_slice() != chain_id {
@@ -3496,9 +3525,15 @@ impl MemoryStorage {
                 .map_err(|_| "coordinator lease epoch is invalid".to_string())?;
             let stored_expiry = u64::try_from(stored_expiry)
                 .map_err(|_| "coordinator lease expiry is invalid".to_string())?;
+                let stored_updated_at = u64::try_from(stored_updated_at)
+                    .map_err(|_| "coordinator lease update time is invalid".to_string())?;
+                let explicitly_released = stored_expiry <= stored_updated_at;
+                if stored_instance.as_slice() == instance_id && explicitly_released {
+                    return Ok(RecordCoordinatorLeaseGrantOutcome::Contended);
+                }
             if stored_instance.as_slice() != instance_id
-                && now
-                    < stored_expiry.saturating_add(COORDINATOR_LEASE_HANDOVER_GRACE_SECS)
+                    && !explicitly_released
+                    && now < stored_expiry.saturating_add(COORDINATOR_LEASE_HANDOVER_GRACE_SECS)
             {
                 return Ok(RecordCoordinatorLeaseGrantOutcome::Contended);
             }
@@ -3539,6 +3574,72 @@ impl MemoryStorage {
         Ok(RecordCoordinatorLeaseGrantOutcome::Granted {
             lease_epoch,
             lease_expires_at,
+        })
+    }
+
+    /// Durably releases only the exact coordinator process instance.
+    ///
+    /// The row is retained so the witness keeps a monotonic generation and can
+    /// reject a delayed renewal from the released instance. A released row is
+    /// encoded as `lease_expires_at <= updated_at`; the next different process
+    /// may therefore acquire immediately with the next lease epoch.
+    pub async fn release_record_commitment_coordinator_lease(
+        &self,
+        chain_id: &[u8; 32],
+        coordinator: &[u8; 32],
+        instance_id: &[u8; 32],
+        now: u64,
+    ) -> Result<RecordCoordinatorLeaseReleaseOutcome, String> {
+        let now_i64 = i64::try_from(now)
+            .map_err(|_| "coordinator lease release time is outside SQLite range".to_string())?;
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("begin coordinator lease release transaction: {error}"))?;
+        let existing = tx
+            .query_row(
+                "SELECT chain_id, instance_id, lease_epoch
+                 FROM record_coordinator_leases WHERE coordinator=?1",
+                params![coordinator.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("read coordinator lease for release: {error}"))?;
+        let Some((stored_chain, stored_instance, lease_epoch)) = existing else {
+            return Ok(RecordCoordinatorLeaseReleaseOutcome::NotHolder);
+        };
+        if stored_chain.as_slice() != chain_id || stored_instance.as_slice() != instance_id {
+            return Ok(RecordCoordinatorLeaseReleaseOutcome::NotHolder);
+        }
+        let lease_epoch = u64::try_from(lease_epoch)
+            .map_err(|_| "coordinator lease release epoch is invalid".to_string())?;
+        let updated = tx
+            .execute(
+                "UPDATE record_coordinator_leases
+                 SET lease_expires_at=?1, updated_at=?1
+                 WHERE coordinator=?2 AND chain_id=?3 AND instance_id=?4",
+                params![
+                    now_i64,
+                    coordinator.as_slice(),
+                    chain_id.as_slice(),
+                    instance_id.as_slice(),
+                ],
+            )
+            .map_err(|error| format!("persist coordinator lease release: {error}"))?;
+        if updated != 1 {
+            return Err("coordinator lease release did not update exactly one row".to_string());
+        }
+        tx.commit()
+            .map_err(|error| format!("commit coordinator lease release: {error}"))?;
+        Ok(RecordCoordinatorLeaseReleaseOutcome::Released {
+            lease_epoch,
+            released_at: now,
         })
     }
 
@@ -6259,6 +6360,79 @@ mod tests {
                 .await
                 .unwrap(),
             RecordCoordinatorLeaseGrantOutcome::TipMismatch
+        );
+
+        assert_eq!(
+            reopened
+                .release_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &first_instance,
+                    1_101,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseReleaseOutcome::NotHolder
+        );
+        assert_eq!(
+            reopened
+                .release_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    1_101,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseReleaseOutcome::Released {
+                lease_epoch: 2,
+                released_at: 1_101,
+            }
+        );
+        assert_eq!(
+            reopened
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    1_102,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Contended
+        );
+        assert_eq!(
+            reopened
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &first_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    1_102,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted {
+                lease_epoch: 3,
+                lease_expires_at: 1_162,
+            }
+        );
+        assert_eq!(
+            reopened
+                .release_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    1_103,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseReleaseOutcome::NotHolder
         );
     }
 

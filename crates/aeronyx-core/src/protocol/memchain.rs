@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.10-CoordinatorLease
+// Version: 2.8.11-CoordinatorLeaseRelease
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -18,6 +18,8 @@
 //   certificate request/response variants for admitted node peers.
 //   v2.8.10-CoordinatorLease — Appended signed short-lived coordinator lease
 //   request/response variants. Existing discriminants remain unchanged.
+//   v2.8.11-CoordinatorLeaseRelease — Appended signed graceful lease release
+//   request/response variants without changing existing wire indices.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -42,7 +44,7 @@
 //   - v1.3.0 is a BREAKING CHANGE: DeviceRegister, ChatPull, ChatAck wire
 //     format changed — old clients cannot talk to new servers and vice versa
 //   - WalletPresence (17) is a lightweight heartbeat — node never replies
-//   - Record block/checkpoint/certificate/lease frames (19-22, 25-28) are node-peer
+//   - Record block/checkpoint/certificate/lease frames (19-22, 25-30) are node-peer
 //     control messages and MUST NOT be accepted from ordinary client tunnels
 //   - Commitment blocks contain opaque record IDs only; sealed memory payload
 //     replication requires a separate owner-authorised protocol
@@ -50,6 +52,8 @@
 //     use the same two-[u8;32] trick for bincode compatibility
 //
 // Last Modified:
+//   v2.8.11-CoordinatorLeaseRelease — Appended variants 29-30 for authenticated
+//                        graceful handover without weakening crash fencing
 //   v2.8.10-CoordinatorLease — Appended variants 27-28 and canonical lease
 //                        signing contracts for cross-host writer fencing
 //   v2.8.7-CheckpointCertificateExchange — Appended variants 25-26 and fixed
@@ -209,6 +213,8 @@ pub struct RecordCheckpointCertificateMemberV1 {
 /// | 26    | RecordCheckpointCertificateResponseV1| v2.8.7-CertificateExchange |
 /// | 27    | RecordCoordinatorLeaseRequestV1 | v2.8.10-CoordinatorLease |
 /// | 28    | RecordCoordinatorLeaseResponseV1| v2.8.10-CoordinatorLease |
+/// | 29    | RecordCoordinatorLeaseReleaseRequestV1 | v2.8.11-LeaseRelease |
+/// | 30    | RecordCoordinatorLeaseReleaseResponseV1| v2.8.11-LeaseRelease |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(deprecated)]
 pub enum MemChainMessage {
@@ -633,6 +639,50 @@ pub enum MemChainMessage {
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
+
+    // ── v2.8.11: authenticated graceful lease release (indices 29-30) ──
+    /// [index 29] Releases only the calling process instance's current lease.
+    ///
+    /// Crash recovery does not send this frame and therefore remains bounded
+    /// by the signed lease expiry. A copied identity cannot release a different
+    /// active instance because the process id is covered by the signature and
+    /// checked against the witness's durable row.
+    RecordCoordinatorLeaseReleaseRequestV1 {
+        /// Production/private chain identifier.
+        chain_id: [u8; 32],
+        /// Configured long-term coordinator Ed25519 identity.
+        coordinator: [u8; 32],
+        /// Exact process instance that previously acquired the lease.
+        instance_id: [u8; 32],
+        /// Per-request random identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Unix epoch seconds; witnesses reject stale requests.
+        request_timestamp: u64,
+        /// Coordinator signature over every canonical release field.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+
+    /// [index 30] Confirms one durable instance-matched release.
+    RecordCoordinatorLeaseReleaseResponseV1 {
+        /// Production/private chain identifier.
+        chain_id: [u8; 32],
+        /// Request identifier copied from the request.
+        request_id: [u8; 16],
+        /// Long-term coordinator identity copied from the request.
+        coordinator: [u8; 32],
+        /// Released process instance copied from the request.
+        instance_id: [u8; 32],
+        /// Releasing witness Ed25519 identity.
+        witness: [u8; 32],
+        /// Unix epoch seconds when the release was durably applied.
+        released_at: u64,
+        /// Lease generation released by this witness.
+        lease_epoch: u64,
+        /// Witness signature over every canonical response field.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
 }
 
 fn deserialize_chat_pull_cursor_v2<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -920,6 +970,49 @@ pub fn record_coordinator_lease_response_signing_bytes(
     bytes.extend_from_slice(&lease_expires_at.to_le_bytes());
     bytes.extend_from_slice(&witness_tip_height.to_le_bytes());
     bytes.extend_from_slice(witness_tip_hash);
+    bytes
+}
+
+/// Canonical bytes signed by `RecordCoordinatorLeaseReleaseRequestV1.coordinator`.
+#[must_use]
+pub fn record_coordinator_lease_release_request_signing_bytes(
+    chain_id: &[u8; 32],
+    coordinator: &[u8; 32],
+    instance_id: &[u8; 32],
+    request_id: &[u8; 16],
+    request_timestamp: u64,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(160);
+    bytes.extend_from_slice(b"AeroNyx-RecordCoordinatorLeaseReleaseRequest-v1");
+    bytes.extend_from_slice(chain_id);
+    bytes.extend_from_slice(coordinator);
+    bytes.extend_from_slice(instance_id);
+    bytes.extend_from_slice(request_id);
+    bytes.extend_from_slice(&request_timestamp.to_le_bytes());
+    bytes
+}
+
+/// Canonical bytes signed by `RecordCoordinatorLeaseReleaseResponseV1.witness`.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn record_coordinator_lease_release_response_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    coordinator: &[u8; 32],
+    instance_id: &[u8; 32],
+    witness: &[u8; 32],
+    released_at: u64,
+    lease_epoch: u64,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(224);
+    bytes.extend_from_slice(b"AeroNyx-RecordCoordinatorLeaseReleaseResponse-v1");
+    bytes.extend_from_slice(chain_id);
+    bytes.extend_from_slice(request_id);
+    bytes.extend_from_slice(coordinator);
+    bytes.extend_from_slice(instance_id);
+    bytes.extend_from_slice(witness);
+    bytes.extend_from_slice(&released_at.to_le_bytes());
+    bytes.extend_from_slice(&lease_epoch.to_le_bytes());
     bytes
 }
 
@@ -1876,6 +1969,64 @@ mod tests {
         witness
             .verify(&response_bytes, &signature)
             .expect("lease response signature");
+
+        let release_request_id = [0xA4; 16];
+        let release_timestamp = response_timestamp + 2;
+        let release_request_bytes = record_coordinator_lease_release_request_signing_bytes(
+            &chain_id,
+            &coordinator.public_key_bytes(),
+            &instance_id,
+            &release_request_id,
+            release_timestamp,
+        );
+        let release_request = MemChainMessage::RecordCoordinatorLeaseReleaseRequestV1 {
+            chain_id,
+            coordinator: coordinator.public_key_bytes(),
+            instance_id,
+            request_id: release_request_id,
+            request_timestamp: release_timestamp,
+            signature: coordinator.sign(&release_request_bytes),
+        };
+        let encoded = encode_memchain(&release_request).expect("encode lease release request");
+        assert_eq!(u32::from_le_bytes(encoded[1..5].try_into().unwrap()), 29);
+        let decoded = decode_memchain(&encoded[1..]).expect("decode lease release request");
+        let MemChainMessage::RecordCoordinatorLeaseReleaseRequestV1 { signature, .. } = decoded
+        else {
+            panic!("expected coordinator lease release request");
+        };
+        coordinator
+            .verify(&release_request_bytes, &signature)
+            .expect("lease release request signature");
+
+        let release_response_bytes = record_coordinator_lease_release_response_signing_bytes(
+            &chain_id,
+            &release_request_id,
+            &coordinator.public_key_bytes(),
+            &instance_id,
+            &witness.public_key_bytes(),
+            release_timestamp,
+            lease_epoch,
+        );
+        let release_response = MemChainMessage::RecordCoordinatorLeaseReleaseResponseV1 {
+            chain_id,
+            request_id: release_request_id,
+            coordinator: coordinator.public_key_bytes(),
+            instance_id,
+            witness: witness.public_key_bytes(),
+            released_at: release_timestamp,
+            lease_epoch,
+            signature: witness.sign(&release_response_bytes),
+        };
+        let encoded = encode_memchain(&release_response).expect("encode lease release response");
+        assert_eq!(u32::from_le_bytes(encoded[1..5].try_into().unwrap()), 30);
+        let decoded = decode_memchain(&encoded[1..]).expect("decode lease release response");
+        let MemChainMessage::RecordCoordinatorLeaseReleaseResponseV1 { signature, .. } = decoded
+        else {
+            panic!("expected coordinator lease release response");
+        };
+        witness
+            .verify(&release_response_bytes, &signature)
+            .expect("lease release response signature");
     }
 
     // ── Chat Relay variant roundtrip tests ───────────────────────────────
