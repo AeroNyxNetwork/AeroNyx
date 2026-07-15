@@ -44,6 +44,8 @@
 //!   startup fail-closed verification, and aggregate durability evidence
 //! - v2.7.17-AtomicBlockPage: one SQLite transaction per verified peer page,
 //!   with single-block mining delegated to the same authoritative path
+//! - v2.7.18-VerifiedRangeSnapshot: audit-gated range serving from one SQLite
+//!   snapshot with canonical payload and signature re-verification
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -75,6 +77,8 @@
 //!   the new chain. It delegates to `append_record_commitment_blocks_atomic`;
 //!   never update the tip independently of that transaction.
 //! - Peer range reads return commitments only; full records remain owner-scoped.
+//!   Public serving must use `get_verified_record_commitment_block_page`, not
+//!   the compatibility range reader, so no unaudited/stale view is signed.
 //! - An inbound checkpoint request describes the requester's state, not this
 //!   node's observation of the network. Serving it must never mutate outbound
 //!   checkpoint relation, heights, or divergence counters.
@@ -109,8 +113,10 @@
 //! v2.7.13-CommitmentDurability - Enforced coordinator FULL SQLite commits.
 //! v2.7.14-CommitmentTipAnchor - Added a signed local high-water rollback guard.
 //! v2.7.17-AtomicBlockPage - Made verified peer pages one atomic SQLite append.
+//! v2.7.18-VerifiedRangeSnapshot - Added fail-closed snapshot range serving.
 //!
 //! ## Last Modified
+//! v2.7.18-VerifiedRangeSnapshot - Serve only canonically reverified audit-backed pages.
 //! v2.7.17-AtomicBlockPage - Share one atomic append path across mining and sync.
 //! v2.7.11-CheckpointFreshness - Distinguish vault integrity from proof recency.
 //! v2.7.12-WitnessRoundEvidence - Report bounded witness round coverage.
@@ -195,6 +201,21 @@ pub struct RecordCommitmentBatchAppendOutcome {
     pub inserted: usize,
     /// Exact blocks that were already durable when the transaction began.
     pub already_present: usize,
+}
+
+/// One audit-gated block page and the canonical tip observed in the same
+/// `SQLite` read snapshot.
+///
+/// The page contains only signed commitment blocks. It never contains memory
+/// records, owners, payload plaintext, routes, endpoints, or client metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRecordCommitmentBlockPage {
+    /// Canonically decoded and signature-verified blocks in height order.
+    pub blocks: Vec<RecordCommitmentBlockV1>,
+    /// Canonical chain tip height in the same snapshot.
+    pub tip_height: u64,
+    /// Canonical chain tip hash in the same snapshot.
+    pub tip_hash: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -323,6 +344,159 @@ const MAX_COMMITMENT_TIP_ANCHOR_BYTES: u64 = 4 * 1024;
 const COMMITMENT_TIP_ANCHOR_CONTRACT: &str = "record_commitment_tip_anchor.v1";
 const COMMITMENT_TIP_ANCHOR_DOMAIN: &[u8] = b"aeronyx.record_commitment_tip_anchor.v1\0";
 static COMMITMENT_TIP_ANCHOR_TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
+
+fn read_stored_record_commitment_block_row(
+    row: &rusqlite::Row<'_>,
+    context: &str,
+) -> Result<StoredRecordCommitmentBlockRow, String> {
+    Ok(StoredRecordCommitmentBlockRow {
+        height: row
+            .get(0)
+            .map_err(|error| format!("read {context} height: {error}"))?,
+        block_hash: row
+            .get(1)
+            .map_err(|error| format!("read {context} hash: {error}"))?,
+        chain_id: row
+            .get(2)
+            .map_err(|error| format!("read {context} chain: {error}"))?,
+        protocol_version: row
+            .get(3)
+            .map_err(|error| format!("read {context} version: {error}"))?,
+        timestamp: row
+            .get(4)
+            .map_err(|error| format!("read {context} timestamp: {error}"))?,
+        prev_block_hash: row
+            .get(5)
+            .map_err(|error| format!("read {context} previous hash: {error}"))?,
+        merkle_root: row
+            .get(6)
+            .map_err(|error| format!("read {context} merkle root: {error}"))?,
+        record_count: row
+            .get(7)
+            .map_err(|error| format!("read {context} count: {error}"))?,
+        proposer: row
+            .get(8)
+            .map_err(|error| format!("read {context} proposer: {error}"))?,
+        proposer_signature: row
+            .get(9)
+            .map_err(|error| format!("read {context} signature: {error}"))?,
+        payload: row
+            .get(10)
+            .map_err(|error| format!("read {context} payload: {error}"))?,
+    })
+}
+
+fn read_record_commitment_tip_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    context: &str,
+) -> Result<(u64, [u8; 32]), String> {
+    let tip: Option<(i64, Vec<u8>)> = transaction
+        .query_row(
+            "SELECT height,block_hash FROM record_commitment_blocks
+             ORDER BY height DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("read {context} tip: {error}"))?;
+    match tip {
+        Some((height, hash)) => {
+            let height =
+                u64::try_from(height).map_err(|_| format!("{context} tip height is invalid"))?;
+            let hash: [u8; 32] = hash
+                .try_into()
+                .map_err(|hash: Vec<u8>| format!("{context} tip hash length {}", hash.len()))?;
+            Ok((height, hash))
+        }
+        None => Ok((0, GENESIS_PREV_HASH)),
+    }
+}
+
+fn read_record_commitment_predecessor_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    from_height: u64,
+    tip_height: u64,
+) -> Result<[u8; 32], String> {
+    if from_height == 1 {
+        return Ok(GENESIS_PREV_HASH);
+    }
+    if from_height > tip_height.saturating_add(1) {
+        // A request beyond tip+1 returns an empty signed page while still
+        // binding the current verified tip. No predecessor is consumed.
+        return Ok(GENESIS_PREV_HASH);
+    }
+    let previous_height = i64::try_from(from_height.saturating_sub(1))
+        .map_err(|_| "verified commitment range predecessor overflow".to_string())?;
+    let hash: Vec<u8> = transaction
+        .query_row(
+            "SELECT block_hash FROM record_commitment_blocks WHERE height=?1",
+            params![previous_height],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("read verified commitment range predecessor: {error}"))?;
+    hash.try_into().map_err(|hash: Vec<u8>| {
+        format!(
+            "verified commitment range predecessor hash length {}",
+            hash.len()
+        )
+    })
+}
+
+fn decode_and_verify_stored_record_commitment_block(
+    stored: &StoredRecordCommitmentBlockRow,
+    expected_height: u64,
+    expected_prev_hash: &[u8; 32],
+    context: &str,
+) -> Result<RecordCommitmentBlockV1, String> {
+    let stored_height = u64::try_from(stored.height)
+        .map_err(|_| format!("{context} found an invalid stored height"))?;
+    if stored.payload.len() > MAX_STORED_COMMITMENT_BLOCK_BYTES {
+        return Err(format!(
+            "{context} payload exceeds bound at height {stored_height}"
+        ));
+    }
+    let block = bincode::deserialize::<RecordCommitmentBlockV1>(&stored.payload)
+        .map_err(|_| format!("{context} payload decode failed at height {stored_height}"))?;
+    let canonical_payload = bincode::serialize(&block)
+        .map_err(|_| format!("{context} payload encode failed at height {stored_height}"))?;
+    if canonical_payload != stored.payload {
+        return Err(format!(
+            "{context} payload is non-canonical at height {stored_height}"
+        ));
+    }
+
+    block
+        .verify(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            expected_height,
+            expected_prev_hash,
+        )
+        .map_err(|error| {
+            format!("{context} block validation failed at height {stored_height}: {error}")
+        })?;
+
+    let block_height = i64::try_from(block.header.height)
+        .map_err(|_| format!("{context} height overflow at height {stored_height}"))?;
+    let block_timestamp = i64::try_from(block.header.timestamp)
+        .map_err(|_| format!("{context} timestamp overflow at height {stored_height}"))?;
+    let block_hash = block.hash();
+    if stored.height != block_height
+        || stored.block_hash.as_slice() != block_hash.as_slice()
+        || stored.chain_id.as_slice() != block.header.chain_id.as_slice()
+        || stored.protocol_version != i64::from(block.header.protocol_version)
+        || stored.timestamp != block_timestamp
+        || stored.prev_block_hash.as_slice() != block.header.prev_block_hash.as_slice()
+        || stored.merkle_root.as_slice() != block.header.merkle_root.as_slice()
+        || stored.record_count != i64::from(block.header.record_count)
+        || stored.proposer.as_slice() != block.header.proposer.as_slice()
+        || stored.proposer_signature.as_slice() != block.proposer_signature.as_slice()
+    {
+        return Err(format!(
+            "{context} stored row mismatch at height {stored_height}"
+        ));
+    }
+    Ok(block)
+}
 
 fn persist_record_commitment_block_transaction(
     transaction: &rusqlite::Transaction<'_>,
@@ -2100,96 +2274,17 @@ impl MemoryStorage {
             .next()
             .map_err(|error| format!("read commitment audit block: {error}"))?
         {
-            let stored = StoredRecordCommitmentBlockRow {
-                height: row
-                    .get(0)
-                    .map_err(|error| format!("read commitment audit height: {error}"))?,
-                block_hash: row
-                    .get(1)
-                    .map_err(|error| format!("read commitment audit hash: {error}"))?,
-                chain_id: row
-                    .get(2)
-                    .map_err(|error| format!("read commitment audit chain: {error}"))?,
-                protocol_version: row
-                    .get(3)
-                    .map_err(|error| format!("read commitment audit version: {error}"))?,
-                timestamp: row
-                    .get(4)
-                    .map_err(|error| format!("read commitment audit timestamp: {error}"))?,
-                prev_block_hash: row
-                    .get(5)
-                    .map_err(|error| format!("read commitment audit previous hash: {error}"))?,
-                merkle_root: row
-                    .get(6)
-                    .map_err(|error| format!("read commitment audit merkle root: {error}"))?,
-                record_count: row
-                    .get(7)
-                    .map_err(|error| format!("read commitment audit count: {error}"))?,
-                proposer: row
-                    .get(8)
-                    .map_err(|error| format!("read commitment audit proposer: {error}"))?,
-                proposer_signature: row
-                    .get(9)
-                    .map_err(|error| format!("read commitment audit signature: {error}"))?,
-                payload: row
-                    .get(10)
-                    .map_err(|error| format!("read commitment audit payload: {error}"))?,
-            };
+            let stored = read_stored_record_commitment_block_row(row, "commitment audit")?;
 
             let stored_height = u64::try_from(stored.height)
                 .map_err(|_| "commitment audit found an invalid stored height".to_string())?;
-            if stored.payload.len() > MAX_STORED_COMMITMENT_BLOCK_BYTES {
-                return Err(format!(
-                    "commitment audit payload exceeds bound at height {stored_height}"
-                ));
-            }
-            let block =
-                bincode::deserialize::<RecordCommitmentBlockV1>(&stored.payload).map_err(|_| {
-                    format!("commitment audit payload decode failed at height {stored_height}")
-                })?;
-            let canonical_payload = bincode::serialize(&block).map_err(|_| {
-                format!("commitment audit payload encode failed at height {stored_height}")
-            })?;
-            if canonical_payload != stored.payload {
-                return Err(format!(
-                    "commitment audit payload is non-canonical at height {stored_height}"
-                ));
-            }
-
-            block
-                .verify(
-                    &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
-                    expected_height,
-                    &expected_prev_hash,
-                )
-                .map_err(|error| {
-                    format!(
-                        "commitment audit block validation failed at height {stored_height}: {error}"
-                    )
-                })?;
-
-            let block_height = i64::try_from(block.header.height).map_err(|_| {
-                format!("commitment audit height overflow at height {stored_height}")
-            })?;
-            let block_timestamp = i64::try_from(block.header.timestamp).map_err(|_| {
-                format!("commitment audit timestamp overflow at height {stored_height}")
-            })?;
+            let block = decode_and_verify_stored_record_commitment_block(
+                &stored,
+                expected_height,
+                &expected_prev_hash,
+                "commitment audit",
+            )?;
             let block_hash = block.hash();
-            if stored.height != block_height
-                || stored.block_hash.as_slice() != block_hash.as_slice()
-                || stored.chain_id.as_slice() != block.header.chain_id.as_slice()
-                || stored.protocol_version != i64::from(block.header.protocol_version)
-                || stored.timestamp != block_timestamp
-                || stored.prev_block_hash.as_slice() != block.header.prev_block_hash.as_slice()
-                || stored.merkle_root.as_slice() != block.header.merkle_root.as_slice()
-                || stored.record_count != i64::from(block.header.record_count)
-                || stored.proposer.as_slice() != block.header.proposer.as_slice()
-                || stored.proposer_signature.as_slice() != block.proposer_signature.as_slice()
-            {
-                return Err(format!(
-                    "commitment audit stored row mismatch at height {stored_height}"
-                ));
-            }
 
             let mut membership_rows =
                 membership_statement
@@ -2552,7 +2647,99 @@ impl MemoryStorage {
         Ok(())
     }
 
-    /// Reads a bounded, height-ordered range for peer catch-up.
+    /// Reads one canonically reverified block page and its tip from a single
+    /// audit-gated `SQLite` snapshot.
+    ///
+    /// This is the only range primitive suitable for a signed peer response.
+    /// It refuses to serve when the process has no complete audit baseline,
+    /// when the baseline no longer matches the database tip, or when any
+    /// selected payload, denormalized row, signature, height, or parent link
+    /// fails canonical verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the chain is unaudited/stale, the snapshot cannot
+    /// be read, or a selected stored block fails canonical verification.
+    pub async fn get_verified_record_commitment_block_page(
+        &self,
+        from_height: u64,
+        limit: usize,
+    ) -> Result<VerifiedRecordCommitmentBlockPage, String> {
+        let from_height = from_height.max(1);
+        let query_from_height = i64::try_from(from_height).unwrap_or(i64::MAX);
+        let query_limit = i64::try_from(limit.clamp(1, 32)).unwrap_or(32);
+        let mut conn = self.conn.lock().await;
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| format!("begin verified commitment range snapshot: {error}"))?;
+        let integrity = (*self.commitment_integrity.read())
+            .ok_or_else(|| "commitment chain is not fully audited".to_string())?;
+        let (tip_height, tip_hash) =
+            read_record_commitment_tip_transaction(&transaction, "verified commitment range")?;
+        if integrity.verified_tip_height != tip_height
+            || integrity.verified_tip_hash != tip_hash
+            || integrity.verified_block_count != tip_height
+        {
+            return Err("commitment chain audit baseline is stale".to_string());
+        }
+
+        let mut expected_height = from_height;
+        let mut expected_prev_hash =
+            read_record_commitment_predecessor_transaction(&transaction, from_height, tip_height)?;
+
+        let blocks = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT height,block_hash,chain_id,protocol_version,timestamp,
+                            prev_block_hash,merkle_root,record_count,proposer,
+                            proposer_signature,payload
+                     FROM record_commitment_blocks
+                     WHERE height>=?1 ORDER BY height ASC LIMIT ?2",
+                )
+                .map_err(|error| format!("prepare verified commitment range: {error}"))?;
+            let mut rows = statement
+                .query(params![query_from_height, query_limit])
+                .map_err(|error| format!("query verified commitment range: {error}"))?;
+            let mut blocks = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .map_err(|error| format!("read verified commitment range block: {error}"))?
+            {
+                let stored = read_stored_record_commitment_block_row(row, "commitment range")?;
+                let block = decode_and_verify_stored_record_commitment_block(
+                    &stored,
+                    expected_height,
+                    &expected_prev_hash,
+                    "commitment range",
+                )?;
+                expected_height = expected_height
+                    .checked_add(1)
+                    .ok_or_else(|| "verified commitment range height exhausted".to_string())?;
+                expected_prev_hash = block.hash();
+                blocks.push(block);
+            }
+            blocks
+        };
+        transaction
+            .commit()
+            .map_err(|error| format!("commit verified commitment range snapshot: {error}"))?;
+        drop(conn);
+        Ok(VerifiedRecordCommitmentBlockPage {
+            blocks,
+            tip_height,
+            tip_hash,
+        })
+    }
+
+    /// Reads a bounded height-ordered range for compatibility callers.
+    ///
+    /// This method does not establish an audit-gated snapshot and must never
+    /// feed a signed peer response. New sync serving code must call
+    /// `get_verified_record_commitment_block_page`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the range query or stored payload decode fails.
     pub async fn get_record_commitment_block_range(
         &self,
         from_height: u64,
@@ -2584,8 +2771,11 @@ impl MemoryStorage {
         Ok(blocks)
     }
 
-    /// Returns the verified commitment chain tip from the authoritative block
-    /// table rather than trusting mutable key/value state.
+    /// Returns the raw commitment tip from the authoritative block table.
+    ///
+    /// This compatibility/telemetry helper intentionally has no `Result` and
+    /// therefore cannot prove an audit baseline. Security-sensitive sync code
+    /// must use `record_commitment_chain_checkpoint` or the verified page API.
     pub async fn record_commitment_chain_tip(&self) -> (u64, [u8; 32]) {
         let conn = self.conn.lock().await;
         let tip: Option<(u64, Vec<u8>)> = conn
@@ -4126,6 +4316,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(range, vec![first.clone(), second.clone()]);
+        let first_page = storage
+            .get_verified_record_commitment_block_page(1, 1)
+            .await
+            .unwrap();
+        assert_eq!(first_page.blocks, vec![first.clone()]);
+        assert_eq!(first_page.tip_height, 2);
+        assert_eq!(first_page.tip_hash, second.hash());
+        let terminal_page = storage
+            .get_verified_record_commitment_block_page(2, 10)
+            .await
+            .unwrap();
+        assert_eq!(terminal_page.blocks, vec![second.clone()]);
+        assert_eq!(terminal_page.tip_height, 2);
+        assert_eq!(terminal_page.tip_hash, second.hash());
         assert_eq!(
             storage.record_commitment_chain_tip().await,
             (2, second.hash())
@@ -4162,6 +4366,58 @@ mod tests {
                 tip_height: 2,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn test_verified_commitment_range_fails_closed_without_current_audit() {
+        let unaudited = MemoryStorage::open(":memory:", None).unwrap();
+        assert!(unaudited
+            .get_verified_record_commitment_block_page(1, 16)
+            .await
+            .unwrap_err()
+            .contains("not fully audited"));
+
+        let stale = MemoryStorage::open(":memory:", None).unwrap();
+        stale.audit_record_commitment_chain().await.unwrap();
+        let identity = IdentityKeyPair::generate();
+        let block = signed_commitment_block(1, GENESIS_PREV_HASH, 0xD1, &identity);
+        stale
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        {
+            let conn = stale.conn.lock().await;
+            conn.execute(
+                "UPDATE record_commitment_blocks SET block_hash=?1 WHERE height=1",
+                params![[0xD2_u8; 32].as_slice()],
+            )
+            .unwrap();
+        }
+        assert!(stale
+            .get_verified_record_commitment_block_page(1, 16)
+            .await
+            .unwrap_err()
+            .contains("baseline is stale"));
+
+        let corrupt = MemoryStorage::open(":memory:", None).unwrap();
+        corrupt.audit_record_commitment_chain().await.unwrap();
+        corrupt
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        {
+            let conn = corrupt.conn.lock().await;
+            conn.execute(
+                "UPDATE record_commitment_blocks SET payload=?1 WHERE height=1",
+                params![vec![0xFF_u8; 32]],
+            )
+            .unwrap();
+        }
+        assert!(corrupt
+            .get_verified_record_commitment_block_page(1, 16)
+            .await
+            .unwrap_err()
+            .contains("payload decode failed"));
     }
 
     async fn commitment_audit_fixture() -> (MemoryStorage, RecordCommitmentBlockV1) {

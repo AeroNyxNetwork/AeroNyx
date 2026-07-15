@@ -26,11 +26,14 @@
 //!   as evidence without treating peer count as consensus or fork choice.
 //! - Direction-isolated checkpoint telemetry: serving a requester updates only
 //!   service counters and cannot manufacture local convergence or divergence.
+//! - Audit-gated block pages assembled from one SQLite snapshot and
+//!   canonically reverified before the node signs a response.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` on the public node peer listener and local operator
 //!   listener when Local-mode `MemoryStorage` is available.
-//! - Reads verified blocks through `MemoryStorage::get_record_commitment_block_range`.
+//! - Reads peer pages through
+//!   `MemoryStorage::get_verified_record_commitment_block_page`.
 //! - Uses `PeerStore::get_valid` as the node admission boundary.
 //! - Uses canonical signing bytes from `aeronyx_core::protocol::memchain`.
 //! - `server.rs` runs the optional low-frequency follower and coordinator
@@ -60,8 +63,11 @@
 //!   startup gate. Permissionless discovery peers remain evidence-only.
 //! - Never derive outbound checkpoint state from an inbound request. The peer
 //!   controls its requested height/hash, so those values are not local evidence.
+//! - Never sign a range assembled from separate block/tip reads or from a
+//!   missing/stale process audit baseline.
 //!
 //! ## Last Modified
+//! v2.7.18-VerifiedRangeSnapshot - Sign only snapshot-consistent audited pages.
 //! v2.7.17-AtomicBlockPage - Commit each verified follower page atomically.
 //! v2.7.15-ExternalWitnessGuard - Added identity-pinned reconciliation.
 //! v2.7.5-CheckpointProof - Signed cross-node checkpoint reconciliation.
@@ -107,6 +113,7 @@ use crate::services::PeerStore;
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 512 * 1024;
 const MAX_BLOCKS_PER_RESPONSE: usize = 16;
+const MAX_BLOCKS_PER_RESPONSE_WIRE: u16 = 16;
 const MAX_REQUESTS_PER_PEER_PER_MINUTE: u32 = 30;
 const REQUEST_TIMESTAMP_SKEW_SECS: u64 = 60;
 const REPLAY_RETENTION_SECS: u64 = 120;
@@ -268,8 +275,25 @@ pub fn build_memchain_peer_router(
         .with_state(state)
 }
 
+async fn verified_local_commitment_tip(storage: &MemoryStorage) -> Result<(u64, [u8; 32]), String> {
+    let (_, checkpoint_hash, tip_height, tip_hash) = storage
+        .record_commitment_chain_checkpoint(u64::MAX)
+        .await
+        .map_err(|_| "local_checkpoint_unavailable".to_string())?;
+    if checkpoint_hash != tip_hash {
+        return Err("local_checkpoint_tip_mismatch".to_string());
+    }
+    Ok((tip_height, tip_hash))
+}
+
 /// Obtains and verifies one signed chain-checkpoint comparison from the pinned
 /// coordinator. The response proves peer attestation, not network consensus.
+///
+/// # Errors
+///
+/// Returns a stable privacy-safe code when the local audited tip is
+/// unavailable, the pinned peer cannot be reached, its response is invalid,
+/// or durable checkpoint evidence cannot be stored.
 pub async fn pull_record_commitment_checkpoint(
     storage: &MemoryStorage,
     peer_store: &PeerStore,
@@ -288,13 +312,7 @@ pub async fn pull_record_commitment_checkpoint(
         .ok_or_else(|| "pinned_coordinator_missing_endpoint".to_string())?;
     let url = commitment_checkpoint_url(endpoint)?;
 
-    let (_, known_tip_hash, known_tip_height, current_tip_hash) = storage
-        .record_commitment_chain_checkpoint(u64::MAX)
-        .await
-        .map_err(|_| "local_checkpoint_unavailable".to_string())?;
-    if known_tip_hash != current_tip_hash {
-        return Err("local_checkpoint_tip_mismatch".to_string());
-    }
+    let (known_tip_height, known_tip_hash) = verified_local_commitment_tip(storage).await?;
     let mut request_id = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut request_id);
     let requester = identity.public_key_bytes();
@@ -649,6 +667,12 @@ const fn checkpoint_relation_priority(relation: CommitmentCheckpointRelation) ->
 /// The coordinator identity is supplied by validated operator configuration.
 /// Discovery is used only to resolve that exact identity's current signed
 /// endpoint; this function never selects or falls back to another peer.
+///
+/// # Errors
+///
+/// Returns a stable privacy-safe code when the local audited tip is
+/// unavailable, the pinned peer cannot be reached, the signed page is invalid,
+/// or the atomic local append fails closed.
 pub async fn pull_record_commitment_page(
     storage: &MemoryStorage,
     peer_store: &PeerStore,
@@ -667,12 +691,12 @@ pub async fn pull_record_commitment_page(
         .ok_or_else(|| "pinned_coordinator_missing_endpoint".to_string())?;
     let url = commitment_block_range_url(endpoint)?;
 
-    let local_tip = storage.record_commitment_chain_tip().await;
+    let local_tip = verified_local_commitment_tip(storage).await?;
     let from_height = local_tip.0.saturating_add(1).max(1);
     let mut request_id = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut request_id);
     let requester = identity.public_key_bytes();
-    let limit = MAX_BLOCKS_PER_RESPONSE as u16;
+    let limit = MAX_BLOCKS_PER_RESPONSE_WIRE;
     let signing_bytes = record_block_range_request_signing_bytes(
         &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
         from_height,
@@ -1158,21 +1182,24 @@ async fn block_range_handler(State(state): State<MemChainPeerState>, body: Bytes
     }
 
     let page_limit = usize::from(limit).min(MAX_BLOCKS_PER_RESPONSE);
-    let blocks = match state
+    let page = match state
         .storage
-        .get_record_commitment_block_range(from_height, page_limit)
+        .get_verified_record_commitment_block_page(from_height, page_limit)
         .await
     {
-        Ok(blocks) => blocks,
+        Ok(page) => page,
         Err(error) => {
-            warn!(error = %error, "[MEMCHAIN_BLOCK] Failed to read verified block range");
-            return protocol_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error");
+            warn!(error = %error, "[MEMCHAIN_BLOCK] Refused unverified block range");
+            return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "chain_not_verified");
         }
     };
-    let (tip_height, tip_hash) = state.storage.record_commitment_chain_tip().await;
-    let page_tip = blocks
-        .last()
-        .map_or(from_height.saturating_sub(1), |block| block.header.height);
+    let blocks = page.blocks;
+    let tip_height = page.tip_height;
+    let tip_hash = page.tip_hash;
+    let page_tip = blocks.last().map_or_else(
+        || from_height.saturating_sub(1),
+        |block| block.header.height,
+    );
     let has_more = page_tip < tip_height;
     let responder = state.identity.public_key_bytes();
     let response_timestamp = now_secs();
@@ -1355,6 +1382,49 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/memchain/peer/checkpoint")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(frame))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn block_range_endpoint_refuses_to_sign_an_unaudited_chain() {
+        let now = now_secs();
+        let responder_identity = Arc::new(IdentityKeyPair::generate());
+        let requester_identity = IdentityKeyPair::generate();
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let peer_store = Arc::new(PeerStore::new());
+        admit_peer(&peer_store, &requester_identity, None, now);
+
+        let request_id = [0x92; 16];
+        let requester = requester_identity.public_key_bytes();
+        let signing_bytes = record_block_range_request_signing_bytes(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            1,
+            MAX_BLOCKS_PER_RESPONSE_WIRE,
+            &request_id,
+            &requester,
+            now,
+        );
+        let frame = encode_memchain(&MemChainMessage::RecordBlockRangeRequestV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            from_height: 1,
+            limit: MAX_BLOCKS_PER_RESPONSE_WIRE,
+            request_id,
+            requester,
+            request_timestamp: now,
+            signature: requester_identity.sign(&signing_bytes),
+        })
+        .unwrap();
+        let response = build_memchain_peer_router(storage, peer_store, responder_identity)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/block-range")
                     .header(header::CONTENT_TYPE, "application/octet-stream")
                     .body(Body::from(frame))
                     .unwrap(),
@@ -1636,7 +1706,7 @@ mod tests {
         let signing_bytes = record_block_range_request_signing_bytes(
             &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
             1,
-            MAX_BLOCKS_PER_RESPONSE as u16,
+            MAX_BLOCKS_PER_RESPONSE_WIRE,
             &request_id,
             &requester,
             now,
@@ -1644,7 +1714,7 @@ mod tests {
         let frame = encode_memchain(&MemChainMessage::RecordBlockRangeRequestV1 {
             chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
             from_height: 1,
-            limit: MAX_BLOCKS_PER_RESPONSE as u16,
+            limit: MAX_BLOCKS_PER_RESPONSE_WIRE,
             request_id,
             requester,
             request_timestamp: now,

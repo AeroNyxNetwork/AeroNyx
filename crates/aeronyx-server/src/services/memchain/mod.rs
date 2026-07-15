@@ -69,6 +69,7 @@
 //! v2.7.1-BlockSyncStatus - Re-exported privacy-safe follower runtime evidence.
 //! v2.7.0-BlockSync - Re-exported commitment append outcomes and safe status.
 //! v2.7.17-AtomicBlockPage - Re-exported atomic batch append outcomes.
+//! v2.7.18-VerifiedRangeSnapshot - Re-exported audit-backed peer page snapshots.
 
 // ── Storage engine ──
 pub mod storage;
@@ -138,7 +139,7 @@ pub use storage_ops::{
     OverviewData, OverviewRecord, RecordCommitmentAppendOutcome,
     RecordCommitmentBatchAppendOutcome, RecordCommitmentChainAudit,
     RecordCommitmentChainIntegrityStatus, RecordCommitmentChainStatus,
-    RecordCommitmentCheckpointEvidenceAudit,
+    RecordCommitmentCheckpointEvidenceAudit, VerifiedRecordCommitmentBlockPage,
 };
 
 // ── Storage graph types (v2.4.0+Search) ──
