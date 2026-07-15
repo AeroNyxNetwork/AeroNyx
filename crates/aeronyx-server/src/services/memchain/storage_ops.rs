@@ -59,6 +59,8 @@
 //!   admitted fixed-size peer exchange protocol
 //! - v2.7.24-CertificateRollbackGuard: signed local certificate high-water
 //!   sidecar with serialized DB/sidecar commits and fail-closed recovery
+//! - v2.7.25-CoordinatorProductionFence: process-lifetime OS lock that rejects
+//!   duplicate local coordinators before audit, listeners, or block production
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -153,12 +155,15 @@
 //! v2.7.0-BlockSync - Transactional commitment chain, ranges, and safe status.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, Permissions};
 use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
@@ -303,6 +308,15 @@ pub struct RecordCommitmentChainIntegrityStatus {
     pub verified_tip_height: u64,
     /// Effective SQLite durability mode: `off`, `normal`, `full`, or `extra`.
     pub durability_mode: &'static str,
+    /// Local coordinator production fence: `unconfigured`, `not_required`,
+    /// `isolated_in_memory`, `held`, `contended`, or `failed`.
+    pub coordinator_fence_state: &'static str,
+    /// Most recent successful OS lock acquisition in this process.
+    pub coordinator_fence_acquired_at: Option<u64>,
+    /// Failed or contended acquisition attempts in this process.
+    pub coordinator_fence_acquisition_failures_total: u64,
+    /// Exact local-only protection boundary; never implies distributed lease.
+    pub coordinator_fence_scope: &'static str,
     /// Local signed high-water guard state. Never contains the anchor path,
     /// signer, signature, or block hash.
     pub rollback_guard_state: &'static str,
@@ -1094,6 +1108,87 @@ fn checkpoint_certificate_anchor_path(tip_anchor_path: &Path) -> Result<PathBuf,
         .to_os_string();
     file_name.push(".checkpoint-certificate-v1.json");
     Ok(tip_anchor_path.with_file_name(file_name))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoordinatorFenceAcquireError {
+    Contended,
+    UnsafeFile,
+    Io,
+}
+
+impl CoordinatorFenceAcquireError {
+    const fn state(self) -> &'static str {
+        match self {
+            Self::Contended => "contended",
+            Self::UnsafeFile | Self::Io => "failed",
+        }
+    }
+
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Contended => {
+                "commitment coordinator production fence is held by another local process"
+            }
+            Self::UnsafeFile => "commitment coordinator production fence file is unsafe",
+            Self::Io => "commitment coordinator production fence could not be acquired",
+        }
+    }
+}
+
+fn commitment_coordinator_fence_path(database_path: &Path) -> Result<PathBuf, String> {
+    let file_name = database_path
+        .file_name()
+        .ok_or_else(|| "commitment coordinator database path has no file name".to_string())?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".commitment-coordinator-v1.lock");
+    Ok(database_path.with_file_name(lock_name))
+}
+
+fn acquire_commitment_coordinator_fence(
+    database_path: &Path,
+) -> Result<Flock<File>, CoordinatorFenceAcquireError> {
+    let path = commitment_coordinator_fence_path(database_path)
+        .map_err(|_| CoordinatorFenceAcquireError::Io)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
+            return Err(CoordinatorFenceAcquireError::UnsafeFile);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(CoordinatorFenceAcquireError::Io),
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(nix::libc::ELOOP) {
+                CoordinatorFenceAcquireError::UnsafeFile
+            } else {
+                CoordinatorFenceAcquireError::Io
+            }
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| CoordinatorFenceAcquireError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(CoordinatorFenceAcquireError::UnsafeFile);
+    }
+    let lock = Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, error)| {
+        if error == Errno::EWOULDBLOCK {
+            CoordinatorFenceAcquireError::Contended
+        } else {
+            CoordinatorFenceAcquireError::Io
+        }
+    })?;
+    lock.set_permissions(Permissions::from_mode(0o600))
+        .map_err(|_| CoordinatorFenceAcquireError::Io)?;
+    Ok(lock)
 }
 
 async fn read_checkpoint_certificate_anchor(
@@ -3310,18 +3405,26 @@ impl MemoryStorage {
         }
     }
 
-    /// Configures and verifies SQLite commit durability before chain audit.
+    /// Configures and verifies `SQLite` commit durability before chain audit.
     ///
     /// WAL + `NORMAL` preserves database consistency but may lose a recently
     /// acknowledged transaction after host power failure. The single-writer
     /// coordinator therefore upgrades the shared connection to `FULL` and
-    /// refuses startup unless SQLite reports FULL-or-stronger. Followers keep
+    /// refuses startup unless `SQLite` reports FULL-or-stronger. Followers keep
     /// the existing mode to avoid imposing coordinator write latency on every
     /// verifier. This setting contains no chain or user data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local production fence cannot be acquired,
+    /// the durability pragma cannot be applied or read, or a coordinator does
+    /// not receive `FULL`-or-stronger durability.
     pub async fn configure_record_commitment_durability(
         &self,
         coordinator: bool,
     ) -> Result<&'static str, String> {
+        let coordinator_fence_state =
+            self.configure_record_commitment_coordinator_fence(coordinator)?;
         let conn = self.conn.lock().await;
         if coordinator {
             conn.pragma_update(None, "synchronous", "FULL")
@@ -3330,11 +3433,12 @@ impl MemoryStorage {
         let level: i64 = conn
             .query_row("PRAGMA synchronous", [], |row| row.get(0))
             .map_err(|error| format!("read SQLite durability: {error}"))?;
-        let mode = match level {
-            0 => "off",
-            1 => "normal",
-            2 => "full",
-            3 => "extra",
+        drop(conn);
+        let (mode, durability_level) = match level {
+            0 => ("off", 0),
+            1 => ("normal", 1),
+            2 => ("full", 2),
+            3 => ("extra", 3),
             _ => return Err(format!("unsupported SQLite synchronous level {level}")),
         };
         if coordinator && level < 2 {
@@ -3343,7 +3447,7 @@ impl MemoryStorage {
             ));
         }
         self.commitment_durability
-            .store(level as u64, Ordering::Release);
+            .store(durability_level, Ordering::Release);
         info!(
             role = if coordinator {
                 "coordinator"
@@ -3351,9 +3455,77 @@ impl MemoryStorage {
                 "non_coordinator"
             },
             durability_mode = mode,
+            coordinator_fence_state,
             "[MEMCHAIN_BLOCK] SQLite commitment durability configured"
         );
         Ok(mode)
+    }
+
+    /// Acquires the process-lifetime local coordinator production fence.
+    ///
+    /// The lock is non-blocking and precedes `SQLite` durability configuration,
+    /// chain audit, sidecar verification, listener startup, and mining. A
+    /// second process targeting the same on-disk database therefore fails
+    /// closed instead of waiting or racing the canonical writer. The kernel
+    /// releases the advisory lock when the owning process exits.
+    ///
+    /// This is a local duplicate-process guard only. It cannot fence another
+    /// host with a copied database or identity and is not a distributed lease,
+    /// leader election, consensus, quorum, fork choice, or finality.
+    fn configure_record_commitment_coordinator_fence(
+        &self,
+        coordinator: bool,
+    ) -> Result<&'static str, String> {
+        let mut runtime = self.commitment_coordinator_fence.write();
+        if !coordinator {
+            if runtime.handle.is_none() {
+                runtime.state = "not_required";
+                runtime.acquired_at = None;
+            }
+            let state = runtime.state;
+            drop(runtime);
+            return Ok(state);
+        }
+        if runtime.handle.is_some() {
+            drop(runtime);
+            return Ok("held");
+        }
+        let Some(database_path) = self.database_path.as_deref() else {
+            runtime.state = "isolated_in_memory";
+            runtime.acquired_at = None;
+            let state = runtime.state;
+            drop(runtime);
+            return Ok(state);
+        };
+
+        match acquire_commitment_coordinator_fence(database_path) {
+            Ok(handle) => {
+                let acquired_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                runtime.handle = Some(handle);
+                runtime.state = "held";
+                runtime.acquired_at = Some(acquired_at);
+                let state = runtime.state;
+                drop(runtime);
+                info!(
+                    state,
+                    scope = "same_host_same_database_only",
+                    "[MEMCHAIN_BLOCK] Coordinator production fence acquired"
+                );
+                Ok(state)
+            }
+            Err(error) => {
+                runtime.handle = None;
+                runtime.state = error.state();
+                runtime.acquired_at = None;
+                runtime.acquisition_failures_total =
+                    runtime.acquisition_failures_total.saturating_add(1);
+                drop(runtime);
+                Err(error.message().to_string())
+            }
+        }
     }
 
     /// Verifies or initializes the coordinator's signed tip high-water mark.
@@ -3941,10 +4113,11 @@ impl MemoryStorage {
     /// Returns the privacy-safe chain-integrity baseline for this process.
     ///
     /// A persisted flag is intentionally not used: every process lifetime must
-    /// re-establish the baseline from the complete SQLite chain before it may
+    /// re-establish the baseline from the complete `SQLite` chain before it may
     /// report `verified`.
     pub fn record_commitment_chain_integrity_status(&self) -> RecordCommitmentChainIntegrityStatus {
-        const POLICY: &str = "full snapshot-consistent startup audit plus transactionally verified appends; coordinator requires SQLite FULL-or-stronger commit durability and a signed local tip anchor; no block hashes, proposer identities, commitment ids, owners, payloads, peers, endpoints, routes, or client metadata";
+        const POLICY: &str = "full snapshot-consistent startup audit plus transactionally verified appends; coordinator requires an exclusive local production fence, SQLite FULL-or-stronger commit durability, and a signed local tip anchor; no lock path, process id, block hashes, proposer identities, commitment ids, owners, payloads, peers, endpoints, routes, or client metadata";
+        const COORDINATOR_FENCE_SCOPE: &str = "prevents duplicate coordinator processes on one host from producing against the same database while the OS lock holder remains alive; does not fence copied databases or identities on other hosts and is not a distributed lease, leader election, consensus, quorum, fork choice, or finality";
         const ROLLBACK_GUARD_SCOPE: &str = "detects commitment SQLite rollback or replacement while the host-side signed anchor remains; does not detect whole-host or whole-disk snapshot rollback and is not consensus, quorum, or finality";
         let durability_mode = match self.commitment_durability.load(Ordering::Acquire) {
             0 => "off",
@@ -3953,8 +4126,32 @@ impl MemoryStorage {
             3 => "extra",
             _ => "unknown",
         };
-        let rollback_guard = self.commitment_tip_anchor.read();
-        match *self.commitment_integrity.read() {
+        let (coordinator_fence_state, coordinator_fence_acquired_at, coordinator_fence_failures) = {
+            let runtime = self.commitment_coordinator_fence.read();
+            (
+                runtime.state,
+                runtime.acquired_at,
+                runtime.acquisition_failures_total,
+            )
+        };
+        let (
+            rollback_guard_state,
+            rollback_guard_height,
+            rollback_guard_last_verified_at,
+            rollback_guard_last_persisted_at,
+            rollback_guard_write_failures_total,
+        ) = {
+            let runtime = self.commitment_tip_anchor.read();
+            (
+                runtime.state,
+                runtime.anchored_height,
+                runtime.last_verified_at,
+                runtime.last_persisted_at,
+                runtime.write_failures_total,
+            )
+        };
+        let integrity = *self.commitment_integrity.read();
+        match integrity {
             Some(runtime) => RecordCommitmentChainIntegrityStatus {
                 contract_version: "record_commitment_integrity.v1",
                 state: "verified",
@@ -3965,11 +4162,15 @@ impl MemoryStorage {
                 verified_commitment_count: runtime.verified_commitment_count,
                 verified_tip_height: runtime.verified_tip_height,
                 durability_mode,
-                rollback_guard_state: rollback_guard.state,
-                rollback_guard_height: rollback_guard.anchored_height,
-                rollback_guard_last_verified_at: rollback_guard.last_verified_at,
-                rollback_guard_last_persisted_at: rollback_guard.last_persisted_at,
-                rollback_guard_write_failures_total: rollback_guard.write_failures_total,
+                coordinator_fence_state,
+                coordinator_fence_acquired_at,
+                coordinator_fence_acquisition_failures_total: coordinator_fence_failures,
+                coordinator_fence_scope: COORDINATOR_FENCE_SCOPE,
+                rollback_guard_state,
+                rollback_guard_height,
+                rollback_guard_last_verified_at,
+                rollback_guard_last_persisted_at,
+                rollback_guard_write_failures_total,
                 rollback_guard_scope: ROLLBACK_GUARD_SCOPE,
                 verification_policy: POLICY,
             },
@@ -3983,11 +4184,15 @@ impl MemoryStorage {
                 verified_commitment_count: 0,
                 verified_tip_height: 0,
                 durability_mode,
-                rollback_guard_state: rollback_guard.state,
-                rollback_guard_height: rollback_guard.anchored_height,
-                rollback_guard_last_verified_at: rollback_guard.last_verified_at,
-                rollback_guard_last_persisted_at: rollback_guard.last_persisted_at,
-                rollback_guard_write_failures_total: rollback_guard.write_failures_total,
+                coordinator_fence_state,
+                coordinator_fence_acquired_at,
+                coordinator_fence_acquisition_failures_total: coordinator_fence_failures,
+                coordinator_fence_scope: COORDINATOR_FENCE_SCOPE,
+                rollback_guard_state,
+                rollback_guard_height,
+                rollback_guard_last_verified_at,
+                rollback_guard_last_persisted_at,
+                rollback_guard_write_failures_total,
                 rollback_guard_scope: ROLLBACK_GUARD_SCOPE,
                 verification_policy: POLICY,
             },
@@ -5544,6 +5749,12 @@ mod tests {
         );
         assert_eq!(
             storage
+                .record_commitment_chain_integrity_status()
+                .coordinator_fence_state,
+            "not_required"
+        );
+        assert_eq!(
+            storage
                 .configure_record_commitment_durability(true)
                 .await
                 .unwrap(),
@@ -5561,6 +5772,108 @@ mod tests {
                 .durability_mode,
             "full"
         );
+        assert_eq!(
+            storage
+                .record_commitment_chain_integrity_status()
+                .coordinator_fence_state,
+            "isolated_in_memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_production_fence_rejects_duplicate_and_recovers_after_release() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("coordinator-fence.db");
+        let first = MemoryStorage::open(&db_path, None).unwrap();
+        let second = MemoryStorage::open(&db_path, None).unwrap();
+
+        first
+            .configure_record_commitment_durability(true)
+            .await
+            .unwrap();
+        let first_status = first.record_commitment_chain_integrity_status();
+        assert_eq!(first_status.coordinator_fence_state, "held");
+        assert!(first_status.coordinator_fence_acquired_at.is_some());
+        assert_eq!(first_status.coordinator_fence_acquisition_failures_total, 0);
+
+        let error = second
+            .configure_record_commitment_durability(true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "commitment coordinator production fence is held by another local process"
+        );
+        let contended = second.record_commitment_chain_integrity_status();
+        assert_eq!(contended.coordinator_fence_state, "contended");
+        assert_eq!(contended.coordinator_fence_acquisition_failures_total, 1);
+        assert!(contended.coordinator_fence_acquired_at.is_none());
+
+        let fence_path = commitment_coordinator_fence_path(&db_path).unwrap();
+        let mode = std::fs::metadata(&fence_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        drop(first);
+        second
+            .configure_record_commitment_durability(true)
+            .await
+            .unwrap();
+        let recovered = second.record_commitment_chain_integrity_status();
+        assert_eq!(recovered.coordinator_fence_state, "held");
+        assert!(recovered.coordinator_fence_acquired_at.is_some());
+        assert_eq!(recovered.coordinator_fence_acquisition_failures_total, 1);
+    }
+
+    #[tokio::test]
+    async fn test_non_coordinator_does_not_claim_production_fence() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("follower-compatible.db");
+        let follower = MemoryStorage::open(&db_path, None).unwrap();
+        follower
+            .configure_record_commitment_durability(false)
+            .await
+            .unwrap();
+        assert_eq!(
+            follower
+                .record_commitment_chain_integrity_status()
+                .coordinator_fence_state,
+            "not_required"
+        );
+
+        let coordinator = MemoryStorage::open(&db_path, None).unwrap();
+        coordinator
+            .configure_record_commitment_durability(true)
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .record_commitment_chain_integrity_status()
+                .coordinator_fence_state,
+            "held"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_production_fence_rejects_symlink() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("coordinator-symlink.db");
+        let storage = MemoryStorage::open(&db_path, None).unwrap();
+        let fence_path = commitment_coordinator_fence_path(&db_path).unwrap();
+        let target = directory.path().join("unexpected-target");
+        File::create(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &fence_path).unwrap();
+
+        let error = storage
+            .configure_record_commitment_durability(true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "commitment coordinator production fence file is unsafe"
+        );
+        let status = storage.record_commitment_chain_integrity_status();
+        assert_eq!(status.coordinator_fence_state, "failed");
+        assert_eq!(status.coordinator_fence_acquisition_failures_total, 1);
     }
 
     #[tokio::test]

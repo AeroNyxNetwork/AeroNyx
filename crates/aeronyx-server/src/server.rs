@@ -222,6 +222,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.8.9-CoordinatorProductionFence - Reject duplicate local block producers
 //   v2.8.8-CertificateRollbackGuard - Signed local certificate-vault high-water gate
 //   v2.8.7-CertificateExchange - Post-startup audited certificate exchange
 //   v2.8.5-TrustedDivergenceHalt - Sticky trusted fork evidence and live production halt
@@ -1509,9 +1510,13 @@ impl Server {
             .map_err(|error| {
                 ServerError::startup_failed(format!("MemChain commitment durability: {error}"))
             })?;
+        let coordinator_fence_state = storage
+            .record_commitment_chain_integrity_status()
+            .coordinator_fence_state;
         info!(
             durability_mode = commitment_durability,
             coordinator = self.config.memchain.commitment_coordinator_enabled,
+            coordinator_fence_state,
             "[MEMCHAIN_BLOCK] Commitment durability gate passed"
         );
         let commitment_audit = storage
@@ -2122,6 +2127,11 @@ impl Server {
                             verified_commitment_count: status.verified_commitment_count,
                             verified_tip_height: status.verified_tip_height,
                             durability_mode: status.durability_mode,
+                            coordinator_fence_state: status.coordinator_fence_state,
+                            coordinator_fence_acquired_at: status.coordinator_fence_acquired_at,
+                            coordinator_fence_acquisition_failures_total: status
+                                .coordinator_fence_acquisition_failures_total,
+                            coordinator_fence_scope: status.coordinator_fence_scope,
                             rollback_guard_state: status.rollback_guard_state,
                             rollback_guard_height: status.rollback_guard_height,
                             rollback_guard_last_verified_at: status.rollback_guard_last_verified_at,

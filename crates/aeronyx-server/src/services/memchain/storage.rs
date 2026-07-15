@@ -198,14 +198,19 @@
 //! v2.7.23-CertificateExchange - Added audited internal certificate export;
 //! v2.7.24-CertificateRollbackGuard - Added a signed local high-water sidecar
 //!   for the latest fully audited checkpoint certificate.
-//!   no schema or public-status contract change.
+//! v2.7.25-CoordinatorProductionFence - Added an OS-owned exclusive lock that
+//!   prevents duplicate local coordinator processes from producing against
+//!   the same SQLite chain and sidecars.
+//!   No SQLite schema change; aggregate public fence status was added.
 // ============================================
 
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use nix::fcntl::Flock;
 use parking_lot::RwLock;
 use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::Mutex as TokioMutex;
@@ -686,6 +691,29 @@ pub(crate) struct RecordCommitmentIntegrityRuntime {
     pub(crate) verified_tip_hash: [u8; 32],
 }
 
+/// Runtime-only ownership of the local coordinator production fence.
+///
+/// `handle` owns the kernel advisory lock and must remain alive for the whole
+/// storage lifetime. The file path, process id, host identity, and lock errno
+/// are deliberately not retained, serialized, logged, or reported.
+pub(crate) struct RecordCommitmentCoordinatorFenceRuntime {
+    pub(crate) handle: Option<Flock<File>>,
+    pub(crate) state: &'static str,
+    pub(crate) acquired_at: Option<u64>,
+    pub(crate) acquisition_failures_total: u64,
+}
+
+impl Default for RecordCommitmentCoordinatorFenceRuntime {
+    fn default() -> Self {
+        Self {
+            handle: None,
+            state: "unconfigured",
+            acquired_at: None,
+            acquisition_failures_total: 0,
+        }
+    }
+}
+
 /// Private coordinator material required to advance the local signed anchor.
 ///
 /// The identity is cloned only while writing a new anchor, then dropped. This
@@ -811,6 +839,9 @@ impl LruCache {
 
 pub struct MemoryStorage {
     pub(crate) conn: TokioMutex<Connection>,
+    /// On-disk `SQLite` path used only to derive the private coordinator fence.
+    /// `None` denotes an isolated in-memory database used by tests/tools.
+    pub(crate) database_path: Option<PathBuf>,
     pub(crate) total_inserted: AtomicU64,
     pub(crate) total_rejected: AtomicU64,
     pub(crate) cache: RwLock<LruCache>,
@@ -826,6 +857,10 @@ pub struct MemoryStorage {
     /// Effective SQLite `PRAGMA synchronous` level for this process. This is
     /// aggregate configuration evidence only and never contains chain data.
     pub(crate) commitment_durability: AtomicU64,
+    /// Kernel-owned exclusive coordinator lock. It prevents a second local
+    /// process from producing blocks or replacing sidecars for this database.
+    pub(crate) commitment_coordinator_fence:
+        RwLock<RecordCommitmentCoordinatorFenceRuntime>,
     /// Signed local high-water mark outside SQLite. The private config never
     /// leaves this process; only aggregate status is reportable.
     pub(crate) commitment_tip_anchor: RwLock<RecordCommitmentTipAnchorRuntime>,
@@ -886,6 +921,7 @@ impl MemoryStorage {
 
         Ok(Self {
             conn: TokioMutex::new(conn),
+            database_path: (path.to_str() != Some(":memory:")).then(|| path.to_path_buf()),
             total_inserted: AtomicU64::new(0),
             total_rejected: AtomicU64::new(0),
             cache: RwLock::new(LruCache::new(LRU_CACHE_CAPACITY)),
@@ -895,6 +931,9 @@ impl MemoryStorage {
             // `open` explicitly configures NORMAL. A coordinator upgrades this
             // to FULL and verifies the effective value before startup audit.
             commitment_durability: AtomicU64::new(1),
+            commitment_coordinator_fence: RwLock::new(
+                RecordCommitmentCoordinatorFenceRuntime::default(),
+            ),
             commitment_tip_anchor: RwLock::new(RecordCommitmentTipAnchorRuntime::default()),
             commitment_checkpoint: RwLock::new(RecordCommitmentCheckpointRuntime::default()),
             commitment_checkpoint_certificate_anchor: RwLock::new(

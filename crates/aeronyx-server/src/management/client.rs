@@ -59,6 +59,7 @@
 //   v2.7.20        - Added aggregate durable witness-equivocation incidents
 //   v2.7.21        - Added aggregate trusted-divergence incidents and production halt
 //   v2.7.24        - Added aggregate certificate rollback-guard evidence
+//   v2.7.25        - Added aggregate local coordinator production-fence evidence
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -121,8 +122,16 @@ pub struct RecordCommitmentIntegrityHeartbeatStatus {
     pub verified_commitment_count: u64,
     /// Last verified one-based height, or zero for an empty chain.
     pub verified_tip_height: u64,
-    /// Effective SQLite mode: `off`, `normal`, `full`, or `extra`.
+    /// Effective `SQLite` mode: `off`, `normal`, `full`, or `extra`.
     pub durability_mode: &'static str,
+    /// Local duplicate-process guard state; never includes path or process id.
+    pub coordinator_fence_state: &'static str,
+    /// Most recent successful local OS lock acquisition.
+    pub coordinator_fence_acquired_at: Option<u64>,
+    /// Process-lifetime local lock acquisition failures.
+    pub coordinator_fence_acquisition_failures_total: u64,
+    /// Exact local-only protection boundary.
+    pub coordinator_fence_scope: &'static str,
     /// Signed local high-water guard state.
     pub rollback_guard_state: &'static str,
     /// Highest height covered by the local guard.
@@ -765,6 +774,10 @@ mod tests {
                 verified_commitment_count: 27,
                 verified_tip_height: 9,
                 durability_mode: "full",
+                coordinator_fence_state: "held",
+                coordinator_fence_acquired_at: Some(90),
+                coordinator_fence_acquisition_failures_total: 0,
+                coordinator_fence_scope: "same host and database only",
                 rollback_guard_state: "verified",
                 rollback_guard_height: 9,
                 rollback_guard_last_verified_at: Some(100),
@@ -850,6 +863,12 @@ mod tests {
         assert_eq!(integrity["verified_commitment_count"], 27);
         assert_eq!(integrity["verified_tip_height"], 9);
         assert_eq!(integrity["durability_mode"], "full");
+        assert_eq!(integrity["coordinator_fence_state"], "held");
+        assert_eq!(integrity["coordinator_fence_acquired_at"], 90);
+        assert_eq!(
+            integrity["coordinator_fence_acquisition_failures_total"],
+            0
+        );
         assert_eq!(integrity["rollback_guard_state"], "verified");
         assert_eq!(integrity["rollback_guard_height"], 9);
         assert_eq!(integrity["rollback_guard_write_failures_total"], 0);
@@ -912,6 +931,11 @@ mod tests {
                 "signer",
                 "anchor_path",
                 "rollback_guard_path",
+                "coordinator_fence_path",
+                "lock_path",
+                "process_id",
+                "pid",
+                "host_identity",
                 "request_id",
                 "peer",
                 "route",

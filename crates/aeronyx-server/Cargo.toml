@@ -175,6 +175,9 @@ bytes = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 arc-swap = { workspace = true }
+# v2.7.25: OS-owned non-blocking coordinator production fence. The `fs`
+# feature is defined at workspace level and provides the RAII `Flock` guard.
+nix = { workspace = true }
 
 # Cryptography (for key management)
 rand = { workspace = true }
