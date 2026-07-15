@@ -156,6 +156,8 @@
 //      as current convergence or divergence.
 //  66. Uses a validated configurable follower pages-per-round budget so
 //      catch-up remains bounded, restartable, and operable on low-I/O nodes.
+//  67. Exercises the coordinator startup policy with a real signed divergent
+//      witness checkpoint while proving the local canonical chain is immutable.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -210,6 +212,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.8.3-WitnessDivergence - Signed divergent startup-gate integration test
 //   v2.8.1-BlockFollowerOps - Configurable bounded catch-up round budget
 //   v2.8.0-ChatPullV2 - Signed opaque-cursor stable mailbox snapshots
 //   v2.7.22-ChatRelayMaintenance - Scheduled TTL cleanup with health evidence
@@ -6024,12 +6027,13 @@ mod tests {
         unix_now_secs, CommitmentWitnessStartupBlockReason, CommitmentWitnessStartupDecision,
         Server, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
     };
-    use crate::api::memchain_peer::CommitmentReconciliationOutcome;
+    use crate::api::memchain_peer::{build_memchain_peer_router, CommitmentReconciliationOutcome};
     use crate::api::{
         decode_bounded_json_response, read_bounded_http_response, BoundedHttpResponseError,
     };
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
     use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
+    use aeronyx_core::ledger::{RecordCommitmentBlockV1, GENESIS_PREV_HASH};
     use aeronyx_core::protocol::chat::{ChatContentType, ChatEnvelope};
     use aeronyx_core::protocol::onion::is_onion_blob;
     use aeronyx_core::protocol::{
@@ -6046,6 +6050,7 @@ mod tests {
     use crate::api::chat_peer::{PeerChatRelayRequest, PeerChatRelayResponse};
     use crate::api::discovery::GossipResponse;
     use crate::config::{DiscoveryConfig, ServerConfig};
+    use crate::services::memchain::MemoryStorage;
     use crate::services::{PeerStore, PeerStoreImportReport};
 
     #[test]
@@ -6107,6 +6112,124 @@ mod tests {
             commitment_witness_startup_decision(&diverged, false, 2),
             Err(CommitmentWitnessStartupBlockReason::Divergence)
         );
+    }
+
+    #[tokio::test]
+    async fn signed_divergent_witness_blocks_coordinator_startup_policy() {
+        let now = unix_now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let witness = Arc::new(IdentityKeyPair::generate());
+        let coordinator_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let witness_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+
+        let coordinator_block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now.saturating_sub(2),
+            GENESIS_PREV_HASH,
+            vec![[0xA1; 32]],
+            &coordinator,
+        );
+        let divergent_block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now.saturating_sub(1),
+            GENESIS_PREV_HASH,
+            vec![[0xB1; 32]],
+            &coordinator,
+        );
+        assert_ne!(coordinator_block.hash(), divergent_block.hash());
+        coordinator_storage
+            .append_record_commitment_block(&coordinator_block, None)
+            .await
+            .unwrap();
+        witness_storage
+            .append_record_commitment_block(&divergent_block, None)
+            .await
+            .unwrap();
+        coordinator_storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+        coordinator_storage
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        witness_storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+
+        let admit_encrypted_storage_peer =
+            |peer_store: &PeerStore, identity: &IdentityKeyPair, endpoint: Option<String>| {
+                let mut descriptor = NodeDescriptor::new(
+                    identity.public_key_bytes(),
+                    1,
+                    now.saturating_sub(1),
+                    now.saturating_add(600),
+                    "signed-witness-startup-test",
+                );
+                descriptor.public_endpoint = endpoint;
+                descriptor.capabilities = vec![NodeCapability::EncryptedStorage];
+                let descriptor = SignedNodeDescriptor::sign(descriptor, identity).unwrap();
+                let import = peer_store.apply_discovery_message(
+                    &NodeDiscoveryMessage::DescriptorAnnounce { descriptor },
+                    now,
+                );
+                assert_eq!(import.inserted, 1);
+            };
+
+        let witness_peers = Arc::new(PeerStore::new());
+        admit_encrypted_storage_peer(&witness_peers, &coordinator, None);
+        let witness_router = build_memchain_peer_router(
+            Arc::clone(&witness_storage),
+            witness_peers,
+            Arc::clone(&witness),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let witness_address = listener.local_addr().unwrap();
+        let witness_server = tokio::spawn(async move {
+            axum::serve(listener, witness_router).await.unwrap();
+        });
+
+        let coordinator_peers = PeerStore::new();
+        admit_encrypted_storage_peer(
+            &coordinator_peers,
+            &witness,
+            Some(format!("http://{witness_address}")),
+        );
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let round = crate::api::memchain_peer::reconcile_record_commitment_pinned_witnesses_with_endpoint_policy(
+            &coordinator_storage,
+            &coordinator_peers,
+            &coordinator,
+            &client,
+            &[witness.public_key_bytes()],
+            |_| true,
+        )
+        .await;
+
+        assert_eq!(round.eligible_witnesses, 1);
+        assert_eq!(round.attempted, 1);
+        assert_eq!(round.verified, 1);
+        assert_eq!(round.diverged, 1);
+        assert_eq!(round.failed, 0);
+        assert_eq!(
+            commitment_witness_startup_decision(&round, true, 1),
+            Err(CommitmentWitnessStartupBlockReason::Divergence)
+        );
+        assert_eq!(
+            coordinator_storage.record_commitment_chain_tip().await,
+            (1, coordinator_block.hash())
+        );
+        let checkpoint_status = coordinator_storage.record_commitment_checkpoint_status();
+        assert_eq!(checkpoint_status.state, "diverged");
+        assert_eq!(checkpoint_status.divergences_total, 1);
+        assert_eq!(checkpoint_status.evidence_records, 1);
+
+        witness_server.abort();
+        let _ = witness_server.await;
     }
 
     fn signed_test_chat_envelope(now: u64) -> ChatEnvelope {

@@ -67,6 +67,7 @@
 //!   missing/stale process audit baseline.
 //!
 //! ## Last Modified
+//! v2.8.3-WitnessDivergence - Exposed crate-local reconciliation for startup tests.
 //! v2.8.2-AdversarialFollower - Added signed malicious-page regression coverage.
 //! v2.7.18-VerifiedRangeSnapshot - Sign only snapshot-consistent audited pages.
 //! v2.7.17-AtomicBlockPage - Commit each verified follower page atomically.
@@ -478,7 +479,7 @@ where
     .await
 }
 
-async fn reconcile_record_commitment_pinned_witnesses_with_endpoint_policy<F>(
+pub(crate) async fn reconcile_record_commitment_pinned_witnesses_with_endpoint_policy<F>(
     storage: &MemoryStorage,
     peer_store: &PeerStore,
     identity: &IdentityKeyPair,
