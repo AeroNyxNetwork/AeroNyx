@@ -168,9 +168,10 @@ use super::storage::{
     LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentCheckpointStatus,
     RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime,
     RecordCommitmentSyncStatus, RecordCommitmentTipAnchorConfig, StorageStats,
-    CHECKPOINT_EQUIVOCATION_CAPACITY, CHECKPOINT_EVIDENCE_CAPACITY,
-    CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS, CHECKPOINT_TRUSTED_DIVERGENCE_CAPACITY,
-    COMMITMENT_SYNC_EVENT_CAPACITY, MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES,
+    CHECKPOINT_CERTIFICATE_CAPACITY, CHECKPOINT_EQUIVOCATION_CAPACITY,
+    CHECKPOINT_EVIDENCE_CAPACITY, CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS,
+    CHECKPOINT_TRUSTED_DIVERGENCE_CAPACITY, COMMITMENT_SYNC_EVENT_CAPACITY,
+    MAX_CHECKPOINT_CERTIFICATE_SIGNERS, MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES,
 };
 use super::storage_crypto::{
     decrypt_rawlog_content, decrypt_record_content, encrypt_rawlog_content, encrypt_record_content,
@@ -343,6 +344,14 @@ pub struct RecordCommitmentCheckpointEvidenceAudit {
     pub equivocation_incidents: u64,
     /// Durable operator-pinned witness divergent-prefix incidents.
     pub trusted_divergence_incidents: u64,
+    /// Immutable threshold certificates retained after complete re-audit.
+    pub checkpoint_certificates: u64,
+    /// Highest retained certified local checkpoint.
+    pub latest_certified_height: Option<u64>,
+    /// Distinct signed witness frames in the latest certificate.
+    pub latest_certificate_signers: usize,
+    /// Threshold recorded in the latest certificate.
+    pub latest_certificate_required_signers: usize,
     /// Latest applicable observation; deferred frames cannot advance it.
     pub last_evidence_at: Option<u64>,
 }
@@ -361,12 +370,14 @@ pub(crate) enum RecordCommitmentCheckpointEvidencePersistOutcome {
 #[derive(Debug, Clone, Copy)]
 struct CheckpointEvidenceClaims {
     responder: [u8; 32],
+    local_tip_height: u64,
     checkpoint_height: u64,
     checkpoint_hash: [u8; 32],
     tip_height: u64,
     tip_hash: [u8; 32],
     applicable: bool,
     diverged: bool,
+    certifiable: bool,
 }
 
 struct StoredRecordCommitmentBlockRow {
@@ -900,13 +911,41 @@ fn decode_checkpoint_evidence_claims(frame: &[u8]) -> Result<CheckpointEvidenceC
     };
     Ok(CheckpointEvidenceClaims {
         responder,
+        local_tip_height: 0,
         checkpoint_height,
         checkpoint_hash,
         tip_height,
         tip_hash,
         applicable: false,
         diverged: false,
+        certifiable: false,
     })
+}
+
+/// Computes the canonical digest for one immutable local certificate bundle.
+/// Each member is an independently signed checkpoint response identified by
+/// `(responder, evidence_digest)`. Sorting removes network arrival order from
+/// the certificate identity.
+fn checkpoint_certificate_digest(
+    checkpoint_height: u64,
+    checkpoint_hash: &[u8; 32],
+    required_signers: usize,
+    members: &[([u8; 32], [u8; 32])],
+) -> [u8; 32] {
+    let mut ordered = members.to_vec();
+    ordered.sort_unstable_by_key(|member| member.0);
+    let mut digest = Sha256::new();
+    digest.update(b"AERONYX_RECORD_CHECKPOINT_CERTIFICATE_V1");
+    digest.update(AERONYX_MEMCHAIN_MAINNET_CHAIN_ID);
+    digest.update(checkpoint_height.to_be_bytes());
+    digest.update(checkpoint_hash);
+    digest.update((required_signers as u64).to_be_bytes());
+    digest.update((ordered.len() as u64).to_be_bytes());
+    for (responder, evidence_digest) in ordered {
+        digest.update(responder);
+        digest.update(evidence_digest);
+    }
+    digest.finalize().into()
 }
 
 fn audit_checkpoint_evidence_connection(
@@ -1052,12 +1091,15 @@ fn audit_checkpoint_evidence_snapshot(
                 digest_bytes,
                 CheckpointEvidenceClaims {
                     responder,
+                    local_tip_height,
                     checkpoint_height,
                     checkpoint_hash,
                     tip_height,
                     tip_hash,
                     applicable: local_tip_height <= current_tip_height,
                     diverged: relation == "diverged",
+                    certifiable: matches!(relation.as_str(), "converged" | "remote_ahead")
+                        && checkpoint_height == local_tip_height,
                 },
             );
             if tip_height == 0 && tip_hash != GENESIS_PREV_HASH {
@@ -1275,6 +1317,12 @@ fn audit_checkpoint_evidence_snapshot(
             "trusted checkpoint divergence vault exceeds its configured capacity".to_string(),
         );
     }
+    let (
+        checkpoint_certificates,
+        latest_certified_height,
+        latest_certificate_signers,
+        latest_certificate_required_signers,
+    ) = audit_checkpoint_certificates_snapshot(connection, &claims_by_digest)?;
     Ok(RecordCommitmentCheckpointEvidenceAudit {
         evidence_records,
         applicable_evidence_records,
@@ -1282,8 +1330,184 @@ fn audit_checkpoint_evidence_snapshot(
         divergence_evidence_records,
         equivocation_incidents,
         trusted_divergence_incidents,
+        checkpoint_certificates,
+        latest_certified_height,
+        latest_certificate_signers,
+        latest_certificate_required_signers,
         last_evidence_at,
     })
+}
+
+/// Reconstructs every retained certificate from exact signed member frames.
+/// A certificate is valid only when all members are distinct, applicable,
+/// certifiable pinned-witness observations over the same local block.
+fn audit_checkpoint_certificates_snapshot(
+    connection: &rusqlite::Connection,
+    claims_by_digest: &HashMap<[u8; 32], CheckpointEvidenceClaims>,
+) -> Result<(u64, Option<u64>, usize, usize), String> {
+    type CertificateRow = (u64, [u8; 32], [u8; 32], usize, usize, [u8; 32]);
+    let mut certificates: Vec<CertificateRow> = Vec::new();
+    {
+        let mut statement = connection
+            .prepare(
+                "SELECT checkpoint_height,chain_id,checkpoint_hash,required_signers,
+                        signer_count,certificate_digest,certified_at
+                 FROM record_checkpoint_certificates ORDER BY checkpoint_height ASC",
+            )
+            .map_err(|error| format!("prepare checkpoint certificate audit: {error}"))?;
+        let mut rows = statement
+            .query([])
+            .map_err(|error| format!("query checkpoint certificate audit: {error}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("read checkpoint certificate row: {error}"))?
+        {
+            let height = u64::try_from(
+                row.get::<_, i64>(0)
+                    .map_err(|error| format!("read certificate height: {error}"))?,
+            )
+            .map_err(|_| "checkpoint certificate height is invalid".to_string())?;
+            let chain_id: Vec<u8> = row
+                .get(1)
+                .map_err(|error| format!("read certificate chain id: {error}"))?;
+            let checkpoint_hash: Vec<u8> = row
+                .get(2)
+                .map_err(|error| format!("read certificate checkpoint hash: {error}"))?;
+            let required_signers = usize::try_from(
+                row.get::<_, i64>(3)
+                    .map_err(|error| format!("read certificate threshold: {error}"))?,
+            )
+            .map_err(|_| "checkpoint certificate threshold is invalid".to_string())?;
+            let signer_count = usize::try_from(
+                row.get::<_, i64>(4)
+                    .map_err(|error| format!("read certificate signer count: {error}"))?,
+            )
+            .map_err(|_| "checkpoint certificate signer count is invalid".to_string())?;
+            let certificate_digest: Vec<u8> = row
+                .get(5)
+                .map_err(|error| format!("read certificate digest: {error}"))?;
+            let _certified_at = u64::try_from(
+                row.get::<_, i64>(6)
+                    .map_err(|error| format!("read certificate time: {error}"))?,
+            )
+            .map_err(|_| "checkpoint certificate time is invalid".to_string())?;
+            let chain_id: [u8; 32] = chain_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| "checkpoint certificate chain id has invalid length".to_string())?;
+            let checkpoint_hash: [u8; 32] = checkpoint_hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| "checkpoint certificate hash has invalid length".to_string())?;
+            let certificate_digest: [u8; 32] = certificate_digest
+                .as_slice()
+                .try_into()
+                .map_err(|_| "checkpoint certificate digest has invalid length".to_string())?;
+            if height == 0
+                || chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID
+                || !(2..=MAX_CHECKPOINT_CERTIFICATE_SIGNERS).contains(&required_signers)
+                || signer_count < required_signers
+                || signer_count > MAX_CHECKPOINT_CERTIFICATE_SIGNERS
+            {
+                return Err("checkpoint certificate metadata is invalid".to_string());
+            }
+            certificates.push((
+                height,
+                chain_id,
+                checkpoint_hash,
+                required_signers,
+                signer_count,
+                certificate_digest,
+            ));
+        }
+    }
+    if certificates.len() > CHECKPOINT_CERTIFICATE_CAPACITY {
+        return Err("checkpoint certificate vault exceeds its configured capacity".to_string());
+    }
+
+    let mut latest_height = None;
+    let mut latest_signers = 0usize;
+    let mut latest_required_signers = 0usize;
+    for (height, chain_id, checkpoint_hash, required_signers, signer_count, stored_digest) in
+        &certificates
+    {
+        let (local_chain_id, local_hash): (Vec<u8>, Vec<u8>) = connection
+            .query_row(
+                "SELECT chain_id,block_hash FROM record_commitment_blocks WHERE height=?1",
+                params![i64::try_from(*height)
+                    .map_err(|_| "checkpoint certificate height exceeds SQLite range")?],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| "checkpoint certificate local block is unavailable".to_string())?;
+        if local_chain_id.as_slice() != chain_id || local_hash.as_slice() != checkpoint_hash {
+            return Err("checkpoint certificate local block mismatch".to_string());
+        }
+
+        let mut members = Vec::with_capacity(*signer_count);
+        let mut statement = connection
+            .prepare(
+                "SELECT responder,evidence_digest
+                 FROM record_checkpoint_certificate_members
+                 WHERE checkpoint_height=?1 ORDER BY responder ASC",
+            )
+            .map_err(|error| format!("prepare checkpoint certificate members: {error}"))?;
+        let mut rows = statement
+            .query(params![i64::try_from(*height).map_err(|_| {
+                "checkpoint certificate height exceeds SQLite range"
+            })?])
+            .map_err(|error| format!("query checkpoint certificate members: {error}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("read checkpoint certificate member: {error}"))?
+        {
+            let responder: Vec<u8> = row
+                .get(0)
+                .map_err(|error| format!("read certificate responder: {error}"))?;
+            let evidence_digest: Vec<u8> = row
+                .get(1)
+                .map_err(|error| format!("read certificate evidence digest: {error}"))?;
+            let responder: [u8; 32] = responder
+                .as_slice()
+                .try_into()
+                .map_err(|_| "checkpoint certificate responder has invalid length".to_string())?;
+            let evidence_digest: [u8; 32] =
+                evidence_digest.as_slice().try_into().map_err(|_| {
+                    "checkpoint certificate evidence digest has invalid length".to_string()
+                })?;
+            let claim = claims_by_digest
+                .get(&evidence_digest)
+                .ok_or_else(|| "checkpoint certificate evidence is unavailable".to_string())?;
+            if claim.responder != responder
+                || claim.local_tip_height != *height
+                || claim.checkpoint_height != *height
+                || claim.checkpoint_hash != *checkpoint_hash
+                || !claim.applicable
+                || !claim.certifiable
+                || claim.diverged
+            {
+                return Err("checkpoint certificate member claim is invalid".to_string());
+            }
+            members.push((responder, evidence_digest));
+        }
+        if members.len() != *signer_count {
+            return Err("checkpoint certificate signer count mismatch".to_string());
+        }
+        let computed =
+            checkpoint_certificate_digest(*height, checkpoint_hash, *required_signers, &members);
+        if computed != *stored_digest {
+            return Err("checkpoint certificate digest mismatch".to_string());
+        }
+        latest_height = Some(*height);
+        latest_signers = *signer_count;
+        latest_required_signers = *required_signers;
+    }
+
+    Ok((
+        certificates.len() as u64,
+        latest_height,
+        latest_signers,
+        latest_required_signers,
+    ))
 }
 
 fn insert_checkpoint_equivocation_incident(
@@ -1906,6 +2130,11 @@ impl MemoryStorage {
             divergence_evidence_records: runtime.divergence_evidence_records,
             equivocation_incidents: runtime.equivocation_incidents,
             trusted_divergence_incidents: runtime.trusted_divergence_incidents,
+            checkpoint_certificates: runtime.checkpoint_certificates,
+            latest_certified_height: runtime.latest_certified_height,
+            latest_certificate_signers: runtime.latest_certificate_signers,
+            latest_certificate_required_signers: runtime
+                .latest_certificate_required_signers,
             production_halted: self.record_commitment_production_halted(),
             last_evidence_at: runtime.last_evidence_at,
             observation_freshness: observation_freshness.to_string(),
@@ -1923,7 +2152,7 @@ impl MemoryStorage {
             last_round_diverged: runtime.last_round_diverged,
             evidence_persistence_failures_total: runtime
                 .evidence_persistence_failures_total,
-            privacy_policy: "aggregate signed checkpoint outcomes, bounded witness-round coverage, applicable/deferred evidence counts, durable observation freshness, and local evidence-vault health only; counts are not consensus; raw frames, peer identities, block hashes, signatures, request ids, commitments, owners, payloads, endpoints, routes, and client metadata never leave the node",
+            privacy_policy: "aggregate signed checkpoint outcomes, bounded witness-round coverage, immutable certificate counts, applicable/deferred evidence counts, durable observation freshness, and local evidence-vault health only; certificates prove configured pinned-witness observations, not global consensus or fork choice; raw frames, peer identities, block hashes, signatures, certificate digests, request ids, commitments, owners, payloads, endpoints, routes, and client metadata never leave the node",
         }
     }
 
@@ -2199,6 +2428,9 @@ impl MemoryStorage {
                                     UNION
                                     SELECT evidence_digest
                                     FROM record_checkpoint_trusted_divergences
+                                    UNION
+                                    SELECT evidence_digest
+                                    FROM record_checkpoint_certificate_members
                                 )
                                 ORDER BY CASE WHEN relation='diverged' THEN 1 ELSE 0 END ASC,
                                          observed_at ASC,rowid ASC
@@ -2257,6 +2489,11 @@ impl MemoryStorage {
                 runtime.divergence_evidence_records = report.divergence_evidence_records;
                 runtime.equivocation_incidents = report.equivocation_incidents;
                 runtime.trusted_divergence_incidents = report.trusted_divergence_incidents;
+                runtime.checkpoint_certificates = report.checkpoint_certificates;
+                runtime.latest_certified_height = report.latest_certified_height;
+                runtime.latest_certificate_signers = report.latest_certificate_signers;
+                runtime.latest_certificate_required_signers =
+                    report.latest_certificate_required_signers;
                 runtime.last_evidence_at = report.last_evidence_at;
                 if new_equivocation_incidents > 0 {
                     Ok(RecordCommitmentCheckpointEvidencePersistOutcome::EquivocationDetected)
@@ -2268,6 +2505,192 @@ impl MemoryStorage {
             }
             Err(error) => failure(error),
         }
+    }
+
+    /// Freezes one immutable certificate from a single pinned-witness round.
+    ///
+    /// Only exact evidence digests from the current round are considered. Every
+    /// member must be a distinct explicitly allowed witness whose signed frame
+    /// confirms the current local tip (`converged` or `remote_ahead`). A
+    /// behind, divergent, permissionless, stale, or duplicate witness cannot
+    /// contribute. This proves a threshold of observations, not global finality.
+    pub(crate) async fn persist_record_commitment_checkpoint_certificate(
+        &self,
+        certified_at: u64,
+        required_signers: usize,
+        allowed_witnesses: &[[u8; 32]],
+        evidence_digests: &[[u8; 32]],
+    ) -> Result<bool, String> {
+        if !(2..=MAX_CHECKPOINT_CERTIFICATE_SIGNERS).contains(&required_signers) {
+            return Err("checkpoint certificate threshold is outside supported bounds".to_string());
+        }
+        if allowed_witnesses.len() < required_signers
+            || evidence_digests.len() < required_signers
+            || evidence_digests.len() > MAX_CHECKPOINT_CERTIFICATE_SIGNERS
+        {
+            return Ok(false);
+        }
+        let certified_at = i64::try_from(certified_at)
+            .map_err(|_| "checkpoint certificate time exceeds SQLite range".to_string())?;
+
+        let mut conn = self.conn.lock().await;
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("begin checkpoint certificate transaction: {error}"))?;
+        let (tip_height_i64, tip_hash): (i64, Vec<u8>) = transaction
+            .query_row(
+                "SELECT height,block_hash FROM record_commitment_blocks ORDER BY height DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("read checkpoint certificate local tip: {error}"))?
+            .ok_or_else(|| "checkpoint certificate local tip is unavailable".to_string())?;
+        let tip_height = u64::try_from(tip_height_i64)
+            .map_err(|_| "checkpoint certificate local tip is invalid".to_string())?;
+        let tip_hash: [u8; 32] = tip_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| "checkpoint certificate local hash has invalid length".to_string())?;
+        if tip_height == 0 {
+            return Ok(false);
+        }
+
+        let mut members = Vec::with_capacity(evidence_digests.len());
+        for evidence_digest in evidence_digests {
+            let (relation, local_tip_height_i64, frame): (String, i64, Vec<u8>) = transaction
+                .query_row(
+                    "SELECT relation,local_tip_height,signed_response
+                     FROM record_checkpoint_evidence WHERE evidence_digest=?1",
+                    params![evidence_digest.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|_| "checkpoint certificate evidence is unavailable".to_string())?;
+            let local_tip_height = u64::try_from(local_tip_height_i64)
+                .map_err(|_| "checkpoint certificate evidence height is invalid".to_string())?;
+            let claim = decode_checkpoint_evidence_claims(&frame)?;
+            if !matches!(relation.as_str(), "converged" | "remote_ahead")
+                || local_tip_height != tip_height
+                || claim.checkpoint_height != tip_height
+                || claim.checkpoint_hash != tip_hash
+                || !allowed_witnesses.contains(&claim.responder)
+                || members
+                    .iter()
+                    .any(|(responder, _)| *responder == claim.responder)
+            {
+                continue;
+            }
+            members.push((claim.responder, *evidence_digest));
+        }
+        members.sort_unstable_by_key(|member| member.0);
+        if members.len() < required_signers {
+            return Ok(false);
+        }
+        let certificate_digest =
+            checkpoint_certificate_digest(tip_height, &tip_hash, required_signers, &members);
+
+        let existing: Option<(Vec<u8>, i64, i64, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT checkpoint_hash,required_signers,signer_count,certificate_digest
+                 FROM record_checkpoint_certificates WHERE checkpoint_height=?1",
+                params![tip_height_i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| format!("read existing checkpoint certificate: {error}"))?;
+        if let Some((stored_hash, stored_required, stored_count, stored_digest)) = existing {
+            if stored_hash.as_slice() != tip_hash
+                || stored_required < 2
+                || stored_count < stored_required
+                || stored_digest.len() != 32
+            {
+                return Err("existing checkpoint certificate conflicts with local tip".to_string());
+            }
+            let report = audit_checkpoint_evidence_snapshot(&transaction)?;
+            transaction
+                .commit()
+                .map_err(|error| format!("finish existing checkpoint certificate: {error}"))?;
+            self.apply_record_commitment_checkpoint_audit(&report);
+            return Ok(true);
+        }
+
+        let certificate_count = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM record_checkpoint_certificates",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("count checkpoint certificates: {error}"))?;
+        let excess = certificate_count
+            .saturating_add(1)
+            .saturating_sub(CHECKPOINT_CERTIFICATE_CAPACITY as i64);
+        if excess > 0 {
+            transaction
+                .execute(
+                    "DELETE FROM record_checkpoint_certificates WHERE checkpoint_height IN (
+                        SELECT checkpoint_height FROM record_checkpoint_certificates
+                        ORDER BY checkpoint_height ASC LIMIT ?1
+                    )",
+                    params![excess],
+                )
+                .map_err(|error| format!("prune checkpoint certificates: {error}"))?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO record_checkpoint_certificates
+                 (checkpoint_height,chain_id,checkpoint_hash,certificate_digest,
+                  required_signers,signer_count,certified_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    tip_height_i64,
+                    AERONYX_MEMCHAIN_MAINNET_CHAIN_ID.as_slice(),
+                    tip_hash.as_slice(),
+                    certificate_digest.as_slice(),
+                    i64::try_from(required_signers)
+                        .map_err(|_| "checkpoint certificate threshold exceeds SQLite range")?,
+                    i64::try_from(members.len())
+                        .map_err(|_| "checkpoint certificate signer count exceeds SQLite range")?,
+                    certified_at,
+                ],
+            )
+            .map_err(|error| format!("insert checkpoint certificate: {error}"))?;
+        for (responder, evidence_digest) in &members {
+            transaction
+                .execute(
+                    "INSERT INTO record_checkpoint_certificate_members
+                     (checkpoint_height,responder,evidence_digest) VALUES (?1,?2,?3)",
+                    params![
+                        tip_height_i64,
+                        responder.as_slice(),
+                        evidence_digest.as_slice(),
+                    ],
+                )
+                .map_err(|error| format!("insert checkpoint certificate member: {error}"))?;
+        }
+        let report = audit_checkpoint_evidence_snapshot(&transaction)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit checkpoint certificate: {error}"))?;
+        self.apply_record_commitment_checkpoint_audit(&report);
+        Ok(true)
+    }
+
+    fn apply_record_commitment_checkpoint_audit(
+        &self,
+        report: &RecordCommitmentCheckpointEvidenceAudit,
+    ) {
+        let mut runtime = self.commitment_checkpoint.write();
+        runtime.evidence_records = report.evidence_records;
+        runtime.applicable_evidence_records = report.applicable_evidence_records;
+        runtime.deferred_evidence_records = report.deferred_evidence_records;
+        runtime.divergence_evidence_records = report.divergence_evidence_records;
+        runtime.equivocation_incidents = report.equivocation_incidents;
+        runtime.trusted_divergence_incidents = report.trusted_divergence_incidents;
+        runtime.checkpoint_certificates = report.checkpoint_certificates;
+        runtime.latest_certified_height = report.latest_certified_height;
+        runtime.latest_certificate_signers = report.latest_certificate_signers;
+        runtime.latest_certificate_required_signers = report.latest_certificate_required_signers;
+        runtime.last_evidence_at = report.last_evidence_at;
     }
 
     /// Re-verifies every durable checkpoint frame before networking starts.
@@ -2298,6 +2721,11 @@ impl MemoryStorage {
                 runtime.divergence_evidence_records = report.divergence_evidence_records;
                 runtime.equivocation_incidents = report.equivocation_incidents;
                 runtime.trusted_divergence_incidents = report.trusted_divergence_incidents;
+                runtime.checkpoint_certificates = report.checkpoint_certificates;
+                runtime.latest_certified_height = report.latest_certified_height;
+                runtime.latest_certificate_signers = report.latest_certificate_signers;
+                runtime.latest_certificate_required_signers =
+                    report.latest_certificate_required_signers;
                 runtime.last_evidence_at = report.last_evidence_at;
                 Ok(report)
             }
@@ -4113,6 +4541,54 @@ mod tests {
         (block, frame, digest)
     }
 
+    async fn seed_checkpoint_certificate(
+        storage: &MemoryStorage,
+        observed_at: u64,
+    ) -> ([[u8; 32]; 2], [[u8; 32]; 2]) {
+        let proposer = IdentityKeyPair::generate();
+        let block = signed_commitment_block(1, GENESIS_PREV_HASH, 0xB1, &proposer);
+        storage
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+
+        let witnesses = [IdentityKeyPair::generate(), IdentityKeyPair::generate()];
+        let mut digests = [[0u8; 32]; 2];
+        for (index, witness) in witnesses.iter().enumerate() {
+            let frame = signed_checkpoint_response_frame(
+                witness,
+                [0xC0u8.saturating_add(index as u8); 16],
+                observed_at.saturating_add(index as u64),
+                1,
+                block.hash(),
+                1,
+                block.hash(),
+            );
+            digests[index] = Sha256::digest(&frame).into();
+            storage
+                .persist_record_commitment_checkpoint_evidence_with_witness_policy(
+                    observed_at.saturating_add(index as u64),
+                    "converged",
+                    1,
+                    1,
+                    1,
+                    &digests[index],
+                    &frame,
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        (
+            [
+                witnesses[0].public_key_bytes(),
+                witnesses[1].public_key_bytes(),
+            ],
+            digests,
+        )
+    }
+
     #[tokio::test]
     async fn test_has_active_content() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
@@ -5371,6 +5847,8 @@ mod tests {
         assert_eq!(initial.proofs_verified_total, 0);
         assert_eq!(initial.last_round_state, "not_checked");
         assert_eq!(initial.last_round_at, None);
+        assert_eq!(initial.checkpoint_certificates, 0);
+        assert_eq!(initial.latest_certified_height, None);
 
         storage.record_commitment_checkpoint_failure(100);
         storage.record_commitment_checkpoint_verified(110, "remote_ahead", 3, 4);
@@ -5408,6 +5886,9 @@ mod tests {
             "signature",
             "request_id",
             "evidence_digest",
+            "certificate_digest",
+            "responder",
+            "witness_id",
             "endpoint",
             "owner",
             "payload",
@@ -5486,6 +5967,152 @@ mod tests {
             ),
             ("stale", Some(CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS + 1))
         );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_certificate_requires_two_distinct_pinned_witnesses_and_reopens() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("checkpoint-certificate.db");
+        let storage = MemoryStorage::open(&path, None).unwrap();
+        let (witnesses, digests) = seed_checkpoint_certificate(&storage, 1_700_500_000).await;
+
+        assert!(storage
+            .persist_record_commitment_checkpoint_certificate(
+                1_700_500_010,
+                2,
+                &witnesses,
+                &digests,
+            )
+            .await
+            .unwrap());
+        let audit = storage
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(audit.checkpoint_certificates, 1);
+        assert_eq!(audit.latest_certified_height, Some(1));
+        assert_eq!(audit.latest_certificate_signers, 2);
+        assert_eq!(audit.latest_certificate_required_signers, 2);
+        let status = storage.record_commitment_checkpoint_status();
+        assert_eq!(status.checkpoint_certificates, 1);
+        assert_eq!(status.latest_certified_height, Some(1));
+        assert_eq!(status.latest_certificate_signers, 2);
+        drop(storage);
+
+        let reopened = MemoryStorage::open(&path, None).unwrap();
+        reopened.audit_record_commitment_chain().await.unwrap();
+        let reopened_audit = reopened
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(reopened_audit.checkpoint_certificates, 1);
+        assert_eq!(reopened_audit.latest_certified_height, Some(1));
+        assert_eq!(reopened_audit.latest_certificate_signers, 2);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_certificate_rejects_duplicate_witness_frames() {
+        let (storage, block) = commitment_audit_fixture().await;
+        let witness = IdentityKeyPair::generate();
+        let witness_id = witness.public_key_bytes();
+        let observed_at = 1_700_500_030u64;
+        let mut digests = [[0u8; 32]; 2];
+        for (index, digest) in digests.iter_mut().enumerate() {
+            let frame = signed_checkpoint_response_frame(
+                &witness,
+                [0xD0u8.saturating_add(index as u8); 16],
+                observed_at.saturating_add(index as u64),
+                1,
+                block.hash(),
+                1,
+                block.hash(),
+            );
+            *digest = Sha256::digest(&frame).into();
+            storage
+                .persist_record_commitment_checkpoint_evidence(
+                    observed_at.saturating_add(index as u64),
+                    "converged",
+                    1,
+                    1,
+                    1,
+                    digest,
+                    &frame,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert!(!storage
+            .persist_record_commitment_checkpoint_certificate(
+                observed_at.saturating_add(10),
+                2,
+                &[witness_id, witness_id],
+                &digests,
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            storage
+                .audit_record_commitment_checkpoint_evidence()
+                .await
+                .unwrap()
+                .checkpoint_certificates,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_certificate_audit_rejects_member_and_digest_tampering() {
+        let member_tamper = MemoryStorage::open(":memory:", None).unwrap();
+        let (witnesses, digests) = seed_checkpoint_certificate(&member_tamper, 1_700_500_050).await;
+        member_tamper
+            .persist_record_commitment_checkpoint_certificate(
+                1_700_500_060,
+                2,
+                &witnesses,
+                &digests,
+            )
+            .await
+            .unwrap();
+        {
+            let conn = member_tamper.conn_lock().await;
+            conn.execute(
+                "UPDATE record_checkpoint_certificate_members SET responder=?1
+                 WHERE evidence_digest=?2",
+                params![[0xEEu8; 32].as_slice(), digests[0].as_slice()],
+            )
+            .unwrap();
+        }
+        assert!(member_tamper
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap_err()
+            .contains("member claim is invalid"));
+
+        let digest_tamper = MemoryStorage::open(":memory:", None).unwrap();
+        let (witnesses, digests) = seed_checkpoint_certificate(&digest_tamper, 1_700_500_070).await;
+        digest_tamper
+            .persist_record_commitment_checkpoint_certificate(
+                1_700_500_080,
+                2,
+                &witnesses,
+                &digests,
+            )
+            .await
+            .unwrap();
+        {
+            let conn = digest_tamper.conn_lock().await;
+            conn.execute(
+                "UPDATE record_checkpoint_certificates SET certificate_digest=?1",
+                params![[0xEFu8; 32].as_slice()],
+            )
+            .unwrap();
+        }
+        assert!(digest_tamper
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap_err()
+            .contains("certificate digest mismatch"));
     }
 
     #[tokio::test]
@@ -5783,7 +6410,7 @@ mod tests {
             conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         let chain = migrated.audit_record_commitment_chain().await.unwrap();
         assert_eq!(chain.block_count, 1);
         assert_eq!(migrated.record_commitment_chain_tip().await.1, block.hash());
@@ -5829,7 +6456,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         assert_eq!(incident_table_exists, 1);
         migrated.audit_record_commitment_chain().await.unwrap();
         let evidence = migrated
@@ -5873,7 +6500,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         assert_eq!(incident_table_exists, 1);
         migrated.audit_record_commitment_chain().await.unwrap();
         let evidence = migrated
@@ -5882,6 +6509,58 @@ mod tests {
             .unwrap();
         assert_eq!(evidence.evidence_records, 1);
         assert_eq!(evidence.trusted_divergence_incidents, 0);
+    }
+
+    #[tokio::test]
+    async fn test_v11_to_v12_file_migration_adds_certificate_tables_without_data_loss() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("checkpoint-certificate-migration.db");
+        let original = MemoryStorage::open(&path, None).unwrap();
+        seed_checkpoint_evidence(&original, 1_700_500_290).await;
+        drop(original);
+
+        let legacy = rusqlite::Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "DROP TABLE record_checkpoint_certificate_members;
+                 DROP TABLE record_checkpoint_certificates;
+                 UPDATE schema_version SET version=11;",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let migrated = MemoryStorage::open(&path, None).unwrap();
+        let (version, certificates, members): (u32, i64, i64) = {
+            let conn = migrated.conn_lock().await;
+            (
+                conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+                    .unwrap(),
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='record_checkpoint_certificates'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='record_checkpoint_certificate_members'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(version, 12);
+        assert_eq!(certificates, 1);
+        assert_eq!(members, 1);
+        migrated.audit_record_commitment_chain().await.unwrap();
+        let evidence = migrated
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(evidence.evidence_records, 1);
+        assert_eq!(evidence.checkpoint_certificates, 0);
     }
 
     #[tokio::test]

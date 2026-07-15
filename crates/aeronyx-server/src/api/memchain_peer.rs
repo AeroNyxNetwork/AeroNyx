@@ -71,6 +71,7 @@
 //!   missing/stale process audit baseline.
 //!
 //! ## Last Modified
+//! v2.8.6-CheckpointCertificate - Require distinct pinned witnesses for certificate rounds.
 //! v2.8.5-TrustedDivergenceHalt - Preserve verified divergence after sticky incident creation.
 //! v2.8.3-WitnessDivergence - Exposed crate-local reconciliation for startup tests.
 //! v2.8.4-WitnessEquivocation - Retain and reject conflicting pinned-witness claims.
@@ -86,7 +87,7 @@
 //! v2.7.1-BlockFollower - Pinned coordinator pull and fail-closed page verification.
 //! v2.7.0-BlockSync - Initial signed node-blind block range protocol.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -213,6 +214,14 @@ pub struct CommitmentReconciliationOutcome {
     pub diverged: usize,
     /// Attempts that did not establish durable signed evidence.
     pub failed: usize,
+    /// Distinct certifiable pinned-witness frames in this exact round.
+    pub certificate_signers: usize,
+    /// Threshold requested for an immutable certificate; zero when disabled.
+    pub certificate_required_signers: usize,
+    /// Whether the current local tip has a re-audited immutable certificate.
+    pub certificate_persisted: bool,
+    /// Whether certificate persistence or its full re-audit failed.
+    pub certificate_persistence_failed: bool,
 }
 
 #[derive(Debug)]
@@ -443,12 +452,36 @@ pub async fn reconcile_record_commitment_pinned_witnesses(
     client: &reqwest::Client,
     witness_node_ids: &[[u8; 32]],
 ) -> CommitmentReconciliationOutcome {
+    reconcile_record_commitment_pinned_witnesses_with_certificate_threshold(
+        storage,
+        peer_store,
+        identity,
+        client,
+        witness_node_ids,
+        2,
+    )
+    .await
+}
+
+/// Collects pinned witness proofs and attempts one immutable certificate using
+/// the operator's configured minimum. Values below two preserve legacy
+/// one-witness startup behavior but cannot be represented as a multi-witness
+/// certificate.
+pub async fn reconcile_record_commitment_pinned_witnesses_with_certificate_threshold(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    witness_node_ids: &[[u8; 32]],
+    minimum_certificate_signers: usize,
+) -> CommitmentReconciliationOutcome {
     reconcile_record_commitment_pinned_witnesses_with_endpoint_policy(
         storage,
         peer_store,
         identity,
         client,
         witness_node_ids,
+        minimum_certificate_signers,
         checkpoint_witness_endpoint_is_public,
     )
     .await
@@ -506,6 +539,7 @@ where
         candidate_ids,
         max_witnesses,
         false,
+        None,
     )
     .await
 }
@@ -516,6 +550,7 @@ pub(crate) async fn reconcile_record_commitment_pinned_witnesses_with_endpoint_p
     identity: &IdentityKeyPair,
     client: &reqwest::Client,
     witness_node_ids: &[[u8; 32]],
+    minimum_certificate_signers: usize,
     endpoint_allowed: F,
 ) -> CommitmentReconciliationOutcome
 where
@@ -549,6 +584,7 @@ where
         candidate_ids,
         witness_node_ids.len().min(MAX_PINNED_WITNESSES_PER_ROUND),
         true,
+        Some(minimum_certificate_signers),
     )
     .await
 }
@@ -561,7 +597,13 @@ async fn reconcile_record_commitment_candidate_ids(
     mut candidate_ids: Vec<[u8; 32]>,
     max_witnesses: usize,
     track_trusted_witness_incidents: bool,
+    minimum_certificate_signers: Option<usize>,
 ) -> CommitmentReconciliationOutcome {
+    // Preserve operator order while ensuring one identity can contribute at
+    // most one request, one result, and one certificate member. This remains
+    // defense in depth even when config parsing already rejects duplicate IDs.
+    let mut distinct_candidates = HashSet::with_capacity(candidate_ids.len());
+    candidate_ids.retain(|candidate| distinct_candidates.insert(*candidate));
     let eligible_witnesses = candidate_ids.len();
     candidate_ids.truncate(max_witnesses);
     let attempted = candidate_ids.len();
@@ -570,7 +612,9 @@ async fn reconcile_record_commitment_candidate_ids(
         attempted,
         ..CommitmentReconciliationOutcome::default()
     };
+    let certificate_witnesses = candidate_ids.clone();
     let mut verified = Vec::with_capacity(attempted);
+    let mut certificate_evidence = Vec::with_capacity(attempted);
 
     for candidate_node_id in candidate_ids {
         match pull_record_commitment_checkpoint_with_witness_policy(
@@ -599,6 +643,14 @@ async fn reconcile_record_commitment_candidate_ids(
                         outcome.diverged = outcome.diverged.saturating_add(1);
                     }
                 }
+                if matches!(
+                    proof.relation,
+                    CommitmentCheckpointRelation::Converged
+                        | CommitmentCheckpointRelation::RemoteAhead
+                ) && proof.checkpoint_height == proof.local_tip_height
+                {
+                    certificate_evidence.push(proof.evidence_digest);
+                }
                 verified.push(proof);
             }
             Err(_) => {
@@ -608,6 +660,27 @@ async fn reconcile_record_commitment_candidate_ids(
     }
 
     let completed_at = now_secs();
+    if let Some(configured_threshold) = minimum_certificate_signers {
+        let threshold = configured_threshold
+            .max(2)
+            .min(MAX_PINNED_WITNESSES_PER_ROUND);
+        outcome.certificate_signers = certificate_evidence.len();
+        outcome.certificate_required_signers = threshold;
+        if certificate_evidence.len() >= threshold {
+            match storage
+                .persist_record_commitment_checkpoint_certificate(
+                    completed_at,
+                    threshold,
+                    &certificate_witnesses,
+                    &certificate_evidence,
+                )
+                .await
+            {
+                Ok(persisted) => outcome.certificate_persisted = persisted,
+                Err(_) => outcome.certificate_persistence_failed = true,
+            }
+        }
+    }
     for _ in 0..outcome.failed {
         storage.record_commitment_checkpoint_failure(completed_at);
     }
@@ -2360,7 +2433,11 @@ mod tests {
             &coordinator_peers,
             &coordinator,
             &client,
-            &[pinned_witness.public_key_bytes()],
+            &[
+                pinned_witness.public_key_bytes(),
+                pinned_witness.public_key_bytes(),
+            ],
+            2,
             |_| true,
         )
         .await;
@@ -2370,6 +2447,8 @@ mod tests {
         assert_eq!(round.verified, 1);
         assert_eq!(round.converged, 1);
         assert_eq!(round.failed, 0);
+        assert_eq!(round.certificate_signers, 1);
+        assert!(!round.certificate_persisted);
         assert_eq!(
             local.record_commitment_checkpoint_status().evidence_records,
             1
@@ -2377,5 +2456,99 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn pinned_witness_round_persists_two_signer_checkpoint_certificate() {
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let witnesses = [
+            Arc::new(IdentityKeyPair::generate()),
+            Arc::new(IdentityKeyPair::generate()),
+        ];
+        let local = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let witness_storages = [
+            Arc::new(MemoryStorage::open(":memory:", None).unwrap()),
+            Arc::new(MemoryStorage::open(":memory:", None).unwrap()),
+        ];
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now.saturating_sub(1),
+            GENESIS_PREV_HASH,
+            vec![[0x91; 32]],
+            &coordinator,
+        );
+        local
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        local.audit_record_commitment_chain().await.unwrap();
+        local
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+
+        let mut addresses = Vec::new();
+        let mut servers = Vec::new();
+        for (storage, witness) in witness_storages.iter().zip(witnesses.iter()) {
+            storage
+                .append_record_commitment_block(&block, None)
+                .await
+                .unwrap();
+            storage.audit_record_commitment_chain().await.unwrap();
+            let peers = Arc::new(PeerStore::new());
+            admit_peer(&peers, &coordinator, None, now);
+            let router =
+                build_memchain_peer_router(Arc::clone(storage), peers, Arc::clone(witness));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addresses.push(listener.local_addr().unwrap());
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            }));
+        }
+
+        let coordinator_peers = PeerStore::new();
+        for (witness, address) in witnesses.iter().zip(addresses.iter()) {
+            admit_peer(
+                &coordinator_peers,
+                witness,
+                Some(format!("http://{address}")),
+                now,
+            );
+        }
+        let witness_ids = [
+            witnesses[0].public_key_bytes(),
+            witnesses[1].public_key_bytes(),
+        ];
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let round = reconcile_record_commitment_pinned_witnesses_with_endpoint_policy(
+            &local,
+            &coordinator_peers,
+            &coordinator,
+            &client,
+            &witness_ids,
+            2,
+            |_| true,
+        )
+        .await;
+
+        assert_eq!(round.verified, 2);
+        assert_eq!(round.converged, 2);
+        assert_eq!(round.certificate_signers, 2);
+        assert_eq!(round.certificate_required_signers, 2);
+        assert!(round.certificate_persisted);
+        assert!(!round.certificate_persistence_failed);
+        let status = local.record_commitment_checkpoint_status();
+        assert_eq!(status.checkpoint_certificates, 1);
+        assert_eq!(status.latest_certified_height, Some(1));
+        assert_eq!(status.latest_certificate_signers, 2);
+
+        for server in servers {
+            server.abort();
+            let _ = server.await;
+        }
     }
 }

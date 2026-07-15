@@ -47,6 +47,9 @@
 //! - v10 (v2.7.20-WitnessEquivocation): Durable same-height double-sign proof.
 //! - v11 (v2.7.21-TrustedDivergenceHalt): Durable operator-pinned witness
 //!   divergence incidents and a process-local fail-closed production latch.
+//! - v12 (v2.7.22-CheckpointCertificate): Immutable bounded certificates that
+//!   bind distinct operator-pinned witness frames to one locally audited
+//!   checkpoint without claiming distributed consensus or fork choice.
 //! - v2.7.4-BlockIntegrityStatus: Runtime-only evidence for the most recent
 //!   complete persisted-chain audit and subsequently verified appends.
 //! - v2.7.5-CheckpointProof: Runtime-only signed checkpoint reconciliation
@@ -126,6 +129,10 @@
 //!   inbound serving never refresh it.
 //! - Witness-round fields are process-local aggregate observations. They must
 //!   never be interpreted as votes, quorum, finality, or fork choice.
+//! - Checkpoint certificates are immutable local evidence bundles over
+//!   independently verified operator-pinned witness frames. They prove only
+//!   that the configured threshold signed one local checkpoint; they are not
+//!   BFT finality, global consensus, leader election, or a fork-choice rule.
 //! - commitment_durability is process-local SQLite configuration evidence.
 //!   A coordinator must configure FULL-or-stronger before startup audit; never
 //!   silently downgrade it while the process is serving commitment traffic.
@@ -181,6 +188,8 @@
 //! v2.7.20-WitnessEquivocation - Schema v10 durable trusted-witness double-sign evidence.
 //! v2.7.21-TrustedDivergenceHalt - Schema v11 sticky trusted divergence incidents
 //!   and an atomic local commitment-production safety latch.
+//! v2.7.22-CheckpointCertificate - Schema v12 immutable bounded multi-witness
+//!   checkpoint certificates with restart-time cryptographic re-audit.
 // ============================================
 
 use std::collections::{HashMap, VecDeque};
@@ -212,12 +221,13 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 /// v8 → v9: bounded local signed checkpoint evidence vault
 /// v9 → v10: durable signed-witness equivocation incidents
 /// v10 → v11: durable trusted-witness divergent-prefix incidents
+/// v11 → v12: immutable pinned-witness checkpoint certificates
 ///
 /// ⚠️ CRITICAL: When bumping this, you MUST also add a new migrate block
 /// in maybe_migrate(). The migrate block MUST use a hardcoded integer
 /// (not this constant) for UPDATE schema_version, to prevent skipping
 /// intermediate migrations on multi-version upgrades.
-const SCHEMA_VERSION: u32 = 11;
+const SCHEMA_VERSION: u32 = 12;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -424,6 +434,14 @@ pub struct RecordCommitmentCheckpointStatus {
     /// Durable incidents where an operator-pinned witness signed a checkpoint
     /// that diverges from the locally audited prefix. Identities stay local.
     pub trusted_divergence_incidents: u64,
+    /// Immutable multi-witness certificates retained after full re-audit.
+    pub checkpoint_certificates: u64,
+    /// Highest local checkpoint covered by a retained certificate.
+    pub latest_certified_height: Option<u64>,
+    /// Distinct signed witness frames in the latest certificate.
+    pub latest_certificate_signers: usize,
+    /// Threshold recorded by the latest immutable certificate.
+    pub latest_certificate_required_signers: usize,
     /// Whether local canonical commitment production is fail-closed for this
     /// process after a trusted witness security incident.
     pub production_halted: bool,
@@ -473,6 +491,11 @@ pub(crate) const CHECKPOINT_EQUIVOCATION_CAPACITY: usize = 64;
 /// A trusted divergent-prefix proof is sticky and cannot be displaced by later
 /// convergence. Only explicitly pinned witnesses can consume this capacity.
 pub(crate) const CHECKPOINT_TRUSTED_DIVERGENCE_CAPACITY: usize = 64;
+/// Certificates retain their exact signed member frames. Sixty-four
+/// certificates with at most three members stay within the 256-frame evidence
+/// bound while preserving a useful rolling audit history.
+pub(crate) const CHECKPOINT_CERTIFICATE_CAPACITY: usize = 64;
+pub(crate) const MAX_CHECKPOINT_CERTIFICATE_SIGNERS: usize = 3;
 /// Defensive bound for one stored proof frame. Increasing this requires an
 /// explicit wire and startup-memory review.
 pub(crate) const MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES: usize = 4 * 1024;
@@ -547,6 +570,10 @@ pub(crate) struct RecordCommitmentCheckpointRuntime {
     pub(crate) divergence_evidence_records: u64,
     pub(crate) equivocation_incidents: u64,
     pub(crate) trusted_divergence_incidents: u64,
+    pub(crate) checkpoint_certificates: u64,
+    pub(crate) latest_certified_height: Option<u64>,
+    pub(crate) latest_certificate_signers: usize,
+    pub(crate) latest_certificate_required_signers: usize,
     pub(crate) last_evidence_at: Option<u64>,
     pub(crate) last_round_state: &'static str,
     pub(crate) last_round_at: Option<u64>,
@@ -583,6 +610,10 @@ impl Default for RecordCommitmentCheckpointRuntime {
             divergence_evidence_records: 0,
             equivocation_incidents: 0,
             trusted_divergence_incidents: 0,
+            checkpoint_certificates: 0,
+            latest_certified_height: None,
+            latest_certificate_signers: 0,
+            latest_certificate_required_signers: 0,
             last_evidence_at: None,
             last_round_state: "not_checked",
             last_round_at: None,
@@ -909,6 +940,36 @@ impl MemoryStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_record_checkpoint_trusted_divergences_detected
                 ON record_checkpoint_trusted_divergences(detected_at);
+
+            -- v12: one immutable threshold certificate per retained local
+            -- checkpoint. Members reference exact v9 signed response frames;
+            -- no synthetic aggregate signature or peer-count consensus exists.
+            CREATE TABLE IF NOT EXISTS record_checkpoint_certificates (
+                checkpoint_height  INTEGER PRIMARY KEY CHECK(checkpoint_height > 0),
+                chain_id           BLOB NOT NULL CHECK(length(chain_id) = 32),
+                checkpoint_hash    BLOB NOT NULL CHECK(length(checkpoint_hash) = 32),
+                certificate_digest BLOB NOT NULL UNIQUE CHECK(length(certificate_digest) = 32),
+                required_signers   INTEGER NOT NULL CHECK(required_signers BETWEEN 2 AND 3),
+                signer_count       INTEGER NOT NULL CHECK(signer_count BETWEEN required_signers AND 3),
+                certified_at       INTEGER NOT NULL CHECK(certified_at >= 0),
+                FOREIGN KEY(checkpoint_height) REFERENCES record_commitment_blocks(height)
+                    ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_record_checkpoint_certificates_time
+                ON record_checkpoint_certificates(certified_at);
+
+            CREATE TABLE IF NOT EXISTS record_checkpoint_certificate_members (
+                checkpoint_height INTEGER NOT NULL,
+                responder         BLOB NOT NULL CHECK(length(responder) = 32),
+                evidence_digest   BLOB NOT NULL UNIQUE CHECK(length(evidence_digest) = 32),
+                PRIMARY KEY(checkpoint_height, responder),
+                FOREIGN KEY(checkpoint_height) REFERENCES record_checkpoint_certificates(checkpoint_height)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(evidence_digest) REFERENCES record_checkpoint_evidence(evidence_digest)
+                    ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_record_checkpoint_certificate_members_height
+                ON record_checkpoint_certificate_members(checkpoint_height);
 
             CREATE TABLE IF NOT EXISTS raw_logs (
                 log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1858,6 +1919,72 @@ impl MemoryStorage {
             info!(
                 "[STORAGE] ✅ Migration to v11 (trusted checkpoint divergence incidents) complete"
             );
+        }
+
+        // v11 -> v12: persist an immutable threshold certificate that points
+        // at exact signature-verified evidence frames. Certificates remain
+        // bounded and never select or mutate the canonical chain.
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(11);
+
+        if current < 12 {
+            info!(
+                "[STORAGE] Migrating schema v{} -> v12 (checkpoint certificates)",
+                current
+            );
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS record_checkpoint_certificates (
+                    checkpoint_height  INTEGER PRIMARY KEY CHECK(checkpoint_height > 0),
+                    chain_id           BLOB NOT NULL CHECK(length(chain_id) = 32),
+                    checkpoint_hash    BLOB NOT NULL CHECK(length(checkpoint_hash) = 32),
+                    certificate_digest BLOB NOT NULL UNIQUE CHECK(length(certificate_digest) = 32),
+                    required_signers   INTEGER NOT NULL CHECK(required_signers BETWEEN 2 AND 3),
+                    signer_count       INTEGER NOT NULL CHECK(signer_count BETWEEN required_signers AND 3),
+                    certified_at       INTEGER NOT NULL CHECK(certified_at >= 0),
+                    FOREIGN KEY(checkpoint_height) REFERENCES record_commitment_blocks(height)
+                        ON DELETE RESTRICT
+                );
+                CREATE INDEX IF NOT EXISTS idx_record_checkpoint_certificates_time
+                    ON record_checkpoint_certificates(certified_at);
+                CREATE TABLE IF NOT EXISTS record_checkpoint_certificate_members (
+                    checkpoint_height INTEGER NOT NULL,
+                    responder         BLOB NOT NULL CHECK(length(responder) = 32),
+                    evidence_digest   BLOB NOT NULL UNIQUE CHECK(length(evidence_digest) = 32),
+                    PRIMARY KEY(checkpoint_height, responder),
+                    FOREIGN KEY(checkpoint_height) REFERENCES record_checkpoint_certificates(checkpoint_height)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY(evidence_digest) REFERENCES record_checkpoint_evidence(evidence_digest)
+                        ON DELETE RESTRICT
+                );
+                CREATE INDEX IF NOT EXISTS idx_record_checkpoint_certificate_members_height
+                    ON record_checkpoint_certificate_members(checkpoint_height);",
+            )
+            .map_err(|error| format!("v12 migration: create checkpoint certificates: {error}"))?;
+            for table in [
+                "record_checkpoint_certificates",
+                "record_checkpoint_certificate_members",
+            ] {
+                let exists = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                        params![table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    > 0;
+                if !exists {
+                    return Err(format!(
+                        "v12 migration: required table '{table}' was not created"
+                    ));
+                }
+            }
+            // Hardcoded 12 preserves sequential upgrades.
+            conn.execute("UPDATE schema_version SET version = 12", [])
+                .map_err(|error| format!("Update schema version to v12: {error}"))?;
+            info!("[STORAGE] Migration to v12 (checkpoint certificates) complete");
         }
 
         Ok(())
@@ -3803,15 +3930,17 @@ mod tests {
         // maybe_migrate() runs through the latest schema: v6 adds SuperNode,
         // v7 adds the blind marker, v8 creates commitment tables, v9 adds the
         // bounded proof vault, v10 adds durable equivocation incidents, and
-        // v11 adds sticky trusted-divergence incidents even when
-        // create_schema() was not called.
-        assert_eq!(v, 11);
+        // v11 adds sticky trusted-divergence incidents and v12 adds immutable
+        // checkpoint certificates even when create_schema() was not called.
+        assert_eq!(v, 12);
         for table in [
             "record_commitment_blocks",
             "record_block_commitments",
             "record_checkpoint_evidence",
             "record_checkpoint_equivocations",
             "record_checkpoint_trusted_divergences",
+            "record_checkpoint_certificates",
+            "record_checkpoint_certificate_members",
         ] {
             let exists: bool = conn
                 .query_row(

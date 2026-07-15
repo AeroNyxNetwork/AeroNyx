@@ -350,8 +350,9 @@ use crate::api::discovery::{
 };
 use crate::api::memchain_peer::{
     build_memchain_peer_router, pull_record_commitment_checkpoint, pull_record_commitment_page,
-    reconcile_record_commitment_pinned_witnesses, reconcile_record_commitment_witnesses,
-    CommitmentCheckpointRelation, CommitmentReconciliationOutcome,
+    reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
+    reconcile_record_commitment_witnesses, CommitmentCheckpointRelation,
+    CommitmentReconciliationOutcome,
 };
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
 use crate::api::voice::build_voice_router;
@@ -516,6 +517,7 @@ enum CommitmentWitnessStartupBlockReason {
     RemoteAhead,
     Unavailable,
     ThresholdUnmet,
+    CertificateUnavailable,
 }
 
 impl CommitmentWitnessStartupBlockReason {
@@ -527,6 +529,7 @@ impl CommitmentWitnessStartupBlockReason {
             Self::RemoteAhead => "signed_checkpoint_remote_ahead",
             Self::Unavailable => "signed_checkpoint_unavailable",
             Self::ThresholdUnmet => "signed_checkpoint_threshold_unmet",
+            Self::CertificateUnavailable => "signed_checkpoint_certificate_unavailable",
         }
     }
 }
@@ -1548,6 +1551,9 @@ impl Server {
             divergence_records = checkpoint_evidence_audit.divergence_evidence_records,
             equivocation_incidents = checkpoint_evidence_audit.equivocation_incidents,
             trusted_divergence_incidents = checkpoint_evidence_audit.trusted_divergence_incidents,
+            checkpoint_certificates = checkpoint_evidence_audit.checkpoint_certificates,
+            latest_certified_height = checkpoint_evidence_audit.latest_certified_height,
+            latest_certificate_signers = checkpoint_evidence_audit.latest_certificate_signers,
             "[MEMCHAIN_BLOCK] Persisted checkpoint evidence audit passed"
         );
 
@@ -2143,6 +2149,11 @@ impl Server {
                             divergence_evidence_records: status.divergence_evidence_records,
                             equivocation_incidents: status.equivocation_incidents,
                             trusted_divergence_incidents: status.trusted_divergence_incidents,
+                            checkpoint_certificates: status.checkpoint_certificates,
+                            latest_certified_height: status.latest_certified_height,
+                            latest_certificate_signers: status.latest_certificate_signers,
+                            latest_certificate_required_signers: status
+                                .latest_certificate_required_signers,
                             production_halted: status.production_halted,
                             last_evidence_at: status.last_evidence_at,
                             observation_freshness: status.observation_freshness,
@@ -2886,12 +2897,13 @@ impl Server {
                     "MemChain external witness rollback guard: HTTP client init failed",
                 )
             })?;
-        let round = reconcile_record_commitment_pinned_witnesses(
+        let round = reconcile_record_commitment_pinned_witnesses_with_certificate_threshold(
             storage,
             peer_store,
             &self.identity,
             &client,
             &witness_node_ids,
+            self.config.memchain.commitment_witness_min_verified,
         )
         .await;
         let observed_equivocations = storage
@@ -2922,6 +2934,17 @@ impl Server {
             return Err(ServerError::startup_failed(format!(
                 "MemChain external witness rollback guard: {}",
                 CommitmentWitnessStartupBlockReason::TrustedDivergence
+            )));
+        }
+        let certificate_required = self.config.memchain.commitment_witness_startup_required
+            && self.config.memchain.commitment_witness_min_verified >= 2;
+        if certificate_required
+            && round.verified >= self.config.memchain.commitment_witness_min_verified
+            && (!round.certificate_persisted || round.certificate_persistence_failed)
+        {
+            return Err(ServerError::startup_failed(format!(
+                "MemChain external witness rollback guard: {}",
+                CommitmentWitnessStartupBlockReason::CertificateUnavailable
             )));
         }
         let decision = commitment_witness_startup_decision(
@@ -2958,6 +2981,9 @@ impl Server {
                     verified = round.verified,
                     converged = round.converged,
                     remote_behind = round.remote_behind,
+                    certificate_signers = round.certificate_signers,
+                    certificate_required_signers = round.certificate_required_signers,
+                    certificate_persisted = round.certificate_persisted,
                     minimum_verified = self.config.memchain.commitment_witness_min_verified,
                     strict = self.config.memchain.commitment_witness_startup_required,
                     "[MEMCHAIN_BLOCK] External startup witness rollback guard passed"
@@ -3009,6 +3035,7 @@ impl Server {
             .commitment_sync_interval_secs
             .max(MIN_INTERVAL_SECS);
         let pinned_witness_node_ids = self.config.memchain.commitment_witness_node_id_bytes();
+        let certificate_minimum_signers = self.config.memchain.commitment_witness_min_verified;
         let witness_scope = if pinned_witness_node_ids.is_empty() {
             "permissionless_evidence"
         } else {
@@ -3045,12 +3072,13 @@ impl Server {
                             )
                             .await
                         } else {
-                            reconcile_record_commitment_pinned_witnesses(
+                            reconcile_record_commitment_pinned_witnesses_with_certificate_threshold(
                                 &storage,
                                 &peer_store,
                                 &identity,
                                 &client,
                                 &pinned_witness_node_ids,
+                                certificate_minimum_signers,
                             )
                             .await
                         }
@@ -3066,6 +3094,13 @@ impl Server {
                         "[MEMCHAIN_BLOCK] Trusted witness security incident halted local commitment production"
                     );
                     break;
+                }
+                if round.certificate_persistence_failed {
+                    error!(
+                        certificate_signers = round.certificate_signers,
+                        certificate_required_signers = round.certificate_required_signers,
+                        "[MEMCHAIN_BLOCK] Checkpoint certificate persistence failed"
+                    );
                 }
 
                 if round.attempted == 0 {
@@ -6295,6 +6330,7 @@ mod tests {
             &coordinator,
             &client,
             &[witness.public_key_bytes()],
+            2,
             |_| true,
         )
         .await;

@@ -229,6 +229,14 @@ pub struct RecordCommitmentCheckpointHeartbeatStatus {
     pub equivocation_incidents: u64,
     /// Durable operator-pinned witness divergent-prefix incidents.
     pub trusted_divergence_incidents: u64,
+    /// Retained immutable pinned-witness checkpoint certificates.
+    pub checkpoint_certificates: u64,
+    /// Highest local checkpoint covered by a retained certificate.
+    pub latest_certified_height: Option<u64>,
+    /// Distinct witness frames in the latest certificate.
+    pub latest_certificate_signers: usize,
+    /// Threshold recorded by the latest certificate.
+    pub latest_certificate_required_signers: usize,
     /// Whether local commitment production is fail-closed in this process.
     pub production_halted: bool,
     /// Most recent applicable durable evidence observation time.
@@ -792,6 +800,10 @@ mod tests {
                 divergence_evidence_records: 0,
                 equivocation_incidents: 0,
                 trusted_divergence_incidents: 0,
+                checkpoint_certificates: 2,
+                latest_certified_height: Some(9),
+                latest_certificate_signers: 2,
+                latest_certificate_required_signers: 2,
                 production_halted: false,
                 last_evidence_at: Some(120),
                 observation_freshness: "fresh".to_string(),
@@ -839,6 +851,10 @@ mod tests {
         assert_eq!(checkpoint["deferred_evidence_records"], 1);
         assert_eq!(checkpoint["equivocation_incidents"], 0);
         assert_eq!(checkpoint["trusted_divergence_incidents"], 0);
+        assert_eq!(checkpoint["checkpoint_certificates"], 2);
+        assert_eq!(checkpoint["latest_certified_height"], 9);
+        assert_eq!(checkpoint["latest_certificate_signers"], 2);
+        assert_eq!(checkpoint["latest_certificate_required_signers"], 2);
         assert_eq!(checkpoint["production_halted"], false);
         assert_eq!(checkpoint["observation_freshness"], "fresh");
         assert_eq!(checkpoint["observation_age_seconds"], 5);
@@ -862,6 +878,9 @@ mod tests {
                 "payload",
                 "signed_response",
                 "evidence_digest",
+                "certificate_digest",
+                "responder",
+                "witness_id",
                 "signature",
                 "signer",
                 "anchor_path",
