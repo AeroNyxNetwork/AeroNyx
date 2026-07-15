@@ -27,6 +27,8 @@
 //!                     is_chat_relay_enabled(), extracted to config_memchain.rs
 //! v2.7.0-BlockSync  — Added an explicit, default-off commitment coordinator
 //!                     role so independent nodes cannot accidentally fork.
+//! v2.8.1-BlockSync  — Made the follower's bounded pages-per-round budget
+//!                     configurable for controlled recovery and low-I/O nodes.
 //!
 //! ## Main Functionality
 //! - `MemChainMode`   — Off / Local / P2p / Saas
@@ -85,6 +87,7 @@
 //!   consensus, quorum, finality, leader election, or fork choice.
 //!
 //! ## Last Modified
+//! v2.8.1-BlockSync - Added a validated follower pages-per-round budget.
 //! v2.7.16-WitnessThreshold - Added a configurable pinned-witness startup threshold.
 //! v2.7.15-ExternalWitnessGuard - Added pinned startup checkpoint witnesses.
 //! v2.7.14-CommitmentTipAnchor - Added the coordinator-local signed tip anchor.
@@ -268,6 +271,15 @@ pub struct MemChainConfig {
     /// Failures use bounded exponential backoff independently of this value.
     #[serde(default = "default_commitment_sync_interval_secs")]
     pub commitment_sync_interval_secs: u64,
+
+    /// Maximum verified commitment pages fetched in one follower round.
+    ///
+    /// Each page is transactionally verified before append. Bounding a round
+    /// keeps shutdown responsive and limits burst I/O; a remaining backlog is
+    /// resumed after a short delay. The default of eight preserves historical
+    /// behavior, while one is useful for constrained nodes and recovery drills.
+    #[serde(default = "default_commitment_sync_max_pages_per_round")]
+    pub commitment_sync_max_pages_per_round: usize,
 
     /// Optional path for the coordinator's signed commitment-tip high-water mark.
     ///
@@ -526,6 +538,9 @@ fn default_max_remote_owners() -> usize {
 }
 fn default_commitment_sync_interval_secs() -> u64 {
     30
+}
+fn default_commitment_sync_max_pages_per_round() -> usize {
+    8
 }
 fn default_commitment_witness_min_verified() -> usize {
     1
@@ -817,6 +832,12 @@ impl MemChainConfig {
                 return Err(ServerError::config_invalid(
                     "memchain.commitment_sync_interval_secs",
                     "must be between 5 and 3600 seconds",
+                ));
+            }
+            if !(1..=64).contains(&self.commitment_sync_max_pages_per_round) {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_sync_max_pages_per_round",
+                    "must be between 1 and 64 pages",
                 ));
             }
             debug!("[MEMCHAIN_BLOCK] Pinned coordinator follower sync enabled");
@@ -1144,6 +1165,7 @@ impl Default for MemChainConfig {
             commitment_sync_enabled: false,
             commitment_coordinator_node_id: String::new(),
             commitment_sync_interval_secs: default_commitment_sync_interval_secs(),
+            commitment_sync_max_pages_per_round: default_commitment_sync_max_pages_per_round(),
             commitment_tip_anchor_path: String::new(),
             commitment_witness_node_ids: Vec::new(),
             commitment_witness_startup_required: false,
@@ -1216,6 +1238,7 @@ mod tests {
         assert!(!mc.commitment_sync_enabled);
         assert!(mc.commitment_coordinator_node_id.is_empty());
         assert_eq!(mc.commitment_sync_interval_secs, 30);
+        assert_eq!(mc.commitment_sync_max_pages_per_round, 8);
         assert!(mc.commitment_tip_anchor_path.is_empty());
         assert!(mc.commitment_witness_node_ids.is_empty());
         assert!(!mc.commitment_witness_startup_required);
@@ -1584,6 +1607,13 @@ mod tests {
                 commitment_sync_enabled: true,
                 commitment_coordinator_node_id: pinned,
                 commitment_sync_interval_secs: 4,
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: "11".repeat(32),
+                commitment_sync_max_pages_per_round: 65,
                 ..Default::default()
             },
         ] {

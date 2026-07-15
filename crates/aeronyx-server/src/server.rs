@@ -154,6 +154,8 @@
 //  65. Reports checkpoint evidence above a follower's recovered local tip as
 //      deferred, allowing block sync to run without presenting old evidence
 //      as current convergence or divergence.
+//  66. Uses a validated configurable follower pages-per-round budget so
+//      catch-up remains bounded, restartable, and operable on low-I/O nodes.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -208,6 +210,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.8.1-BlockFollowerOps - Configurable bounded catch-up round budget
 //   v2.8.0-ChatPullV2 - Signed opaque-cursor stable mailbox snapshots
 //   v2.7.22-ChatRelayMaintenance - Scheduled TTL cleanup with health evidence
 //   v2.7.21-OfflineControlReliability - Bounded ChatExpired pull delivery
@@ -3095,18 +3098,17 @@ impl Server {
         };
         let identity = self.identity.clone();
         let base_interval_secs = self.config.memchain.commitment_sync_interval_secs;
+        let max_pages_per_round = self.config.memchain.commitment_sync_max_pages_per_round;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         Some(tokio::spawn(async move {
-            const MAX_PAGES_PER_ROUND: usize = 8;
             const MAX_BACKOFF_SECS: u64 = 600;
 
             let mut consecutive_failures = 0u32;
             let mut next_delay = Duration::from_secs(0);
             info!(
                 interval_secs = base_interval_secs,
-                max_pages_per_round = MAX_PAGES_PER_ROUND,
-                "[MEMCHAIN_BLOCK] Pinned coordinator follower started"
+                max_pages_per_round, "[MEMCHAIN_BLOCK] Pinned coordinator follower started"
             );
 
             loop {
@@ -3121,7 +3123,7 @@ impl Server {
                 let round_future = async {
                     let mut inserted = 0usize;
                     let mut remote_tip_height = 0u64;
-                    for _ in 0..MAX_PAGES_PER_ROUND {
+                    for _ in 0..max_pages_per_round {
                         let outcome = pull_record_commitment_page(
                             &storage,
                             &peer_store,
