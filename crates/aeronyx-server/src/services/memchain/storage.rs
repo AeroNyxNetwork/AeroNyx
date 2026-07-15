@@ -50,6 +50,8 @@
 //! - v12 (v2.7.22-CheckpointCertificate): Immutable bounded certificates that
 //!   bind distinct operator-pinned witness frames to one locally audited
 //!   checkpoint without claiming distributed consensus or fork choice.
+//! - v2.7.23-CertificateExchange: Snapshot-audited internal bundle export for
+//!   the admitted fixed-size peer protocol; the schema remains v12.
 //! - v2.7.4-BlockIntegrityStatus: Runtime-only evidence for the most recent
 //!   complete persisted-chain audit and subsequently verified appends.
 //! - v2.7.5-CheckpointProof: Runtime-only signed checkpoint reconciliation
@@ -190,6 +192,8 @@
 //!   and an atomic local commitment-production safety latch.
 //! v2.7.22-CheckpointCertificate - Schema v12 immutable bounded multi-witness
 //!   checkpoint certificates with restart-time cryptographic re-audit.
+//! v2.7.23-CertificateExchange - Added audited internal certificate export;
+//!   no schema or public-status contract change.
 // ============================================
 
 use std::collections::{HashMap, VecDeque};
@@ -479,6 +483,20 @@ pub struct RecordCommitmentCheckpointStatus {
     pub evidence_persistence_failures_total: u64,
     /// Explicit privacy boundary for operators and API consumers.
     pub privacy_policy: &'static str,
+}
+
+/// Fully audited internal certificate material for one peer response.
+///
+/// This type must never be serialized into public status or heartbeat. Member
+/// frames expose witness identities and signatures, so only the authenticated
+/// MemChain peer handler may consume it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordCommitmentCheckpointCertificateBundle {
+    pub(crate) checkpoint_height: u64,
+    pub(crate) checkpoint_hash: [u8; 32],
+    pub(crate) certificate_digest: [u8; 32],
+    pub(crate) required_signers: usize,
+    pub(crate) member_frames: Vec<Vec<u8>>,
 }
 
 pub(crate) const COMMITMENT_SYNC_EVENT_CAPACITY: usize = 16;

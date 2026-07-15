@@ -12,6 +12,7 @@
 //! ## Main Functionality
 //! - `POST /api/memchain/peer/block-range`
 //! - `POST /api/memchain/peer/checkpoint`
+//! - `POST /api/memchain/peer/checkpoint-certificate`
 //! - Bincode `MemChainMessage` request/response with the existing magic byte.
 //! - Signed discovery-peer admission, timestamp freshness, replay protection,
 //!   per-peer rate limiting, and bounded pagination.
@@ -30,6 +31,8 @@
 //!   service counters and cannot manufacture local convergence or divergence.
 //! - Audit-gated block pages assembled from one SQLite snapshot and
 //!   canonically reverified before the node signs a response.
+//! - Fixed-size certificate exchange between admitted peers. Imported members
+//!   must still belong to the receiver's operator-pinned witness set.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` on the public node peer listener and local operator
@@ -69,8 +72,11 @@
 //!   controls its requested height/hash, so those values are not local evidence.
 //! - Never sign a range assembled from separate block/tip reads or from a
 //!   missing/stale process audit baseline.
+//! - Imported certificates are post-startup evidence only. Never let a replayed
+//!   bundle satisfy the live startup witness threshold.
 //!
 //! ## Last Modified
+//! v2.8.7-CertificateExchange - Added admitted fixed-size certificate exchange.
 //! v2.8.6-CheckpointCertificate - Require distinct pinned witnesses for certificate rounds.
 //! v2.8.5-TrustedDivergenceHalt - Preserve verified divergence after sticky incident creation.
 //! v2.8.3-WitnessDivergence - Exposed crate-local reconciliation for startup tests.
@@ -111,7 +117,10 @@ use aeronyx_core::ledger::{
 use aeronyx_core::protocol::memchain::{
     decode_memchain, encode_memchain, record_block_range_request_signing_bytes,
     record_block_range_response_signing_bytes, record_chain_checkpoint_request_signing_bytes,
-    record_chain_checkpoint_response_signing_bytes, MemChainMessage, MEMCHAIN_MAGIC,
+    record_chain_checkpoint_response_signing_bytes, record_checkpoint_certificate_digest_v1,
+    record_checkpoint_certificate_request_signing_bytes,
+    record_checkpoint_certificate_response_signing_bytes, MemChainMessage,
+    RecordCheckpointCertificateMemberV1, MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1, MEMCHAIN_MAGIC,
 };
 use aeronyx_core::protocol::NodeCapability;
 use sha2::{Digest, Sha256};
@@ -224,11 +233,39 @@ pub struct CommitmentReconciliationOutcome {
     pub certificate_persistence_failed: bool,
 }
 
+/// Privacy-safe result of importing one independently verified certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitmentCertificateImportOutcome {
+    /// Certified local height; hashes and witness identities remain private.
+    pub checkpoint_height: u64,
+    /// Distinct pinned witnesses represented by exact signed frames.
+    pub signer_count: usize,
+    /// Threshold embedded in the immutable certificate.
+    pub required_signers: usize,
+    /// Whether storage contains a fully re-audited certificate afterward.
+    pub persisted: bool,
+}
+
 #[derive(Debug)]
 struct VerifiedCommitmentPage {
     blocks: Vec<RecordCommitmentBlockV1>,
     has_more: bool,
     tip_height: u64,
+}
+
+#[derive(Debug)]
+struct VerifiedCertificateMember {
+    observed_at: u64,
+    remote_tip_height: u64,
+    evidence_digest: [u8; 32],
+    frame: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct VerifiedCheckpointCertificate {
+    checkpoint_height: u64,
+    required_signers: usize,
+    members: Vec<VerifiedCertificateMember>,
 }
 
 #[derive(Clone)]
@@ -289,6 +326,10 @@ pub fn build_memchain_peer_router(
     Router::new()
         .route("/api/memchain/peer/block-range", post(block_range_handler))
         .route("/api/memchain/peer/checkpoint", post(checkpoint_handler))
+        .route(
+            "/api/memchain/peer/checkpoint-certificate",
+            post(checkpoint_certificate_handler),
+        )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
@@ -412,6 +453,136 @@ async fn pull_record_commitment_checkpoint_with_witness_policy(
         return Err("checkpoint_witness_equivocation".to_string());
     }
     Ok(outcome)
+}
+
+/// Pulls and imports one current-tip certificate from an admitted peer.
+///
+/// The serving peer is transport only. Every historical member must verify as
+/// an exact signed checkpoint frame from a distinct identity in
+/// `allowed_witnesses`. `minimum_required_signers` is the receiver's current
+/// operator policy and cannot be downgraded by the serving peer. Callers must
+/// use this after startup; a replayed bundle never replaces the live startup
+/// witness round.
+///
+/// # Errors
+///
+/// Returns a stable privacy-safe code when peer admission, transport, outer
+/// freshness, member signatures, operator pinning, digest, or durable storage
+/// verification fails.
+pub async fn pull_record_commitment_checkpoint_certificate(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    source_node_id: &[u8; 32],
+    allowed_witnesses: &[[u8; 32]],
+    minimum_required_signers: usize,
+    client: &reqwest::Client,
+) -> Result<CommitmentCertificateImportOutcome, String> {
+    if !(2..=MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1).contains(&minimum_required_signers)
+        || allowed_witnesses.len() < minimum_required_signers
+    {
+        return Err("certificate_policy_invalid".to_string());
+    }
+    let request_timestamp = now_secs();
+    let source = peer_store
+        .get_valid(source_node_id, request_timestamp)
+        .ok_or_else(|| "certificate_source_unavailable".to_string())?;
+    let endpoint = source
+        .descriptor
+        .public_endpoint
+        .as_deref()
+        .ok_or_else(|| "certificate_source_missing_endpoint".to_string())?;
+    let url = commitment_checkpoint_certificate_url(endpoint)?;
+    let (known_tip_height, known_tip_hash) = verified_local_commitment_tip(storage).await?;
+    if known_tip_height == 0 {
+        return Err("certificate_local_tip_unavailable".to_string());
+    }
+
+    let mut request_id = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut request_id);
+    let requester = identity.public_key_bytes();
+    let signing_bytes = record_checkpoint_certificate_request_signing_bytes(
+        &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+        known_tip_height,
+        &known_tip_hash,
+        &request_id,
+        &requester,
+        request_timestamp,
+    );
+    let request = MemChainMessage::RecordCheckpointCertificateRequestV1 {
+        chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+        known_tip_height,
+        known_tip_hash,
+        request_id,
+        requester,
+        request_timestamp,
+        signature: identity.sign(&signing_bytes),
+    };
+    let frame = encode_memchain(&request).map_err(|_| "request_encode_failed".to_string())?;
+    let response = client
+        .post(url)
+        .header("content-type", "application/octet-stream")
+        .body(frame)
+        .send()
+        .await
+        .map_err(|error| classify_http_error("certificate_request", &error))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "certificate_http_status_{}",
+            response.status().as_u16()
+        ));
+    }
+    let body = read_bounded_response(response).await?;
+    let verified = verify_checkpoint_certificate_response(
+        &body,
+        &request_id,
+        source_node_id,
+        (known_tip_height, known_tip_hash),
+        allowed_witnesses,
+        minimum_required_signers,
+        now_secs(),
+    )?;
+
+    let mut evidence_digests = Vec::with_capacity(verified.members.len());
+    for member in &verified.members {
+        let relation = if member.remote_tip_height == verified.checkpoint_height {
+            "converged"
+        } else {
+            "remote_ahead"
+        };
+        let persist_outcome = storage
+            .persist_record_commitment_checkpoint_evidence_with_witness_policy(
+                member.observed_at,
+                relation,
+                verified.checkpoint_height,
+                member.remote_tip_height,
+                verified.checkpoint_height,
+                &member.evidence_digest,
+                &member.frame,
+                true,
+            )
+            .await
+            .map_err(|_| "certificate_member_persist_failed".to_string())?;
+        if persist_outcome != RecordCommitmentCheckpointEvidencePersistOutcome::Stored {
+            return Err("certificate_member_security_incident".to_string());
+        }
+        evidence_digests.push(member.evidence_digest);
+    }
+    let persisted = storage
+        .persist_record_commitment_checkpoint_certificate(
+            now_secs(),
+            verified.required_signers,
+            allowed_witnesses,
+            &evidence_digests,
+        )
+        .await
+        .map_err(|_| "certificate_persist_failed".to_string())?;
+    Ok(CommitmentCertificateImportOutcome {
+        checkpoint_height: verified.checkpoint_height,
+        signer_count: verified.members.len(),
+        required_signers: verified.required_signers,
+        persisted,
+    })
 }
 
 /// Collects a bounded set of signed checkpoint observations from discovered
@@ -864,6 +1035,10 @@ fn commitment_checkpoint_url(endpoint: &str) -> Result<Url, String> {
     commitment_peer_url(endpoint, "/api/memchain/peer/checkpoint")
 }
 
+fn commitment_checkpoint_certificate_url(endpoint: &str) -> Result<Url, String> {
+    commitment_peer_url(endpoint, "/api/memchain/peer/checkpoint-certificate")
+}
+
 fn commitment_peer_url(endpoint: &str, path: &str) -> Result<Url, String> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
@@ -892,6 +1067,160 @@ fn commitment_peer_url(endpoint: &str, path: &str) -> Result<Url, String> {
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
+}
+
+fn verify_checkpoint_certificate_response(
+    body: &[u8],
+    expected_request_id: &[u8; 16],
+    expected_responder: &[u8; 32],
+    local_tip: (u64, [u8; 32]),
+    allowed_witnesses: &[[u8; 32]],
+    minimum_required_signers: usize,
+    now: u64,
+) -> Result<VerifiedCheckpointCertificate, String> {
+    if body.first().copied() != Some(MEMCHAIN_MAGIC) {
+        return Err("invalid_certificate_frame".to_string());
+    }
+    let response = decode_memchain(&body[1..]).map_err(|_| "invalid_certificate_frame")?;
+    let canonical = encode_memchain(&response).map_err(|_| "invalid_certificate_frame")?;
+    if canonical != body {
+        return Err("noncanonical_certificate_frame".to_string());
+    }
+    let MemChainMessage::RecordCheckpointCertificateResponseV1 {
+        chain_id,
+        request_id,
+        responder,
+        response_timestamp,
+        checkpoint_height,
+        checkpoint_hash,
+        certificate_digest,
+        required_signers,
+        members,
+        signature,
+    } = response
+    else {
+        return Err("unexpected_certificate_message".to_string());
+    };
+    if chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID {
+        return Err("certificate_chain_mismatch".to_string());
+    }
+    if request_id != *expected_request_id {
+        return Err("certificate_request_mismatch".to_string());
+    }
+    if responder != *expected_responder {
+        return Err("certificate_responder_mismatch".to_string());
+    }
+    if now.abs_diff(response_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
+        return Err("stale_certificate_response".to_string());
+    }
+    if checkpoint_height == 0 || checkpoint_height != local_tip.0 || checkpoint_hash != local_tip.1
+    {
+        return Err("certificate_local_tip_mismatch".to_string());
+    }
+    let signer_count = members.iter().flatten().count();
+    let required_signers = usize::from(required_signers);
+    if !(2..=MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1).contains(&required_signers)
+        || signer_count < required_signers
+        || signer_count > MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1
+    {
+        return Err("certificate_threshold_invalid".to_string());
+    }
+    if required_signers < minimum_required_signers {
+        return Err("certificate_threshold_below_policy".to_string());
+    }
+    let signing_bytes = record_checkpoint_certificate_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &responder,
+        response_timestamp,
+        checkpoint_height,
+        &checkpoint_hash,
+        &certificate_digest,
+        required_signers as u8,
+        signer_count as u8,
+    );
+    IdentityPublicKey::from_bytes(&responder)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .map_err(|_| "invalid_certificate_response_signature".to_string())?;
+
+    let mut saw_empty_slot = false;
+    let mut previous_responder = None;
+    let mut digest_members = Vec::with_capacity(signer_count);
+    let mut verified_members = Vec::with_capacity(signer_count);
+    for slot in members {
+        let Some(member) = slot else {
+            saw_empty_slot = true;
+            continue;
+        };
+        if saw_empty_slot {
+            return Err("certificate_members_not_packed".to_string());
+        }
+        if previous_responder.is_some_and(|previous| previous >= member.responder) {
+            return Err("certificate_members_not_distinct_sorted".to_string());
+        }
+        previous_responder = Some(member.responder);
+        if !allowed_witnesses.contains(&member.responder) {
+            return Err("certificate_member_not_pinned".to_string());
+        }
+        if member.response_timestamp > now.saturating_add(REQUEST_TIMESTAMP_SKEW_SECS) {
+            return Err("certificate_member_timestamp_invalid".to_string());
+        }
+        if member.checkpoint_height != checkpoint_height
+            || member.checkpoint_hash != checkpoint_hash
+            || member.tip_height < checkpoint_height
+            || (member.tip_height == checkpoint_height && member.tip_hash != checkpoint_hash)
+        {
+            return Err("certificate_member_claim_invalid".to_string());
+        }
+        let member_signing_bytes = record_chain_checkpoint_response_signing_bytes(
+            &chain_id,
+            &member.request_id,
+            &member.responder,
+            member.response_timestamp,
+            member.checkpoint_height,
+            &member.checkpoint_hash,
+            member.tip_height,
+            &member.tip_hash,
+        );
+        IdentityPublicKey::from_bytes(&member.responder)
+            .and_then(|key| key.verify(&member_signing_bytes, &member.signature))
+            .map_err(|_| "invalid_certificate_member_signature".to_string())?;
+        let frame = encode_memchain(&MemChainMessage::RecordChainCheckpointResponseV1 {
+            chain_id,
+            request_id: member.request_id,
+            responder: member.responder,
+            response_timestamp: member.response_timestamp,
+            checkpoint_height: member.checkpoint_height,
+            checkpoint_hash: member.checkpoint_hash,
+            tip_height: member.tip_height,
+            tip_hash: member.tip_hash,
+            signature: member.signature,
+        })
+        .map_err(|_| "certificate_member_encode_failed".to_string())?;
+        let evidence_digest: [u8; 32] = Sha256::digest(&frame).into();
+        digest_members.push((member.responder, evidence_digest));
+        verified_members.push(VerifiedCertificateMember {
+            observed_at: member.response_timestamp,
+            remote_tip_height: member.tip_height,
+            evidence_digest,
+            frame,
+        });
+    }
+    let computed_digest = record_checkpoint_certificate_digest_v1(
+        &chain_id,
+        checkpoint_height,
+        &checkpoint_hash,
+        required_signers,
+        &digest_members,
+    );
+    if computed_digest != certificate_digest {
+        return Err("certificate_digest_mismatch".to_string());
+    }
+    Ok(VerifiedCheckpointCertificate {
+        checkpoint_height,
+        required_signers,
+        members: verified_members,
+    })
 }
 
 async fn verify_record_commitment_checkpoint(
@@ -1122,6 +1451,174 @@ fn classify_http_error(phase: &str, error: &reqwest::Error) -> String {
         "unknown"
     };
     format!("{phase}_{kind}")
+}
+
+fn checkpoint_certificate_member_from_frame(
+    frame: &[u8],
+    expected_chain_id: &[u8; 32],
+) -> Result<RecordCheckpointCertificateMemberV1, String> {
+    if frame.first().copied() != Some(MEMCHAIN_MAGIC) {
+        return Err("certificate_member_frame_invalid".to_string());
+    }
+    let message =
+        decode_memchain(&frame[1..]).map_err(|_| "certificate_member_frame_invalid".to_string())?;
+    let canonical =
+        encode_memchain(&message).map_err(|_| "certificate_member_frame_invalid".to_string())?;
+    if canonical != frame {
+        return Err("certificate_member_frame_noncanonical".to_string());
+    }
+    let MemChainMessage::RecordChainCheckpointResponseV1 {
+        chain_id,
+        request_id,
+        responder,
+        response_timestamp,
+        checkpoint_height,
+        checkpoint_hash,
+        tip_height,
+        tip_hash,
+        signature,
+    } = message
+    else {
+        return Err("certificate_member_frame_unexpected".to_string());
+    };
+    if chain_id != *expected_chain_id {
+        return Err("certificate_member_chain_mismatch".to_string());
+    }
+    Ok(RecordCheckpointCertificateMemberV1 {
+        request_id,
+        responder,
+        response_timestamp,
+        checkpoint_height,
+        checkpoint_hash,
+        tip_height,
+        tip_hash,
+        signature,
+    })
+}
+
+async fn checkpoint_certificate_handler(
+    State(state): State<MemChainPeerState>,
+    body: Bytes,
+) -> Response {
+    if body.first().copied() != Some(MEMCHAIN_MAGIC) {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame");
+    }
+    let message = match decode_memchain(&body[1..]) {
+        Ok(message) => message,
+        Err(_) => return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame"),
+    };
+    let MemChainMessage::RecordCheckpointCertificateRequestV1 {
+        chain_id,
+        known_tip_height,
+        known_tip_hash,
+        request_id,
+        requester,
+        request_timestamp,
+        signature,
+    } = message
+    else {
+        return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
+    };
+
+    let now = now_secs();
+    if chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID || known_tip_height == 0 {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_certificate_request");
+    }
+    if now.abs_diff(request_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
+        return protocol_error(StatusCode::UNAUTHORIZED, "stale_request");
+    }
+    if state.peer_store.get_valid(&requester, now).is_none() {
+        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
+    }
+    let signing_bytes = record_checkpoint_certificate_request_signing_bytes(
+        &chain_id,
+        known_tip_height,
+        &known_tip_hash,
+        &request_id,
+        &requester,
+        request_timestamp,
+    );
+    if IdentityPublicKey::from_bytes(&requester)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .is_err()
+    {
+        return protocol_error(StatusCode::UNAUTHORIZED, "invalid_signature");
+    }
+    if !state.guard.lock().await.admit(requester, request_id, now) {
+        return protocol_error(StatusCode::TOO_MANY_REQUESTS, "rate_or_replay_limited");
+    }
+
+    let bundle = match state
+        .storage
+        .record_commitment_checkpoint_certificate_bundle(known_tip_height, &known_tip_hash)
+        .await
+    {
+        Ok(Some(bundle)) => bundle,
+        Ok(None) => return protocol_error(StatusCode::NOT_FOUND, "certificate_unavailable"),
+        Err(error) => {
+            warn!(error = %error, "[MEMCHAIN_BLOCK] Refused unaudited certificate export");
+            return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "certificate_not_verified");
+        }
+    };
+    if !(2..=MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1).contains(&bundle.required_signers)
+        || bundle.member_frames.len() < bundle.required_signers
+        || bundle.member_frames.len() > MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1
+    {
+        return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "certificate_not_verified");
+    }
+    let mut members = [None; MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1];
+    for (slot, frame) in members.iter_mut().zip(bundle.member_frames.iter()) {
+        *slot = match checkpoint_certificate_member_from_frame(frame, &chain_id) {
+            Ok(member) => Some(member),
+            Err(error) => {
+                warn!(error = %error, "[MEMCHAIN_BLOCK] Refused invalid certificate member");
+                return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "certificate_not_verified");
+            }
+        };
+    }
+    let responder = state.identity.public_key_bytes();
+    let response_timestamp = now_secs();
+    let response_signing_bytes = record_checkpoint_certificate_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &responder,
+        response_timestamp,
+        bundle.checkpoint_height,
+        &bundle.checkpoint_hash,
+        &bundle.certificate_digest,
+        bundle.required_signers as u8,
+        bundle.member_frames.len() as u8,
+    );
+    let response = MemChainMessage::RecordCheckpointCertificateResponseV1 {
+        chain_id,
+        request_id,
+        responder,
+        response_timestamp,
+        checkpoint_height: bundle.checkpoint_height,
+        checkpoint_hash: bundle.checkpoint_hash,
+        certificate_digest: bundle.certificate_digest,
+        required_signers: bundle.required_signers as u8,
+        members,
+        signature: state.identity.sign(&response_signing_bytes),
+    };
+    let encoded = match encode_memchain(&response) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            warn!(error = %error, "[MEMCHAIN_BLOCK] Failed to encode certificate response");
+            return protocol_error(StatusCode::INTERNAL_SERVER_ERROR, "encode_error");
+        }
+    };
+    debug!(
+        checkpoint_height = bundle.checkpoint_height,
+        signer_count = bundle.member_frames.len(),
+        "[MEMCHAIN_BLOCK] Served authenticated checkpoint certificate"
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        encoded,
+    )
+        .into_response()
 }
 
 async fn checkpoint_handler(State(state): State<MemChainPeerState>, body: Bytes) -> Response {
@@ -1458,6 +1955,12 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "http://node.example:9281/api/memchain/peer/checkpoint"
+        );
+        assert_eq!(
+            commitment_checkpoint_certificate_url("node.example:9281/path")
+                .unwrap()
+                .as_str(),
+            "http://node.example:9281/api/memchain/peer/checkpoint-certificate"
         );
     }
 
@@ -2546,9 +3049,108 @@ mod tests {
         assert_eq!(status.latest_certified_height, Some(1));
         assert_eq!(status.latest_certificate_signers, 2);
 
+        let destination_identity = IdentityKeyPair::generate();
+        let destination = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        destination
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        destination.audit_record_commitment_chain().await.unwrap();
+        destination
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+
+        let source_identity = Arc::new(coordinator);
+        let source_peers = Arc::new(PeerStore::new());
+        admit_peer(&source_peers, &destination_identity, None, now);
+        let source_router = build_memchain_peer_router(
+            Arc::clone(&local),
+            source_peers,
+            Arc::clone(&source_identity),
+        );
+        let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_address = source_listener.local_addr().unwrap();
+        let source_server = tokio::spawn(async move {
+            axum::serve(source_listener, source_router).await.unwrap();
+        });
+
+        let destination_peers = PeerStore::new();
+        admit_peer(
+            &destination_peers,
+            &source_identity,
+            Some(format!("http://{source_address}")),
+            now,
+        );
+        let imported = pull_record_commitment_checkpoint_certificate(
+            &destination,
+            &destination_peers,
+            &destination_identity,
+            &source_identity.public_key_bytes(),
+            &witness_ids,
+            2,
+            &client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(imported.checkpoint_height, 1);
+        assert_eq!(imported.signer_count, 2);
+        assert_eq!(imported.required_signers, 2);
+        assert!(imported.persisted);
+        assert_eq!(
+            destination
+                .record_commitment_checkpoint_status()
+                .checkpoint_certificates,
+            1
+        );
+
+        let third_witness = IdentityKeyPair::generate().public_key_bytes();
+        let strict_witness_ids = [witness_ids[0], witness_ids[1], third_witness];
+        let error = pull_record_commitment_checkpoint_certificate(
+            &destination,
+            &destination_peers,
+            &destination_identity,
+            &source_identity.public_key_bytes(),
+            &strict_witness_ids,
+            3,
+            &client,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "certificate_threshold_below_policy");
+
+        let unpinned_destination = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        unpinned_destination
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        unpinned_destination
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+        unpinned_destination
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        let alternative_witness = IdentityKeyPair::generate().public_key_bytes();
+        let error = pull_record_commitment_checkpoint_certificate(
+            &unpinned_destination,
+            &destination_peers,
+            &destination_identity,
+            &source_identity.public_key_bytes(),
+            &[witness_ids[0], alternative_witness],
+            2,
+            &client,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "certificate_member_not_pinned");
+
         for server in servers {
             server.abort();
             let _ = server.await;
         }
+        source_server.abort();
+        let _ = source_server.await;
     }
 }

@@ -162,6 +162,8 @@
 //      blocks coordinator startup before listeners even after later convergence.
 //  69. Retains an operator-pinned witness's divergent shared-prefix proof as a
 //      sticky incident and atomically halts local commitment production.
+//  70. Exchanges fully audited checkpoint certificates only after startup;
+//      imported bundles cannot replace the live pinned-witness startup gate.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -192,6 +194,8 @@
 //     may rotate their signed endpoints, but unpinned peers stay evidence-only.
 //   - The minimum verified witness count is an operator startup threshold over
 //     distinct pins. It is not consensus, quorum, finality, or fork choice.
+//   - Certificate exchange is post-startup evidence transport only. Never use
+//     an imported historical bundle to satisfy the live startup witness gate.
 //   - Outbound peer HTTP responses must pass the shared bounded readers in
 //     api/mod.rs; discovery recovery files use this file's bounded file reader.
 //     Never reintroduce response.json(), response.bytes(), response.text(), or
@@ -216,6 +220,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.8.7-CertificateExchange - Post-startup audited certificate exchange
 //   v2.8.5-TrustedDivergenceHalt - Sticky trusted fork evidence and live production halt
 //   v2.8.3-WitnessDivergence - Signed divergent startup-gate integration test
 //   v2.8.1-BlockFollowerOps - Configurable bounded catch-up round budget
@@ -349,7 +354,8 @@ use crate::api::discovery::{
     GossipResponse,
 };
 use crate::api::memchain_peer::{
-    build_memchain_peer_router, pull_record_commitment_checkpoint, pull_record_commitment_page,
+    build_memchain_peer_router, pull_record_commitment_checkpoint,
+    pull_record_commitment_checkpoint_certificate, pull_record_commitment_page,
     reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
     reconcile_record_commitment_witnesses, CommitmentCheckpointRelation,
     CommitmentReconciliationOutcome,
@@ -3053,7 +3059,7 @@ impl Server {
                 "[MEMCHAIN_BLOCK] Coordinator witness reconciliation started"
             );
 
-            loop {
+            'witness_loop: loop {
                 tokio::select! {
                     _ = shutdown_rx.recv() => break,
                     _ = tokio::time::sleep(next_delay) => {}
@@ -3101,6 +3107,53 @@ impl Server {
                         certificate_required_signers = round.certificate_required_signers,
                         "[MEMCHAIN_BLOCK] Checkpoint certificate persistence failed"
                     );
+                }
+                if !pinned_witness_node_ids.is_empty()
+                    && certificate_minimum_signers >= 2
+                    && !round.certificate_persisted
+                    && !round.certificate_persistence_failed
+                {
+                    // Certificate exchange is deliberately post-startup. It
+                    // supplements durable audit evidence but can never satisfy
+                    // the live startup witness threshold or choose a chain.
+                    let mut imported = 0usize;
+                    let mut rejected = 0usize;
+                    for source_node_id in
+                        pinned_witness_node_ids.iter().take(MAX_WITNESSES_PER_ROUND)
+                    {
+                        let result = tokio::select! {
+                            _ = shutdown_rx.recv() => break 'witness_loop,
+                            result = pull_record_commitment_checkpoint_certificate(
+                                &storage,
+                                &peer_store,
+                                &identity,
+                                source_node_id,
+                                &pinned_witness_node_ids,
+                                certificate_minimum_signers,
+                                &client,
+                            ) => result,
+                        };
+                        match result {
+                            Ok(outcome) if outcome.persisted => {
+                                imported = imported.saturating_add(1);
+                                break;
+                            }
+                            Ok(_) | Err(_) => rejected = rejected.saturating_add(1),
+                        }
+                    }
+                    if imported > 0 {
+                        debug!(
+                            imported,
+                            rejected,
+                            "[MEMCHAIN_BLOCK] Imported audited checkpoint certificate evidence"
+                        );
+                    }
+                    if storage.record_commitment_production_halted() {
+                        error!(
+                            "[MEMCHAIN_BLOCK] Imported checkpoint evidence triggered a trusted security incident; commitment production remains halted"
+                        );
+                        break;
+                    }
                 }
 
                 if round.attempted == 0 {

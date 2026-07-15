@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.0-ChatPullV2
+// Version: 2.8.7-CheckpointCertificateExchange
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -14,6 +14,8 @@
 //   variants. Existing discriminants remain unchanged.
 //   v2.8.0-ChatPullV2 — Appended authenticated opaque-cursor request/response
 //   variants. Existing v1 chat pull discriminants and wire bytes are unchanged.
+//   v2.8.7-CheckpointCertificateExchange — Appended fixed-size, signed
+//   certificate request/response variants for admitted node peers.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -38,14 +40,16 @@
 //   - v1.3.0 is a BREAKING CHANGE: DeviceRegister, ChatPull, ChatAck wire
 //     format changed — old clients cannot talk to new servers and vice versa
 //   - WalletPresence (17) is a lightweight heartbeat — node never replies
-//   - Record block range/checkpoint frames (19-22) are node-peer control messages and
-//     MUST NOT be accepted from ordinary VPN/client tunnel sessions
+//   - Record block/checkpoint/certificate frames (19-22, 25-26) are node-peer
+//     control messages and MUST NOT be accepted from ordinary client tunnels
 //   - Commitment blocks contain opaque record IDs only; sealed memory payload
 //     replication requires a separate owner-authorised protocol
 //   - serde_bytes64 is defined in chat.rs; the [u8;64] signature fields here
 //     use the same two-[u8;32] trick for bincode compatibility
 //
 // Last Modified:
+//   v2.8.7-CheckpointCertificateExchange — Appended variants 25-26 and fixed
+//                        certificate member/signing contracts
 //   v2.8.0-ChatPullV2 — Appended variants 23-24 for monotonic mailbox paging
 //   v1.2.0-MultiDevice — Added DeviceRegister (index 16)
 //   v1.3.0-Sovereign   — Added wallet_pubkey/timestamp/signature to
@@ -89,6 +93,12 @@ pub const MEMCHAIN_MAGIC: u8 = 0xAE;
 /// attacker-controlled allocations before wallet signature verification.
 pub const MAX_CHAT_PULL_CURSOR_V2_BYTES: usize = 128;
 
+/// Maximum independently signed witness frames carried by one certificate.
+///
+/// The fixed three-slot wire representation prevents attacker-controlled
+/// collection lengths from allocating memory before peer authentication.
+pub const MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1: usize = 3;
+
 // ============================================
 // Internal serde helper for [u8; 64]
 // ============================================
@@ -113,6 +123,32 @@ mod serde_bytes64 {
         out[32..].copy_from_slice(&hi);
         Ok(out)
     }
+}
+
+/// Fixed-size representation of one historical signed checkpoint response.
+///
+/// The certificate response supplies the common `chain_id`. Reconstructing a
+/// [`MemChainMessage::RecordChainCheckpointResponseV1`] from these fields
+/// yields the exact frame whose SHA-256 digest is committed by the certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordCheckpointCertificateMemberV1 {
+    /// Original request identifier signed by the witness.
+    pub request_id: [u8; 16],
+    /// Witness Ed25519 public key.
+    pub responder: [u8; 32],
+    /// Original response timestamp signed by the witness.
+    pub response_timestamp: u64,
+    /// Certified shared-prefix height.
+    pub checkpoint_height: u64,
+    /// Witness block hash at `checkpoint_height`.
+    pub checkpoint_hash: [u8; 32],
+    /// Witness tip height when it signed the response.
+    pub tip_height: u64,
+    /// Witness tip hash when it signed the response.
+    pub tip_hash: [u8; 32],
+    /// Original witness signature over the v1 checkpoint response fields.
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
 }
 
 // ============================================
@@ -156,6 +192,8 @@ mod serde_bytes64 {
 /// | 22    | RecordChainCheckpointResponseV1| v2.7.5-CheckpointProof |
 /// | 23    | ChatPullV2          | v2.8.0-ChatPullV2       |
 /// | 24    | ChatPullResponseV2  | v2.8.0-ChatPullV2       |
+/// | 25    | RecordCheckpointCertificateRequestV1 | v2.8.7-CertificateExchange |
+/// | 26    | RecordCheckpointCertificateResponseV1| v2.8.7-CertificateExchange |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(deprecated)]
 pub enum MemChainMessage {
@@ -466,6 +504,60 @@ pub enum MemChainMessage {
         /// Whether the current snapshot still contains another page.
         has_more: bool,
     },
+
+    // ── v2.8.7: admitted checkpoint-certificate exchange (indices 25-26) ──
+    /// [index 25] Requests a certificate for the requester's exact audited tip.
+    ///
+    /// This frame cannot request arbitrary history. The serving peer returns a
+    /// bundle only when its latest retained certificate matches both height
+    /// and hash, preventing certificate enumeration by admitted peers.
+    RecordCheckpointCertificateRequestV1 {
+        /// Expected production/private chain identifier.
+        chain_id: [u8; 32],
+        /// Requester's fully audited local tip height.
+        known_tip_height: u64,
+        /// Requester's fully audited local tip hash.
+        known_tip_hash: [u8; 32],
+        /// Per-request random identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Requesting node's Ed25519 public key.
+        requester: [u8; 32],
+        /// Unix epoch seconds; peers reject stale requests.
+        request_timestamp: u64,
+        /// Requester signature over the canonical certificate request fields.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+
+    /// [index 26] Returns one bounded, independently verifiable certificate.
+    ///
+    /// Slots are packed from index zero and sorted by witness identity. The
+    /// outer responder signature proves fresh transport; every member keeps
+    /// its own historical witness signature and remains independently valid.
+    RecordCheckpointCertificateResponseV1 {
+        /// Production/private chain identifier.
+        chain_id: [u8; 32],
+        /// Request identifier copied from the request.
+        request_id: [u8; 16],
+        /// Serving node's Ed25519 public key.
+        responder: [u8; 32],
+        /// Unix epoch seconds when this bundle was served.
+        response_timestamp: u64,
+        /// Exact certified local tip height.
+        checkpoint_height: u64,
+        /// Exact certified local tip hash.
+        checkpoint_hash: [u8; 32],
+        /// Domain-separated digest of the certificate metadata and members.
+        certificate_digest: [u8; 32],
+        /// Operator threshold used when the certificate was created.
+        required_signers: u8,
+        /// Fixed bounded member slots; unused trailing entries are `None`.
+        members:
+            [Option<RecordCheckpointCertificateMemberV1>; MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1],
+        /// Serving node signature over the fresh response metadata.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
 }
 
 fn deserialize_chat_pull_cursor_v2<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -612,6 +704,92 @@ pub fn record_chain_checkpoint_response_signing_bytes(
     bytes.extend_from_slice(&tip_height.to_le_bytes());
     bytes.extend_from_slice(tip_hash);
     bytes
+}
+
+/// Canonical bytes signed by
+/// `RecordCheckpointCertificateRequestV1.requester`.
+#[must_use]
+pub fn record_checkpoint_certificate_request_signing_bytes(
+    chain_id: &[u8; 32],
+    known_tip_height: u64,
+    known_tip_hash: &[u8; 32],
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(178);
+    bytes.extend_from_slice(b"AeroNyx-RecordCheckpointCertificateRequest-v1");
+    bytes.extend_from_slice(chain_id);
+    bytes.extend_from_slice(&known_tip_height.to_le_bytes());
+    bytes.extend_from_slice(known_tip_hash);
+    bytes.extend_from_slice(request_id);
+    bytes.extend_from_slice(requester);
+    bytes.extend_from_slice(&request_timestamp.to_le_bytes());
+    bytes
+}
+
+/// Canonical bytes signed by
+/// `RecordCheckpointCertificateResponseV1.responder`.
+///
+/// `certificate_digest` already commits the exact independently signed member
+/// frames, so the transport signature binds that digest rather than repeating
+/// historical witness material in the signing preimage.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn record_checkpoint_certificate_response_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    responder: &[u8; 32],
+    response_timestamp: u64,
+    checkpoint_height: u64,
+    checkpoint_hash: &[u8; 32],
+    certificate_digest: &[u8; 32],
+    required_signers: u8,
+    signer_count: u8,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(240);
+    bytes.extend_from_slice(b"AeroNyx-RecordCheckpointCertificateResponse-v1");
+    bytes.extend_from_slice(chain_id);
+    bytes.extend_from_slice(request_id);
+    bytes.extend_from_slice(responder);
+    bytes.extend_from_slice(&response_timestamp.to_le_bytes());
+    bytes.extend_from_slice(&checkpoint_height.to_le_bytes());
+    bytes.extend_from_slice(checkpoint_hash);
+    bytes.extend_from_slice(certificate_digest);
+    bytes.push(required_signers);
+    bytes.push(signer_count);
+    bytes
+}
+
+/// Computes the canonical v1 checkpoint-certificate digest.
+///
+/// Each tuple is `(witness_identity, SHA-256(exact signed checkpoint frame))`.
+/// Sorting makes the digest independent of network arrival order while still
+/// requiring distinct identities at the verifier and storage layers.
+#[must_use]
+pub fn record_checkpoint_certificate_digest_v1(
+    chain_id: &[u8; 32],
+    checkpoint_height: u64,
+    checkpoint_hash: &[u8; 32],
+    required_signers: usize,
+    members: &[([u8; 32], [u8; 32])],
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut ordered = members.to_vec();
+    ordered.sort_unstable_by_key(|member| member.0);
+    let mut digest = Sha256::new();
+    digest.update(b"AERONYX_RECORD_CHECKPOINT_CERTIFICATE_V1");
+    digest.update(chain_id);
+    digest.update(checkpoint_height.to_be_bytes());
+    digest.update(checkpoint_hash);
+    digest.update((required_signers as u64).to_be_bytes());
+    digest.update((ordered.len() as u64).to_be_bytes());
+    for (responder, evidence_digest) in ordered {
+        digest.update(responder);
+        digest.update(evidence_digest);
+    }
+    digest.finalize().into()
 }
 
 // ============================================
@@ -1023,6 +1201,51 @@ mod tests {
         })
         .unwrap();
         assert_eq!(disc(&b), 24, "ChatPullResponseV2 must be discriminant 24");
+
+        let b = bincode::serialize(&MemChainMessage::RecordCheckpointCertificateRequestV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            known_tip_height: 1,
+            known_tip_hash: [0x33; 32],
+            request_id: [0x88; 16],
+            requester: identity.public_key_bytes(),
+            request_timestamp: 1_700_000_007,
+            signature: [0u8; 64],
+        })
+        .unwrap();
+        assert_eq!(
+            disc(&b),
+            25,
+            "RecordCheckpointCertificateRequestV1 must be discriminant 25"
+        );
+
+        let member = RecordCheckpointCertificateMemberV1 {
+            request_id: [0x44; 16],
+            responder: identity.public_key_bytes(),
+            response_timestamp: 1_700_000_005,
+            checkpoint_height: 1,
+            checkpoint_hash: [0x33; 32],
+            tip_height: 1,
+            tip_hash: [0x33; 32],
+            signature: [0u8; 64],
+        };
+        let b = bincode::serialize(&MemChainMessage::RecordCheckpointCertificateResponseV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            request_id: [0x88; 16],
+            responder: identity.public_key_bytes(),
+            response_timestamp: 1_700_000_008,
+            checkpoint_height: 1,
+            checkpoint_hash: [0x33; 32],
+            certificate_digest: [0x99; 32],
+            required_signers: 2,
+            members: [Some(member), Some(member), None],
+            signature: [0u8; 64],
+        })
+        .unwrap();
+        assert_eq!(
+            disc(&b),
+            26,
+            "RecordCheckpointCertificateResponseV1 must be discriminant 26"
+        );
     }
 
     #[test]
@@ -1301,6 +1524,137 @@ mod tests {
         responder
             .verify(&signed, &signature)
             .expect("checkpoint response signature");
+    }
+
+    #[test]
+    fn test_checkpoint_certificate_messages_roundtrip_and_digest() {
+        use sha2::{Digest, Sha256};
+
+        let requester = IdentityKeyPair::generate();
+        let serving_node = IdentityKeyPair::generate();
+        let witnesses = [IdentityKeyPair::generate(), IdentityKeyPair::generate()];
+        let chain_id = AERONYX_MEMCHAIN_MAINNET_CHAIN_ID;
+        let height = 7;
+        let hash = [0xD1; 32];
+        let request_id = [0xD2; 16];
+        let request_timestamp = 1_700_300_000;
+        let request_bytes = record_checkpoint_certificate_request_signing_bytes(
+            &chain_id,
+            height,
+            &hash,
+            &request_id,
+            &requester.public_key_bytes(),
+            request_timestamp,
+        );
+        let request = MemChainMessage::RecordCheckpointCertificateRequestV1 {
+            chain_id,
+            known_tip_height: height,
+            known_tip_hash: hash,
+            request_id,
+            requester: requester.public_key_bytes(),
+            request_timestamp,
+            signature: requester.sign(&request_bytes),
+        };
+        let encoded = encode_memchain(&request).expect("encode certificate request");
+        let decoded = decode_memchain(&encoded[1..]).expect("decode certificate request");
+        let MemChainMessage::RecordCheckpointCertificateRequestV1 { signature, .. } = decoded
+        else {
+            panic!("expected certificate request");
+        };
+        requester
+            .verify(&request_bytes, &signature)
+            .expect("certificate request signature");
+
+        let mut member_slots = [None; MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1];
+        let mut digest_members = Vec::new();
+        for (index, witness) in witnesses.iter().enumerate() {
+            let member_request_id = [0xE0 + index as u8; 16];
+            let member_timestamp = request_timestamp.saturating_sub(60 - index as u64);
+            let signing_bytes = record_chain_checkpoint_response_signing_bytes(
+                &chain_id,
+                &member_request_id,
+                &witness.public_key_bytes(),
+                member_timestamp,
+                height,
+                &hash,
+                height,
+                &hash,
+            );
+            let member = RecordCheckpointCertificateMemberV1 {
+                request_id: member_request_id,
+                responder: witness.public_key_bytes(),
+                response_timestamp: member_timestamp,
+                checkpoint_height: height,
+                checkpoint_hash: hash,
+                tip_height: height,
+                tip_hash: hash,
+                signature: witness.sign(&signing_bytes),
+            };
+            let frame = encode_memchain(&MemChainMessage::RecordChainCheckpointResponseV1 {
+                chain_id,
+                request_id: member.request_id,
+                responder: member.responder,
+                response_timestamp: member.response_timestamp,
+                checkpoint_height: member.checkpoint_height,
+                checkpoint_hash: member.checkpoint_hash,
+                tip_height: member.tip_height,
+                tip_hash: member.tip_hash,
+                signature: member.signature,
+            })
+            .expect("encode certificate member");
+            digest_members.push((member.responder, Sha256::digest(frame).into()));
+            member_slots[index] = Some(member);
+        }
+        member_slots
+            .sort_unstable_by_key(|member| member.map_or([0xFF; 32], |present| present.responder));
+        digest_members.sort_unstable_by_key(|member| member.0);
+        let certificate_digest =
+            record_checkpoint_certificate_digest_v1(&chain_id, height, &hash, 2, &digest_members);
+        let response_timestamp = request_timestamp + 1;
+        let response_bytes = record_checkpoint_certificate_response_signing_bytes(
+            &chain_id,
+            &request_id,
+            &serving_node.public_key_bytes(),
+            response_timestamp,
+            height,
+            &hash,
+            &certificate_digest,
+            2,
+            2,
+        );
+        let response = MemChainMessage::RecordCheckpointCertificateResponseV1 {
+            chain_id,
+            request_id,
+            responder: serving_node.public_key_bytes(),
+            response_timestamp,
+            checkpoint_height: height,
+            checkpoint_hash: hash,
+            certificate_digest,
+            required_signers: 2,
+            members: member_slots,
+            signature: serving_node.sign(&response_bytes),
+        };
+        let encoded = encode_memchain(&response).expect("encode certificate response");
+        let decoded = decode_memchain(&encoded[1..]).expect("decode certificate response");
+        let MemChainMessage::RecordCheckpointCertificateResponseV1 {
+            members, signature, ..
+        } = decoded
+        else {
+            panic!("expected certificate response");
+        };
+        assert_eq!(members.iter().flatten().count(), 2);
+        serving_node
+            .verify(&response_bytes, &signature)
+            .expect("certificate response signature");
+
+        let tampered = record_checkpoint_certificate_digest_v1(
+            &chain_id,
+            height,
+            &[0xD3; 32],
+            2,
+            &digest_members,
+        );
+        assert_ne!(tampered, certificate_digest);
     }
 
     // ── Chat Relay variant roundtrip tests ───────────────────────────────
