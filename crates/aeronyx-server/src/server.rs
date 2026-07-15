@@ -190,6 +190,8 @@
 //   - The signed commitment tip anchor detects an older/replaced SQLite chain
 //     only while the host-side anchor remains current. It does not detect a
 //     whole-host snapshot rollback and is not consensus, quorum, or finality.
+//   - The checkpoint certificate anchor has the same local-only boundary. It
+//     must run after the full evidence-vault audit and before networking.
 //   - External startup witnesses are explicit identity trust pins. Discovery
 //     may rotate their signed endpoints, but unpinned peers stay evidence-only.
 //   - The minimum verified witness count is an operator startup threshold over
@@ -220,6 +222,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.8.8-CertificateRollbackGuard - Signed local certificate-vault high-water gate
 //   v2.8.7-CertificateExchange - Post-startup audited certificate exchange
 //   v2.8.5-TrustedDivergenceHalt - Sticky trusted fork evidence and live production halt
 //   v2.8.3-WitnessDivergence - Signed divergent startup-gate integration test
@@ -1562,6 +1565,27 @@ impl Server {
             latest_certificate_signers = checkpoint_evidence_audit.latest_certificate_signers,
             "[MEMCHAIN_BLOCK] Persisted checkpoint evidence audit passed"
         );
+        if self.config.memchain.commitment_coordinator_enabled {
+            let certificate_anchor_state = storage
+                .configure_record_commitment_checkpoint_certificate_anchor(
+                    self.config.memchain.effective_commitment_tip_anchor_path(),
+                    &self.identity,
+                )
+                .await
+                .map_err(|error| {
+                    ServerError::startup_failed(format!(
+                        "MemChain checkpoint certificate rollback guard: {error}"
+                    ))
+                })?;
+            info!(
+                state = certificate_anchor_state,
+                certificate_height = checkpoint_evidence_audit
+                    .latest_certified_height
+                    .unwrap_or(0),
+                scope = "local_certificate_vault_rollback_only",
+                "[MEMCHAIN_BLOCK] Signed checkpoint certificate rollback guard passed"
+            );
+        }
 
         let quantization_enabled =
             self.config.memchain.vector_quantization == VectorQuantizationMode::ScalarUint8;
@@ -2160,6 +2184,18 @@ impl Server {
                             latest_certificate_signers: status.latest_certificate_signers,
                             latest_certificate_required_signers: status
                                 .latest_certificate_required_signers,
+                            certificate_rollback_guard_state: status
+                                .certificate_rollback_guard_state,
+                            certificate_rollback_guard_height: status
+                                .certificate_rollback_guard_height,
+                            certificate_rollback_guard_last_verified_at: status
+                                .certificate_rollback_guard_last_verified_at,
+                            certificate_rollback_guard_last_persisted_at: status
+                                .certificate_rollback_guard_last_persisted_at,
+                            certificate_rollback_guard_write_failures_total: status
+                                .certificate_rollback_guard_write_failures_total,
+                            certificate_rollback_guard_scope: status
+                                .certificate_rollback_guard_scope,
                             production_halted: status.production_halted,
                             last_evidence_at: status.last_evidence_at,
                             observation_freshness: status.observation_freshness,

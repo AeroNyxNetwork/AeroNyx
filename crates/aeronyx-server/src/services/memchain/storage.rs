@@ -141,6 +141,9 @@
 //! - commitment_tip_anchor keeps its path and signing identity process-local.
 //!   Public status may expose only aggregate state, height, timestamps, and
 //!   failure counts; never expose its path, signature, signer, or tip hash.
+//! - commitment_checkpoint_certificate_anchor applies the same boundary to
+//!   the latest fully audited certificate. It uses a separate signed sidecar
+//!   so certificate writes cannot race or regress the canonical tip anchor.
 //! - commitment_production_halted is one-way for the process lifetime. Only a
 //!   trusted-witness security incident may set it; no network input or later
 //!   converged frame may clear it. Recovery requires operator review/restart.
@@ -193,6 +196,8 @@
 //! v2.7.22-CheckpointCertificate - Schema v12 immutable bounded multi-witness
 //!   checkpoint certificates with restart-time cryptographic re-audit.
 //! v2.7.23-CertificateExchange - Added audited internal certificate export;
+//! v2.7.24-CertificateRollbackGuard - Added a signed local high-water sidecar
+//!   for the latest fully audited checkpoint certificate.
 //!   no schema or public-status contract change.
 // ============================================
 
@@ -446,6 +451,20 @@ pub struct RecordCommitmentCheckpointStatus {
     pub latest_certificate_signers: usize,
     /// Threshold recorded by the latest immutable certificate.
     pub latest_certificate_required_signers: usize,
+    /// Signed local certificate high-water state: `disabled`, `checking`,
+    /// `initialized`, `verified`, `repaired`, `invalid`,
+    /// `rollback_detected`, or `write_failed`.
+    pub certificate_rollback_guard_state: String,
+    /// Highest certificate height retained by the signed local high-water mark.
+    pub certificate_rollback_guard_height: u64,
+    /// Most recent successful comparison with the audited certificate vault.
+    pub certificate_rollback_guard_last_verified_at: Option<u64>,
+    /// Most recent durable signed sidecar replacement.
+    pub certificate_rollback_guard_last_persisted_at: Option<u64>,
+    /// Sidecar persistence failures observed since process start.
+    pub certificate_rollback_guard_write_failures_total: u64,
+    /// Precise protection boundary; this guard is not network finality.
+    pub certificate_rollback_guard_scope: &'static str,
     /// Whether local canonical commitment production is fail-closed for this
     /// process after a trusted witness security incident.
     pub production_halted: bool,
@@ -703,6 +722,39 @@ impl Default for RecordCommitmentTipAnchorRuntime {
     }
 }
 
+/// Private coordinator material required to advance the certificate anchor.
+///
+/// The path and identity must never enter status, heartbeat, logs, or errors.
+/// This is deliberately separate from the block-tip anchor configuration so
+/// independently committed certificate writes cannot overwrite tip state.
+pub(crate) struct RecordCommitmentCheckpointCertificateAnchorConfig {
+    pub(crate) path: PathBuf,
+    pub(crate) identity: IdentityKeyPair,
+}
+
+/// Runtime-only state for cross-restart certificate-vault rollback detection.
+pub(crate) struct RecordCommitmentCheckpointCertificateAnchorRuntime {
+    pub(crate) config: Option<RecordCommitmentCheckpointCertificateAnchorConfig>,
+    pub(crate) state: &'static str,
+    pub(crate) anchored_height: u64,
+    pub(crate) last_verified_at: Option<u64>,
+    pub(crate) last_persisted_at: Option<u64>,
+    pub(crate) write_failures_total: u64,
+}
+
+impl Default for RecordCommitmentCheckpointCertificateAnchorRuntime {
+    fn default() -> Self {
+        Self {
+            config: None,
+            state: "disabled",
+            anchored_height: 0,
+            last_verified_at: None,
+            last_persisted_at: None,
+            write_failures_total: 0,
+        }
+    }
+}
+
 // ============================================
 // LRU Cache
 // ============================================
@@ -779,6 +831,13 @@ pub struct MemoryStorage {
     pub(crate) commitment_tip_anchor: RwLock<RecordCommitmentTipAnchorRuntime>,
     /// Runtime-only aggregate signed-checkpoint reconciliation evidence.
     pub(crate) commitment_checkpoint: RwLock<RecordCommitmentCheckpointRuntime>,
+    /// Signed high-water mark for the latest audited checkpoint certificate.
+    /// Private key material remains process-local; APIs expose aggregates only.
+    pub(crate) commitment_checkpoint_certificate_anchor:
+        RwLock<RecordCommitmentCheckpointCertificateAnchorRuntime>,
+    /// Serializes certificate DB commits with sidecar replacement so two
+    /// concurrent witness/import paths cannot persist anchors out of order.
+    pub(crate) commitment_checkpoint_certificate_anchor_write: TokioMutex<()>,
     /// One-way process-local safety latch. It is set while the incident write
     /// still owns the SQLite connection, closing the append race window.
     pub(crate) commitment_production_halted: AtomicBool,
@@ -838,6 +897,10 @@ impl MemoryStorage {
             commitment_durability: AtomicU64::new(1),
             commitment_tip_anchor: RwLock::new(RecordCommitmentTipAnchorRuntime::default()),
             commitment_checkpoint: RwLock::new(RecordCommitmentCheckpointRuntime::default()),
+            commitment_checkpoint_certificate_anchor: RwLock::new(
+                RecordCommitmentCheckpointCertificateAnchorRuntime::default(),
+            ),
+            commitment_checkpoint_certificate_anchor_write: TokioMutex::new(()),
             commitment_production_halted: AtomicBool::new(false),
         })
     }

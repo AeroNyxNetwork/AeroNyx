@@ -57,6 +57,8 @@
 //! - v2.7.22-CheckpointCertificate: immutable bounded multi-witness bundles
 //! - v2.7.23-CertificateExchange: audited exact-frame bundle export for the
 //!   admitted fixed-size peer exchange protocol
+//! - v2.7.24-CertificateRollbackGuard: signed local certificate high-water
+//!   sidecar with serialized DB/sidecar commits and fail-closed recovery
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -132,6 +134,7 @@
 //!   an atomic local commitment-production halt.
 //! v2.7.22-CheckpointCertificate - Added immutable threshold certificates.
 //! v2.7.23-CertificateExchange - Added snapshot-audited bundle export.
+//! v2.7.24-CertificateRollbackGuard - Detect local certificate-vault rollback.
 //!
 //! ## Last Modified
 //! v2.7.23-CertificateExchange - Export only fully re-audited certificate frames.
@@ -171,10 +174,12 @@ use aeronyx_core::protocol::memchain::{
 };
 
 use super::storage::{
-    LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentCheckpointCertificateBundle,
-    RecordCommitmentCheckpointStatus, RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent,
-    RecordCommitmentSyncRuntime, RecordCommitmentSyncStatus, RecordCommitmentTipAnchorConfig,
-    StorageStats, CHECKPOINT_CERTIFICATE_CAPACITY, CHECKPOINT_EQUIVOCATION_CAPACITY,
+    LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentCheckpointCertificateAnchorConfig,
+    RecordCommitmentCheckpointCertificateAnchorRuntime,
+    RecordCommitmentCheckpointCertificateBundle, RecordCommitmentCheckpointStatus,
+    RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime,
+    RecordCommitmentSyncStatus, RecordCommitmentTipAnchorConfig, StorageStats,
+    CHECKPOINT_CERTIFICATE_CAPACITY, CHECKPOINT_EQUIVOCATION_CAPACITY,
     CHECKPOINT_EVIDENCE_CAPACITY, CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS,
     CHECKPOINT_TRUSTED_DIVERGENCE_CAPACITY, COMMITMENT_SYNC_EVENT_CAPACITY,
     MAX_CHECKPOINT_CERTIFICATE_SIGNERS, MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES,
@@ -412,7 +417,11 @@ const MAX_ATOMIC_COMMITMENT_BLOCK_BATCH: usize = 32;
 const MAX_COMMITMENT_TIP_ANCHOR_BYTES: u64 = 4 * 1024;
 const COMMITMENT_TIP_ANCHOR_CONTRACT: &str = "record_commitment_tip_anchor.v1";
 const COMMITMENT_TIP_ANCHOR_DOMAIN: &[u8] = b"aeronyx.record_commitment_tip_anchor.v1\0";
-static COMMITMENT_TIP_ANCHOR_TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
+const MAX_CHECKPOINT_CERTIFICATE_ANCHOR_BYTES: u64 = 4 * 1024;
+const CHECKPOINT_CERTIFICATE_ANCHOR_CONTRACT: &str = "record_checkpoint_certificate_anchor.v1";
+const CHECKPOINT_CERTIFICATE_ANCHOR_DOMAIN: &[u8] =
+    b"aeronyx.record_checkpoint_certificate_anchor.v1\0";
+static SIGNED_LOCAL_ANCHOR_TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
 
 fn read_stored_record_commitment_block_row(
     row: &rusqlite::Row<'_>,
@@ -794,49 +803,74 @@ fn unix_now_secs() -> u64 {
 async fn read_record_commitment_tip_anchor(
     path: &Path,
 ) -> Result<Option<RecordCommitmentTipAnchorV1>, String> {
-    let metadata = match tokio::fs::symlink_metadata(path).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("inspect commitment tip anchor: {error}")),
+    let Some(bytes) = read_signed_local_anchor_bytes(
+        path,
+        "commitment tip anchor",
+        MAX_COMMITMENT_TIP_ANCHOR_BYTES,
+    )
+    .await?
+    else {
+        return Ok(None);
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err("commitment tip anchor must be a regular file".to_string());
-    }
-    if metadata.len() > MAX_COMMITMENT_TIP_ANCHOR_BYTES {
-        return Err("commitment tip anchor exceeds the defensive size bound".to_string());
-    }
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|error| format!("read commitment tip anchor: {error}"))?;
-    if bytes.len() as u64 > MAX_COMMITMENT_TIP_ANCHOR_BYTES {
-        return Err("commitment tip anchor exceeds the defensive size bound".to_string());
-    }
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|error| format!("decode commitment tip anchor: {error}"))
 }
 
+async fn read_signed_local_anchor_bytes(
+    path: &Path,
+    label: &'static str,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, String> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("inspect {label}: {error}")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!("{label} must be a regular file"));
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!("{label} exceeds the defensive size bound"));
+    }
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|error| format!("read {label}: {error}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("{label} exceeds the defensive size bound"));
+    }
+    Ok(Some(bytes))
+}
+
 fn write_record_commitment_tip_anchor_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_signed_local_anchor_atomic(path, bytes, "commitment tip anchor")
+}
+
+fn write_signed_local_anchor_atomic(
+    path: &Path,
+    bytes: &[u8],
+    label: &'static str,
+) -> Result<(), String> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)
-        .map_err(|error| format!("create commitment tip anchor directory: {error}"))?;
+        .map_err(|error| format!("create {label} directory: {error}"))?;
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err("commitment tip anchor target must be a regular file".to_string());
+                return Err(format!("{label} target must be a regular file"));
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("inspect commitment tip anchor target: {error}")),
+        Err(error) => return Err(format!("inspect {label} target: {error}")),
     }
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| "commitment tip anchor path has no valid file name".to_string())?;
-    let nonce = COMMITMENT_TIP_ANCHOR_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        .ok_or_else(|| format!("{label} path has no valid file name"))?;
+    let nonce = SIGNED_LOCAL_ANCHOR_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let time_nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -858,20 +892,19 @@ fn write_record_commitment_tip_anchor_atomic(path: &Path, bytes: &[u8]) -> Resul
         }
         let mut file = options
             .open(&temp_path)
-            .map_err(|error| format!("create commitment tip anchor temp file: {error}"))?;
+            .map_err(|error| format!("create {label} temp file: {error}"))?;
         file.write_all(bytes)
-            .map_err(|error| format!("write commitment tip anchor: {error}"))?;
+            .map_err(|error| format!("write {label}: {error}"))?;
         file.flush()
-            .map_err(|error| format!("flush commitment tip anchor: {error}"))?;
+            .map_err(|error| format!("flush {label}: {error}"))?;
         file.sync_all()
-            .map_err(|error| format!("sync commitment tip anchor: {error}"))?;
+            .map_err(|error| format!("sync {label}: {error}"))?;
         drop(file);
-        std::fs::rename(&temp_path, path)
-            .map_err(|error| format!("replace commitment tip anchor: {error}"))?;
+        std::fs::rename(&temp_path, path).map_err(|error| format!("replace {label}: {error}"))?;
         #[cfg(unix)]
         File::open(parent)
             .and_then(|directory| directory.sync_all())
-            .map_err(|error| format!("sync commitment tip anchor directory: {error}"))?;
+            .map_err(|error| format!("sync {label} directory: {error}"))?;
         Ok(())
     })();
 
@@ -895,6 +928,207 @@ async fn persist_record_commitment_tip_anchor(
     tokio::task::spawn_blocking(move || write_record_commitment_tip_anchor_atomic(&path, &bytes))
         .await
         .map_err(|error| format!("join commitment tip anchor write: {error}"))??;
+    Ok(updated_at)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckpointCertificateAnchorState {
+    certificate_height: u64,
+    checkpoint_hash: [u8; 32],
+    certificate_digest: [u8; 32],
+    required_signers: u64,
+    signer_count: u64,
+}
+
+impl CheckpointCertificateAnchorState {
+    const EMPTY: Self = Self {
+        certificate_height: 0,
+        checkpoint_hash: GENESIS_PREV_HASH,
+        certificate_digest: [0u8; 32],
+        required_signers: 0,
+        signer_count: 0,
+    };
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordCheckpointCertificateAnchorV1 {
+    contract_version: String,
+    chain_id: String,
+    certificate_height: u64,
+    checkpoint_hash: String,
+    certificate_digest: String,
+    required_signers: u64,
+    signer_count: u64,
+    signer: String,
+    updated_at: u64,
+    signature: String,
+}
+
+impl RecordCheckpointCertificateAnchorV1 {
+    fn new_signed(
+        state: CheckpointCertificateAnchorState,
+        identity: &IdentityKeyPair,
+        updated_at: u64,
+    ) -> Self {
+        let signer = identity.public_key_bytes();
+        let signing_bytes = checkpoint_certificate_anchor_signing_bytes(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            state,
+            &signer,
+            updated_at,
+        );
+        Self {
+            contract_version: CHECKPOINT_CERTIFICATE_ANCHOR_CONTRACT.to_string(),
+            chain_id: hex::encode(AERONYX_MEMCHAIN_MAINNET_CHAIN_ID),
+            certificate_height: state.certificate_height,
+            checkpoint_hash: hex::encode(state.checkpoint_hash),
+            certificate_digest: hex::encode(state.certificate_digest),
+            required_signers: state.required_signers,
+            signer_count: state.signer_count,
+            signer: hex::encode(signer),
+            updated_at,
+            signature: hex::encode(identity.sign(&signing_bytes)),
+        }
+    }
+
+    fn verify(
+        &self,
+        expected_signer: &[u8; 32],
+    ) -> Result<VerifiedCheckpointCertificateAnchor, String> {
+        if self.contract_version != CHECKPOINT_CERTIFICATE_ANCHOR_CONTRACT {
+            return Err("checkpoint certificate anchor contract is unsupported".to_string());
+        }
+        let chain_id = decode_checkpoint_certificate_anchor_hex::<32>(&self.chain_id, "chain id")?;
+        if chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID {
+            return Err("checkpoint certificate anchor chain id is invalid".to_string());
+        }
+        let checkpoint_hash = decode_checkpoint_certificate_anchor_hex::<32>(
+            &self.checkpoint_hash,
+            "checkpoint hash",
+        )?;
+        let certificate_digest = decode_checkpoint_certificate_anchor_hex::<32>(
+            &self.certificate_digest,
+            "certificate digest",
+        )?;
+        let state = CheckpointCertificateAnchorState {
+            certificate_height: self.certificate_height,
+            checkpoint_hash,
+            certificate_digest,
+            required_signers: self.required_signers,
+            signer_count: self.signer_count,
+        };
+        if state.certificate_height == 0 {
+            if state != CheckpointCertificateAnchorState::EMPTY {
+                return Err("checkpoint certificate anchor empty state is invalid".to_string());
+            }
+        } else if !(2..=MAX_CHECKPOINT_CERTIFICATE_SIGNERS as u64).contains(&state.required_signers)
+            || state.signer_count < state.required_signers
+            || state.signer_count > MAX_CHECKPOINT_CERTIFICATE_SIGNERS as u64
+        {
+            return Err("checkpoint certificate anchor signer metadata is invalid".to_string());
+        }
+        let signer = decode_checkpoint_certificate_anchor_hex::<32>(&self.signer, "signer")?;
+        if &signer != expected_signer {
+            return Err(
+                "checkpoint certificate anchor signer does not match this node".to_string(),
+            );
+        }
+        let signature =
+            decode_checkpoint_certificate_anchor_hex::<64>(&self.signature, "signature")?;
+        let signing_bytes =
+            checkpoint_certificate_anchor_signing_bytes(&chain_id, state, &signer, self.updated_at);
+        IdentityPublicKey::from_bytes(&signer)
+            .and_then(|key| key.verify(&signing_bytes, &signature))
+            .map_err(|_| "checkpoint certificate anchor signature is invalid".to_string())?;
+        Ok(VerifiedCheckpointCertificateAnchor {
+            state,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VerifiedCheckpointCertificateAnchor {
+    state: CheckpointCertificateAnchorState,
+    updated_at: u64,
+}
+
+fn checkpoint_certificate_anchor_signing_bytes(
+    chain_id: &[u8; 32],
+    state: CheckpointCertificateAnchorState,
+    signer: &[u8; 32],
+    updated_at: u64,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(CHECKPOINT_CERTIFICATE_ANCHOR_DOMAIN.len() + 160);
+    bytes.extend_from_slice(CHECKPOINT_CERTIFICATE_ANCHOR_DOMAIN);
+    bytes.extend_from_slice(chain_id);
+    bytes.extend_from_slice(&state.certificate_height.to_le_bytes());
+    bytes.extend_from_slice(&state.checkpoint_hash);
+    bytes.extend_from_slice(&state.certificate_digest);
+    bytes.extend_from_slice(&state.required_signers.to_le_bytes());
+    bytes.extend_from_slice(&state.signer_count.to_le_bytes());
+    bytes.extend_from_slice(signer);
+    bytes.extend_from_slice(&updated_at.to_le_bytes());
+    bytes
+}
+
+fn decode_checkpoint_certificate_anchor_hex<const N: usize>(
+    value: &str,
+    label: &str,
+) -> Result<[u8; N], String> {
+    let decoded = hex::decode(value)
+        .map_err(|_| format!("checkpoint certificate anchor {label} is not hexadecimal"))?;
+    decoded.try_into().map_err(|decoded: Vec<u8>| {
+        format!(
+            "checkpoint certificate anchor {label} has invalid length {}",
+            decoded.len()
+        )
+    })
+}
+
+fn checkpoint_certificate_anchor_path(tip_anchor_path: &Path) -> Result<PathBuf, String> {
+    let mut file_name = tip_anchor_path
+        .file_name()
+        .ok_or_else(|| "commitment tip anchor path has no file name".to_string())?
+        .to_os_string();
+    file_name.push(".checkpoint-certificate-v1.json");
+    Ok(tip_anchor_path.with_file_name(file_name))
+}
+
+async fn read_checkpoint_certificate_anchor(
+    path: &Path,
+) -> Result<Option<RecordCheckpointCertificateAnchorV1>, String> {
+    let Some(bytes) = read_signed_local_anchor_bytes(
+        path,
+        "checkpoint certificate anchor",
+        MAX_CHECKPOINT_CERTIFICATE_ANCHOR_BYTES,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("decode checkpoint certificate anchor: {error}"))
+}
+
+fn write_checkpoint_certificate_anchor_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_signed_local_anchor_atomic(path, bytes, "checkpoint certificate anchor")
+}
+
+async fn persist_checkpoint_certificate_anchor(
+    path: PathBuf,
+    state: CheckpointCertificateAnchorState,
+    identity: &IdentityKeyPair,
+) -> Result<u64, String> {
+    let updated_at = unix_now_secs();
+    let anchor = RecordCheckpointCertificateAnchorV1::new_signed(state, identity, updated_at);
+    let bytes = serde_json::to_vec(&anchor)
+        .map_err(|error| format!("encode checkpoint certificate anchor: {error}"))?;
+    tokio::task::spawn_blocking(move || write_checkpoint_certificate_anchor_atomic(&path, &bytes))
+        .await
+        .map_err(|error| format!("join checkpoint certificate anchor write: {error}"))??;
     Ok(updated_at)
 }
 
@@ -1495,6 +1729,74 @@ fn audit_checkpoint_certificates_snapshot(
     ))
 }
 
+/// Reads only the latest certificate metadata after a complete vault audit.
+///
+/// The returned digest and hash are private coordinator material used to bind
+/// the signed local sidecar. Callers must never log or serialize this value.
+type LatestCheckpointCertificateAnchorRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64);
+
+fn read_latest_checkpoint_certificate_anchor_state(
+    connection: &rusqlite::Connection,
+) -> Result<Option<CheckpointCertificateAnchorState>, String> {
+    let row: Option<LatestCheckpointCertificateAnchorRow> = connection
+        .query_row(
+            "SELECT checkpoint_height,chain_id,checkpoint_hash,certificate_digest,
+                    required_signers,signer_count
+             FROM record_checkpoint_certificates
+             ORDER BY checkpoint_height DESC LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("read latest checkpoint certificate anchor state: {error}"))?;
+    let Some((height, chain_id, checkpoint_hash, certificate_digest, required, signers)) = row
+    else {
+        return Ok(None);
+    };
+    let certificate_height = u64::try_from(height)
+        .map_err(|_| "latest checkpoint certificate height is invalid".to_string())?;
+    let chain_id: [u8; 32] = chain_id
+        .as_slice()
+        .try_into()
+        .map_err(|_| "latest checkpoint certificate chain id has invalid length".to_string())?;
+    let checkpoint_hash: [u8; 32] = checkpoint_hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| "latest checkpoint certificate hash has invalid length".to_string())?;
+    let certificate_digest: [u8; 32] = certificate_digest
+        .as_slice()
+        .try_into()
+        .map_err(|_| "latest checkpoint certificate digest has invalid length".to_string())?;
+    let required_signers = u64::try_from(required)
+        .map_err(|_| "latest checkpoint certificate threshold is invalid".to_string())?;
+    let signer_count = u64::try_from(signers)
+        .map_err(|_| "latest checkpoint certificate signer count is invalid".to_string())?;
+    if certificate_height == 0
+        || chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID
+        || !(2..=MAX_CHECKPOINT_CERTIFICATE_SIGNERS as u64).contains(&required_signers)
+        || signer_count < required_signers
+        || signer_count > MAX_CHECKPOINT_CERTIFICATE_SIGNERS as u64
+    {
+        return Err("latest checkpoint certificate metadata is invalid".to_string());
+    }
+    Ok(Some(CheckpointCertificateAnchorState {
+        certificate_height,
+        checkpoint_hash,
+        certificate_digest,
+        required_signers,
+        signer_count,
+    }))
+}
+
 fn insert_checkpoint_equivocation_incident(
     connection: &rusqlite::Connection,
     responder: &[u8; 32],
@@ -2084,6 +2386,7 @@ impl MemoryStorage {
     /// signature, endpoint, or user metadata.
     pub fn record_commitment_checkpoint_status(&self) -> RecordCommitmentCheckpointStatus {
         let runtime = self.commitment_checkpoint.read();
+        let certificate_guard = self.commitment_checkpoint_certificate_anchor.read();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
@@ -2120,6 +2423,13 @@ impl MemoryStorage {
             latest_certificate_signers: runtime.latest_certificate_signers,
             latest_certificate_required_signers: runtime
                 .latest_certificate_required_signers,
+            certificate_rollback_guard_state: certificate_guard.state.to_string(),
+            certificate_rollback_guard_height: certificate_guard.anchored_height,
+            certificate_rollback_guard_last_verified_at: certificate_guard.last_verified_at,
+            certificate_rollback_guard_last_persisted_at: certificate_guard.last_persisted_at,
+            certificate_rollback_guard_write_failures_total: certificate_guard
+                .write_failures_total,
+            certificate_rollback_guard_scope: "detects checkpoint-certificate SQLite rollback or replacement while the separate host-side signed sidecar remains; does not detect whole-host or whole-disk snapshot rollback and is not consensus, quorum, fork choice, or finality",
             production_halted: self.record_commitment_production_halted(),
             last_evidence_at: runtime.last_evidence_at,
             observation_freshness: observation_freshness.to_string(),
@@ -2137,7 +2447,7 @@ impl MemoryStorage {
             last_round_diverged: runtime.last_round_diverged,
             evidence_persistence_failures_total: runtime
                 .evidence_persistence_failures_total,
-            privacy_policy: "aggregate signed checkpoint outcomes, bounded witness-round coverage, immutable certificate counts, applicable/deferred evidence counts, durable observation freshness, and local evidence-vault health only; certificates prove configured pinned-witness observations, not global consensus or fork choice; raw frames, peer identities, block hashes, signatures, certificate digests, request ids, commitments, owners, payloads, endpoints, routes, and client metadata never leave the node",
+            privacy_policy: "aggregate signed checkpoint outcomes, bounded witness-round coverage, immutable certificate counts, local signed rollback-guard state, applicable/deferred evidence counts, durable observation freshness, and local evidence-vault health only; certificates prove configured pinned-witness observations, not global consensus or fork choice; raw frames, peer identities, block hashes, signatures, certificate digests, sidecar paths, request ids, commitments, owners, payloads, endpoints, routes, and client metadata never leave the node",
         }
     }
 
@@ -2625,6 +2935,33 @@ impl MemoryStorage {
         let certified_at = i64::try_from(certified_at)
             .map_err(|_| "checkpoint certificate time exceeds SQLite range".to_string())?;
 
+        let anchor_enabled = self
+            .commitment_checkpoint_certificate_anchor
+            .read()
+            .config
+            .is_some();
+        let _anchor_write_guard = if anchor_enabled {
+            Some(
+                self.commitment_checkpoint_certificate_anchor_write
+                    .lock()
+                    .await,
+            )
+        } else {
+            None
+        };
+        if anchor_enabled
+            && !matches!(
+                self.commitment_checkpoint_certificate_anchor.read().state,
+                "initialized" | "verified" | "repaired"
+            )
+        {
+            return Err(
+                "checkpoint certificate anchor is not ready; restart and complete startup audit"
+                    .to_string(),
+            );
+        }
+
+        let (report, anchor_state) = {
         let mut conn = self.conn.lock().await;
         let transaction = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -2696,8 +3033,9 @@ impl MemoryStorage {
             .optional()
             .map_err(|error| format!("read existing checkpoint certificate: {error}"))?;
         if let Some((stored_hash, stored_required, stored_count, stored_digest)) = existing {
-            let stored_required = usize::try_from(stored_required)
-                .map_err(|_| "existing checkpoint certificate threshold is invalid".to_string())?;
+                let stored_required = usize::try_from(stored_required).map_err(|_| {
+                    "existing checkpoint certificate threshold is invalid".to_string()
+                })?;
             let stored_count = usize::try_from(stored_count).map_err(|_| {
                 "existing checkpoint certificate signer count is invalid".to_string()
             })?;
@@ -2707,7 +3045,9 @@ impl MemoryStorage {
                 || stored_count > MAX_CHECKPOINT_CERTIFICATE_SIGNERS
                 || stored_digest.len() != 32
             {
-                return Err("existing checkpoint certificate conflicts with local tip".to_string());
+                    return Err(
+                        "existing checkpoint certificate conflicts with local tip".to_string()
+                    );
             }
             let report = audit_checkpoint_evidence_snapshot(&transaction)?;
             let mut current_policy_members = 0usize;
@@ -2729,8 +3069,10 @@ impl MemoryStorage {
                     let responder: Vec<u8> = row.get(0).map_err(|error| {
                         format!("read existing checkpoint certificate responder: {error}")
                     })?;
-                    let responder: [u8; 32] = responder.as_slice().try_into().map_err(|_| {
-                        "existing checkpoint certificate responder has invalid length".to_string()
+                        let responder: [u8; 32] =
+                            responder.as_slice().try_into().map_err(|_| {
+                                "existing checkpoint certificate responder has invalid length"
+                                    .to_string()
                     })?;
                     if allowed_witnesses.contains(&responder) {
                         current_policy_members = current_policy_members.saturating_add(1);
@@ -2781,8 +3123,9 @@ impl MemoryStorage {
                     certificate_digest.as_slice(),
                     i64::try_from(required_signers)
                         .map_err(|_| "checkpoint certificate threshold exceeds SQLite range")?,
-                    i64::try_from(members.len())
-                        .map_err(|_| "checkpoint certificate signer count exceeds SQLite range")?,
+                        i64::try_from(members.len()).map_err(|_| {
+                            "checkpoint certificate signer count exceeds SQLite range"
+                        })?,
                     certified_at,
                 ],
             )
@@ -2801,10 +3144,21 @@ impl MemoryStorage {
                 .map_err(|error| format!("insert checkpoint certificate member: {error}"))?;
         }
         let report = audit_checkpoint_evidence_snapshot(&transaction)?;
+            let anchor_state = CheckpointCertificateAnchorState {
+                certificate_height: tip_height,
+                checkpoint_hash: tip_hash,
+                certificate_digest,
+                required_signers: required_signers as u64,
+                signer_count: members.len() as u64,
+            };
         transaction
             .commit()
             .map_err(|error| format!("commit checkpoint certificate: {error}"))?;
+            (report, anchor_state)
+        };
         self.apply_record_commitment_checkpoint_audit(&report);
+        self.persist_checkpoint_certificate_anchor_after_commit(anchor_state)
+            .await?;
         Ok(true)
     }
 
@@ -3209,6 +3563,246 @@ impl MemoryStorage {
         }
         drop(runtime);
         *self.commitment_integrity.write() = None;
+    }
+
+    /// Verifies or initializes the signed certificate-vault high-water mark.
+    ///
+    /// This must run after the complete commitment-chain and checkpoint-vault
+    /// audits. The method re-audits the bounded vault in one `SQLite` snapshot,
+    /// then compares its latest immutable certificate with a separately signed
+    /// sidecar. A lower `SQLite` height or a same-height metadata mismatch fails
+    /// startup closed. A higher fully audited certificate repairs the sidecar,
+    /// covering the expected crash window after a DB commit.
+    ///
+    /// Scope: this detects certificate-vault rollback while the host-side
+    /// sidecar remains. A whole-host snapshot can roll back both artifacts and
+    /// still requires external pinned-witness evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prerequisite audit is absent, the signed
+    /// sidecar is malformed or conflicts with the audited vault, rollback is
+    /// detected, or durable sidecar replacement fails.
+    pub async fn configure_record_commitment_checkpoint_certificate_anchor(
+        &self,
+        commitment_tip_anchor_path: impl AsRef<Path>,
+        identity: &IdentityKeyPair,
+    ) -> Result<&'static str, String> {
+        if self.commitment_checkpoint.read().evidence_state != "verified" {
+            return Err(
+                "checkpoint certificate anchor requires a successful evidence-vault audit"
+                    .to_string(),
+            );
+        }
+        let path = checkpoint_certificate_anchor_path(commitment_tip_anchor_path.as_ref())?;
+        let _write_guard = self
+            .commitment_checkpoint_certificate_anchor_write
+            .lock()
+            .await;
+        {
+            let mut runtime = self.commitment_checkpoint_certificate_anchor.write();
+            *runtime = RecordCommitmentCheckpointCertificateAnchorRuntime::default();
+            runtime.config = Some(RecordCommitmentCheckpointCertificateAnchorConfig {
+                path: path.clone(),
+                identity: identity.clone(),
+            });
+            runtime.state = "checking";
+    }
+
+        let (report, current_state) = {
+            let mut conn = self.conn.lock().await;
+            let transaction = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .map_err(|error| {
+                    self.fail_record_commitment_checkpoint_certificate_anchor("invalid", 0, false);
+                    format!("begin checkpoint certificate anchor audit: {error}")
+                })?;
+            let report = audit_checkpoint_evidence_snapshot(&transaction).map_err(|error| {
+                self.fail_record_commitment_checkpoint_certificate_anchor("invalid", 0, false);
+                error
+            })?;
+            let current_state = read_latest_checkpoint_certificate_anchor_state(&transaction)
+                .map_err(|error| {
+                    self.fail_record_commitment_checkpoint_certificate_anchor("invalid", 0, false);
+                    error
+                })?
+                .unwrap_or(CheckpointCertificateAnchorState::EMPTY);
+            transaction.commit().map_err(|error| {
+                self.fail_record_commitment_checkpoint_certificate_anchor("invalid", 0, false);
+                format!("finish checkpoint certificate anchor audit: {error}")
+            })?;
+            (report, current_state)
+        };
+        self.apply_record_commitment_checkpoint_audit(&report);
+
+        let stored = match read_checkpoint_certificate_anchor(&path).await {
+            Ok(stored) => stored,
+            Err(error) => {
+                self.fail_record_commitment_checkpoint_certificate_anchor("invalid", 0, false);
+                return Err(error);
+        }
+        };
+        let now = unix_now_secs();
+        match stored {
+            None => {
+                let persisted_at =
+                    persist_checkpoint_certificate_anchor(path, current_state, identity)
+                        .await
+                        .map_err(|error| {
+                            self.fail_record_commitment_checkpoint_certificate_anchor(
+                                "write_failed",
+                                current_state.certificate_height,
+                                true,
+                            );
+                            error
+                        })?;
+                let mut runtime = self.commitment_checkpoint_certificate_anchor.write();
+                runtime.state = "initialized";
+                runtime.anchored_height = current_state.certificate_height;
+                runtime.last_verified_at = Some(now);
+                runtime.last_persisted_at = Some(persisted_at);
+                info!(
+                    certificate_height = current_state.certificate_height,
+                    "[MEMCHAIN_BLOCK] Signed checkpoint certificate anchor initialized"
+                );
+                Ok("initialized")
+            }
+            Some(anchor) => {
+                let verified = anchor
+                    .verify(&identity.public_key_bytes())
+                    .map_err(|error| {
+                        self.fail_record_commitment_checkpoint_certificate_anchor(
+                            "invalid", 0, false,
+                        );
+                        error
+                    })?;
+                if verified.state.certificate_height > current_state.certificate_height {
+                    self.fail_record_commitment_checkpoint_certificate_anchor(
+                        "rollback_detected",
+                        verified.state.certificate_height,
+                        false,
+                    );
+                    return Err(format!(
+                        "checkpoint certificate SQLite height {} is behind signed local anchor height {}",
+                        current_state.certificate_height, verified.state.certificate_height
+                    ));
+                }
+                if verified.state.certificate_height == current_state.certificate_height {
+                    if verified.state != current_state {
+                        self.fail_record_commitment_checkpoint_certificate_anchor(
+                            "rollback_detected",
+                            verified.state.certificate_height,
+                            false,
+                        );
+                        return Err(format!(
+                            "signed checkpoint certificate anchor conflicts at height {}",
+                            verified.state.certificate_height
+                        ));
+                    }
+                    let mut runtime = self.commitment_checkpoint_certificate_anchor.write();
+                    runtime.state = "verified";
+                    runtime.anchored_height = current_state.certificate_height;
+                    runtime.last_verified_at = Some(now);
+                    runtime.last_persisted_at = Some(verified.updated_at);
+                    info!(
+                        certificate_height = current_state.certificate_height,
+                        "[MEMCHAIN_BLOCK] Signed checkpoint certificate anchor verified"
+                    );
+                    return Ok("verified");
+                }
+
+                let persisted_at =
+                    persist_checkpoint_certificate_anchor(path, current_state, identity)
+                        .await
+                        .map_err(|error| {
+                            self.fail_record_commitment_checkpoint_certificate_anchor(
+                                "write_failed",
+                                verified.state.certificate_height,
+                                true,
+                            );
+                            error
+                        })?;
+                let mut runtime = self.commitment_checkpoint_certificate_anchor.write();
+                runtime.state = "repaired";
+                runtime.anchored_height = current_state.certificate_height;
+                runtime.last_verified_at = Some(now);
+                runtime.last_persisted_at = Some(persisted_at);
+                info!(
+                    previous_height = verified.state.certificate_height,
+                    certificate_height = current_state.certificate_height,
+                    "[MEMCHAIN_BLOCK] Signed checkpoint certificate anchor advanced after audited DB-ahead recovery"
+                );
+                Ok("repaired")
+            }
+        }
+    }
+
+    fn fail_record_commitment_checkpoint_certificate_anchor(
+        &self,
+        state: &'static str,
+        anchored_height: u64,
+        write_failure: bool,
+    ) {
+        let mut runtime = self.commitment_checkpoint_certificate_anchor.write();
+        runtime.state = state;
+        runtime.anchored_height = anchored_height;
+        runtime.last_verified_at = None;
+        if write_failure {
+            runtime.write_failures_total = runtime.write_failures_total.saturating_add(1);
+        }
+        drop(runtime);
+        *self.commitment_integrity.write() = None;
+    }
+
+    /// Advances the sidecar after a certificate DB transaction has committed.
+    /// The caller must hold `commitment_checkpoint_certificate_anchor_write`
+    /// from before opening that transaction until this method returns.
+    async fn persist_checkpoint_certificate_anchor_after_commit(
+        &self,
+        state: CheckpointCertificateAnchorState,
+    ) -> Result<(), String> {
+        let anchor_config = self
+            .commitment_checkpoint_certificate_anchor
+            .read()
+            .config
+            .as_ref()
+            .map(|config| (config.path.clone(), config.identity.clone()));
+        let Some((path, identity)) = anchor_config else {
+            return Ok(());
+        };
+        let anchored_height = self
+            .commitment_checkpoint_certificate_anchor
+            .read()
+            .anchored_height;
+        if state.certificate_height < anchored_height {
+            self.fail_record_commitment_checkpoint_certificate_anchor(
+                "rollback_detected",
+                anchored_height,
+                false,
+            );
+            return Err(
+                "checkpoint certificate committed below the signed local high-water mark"
+                    .to_string(),
+            );
+        }
+        let persisted_at = persist_checkpoint_certificate_anchor(path, state, &identity)
+            .await
+            .map_err(|error| {
+                self.fail_record_commitment_checkpoint_certificate_anchor(
+                    "write_failed",
+                    anchored_height,
+                    true,
+                );
+                format!(
+                    "checkpoint certificate was committed but signed anchor persistence failed; restart and re-audit: {error}"
+                )
+            })?;
+        let mut runtime = self.commitment_checkpoint_certificate_anchor.write();
+        runtime.state = "verified";
+        runtime.anchored_height = state.certificate_height;
+        runtime.last_verified_at = Some(persisted_at);
+        runtime.last_persisted_at = Some(persisted_at);
+        Ok(())
     }
 
     /// Marks the start of one bounded follower pull round.
@@ -5217,6 +5811,313 @@ mod tests {
             .unwrap_err();
         assert!(blocked.contains("anchor is not ready"));
         assert_eq!(storage.record_commitment_chain_tip().await.0, 1);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_certificate_anchor_initializes_and_verifies_after_restart() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("certificate-anchor-restart.db");
+        let tip_anchor_path = directory.path().join("commitment-tip.json");
+        let certificate_anchor_path = checkpoint_certificate_anchor_path(&tip_anchor_path).unwrap();
+        let identity = IdentityKeyPair::generate();
+        let storage = MemoryStorage::open(&db_path, None).unwrap();
+        let (witnesses, digests) = seed_checkpoint_certificate(&storage, 1_700_610_000).await;
+        storage
+            .persist_record_commitment_checkpoint_certificate(
+                1_700_610_010,
+                2,
+                &witnesses,
+                &digests,
+            )
+            .await
+            .unwrap();
+        storage
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .configure_record_commitment_checkpoint_certificate_anchor(
+                    &tip_anchor_path,
+                    &identity,
+                )
+                .await
+                .unwrap(),
+            "initialized"
+        );
+        assert!(certificate_anchor_path.is_file());
+        let initialized = storage.record_commitment_checkpoint_status();
+        assert_eq!(initialized.certificate_rollback_guard_state, "initialized");
+        assert_eq!(initialized.certificate_rollback_guard_height, 1);
+        drop(storage);
+
+        let reopened = MemoryStorage::open(&db_path, None).unwrap();
+        reopened.audit_record_commitment_chain().await.unwrap();
+        reopened
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .configure_record_commitment_checkpoint_certificate_anchor(
+                    &tip_anchor_path,
+                    &identity,
+                )
+                .await
+                .unwrap(),
+            "verified"
+        );
+        let verified = reopened.record_commitment_checkpoint_status();
+        assert_eq!(verified.certificate_rollback_guard_state, "verified");
+        assert_eq!(verified.certificate_rollback_guard_height, 1);
+        assert_eq!(verified.checkpoint_certificates, 1);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_certificate_anchor_rejects_older_vault_snapshot() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("certificate-anchor-rollback.db");
+        let tip_anchor_path = directory.path().join("commitment-tip.json");
+        let identity = IdentityKeyPair::generate();
+        let storage = MemoryStorage::open(&db_path, None).unwrap();
+        let (witnesses, digests) = seed_checkpoint_certificate(&storage, 1_700_610_100).await;
+        storage
+            .persist_record_commitment_checkpoint_certificate(
+                1_700_610_110,
+                2,
+                &witnesses,
+                &digests,
+            )
+            .await
+            .unwrap();
+        storage
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        storage
+            .configure_record_commitment_checkpoint_certificate_anchor(&tip_anchor_path, &identity)
+            .await
+            .unwrap();
+        drop(storage);
+
+        // Restore only the certificate vault to its valid pre-certificate
+        // state while preserving the independently signed high-water sidecar.
+        let rollback = rusqlite::Connection::open(&db_path).unwrap();
+        rollback
+            .execute("DELETE FROM record_checkpoint_certificate_members", [])
+            .unwrap();
+        rollback
+            .execute("DELETE FROM record_checkpoint_certificates", [])
+            .unwrap();
+        drop(rollback);
+
+        let reopened = MemoryStorage::open(&db_path, None).unwrap();
+        reopened.audit_record_commitment_chain().await.unwrap();
+        reopened
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        let error = reopened
+            .configure_record_commitment_checkpoint_certificate_anchor(&tip_anchor_path, &identity)
+            .await
+            .unwrap_err();
+        assert!(error.contains("behind signed local anchor height 1"));
+        let rejected = reopened.record_commitment_checkpoint_status();
+        assert_eq!(
+            rejected.certificate_rollback_guard_state,
+            "rollback_detected"
+        );
+        assert_eq!(rejected.certificate_rollback_guard_height, 1);
+        assert_eq!(
+            reopened.record_commitment_chain_integrity_status().state,
+            "not_verified"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_certificate_anchor_rejects_signed_same_height_conflict() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("certificate-anchor-conflict.db");
+        let tip_anchor_path = directory.path().join("commitment-tip.json");
+        let certificate_anchor_path = checkpoint_certificate_anchor_path(&tip_anchor_path).unwrap();
+        let identity = IdentityKeyPair::generate();
+        let storage = MemoryStorage::open(&db_path, None).unwrap();
+        let (witnesses, digests) = seed_checkpoint_certificate(&storage, 1_700_610_200).await;
+        storage
+            .persist_record_commitment_checkpoint_certificate(
+                1_700_610_210,
+                2,
+                &witnesses,
+                &digests,
+            )
+            .await
+            .unwrap();
+        storage
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        storage
+            .configure_record_commitment_checkpoint_certificate_anchor(&tip_anchor_path, &identity)
+            .await
+            .unwrap();
+        let mut conflicting = {
+            let conn = storage.conn_lock().await;
+            read_latest_checkpoint_certificate_anchor_state(&conn)
+                .unwrap()
+                .unwrap()
+        };
+        conflicting.certificate_digest = [0xA9; 32];
+        let signed = RecordCheckpointCertificateAnchorV1::new_signed(
+            conflicting,
+            &identity,
+            unix_now_secs(),
+        );
+        write_checkpoint_certificate_anchor_atomic(
+            &certificate_anchor_path,
+            &serde_json::to_vec(&signed).unwrap(),
+        )
+        .unwrap();
+        drop(storage);
+
+        let reopened = MemoryStorage::open(&db_path, None).unwrap();
+        reopened.audit_record_commitment_chain().await.unwrap();
+        reopened
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        let error = reopened
+            .configure_record_commitment_checkpoint_certificate_anchor(&tip_anchor_path, &identity)
+            .await
+            .unwrap_err();
+        assert!(error.contains("conflicts at height 1"));
+        assert_eq!(
+            reopened
+                .record_commitment_checkpoint_status()
+                .certificate_rollback_guard_state,
+            "rollback_detected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_certificate_anchor_repairs_db_ahead_and_fails_closed_on_write_error() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("certificate-anchor-repair.db");
+        let tip_anchor_path = directory.path().join("anchor-parent/commitment-tip.json");
+        let certificate_anchor_path = checkpoint_certificate_anchor_path(&tip_anchor_path).unwrap();
+        let identity = IdentityKeyPair::generate();
+        let storage = MemoryStorage::open(&db_path, None).unwrap();
+        let (witnesses, digests) = seed_checkpoint_certificate(&storage, 1_700_610_300).await;
+        storage
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        storage
+            .configure_record_commitment_checkpoint_certificate_anchor(&tip_anchor_path, &identity)
+            .await
+            .unwrap();
+        drop(storage);
+
+        // Model SQLite committing first and the process stopping before the
+        // certificate sidecar replacement. Startup must safely advance it.
+        let db_ahead = MemoryStorage::open(&db_path, None).unwrap();
+        db_ahead.audit_record_commitment_chain().await.unwrap();
+        db_ahead
+            .persist_record_commitment_checkpoint_certificate(
+                1_700_610_310,
+                2,
+                &witnesses,
+                &digests,
+            )
+            .await
+            .unwrap();
+        drop(db_ahead);
+        let repaired = MemoryStorage::open(&db_path, None).unwrap();
+        repaired.audit_record_commitment_chain().await.unwrap();
+        repaired
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(
+            repaired
+                .configure_record_commitment_checkpoint_certificate_anchor(
+                    &tip_anchor_path,
+                    &identity,
+                )
+                .await
+                .unwrap(),
+            "repaired"
+        );
+        assert_eq!(
+            repaired
+                .record_commitment_checkpoint_status()
+                .certificate_rollback_guard_height,
+            1
+        );
+        drop(repaired);
+
+        // Reset to a pre-certificate DB plus an empty anchor, then inject a
+        // filesystem failure after the next certificate transaction commits.
+        let rollback = rusqlite::Connection::open(&db_path).unwrap();
+        rollback
+            .execute("DELETE FROM record_checkpoint_certificate_members", [])
+            .unwrap();
+        rollback
+            .execute("DELETE FROM record_checkpoint_certificates", [])
+            .unwrap();
+        drop(rollback);
+        let empty = RecordCheckpointCertificateAnchorV1::new_signed(
+            CheckpointCertificateAnchorState::EMPTY,
+            &identity,
+            unix_now_secs(),
+        );
+        write_checkpoint_certificate_anchor_atomic(
+            &certificate_anchor_path,
+            &serde_json::to_vec(&empty).unwrap(),
+        )
+        .unwrap();
+        let failing = MemoryStorage::open(&db_path, None).unwrap();
+        failing.audit_record_commitment_chain().await.unwrap();
+        failing
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        failing
+            .configure_record_commitment_checkpoint_certificate_anchor(&tip_anchor_path, &identity)
+            .await
+            .unwrap();
+        std::fs::remove_file(&certificate_anchor_path).unwrap();
+        let anchor_parent = certificate_anchor_path.parent().unwrap();
+        std::fs::remove_dir(anchor_parent).unwrap();
+        std::fs::write(anchor_parent, b"blocks child creation").unwrap();
+        let error = failing
+            .persist_record_commitment_checkpoint_certificate(
+                1_700_610_320,
+                2,
+                &witnesses,
+                &digests,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("certificate was committed"));
+        assert!(error.contains("anchor persistence failed"));
+        let failed = failing.record_commitment_checkpoint_status();
+        assert_eq!(failed.checkpoint_certificates, 1);
+        assert_eq!(failed.certificate_rollback_guard_state, "write_failed");
+        assert_eq!(failed.certificate_rollback_guard_write_failures_total, 1);
+        assert_eq!(
+            failing.record_commitment_chain_integrity_status().state,
+            "not_verified"
+        );
+        let blocked = failing
+            .persist_record_commitment_checkpoint_certificate(
+                1_700_610_321,
+                2,
+                &witnesses,
+                &digests,
+            )
+            .await
+            .unwrap_err();
+        assert!(blocked.contains("anchor is not ready"));
     }
 
     #[tokio::test]

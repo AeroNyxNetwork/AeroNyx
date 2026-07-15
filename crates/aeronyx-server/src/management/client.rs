@@ -36,7 +36,8 @@
 //   - commitment durability reports only SQLite's aggregate synchronous mode;
 //     never add database paths, host details, block hashes, or user data.
 //   - rollback guard reporting is aggregate only. Never send the sidecar path,
-//     signer, signature, identity material, or anchored block hash.
+//     signer, signature, identity material, anchored block hash, certificate
+//     digest, or checkpoint hash.
 //   - The body used for signing MUST be the same as what is sent.
 //     Do NOT add fields after signing.
 //
@@ -57,6 +58,7 @@
 //   v2.7.19        - Added applicable/deferred checkpoint evidence counts
 //   v2.7.20        - Added aggregate durable witness-equivocation incidents
 //   v2.7.21        - Added aggregate trusted-divergence incidents and production halt
+//   v2.7.24        - Added aggregate certificate rollback-guard evidence
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -237,6 +239,18 @@ pub struct RecordCommitmentCheckpointHeartbeatStatus {
     pub latest_certificate_signers: usize,
     /// Threshold recorded by the latest certificate.
     pub latest_certificate_required_signers: usize,
+    /// Signed local certificate-vault high-water state.
+    pub certificate_rollback_guard_state: String,
+    /// Highest certificate height protected by the signed sidecar.
+    pub certificate_rollback_guard_height: u64,
+    /// Most recent successful sidecar/vault comparison.
+    pub certificate_rollback_guard_last_verified_at: Option<u64>,
+    /// Most recent durable signed sidecar replacement.
+    pub certificate_rollback_guard_last_persisted_at: Option<u64>,
+    /// Sidecar persistence failures since process start.
+    pub certificate_rollback_guard_write_failures_total: u64,
+    /// Exact rollback-detection boundary; never implies network finality.
+    pub certificate_rollback_guard_scope: &'static str,
     /// Whether local commitment production is fail-closed in this process.
     pub production_halted: bool,
     /// Most recent applicable durable evidence observation time.
@@ -804,6 +818,13 @@ mod tests {
                 latest_certified_height: Some(9),
                 latest_certificate_signers: 2,
                 latest_certificate_required_signers: 2,
+                certificate_rollback_guard_state: "verified".to_string(),
+                certificate_rollback_guard_height: 9,
+                certificate_rollback_guard_last_verified_at: Some(121),
+                certificate_rollback_guard_last_persisted_at: Some(120),
+                certificate_rollback_guard_write_failures_total: 0,
+                certificate_rollback_guard_scope:
+                    "local certificate-vault rollback while sidecar remains",
                 production_halted: false,
                 last_evidence_at: Some(120),
                 observation_freshness: "fresh".to_string(),
@@ -855,6 +876,12 @@ mod tests {
         assert_eq!(checkpoint["latest_certified_height"], 9);
         assert_eq!(checkpoint["latest_certificate_signers"], 2);
         assert_eq!(checkpoint["latest_certificate_required_signers"], 2);
+        assert_eq!(checkpoint["certificate_rollback_guard_state"], "verified");
+        assert_eq!(checkpoint["certificate_rollback_guard_height"], 9);
+        assert_eq!(
+            checkpoint["certificate_rollback_guard_write_failures_total"],
+            0
+        );
         assert_eq!(checkpoint["production_halted"], false);
         assert_eq!(checkpoint["observation_freshness"], "fresh");
         assert_eq!(checkpoint["observation_age_seconds"], 5);
