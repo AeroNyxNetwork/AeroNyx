@@ -158,6 +158,8 @@
 //      catch-up remains bounded, restartable, and operable on low-I/O nodes.
 //  67. Exercises the coordinator startup policy with a real signed divergent
 //      witness checkpoint while proving the local canonical chain is immutable.
+//  68. Retains trusted-witness same-height conflicts as durable incidents and
+//      blocks coordinator startup before listeners even after later convergence.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -505,6 +507,7 @@ impl CommitmentWitnessStartupDecision {
 /// Fail-closed reasons produced by authenticated witness evidence or policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommitmentWitnessStartupBlockReason {
+    Equivocation,
     Divergence,
     RemoteAhead,
     Unavailable,
@@ -514,6 +517,7 @@ enum CommitmentWitnessStartupBlockReason {
 impl CommitmentWitnessStartupBlockReason {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Equivocation => "signed_checkpoint_equivocation",
             Self::Divergence => "signed_checkpoint_divergence",
             Self::RemoteAhead => "signed_checkpoint_remote_ahead",
             Self::Unavailable => "signed_checkpoint_unavailable",
@@ -1537,6 +1541,7 @@ impl Server {
             applicable_records = checkpoint_evidence_audit.applicable_evidence_records,
             deferred_records = checkpoint_evidence_audit.deferred_evidence_records,
             divergence_records = checkpoint_evidence_audit.divergence_evidence_records,
+            equivocation_incidents = checkpoint_evidence_audit.equivocation_incidents,
             "[MEMCHAIN_BLOCK] Persisted checkpoint evidence audit passed"
         );
 
@@ -2130,6 +2135,7 @@ impl Server {
                             applicable_evidence_records: status.applicable_evidence_records,
                             deferred_evidence_records: status.deferred_evidence_records,
                             divergence_evidence_records: status.divergence_evidence_records,
+                            equivocation_incidents: status.equivocation_incidents,
                             last_evidence_at: status.last_evidence_at,
                             observation_freshness: status.observation_freshness,
                             observation_age_seconds: status.observation_age_seconds,
@@ -2830,6 +2836,21 @@ impl Server {
             return Ok(());
         }
 
+        let existing_equivocations = storage
+            .count_record_commitment_checkpoint_equivocations_for_witnesses(&witness_node_ids)
+            .await
+            .map_err(|error| {
+                ServerError::startup_failed(format!(
+                    "MemChain external witness rollback guard: durable incident query failed: {error}"
+                ))
+            })?;
+        if existing_equivocations > 0 {
+            return Err(ServerError::startup_failed(format!(
+                "MemChain external witness rollback guard: {}",
+                CommitmentWitnessStartupBlockReason::Equivocation
+            )));
+        }
+
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
@@ -2849,6 +2870,20 @@ impl Server {
             &witness_node_ids,
         )
         .await;
+        let observed_equivocations = storage
+            .count_record_commitment_checkpoint_equivocations_for_witnesses(&witness_node_ids)
+            .await
+            .map_err(|error| {
+                ServerError::startup_failed(format!(
+                    "MemChain external witness rollback guard: post-round incident query failed: {error}"
+                ))
+            })?;
+        if observed_equivocations > 0 {
+            return Err(ServerError::startup_failed(format!(
+                "MemChain external witness rollback guard: {}",
+                CommitmentWitnessStartupBlockReason::Equivocation
+            )));
+        }
         let decision = commitment_witness_startup_decision(
             &round,
             self.config.memchain.commitment_witness_startup_required,
@@ -6055,6 +6090,10 @@ mod tests {
 
     #[test]
     fn commitment_witness_startup_gate_enforces_threshold_and_conflicts() {
+        assert_eq!(
+            CommitmentWitnessStartupBlockReason::Equivocation.as_str(),
+            "signed_checkpoint_equivocation"
+        );
         let unavailable = CommitmentReconciliationOutcome::default();
         assert_eq!(
             commitment_witness_startup_decision(&unavailable, false, 1),

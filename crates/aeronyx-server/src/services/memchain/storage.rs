@@ -201,12 +201,13 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 /// v5 → v6: SuperNode cognitive_tasks + llm_usage_log + sessions.title
 /// v7 → v8: signed node-blind commitment chain + membership index
 /// v8 → v9: bounded local signed checkpoint evidence vault
+/// v9 → v10: durable signed-witness equivocation incidents
 ///
 /// ⚠️ CRITICAL: When bumping this, you MUST also add a new migrate block
 /// in maybe_migrate(). The migrate block MUST use a hardcoded integer
 /// (not this constant) for UPDATE schema_version, to prevent skipping
 /// intermediate migrations on multi-version upgrades.
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -407,6 +408,9 @@ pub struct RecordCommitmentCheckpointStatus {
     pub deferred_evidence_records: u64,
     /// Applicable retained proofs that established a shared-prefix mismatch.
     pub divergence_evidence_records: u64,
+    /// Durable incidents where one trusted witness signed incompatible hashes
+    /// for the same checkpoint or tip height. Witness identities stay local.
+    pub equivocation_incidents: u64,
     /// Most recent applicable durable evidence observation time.
     pub last_evidence_at: Option<u64>,
     /// `unavailable`, `fresh`, or `stale` for the most recent durable signed
@@ -447,6 +451,9 @@ pub(crate) const COMMITMENT_SYNC_EVENT_CAPACITY: usize = 16;
 /// Maximum signed checkpoint frames retained locally. Divergence evidence is
 /// pruned last so normal convergence checks cannot erase the most useful proof.
 pub(crate) const CHECKPOINT_EVIDENCE_CAPACITY: usize = 256;
+/// A detected trusted-witness conflict is retained rather than rotated away.
+/// Bound the incident ledger so unbounded corruption cannot grow startup work.
+pub(crate) const CHECKPOINT_EQUIVOCATION_CAPACITY: usize = 64;
 /// Defensive bound for one stored proof frame. Increasing this requires an
 /// explicit wire and startup-memory review.
 pub(crate) const MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES: usize = 4 * 1024;
@@ -519,6 +526,7 @@ pub(crate) struct RecordCommitmentCheckpointRuntime {
     pub(crate) applicable_evidence_records: u64,
     pub(crate) deferred_evidence_records: u64,
     pub(crate) divergence_evidence_records: u64,
+    pub(crate) equivocation_incidents: u64,
     pub(crate) last_evidence_at: Option<u64>,
     pub(crate) last_round_state: &'static str,
     pub(crate) last_round_at: Option<u64>,
@@ -553,6 +561,7 @@ impl Default for RecordCommitmentCheckpointRuntime {
             applicable_evidence_records: 0,
             deferred_evidence_records: 0,
             divergence_evidence_records: 0,
+            equivocation_incidents: 0,
             last_evidence_at: None,
             last_round_state: "not_checked",
             last_round_at: None,
@@ -839,6 +848,28 @@ impl MemoryStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_record_checkpoint_evidence_observed
                 ON record_checkpoint_evidence(observed_at);
+
+            -- v10: compact, append-only proof that one explicitly trusted
+            -- witness signed incompatible hashes for the same chain position.
+            -- The referenced signed frames remain in the bounded v9 vault and
+            -- cannot be pruned while an incident depends on them.
+            CREATE TABLE IF NOT EXISTS record_checkpoint_equivocations (
+                responder               BLOB NOT NULL CHECK(length(responder) = 32),
+                conflict_scope          TEXT NOT NULL CHECK(conflict_scope IN
+                    ('checkpoint','tip')),
+                conflict_height         INTEGER NOT NULL CHECK(conflict_height >= 0),
+                first_evidence_digest   BLOB NOT NULL CHECK(length(first_evidence_digest) = 32),
+                second_evidence_digest  BLOB NOT NULL CHECK(length(second_evidence_digest) = 32),
+                detected_at             INTEGER NOT NULL CHECK(detected_at >= 0),
+                PRIMARY KEY (responder, conflict_scope, conflict_height),
+                CHECK(first_evidence_digest != second_evidence_digest),
+                FOREIGN KEY(first_evidence_digest) REFERENCES record_checkpoint_evidence(evidence_digest)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(second_evidence_digest) REFERENCES record_checkpoint_evidence(evidence_digest)
+                    ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_record_checkpoint_equivocations_detected
+                ON record_checkpoint_equivocations(detected_at);
 
             CREATE TABLE IF NOT EXISTS raw_logs (
                 log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1681,6 +1712,61 @@ impl MemoryStorage {
             conn.execute("UPDATE schema_version SET version = 9", [])
                 .map_err(|error| format!("Update schema version to v9: {error}"))?;
             info!("[STORAGE] ✅ Migration to v9 (checkpoint evidence vault) complete");
+        }
+
+        // v9 → v10: durable witness-equivocation incidents. This remains a
+        // local operator security primitive: responder identities and signed
+        // frames are never exported through heartbeat or public APIs.
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(9);
+
+        if current < 10 {
+            info!(
+                "[STORAGE] Migrating schema v{} → v10 (checkpoint equivocation incidents)",
+                current
+            );
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS record_checkpoint_equivocations (
+                    responder               BLOB NOT NULL CHECK(length(responder) = 32),
+                    conflict_scope          TEXT NOT NULL CHECK(conflict_scope IN
+                        ('checkpoint','tip')),
+                    conflict_height         INTEGER NOT NULL CHECK(conflict_height >= 0),
+                    first_evidence_digest   BLOB NOT NULL CHECK(length(first_evidence_digest) = 32),
+                    second_evidence_digest  BLOB NOT NULL CHECK(length(second_evidence_digest) = 32),
+                    detected_at             INTEGER NOT NULL CHECK(detected_at >= 0),
+                    PRIMARY KEY (responder, conflict_scope, conflict_height),
+                    CHECK(first_evidence_digest != second_evidence_digest),
+                    FOREIGN KEY(first_evidence_digest) REFERENCES record_checkpoint_evidence(evidence_digest)
+                        ON DELETE RESTRICT,
+                    FOREIGN KEY(second_evidence_digest) REFERENCES record_checkpoint_evidence(evidence_digest)
+                        ON DELETE RESTRICT
+                );
+                CREATE INDEX IF NOT EXISTS idx_record_checkpoint_equivocations_detected
+                    ON record_checkpoint_equivocations(detected_at);",
+            )
+            .map_err(|error| format!("v10 migration: create equivocation incidents: {error}"))?;
+            let exists = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='record_checkpoint_equivocations'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if !exists {
+                return Err(
+                    "v10 migration: required table 'record_checkpoint_equivocations' was not created"
+                        .to_string(),
+                );
+            }
+            // ⚠️ hardcoded 10, not SCHEMA_VERSION — preserves sequential upgrades.
+            conn.execute("UPDATE schema_version SET version = 10", [])
+                .map_err(|error| format!("Update schema version to v10: {error}"))?;
+            info!("[STORAGE] ✅ Migration to v10 (checkpoint equivocation incidents) complete");
         }
 
         Ok(())
@@ -3624,13 +3710,15 @@ mod tests {
             })
             .unwrap();
         // maybe_migrate() runs through the latest schema: v6 adds SuperNode,
-        // v7 adds the blind marker, v8 creates commitment tables, and v9 adds
-        // the bounded proof vault even when create_schema() was not called.
-        assert_eq!(v, 9);
+        // v7 adds the blind marker, v8 creates commitment tables, v9 adds the
+        // bounded proof vault, and v10 adds durable equivocation incidents even
+        // when create_schema() was not called.
+        assert_eq!(v, 10);
         for table in [
             "record_commitment_blocks",
             "record_block_commitments",
             "record_checkpoint_evidence",
+            "record_checkpoint_equivocations",
         ] {
             let exists: bool = conn
                 .query_row(

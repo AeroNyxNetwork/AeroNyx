@@ -68,6 +68,7 @@
 //!
 //! ## Last Modified
 //! v2.8.3-WitnessDivergence - Exposed crate-local reconciliation for startup tests.
+//! v2.8.4-WitnessEquivocation - Retain and reject conflicting pinned-witness claims.
 //! v2.8.2-AdversarialFollower - Added signed malicious-page regression coverage.
 //! v2.7.18-VerifiedRangeSnapshot - Sign only snapshot-consistent audited pages.
 //! v2.7.17-AtomicBlockPage - Commit each verified follower page atomically.
@@ -109,6 +110,7 @@ use aeronyx_core::protocol::memchain::{
 use aeronyx_core::protocol::NodeCapability;
 use sha2::{Digest, Sha256};
 
+use crate::services::memchain::storage_ops::RecordCommitmentCheckpointEvidencePersistOutcome;
 use crate::services::memchain::MemoryStorage;
 use crate::services::PeerStore;
 
@@ -303,6 +305,25 @@ pub async fn pull_record_commitment_checkpoint(
     coordinator_node_id: &[u8; 32],
     client: &reqwest::Client,
 ) -> Result<CommitmentCheckpointOutcome, String> {
+    pull_record_commitment_checkpoint_with_witness_policy(
+        storage,
+        peer_store,
+        identity,
+        coordinator_node_id,
+        client,
+        false,
+    )
+    .await
+}
+
+async fn pull_record_commitment_checkpoint_with_witness_policy(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    coordinator_node_id: &[u8; 32],
+    client: &reqwest::Client,
+    track_trusted_witness_equivocation: bool,
+) -> Result<CommitmentCheckpointOutcome, String> {
     let request_timestamp = now_secs();
     let coordinator = peer_store
         .get_valid(coordinator_node_id, request_timestamp)
@@ -360,8 +381,8 @@ pub async fn pull_record_commitment_checkpoint(
         observed_at,
     )
     .await?;
-    storage
-        .persist_record_commitment_checkpoint_evidence(
+    let persist_outcome = storage
+        .persist_record_commitment_checkpoint_evidence_with_witness_policy(
             observed_at,
             outcome.relation.as_str(),
             outcome.local_tip_height,
@@ -369,9 +390,13 @@ pub async fn pull_record_commitment_checkpoint(
             outcome.checkpoint_height,
             &outcome.evidence_digest,
             &body,
+            track_trusted_witness_equivocation,
         )
         .await
         .map_err(|_| "checkpoint_evidence_persist_failed".to_string())?;
+    if persist_outcome == RecordCommitmentCheckpointEvidencePersistOutcome::EquivocationDetected {
+        return Err("checkpoint_witness_equivocation".to_string());
+    }
     Ok(outcome)
 }
 
@@ -475,6 +500,7 @@ where
         client,
         candidate_ids,
         max_witnesses,
+        false,
     )
     .await
 }
@@ -517,6 +543,7 @@ where
         client,
         candidate_ids,
         witness_node_ids.len().min(MAX_PINNED_WITNESSES_PER_ROUND),
+        true,
     )
     .await
 }
@@ -528,6 +555,7 @@ async fn reconcile_record_commitment_candidate_ids(
     client: &reqwest::Client,
     mut candidate_ids: Vec<[u8; 32]>,
     max_witnesses: usize,
+    track_trusted_witness_equivocation: bool,
 ) -> CommitmentReconciliationOutcome {
     let eligible_witnesses = candidate_ids.len();
     candidate_ids.truncate(max_witnesses);
@@ -540,12 +568,13 @@ async fn reconcile_record_commitment_candidate_ids(
     let mut verified = Vec::with_capacity(attempted);
 
     for candidate_node_id in candidate_ids {
-        match pull_record_commitment_checkpoint(
+        match pull_record_commitment_checkpoint_with_witness_policy(
             storage,
             peer_store,
             identity,
             &candidate_node_id,
             client,
+            track_trusted_witness_equivocation,
         )
         .await
         {
