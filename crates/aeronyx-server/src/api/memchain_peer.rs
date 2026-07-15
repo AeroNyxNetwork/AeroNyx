@@ -33,6 +33,8 @@
 //!   canonically reverified before the node signs a response.
 //! - Fixed-size certificate exchange between admitted peers. Imported members
 //!   must still belong to the receiver's operator-pinned witness set.
+//! - Last-hop public-IP validation on every outbound commitment request so a
+//!   rotated signed descriptor cannot redirect the node into private services.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` on the public node peer listener and local operator
@@ -74,8 +76,11 @@
 //!   missing/stale process audit baseline.
 //! - Imported certificates are post-startup evidence only. Never let a replayed
 //!   bundle satisfy the live startup witness threshold.
+//! - Revalidate the resolved signed endpoint inside every pull helper. Candidate
+//!   filtering alone is vulnerable to concurrent descriptor replacement.
 //!
 //! ## Last Modified
+//! v2.8.8-EndpointSSRFGuard - Enforced final-hop public endpoint validation.
 //! v2.8.7-CertificateExchange - Added admitted fixed-size certificate exchange.
 //! v2.8.6-CheckpointCertificate - Require distinct pinned witnesses for certificate rounds.
 //! v2.8.5-TrustedDivergenceHalt - Preserve verified divergence after sticky incident creation.
@@ -360,25 +365,30 @@ pub async fn pull_record_commitment_checkpoint(
     coordinator_node_id: &[u8; 32],
     client: &reqwest::Client,
 ) -> Result<CommitmentCheckpointOutcome, String> {
-    pull_record_commitment_checkpoint_with_witness_policy(
+    pull_record_commitment_checkpoint_with_endpoint_policy(
         storage,
         peer_store,
         identity,
         coordinator_node_id,
         client,
         false,
+        &commitment_peer_endpoint_is_public,
     )
     .await
 }
 
-async fn pull_record_commitment_checkpoint_with_witness_policy(
+async fn pull_record_commitment_checkpoint_with_endpoint_policy<F>(
     storage: &MemoryStorage,
     peer_store: &PeerStore,
     identity: &IdentityKeyPair,
     coordinator_node_id: &[u8; 32],
     client: &reqwest::Client,
     track_trusted_witness_incidents: bool,
-) -> Result<CommitmentCheckpointOutcome, String> {
+    endpoint_allowed: &F,
+) -> Result<CommitmentCheckpointOutcome, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
     let request_timestamp = now_secs();
     let coordinator = peer_store
         .get_valid(coordinator_node_id, request_timestamp)
@@ -388,6 +398,9 @@ async fn pull_record_commitment_checkpoint_with_witness_policy(
         .public_endpoint
         .as_deref()
         .ok_or_else(|| "pinned_coordinator_missing_endpoint".to_string())?;
+    if !endpoint_allowed(endpoint) {
+        return Err("pinned_coordinator_unsafe_endpoint".to_string());
+    }
     let url = commitment_checkpoint_url(endpoint)?;
 
     let (known_tip_height, known_tip_hash) = verified_local_commitment_tip(storage).await?;
@@ -478,6 +491,32 @@ pub async fn pull_record_commitment_checkpoint_certificate(
     minimum_required_signers: usize,
     client: &reqwest::Client,
 ) -> Result<CommitmentCertificateImportOutcome, String> {
+    pull_record_commitment_checkpoint_certificate_with_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        source_node_id,
+        allowed_witnesses,
+        minimum_required_signers,
+        client,
+        &commitment_peer_endpoint_is_public,
+    )
+    .await
+}
+
+async fn pull_record_commitment_checkpoint_certificate_with_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    source_node_id: &[u8; 32],
+    allowed_witnesses: &[[u8; 32]],
+    minimum_required_signers: usize,
+    client: &reqwest::Client,
+    endpoint_allowed: &F,
+) -> Result<CommitmentCertificateImportOutcome, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
     if !(2..=MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1).contains(&minimum_required_signers)
         || allowed_witnesses.len() < minimum_required_signers
     {
@@ -492,6 +531,9 @@ pub async fn pull_record_commitment_checkpoint_certificate(
         .public_endpoint
         .as_deref()
         .ok_or_else(|| "certificate_source_missing_endpoint".to_string())?;
+    if !endpoint_allowed(endpoint) {
+        return Err("certificate_source_unsafe_endpoint".to_string());
+    }
     let url = commitment_checkpoint_certificate_url(endpoint)?;
     let (known_tip_height, known_tip_hash) = verified_local_commitment_tip(storage).await?;
     if known_tip_height == 0 {
@@ -606,7 +648,7 @@ pub async fn reconcile_record_commitment_witnesses(
         identity,
         client,
         max_witnesses,
-        checkpoint_witness_endpoint_is_public,
+        commitment_peer_endpoint_is_public,
     )
     .await
 }
@@ -653,7 +695,7 @@ pub async fn reconcile_record_commitment_pinned_witnesses_with_certificate_thres
         client,
         witness_node_ids,
         minimum_certificate_signers,
-        checkpoint_witness_endpoint_is_public,
+        commitment_peer_endpoint_is_public,
     )
     .await
 }
@@ -711,6 +753,7 @@ where
         max_witnesses,
         false,
         None,
+        &endpoint_allowed,
     )
     .await
 }
@@ -756,11 +799,12 @@ where
         witness_node_ids.len().min(MAX_PINNED_WITNESSES_PER_ROUND),
         true,
         Some(minimum_certificate_signers),
+        &endpoint_allowed,
     )
     .await
 }
 
-async fn reconcile_record_commitment_candidate_ids(
+async fn reconcile_record_commitment_candidate_ids<F>(
     storage: &MemoryStorage,
     peer_store: &PeerStore,
     identity: &IdentityKeyPair,
@@ -769,7 +813,11 @@ async fn reconcile_record_commitment_candidate_ids(
     max_witnesses: usize,
     track_trusted_witness_incidents: bool,
     minimum_certificate_signers: Option<usize>,
-) -> CommitmentReconciliationOutcome {
+    endpoint_allowed: &F,
+) -> CommitmentReconciliationOutcome
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
     // Preserve operator order while ensuring one identity can contribute at
     // most one request, one result, and one certificate member. This remains
     // defense in depth even when config parsing already rejects duplicate IDs.
@@ -788,13 +836,14 @@ async fn reconcile_record_commitment_candidate_ids(
     let mut certificate_evidence = Vec::with_capacity(attempted);
 
     for candidate_node_id in candidate_ids {
-        match pull_record_commitment_checkpoint_with_witness_policy(
+        match pull_record_commitment_checkpoint_with_endpoint_policy(
             storage,
             peer_store,
             identity,
             &candidate_node_id,
             client,
             track_trusted_witness_incidents,
+            endpoint_allowed,
         )
         .await
         {
@@ -888,7 +937,7 @@ async fn reconcile_record_commitment_candidate_ids(
 /// is safe for this host to contact. Domain names are deliberately excluded to
 /// prevent DNS rebinding; loopback, private, link-local, CGNAT, benchmark,
 /// documentation, multicast, and reserved ranges are also rejected.
-fn checkpoint_witness_endpoint_is_public(endpoint: &str) -> bool {
+fn commitment_peer_endpoint_is_public(endpoint: &str) -> bool {
     let Ok(url) = commitment_checkpoint_url(endpoint) else {
         return false;
     };
@@ -960,6 +1009,28 @@ pub async fn pull_record_commitment_page(
     coordinator_node_id: &[u8; 32],
     client: &reqwest::Client,
 ) -> Result<CommitmentSyncPageOutcome, String> {
+    pull_record_commitment_page_with_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        coordinator_node_id,
+        client,
+        &commitment_peer_endpoint_is_public,
+    )
+    .await
+}
+
+async fn pull_record_commitment_page_with_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    coordinator_node_id: &[u8; 32],
+    client: &reqwest::Client,
+    endpoint_allowed: &F,
+) -> Result<CommitmentSyncPageOutcome, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
     let request_timestamp = now_secs();
     let coordinator = peer_store
         .get_valid(coordinator_node_id, request_timestamp)
@@ -969,6 +1040,9 @@ pub async fn pull_record_commitment_page(
         .public_endpoint
         .as_deref()
         .ok_or_else(|| "pinned_coordinator_missing_endpoint".to_string())?;
+    if !endpoint_allowed(endpoint) {
+        return Err("pinned_coordinator_unsafe_endpoint".to_string());
+    }
     let url = commitment_block_range_url(endpoint)?;
 
     let local_tip = verified_local_commitment_tip(storage).await?;
@@ -1893,6 +1967,10 @@ mod tests {
         assert_eq!(import.inserted, 1);
     }
 
+    fn allow_test_endpoint(_endpoint: &str) -> bool {
+        true
+    }
+
     fn signed_block_page_frame(
         signer: &IdentityKeyPair,
         request_id: [u8; 16],
@@ -1965,13 +2043,17 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_witness_endpoint_rejects_ssrf_targets() {
-        assert!(checkpoint_witness_endpoint_is_public("http://8.8.8.8:8422"));
-        assert!(checkpoint_witness_endpoint_is_public(
+    fn commitment_peer_endpoint_rejects_ssrf_targets() {
+        assert!(commitment_peer_endpoint_is_public("http://8.8.8.8:8422"));
+        assert!(commitment_peer_endpoint_is_public(
             "https://[2606:4700:4700::1111]:8422"
         ));
         for endpoint in [
             "http://127.0.0.1:8422",
+            "http://127.1:8422",
+            "http://2130706433:8422",
+            "http://0x7f000001:8422",
+            "http://017700000001:8422",
             "http://10.0.0.1:8422",
             "http://100.64.0.1:8422",
             "http://169.254.1.1:8422",
@@ -1981,15 +2063,108 @@ mod tests {
             "http://203.0.113.1:8422",
             "http://node.example:8422",
             "http://[::1]:8422",
+            "http://[::ffff:127.0.0.1]:8422",
             "http://[fc00::1]:8422",
             "http://[fe80::1]:8422",
             "http://[2001:db8::1]:8422",
         ] {
             assert!(
-                !checkpoint_witness_endpoint_is_public(endpoint),
+                !commitment_peer_endpoint_is_public(endpoint),
                 "unexpectedly accepted {endpoint}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn outbound_commitment_pulls_reject_private_descriptor_targets() {
+        let now = now_secs();
+        let local_identity = IdentityKeyPair::generate();
+        let remote_identity = IdentityKeyPair::generate();
+        let peer_store = PeerStore::new();
+        admit_peer(
+            &peer_store,
+            &remote_identity,
+            Some("http://169.254.169.254/latest/meta-data".to_string()),
+            now,
+        );
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let remote_id = remote_identity.public_key_bytes();
+
+        let checkpoint_error = pull_record_commitment_checkpoint(
+            &storage,
+            &peer_store,
+            &local_identity,
+            &remote_id,
+            &client,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(checkpoint_error, "pinned_coordinator_unsafe_endpoint");
+
+        let page_error = pull_record_commitment_page(
+            &storage,
+            &peer_store,
+            &local_identity,
+            &remote_id,
+            &client,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(page_error, "pinned_coordinator_unsafe_endpoint");
+
+        let certificate_error = pull_record_commitment_checkpoint_certificate(
+            &storage,
+            &peer_store,
+            &local_identity,
+            &remote_id,
+            &[remote_id, IdentityKeyPair::generate().public_key_bytes()],
+            2,
+            &client,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(certificate_error, "certificate_source_unsafe_endpoint");
+    }
+
+    #[tokio::test]
+    async fn witness_reconciliation_rechecks_endpoint_after_selection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let now = now_secs();
+        let local_identity = IdentityKeyPair::generate();
+        let remote_identity = IdentityKeyPair::generate();
+        let peer_store = PeerStore::new();
+        admit_peer(
+            &peer_store,
+            &remote_identity,
+            Some("http://8.8.8.8:8422".to_string()),
+            now,
+        );
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let checks = AtomicUsize::new(0);
+        let round = reconcile_record_commitment_witnesses_with_endpoint_policy(
+            &storage,
+            &peer_store,
+            &local_identity,
+            &client,
+            1,
+            |_endpoint| checks.fetch_add(1, Ordering::SeqCst) == 0,
+        )
+        .await;
+
+        assert_eq!(round.eligible_witnesses, 1);
+        assert_eq!(round.attempted, 1);
+        assert_eq!(round.verified, 0);
+        assert_eq!(round.failed, 1);
+        assert!(checks.load(Ordering::SeqCst) >= 2);
     }
 
     #[tokio::test]
@@ -2617,12 +2792,14 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
-        let before_pull = pull_record_commitment_checkpoint(
+        let before_pull = pull_record_commitment_checkpoint_with_endpoint_policy(
             &destination,
             &follower_peers,
             &requester_identity,
             &responder_identity.public_key_bytes(),
             &client,
+            false,
+            &allow_test_endpoint,
         )
         .await
         .unwrap();
@@ -2632,12 +2809,13 @@ mod tests {
         );
         assert_eq!(before_pull.local_tip_height, 0);
         assert_eq!(before_pull.remote_tip_height, 2);
-        let outcome = pull_record_commitment_page(
+        let outcome = pull_record_commitment_page_with_endpoint_policy(
             &destination,
             &follower_peers,
             &requester_identity,
             &responder_identity.public_key_bytes(),
             &client,
+            &allow_test_endpoint,
         )
         .await
         .unwrap();
@@ -2650,12 +2828,14 @@ mod tests {
             destination.record_commitment_chain_tip().await,
             source.record_commitment_chain_tip().await
         );
-        let checkpoint = pull_record_commitment_checkpoint(
+        let checkpoint = pull_record_commitment_checkpoint_with_endpoint_policy(
             &destination,
             &follower_peers,
             &requester_identity,
             &responder_identity.public_key_bytes(),
             &client,
+            false,
+            &allow_test_endpoint,
         )
         .await
         .unwrap();
@@ -2735,12 +2915,13 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
-        let error = pull_record_commitment_page(
+        let error = pull_record_commitment_page_with_endpoint_policy(
             &destination,
             &peers,
             &requester,
             &coordinator.public_key_bytes(),
             &client,
+            &allow_test_endpoint,
         )
         .await
         .unwrap_err();
@@ -3082,7 +3263,7 @@ mod tests {
             Some(format!("http://{source_address}")),
             now,
         );
-        let imported = pull_record_commitment_checkpoint_certificate(
+        let imported = pull_record_commitment_checkpoint_certificate_with_endpoint_policy(
             &destination,
             &destination_peers,
             &destination_identity,
@@ -3090,6 +3271,7 @@ mod tests {
             &witness_ids,
             2,
             &client,
+            &allow_test_endpoint,
         )
         .await
         .unwrap();
@@ -3106,7 +3288,7 @@ mod tests {
 
         let third_witness = IdentityKeyPair::generate().public_key_bytes();
         let strict_witness_ids = [witness_ids[0], witness_ids[1], third_witness];
-        let error = pull_record_commitment_checkpoint_certificate(
+        let error = pull_record_commitment_checkpoint_certificate_with_endpoint_policy(
             &destination,
             &destination_peers,
             &destination_identity,
@@ -3114,6 +3296,7 @@ mod tests {
             &strict_witness_ids,
             3,
             &client,
+            &allow_test_endpoint,
         )
         .await
         .unwrap_err();
@@ -3133,7 +3316,7 @@ mod tests {
             .await
             .unwrap();
         let alternative_witness = IdentityKeyPair::generate().public_key_bytes();
-        let error = pull_record_commitment_checkpoint_certificate(
+        let error = pull_record_commitment_checkpoint_certificate_with_endpoint_policy(
             &unpinned_destination,
             &destination_peers,
             &destination_identity,
@@ -3141,6 +3324,7 @@ mod tests {
             &[witness_ids[0], alternative_witness],
             2,
             &client,
+            &allow_test_endpoint,
         )
         .await
         .unwrap_err();
