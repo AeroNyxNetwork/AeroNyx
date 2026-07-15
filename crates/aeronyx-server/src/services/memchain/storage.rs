@@ -50,6 +50,8 @@
 //! - v12 (v2.7.22-CheckpointCertificate): Immutable bounded certificates that
 //!   bind distinct operator-pinned witness frames to one locally audited
 //!   checkpoint without claiming distributed consensus or fork choice.
+//! - v13 (v2.7.26-CoordinatorLease): Durable exclusive coordinator process
+//!   lease grants retained by audited follower witnesses.
 //! - v2.7.23-CertificateExchange: Snapshot-audited internal bundle export for
 //!   the admitted fixed-size peer protocol; the schema remains v12.
 //! - v2.7.4-BlockIntegrityStatus: Runtime-only evidence for the most recent
@@ -202,13 +204,15 @@
 //!   prevents duplicate local coordinator processes from producing against
 //!   the same SQLite chain and sidecars.
 //!   No SQLite schema change; aggregate public fence status was added.
+//! v2.7.26-CoordinatorLease - Added durable witness-side coordinator lease
+//!   grants and process-local lease validity state for cross-host fencing.
 // ============================================
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use nix::fcntl::Flock;
 use parking_lot::RwLock;
@@ -236,12 +240,13 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 /// v9 → v10: durable signed-witness equivocation incidents
 /// v10 → v11: durable trusted-witness divergent-prefix incidents
 /// v11 → v12: immutable pinned-witness checkpoint certificates
+/// v12 → v13: durable exclusive coordinator lease grants on follower witnesses
 ///
 /// ⚠️ CRITICAL: When bumping this, you MUST also add a new migrate block
 /// in maybe_migrate(). The migrate block MUST use a hardcoded integer
 /// (not this constant) for UPDATE schema_version, to prevent skipping
 /// intermediate migrations on multi-version upgrades.
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -714,6 +719,37 @@ impl Default for RecordCommitmentCoordinatorFenceRuntime {
     }
 }
 
+/// Runtime-only coordinator lease validity and aggregate telemetry.
+///
+/// `valid_until` uses the local monotonic clock so wall-clock changes cannot
+/// extend this process's production authority. The random instance id and
+/// witness identities remain in the lease task and are never reported.
+pub(crate) struct RecordCommitmentCoordinatorLeaseRuntime {
+    pub(crate) required: bool,
+    pub(crate) state: &'static str,
+    pub(crate) granted_witnesses: usize,
+    pub(crate) required_witnesses: usize,
+    pub(crate) expires_at: Option<u64>,
+    pub(crate) valid_until: Option<Instant>,
+    pub(crate) last_renewed_at: Option<u64>,
+    pub(crate) renewal_failures_total: u64,
+}
+
+impl Default for RecordCommitmentCoordinatorLeaseRuntime {
+    fn default() -> Self {
+        Self {
+            required: false,
+            state: "disabled",
+            granted_witnesses: 0,
+            required_witnesses: 0,
+            expires_at: None,
+            valid_until: None,
+            last_renewed_at: None,
+            renewal_failures_total: 0,
+        }
+    }
+}
+
 /// Private coordinator material required to advance the local signed anchor.
 ///
 /// The identity is cloned only while writing a new anchor, then dropped. This
@@ -861,6 +897,10 @@ pub struct MemoryStorage {
     /// process from producing blocks or replacing sidecars for this database.
     pub(crate) commitment_coordinator_fence:
         RwLock<RecordCommitmentCoordinatorFenceRuntime>,
+    /// Witness-backed cross-host production authority. This remains disabled
+    /// unless the operator explicitly enables strict coordinator leasing.
+    pub(crate) commitment_coordinator_lease:
+        RwLock<RecordCommitmentCoordinatorLeaseRuntime>,
     /// Signed local high-water mark outside SQLite. The private config never
     /// leaves this process; only aggregate status is reportable.
     pub(crate) commitment_tip_anchor: RwLock<RecordCommitmentTipAnchorRuntime>,
@@ -933,6 +973,9 @@ impl MemoryStorage {
             commitment_durability: AtomicU64::new(1),
             commitment_coordinator_fence: RwLock::new(
                 RecordCommitmentCoordinatorFenceRuntime::default(),
+            ),
+            commitment_coordinator_lease: RwLock::new(
+                RecordCommitmentCoordinatorLeaseRuntime::default(),
             ),
             commitment_tip_anchor: RwLock::new(RecordCommitmentTipAnchorRuntime::default()),
             commitment_checkpoint: RwLock::new(RecordCommitmentCheckpointRuntime::default()),
@@ -1090,6 +1133,20 @@ impl MemoryStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_record_checkpoint_certificate_members_height
                 ON record_checkpoint_certificate_members(checkpoint_height);
+
+            -- v13: one durable exclusive process lease per configured
+            -- coordinator identity on this follower witness. No endpoint,
+            -- host identity, process id, or memory/user data is retained.
+            CREATE TABLE IF NOT EXISTS record_coordinator_leases (
+                coordinator      BLOB PRIMARY KEY CHECK(length(coordinator) = 32),
+                chain_id         BLOB NOT NULL CHECK(length(chain_id) = 32),
+                instance_id      BLOB NOT NULL CHECK(length(instance_id) = 32),
+                lease_epoch      INTEGER NOT NULL CHECK(lease_epoch > 0),
+                lease_expires_at INTEGER NOT NULL CHECK(lease_expires_at >= 0),
+                updated_at       INTEGER NOT NULL CHECK(updated_at >= 0)
+            );
+            CREATE INDEX IF NOT EXISTS idx_record_coordinator_leases_expiry
+                ON record_coordinator_leases(lease_expires_at);
 
             CREATE TABLE IF NOT EXISTS raw_logs (
                 log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2105,6 +2162,54 @@ impl MemoryStorage {
             conn.execute("UPDATE schema_version SET version = 12", [])
                 .map_err(|error| format!("Update schema version to v12: {error}"))?;
             info!("[STORAGE] Migration to v12 (checkpoint certificates) complete");
+        }
+
+        // v12 -> v13: durable witness-side coordinator lease state. This is a
+        // crash-recovery fence for one configured coordinator identity, not a
+        // leader-election, fork-choice, quorum, or finality table.
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(12);
+
+        if current < 13 {
+            info!(
+                "[STORAGE] Migrating schema v{} -> v13 (coordinator leases)",
+                current
+            );
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS record_coordinator_leases (
+                    coordinator      BLOB PRIMARY KEY CHECK(length(coordinator) = 32),
+                    chain_id         BLOB NOT NULL CHECK(length(chain_id) = 32),
+                    instance_id      BLOB NOT NULL CHECK(length(instance_id) = 32),
+                    lease_epoch      INTEGER NOT NULL CHECK(lease_epoch > 0),
+                    lease_expires_at INTEGER NOT NULL CHECK(lease_expires_at >= 0),
+                    updated_at       INTEGER NOT NULL CHECK(updated_at >= 0)
+                );
+                CREATE INDEX IF NOT EXISTS idx_record_coordinator_leases_expiry
+                    ON record_coordinator_leases(lease_expires_at);",
+            )
+            .map_err(|error| format!("v13 migration: create coordinator leases: {error}"))?;
+            let exists = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='record_coordinator_leases'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if !exists {
+                return Err(
+                    "v13 migration: required table 'record_coordinator_leases' was not created"
+                        .to_string(),
+                );
+            }
+            // Hardcoded 13 preserves sequential upgrades.
+            conn.execute("UPDATE schema_version SET version = 13", [])
+                .map_err(|error| format!("Update schema version to v13: {error}"))?;
+            info!("[STORAGE] Migration to v13 (coordinator leases) complete");
         }
 
         Ok(())
@@ -4050,9 +4155,10 @@ mod tests {
         // maybe_migrate() runs through the latest schema: v6 adds SuperNode,
         // v7 adds the blind marker, v8 creates commitment tables, v9 adds the
         // bounded proof vault, v10 adds durable equivocation incidents, and
-        // v11 adds sticky trusted-divergence incidents and v12 adds immutable
-        // checkpoint certificates even when create_schema() was not called.
-        assert_eq!(v, 12);
+        // v11 adds sticky trusted-divergence incidents, v12 adds immutable
+        // checkpoint certificates, and v13 adds durable coordinator leases
+        // even when create_schema() was not called.
+        assert_eq!(v, 13);
         for table in [
             "record_commitment_blocks",
             "record_block_commitments",
@@ -4061,6 +4167,7 @@ mod tests {
             "record_checkpoint_trusted_divergences",
             "record_checkpoint_certificates",
             "record_checkpoint_certificate_members",
+            "record_coordinator_leases",
         ] {
             let exists: bool = conn
                 .query_row(

@@ -85,8 +85,12 @@
 //! - commitment_witness_min_verified defaults to one for compatibility. It is
 //!   an operator startup threshold over distinct pinned identities, not network
 //!   consensus, quorum, finality, leader election, or fork choice.
+//! - commitment_coordinator_lease_required remains default-off. When enabled,
+//!   every configured witness must grant the same short-lived process instance
+//!   before production; deploy the protocol to all pins before activation.
 //!
 //! ## Last Modified
+//! v2.8.10-CoordinatorLease - Added strict all-witness lease policy and TTL.
 //! v2.8.1-BlockSync - Added a validated follower pages-per-round budget.
 //! v2.7.16-WitnessThreshold - Added a configurable pinned-witness startup threshold.
 //! v2.7.15-ExternalWitnessGuard - Added pinned startup checkpoint witnesses.
@@ -100,6 +104,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
+
+use aeronyx_core::protocol::memchain::{
+    MAX_COORDINATOR_LEASE_TTL_SECS_V1, MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+};
 
 use crate::config_chat_relay::ChatRelayConfig;
 use crate::config_saas::SaasConfig;
@@ -316,6 +324,23 @@ pub struct MemChainConfig {
     /// trust policy over pinned identities, not a consensus quorum.
     #[serde(default = "default_commitment_witness_min_verified")]
     pub commitment_witness_min_verified: usize,
+
+    /// Require short-lived grants from every configured pinned witness before
+    /// this coordinator may produce blocks.
+    ///
+    /// Default-off preserves old deployments while witnesses are upgraded.
+    /// Once enabled, any missing, contended, stale, or invalid grant fails
+    /// startup and later expiry pauses production.
+    #[serde(default)]
+    pub commitment_coordinator_lease_required: bool,
+
+    /// Requested witness lease lifetime in seconds.
+    ///
+    /// The coordinator renews early and applies a local monotonic safety
+    /// margin. This value must remain within the protocol's 60–300 second
+    /// bound so failover cannot be delayed indefinitely.
+    #[serde(default = "default_commitment_coordinator_lease_ttl_secs")]
+    pub commitment_coordinator_lease_ttl_secs: u32,
 
     /// Maximum number of distinct remote owners this node will serve.
     #[serde(default = "default_max_remote_owners")]
@@ -545,6 +570,9 @@ fn default_commitment_sync_max_pages_per_round() -> usize {
 fn default_commitment_witness_min_verified() -> usize {
     1
 }
+fn default_commitment_coordinator_lease_ttl_secs() -> u32 {
+    120
+}
 
 const MAX_COMMITMENT_WITNESS_NODE_IDS: usize = 3;
 fn default_ner_model_path() -> String {
@@ -729,9 +757,20 @@ impl MemChainConfig {
                 "must be at least one",
             ));
         }
+        if !(MIN_COORDINATOR_LEASE_TTL_SECS_V1..=MAX_COORDINATOR_LEASE_TTL_SECS_V1)
+            .contains(&self.commitment_coordinator_lease_ttl_secs)
+        {
+            return Err(ServerError::config_invalid(
+                "memchain.commitment_coordinator_lease_ttl_secs",
+                format!(
+                    "must be between {MIN_COORDINATOR_LEASE_TTL_SECS_V1} and {MAX_COORDINATOR_LEASE_TTL_SECS_V1} seconds"
+                ),
+            ));
+        }
 
         if !self.commitment_witness_node_ids.is_empty()
             || self.commitment_witness_startup_required
+            || self.commitment_coordinator_lease_required
             || self.commitment_witness_min_verified != default_commitment_witness_min_verified()
         {
             if !self.commitment_coordinator_enabled {
@@ -788,6 +827,20 @@ impl MemChainConfig {
                     "memchain.commitment_witness_min_verified",
                     "cannot exceed the number of configured pinned witnesses",
                 ));
+            }
+            if self.commitment_coordinator_lease_required {
+                if !self.commitment_witness_startup_required {
+                    return Err(ServerError::config_invalid(
+                        "memchain.commitment_coordinator_lease_required",
+                        "requires memchain.commitment_witness_startup_required = true",
+                    ));
+                }
+                if validated.len() < 2 {
+                    return Err(ServerError::config_invalid(
+                        "memchain.commitment_coordinator_lease_required",
+                        "requires at least two distinct pinned witnesses",
+                    ));
+                }
             }
         }
 
@@ -1170,6 +1223,9 @@ impl Default for MemChainConfig {
             commitment_witness_node_ids: Vec::new(),
             commitment_witness_startup_required: false,
             commitment_witness_min_verified: default_commitment_witness_min_verified(),
+            commitment_coordinator_lease_required: false,
+            commitment_coordinator_lease_ttl_secs:
+                default_commitment_coordinator_lease_ttl_secs(),
             max_remote_owners: default_max_remote_owners(),
             ner_enabled: false,
             ner_model_path: default_ner_model_path(),
@@ -1243,6 +1299,8 @@ mod tests {
         assert!(mc.commitment_witness_node_ids.is_empty());
         assert!(!mc.commitment_witness_startup_required);
         assert_eq!(mc.commitment_witness_min_verified, 1);
+        assert!(!mc.commitment_coordinator_lease_required);
+        assert_eq!(mc.commitment_coordinator_lease_ttl_secs, 120);
         assert_eq!(
             mc.effective_commitment_tip_anchor_path(),
             PathBuf::from("record-commitment-tip-v1.json")
@@ -1554,6 +1612,48 @@ mod tests {
                     "33".repeat(32),
                     "44".repeat(32),
                 ],
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn test_coordinator_lease_requires_strict_multi_witness_policy() {
+        let first = "41".repeat(32);
+        let second = "42".repeat(32);
+        let valid = MemChainConfig {
+            blind_storage_enabled: true,
+            commitment_coordinator_enabled: true,
+            commitment_witness_node_ids: vec![first.clone(), second.clone()],
+            commitment_witness_startup_required: true,
+            commitment_witness_min_verified: 2,
+            commitment_coordinator_lease_required: true,
+            commitment_coordinator_lease_ttl_secs: 120,
+            ..Default::default()
+        };
+        assert!(valid.validate().is_ok());
+
+        for invalid in [
+            MemChainConfig {
+                commitment_coordinator_lease_ttl_secs:
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1 - 1,
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_coordinator_enabled: true,
+                commitment_witness_node_ids: vec![first.clone(), second.clone()],
+                commitment_coordinator_lease_required: true,
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_coordinator_enabled: true,
+                commitment_witness_node_ids: vec![first],
+                commitment_witness_startup_required: true,
+                commitment_coordinator_lease_required: true,
                 ..Default::default()
             },
         ] {

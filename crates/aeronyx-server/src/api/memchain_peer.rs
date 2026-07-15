@@ -13,6 +13,7 @@
 //! - `POST /api/memchain/peer/block-range`
 //! - `POST /api/memchain/peer/checkpoint`
 //! - `POST /api/memchain/peer/checkpoint-certificate`
+//! - `POST /api/memchain/peer/coordinator-lease`
 //! - Bincode `MemChainMessage` request/response with the existing magic byte.
 //! - Signed discovery-peer admission, timestamp freshness, replay protection,
 //!   per-peer rate limiting, and bounded pagination.
@@ -35,6 +36,8 @@
 //!   must still belong to the receiver's operator-pinned witness set.
 //! - Last-hop public-IP validation on every outbound commitment request so a
 //!   rotated signed descriptor cannot redirect the node into private services.
+//! - Default-off, signed short-lived coordinator leases persisted by followers
+//!   for cross-host duplicate-writer fencing.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` on the public node peer listener and local operator
@@ -78,8 +81,11 @@
 //!   bundle satisfy the live startup witness threshold.
 //! - Revalidate the resolved signed endpoint inside every pull helper. Candidate
 //!   filtering alone is vulnerable to concurrent descriptor replacement.
+//! - Coordinator leases require every configured witness grant. Do not describe
+//!   them as permissionless consensus, Byzantine finality, or fork choice.
 //!
 //! ## Last Modified
+//! v2.8.10-CoordinatorLease - Added durable follower lease grants and verified client.
 //! v2.8.8-EndpointSSRFGuard - Enforced final-hop public endpoint validation.
 //! v2.8.7-CertificateExchange - Added admitted fixed-size certificate exchange.
 //! v2.8.6-CheckpointCertificate - Require distinct pinned witnesses for certificate rounds.
@@ -101,7 +107,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
@@ -124,13 +130,18 @@ use aeronyx_core::protocol::memchain::{
     record_block_range_response_signing_bytes, record_chain_checkpoint_request_signing_bytes,
     record_chain_checkpoint_response_signing_bytes, record_checkpoint_certificate_digest_v1,
     record_checkpoint_certificate_request_signing_bytes,
-    record_checkpoint_certificate_response_signing_bytes, MemChainMessage,
-    RecordCheckpointCertificateMemberV1, MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1, MEMCHAIN_MAGIC,
+    record_checkpoint_certificate_response_signing_bytes,
+    record_coordinator_lease_request_signing_bytes,
+    record_coordinator_lease_response_signing_bytes, MemChainMessage,
+    RecordCheckpointCertificateMemberV1, MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1,
+    MAX_COORDINATOR_LEASE_TTL_SECS_V1, MEMCHAIN_MAGIC, MIN_COORDINATOR_LEASE_TTL_SECS_V1,
 };
 use aeronyx_core::protocol::NodeCapability;
 use sha2::{Digest, Sha256};
 
-use crate::services::memchain::storage_ops::RecordCommitmentCheckpointEvidencePersistOutcome;
+use crate::services::memchain::storage_ops::{
+    RecordCommitmentCheckpointEvidencePersistOutcome, RecordCoordinatorLeaseGrantOutcome,
+};
 use crate::services::memchain::MemoryStorage;
 use crate::services::PeerStore;
 
@@ -157,6 +168,17 @@ pub struct CommitmentSyncPageOutcome {
     pub has_more: bool,
     /// Privacy-safe height of the coordinator's signed chain tip.
     pub remote_tip_height: u64,
+}
+
+/// One independently verified coordinator lease grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitmentCoordinatorLeaseGrant {
+    /// Signed witness lease epoch.
+    pub lease_epoch: u64,
+    /// Signed witness wall-clock expiry.
+    pub lease_expires_at: u64,
+    /// Conservative duration between signed response time and expiry.
+    pub valid_for_secs: u64,
 }
 
 /// Relationship proven by one valid signed checkpoint response.
@@ -279,6 +301,7 @@ struct MemChainPeerState {
     peer_store: Arc<PeerStore>,
     identity: Arc<IdentityKeyPair>,
     guard: Arc<Mutex<PeerRequestGuard>>,
+    lease_authorized_coordinator: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Default)]
@@ -322,11 +345,32 @@ pub fn build_memchain_peer_router(
     peer_store: Arc<PeerStore>,
     identity: Arc<IdentityKeyPair>,
 ) -> Router {
+    build_memchain_peer_router_with_coordinator_lease(
+        storage,
+        peer_store,
+        identity,
+        None,
+    )
+}
+
+/// Builds the peer router with an optional follower-side lease trust root.
+///
+/// `lease_authorized_coordinator` must be the follower's explicitly pinned
+/// Block Sync coordinator. `None` keeps the new endpoint fail-closed while all
+/// existing block/checkpoint routes remain wire-compatible.
+#[must_use]
+pub fn build_memchain_peer_router_with_coordinator_lease(
+    storage: Arc<MemoryStorage>,
+    peer_store: Arc<PeerStore>,
+    identity: Arc<IdentityKeyPair>,
+    lease_authorized_coordinator: Option<[u8; 32]>,
+) -> Router {
     let state = MemChainPeerState {
         storage,
         peer_store,
         identity,
         guard: Arc::new(Mutex::new(PeerRequestGuard::default())),
+        lease_authorized_coordinator,
     };
     Router::new()
         .route("/api/memchain/peer/block-range", post(block_range_handler))
@@ -334,6 +378,10 @@ pub fn build_memchain_peer_router(
         .route(
             "/api/memchain/peer/checkpoint-certificate",
             post(checkpoint_certificate_handler),
+        )
+        .route(
+            "/api/memchain/peer/coordinator-lease",
+            post(coordinator_lease_handler),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
@@ -466,6 +514,131 @@ where
         return Err("checkpoint_witness_equivocation".to_string());
     }
     Ok(outcome)
+}
+
+/// Requests and verifies one short-lived lease from an operator-pinned witness.
+///
+/// The response authorizes only `instance_id` and the exact audited local tip.
+/// It does not expose the current holder when contended and does not establish
+/// permissionless consensus, fork choice, or finality.
+///
+/// # Errors
+///
+/// Returns a stable privacy-safe code for invalid policy, peer admission,
+/// unsafe endpoint, contention, transport failure, stale response, tip
+/// mismatch, or signature failure.
+pub async fn request_record_commitment_coordinator_lease(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    witness_node_id: &[u8; 32],
+    instance_id: &[u8; 32],
+    requested_ttl_secs: u32,
+    client: &reqwest::Client,
+) -> Result<CommitmentCoordinatorLeaseGrant, String> {
+    request_record_commitment_coordinator_lease_with_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        witness_node_id,
+        instance_id,
+        requested_ttl_secs,
+        client,
+        &commitment_peer_endpoint_is_public,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn request_record_commitment_coordinator_lease_with_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    witness_node_id: &[u8; 32],
+    instance_id: &[u8; 32],
+    requested_ttl_secs: u32,
+    client: &reqwest::Client,
+    endpoint_allowed: &F,
+) -> Result<CommitmentCoordinatorLeaseGrant, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    if !(MIN_COORDINATOR_LEASE_TTL_SECS_V1..=MAX_COORDINATOR_LEASE_TTL_SECS_V1)
+        .contains(&requested_ttl_secs)
+    {
+        return Err("lease_policy_invalid".to_string());
+    }
+    let request_timestamp = now_secs();
+    let witness = peer_store
+        .get_valid(witness_node_id, request_timestamp)
+        .ok_or_else(|| "lease_witness_unavailable".to_string())?;
+    let endpoint = witness
+        .descriptor
+        .public_endpoint
+        .as_deref()
+        .ok_or_else(|| "lease_witness_missing_endpoint".to_string())?;
+    if !endpoint_allowed(endpoint) {
+        return Err("lease_witness_unsafe_endpoint".to_string());
+    }
+    let url = commitment_coordinator_lease_url(endpoint)?;
+    let (known_tip_height, known_tip_hash) = verified_local_commitment_tip(storage).await?;
+    let mut request_id = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut request_id);
+    let coordinator = identity.public_key_bytes();
+    let signing_bytes = record_coordinator_lease_request_signing_bytes(
+        &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+        &coordinator,
+        instance_id,
+        known_tip_height,
+        &known_tip_hash,
+        requested_ttl_secs,
+        &request_id,
+        request_timestamp,
+    );
+    let request = MemChainMessage::RecordCoordinatorLeaseRequestV1 {
+        chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+        coordinator,
+        instance_id: *instance_id,
+        known_tip_height,
+        known_tip_hash,
+        requested_ttl_secs,
+        request_id,
+        request_timestamp,
+        signature: identity.sign(&signing_bytes),
+    };
+    let frame = encode_memchain(&request).map_err(|_| "lease_request_encode_failed".to_string())?;
+    let request_started = Instant::now();
+    let response = client
+        .post(url)
+        .header("content-type", "application/octet-stream")
+        .body(frame)
+        .send()
+        .await
+        .map_err(|error| classify_http_error("lease_request", &error))?;
+    if response.status().as_u16() == StatusCode::CONFLICT.as_u16() {
+        return Err("lease_contended".to_string());
+    }
+    if !response.status().is_success() {
+        return Err(format!("lease_http_status_{}", response.status().as_u16()));
+    }
+    let body = read_bounded_response(response).await?;
+    let mut grant = verify_record_commitment_coordinator_lease_response(
+        &body,
+        &request_id,
+        &coordinator,
+        instance_id,
+        witness_node_id,
+        (known_tip_height, known_tip_hash),
+        requested_ttl_secs,
+        now_secs(),
+    )?;
+    grant.valid_for_secs = grant
+        .valid_for_secs
+        .saturating_sub(request_started.elapsed().as_secs());
+    if grant.valid_for_secs == 0 {
+        return Err("lease_expired_in_transit".to_string());
+    }
+    Ok(grant)
 }
 
 /// Pulls and imports one current-tip certificate from an admitted peer.
@@ -1113,6 +1286,10 @@ fn commitment_checkpoint_certificate_url(endpoint: &str) -> Result<Url, String> 
     commitment_peer_url(endpoint, "/api/memchain/peer/checkpoint-certificate")
 }
 
+fn commitment_coordinator_lease_url(endpoint: &str) -> Result<Url, String> {
+    commitment_peer_url(endpoint, "/api/memchain/peer/coordinator-lease")
+}
+
 fn commitment_peer_url(endpoint: &str, path: &str) -> Result<Url, String> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
@@ -1141,6 +1318,92 @@ fn commitment_peer_url(endpoint: &str, path: &str) -> Result<Url, String> {
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_record_commitment_coordinator_lease_response(
+    body: &[u8],
+    expected_request_id: &[u8; 16],
+    expected_coordinator: &[u8; 32],
+    expected_instance_id: &[u8; 32],
+    expected_witness: &[u8; 32],
+    expected_tip: (u64, [u8; 32]),
+    requested_ttl_secs: u32,
+    now: u64,
+) -> Result<CommitmentCoordinatorLeaseGrant, String> {
+    if body.first().copied() != Some(MEMCHAIN_MAGIC) {
+        return Err("invalid_lease_frame".to_string());
+    }
+    let response = decode_memchain(&body[1..]).map_err(|_| "invalid_lease_frame")?;
+    let canonical = encode_memchain(&response).map_err(|_| "invalid_lease_frame")?;
+    if canonical != body {
+        return Err("noncanonical_lease_frame".to_string());
+    }
+    let MemChainMessage::RecordCoordinatorLeaseResponseV1 {
+        chain_id,
+        request_id,
+        coordinator,
+        instance_id,
+        witness,
+        response_timestamp,
+        lease_epoch,
+        lease_expires_at,
+        witness_tip_height,
+        witness_tip_hash,
+        signature,
+    } = response
+    else {
+        return Err("unexpected_lease_message".to_string());
+    };
+    if chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID {
+        return Err("lease_chain_mismatch".to_string());
+    }
+    if request_id != *expected_request_id {
+        return Err("lease_request_mismatch".to_string());
+    }
+    if coordinator != *expected_coordinator || instance_id != *expected_instance_id {
+        return Err("lease_instance_mismatch".to_string());
+    }
+    if witness != *expected_witness {
+        return Err("lease_witness_mismatch".to_string());
+    }
+    if now.abs_diff(response_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
+        return Err("stale_lease_response".to_string());
+    }
+    if (witness_tip_height, witness_tip_hash) != expected_tip {
+        return Err("lease_tip_mismatch".to_string());
+    }
+    if lease_epoch == 0 || lease_expires_at <= now {
+        return Err("lease_expiry_invalid".to_string());
+    }
+    let valid_for_secs = lease_expires_at
+        .checked_sub(response_timestamp)
+        .ok_or_else(|| "lease_expiry_invalid".to_string())?;
+    // The signed remainder can be slightly shorter than the minimum request
+    // TTL when persistence and response signing cross a second boundary.
+    if valid_for_secs == 0 || valid_for_secs > u64::from(requested_ttl_secs) {
+        return Err("lease_duration_invalid".to_string());
+    }
+    let signing_bytes = record_coordinator_lease_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &coordinator,
+        &instance_id,
+        &witness,
+        response_timestamp,
+        lease_epoch,
+        lease_expires_at,
+        witness_tip_height,
+        &witness_tip_hash,
+    );
+    IdentityPublicKey::from_bytes(&witness)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .map_err(|_| "invalid_lease_signature".to_string())?;
+    Ok(CommitmentCoordinatorLeaseGrant {
+        lease_epoch,
+        lease_expires_at,
+        valid_for_secs,
+    })
 }
 
 fn verify_checkpoint_certificate_response(
@@ -1695,6 +1958,149 @@ async fn checkpoint_certificate_handler(
         .into_response()
 }
 
+async fn coordinator_lease_handler(
+    State(state): State<MemChainPeerState>,
+    body: Bytes,
+) -> Response {
+    if body.first().copied() != Some(MEMCHAIN_MAGIC) {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame");
+    }
+    let message = match decode_memchain(&body[1..]) {
+        Ok(message) => message,
+        Err(_) => return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame"),
+    };
+    let MemChainMessage::RecordCoordinatorLeaseRequestV1 {
+        chain_id,
+        coordinator,
+        instance_id,
+        known_tip_height,
+        known_tip_hash,
+        requested_ttl_secs,
+        request_id,
+        request_timestamp,
+        signature,
+    } = message
+    else {
+        return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
+    };
+
+    let now = now_secs();
+    if chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID
+        || instance_id.iter().all(|byte| *byte == 0)
+        || !(MIN_COORDINATOR_LEASE_TTL_SECS_V1..=MAX_COORDINATOR_LEASE_TTL_SECS_V1)
+            .contains(&requested_ttl_secs)
+    {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_lease_request");
+    }
+    if state.lease_authorized_coordinator != Some(coordinator) {
+        return protocol_error(StatusCode::FORBIDDEN, "unauthorized_coordinator");
+    }
+    if now.abs_diff(request_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
+        return protocol_error(StatusCode::UNAUTHORIZED, "stale_request");
+    }
+    if state.peer_store.get_valid(&coordinator, now).is_none() {
+        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
+    }
+    let signing_bytes = record_coordinator_lease_request_signing_bytes(
+        &chain_id,
+        &coordinator,
+        &instance_id,
+        known_tip_height,
+        &known_tip_hash,
+        requested_ttl_secs,
+        &request_id,
+        request_timestamp,
+    );
+    if IdentityPublicKey::from_bytes(&coordinator)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .is_err()
+    {
+        return protocol_error(StatusCode::UNAUTHORIZED, "invalid_signature");
+    }
+    if !state.guard.lock().await.admit(coordinator, request_id, now) {
+        return protocol_error(StatusCode::TOO_MANY_REQUESTS, "rate_or_replay_limited");
+    }
+    let witness_tip = match verified_local_commitment_tip(&state.storage).await {
+        Ok(tip) => tip,
+        Err(_) => {
+            return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "witness_tip_unavailable");
+        }
+    };
+    if witness_tip != (known_tip_height, known_tip_hash) {
+        return protocol_error(StatusCode::CONFLICT, "lease_tip_mismatch");
+    }
+    let grant = match state
+        .storage
+        .grant_record_commitment_coordinator_lease(
+            &chain_id,
+            &coordinator,
+            &instance_id,
+            known_tip_height,
+            &known_tip_hash,
+            now,
+            requested_ttl_secs,
+        )
+        .await
+    {
+        Ok(RecordCoordinatorLeaseGrantOutcome::Granted {
+            lease_epoch,
+            lease_expires_at,
+        }) => (lease_epoch, lease_expires_at),
+        Ok(RecordCoordinatorLeaseGrantOutcome::TipMismatch) => {
+            return protocol_error(StatusCode::CONFLICT, "lease_tip_mismatch");
+        }
+        Ok(RecordCoordinatorLeaseGrantOutcome::Contended) => {
+            return protocol_error(StatusCode::CONFLICT, "lease_contended");
+        }
+        Err(error) => {
+            warn!(error = %error, "[MEMCHAIN_BLOCK] Coordinator lease persistence failed");
+            return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "lease_persist_failed");
+        }
+    };
+    let witness = state.identity.public_key_bytes();
+    let response_timestamp = now_secs();
+    let response_signing_bytes = record_coordinator_lease_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &coordinator,
+        &instance_id,
+        &witness,
+        response_timestamp,
+        grant.0,
+        grant.1,
+        witness_tip.0,
+        &witness_tip.1,
+    );
+    let response = MemChainMessage::RecordCoordinatorLeaseResponseV1 {
+        chain_id,
+        request_id,
+        coordinator,
+        instance_id,
+        witness,
+        response_timestamp,
+        lease_epoch: grant.0,
+        lease_expires_at: grant.1,
+        witness_tip_height: witness_tip.0,
+        witness_tip_hash: witness_tip.1,
+        signature: state.identity.sign(&response_signing_bytes),
+    };
+    let encoded = match encode_memchain(&response) {
+        Ok(encoded) => encoded,
+        Err(_) => return protocol_error(StatusCode::INTERNAL_SERVER_ERROR, "encode_error"),
+    };
+    debug!(
+        lease_epoch = grant.0,
+        lease_ttl_secs = requested_ttl_secs,
+        "[MEMCHAIN_BLOCK] Granted authenticated coordinator lease"
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        encoded,
+    )
+        .into_response()
+}
+
 async fn checkpoint_handler(State(state): State<MemChainPeerState>, body: Bytes) -> Response {
     if body.first().copied() != Some(MEMCHAIN_MAGIC) {
         return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame");
@@ -1969,6 +2375,346 @@ mod tests {
 
     fn allow_test_endpoint(_endpoint: &str) -> bool {
         true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn coordinator_lease_request_frame(
+        coordinator: &IdentityKeyPair,
+        instance_id: [u8; 32],
+        tip_height: u64,
+        tip_hash: [u8; 32],
+        ttl_secs: u32,
+        request_id: [u8; 16],
+        request_timestamp: u64,
+    ) -> Vec<u8> {
+        let coordinator_id = coordinator.public_key_bytes();
+        let signing_bytes = record_coordinator_lease_request_signing_bytes(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            &coordinator_id,
+            &instance_id,
+            tip_height,
+            &tip_hash,
+            ttl_secs,
+            &request_id,
+            request_timestamp,
+        );
+        encode_memchain(&MemChainMessage::RecordCoordinatorLeaseRequestV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            coordinator: coordinator_id,
+            instance_id,
+            known_tip_height: tip_height,
+            known_tip_hash: tip_hash,
+            requested_ttl_secs: ttl_secs,
+            request_id,
+            request_timestamp,
+            signature: coordinator.sign(&signing_bytes),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn coordinator_lease_endpoint_grants_renews_and_rejects_competing_instance() {
+        let now = now_secs();
+        let witness = Arc::new(IdentityKeyPair::generate());
+        let coordinator = IdentityKeyPair::generate();
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        storage.audit_record_commitment_chain().await.unwrap();
+        let peer_store = Arc::new(PeerStore::new());
+        admit_peer(&peer_store, &coordinator, None, now);
+        let router = build_memchain_peer_router_with_coordinator_lease(
+            Arc::clone(&storage),
+            peer_store,
+            Arc::clone(&witness),
+            Some(coordinator.public_key_bytes()),
+        );
+        let first_instance = [0x71; 32];
+        let first_request_id = [0x72; 16];
+        let first_frame = coordinator_lease_request_frame(
+            &coordinator,
+            first_instance,
+            0,
+            GENESIS_PREV_HASH,
+            MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+            first_request_id,
+            now,
+        );
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/coordinator-lease")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(first_frame))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), MAX_RESPONSE_BODY_BYTES)
+            .await
+            .unwrap();
+        let grant = verify_record_commitment_coordinator_lease_response(
+            &body,
+            &first_request_id,
+            &coordinator.public_key_bytes(),
+            &first_instance,
+            &witness.public_key_bytes(),
+            (0, GENESIS_PREV_HASH),
+            MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+            now,
+        )
+        .unwrap();
+        assert_eq!(grant.lease_epoch, 1);
+
+        let renewal = coordinator_lease_request_frame(
+            &coordinator,
+            first_instance,
+            0,
+            GENESIS_PREV_HASH,
+            MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+            [0x73; 16],
+            now,
+        );
+        let renewed = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/coordinator-lease")
+                    .body(Body::from(renewal))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renewed.status(), StatusCode::OK);
+
+        let competing = coordinator_lease_request_frame(
+            &coordinator,
+            [0x74; 32],
+            0,
+            GENESIS_PREV_HASH,
+            MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+            [0x75; 16],
+            now,
+        );
+        let rejected = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/coordinator-lease")
+                    .body(Body::from(competing))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn coordinator_lease_endpoint_rejects_unpinned_invalid_and_wrong_tip_requests() {
+        let now = now_secs();
+        let witness = Arc::new(IdentityKeyPair::generate());
+        let coordinator = IdentityKeyPair::generate();
+        let unpinned = IdentityKeyPair::generate();
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        storage.audit_record_commitment_chain().await.unwrap();
+        let peer_store = Arc::new(PeerStore::new());
+        admit_peer(&peer_store, &coordinator, None, now);
+        admit_peer(&peer_store, &unpinned, None, now);
+        let router = build_memchain_peer_router_with_coordinator_lease(
+            storage,
+            peer_store,
+            witness,
+            Some(coordinator.public_key_bytes()),
+        );
+
+        let unpinned_frame = coordinator_lease_request_frame(
+            &unpinned,
+            [0x81; 32],
+            0,
+            GENESIS_PREV_HASH,
+            MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+            [0x82; 16],
+            now,
+        );
+        let unpinned_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/coordinator-lease")
+                    .body(Body::from(unpinned_frame))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unpinned_response.status(), StatusCode::FORBIDDEN);
+
+        let mut invalid_signature = coordinator_lease_request_frame(
+            &coordinator,
+            [0x83; 32],
+            0,
+            GENESIS_PREV_HASH,
+            MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+            [0x84; 16],
+            now,
+        );
+        let last = invalid_signature.len() - 1;
+        invalid_signature[last] ^= 0x01;
+        let signature_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/coordinator-lease")
+                    .body(Body::from(invalid_signature))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(signature_response.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_tip = coordinator_lease_request_frame(
+            &coordinator,
+            [0x85; 32],
+            1,
+            [0x86; 32],
+            MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+            [0x87; 16],
+            now,
+        );
+        let tip_response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/coordinator-lease")
+                    .body(Body::from(wrong_tip))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tip_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn coordinator_lease_response_accepts_processing_time_remainder() {
+        let coordinator = IdentityKeyPair::generate();
+        let witness = IdentityKeyPair::generate();
+        let chain_id = AERONYX_MEMCHAIN_MAINNET_CHAIN_ID;
+        let request_id = [0x88; 16];
+        let instance_id = [0x89; 32];
+        let response_timestamp = 10_001;
+        let lease_expires_at = 10_060;
+        let signing_bytes = record_coordinator_lease_response_signing_bytes(
+            &chain_id,
+            &request_id,
+            &coordinator.public_key_bytes(),
+            &instance_id,
+            &witness.public_key_bytes(),
+            response_timestamp,
+            1,
+            lease_expires_at,
+            0,
+            &GENESIS_PREV_HASH,
+        );
+        let frame = encode_memchain(&MemChainMessage::RecordCoordinatorLeaseResponseV1 {
+            chain_id,
+            request_id,
+            coordinator: coordinator.public_key_bytes(),
+            instance_id,
+            witness: witness.public_key_bytes(),
+            response_timestamp,
+            lease_epoch: 1,
+            lease_expires_at,
+            witness_tip_height: 0,
+            witness_tip_hash: GENESIS_PREV_HASH,
+            signature: witness.sign(&signing_bytes),
+        })
+        .unwrap();
+
+        let grant = verify_record_commitment_coordinator_lease_response(
+            &frame,
+            &request_id,
+            &coordinator.public_key_bytes(),
+            &instance_id,
+            &witness.public_key_bytes(),
+            (0, GENESIS_PREV_HASH),
+            MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+            response_timestamp,
+        )
+        .unwrap();
+        assert_eq!(grant.valid_for_secs, 59);
+    }
+
+    #[tokio::test]
+    async fn coordinator_lease_client_verifies_grant_and_reports_contention() {
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let witness = Arc::new(IdentityKeyPair::generate());
+        let witness_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        witness_storage.audit_record_commitment_chain().await.unwrap();
+        let witness_peers = Arc::new(PeerStore::new());
+        admit_peer(&witness_peers, &coordinator, None, now);
+        let router = build_memchain_peer_router_with_coordinator_lease(
+            witness_storage,
+            witness_peers,
+            Arc::clone(&witness),
+            Some(coordinator.public_key_bytes()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let coordinator_storage = MemoryStorage::open(":memory:", None).unwrap();
+        coordinator_storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+        let coordinator_peers = PeerStore::new();
+        admit_peer(
+            &coordinator_peers,
+            &witness,
+            Some(format!("http://{address}")),
+            now,
+        );
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let grant = request_record_commitment_coordinator_lease_with_endpoint_policy(
+            &coordinator_storage,
+            &coordinator_peers,
+            &coordinator,
+            &witness.public_key_bytes(),
+            &[0x91; 32],
+            MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+            &client,
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(grant.lease_epoch, 1);
+        assert!(grant.valid_for_secs > 0);
+
+        let error = request_record_commitment_coordinator_lease_with_endpoint_policy(
+            &coordinator_storage,
+            &coordinator_peers,
+            &coordinator,
+            &witness.public_key_bytes(),
+            &[0x92; 32],
+            MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+            &client,
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "lease_contended");
+        server.abort();
     }
 
     fn signed_block_page_frame(

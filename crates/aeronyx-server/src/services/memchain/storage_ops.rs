@@ -175,7 +175,8 @@ use aeronyx_core::ledger::{
 };
 use aeronyx_core::protocol::memchain::{
     decode_memchain, encode_memchain, record_chain_checkpoint_response_signing_bytes,
-    record_checkpoint_certificate_digest_v1, MemChainMessage, MEMCHAIN_MAGIC,
+    record_checkpoint_certificate_digest_v1, MemChainMessage,
+    MAX_COORDINATOR_LEASE_TTL_SECS_V1, MEMCHAIN_MAGIC, MIN_COORDINATOR_LEASE_TTL_SECS_V1,
 };
 
 use super::storage::{
@@ -223,6 +224,22 @@ pub enum RecordCommitmentAppendOutcome {
     Inserted,
     /// The exact same block was already stored at that height.
     AlreadyPresent,
+}
+
+/// Result of one serialized durable witness lease decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordCoordinatorLeaseGrantOutcome {
+    /// This process instance owns the witness lease until the signed expiry.
+    Granted {
+        /// Monotonic lease generation stored by this witness.
+        lease_epoch: u64,
+        /// Witness wall-clock expiry used for restart-safe refusal.
+        lease_expires_at: u64,
+    },
+    /// The witness chain advanced or changed before the lease transaction.
+    TipMismatch,
+    /// A different process instance still owns the durable lease.
+    Contended,
 }
 
 /// Aggregate result of one atomic bounded commitment-block append.
@@ -317,6 +334,20 @@ pub struct RecordCommitmentChainIntegrityStatus {
     pub coordinator_fence_acquisition_failures_total: u64,
     /// Exact local-only protection boundary; never implies distributed lease.
     pub coordinator_fence_scope: &'static str,
+    /// Witness-backed cross-host lease state.
+    pub coordinator_lease_state: &'static str,
+    /// Grants returned by the most recent lease round.
+    pub coordinator_lease_granted_witnesses: usize,
+    /// Number of operator-pinned witnesses required for production.
+    pub coordinator_lease_required_witnesses: usize,
+    /// Conservative local production-authority deadline.
+    pub coordinator_lease_expires_at: Option<u64>,
+    /// Most recent successful all-witness lease round.
+    pub coordinator_lease_last_renewed_at: Option<u64>,
+    /// Failed lease rounds in this process lifetime.
+    pub coordinator_lease_renewal_failures_total: u64,
+    /// Exact anti-overclaim boundary for the witness lease mechanism.
+    pub coordinator_lease_scope: &'static str,
     /// Local signed high-water guard state. Never contains the anchor path,
     /// signer, signature, or block hash.
     pub rollback_guard_state: &'static str,
@@ -435,6 +466,8 @@ const MAX_CHECKPOINT_CERTIFICATE_ANCHOR_BYTES: u64 = 4 * 1024;
 const CHECKPOINT_CERTIFICATE_ANCHOR_CONTRACT: &str = "record_checkpoint_certificate_anchor.v1";
 const CHECKPOINT_CERTIFICATE_ANCHOR_DOMAIN: &[u8] =
     b"aeronyx.record_checkpoint_certificate_anchor.v1\0";
+/// Prevent immediate lease takeover at the exact wall-clock expiry boundary.
+const COORDINATOR_LEASE_HANDOVER_GRACE_SECS: u64 = 15;
 static SIGNED_LOCAL_ANCHOR_TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
 
 fn read_stored_record_commitment_block_row(
@@ -3376,6 +3409,217 @@ impl MemoryStorage {
         Ok(total)
     }
 
+    /// Atomically grants or renews one durable witness-side coordinator lease.
+    ///
+    /// A different instance cannot replace an unexpired row. The short
+    /// handover grace prevents a new process from starting at the exact expiry
+    /// boundary while the previous coordinator is applying its safety margin.
+    /// The row stores no endpoint, host identity, process id, user data, or
+    /// block payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid TTL, integer conversion failure,
+    /// persisted chain mismatch, malformed existing row, or SQLite failure.
+    pub async fn grant_record_commitment_coordinator_lease(
+        &self,
+        chain_id: &[u8; 32],
+        coordinator: &[u8; 32],
+        instance_id: &[u8; 32],
+        expected_tip_height: u64,
+        expected_tip_hash: &[u8; 32],
+        now: u64,
+        ttl_secs: u32,
+    ) -> Result<RecordCoordinatorLeaseGrantOutcome, String> {
+        if !(MIN_COORDINATOR_LEASE_TTL_SECS_V1..=MAX_COORDINATOR_LEASE_TTL_SECS_V1)
+            .contains(&ttl_secs)
+        {
+            return Err("coordinator lease TTL is outside the protocol bounds".to_string());
+        }
+        let now_i64 = i64::try_from(now)
+            .map_err(|_| "coordinator lease time is outside SQLite range".to_string())?;
+        let lease_expires_at = now.saturating_add(u64::from(ttl_secs));
+        let lease_expires_at_i64 = i64::try_from(lease_expires_at)
+            .map_err(|_| "coordinator lease expiry is outside SQLite range".to_string())?;
+
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("begin coordinator lease transaction: {error}"))?;
+        let persisted_tip = tx
+            .query_row(
+                "SELECT height, block_hash FROM record_commitment_blocks
+                 ORDER BY height DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("read coordinator lease chain tip: {error}"))?;
+        let persisted_tip = match persisted_tip {
+            Some((height, hash)) => {
+                let height = u64::try_from(height)
+                    .map_err(|_| "coordinator lease chain height is invalid".to_string())?;
+                let hash: [u8; 32] = hash.try_into().map_err(|hash: Vec<u8>| {
+                    format!("coordinator lease chain hash length {}", hash.len())
+                })?;
+                (height, hash)
+            }
+            None => (0, GENESIS_PREV_HASH),
+        };
+        if persisted_tip != (expected_tip_height, *expected_tip_hash) {
+            return Ok(RecordCoordinatorLeaseGrantOutcome::TipMismatch);
+        }
+        let existing = tx
+            .query_row(
+                "SELECT chain_id, instance_id, lease_epoch, lease_expires_at
+                 FROM record_coordinator_leases WHERE coordinator=?1",
+                params![coordinator.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("read coordinator lease: {error}"))?;
+
+        let lease_epoch = if let Some((stored_chain, stored_instance, epoch, stored_expiry)) =
+            existing
+        {
+            if stored_chain.as_slice() != chain_id {
+                return Err("coordinator lease chain id mismatch".to_string());
+            }
+            let epoch = u64::try_from(epoch)
+                .map_err(|_| "coordinator lease epoch is invalid".to_string())?;
+            let stored_expiry = u64::try_from(stored_expiry)
+                .map_err(|_| "coordinator lease expiry is invalid".to_string())?;
+            if stored_instance.as_slice() != instance_id
+                && now
+                    < stored_expiry.saturating_add(COORDINATOR_LEASE_HANDOVER_GRACE_SECS)
+            {
+                return Ok(RecordCoordinatorLeaseGrantOutcome::Contended);
+            }
+            if stored_instance.as_slice() == instance_id {
+                epoch
+            } else {
+                epoch
+                    .checked_add(1)
+                    .ok_or_else(|| "coordinator lease epoch exhausted".to_string())?
+            }
+        } else {
+            1
+        };
+        let lease_epoch_i64 = i64::try_from(lease_epoch)
+            .map_err(|_| "coordinator lease epoch is outside SQLite range".to_string())?;
+        tx.execute(
+            "INSERT INTO record_coordinator_leases
+                (coordinator, chain_id, instance_id, lease_epoch, lease_expires_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(coordinator) DO UPDATE SET
+                chain_id=excluded.chain_id,
+                instance_id=excluded.instance_id,
+                lease_epoch=excluded.lease_epoch,
+                lease_expires_at=excluded.lease_expires_at,
+                updated_at=excluded.updated_at",
+            params![
+                coordinator.as_slice(),
+                chain_id.as_slice(),
+                instance_id.as_slice(),
+                lease_epoch_i64,
+                lease_expires_at_i64,
+                now_i64,
+            ],
+        )
+        .map_err(|error| format!("persist coordinator lease: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("commit coordinator lease: {error}"))?;
+        Ok(RecordCoordinatorLeaseGrantOutcome::Granted {
+            lease_epoch,
+            lease_expires_at,
+        })
+    }
+
+    /// Configures whether cross-host witness authority is mandatory.
+    pub fn configure_record_commitment_coordinator_lease(
+        &self,
+        required: bool,
+        required_witnesses: usize,
+    ) {
+        let mut runtime = self.commitment_coordinator_lease.write();
+        *runtime = Default::default();
+        runtime.required = required;
+        runtime.required_witnesses = if required { required_witnesses } else { 0 };
+        runtime.state = if required { "acquiring" } else { "disabled" };
+    }
+
+    /// Installs one fully verified all-witness lease round.
+    pub fn apply_record_commitment_coordinator_lease(
+        &self,
+        granted_witnesses: usize,
+        valid_for_secs: u64,
+        now: u64,
+    ) -> Result<(), String> {
+        let mut runtime = self.commitment_coordinator_lease.write();
+        if !runtime.required {
+            return Err("coordinator lease enforcement is disabled".to_string());
+        }
+        if granted_witnesses < runtime.required_witnesses || valid_for_secs == 0 {
+            return Err("coordinator lease grant threshold is incomplete".to_string());
+        }
+        runtime.state = "held";
+        runtime.granted_witnesses = granted_witnesses;
+        runtime.valid_until = Some(Instant::now() + std::time::Duration::from_secs(valid_for_secs));
+        runtime.expires_at = Some(now.saturating_add(valid_for_secs));
+        runtime.last_renewed_at = Some(now);
+        Ok(())
+    }
+
+    /// Records one failed lease round without extending existing authority.
+    pub fn record_commitment_coordinator_lease_failure(&self, granted_witnesses: usize) {
+        let mut runtime = self.commitment_coordinator_lease.write();
+        if !runtime.required {
+            return;
+        }
+        runtime.granted_witnesses = granted_witnesses;
+        runtime.renewal_failures_total = runtime.renewal_failures_total.saturating_add(1);
+        runtime.state = if runtime
+            .valid_until
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            "renewal_degraded"
+        } else {
+            "unavailable"
+        };
+    }
+
+    /// Returns whether every configured production safety gate is currently valid.
+    #[must_use]
+    pub fn record_commitment_production_permitted(&self) -> bool {
+        if self.record_commitment_production_halted() {
+            return false;
+        }
+        let runtime = self.commitment_coordinator_lease.read();
+        !runtime.required
+            || runtime
+                .valid_until
+                .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
+    /// Preserves the historical incident error while distinguishing a
+    /// recoverable lease outage for callers and existing operational checks.
+    fn local_record_commitment_production_error(&self) -> Option<&'static str> {
+        if self.record_commitment_production_halted() {
+            Some("local commitment production halted by trusted witness security incident")
+        } else if !self.record_commitment_production_permitted() {
+            Some("local commitment production authority is unavailable")
+        } else {
+            None
+        }
+    }
+
     /// Returns the one-way process-local coordinator safety latch.
     #[must_use]
     pub fn record_commitment_production_halted(&self) -> bool {
@@ -4116,8 +4360,9 @@ impl MemoryStorage {
     /// re-establish the baseline from the complete `SQLite` chain before it may
     /// report `verified`.
     pub fn record_commitment_chain_integrity_status(&self) -> RecordCommitmentChainIntegrityStatus {
-        const POLICY: &str = "full snapshot-consistent startup audit plus transactionally verified appends; coordinator requires an exclusive local production fence, SQLite FULL-or-stronger commit durability, and a signed local tip anchor; no lock path, process id, block hashes, proposer identities, commitment ids, owners, payloads, peers, endpoints, routes, or client metadata";
+        const POLICY: &str = "full snapshot-consistent startup audit plus transactionally verified appends; coordinator requires an exclusive local production fence, SQLite FULL-or-stronger commit durability, a signed local tip anchor, and any explicitly enabled all-witness coordinator lease; no lock path, process id, instance id, block hashes, proposer identities, commitment ids, owners, payloads, peers, endpoints, routes, or client metadata";
         const COORDINATOR_FENCE_SCOPE: &str = "prevents duplicate coordinator processes on one host from producing against the same database while the OS lock holder remains alive; does not fence copied databases or identities on other hosts and is not a distributed lease, leader election, consensus, quorum, fork choice, or finality";
+        const COORDINATOR_LEASE_SCOPE: &str = "when explicitly enabled, requires short-lived grants from every operator-pinned audited follower before local production; prevents concurrent copied coordinator instances while at least one honest available witness retains the conflicting lease, but is not permissionless consensus, Byzantine finality, fork choice, or proof of global uniqueness";
         const ROLLBACK_GUARD_SCOPE: &str = "detects commitment SQLite rollback or replacement while the host-side signed anchor remains; does not detect whole-host or whole-disk snapshot rollback and is not consensus, quorum, or finality";
         let durability_mode = match self.commitment_durability.load(Ordering::Acquire) {
             0 => "off",
@@ -4132,6 +4377,35 @@ impl MemoryStorage {
                 runtime.state,
                 runtime.acquired_at,
                 runtime.acquisition_failures_total,
+            )
+        };
+        let (
+            coordinator_lease_state,
+            coordinator_lease_granted_witnesses,
+            coordinator_lease_required_witnesses,
+            coordinator_lease_expires_at,
+            coordinator_lease_last_renewed_at,
+            coordinator_lease_renewal_failures_total,
+        ) = {
+            let runtime = self.commitment_coordinator_lease.read();
+            let valid = runtime
+                .valid_until
+                .is_some_and(|deadline| Instant::now() < deadline);
+            let state = if runtime.required
+                && !valid
+                && matches!(runtime.state, "held" | "renewal_degraded")
+            {
+                "expired"
+            } else {
+                runtime.state
+            };
+            (
+                state,
+                runtime.granted_witnesses,
+                runtime.required_witnesses,
+                runtime.expires_at,
+                runtime.last_renewed_at,
+                runtime.renewal_failures_total,
             )
         };
         let (
@@ -4166,6 +4440,13 @@ impl MemoryStorage {
                 coordinator_fence_acquired_at,
                 coordinator_fence_acquisition_failures_total: coordinator_fence_failures,
                 coordinator_fence_scope: COORDINATOR_FENCE_SCOPE,
+                coordinator_lease_state,
+                coordinator_lease_granted_witnesses,
+                coordinator_lease_required_witnesses,
+                coordinator_lease_expires_at,
+                coordinator_lease_last_renewed_at,
+                coordinator_lease_renewal_failures_total,
+                coordinator_lease_scope: COORDINATOR_LEASE_SCOPE,
                 rollback_guard_state,
                 rollback_guard_height,
                 rollback_guard_last_verified_at,
@@ -4188,6 +4469,13 @@ impl MemoryStorage {
                 coordinator_fence_acquired_at,
                 coordinator_fence_acquisition_failures_total: coordinator_fence_failures,
                 coordinator_fence_scope: COORDINATOR_FENCE_SCOPE,
+                coordinator_lease_state,
+                coordinator_lease_granted_witnesses,
+                coordinator_lease_required_witnesses,
+                coordinator_lease_expires_at,
+                coordinator_lease_last_renewed_at,
+                coordinator_lease_renewal_failures_total,
+                coordinator_lease_scope: COORDINATOR_LEASE_SCOPE,
                 rollback_guard_state,
                 rollback_guard_height,
                 rollback_guard_last_verified_at,
@@ -4384,11 +4672,10 @@ impl MemoryStorage {
         if blocks.is_empty() {
             return Ok(RecordCommitmentBatchAppendOutcome::default());
         }
-        if received_from.is_none() && self.record_commitment_production_halted() {
-            return Err(
-                "local commitment production halted by trusted witness security incident"
-                    .to_string(),
-            );
+        if received_from.is_none() {
+            if let Some(error) = self.local_record_commitment_production_error() {
+                return Err(error.to_string());
+            }
         }
         if blocks.len() > MAX_ATOMIC_COMMITMENT_BLOCK_BATCH {
             return Err(format!(
@@ -4449,11 +4736,10 @@ impl MemoryStorage {
         received_from: Option<&[u8; 32]>,
     ) -> Result<CommittedRecordCommitmentBatch, String> {
         let mut conn = self.conn.lock().await;
-        if received_from.is_none() && self.record_commitment_production_halted() {
-            return Err(
-                "local commitment production halted by trusted witness security incident"
-                    .to_string(),
-            );
+        if received_from.is_none() {
+            if let Some(error) = self.local_record_commitment_production_error() {
+                return Err(error.to_string());
+            }
         }
         let transaction = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -5874,6 +6160,147 @@ mod tests {
         let status = storage.record_commitment_chain_integrity_status();
         assert_eq!(status.coordinator_fence_state, "failed");
         assert_eq!(status.coordinator_fence_acquisition_failures_total, 1);
+    }
+
+    #[tokio::test]
+    async fn test_witness_coordinator_lease_is_exclusive_renewable_and_restart_durable() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("witness-lease.db");
+        let chain_id = AERONYX_MEMCHAIN_MAINNET_CHAIN_ID;
+        let coordinator = [0x31; 32];
+        let first_instance = [0x32; 32];
+        let second_instance = [0x33; 32];
+        let storage = MemoryStorage::open(&db_path, None).unwrap();
+
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &first_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    1_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted {
+                lease_epoch: 1,
+                lease_expires_at: 1_060,
+            }
+        );
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &first_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    1_020,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted {
+                lease_epoch: 1,
+                lease_expires_at: 1_080,
+            }
+        );
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    1_081,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Contended
+        );
+        drop(storage);
+
+        let reopened = MemoryStorage::open(&db_path, None).unwrap();
+        assert_eq!(
+            reopened
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    1_096,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted {
+                lease_epoch: 2,
+                lease_expires_at: 1_156,
+            }
+        );
+
+        assert_eq!(
+            reopened
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &coordinator,
+                    &second_instance,
+                    1,
+                    &[0xFF; 32],
+                    1_100,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::TipMismatch
+        );
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_lease_runtime_gates_production_and_expires_monotonically() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        storage.configure_record_commitment_coordinator_lease(true, 2);
+        assert!(!storage.record_commitment_production_permitted());
+        assert_eq!(
+            storage
+                .record_commitment_chain_integrity_status()
+                .coordinator_lease_state,
+            "acquiring"
+        );
+
+        storage
+            .apply_record_commitment_coordinator_lease(2, 1, 2_000)
+            .unwrap();
+        assert!(storage.record_commitment_production_permitted());
+        storage.record_commitment_coordinator_lease_failure(1);
+        assert!(storage.record_commitment_production_permitted());
+        assert_eq!(
+            storage
+                .record_commitment_chain_integrity_status()
+                .coordinator_lease_state,
+            "renewal_degraded"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        assert!(!storage.record_commitment_production_permitted());
+        let expired = storage.record_commitment_chain_integrity_status();
+        assert_eq!(expired.coordinator_lease_state, "expired");
+        assert_eq!(expired.coordinator_lease_renewal_failures_total, 1);
+
+        storage.configure_record_commitment_coordinator_lease(false, 0);
+        assert!(storage.record_commitment_production_permitted());
+        assert_eq!(
+            storage
+                .record_commitment_chain_integrity_status()
+                .coordinator_lease_state,
+            "disabled"
+        );
     }
 
     #[tokio::test]
@@ -7828,7 +8255,7 @@ mod tests {
             conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         let chain = migrated.audit_record_commitment_chain().await.unwrap();
         assert_eq!(chain.block_count, 1);
         assert_eq!(migrated.record_commitment_chain_tip().await.1, block.hash());
@@ -7874,7 +8301,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         assert_eq!(incident_table_exists, 1);
         migrated.audit_record_commitment_chain().await.unwrap();
         let evidence = migrated
@@ -7918,7 +8345,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         assert_eq!(incident_table_exists, 1);
         migrated.audit_record_commitment_chain().await.unwrap();
         let evidence = migrated
@@ -7969,7 +8396,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         assert_eq!(certificates, 1);
         assert_eq!(members, 1);
         migrated.audit_record_commitment_chain().await.unwrap();

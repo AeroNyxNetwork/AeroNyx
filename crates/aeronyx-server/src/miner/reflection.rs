@@ -648,8 +648,8 @@ impl ReflectionMiner {
         if !self.commitment_coordinator_enabled {
             return 0;
         }
-        if self.storage.record_commitment_production_halted() {
-            debug!("[MEMCHAIN_BLOCK] Commitment packing skipped: production safety latch active");
+        if !self.storage.record_commitment_production_permitted() {
+            debug!("[MEMCHAIN_BLOCK] Commitment packing skipped: production authority unavailable");
             return 0;
         }
         let max_blocks = max_blocks.clamp(1, 64);

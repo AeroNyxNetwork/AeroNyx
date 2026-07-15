@@ -140,6 +140,14 @@ miner_interval_secs = 60
 # ChatRelay routes available without noisy model-missing warnings.
 embed_enabled = true
 
+# Cross-host duplicate-coordinator fencing is intentionally default-off.
+# Before enabling it, upgrade every identity in commitment_witness_node_ids,
+# require strict startup witness evidence, and verify that all pins can grant
+# the same audited chain tip. This lease is an operational safety control, not
+# consensus, leader election, finality, or fork choice.
+commitment_coordinator_lease_required = false
+commitment_coordinator_lease_ttl_secs = 120
+
 # ChatRelay is a blind store-and-forward relay for E2E-encrypted chat and
 # media envelopes. It is intentionally disabled by default. To advertise this
 # node as a routeable ChatRelay peer, all three conditions must be true:

@@ -60,6 +60,7 @@
 //   v2.7.21        - Added aggregate trusted-divergence incidents and production halt
 //   v2.7.24        - Added aggregate certificate rollback-guard evidence
 //   v2.7.25        - Added aggregate local coordinator production-fence evidence
+//   v2.7.26        - Added aggregate witness-backed coordinator lease evidence
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -132,6 +133,20 @@ pub struct RecordCommitmentIntegrityHeartbeatStatus {
     pub coordinator_fence_acquisition_failures_total: u64,
     /// Exact local-only protection boundary.
     pub coordinator_fence_scope: &'static str,
+    /// Cross-host lease state; never includes process instance or witness ids.
+    pub coordinator_lease_state: &'static str,
+    /// Grants returned by the most recent bounded lease round.
+    pub coordinator_lease_granted_witnesses: usize,
+    /// Number of operator-pinned witnesses required for production.
+    pub coordinator_lease_required_witnesses: usize,
+    /// Conservative local production-authority deadline.
+    pub coordinator_lease_expires_at: Option<u64>,
+    /// Most recent successful all-witness renewal.
+    pub coordinator_lease_last_renewed_at: Option<u64>,
+    /// Failed lease rounds in this process lifetime.
+    pub coordinator_lease_renewal_failures_total: u64,
+    /// Exact mechanism boundary without consensus overclaim.
+    pub coordinator_lease_scope: &'static str,
     /// Signed local high-water guard state.
     pub rollback_guard_state: &'static str,
     /// Highest height covered by the local guard.
@@ -778,6 +793,13 @@ mod tests {
                 coordinator_fence_acquired_at: Some(90),
                 coordinator_fence_acquisition_failures_total: 0,
                 coordinator_fence_scope: "same host and database only",
+                coordinator_lease_state: "held",
+                coordinator_lease_granted_witnesses: 3,
+                coordinator_lease_required_witnesses: 3,
+                coordinator_lease_expires_at: Some(180),
+                coordinator_lease_last_renewed_at: Some(100),
+                coordinator_lease_renewal_failures_total: 0,
+                coordinator_lease_scope: "all pinned witnesses; not consensus",
                 rollback_guard_state: "verified",
                 rollback_guard_height: 9,
                 rollback_guard_last_verified_at: Some(100),
@@ -869,6 +891,10 @@ mod tests {
             integrity["coordinator_fence_acquisition_failures_total"],
             0
         );
+        assert_eq!(integrity["coordinator_lease_state"], "held");
+        assert_eq!(integrity["coordinator_lease_granted_witnesses"], 3);
+        assert_eq!(integrity["coordinator_lease_required_witnesses"], 3);
+        assert_eq!(integrity["coordinator_lease_renewal_failures_total"], 0);
         assert_eq!(integrity["rollback_guard_state"], "verified");
         assert_eq!(integrity["rollback_guard_height"], 9);
         assert_eq!(integrity["rollback_guard_write_failures_total"], 0);
@@ -936,6 +962,9 @@ mod tests {
                 "process_id",
                 "pid",
                 "host_identity",
+                "coordinator_lease_instance_id",
+                "lease_instance_id",
+                "lease_witness_ids",
                 "request_id",
                 "peer",
                 "route",
