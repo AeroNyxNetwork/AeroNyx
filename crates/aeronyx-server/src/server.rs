@@ -151,6 +151,9 @@
 //      pool, exposes aggregate execution evidence, and skips missed-tick bursts.
 //  64. Adds backward-compatible ChatPullV2 dispatch with a signed bounded
 //      opaque cursor and stable monotonic mailbox snapshot pagination.
+//  65. Reports checkpoint evidence above a follower's recovered local tip as
+//      deferred, allowing block sync to run without presenting old evidence
+//      as current convergence or divergence.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -167,8 +170,9 @@
 //     blind coordinator may pack blocks; all other nodes remain followers.
 //   - Coordinator witness reconciliation is evidence collection only. It must
 //     never mutate the canonical chain, elect a leader, or infer fork choice.
-//   - Checkpoint freshness comes only from audited durable signed evidence.
-//     Failed attempts and inbound served requests cannot refresh it.
+//   - Checkpoint freshness comes only from audited, currently applicable
+//     durable signed evidence. Deferred historical frames, failed attempts,
+//     and inbound served requests cannot refresh it.
 //   - Witness round states are operator evidence only. Never use their counts
 //     as votes, quorum, finality, leader election, or fork choice.
 //   - Commitment coordinators must confirm SQLite FULL-or-stronger durability
@@ -1524,6 +1528,8 @@ impl Server {
             })?;
         info!(
             evidence_records = checkpoint_evidence_audit.evidence_records,
+            applicable_records = checkpoint_evidence_audit.applicable_evidence_records,
+            deferred_records = checkpoint_evidence_audit.deferred_evidence_records,
             divergence_records = checkpoint_evidence_audit.divergence_evidence_records,
             "[MEMCHAIN_BLOCK] Persisted checkpoint evidence audit passed"
         );
@@ -2115,6 +2121,8 @@ impl Server {
                             requests_served_total: status.requests_served_total,
                             evidence_state: status.evidence_state,
                             evidence_records: status.evidence_records,
+                            applicable_evidence_records: status.applicable_evidence_records,
+                            deferred_evidence_records: status.deferred_evidence_records,
                             divergence_evidence_records: status.divergence_evidence_records,
                             last_evidence_at: status.last_evidence_at,
                             observation_freshness: status.observation_freshness,

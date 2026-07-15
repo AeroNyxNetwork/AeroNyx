@@ -57,6 +57,10 @@
 //! - v2.7.13-CommitmentDurability: Tracks the effective SQLite synchronous
 //!   level so a commitment coordinator can fail closed unless WAL commits use
 //!   FULL-or-stronger durability before startup audit and block production.
+//! - v2.7.19-FollowerEvidenceRecovery: Separates cryptographically valid
+//!   checkpoint frames from evidence that is applicable to the currently
+//!   audited local tip, allowing a follower to recover from a local rollback
+//!   without presenting historical evidence as current convergence.
 //!
 //! ## Thread Safety
 //! `rusqlite::Connection` behind `tokio::sync::Mutex`. Phase 2+ can use r2d2 pooling.
@@ -114,7 +118,9 @@
 //!   one may update only `last_served_at` and `requests_served_total`; it must
 //!   never set convergence, divergence, failure, or observed peer heights.
 //! - Checkpoint freshness is derived only from `last_evidence_at` after a valid
-//!   vault audit. Attempts, failures, and inbound serving never refresh it.
+//!   vault audit. Evidence above the currently audited local tip is deferred
+//!   and cannot refresh freshness or divergence state. Attempts, failures, and
+//!   inbound serving never refresh it.
 //! - Witness-round fields are process-local aggregate observations. They must
 //!   never be interpreted as votes, quorum, finality, or fork choice.
 //! - commitment_durability is process-local SQLite configuration evidence.
@@ -387,14 +393,21 @@ pub struct RecordCommitmentCheckpointStatus {
     pub divergences_total: u64,
     /// Authenticated checkpoint responses served since process start.
     pub requests_served_total: u64,
-    /// Startup audit state for durable proof frames: `not_audited`, `verified`,
-    /// or `invalid`. Raw proof material is never returned.
+    /// Startup cryptographic audit state for durable proof frames:
+    /// `not_audited`, `verified`, or `invalid`. A verified frame can still be
+    /// deferred when its historical local tip is not yet available.
     pub evidence_state: String,
     /// Signature-verified proof frames currently retained in the bounded vault.
     pub evidence_records: u64,
-    /// Retained proofs that established a shared-prefix mismatch.
+    /// Retained proofs applicable to the currently audited local chain.
+    pub applicable_evidence_records: u64,
+    /// Cryptographically valid historical proofs whose recorded local tip is
+    /// above the currently audited tip. They remain retained for recovery but
+    /// cannot affect freshness, convergence, or divergence telemetry.
+    pub deferred_evidence_records: u64,
+    /// Applicable retained proofs that established a shared-prefix mismatch.
     pub divergence_evidence_records: u64,
-    /// Most recent durable evidence observation time.
+    /// Most recent applicable durable evidence observation time.
     pub last_evidence_at: Option<u64>,
     /// `unavailable`, `fresh`, or `stale` for the most recent durable signed
     /// outbound observation. Vault integrity is reported separately.
@@ -503,6 +516,8 @@ pub(crate) struct RecordCommitmentCheckpointRuntime {
     pub(crate) requests_served_total: u64,
     pub(crate) evidence_state: &'static str,
     pub(crate) evidence_records: u64,
+    pub(crate) applicable_evidence_records: u64,
+    pub(crate) deferred_evidence_records: u64,
     pub(crate) divergence_evidence_records: u64,
     pub(crate) last_evidence_at: Option<u64>,
     pub(crate) last_round_state: &'static str,
@@ -535,6 +550,8 @@ impl Default for RecordCommitmentCheckpointRuntime {
             requests_served_total: 0,
             evidence_state: "not_audited",
             evidence_records: 0,
+            applicable_evidence_records: 0,
+            deferred_evidence_records: 0,
             divergence_evidence_records: 0,
             last_evidence_at: None,
             last_round_state: "not_checked",

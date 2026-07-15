@@ -26,8 +26,9 @@
 //     coordinator identity, endpoint, block hashes, owners, or payload data.
 //   - record_commitment_integrity reports aggregate verification evidence only.
 //     Never add hashes, proposer identity, commitment IDs, or user metadata.
-//   - checkpoint observation freshness derives from durable signed proof time;
-//     attempts and inbound served responses must never refresh it.
+//   - checkpoint observation freshness derives from applicable durable signed
+//     proof time; deferred evidence above a recovered follower tip, attempts,
+//     and inbound served responses must never refresh it.
 //   - witness round counts are aggregate operational evidence only. They are
 //     not votes, quorum, finality, or a fork-choice input.
 //   - pinned witness reporting exposes only scope, count, and strict-policy
@@ -53,6 +54,7 @@
 //   v2.7.14        - Added aggregate signed tip rollback-guard evidence
 //   v2.7.15        - Added privacy-safe pinned witness policy evidence
 //   v2.7.16        - Added the aggregate strict witness startup threshold
+//   v2.7.19        - Added applicable/deferred checkpoint evidence counts
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -210,13 +212,18 @@ pub struct RecordCommitmentCheckpointHeartbeatStatus {
     pub divergences_total: u64,
     /// Authenticated checkpoint requests served since process start.
     pub requests_served_total: u64,
-    /// `not_audited`, `verified`, or `invalid` for the local durable vault.
+    /// Cryptographic frame audit: `not_audited`, `verified`, or `invalid`.
+    /// Applicability to the current chain is reported by the counts below.
     pub evidence_state: String,
     /// Current bounded durable proof count; raw frames never leave the node.
     pub evidence_records: u64,
-    /// Durable proof count classified as divergence.
+    /// Proofs applicable to the currently audited local chain.
+    pub applicable_evidence_records: u64,
+    /// Historical proofs above the current audited local tip.
+    pub deferred_evidence_records: u64,
+    /// Applicable durable proof count classified as divergence.
     pub divergence_evidence_records: u64,
-    /// Most recent durable evidence observation time.
+    /// Most recent applicable durable evidence observation time.
     pub last_evidence_at: Option<u64>,
     /// `unavailable`, `fresh`, or `stale` for durable signed observations.
     pub observation_freshness: String,
@@ -772,6 +779,8 @@ mod tests {
                 requests_served_total: 2,
                 evidence_state: "verified".to_string(),
                 evidence_records: 3,
+                applicable_evidence_records: 2,
+                deferred_evidence_records: 1,
                 divergence_evidence_records: 0,
                 last_evidence_at: Some(120),
                 observation_freshness: "fresh".to_string(),
@@ -815,6 +824,8 @@ mod tests {
         assert_eq!(checkpoint["requests_served_total"], 2);
         assert_eq!(checkpoint["evidence_state"], "verified");
         assert_eq!(checkpoint["evidence_records"], 3);
+        assert_eq!(checkpoint["applicable_evidence_records"], 2);
+        assert_eq!(checkpoint["deferred_evidence_records"], 1);
         assert_eq!(checkpoint["observation_freshness"], "fresh");
         assert_eq!(checkpoint["observation_age_seconds"], 5);
         assert_eq!(checkpoint["freshness_window_seconds"], 900);

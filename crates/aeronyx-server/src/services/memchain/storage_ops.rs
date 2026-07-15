@@ -46,6 +46,9 @@
 //!   with single-block mining delegated to the same authoritative path
 //! - v2.7.18-VerifiedRangeSnapshot: audit-gated range serving from one SQLite
 //!   snapshot with canonical payload and signature re-verification
+//! - v2.7.19-FollowerEvidenceRecovery: retains cryptographically valid
+//!   historical checkpoint frames across follower-local rollback while
+//!   excluding deferred evidence from current freshness and fork telemetry
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -82,8 +85,9 @@
 //! - An inbound checkpoint request describes the requester's state, not this
 //!   node's observation of the network. Serving it must never mutate outbound
 //!   checkpoint relation, heights, or divergence counters.
-//! - Freshness derives only from an audited, durable `last_evidence_at`; a
-//!   failed attempt or served response must never make stale evidence fresh.
+//! - Freshness derives only from an audited, currently applicable durable
+//!   `last_evidence_at`; a deferred historical frame, failed attempt, or served
+//!   response must never make stale or unavailable evidence appear fresh.
 //! - Witness round state is process-local aggregate telemetry. Do not use its
 //!   counts as votes, quorum, finality, leader election, or fork choice.
 //! - A coordinator must call `configure_record_commitment_durability(true)`
@@ -114,8 +118,10 @@
 //! v2.7.14-CommitmentTipAnchor - Added a signed local high-water rollback guard.
 //! v2.7.17-AtomicBlockPage - Made verified peer pages one atomic SQLite append.
 //! v2.7.18-VerifiedRangeSnapshot - Added fail-closed snapshot range serving.
+//! v2.7.19-FollowerEvidenceRecovery - Deferred valid evidence above a rolled-back tip.
 //!
 //! ## Last Modified
+//! v2.7.19-FollowerEvidenceRecovery - Allow audited followers to resync after local rollback.
 //! v2.7.18-VerifiedRangeSnapshot - Serve only canonically reverified audit-backed pages.
 //! v2.7.17-AtomicBlockPage - Share one atomic append path across mining and sync.
 //! v2.7.11-CheckpointFreshness - Distinguish vault integrity from proof recency.
@@ -312,8 +318,16 @@ pub struct RecordCommitmentChainAudit {
 /// are intentionally absent so this report is safe for startup logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordCommitmentCheckpointEvidenceAudit {
+    /// Total cryptographically valid frames retained in the bounded vault.
     pub evidence_records: u64,
+    /// Frames whose recorded local tip is covered by the audited local chain.
+    pub applicable_evidence_records: u64,
+    /// Historical frames above the audited local tip. These are retained but
+    /// excluded from freshness and divergence telemetry until re-audited.
+    pub deferred_evidence_records: u64,
+    /// Applicable frames proving a shared-prefix mismatch.
     pub divergence_evidence_records: u64,
+    /// Latest applicable observation; deferred frames cannot advance it.
     pub last_evidence_at: Option<u64>,
 }
 
@@ -835,7 +849,17 @@ fn audit_checkpoint_evidence_connection(
     let transaction = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
         .map_err(|error| format!("begin checkpoint evidence audit snapshot: {error}"))?;
-    let current_tip_height_i64 = transaction
+    let report = audit_checkpoint_evidence_snapshot(&transaction)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("finish checkpoint evidence audit snapshot: {error}"))?;
+    Ok(report)
+}
+
+fn audit_checkpoint_evidence_snapshot(
+    connection: &rusqlite::Connection,
+) -> Result<RecordCommitmentCheckpointEvidenceAudit, String> {
+    let current_tip_height_i64 = connection
         .query_row(
             "SELECT COALESCE(MAX(height), 0) FROM record_commitment_blocks",
             [],
@@ -846,10 +870,12 @@ fn audit_checkpoint_evidence_connection(
         .map_err(|_| "checkpoint evidence local tip is invalid".to_string())?;
 
     let mut evidence_records = 0u64;
+    let mut applicable_evidence_records = 0u64;
+    let mut deferred_evidence_records = 0u64;
     let mut divergence_evidence_records = 0u64;
     let mut last_evidence_at = None;
     {
-        let mut statement = transaction
+        let mut statement = connection
             .prepare(
                 "SELECT evidence_digest,observed_at,relation,local_tip_height,
                         remote_tip_height,checkpoint_height,signed_response
@@ -894,8 +920,11 @@ fn audit_checkpoint_evidence_connection(
                 .map_err(|_| "checkpoint evidence remote height is invalid".to_string())?;
             let stored_checkpoint_height = u64::try_from(stored_checkpoint_i64)
                 .map_err(|_| "checkpoint evidence height is invalid".to_string())?;
-            if local_tip_height > current_tip_height {
-                return Err("checkpoint evidence references an unavailable local tip".to_string());
+            if !matches!(
+                relation.as_str(),
+                "converged" | "remote_ahead" | "remote_behind" | "diverged"
+            ) {
+                return Err("checkpoint evidence relation is invalid".to_string());
             }
             if digest.len() != 32 || Sha256::digest(&frame).as_slice() != digest.as_slice() {
                 return Err("checkpoint evidence digest mismatch".to_string());
@@ -958,10 +987,35 @@ fn audit_checkpoint_evidence_connection(
             if checkpoint_height == tip_height && checkpoint_hash != tip_hash {
                 return Err("checkpoint evidence tip hash is inconsistent".to_string());
             }
+            let relation_matches_heights = match relation.as_str() {
+                "converged" => local_tip_height == tip_height,
+                "remote_ahead" => local_tip_height < tip_height,
+                "remote_behind" => local_tip_height > tip_height,
+                // Divergence takes precedence over relative height once the
+                // shared checkpoint hash can be compared to the local chain.
+                "diverged" => true,
+                _ => false,
+            };
+            if !relation_matches_heights {
+                return Err("checkpoint evidence height classification mismatch".to_string());
+            }
+
+            evidence_records = evidence_records.saturating_add(1);
+            if local_tip_height > current_tip_height {
+                // A follower can retain signed observations from a previously
+                // audited higher local tip after restoring an older database
+                // snapshot. The frame remains cryptographically verifiable,
+                // but its relation to the current chain cannot be established
+                // until block sync restores that prefix. Keep it immutable and
+                // bounded, but never let it refresh current operational state.
+                deferred_evidence_records = deferred_evidence_records.saturating_add(1);
+                continue;
+            }
+
             let local_checkpoint_hash: Vec<u8> = if checkpoint_height == 0 {
                 GENESIS_PREV_HASH.to_vec()
             } else {
-                transaction
+                connection
                     .query_row(
                         "SELECT block_hash FROM record_commitment_blocks WHERE height=?1",
                         params![i64::try_from(checkpoint_height).map_err(|_| {
@@ -986,7 +1040,7 @@ fn audit_checkpoint_evidence_connection(
                 return Err("checkpoint evidence classification mismatch".to_string());
             }
 
-            evidence_records = evidence_records.saturating_add(1);
+            applicable_evidence_records = applicable_evidence_records.saturating_add(1);
             if relation == "diverged" {
                 divergence_evidence_records = divergence_evidence_records.saturating_add(1);
             }
@@ -997,11 +1051,10 @@ fn audit_checkpoint_evidence_connection(
     if evidence_records > CHECKPOINT_EVIDENCE_CAPACITY as u64 {
         return Err("checkpoint evidence vault exceeds its configured capacity".to_string());
     }
-    transaction
-        .commit()
-        .map_err(|error| format!("finish checkpoint evidence audit snapshot: {error}"))?;
     Ok(RecordCommitmentCheckpointEvidenceAudit {
         evidence_records,
+        applicable_evidence_records,
+        deferred_evidence_records,
         divergence_evidence_records,
         last_evidence_at,
     })
@@ -1459,6 +1512,8 @@ impl MemoryStorage {
             requests_served_total: runtime.requests_served_total,
             evidence_state: runtime.evidence_state.to_string(),
             evidence_records: runtime.evidence_records,
+            applicable_evidence_records: runtime.applicable_evidence_records,
+            deferred_evidence_records: runtime.deferred_evidence_records,
             divergence_evidence_records: runtime.divergence_evidence_records,
             last_evidence_at: runtime.last_evidence_at,
             observation_freshness: observation_freshness.to_string(),
@@ -1476,7 +1531,7 @@ impl MemoryStorage {
             last_round_diverged: runtime.last_round_diverged,
             evidence_persistence_failures_total: runtime
                 .evidence_persistence_failures_total,
-            privacy_policy: "aggregate signed checkpoint outcomes, bounded witness-round coverage, durable observation freshness, and local evidence-vault health only; counts are not consensus; raw frames, peer identities, block hashes, signatures, request ids, commitments, owners, payloads, endpoints, routes, and client metadata never leave the node",
+            privacy_policy: "aggregate signed checkpoint outcomes, bounded witness-round coverage, applicable/deferred evidence counts, durable observation freshness, and local evidence-vault health only; counts are not consensus; raw frames, peer identities, block hashes, signatures, request ids, commitments, owners, payloads, endpoints, routes, and client metadata never leave the node",
         }
     }
 
@@ -1558,9 +1613,16 @@ impl MemoryStorage {
     /// completed chain, freshness, identity, signature, and relation checks.
     ///
     /// This method independently rechecks the digest and storage bounds, writes
-    /// in one immediate transaction, and prunes the oldest non-divergence proof
-    /// first. A failure is returned to the follower so convergence cannot be
-    /// declared without durable evidence.
+    /// in one immediate transaction, prunes the oldest non-divergence proof
+    /// first, and then re-audits the complete bounded vault. A failure is
+    /// returned to the follower so convergence cannot be declared without
+    /// durable evidence applicable to the current verified chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when inputs violate bounds or relation invariants,
+    /// when any retained frame fails cryptographic/canonical verification, or
+    /// when the atomic SQLite transaction cannot be completed.
     pub async fn persist_record_commitment_checkpoint_evidence(
         &self,
         observed_at: u64,
@@ -1619,7 +1681,7 @@ impl MemoryStorage {
 
         let result = {
             let mut conn = self.conn.lock().await;
-            (|| -> Result<(u64, u64, Option<u64>), String> {
+            (|| -> Result<RecordCommitmentCheckpointEvidenceAudit, String> {
                 let transaction = conn
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(|error| format!("begin checkpoint evidence transaction: {error}"))?;
@@ -1690,46 +1752,27 @@ impl MemoryStorage {
                         )
                         .map_err(|error| format!("prune checkpoint evidence: {error}"))?;
                 }
-                let summary = transaction
-                    .query_row(
-                        "SELECT COUNT(*),
-                                COALESCE(SUM(CASE WHEN relation='diverged' THEN 1 ELSE 0 END),0),
-                                MAX(observed_at)
-                         FROM record_checkpoint_evidence",
-                        [],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, Option<i64>>(2)?,
-                            ))
-                        },
-                    )
-                    .map_err(|error| format!("summarize checkpoint evidence: {error}"))?;
+                // The vault is deliberately small. Re-audit every retained
+                // frame inside the same write transaction. Invalid new data
+                // therefore rolls back atomically, and evidence deferred by a
+                // follower rollback becomes applicable only after its local
+                // chain prefix has actually been restored and reverified.
+                let report = audit_checkpoint_evidence_snapshot(&transaction)?;
                 transaction
                     .commit()
                     .map_err(|error| format!("commit checkpoint evidence: {error}"))?;
-                Ok((
-                    u64::try_from(summary.0)
-                        .map_err(|_| "checkpoint evidence count is invalid".to_string())?,
-                    u64::try_from(summary.1).map_err(|_| {
-                        "checkpoint divergence evidence count is invalid".to_string()
-                    })?,
-                    summary
-                        .2
-                        .map(u64::try_from)
-                        .transpose()
-                        .map_err(|_| "checkpoint evidence time is invalid".to_string())?,
-                ))
+                Ok(report)
             })()
         };
 
         match result {
-            Ok((evidence_records, divergence_records, last_evidence_at)) => {
+            Ok(report) => {
                 let mut runtime = self.commitment_checkpoint.write();
-                runtime.evidence_records = evidence_records;
-                runtime.divergence_evidence_records = divergence_records;
-                runtime.last_evidence_at = last_evidence_at;
+                runtime.evidence_records = report.evidence_records;
+                runtime.applicable_evidence_records = report.applicable_evidence_records;
+                runtime.deferred_evidence_records = report.deferred_evidence_records;
+                runtime.divergence_evidence_records = report.divergence_evidence_records;
+                runtime.last_evidence_at = report.last_evidence_at;
                 Ok(())
             }
             Err(error) => failure(error),
@@ -1738,7 +1781,14 @@ impl MemoryStorage {
 
     /// Re-verifies every durable checkpoint frame before networking starts.
     /// Any malformed digest, non-canonical frame, invalid signature, impossible
-    /// height relation, or local historical-hash mismatch fails startup closed.
+    /// height relation, or available local historical-hash mismatch fails
+    /// startup closed. Valid frames above the currently audited local tip are
+    /// retained as deferred recovery evidence and cannot affect live state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bounded vault or any currently applicable
+    /// relation cannot be verified from one consistent SQLite snapshot.
     pub async fn audit_record_commitment_checkpoint_evidence(
         &self,
     ) -> Result<RecordCommitmentCheckpointEvidenceAudit, String> {
@@ -1752,6 +1802,8 @@ impl MemoryStorage {
                 let mut runtime = self.commitment_checkpoint.write();
                 runtime.evidence_state = "verified";
                 runtime.evidence_records = report.evidence_records;
+                runtime.applicable_evidence_records = report.applicable_evidence_records;
+                runtime.deferred_evidence_records = report.deferred_evidence_records;
                 runtime.divergence_evidence_records = report.divergence_evidence_records;
                 runtime.last_evidence_at = report.last_evidence_at;
                 Ok(report)
@@ -4900,11 +4952,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(audit.evidence_records, 1);
+        assert_eq!(audit.applicable_evidence_records, 1);
+        assert_eq!(audit.deferred_evidence_records, 0);
         assert_eq!(audit.divergence_evidence_records, 0);
         assert_eq!(audit.last_evidence_at, Some(observed_at));
         let status = storage.record_commitment_checkpoint_status();
         assert_eq!(status.evidence_state, "verified");
         assert_eq!(status.evidence_records, 1);
+        assert_eq!(status.applicable_evidence_records, 1);
+        assert_eq!(status.deferred_evidence_records, 0);
         assert_eq!(status.last_evidence_at, Some(observed_at));
     }
 
@@ -5034,6 +5090,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wal_audit.evidence_records, 1);
+        assert_eq!(wal_audit.applicable_evidence_records, 1);
+        assert_eq!(wal_audit.deferred_evidence_records, 0);
         assert_eq!(wal_audit.last_evidence_at, Some(observed_at));
         drop(wal_reader);
         drop(writer);
@@ -5063,6 +5121,72 @@ mod tests {
                 .evidence_state,
             "verified"
         );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_evidence_is_deferred_during_follower_rollback_recovery() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("checkpoint-follower-rollback.db");
+        let original = MemoryStorage::open(&path, None).unwrap();
+        let observed_at = 1_700_500_150;
+        let (block, _, _) = seed_checkpoint_evidence(&original, observed_at).await;
+        drop(original);
+
+        // Model a follower restoring an older local chain snapshot while its
+        // append-only evidence vault survives. Records and evidence remain;
+        // only the derived commitment chain is reset for canonical resync.
+        let rollback = rusqlite::Connection::open(&path).unwrap();
+        rollback
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 DELETE FROM record_block_commitments;
+                 DELETE FROM record_commitment_blocks;
+                 DELETE FROM chain_state WHERE key IN (
+                    'record_block_chain_id',
+                    'record_block_tip_hash',
+                    'record_block_tip_height'
+                 );
+                 COMMIT;",
+            )
+            .unwrap();
+        drop(rollback);
+
+        let recovered = MemoryStorage::open(&path, None).unwrap();
+        let chain = recovered.audit_record_commitment_chain().await.unwrap();
+        assert_eq!(chain.block_count, 0);
+        assert_eq!(chain.tip_height, 0);
+
+        let deferred = recovered
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(deferred.evidence_records, 1);
+        assert_eq!(deferred.applicable_evidence_records, 0);
+        assert_eq!(deferred.deferred_evidence_records, 1);
+        assert_eq!(deferred.divergence_evidence_records, 0);
+        assert_eq!(deferred.last_evidence_at, None);
+        let deferred_status = recovered.record_commitment_checkpoint_status();
+        assert_eq!(deferred_status.evidence_state, "verified");
+        assert_eq!(deferred_status.applicable_evidence_records, 0);
+        assert_eq!(deferred_status.deferred_evidence_records, 1);
+        assert_eq!(deferred_status.observation_freshness, "unavailable");
+        assert_eq!(deferred_status.observation_age_seconds, None);
+
+        // Once the canonical prefix is restored, the same immutable frame can
+        // be reclassified only after its historical hash relation is verified.
+        recovered
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        recovered.audit_record_commitment_chain().await.unwrap();
+        let applicable = recovered
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(applicable.evidence_records, 1);
+        assert_eq!(applicable.applicable_evidence_records, 1);
+        assert_eq!(applicable.deferred_evidence_records, 0);
+        assert_eq!(applicable.last_evidence_at, Some(observed_at));
     }
 
     #[tokio::test]
@@ -5157,11 +5281,36 @@ mod tests {
             .await
             .unwrap_err()
             .contains("relation is invalid"));
+        assert!(
+            storage
+                .persist_record_commitment_checkpoint_evidence(
+                    1,
+                    "converged",
+                    0,
+                    0,
+                    0,
+                    &digest,
+                    &frame,
+                )
+                .await
+                .unwrap_err()
+                .contains("frame decode failed")
+        );
+        let retained_rows: i64 = {
+            let conn = storage.conn_lock().await;
+            conn.query_row(
+                "SELECT COUNT(*) FROM record_checkpoint_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(retained_rows, 0);
         assert_eq!(
             storage
                 .record_commitment_checkpoint_status()
                 .evidence_persistence_failures_total,
-            2
+            3
         );
     }
 
