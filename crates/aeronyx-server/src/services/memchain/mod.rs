@@ -68,6 +68,7 @@
 //! v2.7.3-BlockAudit - Re-exported complete startup chain audit report.
 //! v2.7.1-BlockSyncStatus - Re-exported privacy-safe follower runtime evidence.
 //! v2.7.0-BlockSync - Re-exported commitment append outcomes and safe status.
+//! v2.7.17-AtomicBlockPage - Re-exported atomic batch append outcomes.
 
 // ── Storage engine ──
 pub mod storage;
@@ -134,7 +135,8 @@ pub use storage::{
 };
 pub use storage_crypto::{decrypt_rawlog_content_pub, derive_rawlog_key, derive_record_key};
 pub use storage_ops::{
-    OverviewData, OverviewRecord, RecordCommitmentAppendOutcome, RecordCommitmentChainAudit,
+    OverviewData, OverviewRecord, RecordCommitmentAppendOutcome,
+    RecordCommitmentBatchAppendOutcome, RecordCommitmentChainAudit,
     RecordCommitmentChainIntegrityStatus, RecordCommitmentChainStatus,
     RecordCommitmentCheckpointEvidenceAudit,
 };

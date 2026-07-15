@@ -42,6 +42,8 @@
 //!   that remains evidence only and never becomes a consensus rule
 //! - v2.7.13-CommitmentDurability: coordinator-only SQLite FULL durability,
 //!   startup fail-closed verification, and aggregate durability evidence
+//! - v2.7.17-AtomicBlockPage: one SQLite transaction per verified peer page,
+//!   with single-block mining delegated to the same authoritative path
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -70,7 +72,8 @@
 //!   project_id on EITHER the record directly OR via its session. Records inserted
 //!   via /remember directly (no session) are matched by records.project_id only.
 //! - `append_record_commitment_block` is the only authoritative tip advance for
-//!   the new chain. Never update its tip independently of the block transaction.
+//!   the new chain. It delegates to `append_record_commitment_blocks_atomic`;
+//!   never update the tip independently of that transaction.
 //! - Peer range reads return commitments only; full records remain owner-scoped.
 //! - An inbound checkpoint request describes the requester's state, not this
 //!   node's observation of the network. Serving it must never mutate outbound
@@ -105,8 +108,10 @@
 //! v2.7.12-WitnessRoundEvidence - Added bounded round evidence classification.
 //! v2.7.13-CommitmentDurability - Enforced coordinator FULL SQLite commits.
 //! v2.7.14-CommitmentTipAnchor - Added a signed local high-water rollback guard.
+//! v2.7.17-AtomicBlockPage - Made verified peer pages one atomic SQLite append.
 //!
 //! ## Last Modified
+//! v2.7.17-AtomicBlockPage - Share one atomic append path across mining and sync.
 //! v2.7.11-CheckpointFreshness - Distinguish vault integrity from proof recency.
 //! v2.7.12-WitnessRoundEvidence - Report bounded witness round coverage.
 //! v2.7.10-CheckpointDirectionIsolation - Prevent requester-driven status pollution.
@@ -178,6 +183,25 @@ pub enum RecordCommitmentAppendOutcome {
     Inserted,
     /// The exact same block was already stored at that height.
     AlreadyPresent,
+}
+
+/// Aggregate result of one atomic bounded commitment-block append.
+///
+/// Counts contain no block hashes, record commitments, owners, or peer
+/// identities, so the result is safe for aggregate sync telemetry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecordCommitmentBatchAppendOutcome {
+    /// Blocks committed by this transaction.
+    pub inserted: usize,
+    /// Exact blocks that were already durable when the transaction began.
+    pub already_present: usize,
+}
+
+#[derive(Debug)]
+struct CommittedRecordCommitmentBatch {
+    outcome: RecordCommitmentBatchAppendOutcome,
+    inserted_indices: Vec<usize>,
+    appended_at: u64,
 }
 
 /// Aggregate local state for the node-blind commitment chain.
@@ -290,11 +314,124 @@ struct StoredRecordCommitmentBlockRow {
 // below 9 KiB. Keep startup decoding bounded even if the SQLite file was
 // replaced or modified outside the process.
 const MAX_STORED_COMMITMENT_BLOCK_BYTES: usize = 16 * 1024;
+/// Bound lock time, rollback journal growth, and caller-controlled allocation.
+/// Peer protocol pages currently use 16 blocks; 32 leaves room for internal
+/// maintenance without turning this storage primitive into an unbounded API.
+const MAX_ATOMIC_COMMITMENT_BLOCK_BATCH: usize = 32;
 /// A v1 tip anchor is under 1 KiB. Keep disk reads bounded before JSON decode.
 const MAX_COMMITMENT_TIP_ANCHOR_BYTES: u64 = 4 * 1024;
 const COMMITMENT_TIP_ANCHOR_CONTRACT: &str = "record_commitment_tip_anchor.v1";
 const COMMITMENT_TIP_ANCHOR_DOMAIN: &[u8] = b"aeronyx.record_commitment_tip_anchor.v1\0";
 static COMMITMENT_TIP_ANCHOR_TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
+
+fn persist_record_commitment_block_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    block: &RecordCommitmentBlockV1,
+    received_from: Option<&[u8; 32]>,
+    expected_height: u64,
+    expected_prev_hash: &[u8; 32],
+    created_at: i64,
+) -> Result<RecordCommitmentAppendOutcome, String> {
+    let block_height = i64::try_from(block.header.height)
+        .map_err(|_| "commitment block height exceeds SQLite range".to_string())?;
+    let block_timestamp = i64::try_from(block.header.timestamp)
+        .map_err(|_| "commitment block timestamp exceeds SQLite range".to_string())?;
+    let block_hash = block.hash();
+    let existing_hash: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT block_hash FROM record_commitment_blocks WHERE height=?1",
+            params![block_height],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("read existing commitment block: {error}"))?;
+    if let Some(existing_hash) = existing_hash {
+        if existing_hash.as_slice() == block_hash.as_slice() {
+            return Ok(RecordCommitmentAppendOutcome::AlreadyPresent);
+        }
+        return Err(format!(
+            "commitment chain fork at height {}",
+            block.header.height
+        ));
+    }
+
+    block
+        .verify(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            expected_height,
+            expected_prev_hash,
+        )
+        .map_err(|error| format!("commitment block validation failed: {error}"))?;
+    let payload = bincode::serialize(block)
+        .map_err(|error| format!("serialize commitment block: {error}"))?;
+    if payload.len() > MAX_STORED_COMMITMENT_BLOCK_BYTES {
+        return Err("serialized commitment block exceeds storage limit".to_string());
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO record_commitment_blocks
+             (height,block_hash,chain_id,protocol_version,timestamp,
+              prev_block_hash,merkle_root,record_count,proposer,
+              proposer_signature,payload,received_from,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                block_height,
+                block_hash.as_slice(),
+                block.header.chain_id.as_slice(),
+                i64::from(block.header.protocol_version),
+                block_timestamp,
+                block.header.prev_block_hash.as_slice(),
+                block.header.merkle_root.as_slice(),
+                i64::from(block.header.record_count),
+                block.header.proposer.as_slice(),
+                block.proposer_signature.as_slice(),
+                payload,
+                received_from.map(<[u8; 32]>::as_slice),
+                created_at,
+            ],
+        )
+        .map_err(|error| format!("persist commitment block: {error}"))?;
+
+    for record_id in &block.record_ids {
+        transaction
+            .execute(
+                "INSERT INTO record_block_commitments (record_id,block_height)
+                 VALUES (?1,?2)",
+                params![record_id.as_slice(), block_height],
+            )
+            .map_err(|error| {
+                format!(
+                    "persist commitment membership at height {}: {error}",
+                    block.header.height
+                )
+            })?;
+    }
+    Ok(RecordCommitmentAppendOutcome::Inserted)
+}
+
+fn persist_record_commitment_tip_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    height: u64,
+    hash: &[u8; 32],
+) -> Result<(), String> {
+    for (key, value) in [
+        ("record_block_tip_hash", hash.to_vec()),
+        ("record_block_tip_height", height.to_le_bytes().to_vec()),
+        (
+            "record_block_chain_id",
+            AERONYX_MEMCHAIN_MAINNET_CHAIN_ID.to_vec(),
+        ),
+    ] {
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO chain_state (key,value) VALUES (?1,?2)",
+                params![key, value],
+            )
+            .map_err(|error| format!("update commitment chain state: {error}"))?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2130,21 +2267,65 @@ impl MemoryStorage {
         Ok(report)
     }
 
-    /// Atomically verifies and appends one node-blind commitment block.
+    /// Verifies and appends one node-blind commitment block.
     ///
-    /// Height uniqueness, previous-hash continuity, proposer signature,
-    /// Merkle integrity, commitment uniqueness, block persistence, membership
-    /// indexing, and tip updates share one SQLite transaction. A crash or
-    /// validation failure therefore cannot leave a partially advanced SQLite
-    /// chain. On a configured coordinator, the signed sidecar is advanced only
-    /// after that commit. A sidecar write failure returns an error even though
-    /// the SQLite block is durable, clears verified status, and blocks later
-    /// appends until restart performs a complete audit and safe repair.
+    /// This compatibility API delegates to the bounded batch primitive so
+    /// local mining and peer catch-up cannot drift into different validation,
+    /// durability, integrity-baseline, or rollback-anchor behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation, persistence, integrity advancement,
+    /// or configured signed-tip anchor persistence fails.
     pub async fn append_record_commitment_block(
         &self,
         block: &RecordCommitmentBlockV1,
         received_from: Option<&[u8; 32]>,
     ) -> Result<RecordCommitmentAppendOutcome, String> {
+        let outcome = self
+            .append_record_commitment_blocks_atomic(std::slice::from_ref(block), received_from)
+            .await?;
+        match (outcome.inserted, outcome.already_present) {
+            (1, 0) => Ok(RecordCommitmentAppendOutcome::Inserted),
+            (0, 1) => Ok(RecordCommitmentAppendOutcome::AlreadyPresent),
+            _ => Err("single commitment append produced an invalid aggregate outcome".to_string()),
+        }
+    }
+
+    /// Atomically verifies and appends one bounded node-blind block page.
+    ///
+    /// Height order, previous-hash continuity, proposer signatures, Merkle
+    /// integrity, commitment uniqueness, block rows, membership indexes, and
+    /// the final tip share one `SQLite` `IMMEDIATE` transaction. Exact durable
+    /// prefixes are idempotent, which permits safe retry after a lost response;
+    /// any fork, gap, invalid block, or storage failure rolls back every newly
+    /// inserted block in the page.
+    ///
+    /// The signed sidecar remains intentionally outside `SQLite`. After a page
+    /// commit, it advances once to the final verified tip. A sidecar failure
+    /// fails closed exactly like the legacy single-block path: `SQLite` remains
+    /// durable, verified runtime state is cleared, and restart audit must
+    /// safely repair the high-water mark before another append.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for oversized or non-contiguous input, a fork, an
+    /// invalid block, a storage failure, a stale integrity baseline, or a
+    /// configured signed-tip anchor failure.
+    pub async fn append_record_commitment_blocks_atomic(
+        &self,
+        blocks: &[RecordCommitmentBlockV1],
+        received_from: Option<&[u8; 32]>,
+    ) -> Result<RecordCommitmentBatchAppendOutcome, String> {
+        if blocks.is_empty() {
+            return Ok(RecordCommitmentBatchAppendOutcome::default());
+        }
+        if blocks.len() > MAX_ATOMIC_COMMITMENT_BLOCK_BATCH {
+            return Err(format!(
+                "commitment block batch exceeds maximum of {MAX_ATOMIC_COMMITMENT_BLOCK_BATCH}"
+            ));
+        }
+
         let (anchor_enabled, anchor_ready) = {
             let runtime = self.commitment_tip_anchor.read();
             (
@@ -2158,211 +2339,217 @@ impl MemoryStorage {
                     .to_string(),
             );
         }
-        let block_height = i64::try_from(block.header.height)
-            .map_err(|_| "commitment block height exceeds SQLite range".to_string())?;
-        let block_timestamp = i64::try_from(block.header.timestamp)
-            .map_err(|_| "commitment block timestamp exceeds SQLite range".to_string())?;
-        let can_advance = {
-            let mut conn = self.conn.lock().await;
-            let transaction = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(|error| format!("begin commitment block transaction: {error}"))?;
 
-            let existing_hash: Option<Vec<u8>> = transaction
-                .query_row(
-                    "SELECT block_hash FROM record_commitment_blocks WHERE height=?1",
-                    params![block_height],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| format!("read existing commitment block: {error}"))?;
-            if let Some(existing_hash) = existing_hash {
-                if existing_hash.as_slice() == block.hash().as_slice() {
-                    return Ok(RecordCommitmentAppendOutcome::AlreadyPresent);
-                }
-                return Err(format!(
-                    "commitment chain fork at height {}",
-                    block.header.height
-                ));
-            }
+        let committed = self
+            .append_record_commitment_block_page_transaction(blocks, received_from)
+            .await?;
+        if committed.inserted_indices.is_empty() {
+            return Ok(committed.outcome);
+        }
 
-            let tip: Option<(i64, Vec<u8>)> = transaction
-                .query_row(
-                    "SELECT height,block_hash FROM record_commitment_blocks
+        let can_advance = self.advance_record_commitment_integrity_for_batch(
+            blocks,
+            &committed.inserted_indices,
+            committed.appended_at,
+        );
+        self.persist_record_commitment_batch_anchor(
+            blocks,
+            &committed.inserted_indices,
+            anchor_enabled,
+            can_advance,
+        )
+        .await?;
+
+        for index in committed.inserted_indices {
+            let block = &blocks[index];
+            info!(
+                height = block.header.height,
+                commitments = block.record_ids.len(),
+                hash = %block.header.hash_hex(),
+                source = if received_from.is_some() { "peer" } else { "local" },
+                "[MEMCHAIN_BLOCK] Verified commitment block appended"
+            );
+        }
+        Ok(committed.outcome)
+    }
+
+    async fn append_record_commitment_block_page_transaction(
+        &self,
+        blocks: &[RecordCommitmentBlockV1],
+        received_from: Option<&[u8; 32]>,
+    ) -> Result<CommittedRecordCommitmentBatch, String> {
+        let mut conn = self.conn.lock().await;
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("begin commitment block batch transaction: {error}"))?;
+        let tip: Option<(i64, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT height,block_hash FROM record_commitment_blocks
                  ORDER BY height DESC LIMIT 1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .map_err(|error| format!("read commitment chain tip: {error}"))?;
-            let (expected_height, expected_prev_hash) = match tip {
-                Some((height, hash)) => {
-                    let height = u64::try_from(height)
-                        .map_err(|_| "stored commitment tip has invalid height".to_string())?;
-                    let hash: [u8; 32] = hash.try_into().map_err(|value: Vec<u8>| {
-                        format!("stored tip hash has invalid length {}", value.len())
-                    })?;
-                    (height.saturating_add(1), hash)
-                }
-                None => (1, GENESIS_PREV_HASH),
-            };
-
-            block
-                .verify(
-                    &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
-                    expected_height,
-                    &expected_prev_hash,
-                )
-                .map_err(|error| format!("commitment block validation failed: {error}"))?;
-
-            let payload = bincode::serialize(block)
-                .map_err(|error| format!("serialize commitment block: {error}"))?;
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            transaction
-                .execute(
-                    "INSERT INTO record_commitment_blocks
-                 (height,block_hash,chain_id,protocol_version,timestamp,
-                  prev_block_hash,merkle_root,record_count,proposer,
-                  proposer_signature,payload,received_from,created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-                    params![
-                        block_height,
-                        block.hash().as_slice(),
-                        block.header.chain_id.as_slice(),
-                        block.header.protocol_version as i64,
-                        block_timestamp,
-                        block.header.prev_block_hash.as_slice(),
-                        block.header.merkle_root.as_slice(),
-                        block.header.record_count as i64,
-                        block.header.proposer.as_slice(),
-                        block.proposer_signature.as_slice(),
-                        payload,
-                        received_from.map(|peer| peer.as_slice()),
-                        now,
-                    ],
-                )
-                .map_err(|error| format!("persist commitment block: {error}"))?;
-
-            for record_id in &block.record_ids {
-                transaction
-                    .execute(
-                        "INSERT INTO record_block_commitments (record_id,block_height)
-                     VALUES (?1,?2)",
-                        params![record_id.as_slice(), block_height],
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "persist commitment membership at height {}: {error}",
-                            block.header.height
-                        )
-                    })?;
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("read commitment chain tip: {error}"))?;
+        let (mut current_height, mut current_hash) = match tip {
+            Some((height, hash)) => {
+                let height = u64::try_from(height)
+                    .map_err(|_| "stored commitment tip has invalid height".to_string())?;
+                let hash: [u8; 32] = hash.try_into().map_err(|value: Vec<u8>| {
+                    format!("stored tip hash has invalid length {}", value.len())
+                })?;
+                (height, hash)
             }
-
-            for (key, value) in [
-                ("record_block_tip_hash", block.hash().to_vec()),
-                (
-                    "record_block_tip_height",
-                    block.header.height.to_le_bytes().to_vec(),
-                ),
-                (
-                    "record_block_chain_id",
-                    AERONYX_MEMCHAIN_MAINNET_CHAIN_ID.to_vec(),
-                ),
-            ] {
-                transaction
-                    .execute(
-                        "INSERT OR REPLACE INTO chain_state (key,value) VALUES (?1,?2)",
-                        params![key, value],
-                    )
-                    .map_err(|error| format!("update commitment chain state: {error}"))?;
-            }
-
-            transaction
-                .commit()
-                .map_err(|error| format!("commit commitment block transaction: {error}"))?;
-
-            // Preserve the full-audit guarantee across normal operation. If the
-            // runtime baseline and committed append ever disagree on continuity,
-            // discard the claim and require another complete audit.
-            let appended_at = u64::try_from(now).unwrap_or_default();
-            let mut integrity = self.commitment_integrity.write();
-            let can_advance = integrity
-                .as_ref()
-                .map(|runtime| {
-                    runtime.verified_tip_height.saturating_add(1) == block.header.height
-                        && runtime.verified_block_count.saturating_add(1) == block.header.height
-                        && runtime.verified_tip_hash == block.header.prev_block_hash
-                })
-                .unwrap_or(false);
-            if can_advance {
-                if let Some(runtime) = integrity.as_mut() {
-                    runtime.last_verified_at = appended_at;
-                    runtime.verified_block_count = runtime.verified_block_count.saturating_add(1);
-                    runtime.verified_commitment_count = runtime
-                        .verified_commitment_count
-                        .saturating_add(block.record_ids.len() as u64);
-                    runtime.verified_tip_height = block.header.height;
-                    runtime.verified_tip_hash = block.hash();
-                }
-            } else if integrity.is_some() {
-                *integrity = None;
-            }
-            can_advance
+            None => (0, GENESIS_PREV_HASH),
         };
+        let appended_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let created_at = i64::try_from(appended_at)
+            .map_err(|_| "commitment append time exceeds SQLite range".to_string())?;
+        let mut outcome = RecordCommitmentBatchAppendOutcome::default();
+        let mut inserted_indices = Vec::with_capacity(blocks.len());
+        let mut previous_input_height: Option<u64> = None;
 
+        for (index, block) in blocks.iter().enumerate() {
+            if previous_input_height
+                .is_some_and(|height| height.checked_add(1) != Some(block.header.height))
+            {
+                return Err("commitment block batch is not height-contiguous".to_string());
+            }
+            previous_input_height = Some(block.header.height);
+            let expected_height = current_height
+                .checked_add(1)
+                .ok_or_else(|| "commitment chain height exhausted".to_string())?;
+            match persist_record_commitment_block_transaction(
+                &transaction,
+                block,
+                received_from,
+                expected_height,
+                &current_hash,
+                created_at,
+            )? {
+                RecordCommitmentAppendOutcome::Inserted => {
+                    current_height = block.header.height;
+                    current_hash = block.hash();
+                    inserted_indices.push(index);
+                    outcome.inserted = outcome.inserted.saturating_add(1);
+                }
+                RecordCommitmentAppendOutcome::AlreadyPresent => {
+                    outcome.already_present = outcome.already_present.saturating_add(1);
+                }
+            }
+        }
+
+        if !inserted_indices.is_empty() {
+            persist_record_commitment_tip_transaction(&transaction, current_height, &current_hash)?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("commit commitment block batch transaction: {error}"))?;
+        drop(conn);
+        Ok(CommittedRecordCommitmentBatch {
+            outcome,
+            inserted_indices,
+            appended_at,
+        })
+    }
+
+    fn advance_record_commitment_integrity_for_batch(
+        &self,
+        blocks: &[RecordCommitmentBlockV1],
+        inserted_indices: &[usize],
+        appended_at: u64,
+    ) -> bool {
+        let mut integrity = self.commitment_integrity.write();
+        let mut can_advance = integrity.is_some();
+        for index in inserted_indices {
+            let Some(block) = blocks.get(*index) else {
+                can_advance = false;
+                break;
+            };
+            let step_valid = integrity.as_ref().is_some_and(|runtime| {
+                runtime.verified_tip_height.checked_add(1) == Some(block.header.height)
+                    && runtime.verified_block_count.checked_add(1) == Some(block.header.height)
+                    && runtime.verified_tip_hash == block.header.prev_block_hash
+            });
+            if !step_valid {
+                can_advance = false;
+                break;
+            }
+            if let Some(runtime) = integrity.as_mut() {
+                runtime.last_verified_at = appended_at;
+                runtime.verified_block_count = runtime.verified_block_count.saturating_add(1);
+                runtime.verified_commitment_count = runtime
+                    .verified_commitment_count
+                    .saturating_add(block.record_ids.len() as u64);
+                runtime.verified_tip_height = block.header.height;
+                runtime.verified_tip_hash = block.hash();
+            }
+        }
+        if !can_advance && integrity.is_some() {
+            *integrity = None;
+        }
+        can_advance
+    }
+
+    async fn persist_record_commitment_batch_anchor(
+        &self,
+        blocks: &[RecordCommitmentBlockV1],
+        inserted_indices: &[usize],
+        anchor_enabled: bool,
+        can_advance: bool,
+    ) -> Result<(), String> {
+        let final_block = inserted_indices
+            .last()
+            .and_then(|index| blocks.get(*index))
+            .ok_or_else(|| "commitment batch lost its inserted outcome".to_string())?;
         if anchor_enabled && !can_advance {
-            self.fail_record_commitment_tip_anchor("invalid", block.header.height, false);
+            self.fail_record_commitment_tip_anchor("invalid", final_block.header.height, false);
             return Err(
-                "commitment block was committed but the verified runtime baseline could not advance; restart and re-audit before producing another block"
+                "commitment block was committed in an atomic batch but the verified runtime baseline could not advance; restart and re-audit before producing another block"
                     .to_string(),
             );
         }
 
-        let anchor_config = {
-            let runtime = self.commitment_tip_anchor.read();
-            runtime
-                .config
-                .as_ref()
-                .map(|config| (config.path.clone(), config.identity.clone()))
+        let anchor_config = self
+            .commitment_tip_anchor
+            .read()
+            .config
+            .as_ref()
+            .map(|config| (config.path.clone(), config.identity.clone()));
+        let Some((path, identity)) = anchor_config else {
+            return Ok(());
         };
-        if let Some((path, identity)) = anchor_config {
-            let persisted_at = match persist_record_commitment_tip_anchor(
-                path,
-                block.header.height,
-                block.hash(),
-                &identity,
-            )
-            .await
-            {
-                Ok(persisted_at) => persisted_at,
-                Err(error) => {
-                    self.fail_record_commitment_tip_anchor(
-                        "write_failed",
-                        block.header.height.saturating_sub(1),
-                        true,
-                    );
-                    return Err(format!(
-                        "commitment block was committed but signed tip anchor persistence failed; restart and re-audit: {error}"
-                    ));
-                }
-            };
-            let mut runtime = self.commitment_tip_anchor.write();
-            runtime.state = "verified";
-            runtime.anchored_height = block.header.height;
-            runtime.last_verified_at = Some(persisted_at);
-            runtime.last_persisted_at = Some(persisted_at);
-        }
-        info!(
-            height = block.header.height,
-            commitments = block.record_ids.len(),
-            hash = %block.header.hash_hex(),
-            source = if received_from.is_some() { "peer" } else { "local" },
-            "[MEMCHAIN_BLOCK] Verified commitment block appended"
-        );
-        Ok(RecordCommitmentAppendOutcome::Inserted)
+        let persisted_at = match persist_record_commitment_tip_anchor(
+            path,
+            final_block.header.height,
+            final_block.hash(),
+            &identity,
+        )
+        .await
+        {
+            Ok(persisted_at) => persisted_at,
+            Err(error) => {
+                let previous_height = inserted_indices
+                    .first()
+                    .and_then(|index| blocks.get(*index))
+                    .map_or(final_block.header.height, |block| block.header.height)
+                    .saturating_sub(1);
+                self.fail_record_commitment_tip_anchor("write_failed", previous_height, true);
+                return Err(format!(
+                    "commitment block was committed in an atomic batch but signed tip anchor persistence failed; restart and re-audit: {error}"
+                ));
+            }
+        };
+        let mut runtime = self.commitment_tip_anchor.write();
+        runtime.state = "verified";
+        runtime.anchored_height = final_block.header.height;
+        runtime.last_verified_at = Some(persisted_at);
+        runtime.last_persisted_at = Some(persisted_at);
+        drop(runtime);
+        Ok(())
     }
 
     /// Reads a bounded, height-ordered range for peer catch-up.
@@ -3685,6 +3872,190 @@ mod tests {
                 commitment_count: 0,
                 tip_height: 0,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commitment_page_failure_rolls_back_every_block() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("commitment-page-atomicity.db");
+        let storage = MemoryStorage::open(&path, None).unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+
+        // Fail while inserting the second block. A per-block transaction would
+        // leave height 1 durable; the page transaction must leave no trace.
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute_batch(
+                "CREATE TEMP TRIGGER fail_second_page_block
+                 BEFORE INSERT ON record_commitment_blocks
+                 WHEN NEW.height = 2
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected second block failure');
+                 END;",
+            )
+            .unwrap();
+        }
+        let identity = IdentityKeyPair::generate();
+        let first = signed_commitment_block(1, GENESIS_PREV_HASH, 0xA1, &identity);
+        let second = signed_commitment_block(2, first.hash(), 0xA2, &identity);
+        let error = storage
+            .append_record_commitment_blocks_atomic(&[first.clone(), second.clone()], None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("injected second block failure"));
+        assert_eq!(
+            storage.record_commitment_chain_tip().await,
+            (0, GENESIS_PREV_HASH)
+        );
+        {
+            let conn = storage.conn_lock().await;
+            let (blocks, memberships, tip_keys): (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM record_commitment_blocks),
+                         (SELECT COUNT(*) FROM record_block_commitments),
+                         (SELECT COUNT(*) FROM chain_state WHERE key IN
+                            ('record_block_tip_hash','record_block_tip_height',
+                             'record_block_chain_id'))",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!((blocks, memberships, tip_keys), (0, 0, 0));
+            conn.execute_batch("DROP TRIGGER fail_second_page_block;")
+                .unwrap();
+        }
+
+        // Cross-block commitment reuse is a consensus-invalid page, not a
+        // reason to retain the valid prefix that happened to be processed first.
+        let duplicate_second = signed_commitment_block(2, first.hash(), 0xA1, &identity);
+        let duplicate_error = storage
+            .append_record_commitment_blocks_atomic(&[first.clone(), duplicate_second], None)
+            .await
+            .unwrap_err();
+        assert!(duplicate_error.contains("persist commitment membership"));
+        assert_eq!(
+            storage.record_commitment_chain_tip().await,
+            (0, GENESIS_PREV_HASH)
+        );
+
+        let outcome = storage
+            .append_record_commitment_blocks_atomic(&[first, second.clone()], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RecordCommitmentBatchAppendOutcome {
+                inserted: 2,
+                already_present: 0,
+            }
+        );
+        assert_eq!(
+            storage.record_commitment_chain_tip().await,
+            (2, second.hash())
+        );
+        assert_eq!(
+            storage.record_commitment_chain_integrity_status().state,
+            "verified"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commitment_page_retry_is_idempotent_and_rejects_forks() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+        let identity = IdentityKeyPair::generate();
+        let first = signed_commitment_block(1, GENESIS_PREV_HASH, 0xB1, &identity);
+        let second = signed_commitment_block(2, first.hash(), 0xB2, &identity);
+        let third = signed_commitment_block(3, second.hash(), 0xB3, &identity);
+
+        storage
+            .append_record_commitment_block(&first, None)
+            .await
+            .unwrap();
+        let mixed = storage
+            .append_record_commitment_blocks_atomic(
+                &[first.clone(), second.clone(), third.clone()],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(mixed.inserted, 2);
+        assert_eq!(mixed.already_present, 1);
+
+        let replay = storage
+            .append_record_commitment_blocks_atomic(
+                &[first.clone(), second.clone(), third.clone()],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.inserted, 0);
+        assert_eq!(replay.already_present, 3);
+
+        let fork = signed_commitment_block(2, first.hash(), 0xBF, &identity);
+        let error = storage
+            .append_record_commitment_blocks_atomic(&[first.clone(), fork], None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("fork at height 2"));
+        assert_eq!(
+            storage.record_commitment_chain_tip().await,
+            (3, third.hash())
+        );
+
+        let oversized = vec![first.clone(); MAX_ATOMIC_COMMITMENT_BLOCK_BATCH + 1];
+        let oversized_error = storage
+            .append_record_commitment_blocks_atomic(&oversized, None)
+            .await
+            .unwrap_err();
+        assert!(oversized_error.contains("exceeds maximum"));
+
+        let non_contiguous = storage
+            .append_record_commitment_blocks_atomic(&[first, third], None)
+            .await
+            .unwrap_err();
+        assert!(non_contiguous.contains("not height-contiguous"));
+        assert_eq!(
+            storage
+                .append_record_commitment_blocks_atomic(&[], None)
+                .await
+                .unwrap(),
+            RecordCommitmentBatchAppendOutcome::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commitment_page_advances_integrity_and_anchor_to_final_tip() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("commitment-page-anchor.db");
+        let anchor_path = directory.path().join("commitment-page-tip.json");
+        let identity = IdentityKeyPair::generate();
+        let storage = MemoryStorage::open(&db_path, None).unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+        storage
+            .configure_record_commitment_tip_anchor(&anchor_path, &identity)
+            .await
+            .unwrap();
+        let first = signed_commitment_block(1, GENESIS_PREV_HASH, 0xC1, &identity);
+        let second = signed_commitment_block(2, first.hash(), 0xC2, &identity);
+
+        let outcome = storage
+            .append_record_commitment_blocks_atomic(&[first, second.clone()], None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.inserted, 2);
+        let status = storage.record_commitment_chain_integrity_status();
+        assert_eq!(status.state, "verified");
+        assert_eq!(status.verified_block_count, 2);
+        assert_eq!(status.verified_commitment_count, 2);
+        assert_eq!(status.verified_tip_height, 2);
+        assert_eq!(status.rollback_guard_state, "verified");
+        assert_eq!(status.rollback_guard_height, 2);
+        assert_eq!(
+            storage.record_commitment_chain_tip().await,
+            (2, second.hash())
         );
     }
 

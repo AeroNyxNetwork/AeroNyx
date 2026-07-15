@@ -18,7 +18,7 @@
 //! - Response signing that binds request id, block order, pagination, and tip.
 //! - Default-off follower pull from one configured coordinator identity.
 //! - Whole-page signature, proposer, continuity, fork, and rollback validation
-//!   before any block is appended to the local ledger.
+//!   followed by one atomic SQLite page append.
 //! - Signed tip/checkpoint comparison that distinguishes lag from a fork.
 //! - Durable bounded storage of the exact verified checkpoint response before
 //!   follower convergence can be reported.
@@ -62,6 +62,7 @@
 //!   controls its requested height/hash, so those values are not local evidence.
 //!
 //! ## Last Modified
+//! v2.7.17-AtomicBlockPage - Commit each verified follower page atomically.
 //! v2.7.15-ExternalWitnessGuard - Added identity-pinned reconciliation.
 //! v2.7.5-CheckpointProof - Signed cross-node checkpoint reconciliation.
 //! v2.7.6-EvidenceVault - Fail-closed durable verified checkpoint evidence.
@@ -100,7 +101,7 @@ use aeronyx_core::protocol::memchain::{
 use aeronyx_core::protocol::NodeCapability;
 use sha2::{Digest, Sha256};
 
-use crate::services::memchain::{MemoryStorage, RecordCommitmentAppendOutcome};
+use crate::services::memchain::MemoryStorage;
 use crate::services::PeerStore;
 
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024;
@@ -709,22 +710,14 @@ pub async fn pull_record_commitment_page(
         now_secs(),
     )?;
 
-    let mut inserted = 0usize;
-    let mut already_present = 0usize;
-    for block in &page.blocks {
-        match storage
-            .append_record_commitment_block(block, Some(coordinator_node_id))
-            .await
-            .map_err(|_| "storage_append_rejected".to_string())?
-        {
-            RecordCommitmentAppendOutcome::Inserted => inserted += 1,
-            RecordCommitmentAppendOutcome::AlreadyPresent => already_present += 1,
-        }
-    }
+    let append = storage
+        .append_record_commitment_blocks_atomic(&page.blocks, Some(coordinator_node_id))
+        .await
+        .map_err(|_| "storage_append_rejected".to_string())?;
 
     Ok(CommitmentSyncPageOutcome {
-        inserted,
-        already_present,
+        inserted: append.inserted,
+        already_present: append.already_present,
         has_more: page.has_more,
         remote_tip_height: page.tip_height,
     })
