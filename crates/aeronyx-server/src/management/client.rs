@@ -56,6 +56,7 @@
 //   v2.7.16        - Added the aggregate strict witness startup threshold
 //   v2.7.19        - Added applicable/deferred checkpoint evidence counts
 //   v2.7.20        - Added aggregate durable witness-equivocation incidents
+//   v2.7.21        - Added aggregate trusted-divergence incidents and production halt
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -226,6 +227,10 @@ pub struct RecordCommitmentCheckpointHeartbeatStatus {
     pub divergence_evidence_records: u64,
     /// Durable trusted-witness same-height conflicting-hash incidents.
     pub equivocation_incidents: u64,
+    /// Durable operator-pinned witness divergent-prefix incidents.
+    pub trusted_divergence_incidents: u64,
+    /// Whether local commitment production is fail-closed in this process.
+    pub production_halted: bool,
     /// Most recent applicable durable evidence observation time.
     pub last_evidence_at: Option<u64>,
     /// `unavailable`, `fresh`, or `stale` for durable signed observations.
@@ -786,6 +791,8 @@ mod tests {
                 deferred_evidence_records: 1,
                 divergence_evidence_records: 0,
                 equivocation_incidents: 0,
+                trusted_divergence_incidents: 0,
+                production_halted: false,
                 last_evidence_at: Some(120),
                 observation_freshness: "fresh".to_string(),
                 observation_age_seconds: Some(5),
@@ -831,6 +838,8 @@ mod tests {
         assert_eq!(checkpoint["applicable_evidence_records"], 2);
         assert_eq!(checkpoint["deferred_evidence_records"], 1);
         assert_eq!(checkpoint["equivocation_incidents"], 0);
+        assert_eq!(checkpoint["trusted_divergence_incidents"], 0);
+        assert_eq!(checkpoint["production_halted"], false);
         assert_eq!(checkpoint["observation_freshness"], "fresh");
         assert_eq!(checkpoint["observation_age_seconds"], 5);
         assert_eq!(checkpoint["freshness_window_seconds"], 900);

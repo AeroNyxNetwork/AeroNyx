@@ -24,6 +24,8 @@
 //!   follower convergence can be reported.
 //! - Bounded coordinator witness rounds that collect signed peer checkpoints
 //!   as evidence without treating peer count as consensus or fork choice.
+//! - Operator-pinned divergent checkpoints become durable storage incidents;
+//!   the verified relation still reaches startup/runtime policy unchanged.
 //! - Direction-isolated checkpoint telemetry: serving a requester updates only
 //!   service counters and cannot manufacture local convergence or divergence.
 //! - Audit-gated block pages assembled from one SQLite snapshot and
@@ -61,12 +63,15 @@
 //!   canonical chain; they are operator evidence until consensus is designed.
 //! - Only explicit operator pins may turn signed checkpoint evidence into a
 //!   startup gate. Permissionless discovery peers remain evidence-only.
+//! - A trusted divergent-prefix incident must not be converted into a generic
+//!   transport failure: callers need the verified divergence to fail closed.
 //! - Never derive outbound checkpoint state from an inbound request. The peer
 //!   controls its requested height/hash, so those values are not local evidence.
 //! - Never sign a range assembled from separate block/tip reads or from a
 //!   missing/stale process audit baseline.
 //!
 //! ## Last Modified
+//! v2.8.5-TrustedDivergenceHalt - Preserve verified divergence after sticky incident creation.
 //! v2.8.3-WitnessDivergence - Exposed crate-local reconciliation for startup tests.
 //! v2.8.4-WitnessEquivocation - Retain and reject conflicting pinned-witness claims.
 //! v2.8.2-AdversarialFollower - Added signed malicious-page regression coverage.
@@ -322,7 +327,7 @@ async fn pull_record_commitment_checkpoint_with_witness_policy(
     identity: &IdentityKeyPair,
     coordinator_node_id: &[u8; 32],
     client: &reqwest::Client,
-    track_trusted_witness_equivocation: bool,
+    track_trusted_witness_incidents: bool,
 ) -> Result<CommitmentCheckpointOutcome, String> {
     let request_timestamp = now_secs();
     let coordinator = peer_store
@@ -390,7 +395,7 @@ async fn pull_record_commitment_checkpoint_with_witness_policy(
             outcome.checkpoint_height,
             &outcome.evidence_digest,
             &body,
-            track_trusted_witness_equivocation,
+            track_trusted_witness_incidents,
         )
         .await
         .map_err(|_| "checkpoint_evidence_persist_failed".to_string())?;
@@ -555,7 +560,7 @@ async fn reconcile_record_commitment_candidate_ids(
     client: &reqwest::Client,
     mut candidate_ids: Vec<[u8; 32]>,
     max_witnesses: usize,
-    track_trusted_witness_equivocation: bool,
+    track_trusted_witness_incidents: bool,
 ) -> CommitmentReconciliationOutcome {
     let eligible_witnesses = candidate_ids.len();
     candidate_ids.truncate(max_witnesses);
@@ -574,7 +579,7 @@ async fn reconcile_record_commitment_candidate_ids(
             identity,
             &candidate_node_id,
             client,
-            track_trusted_witness_equivocation,
+            track_trusted_witness_incidents,
         )
         .await
         {

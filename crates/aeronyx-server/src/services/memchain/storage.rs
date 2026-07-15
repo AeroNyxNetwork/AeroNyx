@@ -44,6 +44,9 @@
 //! - v9 (v2.7.6-EvidenceVault): Bounded local checkpoint proof evidence:
 //!   - record_checkpoint_evidence: exact signature-verified peer response frames
 //!     retained locally for restart-safe operator audit; never exposed raw
+//! - v10 (v2.7.20-WitnessEquivocation): Durable same-height double-sign proof.
+//! - v11 (v2.7.21-TrustedDivergenceHalt): Durable operator-pinned witness
+//!   divergence incidents and a process-local fail-closed production latch.
 //! - v2.7.4-BlockIntegrityStatus: Runtime-only evidence for the most recent
 //!   complete persisted-chain audit and subsequently verified appends.
 //! - v2.7.5-CheckpointProof: Runtime-only signed checkpoint reconciliation
@@ -129,6 +132,9 @@
 //! - commitment_tip_anchor keeps its path and signing identity process-local.
 //!   Public status may expose only aggregate state, height, timestamps, and
 //!   failure counts; never expose its path, signature, signer, or tip hash.
+//! - commitment_production_halted is one-way for the process lifetime. Only a
+//!   trusted-witness security incident may set it; no network input or later
+//!   converged frame may clear it. Recovery requires operator review/restart.
 //!
 //! ## Last Modified
 //! v1.0.0 - Initial SQLite storage engine
@@ -172,11 +178,14 @@
 //!   legacy migration callers before startup integrity verification.
 //! v2.7.1-BlockSyncStatus - Runtime-only bounded follower status and fault evidence.
 //! v2.7.0-BlockSync - Schema v8 commitment blocks and unique membership index.
+//! v2.7.20-WitnessEquivocation - Schema v10 durable trusted-witness double-sign evidence.
+//! v2.7.21-TrustedDivergenceHalt - Schema v11 sticky trusted divergence incidents
+//!   and an atomic local commitment-production safety latch.
 // ============================================
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
@@ -202,12 +211,13 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 /// v7 → v8: signed node-blind commitment chain + membership index
 /// v8 → v9: bounded local signed checkpoint evidence vault
 /// v9 → v10: durable signed-witness equivocation incidents
+/// v10 → v11: durable trusted-witness divergent-prefix incidents
 ///
 /// ⚠️ CRITICAL: When bumping this, you MUST also add a new migrate block
 /// in maybe_migrate(). The migrate block MUST use a hardcoded integer
 /// (not this constant) for UPDATE schema_version, to prevent skipping
 /// intermediate migrations on multi-version upgrades.
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 11;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -411,6 +421,12 @@ pub struct RecordCommitmentCheckpointStatus {
     /// Durable incidents where one trusted witness signed incompatible hashes
     /// for the same checkpoint or tip height. Witness identities stay local.
     pub equivocation_incidents: u64,
+    /// Durable incidents where an operator-pinned witness signed a checkpoint
+    /// that diverges from the locally audited prefix. Identities stay local.
+    pub trusted_divergence_incidents: u64,
+    /// Whether local canonical commitment production is fail-closed for this
+    /// process after a trusted witness security incident.
+    pub production_halted: bool,
     /// Most recent applicable durable evidence observation time.
     pub last_evidence_at: Option<u64>,
     /// `unavailable`, `fresh`, or `stale` for the most recent durable signed
@@ -454,6 +470,9 @@ pub(crate) const CHECKPOINT_EVIDENCE_CAPACITY: usize = 256;
 /// A detected trusted-witness conflict is retained rather than rotated away.
 /// Bound the incident ledger so unbounded corruption cannot grow startup work.
 pub(crate) const CHECKPOINT_EQUIVOCATION_CAPACITY: usize = 64;
+/// A trusted divergent-prefix proof is sticky and cannot be displaced by later
+/// convergence. Only explicitly pinned witnesses can consume this capacity.
+pub(crate) const CHECKPOINT_TRUSTED_DIVERGENCE_CAPACITY: usize = 64;
 /// Defensive bound for one stored proof frame. Increasing this requires an
 /// explicit wire and startup-memory review.
 pub(crate) const MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES: usize = 4 * 1024;
@@ -527,6 +546,7 @@ pub(crate) struct RecordCommitmentCheckpointRuntime {
     pub(crate) deferred_evidence_records: u64,
     pub(crate) divergence_evidence_records: u64,
     pub(crate) equivocation_incidents: u64,
+    pub(crate) trusted_divergence_incidents: u64,
     pub(crate) last_evidence_at: Option<u64>,
     pub(crate) last_round_state: &'static str,
     pub(crate) last_round_at: Option<u64>,
@@ -562,6 +582,7 @@ impl Default for RecordCommitmentCheckpointRuntime {
             deferred_evidence_records: 0,
             divergence_evidence_records: 0,
             equivocation_incidents: 0,
+            trusted_divergence_incidents: 0,
             last_evidence_at: None,
             last_round_state: "not_checked",
             last_round_at: None,
@@ -709,6 +730,9 @@ pub struct MemoryStorage {
     pub(crate) commitment_tip_anchor: RwLock<RecordCommitmentTipAnchorRuntime>,
     /// Runtime-only aggregate signed-checkpoint reconciliation evidence.
     pub(crate) commitment_checkpoint: RwLock<RecordCommitmentCheckpointRuntime>,
+    /// One-way process-local safety latch. It is set while the incident write
+    /// still owns the SQLite connection, closing the append race window.
+    pub(crate) commitment_production_halted: AtomicBool,
 }
 
 impl MemoryStorage {
@@ -765,6 +789,7 @@ impl MemoryStorage {
             commitment_durability: AtomicU64::new(1),
             commitment_tip_anchor: RwLock::new(RecordCommitmentTipAnchorRuntime::default()),
             commitment_checkpoint: RwLock::new(RecordCommitmentCheckpointRuntime::default()),
+            commitment_production_halted: AtomicBool::new(false),
         })
     }
 
@@ -870,6 +895,20 @@ impl MemoryStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_record_checkpoint_equivocations_detected
                 ON record_checkpoint_equivocations(detected_at);
+
+            -- v11: first durable proof that one operator-pinned witness signed
+            -- a shared checkpoint inconsistent with the locally audited chain.
+            -- Later convergence cannot overwrite this incident.
+            CREATE TABLE IF NOT EXISTS record_checkpoint_trusted_divergences (
+                responder          BLOB PRIMARY KEY CHECK(length(responder) = 32),
+                evidence_digest    BLOB NOT NULL UNIQUE CHECK(length(evidence_digest) = 32),
+                checkpoint_height  INTEGER NOT NULL CHECK(checkpoint_height >= 0),
+                detected_at        INTEGER NOT NULL CHECK(detected_at >= 0),
+                FOREIGN KEY(evidence_digest) REFERENCES record_checkpoint_evidence(evidence_digest)
+                    ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_record_checkpoint_trusted_divergences_detected
+                ON record_checkpoint_trusted_divergences(detected_at);
 
             CREATE TABLE IF NOT EXISTS raw_logs (
                 log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1767,6 +1806,58 @@ impl MemoryStorage {
             conn.execute("UPDATE schema_version SET version = 10", [])
                 .map_err(|error| format!("Update schema version to v10: {error}"))?;
             info!("[STORAGE] ✅ Migration to v10 (checkpoint equivocation incidents) complete");
+        }
+
+        // v10 → v11: a verified divergent prefix from an explicitly pinned
+        // witness becomes a sticky local safety incident. The referenced frame
+        // remains private and protected from bounded-vault pruning.
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(10);
+
+        if current < 11 {
+            info!(
+                "[STORAGE] Migrating schema v{} → v11 (trusted checkpoint divergence incidents)",
+                current
+            );
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS record_checkpoint_trusted_divergences (
+                    responder          BLOB PRIMARY KEY CHECK(length(responder) = 32),
+                    evidence_digest    BLOB NOT NULL UNIQUE CHECK(length(evidence_digest) = 32),
+                    checkpoint_height  INTEGER NOT NULL CHECK(checkpoint_height >= 0),
+                    detected_at        INTEGER NOT NULL CHECK(detected_at >= 0),
+                    FOREIGN KEY(evidence_digest) REFERENCES record_checkpoint_evidence(evidence_digest)
+                        ON DELETE RESTRICT
+                );
+                CREATE INDEX IF NOT EXISTS idx_record_checkpoint_trusted_divergences_detected
+                    ON record_checkpoint_trusted_divergences(detected_at);",
+            )
+            .map_err(|error| {
+                format!("v11 migration: create trusted divergence incidents: {error}")
+            })?;
+            let exists = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='record_checkpoint_trusted_divergences'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if !exists {
+                return Err(
+                    "v11 migration: required table 'record_checkpoint_trusted_divergences' was not created"
+                        .to_string(),
+                );
+            }
+            // ⚠️ hardcoded 11, not SCHEMA_VERSION — preserves sequential upgrades.
+            conn.execute("UPDATE schema_version SET version = 11", [])
+                .map_err(|error| format!("Update schema version to v11: {error}"))?;
+            info!(
+                "[STORAGE] ✅ Migration to v11 (trusted checkpoint divergence incidents) complete"
+            );
         }
 
         Ok(())
@@ -3711,14 +3802,16 @@ mod tests {
             .unwrap();
         // maybe_migrate() runs through the latest schema: v6 adds SuperNode,
         // v7 adds the blind marker, v8 creates commitment tables, v9 adds the
-        // bounded proof vault, and v10 adds durable equivocation incidents even
-        // when create_schema() was not called.
-        assert_eq!(v, 10);
+        // bounded proof vault, v10 adds durable equivocation incidents, and
+        // v11 adds sticky trusted-divergence incidents even when
+        // create_schema() was not called.
+        assert_eq!(v, 11);
         for table in [
             "record_commitment_blocks",
             "record_block_commitments",
             "record_checkpoint_evidence",
             "record_checkpoint_equivocations",
+            "record_checkpoint_trusted_divergences",
         ] {
             let exists: bool = conn
                 .query_row(

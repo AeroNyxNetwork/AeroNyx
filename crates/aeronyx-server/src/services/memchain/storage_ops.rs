@@ -52,6 +52,8 @@
 //! - v2.7.20-WitnessEquivocation: atomically retains conflicting signed claims
 //!   from explicitly trusted witnesses and blocks later evidence rotation from
 //!   erasing the incident
+//! - v2.7.21-TrustedDivergenceHalt: promotes an operator-pinned divergent
+//!   prefix to a sticky incident and closes local production at the append layer
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -123,8 +125,11 @@
 //! v2.7.18-VerifiedRangeSnapshot - Added fail-closed snapshot range serving.
 //! v2.7.19-FollowerEvidenceRecovery - Deferred valid evidence above a rolled-back tip.
 //! v2.7.20-WitnessEquivocation - Added durable trusted-witness conflict incidents.
+//! v2.7.21-TrustedDivergenceHalt - Added sticky trusted-prefix incidents and
+//!   an atomic local commitment-production halt.
 //!
 //! ## Last Modified
+//! v2.7.21-TrustedDivergenceHalt - Freeze production after trusted fork evidence.
 //! v2.7.20-WitnessEquivocation - Retain trusted signed conflicts across restart and rotation.
 //! v2.7.19-FollowerEvidenceRecovery - Allow audited followers to resync after local rollback.
 //! v2.7.18-VerifiedRangeSnapshot - Serve only canonically reverified audit-backed pages.
@@ -164,8 +169,8 @@ use super::storage::{
     RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime,
     RecordCommitmentSyncStatus, RecordCommitmentTipAnchorConfig, StorageStats,
     CHECKPOINT_EQUIVOCATION_CAPACITY, CHECKPOINT_EVIDENCE_CAPACITY,
-    CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS, COMMITMENT_SYNC_EVENT_CAPACITY,
-    MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES,
+    CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS, CHECKPOINT_TRUSTED_DIVERGENCE_CAPACITY,
+    COMMITMENT_SYNC_EVENT_CAPACITY, MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES,
 };
 use super::storage_crypto::{
     decrypt_rawlog_content, decrypt_record_content, encrypt_rawlog_content, encrypt_record_content,
@@ -336,6 +341,8 @@ pub struct RecordCommitmentCheckpointEvidenceAudit {
     /// Durable same-signer/same-height conflicting-hash incidents. The count
     /// contains no witness identity, signed frame, or hash material.
     pub equivocation_incidents: u64,
+    /// Durable operator-pinned witness divergent-prefix incidents.
+    pub trusted_divergence_incidents: u64,
     /// Latest applicable observation; deferred frames cannot advance it.
     pub last_evidence_at: Option<u64>,
 }
@@ -345,6 +352,8 @@ pub struct RecordCommitmentCheckpointEvidenceAudit {
 pub(crate) enum RecordCommitmentCheckpointEvidencePersistOutcome {
     /// No new trusted-witness conflict was established.
     Stored,
+    /// A pinned witness supplied the first durable divergent-prefix proof.
+    TrustedDivergenceDetected,
     /// The frame completed at least one durable signed equivocation proof.
     EquivocationDetected,
 }
@@ -356,6 +365,8 @@ struct CheckpointEvidenceClaims {
     checkpoint_hash: [u8; 32],
     tip_height: u64,
     tip_hash: [u8; 32],
+    applicable: bool,
+    diverged: bool,
 }
 
 struct StoredRecordCommitmentBlockRow {
@@ -893,6 +904,8 @@ fn decode_checkpoint_evidence_claims(frame: &[u8]) -> Result<CheckpointEvidenceC
         checkpoint_hash,
         tip_height,
         tip_hash,
+        applicable: false,
+        diverged: false,
     })
 }
 
@@ -927,6 +940,7 @@ fn audit_checkpoint_evidence_snapshot(
     let mut deferred_evidence_records = 0u64;
     let mut divergence_evidence_records = 0u64;
     let mut equivocation_incidents = 0u64;
+    let mut trusted_divergence_incidents = 0u64;
     let mut last_evidence_at = None;
     let mut claims_by_digest = HashMap::with_capacity(CHECKPOINT_EVIDENCE_CAPACITY);
     {
@@ -1042,6 +1056,8 @@ fn audit_checkpoint_evidence_snapshot(
                     checkpoint_hash,
                     tip_height,
                     tip_hash,
+                    applicable: local_tip_height <= current_tip_height,
+                    diverged: relation == "diverged",
                 },
             );
             if tip_height == 0 && tip_hash != GENESIS_PREV_HASH {
@@ -1202,12 +1218,70 @@ fn audit_checkpoint_evidence_snapshot(
     if equivocation_incidents > CHECKPOINT_EQUIVOCATION_CAPACITY as u64 {
         return Err("checkpoint equivocation vault exceeds its configured capacity".to_string());
     }
+    {
+        let mut statement = connection
+            .prepare(
+                "SELECT responder,evidence_digest,checkpoint_height,detected_at
+                 FROM record_checkpoint_trusted_divergences
+                 ORDER BY detected_at ASC,responder ASC",
+            )
+            .map_err(|error| format!("prepare trusted checkpoint divergence audit: {error}"))?;
+        let mut rows = statement
+            .query([])
+            .map_err(|error| format!("query trusted checkpoint divergence audit: {error}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("read trusted checkpoint divergence row: {error}"))?
+        {
+            let responder: Vec<u8> = row
+                .get(0)
+                .map_err(|error| format!("read trusted divergence responder: {error}"))?;
+            let evidence_digest: Vec<u8> = row
+                .get(1)
+                .map_err(|error| format!("read trusted divergence digest: {error}"))?;
+            let checkpoint_height_i64: i64 = row
+                .get(2)
+                .map_err(|error| format!("read trusted divergence height: {error}"))?;
+            let detected_at_i64: i64 = row
+                .get(3)
+                .map_err(|error| format!("read trusted divergence time: {error}"))?;
+            let responder: [u8; 32] = responder
+                .as_slice()
+                .try_into()
+                .map_err(|_| "trusted divergence responder has invalid length".to_string())?;
+            let evidence_digest: [u8; 32] = evidence_digest
+                .as_slice()
+                .try_into()
+                .map_err(|_| "trusted divergence digest has invalid length".to_string())?;
+            let checkpoint_height = u64::try_from(checkpoint_height_i64)
+                .map_err(|_| "trusted divergence height is invalid".to_string())?;
+            let _detected_at = u64::try_from(detected_at_i64)
+                .map_err(|_| "trusted divergence time is invalid".to_string())?;
+            let claim = claims_by_digest
+                .get(&evidence_digest)
+                .ok_or_else(|| "trusted divergence evidence is unavailable".to_string())?;
+            if claim.responder != responder
+                || claim.checkpoint_height != checkpoint_height
+                || !claim.diverged
+                || !claim.applicable
+            {
+                return Err("trusted checkpoint divergence claim is invalid".to_string());
+            }
+            trusted_divergence_incidents = trusted_divergence_incidents.saturating_add(1);
+        }
+    }
+    if trusted_divergence_incidents > CHECKPOINT_TRUSTED_DIVERGENCE_CAPACITY as u64 {
+        return Err(
+            "trusted checkpoint divergence vault exceeds its configured capacity".to_string(),
+        );
+    }
     Ok(RecordCommitmentCheckpointEvidenceAudit {
         evidence_records,
         applicable_evidence_records,
         deferred_evidence_records,
         divergence_evidence_records,
         equivocation_incidents,
+        trusted_divergence_incidents,
         last_evidence_at,
     })
 }
@@ -1326,6 +1400,51 @@ fn detect_trusted_checkpoint_equivocations(
         .map_err(|error| format!("count checkpoint equivocation incidents: {error}"))?;
     if incident_count > CHECKPOINT_EQUIVOCATION_CAPACITY as i64 {
         return Err("checkpoint equivocation vault exceeds its configured capacity".to_string());
+    }
+    Ok(inserted)
+}
+
+/// Retains the first verified divergent-prefix proof for one operator-pinned
+/// witness. A later converged frame cannot replace or delete this incident.
+fn insert_trusted_checkpoint_divergence_incident(
+    connection: &rusqlite::Connection,
+    evidence_digest: &[u8; 32],
+    signed_response: &[u8],
+    checkpoint_height: u64,
+    detected_at: u64,
+) -> Result<usize, String> {
+    let claim = decode_checkpoint_evidence_claims(signed_response)?;
+    if claim.checkpoint_height != checkpoint_height {
+        return Err("trusted divergence checkpoint height mismatch".to_string());
+    }
+    let checkpoint_height = i64::try_from(checkpoint_height)
+        .map_err(|_| "trusted divergence height exceeds SQLite range".to_string())?;
+    let detected_at = i64::try_from(detected_at)
+        .map_err(|_| "trusted divergence time exceeds SQLite range".to_string())?;
+    let inserted = connection
+        .execute(
+            "INSERT OR IGNORE INTO record_checkpoint_trusted_divergences
+             (responder,evidence_digest,checkpoint_height,detected_at)
+             VALUES (?1,?2,?3,?4)",
+            params![
+                claim.responder.as_slice(),
+                evidence_digest.as_slice(),
+                checkpoint_height,
+                detected_at,
+            ],
+        )
+        .map_err(|error| format!("insert trusted checkpoint divergence incident: {error}"))?;
+    let incident_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM record_checkpoint_trusted_divergences",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("count trusted checkpoint divergence incidents: {error}"))?;
+    if incident_count > CHECKPOINT_TRUSTED_DIVERGENCE_CAPACITY as i64 {
+        return Err(
+            "trusted checkpoint divergence vault exceeds its configured capacity".to_string(),
+        );
     }
     Ok(inserted)
 }
@@ -1786,6 +1905,8 @@ impl MemoryStorage {
             deferred_evidence_records: runtime.deferred_evidence_records,
             divergence_evidence_records: runtime.divergence_evidence_records,
             equivocation_incidents: runtime.equivocation_incidents,
+            trusted_divergence_incidents: runtime.trusted_divergence_incidents,
+            production_halted: self.record_commitment_production_halted(),
             last_evidence_at: runtime.last_evidence_at,
             observation_freshness: observation_freshness.to_string(),
             observation_age_seconds,
@@ -1918,9 +2039,9 @@ impl MemoryStorage {
         .map(|_| ())
     }
 
-    /// Persists evidence while optionally binding it to the trusted-witness
-    /// equivocation ledger. Only a caller that has matched the responder to an
-    /// explicit operator pin may set `track_trusted_witness_equivocation`.
+    /// Persists evidence while optionally binding it to trusted-witness
+    /// security ledgers. Only a caller that has matched the responder to an
+    /// explicit operator pin may set `track_trusted_witness_incidents`.
     pub(crate) async fn persist_record_commitment_checkpoint_evidence_with_witness_policy(
         &self,
         observed_at: u64,
@@ -1930,7 +2051,7 @@ impl MemoryStorage {
         checkpoint_height: u64,
         evidence_digest: &[u8; 32],
         signed_response: &[u8],
-        track_trusted_witness_equivocation: bool,
+        track_trusted_witness_incidents: bool,
     ) -> Result<RecordCommitmentCheckpointEvidencePersistOutcome, String> {
         let failure = |message: String| {
             let mut runtime = self.commitment_checkpoint.write();
@@ -1953,6 +2074,8 @@ impl MemoryStorage {
         if &computed_digest != evidence_digest {
             return failure("checkpoint evidence digest mismatch".to_string());
         }
+        let observed_at_u64 = observed_at;
+        let checkpoint_height_u64 = checkpoint_height;
         let observed_at = match i64::try_from(observed_at) {
             Ok(value) => value,
             Err(_) => return failure("checkpoint evidence time exceeds SQLite range".to_string()),
@@ -1980,80 +2103,92 @@ impl MemoryStorage {
 
         let result = {
             let mut conn = self.conn.lock().await;
-            (|| -> Result<(RecordCommitmentCheckpointEvidenceAudit, usize), String> {
-                let transaction = conn
-                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                    .map_err(|error| format!("begin checkpoint evidence transaction: {error}"))?;
-                transaction
-                    .execute(
-                        "INSERT OR IGNORE INTO record_checkpoint_evidence
+            let operation =
+                (|| -> Result<(RecordCommitmentCheckpointEvidenceAudit, usize, usize), String> {
+                    let transaction = conn
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                        .map_err(|error| {
+                            format!("begin checkpoint evidence transaction: {error}")
+                        })?;
+                    transaction
+                        .execute(
+                            "INSERT OR IGNORE INTO record_checkpoint_evidence
                          (evidence_digest,observed_at,relation,local_tip_height,
                           remote_tip_height,checkpoint_height,signed_response,created_at)
                          VALUES (?1,?2,?3,?4,?5,?6,?7,?2)",
-                        params![
-                            evidence_digest.as_slice(),
-                            observed_at,
-                            relation,
-                            local_tip_height,
-                            remote_tip_height,
-                            checkpoint_height,
-                            signed_response,
-                        ],
-                    )
-                    .map_err(|error| format!("insert checkpoint evidence: {error}"))?;
-                let stored = transaction
-                    .query_row(
-                        "SELECT observed_at,relation,local_tip_height,remote_tip_height,
+                            params![
+                                evidence_digest.as_slice(),
+                                observed_at,
+                                relation,
+                                local_tip_height,
+                                remote_tip_height,
+                                checkpoint_height,
+                                signed_response,
+                            ],
+                        )
+                        .map_err(|error| format!("insert checkpoint evidence: {error}"))?;
+                    let stored = transaction
+                        .query_row(
+                            "SELECT observed_at,relation,local_tip_height,remote_tip_height,
                                 checkpoint_height,signed_response
                          FROM record_checkpoint_evidence WHERE evidence_digest=?1",
-                        params![evidence_digest.as_slice()],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, i64>(2)?,
-                                row.get::<_, i64>(3)?,
-                                row.get::<_, i64>(4)?,
-                                row.get::<_, Vec<u8>>(5)?,
-                            ))
-                        },
-                    )
-                    .map_err(|error| format!("read inserted checkpoint evidence: {error}"))?;
-                if stored.0 != observed_at
-                    || stored.1 != relation
-                    || stored.2 != local_tip_height
-                    || stored.3 != remote_tip_height
-                    || stored.4 != checkpoint_height
-                    || stored.5.as_slice() != signed_response
-                {
-                    return Err(
-                        "existing checkpoint evidence conflicts with verified frame".to_string()
-                    );
-                }
-                let new_equivocation_incidents = if track_trusted_witness_equivocation {
-                    detect_trusted_checkpoint_equivocations(
-                        &transaction,
-                        evidence_digest,
-                        signed_response,
-                        u64::try_from(observed_at).map_err(|_| {
-                            "checkpoint evidence time is invalid after conversion".to_string()
-                        })?,
-                    )?
-                } else {
-                    0
-                };
-                let count_i64 = transaction
-                    .query_row(
-                        "SELECT COUNT(*) FROM record_checkpoint_evidence",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .map_err(|error| format!("count checkpoint evidence: {error}"))?;
-                let excess = count_i64.saturating_sub(CHECKPOINT_EVIDENCE_CAPACITY as i64);
-                if excess > 0 {
-                    transaction
-                        .execute(
-                            "DELETE FROM record_checkpoint_evidence WHERE rowid IN (
+                            params![evidence_digest.as_slice()],
+                            |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, i64>(2)?,
+                                    row.get::<_, i64>(3)?,
+                                    row.get::<_, i64>(4)?,
+                                    row.get::<_, Vec<u8>>(5)?,
+                                ))
+                            },
+                        )
+                        .map_err(|error| format!("read inserted checkpoint evidence: {error}"))?;
+                    if stored.0 != observed_at
+                        || stored.1 != relation
+                        || stored.2 != local_tip_height
+                        || stored.3 != remote_tip_height
+                        || stored.4 != checkpoint_height
+                        || stored.5.as_slice() != signed_response
+                    {
+                        return Err("existing checkpoint evidence conflicts with verified frame"
+                            .to_string());
+                    }
+                    let new_equivocation_incidents = if track_trusted_witness_incidents {
+                        detect_trusted_checkpoint_equivocations(
+                            &transaction,
+                            evidence_digest,
+                            signed_response,
+                            observed_at_u64,
+                        )?
+                    } else {
+                        0
+                    };
+                    let new_trusted_divergence_incidents =
+                        if track_trusted_witness_incidents && relation == "diverged" {
+                            insert_trusted_checkpoint_divergence_incident(
+                                &transaction,
+                                evidence_digest,
+                                signed_response,
+                                checkpoint_height_u64,
+                                observed_at_u64,
+                            )?
+                        } else {
+                            0
+                        };
+                    let count_i64 = transaction
+                        .query_row(
+                            "SELECT COUNT(*) FROM record_checkpoint_evidence",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(|error| format!("count checkpoint evidence: {error}"))?;
+                    let excess = count_i64.saturating_sub(CHECKPOINT_EVIDENCE_CAPACITY as i64);
+                    if excess > 0 {
+                        transaction
+                            .execute(
+                                "DELETE FROM record_checkpoint_evidence WHERE rowid IN (
                                 SELECT rowid FROM record_checkpoint_evidence
                                 WHERE evidence_digest NOT IN (
                                     SELECT first_evidence_digest
@@ -2061,52 +2196,72 @@ impl MemoryStorage {
                                     UNION
                                     SELECT second_evidence_digest
                                     FROM record_checkpoint_equivocations
+                                    UNION
+                                    SELECT evidence_digest
+                                    FROM record_checkpoint_trusted_divergences
                                 )
                                 ORDER BY CASE WHEN relation='diverged' THEN 1 ELSE 0 END ASC,
                                          observed_at ASC,rowid ASC
                                 LIMIT ?1
                             )",
-                            params![excess],
-                        )
-                        .map_err(|error| format!("prune checkpoint evidence: {error}"))?;
-                    let retained_count = transaction
-                        .query_row(
-                            "SELECT COUNT(*) FROM record_checkpoint_evidence",
-                            [],
-                            |row| row.get::<_, i64>(0),
-                        )
-                        .map_err(|error| format!("recount checkpoint evidence: {error}"))?;
-                    if retained_count > CHECKPOINT_EVIDENCE_CAPACITY as i64 {
-                        return Err(
-                            "checkpoint evidence capacity is reserved by security incidents"
-                                .to_string(),
-                        );
+                                params![excess],
+                            )
+                            .map_err(|error| format!("prune checkpoint evidence: {error}"))?;
+                        let retained_count = transaction
+                            .query_row(
+                                "SELECT COUNT(*) FROM record_checkpoint_evidence",
+                                [],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .map_err(|error| format!("recount checkpoint evidence: {error}"))?;
+                        if retained_count > CHECKPOINT_EVIDENCE_CAPACITY as i64 {
+                            return Err(
+                                "checkpoint evidence capacity is reserved by security incidents"
+                                    .to_string(),
+                            );
+                        }
                     }
-                }
-                // The vault is deliberately small. Re-audit every retained
-                // frame inside the same write transaction. Invalid new data
-                // therefore rolls back atomically, and evidence deferred by a
-                // follower rollback becomes applicable only after its local
-                // chain prefix has actually been restored and reverified.
-                let report = audit_checkpoint_evidence_snapshot(&transaction)?;
-                transaction
-                    .commit()
-                    .map_err(|error| format!("commit checkpoint evidence: {error}"))?;
-                Ok((report, new_equivocation_incidents))
-            })()
+                    // The vault is deliberately small. Re-audit every retained
+                    // frame inside the same write transaction. Invalid new data
+                    // therefore rolls back atomically, and evidence deferred by a
+                    // follower rollback becomes applicable only after its local
+                    // chain prefix has actually been restored and reverified.
+                    let report = audit_checkpoint_evidence_snapshot(&transaction)?;
+                    transaction
+                        .commit()
+                        .map_err(|error| format!("commit checkpoint evidence: {error}"))?;
+                    Ok((
+                        report,
+                        new_equivocation_incidents,
+                        new_trusted_divergence_incidents,
+                    ))
+                })();
+            if matches!(
+                &operation,
+                Ok((_, equivocations, divergences)) if *equivocations > 0 || *divergences > 0
+            ) {
+                // Set while this task still owns the SQLite connection. Any
+                // racing append must wait, then observe the one-way latch.
+                self.commitment_production_halted
+                    .store(true, Ordering::Release);
+            }
+            operation
         };
 
         match result {
-            Ok((report, new_equivocation_incidents)) => {
+            Ok((report, new_equivocation_incidents, new_trusted_divergence_incidents)) => {
                 let mut runtime = self.commitment_checkpoint.write();
                 runtime.evidence_records = report.evidence_records;
                 runtime.applicable_evidence_records = report.applicable_evidence_records;
                 runtime.deferred_evidence_records = report.deferred_evidence_records;
                 runtime.divergence_evidence_records = report.divergence_evidence_records;
                 runtime.equivocation_incidents = report.equivocation_incidents;
+                runtime.trusted_divergence_incidents = report.trusted_divergence_incidents;
                 runtime.last_evidence_at = report.last_evidence_at;
                 if new_equivocation_incidents > 0 {
                     Ok(RecordCommitmentCheckpointEvidencePersistOutcome::EquivocationDetected)
+                } else if new_trusted_divergence_incidents > 0 {
+                    Ok(RecordCommitmentCheckpointEvidencePersistOutcome::TrustedDivergenceDetected)
                 } else {
                     Ok(RecordCommitmentCheckpointEvidencePersistOutcome::Stored)
                 }
@@ -2142,6 +2297,7 @@ impl MemoryStorage {
                 runtime.deferred_evidence_records = report.deferred_evidence_records;
                 runtime.divergence_evidence_records = report.divergence_evidence_records;
                 runtime.equivocation_incidents = report.equivocation_incidents;
+                runtime.trusted_divergence_incidents = report.trusted_divergence_incidents;
                 runtime.last_evidence_at = report.last_evidence_at;
                 Ok(report)
             }
@@ -2179,6 +2335,41 @@ impl MemoryStorage {
             total = total.saturating_add(count);
         }
         Ok(total)
+    }
+
+    /// Counts sticky divergent-prefix incidents for currently configured
+    /// operator-pinned witnesses. Witness identities never leave this method.
+    pub async fn count_record_commitment_checkpoint_trusted_divergences_for_witnesses(
+        &self,
+        witness_node_ids: &[[u8; 32]],
+    ) -> Result<u64, String> {
+        let conn = self.conn.lock().await;
+        let mut total = 0u64;
+        let mut seen = Vec::with_capacity(witness_node_ids.len());
+        for node_id in witness_node_ids {
+            if seen.contains(node_id) {
+                continue;
+            }
+            seen.push(*node_id);
+            let count = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM record_checkpoint_trusted_divergences
+                     WHERE responder=?1",
+                    params![node_id.as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| format!("count trusted checkpoint divergences: {error}"))?;
+            let count = u64::try_from(count)
+                .map_err(|_| "trusted checkpoint divergence count is invalid".to_string())?;
+            total = total.saturating_add(count);
+        }
+        Ok(total)
+    }
+
+    /// Returns the one-way process-local coordinator safety latch.
+    #[must_use]
+    pub fn record_commitment_production_halted(&self) -> bool {
+        self.commitment_production_halted.load(Ordering::Acquire)
     }
 
     /// Configures the process-local Block Sync role once startup validation has
@@ -2833,6 +3024,12 @@ impl MemoryStorage {
         if blocks.is_empty() {
             return Ok(RecordCommitmentBatchAppendOutcome::default());
         }
+        if received_from.is_none() && self.record_commitment_production_halted() {
+            return Err(
+                "local commitment production halted by trusted witness security incident"
+                    .to_string(),
+            );
+        }
         if blocks.len() > MAX_ATOMIC_COMMITMENT_BLOCK_BATCH {
             return Err(format!(
                 "commitment block batch exceeds maximum of {MAX_ATOMIC_COMMITMENT_BLOCK_BATCH}"
@@ -2892,6 +3089,12 @@ impl MemoryStorage {
         received_from: Option<&[u8; 32]>,
     ) -> Result<CommittedRecordCommitmentBatch, String> {
         let mut conn = self.conn.lock().await;
+        if received_from.is_none() && self.record_commitment_production_halted() {
+            return Err(
+                "local commitment production halted by trusted witness security incident"
+                    .to_string(),
+            );
+        }
         let transaction = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("begin commitment block batch transaction: {error}"))?;
@@ -5580,7 +5783,7 @@ mod tests {
             conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         let chain = migrated.audit_record_commitment_chain().await.unwrap();
         assert_eq!(chain.block_count, 1);
         assert_eq!(migrated.record_commitment_chain_tip().await.1, block.hash());
@@ -5626,7 +5829,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         assert_eq!(incident_table_exists, 1);
         migrated.audit_record_commitment_chain().await.unwrap();
         let evidence = migrated
@@ -5635,6 +5838,50 @@ mod tests {
             .unwrap();
         assert_eq!(evidence.evidence_records, 1);
         assert_eq!(evidence.equivocation_incidents, 0);
+        assert_eq!(evidence.trusted_divergence_incidents, 0);
+    }
+
+    #[tokio::test]
+    async fn test_v10_to_v11_file_migration_preserves_checkpoint_evidence() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("checkpoint-divergence-migration.db");
+        let original = MemoryStorage::open(&path, None).unwrap();
+        seed_checkpoint_evidence(&original, 1_700_500_275).await;
+        drop(original);
+
+        let legacy = rusqlite::Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "DROP TABLE record_checkpoint_trusted_divergences;
+                 UPDATE schema_version SET version=10;",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let migrated = MemoryStorage::open(&path, None).unwrap();
+        let (version, incident_table_exists): (u32, i64) = {
+            let conn = migrated.conn_lock().await;
+            (
+                conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+                    .unwrap(),
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='record_checkpoint_trusted_divergences'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(version, 11);
+        assert_eq!(incident_table_exists, 1);
+        migrated.audit_record_commitment_chain().await.unwrap();
+        let evidence = migrated
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(evidence.evidence_records, 1);
+        assert_eq!(evidence.trusted_divergence_incidents, 0);
     }
 
     #[tokio::test]
@@ -5890,6 +6137,8 @@ mod tests {
             .unwrap();
         assert_eq!(audit.evidence_records, 3);
         assert_eq!(audit.equivocation_incidents, 1);
+        assert_eq!(audit.trusted_divergence_incidents, 1);
+        assert!(storage.record_commitment_production_halted());
         assert_eq!(
             storage
                 .count_record_commitment_checkpoint_equivocations_for_witnesses(&[
@@ -5908,10 +6157,133 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reopened_audit.equivocation_incidents, 1);
+        assert_eq!(reopened_audit.trusted_divergence_incidents, 1);
         assert_eq!(
             reopened
                 .record_commitment_checkpoint_status()
                 .equivocation_incidents,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_divergence_halts_local_production_and_survives_convergence() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("checkpoint-trusted-divergence.db");
+        let storage = MemoryStorage::open(&path, None).unwrap();
+        let proposer = IdentityKeyPair::generate();
+        let first = signed_commitment_block(1, GENESIS_PREV_HASH, 0xD1, &proposer);
+        storage
+            .append_record_commitment_block(&first, None)
+            .await
+            .unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+
+        let witness = IdentityKeyPair::generate();
+        let diverged_at = 1_700_525_000;
+        let fork_hash = [0xD2; 32];
+        let divergent = signed_checkpoint_response_frame(
+            &witness,
+            [0x71; 16],
+            diverged_at,
+            1,
+            fork_hash,
+            1,
+            fork_hash,
+        );
+        let divergent_digest: [u8; 32] = Sha256::digest(&divergent).into();
+        assert_eq!(
+            storage
+                .persist_record_commitment_checkpoint_evidence_with_witness_policy(
+                    diverged_at,
+                    "diverged",
+                    1,
+                    1,
+                    1,
+                    &divergent_digest,
+                    &divergent,
+                    true,
+                )
+                .await
+                .unwrap(),
+            RecordCommitmentCheckpointEvidencePersistOutcome::TrustedDivergenceDetected
+        );
+        assert!(storage.record_commitment_production_halted());
+
+        let blocked = signed_commitment_block(2, first.hash(), 0xD3, &proposer);
+        assert!(storage
+            .append_record_commitment_block(&blocked, None)
+            .await
+            .unwrap_err()
+            .contains("production halted"));
+
+        // A verified follower append remains available for recovery and lets
+        // us prove that later convergence at another height cannot wash out
+        // the original trusted incident.
+        let recovery_source = [0xD4; 32];
+        storage
+            .append_record_commitment_block(&blocked, Some(&recovery_source))
+            .await
+            .unwrap();
+        let converged_at = diverged_at + 1;
+        let converged = signed_checkpoint_response_frame(
+            &witness,
+            [0x72; 16],
+            converged_at,
+            2,
+            blocked.hash(),
+            2,
+            blocked.hash(),
+        );
+        let converged_digest: [u8; 32] = Sha256::digest(&converged).into();
+        assert_eq!(
+            storage
+                .persist_record_commitment_checkpoint_evidence_with_witness_policy(
+                    converged_at,
+                    "converged",
+                    2,
+                    2,
+                    2,
+                    &converged_digest,
+                    &converged,
+                    true,
+                )
+                .await
+                .unwrap(),
+            RecordCommitmentCheckpointEvidencePersistOutcome::Stored
+        );
+        let audit = storage
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(audit.equivocation_incidents, 0);
+        assert_eq!(audit.trusted_divergence_incidents, 1);
+        assert_eq!(
+            storage
+                .count_record_commitment_checkpoint_trusted_divergences_for_witnesses(&[
+                    witness.public_key_bytes(),
+                ])
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(storage.record_commitment_production_halted());
+        drop(storage);
+
+        let reopened = MemoryStorage::open(&path, None).unwrap();
+        reopened.audit_record_commitment_chain().await.unwrap();
+        let reopened_audit = reopened
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        assert_eq!(reopened_audit.trusted_divergence_incidents, 1);
+        assert_eq!(
+            reopened
+                .count_record_commitment_checkpoint_trusted_divergences_for_witnesses(&[
+                    witness.public_key_bytes(),
+                ])
+                .await
+                .unwrap(),
             1
         );
     }
@@ -5973,6 +6345,8 @@ mod tests {
             .unwrap();
         assert_eq!(audit.evidence_records, 2);
         assert_eq!(audit.equivocation_incidents, 0);
+        assert_eq!(audit.trusted_divergence_incidents, 0);
+        assert!(!storage.record_commitment_production_halted());
     }
 
     #[tokio::test]

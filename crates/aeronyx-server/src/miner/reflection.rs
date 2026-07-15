@@ -57,6 +57,9 @@
 //! - Block Sync v1 has no fork-choice protocol. Keep commitment production
 //!   disabled on follower nodes; only the explicitly configured coordinator
 //!   may call the packing path.
+//! - A trusted-witness security incident sets a one-way storage latch. Always
+//!   check it before reading candidate records; the storage append path checks
+//!   it again under the SQLite lock and remains authoritative.
 //!
 //! ## Modification History
 //! v0.5.0                   - Initial timer-based block packer
@@ -75,8 +78,10 @@
 //!   false chain-tip mutation from local-only cognitive compaction.
 //! v2.7.14-RustdocQuality   - Corrected nested Markdown filename example so
 //!   Rustdoc treats it as documentation rather than two Rust test programs.
+//! v2.7.21-TrustedDivergenceHalt - Stop packing after trusted fork evidence.
 //!
 //! ## Last Modified
+//! v2.7.21-TrustedDivergenceHalt - Honor the storage production safety latch.
 //! v2.7.14-RustdocQuality - Corrected filename example fence semantics.
 //! v2.7.0-BlockSync - Signed node-blind commitment block production.
 
@@ -641,6 +646,10 @@ impl ReflectionMiner {
     /// payload replication. Returns the number of blocks appended this round.
     pub async fn pack_commitment_blocks(&self, max_blocks: usize) -> usize {
         if !self.commitment_coordinator_enabled {
+            return 0;
+        }
+        if self.storage.record_commitment_production_halted() {
+            debug!("[MEMCHAIN_BLOCK] Commitment packing skipped: production safety latch active");
             return 0;
         }
         let max_blocks = max_blocks.clamp(1, 64);

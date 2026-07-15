@@ -160,6 +160,8 @@
 //      witness checkpoint while proving the local canonical chain is immutable.
 //  68. Retains trusted-witness same-height conflicts as durable incidents and
 //      blocks coordinator startup before listeners even after later convergence.
+//  69. Retains an operator-pinned witness's divergent shared-prefix proof as a
+//      sticky incident and atomically halts local commitment production.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -214,6 +216,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.8.5-TrustedDivergenceHalt - Sticky trusted fork evidence and live production halt
 //   v2.8.3-WitnessDivergence - Signed divergent startup-gate integration test
 //   v2.8.1-BlockFollowerOps - Configurable bounded catch-up round budget
 //   v2.8.0-ChatPullV2 - Signed opaque-cursor stable mailbox snapshots
@@ -508,6 +511,7 @@ impl CommitmentWitnessStartupDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommitmentWitnessStartupBlockReason {
     Equivocation,
+    TrustedDivergence,
     Divergence,
     RemoteAhead,
     Unavailable,
@@ -518,6 +522,7 @@ impl CommitmentWitnessStartupBlockReason {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Equivocation => "signed_checkpoint_equivocation",
+            Self::TrustedDivergence => "trusted_checkpoint_divergence_incident",
             Self::Divergence => "signed_checkpoint_divergence",
             Self::RemoteAhead => "signed_checkpoint_remote_ahead",
             Self::Unavailable => "signed_checkpoint_unavailable",
@@ -1542,6 +1547,7 @@ impl Server {
             deferred_records = checkpoint_evidence_audit.deferred_evidence_records,
             divergence_records = checkpoint_evidence_audit.divergence_evidence_records,
             equivocation_incidents = checkpoint_evidence_audit.equivocation_incidents,
+            trusted_divergence_incidents = checkpoint_evidence_audit.trusted_divergence_incidents,
             "[MEMCHAIN_BLOCK] Persisted checkpoint evidence audit passed"
         );
 
@@ -2136,6 +2142,8 @@ impl Server {
                             deferred_evidence_records: status.deferred_evidence_records,
                             divergence_evidence_records: status.divergence_evidence_records,
                             equivocation_incidents: status.equivocation_incidents,
+                            trusted_divergence_incidents: status.trusted_divergence_incidents,
+                            production_halted: status.production_halted,
                             last_evidence_at: status.last_evidence_at,
                             observation_freshness: status.observation_freshness,
                             observation_age_seconds: status.observation_age_seconds,
@@ -2850,6 +2858,22 @@ impl Server {
                 CommitmentWitnessStartupBlockReason::Equivocation
             )));
         }
+        let existing_trusted_divergences = storage
+            .count_record_commitment_checkpoint_trusted_divergences_for_witnesses(
+                &witness_node_ids,
+            )
+            .await
+            .map_err(|error| {
+                ServerError::startup_failed(format!(
+                    "MemChain external witness rollback guard: durable divergence query failed: {error}"
+                ))
+            })?;
+        if existing_trusted_divergences > 0 {
+            return Err(ServerError::startup_failed(format!(
+                "MemChain external witness rollback guard: {}",
+                CommitmentWitnessStartupBlockReason::TrustedDivergence
+            )));
+        }
 
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -2882,6 +2906,22 @@ impl Server {
             return Err(ServerError::startup_failed(format!(
                 "MemChain external witness rollback guard: {}",
                 CommitmentWitnessStartupBlockReason::Equivocation
+            )));
+        }
+        let observed_trusted_divergences = storage
+            .count_record_commitment_checkpoint_trusted_divergences_for_witnesses(
+                &witness_node_ids,
+            )
+            .await
+            .map_err(|error| {
+                ServerError::startup_failed(format!(
+                    "MemChain external witness rollback guard: post-round divergence query failed: {error}"
+                ))
+            })?;
+        if observed_trusted_divergences > 0 {
+            return Err(ServerError::startup_failed(format!(
+                "MemChain external witness rollback guard: {}",
+                CommitmentWitnessStartupBlockReason::TrustedDivergence
             )));
         }
         let decision = commitment_witness_startup_decision(
@@ -3017,6 +3057,16 @@ impl Server {
                     } => outcome,
                 };
                 next_delay = Duration::from_secs(interval_secs);
+
+                if storage.record_commitment_production_halted() {
+                    error!(
+                        attempted = round.attempted,
+                        verified = round.verified,
+                        failed = round.failed,
+                        "[MEMCHAIN_BLOCK] Trusted witness security incident halted local commitment production"
+                    );
+                    break;
+                }
 
                 if round.attempted == 0 {
                     consecutive_unverified_rounds = 0;
