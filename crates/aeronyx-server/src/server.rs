@@ -381,9 +381,9 @@ use crate::api::discovery::{
     GossipResponse,
 };
 use crate::api::memchain_peer::{
-    build_memchain_peer_router, build_memchain_peer_router_with_coordinator_lease,
-    pull_record_commitment_checkpoint, pull_record_commitment_checkpoint_certificate,
-    pull_record_commitment_page,
+    announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
+    pull_record_commitment_checkpoint,
+    pull_record_commitment_checkpoint_certificate, pull_record_commitment_page,
     reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
     reconcile_record_commitment_witnesses, release_record_commitment_coordinator_lease,
     request_record_commitment_coordinator_lease, CommitmentCheckpointRelation,
@@ -1155,6 +1155,18 @@ impl Server {
                 }
             }
 
+            // The coordinator's local tip channel and the follower's remote
+            // announcement channel are deliberately separate. Each is bounded
+            // to one pending height because its consumer always re-reads the
+            // current audited chain rather than trusting event payload state.
+            let (commitment_sync_tip_tx, commitment_sync_tip_rx) = mpsc::channel(1);
+            let commitment_sync_tip_notifier = self
+                .config
+                .memchain
+                .commitment_sync_enabled
+                .then_some(commitment_sync_tip_tx);
+            let (commitment_tip_tx, commitment_tip_rx) = mpsc::channel(1);
+
             let api_task = self.start_combined_api(
                 self.config.memchain.api_listen_addr,
                 Arc::clone(&mpi_state),
@@ -1170,17 +1182,15 @@ impl Server {
                 Arc::clone(&peer_store),
                 chat_relay.clone(),
                 Arc::clone(&udp),
+                commitment_sync_tip_notifier,
             );
             tasks.push(("memchain-api", api_task));
 
-            // One pending event is sufficient: reconciliation always reads
-            // the current audited tip, so multiple fast block advances can be
-            // safely coalesced without blocking VPN, chat, or miner work.
-            let (commitment_tip_tx, commitment_tip_rx) = mpsc::channel(1);
-
-            if let Some(sync_task) =
-                self.spawn_memchain_commitment_sync_task(Arc::clone(st), Arc::clone(&peer_store))
-            {
+            if let Some(sync_task) = self.spawn_memchain_commitment_sync_task(
+                Arc::clone(st),
+                Arc::clone(&peer_store),
+                commitment_sync_tip_rx,
+            ) {
                 tasks.push(("memchain-block-sync", sync_task));
             }
             if let Some(reconciliation_task) = self.spawn_memchain_commitment_reconciliation_task(
@@ -1976,6 +1986,7 @@ impl Server {
         peer_store: Arc<PeerStore>,
         chat_relay: Option<Arc<ChatRelayService>>,
         udp: Arc<UdpTransport>,
+        commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
     ) -> JoinHandle<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut shutdown_rx_vpn = self.shutdown_tx.subscribe();
@@ -2005,6 +2016,7 @@ impl Server {
         let commitment_storage = mpi_state.storage.clone();
         let commitment_lease_authorized_coordinator =
             self.config.memchain.commitment_sync_coordinator_node_id();
+        let public_commitment_sync_tip_notifier = commitment_sync_tip_notifier.clone();
 
         tokio::spawn(async move {
             if let Some(public_addr) = public_api_listen_addr {
@@ -2019,6 +2031,7 @@ impl Server {
                     local_capability_status.clone(),
                     commitment_storage.clone(),
                     commitment_lease_authorized_coordinator,
+                    public_commitment_sync_tip_notifier,
                 );
                 tokio::spawn(async move {
                     Self::serve_public_discovery_api(public_addr, public_app, shutdown_rx_public)
@@ -2114,11 +2127,12 @@ impl Server {
                     local_capability_status,
                 ));
             let app = if let Some(storage) = commitment_storage {
-                app.merge(build_memchain_peer_router_with_coordinator_lease(
+                app.merge(build_memchain_peer_router_with_runtime(
                     storage,
                     peer_store,
                     node_identity,
                     commitment_lease_authorized_coordinator,
+                    commitment_sync_tip_notifier,
                 ))
             } else {
                 app
@@ -2207,6 +2221,7 @@ impl Server {
         local_capability_status: DiscoveryLocalCapabilityStatus,
         commitment_storage: Option<Arc<MemoryStorage>>,
         commitment_lease_authorized_coordinator: Option<[u8; 32]>,
+        commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
     ) -> axum::Router {
         let block_peer_store = Arc::clone(&peer_store);
         let block_identity = Arc::clone(&node_identity);
@@ -2224,11 +2239,12 @@ impl Server {
             peer_http_client,
         ));
         if let Some(storage) = commitment_storage {
-            app.merge(build_memchain_peer_router_with_coordinator_lease(
+            app.merge(build_memchain_peer_router_with_runtime(
                 storage,
                 block_peer_store,
                 block_identity,
                 commitment_lease_authorized_coordinator,
+                commitment_sync_tip_notifier,
             ))
         } else {
             app
@@ -2243,7 +2259,7 @@ impl Server {
         let listener = match tokio::net::TcpListener::bind(listen_addr).await {
             Ok(listener) => {
                 info!(
-                    "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/chat/peer/*, /api/memchain/peer/block-range, /api/memchain/peer/checkpoint, /api/memchain/peer/coordinator-lease)",
+                    "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/chat/peer/*, /api/memchain/peer/block-announce, /api/memchain/peer/block-range, /api/memchain/peer/checkpoint, /api/memchain/peer/coordinator-lease)",
                     listen_addr
                 );
                 listener
@@ -3589,6 +3605,34 @@ impl Server {
                         tip_height,
                         "[MEMCHAIN_BLOCK] New commitment tip triggered witness reconciliation"
                     );
+                    if !pinned_witness_node_ids.is_empty() {
+                        let delivery = tokio::select! {
+                            _ = shutdown_rx.recv() => break 'witness_loop,
+                            outcome = announce_current_record_commitment_tip(
+                                &storage,
+                                &peer_store,
+                                &identity,
+                                &client,
+                                &pinned_witness_node_ids,
+                            ) => outcome,
+                        };
+                        match delivery {
+                            Ok(delivery) => {
+                                debug!(
+                                    attempted = delivery.attempted,
+                                    accepted = delivery.accepted,
+                                    failed = delivery.failed,
+                                    "[MEMCHAIN_BLOCK] Sent bounded follower tip announcements"
+                                );
+                            }
+                            Err(reason) => {
+                                warn!(
+                                    reason = %reason,
+                                    "[MEMCHAIN_BLOCK] Tip announcement skipped; witness reconciliation retained"
+                                );
+                            }
+                        }
+                    }
                 }
 
                 let round = tokio::select! {
@@ -3749,6 +3793,7 @@ impl Server {
         &self,
         storage: Arc<MemoryStorage>,
         peer_store: Arc<PeerStore>,
+        mut block_announce_rx: mpsc::Receiver<u64>,
     ) -> Option<JoinHandle<()>> {
         if !self.config.memchain.commitment_sync_enabled {
             return None;
@@ -3813,16 +3858,46 @@ impl Server {
 
             let mut consecutive_failures = 0u32;
             let mut next_delay = Duration::from_secs(0);
+            let mut announcement_channel_open = true;
             info!(
                 interval_secs = base_interval_secs,
-                max_pages_per_round, "[MEMCHAIN_BLOCK] Pinned coordinator follower started"
+                max_pages_per_round,
+                event_driven = true,
+                "[MEMCHAIN_BLOCK] Pinned coordinator follower started"
             );
 
-            loop {
+            'sync_loop: loop {
+                let mut trigger = "scheduled";
                 if !next_delay.is_zero() {
-                    tokio::select! {
-                        _ = shutdown_rx.recv() => break,
-                        _ = tokio::time::sleep(next_delay) => {}
+                    let deadline = tokio::time::Instant::now() + next_delay;
+                    loop {
+                        tokio::select! {
+                            _ = shutdown_rx.recv() => break 'sync_loop,
+                            _ = tokio::time::sleep_until(deadline) => break,
+                            announcement = block_announce_rx.recv(), if announcement_channel_open => {
+                                match announcement {
+                                    Some(announced_height) if consecutive_failures == 0 => {
+                                        trigger = "block_announce";
+                                        debug!(
+                                            announced_height,
+                                            "[MEMCHAIN_BLOCK] Pinned coordinator announcement woke follower"
+                                        );
+                                        break;
+                                    }
+                                    Some(announced_height) => {
+                                        debug!(
+                                            announced_height,
+                                            consecutive_failures,
+                                            "[MEMCHAIN_BLOCK] Announcement retained failure backoff"
+                                        );
+                                    }
+                                    None => announcement_channel_open = false,
+                                }
+                            }
+                        }
+                        if tokio::time::Instant::now() >= deadline || trigger == "block_announce" {
+                            break;
+                        }
                     }
                 }
 
@@ -3899,7 +3974,7 @@ impl Server {
                     Ok((inserted, remote_tip_height, true))
                 };
                 let round: std::result::Result<(usize, u64, bool), String> = tokio::select! {
-                    _ = shutdown_rx.recv() => break,
+                    _ = shutdown_rx.recv() => break 'sync_loop,
                     result = round_future => result,
                 };
 
@@ -3916,6 +3991,7 @@ impl Server {
                         } else {
                             debug!(
                                 tip_height = remote_tip_height,
+                                trigger,
                                 "[MEMCHAIN_BLOCK] Follower is current"
                             );
                         }

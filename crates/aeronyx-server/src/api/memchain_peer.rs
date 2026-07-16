@@ -11,6 +11,7 @@
 //!
 //! ## Main Functionality
 //! - `POST /api/memchain/peer/block-range`
+//! - `POST /api/memchain/peer/block-announce`
 //! - `POST /api/memchain/peer/checkpoint`
 //! - `POST /api/memchain/peer/checkpoint-certificate`
 //! - `POST /api/memchain/peer/coordinator-lease`
@@ -20,6 +21,8 @@
 //!   per-peer rate limiting, and bounded pagination.
 //! - Response signing that binds request id, block order, pagination, and tip.
 //! - Default-off follower pull from one configured coordinator identity.
+//! - Best-effort signed tip announcements that only wake the existing verified
+//!   follower pull; an announcement can never append or select a chain.
 //! - Whole-page signature, proposer, continuity, fork, and rollback validation
 //!   followed by one atomic SQLite page append.
 //! - Signed tip/checkpoint comparison that distinguishes lag from a fork.
@@ -64,6 +67,9 @@
 //! - Sealed payload replication requires a separate owner-authorised protocol.
 //! - Never fall back from the pinned coordinator to an arbitrary discovered
 //!   peer. Block Sync v1 is authenticated replication, not consensus.
+//! - A block announcement is an untrusted scheduling hint even after its
+//!   signature is verified. It must never bypass page/checkpoint validation,
+//!   failure backoff, rollback protection, or the pinned coordinator policy.
 //! - Checkpoint proof establishes what a peer signed; it is not a majority,
 //!   finality, leader-election, or longest-chain consensus rule.
 //! - The latest bounded round summary is aggregate operational evidence only;
@@ -86,6 +92,7 @@
 //!   them as permissionless consensus, Byzantine finality, or fork choice.
 //!
 //! ## Last Modified
+//! v2.8.13-EventDrivenFollower - Added authenticated coalesced tip wake-ups.
 //! v2.8.11-CoordinatorLeaseRelease - Added authenticated graceful lease handover.
 //! v2.8.10-CoordinatorLease - Added durable follower lease grants and verified client.
 //! v2.8.8-EndpointSSRFGuard - Enforced final-hop public endpoint validation.
@@ -120,12 +127,13 @@ use axum::Router;
 use futures::StreamExt;
 use rand::RngCore;
 use reqwest::Url;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
 
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::ledger::{
     RecordCommitmentBlockV1, AERONYX_MEMCHAIN_MAINNET_CHAIN_ID, GENESIS_PREV_HASH,
+    MAX_RECORD_COMMITMENTS_PER_BLOCK, RECORD_COMMITMENT_BLOCK_VERSION_V1,
 };
 use aeronyx_core::protocol::memchain::{
     decode_memchain, encode_memchain, record_block_range_request_signing_bytes,
@@ -287,6 +295,20 @@ pub struct CommitmentCertificateImportOutcome {
     pub persisted: bool,
 }
 
+/// Aggregate delivery result for one best-effort commitment tip announcement.
+///
+/// Peer identities, endpoints, hashes, and timing remain intentionally absent
+/// so the result is safe for operational logs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommitmentTipAnnouncementOutcome {
+    /// Distinct operator-pinned peers considered in this bounded round.
+    pub attempted: usize,
+    /// Peers that accepted or coalesced the wake-up hint.
+    pub accepted: usize,
+    /// Missing, unsafe, unreachable, or incompatible peers.
+    pub failed: usize,
+}
+
 #[derive(Debug)]
 struct VerifiedCommitmentPage {
     blocks: Vec<RecordCommitmentBlockV1>,
@@ -316,6 +338,7 @@ struct MemChainPeerState {
     identity: Arc<IdentityKeyPair>,
     guard: Arc<Mutex<PeerRequestGuard>>,
     lease_authorized_coordinator: Option<[u8; 32]>,
+    block_announce_notifier: Option<mpsc::Sender<u64>>,
 }
 
 #[derive(Debug, Default)]
@@ -359,7 +382,7 @@ pub fn build_memchain_peer_router(
     peer_store: Arc<PeerStore>,
     identity: Arc<IdentityKeyPair>,
 ) -> Router {
-    build_memchain_peer_router_with_coordinator_lease(storage, peer_store, identity, None)
+    build_memchain_peer_router_with_runtime(storage, peer_store, identity, None, None)
 }
 
 /// Builds the peer router with an optional follower-side lease trust root.
@@ -374,14 +397,41 @@ pub fn build_memchain_peer_router_with_coordinator_lease(
     identity: Arc<IdentityKeyPair>,
     lease_authorized_coordinator: Option<[u8; 32]>,
 ) -> Router {
+    build_memchain_peer_router_with_runtime(
+        storage,
+        peer_store,
+        identity,
+        lease_authorized_coordinator,
+        None,
+    )
+}
+
+/// Builds the peer router with follower lease and event-driven sync runtime.
+///
+/// The same explicitly pinned coordinator identity authorizes lease requests
+/// and block announcements. The notifier is bounded by the caller; this
+/// handler uses only `try_send`, so public traffic cannot stall the HTTP task.
+#[must_use]
+pub fn build_memchain_peer_router_with_runtime(
+    storage: Arc<MemoryStorage>,
+    peer_store: Arc<PeerStore>,
+    identity: Arc<IdentityKeyPair>,
+    lease_authorized_coordinator: Option<[u8; 32]>,
+    block_announce_notifier: Option<mpsc::Sender<u64>>,
+) -> Router {
     let state = MemChainPeerState {
         storage,
         peer_store,
         identity,
         guard: Arc::new(Mutex::new(PeerRequestGuard::default())),
         lease_authorized_coordinator,
+        block_announce_notifier,
     };
     Router::new()
+        .route(
+            "/api/memchain/peer/block-announce",
+            post(block_announce_handler),
+        )
         .route("/api/memchain/peer/block-range", post(block_range_handler))
         .route("/api/memchain/peer/checkpoint", post(checkpoint_handler))
         .route(
@@ -409,6 +459,205 @@ async fn verified_local_commitment_tip(storage: &MemoryStorage) -> Result<(u64, 
         return Err("local_checkpoint_tip_mismatch".to_string());
     }
     Ok((tip_height, tip_hash))
+}
+
+/// Announces the current audited tip to a bounded set of operator-pinned peers.
+///
+/// Delivery is advisory and best effort. Followers independently authenticate
+/// the pinned coordinator and then run the ordinary signed page/checkpoint
+/// pull, so accepting this frame never changes their canonical chain.
+///
+/// # Errors
+///
+/// Returns an error only when the local audited tip cannot be loaded or encoded.
+/// Individual peer failures are represented in the privacy-safe aggregate.
+pub async fn announce_current_record_commitment_tip(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    pinned_peer_ids: &[[u8; 32]],
+) -> Result<CommitmentTipAnnouncementOutcome, String> {
+    announce_current_record_commitment_tip_with_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        client,
+        pinned_peer_ids,
+        &commitment_peer_endpoint_is_public,
+    )
+    .await
+}
+
+async fn announce_current_record_commitment_tip_with_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    pinned_peer_ids: &[[u8; 32]],
+    endpoint_allowed: &F,
+) -> Result<CommitmentTipAnnouncementOutcome, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    let (tip_height, _) = verified_local_commitment_tip(storage).await?;
+    if tip_height == 0 {
+        return Err("local_commitment_tip_empty".to_string());
+    }
+    let page = storage
+        .get_verified_record_commitment_block_page(tip_height, 1)
+        .await
+        .map_err(|_| "local_commitment_tip_unavailable".to_string())?;
+    let block = page
+        .blocks
+        .into_iter()
+        .next()
+        .filter(|block| block.header.height == tip_height)
+        .ok_or_else(|| "local_commitment_tip_unavailable".to_string())?;
+    if block.header.proposer != identity.public_key_bytes() {
+        return Err("local_commitment_tip_not_self_proposed".to_string());
+    }
+    let frame = encode_memchain(&MemChainMessage::RecordBlockAnnounceV1 {
+        header: block.header,
+        proposer_signature: block.proposer_signature,
+    })
+    .map_err(|_| "tip_announcement_encode_failed".to_string())?;
+
+    let now = now_secs();
+    let self_node_id = identity.public_key_bytes();
+    let mut distinct = HashSet::new();
+    let mut outcome = CommitmentTipAnnouncementOutcome::default();
+    let mut urls = Vec::with_capacity(MAX_PINNED_WITNESSES_PER_ROUND);
+    for peer_id in pinned_peer_ids
+        .iter()
+        .copied()
+        .filter(|peer_id| *peer_id != self_node_id && distinct.insert(*peer_id))
+        .take(MAX_PINNED_WITNESSES_PER_ROUND)
+    {
+        outcome.attempted = outcome.attempted.saturating_add(1);
+        let Some(peer) = peer_store.get_valid(&peer_id, now) else {
+            outcome.failed = outcome.failed.saturating_add(1);
+            continue;
+        };
+        let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
+            outcome.failed = outcome.failed.saturating_add(1);
+            continue;
+        };
+        if !endpoint_allowed(endpoint) {
+            outcome.failed = outcome.failed.saturating_add(1);
+            continue;
+        }
+        let Ok(url) = commitment_block_announce_url(endpoint) else {
+            outcome.failed = outcome.failed.saturating_add(1);
+            continue;
+        };
+        urls.push(url);
+    }
+    let deliveries = futures::stream::iter(urls)
+        .map(|url| {
+            let frame = frame.clone();
+            async move {
+                match client
+                    .post(url)
+                    .header("content-type", "application/octet-stream")
+                    .body(frame)
+                    .send()
+                    .await
+                {
+                    Ok(response) => response.status().is_success(),
+                    Err(_) => false,
+                }
+            }
+        })
+        .buffer_unordered(MAX_PINNED_WITNESSES_PER_ROUND)
+        .collect::<Vec<_>>()
+        .await;
+    for accepted in deliveries {
+        if accepted {
+            outcome.accepted = outcome.accepted.saturating_add(1);
+        } else {
+            outcome.failed = outcome.failed.saturating_add(1);
+        }
+    }
+    Ok(outcome)
+}
+
+async fn block_announce_handler(State(state): State<MemChainPeerState>, body: Bytes) -> Response {
+    if body.first().copied() != Some(MEMCHAIN_MAGIC) {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame");
+    }
+    let message = match decode_memchain(&body[1..]) {
+        Ok(message) => message,
+        Err(_) => return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame"),
+    };
+    let MemChainMessage::RecordBlockAnnounceV1 {
+        header,
+        proposer_signature,
+    } = message
+    else {
+        return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
+    };
+
+    let Some(authorized_coordinator) = state.lease_authorized_coordinator else {
+        return protocol_error(StatusCode::FORBIDDEN, "follower_sync_disabled");
+    };
+    if header.proposer != authorized_coordinator {
+        return protocol_error(StatusCode::FORBIDDEN, "coordinator_not_pinned");
+    }
+    let now = now_secs();
+    if header.protocol_version != RECORD_COMMITMENT_BLOCK_VERSION_V1
+        || header.chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID
+        || header.height == 0
+        || header.timestamp == 0
+        || header.timestamp > now.saturating_add(REQUEST_TIMESTAMP_SKEW_SECS)
+        || header.record_count == 0
+        || header.record_count as usize > MAX_RECORD_COMMITMENTS_PER_BLOCK
+        || (header.height == 1 && header.prev_block_hash != GENESIS_PREV_HASH)
+    {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_block_announcement");
+    }
+    if state.peer_store.get_valid(&header.proposer, now).is_none() {
+        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
+    }
+    let header_hash = header.hash();
+    let signature_valid = IdentityPublicKey::from_bytes(&header.proposer)
+        .and_then(|key| key.verify(&header_hash, &proposer_signature))
+        .is_ok();
+    if !signature_valid {
+        return protocol_error(StatusCode::UNAUTHORIZED, "invalid_signature");
+    }
+    let mut request_id = [0u8; 16];
+    request_id.copy_from_slice(&header_hash[..16]);
+    if !state
+        .guard
+        .lock()
+        .await
+        .admit(header.proposer, request_id, now)
+    {
+        return protocol_error(StatusCode::TOO_MANY_REQUESTS, "rate_or_replay_limited");
+    }
+    let (local_tip_height, _) = match verified_local_commitment_tip(&state.storage).await {
+        Ok(tip) => tip,
+        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "chain_not_verified"),
+    };
+    if header.height <= local_tip_height {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let Some(notifier) = state.block_announce_notifier.as_ref() else {
+        return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "sync_notifier_unavailable");
+    };
+    match notifier.try_send(header.height) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {
+            debug!(
+                announced_height = header.height,
+                local_tip_height, "[MEMCHAIN_BLOCK] Authenticated follower wake-up accepted"
+            );
+            StatusCode::ACCEPTED.into_response()
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            protocol_error(StatusCode::SERVICE_UNAVAILABLE, "sync_notifier_unavailable")
+        }
+    }
 }
 
 /// Obtains and verifies one signed chain-checkpoint comparison from the pinned
@@ -1382,6 +1631,10 @@ where
 
 fn commitment_block_range_url(endpoint: &str) -> Result<Url, String> {
     commitment_peer_url(endpoint, "/api/memchain/peer/block-range")
+}
+
+fn commitment_block_announce_url(endpoint: &str) -> Result<Url, String> {
+    commitment_peer_url(endpoint, "/api/memchain/peer/block-announce")
 }
 
 fn commitment_checkpoint_url(endpoint: &str) -> Result<Url, String> {
@@ -2657,6 +2910,206 @@ mod tests {
 
     fn allow_test_endpoint(_endpoint: &str) -> bool {
         true
+    }
+
+    fn block_announce_frame(block: &RecordCommitmentBlockV1) -> Vec<u8> {
+        encode_memchain(&MemChainMessage::RecordBlockAnnounceV1 {
+            header: block.header.clone(),
+            proposer_signature: block.proposer_signature,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pinned_block_announcement_wakes_follower_without_mutating_chain() {
+        let now = now_secs();
+        let follower = Arc::new(IdentityKeyPair::generate());
+        let coordinator = IdentityKeyPair::generate();
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        storage.audit_record_commitment_chain().await.unwrap();
+        let peer_store = Arc::new(PeerStore::new());
+        admit_peer(&peer_store, &coordinator, None, now);
+        let (notifier, mut notifications) = mpsc::channel(1);
+        let router = build_memchain_peer_router_with_runtime(
+            Arc::clone(&storage),
+            peer_store,
+            follower,
+            Some(coordinator.public_key_bytes()),
+            Some(notifier),
+        );
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now,
+            GENESIS_PREV_HASH,
+            vec![[0x31; 32]],
+            &coordinator,
+        );
+        let frame = block_announce_frame(&block);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/block-announce")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(frame.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(notifications.recv().await, Some(1));
+        assert_eq!(storage.record_commitment_chain_tip().await.0, 0);
+
+        let replay = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/block-announce")
+                    .body(Body::from(frame))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(storage.record_commitment_chain_tip().await.0, 0);
+    }
+
+    #[tokio::test]
+    async fn block_announcement_rejects_unpinned_or_invalid_proposer() {
+        let now = now_secs();
+        let follower = Arc::new(IdentityKeyPair::generate());
+        let coordinator = IdentityKeyPair::generate();
+        let unpinned = IdentityKeyPair::generate();
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        storage.audit_record_commitment_chain().await.unwrap();
+        let peer_store = Arc::new(PeerStore::new());
+        admit_peer(&peer_store, &coordinator, None, now);
+        admit_peer(&peer_store, &unpinned, None, now);
+        let (notifier, mut notifications) = mpsc::channel(1);
+        let router = build_memchain_peer_router_with_runtime(
+            storage,
+            peer_store,
+            follower,
+            Some(coordinator.public_key_bytes()),
+            Some(notifier),
+        );
+        let unpinned_block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now,
+            GENESIS_PREV_HASH,
+            vec![[0x32; 32]],
+            &unpinned,
+        );
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/block-announce")
+                    .body(Body::from(block_announce_frame(&unpinned_block)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(notifications.try_recv().is_err());
+
+        let coordinator_block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now,
+            GENESIS_PREV_HASH,
+            vec![[0x34; 32]],
+            &coordinator,
+        );
+        let coordinator_block_hash = coordinator_block.hash();
+        let invalid_signature = encode_memchain(&MemChainMessage::RecordBlockAnnounceV1 {
+            header: coordinator_block.header,
+            proposer_signature: unpinned.sign(&coordinator_block_hash),
+        })
+        .unwrap();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/block-announce")
+                    .body(Body::from(invalid_signature))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(notifications.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn coordinator_tip_announcement_reaches_pinned_follower_runtime() {
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let follower = Arc::new(IdentityKeyPair::generate());
+        let source_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now,
+            GENESIS_PREV_HASH,
+            vec![[0x33; 32]],
+            &coordinator,
+        );
+        source_storage
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        source_storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+
+        let follower_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        follower_storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+        let follower_peers = Arc::new(PeerStore::new());
+        admit_peer(&follower_peers, &coordinator, None, now);
+        let (notifier, mut notifications) = mpsc::channel(1);
+        let router = build_memchain_peer_router_with_runtime(
+            follower_storage,
+            follower_peers,
+            Arc::clone(&follower),
+            Some(coordinator.public_key_bytes()),
+            Some(notifier),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let source_peers = PeerStore::new();
+        admit_peer(
+            &source_peers,
+            &follower,
+            Some(format!("http://{address}")),
+            now,
+        );
+        let outcome = announce_current_record_commitment_tip_with_endpoint_policy(
+            &source_storage,
+            &source_peers,
+            &coordinator,
+            &reqwest::Client::new(),
+            &[follower.public_key_bytes()],
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.attempted, 1);
+        assert_eq!(outcome.accepted, 1);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(notifications.recv().await, Some(1));
+
+        server.abort();
+        let _ = server.await;
     }
 
     #[allow(clippy::too_many_arguments)]
