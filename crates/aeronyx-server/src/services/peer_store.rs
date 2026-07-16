@@ -920,6 +920,7 @@ pub struct PeerStoreBlindRelayQualityStatus {
     /// Whether this process has fresh successful synthetic route probe evidence.
     pub synthetic_probe_ready: bool,
     /// Stable evidence bucket: idle, opaque_relay_acceptance,
+    /// synthetic_onion_message_delivery_probe,
     /// synthetic_two_hop_control_probe, synthetic_probe, probe_failed, or
     /// opaque_relay_attempted.
     pub evidence_mode: String,
@@ -4499,6 +4500,10 @@ impl PeerStore {
         let accepted_evidence_seen = accepted_total > 0;
         let probe_evidence_seen = stats.probe_succeeded > 0;
         let two_hop_probe_evidence_seen = stats.two_hop_probe_succeeded > 0;
+        let synthetic_onion_delivery_evidence_seen = two_hop_probe_evidence_seen
+            && two_hop_path_proof_history.message_delivery_successes > 0
+            && two_hop_path_proof_history.message_delivery_evidence_mode
+                == "synthetic_onion_message_delivery_probe";
         let accepted_relay_ready = accepted_evidence_seen
             && last_accepted_age_seconds
                 .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
@@ -4523,6 +4528,8 @@ impl PeerStore {
                 && !runtime_ready;
         let evidence_mode = if accepted_evidence_seen {
             "opaque_relay_acceptance"
+        } else if synthetic_onion_delivery_evidence_seen {
+            "synthetic_onion_message_delivery_probe"
         } else if two_hop_probe_evidence_seen {
             "synthetic_two_hop_control_probe"
         } else if probe_evidence_seen {
@@ -4538,6 +4545,8 @@ impl PeerStore {
         };
         let proof_scope = if accepted_evidence_seen {
             "relay_acceptance"
+        } else if synthetic_onion_delivery_evidence_seen {
+            "message_delivery"
         } else if two_hop_probe_evidence_seen || stats.two_hop_probe_attempted > 0 {
             "control_plane"
         } else if probe_evidence_seen || stats.probe_attempted > 0 {
@@ -4597,6 +4606,12 @@ impl PeerStore {
                 "opaque_relay_transport_attention"
             } else if accepted_relay_ready && protection_active {
                 "opaque_relay_protection_active"
+            } else if two_hop_probe_ready
+                && synthetic_onion_delivery_evidence_seen
+                && !active_transport_attention
+                && !protection_active
+            {
+                "synthetic_onion_message_delivery_probe_ready"
             } else if two_hop_probe_ready && !active_transport_attention && !protection_active {
                 "synthetic_two_hop_control_probe_ready"
             } else if synthetic_probe_ready && !active_transport_attention && !protection_active {
@@ -4611,6 +4626,8 @@ impl PeerStore {
                 "protection_active"
             } else if accepted_evidence_seen && !accepted_relay_ready {
                 "opaque_relay_acceptance_stale"
+            } else if synthetic_onion_delivery_evidence_seen && !two_hop_probe_ready {
+                "synthetic_onion_message_delivery_probe_stale"
             } else if two_hop_probe_evidence_seen && !two_hop_probe_ready {
                 "synthetic_two_hop_control_probe_stale"
             } else if probe_evidence_seen && !probe_ready {
@@ -4637,6 +4654,9 @@ impl PeerStore {
             }
             "ready" if accepted_relay_ready => {
                 "blind relay runtime has accepted encrypted relay work"
+            }
+            "ready" if two_hop_probe_ready && synthetic_onion_delivery_evidence_seen => {
+                "synthetic onion terminal delivery probe succeeded; do not present it as App/user traffic"
             }
             "ready" if two_hop_probe_ready => {
                 "two-hop synthetic path proof succeeded; do not present it as App/user traffic"
@@ -7883,6 +7903,17 @@ mod tests {
         );
 
         let status = store.status(1_700_000_015);
+        assert_eq!(
+            status.blind_relay_quality.evidence_mode,
+            "synthetic_onion_message_delivery_probe"
+        );
+        assert_eq!(status.blind_relay_quality.proof_scope, "message_delivery");
+        assert_eq!(
+            status.blind_relay_quality.readiness_reason,
+            "synthetic_onion_message_delivery_probe_ready"
+        );
+        assert!(!status.blind_relay_quality.real_relay_ready);
+        assert!(!status.blind_relay_quality.accepted_relay_ready);
         let history = status.two_hop_path_proof_history;
 
         assert_eq!(

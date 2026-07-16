@@ -2674,6 +2674,14 @@ mod tests {
         );
         assert_eq!(parsed["blind_relay"]["runtime_ready"].as_bool(), Some(true));
         assert_eq!(
+            parsed["blind_relay"]["evidence_mode"].as_str(),
+            Some("opaque_relay_acceptance")
+        );
+        assert_eq!(
+            parsed["blind_relay"]["readiness_reason"].as_str(),
+            Some("opaque_relay_acceptance_observed")
+        );
+        assert_eq!(
             parsed["two_hop_path_proof"]["proof_ready"].as_bool(),
             Some(true)
         );
@@ -2969,6 +2977,14 @@ mod tests {
 
         assert_eq!(parsed["status"].as_str(), Some("ready"));
         assert_eq!(parsed["stage"].as_str(), Some("two_hop_path_ready"));
+        assert_eq!(
+            parsed["blind_relay"]["evidence_mode"].as_str(),
+            Some("synthetic_onion_message_delivery_probe")
+        );
+        assert_eq!(
+            parsed["blind_relay"]["readiness_reason"].as_str(),
+            Some("synthetic_onion_message_delivery_probe_ready")
+        );
         assert_eq!(
             parsed["two_hop_path_proof"]["latest_reason_bucket"].as_str(),
             Some("onion_terminal_delivered")
