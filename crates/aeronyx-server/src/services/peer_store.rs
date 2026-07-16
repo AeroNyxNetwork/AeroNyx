@@ -123,6 +123,9 @@
 //! - Local peer-cache snapshots can retain descriptor-bound successful
 //!   routeability evidence across a short process restart while rejecting
 //!   stale, future-dated, mismatched, quarantined, or unsigned state
+//! - Routeability evidence follows the signed route surface across ordinary
+//!   descriptor sequence/TTL refreshes, but endpoint, capability, discovery
+//!   visibility, or onion KEM changes fail closed until a new direct success
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -149,6 +152,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.53.0-RouteSurfaceEvidence - Bound route health to stable signed routing fields across descriptor refreshes
 //! v0.52.0-RouteabilityCacheEvidence - Added bounded descriptor-bound warm-restart route evidence
 //! v0.51.0-RouteGovernanceSummary - Added aggregate route-quality governance contract
 //! v0.50.0-TwoHopProofStabilityWindow - Added privacy-safe stability window and failure circuit breaker fields
@@ -227,6 +231,8 @@ const PEER_ROUTE_RECENT_FAILURE_SECS: u64 = 600;
 const PEER_ROUTEABILITY_STALE_AFTER_SECS: u64 = 1_800;
 /// Local peer-cache routeability evidence schema understood by this node.
 pub const ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION: u16 = 1;
+const ROUTEABILITY_EVIDENCE_KIND_EXACT_DESCRIPTOR: &str = "direct_opaque_route_success";
+const ROUTEABILITY_EVIDENCE_KIND_ROUTE_SURFACE: &str = "direct_opaque_route_surface_success";
 const PEER_ROUTEABILITY_CACHE_MAX_ENTRIES: usize = 4_096;
 const PEER_ROUTE_FAILURE_QUARANTINE_THRESHOLD: u64 = 3;
 const PEER_ROUTE_FAILURE_QUARANTINE_SECS: u64 = 300;
@@ -1176,6 +1182,11 @@ struct PeerRouteHealth {
     failure_count: u64,
     consecutive_failures: u64,
     last_success_at: Option<u64>,
+    /// Fingerprint of the signed route surface used by the latest success.
+    ///
+    /// This lets routine sequence/TTL refreshes retain health while endpoint,
+    /// capability, public-discovery, or KEM changes invalidate it fail-closed.
+    last_success_route_fingerprint_sha256: Option<String>,
     last_failure_at: Option<u64>,
     last_failure_reason: Option<String>,
     quarantine_count: u64,
@@ -1184,25 +1195,31 @@ struct PeerRouteHealth {
     last_quarantine_reason: Option<String>,
 }
 
-/// Descriptor-bound successful routeability evidence stored only in the local
-/// peer cache for warm restart recovery.
+/// Signed-route-surface-bound successful routeability evidence stored only in
+/// the local peer cache for warm restart recovery.
 ///
 /// This deliberately excludes endpoints, route ids, payloads, receiver ids,
 /// client metadata, failure history, quarantine state, and social graph data.
-/// A record is usable only while its exact signed descriptor remains valid and
-/// its success timestamp remains inside the normal routeability freshness
-/// window. Startup direct probes still revalidate restored evidence.
+/// New records survive sequence/TTL-only descriptor refreshes because they bind
+/// to the signed fields that affect routing. Legacy exact-descriptor records
+/// remain readable. Endpoint, capability, discovery visibility, or KEM changes
+/// invalidate both runtime and cached success. Startup direct probes still run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerStoreRouteabilityCacheEvidence {
     /// Full node id encoded as lowercase hex for exact local descriptor lookup.
     pub node_id_hex: String,
-    /// Sequence of the exact signed descriptor observed during the success.
+    /// Descriptor sequence current when this evidence was exported.
+    ///
+    /// Route-surface evidence permits a newer sequence only when the signed
+    /// route surface is unchanged. Legacy exact-descriptor evidence requires
+    /// an exact sequence match.
     pub descriptor_sequence: u64,
-    /// SHA-256 binding over the canonical descriptor bytes and signature.
+    /// SHA-256 binding over either the stable signed route surface (current)
+    /// or canonical descriptor bytes plus signature (legacy).
     pub descriptor_fingerprint_sha256: String,
     /// Unix timestamp of the last successful direct opaque probe or forward.
     pub last_success_at: u64,
-    /// Stable evidence kind; currently `direct_opaque_route_success` only.
+    /// Stable evidence kind identifying route-surface or legacy exact binding.
     pub evidence_kind: String,
 }
 
@@ -2164,6 +2181,8 @@ impl PeerStore {
     ) -> Result<bool, PeerStoreError> {
         let node_id = descriptor.node_id();
         let incoming_sequence = descriptor.sequence();
+        let incoming_route_fingerprint =
+            Self::descriptor_routeability_surface_fingerprint(&descriptor);
         let source = source.into();
         if descriptor.verify_at(now).is_err() {
             self.record_peer_event(
@@ -2179,6 +2198,7 @@ impl PeerStore {
         }
 
         let mut peers = self.peers.write();
+        let mut route_surface_changed = false;
 
         let is_existing_peer = if let Some(existing) = peers.get(&node_id) {
             let current = existing.sequence();
@@ -2199,6 +2219,19 @@ impl PeerStore {
                 });
             }
             if incoming_sequence == current {
+                if existing != &descriptor {
+                    drop(peers);
+                    self.record_peer_event(
+                        now,
+                        "peer_rejected",
+                        "rejected",
+                        source,
+                        &node_id,
+                        Some(incoming_sequence),
+                        Some("sequence_conflict"),
+                    );
+                    return Err(PeerStoreError::VerificationFailed);
+                }
                 drop(peers);
                 self.record_peer_runtime(&descriptor, now, source.clone(), false);
                 self.record_peer_event(
@@ -2212,6 +2245,8 @@ impl PeerStore {
                 );
                 return Ok(false);
             }
+            route_surface_changed = Self::descriptor_routeability_surface_fingerprint(existing)
+                != incoming_route_fingerprint;
             true
         } else {
             false
@@ -2238,6 +2273,9 @@ impl PeerStore {
 
         peers.insert(node_id, descriptor.clone());
         drop(peers);
+        if route_surface_changed {
+            self.invalidate_route_success_for_surface_change(&node_id, now);
+        }
         self.record_peer_runtime(&descriptor, now, source.clone(), true);
         self.record_peer_event(
             now,
@@ -2253,6 +2291,39 @@ impl PeerStore {
             None,
         );
         Ok(true)
+    }
+
+    /// Invalidates only positive route evidence after a signed route-surface
+    /// change. Failure and quarantine history is retained so descriptor
+    /// rotation cannot be used to evade local abuse or failure isolation.
+    fn invalidate_route_success_for_surface_change(&self, node_id: &[u8; 32], now: u64) {
+        let invalidated = {
+            let mut route_health = self.route_health.write();
+            let Some(health) = route_health.get_mut(node_id) else {
+                return;
+            };
+            let invalidated = health.last_success_at.take().is_some()
+                || health
+                    .last_success_route_fingerprint_sha256
+                    .take()
+                    .is_some();
+            if invalidated {
+                health.success_count = 0;
+            }
+            invalidated
+        };
+
+        if invalidated {
+            self.record_audit_event(
+                now,
+                "routeability_surface_changed",
+                "invalidated",
+                format!(
+                    "node_prefix={} result=reprobe_required",
+                    hex::encode(&node_id[..4])
+                ),
+            );
+        }
     }
 
     fn record_peer_runtime(
@@ -2886,12 +2957,34 @@ impl PeerStore {
     /// pass route ids, encrypted blobs, client identifiers, endpoint URLs, or
     /// payload-derived details into this method.
     pub fn record_route_forward_success(&self, node_id: &[u8; 32], now: u64) {
-        let mut route_health = self.route_health.write();
-        let health = route_health.entry(*node_id).or_default();
-        health.success_count = health.success_count.saturating_add(1);
-        health.consecutive_failures = 0;
-        health.last_success_at = Some(now);
-        health.quarantine_until = None;
+        let route_fingerprint = self
+            .peers
+            .read()
+            .get(node_id)
+            .filter(|descriptor| descriptor.verify_at(now).is_ok())
+            .and_then(Self::descriptor_routeability_surface_fingerprint);
+        let Some(route_fingerprint) = route_fingerprint else {
+            self.record_audit_event(
+                now,
+                "blind_relay_route_health",
+                "rejected",
+                format!(
+                    "node_prefix={} result=ignored reason=missing_verified_route_surface",
+                    hex::encode(&node_id[..4])
+                ),
+            );
+            return;
+        };
+
+        {
+            let mut route_health = self.route_health.write();
+            let health = route_health.entry(*node_id).or_default();
+            health.success_count = health.success_count.saturating_add(1);
+            health.consecutive_failures = 0;
+            health.last_success_at = Some(now);
+            health.last_success_route_fingerprint_sha256 = Some(route_fingerprint);
+            health.quarantine_until = None;
+        }
         self.record_audit_event(
             now,
             "blind_relay_route_health",
@@ -3625,11 +3718,11 @@ impl PeerStore {
 
     /// Exports fresh successful routeability evidence for local restart recovery.
     ///
-    /// Every record is bound to the exact signed descriptor that was active
-    /// when the direct opaque route succeeded. Failure counters, quarantine
-    /// state, proof history, endpoint values, route ids, and payload metadata
-    /// are intentionally excluded. The result is bounded independently of the
-    /// configured peer count to keep local cache amplification controlled.
+    /// Every record is bound to the signed route surface proven by the latest
+    /// direct opaque success. Sequence/TTL-only descriptor refreshes can retain
+    /// that evidence; endpoint, capability, discovery-policy, or KEM changes
+    /// cannot. Failure counters, quarantine state, proof history, endpoint
+    /// values, route ids, and payload metadata remain excluded.
     #[must_use]
     pub fn export_routeability_cache_evidence(
         &self,
@@ -3660,9 +3753,7 @@ impl PeerStore {
                 continue;
             };
             if last_success_at > generated_at
-                || last_success_at < descriptor.descriptor.issued_at
-                || generated_at.saturating_sub(last_success_at)
-                    > PEER_ROUTEABILITY_STALE_AFTER_SECS
+                || generated_at.saturating_sub(last_success_at) > PEER_ROUTEABILITY_STALE_AFTER_SECS
                 || health
                     .last_failure_at
                     .is_some_and(|failure_at| failure_at >= last_success_at)
@@ -3671,16 +3762,21 @@ impl PeerStore {
                 continue;
             }
             let Some(descriptor_fingerprint_sha256) =
-                Self::descriptor_routeability_fingerprint(descriptor)
+                Self::descriptor_routeability_surface_fingerprint(descriptor)
             else {
                 continue;
             };
+            if health.last_success_route_fingerprint_sha256.as_deref()
+                != Some(descriptor_fingerprint_sha256.as_str())
+            {
+                continue;
+            }
             evidence.push(PeerStoreRouteabilityCacheEvidence {
                 node_id_hex: hex::encode(node_id),
                 descriptor_sequence: descriptor.sequence(),
                 descriptor_fingerprint_sha256,
                 last_success_at,
-                evidence_kind: "direct_opaque_route_success".to_string(),
+                evidence_kind: ROUTEABILITY_EVIDENCE_KIND_ROUTE_SURFACE.to_string(),
             });
         }
         drop(route_health);
@@ -3705,9 +3801,11 @@ impl PeerStore {
     ///
     /// This method fails closed per record. It restores only a successful
     /// timestamp, never failures, scores, quarantine state, route paths, proof
-    /// history, or traffic counters. Exact descriptor fingerprint matching
-    /// prevents evidence from surviving endpoint, capability, KEM key, policy,
-    /// sequence, or signature changes. Startup direct probes must still run.
+    /// history, or traffic counters. Route-surface fingerprint matching
+    /// prevents evidence from surviving endpoint, capability, KEM key, or
+    /// routing-policy changes while allowing a newer signed sequence/TTL.
+    /// Legacy exact-descriptor cache records remain accepted. Startup direct
+    /// probes must still run.
     pub fn restore_routeability_cache_evidence(
         &self,
         records: &[PeerStoreRouteabilityCacheEvidence],
@@ -3720,11 +3818,15 @@ impl PeerStore {
 
         for record in records.iter().take(PEER_ROUTEABILITY_CACHE_MAX_ENTRIES) {
             let mut node_id = [0u8; 32];
-            if record.evidence_kind != "direct_opaque_route_success"
+            let supported_evidence_kind = matches!(
+                record.evidence_kind.as_str(),
+                ROUTEABILITY_EVIDENCE_KIND_EXACT_DESCRIPTOR
+                    | ROUTEABILITY_EVIDENCE_KIND_ROUTE_SURFACE
+            );
+            if !supported_evidence_kind
                 || hex::decode_to_slice(&record.node_id_hex, &mut node_id).is_err()
                 || record.last_success_at > now
-                || now.saturating_sub(record.last_success_at)
-                    > PEER_ROUTEABILITY_STALE_AFTER_SECS
+                || now.saturating_sub(record.last_success_at) > PEER_ROUTEABILITY_STALE_AFTER_SECS
             {
                 rejected = rejected.saturating_add(1);
                 continue;
@@ -3735,19 +3837,29 @@ impl PeerStore {
                 rejected = rejected.saturating_add(1);
                 continue;
             };
+            let route_surface_fingerprint =
+                Self::descriptor_routeability_surface_fingerprint(&descriptor);
+            let binding_matches = match record.evidence_kind.as_str() {
+                ROUTEABILITY_EVIDENCE_KIND_EXACT_DESCRIPTOR => {
+                    descriptor.sequence() == record.descriptor_sequence
+                        && descriptor.descriptor.issued_at <= record.last_success_at
+                        && Self::descriptor_routeability_fingerprint(&descriptor).is_some_and(
+                            |fingerprint| fingerprint == record.descriptor_fingerprint_sha256,
+                        )
+                }
+                ROUTEABILITY_EVIDENCE_KIND_ROUTE_SURFACE => {
+                    descriptor.sequence() >= record.descriptor_sequence
+                        && route_surface_fingerprint
+                            .as_ref()
+                            .is_some_and(|fingerprint| {
+                                fingerprint == &record.descriptor_fingerprint_sha256
+                            })
+                }
+                _ => false,
+            };
             let descriptor_matches = descriptor.verify_at(now).is_ok()
-                && descriptor.sequence() == record.descriptor_sequence
-                && descriptor.descriptor.issued_at <= record.last_success_at
-                && descriptor
-                    .descriptor
-                    .public_endpoint
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|endpoint| !endpoint.is_empty())
-                && Self::descriptor_routeability_fingerprint(&descriptor)
-                    .is_some_and(|fingerprint| {
-                        fingerprint == record.descriptor_fingerprint_sha256
-                    });
+                && route_surface_fingerprint.is_some()
+                && binding_matches;
             if !descriptor_matches {
                 rejected = rejected.saturating_add(1);
                 continue;
@@ -3769,6 +3881,7 @@ impl PeerStore {
             {
                 health.last_success_at = Some(record.last_success_at);
             }
+            health.last_success_route_fingerprint_sha256 = route_surface_fingerprint;
             health.success_count = health.success_count.max(1);
             restored = restored.saturating_add(1);
         }
@@ -3853,9 +3966,56 @@ impl PeerStore {
         }
     }
 
-    fn descriptor_routeability_fingerprint(
+    /// Fingerprints only signed fields that can change route behavior.
+    ///
+    /// Sequence, validity timestamps, software version, capacity, and region
+    /// are deliberately excluded: refreshing those fields must not claim a new
+    /// transport surface. Endpoint, capabilities, discovery/exit policy, and
+    /// onion KEM material are included so a behavior change requires a probe.
+    fn descriptor_routeability_surface_fingerprint(
         descriptor: &SignedNodeDescriptor,
     ) -> Option<String> {
+        let endpoint = descriptor
+            .descriptor
+            .public_endpoint
+            .as_deref()?
+            .trim()
+            .trim_end_matches('/');
+        if endpoint.is_empty() {
+            return None;
+        }
+
+        let mut capabilities = descriptor
+            .descriptor
+            .capabilities
+            .iter()
+            .map(|capability| match capability {
+                NodeCapability::PrivacyRelay => 1u8,
+                NodeCapability::ChatRelay => 2,
+                NodeCapability::EncryptedStorage => 3,
+                NodeCapability::AgentRelay => 4,
+                NodeCapability::OnionMiddle => 5,
+            })
+            .collect::<Vec<_>>();
+        capabilities.sort_unstable();
+        capabilities.dedup();
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"aeronyx-routeability-surface-v1");
+        hasher.update(descriptor.descriptor.node_id);
+        hasher.update(u64::try_from(endpoint.len()).ok()?.to_be_bytes());
+        hasher.update(endpoint.as_bytes());
+        hasher.update(u64::try_from(capabilities.len()).ok()?.to_be_bytes());
+        hasher.update(&capabilities);
+        hasher.update([u8::from(descriptor.descriptor.policy.public_discovery)]);
+        hasher.update([u8::from(descriptor.descriptor.policy.allows_public_exit)]);
+        hasher.update([descriptor.descriptor.kem_alg]);
+        hasher.update(descriptor.descriptor.kem_public);
+        Some(hex::encode(hasher.finalize()))
+    }
+
+    /// Legacy exact-descriptor fingerprint retained for reading v0.52 caches.
+    fn descriptor_routeability_fingerprint(descriptor: &SignedNodeDescriptor) -> Option<String> {
         let signing_bytes = descriptor.descriptor.signing_bytes().ok()?;
         let mut hasher = Sha256::new();
         hasher.update(b"aeronyx-routeability-cache-evidence-v1");
@@ -5816,7 +5976,7 @@ mod tests {
     }
 
     #[test]
-    fn test_routeability_cache_restores_only_exact_fresh_descriptor_evidence() {
+    fn test_routeability_cache_restores_across_sequence_only_descriptor_refresh() {
         let now = 1_700_000_100;
         let peer_kp = IdentityKeyPair::generate();
         let mut descriptor = signed_descriptor_for(&peer_kp, 7, now + 4_000);
@@ -5829,15 +5989,36 @@ mod tests {
             .upsert_verified_from_source(descriptor.clone(), now, "gossip_announce")
             .unwrap();
         original.record_route_forward_success(&node_id, now + 10);
+
+        let mut refreshed_body = descriptor.descriptor.clone();
+        refreshed_body.sequence = 8;
+        refreshed_body.issued_at = now + 15;
+        refreshed_body.expires_at = now + 4_015;
+        let refreshed = SignedNodeDescriptor::sign(refreshed_body, &peer_kp).unwrap();
+        original
+            .upsert_verified_from_source(refreshed.clone(), now + 15, "gossip_announce")
+            .unwrap();
+        assert!(original.is_routeable_now(&node_id, now + 16));
+
         let evidence = original.export_routeability_cache_evidence(now + 20);
         assert_eq!(evidence.len(), 1);
-        assert_eq!(evidence[0].descriptor_sequence, 7);
-        assert_eq!(evidence[0].evidence_kind, "direct_opaque_route_success");
-        assert!(!serde_json::to_string(&evidence).unwrap().contains("warm-restart.example"));
+        assert_eq!(evidence[0].descriptor_sequence, 8);
+        assert_eq!(
+            evidence[0].evidence_kind,
+            ROUTEABILITY_EVIDENCE_KIND_ROUTE_SURFACE
+        );
+        assert!(!serde_json::to_string(&evidence)
+            .unwrap()
+            .contains("warm-restart.example"));
 
+        let mut newer_body = refreshed.descriptor;
+        newer_body.sequence = 9;
+        newer_body.issued_at = now + 21;
+        newer_body.expires_at = now + 4_021;
+        let newer = SignedNodeDescriptor::sign(newer_body, &peer_kp).unwrap();
         let restored = PeerStore::new();
         restored
-            .upsert_verified_from_source(descriptor, now + 21, "cache")
+            .upsert_verified_from_source(newer, now + 21, "cache")
             .unwrap();
         let report = restored.restore_routeability_cache_evidence(&evidence, now + 21);
 
@@ -5858,6 +6039,97 @@ mod tests {
         assert_eq!(status.bootstrap.last_routeability_cache_restored, 1);
         assert_eq!(status.bootstrap.last_routeability_cache_rejected, 0);
         assert_eq!(status.bootstrap.last_routeability_cache_at, Some(now + 21));
+    }
+
+    #[test]
+    fn test_routeability_cache_accepts_legacy_exact_descriptor_evidence() {
+        let now = 1_700_000_100;
+        let peer_kp = IdentityKeyPair::generate();
+        let mut descriptor = signed_descriptor_for(&peer_kp, 4, now + 4_000);
+        descriptor.descriptor.public_endpoint = Some("https://legacy-cache.example".to_string());
+        descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &peer_kp).unwrap();
+        let node_id = descriptor.node_id();
+        let evidence = PeerStoreRouteabilityCacheEvidence {
+            node_id_hex: hex::encode(node_id),
+            descriptor_sequence: descriptor.sequence(),
+            descriptor_fingerprint_sha256: PeerStore::descriptor_routeability_fingerprint(
+                &descriptor,
+            )
+            .unwrap(),
+            last_success_at: now + 10,
+            evidence_kind: ROUTEABILITY_EVIDENCE_KIND_EXACT_DESCRIPTOR.to_string(),
+        };
+
+        let restored = PeerStore::new();
+        restored.upsert_verified(descriptor, now + 11).unwrap();
+        let report = restored.restore_routeability_cache_evidence(&[evidence], now + 11);
+
+        assert_eq!(report.restored, 1);
+        assert_eq!(report.rejected, 0);
+        assert!(restored.is_routeable_now(&node_id, now + 11));
+    }
+
+    #[test]
+    fn test_route_surface_changes_invalidate_success_until_reprobed() {
+        let now = 1_700_000_100;
+        let peer_kp = IdentityKeyPair::generate();
+        let mut descriptor = signed_descriptor_for(&peer_kp, 7, now + 4_000);
+        descriptor.descriptor.public_endpoint = Some("https://route-a.example".to_string());
+        descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &peer_kp).unwrap();
+        let node_id = descriptor.node_id();
+
+        let store = PeerStore::new();
+        store.upsert_verified(descriptor.clone(), now).unwrap();
+        store.record_route_forward_success(&node_id, now + 10);
+        assert!(store.is_routeable_now(&node_id, now + 11));
+
+        let mut endpoint_changed_body = descriptor.descriptor.clone();
+        endpoint_changed_body.sequence = 8;
+        endpoint_changed_body.issued_at = now + 20;
+        endpoint_changed_body.expires_at = now + 4_020;
+        endpoint_changed_body.public_endpoint = Some("https://route-b.example".to_string());
+        let endpoint_changed = SignedNodeDescriptor::sign(endpoint_changed_body, &peer_kp).unwrap();
+        store
+            .upsert_verified(endpoint_changed.clone(), now + 20)
+            .unwrap();
+        assert!(!store.is_routeable_now(&node_id, now + 21));
+        assert!(store
+            .export_routeability_cache_evidence(now + 21)
+            .is_empty());
+
+        store.record_route_forward_success(&node_id, now + 22);
+        assert!(store.is_routeable_now(&node_id, now + 23));
+
+        let mut kem_changed_body = endpoint_changed.descriptor;
+        kem_changed_body.sequence = 9;
+        kem_changed_body.issued_at = now + 30;
+        kem_changed_body.expires_at = now + 4_030;
+        kem_changed_body.kem_alg = 1;
+        kem_changed_body.kem_public = [7u8; 32];
+        let kem_changed = SignedNodeDescriptor::sign(kem_changed_body, &peer_kp).unwrap();
+        store.upsert_verified(kem_changed, now + 30).unwrap();
+        assert!(!store.is_routeable_now(&node_id, now + 31));
+    }
+
+    #[test]
+    fn test_same_sequence_descriptor_conflict_is_rejected() {
+        let now = 1_700_000_100;
+        let peer_kp = IdentityKeyPair::generate();
+        let mut descriptor = signed_descriptor_for(&peer_kp, 7, now + 4_000);
+        descriptor.descriptor.public_endpoint = Some("https://route-a.example".to_string());
+        descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &peer_kp).unwrap();
+
+        let store = PeerStore::new();
+        store.upsert_verified(descriptor.clone(), now).unwrap();
+        let mut conflicting_body = descriptor.descriptor;
+        conflicting_body.public_endpoint = Some("https://route-b.example".to_string());
+        let conflicting = SignedNodeDescriptor::sign(conflicting_body, &peer_kp).unwrap();
+
+        assert!(matches!(
+            store.upsert_verified(conflicting, now + 1),
+            Err(PeerStoreError::VerificationFailed)
+        ));
+        assert_eq!(store.len(), 1);
     }
 
     #[test]
@@ -5889,10 +6161,8 @@ mod tests {
 
         let restored = PeerStore::new();
         restored.upsert_verified(descriptor, now + 7).unwrap();
-        let report = restored.restore_routeability_cache_evidence(
-            &[tampered, future, stale],
-            now + 7,
-        );
+        let report =
+            restored.restore_routeability_cache_evidence(&[tampered, future, stale], now + 7);
 
         assert_eq!(report.total, 3);
         assert_eq!(report.restored, 0);
