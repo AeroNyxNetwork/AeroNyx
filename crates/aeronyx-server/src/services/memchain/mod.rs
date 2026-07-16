@@ -49,6 +49,7 @@
 //!   replication and owner recovery must remain separate and authorised.
 //!
 //! ## Last Modified
+//! v2.8.14-SyncObservability - Re-export follower announcement disposition telemetry.
 //! v0.2.0 - Initial MemChain storage engine
 //! v2.1.0 - Added storage, vector, mvf, graph modules
 //! v2.1.0+Embed - Added embed module
@@ -132,7 +133,8 @@ pub mod mempool;
 // ── Storage core ──
 pub use storage::{
     LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentCheckpointStatus,
-    RecordCommitmentSyncEvent, RecordCommitmentSyncStatus, StorageStats,
+    RecordCommitmentAnnouncementDisposition, RecordCommitmentSyncEvent,
+    RecordCommitmentSyncStatus, StorageStats,
 };
 pub use storage_crypto::{decrypt_rawlog_content_pub, derive_rawlog_key, derive_record_key};
 pub use storage_ops::{

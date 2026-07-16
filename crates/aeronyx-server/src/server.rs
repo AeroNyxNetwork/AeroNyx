@@ -241,6 +241,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.8.14-SyncObservability - Event-driven follower trigger and announcement evidence
 //   v2.8.12-LeaseFailClosedTelemetry - Partition/recovery lease evidence
 //   v2.8.11-CoordinatorLeaseRelease - Signed graceful lease handover on SIGINT/SIGTERM
 //   v2.8.10-CoordinatorLease - Strict all-witness short-lived production authority
@@ -2401,6 +2402,15 @@ impl Server {
                             role: status.role,
                             state: status.state,
                             enabled: status.enabled,
+                            last_trigger: status.last_trigger,
+                            last_announcement_at: status.last_announcement_at,
+                            last_announced_height: status.last_announced_height,
+                            last_announcement_result: status.last_announcement_result,
+                            announcements_accepted_total: status.announcements_accepted_total,
+                            announcements_coalesced_total: status.announcements_coalesced_total,
+                            announcements_stale_total: status.announcements_stale_total,
+                            announcements_unavailable_total: status
+                                .announcements_unavailable_total,
                             last_attempt_at: status.last_attempt_at,
                             last_success_at: status.last_success_at,
                             last_failure_at: status.last_failure_at,
@@ -3901,7 +3911,12 @@ impl Server {
                     }
                 }
 
-                storage.record_commitment_sync_attempt(unix_now_secs());
+                let attempt_at = unix_now_secs();
+                if trigger == "block_announce" {
+                    storage.record_commitment_sync_announcement_attempt(attempt_at);
+                } else {
+                    storage.record_commitment_sync_attempt(attempt_at);
+                }
                 let round_future = async {
                     let mut inserted = 0usize;
                     let mut remote_tip_height = 0u64;

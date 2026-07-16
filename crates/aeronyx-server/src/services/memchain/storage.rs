@@ -154,6 +154,7 @@
 //!   converged frame may clear it. Recovery requires operator review/restart.
 //!
 //! ## Last Modified
+//! v2.8.14-SyncObservability - Added authenticated announcement dispositions and trigger evidence.
 //! v2.8.13-BlockConfirmation - Added privacy-safe witness-certificate coverage.
 //! v1.0.0 - Initial SQLite storage engine
 //! v2.1.0 - 4-layer, plaintext embedding BLOB, compaction via layer change
@@ -346,6 +347,36 @@ pub struct RecordProvenance {
 // Commitment Sync Runtime Evidence (v2.7.1)
 // ============================================
 
+/// Authenticated block-announcement disposition recorded by a follower.
+///
+/// This enum deliberately describes only scheduler handling. It does not
+/// claim that the announced block was imported, valid, or canonical; those
+/// properties are established later by the signed pull and checkpoint path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordCommitmentAnnouncementDisposition {
+    /// The bounded follower wake-up channel accepted a new event.
+    Accepted,
+    /// An equivalent wake-up was already pending and the event was coalesced.
+    Coalesced,
+    /// The authenticated announcement did not exceed the audited local tip.
+    Stale,
+    /// The follower task was unavailable while the HTTP runtime remained up.
+    Unavailable,
+}
+
+impl RecordCommitmentAnnouncementDisposition {
+    /// Returns the stable privacy-safe API value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Coalesced => "coalesced",
+            Self::Stale => "stale",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// One privacy-safe follower lifecycle event.
 ///
 /// Events contain no node identity, endpoint, block hash, record commitment,
@@ -378,6 +409,24 @@ pub struct RecordCommitmentSyncStatus {
     pub state: String,
     /// Whether active follower polling is configured.
     pub enabled: bool,
+    /// Trigger used by the most recent pull attempt: `scheduled` or
+    /// `block_announce`.
+    pub last_trigger: String,
+    /// Most recent authenticated announcement handling time.
+    pub last_announcement_at: Option<u64>,
+    /// Highest authenticated announced height observed this process lifetime.
+    pub last_announced_height: Option<u64>,
+    /// Last scheduler disposition: `accepted`, `coalesced`, `stale`, or
+    /// `unavailable`.
+    pub last_announcement_result: Option<String>,
+    /// Announcements inserted into the bounded follower wake-up channel.
+    pub announcements_accepted_total: u64,
+    /// Announcements merged because one wake-up was already pending.
+    pub announcements_coalesced_total: u64,
+    /// Authenticated announcements at or below the audited local tip.
+    pub announcements_stale_total: u64,
+    /// Authenticated announcements received after the follower task closed.
+    pub announcements_unavailable_total: u64,
     /// Most recent pull attempt time.
     pub last_attempt_at: Option<u64>,
     /// Most recent successfully verified page time.
@@ -571,6 +620,14 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) role: &'static str,
     pub(crate) state: &'static str,
     pub(crate) enabled: bool,
+    pub(crate) last_trigger: &'static str,
+    pub(crate) last_announcement_at: Option<u64>,
+    pub(crate) last_announced_height: Option<u64>,
+    pub(crate) last_announcement_result: Option<&'static str>,
+    pub(crate) announcements_accepted_total: u64,
+    pub(crate) announcements_coalesced_total: u64,
+    pub(crate) announcements_stale_total: u64,
+    pub(crate) announcements_unavailable_total: u64,
     pub(crate) last_attempt_at: Option<u64>,
     pub(crate) last_success_at: Option<u64>,
     pub(crate) last_failure_at: Option<u64>,
@@ -593,6 +650,14 @@ impl Default for RecordCommitmentSyncRuntime {
             role: "verifier",
             state: "disabled",
             enabled: false,
+            last_trigger: "none",
+            last_announcement_at: None,
+            last_announced_height: None,
+            last_announcement_result: None,
+            announcements_accepted_total: 0,
+            announcements_coalesced_total: 0,
+            announcements_stale_total: 0,
+            announcements_unavailable_total: 0,
             last_attempt_at: None,
             last_success_at: None,
             last_failure_at: None,

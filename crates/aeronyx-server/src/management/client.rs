@@ -65,6 +65,7 @@
 //   v2.7.26        - Added aggregate witness-backed coordinator lease evidence
 //   v2.8.12        - Added fail-closed lease window and recovery evidence
 //   v2.8.13        - Added witness-certificate block confirmation coverage
+//   v2.8.14        - Added privacy-safe event-driven follower telemetry
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -189,6 +190,22 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub state: String,
     /// Whether active follower polling is configured.
     pub enabled: bool,
+    /// Trigger used by the latest pull attempt: `scheduled` or `block_announce`.
+    pub last_trigger: String,
+    /// Most recent authenticated block-announcement handling time.
+    pub last_announcement_at: Option<u64>,
+    /// Highest authenticated announced height observed this process lifetime.
+    pub last_announced_height: Option<u64>,
+    /// Latest privacy-safe scheduler disposition.
+    pub last_announcement_result: Option<String>,
+    /// Announcements inserted into the bounded follower wake-up channel.
+    pub announcements_accepted_total: u64,
+    /// Announcements merged because a wake-up was already pending.
+    pub announcements_coalesced_total: u64,
+    /// Authenticated announcements at or below the audited local tip.
+    pub announcements_stale_total: u64,
+    /// Authenticated announcements observed while the follower task was unavailable.
+    pub announcements_unavailable_total: u64,
     /// Most recent follower pull attempt.
     pub last_attempt_at: Option<u64>,
     /// Most recent successful verified response page.
@@ -839,6 +856,14 @@ mod tests {
                 role: "follower".to_string(),
                 state: "backoff".to_string(),
                 enabled: true,
+                last_trigger: "block_announce".to_string(),
+                last_announcement_at: Some(98),
+                last_announced_height: Some(10),
+                last_announcement_result: Some("accepted".to_string()),
+                announcements_accepted_total: 2,
+                announcements_coalesced_total: 1,
+                announcements_stale_total: 3,
+                announcements_unavailable_total: 0,
                 last_attempt_at: Some(99),
                 last_success_at: Some(100),
                 last_failure_at: Some(110),
@@ -939,6 +964,14 @@ mod tests {
         let sync = &value["record_commitment_sync"];
         assert_eq!(sync["state"], "backoff");
         assert_eq!(sync["enabled"], true);
+        assert_eq!(sync["last_trigger"], "block_announce");
+        assert_eq!(sync["last_announcement_at"], 98);
+        assert_eq!(sync["last_announced_height"], 10);
+        assert_eq!(sync["last_announcement_result"], "accepted");
+        assert_eq!(sync["announcements_accepted_total"], 2);
+        assert_eq!(sync["announcements_coalesced_total"], 1);
+        assert_eq!(sync["announcements_stale_total"], 3);
+        assert_eq!(sync["announcements_unavailable_total"], 0);
         assert_eq!(sync["last_attempt_at"], 99);
         assert_eq!(sync["last_error_code"], "request_timeout");
         let checkpoint = &value["record_commitment_checkpoint"];

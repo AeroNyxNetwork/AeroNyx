@@ -92,6 +92,7 @@
 //!   them as permissionless consensus, Byzantine finality, or fork choice.
 //!
 //! ## Last Modified
+//! v2.8.14-SyncObservability - Added privacy-safe authenticated announcement dispositions.
 //! v2.8.13-EventDrivenFollower - Added authenticated coalesced tip wake-ups.
 //! v2.8.11-CoordinatorLeaseRelease - Added authenticated graceful lease handover.
 //! v2.8.10-CoordinatorLease - Added durable follower lease grants and verified client.
@@ -155,7 +156,9 @@ use crate::services::memchain::storage_ops::{
     RecordCommitmentCheckpointEvidencePersistOutcome, RecordCoordinatorLeaseGrantOutcome,
     RecordCoordinatorLeaseReleaseOutcome,
 };
-use crate::services::memchain::MemoryStorage;
+use crate::services::memchain::{
+    MemoryStorage, RecordCommitmentAnnouncementDisposition,
+};
 use crate::services::PeerStore;
 
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024;
@@ -641,20 +644,52 @@ async fn block_announce_handler(State(state): State<MemChainPeerState>, body: By
         Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "chain_not_verified"),
     };
     if header.height <= local_tip_height {
+        state.storage.record_commitment_sync_announcement(
+            now,
+            header.height,
+            RecordCommitmentAnnouncementDisposition::Stale,
+        );
         return StatusCode::NO_CONTENT.into_response();
     }
     let Some(notifier) = state.block_announce_notifier.as_ref() else {
+        state.storage.record_commitment_sync_announcement(
+            now,
+            header.height,
+            RecordCommitmentAnnouncementDisposition::Unavailable,
+        );
         return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "sync_notifier_unavailable");
     };
     match notifier.try_send(header.height) {
-        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {
+        Ok(()) => {
+            state.storage.record_commitment_sync_announcement(
+                now,
+                header.height,
+                RecordCommitmentAnnouncementDisposition::Accepted,
+            );
             debug!(
                 announced_height = header.height,
                 local_tip_height, "[MEMCHAIN_BLOCK] Authenticated follower wake-up accepted"
             );
             StatusCode::ACCEPTED.into_response()
         }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            state.storage.record_commitment_sync_announcement(
+                now,
+                header.height,
+                RecordCommitmentAnnouncementDisposition::Coalesced,
+            );
+            debug!(
+                announced_height = header.height,
+                local_tip_height, "[MEMCHAIN_BLOCK] Authenticated follower wake-up coalesced"
+            );
+            StatusCode::ACCEPTED.into_response()
+        }
         Err(mpsc::error::TrySendError::Closed(_)) => {
+            state.storage.record_commitment_sync_announcement(
+                now,
+                header.height,
+                RecordCommitmentAnnouncementDisposition::Unavailable,
+            );
             protocol_error(StatusCode::SERVICE_UNAVAILABLE, "sync_notifier_unavailable")
         }
     }
@@ -2927,6 +2962,7 @@ mod tests {
         let coordinator = IdentityKeyPair::generate();
         let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
         storage.audit_record_commitment_chain().await.unwrap();
+        storage.configure_record_commitment_sync(false, true);
         let peer_store = Arc::new(PeerStore::new());
         admit_peer(&peer_store, &coordinator, None, now);
         let (notifier, mut notifications) = mpsc::channel(1);
@@ -2959,6 +2995,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let accepted = storage.record_commitment_sync_status();
+        assert_eq!(accepted.last_announcement_result.as_deref(), Some("accepted"));
+        assert_eq!(accepted.announcements_accepted_total, 1);
+
+        let next_block = RecordCommitmentBlockV1::new_signed(
+            2,
+            now,
+            block.header.hash(),
+            vec![[0x32; 32]],
+            &coordinator,
+        );
+        let coalesced = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/block-announce")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(block_announce_frame(&next_block)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(coalesced.status(), StatusCode::ACCEPTED);
+        let coalesced_status = storage.record_commitment_sync_status();
+        assert_eq!(
+            coalesced_status.last_announcement_result.as_deref(),
+            Some("coalesced")
+        );
+        assert_eq!(coalesced_status.last_announced_height, Some(2));
+        assert_eq!(coalesced_status.announcements_accepted_total, 1);
+        assert_eq!(coalesced_status.announcements_coalesced_total, 1);
         assert_eq!(notifications.recv().await, Some(1));
         assert_eq!(storage.record_commitment_chain_tip().await.0, 0);
 

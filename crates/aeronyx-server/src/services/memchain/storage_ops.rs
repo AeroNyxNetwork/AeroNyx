@@ -155,6 +155,7 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! v2.8.14-SyncObservability - Distinguish scheduled and authenticated follower wake-ups.
 //! v2.8.13-BlockConfirmation - Expose audited witness-certificate block coverage.
 //! v2.8.12-LeaseFailClosedTelemetry - Expose bounded fail-closed lease state.
 //! v2.8.11-CoordinatorLeaseRelease - Retain epochs while releasing planned restarts.
@@ -202,9 +203,10 @@ use aeronyx_core::protocol::memchain::{
 use super::storage::{
     LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentCheckpointCertificateAnchorConfig,
     RecordCommitmentCheckpointCertificateAnchorRuntime,
-    RecordCommitmentCheckpointCertificateBundle, RecordCommitmentCheckpointStatus,
-    RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime,
-    RecordCommitmentSyncStatus, RecordCommitmentTipAnchorConfig, StorageStats,
+    RecordCommitmentAnnouncementDisposition, RecordCommitmentCheckpointCertificateBundle,
+    RecordCommitmentCheckpointStatus, RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent,
+    RecordCommitmentSyncRuntime, RecordCommitmentSyncStatus, RecordCommitmentTipAnchorConfig,
+    StorageStats,
     CHECKPOINT_CERTIFICATE_CAPACITY, CHECKPOINT_EQUIVOCATION_CAPACITY,
     CHECKPOINT_EVIDENCE_CAPACITY, CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS,
     CHECKPOINT_TRUSTED_DIVERGENCE_CAPACITY, COMMITMENT_SYNC_EVENT_CAPACITY,
@@ -4402,15 +4404,73 @@ impl MemoryStorage {
         Ok(())
     }
 
-    /// Marks the start of one bounded follower pull round.
+    /// Marks the start of one scheduled bounded follower pull round.
+    ///
+    /// This entry point remains stable for existing callers. Event-driven
+    /// rounds use `record_commitment_sync_announcement_attempt` so operators
+    /// can distinguish fallback polling from authenticated wake-ups.
     pub fn record_commitment_sync_attempt(&self, now: u64) {
+        self.record_commitment_sync_attempt_with_trigger(now, "scheduled");
+    }
+
+    /// Marks the start of one bounded pull round triggered by an authenticated
+    /// block announcement from the pinned coordinator.
+    pub fn record_commitment_sync_announcement_attempt(&self, now: u64) {
+        self.record_commitment_sync_attempt_with_trigger(now, "block_announce");
+    }
+
+    fn record_commitment_sync_attempt_with_trigger(&self, now: u64, trigger: &'static str) {
         let mut runtime = self.commitment_sync.write();
         if !runtime.enabled {
             return;
         }
         runtime.state = "syncing";
+        runtime.last_trigger = trigger;
         runtime.last_attempt_at = Some(now);
         runtime.next_poll_at = None;
+    }
+
+    /// Records how one authenticated coordinator block announcement was
+    /// handled by the follower scheduler.
+    ///
+    /// This method does not claim that the announced block was imported or
+    /// canonical. The signed pull and checkpoint path remains the only path
+    /// that can advance replicated commitment state.
+    pub fn record_commitment_sync_announcement(
+        &self,
+        now: u64,
+        announced_height: u64,
+        disposition: RecordCommitmentAnnouncementDisposition,
+    ) {
+        let mut runtime = self.commitment_sync.write();
+        if !runtime.enabled {
+            return;
+        }
+        runtime.last_announcement_at = Some(now);
+        runtime.last_announced_height = Some(
+            runtime
+                .last_announced_height
+                .map_or(announced_height, |height| height.max(announced_height)),
+        );
+        runtime.last_announcement_result = Some(disposition.as_str());
+        match disposition {
+            RecordCommitmentAnnouncementDisposition::Accepted => {
+                runtime.announcements_accepted_total =
+                    runtime.announcements_accepted_total.saturating_add(1);
+            }
+            RecordCommitmentAnnouncementDisposition::Coalesced => {
+                runtime.announcements_coalesced_total =
+                    runtime.announcements_coalesced_total.saturating_add(1);
+            }
+            RecordCommitmentAnnouncementDisposition::Stale => {
+                runtime.announcements_stale_total =
+                    runtime.announcements_stale_total.saturating_add(1);
+            }
+            RecordCommitmentAnnouncementDisposition::Unavailable => {
+                runtime.announcements_unavailable_total =
+                    runtime.announcements_unavailable_total.saturating_add(1);
+            }
+        }
     }
 
     /// Records one fully verified response page after all included blocks have
@@ -4517,6 +4577,14 @@ impl MemoryStorage {
             role: runtime.role.to_string(),
             state: runtime.state.to_string(),
             enabled: runtime.enabled,
+            last_trigger: runtime.last_trigger.to_string(),
+            last_announcement_at: runtime.last_announcement_at,
+            last_announced_height: runtime.last_announced_height,
+            last_announcement_result: runtime.last_announcement_result.map(str::to_string),
+            announcements_accepted_total: runtime.announcements_accepted_total,
+            announcements_coalesced_total: runtime.announcements_coalesced_total,
+            announcements_stale_total: runtime.announcements_stale_total,
+            announcements_unavailable_total: runtime.announcements_unavailable_total,
             last_attempt_at: runtime.last_attempt_at,
             last_success_at: runtime.last_success_at,
             last_failure_at: runtime.last_failure_at,
@@ -7830,6 +7898,8 @@ mod tests {
         assert_eq!(initial.role, "verifier");
         assert_eq!(initial.state, "disabled");
         assert!(!initial.enabled);
+        assert_eq!(initial.last_trigger, "none");
+        assert_eq!(initial.announcements_accepted_total, 0);
 
         storage.configure_record_commitment_sync(false, true);
         storage.record_commitment_sync_attempt(100);
@@ -7842,6 +7912,7 @@ mod tests {
         let failed = storage.record_commitment_sync_status();
         assert_eq!(failed.role, "follower");
         assert_eq!(failed.state, "backoff");
+        assert_eq!(failed.last_trigger, "scheduled");
         assert_eq!(failed.last_attempt_at, Some(100));
         assert_eq!(failed.last_failure_at, Some(101));
         assert_eq!(failed.next_poll_at, Some(131));
@@ -7872,6 +7943,40 @@ mod tests {
         assert_eq!(recovered.recovery_events_total, 1);
         assert_eq!(recovered.recent_events.len(), 2);
         assert_eq!(recovered.recent_events[1].kind, "recovered");
+
+        storage.record_commitment_sync_announcement(
+            140,
+            12,
+            RecordCommitmentAnnouncementDisposition::Accepted,
+        );
+        storage.record_commitment_sync_announcement(
+            141,
+            11,
+            RecordCommitmentAnnouncementDisposition::Coalesced,
+        );
+        storage.record_commitment_sync_announcement(
+            142,
+            10,
+            RecordCommitmentAnnouncementDisposition::Stale,
+        );
+        storage.record_commitment_sync_announcement(
+            143,
+            9,
+            RecordCommitmentAnnouncementDisposition::Unavailable,
+        );
+        storage.record_commitment_sync_announcement_attempt(144);
+        let announced = storage.record_commitment_sync_status();
+        assert_eq!(announced.last_trigger, "block_announce");
+        assert_eq!(announced.last_announcement_at, Some(143));
+        assert_eq!(announced.last_announced_height, Some(12));
+        assert_eq!(
+            announced.last_announcement_result.as_deref(),
+            Some("unavailable")
+        );
+        assert_eq!(announced.announcements_accepted_total, 1);
+        assert_eq!(announced.announcements_coalesced_total, 1);
+        assert_eq!(announced.announcements_stale_total, 1);
+        assert_eq!(announced.announcements_unavailable_total, 1);
 
         for failure in 1..=20u32 {
             storage.record_commitment_sync_failure(
