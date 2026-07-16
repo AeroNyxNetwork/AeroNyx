@@ -92,6 +92,7 @@
 //!   them as permissionless consensus, Byzantine finality, or fork choice.
 //!
 //! ## Last Modified
+//! v2.8.15-AnnouncementReceipts - Classified exact accepted, stale, and failed receipts.
 //! v2.8.14-SyncObservability - Added privacy-safe authenticated announcement dispositions.
 //! v2.8.13-EventDrivenFollower - Added authenticated coalesced tip wake-ups.
 //! v2.8.11-CoordinatorLeaseRelease - Added authenticated graceful lease handover.
@@ -304,12 +305,34 @@ pub struct CommitmentCertificateImportOutcome {
 /// so the result is safe for operational logs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CommitmentTipAnnouncementOutcome {
+    /// Audited local tip height actually encoded in the outbound frame.
+    pub announced_height: u64,
     /// Distinct operator-pinned peers considered in this bounded round.
     pub attempted: usize,
     /// Peers that accepted or coalesced the wake-up hint.
     pub accepted: usize,
+    /// Peers already at or above the announced height.
+    pub stale: usize,
     /// Missing, unsafe, unreachable, or incompatible peers.
     pub failed: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitmentTipAnnouncementDelivery {
+    Accepted,
+    Stale,
+    Failed,
+}
+
+// Keep the receipt contract at the HTTP wire boundary. Axum and Reqwest may
+// resolve different `http` crate versions, but the protocol status codes are
+// stable and must not depend on either transport library's Rust type.
+fn classify_commitment_tip_announcement_status(status: u16) -> CommitmentTipAnnouncementDelivery {
+    match status {
+        202 => CommitmentTipAnnouncementDelivery::Accepted,
+        204 => CommitmentTipAnnouncementDelivery::Stale,
+        _ => CommitmentTipAnnouncementDelivery::Failed,
+    }
 }
 
 #[derive(Debug)]
@@ -529,7 +552,10 @@ where
     let now = now_secs();
     let self_node_id = identity.public_key_bytes();
     let mut distinct = HashSet::new();
-    let mut outcome = CommitmentTipAnnouncementOutcome::default();
+    let mut outcome = CommitmentTipAnnouncementOutcome {
+        announced_height: tip_height,
+        ..CommitmentTipAnnouncementOutcome::default()
+    };
     let mut urls = Vec::with_capacity(MAX_PINNED_WITNESSES_PER_ROUND);
     for peer_id in pinned_peer_ids
         .iter()
@@ -567,19 +593,27 @@ where
                     .send()
                     .await
                 {
-                    Ok(response) => response.status().is_success(),
-                    Err(_) => false,
+                    Ok(response) => {
+                        classify_commitment_tip_announcement_status(response.status().as_u16())
+                    }
+                    Err(_) => CommitmentTipAnnouncementDelivery::Failed,
                 }
             }
         })
         .buffer_unordered(MAX_PINNED_WITNESSES_PER_ROUND)
         .collect::<Vec<_>>()
         .await;
-    for accepted in deliveries {
-        if accepted {
-            outcome.accepted = outcome.accepted.saturating_add(1);
-        } else {
-            outcome.failed = outcome.failed.saturating_add(1);
+    for delivery in deliveries {
+        match delivery {
+            CommitmentTipAnnouncementDelivery::Accepted => {
+                outcome.accepted = outcome.accepted.saturating_add(1);
+            }
+            CommitmentTipAnnouncementDelivery::Stale => {
+                outcome.stale = outcome.stale.saturating_add(1);
+            }
+            CommitmentTipAnnouncementDelivery::Failed => {
+                outcome.failed = outcome.failed.saturating_add(1);
+            }
         }
     }
     Ok(outcome)
@@ -2955,6 +2989,22 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn tip_announcement_status_contract_is_exact() {
+        assert_eq!(
+            classify_commitment_tip_announcement_status(StatusCode::ACCEPTED.as_u16()),
+            CommitmentTipAnnouncementDelivery::Accepted
+        );
+        assert_eq!(
+            classify_commitment_tip_announcement_status(StatusCode::NO_CONTENT.as_u16()),
+            CommitmentTipAnnouncementDelivery::Stale
+        );
+        assert_eq!(
+            classify_commitment_tip_announcement_status(StatusCode::OK.as_u16()),
+            CommitmentTipAnnouncementDelivery::Failed
+        );
+    }
+
     #[tokio::test]
     async fn pinned_block_announcement_wakes_follower_without_mutating_chain() {
         let now = now_secs();
@@ -3171,10 +3221,88 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(outcome.announced_height, 1);
         assert_eq!(outcome.attempted, 1);
         assert_eq!(outcome.accepted, 1);
+        assert_eq!(outcome.stale, 0);
         assert_eq!(outcome.failed, 0);
         assert_eq!(notifications.recv().await, Some(1));
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_tip_announcement_reports_current_follower_as_stale() {
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let follower = Arc::new(IdentityKeyPair::generate());
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now,
+            GENESIS_PREV_HASH,
+            vec![[0x34; 32]],
+            &coordinator,
+        );
+
+        let source_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        source_storage
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        source_storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+        let follower_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        follower_storage
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        follower_storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+
+        let follower_peers = Arc::new(PeerStore::new());
+        admit_peer(&follower_peers, &coordinator, None, now);
+        let (notifier, mut notifications) = mpsc::channel(1);
+        let router = build_memchain_peer_router_with_runtime(
+            follower_storage,
+            follower_peers,
+            Arc::clone(&follower),
+            Some(coordinator.public_key_bytes()),
+            Some(notifier),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let source_peers = PeerStore::new();
+        admit_peer(
+            &source_peers,
+            &follower,
+            Some(format!("http://{address}")),
+            now,
+        );
+        let outcome = announce_current_record_commitment_tip_with_endpoint_policy(
+            &source_storage,
+            &source_peers,
+            &coordinator,
+            &reqwest::Client::new(),
+            &[follower.public_key_bytes()],
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.announced_height, 1);
+        assert_eq!(outcome.attempted, 1);
+        assert_eq!(outcome.accepted, 0);
+        assert_eq!(outcome.stale, 1);
+        assert_eq!(outcome.failed, 0);
+        assert!(notifications.try_recv().is_err());
 
         server.abort();
         let _ = server.await;

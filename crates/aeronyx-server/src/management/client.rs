@@ -66,6 +66,7 @@
 //   v2.8.12        - Added fail-closed lease window and recovery evidence
 //   v2.8.13        - Added witness-certificate block confirmation coverage
 //   v2.8.14        - Added privacy-safe event-driven follower telemetry
+//   v2.8.15        - Added exact coordinator announcement receipt telemetry
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -206,6 +207,24 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub announcements_stale_total: u64,
     /// Authenticated announcements observed while the follower task was unavailable.
     pub announcements_unavailable_total: u64,
+    /// Most recent coordinator-side tip announcement round time.
+    pub last_outbound_announcement_at: Option<u64>,
+    /// Audited local tip height encoded by the latest outbound frame.
+    pub last_outbound_announced_height: Option<u64>,
+    /// Latest privacy-safe aggregate outbound delivery result.
+    pub last_outbound_announcement_result: Option<String>,
+    /// Outbound announcement rounds observed since process start.
+    pub outbound_announcement_rounds_total: u64,
+    /// Rounds skipped before any peer delivery result existed.
+    pub outbound_announcement_rounds_skipped_total: u64,
+    /// Distinct pinned peers considered by outbound rounds.
+    pub outbound_announcements_attempted_total: u64,
+    /// Peers returning exactly `202 Accepted`.
+    pub outbound_announcements_accepted_total: u64,
+    /// Peers returning exactly `204 No Content`.
+    pub outbound_announcements_stale_total: u64,
+    /// Missing, unsafe, unreachable, or protocol-incompatible peers.
+    pub outbound_announcements_failed_total: u64,
     /// Most recent follower pull attempt.
     pub last_attempt_at: Option<u64>,
     /// Most recent successful verified response page.
@@ -864,6 +883,15 @@ mod tests {
                 announcements_coalesced_total: 1,
                 announcements_stale_total: 3,
                 announcements_unavailable_total: 0,
+                last_outbound_announcement_at: Some(97),
+                last_outbound_announced_height: Some(10),
+                last_outbound_announcement_result: Some("partial".to_string()),
+                outbound_announcement_rounds_total: 4,
+                outbound_announcement_rounds_skipped_total: 1,
+                outbound_announcements_attempted_total: 9,
+                outbound_announcements_accepted_total: 5,
+                outbound_announcements_stale_total: 2,
+                outbound_announcements_failed_total: 2,
                 last_attempt_at: Some(99),
                 last_success_at: Some(100),
                 last_failure_at: Some(110),
@@ -972,6 +1000,15 @@ mod tests {
         assert_eq!(sync["announcements_coalesced_total"], 1);
         assert_eq!(sync["announcements_stale_total"], 3);
         assert_eq!(sync["announcements_unavailable_total"], 0);
+        assert_eq!(sync["last_outbound_announcement_at"], 97);
+        assert_eq!(sync["last_outbound_announced_height"], 10);
+        assert_eq!(sync["last_outbound_announcement_result"], "partial");
+        assert_eq!(sync["outbound_announcement_rounds_total"], 4);
+        assert_eq!(sync["outbound_announcement_rounds_skipped_total"], 1);
+        assert_eq!(sync["outbound_announcements_attempted_total"], 9);
+        assert_eq!(sync["outbound_announcements_accepted_total"], 5);
+        assert_eq!(sync["outbound_announcements_stale_total"], 2);
+        assert_eq!(sync["outbound_announcements_failed_total"], 2);
         assert_eq!(sync["last_attempt_at"], 99);
         assert_eq!(sync["last_error_code"], "request_timeout");
         let checkpoint = &value["record_commitment_checkpoint"];

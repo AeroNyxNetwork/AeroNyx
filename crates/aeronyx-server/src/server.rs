@@ -241,6 +241,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.8.15-AnnouncementReceipts - Exact coordinator tip-delivery result evidence
 //   v2.8.14-SyncObservability - Event-driven follower trigger and announcement evidence
 //   v2.8.12-LeaseFailClosedTelemetry - Partition/recovery lease evidence
 //   v2.8.11-CoordinatorLeaseRelease - Signed graceful lease handover on SIGINT/SIGTERM
@@ -2411,6 +2412,23 @@ impl Server {
                             announcements_stale_total: status.announcements_stale_total,
                             announcements_unavailable_total: status
                                 .announcements_unavailable_total,
+                            last_outbound_announcement_at: status.last_outbound_announcement_at,
+                            last_outbound_announced_height: status
+                                .last_outbound_announced_height,
+                            last_outbound_announcement_result: status
+                                .last_outbound_announcement_result,
+                            outbound_announcement_rounds_total: status
+                                .outbound_announcement_rounds_total,
+                            outbound_announcement_rounds_skipped_total: status
+                                .outbound_announcement_rounds_skipped_total,
+                            outbound_announcements_attempted_total: status
+                                .outbound_announcements_attempted_total,
+                            outbound_announcements_accepted_total: status
+                                .outbound_announcements_accepted_total,
+                            outbound_announcements_stale_total: status
+                                .outbound_announcements_stale_total,
+                            outbound_announcements_failed_total: status
+                                .outbound_announcements_failed_total,
                             last_attempt_at: status.last_attempt_at,
                             last_success_at: status.last_success_at,
                             last_failure_at: status.last_failure_at,
@@ -3628,14 +3646,27 @@ impl Server {
                         };
                         match delivery {
                             Ok(delivery) => {
+                                storage.record_commitment_outbound_announcement(
+                                    unix_now_secs(),
+                                    delivery.announced_height,
+                                    delivery.attempted,
+                                    delivery.accepted,
+                                    delivery.stale,
+                                    delivery.failed,
+                                );
                                 debug!(
+                                    announced_height = delivery.announced_height,
                                     attempted = delivery.attempted,
                                     accepted = delivery.accepted,
+                                    stale = delivery.stale,
                                     failed = delivery.failed,
                                     "[MEMCHAIN_BLOCK] Sent bounded follower tip announcements"
                                 );
                             }
                             Err(reason) => {
+                                storage.record_commitment_outbound_announcement_skipped(
+                                    unix_now_secs(),
+                                );
                                 warn!(
                                     reason = %reason,
                                     "[MEMCHAIN_BLOCK] Tip announcement skipped; witness reconciliation retained"
