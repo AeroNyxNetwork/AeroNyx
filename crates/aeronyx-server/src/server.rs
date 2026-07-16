@@ -175,6 +175,8 @@
 //  75. Triggers witness reconciliation immediately after a canonical tip
 //      advance through a bounded local channel; the low-frequency schedule
 //      remains the recovery path and block production never waits on witnesses.
+//  76. Warms at most three direct blind-relay candidates concurrently on the
+//      first gossip round, then returns to one candidate per recovery cadence.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -244,8 +246,12 @@
 //   - A newer audited commitment tip may cancel an older in-flight announcement
 //     round. Cancellation is delivery prioritization only: it must not mutate
 //     the canonical chain, witness evidence, lease state, or production gates.
+//   - A middle-hop ACK is not terminal-authenticated routeability evidence.
+//     Startup warm-up must probe each candidate directly and remain bounded;
+//     never mark a terminal healthy solely because a middle claims forwarding.
 //
 // Last Modified:
+//   v2.8.20-RouteWarmup - Bounded direct startup routeability probes
 //   v2.8.19-TipSupersessionIntegration - Verify latest-tip delivery over real HTTP
 //   v2.8.18-TipSupersession - Prioritize newer audited tip announcements
 //   v2.8.17-TipRetryQueue - Bounded transient follower wake-up retries
@@ -458,6 +464,8 @@ const KEEPALIVE_ACK_TIMEOUT_SECS: u64 = 90;
 const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
 const BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS: u64 = 15 * 60;
 const BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS: u64 = 60;
+/// Direct startup probes are bounded independently of untrusted peer count.
+const BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES: usize = 3;
 
 /// Public IP services should return one textual IP address and whitespace.
 const PUBLIC_IP_RESPONSE_MAX_BYTES: usize = 256;
@@ -4410,15 +4418,21 @@ impl Server {
                             >= probe_cooldown_secs;
 
                     if probe_due {
-                        if Self::probe_blind_relay_candidate(
+                        let max_candidates = if last_blind_relay_probe_at == 0 {
+                            BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES
+                        } else {
+                            1
+                        };
+                        let probes_started = Self::probe_blind_relay_candidates(
                             &client,
                             &peer_store,
                             &identity,
                             &self_node_id,
                             probe_now,
+                            max_candidates,
                         )
-                        .await
-                        {
+                        .await;
+                        if probes_started > 0 {
                             last_blind_relay_probe_at = probe_now;
                         }
                     } else {
@@ -4632,13 +4646,23 @@ impl Server {
         Ok(())
     }
 
-    async fn probe_blind_relay_candidate(
+    /// Directly probes a bounded set of signed ChatRelay candidates.
+    ///
+    /// The first recovery round may cover up to three peers concurrently so a
+    /// small node mesh does not spend multiple gossip intervals in a partially
+    /// routeable state after restart. The hard clamp prevents peer-count-based
+    /// request amplification; steady-state callers pass one.
+    async fn probe_blind_relay_candidates(
         client: &reqwest::Client,
         peer_store: &PeerStore,
         identity: &IdentityKeyPair,
         self_node_id: &[u8; 32],
         now: u64,
-    ) -> bool {
+        max_candidates: usize,
+    ) -> usize {
+        if max_candidates == 0 {
+            return 0;
+        }
         let mut candidates = peer_store.route_probe_candidates_with_capability_excluding(
             NodeCapability::ChatRelay,
             now,
@@ -4646,20 +4670,43 @@ impl Server {
             &[*self_node_id],
         );
         Self::prioritize_probe_candidates(peer_store, now, &mut candidates);
-        let Some(candidate) = candidates.into_iter().next() else {
-            return false;
-        };
+        let candidates = candidates
+            .into_iter()
+            .take(max_candidates.min(BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES))
+            .collect::<Vec<_>>();
+        let attempted = candidates.len();
+        let probes = candidates.into_iter().map(|candidate| {
+            Self::probe_blind_relay_candidate_descriptor(
+                client,
+                peer_store,
+                identity,
+                self_node_id,
+                candidate,
+                now,
+            )
+        });
+        futures::future::join_all(probes).await;
+        attempted
+    }
 
+    async fn probe_blind_relay_candidate_descriptor(
+        client: &reqwest::Client,
+        peer_store: &PeerStore,
+        identity: &IdentityKeyPair,
+        self_node_id: &[u8; 32],
+        candidate: SignedNodeDescriptor,
+        now: u64,
+    ) {
         let next_hop = candidate.node_id();
         let Some(endpoint) = candidate.descriptor.public_endpoint.as_deref() else {
             peer_store.record_blind_relay_probe_result(now, false, "missing_endpoint");
             peer_store.record_route_forward_failure(&next_hop, now, "missing_endpoint");
-            return true;
+            return;
         };
         let Some(url) = Self::blind_relay_probe_url(endpoint) else {
             peer_store.record_blind_relay_probe_result(now, false, "invalid_endpoint");
             peer_store.record_route_forward_failure(&next_hop, now, "invalid_endpoint");
-            return true;
+            return;
         };
 
         let envelope = BlindRelayEnvelope {
@@ -4720,7 +4767,6 @@ impl Server {
                 peer_store.record_route_forward_failure(&next_hop, now, reason);
             }
         }
-        true
     }
 
     async fn probe_two_hop_blind_relay_path(
@@ -6991,7 +7037,8 @@ mod tests {
         memchain_index_rejection_reason, prefix_to_netmask, unix_now_secs,
         CommitmentCoordinatorLeaseRound, CommitmentTipAnnouncementWaitOutcome,
         CommitmentWitnessStartupBlockReason, CommitmentWitnessStartupDecision, Server,
-        BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
+        BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
+        COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
     };
     use crate::api::memchain_peer::{
         announce_current_record_commitment_tip_for_test, build_memchain_peer_router,
@@ -7016,7 +7063,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
 
-    use crate::api::chat_peer::{PeerChatRelayRequest, PeerChatRelayResponse};
+    use crate::api::chat_peer::{
+        PeerBlindRelayResponse, PeerChatRelayRequest, PeerChatRelayResponse,
+    };
     use crate::api::discovery::GossipResponse;
     use crate::config::{DiscoveryConfig, ServerConfig};
     use crate::services::memchain::MemoryStorage;
@@ -8276,6 +8325,92 @@ mod tests {
         assert_eq!(candidates[0].node_id(), unproven_id);
         assert_eq!(candidates[1].node_id(), proven_id);
         assert_eq!(candidates[2].node_id(), quarantined_id);
+    }
+
+    #[tokio::test]
+    async fn startup_blind_relay_probe_batch_is_bounded_and_completes_coverage() {
+        let now = 1_800_100_000u64;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let handler_requests = Arc::clone(&requests);
+        let router = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(move || {
+                let requests = Arc::clone(&handler_requests);
+                async move {
+                    requests.fetch_add(1, AtomicOrdering::SeqCst);
+                    Json(PeerBlindRelayResponse {
+                        accepted: true,
+                        terminal: true,
+                        forwarded: false,
+                        ttl_remaining: 1,
+                        reason: Some("terminal_next_hop".to_string()),
+                    })
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let http_server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let store = PeerStore::new();
+        let endpoint = format!("http://{address}");
+        let candidates = (1..=4)
+            .map(|sequence| {
+                signed_chat_relay_peer_descriptor(
+                    endpoint.clone(),
+                    sequence,
+                    now.saturating_add(600),
+                )
+            })
+            .collect::<Vec<_>>();
+        let candidate_ids = candidates
+            .iter()
+            .map(SignedNodeDescriptor::node_id)
+            .collect::<Vec<_>>();
+        for candidate in candidates {
+            store.upsert_verified(candidate, now).unwrap();
+        }
+
+        let identity = IdentityKeyPair::generate();
+        let self_node_id = identity.public_key_bytes();
+        let attempted = Server::probe_blind_relay_candidates(
+            &reqwest::Client::new(),
+            &store,
+            &identity,
+            &self_node_id,
+            now,
+            usize::MAX,
+        )
+        .await;
+        assert_eq!(attempted, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES);
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(
+            candidate_ids
+                .iter()
+                .filter(|node_id| store.is_routeable_now(node_id, now))
+                .count(),
+            3
+        );
+
+        let attempted = Server::probe_blind_relay_candidates(
+            &reqwest::Client::new(),
+            &store,
+            &identity,
+            &self_node_id,
+            now.saturating_add(1),
+            1,
+        )
+        .await;
+        assert_eq!(attempted, 1);
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 4);
+        assert!(candidate_ids
+            .iter()
+            .all(|node_id| store.is_routeable_now(node_id, now.saturating_add(1))));
+
+        http_server.abort();
+        let _ = http_server.await;
     }
 
     #[test]
