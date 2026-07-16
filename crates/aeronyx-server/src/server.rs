@@ -180,6 +180,8 @@
 //  77. Persists only fresh descriptor-bound routeability success evidence in
 //      the local peer cache, restores it fail-closed, and still revalidates all
 //      startup candidates with bounded direct probes.
+//  78. Joins peer-cache persistence and discovery gossip tasks during graceful
+//      shutdown so signed route evidence is durably fsynced before process exit.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -254,6 +256,7 @@
 //     never mark a terminal healthy solely because a middle claims forwarding.
 //
 // Last Modified:
+//   v2.8.22-DiscoveryTaskLifecycle - Await peer-cache and gossip shutdown tasks
 //   v2.8.21-RouteEvidenceCache - Descriptor-bound warm-restart routeability evidence
 //   v2.8.20-RouteWarmup - Bounded direct startup routeability probes
 //   v2.8.19-TipSupersessionIntegration - Verify latest-tip delivery over real HTTP
@@ -1033,9 +1036,9 @@ impl Server {
         } else {
             None
         };
-        let _peer_store_persistence_task =
+        let peer_store_persistence_task =
             self.spawn_peer_store_persistence_task(Arc::clone(&peer_store));
-        let _discovery_gossip_task =
+        let discovery_gossip_task =
             self.spawn_discovery_gossip_task(Arc::clone(&peer_store), chat_relay_runtime_ready);
 
         let udp = Arc::new(
@@ -1050,6 +1053,12 @@ impl Server {
 
         let server_pubkey_hex = hex::encode(self.identity.public_key_bytes());
         let mut tasks: Vec<(&str, JoinHandle<()>)> = Vec::new();
+        if let Some(task) = peer_store_persistence_task {
+            tasks.push(("peer-cache-persistence", task));
+        }
+        if let Some(task) = discovery_gossip_task {
+            tasks.push(("discovery-gossip", task));
+        }
 
         // AeroNyx client readiness requires DNS to be available at the tunnel
         // gateway. When enabled, this proxy forwards opaque UDP DNS bytes only
