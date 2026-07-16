@@ -120,6 +120,9 @@
 //! - Route governance summary condenses routeability, scoring, quarantine,
 //!   and degradation state into one aggregate nodeboard/backend contract
 //!   without exposing endpoints, route IDs, payloads, or peer graph data
+//! - Local peer-cache snapshots can retain descriptor-bound successful
+//!   routeability evidence across a short process restart while rejecting
+//!   stale, future-dated, mismatched, quarantined, or unsigned state
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -146,6 +149,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.52.0-RouteabilityCacheEvidence - Added bounded descriptor-bound warm-restart route evidence
 //! v0.51.0-RouteGovernanceSummary - Added aggregate route-quality governance contract
 //! v0.50.0-TwoHopProofStabilityWindow - Added privacy-safe stability window and failure circuit breaker fields
 //! v0.49.0-TwoHopProbeReasonBuckets - Bucket runtime two-hop blind relay probe errors
@@ -211,6 +215,7 @@ use aeronyx_core::protocol::discovery::{
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const DISCOVERY_GOSSIP_STALE_AFTER_SECS: u64 = 900;
 const DISCOVERY_GOSSIP_FAILURE_ATTENTION_THRESHOLD: u64 = 3;
@@ -220,6 +225,9 @@ const PEER_ROUTE_LAST_SEEN_ACCEPTABLE_SECS: u64 = 900;
 const PEER_ROUTE_LAST_SEEN_STALE_SECS: u64 = 1_800;
 const PEER_ROUTE_RECENT_FAILURE_SECS: u64 = 600;
 const PEER_ROUTEABILITY_STALE_AFTER_SECS: u64 = 1_800;
+/// Local peer-cache routeability evidence schema understood by this node.
+pub const ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION: u16 = 1;
+const PEER_ROUTEABILITY_CACHE_MAX_ENTRIES: usize = 4_096;
 const PEER_ROUTE_FAILURE_QUARANTINE_THRESHOLD: u64 = 3;
 const PEER_ROUTE_FAILURE_QUARANTINE_SECS: u64 = 300;
 const PEER_ROUTE_RECOVERY_PROBE_AFTER_SECS: u64 = 60;
@@ -590,6 +598,18 @@ pub struct PeerStoreBootstrapStatus {
     pub last_cache_load_detail: Option<String>,
     /// Timestamp of the last peer-cache startup load attempt.
     pub last_cache_load_at: Option<u64>,
+    /// Routeability cache restore status: restored, partial, empty, or rejected.
+    #[serde(default)]
+    pub last_routeability_cache_status: Option<String>,
+    /// Number of descriptor-bound routeability records restored at startup.
+    #[serde(default)]
+    pub last_routeability_cache_restored: u64,
+    /// Number of routeability cache records rejected by freshness or binding checks.
+    #[serde(default)]
+    pub last_routeability_cache_rejected: u64,
+    /// Timestamp of the last routeability cache restore attempt.
+    #[serde(default)]
+    pub last_routeability_cache_at: Option<u64>,
     /// Number of peers attempted in the last outbound gossip round.
     pub last_gossip_attempted: u64,
     /// Number of configured seed endpoints attempted in the last gossip round.
@@ -652,6 +672,10 @@ impl Default for PeerStoreBootstrapStatus {
             last_cache_load_status: None,
             last_cache_load_detail: None,
             last_cache_load_at: None,
+            last_routeability_cache_status: None,
+            last_routeability_cache_restored: 0,
+            last_routeability_cache_rejected: 0,
+            last_routeability_cache_at: None,
             last_gossip_attempted: 0,
             last_gossip_seed_attempted: 0,
             last_gossip_succeeded: 0,
@@ -1158,6 +1182,39 @@ struct PeerRouteHealth {
     quarantine_until: Option<u64>,
     last_quarantine_at: Option<u64>,
     last_quarantine_reason: Option<String>,
+}
+
+/// Descriptor-bound successful routeability evidence stored only in the local
+/// peer cache for warm restart recovery.
+///
+/// This deliberately excludes endpoints, route ids, payloads, receiver ids,
+/// client metadata, failure history, quarantine state, and social graph data.
+/// A record is usable only while its exact signed descriptor remains valid and
+/// its success timestamp remains inside the normal routeability freshness
+/// window. Startup direct probes still revalidate restored evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreRouteabilityCacheEvidence {
+    /// Full node id encoded as lowercase hex for exact local descriptor lookup.
+    pub node_id_hex: String,
+    /// Sequence of the exact signed descriptor observed during the success.
+    pub descriptor_sequence: u64,
+    /// SHA-256 binding over the canonical descriptor bytes and signature.
+    pub descriptor_fingerprint_sha256: String,
+    /// Unix timestamp of the last successful direct opaque probe or forward.
+    pub last_success_at: u64,
+    /// Stable evidence kind; currently `direct_opaque_route_success` only.
+    pub evidence_kind: String,
+}
+
+/// Aggregate result of restoring descriptor-bound routeability evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreRouteabilityCacheRestoreReport {
+    /// Number of cache evidence records supplied, including bounded overflow.
+    pub total: usize,
+    /// Number of fresh records restored into local route-health state.
+    pub restored: usize,
+    /// Number rejected by schema, descriptor binding, validity, or freshness checks.
+    pub rejected: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3566,6 +3623,247 @@ impl PeerStore {
         NodeBootstrapSnapshot::new(generated_at, descriptors)
     }
 
+    /// Exports fresh successful routeability evidence for local restart recovery.
+    ///
+    /// Every record is bound to the exact signed descriptor that was active
+    /// when the direct opaque route succeeded. Failure counters, quarantine
+    /// state, proof history, endpoint values, route ids, and payload metadata
+    /// are intentionally excluded. The result is bounded independently of the
+    /// configured peer count to keep local cache amplification controlled.
+    #[must_use]
+    pub fn export_routeability_cache_evidence(
+        &self,
+        generated_at: u64,
+    ) -> Vec<PeerStoreRouteabilityCacheEvidence> {
+        let peers = self.peers.read();
+        let route_health = self.route_health.read();
+        let mut evidence = Vec::new();
+
+        for (node_id, descriptor) in peers.iter() {
+            if evidence.len() >= PEER_ROUTEABILITY_CACHE_MAX_ENTRIES {
+                break;
+            }
+            if descriptor.verify_at(generated_at).is_err()
+                || descriptor
+                    .descriptor
+                    .public_endpoint
+                    .as_deref()
+                    .map(str::trim)
+                    .is_none_or(str::is_empty)
+            {
+                continue;
+            }
+            let Some(health) = route_health.get(node_id) else {
+                continue;
+            };
+            let Some(last_success_at) = health.last_success_at else {
+                continue;
+            };
+            if last_success_at > generated_at
+                || last_success_at < descriptor.descriptor.issued_at
+                || generated_at.saturating_sub(last_success_at)
+                    > PEER_ROUTEABILITY_STALE_AFTER_SECS
+                || health
+                    .last_failure_at
+                    .is_some_and(|failure_at| failure_at >= last_success_at)
+                || Self::route_quarantine_remaining_seconds(health, generated_at).is_some()
+            {
+                continue;
+            }
+            let Some(descriptor_fingerprint_sha256) =
+                Self::descriptor_routeability_fingerprint(descriptor)
+            else {
+                continue;
+            };
+            evidence.push(PeerStoreRouteabilityCacheEvidence {
+                node_id_hex: hex::encode(node_id),
+                descriptor_sequence: descriptor.sequence(),
+                descriptor_fingerprint_sha256,
+                last_success_at,
+                evidence_kind: "direct_opaque_route_success".to_string(),
+            });
+        }
+        drop(route_health);
+        drop(peers);
+
+        evidence.sort_by(|left, right| left.node_id_hex.cmp(&right.node_id_hex));
+        self.record_audit_event(
+            generated_at,
+            "routeability_cache_export",
+            "accepted",
+            format!(
+                "schema_version={} exported={} stale_after_seconds={}",
+                ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
+                evidence.len(),
+                PEER_ROUTEABILITY_STALE_AFTER_SECS
+            ),
+        );
+        evidence
+    }
+
+    /// Restores fresh descriptor-bound routeability evidence from local cache.
+    ///
+    /// This method fails closed per record. It restores only a successful
+    /// timestamp, never failures, scores, quarantine state, route paths, proof
+    /// history, or traffic counters. Exact descriptor fingerprint matching
+    /// prevents evidence from surviving endpoint, capability, KEM key, policy,
+    /// sequence, or signature changes. Startup direct probes must still run.
+    pub fn restore_routeability_cache_evidence(
+        &self,
+        records: &[PeerStoreRouteabilityCacheEvidence],
+        now: u64,
+    ) -> PeerStoreRouteabilityCacheRestoreReport {
+        let mut restored = 0usize;
+        let mut rejected = records
+            .len()
+            .saturating_sub(PEER_ROUTEABILITY_CACHE_MAX_ENTRIES);
+
+        for record in records.iter().take(PEER_ROUTEABILITY_CACHE_MAX_ENTRIES) {
+            let mut node_id = [0u8; 32];
+            if record.evidence_kind != "direct_opaque_route_success"
+                || hex::decode_to_slice(&record.node_id_hex, &mut node_id).is_err()
+                || record.last_success_at > now
+                || now.saturating_sub(record.last_success_at)
+                    > PEER_ROUTEABILITY_STALE_AFTER_SECS
+            {
+                rejected = rejected.saturating_add(1);
+                continue;
+            }
+
+            let descriptor = self.peers.read().get(&node_id).cloned();
+            let Some(descriptor) = descriptor else {
+                rejected = rejected.saturating_add(1);
+                continue;
+            };
+            let descriptor_matches = descriptor.verify_at(now).is_ok()
+                && descriptor.sequence() == record.descriptor_sequence
+                && descriptor.descriptor.issued_at <= record.last_success_at
+                && descriptor
+                    .descriptor
+                    .public_endpoint
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|endpoint| !endpoint.is_empty())
+                && Self::descriptor_routeability_fingerprint(&descriptor)
+                    .is_some_and(|fingerprint| {
+                        fingerprint == record.descriptor_fingerprint_sha256
+                    });
+            if !descriptor_matches {
+                rejected = rejected.saturating_add(1);
+                continue;
+            }
+
+            let mut route_health = self.route_health.write();
+            let health = route_health.entry(node_id).or_default();
+            let conflicts_with_newer_runtime_state = health
+                .last_failure_at
+                .is_some_and(|failure_at| failure_at >= record.last_success_at)
+                || Self::route_quarantine_remaining_seconds(health, now).is_some();
+            if conflicts_with_newer_runtime_state {
+                rejected = rejected.saturating_add(1);
+                continue;
+            }
+            if health
+                .last_success_at
+                .is_none_or(|last_success_at| record.last_success_at > last_success_at)
+            {
+                health.last_success_at = Some(record.last_success_at);
+            }
+            health.success_count = health.success_count.max(1);
+            restored = restored.saturating_add(1);
+        }
+
+        let report = PeerStoreRouteabilityCacheRestoreReport {
+            total: records.len(),
+            restored,
+            rejected,
+        };
+        let status_bucket = if records.is_empty() {
+            "empty"
+        } else if restored == records.len() {
+            "restored"
+        } else if restored > 0 {
+            "partial"
+        } else {
+            "rejected"
+        };
+        {
+            let mut status = self.bootstrap_status.write();
+            status.last_routeability_cache_status = Some(status_bucket.to_string());
+            status.last_routeability_cache_restored = restored as u64;
+            status.last_routeability_cache_rejected = rejected as u64;
+            status.last_routeability_cache_at = Some(now);
+        }
+        self.record_audit_event(
+            now,
+            "routeability_cache_restore",
+            if restored > 0 || records.is_empty() {
+                "accepted"
+            } else {
+                "rejected"
+            },
+            format!(
+                "schema_version={} total={} restored={} rejected={} status={status_bucket}",
+                ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
+                records.len(),
+                restored,
+                rejected
+            ),
+        );
+        report
+    }
+
+    /// Records a cache-level routeability authentication rejection while
+    /// allowing independently signed peer descriptors to remain recoverable.
+    ///
+    /// The reason is normalized to a fixed bucket so parser or key details do
+    /// not enter operator telemetry. No routeability state is restored.
+    pub fn reject_routeability_cache_evidence(
+        &self,
+        total: usize,
+        now: u64,
+        reason: &str,
+    ) -> PeerStoreRouteabilityCacheRestoreReport {
+        let reason_bucket = match reason {
+            "identity_unavailable" => "identity_unavailable",
+            _ => "signature_invalid",
+        };
+        {
+            let mut status = self.bootstrap_status.write();
+            status.last_routeability_cache_status = Some("rejected".to_string());
+            status.last_routeability_cache_restored = 0;
+            status.last_routeability_cache_rejected = total as u64;
+            status.last_routeability_cache_at = Some(now);
+        }
+        self.record_audit_event(
+            now,
+            "routeability_cache_restore",
+            "rejected",
+            format!(
+                "schema_version={} total={} restored=0 rejected={} status=rejected reason={reason_bucket}",
+                ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
+                total,
+                total
+            ),
+        );
+        PeerStoreRouteabilityCacheRestoreReport {
+            total,
+            restored: 0,
+            rejected: total,
+        }
+    }
+
+    fn descriptor_routeability_fingerprint(
+        descriptor: &SignedNodeDescriptor,
+    ) -> Option<String> {
+        let signing_bytes = descriptor.descriptor.signing_bytes().ok()?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"aeronyx-routeability-cache-evidence-v1");
+        hasher.update(signing_bytes);
+        hasher.update(descriptor.signature);
+        Some(hex::encode(hasher.finalize()))
+    }
+
     /// Builds a discovery snapshot response from current valid peers.
     #[must_use]
     pub fn build_snapshot_response(
@@ -5515,6 +5813,99 @@ mod tests {
         assert!(store.is_routeable_now(&node_id, now + 4));
 
         assert!(!store.is_routeable_now(&node_id, now + 3 + PEER_ROUTEABILITY_STALE_AFTER_SECS + 1));
+    }
+
+    #[test]
+    fn test_routeability_cache_restores_only_exact_fresh_descriptor_evidence() {
+        let now = 1_700_000_100;
+        let peer_kp = IdentityKeyPair::generate();
+        let mut descriptor = signed_descriptor_for(&peer_kp, 7, now + 4_000);
+        descriptor.descriptor.public_endpoint = Some("https://warm-restart.example".to_string());
+        descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &peer_kp).unwrap();
+        let node_id = descriptor.node_id();
+
+        let original = PeerStore::new();
+        original
+            .upsert_verified_from_source(descriptor.clone(), now, "gossip_announce")
+            .unwrap();
+        original.record_route_forward_success(&node_id, now + 10);
+        let evidence = original.export_routeability_cache_evidence(now + 20);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].descriptor_sequence, 7);
+        assert_eq!(evidence[0].evidence_kind, "direct_opaque_route_success");
+        assert!(!serde_json::to_string(&evidence).unwrap().contains("warm-restart.example"));
+
+        let restored = PeerStore::new();
+        restored
+            .upsert_verified_from_source(descriptor, now + 21, "cache")
+            .unwrap();
+        let report = restored.restore_routeability_cache_evidence(&evidence, now + 21);
+
+        assert_eq!(
+            report,
+            PeerStoreRouteabilityCacheRestoreReport {
+                total: 1,
+                restored: 1,
+                rejected: 0,
+            }
+        );
+        assert!(restored.is_routeable_now(&node_id, now + 21));
+        let status = restored.status(now + 21);
+        assert_eq!(
+            status.bootstrap.last_routeability_cache_status.as_deref(),
+            Some("restored")
+        );
+        assert_eq!(status.bootstrap.last_routeability_cache_restored, 1);
+        assert_eq!(status.bootstrap.last_routeability_cache_rejected, 0);
+        assert_eq!(status.bootstrap.last_routeability_cache_at, Some(now + 21));
+    }
+
+    #[test]
+    fn test_routeability_cache_rejects_tampered_future_and_stale_evidence() {
+        let now = 1_700_000_100;
+        let peer_kp = IdentityKeyPair::generate();
+        let mut descriptor = signed_descriptor_for(&peer_kp, 3, now + 10_000);
+        descriptor.descriptor.public_endpoint = Some("https://strict-cache.example".to_string());
+        descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &peer_kp).unwrap();
+        let node_id = descriptor.node_id();
+
+        let source = PeerStore::new();
+        source.upsert_verified(descriptor.clone(), now).unwrap();
+        source.record_route_forward_success(&node_id, now + 5);
+        let valid = source.export_routeability_cache_evidence(now + 6).remove(0);
+        let mut tampered = valid.clone();
+        let replacement = if tampered.descriptor_fingerprint_sha256.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        tampered
+            .descriptor_fingerprint_sha256
+            .replace_range(..1, replacement);
+        let mut future = valid.clone();
+        future.last_success_at = now + 100;
+        let mut stale = valid;
+        stale.last_success_at = now.saturating_sub(PEER_ROUTEABILITY_STALE_AFTER_SECS + 1);
+
+        let restored = PeerStore::new();
+        restored.upsert_verified(descriptor, now + 7).unwrap();
+        let report = restored.restore_routeability_cache_evidence(
+            &[tampered, future, stale],
+            now + 7,
+        );
+
+        assert_eq!(report.total, 3);
+        assert_eq!(report.restored, 0);
+        assert_eq!(report.rejected, 3);
+        assert!(!restored.is_routeable_now(&node_id, now + 7));
+        assert_eq!(
+            restored
+                .status(now + 7)
+                .bootstrap
+                .last_routeability_cache_status
+                .as_deref(),
+            Some("rejected")
+        );
     }
 
     #[test]

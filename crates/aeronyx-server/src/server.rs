@@ -177,6 +177,9 @@
 //      remains the recovery path and block production never waits on witnesses.
 //  76. Warms at most three direct blind-relay candidates concurrently on the
 //      first gossip round, then returns to one candidate per recovery cadence.
+//  77. Persists only fresh descriptor-bound routeability success evidence in
+//      the local peer cache, restores it fail-closed, and still revalidates all
+//      startup candidates with bounded direct probes.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -251,6 +254,7 @@
 //     never mark a terminal healthy solely because a middle claims forwarding.
 //
 // Last Modified:
+//   v2.8.21-RouteEvidenceCache - Descriptor-bound warm-restart routeability evidence
 //   v2.8.20-RouteWarmup - Bounded direct startup routeability probes
 //   v2.8.19-TipSupersessionIntegration - Verify latest-tip delivery over real HTTP
 //   v2.8.18-TipSupersession - Prioritize newer audited tip announcements
@@ -438,6 +442,9 @@ use crate::services::memchain::{
 #[allow(deprecated)]
 use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
 use crate::services::memchain::{LlmRouter, TaskWorker};
+use crate::services::peer_store::{
+    PeerStoreRouteabilityCacheEvidence, ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
+};
 use crate::services::{
     spawn_dns_proxy, HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore, RoutingService,
     SessionManager,
@@ -475,6 +482,125 @@ const DISCOVERY_GOSSIP_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 
 /// Bootstrap/cache snapshots may contain thousands of signed descriptors.
 const DISCOVERY_SNAPSHOT_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Backward-compatible local peer-cache document.
+///
+/// `descriptor_snapshot` is flattened so legacy readers still see the exact
+/// `NodeBootstrapSnapshot` top-level shape and ignore the additive routeability
+/// fields. This document is local-only and must never be served by gossip.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PeerStoreCacheDocument {
+    #[serde(flatten)]
+    descriptor_snapshot: NodeBootstrapSnapshot,
+    #[serde(default)]
+    routeability_evidence_schema_version: u16,
+    #[serde(default)]
+    routeability_evidence: Vec<PeerStoreRouteabilityCacheEvidence>,
+    #[serde(default)]
+    routeability_evidence_signer_node_id: Option<String>,
+    #[serde(default)]
+    routeability_evidence_signature_ed25519: Option<String>,
+}
+
+impl PeerStoreCacheDocument {
+    fn new(
+        descriptor_snapshot: NodeBootstrapSnapshot,
+        routeability_evidence: Vec<PeerStoreRouteabilityCacheEvidence>,
+        identity: &IdentityKeyPair,
+    ) -> Result<Self> {
+        let mut document = Self {
+            descriptor_snapshot,
+            routeability_evidence_schema_version: ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
+            routeability_evidence,
+            routeability_evidence_signer_node_id: None,
+            routeability_evidence_signature_ed25519: None,
+        };
+        let signing_bytes = document
+            .routeability_evidence_signing_bytes()
+            .map_err(ServerError::internal)?;
+        document.routeability_evidence_signer_node_id =
+            Some(hex::encode(identity.public_key_bytes()));
+        document.routeability_evidence_signature_ed25519 =
+            Some(hex::encode(identity.sign(&signing_bytes)));
+        Ok(document)
+    }
+
+    fn from_json_bytes(bytes: &[u8]) -> std::result::Result<Self, String> {
+        if bytes.len() > DISCOVERY_SNAPSHOT_MAX_BYTES {
+            return Err(format!(
+                "peer cache exceeds {} bytes",
+                DISCOVERY_SNAPSHOT_MAX_BYTES
+            ));
+        }
+        let document: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("peer cache json: {error}"))?;
+        document
+            .descriptor_snapshot
+            .validate_schema()
+            .map_err(|error| format!("peer cache descriptor snapshot: {error}"))?;
+        let evidence_version_valid = (document.routeability_evidence.is_empty()
+            && document.routeability_evidence_schema_version == 0)
+            || document.routeability_evidence_schema_version
+                == ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION;
+        if !evidence_version_valid {
+            return Err(format!(
+                "unsupported routeability evidence schema version: {}",
+                document.routeability_evidence_schema_version
+            ));
+        }
+        Ok(document)
+    }
+
+    fn verify_routeability_evidence_signature(
+        &self,
+        identity: &IdentityKeyPair,
+    ) -> std::result::Result<(), String> {
+        if self.routeability_evidence.is_empty()
+            && self.routeability_evidence_schema_version == 0
+        {
+            return Ok(());
+        }
+        let expected_signer = hex::encode(identity.public_key_bytes());
+        if self.routeability_evidence_signer_node_id.as_deref() != Some(&expected_signer) {
+            return Err("routeability evidence signer mismatch".to_string());
+        }
+        let signature_hex = self
+            .routeability_evidence_signature_ed25519
+            .as_deref()
+            .ok_or_else(|| "routeability evidence signature missing".to_string())?;
+        let mut signature = [0u8; 64];
+        hex::decode_to_slice(signature_hex, &mut signature)
+            .map_err(|_| "routeability evidence signature encoding invalid".to_string())?;
+        let public_key = IdentityPublicKey::from_bytes(&identity.public_key_bytes())
+            .map_err(|_| "routeability evidence signer key invalid".to_string())?;
+        let signing_bytes = self.routeability_evidence_signing_bytes()?;
+        public_key
+            .verify(&signing_bytes, &signature)
+            .map_err(|_| "routeability evidence signature invalid".to_string())
+    }
+
+    fn routeability_evidence_signing_bytes(&self) -> std::result::Result<Vec<u8>, String> {
+        bincode::serialize(&(
+            "aeronyx-peer-cache-routeability-v1",
+            self.descriptor_snapshot.generated_at,
+            self.routeability_evidence_schema_version,
+            &self.routeability_evidence,
+        ))
+        .map_err(|error| format!("routeability evidence signing bytes: {error}"))
+    }
+
+    fn to_json_pretty(&self) -> Result<Vec<u8>> {
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| ServerError::internal(format!("peer cache json: {error}")))?;
+        if bytes.len() > DISCOVERY_SNAPSHOT_MAX_BYTES {
+            return Err(ServerError::internal(format!(
+                "peer cache exceeds {} bytes",
+                DISCOVERY_SNAPSHOT_MAX_BYTES
+            )));
+        }
+        Ok(bytes)
+    }
+}
 
 /// Return the privacy-safe reason a persisted MemChain record must not enter
 /// the in-memory recall index.
@@ -2902,7 +3028,14 @@ impl Server {
         if let Some(path) = &self.config.discovery.bootstrap_snapshot_path {
             match Self::read_bounded_file(Path::new(path), DISCOVERY_SNAPSHOT_MAX_BYTES).await {
                 Ok(bytes) => {
-                    Self::import_bootstrap_snapshot_bytes(&peer_store, "file", path, &bytes, now);
+                    Self::import_bootstrap_snapshot_bytes(
+                        &peer_store,
+                        "file",
+                        path,
+                        &bytes,
+                        now,
+                        None,
+                    );
                 }
                 Err(e) => {
                     peer_store.record_bootstrap_source(
@@ -2941,6 +3074,7 @@ impl Server {
                                         url,
                                         &bytes,
                                         now,
+                                        None,
                                     );
                                 }
                                 Err(e) => {
@@ -3047,7 +3181,13 @@ impl Server {
         if let Some(path) = &self.config.discovery.peer_cache_path {
             let cache_save_at = unix_now_secs();
             if let Err(e) =
-                Self::persist_peer_store_cache_once(&peer_store, path, cache_save_at).await
+                Self::persist_peer_store_cache_once(
+                    &self.identity,
+                    &peer_store,
+                    path,
+                    cache_save_at,
+                )
+                .await
             {
                 warn!(
                     source = %path,
@@ -3109,7 +3249,14 @@ impl Server {
     async fn load_peer_cache(&self, peer_store: &PeerStore, path: &str, now: u64) {
         match Self::read_bounded_file(Path::new(path), DISCOVERY_SNAPSHOT_MAX_BYTES).await {
             Ok(bytes) => {
-                if !Self::import_bootstrap_snapshot_bytes(peer_store, "cache", path, &bytes, now) {
+                if !Self::import_bootstrap_snapshot_bytes(
+                    peer_store,
+                    "cache",
+                    path,
+                    &bytes,
+                    now,
+                    Some(&self.identity),
+                ) {
                     self.load_peer_cache_backup(peer_store, path, now).await;
                 }
             }
@@ -3149,6 +3296,7 @@ impl Server {
                     &backup_source,
                     &bytes,
                     now,
+                    Some(&self.identity),
                 ) {
                     info!(
                         source = %backup_source,
@@ -3193,14 +3341,24 @@ impl Server {
 
         let interval_secs = self.config.discovery.peer_cache_write_interval_secs;
         let shutdown = Arc::clone(&self.shutdown);
+        let identity = Arc::new(self.identity.clone());
         let mut rx = self.shutdown_tx.subscribe();
 
         Some(tokio::spawn(async move {
             let mut timer = tokio::time::interval(Duration::from_secs(interval_secs));
-            let persist_snapshot =
-                |peer_store: Arc<PeerStore>, path: String, reason: &'static str| async move {
+            let persist_snapshot = |identity: Arc<IdentityKeyPair>,
+                                    peer_store: Arc<PeerStore>,
+                                    path: String,
+                                    reason: &'static str| async move {
                     let now = unix_now_secs();
-                    match Self::persist_peer_store_cache_once(&peer_store, &path, now).await {
+                    match Self::persist_peer_store_cache_once(
+                        identity.as_ref(),
+                        &peer_store,
+                        &path,
+                        now,
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             debug!(
                                 source = %path,
@@ -3222,15 +3380,15 @@ impl Server {
             loop {
                 tokio::select! {
                     _ = rx.recv() => {
-                        persist_snapshot(Arc::clone(&peer_store), path.clone(), "shutdown").await;
+                        persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), path.clone(), "shutdown").await;
                         break;
                     }
                     _ = timer.tick() => {
                         if shutdown.load(Ordering::SeqCst) {
-                            persist_snapshot(Arc::clone(&peer_store), path.clone(), "shutdown_flag").await;
+                            persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), path.clone(), "shutdown_flag").await;
                             break;
                         }
-                        persist_snapshot(Arc::clone(&peer_store), path.clone(), "interval").await;
+                        persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), path.clone(), "interval").await;
                     }
                 }
             }
@@ -5496,6 +5654,7 @@ impl Server {
     }
 
     async fn save_peer_store_cache_snapshot(
+        identity: &IdentityKeyPair,
         peer_store: &PeerStore,
         path: &str,
         now: u64,
@@ -5507,8 +5666,14 @@ impl Server {
             }
         }
 
-        let snapshot = peer_store.export_peer_cache_snapshot(now);
-        let bytes = snapshot.to_json_pretty()?;
+        let descriptor_snapshot = peer_store.export_peer_cache_snapshot(now);
+        let routeability_evidence = peer_store.export_routeability_cache_evidence(now);
+        let document = PeerStoreCacheDocument::new(
+            descriptor_snapshot,
+            routeability_evidence,
+            identity,
+        )?;
+        let bytes = document.to_json_pretty()?;
         let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
         let backup_path = Self::peer_cache_backup_path(path.to_string_lossy().as_ref());
 
@@ -5569,6 +5734,7 @@ impl Server {
     }
 
     async fn persist_peer_store_cache_once(
+        identity: &IdentityKeyPair,
         peer_store: &PeerStore,
         path: &str,
         now: u64,
@@ -5581,7 +5747,7 @@ impl Server {
             return Ok(());
         }
 
-        match Self::save_peer_store_cache_snapshot(peer_store, path, now).await {
+        match Self::save_peer_store_cache_snapshot(identity, peer_store, path, now).await {
             Ok(()) => {
                 peer_store.record_cache_save_status(now, "success", "snapshot_persisted");
                 Ok(())
@@ -5607,11 +5773,11 @@ impl Server {
         let Ok(bytes) = Self::read_bounded_file(path, DISCOVERY_SNAPSHOT_MAX_BYTES).await else {
             return false;
         };
-        let Ok(snapshot) = NodeBootstrapSnapshot::from_json_bytes(&bytes) else {
+        let Ok(document) = PeerStoreCacheDocument::from_json_bytes(&bytes) else {
             return false;
         };
 
-        snapshot.verified_count_at(now) > 0
+        document.descriptor_snapshot.verified_count_at(now) > 0
     }
 
     fn build_self_discovery_descriptor(&self, now: u64) -> Result<SignedNodeDescriptor> {
@@ -5761,54 +5927,115 @@ impl Server {
         source: &str,
         bytes: &[u8],
         now: u64,
+        cache_identity: Option<&IdentityKeyPair>,
     ) -> bool {
-        match NodeBootstrapSnapshot::from_json_bytes(bytes) {
-            Ok(snapshot) => {
-                let report = if matches!(source_kind, "cache" | "cache_backup") {
-                    peer_store.load_peer_cache_snapshot_from_source(&snapshot, now, source_kind)
-                } else {
-                    peer_store.load_bootstrap_snapshot_from_source(&snapshot, now, source_kind)
-                };
-                peer_store.record_bootstrap_source(
-                    now,
-                    source_kind,
-                    if report.rejected > 0 {
-                        "warning"
+        let is_peer_cache = matches!(source_kind, "cache" | "cache_backup");
+        let parsed = if is_peer_cache {
+            PeerStoreCacheDocument::from_json_bytes(bytes).map(|document| {
+                let authentication_status =
+                    if document.routeability_evidence_schema_version == 0 {
+                        "legacy_descriptor_only"
+                    } else if cache_identity.is_some_and(|identity| {
+                        document
+                            .verify_routeability_evidence_signature(identity)
+                            .is_ok()
+                    }) {
+                        "verified"
+                    } else if cache_identity.is_some() {
+                        "signature_invalid"
                     } else {
-                        "success"
-                    },
-                    format!(
-                        "total={} inserted={} unchanged={} stale={} rejected={}",
-                        report.total,
-                        report.inserted,
-                        report.unchanged,
-                        report.stale,
-                        report.rejected
-                    ),
-                );
-                info!(
-                    source_kind,
-                    source = %source,
-                    total = report.total,
-                    inserted = report.inserted,
-                    unchanged = report.unchanged,
-                    stale = report.stale,
-                    rejected = report.rejected,
-                    "[DISCOVERY] Bootstrap snapshot imported"
-                );
-                report.inserted > 0 || report.unchanged > 0
-            }
-            Err(e) => {
+                        "identity_unavailable"
+                    };
+                (
+                    document.descriptor_snapshot,
+                    Some(document.routeability_evidence),
+                    authentication_status,
+                )
+            })
+        } else {
+            NodeBootstrapSnapshot::from_json_bytes(bytes)
+                .map(|snapshot| (snapshot, None, "not_applicable"))
+                .map_err(|error| error.to_string())
+        };
+        let (snapshot, routeability_evidence, routeability_authentication) = match parsed {
+            Ok(parsed) => parsed,
+            Err(error) => {
                 peer_store.record_bootstrap_source(now, source_kind, "failed", "json_rejected");
                 warn!(
                     source_kind,
                     source = %source,
-                    error = %e,
+                    error = %error,
                     "[DISCOVERY] Bootstrap snapshot rejected"
                 );
-                false
+                return false;
             }
-        }
+        };
+
+        let report = if is_peer_cache {
+            peer_store.load_peer_cache_snapshot_from_source(&snapshot, now, source_kind)
+        } else {
+            peer_store.load_bootstrap_snapshot_from_source(&snapshot, now, source_kind)
+        };
+        let route_report = match (routeability_authentication, routeability_evidence.as_deref()) {
+            ("signature_invalid", Some(records)) => Some(
+                peer_store.reject_routeability_cache_evidence(
+                    records.len(),
+                    now,
+                    "signature_invalid",
+                ),
+            ),
+            ("identity_unavailable", Some(records)) => Some(
+                peer_store.reject_routeability_cache_evidence(
+                    records.len(),
+                    now,
+                    "identity_unavailable",
+                ),
+            ),
+            (_, Some(records)) => {
+                Some(peer_store.restore_routeability_cache_evidence(records, now))
+            }
+            (_, None) => None,
+        };
+        let route_restored = route_report.map(|value| value.restored).unwrap_or(0);
+        let route_rejected = route_report.map(|value| value.rejected).unwrap_or(0);
+        let route_authentication_rejected = matches!(
+            routeability_authentication,
+            "signature_invalid" | "identity_unavailable"
+        );
+        peer_store.record_bootstrap_source(
+            now,
+            source_kind,
+            if report.rejected > 0 || route_rejected > 0 || route_authentication_rejected {
+                "warning"
+            } else {
+                "success"
+            },
+            format!(
+                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_restored={} routeability_rejected={}",
+                report.total,
+                report.inserted,
+                report.unchanged,
+                report.stale,
+                report.rejected,
+                routeability_authentication,
+                route_restored,
+                route_rejected
+            ),
+        );
+        info!(
+            source_kind,
+            source = %source,
+            total = report.total,
+            inserted = report.inserted,
+            unchanged = report.unchanged,
+            stale = report.stale,
+            rejected = report.rejected,
+            routeability_authentication,
+            routeability_restored = route_restored,
+            routeability_rejected = route_rejected,
+            "[DISCOVERY] Bootstrap snapshot imported"
+        );
+        report.inserted > 0 || report.unchanged > 0
     }
 
     fn init_services(
@@ -7036,9 +7263,11 @@ mod tests {
         commitment_coordinator_lease_production_valid_for, commitment_witness_startup_decision,
         memchain_index_rejection_reason, prefix_to_netmask, unix_now_secs,
         CommitmentCoordinatorLeaseRound, CommitmentTipAnnouncementWaitOutcome,
-        CommitmentWitnessStartupBlockReason, CommitmentWitnessStartupDecision, Server,
+        CommitmentWitnessStartupBlockReason, CommitmentWitnessStartupDecision,
+        PeerStoreCacheDocument, Server,
         BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
         COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
+        ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
     };
     use crate::api::memchain_peer::{
         announce_current_record_commitment_tip_for_test, build_memchain_peer_router,
@@ -8669,15 +8898,21 @@ mod tests {
         let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-{unique}.json"));
         let path_str = path.to_string_lossy().to_string();
 
-        Server::save_peer_store_cache_snapshot(&peer_store, &path_str, now)
+        Server::save_peer_store_cache_snapshot(&server.identity, &peer_store, &path_str, now)
             .await
             .unwrap();
 
         let bytes = tokio::fs::read(&path).await.unwrap();
         let snapshot = NodeBootstrapSnapshot::from_json_bytes(&bytes).unwrap();
+        let document = PeerStoreCacheDocument::from_json_bytes(&bytes).unwrap();
 
         assert_eq!(snapshot.peers.len(), 1);
         assert_eq!(snapshot.verified_count_at(now + 1), 1);
+        assert_eq!(
+            document.routeability_evidence_schema_version,
+            ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION
+        );
+        assert!(document.routeability_evidence.is_empty());
 
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -8693,6 +8928,7 @@ mod tests {
         let signed = server.build_self_discovery_descriptor(now).unwrap();
         let original_store = Arc::new(PeerStore::new());
         assert!(original_store.upsert_verified(signed.clone(), now).unwrap());
+        original_store.record_route_forward_success(&signed.node_id(), now + 1);
 
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -8701,20 +8937,33 @@ mod tests {
         let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-restore-{unique}.json"));
         let path_str = path.to_string_lossy().to_string();
 
-        Server::save_peer_store_cache_snapshot(&original_store, &path_str, now)
+        Server::save_peer_store_cache_snapshot(
+            &server.identity,
+            &original_store,
+            &path_str,
+            now + 2,
+        )
             .await
             .unwrap();
 
         let restored_store = PeerStore::new();
         let bytes = tokio::fs::read(&path).await.unwrap();
-        Server::import_bootstrap_snapshot_bytes(&restored_store, "cache", &path_str, &bytes, now);
+        Server::import_bootstrap_snapshot_bytes(
+            &restored_store,
+            "cache",
+            &path_str,
+            &bytes,
+            now + 3,
+            Some(&server.identity),
+        );
 
         assert_eq!(restored_store.len(), 1);
         assert!(restored_store
-            .get_valid(&signed.node_id(), now + 1)
+            .get_valid(&signed.node_id(), now + 3)
             .is_some());
+        assert!(restored_store.is_routeable_now(&signed.node_id(), now + 3));
 
-        let status = restored_store.status(now + 1);
+        let status = restored_store.status(now + 3);
         assert_eq!(status.snapshot.valid_peers, 1);
         assert_eq!(status.bootstrap.last_source_kind.as_deref(), Some("cache"));
         assert_eq!(
@@ -8729,11 +8978,119 @@ mod tests {
             status.bootstrap.last_cache_load_status.as_deref(),
             Some("success")
         );
-        assert_eq!(status.bootstrap.last_cache_load_at, Some(now));
+        assert_eq!(status.bootstrap.last_cache_load_at, Some(now + 3));
+        assert_eq!(
+            status.bootstrap.last_routeability_cache_status.as_deref(),
+            Some("restored")
+        );
+        assert_eq!(status.bootstrap.last_routeability_cache_restored, 1);
+        assert_eq!(status.bootstrap.last_routeability_cache_rejected, 0);
+        assert_eq!(status.bootstrap.last_routeability_cache_at, Some(now + 3));
         assert!(status
             .recent_audit_events
             .iter()
             .any(|event| event.action == "bootstrap_source"));
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_peer_cache_without_routeability_fields_remains_accepted() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let now: u64 = 1_800_010_000;
+        let signed = server.build_self_discovery_descriptor(now).unwrap();
+        let legacy = NodeBootstrapSnapshot::new(now, vec![signed.clone()]);
+        let bytes = legacy.to_json_pretty().unwrap();
+        let restored_store = PeerStore::new();
+
+        assert!(Server::import_bootstrap_snapshot_bytes(
+            &restored_store,
+            "cache",
+            "legacy-test-cache",
+            &bytes,
+            now + 1,
+            Some(&server.identity),
+        ));
+        assert!(restored_store
+            .get_valid(&signed.node_id(), now + 1)
+            .is_some());
+        assert!(!restored_store.is_routeable_now(&signed.node_id(), now + 1));
+        assert_eq!(
+            restored_store
+                .status(now + 1)
+                .bootstrap
+                .last_routeability_cache_status
+                .as_deref(),
+            Some("empty")
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_rejects_tampered_routeability_signature() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let now: u64 = 1_800_020_000;
+        let signed = server.build_self_discovery_descriptor(now).unwrap();
+        let original_store = Arc::new(PeerStore::new());
+        original_store.upsert_verified(signed.clone(), now).unwrap();
+        original_store.record_route_forward_success(&signed.node_id(), now + 1);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "aeronyx-peer-cache-signature-tamper-{unique}.json"
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        Server::save_peer_store_cache_snapshot(
+            &server.identity,
+            &original_store,
+            &path_str,
+            now + 2,
+        )
+        .await
+        .unwrap();
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let mut document = PeerStoreCacheDocument::from_json_bytes(&bytes).unwrap();
+        document.routeability_evidence[0].last_success_at = now + 2;
+        let tampered = serde_json::to_vec_pretty(&document).unwrap();
+        let restored_store = PeerStore::new();
+
+        assert!(Server::import_bootstrap_snapshot_bytes(
+            &restored_store,
+            "cache",
+            &path_str,
+            &tampered,
+            now + 3,
+            Some(&server.identity),
+        ));
+        assert!(restored_store
+            .get_valid(&signed.node_id(), now + 3)
+            .is_some());
+        assert!(!restored_store.is_routeable_now(&signed.node_id(), now + 3));
+        assert_eq!(
+            restored_store
+                .status(now + 3)
+                .bootstrap
+                .last_source_status
+                .as_deref(),
+            Some("warning")
+        );
+        let status = restored_store.status(now + 3);
+        assert_eq!(
+            status.bootstrap.last_routeability_cache_status.as_deref(),
+            Some("rejected")
+        );
+        assert_eq!(status.bootstrap.last_routeability_cache_restored, 0);
+        assert_eq!(status.bootstrap.last_routeability_cache_rejected, 1);
 
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -8771,13 +9128,25 @@ mod tests {
             std::env::temp_dir().join(format!("aeronyx-peer-cache-expired-restore-{unique}.json"));
         let path_str = path.to_string_lossy().to_string();
 
-        Server::save_peer_store_cache_snapshot(&original_store, &path_str, now)
+        Server::save_peer_store_cache_snapshot(
+            &server.identity,
+            &original_store,
+            &path_str,
+            now,
+        )
             .await
             .unwrap();
 
         let restored_store = PeerStore::new();
         let bytes = tokio::fs::read(&path).await.unwrap();
-        Server::import_bootstrap_snapshot_bytes(&restored_store, "cache", &path_str, &bytes, now);
+        Server::import_bootstrap_snapshot_bytes(
+            &restored_store,
+            "cache",
+            &path_str,
+            &bytes,
+            now,
+            Some(&server.identity),
+        );
 
         assert_eq!(restored_store.len(), 1);
         assert!(restored_store.get_valid(&node_id, now).is_none());
@@ -8814,7 +9183,12 @@ mod tests {
         let path_str = path.to_string_lossy().to_string();
         let backup_path = Server::peer_cache_backup_path(&path_str);
 
-        Server::save_peer_store_cache_snapshot(&original_store, &path_str, now)
+        Server::save_peer_store_cache_snapshot(
+            &server.identity,
+            &original_store,
+            &path_str,
+            now,
+        )
             .await
             .unwrap();
         tokio::fs::copy(&path, &backup_path).await.unwrap();
@@ -8874,7 +9248,12 @@ mod tests {
         let path_str = path.to_string_lossy().to_string();
         let backup_path = Server::peer_cache_backup_path(&path_str);
 
-        Server::save_peer_store_cache_snapshot(&original_store, &path_str, now)
+        Server::save_peer_store_cache_snapshot(
+            &server.identity,
+            &original_store,
+            &path_str,
+            now,
+        )
             .await
             .unwrap();
         tokio::fs::copy(&path, &backup_path).await.unwrap();
@@ -8970,12 +9349,22 @@ mod tests {
         let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-preserve-{unique}.json"));
         let path_str = path.to_string_lossy().to_string();
 
-        Server::save_peer_store_cache_snapshot(&recovery_store, &path_str, now)
+        Server::save_peer_store_cache_snapshot(
+            &server.identity,
+            &recovery_store,
+            &path_str,
+            now,
+        )
             .await
             .unwrap();
 
         let empty_store = Arc::new(PeerStore::new());
-        Server::persist_peer_store_cache_once(&empty_store, &path_str, now + 1)
+        Server::persist_peer_store_cache_once(
+            &server.identity,
+            &empty_store,
+            &path_str,
+            now + 1,
+        )
             .await
             .unwrap();
 
@@ -9022,7 +9411,13 @@ mod tests {
             signed_chat_relay_peer_descriptor("http://127.0.0.1:10".to_string(), now, now + 300);
         let cache_store = Arc::new(PeerStore::new());
         assert!(cache_store.upsert_verified(fresh.clone(), now).unwrap());
-        Server::save_peer_store_cache_snapshot(&cache_store, &cache_path_str, now)
+        let identity = IdentityKeyPair::generate();
+        Server::save_peer_store_cache_snapshot(
+            &identity,
+            &cache_store,
+            &cache_path_str,
+            now,
+        )
             .await
             .unwrap();
 
@@ -9033,7 +9428,7 @@ mod tests {
         config.discovery.peer_cache_path = Some(cache_path_str.clone());
         config.discovery.public_endpoint = Some("node.example.com:443".to_string());
 
-        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let server = Server::new(config, identity, None);
         let restored_store = server.init_peer_store(false).await;
         let status = restored_store.status(now + 1);
 
