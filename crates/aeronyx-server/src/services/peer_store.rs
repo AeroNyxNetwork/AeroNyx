@@ -152,6 +152,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.55.0-TwoHopProofCache - Added signed bounded warm-restart proof history
 //! v0.54.0-RelayEvidenceTruthfulness - Stopped classifying unlabelled blind-relay acceptance as real user traffic
 //! v0.53.0-RouteSurfaceEvidence - Bound route health to stable signed routing fields across descriptor refreshes
 //! v0.52.0-RouteabilityCacheEvidence - Added bounded descriptor-bound warm-restart route evidence
@@ -232,6 +233,8 @@ const PEER_ROUTE_RECENT_FAILURE_SECS: u64 = 600;
 const PEER_ROUTEABILITY_STALE_AFTER_SECS: u64 = 1_800;
 /// Local peer-cache routeability evidence schema understood by this node.
 pub const ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION: u16 = 1;
+/// Local peer-cache two-hop proof history schema understood by this node.
+pub const TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION: u16 = 1;
 const ROUTEABILITY_EVIDENCE_KIND_EXACT_DESCRIPTOR: &str = "direct_opaque_route_success";
 const ROUTEABILITY_EVIDENCE_KIND_ROUTE_SURFACE: &str = "direct_opaque_route_surface_success";
 const PEER_ROUTEABILITY_CACHE_MAX_ENTRIES: usize = 4_096;
@@ -297,6 +300,10 @@ pub struct PeerStoreSnapshot {
 const MAX_AUDIT_EVENTS: usize = 64;
 const MAX_PEER_EVENTS: usize = 64;
 const MAX_TWO_HOP_PATH_PROOF_EVENTS: usize = 32;
+/// Warm-restart proof history is intentionally smaller than runtime history.
+/// Eight events are enough for the existing stability window while bounding
+/// disk exposure and preventing a local cache from becoming a traffic ledger.
+const TWO_HOP_PATH_PROOF_CACHE_MAX_ENTRIES: usize = 8;
 const TWO_HOP_PATH_PROOF_STABILITY_WINDOW_EVENTS: usize = 8;
 const TWO_HOP_PATH_PROOF_STABILITY_MIN_ATTEMPTS: u64 = 3;
 const TWO_HOP_PATH_PROOF_STABILITY_SUCCESS_PERCENT: u8 = 80;
@@ -373,7 +380,8 @@ pub struct PeerStoreTwoHopPathProofEvent {
 /// rolling operator view over synthetic protocol-health probes so nodeboard and
 /// the public website can show whether the blind relay fabric is repeatedly
 /// proving entry -> middle -> terminal reachability while preserving the
-/// blind-node invariant.
+/// blind-node invariant. A separately signed, freshness-bounded subset may be
+/// restored after a warm restart; stale history is discarded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerStoreTwoHopPathProofHistory {
     /// Unix timestamp when this summary was generated.
@@ -629,6 +637,18 @@ pub struct PeerStoreBootstrapStatus {
     /// Timestamp of the last routeability cache restore attempt.
     #[serde(default)]
     pub last_routeability_cache_at: Option<u64>,
+    /// Signed two-hop proof cache restore status: restored, partial, empty, or rejected.
+    #[serde(default)]
+    pub last_two_hop_proof_cache_status: Option<String>,
+    /// Number of fresh synthetic proof events restored at startup.
+    #[serde(default)]
+    pub last_two_hop_proof_cache_restored: u64,
+    /// Number of proof events rejected by authentication, schema, or freshness checks.
+    #[serde(default)]
+    pub last_two_hop_proof_cache_rejected: u64,
+    /// Timestamp of the last two-hop proof cache restore attempt.
+    #[serde(default)]
+    pub last_two_hop_proof_cache_at: Option<u64>,
     /// Number of peers attempted in the last outbound gossip round.
     pub last_gossip_attempted: u64,
     /// Number of configured seed endpoints attempted in the last gossip round.
@@ -695,6 +715,10 @@ impl Default for PeerStoreBootstrapStatus {
             last_routeability_cache_restored: 0,
             last_routeability_cache_rejected: 0,
             last_routeability_cache_at: None,
+            last_two_hop_proof_cache_status: None,
+            last_two_hop_proof_cache_restored: 0,
+            last_two_hop_proof_cache_rejected: 0,
+            last_two_hop_proof_cache_at: None,
             last_gossip_attempted: 0,
             last_gossip_seed_attempted: 0,
             last_gossip_succeeded: 0,
@@ -1257,6 +1281,17 @@ pub struct PeerStoreRouteabilityCacheRestoreReport {
     /// Number of fresh records restored into local route-health state.
     pub restored: usize,
     /// Number rejected by schema, descriptor binding, validity, or freshness checks.
+    pub rejected: usize,
+}
+
+/// Aggregate result of restoring signed, privacy-safe two-hop proof history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreTwoHopProofCacheRestoreReport {
+    /// Number of cache events supplied, including bounded overflow.
+    pub total: usize,
+    /// Number of fresh, schema-valid events restored into local probe history.
+    pub restored: usize,
+    /// Number rejected by bounds, freshness, route-pool, or field checks.
     pub rejected: usize,
 }
 
@@ -3749,6 +3784,248 @@ impl PeerStore {
         NodeBootstrapSnapshot::new(generated_at, descriptors)
     }
 
+    /// Exports a bounded, freshness-checked subset of synthetic two-hop proofs.
+    ///
+    /// The returned events contain only allowlisted aggregate fields and are
+    /// intended for a separately signed local cache section. They are not a
+    /// relay receipt, user-message history, route log, or consensus record.
+    #[must_use]
+    pub fn export_two_hop_path_proof_cache_events(
+        &self,
+        generated_at: u64,
+    ) -> Vec<PeerStoreTwoHopPathProofEvent> {
+        let mut events = self
+            .two_hop_path_proof_events
+            .read()
+            .iter()
+            .rev()
+            .filter(|event| Self::two_hop_path_proof_cache_event_valid(event, generated_at))
+            .take(TWO_HOP_PATH_PROOF_CACHE_MAX_ENTRIES)
+            .cloned()
+            .collect::<Vec<_>>();
+        events.reverse();
+        self.record_audit_event(
+            generated_at,
+            "two_hop_proof_cache_export",
+            "accepted",
+            format!(
+                "schema_version={} exported={} max_entries={} stale_after_seconds={}",
+                TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+                events.len(),
+                TWO_HOP_PATH_PROOF_CACHE_MAX_ENTRIES,
+                PEER_ROUTEABILITY_STALE_AFTER_SECS
+            ),
+        );
+        events
+    }
+
+    /// Restores a signed, bounded two-hop synthetic proof window.
+    ///
+    /// Recovery is permitted only after descriptor-bound routeability evidence
+    /// has rebuilt a complete, distinct middle/terminal path. This prevents an
+    /// old proof cache from claiming readiness for a changed or unavailable
+    /// route pool. Only synthetic probe counters are reconstructed; real relay
+    /// received, terminal, forwarded, and payload-volume counters remain zero.
+    pub fn restore_two_hop_path_proof_cache_events(
+        &self,
+        records: &[PeerStoreTwoHopPathProofEvent],
+        now: u64,
+    ) -> PeerStoreTwoHopProofCacheRestoreReport {
+        if records.is_empty() {
+            return self.finish_two_hop_proof_cache_restore(0, 0, 0, now, None);
+        }
+        if !self.route_path_status(now).chat_two_hop_onion_ready.complete {
+            return self.finish_two_hop_proof_cache_restore(
+                records.len(), 0, records.len(), now, Some("route_pool_unready"),
+            );
+        }
+
+        let bounded_start = records
+            .len()
+            .saturating_sub(TWO_HOP_PATH_PROOF_CACHE_MAX_ENTRIES);
+        let mut rejected = bounded_start;
+        let mut restored_events = Vec::new();
+        let mut previous_at = None;
+        {
+            let mut history = self.two_hop_path_proof_events.write();
+            for event in records.iter().skip(bounded_start) {
+                let timestamp_order_valid = previous_at.is_none_or(|at| event.at >= at);
+                previous_at = Some(event.at);
+                if !timestamp_order_valid
+                    || !Self::two_hop_path_proof_cache_event_valid(event, now)
+                    || history.iter().any(|existing| existing == event)
+                {
+                    rejected = rejected.saturating_add(1);
+                    continue;
+                }
+                if history.len() >= MAX_TWO_HOP_PATH_PROOF_EVENTS {
+                    history.pop_front();
+                }
+                history.push_back(event.clone());
+                restored_events.push(event.clone());
+            }
+        }
+
+        let restored = restored_events.len();
+        if restored > 0 {
+            let succeeded = restored_events
+                .iter()
+                .filter(|event| event.outcome == "accepted")
+                .count();
+            let failed = restored.saturating_sub(succeeded);
+            let latest_at = restored_events
+                .iter()
+                .map(|event| event.at)
+                .max()
+                .unwrap_or(0);
+            self.counters
+                .blind_relay_two_hop_probe_attempted
+                .fetch_add(restored as u64, Ordering::Relaxed);
+            self.counters
+                .blind_relay_two_hop_probe_succeeded
+                .fetch_add(succeeded as u64, Ordering::Relaxed);
+            self.counters
+                .blind_relay_two_hop_probe_failed
+                .fetch_add(failed as u64, Ordering::Relaxed);
+            self.counters
+                .last_blind_relay_two_hop_probe_at
+                .fetch_max(latest_at, Ordering::Relaxed);
+            self.counters
+                .last_blind_relay_at
+                .fetch_max(latest_at, Ordering::Relaxed);
+        }
+
+        self.finish_two_hop_proof_cache_restore(
+            records.len(), restored, rejected, now, None,
+        )
+    }
+
+    /// Records cache authentication failure without discarding independently
+    /// verified descriptors or routeability evidence.
+    pub fn reject_two_hop_path_proof_cache_events(
+        &self,
+        total: usize,
+        now: u64,
+        reason: &str,
+    ) -> PeerStoreTwoHopProofCacheRestoreReport {
+        let reason_bucket = match reason {
+            "identity_unavailable" => "identity_unavailable",
+            _ => "signature_invalid",
+        };
+        {
+            let mut status = self.bootstrap_status.write();
+            status.last_two_hop_proof_cache_status = Some("rejected".to_string());
+            status.last_two_hop_proof_cache_restored = 0;
+            status.last_two_hop_proof_cache_rejected = total as u64;
+            status.last_two_hop_proof_cache_at = Some(now);
+        }
+        self.record_audit_event(
+            now,
+            "two_hop_proof_cache_restore",
+            "rejected",
+            format!(
+                "schema_version={} total={} restored=0 rejected={} status=rejected reason={reason_bucket}",
+                TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+                total,
+                total
+            ),
+        );
+        PeerStoreTwoHopProofCacheRestoreReport {
+            total,
+            restored: 0,
+            rejected: total,
+        }
+    }
+
+    fn finish_two_hop_proof_cache_restore(
+        &self,
+        total: usize,
+        restored: usize,
+        rejected: usize,
+        now: u64,
+        rejection_reason: Option<&str>,
+    ) -> PeerStoreTwoHopProofCacheRestoreReport {
+        let status_bucket = if total == 0 {
+            "empty"
+        } else if restored == total {
+            "restored"
+        } else if restored > 0 {
+            "partial"
+        } else {
+            "rejected"
+        };
+        {
+            let mut status = self.bootstrap_status.write();
+            status.last_two_hop_proof_cache_status = Some(status_bucket.to_string());
+            status.last_two_hop_proof_cache_restored = restored as u64;
+            status.last_two_hop_proof_cache_rejected = rejected as u64;
+            status.last_two_hop_proof_cache_at = Some(now);
+        }
+        let reason_detail = rejection_reason
+            .map(|reason| format!(" reason={reason}"))
+            .unwrap_or_default();
+        self.record_audit_event(
+            now,
+            "two_hop_proof_cache_restore",
+            if restored > 0 || total == 0 { "accepted" } else { "rejected" },
+            format!(
+                "schema_version={} total={} restored={} rejected={} status={}{}",
+                TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+                total,
+                restored,
+                rejected,
+                status_bucket,
+                reason_detail
+            ),
+        );
+        PeerStoreTwoHopProofCacheRestoreReport {
+            total,
+            restored,
+            rejected,
+        }
+    }
+
+    fn two_hop_path_proof_cache_event_valid(
+        event: &PeerStoreTwoHopPathProofEvent,
+        now: u64,
+    ) -> bool {
+        if event.at == 0
+            || event.at > now
+            || now.saturating_sub(event.at) > PEER_ROUTEABILITY_STALE_AFTER_SECS
+            || event.path_shape != "entry_middle_terminal"
+            || event.hop_count != 2
+            || event.path_policy != "distinct_middle_terminal"
+            || event.ttl_shape != "entry_ttl_2_onward_ttl_1"
+            || !matches!(event.middle_candidate_bucket.as_str(), "none" | "one" | "few" | "healthy" | "deep")
+            || !matches!(event.terminal_candidate_bucket.as_str(), "none" | "one" | "few" | "healthy" | "deep")
+        {
+            return false;
+        }
+
+        match event.reason_bucket.as_str() {
+            "onion_terminal_delivered" => {
+                event.outcome == "accepted"
+                    && event.evidence_mode == "synthetic_onion_message_delivery_probe"
+                    && event.proof_scope == "message_delivery"
+            }
+            "accepted" => {
+                event.outcome == "accepted"
+                    && event.evidence_mode == "synthetic_two_hop_control_probe"
+                    && event.proof_scope == "control_plane"
+            }
+            "onion_ack_rejected" | "onion_ack_decode" | "onion_kem_unavailable"
+            | "ack_rejected" | "ack_decode" | "no_distinct_path"
+            | "middle_missing_endpoint" | "middle_invalid_endpoint"
+            | "onion_http_error" | "http_error" | "onion_request_error"
+            | "request_error" => {
+                event.outcome == "rejected"
+                    && event.evidence_mode == "synthetic_two_hop_control_probe"
+                    && event.proof_scope == "control_plane"
+            }
+            _ => false,
+        }
+    }
+
     /// Exports fresh successful routeability evidence for local restart recovery.
     ///
     /// Every record is bound to the signed route surface proven by the latest
@@ -6235,6 +6512,172 @@ mod tests {
                 .as_deref(),
             Some("rejected")
         );
+    }
+
+    #[test]
+    fn test_two_hop_proof_cache_exports_only_newest_strict_fresh_window() {
+        let now = 1_700_100_000;
+        let store = PeerStore::new();
+        for offset in 1..=10 {
+            store.record_blind_relay_two_hop_probe_result_with_context(
+                now + offset, true, "onion_terminal_delivered", 3, 3, 2, 1,
+            );
+        }
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            now + 11, false, "not_allowlisted", 3, 3, 2, 1,
+        );
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            now + 100, true, "onion_terminal_delivered", 3, 3, 2, 1,
+        );
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            now.saturating_sub(PEER_ROUTEABILITY_STALE_AFTER_SECS + 1),
+            true,
+            "onion_terminal_delivered",
+            3,
+            3,
+            2,
+            1,
+        );
+
+        let events = store.export_two_hop_path_proof_cache_events(now + 20);
+
+        assert_eq!(events.len(), TWO_HOP_PATH_PROOF_CACHE_MAX_ENTRIES);
+        assert_eq!(events.first().map(|event| event.at), Some(now + 3));
+        assert_eq!(events.last().map(|event| event.at), Some(now + 10));
+        assert!(events.iter().all(|event| {
+            event.reason_bucket == "onion_terminal_delivered"
+                && event.evidence_mode == "synthetic_onion_message_delivery_probe"
+                && event.proof_scope == "message_delivery"
+        }));
+        let json = serde_json::to_string(&events).unwrap();
+        for forbidden in ["node_id", "endpoint", "route_id", "payload", "receiver"] {
+            assert!(!json.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn test_two_hop_proof_cache_restores_only_with_current_route_pool() {
+        let now = 1_700_200_000;
+        let middle_kp = IdentityKeyPair::generate();
+        let terminal_kp = IdentityKeyPair::generate();
+        let mut middle = signed_descriptor_for(&middle_kp, 1, now + 4_000);
+        middle.descriptor.public_endpoint = Some("https://middle.example".to_string());
+        middle.descriptor.capabilities.push(NodeCapability::OnionMiddle);
+        middle = SignedNodeDescriptor::sign(middle.descriptor, &middle_kp).unwrap();
+        let mut terminal = signed_descriptor_for(&terminal_kp, 1, now + 4_000);
+        terminal.descriptor.public_endpoint = Some("https://terminal.example".to_string());
+        terminal = SignedNodeDescriptor::sign(terminal.descriptor, &terminal_kp).unwrap();
+
+        let source = PeerStore::new();
+        source.upsert_verified(middle.clone(), now).unwrap();
+        source.upsert_verified(terminal.clone(), now).unwrap();
+        source.record_route_forward_success(&middle.node_id(), now + 1);
+        source.record_route_forward_success(&terminal.node_id(), now + 1);
+        for offset in 2..=4 {
+            source.record_blind_relay_two_hop_probe_result_with_context(
+                now + offset, true, "onion_terminal_delivered", 2, 2, 2, 1,
+            );
+        }
+        let route_evidence = source.export_routeability_cache_evidence(now + 5);
+        let proof_events = source.export_two_hop_path_proof_cache_events(now + 5);
+
+        let without_routes = PeerStore::new();
+        assert_eq!(
+            without_routes.restore_two_hop_path_proof_cache_events(&proof_events, now + 6),
+            PeerStoreTwoHopProofCacheRestoreReport {
+                total: 3,
+                restored: 0,
+                rejected: 3,
+            }
+        );
+
+        let restored = PeerStore::new();
+        restored.upsert_verified(middle, now + 6).unwrap();
+        restored.upsert_verified(terminal, now + 6).unwrap();
+        assert_eq!(
+            restored.restore_routeability_cache_evidence(&route_evidence, now + 6).restored,
+            2
+        );
+        let report = restored.restore_two_hop_path_proof_cache_events(&proof_events, now + 6);
+
+        assert_eq!(report.total, 3);
+        assert_eq!(report.restored, 3);
+        assert_eq!(report.rejected, 0);
+        let status = restored.status(now + 6);
+        assert_eq!(status.bootstrap.last_two_hop_proof_cache_status.as_deref(), Some("restored"));
+        assert_eq!(status.bootstrap.last_two_hop_proof_cache_restored, 3);
+        assert_eq!(status.bootstrap.last_two_hop_proof_cache_rejected, 0);
+        assert!(status.two_hop_path_proof_history.stability_ready);
+        assert!(status.two_hop_path_proof_history.recent_message_delivery_ready);
+        assert_eq!(status.runtime.blind_relay.two_hop_probe_attempted, 3);
+        assert_eq!(status.runtime.blind_relay.two_hop_probe_succeeded, 3);
+        assert_eq!(status.runtime.blind_relay.received, 0);
+        assert_eq!(status.runtime.blind_relay.terminal, 0);
+        assert_eq!(status.runtime.blind_relay.forwarded, 0);
+    }
+
+    #[test]
+    fn test_two_hop_proof_cache_rejects_inconsistent_semantics() {
+        let now = 1_700_300_000;
+        let middle_kp = IdentityKeyPair::generate();
+        let terminal_kp = IdentityKeyPair::generate();
+        let mut middle = signed_descriptor_for(&middle_kp, 1, now + 4_000);
+        middle.descriptor.public_endpoint = Some("https://middle.example".to_string());
+        middle.descriptor.capabilities.push(NodeCapability::OnionMiddle);
+        middle = SignedNodeDescriptor::sign(middle.descriptor, &middle_kp).unwrap();
+        let mut terminal = signed_descriptor_for(&terminal_kp, 1, now + 4_000);
+        terminal.descriptor.public_endpoint = Some("https://terminal.example".to_string());
+        terminal = SignedNodeDescriptor::sign(terminal.descriptor, &terminal_kp).unwrap();
+        let store = PeerStore::new();
+        store.upsert_verified(middle.clone(), now).unwrap();
+        store.upsert_verified(terminal.clone(), now).unwrap();
+        store.record_route_forward_success(&middle.node_id(), now + 1);
+        store.record_route_forward_success(&terminal.node_id(), now + 1);
+
+        let invalid = PeerStoreTwoHopPathProofEvent {
+            at: now + 2,
+            outcome: "accepted".to_string(),
+            reason_bucket: "onion_terminal_delivered".to_string(),
+            evidence_mode: "synthetic_two_hop_control_probe".to_string(),
+            proof_scope: "control_plane".to_string(),
+            path_shape: "entry_middle_terminal".to_string(),
+            hop_count: 2,
+            path_policy: "distinct_middle_terminal".to_string(),
+            middle_candidate_bucket: "few".to_string(),
+            terminal_candidate_bucket: "few".to_string(),
+            ttl_shape: "entry_ttl_2_onward_ttl_1".to_string(),
+        };
+
+        let report = store.restore_two_hop_path_proof_cache_events(&[invalid], now + 3);
+        assert_eq!(report.restored, 0);
+        assert_eq!(report.rejected, 1);
+        assert!(store.status(now + 3).two_hop_path_proof_history.events.is_empty());
+    }
+
+    #[test]
+    fn test_two_hop_proof_cache_marks_empty_authentication_failure_rejected() {
+        let store = PeerStore::new();
+        let now = 1_700_400_000;
+
+        let report = store.reject_two_hop_path_proof_cache_events(
+            0,
+            now,
+            "signature_invalid",
+        );
+
+        assert_eq!(report.total, 0);
+        assert_eq!(report.restored, 0);
+        assert_eq!(report.rejected, 0);
+        let status = store.status(now);
+        assert_eq!(
+            status.bootstrap.last_two_hop_proof_cache_status.as_deref(),
+            Some("rejected")
+        );
+        assert!(status.recent_audit_events.iter().any(|event| {
+            event.action == "two_hop_proof_cache_restore"
+                && event.outcome == "rejected"
+                && event.detail.contains("reason=signature_invalid")
+        }));
     }
 
     #[test]

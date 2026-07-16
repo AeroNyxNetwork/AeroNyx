@@ -182,6 +182,8 @@
 //      startup candidates with bounded direct probes.
 //  78. Joins peer-cache persistence and discovery gossip tasks during graceful
 //      shutdown so signed route evidence is durably fsynced before process exit.
+//  79. Signs and restores an independent bounded two-hop synthetic proof window
+//      only after current descriptor-bound routeability rebuilds the path.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -446,7 +448,8 @@ use crate::services::memchain::{
 use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
 use crate::services::memchain::{LlmRouter, TaskWorker};
 use crate::services::peer_store::{
-    PeerStoreRouteabilityCacheEvidence, ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
+    PeerStoreRouteabilityCacheEvidence, PeerStoreTwoHopPathProofEvent,
+    ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
 };
 use crate::services::{
     spawn_dns_proxy, HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore, RoutingService,
@@ -490,7 +493,10 @@ const DISCOVERY_SNAPSHOT_MAX_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// `descriptor_snapshot` is flattened so legacy readers still see the exact
 /// `NodeBootstrapSnapshot` top-level shape and ignore the additive routeability
-/// fields. This document is local-only and must never be served by gossip.
+/// and two-hop proof fields. Each recovery section has an independent signature
+/// domain, allowing one invalid section to fail closed without discarding the
+/// separately signed descriptors or other recovery evidence. This document is
+/// local-only and must never be served by gossip.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct PeerStoreCacheDocument {
     #[serde(flatten)]
@@ -503,12 +509,21 @@ struct PeerStoreCacheDocument {
     routeability_evidence_signer_node_id: Option<String>,
     #[serde(default)]
     routeability_evidence_signature_ed25519: Option<String>,
+    #[serde(default)]
+    two_hop_path_proof_schema_version: u16,
+    #[serde(default)]
+    two_hop_path_proof_events: Vec<PeerStoreTwoHopPathProofEvent>,
+    #[serde(default)]
+    two_hop_path_proof_signer_node_id: Option<String>,
+    #[serde(default)]
+    two_hop_path_proof_signature_ed25519: Option<String>,
 }
 
 impl PeerStoreCacheDocument {
     fn new(
         descriptor_snapshot: NodeBootstrapSnapshot,
         routeability_evidence: Vec<PeerStoreRouteabilityCacheEvidence>,
+        two_hop_path_proof_events: Vec<PeerStoreTwoHopPathProofEvent>,
         identity: &IdentityKeyPair,
     ) -> Result<Self> {
         let mut document = Self {
@@ -517,6 +532,10 @@ impl PeerStoreCacheDocument {
             routeability_evidence,
             routeability_evidence_signer_node_id: None,
             routeability_evidence_signature_ed25519: None,
+            two_hop_path_proof_schema_version: TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+            two_hop_path_proof_events,
+            two_hop_path_proof_signer_node_id: None,
+            two_hop_path_proof_signature_ed25519: None,
         };
         let signing_bytes = document
             .routeability_evidence_signing_bytes()
@@ -525,6 +544,13 @@ impl PeerStoreCacheDocument {
             Some(hex::encode(identity.public_key_bytes()));
         document.routeability_evidence_signature_ed25519 =
             Some(hex::encode(identity.sign(&signing_bytes)));
+        let proof_signing_bytes = document
+            .two_hop_path_proof_signing_bytes()
+            .map_err(ServerError::internal)?;
+        document.two_hop_path_proof_signer_node_id =
+            Some(hex::encode(identity.public_key_bytes()));
+        document.two_hop_path_proof_signature_ed25519 =
+            Some(hex::encode(identity.sign(&proof_signing_bytes)));
         Ok(document)
     }
 
@@ -549,6 +575,16 @@ impl PeerStoreCacheDocument {
             return Err(format!(
                 "unsupported routeability evidence schema version: {}",
                 document.routeability_evidence_schema_version
+            ));
+        }
+        let proof_version_valid = (document.two_hop_path_proof_events.is_empty()
+            && document.two_hop_path_proof_schema_version == 0)
+            || document.two_hop_path_proof_schema_version
+                == TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION;
+        if !proof_version_valid {
+            return Err(format!(
+                "unsupported two-hop proof schema version: {}",
+                document.two_hop_path_proof_schema_version
             ));
         }
         Ok(document)
@@ -590,6 +626,44 @@ impl PeerStoreCacheDocument {
             &self.routeability_evidence,
         ))
         .map_err(|error| format!("routeability evidence signing bytes: {error}"))
+    }
+
+    fn verify_two_hop_path_proof_signature(
+        &self,
+        identity: &IdentityKeyPair,
+    ) -> std::result::Result<(), String> {
+        if self.two_hop_path_proof_events.is_empty()
+            && self.two_hop_path_proof_schema_version == 0
+        {
+            return Ok(());
+        }
+        let expected_signer = hex::encode(identity.public_key_bytes());
+        if self.two_hop_path_proof_signer_node_id.as_deref() != Some(&expected_signer) {
+            return Err("two-hop proof signer mismatch".to_string());
+        }
+        let signature_hex = self
+            .two_hop_path_proof_signature_ed25519
+            .as_deref()
+            .ok_or_else(|| "two-hop proof signature missing".to_string())?;
+        let mut signature = [0u8; 64];
+        hex::decode_to_slice(signature_hex, &mut signature)
+            .map_err(|_| "two-hop proof signature encoding invalid".to_string())?;
+        let public_key = IdentityPublicKey::from_bytes(&identity.public_key_bytes())
+            .map_err(|_| "two-hop proof signer key invalid".to_string())?;
+        let signing_bytes = self.two_hop_path_proof_signing_bytes()?;
+        public_key
+            .verify(&signing_bytes, &signature)
+            .map_err(|_| "two-hop proof signature invalid".to_string())
+    }
+
+    fn two_hop_path_proof_signing_bytes(&self) -> std::result::Result<Vec<u8>, String> {
+        bincode::serialize(&(
+            "aeronyx-peer-cache-two-hop-proof-v1",
+            self.descriptor_snapshot.generated_at,
+            self.two_hop_path_proof_schema_version,
+            &self.two_hop_path_proof_events,
+        ))
+        .map_err(|error| format!("two-hop proof signing bytes: {error}"))
     }
 
     fn to_json_pretty(&self) -> Result<Vec<u8>> {
@@ -5677,9 +5751,12 @@ impl Server {
 
         let descriptor_snapshot = peer_store.export_peer_cache_snapshot(now);
         let routeability_evidence = peer_store.export_routeability_cache_evidence(now);
+        let two_hop_path_proof_events =
+            peer_store.export_two_hop_path_proof_cache_events(now);
         let document = PeerStoreCacheDocument::new(
             descriptor_snapshot,
             routeability_evidence,
+            two_hop_path_proof_events,
             identity,
         )?;
         let bytes = document.to_json_pretty()?;
@@ -5941,7 +6018,7 @@ impl Server {
         let is_peer_cache = matches!(source_kind, "cache" | "cache_backup");
         let parsed = if is_peer_cache {
             PeerStoreCacheDocument::from_json_bytes(bytes).map(|document| {
-                let authentication_status =
+                let routeability_authentication =
                     if document.routeability_evidence_schema_version == 0 {
                         "legacy_descriptor_only"
                     } else if cache_identity.is_some_and(|identity| {
@@ -5955,18 +6032,42 @@ impl Server {
                     } else {
                         "identity_unavailable"
                     };
+                let two_hop_proof_authentication =
+                    if document.two_hop_path_proof_schema_version == 0 {
+                        "legacy_descriptor_only"
+                    } else if cache_identity.is_some_and(|identity| {
+                        document
+                            .verify_two_hop_path_proof_signature(identity)
+                            .is_ok()
+                    }) {
+                        "verified"
+                    } else if cache_identity.is_some() {
+                        "signature_invalid"
+                    } else {
+                        "identity_unavailable"
+                    };
                 (
                     document.descriptor_snapshot,
                     Some(document.routeability_evidence),
-                    authentication_status,
+                    routeability_authentication,
+                    Some(document.two_hop_path_proof_events),
+                    two_hop_proof_authentication,
                 )
             })
         } else {
             NodeBootstrapSnapshot::from_json_bytes(bytes)
-                .map(|snapshot| (snapshot, None, "not_applicable"))
+                .map(|snapshot| {
+                    (snapshot, None, "not_applicable", None, "not_applicable")
+                })
                 .map_err(|error| error.to_string())
         };
-        let (snapshot, routeability_evidence, routeability_authentication) = match parsed {
+        let (
+            snapshot,
+            routeability_evidence,
+            routeability_authentication,
+            two_hop_proof_events,
+            two_hop_proof_authentication,
+        ) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
                 peer_store.record_bootstrap_source(now, source_kind, "failed", "json_rejected");
@@ -6011,16 +6112,49 @@ impl Server {
             routeability_authentication,
             "signature_invalid" | "identity_unavailable"
         );
+        // Routeability must be restored first: proof history is accepted only
+        // when the current signed descriptors still form a complete distinct
+        // middle/terminal path.
+        let proof_report = match (
+            two_hop_proof_authentication,
+            two_hop_proof_events.as_deref(),
+        ) {
+            ("signature_invalid", Some(records)) => Some(
+                peer_store.reject_two_hop_path_proof_cache_events(
+                    records.len(), now, "signature_invalid",
+                ),
+            ),
+            ("identity_unavailable", Some(records)) => Some(
+                peer_store.reject_two_hop_path_proof_cache_events(
+                    records.len(), now, "identity_unavailable",
+                ),
+            ),
+            (_, Some(records)) => Some(
+                peer_store.restore_two_hop_path_proof_cache_events(records, now),
+            ),
+            (_, None) => None,
+        };
+        let proof_restored = proof_report.map(|value| value.restored).unwrap_or(0);
+        let proof_rejected = proof_report.map(|value| value.rejected).unwrap_or(0);
+        let proof_authentication_rejected = matches!(
+            two_hop_proof_authentication,
+            "signature_invalid" | "identity_unavailable"
+        );
         peer_store.record_bootstrap_source(
             now,
             source_kind,
-            if report.rejected > 0 || route_rejected > 0 || route_authentication_rejected {
+            if report.rejected > 0
+                || route_rejected > 0
+                || route_authentication_rejected
+                || proof_rejected > 0
+                || proof_authentication_rejected
+            {
                 "warning"
             } else {
                 "success"
             },
             format!(
-                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_restored={} routeability_rejected={}",
+                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_restored={} routeability_rejected={} two_hop_proof_authentication={} two_hop_proof_restored={} two_hop_proof_rejected={}",
                 report.total,
                 report.inserted,
                 report.unchanged,
@@ -6028,7 +6162,10 @@ impl Server {
                 report.rejected,
                 routeability_authentication,
                 route_restored,
-                route_rejected
+                route_rejected,
+                two_hop_proof_authentication,
+                proof_restored,
+                proof_rejected
             ),
         );
         info!(
@@ -6042,6 +6179,9 @@ impl Server {
             routeability_authentication,
             routeability_restored = route_restored,
             routeability_rejected = route_rejected,
+            two_hop_proof_authentication,
+            two_hop_proof_restored = proof_restored,
+            two_hop_proof_rejected = proof_rejected,
             "[DISCOVERY] Bootstrap snapshot imported"
         );
         report.inserted > 0 || report.unchanged > 0
@@ -7277,6 +7417,7 @@ mod tests {
         BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
         COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
         ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
+        TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
     };
     use crate::api::memchain_peer::{
         announce_current_record_commitment_tip_for_test, build_memchain_peer_router,
@@ -8922,6 +9063,17 @@ mod tests {
             ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION
         );
         assert!(document.routeability_evidence.is_empty());
+        assert_eq!(
+            document.two_hop_path_proof_schema_version,
+            TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION
+        );
+        assert!(document.two_hop_path_proof_events.is_empty());
+        assert!(document
+            .verify_routeability_evidence_signature(&server.identity)
+            .is_ok());
+        assert!(document
+            .verify_two_hop_path_proof_signature(&server.identity)
+            .is_ok());
 
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -9036,6 +9188,132 @@ mod tests {
                 .as_deref(),
             Some("empty")
         );
+        assert_eq!(
+            restored_store
+                .status(now + 1)
+                .bootstrap
+                .last_two_hop_proof_cache_status
+                .as_deref(),
+            Some("empty")
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_restores_signed_two_hop_proof_window() {
+        let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+        let now: u64 = 1_800_015_000;
+        let middle = signed_probe_peer_descriptor(
+            "https://middle-cache.example".to_string(),
+            1,
+            now + 4_000,
+            vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+            [0x41; 32],
+        );
+        let terminal = signed_probe_peer_descriptor(
+            "https://terminal-cache.example".to_string(),
+            2,
+            now + 4_000,
+            vec![NodeCapability::ChatRelay],
+            [0x42; 32],
+        );
+        let original_store = Arc::new(PeerStore::new());
+        original_store.upsert_verified(middle.clone(), now).unwrap();
+        original_store.upsert_verified(terminal.clone(), now).unwrap();
+        original_store.record_route_forward_success(&middle.node_id(), now + 1);
+        original_store.record_route_forward_success(&terminal.node_id(), now + 1);
+        for offset in 2..=4 {
+            original_store.record_blind_relay_two_hop_probe_result_with_context(
+                now + offset, true, "onion_terminal_delivered", 2, 2, 2, 1,
+            );
+        }
+
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-two-hop-proof-{unique}.json"));
+        let path_str = path.to_string_lossy().to_string();
+        Server::save_peer_store_cache_snapshot(
+            &server.identity, &original_store, &path_str, now + 5,
+        )
+        .await
+        .unwrap();
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let document = PeerStoreCacheDocument::from_json_bytes(&bytes).unwrap();
+        assert_eq!(document.two_hop_path_proof_events.len(), 3);
+        assert!(document.verify_two_hop_path_proof_signature(&server.identity).is_ok());
+        let restored_store = PeerStore::new();
+        assert!(Server::import_bootstrap_snapshot_bytes(
+            &restored_store, "cache", &path_str, &bytes, now + 6, Some(&server.identity),
+        ));
+
+        assert!(restored_store.is_routeable_now(&middle.node_id(), now + 6));
+        assert!(restored_store.is_routeable_now(&terminal.node_id(), now + 6));
+        let status = restored_store.status(now + 6);
+        assert_eq!(status.bootstrap.last_two_hop_proof_cache_status.as_deref(), Some("restored"));
+        assert_eq!(status.bootstrap.last_two_hop_proof_cache_restored, 3);
+        assert!(status.two_hop_path_proof_history.stability_ready);
+        assert!(status.two_hop_path_proof_history.recent_message_delivery_ready);
+        assert_eq!(status.runtime.blind_relay.received, 0);
+        assert_eq!(status.runtime.blind_relay.terminal, 0);
+        assert_eq!(status.runtime.blind_relay.forwarded, 0);
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_rejects_tampered_two_hop_proof_independently() {
+        let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+        let now: u64 = 1_800_018_000;
+        let middle = signed_probe_peer_descriptor(
+            "https://middle-tamper.example".to_string(),
+            1,
+            now + 4_000,
+            vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+            [0x51; 32],
+        );
+        let terminal = signed_probe_peer_descriptor(
+            "https://terminal-tamper.example".to_string(),
+            2,
+            now + 4_000,
+            vec![NodeCapability::ChatRelay],
+            [0x52; 32],
+        );
+        let original_store = Arc::new(PeerStore::new());
+        original_store.upsert_verified(middle.clone(), now).unwrap();
+        original_store.upsert_verified(terminal.clone(), now).unwrap();
+        original_store.record_route_forward_success(&middle.node_id(), now + 1);
+        original_store.record_route_forward_success(&terminal.node_id(), now + 1);
+        original_store.record_blind_relay_two_hop_probe_result_with_context(
+            now + 2, true, "onion_terminal_delivered", 2, 2, 2, 1,
+        );
+
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-two-hop-tamper-{unique}.json"));
+        let path_str = path.to_string_lossy().to_string();
+        Server::save_peer_store_cache_snapshot(
+            &server.identity, &original_store, &path_str, now + 3,
+        )
+        .await
+        .unwrap();
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let mut document = PeerStoreCacheDocument::from_json_bytes(&bytes).unwrap();
+        document.two_hop_path_proof_events[0].outcome = "rejected".to_string();
+        let tampered = serde_json::to_vec_pretty(&document).unwrap();
+        let restored_store = PeerStore::new();
+        assert!(Server::import_bootstrap_snapshot_bytes(
+            &restored_store, "cache", &path_str, &tampered, now + 4, Some(&server.identity),
+        ));
+
+        assert!(restored_store.is_routeable_now(&middle.node_id(), now + 4));
+        assert!(restored_store.is_routeable_now(&terminal.node_id(), now + 4));
+        let status = restored_store.status(now + 4);
+        assert_eq!(status.bootstrap.last_source_status.as_deref(), Some("warning"));
+        assert_eq!(status.bootstrap.last_two_hop_proof_cache_status.as_deref(), Some("rejected"));
+        assert_eq!(status.bootstrap.last_two_hop_proof_cache_restored, 0);
+        assert_eq!(status.bootstrap.last_two_hop_proof_cache_rejected, 1);
+        assert!(status.two_hop_path_proof_history.events.is_empty());
+
+        let _ = tokio::fs::remove_file(path).await;
     }
 
     #[tokio::test]
