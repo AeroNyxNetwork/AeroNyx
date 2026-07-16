@@ -263,6 +263,7 @@
 //     never mark a terminal healthy solely because a middle claims forwarding.
 //
 // Last Modified:
+//   v2.8.24-ReceiptProbeFallbackSearch - Continue bounded mixed-version probes until a signed terminal receipt is found
 //   v2.8.23-RouteNetworkAntiAffinity - Fail closed on unreachable or endpoint-collocated relay paths
 //   v2.8.22-DiscoveryTaskLifecycle - Await peer-cache and gossip shutdown tasks
 //   v2.8.21-RouteEvidenceCache - Descriptor-bound warm-restart routeability evidence
@@ -482,6 +483,7 @@ const KEEPALIVE_PROBE_INTERVAL_SECS: u64 = 60;
 const KEEPALIVE_ACK_TIMEOUT_SECS: u64 = 90;
 const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
 const ONION_ROUTE_SELECTION_CANDIDATE_LIMIT: usize = 8;
+const TWO_HOP_PROBE_REQUEST_LIMIT: usize = 8;
 const BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS: u64 = 15 * 60;
 const BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS: u64 = 60;
 const BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS: u64 = 120;
@@ -5040,7 +5042,9 @@ impl Server {
         let middle_candidate_count = middle_candidates.len();
         let mut attempted = false;
         let mut network_diversity_blocked = false;
-        for middle in middle_candidates {
+        let mut legacy_delivery_context = None;
+        let mut request_count = 0usize;
+        'candidate_search: for middle in middle_candidates {
             let middle_node_id = middle.node_id();
             let mut terminal_candidates = peer_store
                 .route_probe_candidates_with_capability_excluding(
@@ -5061,7 +5065,10 @@ impl Server {
                 continue;
             }
 
-            for terminal in terminal_candidates {
+            'terminal_candidates: for terminal in terminal_candidates {
+                if request_count >= TWO_HOP_PROBE_REQUEST_LIMIT {
+                    break 'candidate_search;
+                }
                 attempted = true;
                 let terminal_node_id = terminal.node_id();
                 let Some(endpoint) = middle.descriptor.public_endpoint.as_deref() else {
@@ -5115,6 +5122,7 @@ impl Server {
                         now,
                     )
                 {
+                    request_count = request_count.saturating_add(1);
                     match client.post(&url).json(&request).send().await {
                         Ok(response) if response.status().is_success() => {
                             match decode_bounded_json_response::<PeerBlindRelayResponse>(
@@ -5160,18 +5168,16 @@ impl Server {
                                     // legacy synthetic route, but are not
                                     // eligible for authenticated App onion
                                     // traffic until a signed receipt verifies.
-                                    peer_store
-                                        .record_blind_relay_two_hop_probe_result_with_context(
-                                            now,
-                                            true,
-                                            "onion_terminal_delivered",
-                                            middle_candidate_count,
-                                            terminal_candidate_count,
-                                            2,
-                                            1,
-                                        );
+                                    // Keep the compatibility success as a
+                                    // fallback, then continue the bounded search
+                                    // so one legacy peer cannot hide a newer,
+                                    // receipt-capable path after restart.
+                                    legacy_delivery_context.get_or_insert((
+                                        middle_candidate_count,
+                                        terminal_candidate_count,
+                                    ));
                                     peer_store.record_route_forward_success(&middle_node_id, now);
-                                    return true;
+                                    continue 'terminal_candidates;
                                 }
                                 Ok(_ack) => {
                                     peer_store
@@ -5259,6 +5265,11 @@ impl Server {
                         1,
                     );
                 }
+
+                if request_count >= TWO_HOP_PROBE_REQUEST_LIMIT {
+                    break 'candidate_search;
+                }
+                request_count = request_count.saturating_add(1);
 
                 let outer_envelope = BlindRelayEnvelope {
                     route_id: Self::blind_relay_two_hop_probe_route_id(
@@ -5398,6 +5409,19 @@ impl Server {
                     }
                 }
             }
+        }
+
+        if let Some((middle_candidates, terminal_candidates)) = legacy_delivery_context {
+            peer_store.record_blind_relay_two_hop_probe_result_with_context(
+                now,
+                true,
+                "onion_terminal_delivered",
+                middle_candidates,
+                terminal_candidates,
+                2,
+                1,
+            );
+            return true;
         }
 
         if !attempted {
@@ -9345,6 +9369,164 @@ mod tests {
 
         http_server.abort();
         let _ = http_server.await;
+    }
+
+    #[tokio::test]
+    async fn two_hop_probe_continues_past_legacy_ack_to_find_signed_receipt() {
+        let now = 1_800_200_000u64;
+        let source_identity = IdentityKeyPair::generate();
+        let legacy_middle_identity = IdentityKeyPair::generate();
+        let receipt_middle_identity = IdentityKeyPair::generate();
+        let terminal_identity = IdentityKeyPair::generate();
+
+        let signed_descriptor = |
+            identity: &IdentityKeyPair,
+            endpoint: String,
+            capability: NodeCapability,
+            name: &str,
+        | {
+            let mut descriptor = NodeDescriptor::new(
+                identity.public_key_bytes(),
+                now,
+                now,
+                now + 300,
+                name,
+            )
+            .with_x25519_kem(identity.x25519_public_key_bytes());
+            descriptor.public_endpoint = Some(endpoint);
+            descriptor.capabilities = vec![capability];
+            SignedNodeDescriptor::sign(descriptor, identity).unwrap()
+        };
+
+        let terminal = signed_descriptor(
+            &terminal_identity,
+            "https://terminal.test".to_string(),
+            NodeCapability::ChatRelay,
+            "receipt-terminal",
+        );
+        let receipt_middle_template = signed_descriptor(
+            &receipt_middle_identity,
+            "https://receipt-middle.test".to_string(),
+            NodeCapability::OnionMiddle,
+            "receipt-middle",
+        );
+        let self_node_id = source_identity.public_key_bytes();
+        let (expected_request, payload_commitment) =
+            Server::build_two_hop_onion_delivery_probe_request(
+                &source_identity,
+                &self_node_id,
+                &receipt_middle_template,
+                &terminal,
+                now,
+            )
+            .expect("receipt-capable test route should build");
+        let expected_route_id = expected_request.envelope.route_id;
+        let delivery_receipt = BlindRelayDeliveryReceipt::accepted(
+            expected_route_id,
+            payload_commitment,
+            now,
+            &terminal_identity,
+        );
+
+        let legacy_requests = Arc::new(AtomicUsize::new(0));
+        let legacy_requests_for_handler = Arc::clone(&legacy_requests);
+        let legacy_router = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(move || {
+                let requests = Arc::clone(&legacy_requests_for_handler);
+                async move {
+                    requests.fetch_add(1, AtomicOrdering::SeqCst);
+                    Json(PeerBlindRelayResponse {
+                        accepted: true,
+                        terminal: false,
+                        forwarded: true,
+                        ttl_remaining: 1,
+                        reason: None,
+                        delivery_receipt: None,
+                    })
+                }
+            }),
+        );
+        let legacy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let legacy_address = legacy_listener.local_addr().unwrap();
+        let legacy_server = tokio::spawn(async move {
+            axum::serve(legacy_listener, legacy_router).await.unwrap();
+        });
+
+        let receipt_requests = Arc::new(AtomicUsize::new(0));
+        let receipt_requests_for_handler = Arc::clone(&receipt_requests);
+        let receipt_router = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(move |Json(request): Json<PeerBlindRelayRequest>| {
+                let requests = Arc::clone(&receipt_requests_for_handler);
+                let receipt = delivery_receipt.clone();
+                async move {
+                    requests.fetch_add(1, AtomicOrdering::SeqCst);
+                    assert_eq!(request.envelope.route_id, expected_route_id);
+                    Json(PeerBlindRelayResponse {
+                        accepted: true,
+                        terminal: false,
+                        forwarded: true,
+                        ttl_remaining: 1,
+                        reason: None,
+                        delivery_receipt: Some(receipt),
+                    })
+                }
+            }),
+        );
+        let receipt_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let receipt_address = receipt_listener.local_addr().unwrap();
+        let receipt_server = tokio::spawn(async move {
+            axum::serve(receipt_listener, receipt_router).await.unwrap();
+        });
+
+        let legacy_middle = signed_descriptor(
+            &legacy_middle_identity,
+            format!("http://localhost:{}", legacy_address.port()),
+            NodeCapability::OnionMiddle,
+            "legacy-middle",
+        );
+        let receipt_middle = signed_descriptor(
+            &receipt_middle_identity,
+            format!("http://{receipt_address}"),
+            NodeCapability::OnionMiddle,
+            "receipt-middle",
+        );
+        let receipt_middle_id = receipt_middle.node_id();
+
+        let store = PeerStore::new();
+        for descriptor in [legacy_middle, receipt_middle, terminal] {
+            store.upsert_verified(descriptor, now).unwrap();
+        }
+        // Coverage ordering tries unknown peers first. Mark only the modern
+        // middle as proven so this test deterministically exercises the legacy
+        // ACK before the signed-receipt route.
+        store.record_route_forward_success(&receipt_middle_id, now);
+
+        let accepted = Server::probe_two_hop_blind_relay_path(
+            &reqwest::Client::new(),
+            &store,
+            &source_identity,
+            &self_node_id,
+            now,
+        )
+        .await;
+
+        assert!(accepted);
+        assert_eq!(legacy_requests.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(receipt_requests.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            store
+                .status(now)
+                .blind_relay_quality
+                .delivery_receipt_capable_peers,
+            2,
+        );
+
+        legacy_server.abort();
+        receipt_server.abort();
+        let _ = legacy_server.await;
+        let _ = receipt_server.await;
     }
 
     #[test]
