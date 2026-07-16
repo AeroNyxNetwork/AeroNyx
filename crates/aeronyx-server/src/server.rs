@@ -170,6 +170,8 @@
 //      so planned restarts hand over immediately without weakening crash TTLs.
 //  73. Reports monotonic lease authority, consecutive renewal failures, and
 //      recovery evidence so witness partitions remain observable and fail closed.
+//  74. Reports witness-certificate coverage and uncertified block lag without
+//      exposing hashes, witness identities, signatures, or claiming finality.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -2416,15 +2418,21 @@ impl Server {
                             latest_certificate_signers: status.latest_certificate_signers,
                             latest_certificate_required_signers: status
                                 .latest_certificate_required_signers,
-                        certificate_rollback_guard_state: status.certificate_rollback_guard_state,
-                        certificate_rollback_guard_height: status.certificate_rollback_guard_height,
+                            block_confirmation_state: status.block_confirmation_state,
+                            uncertified_block_count: status.uncertified_block_count,
+                            block_confirmation_policy: status.block_confirmation_policy,
+                            certificate_rollback_guard_state: status
+                                .certificate_rollback_guard_state,
+                            certificate_rollback_guard_height: status
+                                .certificate_rollback_guard_height,
                             certificate_rollback_guard_last_verified_at: status
                                 .certificate_rollback_guard_last_verified_at,
                             certificate_rollback_guard_last_persisted_at: status
                                 .certificate_rollback_guard_last_persisted_at,
                             certificate_rollback_guard_write_failures_total: status
                                 .certificate_rollback_guard_write_failures_total,
-                        certificate_rollback_guard_scope: status.certificate_rollback_guard_scope,
+                            certificate_rollback_guard_scope: status
+                                .certificate_rollback_guard_scope,
                             production_halted: status.production_halted,
                             last_evidence_at: status.last_evidence_at,
                             observation_freshness: status.observation_freshness,

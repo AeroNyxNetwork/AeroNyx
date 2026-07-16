@@ -67,6 +67,8 @@
 //!   preserves monotonic epochs and immediate planned-restart handover
 //! - v2.8.12-LeaseFailClosedTelemetry: monotonic remaining authority,
 //!   consecutive renewal failures, last attempt/failure, and recovery counts
+//! - v2.8.13-BlockConfirmation: derives privacy-safe witness-certificate
+//!   coverage and lag from the audited local tip without claiming finality
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -153,6 +155,7 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! v2.8.13-BlockConfirmation - Expose audited witness-certificate block coverage.
 //! v2.8.12-LeaseFailClosedTelemetry - Expose bounded fail-closed lease state.
 //! v2.8.11-CoordinatorLeaseRelease - Retain epochs while releasing planned restarts.
 //! v2.8.10-CoordinatorLease - Fence duplicate coordinators across witness hosts.
@@ -2552,10 +2555,49 @@ fn checkpoint_witness_round_state(
     }
 }
 
+/// Derives privacy-safe certificate coverage for the fully audited local tip.
+///
+/// A certificate proves only that the configured operator-pinned witnesses
+/// signed one checkpoint. The state deliberately avoids `finalized`, `quorum`,
+/// and `consensus`: those terms require a separate network protocol.
+fn commitment_block_confirmation_state(
+    integrity_verified: bool,
+    verified_tip_height: u64,
+    latest_certified_height: Option<u64>,
+    certificate_signers: usize,
+    certificate_required_signers: usize,
+) -> (&'static str, u64) {
+    if !integrity_verified {
+        return ("not_verified", 0);
+    }
+    if verified_tip_height == 0 {
+        return ("empty", 0);
+    }
+    let Some(certified_height) = latest_certified_height else {
+        return ("uncertified", verified_tip_height);
+    };
+    if certified_height > verified_tip_height {
+        return ("certificate_ahead", 0);
+    }
+    if certificate_required_signers < 2 || certificate_signers < certificate_required_signers {
+        return (
+            "certificate_invalid",
+            verified_tip_height.saturating_sub(certified_height),
+        );
+    }
+    let lag = verified_tip_height.saturating_sub(certified_height);
+    if lag == 0 {
+        ("witness_certified", 0)
+    } else {
+        ("certificate_lagging", lag)
+    }
+}
+
 impl MemoryStorage {
     /// Returns aggregate signed checkpoint evidence without peer, hash,
     /// signature, endpoint, or user metadata.
     pub fn record_commitment_checkpoint_status(&self) -> RecordCommitmentCheckpointStatus {
+        let integrity = self.record_commitment_chain_integrity_status();
         let runtime = self.commitment_checkpoint.read();
         let certificate_guard = self.commitment_checkpoint_certificate_anchor.read();
         let now = SystemTime::now()
@@ -2568,6 +2610,14 @@ impl MemoryStorage {
             } else {
                 ("unavailable", None)
             };
+        let (block_confirmation_state, uncertified_block_count) =
+            commitment_block_confirmation_state(
+                integrity.state == "verified",
+                integrity.verified_tip_height,
+                runtime.latest_certified_height,
+                runtime.latest_certificate_signers,
+                runtime.latest_certificate_required_signers,
+            );
         RecordCommitmentCheckpointStatus {
             contract_version: "record_commitment_checkpoint.v1",
             state: runtime.state.to_string(),
@@ -2594,6 +2644,9 @@ impl MemoryStorage {
             latest_certificate_signers: runtime.latest_certificate_signers,
             latest_certificate_required_signers: runtime
                 .latest_certificate_required_signers,
+            block_confirmation_state: block_confirmation_state.to_string(),
+            uncertified_block_count,
+            block_confirmation_policy: "operator-pinned witness certificate coverage of the audited local commitment tip; not permissionless consensus, quorum finality, fork choice, or a public-chain confirmation",
             certificate_rollback_guard_state: certificate_guard.state.to_string(),
             certificate_rollback_guard_height: certificate_guard.anchored_height,
             certificate_rollback_guard_last_verified_at: certificate_guard.last_verified_at,
@@ -7978,6 +8031,38 @@ mod tests {
     }
 
     #[test]
+    fn test_block_confirmation_state_never_overclaims_certificate_coverage() {
+        assert_eq!(
+            commitment_block_confirmation_state(false, 9, Some(9), 3, 2),
+            ("not_verified", 0)
+        );
+        assert_eq!(
+            commitment_block_confirmation_state(true, 0, None, 0, 0),
+            ("empty", 0)
+        );
+        assert_eq!(
+            commitment_block_confirmation_state(true, 3, None, 0, 0),
+            ("uncertified", 3)
+        );
+        assert_eq!(
+            commitment_block_confirmation_state(true, 3, Some(3), 1, 2),
+            ("certificate_invalid", 0)
+        );
+        assert_eq!(
+            commitment_block_confirmation_state(true, 3, Some(3), 2, 2),
+            ("witness_certified", 0)
+        );
+        assert_eq!(
+            commitment_block_confirmation_state(true, 5, Some(3), 2, 2),
+            ("certificate_lagging", 2)
+        );
+        assert_eq!(
+            commitment_block_confirmation_state(true, 3, Some(4), 2, 2),
+            ("certificate_ahead", 0)
+        );
+    }
+
+    #[test]
     fn test_checkpoint_observation_freshness_is_age_bounded() {
         assert_eq!(
             checkpoint_observation_freshness(None, 1_000),
@@ -8014,6 +8099,10 @@ mod tests {
         let storage = MemoryStorage::open(&path, None).unwrap();
         let (witnesses, digests) = seed_checkpoint_certificate(&storage, 1_700_500_000).await;
 
+        let uncertified = storage.record_commitment_checkpoint_status();
+        assert_eq!(uncertified.block_confirmation_state, "uncertified");
+        assert_eq!(uncertified.uncertified_block_count, 1);
+
         assert!(storage
             .persist_record_commitment_checkpoint_certificate(
                 1_700_500_010,
@@ -8035,6 +8124,8 @@ mod tests {
         assert_eq!(status.checkpoint_certificates, 1);
         assert_eq!(status.latest_certified_height, Some(1));
         assert_eq!(status.latest_certificate_signers, 2);
+        assert_eq!(status.block_confirmation_state, "witness_certified");
+        assert_eq!(status.uncertified_block_count, 0);
         let (_, tip_hash, tip_height, _) = storage
             .record_commitment_chain_checkpoint(u64::MAX)
             .await
@@ -8106,6 +8197,17 @@ mod tests {
             .unwrap();
         assert_eq!(policy_audit.latest_certificate_required_signers, 2);
         assert_eq!(policy_audit.latest_certificate_signers, 2);
+
+        let proposer = IdentityKeyPair::generate();
+        let next_block = signed_commitment_block(2, tip_hash, 0xB2, &proposer);
+        storage
+            .append_record_commitment_block(&next_block, None)
+            .await
+            .unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+        let lagging = storage.record_commitment_checkpoint_status();
+        assert_eq!(lagging.block_confirmation_state, "certificate_lagging");
+        assert_eq!(lagging.uncertified_block_count, 1);
         drop(storage);
 
         let reopened = MemoryStorage::open(&path, None).unwrap();
@@ -8117,6 +8219,12 @@ mod tests {
         assert_eq!(reopened_audit.checkpoint_certificates, 1);
         assert_eq!(reopened_audit.latest_certified_height, Some(1));
         assert_eq!(reopened_audit.latest_certificate_signers, 2);
+        let reopened_status = reopened.record_commitment_checkpoint_status();
+        assert_eq!(
+            reopened_status.block_confirmation_state,
+            "certificate_lagging"
+        );
+        assert_eq!(reopened_status.uncertified_block_count, 1);
     }
 
     #[tokio::test]

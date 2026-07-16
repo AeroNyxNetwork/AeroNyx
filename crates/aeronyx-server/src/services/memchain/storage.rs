@@ -137,6 +137,9 @@
 //!   independently verified operator-pinned witness frames. They prove only
 //!   that the configured threshold signed one local checkpoint; they are not
 //!   BFT finality, global consensus, leader election, or a fork-choice rule.
+//! - Block confirmation is derived only from the fully audited local tip and
+//!   latest immutable checkpoint certificate. It reports certificate coverage
+//!   and lag; it must never be renamed or interpreted as network finality.
 //! - commitment_durability is process-local SQLite configuration evidence.
 //!   A coordinator must configure FULL-or-stronger before startup audit; never
 //!   silently downgrade it while the process is serving commitment traffic.
@@ -151,6 +154,7 @@
 //!   converged frame may clear it. Recovery requires operator review/restart.
 //!
 //! ## Last Modified
+//! v2.8.13-BlockConfirmation - Added privacy-safe witness-certificate coverage.
 //! v1.0.0 - Initial SQLite storage engine
 //! v2.1.0 - 4-layer, plaintext embedding BLOB, compaction via layer change
 //! v2.1.0+MVF - Schema v4, feedback columns, content dedup
@@ -463,6 +467,15 @@ pub struct RecordCommitmentCheckpointStatus {
     pub latest_certificate_signers: usize,
     /// Threshold recorded by the latest immutable certificate.
     pub latest_certificate_required_signers: usize,
+    /// `not_verified`, `empty`, `uncertified`, `witness_certified`,
+    /// `certificate_lagging`, `certificate_invalid`, or `certificate_ahead`.
+    /// This is certificate coverage, not global finality.
+    pub block_confirmation_state: String,
+    /// Number of locally verified tip blocks above the latest certificate.
+    /// Zero does not imply consensus; consult `block_confirmation_state`.
+    pub uncertified_block_count: u64,
+    /// Exact anti-overclaim boundary for the derived confirmation state.
+    pub block_confirmation_policy: &'static str,
     /// Signed local certificate high-water state: `disabled`, `checking`,
     /// `initialized`, `verified`, `repaired`, `invalid`,
     /// `rollback_detected`, or `write_failed`.

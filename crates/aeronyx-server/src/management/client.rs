@@ -64,6 +64,7 @@
 //   v2.7.25        - Added aggregate local coordinator production-fence evidence
 //   v2.7.26        - Added aggregate witness-backed coordinator lease evidence
 //   v2.8.12        - Added fail-closed lease window and recovery evidence
+//   v2.8.13        - Added witness-certificate block confirmation coverage
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -278,6 +279,12 @@ pub struct RecordCommitmentCheckpointHeartbeatStatus {
     pub latest_certificate_signers: usize,
     /// Threshold recorded by the latest certificate.
     pub latest_certificate_required_signers: usize,
+    /// Privacy-safe certificate coverage of the fully audited local tip.
+    pub block_confirmation_state: String,
+    /// Verified tip blocks above the latest immutable certificate.
+    pub uncertified_block_count: u64,
+    /// Exact boundary: operator-pinned evidence, never network finality.
+    pub block_confirmation_policy: &'static str,
     /// Signed local certificate-vault high-water state.
     pub certificate_rollback_guard_state: String,
     /// Highest certificate height protected by the signed sidecar.
@@ -874,6 +881,10 @@ mod tests {
                 latest_certified_height: Some(9),
                 latest_certificate_signers: 2,
                 latest_certificate_required_signers: 2,
+                block_confirmation_state: "witness_certified".to_string(),
+                uncertified_block_count: 0,
+                block_confirmation_policy:
+                    "operator-pinned certificate coverage; not network finality",
                 certificate_rollback_guard_state: "verified".to_string(),
                 certificate_rollback_guard_height: 9,
                 certificate_rollback_guard_last_verified_at: Some(121),
@@ -948,6 +959,8 @@ mod tests {
         assert_eq!(checkpoint["latest_certified_height"], 9);
         assert_eq!(checkpoint["latest_certificate_signers"], 2);
         assert_eq!(checkpoint["latest_certificate_required_signers"], 2);
+        assert_eq!(checkpoint["block_confirmation_state"], "witness_certified");
+        assert_eq!(checkpoint["uncertified_block_count"], 0);
         assert_eq!(checkpoint["certificate_rollback_guard_state"], "verified");
         assert_eq!(checkpoint["certificate_rollback_guard_height"], 9);
         assert_eq!(
