@@ -168,6 +168,8 @@
 //      witness before startup and renewal may authorize local block production.
 //  72. Releases the exact process lease from every witness after SIGINT/SIGTERM
 //      so planned restarts hand over immediately without weakening crash TTLs.
+//  73. Reports monotonic lease authority, consecutive renewal failures, and
+//      recovery evidence so witness partitions remain observable and fail closed.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -231,6 +233,7 @@
 //     that listener independently.
 //
 // Last Modified:
+//   v2.8.12-LeaseFailClosedTelemetry - Partition/recovery lease evidence
 //   v2.8.11-CoordinatorLeaseRelease - Signed graceful lease handover on SIGINT/SIGTERM
 //   v2.8.10-CoordinatorLease - Strict all-witness short-lived production authority
 //   v2.8.9-CoordinatorProductionFence - Reject duplicate local block producers
@@ -594,6 +597,7 @@ fn commitment_witness_startup_decision(
 }
 
 const COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS: u64 = 15;
+const COORDINATOR_LEASE_DEGRADED_RETRY_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct CommitmentCoordinatorLeaseRound {
@@ -717,6 +721,27 @@ fn commitment_coordinator_lease_production_valid_for(
         .minimum_valid_for_secs
         .saturating_sub(COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS);
     (valid_for_secs > 0).then_some(valid_for_secs)
+}
+
+/// Selects a bounded retry delay after an incomplete lease round.
+///
+/// While existing authority remains valid, retries converge toward its
+/// monotonic deadline so a recovered witness can refresh the lease before
+/// production stops. Once authority is unavailable, a fixed low-frequency
+/// recovery probe avoids both a 40-second blind spot and a hot retry loop.
+fn commitment_coordinator_lease_degraded_retry_delay(
+    normal_interval_secs: u64,
+    production_permitted: bool,
+    seconds_remaining: Option<u64>,
+) -> u64 {
+    let normal_interval_secs = normal_interval_secs.max(1);
+    if !production_permitted {
+        return COORDINATOR_LEASE_DEGRADED_RETRY_SECS.min(normal_interval_secs);
+    }
+    seconds_remaining.map_or(
+        COORDINATOR_LEASE_DEGRADED_RETRY_SECS.min(normal_interval_secs),
+        |remaining| (remaining / 2).max(1).min(normal_interval_secs),
+    )
 }
 
 pub struct Server {
@@ -2312,14 +2337,28 @@ impl Server {
                             coordinator_lease_required_witnesses: status
                                 .coordinator_lease_required_witnesses,
                             coordinator_lease_expires_at: status.coordinator_lease_expires_at,
-                        coordinator_lease_last_renewed_at: status.coordinator_lease_last_renewed_at,
+                            coordinator_lease_seconds_remaining: status
+                                .coordinator_lease_seconds_remaining,
+                            coordinator_lease_production_permitted: status
+                                .coordinator_lease_production_permitted,
+                            coordinator_lease_last_attempted_at: status
+                                .coordinator_lease_last_attempted_at,
+                            coordinator_lease_last_renewed_at: status
+                                .coordinator_lease_last_renewed_at,
+                            coordinator_lease_last_failure_at: status
+                                .coordinator_lease_last_failure_at,
                             coordinator_lease_renewal_failures_total: status
                                 .coordinator_lease_renewal_failures_total,
+                            coordinator_lease_consecutive_failures: status
+                                .coordinator_lease_consecutive_failures,
+                            coordinator_lease_recoveries_total: status
+                                .coordinator_lease_recoveries_total,
                             coordinator_lease_scope: status.coordinator_lease_scope,
                             rollback_guard_state: status.rollback_guard_state,
                             rollback_guard_height: status.rollback_guard_height,
                             rollback_guard_last_verified_at: status.rollback_guard_last_verified_at,
-                        rollback_guard_last_persisted_at: status.rollback_guard_last_persisted_at,
+                            rollback_guard_last_persisted_at: status
+                                .rollback_guard_last_persisted_at,
                             rollback_guard_write_failures_total: status
                                 .rollback_guard_write_failures_total,
                         }
@@ -3335,10 +3374,11 @@ impl Server {
                 required_witnesses = witness_node_ids.len(),
                 "[MEMCHAIN_BLOCK] Coordinator lease renewal started"
             );
+            let mut next_round_delay_secs = renewal_interval_secs;
             loop {
                 let shutdown_requested = tokio::select! {
                     _ = shutdown_rx.recv() => true,
-                    _ = tokio::time::sleep(Duration::from_secs(renewal_interval_secs)) => false,
+                    _ = tokio::time::sleep(Duration::from_secs(next_round_delay_secs)) => false,
                 };
                 if shutdown_requested {
                     break;
@@ -3361,14 +3401,39 @@ impl Server {
                     &round,
                     witness_node_ids.len(),
                 ) {
+                    let previous_lease_status =
+                        storage.record_commitment_chain_integrity_status();
                     if let Err(error) = storage.apply_record_commitment_coordinator_lease(
                         round.granted,
                         valid_for_secs,
                         unix_now_secs(),
                     ) {
                         storage.record_commitment_coordinator_lease_failure(round.granted);
-                        error!(error = %error, "[MEMCHAIN_BLOCK] Coordinator lease runtime update failed");
+                        let degraded = storage.record_commitment_chain_integrity_status();
+                        next_round_delay_secs = commitment_coordinator_lease_degraded_retry_delay(
+                            renewal_interval_secs,
+                            degraded.coordinator_lease_production_permitted,
+                            degraded.coordinator_lease_seconds_remaining,
+                        );
+                        error!(
+                            error = %error,
+                            lease_state = degraded.coordinator_lease_state,
+                            next_retry_secs = next_round_delay_secs,
+                            "[MEMCHAIN_BLOCK] Coordinator lease runtime update failed"
+                        );
+                    } else if previous_lease_status.coordinator_lease_consecutive_failures > 0 {
+                        next_round_delay_secs = renewal_interval_secs;
+                        let recovered = storage.record_commitment_chain_integrity_status();
+                        info!(
+                            granted = round.granted,
+                            production_valid_for_secs = valid_for_secs,
+                            previous_consecutive_failures = previous_lease_status
+                                .coordinator_lease_consecutive_failures,
+                            recoveries_total = recovered.coordinator_lease_recoveries_total,
+                            "[MEMCHAIN_BLOCK] Coordinator lease renewal recovered"
+                        );
                     } else {
+                        next_round_delay_secs = renewal_interval_secs;
                         debug!(
                             granted = round.granted,
                             production_valid_for_secs = valid_for_secs,
@@ -3377,12 +3442,25 @@ impl Server {
                     }
                 } else {
                     storage.record_commitment_coordinator_lease_failure(round.granted);
+                    let degraded = storage.record_commitment_chain_integrity_status();
+                    next_round_delay_secs = commitment_coordinator_lease_degraded_retry_delay(
+                        renewal_interval_secs,
+                        degraded.coordinator_lease_production_permitted,
+                        degraded.coordinator_lease_seconds_remaining,
+                    );
                     warn!(
                         attempted = round.attempted,
                         granted = round.granted,
                         contended = round.contended,
                         failed = round.failed,
-                        production_permitted = storage.record_commitment_production_permitted(),
+                        lease_state = degraded.coordinator_lease_state,
+                        production_permitted = degraded.coordinator_lease_production_permitted,
+                        seconds_remaining = degraded
+                            .coordinator_lease_seconds_remaining
+                            .unwrap_or(0),
+                        consecutive_failures = degraded
+                            .coordinator_lease_consecutive_failures,
+                        next_retry_secs = next_round_delay_secs,
                         "[MEMCHAIN_BLOCK] Coordinator lease renewal incomplete"
                     );
                 }
@@ -6632,6 +6710,7 @@ impl std::fmt::Debug for Server {
 #[cfg(test)]
 mod tests {
     use super::{
+        commitment_coordinator_lease_degraded_retry_delay,
         commitment_coordinator_lease_production_valid_for, commitment_witness_startup_decision,
         memchain_index_rejection_reason, prefix_to_netmask, unix_now_secs,
         CommitmentCoordinatorLeaseRound, CommitmentWitnessStartupBlockReason,
@@ -6767,6 +6846,30 @@ mod tests {
         assert_eq!(
             commitment_coordinator_lease_production_valid_for(&complete, 0),
             None
+        );
+    }
+
+    #[test]
+    fn coordinator_lease_degraded_retry_converges_without_hot_looping() {
+        assert_eq!(
+            commitment_coordinator_lease_degraded_retry_delay(40, true, Some(65)),
+            32
+        );
+        assert_eq!(
+            commitment_coordinator_lease_degraded_retry_delay(40, true, Some(9)),
+            4
+        );
+        assert_eq!(
+            commitment_coordinator_lease_degraded_retry_delay(40, true, Some(1)),
+            1
+        );
+        assert_eq!(
+            commitment_coordinator_lease_degraded_retry_delay(40, false, Some(0)),
+            10
+        );
+        assert_eq!(
+            commitment_coordinator_lease_degraded_retry_delay(5, false, None),
+            5
         );
     }
 

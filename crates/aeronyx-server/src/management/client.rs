@@ -40,6 +40,8 @@
 //     digest, or checkpoint hash.
 //   - The body used for signing MUST be the same as what is sent.
 //     Do NOT add fields after signing.
+//   - Lease telemetry is process-local and aggregate. Never add witness ids,
+//     endpoints, process instance ids, signatures, or lease response frames.
 //
 // Last Modified:
 //   v1.0.0         - Initial implementation
@@ -61,6 +63,7 @@
 //   v2.7.24        - Added aggregate certificate rollback-guard evidence
 //   v2.7.25        - Added aggregate local coordinator production-fence evidence
 //   v2.7.26        - Added aggregate witness-backed coordinator lease evidence
+//   v2.8.12        - Added fail-closed lease window and recovery evidence
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -141,10 +144,22 @@ pub struct RecordCommitmentIntegrityHeartbeatStatus {
     pub coordinator_lease_required_witnesses: usize,
     /// Conservative local production-authority deadline.
     pub coordinator_lease_expires_at: Option<u64>,
+    /// Monotonic seconds of production authority remaining.
+    pub coordinator_lease_seconds_remaining: Option<u64>,
+    /// Whether the lease gate alone currently permits production.
+    pub coordinator_lease_production_permitted: bool,
+    /// Most recent all-witness lease round attempt.
+    pub coordinator_lease_last_attempted_at: Option<u64>,
     /// Most recent successful all-witness renewal.
     pub coordinator_lease_last_renewed_at: Option<u64>,
+    /// Most recent incomplete or failed lease round.
+    pub coordinator_lease_last_failure_at: Option<u64>,
     /// Failed lease rounds in this process lifetime.
     pub coordinator_lease_renewal_failures_total: u64,
+    /// Consecutive failed rounds since the latest complete grant.
+    pub coordinator_lease_consecutive_failures: u64,
+    /// Number of degraded or expired periods recovered in this process.
+    pub coordinator_lease_recoveries_total: u64,
     /// Exact mechanism boundary without consensus overclaim.
     pub coordinator_lease_scope: &'static str,
     /// Signed local high-water guard state.
@@ -797,8 +812,14 @@ mod tests {
                 coordinator_lease_granted_witnesses: 3,
                 coordinator_lease_required_witnesses: 3,
                 coordinator_lease_expires_at: Some(180),
+                coordinator_lease_seconds_remaining: Some(80),
+                coordinator_lease_production_permitted: true,
+                coordinator_lease_last_attempted_at: Some(100),
                 coordinator_lease_last_renewed_at: Some(100),
+                coordinator_lease_last_failure_at: None,
                 coordinator_lease_renewal_failures_total: 0,
+                coordinator_lease_consecutive_failures: 0,
+                coordinator_lease_recoveries_total: 0,
                 coordinator_lease_scope: "all pinned witnesses; not consensus",
                 rollback_guard_state: "verified",
                 rollback_guard_height: 9,
@@ -894,7 +915,13 @@ mod tests {
         assert_eq!(integrity["coordinator_lease_state"], "held");
         assert_eq!(integrity["coordinator_lease_granted_witnesses"], 3);
         assert_eq!(integrity["coordinator_lease_required_witnesses"], 3);
+        assert_eq!(integrity["coordinator_lease_seconds_remaining"], 80);
+        assert_eq!(integrity["coordinator_lease_production_permitted"], true);
+        assert_eq!(integrity["coordinator_lease_last_attempted_at"], 100);
+        assert!(integrity["coordinator_lease_last_failure_at"].is_null());
         assert_eq!(integrity["coordinator_lease_renewal_failures_total"], 0);
+        assert_eq!(integrity["coordinator_lease_consecutive_failures"], 0);
+        assert_eq!(integrity["coordinator_lease_recoveries_total"], 0);
         assert_eq!(integrity["rollback_guard_state"], "verified");
         assert_eq!(integrity["rollback_guard_height"], 9);
         assert_eq!(integrity["rollback_guard_write_failures_total"], 0);

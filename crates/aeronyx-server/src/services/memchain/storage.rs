@@ -206,6 +206,8 @@
 //!   No SQLite schema change; aggregate public fence status was added.
 //! v2.7.26-CoordinatorLease - Added durable witness-side coordinator lease
 //!   grants and process-local lease validity state for cross-host fencing.
+//! v2.8.12-LeaseFailClosedTelemetry - Added process-local lease attempt,
+//!   consecutive-failure, recovery, and monotonic remaining-window evidence.
 // ============================================
 
 use std::collections::{HashMap, VecDeque};
@@ -731,8 +733,12 @@ pub(crate) struct RecordCommitmentCoordinatorLeaseRuntime {
     pub(crate) required_witnesses: usize,
     pub(crate) expires_at: Option<u64>,
     pub(crate) valid_until: Option<Instant>,
+    pub(crate) last_attempted_at: Option<u64>,
     pub(crate) last_renewed_at: Option<u64>,
+    pub(crate) last_failure_at: Option<u64>,
     pub(crate) renewal_failures_total: u64,
+    pub(crate) consecutive_failures: u64,
+    pub(crate) recoveries_total: u64,
 }
 
 impl Default for RecordCommitmentCoordinatorLeaseRuntime {
@@ -744,8 +750,12 @@ impl Default for RecordCommitmentCoordinatorLeaseRuntime {
             required_witnesses: 0,
             expires_at: None,
             valid_until: None,
+            last_attempted_at: None,
             last_renewed_at: None,
+            last_failure_at: None,
             renewal_failures_total: 0,
+            consecutive_failures: 0,
+            recoveries_total: 0,
         }
     }
 }

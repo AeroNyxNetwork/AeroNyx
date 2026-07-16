@@ -65,6 +65,8 @@
 //!   duplicate cross-host coordinator process instances
 //! - v2.8.11-CoordinatorLeaseRelease: exact-instance graceful release that
 //!   preserves monotonic epochs and immediate planned-restart handover
+//! - v2.8.12-LeaseFailClosedTelemetry: monotonic remaining authority,
+//!   consecutive renewal failures, last attempt/failure, and recovery counts
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -148,8 +150,10 @@
 //! v2.7.24-CertificateRollbackGuard - Detect local certificate-vault rollback.
 //! v2.8.10-CoordinatorLease - Added durable exclusive witness lease grants.
 //! v2.8.11-CoordinatorLeaseRelease - Added exact-instance graceful handover.
+//! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! v2.8.12-LeaseFailClosedTelemetry - Expose bounded fail-closed lease state.
 //! v2.8.11-CoordinatorLeaseRelease - Retain epochs while releasing planned restarts.
 //! v2.8.10-CoordinatorLease - Fence duplicate coordinators across witness hosts.
 //! v2.7.23-CertificateExchange - Export only fully re-audited certificate frames.
@@ -369,10 +373,22 @@ pub struct RecordCommitmentChainIntegrityStatus {
     pub coordinator_lease_required_witnesses: usize,
     /// Conservative local production-authority deadline.
     pub coordinator_lease_expires_at: Option<u64>,
+    /// Monotonic seconds of production authority remaining, zero when expired.
+    pub coordinator_lease_seconds_remaining: Option<u64>,
+    /// Whether the lease gate alone currently permits coordinator production.
+    pub coordinator_lease_production_permitted: bool,
+    /// Most recent all-witness lease round attempt.
+    pub coordinator_lease_last_attempted_at: Option<u64>,
     /// Most recent successful all-witness lease round.
     pub coordinator_lease_last_renewed_at: Option<u64>,
+    /// Most recent incomplete or failed all-witness lease round.
+    pub coordinator_lease_last_failure_at: Option<u64>,
     /// Failed lease rounds in this process lifetime.
     pub coordinator_lease_renewal_failures_total: u64,
+    /// Consecutive failed rounds since the latest complete grant.
+    pub coordinator_lease_consecutive_failures: u64,
+    /// Degraded or expired periods recovered by a later complete grant.
+    pub coordinator_lease_recoveries_total: u64,
     /// Exact anti-overclaim boundary for the witness lease mechanism.
     pub coordinator_lease_scope: &'static str,
     /// Local signed high-water guard state. Never contains the anchor path,
@@ -3670,11 +3686,16 @@ impl MemoryStorage {
         if granted_witnesses < runtime.required_witnesses || valid_for_secs == 0 {
             return Err("coordinator lease grant threshold is incomplete".to_string());
         }
+        if runtime.consecutive_failures > 0 {
+            runtime.recoveries_total = runtime.recoveries_total.saturating_add(1);
+        }
         runtime.state = "held";
         runtime.granted_witnesses = granted_witnesses;
         runtime.valid_until = Some(Instant::now() + std::time::Duration::from_secs(valid_for_secs));
         runtime.expires_at = Some(now.saturating_add(valid_for_secs));
+        runtime.last_attempted_at = Some(now);
         runtime.last_renewed_at = Some(now);
+        runtime.consecutive_failures = 0;
         Ok(())
     }
 
@@ -3684,8 +3705,12 @@ impl MemoryStorage {
         if !runtime.required {
             return;
         }
+        let now = unix_now_secs();
         runtime.granted_witnesses = granted_witnesses;
+        runtime.last_attempted_at = Some(now);
+        runtime.last_failure_at = Some(now);
         runtime.renewal_failures_total = runtime.renewal_failures_total.saturating_add(1);
+        runtime.consecutive_failures = runtime.consecutive_failures.saturating_add(1);
         runtime.state = if runtime
             .valid_until
             .is_some_and(|deadline| Instant::now() < deadline)
@@ -4485,13 +4510,25 @@ impl MemoryStorage {
             coordinator_lease_granted_witnesses,
             coordinator_lease_required_witnesses,
             coordinator_lease_expires_at,
+            coordinator_lease_seconds_remaining,
+            coordinator_lease_production_permitted,
+            coordinator_lease_last_attempted_at,
             coordinator_lease_last_renewed_at,
+            coordinator_lease_last_failure_at,
             coordinator_lease_renewal_failures_total,
+            coordinator_lease_consecutive_failures,
+            coordinator_lease_recoveries_total,
         ) = {
             let runtime = self.commitment_coordinator_lease.read();
-            let valid = runtime
-                .valid_until
-                .is_some_and(|deadline| Instant::now() < deadline);
+            let now = Instant::now();
+            let seconds_remaining = runtime.valid_until.map(|deadline| {
+                deadline.checked_duration_since(now).map_or(0, |remaining| {
+                    remaining
+                        .as_secs()
+                        .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                })
+            });
+            let valid = seconds_remaining.is_some_and(|remaining| remaining > 0);
             let state = if runtime.required
                 && !valid
                 && matches!(runtime.state, "held" | "renewal_degraded")
@@ -4505,8 +4542,14 @@ impl MemoryStorage {
                 runtime.granted_witnesses,
                 runtime.required_witnesses,
                 runtime.expires_at,
+                seconds_remaining,
+                !runtime.required || valid,
+                runtime.last_attempted_at,
                 runtime.last_renewed_at,
+                runtime.last_failure_at,
                 runtime.renewal_failures_total,
+                runtime.consecutive_failures,
+                runtime.recoveries_total,
             )
         };
         let (
@@ -4545,8 +4588,14 @@ impl MemoryStorage {
                 coordinator_lease_granted_witnesses,
                 coordinator_lease_required_witnesses,
                 coordinator_lease_expires_at,
+                coordinator_lease_seconds_remaining,
+                coordinator_lease_production_permitted,
+                coordinator_lease_last_attempted_at,
                 coordinator_lease_last_renewed_at,
+                coordinator_lease_last_failure_at,
                 coordinator_lease_renewal_failures_total,
+                coordinator_lease_consecutive_failures,
+                coordinator_lease_recoveries_total,
                 coordinator_lease_scope: COORDINATOR_LEASE_SCOPE,
                 rollback_guard_state,
                 rollback_guard_height,
@@ -4574,8 +4623,14 @@ impl MemoryStorage {
                 coordinator_lease_granted_witnesses,
                 coordinator_lease_required_witnesses,
                 coordinator_lease_expires_at,
+                coordinator_lease_seconds_remaining,
+                coordinator_lease_production_permitted,
+                coordinator_lease_last_attempted_at,
                 coordinator_lease_last_renewed_at,
+                coordinator_lease_last_failure_at,
                 coordinator_lease_renewal_failures_total,
+                coordinator_lease_consecutive_failures,
+                coordinator_lease_recoveries_total,
                 coordinator_lease_scope: COORDINATOR_LEASE_SCOPE,
                 rollback_guard_state,
                 rollback_guard_height,
@@ -6452,20 +6507,45 @@ mod tests {
             .apply_record_commitment_coordinator_lease(2, 1, 2_000)
             .unwrap();
         assert!(storage.record_commitment_production_permitted());
+        let held = storage.record_commitment_chain_integrity_status();
+        assert_eq!(held.coordinator_lease_state, "held");
+        assert!(held.coordinator_lease_production_permitted);
+        assert_eq!(held.coordinator_lease_seconds_remaining, Some(1));
+        assert_eq!(held.coordinator_lease_last_attempted_at, Some(2_000));
+        assert_eq!(held.coordinator_lease_consecutive_failures, 0);
+        assert_eq!(held.coordinator_lease_recoveries_total, 0);
+
         storage.record_commitment_coordinator_lease_failure(1);
         assert!(storage.record_commitment_production_permitted());
-        assert_eq!(
-            storage
-                .record_commitment_chain_integrity_status()
-                .coordinator_lease_state,
-            "renewal_degraded"
-        );
+        let degraded = storage.record_commitment_chain_integrity_status();
+        assert_eq!(degraded.coordinator_lease_state, "renewal_degraded");
+        assert!(degraded.coordinator_lease_production_permitted);
+        assert_eq!(degraded.coordinator_lease_granted_witnesses, 1);
+        assert!(degraded.coordinator_lease_last_failure_at.is_some());
+        assert_eq!(degraded.coordinator_lease_renewal_failures_total, 1);
+        assert_eq!(degraded.coordinator_lease_consecutive_failures, 1);
 
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
         assert!(!storage.record_commitment_production_permitted());
         let expired = storage.record_commitment_chain_integrity_status();
         assert_eq!(expired.coordinator_lease_state, "expired");
+        assert!(!expired.coordinator_lease_production_permitted);
+        assert_eq!(expired.coordinator_lease_seconds_remaining, Some(0));
         assert_eq!(expired.coordinator_lease_renewal_failures_total, 1);
+        assert_eq!(expired.coordinator_lease_consecutive_failures, 1);
+
+        storage
+            .apply_record_commitment_coordinator_lease(2, 1, 2_002)
+            .unwrap();
+        let recovered = storage.record_commitment_chain_integrity_status();
+        assert_eq!(recovered.coordinator_lease_state, "held");
+        assert!(recovered.coordinator_lease_production_permitted);
+        assert_eq!(recovered.coordinator_lease_last_attempted_at, Some(2_002));
+        assert_eq!(recovered.coordinator_lease_last_renewed_at, Some(2_002));
+        assert!(recovered.coordinator_lease_last_failure_at.is_some());
+        assert_eq!(recovered.coordinator_lease_renewal_failures_total, 1);
+        assert_eq!(recovered.coordinator_lease_consecutive_failures, 0);
+        assert_eq!(recovered.coordinator_lease_recoveries_total, 1);
 
         storage.configure_record_commitment_coordinator_lease(false, 0);
         assert!(storage.record_commitment_production_permitted());
