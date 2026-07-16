@@ -3711,11 +3711,13 @@ impl MemoryStorage {
         runtime.last_failure_at = Some(now);
         runtime.renewal_failures_total = runtime.renewal_failures_total.saturating_add(1);
         runtime.consecutive_failures = runtime.consecutive_failures.saturating_add(1);
-        runtime.state = if runtime
+        let still_valid = runtime
             .valid_until
-            .is_some_and(|deadline| Instant::now() < deadline)
-        {
+            .is_some_and(|deadline| Instant::now() < deadline);
+        runtime.state = if still_valid {
             "renewal_degraded"
+        } else if runtime.valid_until.is_some() {
+            "expired"
         } else {
             "unavailable"
         };
@@ -6534,6 +6536,14 @@ mod tests {
         assert_eq!(expired.coordinator_lease_renewal_failures_total, 1);
         assert_eq!(expired.coordinator_lease_consecutive_failures, 1);
 
+        storage.record_commitment_coordinator_lease_failure(1);
+        let expired_retry = storage.record_commitment_chain_integrity_status();
+        assert_eq!(expired_retry.coordinator_lease_state, "expired");
+        assert!(!expired_retry.coordinator_lease_production_permitted);
+        assert_eq!(expired_retry.coordinator_lease_seconds_remaining, Some(0));
+        assert_eq!(expired_retry.coordinator_lease_renewal_failures_total, 2);
+        assert_eq!(expired_retry.coordinator_lease_consecutive_failures, 2);
+
         storage
             .apply_record_commitment_coordinator_lease(2, 1, 2_002)
             .unwrap();
@@ -6543,7 +6553,7 @@ mod tests {
         assert_eq!(recovered.coordinator_lease_last_attempted_at, Some(2_002));
         assert_eq!(recovered.coordinator_lease_last_renewed_at, Some(2_002));
         assert!(recovered.coordinator_lease_last_failure_at.is_some());
-        assert_eq!(recovered.coordinator_lease_renewal_failures_total, 1);
+        assert_eq!(recovered.coordinator_lease_renewal_failures_total, 2);
         assert_eq!(recovered.coordinator_lease_consecutive_failures, 0);
         assert_eq!(recovered.coordinator_lease_recoveries_total, 1);
 
