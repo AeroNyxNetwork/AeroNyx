@@ -44,6 +44,8 @@
 //     endpoints, process instance ids, signatures, or lease response frames.
 //   - Announcement retry telemetry is aggregate only. Never add peer ids,
 //     endpoints, HTTP bodies, block hashes, or per-peer retry timing.
+//   - Announcement supersession is process-local aggregate scheduling evidence.
+//     Never infer delivery, replication, consensus, or finality from it.
 //
 // Last Modified:
 //   v1.0.0         - Initial implementation
@@ -70,6 +72,7 @@
 //   v2.8.14        - Added privacy-safe event-driven follower telemetry
 //   v2.8.15        - Added exact coordinator announcement receipt telemetry
 //   v2.8.17        - Added bounded announcement retry outcome telemetry
+//   v2.8.18        - Added aggregate superseded announcement telemetry
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -220,6 +223,8 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub outbound_announcement_rounds_total: u64,
     /// Rounds skipped before any peer delivery result existed.
     pub outbound_announcement_rounds_skipped_total: u64,
+    /// In-flight rounds canceled in favor of a strictly newer audited tip.
+    pub outbound_announcement_rounds_superseded_total: u64,
     /// Distinct pinned peers considered by outbound rounds.
     pub outbound_announcements_attempted_total: u64,
     /// Peers returning exactly `202 Accepted`.
@@ -897,6 +902,7 @@ mod tests {
                 last_outbound_announcement_result: Some("partial".to_string()),
                 outbound_announcement_rounds_total: 4,
                 outbound_announcement_rounds_skipped_total: 1,
+                outbound_announcement_rounds_superseded_total: 1,
                 outbound_announcements_attempted_total: 9,
                 outbound_announcements_accepted_total: 5,
                 outbound_announcements_stale_total: 2,
@@ -1017,6 +1023,10 @@ mod tests {
         assert_eq!(sync["last_outbound_announcement_result"], "partial");
         assert_eq!(sync["outbound_announcement_rounds_total"], 4);
         assert_eq!(sync["outbound_announcement_rounds_skipped_total"], 1);
+        assert_eq!(
+            sync["outbound_announcement_rounds_superseded_total"],
+            1
+        );
         assert_eq!(sync["outbound_announcements_attempted_total"], 9);
         assert_eq!(sync["outbound_announcements_accepted_total"], 5);
         assert_eq!(sync["outbound_announcements_stale_total"], 2);

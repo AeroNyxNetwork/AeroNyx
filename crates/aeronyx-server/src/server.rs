@@ -241,8 +241,12 @@
 //     that listener independently.
 //   - Tip announcement retries are advisory process-local work. Never let them
 //     gate block production or expose peer identity/endpoint data in telemetry.
+//   - A newer audited commitment tip may cancel an older in-flight announcement
+//     round. Cancellation is delivery prioritization only: it must not mutate
+//     the canonical chain, witness evidence, lease state, or production gates.
 //
 // Last Modified:
+//   v2.8.18-TipSupersession - Prioritize newer audited tip announcements
 //   v2.8.17-TipRetryQueue - Bounded transient follower wake-up retries
 //   v2.8.15-AnnouncementReceipts - Exact coordinator tip-delivery result evidence
 //   v2.8.14-SyncObservability - Event-driven follower trigger and announcement evidence
@@ -755,6 +759,52 @@ fn commitment_coordinator_lease_degraded_retry_delay(
         COORDINATOR_LEASE_DEGRADED_RETRY_SECS.min(normal_interval_secs),
         |remaining| (remaining / 2).max(1).min(normal_interval_secs),
     )
+}
+
+/// Result of waiting for one outbound tip announcement while continuing to
+/// observe the bounded miner notification channel.
+///
+/// A superseded future is deliberately dropped. The peer protocol is
+/// idempotent, so a canceled HTTP request that already reached a follower can
+/// only produce an extra wake-up; it cannot change either node's chain.
+#[derive(Debug, PartialEq, Eq)]
+enum CommitmentTipAnnouncementWaitOutcome<T> {
+    Completed(T),
+    Superseded(u64),
+}
+
+/// Waits for an outbound announcement unless a strictly newer audited tip is
+/// observed first.
+///
+/// Equal or older notifications are coalesced as stale process-local work.
+/// The caller owns shutdown handling so dropping this helper also cancels the
+/// in-flight HTTP/retry future without coupling delivery to block production.
+async fn await_commitment_tip_announcement_or_newer<F>(
+    current_tip_height: u64,
+    commitment_tip_rx: &mut mpsc::Receiver<u64>,
+    announcement: F,
+) -> CommitmentTipAnnouncementWaitOutcome<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::pin!(announcement);
+    let mut notification_channel_open = true;
+    loop {
+        tokio::select! {
+            outcome = &mut announcement => {
+                return CommitmentTipAnnouncementWaitOutcome::Completed(outcome);
+            }
+            next_tip = commitment_tip_rx.recv(), if notification_channel_open => {
+                match next_tip {
+                    Some(next_tip_height) if next_tip_height > current_tip_height => {
+                        return CommitmentTipAnnouncementWaitOutcome::Superseded(next_tip_height);
+                    }
+                    Some(_) => {}
+                    None => notification_channel_open = false,
+                }
+            }
+        }
+    }
 }
 
 pub struct Server {
@@ -2424,6 +2474,8 @@ impl Server {
                                 .outbound_announcement_rounds_total,
                             outbound_announcement_rounds_skipped_total: status
                                 .outbound_announcement_rounds_skipped_total,
+                            outbound_announcement_rounds_superseded_total: status
+                                .outbound_announcement_rounds_superseded_total,
                             outbound_announcements_attempted_total: status
                                 .outbound_announcements_attempted_total,
                             outbound_announcements_accepted_total: status
@@ -3643,50 +3695,98 @@ impl Server {
                         "[MEMCHAIN_BLOCK] New commitment tip triggered witness reconciliation"
                     );
                     if !pinned_witness_node_ids.is_empty() {
-                        let delivery = tokio::select! {
-                            _ = shutdown_rx.recv() => break 'witness_loop,
-                            outcome = announce_current_record_commitment_tip(
-                                &storage,
-                                &peer_store,
-                                &identity,
-                                &client,
-                                &pinned_witness_node_ids,
-                            ) => outcome,
-                        };
-                        match delivery {
-                            Ok(delivery) => {
-                                storage.record_commitment_outbound_announcement(
-                                    unix_now_secs(),
-                                    delivery.announced_height,
-                                    delivery.attempted,
-                                    delivery.accepted,
-                                    delivery.stale,
-                                    delivery.failed,
-                                    delivery.retries_attempted,
-                                    delivery.retries_succeeded,
-                                    delivery.retries_exhausted,
-                                );
+                        let mut pending_tip_height = tip_height;
+                        loop {
+                            // Re-read the authoritative audited tip before each
+                            // attempt. This prevents a coalesced older channel
+                            // value from canceling delivery of a newer local tip.
+                            let announcement_tip_height = storage
+                                .record_commitment_chain_tip()
+                                .await
+                                .0
+                                .max(pending_tip_height);
+                            let wait_outcome = tokio::select! {
+                                _ = shutdown_rx.recv() => break 'witness_loop,
+                                outcome = await_commitment_tip_announcement_or_newer(
+                                    announcement_tip_height,
+                                    &mut commitment_tip_rx,
+                                    announce_current_record_commitment_tip(
+                                        &storage,
+                                        &peer_store,
+                                        &identity,
+                                        &client,
+                                        &pinned_witness_node_ids,
+                                    ),
+                                ) => outcome,
+                            };
+                            let completed_height = match wait_outcome {
+                                CommitmentTipAnnouncementWaitOutcome::Superseded(
+                                    newer_tip_height,
+                                ) => {
+                                    storage.record_commitment_outbound_announcement_superseded(
+                                        unix_now_secs(),
+                                    );
+                                    pending_tip_height =
+                                        pending_tip_height.max(newer_tip_height);
+                                    debug!(
+                                        superseded_height = announcement_tip_height,
+                                        latest_height = pending_tip_height,
+                                        "[MEMCHAIN_BLOCK] Newer commitment tip superseded an in-flight announcement"
+                                    );
+                                    continue;
+                                }
+                                CommitmentTipAnnouncementWaitOutcome::Completed(Ok(delivery)) => {
+                                    storage.record_commitment_outbound_announcement(
+                                        unix_now_secs(),
+                                        delivery.announced_height,
+                                        delivery.attempted,
+                                        delivery.accepted,
+                                        delivery.stale,
+                                        delivery.failed,
+                                        delivery.retries_attempted,
+                                        delivery.retries_succeeded,
+                                        delivery.retries_exhausted,
+                                    );
+                                    debug!(
+                                        announced_height = delivery.announced_height,
+                                        attempted = delivery.attempted,
+                                        accepted = delivery.accepted,
+                                        stale = delivery.stale,
+                                        failed = delivery.failed,
+                                        retries_attempted = delivery.retries_attempted,
+                                        retries_succeeded = delivery.retries_succeeded,
+                                        retries_exhausted = delivery.retries_exhausted,
+                                        "[MEMCHAIN_BLOCK] Sent bounded follower tip announcements"
+                                    );
+                                    delivery.announced_height
+                                }
+                                CommitmentTipAnnouncementWaitOutcome::Completed(Err(reason)) => {
+                                    storage.record_commitment_outbound_announcement_skipped(
+                                        unix_now_secs(),
+                                    );
+                                    warn!(
+                                        reason = %reason,
+                                        "[MEMCHAIN_BLOCK] Tip announcement skipped; witness reconciliation retained"
+                                    );
+                                    announcement_tip_height
+                                }
+                            };
+
+                            // The notification channel has capacity one, but
+                            // drain defensively so a completion/new-tip race
+                            // cannot send witness work ahead of the latest tip.
+                            while let Ok(queued_tip_height) = commitment_tip_rx.try_recv() {
+                                pending_tip_height = pending_tip_height.max(queued_tip_height);
+                            }
+                            if pending_tip_height > completed_height {
                                 debug!(
-                                    announced_height = delivery.announced_height,
-                                    attempted = delivery.attempted,
-                                    accepted = delivery.accepted,
-                                    stale = delivery.stale,
-                                    failed = delivery.failed,
-                                    retries_attempted = delivery.retries_attempted,
-                                    retries_succeeded = delivery.retries_succeeded,
-                                    retries_exhausted = delivery.retries_exhausted,
-                                    "[MEMCHAIN_BLOCK] Sent bounded follower tip announcements"
+                                    completed_height,
+                                    latest_height = pending_tip_height,
+                                    "[MEMCHAIN_BLOCK] Delivering a tip queued during announcement completion"
                                 );
+                                continue;
                             }
-                            Err(reason) => {
-                                storage.record_commitment_outbound_announcement_skipped(
-                                    unix_now_secs(),
-                                );
-                                warn!(
-                                    reason = %reason,
-                                    "[MEMCHAIN_BLOCK] Tip announcement skipped; witness reconciliation retained"
-                                );
-                            }
+                            break;
                         }
                     }
                 }
@@ -6884,12 +6984,13 @@ impl std::fmt::Debug for Server {
 #[cfg(test)]
 mod tests {
     use super::{
+        await_commitment_tip_announcement_or_newer,
         commitment_coordinator_lease_degraded_retry_delay,
         commitment_coordinator_lease_production_valid_for, commitment_witness_startup_decision,
         memchain_index_rejection_reason, prefix_to_netmask, unix_now_secs,
-        CommitmentCoordinatorLeaseRound, CommitmentWitnessStartupBlockReason,
-        CommitmentWitnessStartupDecision, Server, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
-        COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
+        CommitmentCoordinatorLeaseRound, CommitmentTipAnnouncementWaitOutcome,
+        CommitmentWitnessStartupBlockReason, CommitmentWitnessStartupDecision, Server,
+        BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
     };
     use crate::api::memchain_peer::{build_memchain_peer_router, CommitmentReconciliationOutcome};
     use crate::api::{
@@ -6916,6 +7017,41 @@ mod tests {
     use crate::config::{DiscoveryConfig, ServerConfig};
     use crate::services::memchain::MemoryStorage;
     use crate::services::{PeerStore, PeerStoreImportReport};
+
+    #[tokio::test]
+    async fn newer_commitment_tip_supersedes_inflight_announcement() {
+        let (tip_tx, mut tip_rx) = tokio::sync::mpsc::channel(1);
+        tip_tx.send(11).await.unwrap();
+
+        let outcome = await_commitment_tip_announcement_or_newer(
+            10,
+            &mut tip_rx,
+            std::future::pending::<u8>(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            CommitmentTipAnnouncementWaitOutcome::Superseded(11)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_commitment_tip_does_not_supersede_inflight_announcement() {
+        let (tip_tx, mut tip_rx) = tokio::sync::mpsc::channel(1);
+        tip_tx.send(10).await.unwrap();
+
+        let outcome = await_commitment_tip_announcement_or_newer(10, &mut tip_rx, async {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            42u8
+        })
+        .await;
+
+        assert_eq!(
+            outcome,
+            CommitmentTipAnnouncementWaitOutcome::Completed(42)
+        );
+    }
 
     #[test]
     fn commitment_witness_startup_gate_enforces_threshold_and_conflicts() {

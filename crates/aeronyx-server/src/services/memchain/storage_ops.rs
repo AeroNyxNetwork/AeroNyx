@@ -123,6 +123,7 @@
 //!   election, finality, quorum, or fork choice.
 //!
 //! ## Modification History
+//! v2.8.18-TipSupersession - Added aggregate superseded announcement rounds.
 //! v2.8.17-TipRetryQueue - Added bounded announcement retry outcome counters.
 //! v2.2.0               - 🌟 Extracted from storage.rs; added get_embedding_model, get_overview
 //! v2.3.0+RemoteStorage - 🌟 Added count_distinct_owners(), owner_exists()
@@ -156,6 +157,7 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! v2.8.18-TipSupersession - Prioritize fresh tips without delivery claims.
 //! v2.8.17-TipRetryQueue - Track retry attempts, recoveries, and exhaustion.
 //! v2.8.15-AnnouncementReceipts - Track exact coordinator tip-delivery outcomes.
 //! v2.8.14-SyncObservability - Distinguish scheduled and authenticated follower wake-ups.
@@ -4572,6 +4574,28 @@ impl MemoryStorage {
             .saturating_add(1);
     }
 
+    /// Records an in-flight coordinator round canceled for a strictly newer
+    /// audited tip.
+    ///
+    /// Supersession makes no per-peer delivery claim because a canceled HTTP
+    /// request may or may not have reached its follower. It is process-local
+    /// scheduling evidence only and cannot affect chain, witness, lease,
+    /// consensus, fork-choice, or finality state.
+    pub fn record_commitment_outbound_announcement_superseded(&self, now: u64) {
+        let mut runtime = self.commitment_sync.write();
+        if runtime.role != "coordinator" {
+            return;
+        }
+        runtime.last_outbound_announcement_at = Some(now);
+        runtime.last_outbound_announced_height = None;
+        runtime.last_outbound_announcement_result = Some("superseded");
+        runtime.outbound_announcement_rounds_total =
+            runtime.outbound_announcement_rounds_total.saturating_add(1);
+        runtime.outbound_announcement_rounds_superseded_total = runtime
+            .outbound_announcement_rounds_superseded_total
+            .saturating_add(1);
+    }
+
     /// Records one fully verified response page after all included blocks have
     /// been accepted by the local transactional chain store.
     pub fn record_commitment_sync_page_success(
@@ -4692,6 +4716,8 @@ impl MemoryStorage {
             outbound_announcement_rounds_total: runtime.outbound_announcement_rounds_total,
             outbound_announcement_rounds_skipped_total: runtime
                 .outbound_announcement_rounds_skipped_total,
+            outbound_announcement_rounds_superseded_total: runtime
+                .outbound_announcement_rounds_superseded_total,
             outbound_announcements_attempted_total: runtime
                 .outbound_announcements_attempted_total,
             outbound_announcements_accepted_total: runtime
@@ -8121,20 +8147,28 @@ mod tests {
         storage.configure_record_commitment_sync(true, false);
         storage.record_commitment_outbound_announcement(100, 9, 3, 2, 1, 0, 1, 1, 0);
         storage.record_commitment_outbound_announcement(101, 10, 3, 1, 1, 1, 2, 0, 1);
-        storage.record_commitment_outbound_announcement_skipped(102);
+        storage.record_commitment_outbound_announcement_superseded(102);
+        let superseded = storage.record_commitment_sync_status();
+        assert_eq!(superseded.last_outbound_announced_height, None);
+        assert_eq!(
+            superseded.last_outbound_announcement_result.as_deref(),
+            Some("superseded")
+        );
+        storage.record_commitment_outbound_announcement_skipped(103);
         let status = storage.record_commitment_sync_status();
         assert_eq!(status.role, "coordinator");
         assert_eq!(status.state, "producing");
         assert!(!status.enabled);
         assert!(status.recent_events.is_empty());
-        assert_eq!(status.last_outbound_announcement_at, Some(102));
+        assert_eq!(status.last_outbound_announcement_at, Some(103));
         assert_eq!(status.last_outbound_announced_height, None);
         assert_eq!(
             status.last_outbound_announcement_result.as_deref(),
             Some("skipped")
         );
-        assert_eq!(status.outbound_announcement_rounds_total, 3);
+        assert_eq!(status.outbound_announcement_rounds_total, 4);
         assert_eq!(status.outbound_announcement_rounds_skipped_total, 1);
+        assert_eq!(status.outbound_announcement_rounds_superseded_total, 1);
         assert_eq!(status.outbound_announcements_attempted_total, 6);
         assert_eq!(status.outbound_announcements_accepted_total, 3);
         assert_eq!(status.outbound_announcements_stale_total, 2);

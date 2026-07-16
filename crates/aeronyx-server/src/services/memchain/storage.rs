@@ -156,6 +156,7 @@
 //!   converged frame may clear it. Recovery requires operator review/restart.
 //!
 //! ## Last Modified
+//! v2.8.18-TipSupersession - Added aggregate superseded announcement evidence.
 //! v2.8.17-TipRetryQueue - Added aggregate bounded announcement retry evidence.
 //! v2.8.15-AnnouncementReceipts - Added coordinator-side aggregate delivery evidence.
 //! v2.8.14-SyncObservability - Added authenticated announcement dispositions and trigger evidence.
@@ -436,12 +437,14 @@ pub struct RecordCommitmentSyncStatus {
     /// Audited local tip height encoded by the most recent outbound round.
     pub last_outbound_announced_height: Option<u64>,
     /// Last aggregate delivery result: `all_woken`, `delivered`, `partial`,
-    /// `failed`, `no_targets`, or `skipped`.
+    /// `failed`, `no_targets`, `superseded`, or `skipped`.
     pub last_outbound_announcement_result: Option<String>,
     /// Outbound announcement rounds observed since process start.
     pub outbound_announcement_rounds_total: u64,
     /// Rounds skipped before a peer delivery outcome could be produced.
     pub outbound_announcement_rounds_skipped_total: u64,
+    /// In-flight rounds canceled in favor of a strictly newer audited tip.
+    pub outbound_announcement_rounds_superseded_total: u64,
     /// Distinct pinned peers considered by outbound announcement rounds.
     pub outbound_announcements_attempted_total: u64,
     /// Peers returning exactly `202 Accepted`.
@@ -662,6 +665,7 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) last_outbound_announcement_result: Option<&'static str>,
     pub(crate) outbound_announcement_rounds_total: u64,
     pub(crate) outbound_announcement_rounds_skipped_total: u64,
+    pub(crate) outbound_announcement_rounds_superseded_total: u64,
     pub(crate) outbound_announcements_attempted_total: u64,
     pub(crate) outbound_announcements_accepted_total: u64,
     pub(crate) outbound_announcements_stale_total: u64,
@@ -704,6 +708,7 @@ impl Default for RecordCommitmentSyncRuntime {
             last_outbound_announcement_result: None,
             outbound_announcement_rounds_total: 0,
             outbound_announcement_rounds_skipped_total: 0,
+            outbound_announcement_rounds_superseded_total: 0,
             outbound_announcements_attempted_total: 0,
             outbound_announcements_accepted_total: 0,
             outbound_announcements_stale_total: 0,
