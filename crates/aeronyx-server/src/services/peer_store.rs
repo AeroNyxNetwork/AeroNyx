@@ -152,6 +152,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.58.0-RouteNetworkAntiAffinity - Require routeable peers and distinct endpoint network identities for multi-hop paths
 //! v0.57.0-SignedDeliveryReceipts - Track freshness-bounded receipt-capable routes and verified client onion delivery evidence
 //! v0.56.0-ProofRestartContinuity - Expose authenticated restore and signed proof persistence evidence
 //! v0.55.0-TwoHopProofCache - Added signed bounded warm-restart proof history
@@ -216,6 +217,7 @@
 // ============================================================================
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aeronyx_core::protocol::discovery::{
@@ -247,6 +249,20 @@ const PEER_ROUTE_STATUS_LIMIT: usize = 8;
 const PEER_HEALTH_STATUS_LIMIT: usize = 64;
 const PEER_QUORUM_MIN_VALID_PEERS: usize = 2;
 const PEER_QUORUM_MIN_ROUTEABLE_CHAT_RELAYS: usize = 1;
+const TWO_HOP_PATH_POLICY_NETWORK_DIVERSE: &str = "distinct_node_and_network_prefix";
+
+/// Coarse endpoint identity used only to prevent obviously collocated hops.
+///
+/// IP endpoints are grouped by IPv4 /24 or IPv6 /48. DNS endpoints use their
+/// normalized exact hostname because this process does not perform mutable DNS
+/// resolution during route planning. This is deliberately not presented as
+/// ASN or operator diversity proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EndpointNetworkIdentity {
+    Ipv4([u8; 3]),
+    Ipv6([u8; 6]),
+    Dns(String),
+}
 
 // ============================================
 // PeerStoreError
@@ -3375,7 +3391,7 @@ impl PeerStore {
             proof_scope: Self::two_hop_path_proof_scope(reason).to_string(),
             path_shape: "entry_middle_terminal".to_string(),
             hop_count: 2,
-            path_policy: "distinct_middle_terminal".to_string(),
+            path_policy: TWO_HOP_PATH_POLICY_NETWORK_DIVERSE.to_string(),
             middle_candidate_bucket: Self::two_hop_candidate_count_bucket(middle_candidate_count)
                 .to_string(),
             terminal_candidate_bucket: Self::two_hop_candidate_count_bucket(
@@ -3429,6 +3445,7 @@ impl PeerStore {
             "ack_rejected" => "ack_rejected".to_string(),
             "ack_decode" => "ack_decode".to_string(),
             "no_distinct_path" => "no_distinct_path".to_string(),
+            "no_network_diverse_path" => "no_network_diverse_path".to_string(),
             "middle_missing_endpoint" => "middle_missing_endpoint".to_string(),
             "middle_invalid_endpoint" => "middle_invalid_endpoint".to_string(),
             value if value.starts_with("onion_http_") => "onion_http_error".to_string(),
@@ -4224,7 +4241,7 @@ impl PeerStore {
             || now.saturating_sub(event.at) > PEER_ROUTEABILITY_STALE_AFTER_SECS
             || event.path_shape != "entry_middle_terminal"
             || event.hop_count != 2
-            || event.path_policy != "distinct_middle_terminal"
+            || event.path_policy != TWO_HOP_PATH_POLICY_NETWORK_DIVERSE
             || event.ttl_shape != "entry_ttl_2_onward_ttl_1"
             || !matches!(event.middle_candidate_bucket.as_str(), "none" | "one" | "few" | "healthy" | "deep")
             || !matches!(event.terminal_candidate_bucket.as_str(), "none" | "one" | "few" | "healthy" | "deep")
@@ -4245,6 +4262,7 @@ impl PeerStore {
             }
             "onion_ack_rejected" | "onion_ack_decode" | "onion_kem_unavailable"
             | "ack_rejected" | "ack_decode" | "no_distinct_path"
+            | "no_network_diverse_path"
             | "middle_missing_endpoint" | "middle_invalid_endpoint"
             | "onion_http_error" | "http_error" | "onion_request_error"
             | "request_error" => {
@@ -4604,6 +4622,75 @@ impl PeerStore {
             .collect()
     }
 
+    fn endpoint_network_identity(
+        descriptor: &SignedNodeDescriptor,
+    ) -> Option<EndpointNetworkIdentity> {
+        let endpoint = descriptor.descriptor.public_endpoint.as_deref()?.trim();
+        if endpoint.is_empty() {
+            return None;
+        }
+        let normalized = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+            endpoint.to_string()
+        } else {
+            format!("http://{endpoint}")
+        };
+        let url = reqwest::Url::parse(&normalized).ok()?;
+        let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return None;
+        }
+
+        let ip_host = host.trim_start_matches('[').trim_end_matches(']');
+        match ip_host.parse::<IpAddr>() {
+            Ok(IpAddr::V4(address)) => {
+                let octets = address.octets();
+                Some(EndpointNetworkIdentity::Ipv4([
+                    octets[0], octets[1], octets[2],
+                ]))
+            }
+            Ok(IpAddr::V6(address)) => {
+                let octets = address.octets();
+                Some(EndpointNetworkIdentity::Ipv6([
+                    octets[0], octets[1], octets[2], octets[3], octets[4], octets[5],
+                ]))
+            }
+            Err(_) => Some(EndpointNetworkIdentity::Dns(host)),
+        }
+    }
+
+    /// Returns whether two signed route endpoints pass coarse anti-affinity.
+    ///
+    /// Literal IPv4 endpoints must differ at /24 and IPv6 endpoints at /48;
+    /// DNS endpoints must have different normalized hostnames. Missing or
+    /// malformed endpoints fail closed. This prevents obviously collocated
+    /// hops, but it is not proof of distinct operators or autonomous systems.
+    /// That stronger property requires separately audited routing-domain
+    /// attestations and must not be inferred from this helper.
+    #[must_use]
+    pub fn route_endpoints_are_network_diverse(
+        left: &SignedNodeDescriptor,
+        right: &SignedNodeDescriptor,
+    ) -> bool {
+        match (
+            Self::endpoint_network_identity(left),
+            Self::endpoint_network_identity(right),
+        ) {
+            (Some(left), Some(right)) => left != right,
+            _ => false,
+        }
+    }
+
+    /// Returns whether a candidate is network-diverse from every selected hop.
+    #[must_use]
+    pub fn route_endpoint_is_network_diverse_from_all(
+        candidate: &SignedNodeDescriptor,
+        selected: &[SignedNodeDescriptor],
+    ) -> bool {
+        selected
+            .iter()
+            .all(|hop| Self::route_endpoints_are_network_diverse(candidate, hop))
+    }
+
     /// Returns health-ranked route candidates for a capability.
     ///
     /// This method is the server-internal companion to the privacy-safe
@@ -4673,9 +4760,10 @@ impl PeerStore {
             .into_iter()
             .filter(|candidate| {
                 let node_id = candidate.descriptor.node_id();
-                !excluded_node_ids
-                    .iter()
-                    .any(|excluded| *excluded == node_id)
+                candidate.summary.routeability_ready
+                    && !excluded_node_ids
+                        .iter()
+                        .any(|excluded| *excluded == node_id)
                     && capability_evidence.get(&node_id).is_some_and(|at| {
                         *at <= now && now.saturating_sub(*at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
                     })
@@ -4728,6 +4816,61 @@ impl PeerStore {
             .collect()
     }
 
+    fn scored_route_path_with_capabilities_excluding(
+        &self,
+        capabilities: &[NodeCapability],
+        now: u64,
+        excluded_node_ids: &[[u8; 32]],
+    ) -> Option<Vec<ScoredPeerRouteCandidate>> {
+        fn search_complete_path(
+            candidates_by_hop: &[Vec<ScoredPeerRouteCandidate>],
+            hop_index: usize,
+            excluded: &mut Vec<[u8; 32]>,
+            selected: &mut Vec<ScoredPeerRouteCandidate>,
+        ) -> bool {
+            if hop_index == candidates_by_hop.len() {
+                return true;
+            }
+
+            for candidate in &candidates_by_hop[hop_index] {
+                let node_id = candidate.descriptor.node_id();
+                if excluded.iter().any(|excluded| *excluded == node_id)
+                    || selected.iter().any(|hop| {
+                        !PeerStore::route_endpoints_are_network_diverse(
+                            &candidate.descriptor,
+                            &hop.descriptor,
+                        )
+                    })
+                {
+                    continue;
+                }
+
+                excluded.push(node_id);
+                selected.push(candidate.clone());
+                if search_complete_path(candidates_by_hop, hop_index + 1, excluded, selected) {
+                    return true;
+                }
+                selected.pop();
+                excluded.pop();
+            }
+            false
+        }
+
+        let candidates_by_hop = capabilities
+            .iter()
+            .map(|capability| {
+                self.scored_route_candidates(*capability, now, None, false)
+                    .into_iter()
+                    .filter(|candidate| candidate.summary.routeability_ready)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut excluded = excluded_node_ids.to_vec();
+        let mut selected = Vec::with_capacity(capabilities.len());
+        search_complete_path(&candidates_by_hop, 0, &mut excluded, &mut selected)
+            .then_some(selected)
+    }
+
     /// Plans a complete controlled route for the requested capability sequence.
     ///
     /// The planner selects one unique healthy-ranked peer for each requested
@@ -4746,23 +4889,12 @@ impl PeerStore {
         now: u64,
         excluded_node_ids: &[[u8; 32]],
     ) -> Option<Vec<SignedNodeDescriptor>> {
-        let mut excluded = excluded_node_ids.to_vec();
-        let mut path = Vec::with_capacity(capabilities.len());
-
-        for capability in capabilities {
-            let next = self
-                .scored_route_candidates(*capability, now, None, false)
-                .into_iter()
-                .find(|candidate| {
-                    let node_id = candidate.descriptor.node_id();
-                    !excluded.iter().any(|excluded| *excluded == node_id)
-                })?;
-            let node_id = next.descriptor.node_id();
-            excluded.push(node_id);
-            path.push(next.descriptor);
-        }
-
-        Some(path)
+        self.scored_route_path_with_capabilities_excluding(
+            capabilities,
+            now,
+            excluded_node_ids,
+        )
+        .map(|path| path.into_iter().map(|candidate| candidate.descriptor).collect())
     }
 
     /// Downgrades descriptors that are no longer valid at `now`.
@@ -6009,36 +6141,23 @@ impl PeerStore {
         capabilities: &[NodeCapability],
         now: u64,
     ) -> PeerStoreRoutePathPlan {
-        let mut excluded = Vec::with_capacity(capabilities.len());
-        let mut hops = Vec::with_capacity(capabilities.len());
-
-        for capability in capabilities {
-            let Some(next) = self
-                .scored_route_candidates(*capability, now, None, false)
-                .into_iter()
-                .filter(|candidate| candidate.summary.routeability_ready)
-                .find(|candidate| {
-                    let node_id = candidate.descriptor.node_id();
-                    !excluded.iter().any(|excluded| *excluded == node_id)
-                })
-            else {
-                break;
-            };
-
-            let node_id = next.descriptor.node_id();
-            excluded.push(node_id);
-            hops.push(PeerStoreRoutePathHop {
-                hop_index: hops.len(),
-                capability: Self::capability_label(*capability).to_string(),
-                node_id_prefix: next.summary.node_id_prefix,
-                score: next.summary.score,
-                health: next.summary.health,
-                route_health: next.summary.route_health,
-                last_seen_age_seconds: next.summary.last_seen_age_seconds,
-                ttl_remaining_seconds: next.summary.ttl_remaining_seconds,
-                region: next.summary.region,
-            });
-        }
+        let planned = self.scored_route_path_with_capabilities_excluding(capabilities, now, &[]);
+        let hops = planned
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(hop_index, candidate)| PeerStoreRoutePathHop {
+                hop_index,
+                capability: Self::capability_label(capabilities[hop_index]).to_string(),
+                node_id_prefix: candidate.summary.node_id_prefix,
+                score: candidate.summary.score,
+                health: candidate.summary.health,
+                route_health: candidate.summary.route_health,
+                last_seen_age_seconds: candidate.summary.last_seen_age_seconds,
+                ttl_remaining_seconds: candidate.summary.ttl_remaining_seconds,
+                region: candidate.summary.region,
+            })
+            .collect::<Vec<_>>();
 
         PeerStoreRoutePathPlan {
             label: label.to_string(),
@@ -6944,7 +7063,7 @@ mod tests {
             proof_scope: "control_plane".to_string(),
             path_shape: "entry_middle_terminal".to_string(),
             hop_count: 2,
-            path_policy: "distinct_middle_terminal".to_string(),
+            path_policy: TWO_HOP_PATH_POLICY_NETWORK_DIVERSE.to_string(),
             middle_candidate_bucket: "few".to_string(),
             terminal_candidate_bucket: "few".to_string(),
             ttl_shape: "entry_ttl_2_onward_ttl_1".to_string(),
@@ -7243,6 +7362,55 @@ mod tests {
     }
 
     #[test]
+    fn test_route_endpoint_network_anti_affinity_is_fail_closed_and_prefix_aware() {
+        let now = 1_700_000_100;
+        let descriptor = |endpoint: &str| {
+            let identity = IdentityKeyPair::generate();
+            let mut descriptor = signed_descriptor_for(&identity, 1, now + 2_000);
+            descriptor.descriptor.public_endpoint = Some(endpoint.to_string());
+            SignedNodeDescriptor::sign(descriptor.descriptor, &identity).unwrap()
+        };
+
+        let ipv4_a = descriptor("http://203.0.113.10:8422");
+        let ipv4_same_24 = descriptor("https://203.0.113.240:8422");
+        let ipv4_other_24 = descriptor("http://203.0.114.10:8422");
+        assert!(!PeerStore::route_endpoints_are_network_diverse(
+            &ipv4_a,
+            &ipv4_same_24,
+        ));
+        assert!(PeerStore::route_endpoints_are_network_diverse(
+            &ipv4_a,
+            &ipv4_other_24,
+        ));
+
+        let ipv6_a = descriptor("http://[2001:db8:1::10]:8422");
+        let ipv6_same_48 = descriptor("https://[2001:db8:1:ffff::20]:8422");
+        let ipv6_other_48 = descriptor("http://[2001:db8:2::10]:8422");
+        assert!(!PeerStore::route_endpoints_are_network_diverse(
+            &ipv6_a,
+            &ipv6_same_48,
+        ));
+        assert!(PeerStore::route_endpoints_are_network_diverse(
+            &ipv6_a,
+            &ipv6_other_48,
+        ));
+
+        let dns_a = descriptor("https://Relay.Example.com.:8422");
+        let dns_same = descriptor("https://relay.example.com:9443");
+        let dns_other = descriptor("https://relay.other.example:8422");
+        let malformed = descriptor("http:///");
+        assert!(!PeerStore::route_endpoints_are_network_diverse(
+            &dns_a, &dns_same,
+        ));
+        assert!(PeerStore::route_endpoints_are_network_diverse(
+            &dns_a, &dns_other,
+        ));
+        assert!(!PeerStore::route_endpoints_are_network_diverse(
+            &dns_a, &malformed,
+        ));
+    }
+
+    #[test]
     fn test_route_path_planner_selects_unique_hops_without_payload_data() {
         let store = PeerStore::new();
         let now = 1_700_000_100;
@@ -7274,6 +7442,7 @@ mod tests {
         middle_descriptor.descriptor.capacity.max_sessions = 512;
         middle_descriptor =
             SignedNodeDescriptor::sign(middle_descriptor.descriptor, &middle_kp).unwrap();
+        let middle_node_id = middle_descriptor.node_id();
 
         let mut relay_descriptor = signed_descriptor_for(&relay_kp, 1, now + 2_000);
         relay_descriptor.descriptor.capabilities = vec![NodeCapability::ChatRelay];
@@ -7295,6 +7464,9 @@ mod tests {
         store
             .upsert_verified_from_source(relay_descriptor, now, "gossip_announce")
             .unwrap();
+        store.record_route_forward_success(&shared_node_id, now);
+        store.record_route_forward_success(&middle_node_id, now);
+        store.record_route_forward_success(&relay_node_id, now);
 
         let path = store
             .route_path_with_capabilities_excluding(
@@ -7309,6 +7481,65 @@ mod tests {
         assert_eq!(path[1].node_id(), relay_node_id);
         assert_ne!(path[0].node_id(), path[1].node_id());
         assert!(!path.iter().any(|hop| hop.node_id() == self_node_id));
+    }
+
+    #[test]
+    fn test_route_path_planner_backtracks_around_collocated_high_score_hop() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let preferred_middle_kp = IdentityKeyPair::generate();
+        let alternate_middle_kp = IdentityKeyPair::generate();
+        let terminal_kp = IdentityKeyPair::generate();
+
+        let mut preferred_middle =
+            signed_descriptor_for(&preferred_middle_kp, 1, now + 2_000);
+        preferred_middle.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        preferred_middle.descriptor.public_endpoint =
+            Some("http://203.0.113.10:8422".to_string());
+        preferred_middle.descriptor.capacity.max_sessions = 4096;
+        preferred_middle =
+            SignedNodeDescriptor::sign(preferred_middle.descriptor, &preferred_middle_kp).unwrap();
+        let preferred_middle_id = preferred_middle.node_id();
+
+        let mut alternate_middle =
+            signed_descriptor_for(&alternate_middle_kp, 1, now + 2_000);
+        alternate_middle.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        alternate_middle.descriptor.public_endpoint =
+            Some("http://198.51.100.10:8422".to_string());
+        alternate_middle.descriptor.capacity.max_sessions = 64;
+        alternate_middle =
+            SignedNodeDescriptor::sign(alternate_middle.descriptor, &alternate_middle_kp).unwrap();
+        let alternate_middle_id = alternate_middle.node_id();
+
+        let mut terminal = signed_descriptor_for(&terminal_kp, 1, now + 2_000);
+        terminal.descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        terminal.descriptor.public_endpoint = Some("http://203.0.113.90:8422".to_string());
+        terminal = SignedNodeDescriptor::sign(terminal.descriptor, &terminal_kp).unwrap();
+        let terminal_id = terminal.node_id();
+
+        for descriptor in [preferred_middle, alternate_middle, terminal] {
+            store
+                .upsert_verified_from_source(descriptor, now, "gossip_announce")
+                .unwrap();
+        }
+        for node_id in [preferred_middle_id, alternate_middle_id, terminal_id] {
+            store.record_route_forward_success(&node_id, now);
+        }
+
+        let path = store
+            .route_path_with_capabilities_excluding(
+                &[NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+                now,
+                &[],
+            )
+            .expect("a lower-scored network-diverse path should be selected");
+
+        assert_eq!(path[0].node_id(), alternate_middle_id);
+        assert_eq!(path[1].node_id(), terminal_id);
+        assert_ne!(path[0].node_id(), preferred_middle_id);
+        assert!(PeerStore::route_endpoints_are_network_diverse(
+            &path[0], &path[1],
+        ));
     }
 
     #[test]
@@ -8326,6 +8557,16 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(store.status(now + 3).blind_relay_quality.delivery_receipt_capable_peers, 1);
 
+        store.record_route_forward_failure(&node_id, now + 4, "request_failed");
+        assert!(store
+            .delivery_receipt_route_candidates_with_capability_excluding(
+                NodeCapability::ChatRelay,
+                now + 5,
+                4,
+                &[],
+            )
+            .is_empty());
+
         let stale_at = now + 2 + PEER_ROUTEABILITY_STALE_AFTER_SECS + 1;
         assert!(store
             .delivery_receipt_route_candidates_with_capability_excluding(
@@ -8585,7 +8826,7 @@ mod tests {
         assert_eq!(status.two_hop_path_proof_history.events[0].hop_count, 2);
         assert_eq!(
             status.two_hop_path_proof_history.events[0].path_policy,
-            "distinct_middle_terminal"
+            TWO_HOP_PATH_POLICY_NETWORK_DIVERSE
         );
         assert_eq!(
             status.two_hop_path_proof_history.events[0].middle_candidate_bucket,

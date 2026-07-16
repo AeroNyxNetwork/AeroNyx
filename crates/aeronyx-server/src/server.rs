@@ -263,6 +263,7 @@
 //     never mark a terminal healthy solely because a middle claims forwarding.
 //
 // Last Modified:
+//   v2.8.23-RouteNetworkAntiAffinity - Fail closed on unreachable or endpoint-collocated relay paths
 //   v2.8.22-DiscoveryTaskLifecycle - Await peer-cache and gossip shutdown tasks
 //   v2.8.21-RouteEvidenceCache - Descriptor-bound warm-restart routeability evidence
 //   v2.8.20-RouteWarmup - Bounded direct startup routeability probes
@@ -480,6 +481,7 @@ const MINER_SCHEDULER_TICK_SECS: u64 = 60;
 const KEEPALIVE_PROBE_INTERVAL_SECS: u64 = 60;
 const KEEPALIVE_ACK_TIMEOUT_SECS: u64 = 90;
 const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
+const ONION_ROUTE_SELECTION_CANDIDATE_LIMIT: usize = 8;
 const BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS: u64 = 15 * 60;
 const BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS: u64 = 60;
 const BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS: u64 = 120;
@@ -5037,6 +5039,7 @@ impl Server {
 
         let middle_candidate_count = middle_candidates.len();
         let mut attempted = false;
+        let mut network_diversity_blocked = false;
         for middle in middle_candidates {
             let middle_node_id = middle.node_id();
             let mut terminal_candidates = peer_store
@@ -5047,6 +5050,12 @@ impl Server {
                     &[*self_node_id, middle_node_id],
                 );
             Self::prioritize_probe_candidates(peer_store, now, &mut terminal_candidates);
+            let pre_diversity_candidate_count = terminal_candidates.len();
+            terminal_candidates.retain(|terminal| {
+                PeerStore::route_endpoints_are_network_diverse(&middle, terminal)
+            });
+            network_diversity_blocked |=
+                pre_diversity_candidate_count > 0 && terminal_candidates.is_empty();
             let terminal_candidate_count = terminal_candidates.len();
             if terminal_candidates.is_empty() {
                 continue;
@@ -5395,7 +5404,11 @@ impl Server {
             peer_store.record_blind_relay_two_hop_probe_result_with_context(
                 now,
                 false,
-                "no_distinct_path",
+                if network_diversity_blocked {
+                    "no_network_diverse_path"
+                } else {
+                    "no_distinct_path"
+                },
                 middle_candidate_count,
                 0,
                 2,
@@ -5723,17 +5736,34 @@ impl Server {
         let mut attempted = 0usize;
         let mut accepted = 0usize;
         let mut last_failure_reason = None;
+        let mut used_hop_node_ids = Vec::new();
+        let mut used_hops = Vec::new();
         for terminal in terminal_candidates {
             let terminal_node_id = terminal.node_id();
+            if used_hop_node_ids.contains(&terminal_node_id)
+                || !PeerStore::route_endpoint_is_network_diverse_from_all(&terminal, &used_hops)
+            {
+                continue;
+            }
+            let mut excluded_node_ids = Vec::with_capacity(used_hop_node_ids.len() + 2);
+            excluded_node_ids.push(*self_node_id);
+            excluded_node_ids.push(terminal_node_id);
+            excluded_node_ids.extend(used_hop_node_ids.iter().copied());
             let Some(middle) = peer_store
                 .delivery_receipt_route_candidates_with_capability_excluding(
                     NodeCapability::OnionMiddle,
                     now,
-                    1,
-                    &[*self_node_id, terminal_node_id],
+                    ONION_ROUTE_SELECTION_CANDIDATE_LIMIT,
+                    &excluded_node_ids,
                 )
                 .into_iter()
-                .next()
+                .find(|middle| {
+                    PeerStore::route_endpoints_are_network_diverse(middle, &terminal)
+                        && PeerStore::route_endpoint_is_network_diverse_from_all(
+                            middle,
+                            &used_hops,
+                        )
+                })
             else {
                 continue;
             };
@@ -5759,6 +5789,13 @@ impl Server {
                 continue;
             };
 
+            // Once sent, both hops are considered exposed for this envelope
+            // even if the ACK is lost. Reusing either node or endpoint network
+            // for another replica would weaken unlinkability under ambiguity.
+            used_hop_node_ids.push(middle_node_id);
+            used_hop_node_ids.push(terminal_node_id);
+            used_hops.push(middle.clone());
+            used_hops.push(terminal.clone());
             attempted = attempted.saturating_add(1);
             match client.post(&url).json(&request).send().await {
                 Ok(response) if response.status().is_success() => {
@@ -5850,12 +5887,16 @@ impl Server {
         let mut last_failure_reason: Option<String> = None;
 
         let excluded_node_ids = [*self_node_id];
-        for peer in peer_store.route_candidates_with_capability_excluding(
-            NodeCapability::ChatRelay,
-            now,
-            CHAT_PEER_RELAY_FANOUT_LIMIT,
-            &excluded_node_ids,
-        ) {
+        for peer in peer_store
+            .route_candidates_with_capability_excluding(
+                NodeCapability::ChatRelay,
+                now,
+                CHAT_PEER_RELAY_FANOUT_LIMIT,
+                &excluded_node_ids,
+            )
+            .into_iter()
+            .filter(|peer| peer_store.is_routeable_now(&peer.node_id(), now))
+        {
             let peer_node_id = peer.node_id();
             let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
                 peer_store.record_route_forward_failure(&peer_node_id, now, "missing_endpoint");
@@ -8544,7 +8585,7 @@ mod tests {
             "test-receipt-terminal",
         )
         .with_x25519_kem(terminal_identity.x25519_public_key_bytes());
-        terminal_descriptor.public_endpoint = Some("http://127.0.0.1:9".to_string());
+        terminal_descriptor.public_endpoint = Some("http://127.0.1.1:9".to_string());
         terminal_descriptor.capabilities = vec![NodeCapability::ChatRelay];
         let terminal_descriptor =
             SignedNodeDescriptor::sign(terminal_descriptor, &terminal_identity).unwrap();
@@ -8574,6 +8615,80 @@ mod tests {
         assert_eq!(quality.verified_client_onion_deliveries, 1);
         assert_eq!(quality.delivery_receipt_capable_peers, 2);
         assert_eq!(quality.evidence_mode, "verified_client_onion_delivery_receipt");
+    }
+
+    #[tokio::test]
+    async fn authenticated_chat_rejects_receipt_capable_hops_on_same_network() {
+        let now = unix_now_secs();
+        let source = IdentityKeyPair::generate();
+        let sender = IdentityKeyPair::generate();
+        let middle_identity = IdentityKeyPair::generate();
+        let terminal_identity = IdentityKeyPair::generate();
+        let middle_node_id = middle_identity.public_key_bytes();
+        let terminal_node_id = terminal_identity.public_key_bytes();
+
+        let mut envelope = ChatEnvelope {
+            message_id: [0x51; 16],
+            sender: sender.public_key_bytes(),
+            receiver: [0x52; 32],
+            timestamp: now,
+            ciphertext: b"opaque app ciphertext".to_vec(),
+            nonce: [0x53; 24],
+            content_type: ChatContentType::Text,
+            signature: [0u8; 64],
+        };
+        envelope.signature = sender.sign(&envelope.sign_data());
+
+        let mut middle = NodeDescriptor::new(
+            middle_node_id,
+            now,
+            now,
+            now + 300,
+            "test-collocated-middle",
+        )
+        .with_x25519_kem(middle_identity.x25519_public_key_bytes());
+        middle.public_endpoint = Some("http://203.0.113.10:8422".to_string());
+        middle.capabilities = vec![NodeCapability::OnionMiddle];
+        let middle = SignedNodeDescriptor::sign(middle, &middle_identity).unwrap();
+
+        let mut terminal = NodeDescriptor::new(
+            terminal_node_id,
+            now,
+            now,
+            now + 300,
+            "test-collocated-terminal",
+        )
+        .with_x25519_kem(terminal_identity.x25519_public_key_bytes());
+        terminal.public_endpoint = Some("http://203.0.113.200:8422".to_string());
+        terminal.capabilities = vec![NodeCapability::ChatRelay];
+        let terminal = SignedNodeDescriptor::sign(terminal, &terminal_identity).unwrap();
+
+        let store = PeerStore::new();
+        store.upsert_verified(middle, now).unwrap();
+        store.upsert_verified(terminal, now).unwrap();
+        for node_id in [middle_node_id, terminal_node_id] {
+            store.record_route_forward_success(&node_id, now);
+            store.record_delivery_receipt_capability(&node_id, now);
+        }
+
+        let delivered = Server::relay_authenticated_chat_over_onion_paths(
+            Some(&reqwest::Client::new()),
+            None,
+            &store,
+            &source,
+            &source.public_key_bytes(),
+            &envelope,
+        )
+        .await;
+
+        assert!(!delivered);
+        assert_eq!(
+            store
+                .status(unix_now_secs())
+                .blind_relay_quality
+                .verified_client_onion_deliveries,
+            0,
+        );
     }
 
     #[test]
@@ -9315,6 +9430,7 @@ mod tests {
         peer_store
             .upsert_verified(peer_descriptor, now)
             .expect("mock peer descriptor should verify");
+        peer_store.record_route_forward_success(&peer_node_id, now);
 
         let client = reqwest::Client::new();
         let accepted = Server::relay_chat_envelope_to_discovered_peers(
@@ -9371,12 +9487,17 @@ mod tests {
             .unwrap()
             .as_secs();
         let peer_store = PeerStore::new();
-        let peer_descriptor = signed_chat_relay_peer_descriptor(endpoint, now, now + 300);
+        let peer_descriptor = signed_chat_relay_peer_descriptor(
+            endpoint,
+            now.saturating_sub(1),
+            now + 300,
+        );
         let peer_node_id = peer_descriptor.node_id();
         let peer_prefix = hex::encode(&peer_node_id[..4]);
         peer_store
             .upsert_verified(peer_descriptor, now)
             .expect("mock peer descriptor should verify");
+        peer_store.record_route_forward_success(&peer_node_id, now.saturating_sub(1));
 
         let client = reqwest::Client::new();
         let accepted = Server::relay_chat_envelope_to_discovered_peers(
@@ -9402,8 +9523,45 @@ mod tests {
             row.last_route_failure_reason.as_deref(),
             Some("peer_relay_ack_rejected")
         );
-        assert_eq!(row.last_route_success_at, None);
+        assert_eq!(row.last_route_success_at, Some(now.saturating_sub(1)));
         mock_peer.abort();
+    }
+
+    #[tokio::test]
+    async fn discovered_chat_relay_skips_peer_with_newer_failure_evidence() {
+        let now = unix_now_secs();
+        let peer_store = PeerStore::new();
+        let descriptor = signed_chat_relay_peer_descriptor(
+            "http://127.0.0.1:9".to_string(),
+            now.saturating_sub(1),
+            now + 300,
+        );
+        let node_id = descriptor.node_id();
+        peer_store
+            .upsert_verified(descriptor, now)
+            .expect("test peer descriptor should verify");
+        peer_store.record_route_forward_success(&node_id, now.saturating_sub(1));
+        peer_store.record_route_forward_failure(&node_id, now, "request_failed");
+
+        let accepted = Server::relay_chat_envelope_to_discovered_peers(
+            Some(&reqwest::Client::new()),
+            None,
+            &peer_store,
+            &[0x99; 32],
+            &signed_test_chat_envelope(now),
+        )
+        .await;
+
+        assert_eq!(accepted, 0);
+        let row = peer_store
+            .route_candidate_status(now + 1)
+            .chat_relay
+            .into_iter()
+            .find(|row| row.node_id_prefix == hex::encode(&node_id[..4]))
+            .expect("unreachable peer should remain visible for diagnostics");
+        assert_eq!(row.routeability_state, "unreachable");
+        assert_eq!(row.route_failure_count, 1);
+        assert_eq!(row.route_consecutive_failures, 1);
     }
 
     #[tokio::test]
