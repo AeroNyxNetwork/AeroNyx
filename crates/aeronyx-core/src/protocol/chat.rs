@@ -59,8 +59,12 @@
 //! - `BlindRelayEnvelope`: node-to-node opaque forwarding frame for future
 //!   controlled multi-hop/onion routing. Nodes see route_id/next_hop/ttl and
 //!   an opaque encrypted_blob only; they do not parse the inner chat/media data.
+//! - `BlindRelayDeliveryReceipt`: terminal-signed proof that an exact opaque
+//!   payload reached the store-and-forward acceptance boundary. The receipt
+//!   contains no sender, receiver, endpoint, online-state, or plaintext data.
 //!
 //! ## Last Modified
+//! v1.2.0-BlindRelayDeliveryReceipt - Added terminal-signed opaque delivery receipt
 //! v1.1.0-BlindRelayEnvelope — Added opaque node-to-node relay envelope skeleton
 //! v1.0.0-ChatRelay — Initial implementation
 
@@ -82,6 +86,12 @@ const MAX_ENVELOPE_BYTES: u64 = 128 * 1024; // 128 KB
 const MAX_BLIND_RELAY_ENVELOPE_BYTES: u64 = 256 * 1024; // 256 KB opaque relay frame cap
 const MAX_BLIND_RELAY_BLOB_BYTES: usize = 192 * 1024; // media/file bytes must use blob storage
 const BLIND_RELAY_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-v1";
+const BLIND_RELAY_DELIVERY_RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-DeliveryReceipt-v1";
+
+/// Initial signed blind-relay terminal receipt version.
+pub const BLIND_RELAY_DELIVERY_RECEIPT_VERSION: u8 = 1;
+/// Terminal accepted the opaque payload into online or durable pending delivery.
+pub const BLIND_RELAY_DELIVERY_ACCEPTED: u8 = 1;
 
 // ============================================
 // Serde helper for [u8; 64]
@@ -381,6 +391,116 @@ impl BlindRelayEnvelope {
         next.ttl = next.ttl.saturating_sub(1);
         next.signature = [0u8; 64];
         Some(next)
+    }
+}
+
+// ============================================
+// BlindRelayDeliveryReceipt
+// ============================================
+
+/// Terminal-signed proof for one accepted opaque blind-relay payload.
+///
+/// The payload commitment binds the ACK to the exact bytes delivered at the
+/// terminal boundary without returning those bytes through the relay path.
+/// The receipt deliberately omits sender/receiver identities, endpoints,
+/// online state, mailbox state, content type, and payload size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindRelayDeliveryReceipt {
+    /// Receipt schema version.
+    pub version: u8,
+    /// Random route correlation id supplied by the source for this route.
+    pub route_id: [u8; 16],
+    /// SHA-256 commitment to the exact terminal payload bytes. For chat this
+    /// payload is still the sender's end-to-end encrypted `ChatEnvelope`.
+    pub payload_commitment: [u8; 32],
+    /// Ed25519 identity of the terminal node that accepted the payload.
+    pub terminal_node_id: [u8; 32],
+    /// Unix timestamp when terminal acceptance completed.
+    pub delivered_at: u64,
+    /// Stable disposition. Version 1 accepts only `BLIND_RELAY_DELIVERY_ACCEPTED`.
+    pub disposition: u8,
+    /// Ed25519 signature over `signing_data()`.
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl BlindRelayDeliveryReceipt {
+    /// Creates and signs a successful terminal receipt.
+    #[must_use]
+    pub fn accepted(
+        route_id: [u8; 16],
+        payload_commitment: [u8; 32],
+        delivered_at: u64,
+        terminal: &IdentityKeyPair,
+    ) -> Self {
+        let mut receipt = Self {
+            version: BLIND_RELAY_DELIVERY_RECEIPT_VERSION,
+            route_id,
+            payload_commitment,
+            terminal_node_id: terminal.public_key_bytes(),
+            delivered_at,
+            disposition: BLIND_RELAY_DELIVERY_ACCEPTED,
+            signature: [0u8; 64],
+        };
+        receipt.signature = terminal.sign(&receipt.signing_data());
+        receipt
+    }
+
+    /// Returns the SHA-256 commitment used by terminal and source verification.
+    #[must_use]
+    pub fn payload_commitment(payload: &[u8]) -> [u8; 32] {
+        Sha256::digest(payload).into()
+    }
+
+    /// Builds canonical domain-separated receipt signing bytes.
+    #[must_use]
+    pub fn signing_data(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(
+            BLIND_RELAY_DELIVERY_RECEIPT_SIGNING_DOMAIN.len() + 1 + 16 + 32 + 32 + 8 + 1,
+        );
+        data.extend_from_slice(BLIND_RELAY_DELIVERY_RECEIPT_SIGNING_DOMAIN);
+        data.push(self.version);
+        data.extend_from_slice(&self.route_id);
+        data.extend_from_slice(&self.payload_commitment);
+        data.extend_from_slice(&self.terminal_node_id);
+        data.extend_from_slice(&self.delivered_at.to_le_bytes());
+        data.push(self.disposition);
+        data
+    }
+
+    /// Verifies version, disposition, and the terminal Ed25519 signature.
+    pub fn verify_signature(&self) -> Result<(), CoreError> {
+        if self.version != BLIND_RELAY_DELIVERY_RECEIPT_VERSION {
+            return Err(CoreError::malformed(
+                "blind relay delivery receipt: unsupported version",
+            ));
+        }
+        if self.disposition != BLIND_RELAY_DELIVERY_ACCEPTED {
+            return Err(CoreError::malformed(
+                "blind relay delivery receipt: unsupported disposition",
+            ));
+        }
+        let terminal = IdentityPublicKey::from_bytes(&self.terminal_node_id)?;
+        terminal.verify(&self.signing_data(), &self.signature)
+    }
+
+    /// Verifies the signature and binds the receipt to the source's expected route.
+    pub fn verify_expected(
+        &self,
+        route_id: &[u8; 16],
+        payload_commitment: &[u8; 32],
+        terminal_node_id: &[u8; 32],
+    ) -> Result<(), CoreError> {
+        self.verify_signature()?;
+        if &self.route_id != route_id
+            || &self.payload_commitment != payload_commitment
+            || &self.terminal_node_id != terminal_node_id
+        {
+            return Err(CoreError::malformed(
+                "blind relay delivery receipt: route binding mismatch",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -783,6 +903,51 @@ mod tests {
         .sign_with(&kp);
 
         assert!(encode_blind_relay_envelope(&env).is_err());
+    }
+
+    #[test]
+    fn test_blind_relay_delivery_receipt_binds_terminal_route_and_payload() {
+        let terminal = IdentityKeyPair::generate();
+        let route_id = [0x31u8; 16];
+        let commitment = BlindRelayDeliveryReceipt::payload_commitment(b"opaque payload");
+        let receipt =
+            BlindRelayDeliveryReceipt::accepted(route_id, commitment, 1_700_000_200, &terminal);
+
+        assert!(receipt.verify_signature().is_ok());
+        assert!(receipt
+            .verify_expected(&route_id, &commitment, &terminal.public_key_bytes())
+            .is_ok());
+    }
+
+    #[test]
+    fn test_blind_relay_delivery_receipt_rejects_route_or_payload_substitution() {
+        let terminal = IdentityKeyPair::generate();
+        let route_id = [0x41u8; 16];
+        let commitment = BlindRelayDeliveryReceipt::payload_commitment(b"opaque payload");
+        let receipt =
+            BlindRelayDeliveryReceipt::accepted(route_id, commitment, 1_700_000_200, &terminal);
+
+        assert!(receipt
+            .verify_expected(&[0x42u8; 16], &commitment, &terminal.public_key_bytes())
+            .is_err());
+        assert!(receipt
+            .verify_expected(
+                &route_id,
+                &BlindRelayDeliveryReceipt::payload_commitment(b"other payload"),
+                &terminal.public_key_bytes(),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn test_blind_relay_delivery_receipt_rejects_tampered_signature_fields() {
+        let terminal = IdentityKeyPair::generate();
+        let commitment = BlindRelayDeliveryReceipt::payload_commitment(b"opaque payload");
+        let mut receipt =
+            BlindRelayDeliveryReceipt::accepted([0x51u8; 16], commitment, 1_700_000_200, &terminal);
+        receipt.delivered_at = receipt.delivered_at.saturating_add(1);
+
+        assert!(receipt.verify_signature().is_err());
     }
 
     // ── MediaPointer ──

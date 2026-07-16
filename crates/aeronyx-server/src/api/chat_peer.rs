@@ -17,6 +17,8 @@
 //! - Delivers to locally online receiver devices when possible
 //! - Falls back to the existing SQLite pending queue when the receiver is
 //!   offline or all local routes are stale
+//! - Returns a terminal-signed receipt bound to the exact opaque payload after
+//!   successful onion terminal store-and-forward; middle hops only propagate it
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -104,8 +106,12 @@
 //! - Durable queue count/byte exhaustion is a retryable capacity condition,
 //!   not an internal server fault. Preserve the service's privacy-safe reason
 //!   bucket while returning HTTP 503 to the previous hop.
+//! - Delivery receipts authenticate terminal acceptance only. They must not add
+//!   sender, receiver, endpoint, online-state, mailbox-state, or payload-size
+//!   fields, and intermediates must reject invalid signatures before forwarding.
 //!
 //! ## Last Modified
+//! v0.26.0-SignedDeliveryReceipt - Sign exact terminal payload acceptance and propagate verified receipts
 //! v0.25.0-DurableQueueCapacity - Classify global pending-store quota exhaustion
 //! v0.24.0-PublicRequestBounds - Bound peer bodies and concurrency before JSON extraction
 //! v0.23.0-RouteSafeRelayLogs - Remove user/route-adjacent values and raw transport errors from chat peer logs
@@ -144,7 +150,8 @@ use aeronyx_core::crypto::transport::{
 };
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::chat::{
-    decode_envelope, encode_blind_relay_envelope, encode_envelope, BlindRelayEnvelope, ChatEnvelope,
+    decode_envelope, encode_blind_relay_envelope, encode_envelope, BlindRelayDeliveryReceipt,
+    BlindRelayEnvelope, ChatEnvelope,
 };
 use aeronyx_core::protocol::codec::encode_data_packet;
 use aeronyx_core::protocol::discovery::SignedNodeDescriptor;
@@ -255,6 +262,10 @@ const BLIND_RELAY_MAX_ENVELOPE_AGE_SECS: u64 = 10 * 60;
 
 /// Small clock-skew allowance for peers whose clocks run slightly ahead.
 const BLIND_RELAY_MAX_FUTURE_SKEW_SECS: u64 = 120;
+/// Terminal delivery receipts are short-lived acknowledgements, not durable tokens.
+const BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS: u64 = 120;
+/// Delivery receipt future skew is intentionally tighter than relay-frame skew.
+const BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 30;
 
 // ============================================
 // State / Request / Response Types
@@ -518,6 +529,12 @@ pub struct PeerBlindRelayResponse {
     pub ttl_remaining: u8,
     /// Privacy-safe coarse result bucket for nodeboard/audits.
     pub reason: Option<String>,
+    /// Optional terminal-signed proof bound to the exact delivered payload.
+    ///
+    /// Older nodes omit this field. Intermediate nodes may propagate it but
+    /// must not infer sender, receiver, online state, or payload contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_receipt: Option<BlindRelayDeliveryReceipt>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -740,6 +757,7 @@ async fn peer_blind_relay_request_gate(
                 forwarded: false,
                 ttl_remaining: 0,
                 reason: Some("backpressure".to_string()),
+                delivery_receipt: None,
             }),
         )
             .into_response();
@@ -781,6 +799,7 @@ async fn peer_blind_relay_handler(
                 forwarded: false,
                 ttl_remaining: 0,
                 reason: Some(error.reason_bucket().to_string()),
+                delivery_receipt: None,
             }),
         )
             .into_response(),
@@ -926,6 +945,7 @@ async fn process_peer_blind_relay(
             forwarded: false,
             ttl_remaining: envelope.ttl,
             reason: Some("terminal_next_hop".to_string()),
+            delivery_receipt: None,
         });
     }
 
@@ -1041,6 +1061,7 @@ async fn process_peer_blind_relay(
         forwarded: true,
         ttl_remaining,
         reason: Some("forwarded".to_string()),
+        delivery_receipt: None,
     })
 }
 
@@ -1089,6 +1110,7 @@ async fn process_onion_blind_relay(
     match peel.next_hop {
         // Terminal hop: `inner` is the delivered payload (a ChatEnvelope).
         None => {
+            let payload_commitment = BlindRelayDeliveryReceipt::payload_commitment(&peel.inner);
             let inner_envelope = decode_envelope(&peel.inner).map_err(|_| {
                 forget_blind_relay_route(&state, &envelope.route_id);
                 reject_blind_relay_previous_hop(
@@ -1126,12 +1148,19 @@ async fn process_onion_blind_relay(
                 envelope.ttl,
                 envelope.encrypted_blob.len(),
             );
+            let delivery_receipt = BlindRelayDeliveryReceipt::accepted(
+                envelope.route_id,
+                payload_commitment,
+                now,
+                state.node_identity.as_ref(),
+            );
             Ok(PeerBlindRelayResponse {
                 accepted: true,
                 terminal: true,
                 forwarded: false,
                 ttl_remaining: envelope.ttl,
                 reason: Some("onion_terminal_delivered".to_string()),
+                delivery_receipt: Some(delivery_receipt),
             })
         }
         // Entry/middle hop: forward the inner layer to the revealed next hop.
@@ -1236,7 +1265,7 @@ async fn process_onion_blind_relay(
             .sign_with(state.node_identity.as_ref());
             let ttl_remaining = forwarded_envelope.ttl;
 
-            if let Err(error) = forward_blind_relay_with_retry(
+            let next_hop_ack = match forward_blind_relay_with_retry(
                 &state,
                 &url,
                 next_hop,
@@ -1250,9 +1279,12 @@ async fn process_onion_blind_relay(
             )
             .await
             {
-                forget_blind_relay_route(&state, &envelope.route_id);
-                return Err(error);
-            }
+                Ok(ack) => ack,
+                Err(error) => {
+                    forget_blind_relay_route(&state, &envelope.route_id);
+                    return Err(error);
+                }
+            };
 
             state
                 .peer_store
@@ -1268,6 +1300,7 @@ async fn process_onion_blind_relay(
                 forwarded: true,
                 ttl_remaining,
                 reason: Some("onion_forwarded".to_string()),
+                delivery_receipt: next_hop_ack.delivery_receipt,
             })
         }
     }
@@ -1371,7 +1404,7 @@ async fn process_onion_middle_blind_relay(
         .sign_with(state.node_identity.as_ref());
     let ttl_remaining = forwarded_envelope.ttl;
 
-    if let Err(error) = forward_blind_relay_with_retry(
+    let next_hop_ack = match forward_blind_relay_with_retry(
         &state,
         &url,
         next_hop,
@@ -1385,9 +1418,12 @@ async fn process_onion_middle_blind_relay(
     )
     .await
     {
-        forget_blind_relay_route(&state, &outer_envelope.route_id);
-        return Err(error);
-    }
+        Ok(ack) => ack,
+        Err(error) => {
+            forget_blind_relay_route(&state, &outer_envelope.route_id);
+            return Err(error);
+        }
+    };
 
     state
         .peer_store
@@ -1403,6 +1439,7 @@ async fn process_onion_middle_blind_relay(
         forwarded: true,
         ttl_remaining,
         reason: Some("onion_middle_forwarded".to_string()),
+        delivery_receipt: next_hop_ack.delivery_receipt,
     })
 }
 
@@ -1572,6 +1609,7 @@ fn duplicate_blind_relay_response(
         forwarded: false,
         ttl_remaining,
         reason: Some("duplicate_route".to_string()),
+        delivery_receipt: None,
     }
 }
 
@@ -1581,7 +1619,7 @@ async fn forward_blind_relay_with_retry(
     next_hop: [u8; 32],
     request: PeerBlindRelayRequest,
     now: u64,
-) -> Result<(), BlindRelayError> {
+) -> Result<PeerBlindRelayResponse, BlindRelayError> {
     for attempt in 1..=MAX_BLIND_RELAY_FORWARD_ATTEMPTS {
         match state.http_client.post(url).json(&request).send().await {
             Ok(response) if response.status().is_success() => {
@@ -1592,12 +1630,38 @@ async fn forward_blind_relay_with_retry(
                 .await
                 {
                     Ok(ack) if ack.accepted => {
+                        if let Some(receipt) = ack.delivery_receipt.as_ref() {
+                            if receipt.route_id != request.envelope.route_id
+                                || receipt.terminal_node_id != next_hop
+                                || receipt.delivered_at
+                                    > now.saturating_add(
+                                        BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS,
+                                    )
+                                || now.saturating_sub(receipt.delivered_at)
+                                    > BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS
+                                || receipt.verify_signature().is_err()
+                            {
+                                debug!(
+                                    attempt,
+                                    "[BLIND_RELAY] Next-hop delivery receipt verification failed"
+                                );
+                                state.peer_store.record_route_forward_failure(
+                                    &next_hop,
+                                    now,
+                                    "delivery_receipt_invalid",
+                                );
+                                state
+                                    .peer_store
+                                    .record_blind_relay_rejected(now, "delivery_receipt_invalid");
+                                return Err(BlindRelayError::ForwardFailed);
+                            }
+                        }
                         if attempt > 1 {
                             state
                                 .peer_store
                                 .record_blind_relay_retry_succeeded(now, attempt);
                         }
-                        return Ok(());
+                        return Ok(ack);
                     }
                     Ok(_ack) => {
                         debug!(
@@ -2326,6 +2390,16 @@ mod tests {
         assert!(result.terminal);
         assert!(!result.forwarded);
         assert_eq!(result.reason.as_deref(), Some("onion_terminal_delivered"));
+        result
+            .delivery_receipt
+            .as_ref()
+            .expect("terminal onion delivery must return a signed receipt")
+            .verify_expected(
+                &[0x55u8; 16],
+                &BlindRelayDeliveryReceipt::payload_commitment(&inner),
+                &node_identity.public_key_bytes(),
+            )
+            .expect("receipt must bind the exact terminal payload and node");
         let blind_stats = peer_store.status(now + 1).runtime.blind_relay;
         assert_eq!(blind_stats.terminal, 1);
         assert_eq!(blind_stats.rejected, 0);
@@ -2495,6 +2569,7 @@ mod tests {
                         forwarded: false,
                         ttl_remaining: 2,
                         reason: Some("terminal_next_hop".to_string()),
+                        delivery_receipt: None,
                     })
                     .into_response()
                 }
@@ -2610,6 +2685,7 @@ mod tests {
         let source = IdentityKeyPair::generate();
         let middle_identity = Arc::new(IdentityKeyPair::generate());
         let terminal_identity = IdentityKeyPair::generate();
+        let terminal_receipt_identity = terminal_identity.clone();
         let terminal_node_id = terminal_identity.public_key_bytes();
         let terminal_secret = terminal_identity.to_x25519().0;
 
@@ -2638,6 +2714,7 @@ mod tests {
             "/api/chat/peer/blind-relay",
             post(move |Json(request): Json<PeerBlindRelayRequest>| {
                 let terminal_relay_for_request = Arc::clone(&terminal_relay_for_route);
+                let terminal_receipt_identity = terminal_receipt_identity.clone();
                 let terminal_previous_hops_for_request =
                     Arc::clone(&terminal_previous_hops_for_route);
                 async move {
@@ -2672,6 +2749,12 @@ mod tests {
                     if terminal_relay_for_request.store_pending(&inner).is_err() {
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
+                    let delivery_receipt = BlindRelayDeliveryReceipt::accepted(
+                        request.envelope.route_id,
+                        BlindRelayDeliveryReceipt::payload_commitment(&peel.inner),
+                        now_secs(),
+                        &terminal_receipt_identity,
+                    );
                     terminal_previous_hops_for_request
                         .lock()
                         .unwrap()
@@ -2683,6 +2766,7 @@ mod tests {
                         forwarded: false,
                         ttl_remaining: request.envelope.ttl,
                         reason: Some("onion_terminal_delivered".to_string()),
+                        delivery_receipt: Some(delivery_receipt),
                     })
                     .into_response()
                 }
@@ -2766,6 +2850,16 @@ mod tests {
         assert!(!response.terminal);
         assert_eq!(response.ttl_remaining, 1);
         assert_eq!(response.reason.as_deref(), Some("onion_forwarded"));
+        response
+            .delivery_receipt
+            .as_ref()
+            .expect("middle hop must propagate the terminal receipt")
+            .verify_expected(
+                &route_id,
+                &BlindRelayDeliveryReceipt::payload_commitment(&encoded_chat),
+                &terminal_node_id,
+            )
+            .expect("propagated receipt must retain terminal binding");
 
         let previous_hops = terminal_previous_hops.lock().unwrap();
         assert_eq!(
@@ -3040,6 +3134,7 @@ mod tests {
                             forwarded: false,
                             ttl_remaining: 1,
                             reason: Some("terminal_next_hop".to_string()),
+                            delivery_receipt: None,
                         })
                         .into_response()
                     }
@@ -3134,6 +3229,7 @@ mod tests {
                         forwarded: false,
                         ttl_remaining: 0,
                         reason: Some("terminal_next_hop".to_string()),
+                        delivery_receipt: None,
                     })
                     .into_response()
                 }
@@ -3258,6 +3354,7 @@ mod tests {
                         forwarded: false,
                         ttl_remaining: 1,
                         reason: Some("relay_unavailable".to_string()),
+                        delivery_receipt: None,
                     })
                 }
             }),
@@ -3515,6 +3612,7 @@ mod tests {
                         forwarded: false,
                         ttl_remaining: 1,
                         reason: Some("terminal_next_hop".to_string()),
+                        delivery_receipt: None,
                     })
                 }
             }),
@@ -3702,6 +3800,7 @@ mod tests {
                         forwarded: false,
                         ttl_remaining: 1,
                         reason: Some("terminal_next_hop".to_string()),
+                        delivery_receipt: None,
                     })
                 },
             ),

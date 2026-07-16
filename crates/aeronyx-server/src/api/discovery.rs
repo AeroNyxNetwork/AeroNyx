@@ -60,6 +60,7 @@
 //!   Keep `DISCOVERY_REQUEST_BODY_MAX_BYTES` aligned with protocol limits.
 //!
 //! ## Last Modified
+//! v0.28.0-VerifiedClientRelayEvidence - Expose aggregate terminal-signed App onion delivery readiness
 //! v0.27.0-ProofRestartContinuity - Gate onion admission on verified or durably signed proof stability
 //! v0.26.0-RelayEvidenceTruthfulness - Expose origin-neutral accepted relay readiness without claiming user traffic
 //! v0.25.0-BoundedGossipBody - Reject oversized gossip before JSON deserialization
@@ -1011,6 +1012,9 @@ pub fn discovery_readiness_status_value(
             "relay_readiness_reason": &blind_relay_quality.readiness_reason,
             "timestamp_rejected": blind_relay_quality.timestamp_rejected,
             "real_relay_ready": blind_relay_quality.real_relay_ready,
+            "verified_client_onion_deliveries": blind_relay_quality.verified_client_onion_deliveries,
+            "last_verified_client_onion_delivery_age_seconds": blind_relay_quality.last_verified_client_onion_delivery_age_seconds,
+            "delivery_receipt_capable_peers": blind_relay_quality.delivery_receipt_capable_peers,
             "accepted_relay_ready": blind_relay_quality.accepted_relay_ready,
             "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
             "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
@@ -1079,6 +1083,9 @@ pub fn discovery_readiness_status_value(
             "runtime_ready": blind_relay_quality.runtime_ready,
             "quality_ready": blind_relay_quality.quality_ready,
             "real_relay_ready": blind_relay_quality.real_relay_ready,
+            "verified_client_onion_deliveries": blind_relay_quality.verified_client_onion_deliveries,
+            "last_verified_client_onion_delivery_age_seconds": blind_relay_quality.last_verified_client_onion_delivery_age_seconds,
+            "delivery_receipt_capable_peers": blind_relay_quality.delivery_receipt_capable_peers,
             "accepted_relay_ready": blind_relay_quality.accepted_relay_ready,
             "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
             "evidence_mode": &blind_relay_quality.evidence_mode,
@@ -1138,6 +1145,9 @@ pub fn blind_relay_runtime_status_value(
         "runtime_ready": quality.runtime_ready,
         "quality_ready": quality.quality_ready,
         "real_relay_ready": quality.real_relay_ready,
+        "verified_client_onion_deliveries": quality.verified_client_onion_deliveries,
+        "last_verified_client_onion_delivery_age_seconds": quality.last_verified_client_onion_delivery_age_seconds,
+        "delivery_receipt_capable_peers": quality.delivery_receipt_capable_peers,
         "accepted_relay_ready": quality.accepted_relay_ready,
         "synthetic_probe_ready": quality.synthetic_probe_ready,
         "evidence_mode": &quality.evidence_mode,
@@ -1154,6 +1164,7 @@ pub fn blind_relay_runtime_status_value(
         "relay_counters": {
             "received": stats.received,
             "accepted_total": quality.accepted_total,
+            "verified_client_onion_deliveries": stats.verified_client_onion_deliveries,
             "terminal_delivered_count": stats.terminal,
             "middle_forwarded_count": stats.forwarded,
             "rejected": stats.rejected,
@@ -1537,6 +1548,9 @@ pub fn discovery_summary_response(
             "runtime_ready": blind_relay_quality.runtime_ready,
             "quality_ready": blind_relay_quality.quality_ready,
             "real_relay_ready": blind_relay_quality.real_relay_ready,
+            "verified_client_onion_deliveries": blind_relay_quality.verified_client_onion_deliveries,
+            "last_verified_client_onion_delivery_age_seconds": blind_relay_quality.last_verified_client_onion_delivery_age_seconds,
+            "delivery_receipt_capable_peers": blind_relay_quality.delivery_receipt_capable_peers,
             "accepted_relay_ready": blind_relay_quality.accepted_relay_ready,
             "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
             "evidence_mode": &blind_relay_quality.evidence_mode,
@@ -1652,6 +1666,9 @@ pub fn discovery_public_card_response(
                 "status": &blind_relay_quality.status,
                 "runtime_ready": blind_relay_quality.runtime_ready,
                 "real_relay_ready": blind_relay_quality.real_relay_ready,
+                "verified_client_onion_deliveries": blind_relay_quality.verified_client_onion_deliveries,
+                "last_verified_client_onion_delivery_age_seconds": blind_relay_quality.last_verified_client_onion_delivery_age_seconds,
+                "delivery_receipt_capable_peers": blind_relay_quality.delivery_receipt_capable_peers,
                 "accepted_relay_ready": blind_relay_quality.accepted_relay_ready,
                 "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
                 "proof_ready": two_hop_history.proof_ready,

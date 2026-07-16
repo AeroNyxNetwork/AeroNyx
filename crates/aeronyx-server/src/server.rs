@@ -186,6 +186,9 @@
 //      only after current descriptor-bound routeability rebuilds the path.
 //  80. Records proof-cache authentication and successful signed persistence as
 //      structured admission evidence instead of parsing bootstrap log detail.
+//  81. Uses fresh terminal-signed delivery receipts to unlock authenticated
+//      App two-hop onion routing while retaining the legacy encrypted relay
+//      path for mixed-version peers and never classifying probes as user work.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -365,7 +368,7 @@ use aeronyx_core::protocol::auth::{
     DOMAIN_DEVICE_REGISTER, DOMAIN_WALLET_PRESENCE,
 };
 use aeronyx_core::protocol::chat::{
-    encode_envelope, BlindRelayEnvelope, ChatContentType, ChatEnvelope,
+    encode_envelope, BlindRelayDeliveryReceipt, BlindRelayEnvelope, ChatContentType, ChatEnvelope,
 };
 use sha2::{Digest, Sha256};
 
@@ -479,6 +482,8 @@ const KEEPALIVE_ACK_TIMEOUT_SECS: u64 = 90;
 const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
 const BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS: u64 = 15 * 60;
 const BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS: u64 = 60;
+const BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS: u64 = 120;
+const BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 30;
 /// Direct startup probes are bounded independently of untrusted peer count.
 const BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES: usize = 3;
 
@@ -5092,13 +5097,15 @@ impl Server {
                 // ChatEnvelope and hand it to ChatRelay store-and-forward before
                 // ACKing. The payload remains opaque and synthetic, and no
                 // route id, receiver, endpoint, or ciphertext is reported.
-                if let Some(request) = Self::build_two_hop_onion_delivery_probe_request(
-                    identity,
-                    self_node_id,
-                    &middle,
-                    &terminal,
-                    now,
-                ) {
+                if let Some((request, payload_commitment)) =
+                    Self::build_two_hop_onion_delivery_probe_request(
+                        identity,
+                        self_node_id,
+                        &middle,
+                        &terminal,
+                        now,
+                    )
+                {
                     match client.post(&url).json(&request).send().await {
                         Ok(response) if response.status().is_success() => {
                             match decode_bounded_json_response::<PeerBlindRelayResponse>(
@@ -5107,7 +5114,43 @@ impl Server {
                             )
                             .await
                             {
+                                Ok(ack)
+                                    if ack.accepted
+                                        && ack.forwarded
+                                        && Self::verified_delivery_receipt(
+                                            ack.delivery_receipt.as_ref(),
+                                            &request.envelope.route_id,
+                                            &payload_commitment,
+                                            &terminal_node_id,
+                                            now,
+                                        ) =>
+                                {
+                                    peer_store.record_delivery_receipt_capability(
+                                        &middle_node_id,
+                                        now,
+                                    );
+                                    peer_store.record_delivery_receipt_capability(
+                                        &terminal_node_id,
+                                        now,
+                                    );
+                                    peer_store
+                                        .record_blind_relay_two_hop_probe_result_with_context(
+                                            now,
+                                            true,
+                                            "onion_terminal_delivered",
+                                            middle_candidate_count,
+                                            terminal_candidate_count,
+                                            2,
+                                            1,
+                                        );
+                                    peer_store.record_route_forward_success(&middle_node_id, now);
+                                    return true;
+                                }
                                 Ok(ack) if ack.accepted && ack.forwarded => {
+                                    // Mixed-version nodes can still prove the
+                                    // legacy synthetic route, but are not
+                                    // eligible for authenticated App onion
+                                    // traffic until a signed receipt verifies.
                                     peer_store
                                         .record_blind_relay_two_hop_probe_result_with_context(
                                             now,
@@ -5368,11 +5411,9 @@ impl Server {
         middle: &SignedNodeDescriptor,
         terminal: &SignedNodeDescriptor,
         now: u64,
-    ) -> Option<PeerBlindRelayRequest> {
+    ) -> Option<(PeerBlindRelayRequest, [u8; 32])> {
         let middle_node_id = middle.node_id();
         let terminal_node_id = terminal.node_id();
-        let middle_kem_pub = middle.descriptor.x25519_kem_public()?;
-        let terminal_kem_pub = terminal.descriptor.x25519_kem_public()?;
         let route_id = Self::blind_relay_two_hop_probe_route_id(
             now,
             self_node_id,
@@ -5388,7 +5429,32 @@ impl Server {
             route_id,
             now,
         );
-        let encoded_chat = encode_envelope(&chat_envelope).ok()?;
+        Self::build_two_hop_onion_request(
+            identity,
+            self_node_id,
+            middle,
+            terminal,
+            &chat_envelope,
+            route_id,
+            now,
+        )
+    }
+
+    fn build_two_hop_onion_request(
+        identity: &IdentityKeyPair,
+        self_node_id: &[u8; 32],
+        middle: &SignedNodeDescriptor,
+        terminal: &SignedNodeDescriptor,
+        chat_envelope: &ChatEnvelope,
+        route_id: [u8; 16],
+        now: u64,
+    ) -> Option<(PeerBlindRelayRequest, [u8; 32])> {
+        let middle_node_id = middle.node_id();
+        let terminal_node_id = terminal.node_id();
+        let middle_kem_pub = middle.descriptor.x25519_kem_public()?;
+        let terminal_kem_pub = terminal.descriptor.x25519_kem_public()?;
+        let encoded_chat = encode_envelope(chat_envelope).ok()?;
+        let payload_commitment = BlindRelayDeliveryReceipt::payload_commitment(&encoded_chat);
         let path = [
             OnionHop {
                 node_id: middle_node_id,
@@ -5402,12 +5468,33 @@ impl Server {
         let envelope =
             build_onion_envelope(&path, &encoded_chat, route_id, 2, now, identity).ok()?;
 
-        Some(PeerBlindRelayRequest {
-            envelope,
-            previous_hop_node_id: *self_node_id,
-            onward_envelope: None,
-            onward_descriptor_hint: None,
-        })
+        Some((
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: *self_node_id,
+                onward_envelope: None,
+                onward_descriptor_hint: None,
+            },
+            payload_commitment,
+        ))
+    }
+
+    fn verified_delivery_receipt(
+        receipt: Option<&BlindRelayDeliveryReceipt>,
+        route_id: &[u8; 16],
+        payload_commitment: &[u8; 32],
+        terminal_node_id: &[u8; 32],
+        now: u64,
+    ) -> bool {
+        let Some(receipt) = receipt else {
+            return false;
+        };
+        receipt.delivered_at <= now.saturating_add(BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS)
+            && now.saturating_sub(receipt.delivered_at)
+                <= BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS
+            && receipt
+                .verify_expected(route_id, payload_commitment, terminal_node_id)
+                .is_ok()
     }
 
     fn synthetic_two_hop_probe_chat_envelope(
@@ -5601,6 +5688,141 @@ impl Server {
             format!("http://{endpoint}")
         };
         Some(format!("{base}/api/discovery/gossip"))
+    }
+
+    /// Attempts authenticated client traffic over receipt-capable two-hop
+    /// onion paths. `true` means every planned terminal replica returned a
+    /// fresh signature bound to the exact opaque terminal payload.
+    ///
+    /// Mixed-version meshes return `false` before sending when fewer than two
+    /// distinct receipt-capable peers exist. The caller then uses the legacy
+    /// direct encrypted relay path, preserving availability during rollout.
+    async fn relay_authenticated_chat_over_onion_paths(
+        client: Option<&reqwest::Client>,
+        relay: Option<&ChatRelayService>,
+        peer_store: &PeerStore,
+        identity: &IdentityKeyPair,
+        self_node_id: &[u8; 32],
+        envelope: &ChatEnvelope,
+    ) -> bool {
+        let now = unix_now_secs();
+        let Some(client) = client else {
+            return false;
+        };
+        let terminal_candidates = peer_store
+            .delivery_receipt_route_candidates_with_capability_excluding(
+                NodeCapability::ChatRelay,
+                now,
+                CHAT_PEER_RELAY_FANOUT_LIMIT,
+                &[*self_node_id],
+            );
+        if terminal_candidates.is_empty() {
+            return false;
+        }
+
+        let mut attempted = 0usize;
+        let mut accepted = 0usize;
+        let mut last_failure_reason = None;
+        for terminal in terminal_candidates {
+            let terminal_node_id = terminal.node_id();
+            let Some(middle) = peer_store
+                .delivery_receipt_route_candidates_with_capability_excluding(
+                    NodeCapability::OnionMiddle,
+                    now,
+                    1,
+                    &[*self_node_id, terminal_node_id],
+                )
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            let middle_node_id = middle.node_id();
+            let Some(endpoint) = middle.descriptor.public_endpoint.as_deref() else {
+                continue;
+            };
+            let Some(url) = Self::blind_relay_probe_url(endpoint) else {
+                continue;
+            };
+
+            let mut route_id = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut route_id);
+            let Some((request, payload_commitment)) = Self::build_two_hop_onion_request(
+                identity,
+                self_node_id,
+                &middle,
+                &terminal,
+                envelope,
+                route_id,
+                now,
+            ) else {
+                continue;
+            };
+
+            attempted = attempted.saturating_add(1);
+            match client.post(&url).json(&request).send().await {
+                Ok(response) if response.status().is_success() => {
+                    match decode_bounded_json_response::<PeerBlindRelayResponse>(
+                        response,
+                        PEER_ACK_RESPONSE_MAX_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(ack)
+                            if ack.accepted
+                                && ack.forwarded
+                                && Self::verified_delivery_receipt(
+                                    ack.delivery_receipt.as_ref(),
+                                    &route_id,
+                                    &payload_commitment,
+                                    &terminal_node_id,
+                                    now,
+                                ) =>
+                        {
+                            accepted = accepted.saturating_add(1);
+                            peer_store.record_delivery_receipt_capability(&middle_node_id, now);
+                            peer_store.record_delivery_receipt_capability(&terminal_node_id, now);
+                            peer_store.record_route_forward_success(&middle_node_id, now);
+                            peer_store.record_route_forward_success(&terminal_node_id, now);
+                            peer_store.record_verified_client_onion_delivery(now);
+                        }
+                        Ok(_) => {
+                            last_failure_reason =
+                                Some("onion_delivery_receipt_rejected".to_string());
+                            peer_store.record_route_forward_failure(
+                                &middle_node_id,
+                                now,
+                                "delivery_receipt_rejected",
+                            );
+                        }
+                        Err(error) => {
+                            let reason = format!("onion_delivery_ack_{}", error.as_str());
+                            last_failure_reason = Some(reason.clone());
+                            peer_store.record_route_forward_failure(
+                                &middle_node_id,
+                                now,
+                                reason,
+                            );
+                        }
+                    }
+                }
+                Ok(response) => {
+                    let reason = format!("onion_delivery_http_{}", response.status().as_u16());
+                    last_failure_reason = Some(reason.clone());
+                    peer_store.record_route_forward_failure(&middle_node_id, now, reason);
+                }
+                Err(error) => {
+                    let reason = Self::classify_reqwest_error("onion_delivery_request", &error);
+                    last_failure_reason = Some(reason.clone());
+                    peer_store.record_route_forward_failure(&middle_node_id, now, reason);
+                }
+            }
+        }
+
+        if let Some(relay) = relay {
+            relay.record_peer_relay_outbound(now, attempted, accepted, last_failure_reason);
+        }
+        attempted > 0 && attempted == accepted
     }
 
     async fn relay_chat_envelope_to_discovered_peers(
@@ -6280,6 +6502,7 @@ impl Server {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let udp_reply = Arc::clone(&udp);
         let self_node_id = self.identity.public_key_bytes();
+        let node_identity = self.identity.clone();
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
@@ -6424,7 +6647,8 @@ impl Server {
                                                         &memchain_config, &server_pubkey_hex,
                                                         &session, &udp_reply, &crypto,
                                                         &sessions, &chat_relay, &peer_store,
-                                                        &self_node_id, chat_peer_client.as_ref(),
+                                                        &self_node_id, &node_identity,
+                                                        chat_peer_client.as_ref(),
                                                     ).await;
                                                 }
                                             }
@@ -6463,6 +6687,7 @@ impl Server {
         chat_relay: &Option<Arc<ChatRelayService>>,
         peer_store: &Arc<PeerStore>,
         self_node_id: &[u8; 32],
+        node_identity: &IdentityKeyPair,
         chat_peer_client: Option<&reqwest::Client>,
     ) {
         match msg {
@@ -6647,6 +6872,8 @@ impl Server {
                     session.client_endpoint,
                 );
                 let receiver = envelope.receiver;
+                let authenticated_client_origin =
+                    envelope.sender == session.client_public_key.to_bytes();
                 let target_routes = relay.wallet_routes.lookup(&receiver);
 
                 if !target_routes.is_empty() {
@@ -6675,14 +6902,26 @@ impl Server {
                         }
                     }
                     if all_failed {
-                        Self::relay_chat_envelope_to_discovered_peers(
-                            chat_peer_client,
-                            Some(relay.as_ref()),
-                            peer_store,
-                            self_node_id,
-                            &envelope,
-                        )
-                        .await;
+                        let onion_delivered = authenticated_client_origin
+                            && Self::relay_authenticated_chat_over_onion_paths(
+                                chat_peer_client,
+                                Some(relay.as_ref()),
+                                peer_store,
+                                node_identity,
+                                self_node_id,
+                                &envelope,
+                            )
+                            .await;
+                        if !onion_delivered {
+                            Self::relay_chat_envelope_to_discovered_peers(
+                                chat_peer_client,
+                                Some(relay.as_ref()),
+                                peer_store,
+                                self_node_id,
+                                &envelope,
+                            )
+                            .await;
+                        }
                         if let Err(e) = relay.store_pending(&envelope) {
                             warn!(
                                 reason = e.reason_bucket(),
@@ -6698,14 +6937,26 @@ impl Server {
                         );
                     }
                 } else {
-                    Self::relay_chat_envelope_to_discovered_peers(
-                        chat_peer_client,
-                        Some(relay.as_ref()),
-                        peer_store,
-                        self_node_id,
-                        &envelope,
-                    )
-                    .await;
+                    let onion_delivered = authenticated_client_origin
+                        && Self::relay_authenticated_chat_over_onion_paths(
+                            chat_peer_client,
+                            Some(relay.as_ref()),
+                            peer_store,
+                            node_identity,
+                            self_node_id,
+                            &envelope,
+                        )
+                        .await;
+                    if !onion_delivered {
+                        Self::relay_chat_envelope_to_discovered_peers(
+                            chat_peer_client,
+                            Some(relay.as_ref()),
+                            peer_store,
+                            self_node_id,
+                            &envelope,
+                        )
+                        .await;
+                    }
                     if let Err(e) = relay.store_pending(&envelope) {
                         warn!(
                             reason = e.reason_bucket(),
@@ -7436,7 +7687,8 @@ mod tests {
         CommitmentCoordinatorLeaseRound, CommitmentTipAnnouncementWaitOutcome,
         CommitmentWitnessStartupBlockReason, CommitmentWitnessStartupDecision,
         PeerStoreCacheDocument, Server,
-        BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
+        BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
+        BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
         COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
         ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
         TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
@@ -7451,7 +7703,9 @@ mod tests {
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
     use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
     use aeronyx_core::ledger::{RecordCommitmentBlockV1, GENESIS_PREV_HASH};
-    use aeronyx_core::protocol::chat::{ChatContentType, ChatEnvelope};
+    use aeronyx_core::protocol::chat::{
+        encode_envelope, BlindRelayDeliveryReceipt, ChatContentType, ChatEnvelope,
+    };
     use aeronyx_core::protocol::onion::is_onion_blob;
     use aeronyx_core::protocol::{
         NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor, NodeDiscoveryMessage,
@@ -7465,7 +7719,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use crate::api::chat_peer::{
-        PeerBlindRelayResponse, PeerChatRelayRequest, PeerChatRelayResponse,
+        PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayRequest,
+        PeerChatRelayResponse,
     };
     use crate::api::discovery::GossipResponse;
     use crate::config::{DiscoveryConfig, ServerConfig};
@@ -8091,7 +8346,7 @@ mod tests {
             [0x22; 32],
         );
 
-        let request = Server::build_two_hop_onion_delivery_probe_request(
+        let (request, payload_commitment) = Server::build_two_hop_onion_delivery_probe_request(
             &source,
             &self_node_id,
             &middle,
@@ -8127,6 +8382,11 @@ mod tests {
         assert_eq!(synthetic_chat.sender, self_node_id);
         assert_ne!(synthetic_chat.receiver, [0u8; 32]);
         assert_eq!(synthetic_chat.content_type, ChatContentType::System);
+        let encoded_chat = encode_envelope(&synthetic_chat).unwrap();
+        assert_eq!(
+            payload_commitment,
+            BlindRelayDeliveryReceipt::payload_commitment(&encoded_chat)
+        );
     }
 
     #[test]
@@ -8157,6 +8417,163 @@ mod tests {
             now,
         )
         .is_none());
+    }
+
+    #[test]
+    fn signed_delivery_receipt_verification_binds_route_payload_terminal_and_freshness() {
+        let now = 1_800_000_000;
+        let terminal = IdentityKeyPair::generate();
+        let route_id = [0x31; 16];
+        let payload_commitment =
+            BlindRelayDeliveryReceipt::payload_commitment(b"opaque terminal payload");
+        let receipt = BlindRelayDeliveryReceipt::accepted(
+            route_id,
+            payload_commitment,
+            now,
+            &terminal,
+        );
+
+        assert!(Server::verified_delivery_receipt(
+            Some(&receipt),
+            &route_id,
+            &payload_commitment,
+            &terminal.public_key_bytes(),
+            now + 1,
+        ));
+        assert!(!Server::verified_delivery_receipt(
+            Some(&receipt),
+            &[0x32; 16],
+            &payload_commitment,
+            &terminal.public_key_bytes(),
+            now + 1,
+        ));
+        assert!(!Server::verified_delivery_receipt(
+            Some(&receipt),
+            &route_id,
+            &[0x33; 32],
+            &terminal.public_key_bytes(),
+            now + 1,
+        ));
+        assert!(!Server::verified_delivery_receipt(
+            Some(&receipt),
+            &route_id,
+            &payload_commitment,
+            &IdentityKeyPair::generate().public_key_bytes(),
+            now + 1,
+        ));
+        assert!(!Server::verified_delivery_receipt(
+            Some(&receipt),
+            &route_id,
+            &payload_commitment,
+            &terminal.public_key_bytes(),
+            now + BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS + 1,
+        ));
+    }
+
+    #[tokio::test]
+    async fn authenticated_chat_uses_distinct_receipt_capable_onion_path() {
+        let now = unix_now_secs();
+        let source = IdentityKeyPair::generate();
+        let chat_sender = IdentityKeyPair::generate();
+        let terminal_identity = IdentityKeyPair::generate();
+        let terminal_node_id = terminal_identity.public_key_bytes();
+        let middle_identity = IdentityKeyPair::generate();
+        let middle_node_id = middle_identity.public_key_bytes();
+
+        let mut envelope = ChatEnvelope {
+            message_id: [0x41; 16],
+            sender: chat_sender.public_key_bytes(),
+            receiver: [0x42; 32],
+            timestamp: now,
+            ciphertext: b"opaque app ciphertext".to_vec(),
+            nonce: [0x43; 24],
+            content_type: ChatContentType::Text,
+            signature: [0u8; 64],
+        };
+        envelope.signature = chat_sender.sign(&envelope.sign_data());
+        let payload_commitment = BlindRelayDeliveryReceipt::payload_commitment(
+            &encode_envelope(&envelope).unwrap(),
+        );
+
+        let terminal_receipt_identity = terminal_identity.clone();
+        let relay = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(move |Json(request): Json<PeerBlindRelayRequest>| {
+                let terminal_receipt_identity = terminal_receipt_identity.clone();
+                async move {
+                    Json(PeerBlindRelayResponse {
+                        accepted: true,
+                        terminal: false,
+                        forwarded: true,
+                        ttl_remaining: 1,
+                        reason: Some("onion_forwarded".to_string()),
+                        delivery_receipt: Some(BlindRelayDeliveryReceipt::accepted(
+                            request.envelope.route_id,
+                            payload_commitment,
+                            unix_now_secs(),
+                            &terminal_receipt_identity,
+                        )),
+                    })
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let middle_endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let relay_server = tokio::spawn(async move {
+            axum::serve(listener, relay).await.unwrap();
+        });
+
+        let mut middle_descriptor = NodeDescriptor::new(
+            middle_node_id,
+            now,
+            now,
+            now + 300,
+            "test-receipt-middle",
+        )
+        .with_x25519_kem(middle_identity.x25519_public_key_bytes());
+        middle_descriptor.public_endpoint = Some(middle_endpoint);
+        middle_descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        let middle_descriptor =
+            SignedNodeDescriptor::sign(middle_descriptor, &middle_identity).unwrap();
+
+        let mut terminal_descriptor = NodeDescriptor::new(
+            terminal_node_id,
+            now,
+            now,
+            now + 300,
+            "test-receipt-terminal",
+        )
+        .with_x25519_kem(terminal_identity.x25519_public_key_bytes());
+        terminal_descriptor.public_endpoint = Some("http://127.0.0.1:9".to_string());
+        terminal_descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        let terminal_descriptor =
+            SignedNodeDescriptor::sign(terminal_descriptor, &terminal_identity).unwrap();
+
+        let store = PeerStore::new();
+        store.upsert_verified(middle_descriptor, now).unwrap();
+        store.upsert_verified(terminal_descriptor, now).unwrap();
+        store.record_route_forward_success(&middle_node_id, now);
+        store.record_route_forward_success(&terminal_node_id, now);
+        store.record_delivery_receipt_capability(&middle_node_id, now);
+        store.record_delivery_receipt_capability(&terminal_node_id, now);
+
+        let delivered = Server::relay_authenticated_chat_over_onion_paths(
+            Some(&reqwest::Client::new()),
+            None,
+            &store,
+            &source,
+            &source.public_key_bytes(),
+            &envelope,
+        )
+        .await;
+        relay_server.abort();
+
+        assert!(delivered);
+        let quality = store.status(unix_now_secs()).blind_relay_quality;
+        assert!(quality.real_relay_ready);
+        assert_eq!(quality.verified_client_onion_deliveries, 1);
+        assert_eq!(quality.delivery_receipt_capable_peers, 2);
+        assert_eq!(quality.evidence_mode, "verified_client_onion_delivery_receipt");
     }
 
     #[test]
@@ -8745,6 +9162,7 @@ mod tests {
                         forwarded: false,
                         ttl_remaining: 1,
                         reason: Some("terminal_next_hop".to_string()),
+                        delivery_receipt: None,
                     })
                 }
             }),

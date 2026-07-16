@@ -152,6 +152,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.57.0-SignedDeliveryReceipts - Track freshness-bounded receipt-capable routes and verified client onion delivery evidence
 //! v0.56.0-ProofRestartContinuity - Expose authenticated restore and signed proof persistence evidence
 //! v0.55.0-TwoHopProofCache - Added signed bounded warm-restart proof history
 //! v0.54.0-RelayEvidenceTruthfulness - Stopped classifying unlabelled blind-relay acceptance as real user traffic
@@ -926,6 +927,16 @@ pub struct PeerStoreBlindRelayStats {
     pub two_hop_probe_failed: u64,
     /// Unix timestamp of the last two-hop synthetic path proof.
     pub last_two_hop_probe_at: Option<u64>,
+    /// Authenticated App/client-originated onion deliveries whose exact opaque
+    /// terminal payload was acknowledged by a valid terminal-node signature.
+    ///
+    /// This is an aggregate process-local count. It must never be joined with
+    /// route ids, peer ids, receiver identities, or message metadata.
+    #[serde(default)]
+    pub verified_client_onion_deliveries: u64,
+    /// Unix timestamp of the last verified client-originated delivery receipt.
+    #[serde(default)]
+    pub last_verified_client_onion_delivery_at: Option<u64>,
     /// Unix timestamp of the last accepted terminal or forwarded blind relay work.
     ///
     /// This is aggregate freshness evidence only. It must never be joined with
@@ -956,13 +967,18 @@ pub struct PeerStoreBlindRelayQualityStatus {
     pub runtime_ready: bool,
     /// Whether fresh successful terminal/forwarded/probe evidence exists without final transport failures.
     pub quality_ready: bool,
-    /// Deprecated compatibility field for authenticated App/user traffic.
-    ///
-    /// Blind relay frames currently prove node-to-node acceptance but do not
-    /// carry an authenticated traffic-class claim. Therefore this remains
-    /// false until the protocol can distinguish App traffic from scheduled
-    /// synthetic probes without weakening the blind-relay privacy boundary.
+    /// Whether a fresh terminal-signed receipt proves an authenticated
+    /// App/client-originated opaque payload reached terminal store-and-forward.
     pub real_relay_ready: bool,
+    /// Aggregate verified App/client-originated onion deliveries in this process.
+    #[serde(default)]
+    pub verified_client_onion_deliveries: u64,
+    /// Seconds since the last verified client delivery receipt, when known.
+    #[serde(default)]
+    pub last_verified_client_onion_delivery_age_seconds: Option<u64>,
+    /// Number of currently fresh peers proven to carry signed delivery receipts.
+    #[serde(default)]
+    pub delivery_receipt_capable_peers: usize,
     /// Whether this process has fresh accepted terminal or forwarded relay work.
     ///
     /// This is intentionally origin-neutral: accepted work may be App traffic,
@@ -1767,6 +1783,8 @@ struct PeerStoreCounters {
     blind_relay_two_hop_probe_succeeded: AtomicU64,
     blind_relay_two_hop_probe_failed: AtomicU64,
     last_blind_relay_two_hop_probe_at: AtomicU64,
+    verified_client_onion_deliveries: AtomicU64,
+    last_verified_client_onion_delivery_at: AtomicU64,
     last_blind_relay_accepted_at: AtomicU64,
     last_import_at: AtomicU64,
     last_gossip_at: AtomicU64,
@@ -1816,6 +1834,8 @@ impl PeerStoreCounters {
             blind_relay_two_hop_probe_succeeded: AtomicU64::new(0),
             blind_relay_two_hop_probe_failed: AtomicU64::new(0),
             last_blind_relay_two_hop_probe_at: AtomicU64::new(0),
+            verified_client_onion_deliveries: AtomicU64::new(0),
+            last_verified_client_onion_delivery_at: AtomicU64::new(0),
             last_blind_relay_accepted_at: AtomicU64::new(0),
             last_import_at: AtomicU64::new(0),
             last_gossip_at: AtomicU64::new(0),
@@ -1883,6 +1903,13 @@ impl PeerStoreCounters {
                     self.last_blind_relay_two_hop_probe_at
                         .load(Ordering::Relaxed),
                 ),
+                verified_client_onion_deliveries: self
+                    .verified_client_onion_deliveries
+                    .load(Ordering::Relaxed),
+                last_verified_client_onion_delivery_at: Self::optional_ts(
+                    self.last_verified_client_onion_delivery_at
+                        .load(Ordering::Relaxed),
+                ),
                 last_accepted_at: Self::optional_ts(
                     self.last_blind_relay_accepted_at.load(Ordering::Relaxed),
                 ),
@@ -1945,6 +1972,7 @@ pub struct PeerStore {
     peer_runtime: RwLock<HashMap<[u8; 32], PeerRuntimeMetadata>>,
     route_health: RwLock<HashMap<[u8; 32], PeerRouteHealth>>,
     relay_protection_health: RwLock<HashMap<[u8; 32], PeerRelayProtectionHealth>>,
+    delivery_receipt_capability: RwLock<HashMap<[u8; 32], u64>>,
     max_peers: RwLock<Option<usize>>,
     counters: PeerStoreCounters,
     audit_events: RwLock<VecDeque<PeerStoreAuditEvent>>,
@@ -1962,6 +1990,7 @@ impl PeerStore {
             peer_runtime: RwLock::new(HashMap::new()),
             route_health: RwLock::new(HashMap::new()),
             relay_protection_health: RwLock::new(HashMap::new()),
+            delivery_receipt_capability: RwLock::new(HashMap::new()),
             max_peers: RwLock::new(None),
             counters: PeerStoreCounters::new(),
             audit_events: RwLock::new(VecDeque::with_capacity(MAX_AUDIT_EVENTS)),
@@ -2999,6 +3028,48 @@ impl PeerStore {
         );
     }
 
+    /// Records that a verified peer participated in a route carrying a valid
+    /// terminal-signed delivery receipt.
+    ///
+    /// The node id is process-private selection state. Public status exposes
+    /// only a fresh aggregate count; no route id, endpoint, receipt, payload
+    /// commitment, sender, receiver, message id, or social-graph edge is kept.
+    pub fn record_delivery_receipt_capability(&self, node_id: &[u8; 32], now: u64) {
+        if self.get_valid(node_id, now).is_none() {
+            return;
+        }
+        self.delivery_receipt_capability
+            .write()
+            .insert(*node_id, now);
+        self.record_audit_event(
+            now,
+            "blind_relay_receipt_capability",
+            "accepted",
+            "fresh_signed_delivery_receipt".to_string(),
+        );
+    }
+
+    /// Records one authenticated App/client-originated onion delivery whose
+    /// terminal receipt was signature-, route-, payload-, and freshness-checked.
+    ///
+    /// This deliberately records only an aggregate count and timestamp. It
+    /// never stores receipt bytes, route ids, peer ids, payload commitments,
+    /// sender/receiver keys, message ids, endpoints, or ciphertext.
+    pub fn record_verified_client_onion_delivery(&self, now: u64) {
+        self.counters
+            .verified_client_onion_deliveries
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .last_verified_client_onion_delivery_at
+            .store(now, Ordering::Relaxed);
+        self.record_audit_event(
+            now,
+            "blind_relay_client_delivery_receipt",
+            "accepted",
+            "terminal_signature_verified".to_string(),
+        );
+    }
+
     /// Records a blind relay rejection with a stable privacy-safe reason.
     pub fn record_blind_relay_rejected(&self, now: u64, reason: impl AsRef<str>) {
         let reason = reason.as_ref();
@@ -3043,7 +3114,7 @@ impl PeerStore {
                     .blind_relay_invalid_endpoint
                     .fetch_add(1, Ordering::Relaxed);
             }
-            "request_failed" | "forward_failed" => {
+            "request_failed" | "forward_failed" | "delivery_receipt_invalid" => {
                 self.counters
                     .blind_relay_forward_failed
                     .fetch_add(1, Ordering::Relaxed);
@@ -4582,6 +4653,38 @@ impl PeerStore {
             .collect()
     }
 
+    /// Returns routeable peers that recently proved signed delivery-receipt
+    /// interoperability, after applying capability and exclusion policy.
+    ///
+    /// This gate is intentionally process-local and freshness-bounded. It
+    /// enables gradual mixed-version rollout without advertising a descriptor
+    /// enum that older nodes may reject. Selection never reads message data,
+    /// sender/receiver identities, route ids, endpoints, or payload contents.
+    #[must_use]
+    pub fn delivery_receipt_route_candidates_with_capability_excluding(
+        &self,
+        capability: NodeCapability,
+        now: u64,
+        limit: usize,
+        excluded_node_ids: &[[u8; 32]],
+    ) -> Vec<SignedNodeDescriptor> {
+        let capability_evidence = self.delivery_receipt_capability.read();
+        self.scored_route_candidates(capability, now, None, false)
+            .into_iter()
+            .filter(|candidate| {
+                let node_id = candidate.descriptor.node_id();
+                !excluded_node_ids
+                    .iter()
+                    .any(|excluded| *excluded == node_id)
+                    && capability_evidence.get(&node_id).is_some_and(|at| {
+                        *at <= now && now.saturating_sub(*at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
+                    })
+            })
+            .take(limit)
+            .map(|candidate| candidate.descriptor)
+            .collect()
+    }
+
     /// Returns probe-only route candidates with cooled-down quarantine recovery.
     ///
     /// This method is intentionally narrower than the normal route candidate
@@ -4876,10 +4979,19 @@ impl PeerStore {
         let bootstrap = self.bootstrap_status.read().clone();
         let two_hop_path_proof_history = self.two_hop_path_proof_history(now);
         let runtime = self.counters.snapshot();
+        let delivery_receipt_capable_peers = self
+            .delivery_receipt_capability
+            .read()
+            .values()
+            .filter(|at| {
+                **at <= now && now.saturating_sub(**at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
+            })
+            .count();
         let blind_relay_quality = Self::blind_relay_quality_status(
             now,
             &runtime.blind_relay,
             &two_hop_path_proof_history,
+            delivery_receipt_capable_peers,
         );
         let stability = Self::stability(&snapshot, &bootstrap, now);
         let peer_summary = self.peer_summary(now);
@@ -4919,6 +5031,7 @@ impl PeerStore {
         now: u64,
         stats: &PeerStoreBlindRelayStats,
         two_hop_path_proof_history: &PeerStoreTwoHopPathProofHistory,
+        delivery_receipt_capable_peers: usize,
     ) -> PeerStoreBlindRelayQualityStatus {
         let accepted_total = stats.terminal.saturating_add(stats.forwarded);
         let last_event_age_seconds = stats
@@ -4933,7 +5046,11 @@ impl PeerStore {
         let last_two_hop_probe_age_seconds = stats
             .last_two_hop_probe_at
             .map(|last_probe_at| now.saturating_sub(last_probe_at));
+        let last_verified_client_onion_delivery_age_seconds = stats
+            .last_verified_client_onion_delivery_at
+            .map(|at| now.saturating_sub(at));
         let accepted_evidence_seen = accepted_total > 0;
+        let verified_client_onion_evidence_seen = stats.verified_client_onion_deliveries > 0;
         let probe_evidence_seen = stats.probe_succeeded > 0;
         let two_hop_probe_evidence_seen = stats.two_hop_probe_succeeded > 0;
         let synthetic_onion_delivery_evidence_seen = two_hop_probe_evidence_seen
@@ -4944,11 +5061,10 @@ impl PeerStore {
             && last_accepted_age_seconds
                 .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
                 .unwrap_or(false);
-        // The signed blind-relay envelope does not yet authenticate whether an
-        // accepted frame originated from App traffic or a scheduled node
-        // probe. Keep the legacy field for API compatibility, but never infer
-        // verified user traffic from origin-neutral acceptance counters.
-        let real_relay_ready = false;
+        let real_relay_ready = verified_client_onion_evidence_seen
+            && last_verified_client_onion_delivery_age_seconds
+                .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
+                .unwrap_or(false);
         let probe_ready = probe_evidence_seen
             && last_probe_age_seconds
                 .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
@@ -4958,11 +5074,16 @@ impl PeerStore {
                 .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
                 .unwrap_or(false);
         let synthetic_probe_ready = probe_ready || two_hop_probe_ready;
-        let runtime_ready = accepted_relay_ready || synthetic_probe_ready;
+        let runtime_ready = real_relay_ready || accepted_relay_ready || synthetic_probe_ready;
         let stale_success_evidence =
-            (accepted_evidence_seen || probe_evidence_seen || two_hop_probe_evidence_seen)
+            (verified_client_onion_evidence_seen
+                || accepted_evidence_seen
+                || probe_evidence_seen
+                || two_hop_probe_evidence_seen)
                 && !runtime_ready;
-        let evidence_mode = if accepted_evidence_seen {
+        let evidence_mode = if verified_client_onion_evidence_seen {
+            "verified_client_onion_delivery_receipt"
+        } else if accepted_evidence_seen {
             "opaque_relay_acceptance"
         } else if synthetic_onion_delivery_evidence_seen {
             "synthetic_onion_message_delivery_probe"
@@ -4979,7 +5100,9 @@ impl PeerStore {
         } else {
             "idle"
         };
-        let proof_scope = if accepted_evidence_seen {
+        let proof_scope = if verified_client_onion_evidence_seen {
+            "client_message_delivery"
+        } else if accepted_evidence_seen {
             "relay_acceptance"
         } else if synthetic_onion_delivery_evidence_seen {
             "message_delivery"
@@ -5016,6 +5139,7 @@ impl PeerStore {
         let status = if stats.received == 0
             && stats.probe_attempted == 0
             && stats.two_hop_probe_attempted == 0
+            && !verified_client_onion_evidence_seen
         {
             "idle"
         } else if active_transport_attention
@@ -5036,7 +5160,13 @@ impl PeerStore {
         };
 
         let readiness_reason =
-            if accepted_relay_ready && !active_transport_attention && !protection_active {
+            if real_relay_ready && !active_transport_attention && !protection_active {
+                "verified_client_onion_delivery_receipt_ready"
+            } else if real_relay_ready && active_transport_attention {
+                "verified_client_onion_delivery_transport_attention"
+            } else if real_relay_ready && protection_active {
+                "verified_client_onion_delivery_protection_active"
+            } else if accepted_relay_ready && !active_transport_attention && !protection_active {
                 "opaque_relay_acceptance_observed"
             } else if accepted_relay_ready && active_transport_attention {
                 "opaque_relay_transport_attention"
@@ -5060,6 +5190,8 @@ impl PeerStore {
                 "transport_attention"
             } else if protection_active {
                 "protection_active"
+            } else if verified_client_onion_evidence_seen && !real_relay_ready {
+                "verified_client_onion_delivery_receipt_stale"
             } else if accepted_evidence_seen && !accepted_relay_ready {
                 "opaque_relay_acceptance_stale"
             } else if synthetic_onion_delivery_evidence_seen && !two_hop_probe_ready {
@@ -5088,6 +5220,9 @@ impl PeerStore {
             "protecting" => {
                 "review aggregate abuse-guard buckets while preserving blind relay metadata"
             }
+            "ready" if real_relay_ready => {
+                "fresh terminal-signed receipt proves authenticated client onion delivery"
+            }
             "ready" if accepted_relay_ready => {
                 "blind relay runtime has accepted encrypted relay work"
             }
@@ -5103,7 +5238,7 @@ impl PeerStore {
         };
 
         let detail = format!(
-            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} two_hop_probe_attempted={} two_hop_probe_succeeded={} two_hop_probe_failed={} timestamp_rejected={} real_relay_ready={} accepted_relay_ready={} synthetic_probe_ready={} two_hop_probe_ready={} evidence_mode={} proof_scope={} readiness_reason={} protection_active={} accepted_percent={} transport_attention_recovered={} proof_stability_status={} stale_after_seconds={} last_event_age_seconds={} last_accepted_age_seconds={} last_probe_age_seconds={} last_two_hop_probe_age_seconds={}",
+            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} two_hop_probe_attempted={} two_hop_probe_succeeded={} two_hop_probe_failed={} timestamp_rejected={} real_relay_ready={} verified_client_onion_deliveries={} delivery_receipt_capable_peers={} accepted_relay_ready={} synthetic_probe_ready={} two_hop_probe_ready={} evidence_mode={} proof_scope={} readiness_reason={} protection_active={} accepted_percent={} transport_attention_recovered={} proof_stability_status={} stale_after_seconds={} last_event_age_seconds={} last_accepted_age_seconds={} last_probe_age_seconds={} last_two_hop_probe_age_seconds={} last_verified_client_onion_delivery_age_seconds={}",
             stats.received,
             accepted_total,
             stats.terminal,
@@ -5122,6 +5257,8 @@ impl PeerStore {
             stats.two_hop_probe_failed,
             stats.timestamp_rejected,
             real_relay_ready,
+            stats.verified_client_onion_deliveries,
+            delivery_receipt_capable_peers,
             accepted_relay_ready,
             synthetic_probe_ready,
             two_hop_probe_ready,
@@ -5144,6 +5281,9 @@ impl PeerStore {
                 .unwrap_or_else(|| "unknown".to_string()),
             last_two_hop_probe_age_seconds
                 .map(|age| age.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            last_verified_client_onion_delivery_age_seconds
+                .map(|age| age.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         );
 
@@ -5153,6 +5293,9 @@ impl PeerStore {
             runtime_ready,
             quality_ready,
             real_relay_ready,
+            verified_client_onion_deliveries: stats.verified_client_onion_deliveries,
+            last_verified_client_onion_delivery_age_seconds,
+            delivery_receipt_capable_peers,
             accepted_relay_ready,
             synthetic_probe_ready,
             evidence_mode: evidence_mode.to_string(),
@@ -8154,6 +8297,70 @@ mod tests {
             event.action == "blind_relay_terminal"
                 && event.detail.contains("encrypted_blob_size_bucket=lte_4kb")
         }));
+    }
+
+    #[test]
+    fn test_delivery_receipt_capability_is_verified_peer_and_freshness_bounded() {
+        let now = 1_700_000_000;
+        let identity = IdentityKeyPair::generate();
+        let mut descriptor = signed_descriptor_for(&identity, 1, now + 4_000);
+        descriptor.descriptor.public_endpoint = Some("https://relay.example".to_string());
+        descriptor.descriptor.capabilities = vec![
+            NodeCapability::ChatRelay,
+            NodeCapability::OnionMiddle,
+        ];
+        descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &identity).unwrap();
+        let node_id = descriptor.node_id();
+        let store = PeerStore::new();
+        store.upsert_verified(descriptor, now).unwrap();
+        store.record_route_forward_success(&node_id, now + 1);
+        store.record_delivery_receipt_capability(&node_id, now + 2);
+
+        let candidates = store
+            .delivery_receipt_route_candidates_with_capability_excluding(
+                NodeCapability::ChatRelay,
+                now + 3,
+                4,
+                &[],
+            );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(store.status(now + 3).blind_relay_quality.delivery_receipt_capable_peers, 1);
+
+        let stale_at = now + 2 + PEER_ROUTEABILITY_STALE_AFTER_SECS + 1;
+        assert!(store
+            .delivery_receipt_route_candidates_with_capability_excluding(
+                NodeCapability::ChatRelay,
+                stale_at,
+                4,
+                &[],
+            )
+            .is_empty());
+        assert_eq!(store.status(stale_at).blind_relay_quality.delivery_receipt_capable_peers, 0);
+    }
+
+    #[test]
+    fn test_verified_client_delivery_receipt_drives_real_relay_readiness_only_while_fresh() {
+        let store = PeerStore::new();
+        let now = 1_700_000_000;
+        store.record_verified_client_onion_delivery(now);
+
+        let fresh = store.status(now + 10).blind_relay_quality;
+        assert!(fresh.real_relay_ready);
+        assert_eq!(fresh.verified_client_onion_deliveries, 1);
+        assert_eq!(fresh.last_verified_client_onion_delivery_age_seconds, Some(10));
+        assert_eq!(fresh.evidence_mode, "verified_client_onion_delivery_receipt");
+        assert_eq!(fresh.proof_scope, "client_message_delivery");
+        assert_eq!(fresh.readiness_reason, "verified_client_onion_delivery_receipt_ready");
+
+        let stale = store
+            .status(now + PEER_ROUTEABILITY_STALE_AFTER_SECS + 1)
+            .blind_relay_quality;
+        assert!(!stale.real_relay_ready);
+        assert_eq!(stale.status, "stale");
+        assert_eq!(
+            stale.readiness_reason,
+            "verified_client_onion_delivery_receipt_stale"
+        );
     }
 
     #[test]
