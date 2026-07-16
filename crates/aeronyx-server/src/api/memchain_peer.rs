@@ -17,8 +17,10 @@
 //! - `POST /api/memchain/peer/coordinator-lease`
 //! - `POST /api/memchain/peer/coordinator-lease/release`
 //! - Bincode `MemChainMessage` request/response with the existing magic byte.
-//! - Signed discovery-peer admission, timestamp freshness, replay protection,
-//!   per-peer rate limiting, and bounded pagination.
+//! - Signed discovery-peer admission, timestamp freshness, stateful-request
+//!   replay protection, shared per-peer rate limiting, and bounded pagination.
+//! - Idempotent signed tip hints may be retried within that shared rate limit;
+//!   they only coalesce a follower wake-up and never mutate canonical state.
 //! - Response signing that binds request id, block order, pagination, and tip.
 //! - Default-off follower pull from one configured coordinator identity.
 //! - Best-effort signed tip announcements that only wake the existing verified
@@ -70,6 +72,10 @@
 //! - A block announcement is an untrusted scheduling hint even after its
 //!   signature is verified. It must never bypass page/checkpoint validation,
 //!   failure backoff, rollback protection, or the pinned coordinator policy.
+//! - Do not put the deterministic block-header hash into the stateful replay
+//!   cache. A follower must be able to retry the exact signed hint after a
+//!   transient pull failure; rate limiting and the capacity-one notifier bound
+//!   that idempotent wake-up without weakening other anti-replay checks.
 //! - Checkpoint proof establishes what a peer signed; it is not a majority,
 //!   finality, leader-election, or longest-chain consensus rule.
 //! - The latest bounded round summary is aggregate operational evidence only;
@@ -92,6 +98,7 @@
 //!   them as permissionless consensus, Byzantine finality, or fork choice.
 //!
 //! ## Last Modified
+//! v2.8.16-IdempotentTipRetry - Allowed bounded retry of signed follower wake-ups.
 //! v2.8.15-AnnouncementReceipts - Classified exact accepted, stale, and failed receipts.
 //! v2.8.14-SyncObservability - Added privacy-safe authenticated announcement dispositions.
 //! v2.8.13-EventDrivenFollower - Added authenticated coalesced tip wake-ups.
@@ -157,9 +164,7 @@ use crate::services::memchain::storage_ops::{
     RecordCommitmentCheckpointEvidencePersistOutcome, RecordCoordinatorLeaseGrantOutcome,
     RecordCoordinatorLeaseReleaseOutcome,
 };
-use crate::services::memchain::{
-    MemoryStorage, RecordCommitmentAnnouncementDisposition,
-};
+use crate::services::memchain::{MemoryStorage, RecordCommitmentAnnouncementDisposition};
 use crate::services::PeerStore;
 
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024;
@@ -380,14 +385,15 @@ struct PeerRateWindow {
 }
 
 impl PeerRequestGuard {
-    fn admit(&mut self, requester: [u8; 32], request_id: [u8; 16], now: u64) -> bool {
+    fn prune_replay_requests(&mut self, now: u64) {
         self.seen_requests
             .retain(|_, seen_at| now.saturating_sub(*seen_at) <= REPLAY_RETENTION_SECS);
-        if self.seen_requests.contains_key(&(requester, request_id)) {
-            return false;
-        }
+    }
 
+    fn admit_rate_limited(&mut self, requester: [u8; 32], now: u64) -> bool {
         let minute = now / 60;
+        self.rate_windows
+            .retain(|_, window| window.minute >= minute.saturating_sub(1));
         let window = self.rate_windows.entry(requester).or_default();
         if window.minute != minute {
             *window = PeerRateWindow { minute, used: 0 };
@@ -396,8 +402,28 @@ impl PeerRequestGuard {
             return false;
         }
         window.used += 1;
+        true
+    }
+
+    /// Admits a stateful request exactly once inside the replay-retention window.
+    fn admit(&mut self, requester: [u8; 32], request_id: [u8; 16], now: u64) -> bool {
+        self.prune_replay_requests(now);
+        if !self.admit_rate_limited(requester, now) {
+            return false;
+        }
+        // Rejected replay attempts consume the same abuse budget as valid
+        // requests; otherwise one signed frame could bypass the rate cap.
+        if self.seen_requests.contains_key(&(requester, request_id)) {
+            return false;
+        }
         self.seen_requests.insert((requester, request_id), now);
         true
+    }
+
+    /// Admits an authenticated, idempotent scheduling hint within the shared cap.
+    fn admit_idempotent_hint(&mut self, requester: [u8; 32], now: u64) -> bool {
+        self.prune_replay_requests(now);
+        self.admit_rate_limited(requester, now)
     }
 }
 
@@ -663,14 +689,14 @@ async fn block_announce_handler(State(state): State<MemChainPeerState>, body: By
     if !signature_valid {
         return protocol_error(StatusCode::UNAUTHORIZED, "invalid_signature");
     }
-    let mut request_id = [0u8; 16];
-    request_id.copy_from_slice(&header_hash[..16]);
     if !state
         .guard
         .lock()
         .await
-        .admit(header.proposer, request_id, now)
+        .admit_idempotent_hint(header.proposer, now)
     {
+        // Keep the established wire error for older coordinators even though
+        // authenticated tip hints are now rejected only by the shared rate cap.
         return protocol_error(StatusCode::TOO_MANY_REQUESTS, "rate_or_replay_limited");
     }
     let (local_tip_height, _) = match verified_local_commitment_tip(&state.storage).await {
@@ -3046,7 +3072,10 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let accepted = storage.record_commitment_sync_status();
-        assert_eq!(accepted.last_announcement_result.as_deref(), Some("accepted"));
+        assert_eq!(
+            accepted.last_announcement_result.as_deref(),
+            Some("accepted")
+        );
         assert_eq!(accepted.announcements_accepted_total, 1);
 
         let next_block = RecordCommitmentBlockV1::new_signed(
@@ -3080,7 +3109,7 @@ mod tests {
         assert_eq!(notifications.recv().await, Some(1));
         assert_eq!(storage.record_commitment_chain_tip().await.0, 0);
 
-        let replay = router
+        let retry = router
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -3090,7 +3119,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(replay.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(retry.status(), StatusCode::ACCEPTED);
+        assert_eq!(notifications.recv().await, Some(1));
+        let retry_status = storage.record_commitment_sync_status();
+        assert_eq!(
+            retry_status.last_announcement_result.as_deref(),
+            Some("accepted")
+        );
+        assert_eq!(retry_status.last_announced_height, Some(2));
+        assert_eq!(retry_status.announcements_accepted_total, 2);
+        assert_eq!(retry_status.announcements_coalesced_total, 1);
         assert_eq!(storage.record_commitment_chain_tip().await.0, 0);
     }
 
@@ -3898,13 +3936,26 @@ mod tests {
         let mut guard = PeerRequestGuard::default();
         assert!(guard.admit(peer, [0x01; 16], now));
         assert!(!guard.admit(peer, [0x01; 16], now));
-        for value in 2..=MAX_REQUESTS_PER_PEER_PER_MINUTE {
+        for value in 2..MAX_REQUESTS_PER_PEER_PER_MINUTE {
             let mut request_id = [0u8; 16];
             request_id[..4].copy_from_slice(&value.to_le_bytes());
             assert!(guard.admit(peer, request_id, now));
         }
         assert!(!guard.admit(peer, [0xFF; 16], now));
         assert!(guard.admit(peer, [0xFF; 16], now + 61));
+    }
+
+    #[test]
+    fn peer_guard_allows_idempotent_hint_retries_within_shared_rate_limit() {
+        let peer = [0x22; 32];
+        let now = 1_700_000_000;
+        let mut guard = PeerRequestGuard::default();
+
+        for _ in 0..MAX_REQUESTS_PER_PEER_PER_MINUTE {
+            assert!(guard.admit_idempotent_hint(peer, now));
+        }
+        assert!(!guard.admit_idempotent_hint(peer, now));
+        assert!(guard.admit_idempotent_hint(peer, now + 61));
     }
 
     #[test]
