@@ -21,6 +21,9 @@
 //!   replay protection, shared per-peer rate limiting, and bounded pagination.
 //! - Idempotent signed tip hints may be retried within that shared rate limit;
 //!   they only coalesce a follower wake-up and never mutate canonical state.
+//! - Coordinator delivery uses a three-peer, three-attempt in-memory retry
+//!   queue with bounded exponential backoff for transport and transient HTTP
+//!   failures; every retry revalidates the latest signed peer endpoint.
 //! - Response signing that binds request id, block order, pagination, and tip.
 //! - Default-off follower pull from one configured coordinator identity.
 //! - Best-effort signed tip announcements that only wake the existing verified
@@ -76,6 +79,9 @@
 //!   cache. A follower must be able to retry the exact signed hint after a
 //!   transient pull failure; rate limiting and the capacity-one notifier bound
 //!   that idempotent wake-up without weakening other anti-replay checks.
+//! - Never retry permanent `4xx` or protocol-incompatible receipts. Retry work
+//!   must remain process-local, bounded to pinned peers, cancellable on task
+//!   shutdown, and unable to delay or roll back canonical block production.
 //! - Checkpoint proof establishes what a peer signed; it is not a majority,
 //!   finality, leader-election, or longest-chain consensus rule.
 //! - The latest bounded round summary is aggregate operational evidence only;
@@ -98,6 +104,7 @@
 //!   them as permissionless consensus, Byzantine finality, or fork choice.
 //!
 //! ## Last Modified
+//! v2.8.17-TipRetryQueue - Added bounded transient-failure delivery retries.
 //! v2.8.16-IdempotentTipRetry - Allowed bounded retry of signed follower wake-ups.
 //! v2.8.15-AnnouncementReceipts - Classified exact accepted, stale, and failed receipts.
 //! v2.8.14-SyncObservability - Added privacy-safe authenticated announcement dispositions.
@@ -125,7 +132,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
@@ -175,6 +182,8 @@ const MAX_REQUESTS_PER_PEER_PER_MINUTE: u32 = 30;
 const REQUEST_TIMESTAMP_SKEW_SECS: u64 = 60;
 const REPLAY_RETENTION_SECS: u64 = 120;
 const MAX_PINNED_WITNESSES_PER_ROUND: usize = 3;
+const TIP_ANNOUNCEMENT_MAX_ATTEMPTS: usize = 3;
+const TIP_ANNOUNCEMENT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 
 /// Aggregate result of one bounded follower pull.
 ///
@@ -320,13 +329,20 @@ pub struct CommitmentTipAnnouncementOutcome {
     pub stale: usize,
     /// Missing, unsafe, unreachable, or incompatible peers.
     pub failed: usize,
+    /// Additional HTTP attempts after an initial transient delivery failure.
+    pub retries_attempted: usize,
+    /// Peers that returned a terminal accepted/stale receipt after a retry.
+    pub retries_succeeded: usize,
+    /// Peers still transiently failing after the bounded retry budget.
+    pub retries_exhausted: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommitmentTipAnnouncementDelivery {
     Accepted,
     Stale,
-    Failed,
+    RetryableFailure,
+    PermanentFailure,
 }
 
 // Keep the receipt contract at the HTTP wire boundary. Axum and Reqwest may
@@ -336,9 +352,22 @@ fn classify_commitment_tip_announcement_status(status: u16) -> CommitmentTipAnno
     match status {
         202 => CommitmentTipAnnouncementDelivery::Accepted,
         204 => CommitmentTipAnnouncementDelivery::Stale,
-        _ => CommitmentTipAnnouncementDelivery::Failed,
+        408 | 425 | 500..=599 => CommitmentTipAnnouncementDelivery::RetryableFailure,
+        _ => CommitmentTipAnnouncementDelivery::PermanentFailure,
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+struct CommitmentTipAnnouncementRetryPolicy {
+    max_attempts: usize,
+    base_delay: Duration,
+}
+
+const TIP_ANNOUNCEMENT_RETRY_POLICY: CommitmentTipAnnouncementRetryPolicy =
+    CommitmentTipAnnouncementRetryPolicy {
+        max_attempts: TIP_ANNOUNCEMENT_MAX_ATTEMPTS,
+        base_delay: TIP_ANNOUNCEMENT_RETRY_BASE_DELAY,
+    };
 
 #[derive(Debug)]
 struct VerifiedCommitmentPage {
@@ -552,6 +581,31 @@ async fn announce_current_record_commitment_tip_with_endpoint_policy<F>(
 where
     F: Fn(&str) -> bool + Send + Sync + ?Sized,
 {
+    announce_current_record_commitment_tip_with_endpoint_policy_and_retry_policy(
+        storage,
+        peer_store,
+        identity,
+        client,
+        pinned_peer_ids,
+        endpoint_allowed,
+        TIP_ANNOUNCEMENT_RETRY_POLICY,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn announce_current_record_commitment_tip_with_endpoint_policy_and_retry_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    pinned_peer_ids: &[[u8; 32]],
+    endpoint_allowed: &F,
+    retry_policy: CommitmentTipAnnouncementRetryPolicy,
+) -> Result<CommitmentTipAnnouncementOutcome, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
     let (tip_height, _) = verified_local_commitment_tip(storage).await?;
     if tip_height == 0 {
         return Err("local_commitment_tip_empty".to_string());
@@ -575,74 +629,119 @@ where
     })
     .map_err(|_| "tip_announcement_encode_failed".to_string())?;
 
-    let now = now_secs();
     let self_node_id = identity.public_key_bytes();
     let mut distinct = HashSet::new();
     let mut outcome = CommitmentTipAnnouncementOutcome {
         announced_height: tip_height,
         ..CommitmentTipAnnouncementOutcome::default()
     };
-    let mut urls = Vec::with_capacity(MAX_PINNED_WITNESSES_PER_ROUND);
-    for peer_id in pinned_peer_ids
+    let mut pending = pinned_peer_ids
         .iter()
         .copied()
         .filter(|peer_id| *peer_id != self_node_id && distinct.insert(*peer_id))
         .take(MAX_PINNED_WITNESSES_PER_ROUND)
-    {
-        outcome.attempted = outcome.attempted.saturating_add(1);
-        let Some(peer) = peer_store.get_valid(&peer_id, now) else {
-            outcome.failed = outcome.failed.saturating_add(1);
-            continue;
-        };
-        let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
-            outcome.failed = outcome.failed.saturating_add(1);
-            continue;
-        };
-        if !endpoint_allowed(endpoint) {
-            outcome.failed = outcome.failed.saturating_add(1);
-            continue;
+        .collect::<Vec<_>>();
+    outcome.attempted = pending.len();
+
+    // Keep the queue hard-bounded even if a future internal caller supplies a
+    // malformed policy. Production uses exactly three attempts.
+    let max_attempts = retry_policy.max_attempts.clamp(1, 8);
+    let mut attempt_number = 1usize;
+    while !pending.is_empty() {
+        if attempt_number > 1 {
+            let shift = u32::try_from(attempt_number.saturating_sub(2))
+                .unwrap_or(u32::MAX)
+                .min(7);
+            let multiplier = 1u32 << shift;
+            tokio::time::sleep(retry_policy.base_delay.saturating_mul(multiplier)).await;
+            outcome.retries_attempted = outcome.retries_attempted.saturating_add(pending.len());
         }
-        let Ok(url) = commitment_block_announce_url(endpoint) else {
-            outcome.failed = outcome.failed.saturating_add(1);
-            continue;
-        };
-        urls.push(url);
-    }
-    let deliveries = futures::stream::iter(urls)
-        .map(|url| {
-            let frame = frame.clone();
-            async move {
-                match client
-                    .post(url)
-                    .header("content-type", "application/octet-stream")
-                    .body(frame)
-                    .send()
-                    .await
-                {
-                    Ok(response) => {
-                        classify_commitment_tip_announcement_status(response.status().as_u16())
+
+        let deliveries = futures::stream::iter(pending.into_iter())
+            .map(|peer_id| {
+                let frame = frame.clone();
+                async move {
+                    let delivery = deliver_commitment_tip_announcement(
+                        peer_store,
+                        client,
+                        peer_id,
+                        frame,
+                        endpoint_allowed,
+                    )
+                    .await;
+                    (peer_id, delivery)
+                }
+            })
+            .buffer_unordered(MAX_PINNED_WITNESSES_PER_ROUND)
+            .collect::<Vec<_>>()
+            .await;
+        let mut retry_queue = Vec::with_capacity(deliveries.len());
+        for (peer_id, delivery) in deliveries {
+            match delivery {
+                CommitmentTipAnnouncementDelivery::Accepted => {
+                    outcome.accepted = outcome.accepted.saturating_add(1);
+                    if attempt_number > 1 {
+                        outcome.retries_succeeded = outcome.retries_succeeded.saturating_add(1);
                     }
-                    Err(_) => CommitmentTipAnnouncementDelivery::Failed,
+                }
+                CommitmentTipAnnouncementDelivery::Stale => {
+                    outcome.stale = outcome.stale.saturating_add(1);
+                    if attempt_number > 1 {
+                        outcome.retries_succeeded = outcome.retries_succeeded.saturating_add(1);
+                    }
+                }
+                CommitmentTipAnnouncementDelivery::RetryableFailure
+                    if attempt_number < max_attempts =>
+                {
+                    retry_queue.push(peer_id);
+                }
+                CommitmentTipAnnouncementDelivery::RetryableFailure => {
+                    outcome.failed = outcome.failed.saturating_add(1);
+                    outcome.retries_exhausted = outcome.retries_exhausted.saturating_add(1);
+                }
+                CommitmentTipAnnouncementDelivery::PermanentFailure => {
+                    outcome.failed = outcome.failed.saturating_add(1);
                 }
             }
-        })
-        .buffer_unordered(MAX_PINNED_WITNESSES_PER_ROUND)
-        .collect::<Vec<_>>()
-        .await;
-    for delivery in deliveries {
-        match delivery {
-            CommitmentTipAnnouncementDelivery::Accepted => {
-                outcome.accepted = outcome.accepted.saturating_add(1);
-            }
-            CommitmentTipAnnouncementDelivery::Stale => {
-                outcome.stale = outcome.stale.saturating_add(1);
-            }
-            CommitmentTipAnnouncementDelivery::Failed => {
-                outcome.failed = outcome.failed.saturating_add(1);
-            }
         }
+        pending = retry_queue;
+        attempt_number = attempt_number.saturating_add(1);
     }
     Ok(outcome)
+}
+
+async fn deliver_commitment_tip_announcement<F>(
+    peer_store: &PeerStore,
+    client: &reqwest::Client,
+    peer_id: [u8; 32],
+    frame: Vec<u8>,
+    endpoint_allowed: &F,
+) -> CommitmentTipAnnouncementDelivery
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    let Some(peer) = peer_store.get_valid(&peer_id, now_secs()) else {
+        return CommitmentTipAnnouncementDelivery::PermanentFailure;
+    };
+    let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
+        return CommitmentTipAnnouncementDelivery::PermanentFailure;
+    };
+    if !endpoint_allowed(endpoint) {
+        return CommitmentTipAnnouncementDelivery::PermanentFailure;
+    }
+    let Ok(url) = commitment_block_announce_url(endpoint) else {
+        return CommitmentTipAnnouncementDelivery::PermanentFailure;
+    };
+    match client
+        .post(url)
+        .header("content-type", "application/octet-stream")
+        .body(frame)
+        .send()
+        .await
+    {
+        Ok(response) => classify_commitment_tip_announcement_status(response.status().as_u16()),
+        Err(_) => CommitmentTipAnnouncementDelivery::RetryableFailure,
+    }
 }
 
 async fn block_announce_handler(State(state): State<MemChainPeerState>, body: Bytes) -> Response {
@@ -3027,7 +3126,15 @@ mod tests {
         );
         assert_eq!(
             classify_commitment_tip_announcement_status(StatusCode::OK.as_u16()),
-            CommitmentTipAnnouncementDelivery::Failed
+            CommitmentTipAnnouncementDelivery::PermanentFailure
+        );
+        assert_eq!(
+            classify_commitment_tip_announcement_status(StatusCode::SERVICE_UNAVAILABLE.as_u16()),
+            CommitmentTipAnnouncementDelivery::RetryableFailure
+        );
+        assert_eq!(
+            classify_commitment_tip_announcement_status(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+            CommitmentTipAnnouncementDelivery::PermanentFailure
         );
     }
 
@@ -3264,6 +3371,9 @@ mod tests {
         assert_eq!(outcome.accepted, 1);
         assert_eq!(outcome.stale, 0);
         assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.retries_attempted, 0);
+        assert_eq!(outcome.retries_succeeded, 0);
+        assert_eq!(outcome.retries_exhausted, 0);
         assert_eq!(notifications.recv().await, Some(1));
 
         server.abort();
@@ -3340,7 +3450,169 @@ mod tests {
         assert_eq!(outcome.accepted, 0);
         assert_eq!(outcome.stale, 1);
         assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.retries_attempted, 0);
+        assert_eq!(outcome.retries_succeeded, 0);
+        assert_eq!(outcome.retries_exhausted, 0);
         assert!(notifications.try_recv().is_err());
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_tip_announcement_retries_transient_failure_to_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let follower = IdentityKeyPair::generate();
+        let source_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now,
+            GENESIS_PREV_HASH,
+            vec![[0x35; 32]],
+            &coordinator,
+        );
+        source_storage
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        source_storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let endpoint_checks = AtomicUsize::new(0);
+        let endpoint_policy = |_endpoint: &str| {
+            endpoint_checks.fetch_add(1, Ordering::SeqCst);
+            true
+        };
+        let router = Router::new().route(
+            "/api/memchain/peer/block-announce",
+            post(move || {
+                let attempts = Arc::clone(&handler_attempts);
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::ACCEPTED
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let source_peers = PeerStore::new();
+        admit_peer(
+            &source_peers,
+            &follower,
+            Some(format!("http://{address}")),
+            now,
+        );
+        let outcome = announce_current_record_commitment_tip_with_endpoint_policy_and_retry_policy(
+            &source_storage,
+            &source_peers,
+            &coordinator,
+            &reqwest::Client::new(),
+            &[follower.public_key_bytes()],
+            &endpoint_policy,
+            CommitmentTipAnnouncementRetryPolicy {
+                max_attempts: 3,
+                base_delay: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(endpoint_checks.load(Ordering::SeqCst), 2);
+        assert_eq!(outcome.attempted, 1);
+        assert_eq!(outcome.accepted, 1);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.retries_attempted, 1);
+        assert_eq!(outcome.retries_succeeded, 1);
+        assert_eq!(outcome.retries_exhausted, 0);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_tip_announcement_stops_after_retry_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let follower = IdentityKeyPair::generate();
+        let source_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now,
+            GENESIS_PREV_HASH,
+            vec![[0x36; 32]],
+            &coordinator,
+        );
+        source_storage
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        source_storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let router = Router::new().route(
+            "/api/memchain/peer/block-announce",
+            post(move || {
+                let attempts = Arc::clone(&handler_attempts);
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let source_peers = PeerStore::new();
+        admit_peer(
+            &source_peers,
+            &follower,
+            Some(format!("http://{address}")),
+            now,
+        );
+        let outcome = announce_current_record_commitment_tip_with_endpoint_policy_and_retry_policy(
+            &source_storage,
+            &source_peers,
+            &coordinator,
+            &reqwest::Client::new(),
+            &[follower.public_key_bytes()],
+            &allow_test_endpoint,
+            CommitmentTipAnnouncementRetryPolicy {
+                max_attempts: 3,
+                base_delay: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(outcome.attempted, 1);
+        assert_eq!(outcome.accepted, 0);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.retries_attempted, 2);
+        assert_eq!(outcome.retries_succeeded, 0);
+        assert_eq!(outcome.retries_exhausted, 1);
 
         server.abort();
         let _ = server.await;

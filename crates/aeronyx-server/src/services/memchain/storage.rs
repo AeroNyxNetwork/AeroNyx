@@ -133,6 +133,8 @@
 //!   inbound serving never refresh it.
 //! - Witness-round fields are process-local aggregate observations. They must
 //!   never be interpreted as votes, quorum, finality, or fork choice.
+//! - Outbound announcement retry fields are process-local aggregate counters.
+//!   Never add peer identities, endpoints, response bodies, or retry timing.
 //! - Checkpoint certificates are immutable local evidence bundles over
 //!   independently verified operator-pinned witness frames. They prove only
 //!   that the configured threshold signed one local checkpoint; they are not
@@ -154,6 +156,7 @@
 //!   converged frame may clear it. Recovery requires operator review/restart.
 //!
 //! ## Last Modified
+//! v2.8.17-TipRetryQueue - Added aggregate bounded announcement retry evidence.
 //! v2.8.15-AnnouncementReceipts - Added coordinator-side aggregate delivery evidence.
 //! v2.8.14-SyncObservability - Added authenticated announcement dispositions and trigger evidence.
 //! v2.8.13-BlockConfirmation - Added privacy-safe witness-certificate coverage.
@@ -447,6 +450,12 @@ pub struct RecordCommitmentSyncStatus {
     pub outbound_announcements_stale_total: u64,
     /// Missing, unsafe, unreachable, or protocol-incompatible peers.
     pub outbound_announcements_failed_total: u64,
+    /// Additional delivery attempts after transient failures.
+    pub outbound_announcement_retries_attempted_total: u64,
+    /// Peers recovered by a bounded retry.
+    pub outbound_announcement_retries_succeeded_total: u64,
+    /// Peers still transiently failing after the retry budget.
+    pub outbound_announcement_retries_exhausted_total: u64,
     /// Most recent pull attempt time.
     pub last_attempt_at: Option<u64>,
     /// Most recent successfully verified page time.
@@ -657,6 +666,9 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) outbound_announcements_accepted_total: u64,
     pub(crate) outbound_announcements_stale_total: u64,
     pub(crate) outbound_announcements_failed_total: u64,
+    pub(crate) outbound_announcement_retries_attempted_total: u64,
+    pub(crate) outbound_announcement_retries_succeeded_total: u64,
+    pub(crate) outbound_announcement_retries_exhausted_total: u64,
     pub(crate) last_attempt_at: Option<u64>,
     pub(crate) last_success_at: Option<u64>,
     pub(crate) last_failure_at: Option<u64>,
@@ -696,6 +708,9 @@ impl Default for RecordCommitmentSyncRuntime {
             outbound_announcements_accepted_total: 0,
             outbound_announcements_stale_total: 0,
             outbound_announcements_failed_total: 0,
+            outbound_announcement_retries_attempted_total: 0,
+            outbound_announcement_retries_succeeded_total: 0,
+            outbound_announcement_retries_exhausted_total: 0,
             last_attempt_at: None,
             last_success_at: None,
             last_failure_at: None,

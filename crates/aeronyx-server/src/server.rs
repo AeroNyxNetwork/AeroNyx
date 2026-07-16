@@ -239,8 +239,11 @@
 //   - If vpn.dns_proxy_enabled=false, an external gateway DNS listener such as
 //     systemd-resolved must own gateway_ip:53. The health endpoint verifies
 //     that listener independently.
+//   - Tip announcement retries are advisory process-local work. Never let them
+//     gate block production or expose peer identity/endpoint data in telemetry.
 //
 // Last Modified:
+//   v2.8.17-TipRetryQueue - Bounded transient follower wake-up retries
 //   v2.8.15-AnnouncementReceipts - Exact coordinator tip-delivery result evidence
 //   v2.8.14-SyncObservability - Event-driven follower trigger and announcement evidence
 //   v2.8.12-LeaseFailClosedTelemetry - Partition/recovery lease evidence
@@ -2429,6 +2432,12 @@ impl Server {
                                 .outbound_announcements_stale_total,
                             outbound_announcements_failed_total: status
                                 .outbound_announcements_failed_total,
+                            outbound_announcement_retries_attempted_total: status
+                                .outbound_announcement_retries_attempted_total,
+                            outbound_announcement_retries_succeeded_total: status
+                                .outbound_announcement_retries_succeeded_total,
+                            outbound_announcement_retries_exhausted_total: status
+                                .outbound_announcement_retries_exhausted_total,
                             last_attempt_at: status.last_attempt_at,
                             last_success_at: status.last_success_at,
                             last_failure_at: status.last_failure_at,
@@ -3653,6 +3662,9 @@ impl Server {
                                     delivery.accepted,
                                     delivery.stale,
                                     delivery.failed,
+                                    delivery.retries_attempted,
+                                    delivery.retries_succeeded,
+                                    delivery.retries_exhausted,
                                 );
                                 debug!(
                                     announced_height = delivery.announced_height,
@@ -3660,6 +3672,9 @@ impl Server {
                                     accepted = delivery.accepted,
                                     stale = delivery.stale,
                                     failed = delivery.failed,
+                                    retries_attempted = delivery.retries_attempted,
+                                    retries_succeeded = delivery.retries_succeeded,
+                                    retries_exhausted = delivery.retries_exhausted,
                                     "[MEMCHAIN_BLOCK] Sent bounded follower tip announcements"
                                 );
                             }

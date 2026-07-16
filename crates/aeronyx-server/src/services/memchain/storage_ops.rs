@@ -123,6 +123,7 @@
 //!   election, finality, quorum, or fork choice.
 //!
 //! ## Modification History
+//! v2.8.17-TipRetryQueue - Added bounded announcement retry outcome counters.
 //! v2.2.0               - 🌟 Extracted from storage.rs; added get_embedding_model, get_overview
 //! v2.3.0+RemoteStorage - 🌟 Added count_distinct_owners(), owner_exists()
 //! v2.4.0-GraphCognition - 🌟 Added full CRUD for cognitive graph tables
@@ -155,6 +156,7 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! v2.8.17-TipRetryQueue - Track retry attempts, recoveries, and exhaustion.
 //! v2.8.15-AnnouncementReceipts - Track exact coordinator tip-delivery outcomes.
 //! v2.8.14-SyncObservability - Distinguish scheduled and authenticated follower wake-ups.
 //! v2.8.13-BlockConfirmation - Expose audited witness-certificate block coverage.
@@ -4478,9 +4480,11 @@ impl MemoryStorage {
     ///
     /// `accepted` means the peer returned exactly `202 Accepted`; `stale`
     /// means exactly `204 No Content`. Other HTTP statuses, transport errors,
-    /// and preflight rejections belong in `failed`. These counters are
-    /// operational evidence only and never establish replication, consensus,
-    /// fork choice, or finality.
+    /// and preflight rejections belong in `failed`. Retry counters contain
+    /// only aggregate attempts and terminal outcomes; they never expose peers,
+    /// endpoints, response bodies, or timing. These counters are operational
+    /// evidence only and never establish replication, consensus, fork choice,
+    /// or finality.
     pub fn record_commitment_outbound_announcement(
         &self,
         now: u64,
@@ -4489,6 +4493,9 @@ impl MemoryStorage {
         accepted: usize,
         stale: usize,
         failed: usize,
+        retries_attempted: usize,
+        retries_succeeded: usize,
+        retries_exhausted: usize,
     ) {
         let mut runtime = self.commitment_sync.write();
         if runtime.role != "coordinator" {
@@ -4499,8 +4506,14 @@ impl MemoryStorage {
         let accepted = u64::try_from(accepted).unwrap_or(u64::MAX);
         let stale = u64::try_from(stale).unwrap_or(u64::MAX);
         let failed = u64::try_from(failed).unwrap_or(u64::MAX);
+        let retries_attempted = u64::try_from(retries_attempted).unwrap_or(u64::MAX);
+        let retries_succeeded = u64::try_from(retries_succeeded).unwrap_or(u64::MAX);
+        let retries_exhausted = u64::try_from(retries_exhausted).unwrap_or(u64::MAX);
         let classified = accepted.saturating_add(stale).saturating_add(failed);
-        let result = if classified != attempted {
+        let retry_evidence_valid = retries_succeeded <= retries_attempted
+            && retries_exhausted <= retries_attempted
+            && retries_succeeded.saturating_add(retries_exhausted) <= attempted;
+        let result = if classified != attempted || !retry_evidence_valid {
             "failed"
         } else if attempted == 0 {
             "no_targets"
@@ -4531,6 +4544,15 @@ impl MemoryStorage {
         runtime.outbound_announcements_failed_total = runtime
             .outbound_announcements_failed_total
             .saturating_add(failed);
+        runtime.outbound_announcement_retries_attempted_total = runtime
+            .outbound_announcement_retries_attempted_total
+            .saturating_add(retries_attempted);
+        runtime.outbound_announcement_retries_succeeded_total = runtime
+            .outbound_announcement_retries_succeeded_total
+            .saturating_add(retries_succeeded);
+        runtime.outbound_announcement_retries_exhausted_total = runtime
+            .outbound_announcement_retries_exhausted_total
+            .saturating_add(retries_exhausted);
     }
 
     /// Records a coordinator round that could not encode or load an audited
@@ -4676,6 +4698,12 @@ impl MemoryStorage {
                 .outbound_announcements_accepted_total,
             outbound_announcements_stale_total: runtime.outbound_announcements_stale_total,
             outbound_announcements_failed_total: runtime.outbound_announcements_failed_total,
+            outbound_announcement_retries_attempted_total: runtime
+                .outbound_announcement_retries_attempted_total,
+            outbound_announcement_retries_succeeded_total: runtime
+                .outbound_announcement_retries_succeeded_total,
+            outbound_announcement_retries_exhausted_total: runtime
+                .outbound_announcement_retries_exhausted_total,
             last_attempt_at: runtime.last_attempt_at,
             last_success_at: runtime.last_success_at,
             last_failure_at: runtime.last_failure_at,
@@ -8091,8 +8119,8 @@ mod tests {
     fn test_commitment_sync_runtime_reports_coordinator_without_polling() {
         let storage = MemoryStorage::open(":memory:", None).unwrap();
         storage.configure_record_commitment_sync(true, false);
-        storage.record_commitment_outbound_announcement(100, 9, 3, 2, 1, 0);
-        storage.record_commitment_outbound_announcement(101, 10, 3, 1, 1, 1);
+        storage.record_commitment_outbound_announcement(100, 9, 3, 2, 1, 0, 1, 1, 0);
+        storage.record_commitment_outbound_announcement(101, 10, 3, 1, 1, 1, 2, 0, 1);
         storage.record_commitment_outbound_announcement_skipped(102);
         let status = storage.record_commitment_sync_status();
         assert_eq!(status.role, "coordinator");
@@ -8111,6 +8139,9 @@ mod tests {
         assert_eq!(status.outbound_announcements_accepted_total, 3);
         assert_eq!(status.outbound_announcements_stale_total, 2);
         assert_eq!(status.outbound_announcements_failed_total, 1);
+        assert_eq!(status.outbound_announcement_retries_attempted_total, 3);
+        assert_eq!(status.outbound_announcement_retries_succeeded_total, 1);
+        assert_eq!(status.outbound_announcement_retries_exhausted_total, 1);
     }
 
     #[test]
@@ -8118,7 +8149,7 @@ mod tests {
         let storage = MemoryStorage::open(":memory:", None).unwrap();
         storage.configure_record_commitment_sync(true, false);
 
-        storage.record_commitment_outbound_announcement(100, 9, 3, 3, 0, 0);
+        storage.record_commitment_outbound_announcement(100, 9, 3, 3, 0, 0, 0, 0, 0);
         assert_eq!(
             storage
                 .record_commitment_sync_status()
@@ -8126,7 +8157,7 @@ mod tests {
                 .as_deref(),
             Some("all_woken")
         );
-        storage.record_commitment_outbound_announcement(101, 10, 3, 2, 1, 0);
+        storage.record_commitment_outbound_announcement(101, 10, 3, 2, 1, 0, 0, 0, 0);
         assert_eq!(
             storage
                 .record_commitment_sync_status()
@@ -8134,7 +8165,7 @@ mod tests {
                 .as_deref(),
             Some("delivered")
         );
-        storage.record_commitment_outbound_announcement(102, 11, 3, 1, 1, 1);
+        storage.record_commitment_outbound_announcement(102, 11, 3, 1, 1, 1, 0, 0, 0);
         assert_eq!(
             storage
                 .record_commitment_sync_status()
@@ -8142,7 +8173,7 @@ mod tests {
                 .as_deref(),
             Some("partial")
         );
-        storage.record_commitment_outbound_announcement(103, 12, 3, 0, 0, 3);
+        storage.record_commitment_outbound_announcement(103, 12, 3, 0, 0, 3, 2, 0, 1);
         assert_eq!(
             storage
                 .record_commitment_sync_status()
@@ -8150,7 +8181,7 @@ mod tests {
                 .as_deref(),
             Some("failed")
         );
-        storage.record_commitment_outbound_announcement(104, 13, 0, 0, 0, 0);
+        storage.record_commitment_outbound_announcement(104, 13, 0, 0, 0, 0, 0, 0, 0);
         assert_eq!(
             storage
                 .record_commitment_sync_status()
@@ -8158,7 +8189,15 @@ mod tests {
                 .as_deref(),
             Some("no_targets")
         );
-        storage.record_commitment_outbound_announcement(105, 14, 3, 3, 1, 0);
+        storage.record_commitment_outbound_announcement(105, 14, 3, 3, 1, 0, 0, 0, 0);
+        assert_eq!(
+            storage
+                .record_commitment_sync_status()
+                .last_outbound_announcement_result
+                .as_deref(),
+            Some("failed")
+        );
+        storage.record_commitment_outbound_announcement(106, 15, 3, 3, 0, 0, 1, 2, 0);
         assert_eq!(
             storage
                 .record_commitment_sync_status()

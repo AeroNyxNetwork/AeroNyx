@@ -42,6 +42,8 @@
 //     Do NOT add fields after signing.
 //   - Lease telemetry is process-local and aggregate. Never add witness ids,
 //     endpoints, process instance ids, signatures, or lease response frames.
+//   - Announcement retry telemetry is aggregate only. Never add peer ids,
+//     endpoints, HTTP bodies, block hashes, or per-peer retry timing.
 //
 // Last Modified:
 //   v1.0.0         - Initial implementation
@@ -67,6 +69,7 @@
 //   v2.8.13        - Added witness-certificate block confirmation coverage
 //   v2.8.14        - Added privacy-safe event-driven follower telemetry
 //   v2.8.15        - Added exact coordinator announcement receipt telemetry
+//   v2.8.17        - Added bounded announcement retry outcome telemetry
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -225,6 +228,12 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub outbound_announcements_stale_total: u64,
     /// Missing, unsafe, unreachable, or protocol-incompatible peers.
     pub outbound_announcements_failed_total: u64,
+    /// Additional attempts after transient outbound delivery failures.
+    pub outbound_announcement_retries_attempted_total: u64,
+    /// Peers recovered by a bounded outbound retry.
+    pub outbound_announcement_retries_succeeded_total: u64,
+    /// Peers still transiently failing after the bounded retry budget.
+    pub outbound_announcement_retries_exhausted_total: u64,
     /// Most recent follower pull attempt.
     pub last_attempt_at: Option<u64>,
     /// Most recent successful verified response page.
@@ -892,6 +901,9 @@ mod tests {
                 outbound_announcements_accepted_total: 5,
                 outbound_announcements_stale_total: 2,
                 outbound_announcements_failed_total: 2,
+                outbound_announcement_retries_attempted_total: 4,
+                outbound_announcement_retries_succeeded_total: 2,
+                outbound_announcement_retries_exhausted_total: 1,
                 last_attempt_at: Some(99),
                 last_success_at: Some(100),
                 last_failure_at: Some(110),
@@ -1009,6 +1021,9 @@ mod tests {
         assert_eq!(sync["outbound_announcements_accepted_total"], 5);
         assert_eq!(sync["outbound_announcements_stale_total"], 2);
         assert_eq!(sync["outbound_announcements_failed_total"], 2);
+        assert_eq!(sync["outbound_announcement_retries_attempted_total"], 4);
+        assert_eq!(sync["outbound_announcement_retries_succeeded_total"], 2);
+        assert_eq!(sync["outbound_announcement_retries_exhausted_total"], 1);
         assert_eq!(sync["last_attempt_at"], 99);
         assert_eq!(sync["last_error_code"], "request_timeout");
         let checkpoint = &value["record_commitment_checkpoint"];
