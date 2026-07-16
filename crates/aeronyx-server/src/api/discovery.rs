@@ -60,6 +60,7 @@
 //!   Keep `DISCOVERY_REQUEST_BODY_MAX_BYTES` aligned with protocol limits.
 //!
 //! ## Last Modified
+//! v0.27.0-ProofRestartContinuity - Gate onion admission on verified or durably signed proof stability
 //! v0.26.0-RelayEvidenceTruthfulness - Expose origin-neutral accepted relay readiness without claiming user traffic
 //! v0.25.0-BoundedGossipBody - Reject oversized gossip before JSON deserialization
 //! v0.24.0-DiscoveryPublicCard - Add product-facing public protocol card endpoint
@@ -635,6 +636,72 @@ impl Default for DiscoveryLocalCapabilityStatus {
     }
 }
 
+/// Internal aggregate proof-continuity decision shared by admission and the
+/// public summary. It deliberately carries only authentication/status buckets
+/// and counts already present in `PeerStoreBootstrapStatus`.
+struct TwoHopProofRestartContinuity {
+    peer_recovery_configured: bool,
+    authenticated_restore_ready: bool,
+    signed_persistence_ready: bool,
+    ready: bool,
+    source: &'static str,
+    authentication: String,
+    restored: u64,
+    persisted: u64,
+}
+
+fn two_hop_proof_restart_continuity(status: &PeerStoreStatus) -> TwoHopProofRestartContinuity {
+    let bootstrap = &status.bootstrap;
+    let proof = &status.two_hop_path_proof_history;
+    let authentication = bootstrap
+        .last_two_hop_proof_cache_authentication
+        .clone()
+        .unwrap_or_else(|| "not_observed".to_string());
+    let restore_evidence_fresh = bootstrap
+        .last_two_hop_proof_cache_at
+        .map(|at| {
+            at <= proof.generated_at
+                && proof.generated_at.saturating_sub(at) <= proof.stale_after_seconds
+        })
+        .unwrap_or(false);
+    let persistence_evidence_fresh = bootstrap
+        .last_two_hop_proof_cache_persisted_at
+        .map(|at| {
+            at <= proof.generated_at
+                && proof.generated_at.saturating_sub(at) <= proof.stale_after_seconds
+        })
+        .unwrap_or(false);
+    let authenticated_restore_ready = authentication == "verified"
+        && bootstrap.last_two_hop_proof_cache_restored_stability_ready
+        && restore_evidence_fresh;
+    let signed_persistence_ready =
+        bootstrap.last_two_hop_proof_cache_persisted_stability_ready && persistence_evidence_fresh;
+    let peer_recovery_configured = status.peer_quorum.restart_recovery_configured;
+    let ready = authenticated_restore_ready || signed_persistence_ready;
+    let source = match (authenticated_restore_ready, signed_persistence_ready) {
+        (true, true) => "verified_restore_and_signed_persistence",
+        (true, false) => "verified_restore",
+        (false, true) => "signed_persistence",
+        (false, false) if authentication == "signature_invalid" => "restore_signature_invalid",
+        (false, false) if authentication == "identity_unavailable" => {
+            "restore_identity_unavailable"
+        }
+        (false, false) if authentication == "legacy_descriptor_only" => "legacy_cache",
+        _ => "not_ready",
+    };
+
+    TwoHopProofRestartContinuity {
+        peer_recovery_configured,
+        authenticated_restore_ready,
+        signed_persistence_ready,
+        ready,
+        source,
+        authentication,
+        restored: bootstrap.last_two_hop_proof_cache_restored,
+        persisted: bootstrap.last_two_hop_proof_cache_persisted,
+    }
+}
+
 /// Builds the aggregate relay-pool admission contract.
 ///
 /// This is the Rust-side source of truth for nodeboard, backend aggregation,
@@ -658,7 +725,10 @@ pub fn onion_relay_admission_status_value(
         && peer_quorum.routeable_onion_middle_hops >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
     let recent_path_proof_ready = proof.proof_ready && !proof.failure_streak_active;
     let stable_path_proof_ready = proof.stability_ready && !proof.failure_circuit_breaker_active;
-    let restart_recovery_ready = peer_quorum.restart_recovery_configured;
+    let proof_restart_continuity = two_hop_proof_restart_continuity(status);
+    let peer_restart_recovery_ready = proof_restart_continuity.peer_recovery_configured;
+    let proof_restart_continuity_ready = proof_restart_continuity.ready;
+    let restart_recovery_ready = peer_restart_recovery_ready && proof_restart_continuity_ready;
     let stability_remaining_attempts =
         ONION_RELAY_ADMISSION_STABILITY_MIN_PROOFS.saturating_sub(proof.stability_window_attempted);
     let checks_total = 5u8;
@@ -695,8 +765,10 @@ pub fn onion_relay_admission_status_value(
         "path_proof"
     } else if !stable_path_proof_ready {
         "stability_window"
-    } else if !restart_recovery_ready {
+    } else if !peer_restart_recovery_ready {
         "restart_recovery"
+    } else if !proof_restart_continuity_ready {
+        "proof_restart_continuity"
     } else {
         "eligible"
     };
@@ -713,8 +785,11 @@ pub fn onion_relay_admission_status_value(
     if !stable_path_proof_ready {
         admission_blockers.push("stable_path_proof_not_ready");
     }
-    if !restart_recovery_ready {
+    if !peer_restart_recovery_ready {
         admission_blockers.push("restart_recovery_not_ready");
+    }
+    if !proof_restart_continuity_ready {
+        admission_blockers.push("proof_restart_continuity_not_ready");
     }
     let warmup_hint = match warmup_stage {
         "eligible" => "node is eligible for client-selected two-hop onion relay paths".to_string(),
@@ -733,10 +808,14 @@ pub fn onion_relay_admission_status_value(
             "configure peer cache or seed endpoints before treating admission as restart-resilient"
                 .to_string()
         }
+        "proof_restart_continuity" => {
+            "persist or restore a fresh independently signed stable proof window"
+                .to_string()
+        }
         _ => "continue warming relay admission gates".to_string(),
     };
 
-    serde_json::json!({
+    let mut admission = serde_json::json!({
         "status": admission_status,
         "eligible": admission_ready,
         "permissionless": true,
@@ -777,7 +856,43 @@ pub fn onion_relay_admission_status_value(
         "network_story_status": &network_story.status,
         "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
         "privacy_boundary": "aggregate onion relay admission gates only; no node endpoints, route ids, selected hops, receiver keys, encrypted payloads, client IPs, DNS contents, destinations, Memory Chain plaintext, private keys, wallet-level traffic, or social graph metadata",
-    })
+    });
+    let admission_fields = admission
+        .as_object_mut()
+        .expect("onion relay admission JSON must be an object");
+    admission_fields.insert(
+        "peer_restart_recovery_ready".to_string(),
+        serde_json::json!(peer_restart_recovery_ready),
+    );
+    admission_fields.insert(
+        "proof_restart_continuity_ready".to_string(),
+        serde_json::json!(proof_restart_continuity_ready),
+    );
+    admission_fields.insert(
+        "proof_restart_continuity_source".to_string(),
+        serde_json::json!(proof_restart_continuity.source),
+    );
+    admission_fields.insert(
+        "proof_cache_authentication".to_string(),
+        serde_json::json!(proof_restart_continuity.authentication),
+    );
+    admission_fields.insert(
+        "proof_cache_authenticated_restore_ready".to_string(),
+        serde_json::json!(proof_restart_continuity.authenticated_restore_ready),
+    );
+    admission_fields.insert(
+        "proof_cache_signed_persistence_ready".to_string(),
+        serde_json::json!(proof_restart_continuity.signed_persistence_ready),
+    );
+    admission_fields.insert(
+        "proof_cache_restored_events".to_string(),
+        serde_json::json!(proof_restart_continuity.restored),
+    );
+    admission_fields.insert(
+        "proof_cache_persisted_events".to_string(),
+        serde_json::json!(proof_restart_continuity.persisted),
+    );
+    admission
 }
 
 /// Builds the compact aggregate discovery readiness contract.
@@ -1154,17 +1269,21 @@ pub fn discovery_summary_response(
     let network_story = &status.network_story;
     let blind_relay_quality = &status.blind_relay_quality;
     let two_hop_history = &status.two_hop_path_proof_history;
+    let proof_restart_continuity = two_hop_proof_restart_continuity(status);
     let two_hop_restart_survivable_ready = two_hop_history.recent_message_delivery_ready
         && peer_quorum.quorum_ready
-        && peer_quorum.restart_recovery_configured;
+        && proof_restart_continuity.peer_recovery_configured
+        && proof_restart_continuity.ready;
     let two_hop_restart_recovery_basis = if two_hop_restart_survivable_ready {
-        "message_delivery_proof_with_restart_recovery"
+        "message_delivery_proof_with_verified_restart_continuity"
     } else if !two_hop_history.recent_message_delivery_ready {
         "waiting_for_fresh_message_delivery_proof"
     } else if !peer_quorum.quorum_ready {
         "waiting_for_peer_quorum"
-    } else {
+    } else if !proof_restart_continuity.peer_recovery_configured {
         "restart_recovery_not_configured"
+    } else {
+        "proof_restart_continuity_not_ready"
     };
 
     let status_bucket = protocol_foundation["status"]
@@ -1347,6 +1466,26 @@ pub fn discovery_summary_response(
     two_hop_path_proof.insert(
         "restart_survivable_ready".to_string(),
         serde_json::json!(two_hop_restart_survivable_ready),
+    );
+    two_hop_path_proof.insert(
+        "proof_restart_continuity_ready".to_string(),
+        serde_json::json!(proof_restart_continuity.ready),
+    );
+    two_hop_path_proof.insert(
+        "proof_restart_continuity_source".to_string(),
+        serde_json::json!(proof_restart_continuity.source),
+    );
+    two_hop_path_proof.insert(
+        "proof_cache_authentication".to_string(),
+        serde_json::json!(proof_restart_continuity.authentication),
+    );
+    two_hop_path_proof.insert(
+        "proof_cache_restored_events".to_string(),
+        serde_json::json!(proof_restart_continuity.restored),
+    );
+    two_hop_path_proof.insert(
+        "proof_cache_persisted_events".to_string(),
+        serde_json::json!(proof_restart_continuity.persisted),
     );
     two_hop_path_proof.insert(
         "restart_recovery_basis".to_string(),
@@ -2818,6 +2957,91 @@ mod tests {
         assert!(!serialized.contains("selected_hop"));
     }
 
+    #[test]
+    fn test_onion_admission_requires_and_accepts_signed_proof_persistence() {
+        let store = PeerStore::new();
+        let now = now_secs();
+        let first =
+            signed_routeable_chat_descriptor(1, now + 1_000, "https://continuity-one.example");
+        let first_node_id = first.node_id();
+        let second =
+            signed_routeable_chat_descriptor(1, now + 1_000, "https://continuity-two.example");
+        let second_node_id = second.node_id();
+
+        store.configure_bootstrap_status(true, true, true, 2);
+        store
+            .upsert_verified_from_source(first, now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(second, now, "gossip_snapshot")
+            .unwrap();
+        store.record_gossip_round(now + 1, 2, 2, 2, None);
+        store.record_route_forward_success(&first_node_id, now + 2);
+        store.record_route_forward_success(&second_node_id, now + 3);
+        for offset in 4..=6 {
+            store.record_blind_relay_two_hop_probe_result_with_context(
+                now + offset,
+                true,
+                "onion_terminal_delivered",
+                2,
+                1,
+                2,
+                1,
+            );
+        }
+
+        let local_capabilities = DiscoveryLocalCapabilityStatus::new(true, true, true, true);
+        store.record_two_hop_proof_cache_persisted(now + 60, 3, true);
+        let before_persist = store.status(now + 7);
+        let before_admission =
+            onion_relay_admission_status_value(&before_persist, &local_capabilities);
+        assert!(before_persist.two_hop_path_proof_history.stability_ready);
+        assert_eq!(before_admission["status"].as_str(), Some("warming"));
+        assert_eq!(
+            before_admission["warmup_stage"].as_str(),
+            Some("proof_restart_continuity")
+        );
+        assert_eq!(
+            before_admission["admission_blockers"][0].as_str(),
+            Some("proof_restart_continuity_not_ready")
+        );
+        assert_eq!(
+            before_admission["proof_cache_signed_persistence_ready"].as_bool(),
+            Some(false)
+        );
+
+        store.record_cache_save_status(now + 8, "success", "snapshot_persisted");
+        store.record_two_hop_proof_cache_persisted(now + 8, 3, true);
+        let after_persist = store.status(now + 8);
+        let after_admission =
+            onion_relay_admission_status_value(&after_persist, &local_capabilities);
+
+        assert_eq!(after_admission["status"].as_str(), Some("eligible"));
+        assert_eq!(after_admission["eligible"].as_bool(), Some(true));
+        assert_eq!(
+            after_admission["restart_recovery_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            after_admission["proof_restart_continuity_source"].as_str(),
+            Some("signed_persistence")
+        );
+        assert_eq!(
+            after_admission["proof_cache_signed_persistence_ready"].as_bool(),
+            Some(true)
+        );
+
+        let summary = discovery_summary_response(now + 8, &after_persist, &local_capabilities);
+        assert_eq!(
+            summary.two_hop_path_proof["restart_survivable_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            summary.two_hop_path_proof["restart_recovery_basis"].as_str(),
+            Some("message_delivery_proof_with_verified_restart_continuity")
+        );
+    }
+
     #[tokio::test]
     async fn test_public_card_endpoint_returns_minimal_product_protocol_card() {
         let store = Arc::new(PeerStore::new());
@@ -2927,13 +3151,13 @@ mod tests {
         store
             .upsert_verified_from_source(second, now, "gossip_snapshot")
             .unwrap();
-        store.record_gossip_round(now + 1, 2, 2, 2, None);
-        store.record_route_forward_success(&first_node_id, now + 2);
-        store.record_route_forward_success(&second_node_id, now + 3);
+        store.record_gossip_round(now, 2, 2, 2, None);
+        store.record_route_forward_success(&first_node_id, now);
+        store.record_route_forward_success(&second_node_id, now);
 
-        for offset in 4..10 {
+        for _ in 0..6 {
             store.record_blind_relay_two_hop_probe_result_with_context(
-                now + offset,
+                now,
                 false,
                 "request_error",
                 2,
@@ -2943,7 +3167,7 @@ mod tests {
             );
         }
         store.record_blind_relay_two_hop_probe_result_with_context(
-            now + 10,
+            now,
             true,
             "onion_terminal_delivered",
             2,
@@ -3007,7 +3231,7 @@ mod tests {
         );
         assert_eq!(
             parsed["onion_relay_admission"]["admission_score_percent"].as_u64(),
-            Some(80)
+            Some(60)
         );
         assert_eq!(
             parsed["onion_relay_admission"]["warmup_stage"].as_str(),
@@ -3023,7 +3247,15 @@ mod tests {
         );
         assert_eq!(
             parsed["onion_relay_admission"]["restart_recovery_ready"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["peer_restart_recovery_ready"].as_bool(),
             Some(true)
+        );
+        assert_eq!(
+            parsed["onion_relay_admission"]["proof_restart_continuity_ready"].as_bool(),
+            Some(false)
         );
         assert_eq!(
             parsed["onion_relay_admission"]["stable_path_proof_ready"].as_bool(),
@@ -3063,11 +3295,11 @@ mod tests {
         );
         assert_eq!(
             parsed["two_hop_path_proof"]["restart_survivable_ready"].as_bool(),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             parsed["two_hop_path_proof"]["restart_recovery_basis"].as_str(),
-            Some("message_delivery_proof_with_restart_recovery")
+            Some("proof_restart_continuity_not_ready")
         );
         assert_eq!(
             parsed["two_hop_path_proof"]["stability_window_attempted"].as_u64(),

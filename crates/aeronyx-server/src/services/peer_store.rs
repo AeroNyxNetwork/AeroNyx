@@ -152,6 +152,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.56.0-ProofRestartContinuity - Expose authenticated restore and signed proof persistence evidence
 //! v0.55.0-TwoHopProofCache - Added signed bounded warm-restart proof history
 //! v0.54.0-RelayEvidenceTruthfulness - Stopped classifying unlabelled blind-relay acceptance as real user traffic
 //! v0.53.0-RouteSurfaceEvidence - Bound route health to stable signed routing fields across descriptor refreshes
@@ -640,15 +641,38 @@ pub struct PeerStoreBootstrapStatus {
     /// Signed two-hop proof cache restore status: restored, partial, empty, or rejected.
     #[serde(default)]
     pub last_two_hop_proof_cache_status: Option<String>,
+    /// Authentication result for the last parsed two-hop proof cache section.
+    ///
+    /// Stable buckets are `verified`, `legacy_descriptor_only`,
+    /// `signature_invalid`, and `identity_unavailable`. Keeping this separate
+    /// from the aggregate source detail lets admission fail closed without
+    /// parsing log text.
+    #[serde(default)]
+    pub last_two_hop_proof_cache_authentication: Option<String>,
     /// Number of fresh synthetic proof events restored at startup.
     #[serde(default)]
     pub last_two_hop_proof_cache_restored: u64,
+    /// Whether the restored events independently reconstructed a mature fresh
+    /// stability window at restore time.
+    #[serde(default)]
+    pub last_two_hop_proof_cache_restored_stability_ready: bool,
     /// Number of proof events rejected by authentication, schema, or freshness checks.
     #[serde(default)]
     pub last_two_hop_proof_cache_rejected: u64,
     /// Timestamp of the last two-hop proof cache restore attempt.
     #[serde(default)]
     pub last_two_hop_proof_cache_at: Option<u64>,
+    /// Number of fresh proof events included in the latest successfully
+    /// persisted, independently signed cache section during this process.
+    #[serde(default)]
+    pub last_two_hop_proof_cache_persisted: u64,
+    /// Whether that exact persisted proof section contained a mature fresh
+    /// stability window.
+    #[serde(default)]
+    pub last_two_hop_proof_cache_persisted_stability_ready: bool,
+    /// Timestamp of the latest successful signed proof-cache persistence.
+    #[serde(default)]
+    pub last_two_hop_proof_cache_persisted_at: Option<u64>,
     /// Number of peers attempted in the last outbound gossip round.
     pub last_gossip_attempted: u64,
     /// Number of configured seed endpoints attempted in the last gossip round.
@@ -716,9 +740,14 @@ impl Default for PeerStoreBootstrapStatus {
             last_routeability_cache_rejected: 0,
             last_routeability_cache_at: None,
             last_two_hop_proof_cache_status: None,
+            last_two_hop_proof_cache_authentication: None,
             last_two_hop_proof_cache_restored: 0,
+            last_two_hop_proof_cache_restored_stability_ready: false,
             last_two_hop_proof_cache_rejected: 0,
             last_two_hop_proof_cache_at: None,
+            last_two_hop_proof_cache_persisted: 0,
+            last_two_hop_proof_cache_persisted_stability_ready: false,
+            last_two_hop_proof_cache_persisted_at: None,
             last_gossip_attempted: 0,
             last_gossip_seed_attempted: 0,
             last_gossip_succeeded: 0,
@@ -2108,6 +2137,66 @@ impl PeerStore {
         self.record_audit_event(now, "peer_cache_save", source_status, detail);
     }
 
+    /// Records that the latest cache write durably included a separately
+    /// signed two-hop proof section.
+    ///
+    /// This count is aggregate-only and process-local. Admission uses it to
+    /// distinguish merely configured restart recovery from a proof stability
+    /// window that has actually reached durable storage.
+    pub fn record_two_hop_proof_cache_persisted(
+        &self,
+        now: u64,
+        persisted: usize,
+        stability_ready: bool,
+    ) {
+        {
+            let mut status = self.bootstrap_status.write();
+            status.last_two_hop_proof_cache_persisted = persisted as u64;
+            status.last_two_hop_proof_cache_persisted_stability_ready = stability_ready;
+            status.last_two_hop_proof_cache_persisted_at = Some(now);
+        }
+        self.record_audit_event(
+            now,
+            "two_hop_proof_cache_persist",
+            "success",
+            format!(
+                "schema_version={} persisted={persisted} stability_ready={stability_ready}",
+                TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION
+            ),
+        );
+    }
+
+    /// Records the independently evaluated proof-cache authentication bucket.
+    ///
+    /// The parser owns signature verification; PeerStore stores only this
+    /// allowlisted result so API admission never depends on free-form log text.
+    pub fn record_two_hop_proof_cache_authentication(
+        &self,
+        now: u64,
+        authentication: &str,
+    ) {
+        let authentication = match authentication {
+            "verified" | "legacy_descriptor_only" | "signature_invalid"
+            | "identity_unavailable" => authentication,
+            _ => "unknown",
+        };
+        self.bootstrap_status
+            .write()
+            .last_two_hop_proof_cache_authentication = Some(authentication.to_string());
+        self.record_audit_event(
+            now,
+            "two_hop_proof_cache_authentication",
+            if authentication == "verified" {
+                "accepted"
+            } else if authentication == "legacy_descriptor_only" {
+                "warning"
+            } else {
+                "rejected"
+            },
+            format!("authentication={authentication}"),
+        );
+    }
+
     /// Records outbound gossip round result.
     pub fn record_gossip_round(
         &self,
@@ -3306,16 +3395,26 @@ impl PeerStore {
         } else {
             ((succeeded.saturating_mul(100)) / attempted).min(100) as u8
         };
-        let message_delivery_events = events
+        // Stability is a freshness claim, so old retained diagnostics must not
+        // satisfy its sample threshold or keep a failure circuit open forever.
+        let fresh_events = events
             .iter()
+            .filter(|event| {
+                event.at <= now
+                    && now.saturating_sub(event.at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
+            })
+            .collect::<Vec<_>>();
+        let fresh_message_delivery_events = fresh_events
+            .iter()
+            .copied()
             .filter(|event| event.proof_scope == "message_delivery")
             .collect::<Vec<_>>();
-        let stability_source_events = if (message_delivery_events.len() as u64)
+        let stability_source_events = if (fresh_message_delivery_events.len() as u64)
             >= TWO_HOP_PATH_PROOF_STABILITY_MIN_ATTEMPTS
         {
-            message_delivery_events
+            fresh_message_delivery_events
         } else {
-            events.iter().collect::<Vec<_>>()
+            fresh_events
         };
         let stability_events = stability_source_events
             .iter()
@@ -3420,9 +3519,12 @@ impl PeerStore {
         let recent_message_delivery_ready = latest_message_delivery_age_seconds
             .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
             .unwrap_or(false);
-        let failure_streak_active = consecutive_failures > 0;
-        let failure_circuit_breaker_active =
-            consecutive_failures >= TWO_HOP_PATH_PROOF_FAILURE_CIRCUIT_BREAKER_THRESHOLD;
+        let latest_is_fresh = latest_age_seconds
+            .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
+            .unwrap_or(false);
+        let failure_streak_active = latest_is_fresh && consecutive_failures > 0;
+        let failure_circuit_breaker_active = latest_is_fresh
+            && consecutive_failures >= TWO_HOP_PATH_PROOF_FAILURE_CIRCUIT_BREAKER_THRESHOLD;
         let latest_age_bucket = Self::two_hop_path_proof_age_bucket(latest_age_seconds);
         let stability_ready = stability_window_attempted
             >= TWO_HOP_PATH_PROOF_STABILITY_MIN_ATTEMPTS
@@ -3794,16 +3896,65 @@ impl PeerStore {
         &self,
         generated_at: u64,
     ) -> Vec<PeerStoreTwoHopPathProofEvent> {
-        let mut events = self
+        let fresh_events = self
             .two_hop_path_proof_events
             .read()
             .iter()
-            .rev()
             .filter(|event| Self::two_hop_path_proof_cache_event_valid(event, generated_at))
-            .take(TWO_HOP_PATH_PROOF_CACHE_MAX_ENTRIES)
             .cloned()
             .collect::<Vec<_>>();
-        events.reverse();
+        let message_delivery_count = fresh_events
+            .iter()
+            .filter(|event| event.proof_scope == "message_delivery")
+            .count();
+        let events = if message_delivery_count
+            >= TWO_HOP_PATH_PROOF_STABILITY_MIN_ATTEMPTS as usize
+        {
+            // Preserve the same evidence used by runtime stability while also
+            // retaining up to the three trailing failures that control the
+            // circuit breaker. Fill remaining slots from newest aggregate
+            // events, then restore chronological ordering for signature and
+            // import determinism.
+            let mut selected = Vec::with_capacity(TWO_HOP_PATH_PROOF_CACHE_MAX_ENTRIES);
+            for (index, _) in fresh_events
+                .iter()
+                .enumerate()
+                .rev()
+                .take_while(|(_, event)| event.outcome == "rejected")
+                .take(TWO_HOP_PATH_PROOF_FAILURE_CIRCUIT_BREAKER_THRESHOLD as usize)
+            {
+                selected.push(index);
+            }
+            for (index, event) in fresh_events.iter().enumerate().rev() {
+                if selected.len() >= TWO_HOP_PATH_PROOF_CACHE_MAX_ENTRIES {
+                    break;
+                }
+                if event.proof_scope == "message_delivery" && !selected.contains(&index) {
+                    selected.push(index);
+                }
+            }
+            for index in (0..fresh_events.len()).rev() {
+                if selected.len() >= TWO_HOP_PATH_PROOF_CACHE_MAX_ENTRIES {
+                    break;
+                }
+                if !selected.contains(&index) {
+                    selected.push(index);
+                }
+            }
+            selected.sort_unstable();
+            selected
+                .into_iter()
+                .map(|index| fresh_events[index].clone())
+                .collect::<Vec<_>>()
+        } else {
+            let mut latest = fresh_events
+                .into_iter()
+                .rev()
+                .take(TWO_HOP_PATH_PROOF_CACHE_MAX_ENTRIES)
+                .collect::<Vec<_>>();
+            latest.reverse();
+            latest
+        };
         self.record_audit_event(
             generated_at,
             "two_hop_proof_cache_export",
@@ -3916,6 +4067,7 @@ impl PeerStore {
             let mut status = self.bootstrap_status.write();
             status.last_two_hop_proof_cache_status = Some("rejected".to_string());
             status.last_two_hop_proof_cache_restored = 0;
+            status.last_two_hop_proof_cache_restored_stability_ready = false;
             status.last_two_hop_proof_cache_rejected = total as u64;
             status.last_two_hop_proof_cache_at = Some(now);
         }
@@ -3954,10 +4106,16 @@ impl PeerStore {
         } else {
             "rejected"
         };
+        let restored_stability_ready = restored > 0
+            && self
+                .two_hop_path_proof_history(now)
+                .stability_ready;
         {
             let mut status = self.bootstrap_status.write();
             status.last_two_hop_proof_cache_status = Some(status_bucket.to_string());
             status.last_two_hop_proof_cache_restored = restored as u64;
+            status.last_two_hop_proof_cache_restored_stability_ready =
+                restored_stability_ready;
             status.last_two_hop_proof_cache_rejected = rejected as u64;
             status.last_two_hop_proof_cache_at = Some(now);
         }
@@ -3969,12 +4127,13 @@ impl PeerStore {
             "two_hop_proof_cache_restore",
             if restored > 0 || total == 0 { "accepted" } else { "rejected" },
             format!(
-                "schema_version={} total={} restored={} rejected={} status={}{}",
+                "schema_version={} total={} restored={} rejected={} status={} stability_ready={}{}",
                 TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
                 total,
                 restored,
                 rejected,
                 status_bucket,
+                restored_stability_ready,
                 reason_detail
             ),
         );
@@ -8643,6 +8802,14 @@ mod tests {
         assert!(!circuit_history.stability_ready);
         assert!(circuit_history.failure_circuit_breaker_active);
         assert_eq!(circuit_history.latest_age_bucket, "fresh");
+
+        let expired_circuit_history = circuit_store
+            .status(1_700_000_030 + PEER_ROUTEABILITY_STALE_AFTER_SECS + 1)
+            .two_hop_path_proof_history;
+        assert_eq!(expired_circuit_history.stability_window_attempted, 0);
+        assert!(!expired_circuit_history.failure_streak_active);
+        assert!(!expired_circuit_history.failure_circuit_breaker_active);
+        assert!(!expired_circuit_history.stability_ready);
 
         let serialized = serde_json::to_string(&circuit_history).expect("history serializes");
         assert!(!serialized.contains("route_id"));

@@ -184,6 +184,8 @@
 //      shutdown so signed route evidence is durably fsynced before process exit.
 //  79. Signs and restores an independent bounded two-hop synthetic proof window
 //      only after current descriptor-bound routeability rebuilds the path.
+//  80. Records proof-cache authentication and successful signed persistence as
+//      structured admission evidence instead of parsing bootstrap log detail.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -5741,7 +5743,7 @@ impl Server {
         peer_store: &PeerStore,
         path: &str,
         now: u64,
-    ) -> Result<()> {
+    ) -> Result<(usize, bool)> {
         let path = PathBuf::from(path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -5753,6 +5755,11 @@ impl Server {
         let routeability_evidence = peer_store.export_routeability_cache_evidence(now);
         let two_hop_path_proof_events =
             peer_store.export_two_hop_path_proof_cache_events(now);
+        let two_hop_path_proof_event_count = two_hop_path_proof_events.len();
+        let two_hop_path_proof_stability_ready = peer_store
+            .status(now)
+            .two_hop_path_proof_history
+            .stability_ready;
         let document = PeerStoreCacheDocument::new(
             descriptor_snapshot,
             routeability_evidence,
@@ -5781,7 +5788,10 @@ impl Server {
         }
         tokio::fs::rename(&tmp_path, &path).await?;
         Self::sync_parent_dir_for_durability(&path).await?;
-        Ok(())
+        Ok((
+            two_hop_path_proof_event_count,
+            two_hop_path_proof_stability_ready,
+        ))
     }
 
     async fn sync_file_for_durability(path: &PathBuf) -> Result<()> {
@@ -5834,8 +5844,13 @@ impl Server {
         }
 
         match Self::save_peer_store_cache_snapshot(identity, peer_store, path, now).await {
-            Ok(()) => {
+            Ok((proof_events_persisted, proof_stability_ready)) => {
                 peer_store.record_cache_save_status(now, "success", "snapshot_persisted");
+                peer_store.record_two_hop_proof_cache_persisted(
+                    now,
+                    proof_events_persisted,
+                    proof_stability_ready,
+                );
                 Ok(())
             }
             Err(e) => {
@@ -6080,6 +6095,13 @@ impl Server {
                 return false;
             }
         };
+
+        if is_peer_cache {
+            peer_store.record_two_hop_proof_cache_authentication(
+                now,
+                two_hop_proof_authentication,
+            );
+        }
 
         let report = if is_peer_cache {
             peer_store.load_peer_cache_snapshot_from_source(&snapshot, now, source_kind)
@@ -9230,7 +9252,7 @@ mod tests {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-two-hop-proof-{unique}.json"));
         let path_str = path.to_string_lossy().to_string();
-        Server::save_peer_store_cache_snapshot(
+        Server::persist_peer_store_cache_once(
             &server.identity, &original_store, &path_str, now + 5,
         )
         .await
@@ -9240,6 +9262,16 @@ mod tests {
         let document = PeerStoreCacheDocument::from_json_bytes(&bytes).unwrap();
         assert_eq!(document.two_hop_path_proof_events.len(), 3);
         assert!(document.verify_two_hop_path_proof_signature(&server.identity).is_ok());
+        let persisted_status = original_store.status(now + 5);
+        assert_eq!(
+            persisted_status
+                .bootstrap
+                .last_two_hop_proof_cache_persisted,
+            3
+        );
+        assert!(persisted_status
+            .bootstrap
+            .last_two_hop_proof_cache_persisted_stability_ready);
         let restored_store = PeerStore::new();
         assert!(Server::import_bootstrap_snapshot_bytes(
             &restored_store, "cache", &path_str, &bytes, now + 6, Some(&server.identity),
@@ -9249,7 +9281,17 @@ mod tests {
         assert!(restored_store.is_routeable_now(&terminal.node_id(), now + 6));
         let status = restored_store.status(now + 6);
         assert_eq!(status.bootstrap.last_two_hop_proof_cache_status.as_deref(), Some("restored"));
+        assert_eq!(
+            status
+                .bootstrap
+                .last_two_hop_proof_cache_authentication
+                .as_deref(),
+            Some("verified")
+        );
         assert_eq!(status.bootstrap.last_two_hop_proof_cache_restored, 3);
+        assert!(status
+            .bootstrap
+            .last_two_hop_proof_cache_restored_stability_ready);
         assert!(status.two_hop_path_proof_history.stability_ready);
         assert!(status.two_hop_path_proof_history.recent_message_delivery_ready);
         assert_eq!(status.runtime.blind_relay.received, 0);
@@ -9309,7 +9351,17 @@ mod tests {
         let status = restored_store.status(now + 4);
         assert_eq!(status.bootstrap.last_source_status.as_deref(), Some("warning"));
         assert_eq!(status.bootstrap.last_two_hop_proof_cache_status.as_deref(), Some("rejected"));
+        assert_eq!(
+            status
+                .bootstrap
+                .last_two_hop_proof_cache_authentication
+                .as_deref(),
+            Some("signature_invalid")
+        );
         assert_eq!(status.bootstrap.last_two_hop_proof_cache_restored, 0);
+        assert!(!status
+            .bootstrap
+            .last_two_hop_proof_cache_restored_stability_ready);
         assert_eq!(status.bootstrap.last_two_hop_proof_cache_rejected, 1);
         assert!(status.two_hop_path_proof_history.events.is_empty());
 
