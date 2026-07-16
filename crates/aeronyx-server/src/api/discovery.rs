@@ -60,6 +60,7 @@
 //!   Keep `DISCOVERY_REQUEST_BODY_MAX_BYTES` aligned with protocol limits.
 //!
 //! ## Last Modified
+//! v0.26.0-RelayEvidenceTruthfulness - Expose origin-neutral accepted relay readiness without claiming user traffic
 //! v0.25.0-BoundedGossipBody - Reject oversized gossip before JSON deserialization
 //! v0.24.0-DiscoveryPublicCard - Add product-facing public protocol card endpoint
 //! v0.23.0-RouteGovernanceHeartbeatReadiness - Add compact route governance to discovery readiness
@@ -878,6 +879,9 @@ pub fn discovery_readiness_status_value(
             "two_hop_recent_message_delivery_ready": status
                 .two_hop_path_proof_history
                 .recent_message_delivery_ready,
+            "two_hop_message_delivery_evidence_mode": &status
+                .two_hop_path_proof_history
+                .message_delivery_evidence_mode,
             "two_hop_probe_attempted": blind_relay_quality.two_hop_probe_attempted,
             "two_hop_probe_succeeded": blind_relay_quality.two_hop_probe_succeeded,
             "two_hop_probe_failed": blind_relay_quality.two_hop_probe_failed,
@@ -892,6 +896,7 @@ pub fn discovery_readiness_status_value(
             "relay_readiness_reason": &blind_relay_quality.readiness_reason,
             "timestamp_rejected": blind_relay_quality.timestamp_rejected,
             "real_relay_ready": blind_relay_quality.real_relay_ready,
+            "accepted_relay_ready": blind_relay_quality.accepted_relay_ready,
             "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
             "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
             "next_action": foundation_next_action,
@@ -959,6 +964,7 @@ pub fn discovery_readiness_status_value(
             "runtime_ready": blind_relay_quality.runtime_ready,
             "quality_ready": blind_relay_quality.quality_ready,
             "real_relay_ready": blind_relay_quality.real_relay_ready,
+            "accepted_relay_ready": blind_relay_quality.accepted_relay_ready,
             "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
             "evidence_mode": &blind_relay_quality.evidence_mode,
             "readiness_reason": &blind_relay_quality.readiness_reason,
@@ -1017,6 +1023,7 @@ pub fn blind_relay_runtime_status_value(
         "runtime_ready": quality.runtime_ready,
         "quality_ready": quality.quality_ready,
         "real_relay_ready": quality.real_relay_ready,
+        "accepted_relay_ready": quality.accepted_relay_ready,
         "synthetic_probe_ready": quality.synthetic_probe_ready,
         "evidence_mode": &quality.evidence_mode,
         "readiness_reason": &quality.readiness_reason,
@@ -1051,6 +1058,7 @@ pub fn blind_relay_runtime_status_value(
             "proof_ready": proof.proof_ready,
             "message_delivery_ready": proof.message_delivery_ready,
             "recent_message_delivery_ready": proof.recent_message_delivery_ready,
+            "message_delivery_evidence_mode": &proof.message_delivery_evidence_mode,
             "proof_accepted": proof.succeeded,
             "proof_rejected": proof.failed,
             "proof_attempted": proof.attempted,
@@ -1199,6 +1207,10 @@ pub fn discovery_summary_response(
     two_hop_path_proof.insert(
         "recent_message_delivery_ready".to_string(),
         serde_json::json!(two_hop_history.recent_message_delivery_ready),
+    );
+    two_hop_path_proof.insert(
+        "message_delivery_evidence_mode".to_string(),
+        serde_json::json!(&two_hop_history.message_delivery_evidence_mode),
     );
     two_hop_path_proof.insert(
         "failure_streak_active".to_string(),
@@ -1386,6 +1398,7 @@ pub fn discovery_summary_response(
             "runtime_ready": blind_relay_quality.runtime_ready,
             "quality_ready": blind_relay_quality.quality_ready,
             "real_relay_ready": blind_relay_quality.real_relay_ready,
+            "accepted_relay_ready": blind_relay_quality.accepted_relay_ready,
             "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
             "evidence_mode": &blind_relay_quality.evidence_mode,
             "readiness_reason": &blind_relay_quality.readiness_reason,
@@ -1500,9 +1513,11 @@ pub fn discovery_public_card_response(
                 "status": &blind_relay_quality.status,
                 "runtime_ready": blind_relay_quality.runtime_ready,
                 "real_relay_ready": blind_relay_quality.real_relay_ready,
+                "accepted_relay_ready": blind_relay_quality.accepted_relay_ready,
                 "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
                 "proof_ready": two_hop_history.proof_ready,
                 "message_delivery_ready": two_hop_history.message_delivery_ready,
+                "message_delivery_evidence_mode": &two_hop_history.message_delivery_evidence_mode,
                 "latest_proof_age_seconds": two_hop_history.latest_age_seconds,
                 "terminal_delivered_count": relay_stats.terminal,
                 "middle_forwarded_count": relay_stats.forwarded,
@@ -2506,11 +2521,11 @@ mod tests {
         );
         assert_eq!(
             parsed["discovery_readiness"]["protocol_foundation"]["relay_evidence_mode"].as_str(),
-            Some("real_relay_traffic")
+            Some("opaque_relay_acceptance")
         );
         assert_eq!(
             parsed["discovery_readiness"]["protocol_foundation"]["relay_readiness_reason"].as_str(),
-            Some("real_relay_observed")
+            Some("opaque_relay_acceptance_observed")
         );
         assert_eq!(
             parsed["discovery_readiness"]["protocol_foundation"]["timestamp_rejected"].as_u64(),
@@ -2518,6 +2533,10 @@ mod tests {
         );
         assert_eq!(
             parsed["discovery_readiness"]["protocol_foundation"]["real_relay_ready"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["protocol_foundation"]["accepted_relay_ready"].as_bool(),
             Some(true)
         );
         assert_eq!(
@@ -2548,14 +2567,18 @@ mod tests {
         );
         assert_eq!(
             parsed["discovery_readiness"]["blind_relay_runtime"]["evidence_mode"].as_str(),
-            Some("real_relay_traffic")
+            Some("opaque_relay_acceptance")
         );
         assert_eq!(
             parsed["discovery_readiness"]["blind_relay_runtime"]["readiness_reason"].as_str(),
-            Some("real_relay_observed")
+            Some("opaque_relay_acceptance_observed")
         );
         assert_eq!(
             parsed["discovery_readiness"]["blind_relay_runtime"]["real_relay_ready"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["discovery_readiness"]["blind_relay_runtime"]["accepted_relay_ready"].as_bool(),
             Some(true)
         );
         assert_eq!(
@@ -2661,6 +2684,10 @@ mod tests {
         assert_eq!(
             parsed["two_hop_path_proof"]["recent_message_delivery_ready"].as_bool(),
             Some(true)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["message_delivery_evidence_mode"].as_str(),
+            Some("synthetic_onion_message_delivery_probe")
         );
         assert_eq!(parsed["two_hop_path_proof"]["succeeded"].as_u64(), Some(1));
         assert_eq!(
@@ -2949,6 +2976,10 @@ mod tests {
         assert_eq!(
             parsed["two_hop_path_proof"]["recent_message_delivery_ready"].as_bool(),
             Some(true)
+        );
+        assert_eq!(
+            parsed["two_hop_path_proof"]["message_delivery_evidence_mode"].as_str(),
+            Some("synthetic_onion_message_delivery_probe")
         );
         assert_eq!(
             parsed["peer_mesh"]["chat_two_hop_onion_ready"].as_bool(),

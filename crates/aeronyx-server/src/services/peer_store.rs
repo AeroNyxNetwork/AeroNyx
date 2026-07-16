@@ -75,10 +75,10 @@
 //! - Blind relay quality summary converts opaque runtime counters into a
 //!   privacy-safe readiness bucket for nodeboard, website, and AI runbooks
 //! - Blind relay synthetic probe counters and last-probe age provide
-//!   low-frequency route readiness evidence without inflating real encrypted
-//!   message traffic totals
-//! - Blind relay evidence mode separates real relay traffic from synthetic
-//!   probes so public surfaces do not overstate user-message movement
+//!   low-frequency route readiness evidence tracked separately from any claim
+//!   about App/user encrypted traffic
+//! - Blind relay evidence semantics separate opaque accepted relay work from
+//!   synthetic probes without claiming that unclassified work is App/user traffic
 //! - Bounded two-hop path proof history records recent entry -> middle ->
 //!   terminal proof outcomes for nodeboard/public status without exposing node
 //!   IDs, route IDs, endpoints, payloads, or social graph metadata
@@ -102,11 +102,11 @@
 //!   buckets so operators can verify relay maturity without seeing node IDs,
 //!   endpoints, route IDs, encrypted blobs, or social graph edges
 //! - Two-hop path proof scope separates synthetic control-plane reachability
-//!   from real message-delivery proof so public surfaces never overstate App
-//!   chat delivery before true terminal store-and-forward evidence exists
-//! - Two-hop message-delivery readiness exposes fresh terminal ChatRelay proof
-//!   as its own aggregate gate, so App/nodeboard/backend can distinguish
-//!   onion route reachability from actual store-and-forward delivery evidence
+//!   from synthetic terminal store-and-forward proof so public surfaces never
+//!   present node-generated checks as App/user chat delivery
+//! - Two-hop message-delivery readiness exposes fresh synthetic terminal
+//!   ChatRelay proof as its own aggregate gate, so App/nodeboard/backend can
+//!   distinguish onion reachability from tested store-and-forward capability
 //! - Onion middle-hop recovery can distinguish route quarantine from ordinary
 //!   unknown routeability, allowing cold-start proof attempts without sending
 //!   through peers that are actively isolated by local route health policy
@@ -152,6 +152,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.54.0-RelayEvidenceTruthfulness - Stopped classifying unlabelled blind-relay acceptance as real user traffic
 //! v0.53.0-RouteSurfaceEvidence - Bound route health to stable signed routing fields across descriptor refreshes
 //! v0.52.0-RouteabilityCacheEvidence - Added bounded descriptor-bound warm-restart route evidence
 //! v0.51.0-RouteGovernanceSummary - Added aggregate route-quality governance contract
@@ -337,11 +338,15 @@ pub struct PeerStoreTwoHopPathProofEvent {
     pub reason_bucket: String,
     /// Stable evidence mode for downstream status copy.
     ///
-    /// Synthetic two-hop probes use `synthetic_two_hop_control_probe` because
-    /// they prove route-control reachability, not App chat payload delivery.
+    /// Control-only checks use `synthetic_two_hop_control_probe`; onion checks
+    /// that reach terminal store-and-forward use
+    /// `synthetic_onion_message_delivery_probe`. Neither is App/user traffic.
     pub evidence_mode: String,
-    /// Stable proof scope: control_plane today, message_delivery in future
-    /// true terminal store-and-forward proof events.
+    /// Stable proof scope: `control_plane` or `message_delivery`.
+    ///
+    /// `message_delivery` means a synthetic encrypted ChatEnvelope reached the
+    /// terminal store-and-forward boundary. It must not be presented as a user
+    /// message, active conversation, or production traffic volume.
     #[serde(default)]
     pub proof_scope: String,
     /// Planned relay path shape for this proof.
@@ -386,16 +391,24 @@ pub struct PeerStoreTwoHopPathProofHistory {
     pub proof_ready: bool,
     /// Whether the latest proof success is still within the routeability window.
     pub recent_success_ready: bool,
-    /// Whether the latest retained proof is a fresh terminal message-delivery proof.
+    /// Whether the latest proof is a fresh synthetic terminal delivery check.
     ///
     /// This is stricter than `proof_ready`: control-plane probes can prove
     /// entry -> middle -> terminal reachability, while this gate requires the
-    /// terminal hop to accept the opaque payload into ChatRelay store-and-forward.
+    /// terminal hop to accept a synthetic opaque payload into ChatRelay
+    /// store-and-forward. It does not prove that a user message was delivered.
     #[serde(default)]
     pub message_delivery_ready: bool,
     /// Whether any retained terminal message-delivery proof is still fresh.
     #[serde(default)]
     pub recent_message_delivery_ready: bool,
+    /// Evidence mode of the newest accepted terminal delivery proof.
+    ///
+    /// Today this is `synthetic_onion_message_delivery_probe`; `none` means no
+    /// such proof is retained. Consumers must inspect this field before
+    /// describing `message_delivery_ready` in product copy.
+    #[serde(default)]
+    pub message_delivery_evidence_mode: String,
     /// Whether the latest retained proof ended in one or more failures.
     pub failure_streak_active: bool,
     /// Maximum number of recent proof events retained by this process.
@@ -406,7 +419,7 @@ pub struct PeerStoreTwoHopPathProofHistory {
     pub attempted: u64,
     /// Retained accepted proofs in the bounded window.
     pub succeeded: u64,
-    /// Retained accepted proofs whose scope is terminal message delivery.
+    /// Retained accepted synthetic proofs whose scope is terminal delivery.
     #[serde(default)]
     pub message_delivery_successes: u64,
     /// Retained rejected proofs in the bounded window.
@@ -494,9 +507,9 @@ pub struct PeerStoreTwoHopPathProofHistory {
     pub ttl_shape_counts: BTreeMap<String, u64>,
     /// Aggregate proof-scope counts in the retained window.
     ///
-    /// Current synthetic two-hop probes are `control_plane` only. Future
-    /// terminal store-and-forward probes or real App traffic can add
-    /// `message_delivery` without changing existing counters.
+    /// Synthetic route-only checks use `control_plane`; synthetic onion checks
+    /// that enter terminal ChatRelay use `message_delivery`. This map does not
+    /// classify App/user traffic.
     #[serde(default)]
     pub proof_scope_counts: BTreeMap<String, u64>,
     /// Seconds after which a retained successful proof is considered stale.
@@ -890,15 +903,27 @@ pub struct PeerStoreBlindRelayQualityStatus {
     pub runtime_ready: bool,
     /// Whether fresh successful terminal/forwarded/probe evidence exists without final transport failures.
     pub quality_ready: bool,
-    /// Whether this process has fresh accepted real terminal or forwarded relay work.
+    /// Deprecated compatibility field for authenticated App/user traffic.
+    ///
+    /// Blind relay frames currently prove node-to-node acceptance but do not
+    /// carry an authenticated traffic-class claim. Therefore this remains
+    /// false until the protocol can distinguish App traffic from scheduled
+    /// synthetic probes without weakening the blind-relay privacy boundary.
     pub real_relay_ready: bool,
+    /// Whether this process has fresh accepted terminal or forwarded relay work.
+    ///
+    /// This is intentionally origin-neutral: accepted work may be App traffic,
+    /// node-generated synthetic delivery probes, or another opaque protocol
+    /// payload. Consumers must not present it as verified user traffic.
+    #[serde(default)]
+    pub accepted_relay_ready: bool,
     /// Whether this process has fresh successful synthetic route probe evidence.
     pub synthetic_probe_ready: bool,
-    /// Stable evidence bucket: idle, real_relay_traffic,
+    /// Stable evidence bucket: idle, opaque_relay_acceptance,
     /// synthetic_two_hop_control_probe, synthetic_probe, probe_failed, or
-    /// real_relay_attempted.
+    /// opaque_relay_attempted.
     pub evidence_mode: String,
-    /// Stable proof scope for UI copy: message_delivery, control_plane,
+    /// Stable proof scope for UI copy: relay_acceptance, control_plane,
     /// single_hop_control_plane, attempted, or none.
     ///
     /// This prevents dashboards from presenting synthetic control-plane
@@ -962,8 +987,8 @@ pub struct PeerStoreBlindRelayQualityStatus {
     pub last_accepted_age_seconds: Option<u64>,
     /// Seconds since the last synthetic route readiness probe, when known.
     ///
-    /// This is separate from real relay event age so dashboards can show probe
-    /// freshness without implying user traffic occurred.
+    /// This is separate from accepted opaque relay age so dashboards can show
+    /// probe freshness without implying user traffic occurred.
     pub last_probe_age_seconds: Option<u64>,
     /// Operator-facing detail with aggregate counters only.
     pub detail: String,
@@ -3168,7 +3193,7 @@ impl PeerStore {
     fn two_hop_path_proof_evidence_mode(reason: &str) -> &'static str {
         let bucket = Self::two_hop_path_proof_reason_bucket(reason);
         match bucket.as_str() {
-            "onion_terminal_delivered" => "real_relay_traffic",
+            "onion_terminal_delivered" => "synthetic_onion_message_delivery_probe",
             _ => "synthetic_two_hop_control_probe",
         }
     }
@@ -3292,6 +3317,12 @@ impl PeerStore {
             .rev()
             .find(|event| event.outcome == "accepted" && event.proof_scope == "message_delivery")
             .map(|event| now.saturating_sub(event.at));
+        let message_delivery_evidence_mode = events
+            .iter()
+            .rev()
+            .find(|event| event.outcome == "accepted" && event.proof_scope == "message_delivery")
+            .map(|event| event.evidence_mode.clone())
+            .unwrap_or_else(|| "none".to_string());
         let consecutive_successes = Self::count_trailing_two_hop_outcomes(&events, "accepted");
         let consecutive_failures = Self::count_trailing_two_hop_outcomes(&events, "rejected");
         let consecutive_message_delivery_successes =
@@ -3430,6 +3461,7 @@ impl PeerStore {
             recent_success_ready,
             message_delivery_ready,
             recent_message_delivery_ready,
+            message_delivery_evidence_mode,
             failure_streak_active,
             window_size: MAX_TWO_HOP_PATH_PROOF_EVENTS,
             retained_events: events.len(),
@@ -4467,10 +4499,15 @@ impl PeerStore {
         let accepted_evidence_seen = accepted_total > 0;
         let probe_evidence_seen = stats.probe_succeeded > 0;
         let two_hop_probe_evidence_seen = stats.two_hop_probe_succeeded > 0;
-        let real_relay_ready = accepted_evidence_seen
+        let accepted_relay_ready = accepted_evidence_seen
             && last_accepted_age_seconds
                 .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
                 .unwrap_or(false);
+        // The signed blind-relay envelope does not yet authenticate whether an
+        // accepted frame originated from App traffic or a scheduled node
+        // probe. Keep the legacy field for API compatibility, but never infer
+        // verified user traffic from origin-neutral acceptance counters.
+        let real_relay_ready = false;
         let probe_ready = probe_evidence_seen
             && last_probe_age_seconds
                 .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
@@ -4480,12 +4517,12 @@ impl PeerStore {
                 .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
                 .unwrap_or(false);
         let synthetic_probe_ready = probe_ready || two_hop_probe_ready;
-        let runtime_ready = real_relay_ready || synthetic_probe_ready;
+        let runtime_ready = accepted_relay_ready || synthetic_probe_ready;
         let stale_success_evidence =
             (accepted_evidence_seen || probe_evidence_seen || two_hop_probe_evidence_seen)
                 && !runtime_ready;
         let evidence_mode = if accepted_evidence_seen {
-            "real_relay_traffic"
+            "opaque_relay_acceptance"
         } else if two_hop_probe_evidence_seen {
             "synthetic_two_hop_control_probe"
         } else if probe_evidence_seen {
@@ -4495,12 +4532,12 @@ impl PeerStore {
         } else if stats.probe_attempted > 0 {
             "probe_failed"
         } else if stats.received > 0 {
-            "real_relay_attempted"
+            "opaque_relay_attempted"
         } else {
             "idle"
         };
         let proof_scope = if accepted_evidence_seen {
-            "message_delivery"
+            "relay_acceptance"
         } else if two_hop_probe_evidence_seen || stats.two_hop_probe_attempted > 0 {
             "control_plane"
         } else if probe_evidence_seen || stats.probe_attempted > 0 {
@@ -4522,7 +4559,7 @@ impl PeerStore {
             || stats.backpressure_dropped > 0
             || stats.probe_failed > 0;
         let transport_attention_recovered_by_stable_message_delivery = transport_attention
-            && real_relay_ready
+            && accepted_relay_ready
             && two_hop_path_proof_history.stability_ready
             && two_hop_path_proof_history.recent_message_delivery_ready
             && !two_hop_path_proof_history.failure_streak_active
@@ -4554,12 +4591,12 @@ impl PeerStore {
         };
 
         let readiness_reason =
-            if real_relay_ready && !active_transport_attention && !protection_active {
-                "real_relay_observed"
-            } else if real_relay_ready && active_transport_attention {
-                "real_relay_transport_attention"
-            } else if real_relay_ready && protection_active {
-                "real_relay_protection_active"
+            if accepted_relay_ready && !active_transport_attention && !protection_active {
+                "opaque_relay_acceptance_observed"
+            } else if accepted_relay_ready && active_transport_attention {
+                "opaque_relay_transport_attention"
+            } else if accepted_relay_ready && protection_active {
+                "opaque_relay_protection_active"
             } else if two_hop_probe_ready && !active_transport_attention && !protection_active {
                 "synthetic_two_hop_control_probe_ready"
             } else if synthetic_probe_ready && !active_transport_attention && !protection_active {
@@ -4572,14 +4609,14 @@ impl PeerStore {
                 "transport_attention"
             } else if protection_active {
                 "protection_active"
-            } else if accepted_evidence_seen && !real_relay_ready {
-                "real_relay_stale"
+            } else if accepted_evidence_seen && !accepted_relay_ready {
+                "opaque_relay_acceptance_stale"
             } else if two_hop_probe_evidence_seen && !two_hop_probe_ready {
                 "synthetic_two_hop_control_probe_stale"
             } else if probe_evidence_seen && !probe_ready {
                 "synthetic_probe_stale"
             } else if stats.received > 0 {
-                "real_relay_attempted"
+                "opaque_relay_attempted"
             } else {
                 "idle_waiting_for_relay"
             };
@@ -4598,19 +4635,19 @@ impl PeerStore {
             "protecting" => {
                 "review aggregate abuse-guard buckets while preserving blind relay metadata"
             }
-            "ready" if real_relay_ready => {
+            "ready" if accepted_relay_ready => {
                 "blind relay runtime has accepted encrypted relay work"
             }
             "ready" if two_hop_probe_ready => {
-                "two-hop control-plane path proof succeeded; wait for real message-delivery evidence"
+                "two-hop synthetic path proof succeeded; do not present it as App/user traffic"
             }
-            "ready" => "synthetic relay probe succeeded; wait for real encrypted relay traffic",
+            "ready" => "synthetic relay probe succeeded; do not present it as App/user traffic",
             "stale" => "refresh relay readiness with a new accepted encrypted relay event or synthetic path proof",
             _ => "observe additional relay traffic before declaring runtime quality ready",
         };
 
         let detail = format!(
-            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} two_hop_probe_attempted={} two_hop_probe_succeeded={} two_hop_probe_failed={} timestamp_rejected={} real_relay_ready={} synthetic_probe_ready={} two_hop_probe_ready={} evidence_mode={} proof_scope={} readiness_reason={} protection_active={} accepted_percent={} transport_attention_recovered={} proof_stability_status={} stale_after_seconds={} last_event_age_seconds={} last_accepted_age_seconds={} last_probe_age_seconds={} last_two_hop_probe_age_seconds={}",
+            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} two_hop_probe_attempted={} two_hop_probe_succeeded={} two_hop_probe_failed={} timestamp_rejected={} real_relay_ready={} accepted_relay_ready={} synthetic_probe_ready={} two_hop_probe_ready={} evidence_mode={} proof_scope={} readiness_reason={} protection_active={} accepted_percent={} transport_attention_recovered={} proof_stability_status={} stale_after_seconds={} last_event_age_seconds={} last_accepted_age_seconds={} last_probe_age_seconds={} last_two_hop_probe_age_seconds={}",
             stats.received,
             accepted_total,
             stats.terminal,
@@ -4629,6 +4666,7 @@ impl PeerStore {
             stats.two_hop_probe_failed,
             stats.timestamp_rejected,
             real_relay_ready,
+            accepted_relay_ready,
             synthetic_probe_ready,
             two_hop_probe_ready,
             evidence_mode,
@@ -4659,6 +4697,7 @@ impl PeerStore {
             runtime_ready,
             quality_ready,
             real_relay_ready,
+            accepted_relay_ready,
             synthetic_probe_ready,
             evidence_mode: evidence_mode.to_string(),
             proof_scope: proof_scope.to_string(),
@@ -7507,11 +7546,12 @@ mod tests {
         assert_eq!(quality.status, "ready");
         assert!(quality.runtime_ready);
         assert!(quality.quality_ready);
-        assert!(quality.real_relay_ready);
+        assert!(!quality.real_relay_ready);
+        assert!(quality.accepted_relay_ready);
         assert!(!quality.synthetic_probe_ready);
-        assert_eq!(quality.evidence_mode, "real_relay_traffic");
-        assert_eq!(quality.proof_scope, "message_delivery");
-        assert_eq!(quality.readiness_reason, "real_relay_observed");
+        assert_eq!(quality.evidence_mode, "opaque_relay_acceptance");
+        assert_eq!(quality.proof_scope, "relay_acceptance");
+        assert_eq!(quality.readiness_reason, "opaque_relay_acceptance_observed");
         assert_eq!(quality.accepted_total, 2);
         assert_eq!(quality.accepted_percent, 100);
         assert_eq!(quality.last_accepted_at, Some(1_700_000_011));
@@ -7528,7 +7568,7 @@ mod tests {
     }
 
     #[test]
-    fn test_blind_relay_quality_does_not_stay_ready_after_stale_real_relay_evidence() {
+    fn test_blind_relay_quality_does_not_stay_ready_after_stale_opaque_relay_evidence() {
         let store = PeerStore::new();
 
         store.record_blind_relay_terminal(1_700_000_010, 2, 128);
@@ -7542,10 +7582,11 @@ mod tests {
         assert!(!quality.runtime_ready);
         assert!(!quality.quality_ready);
         assert!(!quality.real_relay_ready);
+        assert!(!quality.accepted_relay_ready);
         assert!(!quality.synthetic_probe_ready);
-        assert_eq!(quality.evidence_mode, "real_relay_traffic");
-        assert_eq!(quality.proof_scope, "message_delivery");
-        assert_eq!(quality.readiness_reason, "real_relay_stale");
+        assert_eq!(quality.evidence_mode, "opaque_relay_acceptance");
+        assert_eq!(quality.proof_scope, "relay_acceptance");
+        assert_eq!(quality.readiness_reason, "opaque_relay_acceptance_stale");
         assert_eq!(quality.accepted_total, 2);
         assert_eq!(quality.last_accepted_at, Some(1_700_000_011));
         assert_eq!(
@@ -7597,7 +7638,7 @@ mod tests {
         assert!(quality.detail.contains("proof_scope=control_plane"));
         assert!(quality
             .next_action
-            .contains("real message-delivery evidence"));
+            .contains("do not present it as App/user traffic"));
         assert_eq!(quality.last_two_hop_probe_age_seconds, Some(15));
         assert_eq!(status.two_hop_path_proof_history.attempted, 1);
         assert_eq!(status.two_hop_path_proof_history.succeeded, 1);
@@ -7855,6 +7896,10 @@ mod tests {
         assert!(history.message_delivery_ready);
         assert!(history.recent_message_delivery_ready);
         assert_eq!(history.message_delivery_successes, 1);
+        assert_eq!(
+            history.message_delivery_evidence_mode,
+            "synthetic_onion_message_delivery_probe"
+        );
         assert_eq!(history.latest_message_delivery_age_seconds, Some(5));
         assert_eq!(history.consecutive_message_delivery_successes, 1);
         assert_eq!(history.stability_window_attempted, 1);
@@ -7865,7 +7910,10 @@ mod tests {
         assert!(!history.failure_circuit_breaker_active);
         assert_eq!(history.latest_age_bucket, "fresh");
         assert_eq!(history.events.len(), 1);
-        assert_eq!(history.events[0].evidence_mode, "real_relay_traffic");
+        assert_eq!(
+            history.events[0].evidence_mode,
+            "synthetic_onion_message_delivery_probe"
+        );
         assert_eq!(history.events[0].proof_scope, "message_delivery");
         assert!(!history.privacy_boundary.contains("route_id="));
         assert!(!history.privacy_boundary.contains("receiver="));
@@ -8201,7 +8249,8 @@ mod tests {
         assert!(!quality.runtime_ready);
         assert!(!quality.quality_ready);
         assert!(!quality.real_relay_ready);
-        assert_eq!(quality.evidence_mode, "real_relay_attempted");
+        assert!(!quality.accepted_relay_ready);
+        assert_eq!(quality.evidence_mode, "opaque_relay_attempted");
         assert_eq!(quality.readiness_reason, "protection_active");
         assert_eq!(quality.timestamp_rejected, 1);
         assert!(quality.protection_active);
@@ -8226,10 +8275,11 @@ mod tests {
         assert_eq!(quality.status, "attention");
         assert!(quality.runtime_ready);
         assert!(!quality.quality_ready);
-        assert!(quality.real_relay_ready);
-        assert_eq!(quality.evidence_mode, "real_relay_traffic");
-        assert_eq!(quality.proof_scope, "message_delivery");
-        assert_eq!(quality.readiness_reason, "real_relay_transport_attention");
+        assert!(!quality.real_relay_ready);
+        assert!(quality.accepted_relay_ready);
+        assert_eq!(quality.evidence_mode, "opaque_relay_acceptance");
+        assert_eq!(quality.proof_scope, "relay_acceptance");
+        assert_eq!(quality.readiness_reason, "opaque_relay_transport_attention");
         assert_eq!(quality.forward_failed, 1);
         assert_eq!(quality.retry_exhausted, 1);
         assert_eq!(quality.last_event_age_seconds, Some(5));
@@ -8275,10 +8325,11 @@ mod tests {
         assert_eq!(quality.status, "ready");
         assert!(quality.runtime_ready);
         assert!(quality.quality_ready);
-        assert!(quality.real_relay_ready);
-        assert_eq!(quality.evidence_mode, "real_relay_traffic");
-        assert_eq!(quality.proof_scope, "message_delivery");
-        assert_eq!(quality.readiness_reason, "real_relay_observed");
+        assert!(!quality.real_relay_ready);
+        assert!(quality.accepted_relay_ready);
+        assert_eq!(quality.evidence_mode, "opaque_relay_acceptance");
+        assert_eq!(quality.proof_scope, "relay_acceptance");
+        assert_eq!(quality.readiness_reason, "opaque_relay_acceptance_observed");
         assert_eq!(quality.forward_failed, 1);
         assert_eq!(quality.retry_exhausted, 1);
         assert!(quality
@@ -8332,7 +8383,7 @@ mod tests {
             .contains("readiness_reason=synthetic_probe_ready"));
         assert!(quality
             .next_action
-            .contains("wait for real encrypted relay traffic"));
+            .contains("do not present it as App/user traffic"));
 
         let serialized = serde_json::to_string(&quality).unwrap();
         assert!(!serialized.contains("route_id"));
