@@ -102,8 +102,11 @@
 //!   filtering alone is vulnerable to concurrent descriptor replacement.
 //! - Coordinator leases require every configured witness grant. Do not describe
 //!   them as permissionless consensus, Byzantine finality, or fork choice.
+//! - The localhost endpoint override below is compiled only for crate tests.
+//!   Never expose it in production or bypass final-hop SSRF validation.
 //!
 //! ## Last Modified
+//! v2.8.19-TipSupersessionIntegration - Added a test-only real HTTP delivery seam.
 //! v2.8.17-TipRetryQueue - Added bounded transient-failure delivery retries.
 //! v2.8.16-IdempotentTipRetry - Allowed bounded retry of signed follower wake-ups.
 //! v2.8.15-AnnouncementReceipts - Classified exact accepted, stale, and failed receipts.
@@ -566,6 +569,38 @@ pub async fn announce_current_record_commitment_tip(
         client,
         pinned_peer_ids,
         &commitment_peer_endpoint_is_public,
+    )
+    .await
+}
+
+/// Runs the production announcement encoder, peer lookup, HTTP transport, and
+/// retry queue with a localhost-capable endpoint policy for integration tests.
+///
+/// This seam does not exist in non-test builds. Production callers must use
+/// [`announce_current_record_commitment_tip`], which enforces final-hop public
+/// endpoint validation on every attempt.
+#[cfg(test)]
+pub(crate) async fn announce_current_record_commitment_tip_for_test(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    pinned_peer_ids: &[[u8; 32]],
+    max_attempts: usize,
+    base_delay: Duration,
+) -> Result<CommitmentTipAnnouncementOutcome, String> {
+    let endpoint_allowed = |_endpoint: &str| true;
+    announce_current_record_commitment_tip_with_endpoint_policy_and_retry_policy(
+        storage,
+        peer_store,
+        identity,
+        client,
+        pinned_peer_ids,
+        &endpoint_allowed,
+        CommitmentTipAnnouncementRetryPolicy {
+            max_attempts,
+            base_delay,
+        },
     )
     .await
 }

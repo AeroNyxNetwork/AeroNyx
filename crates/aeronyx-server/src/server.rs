@@ -246,6 +246,7 @@
 //     the canonical chain, witness evidence, lease state, or production gates.
 //
 // Last Modified:
+//   v2.8.19-TipSupersessionIntegration - Verify latest-tip delivery over real HTTP
 //   v2.8.18-TipSupersession - Prioritize newer audited tip announcements
 //   v2.8.17-TipRetryQueue - Bounded transient follower wake-up retries
 //   v2.8.15-AnnouncementReceipts - Exact coordinator tip-delivery result evidence
@@ -6992,7 +6993,10 @@ mod tests {
         CommitmentWitnessStartupBlockReason, CommitmentWitnessStartupDecision, Server,
         BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
     };
-    use crate::api::memchain_peer::{build_memchain_peer_router, CommitmentReconciliationOutcome};
+    use crate::api::memchain_peer::{
+        announce_current_record_commitment_tip_for_test, build_memchain_peer_router,
+        CommitmentReconciliationOutcome,
+    };
     use crate::api::{
         decode_bounded_json_response, read_bounded_http_response, BoundedHttpResponseError,
     };
@@ -7051,6 +7055,202 @@ mod tests {
             outcome,
             CommitmentTipAnnouncementWaitOutcome::Completed(42)
         );
+    }
+
+    #[tokio::test]
+    async fn newer_commitment_tip_supersedes_slow_http_announcement_and_delivers_latest() {
+        let now = unix_now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let follower = IdentityKeyPair::generate();
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        storage.configure_record_commitment_sync(true, false);
+        let first_block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now,
+            GENESIS_PREV_HASH,
+            vec![[0xA1; 32]],
+            &coordinator,
+        );
+        storage
+            .append_record_commitment_block(&first_block, None)
+            .await
+            .unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+        let second_block = RecordCommitmentBlockV1::new_signed(
+            2,
+            now.saturating_add(1),
+            first_block.hash(),
+            vec![[0xA2; 32]],
+            &coordinator,
+        );
+
+        let first_request_seen = Arc::new(tokio::sync::Notify::new());
+        let handler_first_request_seen = Arc::clone(&first_request_seen);
+        let received_heights = Arc::new(tokio::sync::Mutex::new(Vec::<u64>::new()));
+        let handler_received_heights = Arc::clone(&received_heights);
+        let coordinator_id = coordinator.public_key_bytes();
+        let router = Router::new().route(
+            "/api/memchain/peer/block-announce",
+            post(move |body: axum::body::Bytes| {
+                let first_request_seen = Arc::clone(&handler_first_request_seen);
+                let received_heights = Arc::clone(&handler_received_heights);
+                async move {
+                    assert_eq!(
+                        body.first().copied(),
+                        Some(aeronyx_core::protocol::memchain::MEMCHAIN_MAGIC)
+                    );
+                    let message = aeronyx_core::protocol::memchain::decode_memchain(&body[1..])
+                        .expect("announcement frame must decode");
+                    let (header, proposer_signature) = match message {
+                        aeronyx_core::protocol::memchain::MemChainMessage::RecordBlockAnnounceV1 {
+                            header,
+                            proposer_signature,
+                        } => (header, proposer_signature),
+                        _ => panic!("expected commitment tip announcement"),
+                    };
+                    assert_eq!(header.proposer, coordinator_id);
+                    IdentityPublicKey::from_bytes(&header.proposer)
+                        .unwrap()
+                        .verify(&header.hash(), &proposer_signature)
+                        .unwrap();
+                    let height = header.height;
+                    received_heights.lock().await.push(height);
+                    if height == 1 {
+                        first_request_seen.notify_one();
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::ACCEPTED
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let http_server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let mut descriptor = NodeDescriptor::new(
+            follower.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now.saturating_add(600),
+            "tip-supersession-http-test",
+        );
+        descriptor.public_endpoint = Some(format!("http://{address}"));
+        descriptor.capabilities = vec![NodeCapability::EncryptedStorage];
+        let descriptor = SignedNodeDescriptor::sign(descriptor, &follower).unwrap();
+        let peer_store = Arc::new(PeerStore::new());
+        let import = peer_store.apply_discovery_message(
+            &NodeDiscoveryMessage::DescriptorAnnounce { descriptor },
+            now,
+        );
+        assert_eq!(import.inserted, 1);
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let (tip_tx, mut tip_rx) = tokio::sync::mpsc::channel(1);
+        let advance_storage = Arc::clone(&storage);
+        let advance_tip = tokio::spawn(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                first_request_seen.notified(),
+            )
+            .await
+            .expect("first HTTP announcement must arrive");
+            advance_storage
+                .append_record_commitment_block(&second_block, None)
+                .await
+                .unwrap();
+            tip_tx.send(2).await.unwrap();
+        });
+
+        let superseded = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            await_commitment_tip_announcement_or_newer(
+                1,
+                &mut tip_rx,
+                announce_current_record_commitment_tip_for_test(
+                    &storage,
+                    &peer_store,
+                    &coordinator,
+                    &client,
+                    &[follower.public_key_bytes()],
+                    3,
+                    std::time::Duration::from_millis(10),
+                ),
+            ),
+        )
+        .await
+        .expect("new tip must cancel the slow HTTP round");
+        assert_eq!(
+            superseded,
+            CommitmentTipAnnouncementWaitOutcome::Superseded(2)
+        );
+        advance_tip.await.unwrap();
+        storage.record_commitment_outbound_announcement_superseded(now.saturating_add(2));
+        let after_supersession = storage.record_commitment_sync_status();
+        assert_eq!(after_supersession.outbound_announcement_rounds_total, 1);
+        assert_eq!(
+            after_supersession.outbound_announcement_rounds_superseded_total,
+            1
+        );
+        assert_eq!(after_supersession.outbound_announcements_attempted_total, 0);
+
+        let latest = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            await_commitment_tip_announcement_or_newer(
+                2,
+                &mut tip_rx,
+                announce_current_record_commitment_tip_for_test(
+                    &storage,
+                    &peer_store,
+                    &coordinator,
+                    &client,
+                    &[follower.public_key_bytes()],
+                    1,
+                    std::time::Duration::ZERO,
+                ),
+            ),
+        )
+        .await
+        .expect("latest HTTP announcement must complete");
+        let CommitmentTipAnnouncementWaitOutcome::Completed(Ok(delivery)) = latest else {
+            panic!("latest tip must produce a delivery outcome");
+        };
+        assert_eq!(delivery.announced_height, 2);
+        assert_eq!(delivery.attempted, 1);
+        assert_eq!(delivery.accepted, 1);
+        assert_eq!(delivery.failed, 0);
+        storage.record_commitment_outbound_announcement(
+            now.saturating_add(3),
+            delivery.announced_height,
+            delivery.attempted,
+            delivery.accepted,
+            delivery.stale,
+            delivery.failed,
+            delivery.retries_attempted,
+            delivery.retries_succeeded,
+            delivery.retries_exhausted,
+        );
+        let status = storage.record_commitment_sync_status();
+        assert_eq!(status.outbound_announcement_rounds_total, 2);
+        assert_eq!(status.outbound_announcement_rounds_superseded_total, 1);
+        assert_eq!(status.outbound_announcements_attempted_total, 1);
+        assert_eq!(status.outbound_announcements_accepted_total, 1);
+        assert_eq!(status.last_outbound_announced_height, Some(2));
+        assert_eq!(
+            status.last_outbound_announcement_result.as_deref(),
+            Some("all_woken")
+        );
+        assert_eq!(*received_heights.lock().await, vec![1, 2]);
+
+        http_server.abort();
+        let _ = http_server.await;
     }
 
     #[test]
