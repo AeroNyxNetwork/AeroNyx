@@ -172,6 +172,9 @@
 //      recovery evidence so witness partitions remain observable and fail closed.
 //  74. Reports witness-certificate coverage and uncertified block lag without
 //      exposing hashes, witness identities, signatures, or claiming finality.
+//  75. Triggers witness reconciliation immediately after a canonical tip
+//      advance through a bounded local channel; the low-frequency schedule
+//      remains the recovery path and block production never waits on witnesses.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -188,6 +191,9 @@
 //     blind coordinator may pack blocks; all other nodes remain followers.
 //   - Coordinator witness reconciliation is evidence collection only. It must
 //     never mutate the canonical chain, elect a leader, or infer fork choice.
+//   - New-tip notifications are bounded process-local hints. Reconciliation
+//     must always read and verify the current audited storage tip, and periodic
+//     polling must remain available when notifications are coalesced or closed.
 //   - Checkpoint freshness comes only from audited, currently applicable
 //     durable signed evidence. Deferred historical frames, failed attempts,
 //     and inbound served requests cannot refresh it.
@@ -1167,6 +1173,11 @@ impl Server {
             );
             tasks.push(("memchain-api", api_task));
 
+            // One pending event is sufficient: reconciliation always reads
+            // the current audited tip, so multiple fast block advances can be
+            // safely coalesced without blocking VPN, chat, or miner work.
+            let (commitment_tip_tx, commitment_tip_rx) = mpsc::channel(1);
+
             if let Some(sync_task) =
                 self.spawn_memchain_commitment_sync_task(Arc::clone(st), Arc::clone(&peer_store))
             {
@@ -1175,6 +1186,7 @@ impl Server {
             if let Some(reconciliation_task) = self.spawn_memchain_commitment_reconciliation_task(
                 Arc::clone(st),
                 Arc::clone(&peer_store),
+                commitment_tip_rx,
             ) {
                 tasks.push(("memchain-checkpoint-witness", reconciliation_task));
             }
@@ -1305,7 +1317,8 @@ impl Server {
                     .with_mvf(self.config.memchain.mvf_enabled, Arc::clone(&user_weights))
                     .with_commitment_coordinator(
                         self.config.memchain.commitment_coordinator_enabled,
-                    );
+                    )
+                    .with_commitment_tip_notifier(commitment_tip_tx);
 
                     let miner = if let Some(ref ee) = embed_engine {
                         miner.with_embed_engine(Arc::clone(ee))
@@ -3513,6 +3526,7 @@ impl Server {
         &self,
         storage: Arc<MemoryStorage>,
         peer_store: Arc<PeerStore>,
+        mut commitment_tip_rx: mpsc::Receiver<u64>,
     ) -> Option<JoinHandle<()>> {
         if !self.config.memchain.commitment_coordinator_enabled {
             return None;
@@ -3558,13 +3572,23 @@ impl Server {
                 interval_secs,
                 max_witnesses = MAX_WITNESSES_PER_ROUND,
                 witness_scope,
+                event_driven = true,
                 "[MEMCHAIN_BLOCK] Coordinator witness reconciliation started"
             );
 
             'witness_loop: loop {
-                tokio::select! {
+                let (trigger, announced_tip_height) = tokio::select! {
                     _ = shutdown_rx.recv() => break,
-                    _ = tokio::time::sleep(next_delay) => {}
+                    _ = tokio::time::sleep(next_delay) => ("scheduled", None),
+                    Some(tip_height) = commitment_tip_rx.recv() => {
+                        ("new_commitment_tip", Some(tip_height))
+                    }
+                };
+                if let Some(tip_height) = announced_tip_height {
+                    info!(
+                        tip_height,
+                        "[MEMCHAIN_BLOCK] New commitment tip triggered witness reconciliation"
+                    );
                 }
 
                 let round = tokio::select! {
@@ -3599,6 +3623,7 @@ impl Server {
                         attempted = round.attempted,
                         verified = round.verified,
                         failed = round.failed,
+                        trigger,
                         "[MEMCHAIN_BLOCK] Trusted witness security incident halted local commitment production"
                     );
                     break;
@@ -3607,6 +3632,7 @@ impl Server {
                     error!(
                         certificate_signers = round.certificate_signers,
                         certificate_required_signers = round.certificate_required_signers,
+                        trigger,
                         "[MEMCHAIN_BLOCK] Checkpoint certificate persistence failed"
                     );
                 }
@@ -3675,6 +3701,7 @@ impl Server {
                             attempted = round.attempted,
                             failed = round.failed,
                             consecutive_unverified_rounds,
+                            trigger,
                             "[MEMCHAIN_BLOCK] Coordinator witness round established no signed evidence"
                         );
                     }
@@ -3691,6 +3718,7 @@ impl Server {
                         remote_behind = round.remote_behind,
                         diverged = round.diverged,
                         failed = round.failed,
+                        trigger,
                         "[MEMCHAIN_BLOCK] Coordinator witness round found signed chain attention evidence"
                     );
                 } else {
@@ -3700,6 +3728,7 @@ impl Server {
                         converged = round.converged,
                         remote_behind = round.remote_behind,
                         failed = round.failed,
+                        trigger,
                         "[MEMCHAIN_BLOCK] Coordinator witness round complete"
                     );
                 }

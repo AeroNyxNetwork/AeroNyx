@@ -79,8 +79,12 @@
 //! v2.7.14-RustdocQuality   - Corrected nested Markdown filename example so
 //!   Rustdoc treats it as documentation rather than two Rust test programs.
 //! v2.7.21-TrustedDivergenceHalt - Stop packing after trusted fork evidence.
+//! v2.7.22-EventDrivenCheckpoint - Notify the coordinator witness task after
+//!   a successful local tip advance. Notification is bounded and non-blocking;
+//!   periodic reconciliation remains the authoritative recovery path.
 //!
 //! ## Last Modified
+//! v2.7.22-EventDrivenCheckpoint - Added local commitment-tip notification.
 //! v2.7.21-TrustedDivergenceHalt - Honor the storage production safety latch.
 //! v2.7.14-RustdocQuality - Corrected filename example fence semantics.
 //! v2.7.0-BlockSync - Signed node-blind commitment block production.
@@ -89,7 +93,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
 
 use aeronyx_core::crypto::transport::{
@@ -125,6 +129,32 @@ const MAX_COMPACTION_BATCH: usize = 200;
 const EMBEDDING_BACKFILL_BATCH: usize = 50;
 /// Bounds startup/tick work so block production cannot starve VPN or relay IO.
 const RECORD_COMMITMENT_BLOCKS_PER_TICK: usize = 8;
+
+/// Result of the best-effort local notification sent after a canonical tip
+/// advance. A full channel means an earlier event is already pending; the
+/// consumer always reconciles the current storage tip, so dropping the newer
+/// height coalesces work without losing correctness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitmentTipNotificationOutcome {
+    Disabled,
+    Sent,
+    Coalesced,
+    Closed,
+}
+
+fn notify_commitment_tip(
+    notifier: Option<&mpsc::Sender<u64>>,
+    tip_height: u64,
+) -> CommitmentTipNotificationOutcome {
+    let Some(notifier) = notifier else {
+        return CommitmentTipNotificationOutcome::Disabled;
+    };
+    match notifier.try_send(tip_height) {
+        Ok(()) => CommitmentTipNotificationOutcome::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => CommitmentTipNotificationOutcome::Coalesced,
+        Err(mpsc::error::TrySendError::Closed(_)) => CommitmentTipNotificationOutcome::Closed,
+    }
+}
 
 const DEFAULT_ENTITY_LABELS: &[&str] = &[
     "project",
@@ -206,6 +236,7 @@ pub struct ReflectionMiner {
     ner_engine: Option<Arc<NerEngine>>,
     llm_router: Option<Arc<LlmRouter>>,
     commitment_coordinator_enabled: bool,
+    commitment_tip_notifier: Option<mpsc::Sender<u64>>,
 }
 
 impl ReflectionMiner {
@@ -236,6 +267,7 @@ impl ReflectionMiner {
             ner_engine: None,
             llm_router: None,
             commitment_coordinator_enabled: false,
+            commitment_tip_notifier: None,
         }
     }
 
@@ -279,6 +311,16 @@ impl ReflectionMiner {
     #[must_use]
     pub const fn with_commitment_coordinator(mut self, enabled: bool) -> Self {
         self.commitment_coordinator_enabled = enabled;
+        self
+    }
+
+    /// Installs a bounded, process-local trigger for checkpoint witness
+    /// reconciliation. Block production never waits for this channel; the
+    /// periodic witness task remains the fallback when an event is coalesced
+    /// or the consumer is unavailable.
+    #[must_use]
+    pub fn with_commitment_tip_notifier(mut self, notifier: mpsc::Sender<u64>) -> Self {
+        self.commitment_tip_notifier = Some(notifier);
         self
     }
 
@@ -728,6 +770,29 @@ impl ReflectionMiner {
 
         if appended > 0 {
             let (tip_height, _) = self.storage.record_commitment_chain_tip().await;
+            let notification =
+                notify_commitment_tip(self.commitment_tip_notifier.as_ref(), tip_height);
+            match notification {
+                CommitmentTipNotificationOutcome::Sent => {
+                    debug!(
+                        tip_height,
+                        "[MEMCHAIN_BLOCK] Queued immediate witness reconciliation"
+                    );
+                }
+                CommitmentTipNotificationOutcome::Coalesced => {
+                    debug!(
+                        tip_height,
+                        "[MEMCHAIN_BLOCK] Witness reconciliation event already pending"
+                    );
+                }
+                CommitmentTipNotificationOutcome::Closed => {
+                    debug!(
+                        tip_height,
+                        "[MEMCHAIN_BLOCK] Immediate witness reconciliation unavailable; periodic fallback retained"
+                    );
+                }
+                CommitmentTipNotificationOutcome::Disabled => {}
+            }
             info!(
                 blocks = appended,
                 tip_height, "[MEMCHAIN_BLOCK] Commitment packing round complete"
@@ -2107,6 +2172,42 @@ impl ReflectionMiner {
             }
         }
         sent
+    }
+}
+
+#[cfg(test)]
+mod commitment_tip_notification_tests {
+    use super::{notify_commitment_tip, CommitmentTipNotificationOutcome};
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn notification_is_non_blocking_and_coalesces_pending_work() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        assert_eq!(
+            notify_commitment_tip(Some(&sender), 34),
+            CommitmentTipNotificationOutcome::Sent
+        );
+        assert_eq!(
+            notify_commitment_tip(Some(&sender), 35),
+            CommitmentTipNotificationOutcome::Coalesced
+        );
+        assert_eq!(receiver.recv().await, Some(34));
+    }
+
+    #[tokio::test]
+    async fn notification_tolerates_disabled_or_closed_consumer() {
+        assert_eq!(
+            notify_commitment_tip(None, 34),
+            CommitmentTipNotificationOutcome::Disabled
+        );
+
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        assert_eq!(
+            notify_commitment_tip(Some(&sender), 34),
+            CommitmentTipNotificationOutcome::Closed
+        );
     }
 }
 
