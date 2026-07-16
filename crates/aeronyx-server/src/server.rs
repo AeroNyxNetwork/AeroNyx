@@ -263,6 +263,7 @@
 //     never mark a terminal healthy solely because a middle claims forwarding.
 //
 // Last Modified:
+//   v2.8.25-LegacyFallbackReceiptSearch - Do not let legacy onward-envelope ACKs mask receipt-capable paths
 //   v2.8.24-ReceiptProbeFallbackSearch - Continue bounded mixed-version probes until a signed terminal receipt is found
 //   v2.8.23-RouteNetworkAntiAffinity - Fail closed on unreachable or endpoint-collocated relay paths
 //   v2.8.22-DiscoveryTaskLifecycle - Await peer-cache and gossip shutdown tasks
@@ -5325,17 +5326,17 @@ impl Server {
                         .await
                         {
                             Ok(ack) if ack.accepted && ack.forwarded => {
-                                peer_store.record_blind_relay_two_hop_probe_result_with_context(
-                                    now,
-                                    true,
-                                    "accepted",
+                                // A legacy onward-envelope proof preserves
+                                // compatibility, but it is not a terminal-signed
+                                // delivery receipt. Keep it as fallback evidence
+                                // and continue the bounded candidate search so an
+                                // older peer cannot mask a receipt-capable path.
+                                legacy_delivery_context.get_or_insert((
                                     middle_candidate_count,
                                     terminal_candidate_count,
-                                    2,
-                                    1,
-                                );
+                                ));
                                 peer_store.record_route_forward_success(&middle_node_id, now);
-                                return true;
+                                continue 'terminal_candidates;
                             }
                             Ok(_ack) => {
                                 peer_store.record_blind_relay_two_hop_probe_result_with_context(
@@ -9432,16 +9433,17 @@ mod tests {
         let legacy_requests_for_handler = Arc::clone(&legacy_requests);
         let legacy_router = Router::new().route(
             "/api/chat/peer/blind-relay",
-            post(move || {
+            post(move |Json(request): Json<PeerBlindRelayRequest>| {
                 let requests = Arc::clone(&legacy_requests_for_handler);
                 async move {
                     requests.fetch_add(1, AtomicOrdering::SeqCst);
+                    let legacy_fallback = request.onward_envelope.is_some();
                     Json(PeerBlindRelayResponse {
-                        accepted: true,
+                        accepted: legacy_fallback,
                         terminal: false,
-                        forwarded: true,
+                        forwarded: legacy_fallback,
                         ttl_remaining: 1,
-                        reason: None,
+                        reason: (!legacy_fallback).then(|| "legacy_only".to_string()),
                         delivery_receipt: None,
                     })
                 }
@@ -9513,7 +9515,7 @@ mod tests {
         .await;
 
         assert!(accepted);
-        assert_eq!(legacy_requests.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(legacy_requests.load(AtomicOrdering::SeqCst), 2);
         assert_eq!(receipt_requests.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(
             store
