@@ -152,6 +152,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.60.0-VerifiedDeliveryRollbackAnchor - Track signed cache generations and fail closed on local delivery-evidence rollback
 //! v0.59.0-VerifiedDeliveryRestartContinuity - Persist only signed aggregate client-delivery evidence and require fresh receipt-capable peers after restart
 //! v0.58.0-RouteNetworkAntiAffinity - Require routeable peers and distinct endpoint network identities for multi-hop paths
 //! v0.57.0-SignedDeliveryReceipts - Track freshness-bounded receipt-capable routes and verified client onion delivery evidence
@@ -242,7 +243,7 @@ pub const ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 /// Local peer-cache two-hop proof history schema understood by this node.
 pub const TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION: u16 = 1;
 /// Local peer-cache aggregate verified-client delivery schema understood by this node.
-pub const VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION: u16 = 1;
+pub const VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION: u16 = 2;
 const ROUTEABILITY_EVIDENCE_KIND_EXACT_DESCRIPTOR: &str = "direct_opaque_route_success";
 const ROUTEABILITY_EVIDENCE_KIND_ROUTE_SURFACE: &str = "direct_opaque_route_surface_success";
 const PEER_ROUTEABILITY_CACHE_MAX_ENTRIES: usize = 4_096;
@@ -716,6 +717,16 @@ pub struct PeerStoreBootstrapStatus {
     /// Timestamp of the latest durable aggregate client-delivery cache write.
     #[serde(default)]
     pub last_client_delivery_cache_persisted_at: Option<u64>,
+    /// Monotonic generation of the latest evaluated aggregate delivery section.
+    #[serde(default)]
+    pub last_client_delivery_cache_generation: u64,
+    /// Local rollback-protection status for the latest aggregate delivery section.
+    ///
+    /// Stable buckets are `anchored`, `cache_ahead`, `legacy_unanchored`,
+    /// `anchor_missing`, `anchor_invalid`, `anchor_conflict`,
+    /// `rollback_detected`, and `not_checked`.
+    #[serde(default)]
+    pub last_client_delivery_cache_rollback_protection: Option<String>,
     /// Number of peers attempted in the last outbound gossip round.
     pub last_gossip_attempted: u64,
     /// Number of configured seed endpoints attempted in the last gossip round.
@@ -797,6 +808,8 @@ impl Default for PeerStoreBootstrapStatus {
             last_client_delivery_cache_at: None,
             last_client_delivery_cache_persisted: 0,
             last_client_delivery_cache_persisted_at: None,
+            last_client_delivery_cache_generation: 0,
+            last_client_delivery_cache_rollback_protection: None,
             last_gossip_attempted: 0,
             last_gossip_seed_attempted: 0,
             last_gossip_succeeded: 0,
@@ -2276,22 +2289,63 @@ impl PeerStore {
         );
     }
 
-    /// Records that the latest atomic peer-cache write included aggregate
-    /// verified-client delivery evidence.
-    pub fn record_client_delivery_cache_persisted(&self, now: u64, persisted: u64) {
+    /// Records that the latest atomic peer-cache write and its independent
+    /// signed rollback anchor durably included aggregate delivery evidence.
+    pub fn record_client_delivery_cache_persisted(
+        &self,
+        now: u64,
+        persisted: u64,
+        generation: u64,
+    ) {
         {
             let mut status = self.bootstrap_status.write();
             status.last_client_delivery_cache_persisted = persisted;
             status.last_client_delivery_cache_persisted_at = Some(now);
+            status.last_client_delivery_cache_generation = generation;
+            status.last_client_delivery_cache_rollback_protection =
+                Some("anchored".to_string());
         }
         self.record_audit_event(
             now,
             "client_delivery_cache_persist",
             "success",
             format!(
-                "schema_version={} persisted={persisted}",
-                VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION
+                "schema_version={} generation={generation} persisted={persisted} rollback_protection=anchored",
+                VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
             ),
+        );
+    }
+
+    /// Records the allowlisted local rollback-protection result without
+    /// retaining anchor bytes, signatures, paths, peer ids, or route data.
+    pub fn record_client_delivery_cache_rollback_protection(
+        &self,
+        now: u64,
+        generation: u64,
+        protection: &str,
+    ) {
+        let protection = match protection {
+            "anchored" | "cache_ahead" | "legacy_unanchored" | "anchor_missing"
+            | "anchor_invalid" | "anchor_conflict" | "rollback_detected"
+            | "not_checked" => protection,
+            _ => "unknown",
+        };
+        {
+            let mut status = self.bootstrap_status.write();
+            status.last_client_delivery_cache_generation = generation;
+            status.last_client_delivery_cache_rollback_protection =
+                Some(protection.to_string());
+        }
+        let outcome = match protection {
+            "anchored" => "accepted",
+            "cache_ahead" | "legacy_unanchored" | "not_checked" => "warning",
+            _ => "rejected",
+        };
+        self.record_audit_event(
+            now,
+            "client_delivery_cache_rollback_protection",
+            outcome,
+            format!("generation={generation} protection={protection}"),
         );
     }
 
@@ -4495,6 +4549,10 @@ impl PeerStore {
     ) -> PeerStoreVerifiedClientDeliveryCacheRestoreReport {
         let reason = match reason {
             "identity_unavailable" => "identity_unavailable",
+            "anchor_missing" => "anchor_missing",
+            "anchor_invalid" => "anchor_invalid",
+            "anchor_conflict" => "anchor_conflict",
+            "rollback_detected" => "rollback_detected",
             _ => "signature_invalid",
         };
         self.finish_client_delivery_cache_restore(present, false, 0, now, Some(reason))

@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.4.0 - Added signed aggregate verified-client delivery restart continuity without persisting routes, peers, message identifiers, payload commitments, or ciphertext.
+Modification Reason: v0.5.0 - Added a monotonic signed local anchor that rejects older valid delivery-evidence caches without persisting correlatable relay data.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.4.0 - Added fail-closed verified-client delivery evidence recovery.
+Last Modified: v0.5.0 - Added local signed rollback protection for verified-client delivery evidence.
+Previous: v0.4.0 - Added fail-closed verified-client delivery evidence recovery.
 Previous: v0.3.0 - Added restart-recovery gate for PeerStore relay foundation readiness.
 Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordination.
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
@@ -1019,6 +1020,32 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-17 - Added monotonic rollback protection for signed delivery evidence.
+- Files changed:
+  - crates/aeronyx-server/src/server.rs
+  - crates/aeronyx-server/src/services/peer_store.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Verification:
+  - Legacy-v1 compatibility, anchored-v2, signed rollback, missing-anchor,
+    cache-ahead crash-window, tamper, expiry, and independent-section tests.
+  - Full aeronyx-server tests, release build, US1 restart, and live encrypted
+    two-hop delivery followed by restart recovery.
+- Notes:
+  - Schema v2 signs a positive monotonic cache generation together with the
+    aggregate delivery count and latest verification timestamp.
+  - The independent anchor is derived from discovery.peer_cache_path, so no
+    new operator configuration is required. Cache is fsynced first and anchor
+    second; a cache one generation ahead is an accepted repairable crash
+    window, while a cache behind the signed anchor is rejected as rollback.
+  - Rollback rejection applies only to aggregate delivery evidence. Signed
+    descriptors, descriptor-bound routeability, and two-hop proof history keep
+    their independent authentication and recovery paths.
+  - The anchor contains no route, endpoint, peer pair, sender, receiver,
+    message ID, payload commitment, receipt, or ciphertext.
+  - This is local single-file rollback protection. It does not claim to detect
+    a whole-host snapshot rollback that replaces both cache and anchor, and it
+    is not consensus, quorum, finality, or a lifetime network counter.
+
 2026-07-17 - Added signed aggregate verified-client delivery restart continuity.
 - Files changed:
   - crates/aeronyx-server/src/server.rs
