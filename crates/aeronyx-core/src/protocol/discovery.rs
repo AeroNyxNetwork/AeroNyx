@@ -19,6 +19,8 @@
 //! - Signature-only descriptor verification for local peer-cache retention
 //! - `DirectoryCommitmentBlockV1`: signed, hash-linked commitments to public
 //!   node descriptor events without embedding endpoint or operator metadata
+//! - `DirectorySyncMessage`: authenticated, bounded node-to-node transport for
+//!   serving one producer's tip, block ranges, and descriptor objects
 //!
 //! ## Dependencies
 //! - crates/aeronyx-core/src/crypto/keys.rs: IdentityKeyPair / IdentityPublicKey
@@ -51,6 +53,7 @@
 //!   records, or client metadata to a directory commitment.
 //!
 //! ## Last Modified
+//! v0.7.0-DirectorySyncWire - Added signed bounded Directory Chain peer frames
 //! v0.6.0-DirectoryCommitmentBlock - Added deterministic signed Directory Chain protocol primitives
 //! v0.5.0-DescriptorKemBackwardCompatibility - Accept schema v1 descriptors without KEM fields
 //! v0.4.0-DiscoverySignatureOnlyVerify - Added signature-only verification for expired peer-cache retention
@@ -89,6 +92,18 @@ const MAX_BOOTSTRAP_SNAPSHOT_BYTES: usize = 512 * 1024;
 
 /// Maximum accepted binary discovery gossip message size.
 const MAX_DISCOVERY_MESSAGE_BYTES: u64 = 512 * 1024;
+
+/// One-byte discriminator prepended to every Directory Sync V1 frame.
+pub const DIRECTORY_SYNC_MAGIC: u8 = 0xd3;
+
+/// Maximum encoded Directory Sync frame payload, excluding the magic byte.
+const MAX_DIRECTORY_SYNC_MESSAGE_BYTES: u64 = 512 * 1024;
+
+/// Maximum blocks returned by one Directory Sync range response.
+pub const MAX_DIRECTORY_SYNC_BLOCKS_V1: u16 = 8;
+
+/// Maximum content-addressed descriptors returned by one object response.
+pub const MAX_DIRECTORY_SYNC_OBJECTS_V1: usize = 16;
 
 /// Stable production chain identifier for public node-directory commitments.
 ///
@@ -824,6 +839,335 @@ fn validate_directory_commitments(
 }
 
 // ============================================
+// Directory Sync V1
+// ============================================
+
+/// Authenticated, bounded wire messages for one producer's Directory Chain.
+///
+/// A responder serves only the chain signed by its own node identity. Requests
+/// are separately signed by an admitted peer. Descriptor objects remain public
+/// node metadata; no user, route, traffic, or encrypted payload data belongs in
+/// this protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirectorySyncMessage {
+    /// Requests the responder's current locally audited chain tip.
+    TipRequestV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Random request identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Ed25519 identity of the requesting node.
+        requester: [u8; 32],
+        /// Request creation time in Unix epoch seconds.
+        request_timestamp: u64,
+        /// Requester signature over canonical tip-request bytes.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Returns the responder's current locally audited chain tip.
+    TipResponseV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Request identifier copied from the authenticated request.
+        request_id: [u8; 16],
+        /// Producer and responder identity for this chain.
+        responder: [u8; 32],
+        /// Response creation time in Unix epoch seconds.
+        response_timestamp: u64,
+        /// Current tip height, or zero for an empty chain.
+        tip_height: u64,
+        /// Current tip hash, or all zeroes for an empty chain.
+        tip_hash: [u8; 32],
+        /// Current tip block timestamp, or zero for an empty chain.
+        tip_timestamp: u64,
+        /// Responder signature over canonical tip-response bytes.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Requests a contiguous bounded range from the responder's own chain.
+    BlockRangeRequestV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// First one-based block height requested.
+        from_height: u64,
+        /// Maximum number of blocks requested.
+        limit: u16,
+        /// Random request identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Ed25519 identity of the requesting node.
+        requester: [u8; 32],
+        /// Request creation time in Unix epoch seconds.
+        request_timestamp: u64,
+        /// Requester signature over canonical range-request bytes.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Returns a contiguous bounded block range and a signed current tip.
+    BlockRangeResponseV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Request identifier copied from the authenticated request.
+        request_id: [u8; 16],
+        /// Producer and responder identity for every returned block.
+        responder: [u8; 32],
+        /// Response creation time in Unix epoch seconds.
+        response_timestamp: u64,
+        /// Contiguous blocks in ascending height order.
+        blocks: Vec<DirectoryCommitmentBlockV1>,
+        /// Whether the signed tip extends beyond this page.
+        has_more: bool,
+        /// Current responder tip height.
+        tip_height: u64,
+        /// Current responder tip hash.
+        tip_hash: [u8; 32],
+        /// Responder signature over request binding, block hashes, and tip.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Requests exact content-addressed signed descriptor objects.
+    DescriptorObjectsRequestV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Descriptor commitment hashes, in required response order.
+        descriptor_hashes: Vec<[u8; 32]>,
+        /// Random request identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Ed25519 identity of the requesting node.
+        requester: [u8; 32],
+        /// Request creation time in Unix epoch seconds.
+        request_timestamp: u64,
+        /// Requester signature over canonical object-request bytes.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Returns exact signed descriptor objects in requested hash order.
+    DescriptorObjectsResponseV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Request identifier copied from the authenticated request.
+        request_id: [u8; 16],
+        /// Producer and responder identity for the source chain.
+        responder: [u8; 32],
+        /// Response creation time in Unix epoch seconds.
+        response_timestamp: u64,
+        /// Requested hashes in the exact order represented by `objects`.
+        descriptor_hashes: Vec<[u8; 32]>,
+        /// Authenticated public node descriptors committed by those hashes.
+        objects: Vec<SignedNodeDescriptor>,
+        /// Responder signature over request binding and ordered object hashes.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+}
+
+fn directory_sync_signing_digest<'a>(
+    domain: &[u8],
+    fields: impl IntoIterator<Item = &'a [u8]>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for field in fields {
+        hasher.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(field);
+    }
+    hasher.finalize().into()
+}
+
+/// Canonical digest signed by a Directory Sync tip request.
+#[must_use]
+pub fn directory_tip_request_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+) -> [u8; 32] {
+    let timestamp = request_timestamp.to_le_bytes();
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-TipRequest-v1",
+        [
+            chain_id.as_slice(),
+            request_id.as_slice(),
+            requester.as_slice(),
+            timestamp.as_slice(),
+        ],
+    )
+}
+
+/// Canonical digest signed by a Directory Sync tip response.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_tip_response_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    responder: &[u8; 32],
+    response_timestamp: u64,
+    tip_height: u64,
+    tip_hash: &[u8; 32],
+    tip_timestamp: u64,
+) -> [u8; 32] {
+    let response_timestamp = response_timestamp.to_le_bytes();
+    let tip_height = tip_height.to_le_bytes();
+    let tip_timestamp = tip_timestamp.to_le_bytes();
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-TipResponse-v1",
+        [
+            chain_id.as_slice(),
+            request_id.as_slice(),
+            responder.as_slice(),
+            response_timestamp.as_slice(),
+            tip_height.as_slice(),
+            tip_hash.as_slice(),
+            tip_timestamp.as_slice(),
+        ],
+    )
+}
+
+/// Canonical digest signed by a Directory Sync block-range request.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_block_range_request_signing_bytes(
+    chain_id: &[u8; 32],
+    from_height: u64,
+    limit: u16,
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+) -> [u8; 32] {
+    let from_height = from_height.to_le_bytes();
+    let limit = limit.to_le_bytes();
+    let request_timestamp = request_timestamp.to_le_bytes();
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-BlockRangeRequest-v1",
+        [
+            chain_id.as_slice(),
+            from_height.as_slice(),
+            limit.as_slice(),
+            request_id.as_slice(),
+            requester.as_slice(),
+            request_timestamp.as_slice(),
+        ],
+    )
+}
+
+/// Canonical digest signed by a Directory Sync block-range response.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_block_range_response_signing_bytes(
+    request_id: &[u8; 16],
+    responder: &[u8; 32],
+    response_timestamp: u64,
+    blocks: &[DirectoryCommitmentBlockV1],
+    has_more: bool,
+    tip_height: u64,
+    tip_hash: &[u8; 32],
+) -> [u8; 32] {
+    let response_timestamp = response_timestamp.to_le_bytes();
+    let block_count = u64::try_from(blocks.len())
+        .unwrap_or(u64::MAX)
+        .to_le_bytes();
+    let has_more = [u8::from(has_more)];
+    let tip_height = tip_height.to_le_bytes();
+    let block_hashes = blocks
+        .iter()
+        .map(DirectoryCommitmentBlockV1::hash)
+        .collect::<Vec<_>>();
+    let mut fields = Vec::<&[u8]>::with_capacity(block_hashes.len() + 7);
+    fields.extend([
+        request_id.as_slice(),
+        responder.as_slice(),
+        response_timestamp.as_slice(),
+        block_count.as_slice(),
+    ]);
+    fields.extend(block_hashes.iter().map(<[u8; 32]>::as_slice));
+    fields.extend([
+        has_more.as_slice(),
+        tip_height.as_slice(),
+        tip_hash.as_slice(),
+    ]);
+    directory_sync_signing_digest(b"AeroNyx-DirectorySync-BlockRangeResponse-v1", fields)
+}
+
+/// Canonical digest signed by a Directory Sync object request.
+#[must_use]
+pub fn directory_descriptor_objects_request_signing_bytes(
+    chain_id: &[u8; 32],
+    descriptor_hashes: &[[u8; 32]],
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+) -> [u8; 32] {
+    let count = u64::try_from(descriptor_hashes.len())
+        .unwrap_or(u64::MAX)
+        .to_le_bytes();
+    let request_timestamp = request_timestamp.to_le_bytes();
+    let mut fields = Vec::<&[u8]>::with_capacity(descriptor_hashes.len() + 5);
+    fields.extend([chain_id.as_slice(), count.as_slice()]);
+    fields.extend(descriptor_hashes.iter().map(<[u8; 32]>::as_slice));
+    fields.extend([
+        request_id.as_slice(),
+        requester.as_slice(),
+        request_timestamp.as_slice(),
+    ]);
+    directory_sync_signing_digest(b"AeroNyx-DirectorySync-ObjectsRequest-v1", fields)
+}
+
+/// Canonical digest signed by a Directory Sync object response.
+#[must_use]
+pub fn directory_descriptor_objects_response_signing_bytes(
+    request_id: &[u8; 16],
+    responder: &[u8; 32],
+    response_timestamp: u64,
+    descriptor_hashes: &[[u8; 32]],
+) -> [u8; 32] {
+    let response_timestamp = response_timestamp.to_le_bytes();
+    let count = u64::try_from(descriptor_hashes.len())
+        .unwrap_or(u64::MAX)
+        .to_le_bytes();
+    let mut fields = Vec::<&[u8]>::with_capacity(descriptor_hashes.len() + 4);
+    fields.extend([
+        request_id.as_slice(),
+        responder.as_slice(),
+        response_timestamp.as_slice(),
+        count.as_slice(),
+    ]);
+    fields.extend(descriptor_hashes.iter().map(<[u8; 32]>::as_slice));
+    directory_sync_signing_digest(b"AeroNyx-DirectorySync-ObjectsResponse-v1", fields)
+}
+
+/// Encodes a canonical bounded Directory Sync frame including its magic byte.
+///
+/// # Errors
+/// Returns `CoreError::MalformedMessage` when serialization fails.
+pub fn encode_directory_sync_message(message: &DirectorySyncMessage) -> Result<Vec<u8>, CoreError> {
+    let payload = bincode::options()
+        .with_fixint_encoding()
+        .with_limit(MAX_DIRECTORY_SYNC_MESSAGE_BYTES)
+        .serialize(message)
+        .map_err(|error| CoreError::malformed(format!("directory sync encode: {error}")))?;
+    let mut frame = Vec::with_capacity(payload.len() + 1);
+    frame.push(DIRECTORY_SYNC_MAGIC);
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+/// Decodes one canonical bounded Directory Sync frame.
+///
+/// # Errors
+/// Returns `CoreError::MalformedMessage` for a wrong magic byte, trailing data,
+/// oversized payload, or malformed message.
+pub fn decode_directory_sync_message(bytes: &[u8]) -> Result<DirectorySyncMessage, CoreError> {
+    if bytes.first().copied() != Some(DIRECTORY_SYNC_MAGIC) {
+        return Err(CoreError::malformed("directory sync magic mismatch"));
+    }
+    bincode::options()
+        .with_fixint_encoding()
+        .with_limit(MAX_DIRECTORY_SYNC_MESSAGE_BYTES)
+        .reject_trailing_bytes()
+        .deserialize(&bytes[1..])
+        .map_err(|error| CoreError::malformed(format!("directory sync decode: {error}")))
+}
+
+// ============================================
 // NodeBootstrapSnapshot
 // ============================================
 
@@ -1175,6 +1519,107 @@ mod tests {
         let decoded = decode_discovery_message(&bytes).unwrap();
 
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn directory_sync_tip_frame_is_canonical_and_domain_bound() {
+        let requester = IdentityKeyPair::from_bytes(&[0x91; 32]).unwrap();
+        let request_id = [0x92; 16];
+        let timestamp = 1_700_000_123;
+        let signing_bytes = directory_tip_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &requester.public_key_bytes(),
+            timestamp,
+        );
+        let message = DirectorySyncMessage::TipRequestV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            requester: requester.public_key_bytes(),
+            request_timestamp: timestamp,
+            signature: requester.sign(&signing_bytes),
+        };
+
+        let encoded = encode_directory_sync_message(&message).unwrap();
+        assert_eq!(encoded.first().copied(), Some(DIRECTORY_SYNC_MAGIC));
+        assert_eq!(decode_directory_sync_message(&encoded).unwrap(), message);
+        assert_ne!(
+            signing_bytes,
+            directory_tip_request_signing_bytes(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &request_id,
+                &requester.public_key_bytes(),
+                timestamp + 1,
+            )
+        );
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(decode_directory_sync_message(&trailing).is_err());
+    }
+
+    #[test]
+    fn directory_sync_range_and_object_digests_bind_order_and_tip() {
+        let producer = IdentityKeyPair::from_bytes(&[0x93; 32]).unwrap();
+        let first_peer = IdentityKeyPair::from_bytes(&[0x94; 32]).unwrap();
+        let second_peer = IdentityKeyPair::from_bytes(&[0x95; 32]).unwrap();
+        let first = SignedNodeDescriptor::sign(descriptor_for(&first_peer), &first_peer).unwrap();
+        let second =
+            SignedNodeDescriptor::sign(descriptor_for(&second_peer), &second_peer).unwrap();
+        let first_commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&first).unwrap();
+        let second_commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&second).unwrap();
+        let block = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            1_700_000_200,
+            [0u8; 32],
+            vec![first_commitment, second_commitment],
+            &producer,
+        )
+        .unwrap();
+        let request_id = [0x96; 16];
+        let forward = directory_block_range_response_signing_bytes(
+            &request_id,
+            &producer.public_key_bytes(),
+            1_700_000_201,
+            std::slice::from_ref(&block),
+            false,
+            1,
+            &block.hash(),
+        );
+        let different_tip = directory_block_range_response_signing_bytes(
+            &request_id,
+            &producer.public_key_bytes(),
+            1_700_000_201,
+            std::slice::from_ref(&block),
+            false,
+            2,
+            &block.hash(),
+        );
+        assert_ne!(forward, different_tip);
+
+        let hashes = [
+            first_commitment.descriptor_hash,
+            second_commitment.descriptor_hash,
+        ];
+        let reversed = [hashes[1], hashes[0]];
+        assert_ne!(
+            directory_descriptor_objects_request_signing_bytes(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &hashes,
+                &request_id,
+                &producer.public_key_bytes(),
+                1_700_000_201,
+            ),
+            directory_descriptor_objects_request_signing_bytes(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &reversed,
+                &request_id,
+                &producer.public_key_bytes(),
+                1_700_000_201,
+            )
+        );
     }
 
     #[test]

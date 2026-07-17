@@ -34,6 +34,7 @@
 //! - [`voice`]: v1.0.0-Voice Peer virtual IP resolution for UDP direct-connect
 //! - [`chat_handlers`]: client/VPN-only encrypted media blob transfer
 //! - [`discovery`]: v0.1.0 Discovery snapshot/gossip endpoints
+//! - [`directory_chain_peer`]: signed bounded Directory Chain peer transport
 //! - [`chat_peer`]: v0.1.0 node-to-node encrypted chat envelope relay
 //! - [`memchain_peer`]: v2.7.0 signed node-to-node commitment block ranges
 //!
@@ -82,6 +83,7 @@
 //! v2.7.19-PublicApiBounds - Centralized bounded peer HTTP response decoding.
 //! v2.7.20-PublicApiBackpressure - Centralized lock-free RAII request permits.
 //! v2.7.21-ChatBlobWiring - Compile the encrypted client blob API module.
+//! v2.8.24-DirectorySyncServing - Compile authenticated Directory Chain peer routes.
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -256,6 +258,7 @@ pub mod local;
 // ── v1.0.0-Voice: Peer virtual IP resolution for UDP direct-connect routing ──
 pub mod chat_handlers;
 pub mod chat_peer;
+pub mod directory_chain_peer;
 pub mod discovery;
 pub mod memchain_peer;
 pub mod voice;

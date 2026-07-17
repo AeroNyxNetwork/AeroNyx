@@ -52,6 +52,7 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.13.0-DirectorySyncPins — Added fail-closed Directory Sync peer admission pins
 //! v0.12.0-DirectoryChainStore — Added optional fail-closed local directory ledger path
 //! v0.11.0-VerifiedDeliveryWitnessAdmission — Added explicit witness requester pins
 //! v0.10.0-VerifiedDeliveryWitness — Added optional pinned cache-anchor witnesses
@@ -84,6 +85,7 @@ use crate::management::ManagementConfig;
 
 const MAX_VERIFIED_DELIVERY_WITNESS_NODE_IDS: usize = 3;
 const MAX_VERIFIED_DELIVERY_WITNESS_REQUESTER_NODE_IDS: usize = 64;
+const MAX_DIRECTORY_CHAIN_SYNC_PEER_NODE_IDS: usize = 16;
 
 // ── Sub-module re-exports (keep callers' use-paths stable) ────────────────
 pub use crate::config_chat_relay::ChatRelayConfig;
@@ -141,6 +143,12 @@ pub struct DiscoveryConfig {
     /// It must never reuse a bootstrap snapshot or mutable peer-cache path.
     #[serde(default)]
     pub directory_chain_path: Option<String>,
+    /// Operator-pinned node identities allowed to exchange Directory Sync V1.
+    ///
+    /// This is deliberately independent of permissionless discovery allow/deny
+    /// policy. An empty list keeps tip/block/object peer routes fail-closed.
+    #[serde(default)]
+    pub directory_chain_sync_peer_node_ids: Vec<String>,
     /// Operator-pinned nodes that witness the signed delivery-cache generation.
     ///
     /// Witnesses receive only this node's identity, a monotonic generation,
@@ -403,6 +411,55 @@ impl DiscoveryConfig {
             }
         }
 
+        if !self.directory_chain_sync_peer_node_ids.is_empty() {
+            if self.directory_chain_path.is_none() {
+                return Err(ServerError::config_invalid(
+                    "discovery.directory_chain_sync_peer_node_ids",
+                    "requires discovery.directory_chain_path",
+                ));
+            }
+            if self.directory_chain_sync_peer_node_ids.len()
+                > MAX_DIRECTORY_CHAIN_SYNC_PEER_NODE_IDS
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.directory_chain_sync_peer_node_ids",
+                    format!(
+                        "supports at most {MAX_DIRECTORY_CHAIN_SYNC_PEER_NODE_IDS} pinned peers"
+                    ),
+                ));
+            }
+            let mut validated =
+                Vec::<[u8; 32]>::with_capacity(self.directory_chain_sync_peer_node_ids.len());
+            for configured in &self.directory_chain_sync_peer_node_ids {
+                let value = configured.trim();
+                let decoded = hex::decode(value).map_err(|_| {
+                    ServerError::config_invalid(
+                        "discovery.directory_chain_sync_peer_node_ids",
+                        "each entry must be a 64-character Ed25519 public key in hexadecimal",
+                    )
+                })?;
+                let node_id: [u8; 32] = decoded.try_into().map_err(|_| {
+                    ServerError::config_invalid(
+                        "discovery.directory_chain_sync_peer_node_ids",
+                        "each entry must decode to exactly 32 bytes",
+                    )
+                })?;
+                if value.len() != 64 || node_id.iter().all(|byte| *byte == 0) {
+                    return Err(ServerError::config_invalid(
+                        "discovery.directory_chain_sync_peer_node_ids",
+                        "each entry must be a non-zero 64-character Ed25519 public key",
+                    ));
+                }
+                if validated.contains(&node_id) {
+                    return Err(ServerError::config_invalid(
+                        "discovery.directory_chain_sync_peer_node_ids",
+                        "duplicate peer identities are not allowed",
+                    ));
+                }
+                validated.push(node_id);
+            }
+        }
+
         if !self.verified_delivery_witness_node_ids.is_empty()
             || self.verified_delivery_witness_required_for_restore
             || self.verified_delivery_witness_min_verified
@@ -655,6 +712,18 @@ impl DiscoveryConfig {
             .collect()
     }
 
+    /// Returns validated Directory Sync peer identities in operator pin order.
+    #[must_use]
+    pub fn directory_chain_sync_peer_node_id_bytes(&self) -> Vec<[u8; 32]> {
+        self.directory_chain_sync_peer_node_ids
+            .iter()
+            .filter_map(|value| {
+                let decoded = hex::decode(value.trim()).ok()?;
+                decoded.try_into().ok()
+            })
+            .collect()
+    }
+
     /// Returns validated identities allowed to use this node as a witness.
     #[must_use]
     pub fn verified_delivery_witness_requester_node_id_bytes(&self) -> Vec<[u8; 32]> {
@@ -705,6 +774,7 @@ impl Default for DiscoveryConfig {
             fetch_timeout_secs: Self::default_fetch_timeout_secs(),
             peer_cache_path: None,
             directory_chain_path: None,
+            directory_chain_sync_peer_node_ids: Vec::new(),
             verified_delivery_witness_node_ids: Vec::new(),
             verified_delivery_witness_requester_node_ids: Vec::new(),
             verified_delivery_witness_min_verified:
@@ -1071,6 +1141,10 @@ db_path = "memchain.db"
         assert!(config.discovery.bootstrap_snapshot_path.is_none());
         assert!(config.discovery.bootstrap_snapshot_url.is_none());
         assert!(config.discovery.directory_chain_path.is_none());
+        assert!(config
+            .discovery
+            .directory_chain_sync_peer_node_ids
+            .is_empty());
         assert!(config.validate().is_ok());
     }
 
@@ -1085,6 +1159,9 @@ seed_endpoints = ["http://34.136.167.59:8422", "8.213.146.244:8422"]
 fetch_timeout_secs = 15
 peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
 directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+directory_chain_sync_peer_node_ids = [
+  "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+]
 peer_cache_write_interval_secs = 120
 gossip_enabled = true
 gossip_interval_secs = 45
@@ -1130,6 +1207,10 @@ advertise_onion_middle = true
         assert_eq!(
             config.discovery.directory_chain_path.as_deref(),
             Some("/var/lib/aeronyx/directory-chain.db")
+        );
+        assert_eq!(
+            config.discovery.directory_chain_sync_peer_node_id_bytes(),
+            vec![[0xcc; 32]]
         );
         assert_eq!(config.discovery.peer_cache_write_interval_secs, 120);
         assert!(config.discovery.gossip_enabled);
@@ -1330,6 +1411,26 @@ enabled = true
 directory_chain_path = "/var/lib/aeronyx/shared.db"
 "#;
         assert!(ServerConfig::from_str(collides_with_memchain).is_err());
+
+        let pins_without_store = r#"
+[discovery]
+enabled = true
+directory_chain_sync_peer_node_ids = [
+  "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+]
+"#;
+        assert!(ServerConfig::from_str(pins_without_store).is_err());
+
+        let duplicate_pins = r#"
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+directory_chain_sync_peer_node_ids = [
+  "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+]
+"#;
+        assert!(ServerConfig::from_str(duplicate_pins).is_err());
     }
 
     #[test]

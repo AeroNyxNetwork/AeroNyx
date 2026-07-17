@@ -41,9 +41,11 @@
 //!   history to this database.
 //! - Do not weaken startup audit or replace `SQLite` transactions with an
 //!   in-place JSON rewrite.
-//! - Peer synchronization and fork selection belong to later reviewed layers.
+//! - Peer transport may export only an audit-gated bounded page or exact
+//!   descriptor object batch. Replica import and fork selection remain separate.
 //!
 //! ## Last Modified
+//! v0.2.0-DirectorySyncReads - Added audit-gated bounded tip/page/object reads.
 //! v0.1.0-DirectoryChainStore - Initial transactional local block persistence.
 // ============================================================================
 
@@ -56,7 +58,8 @@ use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::discovery::{
     DirectoryCommitmentBlockV1, DirectoryCommitmentValidationError,
     DirectoryDescriptorCommitmentV1, SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
-    MAX_DIRECTORY_COMMITMENTS_PER_BLOCK,
+    MAX_DIRECTORY_COMMITMENTS_PER_BLOCK, MAX_DIRECTORY_SYNC_BLOCKS_V1,
+    MAX_DIRECTORY_SYNC_OBJECTS_V1,
 };
 use bincode::Options;
 use parking_lot::Mutex;
@@ -92,6 +95,9 @@ pub enum DirectoryChainStoreError {
     /// Persisted metadata or chain/index state is inconsistent.
     #[error("directory chain integrity error: {0}")]
     Integrity(String),
+    /// A bounded read request violates the V1 transport contract.
+    #[error("directory chain request error: {0}")]
+    Request(String),
 }
 
 /// Result of a complete persisted-chain startup audit.
@@ -132,6 +138,19 @@ pub struct DirectoryChainAppendReport {
     pub tip_height: u64,
     /// Tip hash after the transaction.
     pub tip_hash: [u8; 32],
+}
+
+/// One audit-gated, snapshot-like bounded page of the local producer chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryChainPage {
+    /// Contiguous blocks starting at the requested height.
+    pub blocks: Vec<DirectoryCommitmentBlockV1>,
+    /// Audited local tip height at page construction time.
+    pub tip_height: u64,
+    /// Audited local tip hash at page construction time.
+    pub tip_hash: [u8; 32],
+    /// Audited local tip block timestamp.
+    pub tip_timestamp: u64,
 }
 
 /// Single-producer transactional Directory Chain journal.
@@ -419,6 +438,160 @@ impl DirectoryChainStore {
             ));
         }
         Ok(report)
+    }
+
+    /// Returns the current tip only after a complete persisted-chain audit.
+    ///
+    /// The explicit audit gate keeps the peer transport from signing state that
+    /// was modified outside this process after startup. Dedicated peer pinning
+    /// and rate limiting bound the cost until a future incremental audit cache
+    /// can preserve the same fail-closed property.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryChainStoreError`] if any persisted block, descriptor
+    /// object, or index row fails the complete audit.
+    pub fn audited_tip(
+        &self,
+        observed_at: u64,
+    ) -> Result<DirectoryChainAudit, DirectoryChainStoreError> {
+        self.audit(observed_at)
+    }
+
+    /// Returns one contiguous bounded page after auditing the complete chain.
+    ///
+    /// `from_height` is one-based. A request beyond the current tip returns an
+    /// empty page with the audited tip, allowing an authenticated peer to
+    /// distinguish convergence from a missing local object.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryChainStoreError`] for zero/out-of-contract bounds,
+    /// audit failure, a missing in-range block, or continuity failure.
+    pub fn audited_block_page(
+        &self,
+        from_height: u64,
+        limit: u16,
+        observed_at: u64,
+    ) -> Result<DirectoryChainPage, DirectoryChainStoreError> {
+        if from_height == 0 {
+            return Err(DirectoryChainStoreError::Request(
+                "from_height must be positive".to_string(),
+            ));
+        }
+        if limit == 0 || limit > MAX_DIRECTORY_SYNC_BLOCKS_V1 {
+            return Err(DirectoryChainStoreError::Request(format!(
+                "limit must be between 1 and {MAX_DIRECTORY_SYNC_BLOCKS_V1}"
+            )));
+        }
+        let audit = self.audit(observed_at)?;
+        if from_height > audit.tip_height {
+            return Ok(DirectoryChainPage {
+                blocks: Vec::new(),
+                tip_height: audit.tip_height,
+                tip_hash: audit.tip_hash,
+                tip_timestamp: audit.tip_timestamp,
+            });
+        }
+
+        let available = audit.tip_height - from_height + 1;
+        let count = available.min(u64::from(limit));
+        let count = usize::try_from(count).map_err(|_| {
+            DirectoryChainStoreError::Request("page count exceeds usize range".to_string())
+        })?;
+        let mut blocks = Vec::with_capacity(count);
+        for offset in 0..count {
+            let height = from_height
+                .checked_add(u64::try_from(offset).map_err(|_| {
+                    DirectoryChainStoreError::Request("page offset exceeds u64 range".to_string())
+                })?)
+                .ok_or_else(|| {
+                    DirectoryChainStoreError::Request("page height overflow".to_string())
+                })?;
+            let block = self.block(height)?.ok_or_else(|| {
+                DirectoryChainStoreError::Integrity(format!(
+                    "audited block {height} disappeared while building a page"
+                ))
+            })?;
+            blocks.push(block);
+        }
+
+        if let Some(first) = blocks.first() {
+            let (mut expected_height, mut expected_hash, mut previous_timestamp) =
+                if first.header.height == 1 {
+                    (1, [0u8; 32], 0)
+                } else {
+                    let previous_height = first.header.height - 1;
+                    let previous = self.block(previous_height)?.ok_or_else(|| {
+                        DirectoryChainStoreError::Integrity(format!(
+                            "audited predecessor block {previous_height} disappeared"
+                        ))
+                    })?;
+                    (
+                        first.header.height,
+                        previous.hash(),
+                        previous.header.timestamp,
+                    )
+                };
+            for block in &blocks {
+                block.verify_at(
+                    &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                    expected_height,
+                    &expected_hash,
+                    previous_timestamp,
+                    observed_at,
+                )?;
+                expected_height = expected_height.checked_add(1).ok_or_else(|| {
+                    DirectoryChainStoreError::Integrity(
+                        "directory page height exhausted".to_string(),
+                    )
+                })?;
+                expected_hash = block.hash();
+                previous_timestamp = block.header.timestamp;
+            }
+        }
+
+        Ok(DirectoryChainPage {
+            blocks,
+            tip_height: audit.tip_height,
+            tip_hash: audit.tip_hash,
+            tip_timestamp: audit.tip_timestamp,
+        })
+    }
+
+    /// Loads an exact bounded descriptor-object batch after a complete audit.
+    ///
+    /// Objects are returned in request order. `Ok(None)` means at least one
+    /// requested content hash is absent; partial responses are never emitted.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryChainStoreError`] for an empty/oversized/duplicated
+    /// request, audit failure, malformed object, or content-hash mismatch.
+    pub fn audited_descriptor_objects(
+        &self,
+        descriptor_hashes: &[[u8; 32]],
+        observed_at: u64,
+    ) -> Result<Option<Vec<SignedNodeDescriptor>>, DirectoryChainStoreError> {
+        if descriptor_hashes.is_empty() || descriptor_hashes.len() > MAX_DIRECTORY_SYNC_OBJECTS_V1 {
+            return Err(DirectoryChainStoreError::Request(format!(
+                "descriptor hash count must be between 1 and {MAX_DIRECTORY_SYNC_OBJECTS_V1}"
+            )));
+        }
+        let mut canonical = descriptor_hashes.to_vec();
+        canonical.sort_unstable();
+        if canonical.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(DirectoryChainStoreError::Request(
+                "descriptor hashes must be unique".to_string(),
+            ));
+        }
+        self.audit(observed_at)?;
+
+        let mut objects = Vec::with_capacity(descriptor_hashes.len());
+        for descriptor_hash in descriptor_hashes {
+            let Some(object) = self.descriptor_object(descriptor_hash)? else {
+                return Ok(None);
+            };
+            objects.push(object);
+        }
+        Ok(Some(objects))
     }
 
     /// Loads one verified block by height for future bounded peer sync.
@@ -964,6 +1137,54 @@ mod tests {
                 .unwrap(),
             descriptor
         );
+    }
+
+    #[test]
+    fn audited_peer_reads_are_bounded_ordered_and_exact() {
+        let temp = TempDir::new().unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x24; 32]).unwrap();
+        let first_peer = IdentityKeyPair::from_bytes(&[0x25; 32]).unwrap();
+        let second_peer = IdentityKeyPair::from_bytes(&[0x26; 32]).unwrap();
+        let first = signed_descriptor(&first_peer, 1, "first.example:8422");
+        let second = signed_descriptor(&second_peer, 1, "second.example:8422");
+        let (store, _) = DirectoryChainStore::open(
+            temp.path().join("directory.db"),
+            producer.public_key_bytes(),
+            NOW,
+        )
+        .unwrap();
+        store
+            .append_descriptors(std::slice::from_ref(&first), NOW, &producer)
+            .unwrap();
+        store
+            .append_descriptors(std::slice::from_ref(&second), NOW + 1, &producer)
+            .unwrap();
+
+        let page = store.audited_block_page(2, 1, NOW + 1).unwrap();
+        assert_eq!(page.blocks.len(), 1);
+        assert_eq!(page.blocks[0].header.height, 2);
+        assert_eq!(page.tip_height, 2);
+        assert_eq!(page.tip_hash, page.blocks[0].hash());
+        let beyond = store.audited_block_page(3, 1, NOW + 1).unwrap();
+        assert!(beyond.blocks.is_empty());
+        assert_eq!(beyond.tip_height, 2);
+
+        let first_hash = store.block(1).unwrap().unwrap().commitments[0].descriptor_hash;
+        let second_hash = page.blocks[0].commitments[0].descriptor_hash;
+        let objects = store
+            .audited_descriptor_objects(&[second_hash, first_hash], NOW + 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(objects, vec![second, first]);
+        assert!(store
+            .audited_descriptor_objects(&[[0x42; 32]], NOW + 1)
+            .unwrap()
+            .is_none());
+        assert!(store.audited_block_page(0, 1, NOW + 1).is_err());
+        assert!(store.audited_block_page(1, 0, NOW + 1).is_err());
+        assert!(store
+            .audited_descriptor_objects(&[first_hash, first_hash], NOW + 1)
+            .is_err());
     }
 
     #[test]

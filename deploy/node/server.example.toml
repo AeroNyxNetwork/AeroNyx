@@ -111,6 +111,10 @@ peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
 # node descriptor commitments only; never point it at the peer cache or a
 # MemChain/chat database.
 # directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+# Dedicated bilateral admission for signed Directory Sync tip/block/object
+# exchange. Permissionless discovery alone never grants ledger-read access.
+# Empty keeps all Directory Sync peer requests fail-closed.
+directory_chain_sync_peer_node_ids = []
 peer_cache_write_interval_secs = 120
 # Optional external rollback witness for the signed verified-delivery cache.
 # Each pin is a 32-byte node Ed25519 identity in hexadecimal. Witnesses retain

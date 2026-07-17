@@ -300,6 +300,7 @@
 //   v2.8.7-CertificateExchange - Post-startup audited certificate exchange
 //   v2.8.5-TrustedDivergenceHalt - Sticky trusted fork evidence and live production halt
 //   v2.8.3-WitnessDivergence - Signed divergent startup-gate integration test
+//   v2.8.24-DirectorySyncServing - Mounted pinned authenticated Directory Chain peer reads
 //   v2.8.23-DirectoryChainStore - Transactional local descriptor commitment ledger
 //   v2.8.1-BlockFollowerOps - Configurable bounded catch-up round budget
 //   v2.8.0-ChatPullV2 - Signed opaque-cursor stable mailbox snapshots
@@ -432,6 +433,7 @@ use crate::api::discovery::{
     discovery_readiness_status_value, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
     GossipResponse,
 };
+use crate::api::directory_chain_peer::build_directory_chain_peer_router;
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
     pull_record_commitment_checkpoint, pull_record_commitment_checkpoint_certificate,
@@ -1438,7 +1440,7 @@ impl Server {
             self.spawn_peer_store_persistence_task(Arc::clone(&peer_store));
         let directory_chain_persistence_task = self.spawn_directory_chain_persistence_task(
             Arc::clone(&peer_store),
-            directory_chain_store,
+            directory_chain_store.clone(),
         );
         let discovery_gossip_task =
             self.spawn_discovery_gossip_task(Arc::clone(&peer_store), chat_relay_runtime_ready);
@@ -1784,6 +1786,7 @@ impl Server {
                 Arc::clone(&encrypted_message_counter),
                 Arc::clone(&packet_handler),
                 Arc::clone(&peer_store),
+                directory_chain_store.clone(),
                 chat_relay.clone(),
                 Arc::clone(&udp),
                 commitment_sync_tip_notifier,
@@ -2588,6 +2591,7 @@ impl Server {
         encrypted_message_counter: Arc<AtomicU64>,
         packet_handler: Arc<PacketHandler>,
         peer_store: Arc<PeerStore>,
+        directory_chain_store: Option<Arc<DirectoryChainStore>>,
         chat_relay: Option<Arc<ChatRelayService>>,
         udp: Arc<UdpTransport>,
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
@@ -2621,6 +2625,12 @@ impl Server {
         let commitment_lease_authorized_coordinator =
             self.config.memchain.commitment_sync_coordinator_node_id();
         let public_commitment_sync_tip_notifier = commitment_sync_tip_notifier.clone();
+        let directory_chain_sync_peer_ids = self
+            .config
+            .discovery
+            .directory_chain_sync_peer_node_id_bytes();
+        let public_directory_chain_store = directory_chain_store.clone();
+        let public_directory_chain_sync_peer_ids = directory_chain_sync_peer_ids.clone();
 
         tokio::spawn(async move {
             if let Some(public_addr) = public_api_listen_addr {
@@ -2633,6 +2643,8 @@ impl Server {
                     Arc::clone(&node_identity),
                     Arc::clone(&peer_http_client),
                     local_capability_status.clone(),
+                    public_directory_chain_store,
+                    public_directory_chain_sync_peer_ids,
                     commitment_storage.clone(),
                     commitment_lease_authorized_coordinator,
                     public_commitment_sync_tip_notifier,
@@ -2730,6 +2742,16 @@ impl Server {
                     discovery_api_policy,
                     local_capability_status,
                 ));
+            let app = if let Some(store) = directory_chain_store {
+                app.merge(build_directory_chain_peer_router(
+                    store,
+                    Arc::clone(&peer_store),
+                    Arc::clone(&node_identity),
+                    directory_chain_sync_peer_ids,
+                ))
+            } else {
+                app
+            };
             let app = if let Some(storage) = commitment_storage {
                 app.merge(build_memchain_peer_router_with_runtime(
                     storage,
@@ -2823,12 +2845,16 @@ impl Server {
         node_identity: Arc<IdentityKeyPair>,
         peer_http_client: Arc<reqwest::Client>,
         local_capability_status: DiscoveryLocalCapabilityStatus,
+        directory_chain_store: Option<Arc<DirectoryChainStore>>,
+        directory_chain_sync_peer_ids: Vec<[u8; 32]>,
         commitment_storage: Option<Arc<MemoryStorage>>,
         commitment_lease_authorized_coordinator: Option<[u8; 32]>,
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
     ) -> axum::Router {
         let block_peer_store = Arc::clone(&peer_store);
         let block_identity = Arc::clone(&node_identity);
+        let directory_peer_store = Arc::clone(&peer_store);
+        let directory_identity = Arc::clone(&node_identity);
         let app = build_discovery_router_with_local_status(
             Arc::clone(&peer_store),
             discovery_api_policy,
@@ -2842,6 +2868,16 @@ impl Server {
             node_identity,
             peer_http_client,
         ));
+        let app = if let Some(store) = directory_chain_store {
+            app.merge(build_directory_chain_peer_router(
+                store,
+                directory_peer_store,
+                directory_identity,
+                directory_chain_sync_peer_ids,
+            ))
+        } else {
+            app
+        };
         if let Some(storage) = commitment_storage {
             app.merge(build_memchain_peer_router_with_runtime(
                 storage,
@@ -2863,7 +2899,7 @@ impl Server {
         let listener = match tokio::net::TcpListener::bind(listen_addr).await {
             Ok(listener) => {
                 info!(
-                    "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/chat/peer/*, /api/memchain/peer/block-announce, /api/memchain/peer/block-range, /api/memchain/peer/checkpoint, /api/memchain/peer/coordinator-lease, /api/discovery/peer/verified-delivery-anchor-witness)",
+                    "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/discovery/peer/directory/*, /api/chat/peer/*, /api/memchain/peer/block-announce, /api/memchain/peer/block-range, /api/memchain/peer/checkpoint, /api/memchain/peer/coordinator-lease, /api/discovery/peer/verified-delivery-anchor-witness)",
                     listen_addr
                 );
                 listener

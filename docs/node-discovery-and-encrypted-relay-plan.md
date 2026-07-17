@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.8.0 - Added a transactional local Directory Chain runtime store with fail-closed startup audit and periodic descriptor reconciliation.
+Modification Reason: v0.9.0 - Added authenticated bounded Directory Sync serving for pinned live peers.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.8.0 - Added producer-pinned SQLite persistence and startup recovery for local Directory Chain blocks; peer synchronization and fork selection remain pending.
+Last Modified: v0.9.0 - Added the signed tip, block-range, and descriptor-object serving half of Directory Sync V1; replica import and fork selection remain pending.
+Previous: v0.8.0 - Added producer-pinned SQLite persistence and startup recovery for local Directory Chain blocks.
 Previous: v0.7.0 - Added the privacy-bounded Directory Chain V1 protocol core.
 Previous: v0.6.0 - Added authenticated external witnessing for verified-client delivery-cache anchors.
 Previous: v0.5.0 - Added local signed rollback protection for verified-client delivery evidence.
@@ -948,7 +949,7 @@ Verification:
 
 ### Phase 6 - Directory Chain
 
-Status: Protocol core and local runtime persistence implemented; peer synchronization remains pending.
+Status: Protocol core, local runtime persistence, and authenticated bounded serving implemented; remote replica import remains pending.
 
 Goals:
 
@@ -993,9 +994,25 @@ Implemented in the local Rust runtime:
 - A 64 KiB pre-deserialization limit and the protocol's 256-commitment block
   limit bound recovery memory and block construction.
 
+Implemented in Directory Sync V1 serving:
+
+- Domain-separated Ed25519 request and response signatures bind request ids,
+  timestamps, ordered block hashes/object hashes, and the audited tip.
+- `/api/discovery/peer/directory/tip`, `block-range`, and
+  `descriptor-objects` use bounded binary frames and exact content addressing.
+- A dedicated `discovery.directory_chain_sync_peer_node_ids` pin list is
+  required in addition to a current valid signed PeerStore descriptor. Empty
+  configuration remains fail-closed and backward compatible.
+- Requests enforce timestamp freshness, replay rejection, per-peer rate
+  limits, strict body/page/object limits, canonical decoding, and chain id.
+- Every response is gated by a complete persisted-chain audit. Object batches
+  are all-or-nothing and preserve the requested hash order.
+
 Still pending before Directory Chain can be described as live:
 
-- Peer synchronization, bounded catch-up, and snapshot transport.
+- Outbound peer pull, durable producer-isolated replica import, and bounded
+  multi-page catch-up.
+- Signed fork/equivocation incident quarantine and operator recovery policy.
 - Witness/co-signature policy and deterministic fork selection.
 - Operational API/metrics and multi-node synchronization tests.
 
@@ -1067,6 +1084,27 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-17 - Added Directory Sync V1 authenticated serving transport.
+- Files changed:
+  - crates/aeronyx-core/src/protocol/discovery.rs
+  - crates/aeronyx-server/src/api/directory_chain_peer.rs
+  - crates/aeronyx-server/src/api/mod.rs
+  - crates/aeronyx-server/src/services/directory_chain.rs
+  - crates/aeronyx-server/src/services/mod.rs
+  - crates/aeronyx-server/src/config.rs
+  - crates/aeronyx-server/src/server.rs
+  - deploy/node/server.example.toml
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Verification:
+  - Core canonical frame/signing-domain tests.
+  - Store audit-gated bounded page, exact object ordering, and invalid-bound tests.
+  - API pin/live-peer/signature/replay/range/object integration tests.
+- Notes:
+  - Permissionless discovery does not grant Directory Chain history access.
+  - This transport proves what one producer signed; it does not establish
+    consensus, finality, quorum, longest-chain selection, or financial state.
+  - Replica persistence and fork quarantine are the next reviewed layer.
+
 2026-07-17 - Added transactional local Directory Chain persistence.
 - Files changed:
   - crates/aeronyx-server/src/services/directory_chain.rs
