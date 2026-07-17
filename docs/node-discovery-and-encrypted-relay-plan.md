@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.7.0 - Defined the first Directory Chain protocol core: authenticated descriptor commitments, deterministic Merkle roots, and signed hash-linked blocks.
+Modification Reason: v0.8.0 - Added a transactional local Directory Chain runtime store with fail-closed startup audit and periodic descriptor reconciliation.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.7.0 - Added the privacy-bounded Directory Chain V1 protocol core; runtime persistence, gossip, and fork selection remain pending.
+Last Modified: v0.8.0 - Added producer-pinned SQLite persistence and startup recovery for local Directory Chain blocks; peer synchronization and fork selection remain pending.
+Previous: v0.7.0 - Added the privacy-bounded Directory Chain V1 protocol core.
 Previous: v0.6.0 - Added authenticated external witnessing for verified-client delivery-cache anchors.
 Previous: v0.5.0 - Added local signed rollback protection for verified-client delivery evidence.
 Previous: v0.4.0 - Added fail-closed verified-client delivery evidence recovery.
@@ -947,7 +948,7 @@ Verification:
 
 ### Phase 6 - Directory Chain
 
-Status: Protocol core implemented; runtime persistence and synchronization remain pending.
+Status: Protocol core and local runtime persistence implemented; peer synchronization remains pending.
 
 Goals:
 
@@ -973,18 +974,38 @@ Implemented in the V1 protocol core:
 - Same-node/same-sequence conflicting commitments remain visible as evidence
   instead of being silently collapsed.
 
+Implemented in the local Rust runtime:
+
+- Optional `discovery.directory_chain_path` enables a dedicated SQLite journal;
+  omission preserves backward-compatible disabled behavior.
+- The database pins schema version, production chain id, and this node's exact
+  producer identity. Identity or metadata mismatch fails startup closed.
+- WAL, `synchronous=FULL`, foreign keys, and one immediate transaction keep
+  signed blocks, commitment indexes, and content-addressed signed descriptor
+  objects on the same atomic tip.
+- Startup scans every persisted block and verifies height, previous hash,
+  timestamp, Merkle payload, producer signature, stored columns, and every
+  commitment index field before network listeners start. Every referenced
+  descriptor object is independently signature-verified and rehashed.
+- Authenticated PeerStore records are reconciled at startup, periodically, and
+  during graceful shutdown. Exact commitments are skipped; new or conflicting
+  authenticated descriptor observations become bounded signed blocks.
+- A 64 KiB pre-deserialization limit and the protocol's 256-commitment block
+  limit bound recovery memory and block construction.
+
 Still pending before Directory Chain can be described as live:
 
-- Durable block and chain-tip storage in the Rust node runtime.
 - Peer synchronization, bounded catch-up, and snapshot transport.
 - Witness/co-signature policy and deterministic fork selection.
-- Operational API, metrics, recovery, and multi-node deployment tests.
+- Operational API/metrics and multi-node synchronization tests.
 
 Files likely changed:
 
 ```text
 crates/aeronyx-core/src/protocol/discovery.rs (V1 protocol core implemented)
-crates/aeronyx-server/src/services/discovery/directory_chain.rs
+crates/aeronyx-server/src/services/directory_chain.rs (local persistence implemented)
+crates/aeronyx-server/src/config.rs
+crates/aeronyx-server/src/server.rs
 crates/aeronyx-server/src/services/discovery/witness.rs
 ```
 
@@ -1046,6 +1067,42 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-17 - Added transactional local Directory Chain persistence.
+- Files changed:
+  - crates/aeronyx-server/src/services/directory_chain.rs
+  - crates/aeronyx-server/src/services/mod.rs
+  - crates/aeronyx-server/src/config.rs
+  - crates/aeronyx-server/src/server.rs
+  - deploy/node/server.example.toml
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Verification:
+  - SQLite create/open/reopen, exact deduplication, new-sequence append,
+    same-sequence equivocation preservation, 257-commitment atomic batching,
+    producer mismatch, block-blob tamper, commitment-index tamper, descriptor
+    resolution, and signed descriptor-object tamper tests.
+  - Directory-path backward compatibility, disabled-mode, and database-path
+    isolation tests.
+  - `cargo clippy -p aeronyx-server --tests --no-deps` completed successfully;
+    no new production warning remains in the Directory Chain store.
+  - `aeronyx-server`: 1,055/1,055 unit tests passed; one doctest passed and
+    nine existing examples remained explicitly ignored.
+  - `cargo build -p aeronyx-server --release` completed successfully in 5m39s
+    on the reviewed US1 host.
+- Notes:
+  - Setting `discovery.directory_chain_path` is an explicit fail-closed opt-in.
+    A corrupt, wrong-chain, or wrong-producer database prevents listeners from
+    starting; history is never silently deleted or rebuilt.
+  - Runtime reconciliation stores authenticated public signed node descriptor
+    objects separately from opaque block commitments so historical commitments
+    remain resolvable. Public node endpoints/capabilities may therefore exist
+    in the local object table; they are never embedded in block payloads.
+  - The journal contains no client identity/IP, sender/receiver pair, route,
+    message id, payload, ciphertext, memory content, DNS content, destination,
+    domain, URL, browsing history, private key, or wallet-level traffic.
+  - This is one producer's durable signed observation chain. It is not peer
+    synchronization, witness quorum, fork choice, consensus, finality, token
+    accounting, smart-contract execution, or a financial blockchain.
+
 2026-07-17 - Added Directory Chain V1 protocol core.
 - Files changed:
   - crates/aeronyx-core/src/protocol/discovery.rs

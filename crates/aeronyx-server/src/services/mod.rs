@@ -11,6 +11,7 @@
 //   Re-exported PeerStoreStatus for nodeboard discovery status.
 //
 // Last Modified:
+//   v0.4.0-DirectoryChainStore - Registered transactional local directory ledger
 //   v0.3.0-DiscoveryStatus - Re-exported PeerStoreStatus
 //   v0.2.0-DiscoveryPhase2 - Re-exported PeerStoreImportReport
 //   v0.1.0-DiscoveryPhase1 - Added peer_store submodule
@@ -20,6 +21,7 @@
 
 pub mod chat_relay;
 pub mod deny_list;
+pub mod directory_chain;
 pub mod dns_proxy;
 pub mod handshake;
 pub mod ip_pool;
@@ -35,6 +37,9 @@ pub mod wallet_routes;
 // Re-export primary types
 pub use chat_relay::{derive_node_secret, ChatRelayService};
 pub use deny_list::{DenyList, DenyReason};
+pub use directory_chain::{
+    DirectoryChainAppendReport, DirectoryChainAudit, DirectoryChainStore, DirectoryChainStoreError,
+};
 pub use dns_proxy::spawn_dns_proxy;
 pub use handshake::HandshakeService;
 pub use ip_pool::IpPoolService;

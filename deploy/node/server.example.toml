@@ -105,6 +105,12 @@ node_info_path = "/etc/aeronyx/node_info.json"
 enabled = true
 advertise_self = true
 peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
+# Optional signed local Directory Chain journal. Once configured, startup
+# verifies every stored block, chain link, Merkle root, producer, and
+# commitment index before the service proceeds. This database contains public
+# node descriptor commitments only; never point it at the peer cache or a
+# MemChain/chat database.
+# directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
 peer_cache_write_interval_secs = 120
 # Optional external rollback witness for the signed verified-delivery cache.
 # Each pin is a 32-byte node Ed25519 identity in hexadecimal. Witnesses retain

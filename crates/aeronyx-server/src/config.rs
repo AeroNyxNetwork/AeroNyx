@@ -52,6 +52,7 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.12.0-DirectoryChainStore — Added optional fail-closed local directory ledger path
 //! v0.11.0-VerifiedDeliveryWitnessAdmission — Added explicit witness requester pins
 //! v0.10.0-VerifiedDeliveryWitness — Added optional pinned cache-anchor witnesses
 //! v1.4.0-DiscoveryRelayCapabilities — Added explicit onion-middle advertisement gate
@@ -134,6 +135,12 @@ pub struct DiscoveryConfig {
     /// re-verified on every load, so stale or tampered descriptors are skipped.
     #[serde(default)]
     pub peer_cache_path: Option<String>,
+    /// Optional SQLite path for the signed local Directory Chain journal.
+    ///
+    /// Configuring this path opts the node into fail-closed startup auditing.
+    /// It must never reuse a bootstrap snapshot or mutable peer-cache path.
+    #[serde(default)]
+    pub directory_chain_path: Option<String>,
     /// Operator-pinned nodes that witness the signed delivery-cache generation.
     ///
     /// Witnesses receive only this node's identity, a monotonic generation,
@@ -363,6 +370,35 @@ impl DiscoveryConfig {
                 return Err(ServerError::config_invalid(
                     "discovery.peer_cache_path",
                     "must not be empty when provided",
+                ));
+            }
+        }
+
+        if let Some(path) = &self.directory_chain_path {
+            let path = path.trim();
+            if path.is_empty() {
+                return Err(ServerError::config_invalid(
+                    "discovery.directory_chain_path",
+                    "must not be empty when provided",
+                ));
+            }
+            if !self.enabled {
+                return Err(ServerError::config_invalid(
+                    "discovery.directory_chain_path",
+                    "requires discovery.enabled = true",
+                ));
+            }
+            let conflicts_with = [
+                self.peer_cache_path.as_deref(),
+                self.bootstrap_snapshot_path.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|other| other.trim() == path);
+            if conflicts_with {
+                return Err(ServerError::config_invalid(
+                    "discovery.directory_chain_path",
+                    "must not reuse peer_cache_path or bootstrap_snapshot_path",
                 ));
             }
         }
@@ -668,6 +704,7 @@ impl Default for DiscoveryConfig {
             seed_endpoints: Vec::new(),
             fetch_timeout_secs: Self::default_fetch_timeout_secs(),
             peer_cache_path: None,
+            directory_chain_path: None,
             verified_delivery_witness_node_ids: Vec::new(),
             verified_delivery_witness_requester_node_ids: Vec::new(),
             verified_delivery_witness_min_verified:
@@ -756,6 +793,21 @@ impl ServerConfig {
             .map_err(|e| ServerError::config_invalid("management", e))?;
         self.memchain.validate()?;
         self.discovery.validate()?;
+        if let Some(directory_path) = self.discovery.directory_chain_path.as_deref() {
+            let directory_path = directory_path.trim();
+            if [
+                self.memchain.db_path.as_str(),
+                self.memchain.chat_relay.db_path.as_str(),
+            ]
+            .into_iter()
+            .any(|other| other.trim() == directory_path)
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.directory_chain_path",
+                    "must not reuse a MemChain or ChatRelay database path",
+                ));
+            }
+        }
         if (!self.discovery.verified_delivery_witness_node_ids.is_empty()
             || !self
                 .discovery
@@ -1018,6 +1070,7 @@ db_path = "memchain.db"
         assert!(!config.discovery.enabled);
         assert!(config.discovery.bootstrap_snapshot_path.is_none());
         assert!(config.discovery.bootstrap_snapshot_url.is_none());
+        assert!(config.discovery.directory_chain_path.is_none());
         assert!(config.validate().is_ok());
     }
 
@@ -1031,6 +1084,7 @@ bootstrap_snapshot_url = "https://nodes.aeronyx.network/bootstrap.json"
 seed_endpoints = ["http://34.136.167.59:8422", "8.213.146.244:8422"]
 fetch_timeout_secs = 15
 peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
 peer_cache_write_interval_secs = 120
 gossip_enabled = true
 gossip_interval_secs = 45
@@ -1072,6 +1126,10 @@ advertise_onion_middle = true
         assert_eq!(
             config.discovery.peer_cache_path.as_deref(),
             Some("/var/lib/aeronyx/peers-cache.json")
+        );
+        assert_eq!(
+            config.discovery.directory_chain_path.as_deref(),
+            Some("/var/lib/aeronyx/directory-chain.db")
         );
         assert_eq!(config.discovery.peer_cache_write_interval_secs, 120);
         assert!(config.discovery.gossip_enabled);
@@ -1244,6 +1302,34 @@ enabled = true
 bootstrap_snapshot_url = "file:///tmp/bootstrap.json"
 "#;
         assert!(ServerConfig::from_str(toml_str).is_err());
+    }
+
+    #[test]
+    fn test_discovery_rejects_invalid_directory_chain_path() {
+        let disabled = r#"
+[discovery]
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+"#;
+        assert!(ServerConfig::from_str(disabled).is_err());
+
+        let collides_with_cache = r#"
+[discovery]
+enabled = true
+peer_cache_path = "/var/lib/aeronyx/discovery-state"
+directory_chain_path = "/var/lib/aeronyx/discovery-state"
+"#;
+        assert!(ServerConfig::from_str(collides_with_cache).is_err());
+
+        let collides_with_memchain = r#"
+[memchain]
+mode = "local"
+db_path = "/var/lib/aeronyx/shared.db"
+
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/shared.db"
+"#;
+        assert!(ServerConfig::from_str(collides_with_memchain).is_err());
     }
 
     #[test]

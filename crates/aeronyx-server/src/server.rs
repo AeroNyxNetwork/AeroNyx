@@ -199,6 +199,9 @@
 //      anchor on pinned peer nodes, serializing generations so whole-host
 //      rollback and missed-generation gaps fail closed without exporting
 //      delivery counts, timestamps, routes, messages, payloads, or clients.
+//  85. Optionally opens a producer-pinned SQLite Directory Chain journal,
+//      audits every signed block before listeners start, and transactionally
+//      reconciles authenticated descriptor commitments during runtime/shutdown.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -297,6 +300,7 @@
 //   v2.8.7-CertificateExchange - Post-startup audited certificate exchange
 //   v2.8.5-TrustedDivergenceHalt - Sticky trusted fork evidence and live production halt
 //   v2.8.3-WitnessDivergence - Signed divergent startup-gate integration test
+//   v2.8.23-DirectoryChainStore - Transactional local descriptor commitment ledger
 //   v2.8.1-BlockFollowerOps - Configurable bounded catch-up round budget
 //   v2.8.0-ChatPullV2 - Signed opaque-cursor stable mailbox snapshots
 //   v2.7.22-ChatRelayMaintenance - Scheduled TTL cleanup with health evidence
@@ -478,8 +482,8 @@ use crate::services::peer_store::{
     VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
 };
 use crate::services::{
-    spawn_dns_proxy, HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore, RoutingService,
-    SessionManager,
+    spawn_dns_proxy, DirectoryChainAppendReport, DirectoryChainStore, HandshakeService,
+    IpPoolService, NodePolicyRuntime, PeerStore, RoutingService, SessionManager,
 };
 // v1.0.0-Membership
 use crate::services::deny_list::DenyList;
@@ -1419,6 +1423,7 @@ impl Server {
         let chat_relay_runtime_ready = chat_relay.is_some();
 
         let peer_store = self.init_peer_store(chat_relay_runtime_ready).await;
+        let directory_chain_store = self.init_directory_chain(&peer_store).await?;
         if let Some(ref commitment_storage) = storage {
             self.verify_memchain_commitment_startup_witnesses(commitment_storage, &peer_store)
                 .await?;
@@ -1431,6 +1436,10 @@ impl Server {
         };
         let peer_store_persistence_task =
             self.spawn_peer_store_persistence_task(Arc::clone(&peer_store));
+        let directory_chain_persistence_task = self.spawn_directory_chain_persistence_task(
+            Arc::clone(&peer_store),
+            directory_chain_store,
+        );
         let discovery_gossip_task =
             self.spawn_discovery_gossip_task(Arc::clone(&peer_store), chat_relay_runtime_ready);
 
@@ -1448,6 +1457,9 @@ impl Server {
         let mut tasks: Vec<(&str, JoinHandle<()>)> = Vec::new();
         if let Some(task) = peer_store_persistence_task {
             tasks.push(("peer-cache-persistence", task));
+        }
+        if let Some(task) = directory_chain_persistence_task {
+            tasks.push(("directory-chain-persistence", task));
         }
         if let Some(task) = discovery_gossip_task {
             tasks.push(("discovery-gossip", task));
@@ -4053,6 +4065,141 @@ impl Server {
             }
         }
         Ok(())
+    }
+
+    async fn init_directory_chain(
+        &self,
+        peer_store: &PeerStore,
+    ) -> Result<Option<Arc<DirectoryChainStore>>> {
+        let Some(path) = self.config.discovery.directory_chain_path.clone() else {
+            info!("[DIRECTORY_CHAIN] Local persistence disabled");
+            return Ok(None);
+        };
+        let producer = self.identity.public_key_bytes();
+        let observed_at = unix_now_secs();
+        let open_path = path.clone();
+        let (store, startup_audit) = tokio::task::spawn_blocking(move || {
+            DirectoryChainStore::open(&open_path, producer, observed_at)
+        })
+        .await
+        .map_err(|error| {
+            ServerError::startup_failed(format!(
+                "Directory Chain store task failed before startup: {error}"
+            ))
+        })?
+        .map_err(|error| {
+            ServerError::startup_failed(format!(
+                "Directory Chain startup audit failed for '{path}': {error}"
+            ))
+        })?;
+        let store = Arc::new(store);
+        info!(
+            blocks = startup_audit.blocks,
+            commitments = startup_audit.commitments,
+            tip_height = startup_audit.tip_height,
+            "[DIRECTORY_CHAIN] Persisted local chain audit passed"
+        );
+
+        let append = Self::reconcile_directory_chain_once(
+            Arc::clone(&store),
+            Arc::new(self.identity.clone()),
+            peer_store,
+        )
+        .await
+        .map_err(|error| {
+            ServerError::startup_failed(format!(
+                "Directory Chain startup reconciliation failed for '{path}': {error}"
+            ))
+        })?;
+        let verified_at = unix_now_secs();
+        let audit_store = Arc::clone(&store);
+        let current_audit = tokio::task::spawn_blocking(move || audit_store.audit(verified_at))
+            .await
+            .map_err(|error| {
+                ServerError::startup_failed(format!(
+                    "Directory Chain post-append audit task failed: {error}"
+                ))
+            })?
+            .map_err(|error| {
+                ServerError::startup_failed(format!(
+                    "Directory Chain post-append audit failed for '{path}': {error}"
+                ))
+            })?;
+        info!(
+            blocks_appended = append.blocks_appended,
+            commitments_appended = append.commitments_appended,
+            blocks = current_audit.blocks,
+            commitments = current_audit.commitments,
+            tip_height = current_audit.tip_height,
+            "[DIRECTORY_CHAIN] Startup descriptor reconciliation committed"
+        );
+        Ok(Some(store))
+    }
+
+    async fn reconcile_directory_chain_once(
+        store: Arc<DirectoryChainStore>,
+        identity: Arc<IdentityKeyPair>,
+        peer_store: &PeerStore,
+    ) -> std::result::Result<DirectoryChainAppendReport, String> {
+        let produced_at = unix_now_secs();
+        let descriptors = peer_store.export_peer_cache_snapshot(produced_at).peers;
+        tokio::task::spawn_blocking(move || {
+            store.append_descriptors(&descriptors, produced_at, identity.as_ref())
+        })
+        .await
+        .map_err(|error| format!("blocking reconciliation task failed: {error}"))?
+        .map_err(|error| error.to_string())
+    }
+
+    fn spawn_directory_chain_persistence_task(
+        &self,
+        peer_store: Arc<PeerStore>,
+        store: Option<Arc<DirectoryChainStore>>,
+    ) -> Option<JoinHandle<()>> {
+        let store = store?;
+        let identity = Arc::new(self.identity.clone());
+        let interval_secs = self.config.discovery.peer_cache_write_interval_secs;
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            let period = Duration::from_secs(interval_secs);
+            let start = tokio::time::Instant::now() + period;
+            let mut timer = tokio::time::interval_at(start, period);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                let reason = tokio::select! {
+                    _ = shutdown_rx.recv() => "shutdown",
+                    _ = timer.tick() => "interval",
+                };
+                match Self::reconcile_directory_chain_once(
+                    Arc::clone(&store),
+                    Arc::clone(&identity),
+                    &peer_store,
+                )
+                .await
+                {
+                    Ok(report) => {
+                        debug!(
+                            reason,
+                            blocks_appended = report.blocks_appended,
+                            commitments_appended = report.commitments_appended,
+                            tip_height = report.tip_height,
+                            "[DIRECTORY_CHAIN] Descriptor commitments reconciled"
+                        );
+                    }
+                    Err(error) => {
+                        error!(
+                            reason,
+                            error = %error,
+                            "[DIRECTORY_CHAIN] Descriptor reconciliation failed"
+                        );
+                    }
+                }
+                if reason == "shutdown" {
+                    break;
+                }
+            }
+        }))
     }
 
     fn spawn_peer_store_persistence_task(
@@ -8646,7 +8793,7 @@ mod tests {
         memchain_index_rejection_reason, prefix_to_netmask, unix_now_secs,
         CommitmentCoordinatorLeaseRound, CommitmentTipAnnouncementWaitOutcome,
         CommitmentWitnessStartupBlockReason, CommitmentWitnessStartupDecision,
-        PeerStoreCacheDocument, PeerStoreVerifiedClientDeliveryAnchor,
+        DirectoryChainStore, PeerStoreCacheDocument, PeerStoreVerifiedClientDeliveryAnchor,
         PeerStoreVerifiedClientDeliveryCacheEvidence, Server,
         BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
         BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
@@ -11917,6 +12064,43 @@ mod tests {
 
         let _ = tokio::fs::remove_file(path).await;
         let _ = tokio::fs::remove_file(backup_path).await;
+    }
+
+    #[tokio::test]
+    async fn directory_chain_startup_reconciles_and_reopens_audited_tip() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("aeronyx-directory-chain-{unique}.db"));
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.directory_chain_path = Some(path.to_string_lossy().to_string());
+        config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+        let identity = IdentityKeyPair::generate();
+        let producer = identity.public_key_bytes();
+        let server = Server::new(config, identity, None);
+        let peer_store = server.init_peer_store(false).await;
+
+        let store = server
+            .init_directory_chain(&peer_store)
+            .await
+            .unwrap()
+            .expect("configured Directory Chain store");
+        let first_audit = store.audit(unix_now_secs()).unwrap();
+        assert_eq!(first_audit.blocks, 1);
+        assert!(first_audit.commitments >= 1);
+        drop(store);
+
+        let (reopened, second_audit) =
+            DirectoryChainStore::open(&path, producer, unix_now_secs()).unwrap();
+        assert_eq!(second_audit, first_audit);
+        assert!(reopened.block(second_audit.tip_height).unwrap().is_some());
+        drop(reopened);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
 
     #[tokio::test]
