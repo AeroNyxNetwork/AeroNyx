@@ -17,6 +17,8 @@
 //! - `NodeBootstrapSnapshot`: JSON-friendly bootstrap list of signed descriptors
 //! - `NodeDiscoveryMessage`: bounded gossip message envelope for peer sync
 //! - Signature-only descriptor verification for local peer-cache retention
+//! - `DirectoryCommitmentBlockV1`: signed, hash-linked commitments to public
+//!   node descriptor events without embedding endpoint or operator metadata
 //!
 //! ## Dependencies
 //! - crates/aeronyx-core/src/crypto/keys.rs: IdentityKeyPair / IdentityPublicKey
@@ -33,6 +35,8 @@
 //!    first-contact peer discovery
 //! 6. Gossip messages exchange snapshot requests/responses and descriptor
 //!    announcements without depending on a specific transport
+//! 7. Directory blocks commit to authenticated descriptors using stable hashes;
+//!    witness/fork-choice policy remains a separate operator-reviewed layer
 //!
 //! ## Important Note for Next Developer
 //! - Do not put private keys, client IPs, destination metadata, DNS contents,
@@ -42,8 +46,12 @@
 //!   only at the end and keep backward compatibility in mind.
 //! - Default public policy is no-exit. Future onion routing must opt into any
 //!   exit behavior through a separate reviewed policy.
+//! - Directory blocks are integrity evidence, not financial consensus. Never
+//!   add user identities, traffic facts, routes, message ids, payloads, memory
+//!   records, or client metadata to a directory commitment.
 //!
 //! ## Last Modified
+//! v0.6.0-DirectoryCommitmentBlock - Added deterministic signed Directory Chain protocol primitives
 //! v0.5.0-DescriptorKemBackwardCompatibility - Accept schema v1 descriptors without KEM fields
 //! v0.4.0-DiscoverySignatureOnlyVerify - Added signature-only verification for expired peer-cache retention
 //! v0.1.0-DiscoveryPhase1 - Initial signed descriptor primitives
@@ -53,9 +61,11 @@
 
 use bincode::Options;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 
 use crate::crypto::{IdentityKeyPair, IdentityPublicKey};
 use crate::error::CoreError;
+use crate::ledger::merkle_root;
 
 // ============================================
 // Serialization constants
@@ -79,6 +89,30 @@ const MAX_BOOTSTRAP_SNAPSHOT_BYTES: usize = 512 * 1024;
 
 /// Maximum accepted binary discovery gossip message size.
 const MAX_DISCOVERY_MESSAGE_BYTES: u64 = 512 * 1024;
+
+/// Stable production chain identifier for public node-directory commitments.
+///
+/// This is `SHA-256("AeroNyx-Directory-Mainnet-v1")`. Changing it creates a
+/// different directory chain and requires an explicit protocol migration.
+pub const AERONYX_DIRECTORY_MAINNET_CHAIN_ID: [u8; 32] = [
+    0xa0, 0x4a, 0x2f, 0xdf, 0xc8, 0x32, 0x07, 0x08, 0x30, 0x66, 0x2d, 0x43, 0x5a, 0xfc, 0x9e, 0x1e,
+    0x78, 0x32, 0xda, 0xde, 0x2f, 0xd5, 0x95, 0x6b, 0xe7, 0x78, 0x28, 0x36, 0xca, 0x61, 0xd2, 0x2f,
+];
+
+/// First stable Directory Chain hashing and signature contract.
+pub const DIRECTORY_COMMITMENT_BLOCK_VERSION_V1: u16 = 1;
+
+/// Maximum descriptor commitments accepted in one directory block.
+///
+/// At 72 bytes of canonical commitment data per entry, this keeps the payload
+/// bounded while matching the existing maximum discovery snapshot page size.
+pub const MAX_DIRECTORY_COMMITMENTS_PER_BLOCK: usize = 256;
+
+/// Maximum producer clock lead accepted by a directory verifier.
+///
+/// Without this bound, a malicious producer could timestamp one validly signed
+/// block far in the future and force every later block to follow that clock.
+pub const MAX_DIRECTORY_BLOCK_FUTURE_SKEW_SECS: u64 = 120;
 
 // ============================================
 // Serde helper for [u8; 64]
@@ -415,6 +449,378 @@ impl SignedNodeDescriptor {
     pub const fn sequence(&self) -> u64 {
         self.descriptor.sequence
     }
+}
+
+// ============================================
+// Directory Chain V1
+// ============================================
+
+/// Opaque, content-addressed commitment to one authenticated node descriptor.
+///
+/// The commitment identifies the public node and monotonic descriptor sequence
+/// needed for deterministic replay, while the digest binds the complete signed
+/// descriptor. Endpoint, region, capacity, policy, and capability fields are
+/// not duplicated into the directory block payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DirectoryDescriptorCommitmentV1 {
+    /// Public Ed25519 identity of the node that signed the descriptor.
+    pub node_id: [u8; 32],
+    /// Monotonic sequence copied from the authenticated descriptor.
+    pub sequence: u64,
+    /// Domain-separated digest of descriptor signing bytes and signature.
+    pub descriptor_hash: [u8; 32],
+}
+
+impl DirectoryDescriptorCommitmentV1 {
+    /// Creates a commitment after verifying the descriptor schema and signature.
+    ///
+    /// Expiry is deliberately not checked here: an authenticated descriptor may
+    /// remain part of immutable directory history after it stops being routeable.
+    ///
+    /// # Errors
+    /// Returns a `CoreError` when the descriptor schema, key, signature, or
+    /// canonical serialization is invalid.
+    pub fn from_signed_descriptor(descriptor: &SignedNodeDescriptor) -> Result<Self, CoreError> {
+        descriptor.verify_signature()?;
+        Ok(Self {
+            node_id: descriptor.node_id(),
+            sequence: descriptor.sequence(),
+            descriptor_hash: signed_descriptor_commitment_hash(descriptor)?,
+        })
+    }
+
+    /// Returns the domain-separated Merkle leaf for this commitment.
+    #[must_use]
+    pub fn hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"AeroNyx-DirectoryDescriptorCommitment-v1");
+        hasher.update(self.node_id);
+        hasher.update(self.sequence.to_le_bytes());
+        hasher.update(self.descriptor_hash);
+        hasher.finalize().into()
+    }
+
+    /// Checks whether this commitment binds the supplied signed descriptor.
+    ///
+    /// # Errors
+    /// Returns a `CoreError` when the supplied descriptor is not authentic or
+    /// cannot be canonically serialized.
+    pub fn matches_signed_descriptor(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+    ) -> Result<bool, CoreError> {
+        let candidate = Self::from_signed_descriptor(descriptor)?;
+        Ok(self == &candidate)
+    }
+
+    fn structurally_valid(&self) -> bool {
+        self.node_id != [0u8; 32] && self.sequence > 0 && self.descriptor_hash != [0u8; 32]
+    }
+}
+
+/// Computes the stable digest committed by [`DirectoryDescriptorCommitmentV1`].
+///
+/// The descriptor signature is included so the commitment proves exactly which
+/// authenticated descriptor object was observed. A length prefix keeps the
+/// canonical field boundary explicit for future schema versions.
+fn signed_descriptor_commitment_hash(
+    descriptor: &SignedNodeDescriptor,
+) -> Result<[u8; 32], CoreError> {
+    let signing_bytes = descriptor.descriptor.signing_bytes()?;
+    let signing_bytes_len = u32::try_from(signing_bytes.len()).map_err(|_| {
+        CoreError::malformed("signed node descriptor canonical bytes exceed u32 length")
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"AeroNyx-SignedNodeDescriptorCommitment-v1");
+    hasher.update(signing_bytes_len.to_le_bytes());
+    hasher.update(signing_bytes);
+    hasher.update(descriptor.signature);
+    Ok(hasher.finalize().into())
+}
+
+/// Canonical signed header for one Directory Chain block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryCommitmentHeaderV1 {
+    /// Stable hashing and signature contract version.
+    pub protocol_version: u16,
+    /// Prevents replay between production, test, and private directories.
+    pub chain_id: [u8; 32],
+    /// One-based block height.
+    pub height: u64,
+    /// Producer timestamp in Unix epoch seconds.
+    pub timestamp: u64,
+    /// Hash of the previous V1 header, or all zeroes at height one.
+    pub prev_block_hash: [u8; 32],
+    /// Merkle root of canonically sorted descriptor commitment leaves.
+    pub commitment_root: [u8; 32],
+    /// Number of commitments carried by the block.
+    pub commitment_count: u32,
+    /// Ed25519 identity of the node producing this block.
+    pub producer: [u8; 32],
+}
+
+impl DirectoryCommitmentHeaderV1 {
+    /// Computes the domain-separated canonical block identity.
+    ///
+    /// Field order and little-endian integer encoding are stable protocol
+    /// contracts and must not change within V1.
+    #[must_use]
+    pub fn hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"AeroNyx-DirectoryCommitmentBlock-v1");
+        hasher.update(self.protocol_version.to_le_bytes());
+        hasher.update(self.chain_id);
+        hasher.update(self.height.to_le_bytes());
+        hasher.update(self.timestamp.to_le_bytes());
+        hasher.update(self.prev_block_hash);
+        hasher.update(self.commitment_root);
+        hasher.update(self.commitment_count.to_le_bytes());
+        hasher.update(self.producer);
+        hasher.finalize().into()
+    }
+
+    /// Returns the canonical block hash as lowercase hexadecimal.
+    #[must_use]
+    pub fn hash_hex(&self) -> String {
+        hex::encode(self.hash())
+    }
+}
+
+/// Signed, hash-linked directory block containing no client or traffic data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryCommitmentBlockV1 {
+    /// Signed chain header.
+    pub header: DirectoryCommitmentHeaderV1,
+    /// Canonically sorted descriptor commitments.
+    pub commitments: Vec<DirectoryDescriptorCommitmentV1>,
+    /// Ed25519 signature by `header.producer` over `header.hash()`.
+    #[serde(with = "serde_bytes64")]
+    pub producer_signature: [u8; 64],
+}
+
+/// Validation failures for the V1 Directory Chain contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryCommitmentValidationError {
+    /// The block hashing/signature contract version is unsupported.
+    UnsupportedVersion,
+    /// The block belongs to another directory chain.
+    WrongChain,
+    /// The block height is zero or does not continue the expected chain.
+    InvalidHeight,
+    /// The previous block hash does not match the expected chain tip.
+    InvalidPreviousHash,
+    /// The block timestamp is zero or regresses behind its predecessor.
+    InvalidTimestamp,
+    /// A directory block must carry at least one commitment.
+    EmptyBlock,
+    /// The block exceeds the commitment count bound.
+    TooManyCommitments,
+    /// Header and payload commitment counts differ.
+    CommitmentCountMismatch,
+    /// A commitment contains a sentinel identity, sequence, or digest.
+    InvalidCommitment,
+    /// Commitments are not in canonical lexicographic order.
+    NonCanonicalOrder,
+    /// The same descriptor commitment appears more than once.
+    DuplicateCommitment,
+    /// The payload does not match the signed Merkle root.
+    InvalidMerkleRoot,
+    /// The producer public key is malformed.
+    InvalidProducer,
+    /// The producer signature is invalid.
+    InvalidSignature,
+}
+
+impl std::fmt::Display for DirectoryCommitmentValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::UnsupportedVersion => "unsupported directory block protocol version",
+            Self::WrongChain => "directory block belongs to another chain",
+            Self::InvalidHeight => "directory block height does not continue the chain",
+            Self::InvalidPreviousHash => "directory block previous hash does not match the tip",
+            Self::InvalidTimestamp => "directory block timestamp is invalid",
+            Self::EmptyBlock => "directory block is empty",
+            Self::TooManyCommitments => "directory block exceeds the commitment limit",
+            Self::CommitmentCountMismatch => "directory header count does not match payload",
+            Self::InvalidCommitment => "directory descriptor commitment is invalid",
+            Self::NonCanonicalOrder => "directory commitments are not canonically ordered",
+            Self::DuplicateCommitment => "directory descriptor commitment is duplicated",
+            Self::InvalidMerkleRoot => "directory commitment Merkle root is invalid",
+            Self::InvalidProducer => "directory block producer public key is invalid",
+            Self::InvalidSignature => "directory block producer signature is invalid",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for DirectoryCommitmentValidationError {}
+
+impl DirectoryCommitmentBlockV1 {
+    /// Builds and signs one deterministic production directory block.
+    ///
+    /// Input commitments are sorted before hashing. The constructor rejects
+    /// empty, oversized, duplicated, sentinel, or impossible genesis inputs so
+    /// invalid local blocks are never signed accidentally.
+    ///
+    /// # Errors
+    /// Returns a [`DirectoryCommitmentValidationError`] for invalid block or
+    /// commitment inputs.
+    pub fn new_signed(
+        height: u64,
+        timestamp: u64,
+        prev_block_hash: [u8; 32],
+        mut commitments: Vec<DirectoryDescriptorCommitmentV1>,
+        identity: &IdentityKeyPair,
+    ) -> Result<Self, DirectoryCommitmentValidationError> {
+        validate_directory_block_position(height, timestamp, &prev_block_hash, 0)?;
+        commitments.sort_unstable();
+        validate_directory_commitments(&commitments)?;
+        let commitment_hashes = commitments
+            .iter()
+            .map(DirectoryDescriptorCommitmentV1::hash)
+            .collect::<Vec<_>>();
+        let commitment_count = u32::try_from(commitments.len())
+            .map_err(|_| DirectoryCommitmentValidationError::TooManyCommitments)?;
+        let header = DirectoryCommitmentHeaderV1 {
+            protocol_version: DIRECTORY_COMMITMENT_BLOCK_VERSION_V1,
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            height,
+            timestamp,
+            prev_block_hash,
+            commitment_root: merkle_root(&commitment_hashes),
+            commitment_count,
+            producer: identity.public_key_bytes(),
+        };
+        let producer_signature = identity.sign(&header.hash());
+        Ok(Self {
+            header,
+            commitments,
+            producer_signature,
+        })
+    }
+
+    /// Returns the canonical block identity.
+    #[must_use]
+    pub fn hash(&self) -> [u8; 32] {
+        self.header.hash()
+    }
+
+    /// Validates contract, chain continuity, canonical payload, Merkle root,
+    /// and producer authenticity.
+    ///
+    /// `previous_timestamp` is zero for genesis and the prior block timestamp
+    /// otherwise. Equal timestamps are accepted to tolerate one-second clocks.
+    /// `observed_at` is the verifier's current Unix time and enforces a bounded
+    /// future-clock lead.
+    ///
+    /// # Errors
+    /// Returns a [`DirectoryCommitmentValidationError`] when the block breaks
+    /// the V1 contract, expected chain position, canonical payload, Merkle
+    /// commitment, timestamp bound, producer identity, or signature.
+    pub fn verify_at(
+        &self,
+        expected_chain_id: &[u8; 32],
+        expected_height: u64,
+        expected_prev_hash: &[u8; 32],
+        previous_timestamp: u64,
+        observed_at: u64,
+    ) -> Result<(), DirectoryCommitmentValidationError> {
+        if self.header.protocol_version != DIRECTORY_COMMITMENT_BLOCK_VERSION_V1 {
+            return Err(DirectoryCommitmentValidationError::UnsupportedVersion);
+        }
+        if &self.header.chain_id != expected_chain_id {
+            return Err(DirectoryCommitmentValidationError::WrongChain);
+        }
+        if self.header.height != expected_height {
+            return Err(DirectoryCommitmentValidationError::InvalidHeight);
+        }
+        if &self.header.prev_block_hash != expected_prev_hash {
+            return Err(DirectoryCommitmentValidationError::InvalidPreviousHash);
+        }
+        validate_directory_block_position(
+            self.header.height,
+            self.header.timestamp,
+            &self.header.prev_block_hash,
+            previous_timestamp,
+        )?;
+        if self.header.timestamp > observed_at.saturating_add(MAX_DIRECTORY_BLOCK_FUTURE_SKEW_SECS)
+        {
+            return Err(DirectoryCommitmentValidationError::InvalidTimestamp);
+        }
+        validate_directory_commitments(&self.commitments)?;
+        if self.header.commitment_count as usize != self.commitments.len() {
+            return Err(DirectoryCommitmentValidationError::CommitmentCountMismatch);
+        }
+        let commitment_hashes = self
+            .commitments
+            .iter()
+            .map(DirectoryDescriptorCommitmentV1::hash)
+            .collect::<Vec<_>>();
+        if merkle_root(&commitment_hashes) != self.header.commitment_root {
+            return Err(DirectoryCommitmentValidationError::InvalidMerkleRoot);
+        }
+        let producer = IdentityPublicKey::from_bytes(&self.header.producer)
+            .map_err(|_| DirectoryCommitmentValidationError::InvalidProducer)?;
+        producer
+            .verify(&self.header.hash(), &self.producer_signature)
+            .map_err(|_| DirectoryCommitmentValidationError::InvalidSignature)
+    }
+}
+
+impl std::fmt::Display for DirectoryCommitmentBlockV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "DirectoryCommitmentBlockV1(height={}, commitments={}, hash={}..)",
+            self.header.height,
+            self.commitments.len(),
+            &self.header.hash_hex()[..8],
+        )
+    }
+}
+
+fn validate_directory_block_position(
+    height: u64,
+    timestamp: u64,
+    prev_block_hash: &[u8; 32],
+    previous_timestamp: u64,
+) -> Result<(), DirectoryCommitmentValidationError> {
+    if height == 0 {
+        return Err(DirectoryCommitmentValidationError::InvalidHeight);
+    }
+    let genesis_position_valid = if height == 1 {
+        prev_block_hash == &[0u8; 32]
+    } else {
+        prev_block_hash != &[0u8; 32]
+    };
+    if !genesis_position_valid {
+        return Err(DirectoryCommitmentValidationError::InvalidPreviousHash);
+    }
+    if timestamp == 0 || timestamp < previous_timestamp {
+        return Err(DirectoryCommitmentValidationError::InvalidTimestamp);
+    }
+    Ok(())
+}
+
+fn validate_directory_commitments(
+    commitments: &[DirectoryDescriptorCommitmentV1],
+) -> Result<(), DirectoryCommitmentValidationError> {
+    if commitments.is_empty() {
+        return Err(DirectoryCommitmentValidationError::EmptyBlock);
+    }
+    if commitments.len() > MAX_DIRECTORY_COMMITMENTS_PER_BLOCK {
+        return Err(DirectoryCommitmentValidationError::TooManyCommitments);
+    }
+    if commitments.iter().any(|entry| !entry.structurally_valid()) {
+        return Err(DirectoryCommitmentValidationError::InvalidCommitment);
+    }
+    if commitments.windows(2).any(|pair| pair[0] > pair[1]) {
+        return Err(DirectoryCommitmentValidationError::NonCanonicalOrder);
+    }
+    if commitments.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(DirectoryCommitmentValidationError::DuplicateCommitment);
+    }
+    Ok(())
 }
 
 // ============================================
@@ -769,5 +1175,389 @@ mod tests {
         let decoded = decode_discovery_message(&bytes).unwrap();
 
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn test_directory_descriptor_commitment_binds_authenticated_descriptor() {
+        let identity = IdentityKeyPair::generate();
+        let signed = SignedNodeDescriptor::sign(descriptor_for(&identity), &identity).unwrap();
+        let commitment = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&signed).unwrap();
+
+        assert_eq!(commitment.node_id, identity.public_key_bytes());
+        assert_eq!(commitment.sequence, signed.sequence());
+        assert!(commitment.matches_signed_descriptor(&signed).unwrap());
+        assert_ne!(commitment.hash(), [0u8; 32]);
+
+        let mut next_descriptor = descriptor_for(&identity);
+        next_descriptor.sequence += 1;
+        let next_signed = SignedNodeDescriptor::sign(next_descriptor, &identity).unwrap();
+        assert!(!commitment.matches_signed_descriptor(&next_signed).unwrap());
+
+        let mut forged = signed;
+        forged.signature[0] ^= 0x01;
+        assert!(commitment.matches_signed_descriptor(&forged).is_err());
+    }
+
+    #[test]
+    fn test_directory_block_is_deterministic_and_roundtrips() {
+        let producer = IdentityKeyPair::generate();
+        let first_identity = IdentityKeyPair::generate();
+        let second_identity = IdentityKeyPair::generate();
+        let first = DirectoryDescriptorCommitmentV1::from_signed_descriptor(
+            &SignedNodeDescriptor::sign(descriptor_for(&first_identity), &first_identity).unwrap(),
+        )
+        .unwrap();
+        let second = DirectoryDescriptorCommitmentV1::from_signed_descriptor(
+            &SignedNodeDescriptor::sign(descriptor_for(&second_identity), &second_identity)
+                .unwrap(),
+        )
+        .unwrap();
+
+        let forward = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            1_700_000_100,
+            [0u8; 32],
+            vec![first, second],
+            &producer,
+        )
+        .unwrap();
+        let reverse = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            1_700_000_100,
+            [0u8; 32],
+            vec![second, first],
+            &producer,
+        )
+        .unwrap();
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.header.commitment_count, 2);
+        assert!(forward
+            .verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                1,
+                &[0u8; 32],
+                0,
+                1_700_000_100,
+            )
+            .is_ok());
+        let encoded = bincode::options()
+            .with_fixint_encoding()
+            .serialize(&forward)
+            .unwrap();
+        let decoded: DirectoryCommitmentBlockV1 = bincode::options()
+            .with_fixint_encoding()
+            .deserialize(&encoded)
+            .unwrap();
+        assert_eq!(decoded, forward);
+        assert!(decoded.to_string().contains("height=1"));
+    }
+
+    #[test]
+    fn test_directory_block_verification_rejects_tampering() {
+        let producer = IdentityKeyPair::generate();
+        let node = IdentityKeyPair::generate();
+        let commitment = DirectoryDescriptorCommitmentV1::from_signed_descriptor(
+            &SignedNodeDescriptor::sign(descriptor_for(&node), &node).unwrap(),
+        )
+        .unwrap();
+        let block = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            1_700_000_100,
+            [0u8; 32],
+            vec![commitment],
+            &producer,
+        )
+        .unwrap();
+
+        let mut wrong_chain = block.clone();
+        wrong_chain.header.chain_id[0] ^= 0x01;
+        assert_eq!(
+            wrong_chain.verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                1,
+                &[0u8; 32],
+                0,
+                1_700_000_100,
+            ),
+            Err(DirectoryCommitmentValidationError::WrongChain)
+        );
+
+        let mut wrong_count = block.clone();
+        wrong_count.header.commitment_count += 1;
+        assert_eq!(
+            wrong_count.verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                1,
+                &[0u8; 32],
+                0,
+                1_700_000_100,
+            ),
+            Err(DirectoryCommitmentValidationError::CommitmentCountMismatch)
+        );
+
+        let mut wrong_root = block.clone();
+        wrong_root.header.commitment_root[0] ^= 0x01;
+        assert_eq!(
+            wrong_root.verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                1,
+                &[0u8; 32],
+                0,
+                1_700_000_100,
+            ),
+            Err(DirectoryCommitmentValidationError::InvalidMerkleRoot)
+        );
+
+        let mut wrong_signature = block;
+        wrong_signature.producer_signature[0] ^= 0x01;
+        assert_eq!(
+            wrong_signature.verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                1,
+                &[0u8; 32],
+                0,
+                1_700_000_100,
+            ),
+            Err(DirectoryCommitmentValidationError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn test_directory_block_rejects_invalid_and_unbounded_inputs() {
+        let producer = IdentityKeyPair::generate();
+        let node = IdentityKeyPair::generate();
+        let commitment = DirectoryDescriptorCommitmentV1::from_signed_descriptor(
+            &SignedNodeDescriptor::sign(descriptor_for(&node), &node).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            DirectoryCommitmentBlockV1::new_signed(
+                1,
+                1_700_000_100,
+                [0u8; 32],
+                Vec::new(),
+                &producer,
+            ),
+            Err(DirectoryCommitmentValidationError::EmptyBlock)
+        );
+        assert_eq!(
+            DirectoryCommitmentBlockV1::new_signed(
+                1,
+                1_700_000_100,
+                [0u8; 32],
+                vec![commitment, commitment],
+                &producer,
+            ),
+            Err(DirectoryCommitmentValidationError::DuplicateCommitment)
+        );
+        assert_eq!(
+            DirectoryCommitmentBlockV1::new_signed(
+                1,
+                1_700_000_100,
+                [0u8; 32],
+                vec![commitment; MAX_DIRECTORY_COMMITMENTS_PER_BLOCK + 1],
+                &producer,
+            ),
+            Err(DirectoryCommitmentValidationError::TooManyCommitments)
+        );
+        assert_eq!(
+            DirectoryCommitmentBlockV1::new_signed(
+                2,
+                1_700_000_100,
+                [0u8; 32],
+                vec![commitment],
+                &producer,
+            ),
+            Err(DirectoryCommitmentValidationError::InvalidPreviousHash)
+        );
+        assert_eq!(
+            DirectoryCommitmentBlockV1::new_signed(1, 0, [0u8; 32], vec![commitment], &producer,),
+            Err(DirectoryCommitmentValidationError::InvalidTimestamp)
+        );
+
+        let invalid = DirectoryDescriptorCommitmentV1 {
+            node_id: [0u8; 32],
+            ..commitment
+        };
+        assert_eq!(
+            DirectoryCommitmentBlockV1::new_signed(
+                1,
+                1_700_000_100,
+                [0u8; 32],
+                vec![invalid],
+                &producer,
+            ),
+            Err(DirectoryCommitmentValidationError::InvalidCommitment)
+        );
+    }
+
+    #[test]
+    fn test_directory_block_chain_continuity_binds_height_hash_and_time() {
+        let producer = IdentityKeyPair::generate();
+        let first_node = IdentityKeyPair::generate();
+        let second_node = IdentityKeyPair::generate();
+        let first_commitment = DirectoryDescriptorCommitmentV1::from_signed_descriptor(
+            &SignedNodeDescriptor::sign(descriptor_for(&first_node), &first_node).unwrap(),
+        )
+        .unwrap();
+        let mut second_descriptor = descriptor_for(&second_node);
+        second_descriptor.sequence = 8;
+        let second_commitment = DirectoryDescriptorCommitmentV1::from_signed_descriptor(
+            &SignedNodeDescriptor::sign(second_descriptor, &second_node).unwrap(),
+        )
+        .unwrap();
+        let first = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            1_700_000_100,
+            [0u8; 32],
+            vec![first_commitment],
+            &producer,
+        )
+        .unwrap();
+        let second = DirectoryCommitmentBlockV1::new_signed(
+            2,
+            1_700_000_101,
+            first.hash(),
+            vec![second_commitment],
+            &producer,
+        )
+        .unwrap();
+
+        assert!(second
+            .verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                2,
+                &first.hash(),
+                first.header.timestamp,
+                1_700_000_101,
+            )
+            .is_ok());
+        assert_eq!(
+            second.verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                3,
+                &first.hash(),
+                first.header.timestamp,
+                1_700_000_101,
+            ),
+            Err(DirectoryCommitmentValidationError::InvalidHeight)
+        );
+
+        let regressed = DirectoryCommitmentBlockV1::new_signed(
+            2,
+            1_700_000_099,
+            first.hash(),
+            vec![second_commitment],
+            &producer,
+        )
+        .unwrap();
+        assert_eq!(
+            regressed.verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                2,
+                &first.hash(),
+                first.header.timestamp,
+                1_700_000_101,
+            ),
+            Err(DirectoryCommitmentValidationError::InvalidTimestamp)
+        );
+
+        let future = DirectoryCommitmentBlockV1::new_signed(
+            2,
+            1_700_000_222,
+            first.hash(),
+            vec![second_commitment],
+            &producer,
+        )
+        .unwrap();
+        assert_eq!(
+            future.verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                2,
+                &first.hash(),
+                first.header.timestamp,
+                1_700_000_101,
+            ),
+            Err(DirectoryCommitmentValidationError::InvalidTimestamp)
+        );
+    }
+
+    #[test]
+    fn test_directory_block_preserves_same_sequence_equivocation_evidence() {
+        let producer = IdentityKeyPair::generate();
+        let node = IdentityKeyPair::generate();
+        let first_descriptor = descriptor_for(&node);
+        let mut conflicting_descriptor = first_descriptor.clone();
+        conflicting_descriptor.public_endpoint = Some("conflicting.example:443".to_string());
+        let first = DirectoryDescriptorCommitmentV1::from_signed_descriptor(
+            &SignedNodeDescriptor::sign(first_descriptor, &node).unwrap(),
+        )
+        .unwrap();
+        let conflicting = DirectoryDescriptorCommitmentV1::from_signed_descriptor(
+            &SignedNodeDescriptor::sign(conflicting_descriptor, &node).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(first.node_id, conflicting.node_id);
+        assert_eq!(first.sequence, conflicting.sequence);
+        assert_ne!(first.descriptor_hash, conflicting.descriptor_hash);
+        let block = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            1_700_000_100,
+            [0u8; 32],
+            vec![first, conflicting],
+            &producer,
+        )
+        .unwrap();
+        assert_eq!(block.commitments.len(), 2);
+        assert!(block
+            .verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                1,
+                &[0u8; 32],
+                0,
+                1_700_000_100,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn test_directory_block_v1_canonical_test_vector() {
+        let producer = IdentityKeyPair::from_bytes(&[0x11; 32]).unwrap();
+        let node = IdentityKeyPair::from_bytes(&[0x22; 32]).unwrap();
+        let descriptor = SignedNodeDescriptor::sign(descriptor_for(&node), &node).unwrap();
+        let commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).unwrap();
+        let block = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            1_700_000_100,
+            [0u8; 32],
+            vec![commitment],
+            &producer,
+        )
+        .unwrap();
+
+        assert_eq!(
+            hex::encode(commitment.descriptor_hash),
+            "72d814f3d31e2a08d6f2003009cfa548be8e5fd05bc3ba38bb2285cea4432222"
+        );
+        assert_eq!(
+            hex::encode(commitment.hash()),
+            "fab10c677239ab88f615137654a4096aaa614b23b8eaea80bb898d1bf736d474"
+        );
+        assert_eq!(
+            hex::encode(block.header.commitment_root),
+            "fab10c677239ab88f615137654a4096aaa614b23b8eaea80bb898d1bf736d474"
+        );
+        assert_eq!(
+            hex::encode(block.hash()),
+            "51fc47f962be975d17e1f10e2ae9cc38201eea0e072f1bdb9bf3837ff2ad12c2"
+        );
+        assert_eq!(
+            hex::encode(block.producer_signature),
+            "8a5963474d6c0a6d94340593cbce67756b99e6a01919bde764c96d50fc57b092f479423b866b2c65036da8f2d2668c56d8c9b90782889e17a7ea2c34b4411e05"
+        );
     }
 }

@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.6.0 - Added optional pinned-peer witnessing for delivery-cache anchors so established deployments can detect whole-host rollback without exposing relay metadata.
+Modification Reason: v0.7.0 - Defined the first Directory Chain protocol core: authenticated descriptor commitments, deterministic Merkle roots, and signed hash-linked blocks.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.6.0 - Added authenticated external witnessing for verified-client delivery-cache anchors.
+Last Modified: v0.7.0 - Added the privacy-bounded Directory Chain V1 protocol core; runtime persistence, gossip, and fork selection remain pending.
+Previous: v0.6.0 - Added authenticated external witnessing for verified-client delivery-cache anchors.
 Previous: v0.5.0 - Added local signed rollback protection for verified-client delivery evidence.
 Previous: v0.4.0 - Added fail-closed verified-client delivery evidence recovery.
 Previous: v0.3.0 - Added restart-recovery gate for PeerStore relay foundation readiness.
@@ -946,19 +947,43 @@ Verification:
 
 ### Phase 6 - Directory Chain
 
-Status: Future.
+Status: Protocol core implemented; runtime persistence and synchronization remain pending.
 
 Goals:
 
-- Pack descriptor events into hash-linked blocks.
-- Add Merkle root by epoch.
+- Pack authenticated descriptor commitments into hash-linked blocks.
+- Add a deterministic Merkle root for canonically sorted commitments.
 - Add witness signatures.
 - Add snapshot validation.
+
+Implemented in the V1 protocol core:
+
+- A fixed production chain identifier prevents replay between independent
+  directory networks.
+- Each leaf commits to one already-authenticated signed node descriptor using
+  a domain-separated digest; endpoints and capabilities are not copied into
+  the block payload.
+- Canonical ordering, exact-duplicate rejection, a 256-commitment bound, and a
+  stable Merkle root make independent implementations deterministic.
+- Ed25519 producer signatures bind height, timestamp, previous block hash,
+  commitment root, count, and producer identity.
+- Verification enforces genesis/non-genesis continuity, monotonic timestamps,
+  bounded future clock skew, payload integrity, producer identity, and
+  signature authenticity.
+- Same-node/same-sequence conflicting commitments remain visible as evidence
+  instead of being silently collapsed.
+
+Still pending before Directory Chain can be described as live:
+
+- Durable block and chain-tip storage in the Rust node runtime.
+- Peer synchronization, bounded catch-up, and snapshot transport.
+- Witness/co-signature policy and deterministic fork selection.
+- Operational API, metrics, recovery, and multi-node deployment tests.
 
 Files likely changed:
 
 ```text
-crates/aeronyx-core/src/protocol/directory_chain.rs
+crates/aeronyx-core/src/protocol/discovery.rs (V1 protocol core implemented)
 crates/aeronyx-server/src/services/discovery/directory_chain.rs
 crates/aeronyx-server/src/services/discovery/witness.rs
 ```
@@ -1021,6 +1046,34 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-17 - Added Directory Chain V1 protocol core.
+- Files changed:
+  - crates/aeronyx-core/src/protocol/discovery.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Verification:
+  - Deterministic descriptor commitment, block construction, canonical
+    ordering, binary round-trip, tamper, bounds, chain continuity, clock skew,
+    equivocation preservation, and fixed cross-implementation vector tests.
+  - `cargo clippy -p aeronyx-core --tests --no-deps` completed successfully;
+    the repository's existing warning backlog remains outside this change.
+  - `aeronyx-core`: 192/192 unit tests passed; one doctest passed and three
+    existing examples remained explicitly ignored.
+  - `aeronyx-server`: 1,046/1,046 tests passed; one doctest passed and nine
+    existing examples remained explicitly ignored.
+  - `cargo build -p aeronyx-server --release` completed successfully in 5m34s
+    on the reviewed US1 host.
+- Notes:
+  - V1 blocks contain public node identity, descriptor sequence, and opaque
+    descriptor digests only. They contain no client identity, IP address,
+    sender/receiver pair, route, message ID, payload, ciphertext, Memory Chain
+    content, DNS content, destination, domain, URL, or browsing history.
+  - This change defines deterministic protocol primitives only. It does not
+    start block production, storage, synchronization, witness voting, fork
+    choice, consensus, finality, token accounting, or financial execution.
+  - A signed descriptor may be committed after expiry because the block is an
+    immutable observation record; descriptor authenticity and schema are still
+    verified before commitment.
+
 2026-07-17 - Added optional external witnesses for delivery-cache anchors.
 - Files changed:
   - crates/aeronyx-core/src/protocol/memchain.rs
