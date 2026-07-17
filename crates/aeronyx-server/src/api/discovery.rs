@@ -60,6 +60,7 @@
 //!   Keep `DISCOVERY_REQUEST_BODY_MAX_BYTES` aligned with protocol limits.
 //!
 //! ## Last Modified
+//! v0.29.0-PublicCardRealRelayEvidence - Prefer verified client delivery receipts over synthetic proof labels
 //! v0.28.0-VerifiedClientRelayEvidence - Expose aggregate terminal-signed App onion delivery readiness
 //! v0.27.0-ProofRestartContinuity - Gate onion admission on verified or durably signed proof stability
 //! v0.26.0-RelayEvidenceTruthfulness - Expose origin-neutral accepted relay readiness without claiming user traffic
@@ -1591,6 +1592,16 @@ pub fn discovery_public_card_response(
     let blind_relay_quality = &status.blind_relay_quality;
     let relay_stats = &status.runtime.blind_relay;
     let two_hop_history = &status.two_hop_path_proof_history;
+    let real_delivery_evidence_seen = blind_relay_quality.verified_client_onion_deliveries > 0;
+    let message_delivery_proof_ready =
+        blind_relay_quality.real_relay_ready || two_hop_history.proof_ready;
+    let message_delivery_ready =
+        blind_relay_quality.real_relay_ready || two_hop_history.message_delivery_ready;
+    let latest_delivery_proof_age_seconds = if real_delivery_evidence_seen {
+        blind_relay_quality.last_verified_client_onion_delivery_age_seconds
+    } else {
+        two_hop_history.latest_age_seconds
+    };
 
     let status_bucket = protocol_foundation["status"]
         .as_str()
@@ -1671,10 +1682,10 @@ pub fn discovery_public_card_response(
                 "delivery_receipt_capable_peers": blind_relay_quality.delivery_receipt_capable_peers,
                 "accepted_relay_ready": blind_relay_quality.accepted_relay_ready,
                 "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
-                "proof_ready": two_hop_history.proof_ready,
-                "message_delivery_ready": two_hop_history.message_delivery_ready,
-                "message_delivery_evidence_mode": &two_hop_history.message_delivery_evidence_mode,
-                "latest_proof_age_seconds": two_hop_history.latest_age_seconds,
+                "proof_ready": message_delivery_proof_ready,
+                "message_delivery_ready": message_delivery_ready,
+                "message_delivery_evidence_mode": &blind_relay_quality.evidence_mode,
+                "latest_proof_age_seconds": latest_delivery_proof_age_seconds,
                 "terminal_delivered_count": relay_stats.terminal,
                 "middle_forwarded_count": relay_stats.forwarded,
             }
@@ -3074,6 +3085,7 @@ mod tests {
             2,
             1,
         );
+        store.record_verified_client_onion_delivery(now + 3);
         let app = build_discovery_router_with_local_status(
             store,
             DiscoveryApiPolicy::default(),
@@ -3124,6 +3136,26 @@ mod tests {
         assert_eq!(
             parsed["cards"]["blind_relay"]["middle_forwarded_count"].as_u64(),
             Some(1)
+        );
+        assert_eq!(
+            parsed["cards"]["blind_relay"]["real_relay_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["cards"]["blind_relay"]["verified_client_onion_deliveries"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["cards"]["blind_relay"]["proof_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["cards"]["blind_relay"]["message_delivery_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["cards"]["blind_relay"]["message_delivery_evidence_mode"].as_str(),
+            Some("verified_client_onion_delivery_receipt")
         );
         assert_eq!(
             parsed["signals"]["permissionless_node_admission"].as_bool(),
