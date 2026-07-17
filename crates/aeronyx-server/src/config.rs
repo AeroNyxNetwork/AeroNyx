@@ -52,6 +52,8 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.11.0-VerifiedDeliveryWitnessAdmission — Added explicit witness requester pins
+//! v0.10.0-VerifiedDeliveryWitness — Added optional pinned cache-anchor witnesses
 //! v1.4.0-DiscoveryRelayCapabilities — Added explicit onion-middle advertisement gate
 //! v1.3.0-TransportCapability — Added VPN transport capability accessors
 //! v2.1.0            — Added MemChain config fields
@@ -78,6 +80,9 @@ use tracing::info;
 
 use crate::error::{Result, ServerError};
 use crate::management::ManagementConfig;
+
+const MAX_VERIFIED_DELIVERY_WITNESS_NODE_IDS: usize = 3;
+const MAX_VERIFIED_DELIVERY_WITNESS_REQUESTER_NODE_IDS: usize = 64;
 
 // ── Sub-module re-exports (keep callers' use-paths stable) ────────────────
 pub use crate::config_chat_relay::ChatRelayConfig;
@@ -129,6 +134,30 @@ pub struct DiscoveryConfig {
     /// re-verified on every load, so stale or tampered descriptors are skipped.
     #[serde(default)]
     pub peer_cache_path: Option<String>,
+    /// Operator-pinned nodes that witness the signed delivery-cache generation.
+    ///
+    /// Witnesses receive only this node's identity, a monotonic generation,
+    /// and an opaque digest. Delivery counts, timestamps, routes, message ids,
+    /// payloads, endpoints, and client metadata are never sent.
+    #[serde(default)]
+    pub verified_delivery_witness_node_ids: Vec<String>,
+    /// Requester identities this node explicitly agrees to witness.
+    ///
+    /// This is independent of the permissionless discovery allow/deny policy.
+    /// An empty list keeps the witness endpoint fail-closed while preserving
+    /// ordinary descriptor discovery and encrypted relay participation.
+    #[serde(default)]
+    pub verified_delivery_witness_requester_node_ids: Vec<String>,
+    /// Minimum valid signed witness responses required to protect a generation.
+    #[serde(default = "DiscoveryConfig::default_verified_delivery_witness_min_verified")]
+    pub verified_delivery_witness_min_verified: usize,
+    /// Clears restored delivery evidence when the external threshold is absent.
+    ///
+    /// This remains default-off for backward compatibility. Signed stale,
+    /// conflict, or generation-gap evidence always fails closed regardless of
+    /// this availability policy.
+    #[serde(default)]
+    pub verified_delivery_witness_required_for_restore: bool,
     /// Periodic cache write interval in seconds.
     #[serde(default = "DiscoveryConfig::default_peer_cache_write_interval_secs")]
     pub peer_cache_write_interval_secs: u64,
@@ -223,6 +252,12 @@ impl DiscoveryConfig {
     #[must_use]
     pub const fn default_peer_cache_write_interval_secs() -> u64 {
         300
+    }
+
+    /// Default external cache-anchor witness threshold.
+    #[must_use]
+    pub const fn default_verified_delivery_witness_min_verified() -> usize {
+        1
     }
 
     /// Default outbound gossip interval.
@@ -329,6 +364,129 @@ impl DiscoveryConfig {
                     "discovery.peer_cache_path",
                     "must not be empty when provided",
                 ));
+            }
+        }
+
+        if !self.verified_delivery_witness_node_ids.is_empty()
+            || self.verified_delivery_witness_required_for_restore
+            || self.verified_delivery_witness_min_verified
+                != Self::default_verified_delivery_witness_min_verified()
+        {
+            if !self.enabled {
+                return Err(ServerError::config_invalid(
+                    "discovery.verified_delivery_witness_node_ids",
+                    "requires discovery.enabled = true",
+                ));
+            }
+            if self.peer_cache_path.is_none() {
+                return Err(ServerError::config_invalid(
+                    "discovery.peer_cache_path",
+                    "is required when verified-delivery witnesses are configured",
+                ));
+            }
+            if self.verified_delivery_witness_node_ids.is_empty() {
+                return Err(ServerError::config_invalid(
+                    "discovery.verified_delivery_witness_node_ids",
+                    "requires at least one pinned witness identity",
+                ));
+            }
+            if self.verified_delivery_witness_node_ids.len()
+                > MAX_VERIFIED_DELIVERY_WITNESS_NODE_IDS
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.verified_delivery_witness_node_ids",
+                    format!(
+                        "supports at most {MAX_VERIFIED_DELIVERY_WITNESS_NODE_IDS} pinned witnesses"
+                    ),
+                ));
+            }
+            let mut validated =
+                Vec::<[u8; 32]>::with_capacity(self.verified_delivery_witness_node_ids.len());
+            for configured in &self.verified_delivery_witness_node_ids {
+                let value = configured.trim();
+                let decoded = hex::decode(value).map_err(|_| {
+                    ServerError::config_invalid(
+                        "discovery.verified_delivery_witness_node_ids",
+                        "each entry must be a 64-character Ed25519 public key in hexadecimal",
+                    )
+                })?;
+                let node_id: [u8; 32] = decoded.try_into().map_err(|_| {
+                    ServerError::config_invalid(
+                        "discovery.verified_delivery_witness_node_ids",
+                        "each entry must decode to exactly 32 bytes",
+                    )
+                })?;
+                if value.len() != 64 || node_id.iter().all(|byte| *byte == 0) {
+                    return Err(ServerError::config_invalid(
+                        "discovery.verified_delivery_witness_node_ids",
+                        "each entry must be a non-zero 64-character Ed25519 public key",
+                    ));
+                }
+                if validated.contains(&node_id) {
+                    return Err(ServerError::config_invalid(
+                        "discovery.verified_delivery_witness_node_ids",
+                        "duplicate witness identities are not allowed",
+                    ));
+                }
+                validated.push(node_id);
+            }
+            if self.verified_delivery_witness_min_verified == 0
+                || self.verified_delivery_witness_min_verified > validated.len()
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.verified_delivery_witness_min_verified",
+                    "must be between one and the number of configured witnesses",
+                ));
+            }
+        }
+
+        if !self.verified_delivery_witness_requester_node_ids.is_empty() {
+            if !self.enabled {
+                return Err(ServerError::config_invalid(
+                    "discovery.verified_delivery_witness_requester_node_ids",
+                    "requires discovery.enabled = true",
+                ));
+            }
+            if self.verified_delivery_witness_requester_node_ids.len()
+                > MAX_VERIFIED_DELIVERY_WITNESS_REQUESTER_NODE_IDS
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.verified_delivery_witness_requester_node_ids",
+                    format!(
+                        "supports at most {MAX_VERIFIED_DELIVERY_WITNESS_REQUESTER_NODE_IDS} requester identities"
+                    ),
+                ));
+            }
+            let mut validated = Vec::<[u8; 32]>::with_capacity(
+                self.verified_delivery_witness_requester_node_ids.len(),
+            );
+            for configured in &self.verified_delivery_witness_requester_node_ids {
+                let value = configured.trim();
+                let decoded = hex::decode(value).map_err(|_| {
+                    ServerError::config_invalid(
+                        "discovery.verified_delivery_witness_requester_node_ids",
+                        "each entry must be a 64-character Ed25519 public key in hexadecimal",
+                    )
+                })?;
+                let node_id: [u8; 32] = decoded.try_into().map_err(|_| {
+                    ServerError::config_invalid(
+                        "discovery.verified_delivery_witness_requester_node_ids",
+                        "each entry must decode to exactly 32 bytes",
+                    )
+                })?;
+                if value.len() != 64 || node_id.iter().all(|byte| *byte == 0) {
+                    return Err(ServerError::config_invalid(
+                        "discovery.verified_delivery_witness_requester_node_ids",
+                        "each entry must be a non-zero 64-character Ed25519 public key",
+                    ));
+                }
+                if validated.contains(&node_id) {
+                    return Err(ServerError::config_invalid(
+                        "discovery.verified_delivery_witness_requester_node_ids",
+                        "duplicate requester identities are not allowed",
+                    ));
+                }
+                validated.push(node_id);
             }
         }
 
@@ -446,6 +604,33 @@ impl DiscoveryConfig {
         Ok(())
     }
 
+    /// Returns validated external cache-anchor witness identities in pin order.
+    ///
+    /// Validation rejects malformed values. `filter_map` keeps this accessor
+    /// panic-free for tests and internal callers that bypass validation.
+    #[must_use]
+    pub fn verified_delivery_witness_node_id_bytes(&self) -> Vec<[u8; 32]> {
+        self.verified_delivery_witness_node_ids
+            .iter()
+            .filter_map(|value| {
+                let decoded = hex::decode(value.trim()).ok()?;
+                decoded.try_into().ok()
+            })
+            .collect()
+    }
+
+    /// Returns validated identities allowed to use this node as a witness.
+    #[must_use]
+    pub fn verified_delivery_witness_requester_node_id_bytes(&self) -> Vec<[u8; 32]> {
+        self.verified_delivery_witness_requester_node_ids
+            .iter()
+            .filter_map(|value| {
+                let decoded = hex::decode(value.trim()).ok()?;
+                decoded.try_into().ok()
+            })
+            .collect()
+    }
+
     fn validate_seed_endpoint(endpoint: &str) -> Result<()> {
         let trimmed = endpoint.trim();
         if trimmed.is_empty() {
@@ -483,6 +668,11 @@ impl Default for DiscoveryConfig {
             seed_endpoints: Vec::new(),
             fetch_timeout_secs: Self::default_fetch_timeout_secs(),
             peer_cache_path: None,
+            verified_delivery_witness_node_ids: Vec::new(),
+            verified_delivery_witness_requester_node_ids: Vec::new(),
+            verified_delivery_witness_min_verified:
+                Self::default_verified_delivery_witness_min_verified(),
+            verified_delivery_witness_required_for_restore: false,
             peer_cache_write_interval_secs: Self::default_peer_cache_write_interval_secs(),
             gossip_enabled: false,
             gossip_interval_secs: Self::default_gossip_interval_secs(),
@@ -566,6 +756,18 @@ impl ServerConfig {
             .map_err(|e| ServerError::config_invalid("management", e))?;
         self.memchain.validate()?;
         self.discovery.validate()?;
+        if (!self.discovery.verified_delivery_witness_node_ids.is_empty()
+            || !self
+                .discovery
+                .verified_delivery_witness_requester_node_ids
+                .is_empty())
+            && !self.memchain.is_enabled()
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.verified_delivery_witness_*",
+                "requires a local MemChain storage mode for the authenticated witness endpoint",
+            ));
+        }
         Ok(())
     }
 
@@ -675,6 +877,23 @@ mod tests {
             DiscoveryConfig::default_fetch_timeout_secs()
         );
         assert!(config.discovery.peer_cache_path.is_none());
+        assert!(config
+            .discovery
+            .verified_delivery_witness_node_ids
+            .is_empty());
+        assert!(config
+            .discovery
+            .verified_delivery_witness_requester_node_ids
+            .is_empty());
+        assert_eq!(
+            config.discovery.verified_delivery_witness_min_verified,
+            DiscoveryConfig::default_verified_delivery_witness_min_verified()
+        );
+        assert!(
+            !config
+                .discovery
+                .verified_delivery_witness_required_for_restore
+        );
         assert_eq!(
             config.discovery.peer_cache_write_interval_secs,
             DiscoveryConfig::default_peer_cache_write_interval_secs()
@@ -884,6 +1103,137 @@ advertise_onion_middle = true
         assert_eq!(config.discovery.descriptor_ttl_secs, 7200);
         assert!(!config.discovery.public_discovery);
         assert!(config.discovery.advertise_onion_middle);
+    }
+
+    #[test]
+    fn test_verified_delivery_witness_policy_parses_and_decodes_pins() {
+        let toml_str = r#"
+[memchain]
+mode = "local"
+db_path = "/var/lib/aeronyx/memchain.db"
+
+[discovery]
+enabled = true
+peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
+verified_delivery_witness_node_ids = [
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+]
+verified_delivery_witness_requester_node_ids = [
+  "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+]
+verified_delivery_witness_min_verified = 2
+verified_delivery_witness_required_for_restore = true
+"#;
+        let config = ServerConfig::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.discovery.verified_delivery_witness_node_id_bytes(),
+            vec![[0xAA; 32], [0xBB; 32]]
+        );
+        assert_eq!(
+            config
+                .discovery
+                .verified_delivery_witness_requester_node_id_bytes(),
+            vec![[0xCC; 32]]
+        );
+        assert_eq!(config.discovery.verified_delivery_witness_min_verified, 2);
+        assert!(
+            config
+                .discovery
+                .verified_delivery_witness_required_for_restore
+        );
+    }
+
+    #[test]
+    fn test_verified_delivery_witness_policy_rejects_unsafe_configuration() {
+        let duplicate = r#"
+[memchain]
+mode = "local"
+
+[discovery]
+enabled = true
+peer_cache_path = "/tmp/peers.json"
+verified_delivery_witness_node_ids = [
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+]
+"#;
+        assert!(ServerConfig::from_str(duplicate).is_err());
+
+        let disabled_storage = r#"
+[memchain]
+mode = "off"
+
+[discovery]
+enabled = true
+peer_cache_path = "/tmp/peers.json"
+verified_delivery_witness_node_ids = [
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+]
+"#;
+        assert!(ServerConfig::from_str(disabled_storage).is_err());
+
+        // MemChain historically defaults to local mode when the section is
+        // omitted. Preserve that backward-compatible deployment behavior.
+        let default_local_storage = r#"
+[discovery]
+enabled = true
+peer_cache_path = "/tmp/peers.json"
+verified_delivery_witness_node_ids = [
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+]
+"#;
+        assert!(ServerConfig::from_str(default_local_storage).is_ok());
+
+        let duplicate_requesters = r#"
+[memchain]
+mode = "local"
+
+[discovery]
+enabled = true
+verified_delivery_witness_requester_node_ids = [
+  "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+]
+"#;
+        assert!(ServerConfig::from_str(duplicate_requesters).is_err());
+
+        let disabled_witness_service = r#"
+[memchain]
+mode = "off"
+
+[discovery]
+enabled = true
+verified_delivery_witness_requester_node_ids = [
+  "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+]
+"#;
+        assert!(ServerConfig::from_str(disabled_witness_service).is_err());
+
+        let missing_pins = r#"
+[memchain]
+mode = "local"
+
+[discovery]
+enabled = true
+peer_cache_path = "/tmp/peers.json"
+verified_delivery_witness_required_for_restore = true
+"#;
+        assert!(ServerConfig::from_str(missing_pins).is_err());
+
+        let impossible_threshold = r#"
+[memchain]
+mode = "local"
+
+[discovery]
+enabled = true
+peer_cache_path = "/tmp/peers.json"
+verified_delivery_witness_node_ids = [
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+]
+verified_delivery_witness_min_verified = 2
+"#;
+        assert!(ServerConfig::from_str(impossible_threshold).is_err());
     }
 
     #[test]

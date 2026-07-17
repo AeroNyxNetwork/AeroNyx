@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.11-CoordinatorLeaseRelease
+// Version: 2.8.12-VerifiedDeliveryAnchorWitness
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -20,6 +20,9 @@
 //   request/response variants. Existing discriminants remain unchanged.
 //   v2.8.11-CoordinatorLeaseRelease — Appended signed graceful lease release
 //   request/response variants without changing existing wire indices.
+//   v2.8.12-VerifiedDeliveryAnchorWitness — Appended fixed-size signed node
+//   delivery-anchor witness frames. They carry only generation and digest,
+//   never relay routes, message identifiers, payloads, or delivery counts.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -44,14 +47,17 @@
 //   - v1.3.0 is a BREAKING CHANGE: DeviceRegister, ChatPull, ChatAck wire
 //     format changed — old clients cannot talk to new servers and vice versa
 //   - WalletPresence (17) is a lightweight heartbeat — node never replies
-//   - Record block/checkpoint/certificate/lease frames (19-22, 25-30) are node-peer
-//     control messages and MUST NOT be accepted from ordinary client tunnels
+//   - Record block/checkpoint/certificate/lease and delivery-anchor witness
+//     frames (19-22, 25-32) are node-peer control messages and MUST NOT be
+//     accepted from ordinary client tunnels
 //   - Commitment blocks contain opaque record IDs only; sealed memory payload
 //     replication requires a separate owner-authorised protocol
 //   - serde_bytes64 is defined in chat.rs; the [u8;64] signature fields here
 //     use the same two-[u8;32] trick for bincode compatibility
 //
 // Last Modified:
+//   v2.8.12-VerifiedDeliveryAnchorWitness — Appended variants 31-32 and
+//                        canonical aggregate-only witness signing contracts
 //   v2.8.11-CoordinatorLeaseRelease — Appended variants 29-30 for authenticated
 //                        graceful handover without weakening crash fencing
 //   v2.8.10-CoordinatorLease — Appended variants 27-28 and canonical lease
@@ -115,6 +121,21 @@ pub const MIN_COORDINATOR_LEASE_TTL_SECS_V1: u32 = 60;
 /// Short leases bound failover delay and the exposure window after a lost
 /// renewal. Coordinators renew well before this deadline.
 pub const MAX_COORDINATOR_LEASE_TTL_SECS_V1: u32 = 300;
+
+/// Witness atomically advanced from an older generation to this request.
+pub const VERIFIED_DELIVERY_WITNESS_ADVANCED_V1: u8 = 0;
+/// Witness already retained the same generation and digest.
+pub const VERIFIED_DELIVERY_WITNESS_IDEMPOTENT_V1: u8 = 1;
+/// Request generation was below the witness's durable high-water mark.
+pub const VERIFIED_DELIVERY_WITNESS_STALE_V1: u8 = 2;
+/// Request reused the witness generation with a different digest.
+pub const VERIFIED_DELIVERY_WITNESS_CONFLICT_V1: u8 = 3;
+/// Request skipped one or more generations after this witness was established.
+///
+/// A witness must not advance on this outcome. Requiring contiguous updates
+/// prevents a later, still correctly signed host snapshot from silently
+/// replacing an unwitnessed intermediate generation.
+pub const VERIFIED_DELIVERY_WITNESS_GAP_V1: u8 = 4;
 
 // ============================================
 // Internal serde helper for [u8; 64]
@@ -683,6 +704,57 @@ pub enum MemChainMessage {
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
+
+    // ── v2.8.12: aggregate delivery-anchor witnessing (indices 31-32) ──
+    /// [index 31] Asks an admitted node to witness one signed local cache generation.
+    ///
+    /// `anchor_digest` commits the requester's independently signed local
+    /// aggregate anchor. The anchor and its delivery count never leave the
+    /// requester; the witness receives only this fixed-size opaque digest.
+    VerifiedDeliveryAnchorWitnessRequestV1 {
+        /// Requesting node's Ed25519 identity.
+        requester: [u8; 32],
+        /// Positive monotonic local cache generation.
+        generation: u64,
+        /// Domain-separated digest of the requester's signed local anchor.
+        anchor_digest: [u8; 32],
+        /// Per-request random identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Unix epoch seconds; witnesses reject stale requests.
+        request_timestamp: u64,
+        /// Requester signature over every canonical request field.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+
+    /// [index 32] Returns the witness's signed durable high-water decision.
+    ///
+    /// Outcomes are the fixed `VERIFIED_DELIVERY_WITNESS_*_V1` constants.
+    /// Stale and conflicting requests still receive an authenticated response,
+    /// allowing the requester to fail closed without trusting HTTP text.
+    VerifiedDeliveryAnchorWitnessResponseV1 {
+        /// Request identifier copied from the request.
+        request_id: [u8; 16],
+        /// Requesting node identity copied from the request.
+        requester: [u8; 32],
+        /// Generation copied from the request.
+        requested_generation: u64,
+        /// Anchor digest copied from the request.
+        requested_anchor_digest: [u8; 32],
+        /// Witness Ed25519 identity.
+        witness: [u8; 32],
+        /// Unix epoch seconds when the durable decision was signed.
+        response_timestamp: u64,
+        /// Witness's durable generation after evaluating the request.
+        witness_generation: u64,
+        /// Witness's durable digest after evaluating the request.
+        witness_anchor_digest: [u8; 32],
+        /// Fixed decision bucket; see `VERIFIED_DELIVERY_WITNESS_*_V1`.
+        outcome: u8,
+        /// Witness signature over every canonical response field.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
 }
 
 fn deserialize_chat_pull_cursor_v2<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -1013,6 +1085,55 @@ pub fn record_coordinator_lease_release_response_signing_bytes(
     bytes.extend_from_slice(witness);
     bytes.extend_from_slice(&released_at.to_le_bytes());
     bytes.extend_from_slice(&lease_epoch.to_le_bytes());
+    bytes
+}
+
+/// Canonical bytes signed by
+/// `VerifiedDeliveryAnchorWitnessRequestV1.requester`.
+#[must_use]
+pub fn verified_delivery_anchor_witness_request_signing_bytes(
+    requester: &[u8; 32],
+    generation: u64,
+    anchor_digest: &[u8; 32],
+    request_id: &[u8; 16],
+    request_timestamp: u64,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(160);
+    bytes.extend_from_slice(b"AeroNyx-VerifiedDeliveryAnchorWitnessRequest-v1");
+    bytes.extend_from_slice(requester);
+    bytes.extend_from_slice(&generation.to_le_bytes());
+    bytes.extend_from_slice(anchor_digest);
+    bytes.extend_from_slice(request_id);
+    bytes.extend_from_slice(&request_timestamp.to_le_bytes());
+    bytes
+}
+
+/// Canonical bytes signed by
+/// `VerifiedDeliveryAnchorWitnessResponseV1.witness`.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn verified_delivery_anchor_witness_response_signing_bytes(
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    requested_generation: u64,
+    requested_anchor_digest: &[u8; 32],
+    witness: &[u8; 32],
+    response_timestamp: u64,
+    witness_generation: u64,
+    witness_anchor_digest: &[u8; 32],
+    outcome: u8,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(256);
+    bytes.extend_from_slice(b"AeroNyx-VerifiedDeliveryAnchorWitnessResponse-v1");
+    bytes.extend_from_slice(request_id);
+    bytes.extend_from_slice(requester);
+    bytes.extend_from_slice(&requested_generation.to_le_bytes());
+    bytes.extend_from_slice(requested_anchor_digest);
+    bytes.extend_from_slice(witness);
+    bytes.extend_from_slice(&response_timestamp.to_le_bytes());
+    bytes.extend_from_slice(&witness_generation.to_le_bytes());
+    bytes.extend_from_slice(witness_anchor_digest);
+    bytes.push(outcome);
     bytes
 }
 
@@ -2027,6 +2148,126 @@ mod tests {
         witness
             .verify(&release_response_bytes, &signature)
             .expect("lease release response signature");
+    }
+
+    #[test]
+    fn test_verified_delivery_anchor_witness_messages_roundtrip_and_signatures() {
+        let requester = IdentityKeyPair::generate();
+        let witness = IdentityKeyPair::generate();
+        let generation = 42;
+        let anchor_digest = [0xA5; 32];
+        let request_id = [0xB6; 16];
+        let request_timestamp = 1_700_900_000;
+        let request_signing_bytes = verified_delivery_anchor_witness_request_signing_bytes(
+            &requester.public_key_bytes(),
+            generation,
+            &anchor_digest,
+            &request_id,
+            request_timestamp,
+        );
+        let request = MemChainMessage::VerifiedDeliveryAnchorWitnessRequestV1 {
+            requester: requester.public_key_bytes(),
+            generation,
+            anchor_digest,
+            request_id,
+            request_timestamp,
+            signature: requester.sign(&request_signing_bytes),
+        };
+        let encoded = encode_memchain(&request).expect("encode delivery witness request");
+        assert_eq!(u32::from_le_bytes(encoded[1..5].try_into().unwrap()), 31);
+        let decoded = decode_memchain(&encoded[1..]).expect("decode delivery witness request");
+        let MemChainMessage::VerifiedDeliveryAnchorWitnessRequestV1 {
+            requester: requester_key,
+            generation: decoded_generation,
+            anchor_digest: decoded_digest,
+            request_id: decoded_request_id,
+            request_timestamp: decoded_timestamp,
+            signature,
+        } = decoded
+        else {
+            panic!("expected delivery witness request");
+        };
+        assert_eq!(decoded_generation, generation);
+        assert_eq!(decoded_digest, anchor_digest);
+        let decoded_signing_bytes = verified_delivery_anchor_witness_request_signing_bytes(
+            &requester_key,
+            decoded_generation,
+            &decoded_digest,
+            &decoded_request_id,
+            decoded_timestamp,
+        );
+        requester
+            .verify(&decoded_signing_bytes, &signature)
+            .expect("delivery witness request signature");
+
+        let response_timestamp = request_timestamp + 1;
+        let response_signing_bytes = verified_delivery_anchor_witness_response_signing_bytes(
+            &request_id,
+            &requester.public_key_bytes(),
+            generation,
+            &anchor_digest,
+            &witness.public_key_bytes(),
+            response_timestamp,
+            generation,
+            &anchor_digest,
+            VERIFIED_DELIVERY_WITNESS_ADVANCED_V1,
+        );
+        let response = MemChainMessage::VerifiedDeliveryAnchorWitnessResponseV1 {
+            request_id,
+            requester: requester.public_key_bytes(),
+            requested_generation: generation,
+            requested_anchor_digest: anchor_digest,
+            witness: witness.public_key_bytes(),
+            response_timestamp,
+            witness_generation: generation,
+            witness_anchor_digest: anchor_digest,
+            outcome: VERIFIED_DELIVERY_WITNESS_ADVANCED_V1,
+            signature: witness.sign(&response_signing_bytes),
+        };
+        let encoded = encode_memchain(&response).expect("encode delivery witness response");
+        assert_eq!(u32::from_le_bytes(encoded[1..5].try_into().unwrap()), 32);
+        let decoded = decode_memchain(&encoded[1..]).expect("decode delivery witness response");
+        let MemChainMessage::VerifiedDeliveryAnchorWitnessResponseV1 {
+            request_id: decoded_request_id,
+            requester: requester_key,
+            requested_generation,
+            requested_anchor_digest,
+            witness: witness_key,
+            response_timestamp: decoded_timestamp,
+            witness_generation,
+            witness_anchor_digest,
+            outcome,
+            signature,
+        } = decoded
+        else {
+            panic!("expected delivery witness response");
+        };
+        let decoded_signing_bytes = verified_delivery_anchor_witness_response_signing_bytes(
+            &decoded_request_id,
+            &requester_key,
+            requested_generation,
+            &requested_anchor_digest,
+            &witness_key,
+            decoded_timestamp,
+            witness_generation,
+            &witness_anchor_digest,
+            outcome,
+        );
+        witness
+            .verify(&decoded_signing_bytes, &signature)
+            .expect("delivery witness response signature");
+
+        assert_ne!(
+            verified_delivery_anchor_witness_request_signing_bytes(
+                &requester.public_key_bytes(),
+                generation + 1,
+                &anchor_digest,
+                &request_id,
+                request_timestamp,
+            ),
+            request_signing_bytes,
+            "generation must be covered by the request signature"
+        );
     }
 
     // ── Chat Relay variant roundtrip tests ───────────────────────────────

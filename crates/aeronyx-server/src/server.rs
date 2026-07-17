@@ -195,6 +195,10 @@
 //  83. Binds aggregate delivery evidence to a monotonic cache generation and
 //      independent signed local anchor, rejecting older valid cache snapshots
 //      without coupling descriptor, routeability, or proof recovery.
+//  84. Optionally witnesses the opaque digest of each signed delivery-cache
+//      anchor on pinned peer nodes, serializing generations so whole-host
+//      rollback and missed-generation gaps fail closed without exporting
+//      delivery counts, timestamps, routes, messages, payloads, or clients.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -228,6 +232,9 @@
 //     must run after the full evidence-vault audit and before networking.
 //   - External startup witnesses are explicit identity trust pins. Discovery
 //     may rotate their signed endpoints, but unpinned peers stay evidence-only.
+//   - Delivery-cache witnesses are not Memory Chain checkpoint witnesses. They
+//     retain one aggregate-only opaque high-water row per node and must never
+//     become consensus, finality, routing authority, or user traffic telemetry.
 //   - The minimum verified witness count is an operator startup threshold over
 //     distinct pins. It is not consensus, quorum, finality, or fork choice.
 //   - Certificate exchange is post-startup evidence transport only. Never use
@@ -423,12 +430,13 @@ use crate::api::discovery::{
 };
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
-    pull_record_commitment_checkpoint,
-    pull_record_commitment_checkpoint_certificate, pull_record_commitment_page,
+    pull_record_commitment_checkpoint, pull_record_commitment_checkpoint_certificate,
+    pull_record_commitment_page,
     reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
     reconcile_record_commitment_witnesses, release_record_commitment_coordinator_lease,
-    request_record_commitment_coordinator_lease, CommitmentCheckpointRelation,
-    CommitmentReconciliationOutcome,
+    request_record_commitment_coordinator_lease, witness_verified_delivery_anchor,
+    CommitmentCheckpointRelation, CommitmentReconciliationOutcome,
+    VerifiedDeliveryAnchorWitnessRound,
 };
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
 use crate::api::voice::build_voice_router;
@@ -465,8 +473,9 @@ use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
 use crate::services::memchain::{LlmRouter, TaskWorker};
 use crate::services::peer_store::{
     PeerStoreRouteabilityCacheEvidence, PeerStoreTwoHopPathProofEvent,
-    PeerStoreVerifiedClientDeliveryCacheEvidence, ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
-    TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
+    PeerStoreVerifiedClientDeliveryCacheEvidence, PeerStoreVerifiedDeliveryWitnessRound,
+    ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+    VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
 };
 use crate::services::{
     spawn_dns_proxy, HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore, RoutingService,
@@ -897,6 +906,28 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
             && self.evidence == document.verified_client_delivery_evidence
     }
 
+    /// Returns a domain-separated opaque digest of the exact signed anchor.
+    ///
+    /// External witnesses receive this digest, never the embedded aggregate
+    /// delivery count or verification time. Binding the signer and signature
+    /// prevents two differently signed anchor documents from sharing witness
+    /// state even if their canonical fields were otherwise equal.
+    fn witness_digest(&self) -> std::result::Result<[u8; 32], String> {
+        let mut signer = [0u8; 32];
+        hex::decode_to_slice(&self.signer_node_id, &mut signer)
+            .map_err(|_| "verified client delivery anchor signer encoding invalid".to_string())?;
+        let mut signature = [0u8; 64];
+        hex::decode_to_slice(&self.signature_ed25519, &mut signature).map_err(|_| {
+            "verified client delivery anchor signature encoding invalid".to_string()
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"AeroNyx-VerifiedDeliveryAnchorWitnessDigest-v1");
+        hasher.update(self.signing_bytes()?);
+        hasher.update(signer);
+        hasher.update(signature);
+        Ok(hasher.finalize().into())
+    }
+
     fn to_json_pretty(&self) -> Result<Vec<u8>> {
         let bytes = serde_json::to_vec_pretty(self).map_err(|error| {
             ServerError::internal(format!("verified client delivery anchor json: {error}"))
@@ -918,6 +949,18 @@ enum PeerStoreVerifiedClientDeliveryAnchorState {
     Missing,
     Invalid,
     Verified(PeerStoreVerifiedClientDeliveryAnchor),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerStoreVerifiedClientDeliveryExternalWitnessDecision {
+    /// No external witness policy is configured; local anchor behavior remains unchanged.
+    Disabled,
+    /// No local anchor exists yet. Only a genuinely fresh cache may bootstrap.
+    Missing,
+    /// The exact local anchor reached the configured accepted-response threshold.
+    Protected,
+    /// The local anchor was unavailable, adverse, or below threshold.
+    Unprotected(&'static str),
 }
 
 impl PeerStoreVerifiedClientDeliveryAnchorState {
@@ -2808,7 +2851,7 @@ impl Server {
         let listener = match tokio::net::TcpListener::bind(listen_addr).await {
             Ok(listener) => {
                 info!(
-                    "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/chat/peer/*, /api/memchain/peer/block-announce, /api/memchain/peer/block-range, /api/memchain/peer/checkpoint, /api/memchain/peer/coordinator-lease)",
+                    "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/chat/peer/*, /api/memchain/peer/block-announce, /api/memchain/peer/block-range, /api/memchain/peer/checkpoint, /api/memchain/peer/coordinator-lease, /api/discovery/peer/verified-delivery-anchor-witness)",
                     listen_addr
                 );
                 listener
@@ -3356,6 +3399,12 @@ impl Server {
     async fn init_peer_store(&self, chat_relay_runtime_ready: bool) -> Arc<PeerStore> {
         let peer_store = Arc::new(PeerStore::new());
         peer_store.set_max_peers(Some(self.config.discovery.max_peers));
+        peer_store.configure_verified_delivery_witness_requesters(
+            &self
+                .config
+                .discovery
+                .verified_delivery_witness_requester_node_id_bytes(),
+        );
         peer_store.configure_bootstrap_status(
             self.config.discovery.enabled,
             self.config.discovery.peer_cache_path.is_some(),
@@ -3540,11 +3589,13 @@ impl Server {
         if let Some(path) = &self.config.discovery.peer_cache_path {
             let cache_save_at = unix_now_secs();
             if let Err(e) =
-                Self::persist_peer_store_cache_once(
+                Self::persist_peer_store_cache_with_delivery_witnesses(
                     &self.identity,
                     &peer_store,
+                    &self.config.discovery,
                     path,
                     cache_save_at,
+                    true,
                 )
                 .await
             {
@@ -3729,6 +3780,281 @@ impl Server {
         }
     }
 
+    fn peer_store_delivery_witness_round(
+        round: VerifiedDeliveryAnchorWitnessRound,
+    ) -> PeerStoreVerifiedDeliveryWitnessRound {
+        PeerStoreVerifiedDeliveryWitnessRound {
+            configured: round.configured as u64,
+            attempted: round.attempted as u64,
+            verified: round.verified as u64,
+            advanced: round.advanced as u64,
+            idempotent: round.idempotent as u64,
+            stale: round.stale as u64,
+            conflicts: round.conflicts as u64,
+            gaps: round.gaps as u64,
+            failed: round.failed as u64,
+        }
+    }
+
+    /// Reconciles the exact local signed delivery-cache anchor with pinned peers.
+    ///
+    /// This is intentionally separate from Memory Chain checkpoint witnesses.
+    /// It protects only aggregate local relay-readiness recovery and never
+    /// carries delivery counts, timestamps, routes, message ids, payloads,
+    /// endpoints, or client metadata.
+    async fn reconcile_peer_cache_delivery_witnesses(
+        identity: &IdentityKeyPair,
+        peer_store: &PeerStore,
+        discovery: &DiscoveryConfig,
+        path: &str,
+        startup_gate: bool,
+    ) -> PeerStoreVerifiedClientDeliveryExternalWitnessDecision {
+        let witness_node_ids = discovery.verified_delivery_witness_node_id_bytes();
+        let anchor_state = Self::read_peer_cache_client_delivery_anchor(path, identity).await;
+        let generation = match &anchor_state {
+            PeerStoreVerifiedClientDeliveryAnchorState::Verified(anchor) => anchor.cache_generation,
+            _ => 0,
+        };
+        if witness_node_ids.is_empty() {
+            peer_store.record_client_delivery_witness_round(
+                unix_now_secs(),
+                generation,
+                false,
+                discovery.verified_delivery_witness_min_verified,
+                PeerStoreVerifiedDeliveryWitnessRound::default(),
+            );
+            return PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Disabled;
+        }
+
+        let evaluated_at = unix_now_secs();
+        let anchor = match anchor_state {
+            PeerStoreVerifiedClientDeliveryAnchorState::Verified(anchor) => anchor,
+            PeerStoreVerifiedClientDeliveryAnchorState::Missing => {
+                let round = PeerStoreVerifiedDeliveryWitnessRound {
+                    configured: witness_node_ids.len() as u64,
+                    ..PeerStoreVerifiedDeliveryWitnessRound::default()
+                };
+                peer_store.record_client_delivery_witness_round(
+                    evaluated_at,
+                    0,
+                    discovery.verified_delivery_witness_required_for_restore,
+                    discovery.verified_delivery_witness_min_verified,
+                    round,
+                );
+                if startup_gate && discovery.verified_delivery_witness_required_for_restore {
+                    peer_store.clear_restored_verified_client_delivery_evidence(
+                        evaluated_at,
+                        "external_witness_unavailable",
+                    );
+                }
+                return PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Missing;
+            }
+            PeerStoreVerifiedClientDeliveryAnchorState::Invalid
+            | PeerStoreVerifiedClientDeliveryAnchorState::NotChecked => {
+                let round = PeerStoreVerifiedDeliveryWitnessRound {
+                    configured: witness_node_ids.len() as u64,
+                    failed: witness_node_ids.len() as u64,
+                    ..PeerStoreVerifiedDeliveryWitnessRound::default()
+                };
+                peer_store.record_client_delivery_witness_round(
+                    evaluated_at,
+                    0,
+                    discovery.verified_delivery_witness_required_for_restore,
+                    discovery.verified_delivery_witness_min_verified,
+                    round,
+                );
+                if startup_gate {
+                    peer_store.clear_restored_verified_client_delivery_evidence(
+                        evaluated_at,
+                        "external_witness_invalid",
+                    );
+                }
+                return PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Unprotected(
+                    "unavailable",
+                );
+            }
+        };
+
+        let digest = match anchor.witness_digest() {
+            Ok(digest) => digest,
+            Err(_) => {
+                let round = PeerStoreVerifiedDeliveryWitnessRound {
+                    configured: witness_node_ids.len() as u64,
+                    failed: witness_node_ids.len() as u64,
+                    ..PeerStoreVerifiedDeliveryWitnessRound::default()
+                };
+                peer_store.record_client_delivery_witness_round(
+                    evaluated_at,
+                    anchor.cache_generation,
+                    discovery.verified_delivery_witness_required_for_restore,
+                    discovery.verified_delivery_witness_min_verified,
+                    round,
+                );
+                if startup_gate {
+                    peer_store.clear_restored_verified_client_delivery_evidence(
+                        evaluated_at,
+                        "external_witness_invalid",
+                    );
+                }
+                return PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Unprotected(
+                    "unavailable",
+                );
+            }
+        };
+        let client = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(1)
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => {
+                let round = PeerStoreVerifiedDeliveryWitnessRound {
+                    configured: witness_node_ids.len() as u64,
+                    failed: witness_node_ids.len() as u64,
+                    ..PeerStoreVerifiedDeliveryWitnessRound::default()
+                };
+                let status = peer_store.record_client_delivery_witness_round(
+                    evaluated_at,
+                    anchor.cache_generation,
+                    discovery.verified_delivery_witness_required_for_restore,
+                    discovery.verified_delivery_witness_min_verified,
+                    round,
+                );
+                if startup_gate && discovery.verified_delivery_witness_required_for_restore {
+                    peer_store.clear_restored_verified_client_delivery_evidence(
+                        evaluated_at,
+                        "external_witness_unavailable",
+                    );
+                }
+                return PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Unprotected(status);
+            }
+        };
+        let round = match witness_verified_delivery_anchor(
+            peer_store,
+            identity,
+            &client,
+            &witness_node_ids,
+            anchor.cache_generation,
+            &digest,
+        )
+        .await
+        {
+            Ok(round) => Self::peer_store_delivery_witness_round(round),
+            Err(_) => PeerStoreVerifiedDeliveryWitnessRound {
+                configured: witness_node_ids.len() as u64,
+                failed: witness_node_ids.len() as u64,
+                ..PeerStoreVerifiedDeliveryWitnessRound::default()
+            },
+        };
+        let status = peer_store.record_client_delivery_witness_round(
+            unix_now_secs(),
+            anchor.cache_generation,
+            discovery.verified_delivery_witness_required_for_restore,
+            discovery.verified_delivery_witness_min_verified,
+            round,
+        );
+        let rejection_reason = match status {
+            "rollback_detected" => Some("external_witness_rollback"),
+            "conflict" => Some("external_witness_conflict"),
+            "gap" => Some("external_witness_gap"),
+            "partial" | "unavailable"
+                if discovery.verified_delivery_witness_required_for_restore =>
+            {
+                Some("external_witness_unavailable")
+            }
+            _ => None,
+        };
+        if startup_gate {
+            if let Some(reason) = rejection_reason {
+                peer_store
+                    .clear_restored_verified_client_delivery_evidence(unix_now_secs(), reason);
+            }
+        }
+        if status == "verified" {
+            PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Protected
+        } else {
+            PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Unprotected(status)
+        }
+    }
+
+    /// Persists at most one new local generation after the prior generation is
+    /// externally protected, then witnesses the exact newly written anchor.
+    async fn persist_peer_store_cache_with_delivery_witnesses(
+        identity: &IdentityKeyPair,
+        peer_store: &PeerStore,
+        discovery: &DiscoveryConfig,
+        path: &str,
+        now: u64,
+        startup_gate: bool,
+    ) -> Result<()> {
+        let witnesses_configured = !discovery.verified_delivery_witness_node_ids.is_empty();
+        if witnesses_configured {
+            let primary_exists = tokio::fs::metadata(path).await.is_ok();
+            let backup_exists = tokio::fs::metadata(Self::peer_cache_backup_path(path))
+                .await
+                .is_ok();
+            let decision = Self::reconcile_peer_cache_delivery_witnesses(
+                identity,
+                peer_store,
+                discovery,
+                path,
+                startup_gate,
+            )
+            .await;
+            let fresh_bootstrap = decision
+                == PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Missing
+                && !primary_exists
+                && !backup_exists;
+            if decision != PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Protected
+                && !fresh_bootstrap
+            {
+                let status = match decision {
+                    PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Unprotected(status) => {
+                        status
+                    }
+                    PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Missing => {
+                        "anchor_missing"
+                    }
+                    PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Disabled => "disabled",
+                    PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Protected => "verified",
+                };
+                peer_store.record_cache_save_status(
+                    now,
+                    "skipped",
+                    format!("external_delivery_witness={status}"),
+                );
+                peer_store.mark_client_delivery_cache_dirty();
+                return Ok(());
+            }
+        } else {
+            peer_store.record_client_delivery_witness_round(
+                now,
+                0,
+                false,
+                discovery.verified_delivery_witness_min_verified,
+                PeerStoreVerifiedDeliveryWitnessRound::default(),
+            );
+        }
+
+        Self::persist_peer_store_cache_once(identity, peer_store, path, now).await?;
+        if witnesses_configured {
+            let decision = Self::reconcile_peer_cache_delivery_witnesses(
+                identity,
+                peer_store,
+                discovery,
+                path,
+                startup_gate,
+            )
+            .await;
+            if decision != PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Protected {
+                peer_store.mark_client_delivery_cache_dirty();
+            }
+        }
+        Ok(())
+    }
+
     fn spawn_peer_store_persistence_task(
         &self,
         peer_store: Arc<PeerStore>,
@@ -3743,56 +4069,60 @@ impl Server {
         let interval_secs = self.config.discovery.peer_cache_write_interval_secs;
         let shutdown = Arc::clone(&self.shutdown);
         let identity = Arc::new(self.identity.clone());
+        let discovery = Arc::new(self.config.discovery.clone());
         let mut rx = self.shutdown_tx.subscribe();
 
         Some(tokio::spawn(async move {
             let mut timer = tokio::time::interval(Duration::from_secs(interval_secs));
             let persist_snapshot = |identity: Arc<IdentityKeyPair>,
                                     peer_store: Arc<PeerStore>,
+                                    discovery: Arc<DiscoveryConfig>,
                                     path: String,
                                     reason: &'static str| async move {
-                    let now = unix_now_secs();
-                    match Self::persist_peer_store_cache_once(
-                        identity.as_ref(),
-                        &peer_store,
-                        &path,
-                        now,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            debug!(
-                                source = %path,
-                                reason = reason,
-                                "[DISCOVERY] Peer cache snapshot persisted"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                source = %path,
-                                reason = reason,
-                                error = %e,
-                                "[DISCOVERY] Failed to persist peer cache snapshot"
-                            );
-                        }
+                let now = unix_now_secs();
+                match Self::persist_peer_store_cache_with_delivery_witnesses(
+                    identity.as_ref(),
+                    &peer_store,
+                    discovery.as_ref(),
+                    &path,
+                    now,
+                    false,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        debug!(
+                            source = %path,
+                            reason = reason,
+                            "[DISCOVERY] Peer cache snapshot persisted"
+                        );
                     }
-                };
+                    Err(e) => {
+                        warn!(
+                            source = %path,
+                            reason = reason,
+                            error = %e,
+                            "[DISCOVERY] Failed to persist peer cache snapshot"
+                        );
+                    }
+                }
+            };
 
             loop {
                 tokio::select! {
                     _ = rx.recv() => {
                         peer_store.take_client_delivery_cache_dirty();
-                        persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), path.clone(), "shutdown").await;
+                        persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), Arc::clone(&discovery), path.clone(), "shutdown").await;
                         break;
                     }
                     _ = timer.tick() => {
                         if shutdown.load(Ordering::SeqCst) {
                             peer_store.take_client_delivery_cache_dirty();
-                            persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), path.clone(), "shutdown_flag").await;
+                            persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), Arc::clone(&discovery), path.clone(), "shutdown_flag").await;
                             break;
                         }
                         peer_store.take_client_delivery_cache_dirty();
-                        persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), path.clone(), "interval").await;
+                        persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), Arc::clone(&discovery), path.clone(), "interval").await;
                     }
                     _ = peer_store.wait_for_client_delivery_cache_dirty() => {
                         tokio::time::sleep(Duration::from_millis(
@@ -3802,6 +4132,7 @@ impl Server {
                             persist_snapshot(
                                 Arc::clone(&identity),
                                 Arc::clone(&peer_store),
+                                Arc::clone(&discovery),
                                 path.clone(),
                                 "client_delivery",
                             ).await;
@@ -10434,10 +10765,17 @@ mod tests {
 
         let anchor_path = Server::peer_cache_client_delivery_anchor_path(&path_str);
         let anchor_bytes = tokio::fs::read(&anchor_path).await.unwrap();
-        let anchor =
-            PeerStoreVerifiedClientDeliveryAnchor::from_json_bytes(&anchor_bytes).unwrap();
+        let anchor = PeerStoreVerifiedClientDeliveryAnchor::from_json_bytes(&anchor_bytes).unwrap();
         assert!(anchor.verify(&server.identity).is_ok());
         assert!(anchor.matches_document(&document));
+        let witness_digest = anchor.witness_digest().unwrap();
+        assert_eq!(witness_digest, anchor.witness_digest().unwrap());
+        let mut next_anchor = anchor.clone();
+        next_anchor.cache_generation += 1;
+        next_anchor.signature_ed25519 =
+            hex::encode(server.identity.sign(&next_anchor.signing_bytes().unwrap()));
+        assert!(next_anchor.verify(&server.identity).is_ok());
+        assert_ne!(witness_digest, next_anchor.witness_digest().unwrap());
         let serialized_anchor = String::from_utf8(anchor_bytes).unwrap();
         for forbidden in [
             "route_id",

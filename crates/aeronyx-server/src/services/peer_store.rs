@@ -126,6 +126,9 @@
 //! - Routeability evidence follows the signed route surface across ordinary
 //!   descriptor sequence/TTL refreshes, but endpoint, capability, discovery
 //!   visibility, or onion KEM changes fail closed until a new direct success
+//! - External delivery-cache witness rounds expose aggregate continuity status
+//!   and can clear only restored delivery readiness before listeners, without
+//!   retaining witness identities, opaque digests, or traffic metadata
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -152,6 +155,8 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.62.0-VerifiedDeliveryWitnessAdmission - Added fail-closed bilateral requester pins for witness writes
+//! v0.61.0-VerifiedDeliveryExternalWitness - Added aggregate external witness status and startup fail-closed clearing
 //! v0.60.0-VerifiedDeliveryRollbackAnchor - Track signed cache generations and fail closed on local delivery-evidence rollback
 //! v0.59.0-VerifiedDeliveryRestartContinuity - Persist only signed aggregate client-delivery evidence and require fresh receipt-capable peers after restart
 //! v0.58.0-RouteNetworkAntiAffinity - Require routeable peers and distinct endpoint network identities for multi-hop paths
@@ -218,7 +223,7 @@
 //! v0.3.0-DiscoveryPhase4 - Added discovery gossip apply/export helpers
 // ============================================================================
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -727,6 +732,52 @@ pub struct PeerStoreBootstrapStatus {
     /// `rollback_detected`, and `not_checked`.
     #[serde(default)]
     pub last_client_delivery_cache_rollback_protection: Option<String>,
+    /// External cache-anchor witness result for the latest evaluated generation.
+    ///
+    /// Stable buckets are `disabled`, `verified`, `partial`, `unavailable`,
+    /// `rollback_detected`, `conflict`, and `gap`. All accompanying fields are
+    /// aggregate-only and omit witness identities, endpoints, and digests.
+    #[serde(default)]
+    pub last_client_delivery_witness_status: Option<String>,
+    /// Timestamp of the latest external witness evaluation.
+    #[serde(default)]
+    pub last_client_delivery_witness_checked_at: Option<u64>,
+    /// Local signed cache generation evaluated by the latest witness round.
+    #[serde(default)]
+    pub last_client_delivery_witness_generation: u64,
+    /// Whether availability below threshold rejects restored delivery evidence.
+    #[serde(default)]
+    pub last_client_delivery_witness_required: bool,
+    /// Minimum valid signed responses configured for the latest round.
+    #[serde(default)]
+    pub last_client_delivery_witness_minimum_verified: u64,
+    /// Distinct operator-pinned witnesses in the bounded round.
+    #[serde(default)]
+    pub last_client_delivery_witness_configured: u64,
+    /// Witness HTTP requests attempted in the bounded round.
+    #[serde(default)]
+    pub last_client_delivery_witness_attempted: u64,
+    /// Cryptographically valid signed witness responses.
+    #[serde(default)]
+    pub last_client_delivery_witness_verified: u64,
+    /// Witnesses that advanced their durable high-water mark.
+    #[serde(default)]
+    pub last_client_delivery_witness_advanced: u64,
+    /// Witnesses already holding the exact generation and opaque digest.
+    #[serde(default)]
+    pub last_client_delivery_witness_idempotent: u64,
+    /// Witnesses proving the local generation is below their high-water mark.
+    #[serde(default)]
+    pub last_client_delivery_witness_stale: u64,
+    /// Witnesses proving a different digest reused the same generation.
+    #[serde(default)]
+    pub last_client_delivery_witness_conflicts: u64,
+    /// Witnesses refusing a discontinuous generation advance.
+    #[serde(default)]
+    pub last_client_delivery_witness_gaps: u64,
+    /// Admission, endpoint, transport, decoding, or signature failures.
+    #[serde(default)]
+    pub last_client_delivery_witness_failed: u64,
     /// Number of peers attempted in the last outbound gossip round.
     pub last_gossip_attempted: u64,
     /// Number of configured seed endpoints attempted in the last gossip round.
@@ -810,6 +861,20 @@ impl Default for PeerStoreBootstrapStatus {
             last_client_delivery_cache_persisted_at: None,
             last_client_delivery_cache_generation: 0,
             last_client_delivery_cache_rollback_protection: None,
+            last_client_delivery_witness_status: None,
+            last_client_delivery_witness_checked_at: None,
+            last_client_delivery_witness_generation: 0,
+            last_client_delivery_witness_required: false,
+            last_client_delivery_witness_minimum_verified: 0,
+            last_client_delivery_witness_configured: 0,
+            last_client_delivery_witness_attempted: 0,
+            last_client_delivery_witness_verified: 0,
+            last_client_delivery_witness_advanced: 0,
+            last_client_delivery_witness_idempotent: 0,
+            last_client_delivery_witness_stale: 0,
+            last_client_delivery_witness_conflicts: 0,
+            last_client_delivery_witness_gaps: 0,
+            last_client_delivery_witness_failed: 0,
             last_gossip_attempted: 0,
             last_gossip_seed_attempted: 0,
             last_gossip_succeeded: 0,
@@ -1428,6 +1493,33 @@ pub struct PeerStoreVerifiedClientDeliveryCacheRestoreReport {
     pub restored: bool,
     /// Aggregate count restored when `restored` is true.
     pub restored_deliveries: u64,
+}
+
+/// Aggregate-only input for one external delivery-cache witness status update.
+///
+/// The API layer verifies every response before constructing this value. It
+/// deliberately has no fields for node identities, endpoints, anchor digests,
+/// delivery timestamps, routes, message ids, payloads, or client metadata.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerStoreVerifiedDeliveryWitnessRound {
+    /// Distinct configured witnesses after hard bounding.
+    pub configured: u64,
+    /// Witness HTTP requests attempted.
+    pub attempted: u64,
+    /// Cryptographically valid signed responses.
+    pub verified: u64,
+    /// Durable high-water advances.
+    pub advanced: u64,
+    /// Exact already-durable observations.
+    pub idempotent: u64,
+    /// Responses proving local rollback.
+    pub stale: u64,
+    /// Responses proving same-generation digest conflict.
+    pub conflicts: u64,
+    /// Responses refusing a discontinuous advance.
+    pub gaps: u64,
+    /// Admission, transport, or verification failures.
+    pub failed: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2059,6 +2151,7 @@ impl PeerStoreImportReport {
 /// In-memory verified descriptor store for known AeroNyx nodes.
 pub struct PeerStore {
     peers: RwLock<HashMap<[u8; 32], SignedNodeDescriptor>>,
+    verified_delivery_witness_requesters: RwLock<HashSet<[u8; 32]>>,
     peer_runtime: RwLock<HashMap<[u8; 32], PeerRuntimeMetadata>>,
     route_health: RwLock<HashMap<[u8; 32], PeerRouteHealth>>,
     relay_protection_health: RwLock<HashMap<[u8; 32], PeerRelayProtectionHealth>>,
@@ -2079,6 +2172,7 @@ impl PeerStore {
     pub fn new() -> Self {
         Self {
             peers: RwLock::new(HashMap::new()),
+            verified_delivery_witness_requesters: RwLock::new(HashSet::new()),
             peer_runtime: RwLock::new(HashMap::new()),
             route_health: RwLock::new(HashMap::new()),
             relay_protection_health: RwLock::new(HashMap::new()),
@@ -2113,6 +2207,23 @@ impl PeerStore {
     #[must_use]
     pub fn max_peers(&self) -> Option<usize> {
         *self.max_peers.read()
+    }
+
+    /// Replaces the exact identities allowed to store a delivery-cache anchor.
+    ///
+    /// This bilateral pin is deliberately separate from permissionless peer
+    /// discovery. An empty set disables witness writes without preventing the
+    /// node from discovering or relaying through other protocol peers.
+    pub fn configure_verified_delivery_witness_requesters(&self, requesters: &[[u8; 32]]) {
+        *self.verified_delivery_witness_requesters.write() = requesters.iter().copied().collect();
+    }
+
+    /// Returns whether this requester is explicitly pinned for witness writes.
+    #[must_use]
+    pub fn verified_delivery_witness_requester_allowed(&self, requester: &[u8; 32]) -> bool {
+        self.verified_delivery_witness_requesters
+            .read()
+            .contains(requester)
     }
 
     /// Records discovery bootstrap feature flags from local config.
@@ -2346,6 +2457,114 @@ impl PeerStore {
             "client_delivery_cache_rollback_protection",
             outcome,
             format!("generation={generation} protection={protection}"),
+        );
+    }
+
+    /// Records one bounded external delivery-cache witness round.
+    ///
+    /// Valid adverse responses take precedence over availability. A threshold
+    /// is satisfied only by `advanced + idempotent`; signed stale, conflict,
+    /// and gap responses are verified evidence but never count as protection.
+    /// The method returns the stable status bucket used by startup policy.
+    pub fn record_client_delivery_witness_round(
+        &self,
+        now: u64,
+        generation: u64,
+        required_for_restore: bool,
+        minimum_verified: usize,
+        round: PeerStoreVerifiedDeliveryWitnessRound,
+    ) -> &'static str {
+        let accepted = round.advanced.saturating_add(round.idempotent);
+        let status_bucket = if round.configured == 0 {
+            "disabled"
+        } else if round.stale > 0 {
+            "rollback_detected"
+        } else if round.conflicts > 0 {
+            "conflict"
+        } else if round.gaps > 0 {
+            "gap"
+        } else if accepted >= minimum_verified as u64 {
+            "verified"
+        } else if accepted > 0 {
+            "partial"
+        } else {
+            "unavailable"
+        };
+        {
+            let mut status = self.bootstrap_status.write();
+            status.last_client_delivery_witness_status = Some(status_bucket.to_string());
+            status.last_client_delivery_witness_checked_at = Some(now);
+            status.last_client_delivery_witness_generation = generation;
+            status.last_client_delivery_witness_required = required_for_restore;
+            status.last_client_delivery_witness_minimum_verified = minimum_verified as u64;
+            status.last_client_delivery_witness_configured = round.configured;
+            status.last_client_delivery_witness_attempted = round.attempted;
+            status.last_client_delivery_witness_verified = round.verified;
+            status.last_client_delivery_witness_advanced = round.advanced;
+            status.last_client_delivery_witness_idempotent = round.idempotent;
+            status.last_client_delivery_witness_stale = round.stale;
+            status.last_client_delivery_witness_conflicts = round.conflicts;
+            status.last_client_delivery_witness_gaps = round.gaps;
+            status.last_client_delivery_witness_failed = round.failed;
+        }
+        let audit_outcome = match status_bucket {
+            "verified" | "disabled" => "accepted",
+            "partial" | "unavailable" => "warning",
+            _ => "rejected",
+        };
+        self.record_audit_event(
+            now,
+            "client_delivery_cache_external_witness",
+            audit_outcome,
+            format!(
+                "generation={generation} status={status_bucket} required={} minimum_verified={} configured={} attempted={} verified={} advanced={} idempotent={} stale={} conflicts={} gaps={} failed={}",
+                required_for_restore,
+                minimum_verified,
+                round.configured,
+                round.attempted,
+                round.verified,
+                round.advanced,
+                round.idempotent,
+                round.stale,
+                round.conflicts,
+                round.gaps,
+                round.failed,
+            ),
+        );
+        status_bucket
+    }
+
+    /// Clears only restored aggregate client-delivery readiness evidence.
+    ///
+    /// This startup-only fail-closed operation must run before public listeners
+    /// can accept new client receipts. It does not touch descriptors,
+    /// routeability evidence, proof history, or ordinary relay counters.
+    pub fn clear_restored_verified_client_delivery_evidence(&self, now: u64, reason: &str) {
+        let reason = match reason {
+            "external_witness_unavailable" => "external_witness_unavailable",
+            "external_witness_rollback" => "external_witness_rollback",
+            "external_witness_conflict" => "external_witness_conflict",
+            "external_witness_gap" => "external_witness_gap",
+            _ => "external_witness_invalid",
+        };
+        self.counters
+            .verified_client_onion_deliveries
+            .store(0, Ordering::Release);
+        self.counters
+            .last_verified_client_onion_delivery_at
+            .store(0, Ordering::Release);
+        {
+            let mut status = self.bootstrap_status.write();
+            status.last_client_delivery_cache_status = Some("rejected".to_string());
+            status.last_client_delivery_cache_restored = 0;
+            status.last_client_delivery_cache_at = Some(now);
+        }
+        self.mark_client_delivery_cache_dirty();
+        self.record_audit_event(
+            now,
+            "client_delivery_cache_external_witness_gate",
+            "rejected",
+            format!("restored_deliveries=0 reason={reason}"),
         );
     }
 
@@ -3271,6 +3490,16 @@ impl PeerStore {
     pub fn take_client_delivery_cache_dirty(&self) -> bool {
         self.client_delivery_cache_dirty
             .swap(false, Ordering::AcqRel)
+    }
+
+    /// Re-arms aggregate delivery-cache persistence after a deferred write.
+    ///
+    /// This preserves coalescing semantics: repeated calls set one dirty bit
+    /// and one notification permit, without allocating an unbounded queue.
+    pub fn mark_client_delivery_cache_dirty(&self) {
+        self.client_delivery_cache_dirty
+            .store(true, Ordering::Release);
+        self.client_delivery_cache_notify.notify_one();
     }
 
     /// Records a blind relay rejection with a stable privacy-safe reason.
@@ -8917,6 +9146,88 @@ mod tests {
             )
             .is_empty());
         assert_eq!(store.status(stale_at).blind_relay_quality.delivery_receipt_capable_peers, 0);
+    }
+
+    #[test]
+    fn test_delivery_witness_requester_admission_is_explicit_and_replaceable() {
+        let store = PeerStore::new();
+        let first = [0x11; 32];
+        let second = [0x22; 32];
+        assert!(!store.verified_delivery_witness_requester_allowed(&first));
+
+        store.configure_verified_delivery_witness_requesters(&[first]);
+        assert!(store.verified_delivery_witness_requester_allowed(&first));
+        assert!(!store.verified_delivery_witness_requester_allowed(&second));
+
+        store.configure_verified_delivery_witness_requesters(&[second]);
+        assert!(!store.verified_delivery_witness_requester_allowed(&first));
+        assert!(store.verified_delivery_witness_requester_allowed(&second));
+    }
+
+    #[test]
+    fn test_delivery_witness_status_counts_only_accepted_signed_outcomes() {
+        let store = PeerStore::new();
+        let now = 1_700_000_000;
+        let status = store.record_client_delivery_witness_round(
+            now,
+            7,
+            true,
+            2,
+            PeerStoreVerifiedDeliveryWitnessRound {
+                configured: 3,
+                attempted: 3,
+                verified: 3,
+                advanced: 1,
+                idempotent: 1,
+                stale: 1,
+                ..PeerStoreVerifiedDeliveryWitnessRound::default()
+            },
+        );
+        assert_eq!(status, "rollback_detected");
+        let bootstrap = store.status(now).bootstrap;
+        assert_eq!(
+            bootstrap.last_client_delivery_witness_status.as_deref(),
+            Some("rollback_detected")
+        );
+        assert_eq!(bootstrap.last_client_delivery_witness_generation, 7);
+        assert!(bootstrap.last_client_delivery_witness_required);
+        assert_eq!(bootstrap.last_client_delivery_witness_minimum_verified, 2);
+        assert_eq!(bootstrap.last_client_delivery_witness_configured, 3);
+        assert_eq!(bootstrap.last_client_delivery_witness_verified, 3);
+        assert_eq!(bootstrap.last_client_delivery_witness_stale, 1);
+    }
+
+    #[test]
+    fn test_external_witness_gate_clears_only_client_delivery_evidence() {
+        let store = PeerStore::new();
+        let now = 1_700_000_000;
+        store.record_verified_client_onion_delivery(now);
+        store.record_blind_relay_terminal(now + 1, 0, 32);
+        assert_eq!(
+            store
+                .status(now + 2)
+                .runtime
+                .blind_relay
+                .verified_client_onion_deliveries,
+            1
+        );
+
+        store
+            .clear_restored_verified_client_delivery_evidence(now + 3, "external_witness_rollback");
+        let status = store.status(now + 4);
+        assert_eq!(
+            status.runtime.blind_relay.verified_client_onion_deliveries,
+            0
+        );
+        assert_eq!(status.runtime.blind_relay.terminal, 1);
+        assert_eq!(
+            status
+                .bootstrap
+                .last_client_delivery_cache_status
+                .as_deref(),
+            Some("rejected")
+        );
+        assert!(store.take_client_delivery_cache_dirty());
     }
 
     #[test]

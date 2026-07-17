@@ -52,6 +52,8 @@
 //!   checkpoint without claiming distributed consensus or fork choice.
 //! - v13 (v2.7.26-CoordinatorLease): Durable exclusive coordinator process
 //!   lease grants retained by audited follower witnesses.
+//! - v14 (v2.8.28-VerifiedDeliveryAnchorWitness): One bounded durable
+//!   generation-and-digest high-water row per admitted node identity.
 //! - v2.7.23-CertificateExchange: Snapshot-audited internal bundle export for
 //!   the admitted fixed-size peer protocol; the schema remains v12.
 //! - v2.7.4-BlockIntegrityStatus: Runtime-only evidence for the most recent
@@ -216,6 +218,8 @@
 //!   No SQLite schema change; aggregate public fence status was added.
 //! v2.7.26-CoordinatorLease - Added durable witness-side coordinator lease
 //!   grants and process-local lease validity state for cross-host fencing.
+//! v2.8.28-VerifiedDeliveryAnchorWitness - Schema v14 durable aggregate-only
+//!   delivery-anchor high-water decisions for admitted node peers.
 //! v2.8.12-LeaseFailClosedTelemetry - Added process-local lease attempt,
 //!   consecutive-failure, recovery, and monotonic remaining-window evidence.
 // ============================================
@@ -253,12 +257,13 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 /// v10 → v11: durable trusted-witness divergent-prefix incidents
 /// v11 → v12: immutable pinned-witness checkpoint certificates
 /// v12 → v13: durable exclusive coordinator lease grants on follower witnesses
+/// v13 → v14: durable verified-delivery anchor high-water decisions
 ///
 /// ⚠️ CRITICAL: When bumping this, you MUST also add a new migrate block
 /// in maybe_migrate(). The migrate block MUST use a hardcoded integer
 /// (not this constant) for UPDATE schema_version, to prevent skipping
 /// intermediate migrations on multi-version upgrades.
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 14;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -1293,6 +1298,18 @@ impl MemoryStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_record_coordinator_leases_expiry
                 ON record_coordinator_leases(lease_expires_at);
+
+            -- v14: one aggregate-only high-water decision per admitted node.
+            -- The digest commits a requester-signed local anchor without
+            -- exposing its delivery count, timestamp, routes, or payload data.
+            CREATE TABLE IF NOT EXISTS verified_delivery_anchor_witnesses (
+                requester      BLOB PRIMARY KEY CHECK(length(requester) = 32),
+                generation     INTEGER NOT NULL CHECK(generation > 0),
+                anchor_digest  BLOB NOT NULL CHECK(length(anchor_digest) = 32),
+                observed_at    INTEGER NOT NULL CHECK(observed_at >= 0)
+            );
+            CREATE INDEX IF NOT EXISTS idx_verified_delivery_anchor_witnesses_observed
+                ON verified_delivery_anchor_witnesses(observed_at);
 
             CREATE TABLE IF NOT EXISTS raw_logs (
                 log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2356,6 +2373,52 @@ impl MemoryStorage {
             conn.execute("UPDATE schema_version SET version = 13", [])
                 .map_err(|error| format!("Update schema version to v13: {error}"))?;
             info!("[STORAGE] Migration to v13 (coordinator leases) complete");
+        }
+
+        // v13 -> v14: one bounded aggregate-only delivery-anchor high-water
+        // row per requester. This is local witness state, not relay traffic,
+        // block consensus, fork choice, or a user activity ledger.
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(13);
+
+        if current < 14 {
+            info!(
+                "[STORAGE] Migrating schema v{} -> v14 (delivery anchor witnesses)",
+                current
+            );
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS verified_delivery_anchor_witnesses (
+                    requester      BLOB PRIMARY KEY CHECK(length(requester) = 32),
+                    generation     INTEGER NOT NULL CHECK(generation > 0),
+                    anchor_digest  BLOB NOT NULL CHECK(length(anchor_digest) = 32),
+                    observed_at    INTEGER NOT NULL CHECK(observed_at >= 0)
+                );
+                CREATE INDEX IF NOT EXISTS idx_verified_delivery_anchor_witnesses_observed
+                    ON verified_delivery_anchor_witnesses(observed_at);",
+            )
+            .map_err(|error| format!("v14 migration: create delivery anchor witnesses: {error}"))?;
+            let exists = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='verified_delivery_anchor_witnesses'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if !exists {
+                return Err(
+                    "v14 migration: required table 'verified_delivery_anchor_witnesses' was not created"
+                        .to_string(),
+                );
+            }
+            // Hardcoded 14 preserves sequential upgrades.
+            conn.execute("UPDATE schema_version SET version = 14", [])
+                .map_err(|error| format!("Update schema version to v14: {error}"))?;
+            info!("[STORAGE] Migration to v14 (delivery anchor witnesses) complete");
         }
 
         Ok(())
@@ -4302,9 +4365,10 @@ mod tests {
         // v7 adds the blind marker, v8 creates commitment tables, v9 adds the
         // bounded proof vault, v10 adds durable equivocation incidents, and
         // v11 adds sticky trusted-divergence incidents, v12 adds immutable
-        // checkpoint certificates, and v13 adds durable coordinator leases
+        // checkpoint certificates, v13 adds durable coordinator leases, and
+        // v14 adds aggregate-only delivery-anchor witness high-water state
         // even when create_schema() was not called.
-        assert_eq!(v, 13);
+        assert_eq!(v, 14);
         for table in [
             "record_commitment_blocks",
             "record_block_commitments",
@@ -4314,6 +4378,7 @@ mod tests {
             "record_checkpoint_certificates",
             "record_checkpoint_certificate_members",
             "record_coordinator_leases",
+            "verified_delivery_anchor_witnesses",
         ] {
             let exists: bool = conn
                 .query_row(

@@ -69,6 +69,8 @@
 //!   consecutive renewal failures, last attempt/failure, and recovery counts
 //! - v2.8.13-BlockConfirmation: derives privacy-safe witness-certificate
 //!   coverage and lag from the audited local tip without claiming finality
+//! - v2.8.28-VerifiedDeliveryAnchorWitness: atomic, bounded, generation-
+//!   contiguous external high-water decisions for signed delivery-cache anchors
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -121,6 +123,9 @@
 //!   a different random instance to advance the durable epoch immediately.
 //! - Coordinator leases are duplicate-writer fencing, not consensus, leader
 //!   election, finality, quorum, or fork choice.
+//! - Verified-delivery anchor witnesses retain only one generation and opaque
+//!   digest per requester. They never store delivery counts, timestamps,
+//!   routes, message identifiers, payloads, endpoints, or user identities.
 //!
 //! ## Modification History
 //! v2.8.18-TipSupersession - Added aggregate superseded announcement rounds.
@@ -206,12 +211,12 @@ use aeronyx_core::protocol::memchain::{
 };
 
 use super::storage::{
-    LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentCheckpointCertificateAnchorConfig,
+    LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentAnnouncementDisposition,
+    RecordCommitmentCheckpointCertificateAnchorConfig,
     RecordCommitmentCheckpointCertificateAnchorRuntime,
-    RecordCommitmentAnnouncementDisposition, RecordCommitmentCheckpointCertificateBundle,
-    RecordCommitmentCheckpointStatus, RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent,
-    RecordCommitmentSyncRuntime, RecordCommitmentSyncStatus, RecordCommitmentTipAnchorConfig,
-    StorageStats,
+    RecordCommitmentCheckpointCertificateBundle, RecordCommitmentCheckpointStatus,
+    RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime,
+    RecordCommitmentSyncStatus, RecordCommitmentTipAnchorConfig, StorageStats,
     CHECKPOINT_CERTIFICATE_CAPACITY, CHECKPOINT_EQUIVOCATION_CAPACITY,
     CHECKPOINT_EVIDENCE_CAPACITY, CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS,
     CHECKPOINT_TRUSTED_DIVERGENCE_CAPACITY, COMMITMENT_SYNC_EVENT_CAPACITY,
@@ -281,6 +286,40 @@ pub enum RecordCoordinatorLeaseReleaseOutcome {
     },
     /// No matching instance currently owns the coordinator row.
     NotHolder,
+}
+
+/// Result of one serialized verified-delivery anchor witness decision.
+///
+/// Every variant returns the witness's durable high-water state. Callers must
+/// treat `Stale`, `Conflict`, and `Gap` as evidence that the requester cannot
+/// safely claim continuity; none of those outcomes mutates the high-water row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifiedDeliveryAnchorWitnessOutcome {
+    /// First observation, or an exact one-generation advance, was committed.
+    Advanced {
+        generation: u64,
+        anchor_digest: [u8; 32],
+    },
+    /// The same generation and digest were already durable.
+    Idempotent {
+        generation: u64,
+        anchor_digest: [u8; 32],
+    },
+    /// The request is older than the durable high-water mark.
+    Stale {
+        generation: u64,
+        anchor_digest: [u8; 32],
+    },
+    /// The request reused the durable generation with another digest.
+    Conflict {
+        generation: u64,
+        anchor_digest: [u8; 32],
+    },
+    /// The request skipped at least one generation after witness bootstrap.
+    Gap {
+        generation: u64,
+        anchor_digest: [u8; 32],
+    },
 }
 
 /// Aggregate result of one atomic bounded commitment-block append.
@@ -3512,6 +3551,135 @@ impl MemoryStorage {
         Ok(total)
     }
 
+    /// Atomically witnesses one opaque verified-delivery cache anchor.
+    ///
+    /// The first observation establishes trust-on-first-use at any positive
+    /// generation. Once established, only the exact next generation may
+    /// advance the row. This makes missed witness updates explicit instead of
+    /// allowing a correctly signed but discontinuous host snapshot to replace
+    /// the durable high-water mark.
+    ///
+    /// The table is bounded to one row per requester and intentionally stores
+    /// no delivery count, delivery timestamp, route, message identifier,
+    /// payload, endpoint, or user identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero/out-of-range generations, a zero digest,
+    /// malformed durable state, integer conversion failure, or SQLite failure.
+    pub async fn witness_verified_delivery_anchor(
+        &self,
+        requester: &[u8; 32],
+        generation: u64,
+        anchor_digest: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<VerifiedDeliveryAnchorWitnessOutcome, String> {
+        if generation == 0 {
+            return Err("verified-delivery witness generation must be positive".to_string());
+        }
+        if anchor_digest == &[0u8; 32] {
+            return Err("verified-delivery witness digest must be non-zero".to_string());
+        }
+        let generation_i64 = i64::try_from(generation)
+            .map_err(|_| "verified-delivery witness generation is outside SQLite range")?;
+        let observed_at_i64 = i64::try_from(observed_at)
+            .map_err(|_| "verified-delivery witness time is outside SQLite range")?;
+
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("begin verified-delivery witness transaction: {error}"))?;
+        let existing = tx
+            .query_row(
+                "SELECT generation, anchor_digest
+                 FROM verified_delivery_anchor_witnesses WHERE requester=?1",
+                params![requester.as_slice()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("read verified-delivery witness high-water: {error}"))?;
+
+        let outcome = if let Some((stored_generation, stored_digest)) = existing {
+            let stored_generation = u64::try_from(stored_generation)
+                .map_err(|_| "verified-delivery witness generation is invalid".to_string())?;
+            let stored_digest: [u8; 32] = stored_digest.try_into().map_err(|digest: Vec<u8>| {
+                format!("verified-delivery witness digest length {}", digest.len())
+            })?;
+
+            if generation < stored_generation {
+                VerifiedDeliveryAnchorWitnessOutcome::Stale {
+                    generation: stored_generation,
+                    anchor_digest: stored_digest,
+                }
+            } else if generation == stored_generation {
+                if anchor_digest == &stored_digest {
+                    tx.execute(
+                        "UPDATE verified_delivery_anchor_witnesses
+                         SET observed_at=MAX(observed_at, ?2) WHERE requester=?1",
+                        params![requester.as_slice(), observed_at_i64],
+                    )
+                    .map_err(|error| {
+                        format!("refresh verified-delivery witness observation: {error}")
+                    })?;
+                    VerifiedDeliveryAnchorWitnessOutcome::Idempotent {
+                        generation: stored_generation,
+                        anchor_digest: stored_digest,
+                    }
+                } else {
+                    VerifiedDeliveryAnchorWitnessOutcome::Conflict {
+                        generation: stored_generation,
+                        anchor_digest: stored_digest,
+                    }
+                }
+            } else if stored_generation.checked_add(1) == Some(generation) {
+                tx.execute(
+                    "UPDATE verified_delivery_anchor_witnesses
+                     SET generation=?2, anchor_digest=?3, observed_at=?4
+                     WHERE requester=?1",
+                    params![
+                        requester.as_slice(),
+                        generation_i64,
+                        anchor_digest.as_slice(),
+                        observed_at_i64
+                    ],
+                )
+                .map_err(|error| {
+                    format!("advance verified-delivery witness high-water: {error}")
+                })?;
+                VerifiedDeliveryAnchorWitnessOutcome::Advanced {
+                    generation,
+                    anchor_digest: *anchor_digest,
+                }
+            } else {
+                VerifiedDeliveryAnchorWitnessOutcome::Gap {
+                    generation: stored_generation,
+                    anchor_digest: stored_digest,
+                }
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO verified_delivery_anchor_witnesses
+                 (requester, generation, anchor_digest, observed_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    requester.as_slice(),
+                    generation_i64,
+                    anchor_digest.as_slice(),
+                    observed_at_i64
+                ],
+            )
+            .map_err(|error| format!("insert verified-delivery witness high-water: {error}"))?;
+            VerifiedDeliveryAnchorWitnessOutcome::Advanced {
+                generation,
+                anchor_digest: *anchor_digest,
+            }
+        };
+
+        tx.commit()
+            .map_err(|error| format!("commit verified-delivery witness decision: {error}"))?;
+        Ok(outcome)
+    }
+
     /// Atomically grants or renews one durable witness-side coordinator lease.
     ///
     /// A different instance cannot replace an unexpired row. The short
@@ -6442,6 +6610,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_verified_delivery_anchor_witness_is_contiguous_and_restart_durable() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("verified-delivery-witness.db");
+        let requester = [0x41; 32];
+        let digest_10 = [0x51; 32];
+        let digest_11 = [0x52; 32];
+        let storage = MemoryStorage::open(&db_path, None).unwrap();
+
+        assert_eq!(
+            storage
+                .witness_verified_delivery_anchor(&requester, 10, &digest_10, 1_000)
+                .await
+                .unwrap(),
+            VerifiedDeliveryAnchorWitnessOutcome::Advanced {
+                generation: 10,
+                anchor_digest: digest_10,
+            }
+        );
+        assert_eq!(
+            storage
+                .witness_verified_delivery_anchor(&requester, 10, &digest_10, 1_001)
+                .await
+                .unwrap(),
+            VerifiedDeliveryAnchorWitnessOutcome::Idempotent {
+                generation: 10,
+                anchor_digest: digest_10,
+            }
+        );
+        assert_eq!(
+            storage
+                .witness_verified_delivery_anchor(&requester, 10, &[0x61; 32], 1_002)
+                .await
+                .unwrap(),
+            VerifiedDeliveryAnchorWitnessOutcome::Conflict {
+                generation: 10,
+                anchor_digest: digest_10,
+            }
+        );
+        assert_eq!(
+            storage
+                .witness_verified_delivery_anchor(&requester, 9, &[0x62; 32], 1_003)
+                .await
+                .unwrap(),
+            VerifiedDeliveryAnchorWitnessOutcome::Stale {
+                generation: 10,
+                anchor_digest: digest_10,
+            }
+        );
+        assert_eq!(
+            storage
+                .witness_verified_delivery_anchor(&requester, 12, &[0x63; 32], 1_004)
+                .await
+                .unwrap(),
+            VerifiedDeliveryAnchorWitnessOutcome::Gap {
+                generation: 10,
+                anchor_digest: digest_10,
+            }
+        );
+        assert_eq!(
+            storage
+                .witness_verified_delivery_anchor(&requester, 11, &digest_11, 1_005)
+                .await
+                .unwrap(),
+            VerifiedDeliveryAnchorWitnessOutcome::Advanced {
+                generation: 11,
+                anchor_digest: digest_11,
+            }
+        );
+        drop(storage);
+
+        let reopened = MemoryStorage::open(&db_path, None).unwrap();
+        assert_eq!(
+            reopened
+                .witness_verified_delivery_anchor(&requester, 11, &digest_11, 1_006)
+                .await
+                .unwrap(),
+            VerifiedDeliveryAnchorWitnessOutcome::Idempotent {
+                generation: 11,
+                anchor_digest: digest_11,
+            }
+        );
+        let row_count: i64 = {
+            let conn = reopened.conn_lock().await;
+            conn.query_row(
+                "SELECT COUNT(*) FROM verified_delivery_anchor_witnesses",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            row_count, 1,
+            "witness storage must stay bounded per requester"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verified_delivery_anchor_witness_rejects_sentinel_values() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let requester = [0x71; 32];
+        assert_eq!(
+            storage
+                .witness_verified_delivery_anchor(&requester, 0, &[0x72; 32], 1)
+                .await
+                .unwrap_err(),
+            "verified-delivery witness generation must be positive"
+        );
+        assert_eq!(
+            storage
+                .witness_verified_delivery_anchor(&requester, 1, &[0u8; 32], 1)
+                .await
+                .unwrap_err(),
+            "verified-delivery witness digest must be non-zero"
+        );
+    }
+
+    #[tokio::test]
     async fn test_commitment_coordinator_upgrades_sqlite_durability() {
         let storage = MemoryStorage::open(":memory:", None).unwrap();
         assert_eq!(
@@ -8966,7 +9251,7 @@ mod tests {
             conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         let chain = migrated.audit_record_commitment_chain().await.unwrap();
         assert_eq!(chain.block_count, 1);
         assert_eq!(migrated.record_commitment_chain_tip().await.1, block.hash());
@@ -9012,7 +9297,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         assert_eq!(incident_table_exists, 1);
         migrated.audit_record_commitment_chain().await.unwrap();
         let evidence = migrated
@@ -9056,7 +9341,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         assert_eq!(incident_table_exists, 1);
         migrated.audit_record_commitment_chain().await.unwrap();
         let evidence = migrated
@@ -9107,7 +9392,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         assert_eq!(certificates, 1);
         assert_eq!(members, 1);
         migrated.audit_record_commitment_chain().await.unwrap();

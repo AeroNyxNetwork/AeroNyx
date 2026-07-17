@@ -106,6 +106,19 @@ enabled = true
 advertise_self = true
 peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
 peer_cache_write_interval_secs = 120
+# Optional external rollback witness for the signed verified-delivery cache.
+# Each pin is a 32-byte node Ed25519 identity in hexadecimal. Witnesses retain
+# only this node id, a monotonic generation, an opaque digest, and observation
+# time; no delivery count/time, route, message id, payload, endpoint, or client
+# metadata is sent. Keep disabled until the pinned nodes run the compatible
+# peer API and this node uses a local [memchain] storage mode.
+verified_delivery_witness_node_ids = []
+verified_delivery_witness_min_verified = 1
+verified_delivery_witness_required_for_restore = false
+# Witness-side admission is bilateral and independent of permissionless peer
+# discovery. List only requester node identities this node explicitly agrees
+# to protect. Empty means the witness endpoint refuses every write.
+verified_delivery_witness_requester_node_ids = []
 gossip_enabled = true
 gossip_interval_secs = 45
 gossip_peer_limit = 8

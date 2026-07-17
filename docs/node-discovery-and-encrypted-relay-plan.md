@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.5.0 - Added a monotonic signed local anchor that rejects older valid delivery-evidence caches without persisting correlatable relay data.
+Modification Reason: v0.6.0 - Added optional pinned-peer witnessing for delivery-cache anchors so established deployments can detect whole-host rollback without exposing relay metadata.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.5.0 - Added local signed rollback protection for verified-client delivery evidence.
+Last Modified: v0.6.0 - Added authenticated external witnessing for verified-client delivery-cache anchors.
+Previous: v0.5.0 - Added local signed rollback protection for verified-client delivery evidence.
 Previous: v0.4.0 - Added fail-closed verified-client delivery evidence recovery.
 Previous: v0.3.0 - Added restart-recovery gate for PeerStore relay foundation readiness.
 Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordination.
@@ -1020,6 +1021,54 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-17 - Added optional external witnesses for delivery-cache anchors.
+- Files changed:
+  - crates/aeronyx-core/src/protocol/memchain.rs
+  - crates/aeronyx-server/src/api/memchain_peer.rs
+  - crates/aeronyx-server/src/config.rs
+  - crates/aeronyx-server/src/server.rs
+  - crates/aeronyx-server/src/services/memchain/storage.rs
+  - crates/aeronyx-server/src/services/memchain/storage_ops.rs
+  - crates/aeronyx-server/src/services/peer_store.rs
+  - deploy/node/server.example.toml
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Verification:
+  - Canonical request/response signing and protocol round-trip test.
+  - Real HTTP witness exchange with pinned identity, contiguous generation,
+    bounded response, forged outcome, sentinel, and restart-durability tests.
+  - Configuration rejection tests for duplicates, impossible thresholds,
+    strict mode without pins, and disabled local storage.
+  - PeerStore aggregate status precedence and scoped evidence-clear tests.
+  - `aeronyx-core`: 185/185 unit tests passed; one doctest passed and three
+    existing examples remained explicitly ignored.
+  - `aeronyx-server`: 1,046/1,046 tests passed on the reviewed US1 host.
+  - `cargo build -p aeronyx-server --release` completed successfully in 5m45s.
+- Notes:
+  - Requesters may pin at most three distinct witness node identities and set
+    a minimum verified threshold. Each witness must separately pin the exact
+    requester identity it agrees to protect; the witness-side default is an
+    empty, fail-closed list. This bilateral policy is independent of ordinary
+    permissionless discovery, so it does not restrict the wider relay network.
+  - Each witness stores one high-water row per requester: requester node id,
+    positive contiguous generation, opaque anchor digest, and observed time.
+    It never receives the embedded delivery count, route, endpoint, peer pair,
+    sender, receiver, message id, payload commitment, receipt, or ciphertext.
+  - First contact is trust-on-first-use for the configured requester. Later
+    generations must be exactly contiguous; stale, conflicting, and gapped
+    updates are signed adverse outcomes and never count toward the threshold.
+  - Requests and responses are signed with domain-separated canonical bytes.
+    The caller verifies the pinned responder identity, exact request echo,
+    returned state/outcome relationship, response bound, and signature.
+  - Startup clears only restored aggregate delivery evidence when established
+    witnesses prove rollback/conflict/gap. Descriptor, routeability, proof, and
+    relay counters retain their independent authentication and recovery paths.
+  - `verified_delivery_witness_required_for_restore = true` also fails closed
+    when the configured witnesses are unavailable or below threshold. Enable
+    it only after every pinned witness has accepted a live anchor generation.
+  - This is an anti-rollback checkpoint for an aggregate local cache. It is
+    separate from Memory Chain commitment witnesses and does not claim
+    consensus, finality, a financial blockchain, or lifetime network totals.
+
 2026-07-17 - Added monotonic rollback protection for signed delivery evidence.
 - Files changed:
   - crates/aeronyx-server/src/server.rs

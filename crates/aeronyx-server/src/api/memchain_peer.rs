@@ -16,6 +16,7 @@
 //! - `POST /api/memchain/peer/checkpoint-certificate`
 //! - `POST /api/memchain/peer/coordinator-lease`
 //! - `POST /api/memchain/peer/coordinator-lease/release`
+//! - `POST /api/discovery/peer/verified-delivery-anchor-witness`
 //! - Bincode `MemChainMessage` request/response with the existing magic byte.
 //! - Signed discovery-peer admission, timestamp freshness, stateful-request
 //!   replay protection, shared per-peer rate limiting, and bounded pagination.
@@ -47,6 +48,8 @@
 //!   rotated signed descriptor cannot redirect the node into private services.
 //! - Default-off, signed short-lived coordinator leases persisted by followers
 //!   for cross-host duplicate-writer fencing.
+//! - Default-off external witness transport for signed aggregate-only verified-
+//!   delivery cache anchors, with contiguous generation enforcement.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` on the public node peer listener and local operator
@@ -64,6 +67,10 @@
 //! This API returns only signed commitment blocks. It never returns memory
 //! records, ciphertext, owners, tags, embeddings, client IPs, destinations,
 //! routes, endpoints, or social graph metadata.
+//! The verified-delivery witness endpoint stores only a requester node id,
+//! generation, opaque anchor digest, and observation time. Delivery counts,
+//! delivery timestamps, routes, message ids, payloads, and client metadata
+//! never cross the node-to-node witness boundary.
 //!
 //! ## Important Note for Next Developer
 //! - Do not mount this handler without `PeerStore` admission.
@@ -102,10 +109,15 @@
 //!   filtering alone is vulnerable to concurrent descriptor replacement.
 //! - Coordinator leases require every configured witness grant. Do not describe
 //!   them as permissionless consensus, Byzantine finality, or fork choice.
+//! - A delivery witness accepts any positive generation only for first contact;
+//!   every later advance must be exactly one generation. Never auto-heal a gap
+//!   by overwriting the witness high-water mark.
 //! - The localhost endpoint override below is compiled only for crate tests.
 //!   Never expose it in production or bypass final-hop SSRF validation.
 //!
 //! ## Last Modified
+//! v2.8.29-VerifiedDeliveryWitnessAdmission - Require bilateral requester pinning before witness writes.
+//! v2.8.28-VerifiedDeliveryAnchorWitness - Added authenticated contiguous external cache witnesses.
 //! v2.8.19-TipSupersessionIntegration - Added a test-only real HTTP delivery seam.
 //! v2.8.17-TipRetryQueue - Added bounded transient-failure delivery retries.
 //! v2.8.16-IdempotentTipRetry - Allowed bounded retry of signed follower wake-ups.
@@ -163,16 +175,21 @@ use aeronyx_core::protocol::memchain::{
     record_coordinator_lease_release_request_signing_bytes,
     record_coordinator_lease_release_response_signing_bytes,
     record_coordinator_lease_request_signing_bytes,
-    record_coordinator_lease_response_signing_bytes, MemChainMessage,
+    record_coordinator_lease_response_signing_bytes,
+    verified_delivery_anchor_witness_request_signing_bytes,
+    verified_delivery_anchor_witness_response_signing_bytes, MemChainMessage,
     RecordCheckpointCertificateMemberV1, MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1,
     MAX_COORDINATOR_LEASE_TTL_SECS_V1, MEMCHAIN_MAGIC, MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+    VERIFIED_DELIVERY_WITNESS_ADVANCED_V1, VERIFIED_DELIVERY_WITNESS_CONFLICT_V1,
+    VERIFIED_DELIVERY_WITNESS_GAP_V1, VERIFIED_DELIVERY_WITNESS_IDEMPOTENT_V1,
+    VERIFIED_DELIVERY_WITNESS_STALE_V1,
 };
 use aeronyx_core::protocol::NodeCapability;
 use sha2::{Digest, Sha256};
 
 use crate::services::memchain::storage_ops::{
     RecordCommitmentCheckpointEvidencePersistOutcome, RecordCoordinatorLeaseGrantOutcome,
-    RecordCoordinatorLeaseReleaseOutcome,
+    RecordCoordinatorLeaseReleaseOutcome, VerifiedDeliveryAnchorWitnessOutcome,
 };
 use crate::services::memchain::{MemoryStorage, RecordCommitmentAnnouncementDisposition};
 use crate::services::PeerStore;
@@ -222,6 +239,32 @@ pub struct CommitmentCoordinatorLeaseRelease {
     pub lease_epoch: u64,
     /// Signed witness release timestamp.
     pub released_at: u64,
+}
+
+/// Privacy-safe aggregate result of one bounded external witness round.
+///
+/// No node ids, endpoints, anchor digests, delivery counts, message ids, or
+/// client metadata are retained in this structure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VerifiedDeliveryAnchorWitnessRound {
+    /// Distinct configured witness identities after hard bounding.
+    pub configured: usize,
+    /// Witnesses for which transport was attempted.
+    pub attempted: usize,
+    /// Cryptographically valid signed responses.
+    pub verified: usize,
+    /// Witnesses that durably advanced.
+    pub advanced: usize,
+    /// Witnesses already holding the exact anchor.
+    pub idempotent: usize,
+    /// Witnesses proving the requester rolled back below their high-water.
+    pub stale: usize,
+    /// Witnesses proving a different digest reused the same generation.
+    pub conflicts: usize,
+    /// Witnesses refusing a discontinuous generation advance.
+    pub gaps: usize,
+    /// Admission, endpoint, transport, decoding, or signature failures.
+    pub failed: usize,
 }
 
 /// Relationship proven by one valid signed checkpoint response.
@@ -529,6 +572,10 @@ pub fn build_memchain_peer_router_with_runtime(
         .route(
             "/api/memchain/peer/coordinator-lease/release",
             post(coordinator_lease_release_handler),
+        )
+        .route(
+            "/api/discovery/peer/verified-delivery-anchor-witness",
+            post(verified_delivery_anchor_witness_handler),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
@@ -1061,6 +1108,166 @@ pub async fn release_record_commitment_coordinator_lease(
         &commitment_peer_endpoint_is_public,
     )
     .await
+}
+
+/// Sends one signed aggregate-only cache anchor to operator-pinned witnesses.
+///
+/// Witnesses are discovery-admitted and endpoint-pinned on every request. The
+/// returned counters are operational evidence only; they are not consensus,
+/// finality, voting weight, or a source of user-visible delivery statistics.
+///
+/// # Errors
+///
+/// Returns an error only when the local anchor input is structurally invalid.
+/// Individual witness failures are counted in the bounded round result.
+pub async fn witness_verified_delivery_anchor(
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    witness_node_ids: &[[u8; 32]],
+    generation: u64,
+    anchor_digest: &[u8; 32],
+) -> Result<VerifiedDeliveryAnchorWitnessRound, String> {
+    witness_verified_delivery_anchor_with_endpoint_policy(
+        peer_store,
+        identity,
+        client,
+        witness_node_ids,
+        generation,
+        anchor_digest,
+        &commitment_peer_endpoint_is_public,
+    )
+    .await
+}
+
+async fn witness_verified_delivery_anchor_with_endpoint_policy<F>(
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    witness_node_ids: &[[u8; 32]],
+    generation: u64,
+    anchor_digest: &[u8; 32],
+    endpoint_allowed: &F,
+) -> Result<VerifiedDeliveryAnchorWitnessRound, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    if generation == 0 || generation > i64::MAX as u64 {
+        return Err("verified_delivery_witness_generation_invalid".to_string());
+    }
+    if anchor_digest == &[0u8; 32] {
+        return Err("verified_delivery_witness_digest_invalid".to_string());
+    }
+
+    let self_node_id = identity.public_key_bytes();
+    let mut distinct = HashSet::new();
+    let witnesses = witness_node_ids
+        .iter()
+        .copied()
+        .filter(|node_id| *node_id != self_node_id && distinct.insert(*node_id))
+        .take(MAX_PINNED_WITNESSES_PER_ROUND)
+        .collect::<Vec<_>>();
+    let mut round = VerifiedDeliveryAnchorWitnessRound {
+        configured: witnesses.len(),
+        ..VerifiedDeliveryAnchorWitnessRound::default()
+    };
+
+    for witness_node_id in witnesses {
+        let request_timestamp = now_secs();
+        let Some(peer) = peer_store.get_valid(&witness_node_id, request_timestamp) else {
+            round.failed = round.failed.saturating_add(1);
+            continue;
+        };
+        let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
+            round.failed = round.failed.saturating_add(1);
+            continue;
+        };
+        if !endpoint_allowed(endpoint) {
+            round.failed = round.failed.saturating_add(1);
+            continue;
+        }
+        let Ok(url) = verified_delivery_anchor_witness_url(endpoint) else {
+            round.failed = round.failed.saturating_add(1);
+            continue;
+        };
+
+        let mut request_id = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut request_id);
+        let signing_bytes = verified_delivery_anchor_witness_request_signing_bytes(
+            &self_node_id,
+            generation,
+            anchor_digest,
+            &request_id,
+            request_timestamp,
+        );
+        let request = MemChainMessage::VerifiedDeliveryAnchorWitnessRequestV1 {
+            requester: self_node_id,
+            generation,
+            anchor_digest: *anchor_digest,
+            request_id,
+            request_timestamp,
+            signature: identity.sign(&signing_bytes),
+        };
+        let frame = match encode_memchain(&request) {
+            Ok(frame) => frame,
+            Err(_) => {
+                round.failed = round.failed.saturating_add(1);
+                continue;
+            }
+        };
+        round.attempted = round.attempted.saturating_add(1);
+        let response = match client
+            .post(url)
+            .header("content-type", "application/octet-stream")
+            .body(frame)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => response,
+            Ok(_) | Err(_) => {
+                round.failed = round.failed.saturating_add(1);
+                continue;
+            }
+        };
+        let body = match read_bounded_response(response).await {
+            Ok(body) => body,
+            Err(_) => {
+                round.failed = round.failed.saturating_add(1);
+                continue;
+            }
+        };
+        let outcome = match verify_delivery_anchor_witness_response(
+            &body,
+            &request_id,
+            &self_node_id,
+            generation,
+            anchor_digest,
+            &witness_node_id,
+            now_secs(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                round.failed = round.failed.saturating_add(1);
+                continue;
+            }
+        };
+        round.verified = round.verified.saturating_add(1);
+        match outcome {
+            VERIFIED_DELIVERY_WITNESS_ADVANCED_V1 => {
+                round.advanced = round.advanced.saturating_add(1)
+            }
+            VERIFIED_DELIVERY_WITNESS_IDEMPOTENT_V1 => {
+                round.idempotent = round.idempotent.saturating_add(1)
+            }
+            VERIFIED_DELIVERY_WITNESS_STALE_V1 => round.stale = round.stale.saturating_add(1),
+            VERIFIED_DELIVERY_WITNESS_CONFLICT_V1 => {
+                round.conflicts = round.conflicts.saturating_add(1)
+            }
+            VERIFIED_DELIVERY_WITNESS_GAP_V1 => round.gaps = round.gaps.saturating_add(1),
+            _ => unreachable!("verified response outcome was validated"),
+        }
+    }
+    Ok(round)
 }
 
 async fn release_record_commitment_coordinator_lease_with_endpoint_policy<F>(
@@ -1882,6 +2089,13 @@ fn commitment_coordinator_lease_release_url(endpoint: &str) -> Result<Url, Strin
     commitment_peer_url(endpoint, "/api/memchain/peer/coordinator-lease/release")
 }
 
+fn verified_delivery_anchor_witness_url(endpoint: &str) -> Result<Url, String> {
+    commitment_peer_url(
+        endpoint,
+        "/api/discovery/peer/verified-delivery-anchor-witness",
+    )
+}
+
 fn commitment_peer_url(endpoint: &str, path: &str) -> Result<Url, String> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
@@ -2060,6 +2274,95 @@ fn verify_record_commitment_coordinator_lease_release_response(
         lease_epoch,
         released_at,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_delivery_anchor_witness_response(
+    body: &[u8],
+    expected_request_id: &[u8; 16],
+    expected_requester: &[u8; 32],
+    expected_generation: u64,
+    expected_anchor_digest: &[u8; 32],
+    expected_witness: &[u8; 32],
+    now: u64,
+) -> Result<u8, String> {
+    if body.first().copied() != Some(MEMCHAIN_MAGIC) {
+        return Err("invalid_delivery_witness_frame".to_string());
+    }
+    let response =
+        decode_memchain(&body[1..]).map_err(|_| "invalid_delivery_witness_frame".to_string())?;
+    let canonical =
+        encode_memchain(&response).map_err(|_| "invalid_delivery_witness_frame".to_string())?;
+    if canonical != body {
+        return Err("noncanonical_delivery_witness_frame".to_string());
+    }
+    let MemChainMessage::VerifiedDeliveryAnchorWitnessResponseV1 {
+        request_id,
+        requester,
+        requested_generation,
+        requested_anchor_digest,
+        witness,
+        response_timestamp,
+        witness_generation,
+        witness_anchor_digest,
+        outcome,
+        signature,
+    } = response
+    else {
+        return Err("unexpected_delivery_witness_message".to_string());
+    };
+    if request_id != *expected_request_id
+        || requester != *expected_requester
+        || requested_generation != expected_generation
+        || requested_anchor_digest != *expected_anchor_digest
+    {
+        return Err("delivery_witness_request_mismatch".to_string());
+    }
+    if witness != *expected_witness {
+        return Err("delivery_witness_identity_mismatch".to_string());
+    }
+    if now.abs_diff(response_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS
+        || witness_generation == 0
+        || witness_generation > i64::MAX as u64
+        || witness_anchor_digest == [0u8; 32]
+    {
+        return Err("delivery_witness_state_invalid".to_string());
+    }
+
+    let relation_valid = match outcome {
+        VERIFIED_DELIVERY_WITNESS_ADVANCED_V1 | VERIFIED_DELIVERY_WITNESS_IDEMPOTENT_V1 => {
+            witness_generation == expected_generation
+                && witness_anchor_digest == *expected_anchor_digest
+        }
+        VERIFIED_DELIVERY_WITNESS_STALE_V1 => witness_generation > expected_generation,
+        VERIFIED_DELIVERY_WITNESS_CONFLICT_V1 => {
+            witness_generation == expected_generation
+                && witness_anchor_digest != *expected_anchor_digest
+        }
+        VERIFIED_DELIVERY_WITNESS_GAP_V1 => witness_generation
+            .checked_add(1)
+            .is_some_and(|next| expected_generation > next),
+        _ => false,
+    };
+    if !relation_valid {
+        return Err("delivery_witness_outcome_invalid".to_string());
+    }
+
+    let signing_bytes = verified_delivery_anchor_witness_response_signing_bytes(
+        &request_id,
+        &requester,
+        requested_generation,
+        &requested_anchor_digest,
+        &witness,
+        response_timestamp,
+        witness_generation,
+        &witness_anchor_digest,
+        outcome,
+    );
+    IdentityPublicKey::from_bytes(&witness)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .map_err(|_| "invalid_delivery_witness_signature".to_string())?;
+    Ok(outcome)
 }
 
 fn verify_checkpoint_certificate_response(
@@ -2865,6 +3168,153 @@ async fn coordinator_lease_release_handler(
         .into_response()
 }
 
+async fn verified_delivery_anchor_witness_handler(
+    State(state): State<MemChainPeerState>,
+    body: Bytes,
+) -> Response {
+    if body.first().copied() != Some(MEMCHAIN_MAGIC) {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame");
+    }
+    let message = match decode_memchain(&body[1..]) {
+        Ok(message) => message,
+        Err(_) => return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame"),
+    };
+    let MemChainMessage::VerifiedDeliveryAnchorWitnessRequestV1 {
+        requester,
+        generation,
+        anchor_digest,
+        request_id,
+        request_timestamp,
+        signature,
+    } = message
+    else {
+        return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
+    };
+
+    let now = now_secs();
+    if generation == 0 || generation > i64::MAX as u64 || anchor_digest == [0u8; 32] {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_delivery_witness_request");
+    }
+    if now.abs_diff(request_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
+        return protocol_error(StatusCode::UNAUTHORIZED, "stale_request");
+    }
+    if !state
+        .peer_store
+        .verified_delivery_witness_requester_allowed(&requester)
+    {
+        return protocol_error(StatusCode::FORBIDDEN, "witness_requester_not_pinned");
+    }
+    if state.peer_store.get_valid(&requester, now).is_none() {
+        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
+    }
+    let signing_bytes = verified_delivery_anchor_witness_request_signing_bytes(
+        &requester,
+        generation,
+        &anchor_digest,
+        &request_id,
+        request_timestamp,
+    );
+    if IdentityPublicKey::from_bytes(&requester)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .is_err()
+    {
+        return protocol_error(StatusCode::UNAUTHORIZED, "invalid_signature");
+    }
+    if !state.guard.lock().await.admit(requester, request_id, now) {
+        return protocol_error(StatusCode::TOO_MANY_REQUESTS, "rate_or_replay_limited");
+    }
+
+    let (outcome, witness_generation, witness_anchor_digest) = match state
+        .storage
+        .witness_verified_delivery_anchor(&requester, generation, &anchor_digest, now)
+        .await
+    {
+        Ok(VerifiedDeliveryAnchorWitnessOutcome::Advanced {
+            generation,
+            anchor_digest,
+        }) => (
+            VERIFIED_DELIVERY_WITNESS_ADVANCED_V1,
+            generation,
+            anchor_digest,
+        ),
+        Ok(VerifiedDeliveryAnchorWitnessOutcome::Idempotent {
+            generation,
+            anchor_digest,
+        }) => (
+            VERIFIED_DELIVERY_WITNESS_IDEMPOTENT_V1,
+            generation,
+            anchor_digest,
+        ),
+        Ok(VerifiedDeliveryAnchorWitnessOutcome::Stale {
+            generation,
+            anchor_digest,
+        }) => (
+            VERIFIED_DELIVERY_WITNESS_STALE_V1,
+            generation,
+            anchor_digest,
+        ),
+        Ok(VerifiedDeliveryAnchorWitnessOutcome::Conflict {
+            generation,
+            anchor_digest,
+        }) => (
+            VERIFIED_DELIVERY_WITNESS_CONFLICT_V1,
+            generation,
+            anchor_digest,
+        ),
+        Ok(VerifiedDeliveryAnchorWitnessOutcome::Gap {
+            generation,
+            anchor_digest,
+        }) => (VERIFIED_DELIVERY_WITNESS_GAP_V1, generation, anchor_digest),
+        Err(error) => {
+            warn!(error = %error, "[DISCOVERY] Delivery-anchor witness persistence failed");
+            return protocol_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "delivery_witness_persist_failed",
+            );
+        }
+    };
+
+    let witness = state.identity.public_key_bytes();
+    let response_timestamp = now_secs();
+    let response_signing_bytes = verified_delivery_anchor_witness_response_signing_bytes(
+        &request_id,
+        &requester,
+        generation,
+        &anchor_digest,
+        &witness,
+        response_timestamp,
+        witness_generation,
+        &witness_anchor_digest,
+        outcome,
+    );
+    let response = MemChainMessage::VerifiedDeliveryAnchorWitnessResponseV1 {
+        request_id,
+        requester,
+        requested_generation: generation,
+        requested_anchor_digest: anchor_digest,
+        witness,
+        response_timestamp,
+        witness_generation,
+        witness_anchor_digest,
+        outcome,
+        signature: state.identity.sign(&response_signing_bytes),
+    };
+    let encoded = match encode_memchain(&response) {
+        Ok(encoded) => encoded,
+        Err(_) => return protocol_error(StatusCode::INTERNAL_SERVER_ERROR, "encode_error"),
+    };
+    debug!(
+        generation,
+        outcome, "[DISCOVERY] Served authenticated delivery-anchor witness decision"
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        encoded,
+    )
+        .into_response()
+}
+
 async fn checkpoint_handler(State(state): State<MemChainPeerState>, body: Bytes) -> Response {
     if body.first().copied() != Some(MEMCHAIN_MAGIC) {
         return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame");
@@ -3139,6 +3589,170 @@ mod tests {
 
     fn allow_test_endpoint(_endpoint: &str) -> bool {
         true
+    }
+
+    #[tokio::test]
+    async fn verified_delivery_anchor_witness_round_is_signed_contiguous_and_bounded() {
+        let now = now_secs();
+        let requester = IdentityKeyPair::generate();
+        let witness = Arc::new(IdentityKeyPair::generate());
+        let witness_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let witness_peers = Arc::new(PeerStore::new());
+        admit_peer(&witness_peers, &requester, None, now);
+        let router = build_memchain_peer_router(
+            witness_storage,
+            Arc::clone(&witness_peers),
+            Arc::clone(&witness),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let requester_peers = PeerStore::new();
+        admit_peer(
+            &requester_peers,
+            &witness,
+            Some(format!("http://{address}")),
+            now,
+        );
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let witness_id = witness.public_key_bytes();
+        let digest_10 = [0x81; 32];
+
+        let denied = witness_verified_delivery_anchor_with_endpoint_policy(
+            &requester_peers,
+            &requester,
+            &client,
+            &[witness_id],
+            9,
+            &[0x80; 32],
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(denied.attempted, 1);
+        assert_eq!(denied.verified, 0);
+        assert_eq!(denied.failed, 1);
+
+        witness_peers
+            .configure_verified_delivery_witness_requesters(&[requester.public_key_bytes()]);
+
+        let advanced = witness_verified_delivery_anchor_with_endpoint_policy(
+            &requester_peers,
+            &requester,
+            &client,
+            &[witness_id, witness_id],
+            10,
+            &digest_10,
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            advanced,
+            VerifiedDeliveryAnchorWitnessRound {
+                configured: 1,
+                attempted: 1,
+                verified: 1,
+                advanced: 1,
+                ..VerifiedDeliveryAnchorWitnessRound::default()
+            }
+        );
+
+        let idempotent = witness_verified_delivery_anchor_with_endpoint_policy(
+            &requester_peers,
+            &requester,
+            &client,
+            &[witness_id],
+            10,
+            &digest_10,
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(idempotent.verified, 1);
+        assert_eq!(idempotent.idempotent, 1);
+
+        let gap = witness_verified_delivery_anchor_with_endpoint_policy(
+            &requester_peers,
+            &requester,
+            &client,
+            &[witness_id],
+            12,
+            &[0x82; 32],
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gap.verified, 1);
+        assert_eq!(gap.gaps, 1);
+
+        let advanced_next = witness_verified_delivery_anchor_with_endpoint_policy(
+            &requester_peers,
+            &requester,
+            &client,
+            &[witness_id],
+            11,
+            &[0x83; 32],
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(advanced_next.verified, 1);
+        assert_eq!(advanced_next.advanced, 1);
+        server.abort();
+    }
+
+    #[test]
+    fn verified_delivery_anchor_response_rejects_forged_outcome_relation() {
+        let requester = IdentityKeyPair::generate();
+        let witness = IdentityKeyPair::generate();
+        let request_id = [0x91; 16];
+        let digest = [0x92; 32];
+        let now = now_secs();
+        let signing_bytes = verified_delivery_anchor_witness_response_signing_bytes(
+            &request_id,
+            &requester.public_key_bytes(),
+            10,
+            &digest,
+            &witness.public_key_bytes(),
+            now,
+            9,
+            &[0x93; 32],
+            VERIFIED_DELIVERY_WITNESS_IDEMPOTENT_V1,
+        );
+        let frame = encode_memchain(&MemChainMessage::VerifiedDeliveryAnchorWitnessResponseV1 {
+            request_id,
+            requester: requester.public_key_bytes(),
+            requested_generation: 10,
+            requested_anchor_digest: digest,
+            witness: witness.public_key_bytes(),
+            response_timestamp: now,
+            witness_generation: 9,
+            witness_anchor_digest: [0x93; 32],
+            outcome: VERIFIED_DELIVERY_WITNESS_IDEMPOTENT_V1,
+            signature: witness.sign(&signing_bytes),
+        })
+        .unwrap();
+
+        assert_eq!(
+            verify_delivery_anchor_witness_response(
+                &frame,
+                &request_id,
+                &requester.public_key_bytes(),
+                10,
+                &digest,
+                &witness.public_key_bytes(),
+                now,
+            )
+            .unwrap_err(),
+            "delivery_witness_outcome_invalid"
+        );
     }
 
     fn block_announce_frame(block: &RecordCommitmentBlockV1) -> Vec<u8> {
