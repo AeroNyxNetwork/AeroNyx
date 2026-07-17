@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.10.0 - Added producer-isolated replica persistence and bounded pinned-peer pull.
+Modification Reason: v0.10.1 - Recorded the first audited three-node Directory Replica Sync deployment and restart-recovery proof.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.10.0 - Added audited remote replica namespaces, signed page/object verification, atomic import, and durable producer quarantine.
+Last Modified: v0.10.1 - Verified pinned, signed replica synchronization across US1, Korean1, and Noway1 without mixing producer histories.
+Previous: v0.10.0 - Added audited remote replica namespaces, signed page/object verification, atomic import, and durable producer quarantine.
 Previous: v0.9.0 - Added the signed tip, block-range, and descriptor-object serving half of Directory Sync V1.
 Previous: v0.8.0 - Added producer-pinned SQLite persistence and startup recovery for local Directory Chain blocks.
 Previous: v0.7.0 - Added the privacy-bounded Directory Chain V1 protocol core.
@@ -1118,6 +1119,34 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-17 - Completed the first audited three-node Directory Replica Sync deployment.
+- Deployment:
+  - US1, Korean1, and Noway1 run commit d324b98.
+  - US1 pins Korean1 and Noway1 as independent signed producers.
+  - Korean1 and Noway1 each pin only US1.
+  - Gossip discovery still grants no Directory Chain import permission.
+- Live verification:
+  - All three production configs passed the Rust binary's built-in validator.
+  - All services returned healthy local and public discovery API responses with
+    zero systemd restart loops.
+  - After two bounded rounds, US1 retained two producer-isolated tips at height
+    2: four remote blocks, 16 commitments, and zero incidents or quarantines.
+  - Korean1 and Noway1 independently retained US1's signed tip at height 2 with
+    no incidents or quarantine.
+  - US1 restart recovery re-audited two producers, four blocks, and 16
+    commitments before serving traffic.
+  - Noway1 restart recovery re-audited one producer, two blocks, and eight
+    commitments before serving traffic.
+  - SQLite integrity checks passed. Korean1 used Python's standard sqlite3
+    library because the host intentionally has no sqlite3 CLI package.
+- Operational safety:
+  - Every restart was gated on active VPN sessions. Korean1 was not restarted
+    during the recovery test because one real session became active.
+  - Online backups were created before persistence recovery tests.
+  - No deliberate fork was injected into production. Signed fork quarantine,
+    retained-prefix behavior, and durable incident evidence remain covered by
+    isolated automated tests.
+
 2026-07-17 - Added producer-isolated Directory Chain replicas and bounded pull.
 - Files changed:
   - crates/aeronyx-server/src/services/directory_replica.rs (new)
