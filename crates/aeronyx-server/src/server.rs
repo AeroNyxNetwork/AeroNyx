@@ -433,7 +433,9 @@ use crate::api::discovery::{
     discovery_readiness_status_value, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
     GossipResponse,
 };
-use crate::api::directory_chain_peer::build_directory_chain_peer_router;
+use crate::api::directory_chain_peer::{
+    build_directory_chain_peer_router, pull_directory_chain_page,
+};
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
     pull_record_commitment_checkpoint, pull_record_commitment_checkpoint_certificate,
@@ -484,8 +486,8 @@ use crate::services::peer_store::{
     VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
 };
 use crate::services::{
-    spawn_dns_proxy, DirectoryChainAppendReport, DirectoryChainStore, HandshakeService,
-    IpPoolService, NodePolicyRuntime, PeerStore, RoutingService, SessionManager,
+    spawn_dns_proxy, DirectoryChainAppendReport, DirectoryChainStore, DirectoryReplicaStore,
+    HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore, RoutingService, SessionManager,
 };
 // v1.0.0-Membership
 use crate::services::deny_list::DenyList;
@@ -1426,6 +1428,7 @@ impl Server {
 
         let peer_store = self.init_peer_store(chat_relay_runtime_ready).await;
         let directory_chain_store = self.init_directory_chain(&peer_store).await?;
+        let directory_replica_store = self.init_directory_replica().await?;
         if let Some(ref commitment_storage) = storage {
             self.verify_memchain_commitment_startup_witnesses(commitment_storage, &peer_store)
                 .await?;
@@ -1441,6 +1444,10 @@ impl Server {
         let directory_chain_persistence_task = self.spawn_directory_chain_persistence_task(
             Arc::clone(&peer_store),
             directory_chain_store.clone(),
+        );
+        let directory_replica_sync_task = self.spawn_directory_replica_sync_task(
+            Arc::clone(&peer_store),
+            directory_replica_store,
         );
         let discovery_gossip_task =
             self.spawn_discovery_gossip_task(Arc::clone(&peer_store), chat_relay_runtime_ready);
@@ -1462,6 +1469,9 @@ impl Server {
         }
         if let Some(task) = directory_chain_persistence_task {
             tasks.push(("directory-chain-persistence", task));
+        }
+        if let Some(task) = directory_replica_sync_task {
+            tasks.push(("directory-replica-sync", task));
         }
         if let Some(task) = discovery_gossip_task {
             tasks.push(("discovery-gossip", task));
@@ -4170,6 +4180,130 @@ impl Server {
             "[DIRECTORY_CHAIN] Startup descriptor reconciliation committed"
         );
         Ok(Some(store))
+    }
+
+    /// Opens and fully audits the producer-isolated remote replica namespace.
+    ///
+    /// Replica tables share the Directory Chain SQLite file for one durable
+    /// backup boundary, but never share local producer tables or key space.
+    async fn init_directory_replica(&self) -> Result<Option<Arc<DirectoryReplicaStore>>> {
+        let Some(path) = self.config.discovery.directory_chain_path.clone() else {
+            return Ok(None);
+        };
+        let local_node_id = self.identity.public_key_bytes();
+        let observed_at = unix_now_secs();
+        let open_path = path.clone();
+        let (store, audit) = tokio::task::spawn_blocking(move || {
+            DirectoryReplicaStore::open(&open_path, local_node_id, observed_at)
+        })
+        .await
+        .map_err(|error| {
+            ServerError::startup_failed(format!(
+                "Directory replica store task failed before startup: {error}"
+            ))
+        })?
+        .map_err(|error| {
+            ServerError::startup_failed(format!(
+                "Directory replica startup audit failed for '{path}': {error}"
+            ))
+        })?;
+        info!(
+            producers = audit.producers,
+            quarantined_producers = audit.quarantined_producers,
+            blocks = audit.blocks,
+            commitments = audit.commitments,
+            incidents = audit.incidents,
+            "[DIRECTORY_REPLICA] Producer-isolated startup audit passed"
+        );
+        Ok(Some(Arc::new(store)))
+    }
+
+    /// Starts one low-frequency bounded pull per operator-pinned producer.
+    ///
+    /// Empty pins are a hard disable. Errors are logged only as stable reason
+    /// buckets, without peer ids, endpoints, descriptor hashes, or route data.
+    fn spawn_directory_replica_sync_task(
+        &self,
+        peer_store: Arc<PeerStore>,
+        store: Option<Arc<DirectoryReplicaStore>>,
+    ) -> Option<JoinHandle<()>> {
+        let store = store?;
+        let peers = self
+            .config
+            .discovery
+            .directory_chain_sync_peer_node_id_bytes();
+        if peers.is_empty() {
+            info!("[DIRECTORY_REPLICA] Outbound sync disabled; no peers are pinned");
+            return None;
+        }
+        let interval_secs = self
+            .config
+            .discovery
+            .directory_chain_sync_interval_secs;
+        let identity = Arc::new(self.identity.clone());
+        let client = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(1)
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                error!(
+                    error = %error,
+                    "[DIRECTORY_REPLICA] HTTP client initialization failed"
+                );
+                return None;
+            }
+        };
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            let period = Duration::from_secs(interval_secs);
+            let start = tokio::time::Instant::now() + period;
+            let mut timer = tokio::time::interval_at(start, period);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.recv() => break,
+                    _ = timer.tick() => {}
+                }
+                for producer in &peers {
+                    let pull = pull_directory_chain_page(
+                        Arc::clone(&store),
+                        &peer_store,
+                        identity.as_ref(),
+                        producer,
+                        &client,
+                    );
+                    let outcome = tokio::select! {
+                        _ = shutdown_rx.recv() => return,
+                        outcome = pull => outcome,
+                    };
+                    match outcome {
+                        Ok(outcome) => {
+                            debug!(
+                                blocks_inserted = outcome.import.blocks_inserted,
+                                commitments_inserted = outcome.import.commitments_inserted,
+                                blocks_already_present = outcome.import.blocks_already_present,
+                                descriptor_equivocations = outcome.import.descriptor_equivocations,
+                                replica_tip_height = outcome.import.tip_height,
+                                remote_tip_height = outcome.remote_tip_height,
+                                has_more = outcome.has_more,
+                                "[DIRECTORY_REPLICA] Authenticated bounded page synchronized"
+                            );
+                        }
+                        Err(reason) => {
+                            warn!(
+                                reason = %reason,
+                                "[DIRECTORY_REPLICA] Pinned producer sync round rejected"
+                            );
+                        }
+                    }
+                }
+            }
+            info!("[DIRECTORY_REPLICA] Sync task stopped");
+        }))
     }
 
     async fn reconcile_directory_chain_once(

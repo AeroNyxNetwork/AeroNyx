@@ -1901,7 +1901,7 @@ where
 /// is safe for this host to contact. Domain names are deliberately excluded to
 /// prevent DNS rebinding; loopback, private, link-local, CGNAT, benchmark,
 /// documentation, multicast, and reserved ranges are also rejected.
-fn commitment_peer_endpoint_is_public(endpoint: &str) -> bool {
+pub(crate) fn commitment_peer_endpoint_is_public(endpoint: &str) -> bool {
     let Ok(url) = commitment_checkpoint_url(endpoint) else {
         return false;
     };
@@ -2096,7 +2096,7 @@ fn verified_delivery_anchor_witness_url(endpoint: &str) -> Result<Url, String> {
     )
 }
 
-fn commitment_peer_url(endpoint: &str, path: &str) -> Result<Url, String> {
+pub(crate) fn commitment_peer_url(endpoint: &str, path: &str) -> Result<Url, String> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
         return Err("pinned_coordinator_missing_endpoint".to_string());

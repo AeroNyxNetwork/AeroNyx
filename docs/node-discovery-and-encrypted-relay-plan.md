@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.9.0 - Added authenticated bounded Directory Sync serving for pinned live peers.
+Modification Reason: v0.10.0 - Added producer-isolated replica persistence and bounded pinned-peer pull.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.9.0 - Added the signed tip, block-range, and descriptor-object serving half of Directory Sync V1; replica import and fork selection remain pending.
+Last Modified: v0.10.0 - Added audited remote replica namespaces, signed page/object verification, atomic import, and durable producer quarantine.
+Previous: v0.9.0 - Added the signed tip, block-range, and descriptor-object serving half of Directory Sync V1.
 Previous: v0.8.0 - Added producer-pinned SQLite persistence and startup recovery for local Directory Chain blocks.
 Previous: v0.7.0 - Added the privacy-bounded Directory Chain V1 protocol core.
 Previous: v0.6.0 - Added authenticated external witnessing for verified-client delivery-cache anchors.
@@ -619,7 +620,10 @@ crates/aeronyx-server/src/config_chat_relay.rs
 
 ## 13. Directory Chain Without Smart Contracts
 
-Directory Chain is a future append-only descriptor ledger.
+Directory Chain is an append-only descriptor-attestation ledger foundation.
+V1 now has a protocol core, a local producer journal, authenticated bounded
+serving, and producer-isolated remote replicas. It is not global consensus or
+finality: every remote chain remains explicitly scoped to its signing producer.
 
 It is not:
 
@@ -656,12 +660,13 @@ crates/aeronyx-server/src/services/memchain/aof.rs
 crates/aeronyx-server/src/services/memchain/mempool.rs
 ```
 
-Potential new files:
+Current implementation files:
 
 ```text
-crates/aeronyx-core/src/protocol/directory_chain.rs
-crates/aeronyx-server/src/services/discovery/directory_chain.rs
-crates/aeronyx-server/src/services/discovery/witness.rs
+crates/aeronyx-core/src/protocol/discovery.rs
+crates/aeronyx-server/src/services/directory_chain.rs
+crates/aeronyx-server/src/services/directory_replica.rs
+crates/aeronyx-server/src/api/directory_chain_peer.rs
 ```
 
 ## 14. Onion Routing Relationship
@@ -949,7 +954,8 @@ Verification:
 
 ### Phase 6 - Directory Chain
 
-Status: Protocol core, local runtime persistence, and authenticated bounded serving implemented; remote replica import remains pending.
+Status: Protocol core, local producer persistence, authenticated serving,
+producer-isolated replica import, and bounded pinned-peer pull implemented.
 
 Goals:
 
@@ -1008,22 +1014,50 @@ Implemented in Directory Sync V1 serving:
 - Every response is gated by a complete persisted-chain audit. Object batches
   are all-or-nothing and preserve the requested hash order.
 
+Implemented in Directory Sync V1 replica pull:
+
+- Remote blocks never enter the local producer tables. Every producer has an
+  independent replica tip, block namespace, descriptor object namespace, and
+  quarantine state in `directory_replica_*` SQLite tables.
+- Startup audits every accepted producer prefix, every block signature/link,
+  exact commitment index, content-addressed descriptor object, replica tip,
+  and durable incident digest before listeners start.
+- Outbound sync requires the same operator pin plus a current signed PeerStore
+  descriptor. Endpoints must be public IP literals; redirects, DNS endpoints,
+  loopback, private, CGNAT, documentation, and reserved ranges are rejected.
+- Each low-frequency round requests one block, then hydrates exact descriptor
+  objects in batches of 16. This bounds memory, request amplification, and use
+  of the peer API rate budget.
+- The client verifies canonical encoding, request binding, chain id, producer,
+  freshness, response signature, block producer identity, exact object order,
+  and every descriptor signature/hash. The replica store independently decodes
+  and verifies the signed range evidence again before its atomic transaction.
+- Exact repeated pages are idempotent. A producer-signed rollback, same-height
+  tip fork, block fork, or contradictory empty range persists signed evidence
+  and permanently quarantines only that producer; no automatic rewind, delete,
+  or fork selection occurs.
+- Same-node/same-sequence descriptor conflicts are retained as authenticated
+  incidents without automatically quarantining an honest producer that merely
+  recorded third-party equivocation.
+- `directory_chain_sync_interval_secs` defaults to 120 seconds and accepts
+  60 seconds through 24 hours. Empty peer pins disable the outbound task.
+
 Still pending before Directory Chain can be described as live:
 
-- Outbound peer pull, durable producer-isolated replica import, and bounded
-  multi-page catch-up.
-- Signed fork/equivocation incident quarantine and operator recovery policy.
+- Operator-reviewed quarantine evidence export and explicit recovery tooling.
 - Witness/co-signature policy and deterministic fork selection.
-- Operational API/metrics and multi-node synchronization tests.
+- Operational API/metrics and real multi-node synchronization tests with at
+  least two audited bilateral pins.
 
 Files likely changed:
 
 ```text
 crates/aeronyx-core/src/protocol/discovery.rs (V1 protocol core implemented)
 crates/aeronyx-server/src/services/directory_chain.rs (local persistence implemented)
+crates/aeronyx-server/src/services/directory_replica.rs (remote replicas implemented)
+crates/aeronyx-server/src/api/directory_chain_peer.rs (serve and pull implemented)
 crates/aeronyx-server/src/config.rs
 crates/aeronyx-server/src/server.rs
-crates/aeronyx-server/src/services/discovery/witness.rs
 ```
 
 Verification:
@@ -1084,6 +1118,29 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-17 - Added producer-isolated Directory Chain replicas and bounded pull.
+- Files changed:
+  - crates/aeronyx-server/src/services/directory_replica.rs (new)
+  - crates/aeronyx-server/src/services/mod.rs
+  - crates/aeronyx-server/src/api/directory_chain_peer.rs
+  - crates/aeronyx-server/src/api/memchain_peer.rs
+  - crates/aeronyx-server/src/config.rs
+  - crates/aeronyx-server/src/server.rs
+  - deploy/node/server.example.toml
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Verification:
+  - Replica open/reopen, exact idempotence, signed block-fork quarantine,
+    retained accepted prefix, and unrelated-object rejection tests.
+  - Signed outbound range/object response verification and tamper rejection.
+  - `aeronyx-server`: 1,062/1,062 unit tests passed.
+  - `cargo clippy -p aeronyx-server --tests --no-deps` passed.
+  - Release build and the existing production config validation passed.
+- Notes:
+  - Local and remote producer chains use separate tables in the same durable
+    SQLite file; remote data cannot advance the local producer tip.
+  - US1 remains fail-closed with no outbound sync while its pin list is empty.
+  - Quarantine is persistent and intentionally has no automatic recovery path.
+
 2026-07-17 - Added Directory Sync V1 authenticated serving transport.
 - Files changed:
   - crates/aeronyx-core/src/protocol/discovery.rs

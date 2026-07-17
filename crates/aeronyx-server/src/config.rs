@@ -149,6 +149,13 @@ pub struct DiscoveryConfig {
     /// policy. An empty list keeps tip/block/object peer routes fail-closed.
     #[serde(default)]
     pub directory_chain_sync_peer_node_ids: Vec<String>,
+    /// Low-frequency interval for one bounded replica page per pinned peer.
+    ///
+    /// Empty peer pins disable all outbound Directory Sync regardless of this
+    /// value. One page contains one block and bounded object requests so a
+    /// normal round remains below the peer API's per-minute request budget.
+    #[serde(default = "DiscoveryConfig::default_directory_chain_sync_interval_secs")]
+    pub directory_chain_sync_interval_secs: u64,
     /// Operator-pinned nodes that witness the signed delivery-cache generation.
     ///
     /// Witnesses receive only this node's identity, a monotonic generation,
@@ -267,6 +274,12 @@ impl DiscoveryConfig {
     #[must_use]
     pub const fn default_peer_cache_write_interval_secs() -> u64 {
         300
+    }
+
+    /// Default low-frequency Directory Chain replica pull interval.
+    #[must_use]
+    pub const fn default_directory_chain_sync_interval_secs() -> u64 {
+        120
     }
 
     /// Default external cache-anchor witness threshold.
@@ -458,6 +471,13 @@ impl DiscoveryConfig {
                 }
                 validated.push(node_id);
             }
+        }
+
+        if !(60..=86_400).contains(&self.directory_chain_sync_interval_secs) {
+            return Err(ServerError::config_invalid(
+                "discovery.directory_chain_sync_interval_secs",
+                "must be between 60 seconds and 24 hours",
+            ));
         }
 
         if !self.verified_delivery_witness_node_ids.is_empty()
@@ -775,6 +795,7 @@ impl Default for DiscoveryConfig {
             peer_cache_path: None,
             directory_chain_path: None,
             directory_chain_sync_peer_node_ids: Vec::new(),
+            directory_chain_sync_interval_secs: Self::default_directory_chain_sync_interval_secs(),
             verified_delivery_witness_node_ids: Vec::new(),
             verified_delivery_witness_requester_node_ids: Vec::new(),
             verified_delivery_witness_min_verified:
@@ -1020,6 +1041,10 @@ mod tests {
             config.discovery.peer_cache_write_interval_secs,
             DiscoveryConfig::default_peer_cache_write_interval_secs()
         );
+        assert_eq!(
+            config.discovery.directory_chain_sync_interval_secs,
+            DiscoveryConfig::default_directory_chain_sync_interval_secs()
+        );
         assert!(!config.discovery.gossip_enabled);
         assert_eq!(
             config.discovery.gossip_interval_secs,
@@ -1145,6 +1170,10 @@ db_path = "memchain.db"
             .discovery
             .directory_chain_sync_peer_node_ids
             .is_empty());
+        assert_eq!(
+            config.discovery.directory_chain_sync_interval_secs,
+            DiscoveryConfig::default_directory_chain_sync_interval_secs()
+        );
         assert!(config.validate().is_ok());
     }
 
@@ -1162,6 +1191,7 @@ directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
 directory_chain_sync_peer_node_ids = [
   "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 ]
+directory_chain_sync_interval_secs = 180
 peer_cache_write_interval_secs = 120
 gossip_enabled = true
 gossip_interval_secs = 45
@@ -1212,6 +1242,7 @@ advertise_onion_middle = true
             config.discovery.directory_chain_sync_peer_node_id_bytes(),
             vec![[0xcc; 32]]
         );
+        assert_eq!(config.discovery.directory_chain_sync_interval_secs, 180);
         assert_eq!(config.discovery.peer_cache_write_interval_secs, 120);
         assert!(config.discovery.gossip_enabled);
         assert_eq!(config.discovery.gossip_interval_secs, 45);

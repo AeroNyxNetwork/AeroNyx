@@ -11,6 +11,7 @@
 //   Re-exported PeerStoreStatus for nodeboard discovery status.
 //
 // Last Modified:
+//   v0.6.0-DirectoryReplicaStore - Registered producer-isolated remote replicas
 //   v0.5.0-DirectorySyncReads - Re-exported audit-gated Directory Chain pages
 //   v0.4.0-DirectoryChainStore - Registered transactional local directory ledger
 //   v0.3.0-DiscoveryStatus - Re-exported PeerStoreStatus
@@ -23,6 +24,7 @@
 pub mod chat_relay;
 pub mod deny_list;
 pub mod directory_chain;
+pub mod directory_replica;
 pub mod dns_proxy;
 pub mod handshake;
 pub mod ip_pool;
@@ -41,6 +43,10 @@ pub use deny_list::{DenyList, DenyReason};
 pub use directory_chain::{
     DirectoryChainAppendReport, DirectoryChainAudit, DirectoryChainPage, DirectoryChainStore,
     DirectoryChainStoreError,
+};
+pub use directory_replica::{
+    DirectoryReplicaAudit, DirectoryReplicaImportReport, DirectoryReplicaStore,
+    DirectoryReplicaStoreError, DirectoryReplicaTip,
 };
 pub use dns_proxy::spawn_dns_proxy;
 pub use handshake::HandshakeService;

@@ -115,6 +115,9 @@ peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
 # exchange. Permissionless discovery alone never grants ledger-read access.
 # Empty keeps all Directory Sync peer requests fail-closed.
 directory_chain_sync_peer_node_ids = []
+# Pulls at most one producer block per pinned peer each round. Keep this at 60
+# seconds or higher so descriptor-object hydration stays within peer rate limits.
+directory_chain_sync_interval_secs = 120
 peer_cache_write_interval_secs = 120
 # Optional external rollback witness for the signed verified-delivery cache.
 # Each pin is a 32-byte node Ed25519 identity in hexadecimal. Witnesses retain
