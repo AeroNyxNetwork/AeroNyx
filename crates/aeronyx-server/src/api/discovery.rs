@@ -60,6 +60,7 @@
 //!   Keep `DISCOVERY_REQUEST_BODY_MAX_BYTES` aligned with protocol limits.
 //!
 //! ## Last Modified
+//! v0.30.0-VerifiedDeliveryPeerGate - Keep public real-relay readiness gated by two currently verified receipt-capable peers
 //! v0.29.0-PublicCardRealRelayEvidence - Prefer verified client delivery receipts over synthetic proof labels
 //! v0.28.0-VerifiedClientRelayEvidence - Expose aggregate terminal-signed App onion delivery readiness
 //! v0.27.0-ProofRestartContinuity - Gate onion admission on verified or durably signed proof stability
@@ -3074,10 +3075,21 @@ mod tests {
     async fn test_public_card_endpoint_returns_minimal_product_protocol_card() {
         let store = Arc::new(PeerStore::new());
         let now = now_secs();
+        let middle =
+            signed_routeable_chat_descriptor(1, now + 300, "https://middle.example");
+        let middle_node_id = middle.node_id();
+        let terminal =
+            signed_routeable_chat_descriptor(1, now + 300, "https://terminal.example");
+        let terminal_node_id = terminal.node_id();
+
+        store.upsert_verified(middle, now).unwrap();
+        store.upsert_verified(terminal, now).unwrap();
+        store.record_delivery_receipt_capability(&middle_node_id, now);
+        store.record_delivery_receipt_capability(&terminal_node_id, now);
         store.record_blind_relay_terminal(now, 2, 128);
-        store.record_blind_relay_forwarded(now + 1, 1);
+        store.record_blind_relay_forwarded(now, 1);
         store.record_blind_relay_two_hop_probe_result_with_context(
-            now + 2,
+            now,
             true,
             "onion_terminal_delivered",
             4,
@@ -3085,7 +3097,7 @@ mod tests {
             2,
             1,
         );
-        store.record_verified_client_onion_delivery(now + 3);
+        store.record_verified_client_onion_delivery(now);
         let app = build_discovery_router_with_local_status(
             store,
             DiscoveryApiPolicy::default(),

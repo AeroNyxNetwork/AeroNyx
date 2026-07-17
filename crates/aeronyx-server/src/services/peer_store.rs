@@ -152,6 +152,7 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.59.0-VerifiedDeliveryRestartContinuity - Persist only signed aggregate client-delivery evidence and require fresh receipt-capable peers after restart
 //! v0.58.0-RouteNetworkAntiAffinity - Require routeable peers and distinct endpoint network identities for multi-hop paths
 //! v0.57.0-SignedDeliveryReceipts - Track freshness-bounded receipt-capable routes and verified client onion delivery evidence
 //! v0.56.0-ProofRestartContinuity - Expose authenticated restore and signed proof persistence evidence
@@ -218,7 +219,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aeronyx_core::protocol::discovery::{
     NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage, SignedNodeDescriptor,
@@ -226,6 +227,7 @@ use aeronyx_core::protocol::discovery::{
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 
 const DISCOVERY_GOSSIP_STALE_AFTER_SECS: u64 = 900;
 const DISCOVERY_GOSSIP_FAILURE_ATTENTION_THRESHOLD: u64 = 3;
@@ -239,6 +241,8 @@ const PEER_ROUTEABILITY_STALE_AFTER_SECS: u64 = 1_800;
 pub const ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 /// Local peer-cache two-hop proof history schema understood by this node.
 pub const TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION: u16 = 1;
+/// Local peer-cache aggregate verified-client delivery schema understood by this node.
+pub const VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION: u16 = 1;
 const ROUTEABILITY_EVIDENCE_KIND_EXACT_DESCRIPTOR: &str = "direct_opaque_route_success";
 const ROUTEABILITY_EVIDENCE_KIND_ROUTE_SURFACE: &str = "direct_opaque_route_surface_success";
 const PEER_ROUTEABILITY_CACHE_MAX_ENTRIES: usize = 4_096;
@@ -249,6 +253,7 @@ const PEER_ROUTE_STATUS_LIMIT: usize = 8;
 const PEER_HEALTH_STATUS_LIMIT: usize = 64;
 const PEER_QUORUM_MIN_VALID_PEERS: usize = 2;
 const PEER_QUORUM_MIN_ROUTEABLE_CHAT_RELAYS: usize = 1;
+const TWO_HOP_DELIVERY_RECEIPT_MIN_CAPABLE_PEERS: usize = 2;
 const TWO_HOP_PATH_POLICY_NETWORK_DIVERSE: &str = "distinct_node_and_network_prefix";
 
 /// Coarse endpoint identity used only to prevent obviously collocated hops.
@@ -690,6 +695,27 @@ pub struct PeerStoreBootstrapStatus {
     /// Timestamp of the latest successful signed proof-cache persistence.
     #[serde(default)]
     pub last_two_hop_proof_cache_persisted_at: Option<u64>,
+    /// Signed aggregate client-delivery cache restore status.
+    ///
+    /// Stable buckets are `restored`, `empty`, and `rejected`. The section
+    /// never contains route, peer, sender, receiver, message, or payload data.
+    #[serde(default)]
+    pub last_client_delivery_cache_status: Option<String>,
+    /// Authentication result for the last aggregate client-delivery section.
+    #[serde(default)]
+    pub last_client_delivery_cache_authentication: Option<String>,
+    /// Aggregate delivery count restored from the signed local cache.
+    #[serde(default)]
+    pub last_client_delivery_cache_restored: u64,
+    /// Timestamp of the last aggregate client-delivery restore attempt.
+    #[serde(default)]
+    pub last_client_delivery_cache_at: Option<u64>,
+    /// Aggregate delivery count included in the latest durable cache write.
+    #[serde(default)]
+    pub last_client_delivery_cache_persisted: u64,
+    /// Timestamp of the latest durable aggregate client-delivery cache write.
+    #[serde(default)]
+    pub last_client_delivery_cache_persisted_at: Option<u64>,
     /// Number of peers attempted in the last outbound gossip round.
     pub last_gossip_attempted: u64,
     /// Number of configured seed endpoints attempted in the last gossip round.
@@ -765,6 +791,12 @@ impl Default for PeerStoreBootstrapStatus {
             last_two_hop_proof_cache_persisted: 0,
             last_two_hop_proof_cache_persisted_stability_ready: false,
             last_two_hop_proof_cache_persisted_at: None,
+            last_client_delivery_cache_status: None,
+            last_client_delivery_cache_authentication: None,
+            last_client_delivery_cache_restored: 0,
+            last_client_delivery_cache_at: None,
+            last_client_delivery_cache_persisted: 0,
+            last_client_delivery_cache_persisted_at: None,
             last_gossip_attempted: 0,
             last_gossip_seed_attempted: 0,
             last_gossip_succeeded: 0,
@@ -946,8 +978,9 @@ pub struct PeerStoreBlindRelayStats {
     /// Authenticated App/client-originated onion deliveries whose exact opaque
     /// terminal payload was acknowledged by a valid terminal-node signature.
     ///
-    /// This is an aggregate process-local count. It must never be joined with
-    /// route ids, peer ids, receiver identities, or message metadata.
+    /// This aggregate may be restored from the node's independently signed
+    /// local cache. It must never be joined with route ids, peer ids, receiver
+    /// identities, or message metadata.
     #[serde(default)]
     pub verified_client_onion_deliveries: u64,
     /// Unix timestamp of the last verified client-originated delivery receipt.
@@ -986,7 +1019,8 @@ pub struct PeerStoreBlindRelayQualityStatus {
     /// Whether a fresh terminal-signed receipt proves an authenticated
     /// App/client-originated opaque payload reached terminal store-and-forward.
     pub real_relay_ready: bool,
-    /// Aggregate verified App/client-originated onion deliveries in this process.
+    /// Aggregate verified App/client-originated onion deliveries observed by
+    /// this node, including fresh independently signed local-cache recovery.
     #[serde(default)]
     pub verified_client_onion_deliveries: u64,
     /// Seconds since the last verified client delivery receipt, when known.
@@ -1354,6 +1388,33 @@ pub struct PeerStoreTwoHopProofCacheRestoreReport {
     pub restored: usize,
     /// Number rejected by bounds, freshness, route-pool, or field checks.
     pub rejected: usize,
+}
+
+/// Privacy-safe aggregate client delivery evidence stored in the signed local
+/// peer cache for restart continuity.
+///
+/// A node creates this record only after validating a terminal signature bound
+/// to the exact route and opaque payload. Those correlatable proof inputs are
+/// deliberately discarded. The persisted form contains only a cumulative
+/// count and the most recent verification time, so an operator cannot recover
+/// a route, peer pair, sender, receiver, message id, or payload from the cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreVerifiedClientDeliveryCacheEvidence {
+    /// Aggregate verified deliveries observed by this node.
+    pub verified_deliveries: u64,
+    /// Unix timestamp of the most recent verified terminal receipt.
+    pub last_verified_at: u64,
+}
+
+/// Aggregate result of restoring signed client-delivery evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreVerifiedClientDeliveryCacheRestoreReport {
+    /// Whether the cache contained an evidence record.
+    pub present: bool,
+    /// Whether the record passed schema, signature, freshness, and route-pool checks.
+    pub restored: bool,
+    /// Aggregate count restored when `restored` is true.
+    pub restored_deliveries: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1995,6 +2056,8 @@ pub struct PeerStore {
     peer_events: RwLock<VecDeque<PeerStorePeerEvent>>,
     two_hop_path_proof_events: RwLock<VecDeque<PeerStoreTwoHopPathProofEvent>>,
     bootstrap_status: RwLock<PeerStoreBootstrapStatus>,
+    client_delivery_cache_dirty: AtomicBool,
+    client_delivery_cache_notify: Notify,
 }
 
 impl PeerStore {
@@ -2015,6 +2078,8 @@ impl PeerStore {
                 MAX_TWO_HOP_PATH_PROOF_EVENTS,
             )),
             bootstrap_status: RwLock::new(PeerStoreBootstrapStatus::default()),
+            client_delivery_cache_dirty: AtomicBool::new(false),
+            client_delivery_cache_notify: Notify::new(),
         }
     }
 
@@ -2211,6 +2276,25 @@ impl PeerStore {
         );
     }
 
+    /// Records that the latest atomic peer-cache write included aggregate
+    /// verified-client delivery evidence.
+    pub fn record_client_delivery_cache_persisted(&self, now: u64, persisted: u64) {
+        {
+            let mut status = self.bootstrap_status.write();
+            status.last_client_delivery_cache_persisted = persisted;
+            status.last_client_delivery_cache_persisted_at = Some(now);
+        }
+        self.record_audit_event(
+            now,
+            "client_delivery_cache_persist",
+            "success",
+            format!(
+                "schema_version={} persisted={persisted}",
+                VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION
+            ),
+        );
+    }
+
     /// Records the independently evaluated proof-cache authentication bucket.
     ///
     /// The parser owns signature verification; PeerStore stores only this
@@ -2231,6 +2315,35 @@ impl PeerStore {
         self.record_audit_event(
             now,
             "two_hop_proof_cache_authentication",
+            if authentication == "verified" {
+                "accepted"
+            } else if authentication == "legacy_descriptor_only" {
+                "warning"
+            } else {
+                "rejected"
+            },
+            format!("authentication={authentication}"),
+        );
+    }
+
+    /// Records the independently evaluated aggregate client-delivery cache
+    /// authentication bucket without retaining any proof inputs.
+    pub fn record_client_delivery_cache_authentication(
+        &self,
+        now: u64,
+        authentication: &str,
+    ) {
+        let authentication = match authentication {
+            "verified" | "legacy_descriptor_only" | "signature_invalid"
+            | "identity_unavailable" => authentication,
+            _ => "unknown",
+        };
+        self.bootstrap_status
+            .write()
+            .last_client_delivery_cache_authentication = Some(authentication.to_string());
+        self.record_audit_event(
+            now,
+            "client_delivery_cache_authentication",
             if authentication == "verified" {
                 "accepted"
             } else if authentication == "legacy_descriptor_only" {
@@ -3078,12 +3191,32 @@ impl PeerStore {
         self.counters
             .last_verified_client_onion_delivery_at
             .store(now, Ordering::Relaxed);
+        self.client_delivery_cache_dirty
+            .store(true, Ordering::Release);
+        self.client_delivery_cache_notify.notify_one();
         self.record_audit_event(
             now,
             "blind_relay_client_delivery_receipt",
             "accepted",
             "terminal_signature_verified".to_string(),
         );
+    }
+
+    /// Waits until verified client-delivery evidence needs a durable cache
+    /// refresh. Tokio `Notify` coalesces bursts into bounded wakeups.
+    pub async fn wait_for_client_delivery_cache_dirty(&self) {
+        self.client_delivery_cache_notify.notified().await;
+    }
+
+    /// Atomically claims the pending aggregate delivery evidence update.
+    ///
+    /// The persistence task calls this immediately before exporting a cache
+    /// snapshot. A new receipt arriving during the write sets the flag again
+    /// and schedules a follow-up flush, so abrupt cancellation cannot silently
+    /// clear evidence that was not part of the snapshot.
+    pub fn take_client_delivery_cache_dirty(&self) -> bool {
+        self.client_delivery_cache_dirty
+            .swap(false, Ordering::AcqRel)
     }
 
     /// Records a blind relay rejection with a stable privacy-safe reason.
@@ -4274,6 +4407,148 @@ impl PeerStore {
         }
     }
 
+    /// Exports fresh aggregate terminal-receipt evidence for the signed local
+    /// peer cache.
+    ///
+    /// Receipt bytes and all correlatable proof inputs have already been
+    /// discarded. Returning `None` for empty or stale evidence prevents an old
+    /// cache from reviving current relay readiness indefinitely.
+    #[must_use]
+    pub fn export_verified_client_delivery_cache_evidence(
+        &self,
+        generated_at: u64,
+    ) -> Option<PeerStoreVerifiedClientDeliveryCacheEvidence> {
+        let stats = self.counters.snapshot();
+        let last_verified_at = stats
+            .blind_relay
+            .last_verified_client_onion_delivery_at?;
+        if stats.blind_relay.verified_client_onion_deliveries == 0
+            || last_verified_at == 0
+            || last_verified_at > generated_at
+            || generated_at.saturating_sub(last_verified_at)
+                > PEER_ROUTEABILITY_STALE_AFTER_SECS
+        {
+            return None;
+        }
+        Some(PeerStoreVerifiedClientDeliveryCacheEvidence {
+            verified_deliveries: stats.blind_relay.verified_client_onion_deliveries,
+            last_verified_at,
+        })
+    }
+
+    /// Restores signed aggregate terminal-receipt evidence after descriptor and
+    /// routeability recovery.
+    ///
+    /// The historical count may be restored before receipt-capable peers are
+    /// re-proven, but `real_relay_ready` remains false until at least two fresh
+    /// receipt-capable peers exist in the current process.
+    pub fn restore_verified_client_delivery_cache_evidence(
+        &self,
+        evidence: Option<&PeerStoreVerifiedClientDeliveryCacheEvidence>,
+        now: u64,
+    ) -> PeerStoreVerifiedClientDeliveryCacheRestoreReport {
+        let Some(evidence) = evidence else {
+            return self.finish_client_delivery_cache_restore(false, false, 0, now, None);
+        };
+        let valid = evidence.verified_deliveries > 0
+            && evidence.last_verified_at > 0
+            && evidence.last_verified_at <= now
+            && now.saturating_sub(evidence.last_verified_at)
+                <= PEER_ROUTEABILITY_STALE_AFTER_SECS
+            && self.route_path_status(now).chat_two_hop_onion_ready.complete;
+        if !valid {
+            return self.finish_client_delivery_cache_restore(
+                true,
+                false,
+                0,
+                now,
+                Some("evidence_or_route_pool_invalid"),
+            );
+        }
+
+        self.counters
+            .verified_client_onion_deliveries
+            .fetch_max(evidence.verified_deliveries, Ordering::Relaxed);
+        self.counters
+            .last_verified_client_onion_delivery_at
+            .fetch_max(evidence.last_verified_at, Ordering::Relaxed);
+        self.counters
+            .last_blind_relay_at
+            .fetch_max(evidence.last_verified_at, Ordering::Relaxed);
+        self.finish_client_delivery_cache_restore(
+            true,
+            true,
+            evidence.verified_deliveries,
+            now,
+            None,
+        )
+    }
+
+    /// Rejects an unauthenticated aggregate delivery section without
+    /// discarding independently verified descriptors, routeability, or proof
+    /// history.
+    pub fn reject_verified_client_delivery_cache_evidence(
+        &self,
+        present: bool,
+        now: u64,
+        reason: &str,
+    ) -> PeerStoreVerifiedClientDeliveryCacheRestoreReport {
+        let reason = match reason {
+            "identity_unavailable" => "identity_unavailable",
+            _ => "signature_invalid",
+        };
+        self.finish_client_delivery_cache_restore(present, false, 0, now, Some(reason))
+    }
+
+    fn finish_client_delivery_cache_restore(
+        &self,
+        present: bool,
+        restored: bool,
+        restored_deliveries: u64,
+        now: u64,
+        rejection_reason: Option<&str>,
+    ) -> PeerStoreVerifiedClientDeliveryCacheRestoreReport {
+        let status_bucket = if restored {
+            "restored"
+        } else if present {
+            "rejected"
+        } else {
+            "empty"
+        };
+        {
+            let mut status = self.bootstrap_status.write();
+            status.last_client_delivery_cache_status = Some(status_bucket.to_string());
+            status.last_client_delivery_cache_restored = restored_deliveries;
+            status.last_client_delivery_cache_at = Some(now);
+        }
+        let reason = rejection_reason
+            .map(|value| format!(" reason={value}"))
+            .unwrap_or_default();
+        self.record_audit_event(
+            now,
+            "client_delivery_cache_restore",
+            if restored || !present {
+                "accepted"
+            } else {
+                "rejected"
+            },
+            format!(
+                "schema_version={} present={} restored={} restored_deliveries={} status={}{}",
+                VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
+                present,
+                restored,
+                restored_deliveries,
+                status_bucket,
+                reason
+            ),
+        );
+        PeerStoreVerifiedClientDeliveryCacheRestoreReport {
+            present,
+            restored,
+            restored_deliveries,
+        }
+    }
+
     /// Exports fresh successful routeability evidence for local restart recovery.
     ///
     /// Every record is bound to the signed route surface proven by the latest
@@ -5183,6 +5458,10 @@ impl PeerStore {
             .map(|at| now.saturating_sub(at));
         let accepted_evidence_seen = accepted_total > 0;
         let verified_client_onion_evidence_seen = stats.verified_client_onion_deliveries > 0;
+        let verified_client_onion_evidence_fresh = verified_client_onion_evidence_seen
+            && last_verified_client_onion_delivery_age_seconds
+                .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
+                .unwrap_or(false);
         let probe_evidence_seen = stats.probe_succeeded > 0;
         let two_hop_probe_evidence_seen = stats.two_hop_probe_succeeded > 0;
         let synthetic_onion_delivery_evidence_seen = two_hop_probe_evidence_seen
@@ -5193,10 +5472,9 @@ impl PeerStore {
             && last_accepted_age_seconds
                 .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
                 .unwrap_or(false);
-        let real_relay_ready = verified_client_onion_evidence_seen
-            && last_verified_client_onion_delivery_age_seconds
-                .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
-                .unwrap_or(false);
+        let real_relay_ready = verified_client_onion_evidence_fresh
+            && delivery_receipt_capable_peers
+                >= TWO_HOP_DELIVERY_RECEIPT_MIN_CAPABLE_PEERS;
         let probe_ready = probe_evidence_seen
             && last_probe_age_seconds
                 .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
@@ -5285,6 +5563,8 @@ impl PeerStore {
             "protecting"
         } else if runtime_ready {
             "ready"
+        } else if verified_client_onion_evidence_fresh {
+            "observing"
         } else if stale_success_evidence {
             "stale"
         } else {
@@ -5322,6 +5602,8 @@ impl PeerStore {
                 "transport_attention"
             } else if protection_active {
                 "protection_active"
+            } else if verified_client_onion_evidence_fresh && !real_relay_ready {
+                "verified_client_onion_delivery_peer_revalidation_required"
             } else if verified_client_onion_evidence_seen && !real_relay_ready {
                 "verified_client_onion_delivery_receipt_stale"
             } else if accepted_evidence_seen && !accepted_relay_ready {
@@ -8584,6 +8866,31 @@ mod tests {
         let store = PeerStore::new();
         let now = 1_700_000_000;
         store.record_verified_client_onion_delivery(now);
+
+        let unproven_mesh = store.status(now + 1).blind_relay_quality;
+        assert!(!unproven_mesh.real_relay_ready);
+        assert_eq!(unproven_mesh.delivery_receipt_capable_peers, 0);
+        assert_eq!(unproven_mesh.status, "observing");
+        assert_eq!(
+            unproven_mesh.readiness_reason,
+            "verified_client_onion_delivery_peer_revalidation_required"
+        );
+
+        for (offset, endpoint, capability) in [
+            (1, "https://middle-receipt.example", NodeCapability::OnionMiddle),
+            (2, "https://terminal-receipt.example", NodeCapability::ChatRelay),
+        ] {
+            let identity = IdentityKeyPair::generate();
+            let mut descriptor = signed_descriptor_for(&identity, offset, now + 4_000);
+            descriptor.descriptor.public_endpoint = Some(endpoint.to_string());
+            descriptor.descriptor.capabilities = vec![capability];
+            descriptor =
+                SignedNodeDescriptor::sign(descriptor.descriptor, &identity).unwrap();
+            let node_id = descriptor.node_id();
+            store.upsert_verified(descriptor, now).unwrap();
+            store.record_route_forward_success(&node_id, now);
+            store.record_delivery_receipt_capability(&node_id, now);
+        }
 
         let fresh = store.status(now + 10).blind_relay_quality;
         assert!(fresh.real_relay_ready);

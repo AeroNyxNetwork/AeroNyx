@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.3.0 - Added the discovery restart-recovery gate. A node should not be considered a stable relay or multihop foundation only because its current in-memory PeerStore is fresh; it must also have seed recovery or peer-cache persistence configured.
+Modification Reason: v0.4.0 - Added signed aggregate verified-client delivery restart continuity without persisting routes, peers, message identifiers, payload commitments, or ciphertext.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.3.0 - Added restart-recovery gate for PeerStore relay foundation readiness.
+Last Modified: v0.4.0 - Added fail-closed verified-client delivery evidence recovery.
+Previous: v0.3.0 - Added restart-recovery gate for PeerStore relay foundation readiness.
 Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordination.
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
@@ -1018,6 +1019,29 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-17 - Added signed aggregate verified-client delivery restart continuity.
+- Files changed:
+  - crates/aeronyx-server/src/server.rs
+  - crates/aeronyx-server/src/services/peer_store.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Verification:
+  - Targeted cache compatibility, tamper, expiry, readiness, and debounce tests.
+  - Full aeronyx-server tests and release build on the reviewed US1 node.
+- Notes:
+  - The local peer cache stores only a cumulative verified-delivery count and
+    the latest verification timestamp under an independent Ed25519 signature.
+  - Route IDs, selected paths, peer pairs, sender/receiver identifiers,
+    message IDs, payload commitments, receipt bytes, and ciphertext are never
+    written into this evidence section.
+  - Legacy caches remain readable. A missing section is treated as empty, and
+    an invalid or expired section is rejected without discarding independently
+    verified descriptor, routeability, or synthetic proof sections.
+  - Restored history cannot by itself report real relay readiness. At least two
+    current peers must independently demonstrate fresh signed terminal receipt
+    capability after restart.
+  - Verified delivery events trigger a debounced atomic cache flush so the
+    evidence does not depend on the ordinary low-frequency cache interval.
+
 2026-06-19 - Added Blind Node Invariant as protocol gate.
 - Files changed:
   - docs/node-discovery-and-encrypted-relay-plan.md

@@ -189,6 +189,9 @@
 //  81. Uses fresh terminal-signed delivery receipts to unlock authenticated
 //      App two-hop onion routing while retaining the legacy encrypted relay
 //      path for mixed-version peers and never classifying probes as user work.
+//  82. Persists only a signed aggregate verified-client delivery count and
+//      latest timestamp, then requires fresh current receipt-capable peers
+//      before restart recovery may report authenticated two-hop readiness.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -263,6 +266,7 @@
 //     never mark a terminal healthy solely because a middle claims forwarding.
 //
 // Last Modified:
+//   v2.8.26-VerifiedDeliveryRestartContinuity - Signed aggregate receipt evidence with fail-closed live readiness
 //   v2.8.25-LegacyFallbackReceiptSearch - Do not let legacy onward-envelope ACKs mask receipt-capable paths
 //   v2.8.24-ReceiptProbeFallbackSearch - Continue bounded mixed-version probes until a signed terminal receipt is found
 //   v2.8.23-RouteNetworkAntiAffinity - Fail closed on unreachable or endpoint-collocated relay paths
@@ -457,7 +461,8 @@ use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
 use crate::services::memchain::{LlmRouter, TaskWorker};
 use crate::services::peer_store::{
     PeerStoreRouteabilityCacheEvidence, PeerStoreTwoHopPathProofEvent,
-    ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+    PeerStoreVerifiedClientDeliveryCacheEvidence, ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
+    TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
 };
 use crate::services::{
     spawn_dns_proxy, HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore, RoutingService,
@@ -489,6 +494,8 @@ const BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS: u64 = 15 * 60;
 const BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS: u64 = 60;
 const BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS: u64 = 120;
 const BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 30;
+/// Coalesce verified-delivery bursts before atomically refreshing peer cache.
+const CLIENT_DELIVERY_CACHE_FLUSH_DEBOUNCE_MILLIS: u64 = 250;
 /// Direct startup probes are bounded independently of untrusted peer count.
 const BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES: usize = 3;
 
@@ -529,6 +536,14 @@ struct PeerStoreCacheDocument {
     two_hop_path_proof_signer_node_id: Option<String>,
     #[serde(default)]
     two_hop_path_proof_signature_ed25519: Option<String>,
+    #[serde(default)]
+    verified_client_delivery_schema_version: u16,
+    #[serde(default)]
+    verified_client_delivery_evidence: Option<PeerStoreVerifiedClientDeliveryCacheEvidence>,
+    #[serde(default)]
+    verified_client_delivery_signer_node_id: Option<String>,
+    #[serde(default)]
+    verified_client_delivery_signature_ed25519: Option<String>,
 }
 
 impl PeerStoreCacheDocument {
@@ -536,6 +551,7 @@ impl PeerStoreCacheDocument {
         descriptor_snapshot: NodeBootstrapSnapshot,
         routeability_evidence: Vec<PeerStoreRouteabilityCacheEvidence>,
         two_hop_path_proof_events: Vec<PeerStoreTwoHopPathProofEvent>,
+        verified_client_delivery_evidence: Option<PeerStoreVerifiedClientDeliveryCacheEvidence>,
         identity: &IdentityKeyPair,
     ) -> Result<Self> {
         let mut document = Self {
@@ -548,6 +564,11 @@ impl PeerStoreCacheDocument {
             two_hop_path_proof_events,
             two_hop_path_proof_signer_node_id: None,
             two_hop_path_proof_signature_ed25519: None,
+            verified_client_delivery_schema_version:
+                VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
+            verified_client_delivery_evidence,
+            verified_client_delivery_signer_node_id: None,
+            verified_client_delivery_signature_ed25519: None,
         };
         let signing_bytes = document
             .routeability_evidence_signing_bytes()
@@ -563,6 +584,14 @@ impl PeerStoreCacheDocument {
             Some(hex::encode(identity.public_key_bytes()));
         document.two_hop_path_proof_signature_ed25519 =
             Some(hex::encode(identity.sign(&proof_signing_bytes)));
+        let client_delivery_signing_bytes = document
+            .verified_client_delivery_signing_bytes()
+            .map_err(ServerError::internal)?;
+        document.verified_client_delivery_signer_node_id =
+            Some(hex::encode(identity.public_key_bytes()));
+        document.verified_client_delivery_signature_ed25519 = Some(hex::encode(
+            identity.sign(&client_delivery_signing_bytes),
+        ));
         Ok(document)
     }
 
@@ -597,6 +626,17 @@ impl PeerStoreCacheDocument {
             return Err(format!(
                 "unsupported two-hop proof schema version: {}",
                 document.two_hop_path_proof_schema_version
+            ));
+        }
+        let client_delivery_version_valid =
+            (document.verified_client_delivery_evidence.is_none()
+                && document.verified_client_delivery_schema_version == 0)
+                || document.verified_client_delivery_schema_version
+                    == VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION;
+        if !client_delivery_version_valid {
+            return Err(format!(
+                "unsupported verified client delivery schema version: {}",
+                document.verified_client_delivery_schema_version
             ));
         }
         Ok(document)
@@ -676,6 +716,44 @@ impl PeerStoreCacheDocument {
             &self.two_hop_path_proof_events,
         ))
         .map_err(|error| format!("two-hop proof signing bytes: {error}"))
+    }
+
+    fn verify_verified_client_delivery_signature(
+        &self,
+        identity: &IdentityKeyPair,
+    ) -> std::result::Result<(), String> {
+        if self.verified_client_delivery_evidence.is_none()
+            && self.verified_client_delivery_schema_version == 0
+        {
+            return Ok(());
+        }
+        let expected_signer = hex::encode(identity.public_key_bytes());
+        if self.verified_client_delivery_signer_node_id.as_deref() != Some(&expected_signer) {
+            return Err("verified client delivery signer mismatch".to_string());
+        }
+        let signature_hex = self
+            .verified_client_delivery_signature_ed25519
+            .as_deref()
+            .ok_or_else(|| "verified client delivery signature missing".to_string())?;
+        let mut signature = [0u8; 64];
+        hex::decode_to_slice(signature_hex, &mut signature)
+            .map_err(|_| "verified client delivery signature encoding invalid".to_string())?;
+        let public_key = IdentityPublicKey::from_bytes(&identity.public_key_bytes())
+            .map_err(|_| "verified client delivery signer key invalid".to_string())?;
+        let signing_bytes = self.verified_client_delivery_signing_bytes()?;
+        public_key
+            .verify(&signing_bytes, &signature)
+            .map_err(|_| "verified client delivery signature invalid".to_string())
+    }
+
+    fn verified_client_delivery_signing_bytes(&self) -> std::result::Result<Vec<u8>, String> {
+        bincode::serialize(&(
+            "aeronyx-peer-cache-verified-client-delivery-v1",
+            self.descriptor_snapshot.generated_at,
+            self.verified_client_delivery_schema_version,
+            self.verified_client_delivery_evidence,
+        ))
+        .map_err(|error| format!("verified client delivery signing bytes: {error}"))
     }
 
     fn to_json_pretty(&self) -> Result<Vec<u8>> {
@@ -3475,15 +3553,31 @@ impl Server {
             loop {
                 tokio::select! {
                     _ = rx.recv() => {
+                        peer_store.take_client_delivery_cache_dirty();
                         persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), path.clone(), "shutdown").await;
                         break;
                     }
                     _ = timer.tick() => {
                         if shutdown.load(Ordering::SeqCst) {
+                            peer_store.take_client_delivery_cache_dirty();
                             persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), path.clone(), "shutdown_flag").await;
                             break;
                         }
+                        peer_store.take_client_delivery_cache_dirty();
                         persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), path.clone(), "interval").await;
+                    }
+                    _ = peer_store.wait_for_client_delivery_cache_dirty() => {
+                        tokio::time::sleep(Duration::from_millis(
+                            CLIENT_DELIVERY_CACHE_FLUSH_DEBOUNCE_MILLIS,
+                        )).await;
+                        if peer_store.take_client_delivery_cache_dirty() {
+                            persist_snapshot(
+                                Arc::clone(&identity),
+                                Arc::clone(&peer_store),
+                                path.clone(),
+                                "client_delivery",
+                            ).await;
+                        }
                     }
                 }
             }
@@ -6031,7 +6125,7 @@ impl Server {
         peer_store: &PeerStore,
         path: &str,
         now: u64,
-    ) -> Result<(usize, bool)> {
+    ) -> Result<(usize, bool, u64)> {
         let path = PathBuf::from(path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -6048,10 +6142,16 @@ impl Server {
             .status(now)
             .two_hop_path_proof_history
             .stability_ready;
+        let verified_client_delivery_evidence =
+            peer_store.export_verified_client_delivery_cache_evidence(now);
+        let verified_client_delivery_count = verified_client_delivery_evidence
+            .map(|evidence| evidence.verified_deliveries)
+            .unwrap_or(0);
         let document = PeerStoreCacheDocument::new(
             descriptor_snapshot,
             routeability_evidence,
             two_hop_path_proof_events,
+            verified_client_delivery_evidence,
             identity,
         )?;
         let bytes = document.to_json_pretty()?;
@@ -6079,6 +6179,7 @@ impl Server {
         Ok((
             two_hop_path_proof_event_count,
             two_hop_path_proof_stability_ready,
+            verified_client_delivery_count,
         ))
     }
 
@@ -6132,12 +6233,20 @@ impl Server {
         }
 
         match Self::save_peer_store_cache_snapshot(identity, peer_store, path, now).await {
-            Ok((proof_events_persisted, proof_stability_ready)) => {
+            Ok((
+                proof_events_persisted,
+                proof_stability_ready,
+                client_deliveries_persisted,
+            )) => {
                 peer_store.record_cache_save_status(now, "success", "snapshot_persisted");
                 peer_store.record_two_hop_proof_cache_persisted(
                     now,
                     proof_events_persisted,
                     proof_stability_ready,
+                );
+                peer_store.record_client_delivery_cache_persisted(
+                    now,
+                    client_deliveries_persisted,
                 );
                 Ok(())
             }
@@ -6349,18 +6458,42 @@ impl Server {
                     } else {
                         "identity_unavailable"
                     };
+                let client_delivery_authentication =
+                    if document.verified_client_delivery_schema_version == 0 {
+                        "legacy_descriptor_only"
+                    } else if cache_identity.is_some_and(|identity| {
+                        document
+                            .verify_verified_client_delivery_signature(identity)
+                            .is_ok()
+                    }) {
+                        "verified"
+                    } else if cache_identity.is_some() {
+                        "signature_invalid"
+                    } else {
+                        "identity_unavailable"
+                    };
                 (
                     document.descriptor_snapshot,
                     Some(document.routeability_evidence),
                     routeability_authentication,
                     Some(document.two_hop_path_proof_events),
                     two_hop_proof_authentication,
+                    document.verified_client_delivery_evidence,
+                    client_delivery_authentication,
                 )
             })
         } else {
             NodeBootstrapSnapshot::from_json_bytes(bytes)
                 .map(|snapshot| {
-                    (snapshot, None, "not_applicable", None, "not_applicable")
+                    (
+                        snapshot,
+                        None,
+                        "not_applicable",
+                        None,
+                        "not_applicable",
+                        None,
+                        "not_applicable",
+                    )
                 })
                 .map_err(|error| error.to_string())
         };
@@ -6370,6 +6503,8 @@ impl Server {
             routeability_authentication,
             two_hop_proof_events,
             two_hop_proof_authentication,
+            client_delivery_evidence,
+            client_delivery_authentication,
         ) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -6388,6 +6523,10 @@ impl Server {
             peer_store.record_two_hop_proof_cache_authentication(
                 now,
                 two_hop_proof_authentication,
+            );
+            peer_store.record_client_delivery_cache_authentication(
+                now,
+                client_delivery_authentication,
             );
         }
 
@@ -6450,6 +6589,37 @@ impl Server {
             two_hop_proof_authentication,
             "signature_invalid" | "identity_unavailable"
         );
+        let client_delivery_report = if is_peer_cache {
+            Some(match client_delivery_authentication {
+                "signature_invalid" => peer_store
+                    .reject_verified_client_delivery_cache_evidence(
+                        client_delivery_evidence.is_some(),
+                        now,
+                        "signature_invalid",
+                    ),
+                "identity_unavailable" => peer_store
+                    .reject_verified_client_delivery_cache_evidence(
+                        client_delivery_evidence.is_some(),
+                        now,
+                        "identity_unavailable",
+                    ),
+                _ => peer_store.restore_verified_client_delivery_cache_evidence(
+                    client_delivery_evidence.as_ref(),
+                    now,
+                ),
+            })
+        } else {
+            None
+        };
+        let client_delivery_restored = client_delivery_report
+            .map(|report| report.restored_deliveries)
+            .unwrap_or(0);
+        let client_delivery_rejected = client_delivery_report
+            .is_some_and(|report| report.present && !report.restored);
+        let client_delivery_authentication_rejected = matches!(
+            client_delivery_authentication,
+            "signature_invalid" | "identity_unavailable"
+        );
         peer_store.record_bootstrap_source(
             now,
             source_kind,
@@ -6458,13 +6628,15 @@ impl Server {
                 || route_authentication_rejected
                 || proof_rejected > 0
                 || proof_authentication_rejected
+                || client_delivery_rejected
+                || client_delivery_authentication_rejected
             {
                 "warning"
             } else {
                 "success"
             },
             format!(
-                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_restored={} routeability_rejected={} two_hop_proof_authentication={} two_hop_proof_restored={} two_hop_proof_rejected={}",
+                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_restored={} routeability_rejected={} two_hop_proof_authentication={} two_hop_proof_restored={} two_hop_proof_rejected={} client_delivery_authentication={} client_delivery_restored={} client_delivery_rejected={}",
                 report.total,
                 report.inserted,
                 report.unchanged,
@@ -6475,7 +6647,10 @@ impl Server {
                 route_rejected,
                 two_hop_proof_authentication,
                 proof_restored,
-                proof_rejected
+                proof_rejected,
+                client_delivery_authentication,
+                client_delivery_restored,
+                client_delivery_rejected
             ),
         );
         info!(
@@ -6492,6 +6667,9 @@ impl Server {
             two_hop_proof_authentication,
             two_hop_proof_restored = proof_restored,
             two_hop_proof_rejected = proof_rejected,
+            client_delivery_authentication,
+            client_delivery_restored,
+            client_delivery_rejected,
             "[DISCOVERY] Bootstrap snapshot imported"
         );
         report.inserted > 0 || report.unchanged > 0
@@ -7752,12 +7930,13 @@ mod tests {
         memchain_index_rejection_reason, prefix_to_netmask, unix_now_secs,
         CommitmentCoordinatorLeaseRound, CommitmentTipAnnouncementWaitOutcome,
         CommitmentWitnessStartupBlockReason, CommitmentWitnessStartupDecision,
-        PeerStoreCacheDocument, Server,
+        PeerStoreCacheDocument, PeerStoreVerifiedClientDeliveryCacheEvidence, Server,
         BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
         BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
         COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
         ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
         TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+        VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
     };
     use crate::api::memchain_peer::{
         announce_current_record_commitment_tip_for_test, build_memchain_peer_router,
@@ -7781,7 +7960,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
 
     use crate::api::chat_peer::{
@@ -9850,11 +10029,19 @@ mod tests {
             TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION
         );
         assert!(document.two_hop_path_proof_events.is_empty());
+        assert_eq!(
+            document.verified_client_delivery_schema_version,
+            VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION
+        );
+        assert!(document.verified_client_delivery_evidence.is_none());
         assert!(document
             .verify_routeability_evidence_signature(&server.identity)
             .is_ok());
         assert!(document
             .verify_two_hop_path_proof_signature(&server.identity)
+            .is_ok());
+        assert!(document
+            .verify_verified_client_delivery_signature(&server.identity)
             .is_ok());
 
         let _ = tokio::fs::remove_file(path).await;
@@ -9978,6 +10165,14 @@ mod tests {
                 .as_deref(),
             Some("empty")
         );
+        assert_eq!(
+            restored_store
+                .status(now + 1)
+                .bootstrap
+                .last_client_delivery_cache_status
+                .as_deref(),
+            Some("empty")
+        );
     }
 
     #[tokio::test]
@@ -10008,6 +10203,7 @@ mod tests {
                 now + offset, true, "onion_terminal_delivered", 2, 2, 2, 1,
             );
         }
+        original_store.record_verified_client_onion_delivery(now + 4);
 
         let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-two-hop-proof-{unique}.json"));
@@ -10022,6 +10218,16 @@ mod tests {
         let document = PeerStoreCacheDocument::from_json_bytes(&bytes).unwrap();
         assert_eq!(document.two_hop_path_proof_events.len(), 3);
         assert!(document.verify_two_hop_path_proof_signature(&server.identity).is_ok());
+        assert_eq!(
+            document.verified_client_delivery_evidence,
+            Some(PeerStoreVerifiedClientDeliveryCacheEvidence {
+                verified_deliveries: 1,
+                last_verified_at: now + 4,
+            })
+        );
+        assert!(document
+            .verify_verified_client_delivery_signature(&server.identity)
+            .is_ok());
         let persisted_status = original_store.status(now + 5);
         assert_eq!(
             persisted_status
@@ -10032,6 +10238,12 @@ mod tests {
         assert!(persisted_status
             .bootstrap
             .last_two_hop_proof_cache_persisted_stability_ready);
+        assert_eq!(
+            persisted_status
+                .bootstrap
+                .last_client_delivery_cache_persisted,
+            1
+        );
         let restored_store = PeerStore::new();
         assert!(Server::import_bootstrap_snapshot_bytes(
             &restored_store, "cache", &path_str, &bytes, now + 6, Some(&server.identity),
@@ -10057,6 +10269,28 @@ mod tests {
         assert_eq!(status.runtime.blind_relay.received, 0);
         assert_eq!(status.runtime.blind_relay.terminal, 0);
         assert_eq!(status.runtime.blind_relay.forwarded, 0);
+        assert_eq!(status.runtime.blind_relay.verified_client_onion_deliveries, 1);
+        assert_eq!(
+            status.bootstrap.last_client_delivery_cache_status.as_deref(),
+            Some("restored")
+        );
+        assert_eq!(
+            status
+                .bootstrap
+                .last_client_delivery_cache_authentication
+                .as_deref(),
+            Some("verified")
+        );
+        assert_eq!(status.bootstrap.last_client_delivery_cache_restored, 1);
+        assert!(!status.blind_relay_quality.real_relay_ready);
+
+        for node_id in [middle.node_id(), terminal.node_id()] {
+            restored_store.record_delivery_receipt_capability(&node_id, now + 6);
+        }
+        assert!(restored_store
+            .status(now + 7)
+            .blind_relay_quality
+            .real_relay_ready);
 
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -10087,6 +10321,7 @@ mod tests {
         original_store.record_blind_relay_two_hop_probe_result_with_context(
             now + 2, true, "onion_terminal_delivered", 2, 2, 2, 1,
         );
+        original_store.record_verified_client_onion_delivery(now + 2);
 
         let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-two-hop-tamper-{unique}.json"));
@@ -10124,6 +10359,176 @@ mod tests {
             .last_two_hop_proof_cache_restored_stability_ready);
         assert_eq!(status.bootstrap.last_two_hop_proof_cache_rejected, 1);
         assert!(status.two_hop_path_proof_history.events.is_empty());
+        assert_eq!(
+            status.bootstrap.last_client_delivery_cache_status.as_deref(),
+            Some("restored")
+        );
+        assert_eq!(status.bootstrap.last_client_delivery_cache_restored, 1);
+        assert_eq!(status.runtime.blind_relay.verified_client_onion_deliveries, 1);
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_rejects_tampered_client_delivery_independently() {
+        let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+        let now: u64 = 1_800_019_000;
+        let middle = signed_probe_peer_descriptor(
+            "https://middle-client-tamper.example".to_string(),
+            1,
+            now + 4_000,
+            vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+            [0x61; 32],
+        );
+        let terminal = signed_probe_peer_descriptor(
+            "https://terminal-client-tamper.example".to_string(),
+            2,
+            now + 4_000,
+            vec![NodeCapability::ChatRelay],
+            [0x62; 32],
+        );
+        let original_store = Arc::new(PeerStore::new());
+        original_store.upsert_verified(middle.clone(), now).unwrap();
+        original_store.upsert_verified(terminal.clone(), now).unwrap();
+        original_store.record_route_forward_success(&middle.node_id(), now + 1);
+        original_store.record_route_forward_success(&terminal.node_id(), now + 1);
+        for offset in 2..=4 {
+            original_store.record_blind_relay_two_hop_probe_result_with_context(
+                now + offset, true, "onion_terminal_delivered", 2, 2, 2, 1,
+            );
+        }
+        original_store.record_verified_client_onion_delivery(now + 4);
+
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "aeronyx-peer-cache-client-delivery-tamper-{unique}.json"
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        Server::save_peer_store_cache_snapshot(
+            &server.identity,
+            &original_store,
+            &path_str,
+            now + 5,
+        )
+        .await
+        .unwrap();
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let mut document = PeerStoreCacheDocument::from_json_bytes(&bytes).unwrap();
+        document
+            .verified_client_delivery_evidence
+            .as_mut()
+            .unwrap()
+            .verified_deliveries = 99;
+        let tampered = serde_json::to_vec_pretty(&document).unwrap();
+        let restored_store = PeerStore::new();
+        assert!(Server::import_bootstrap_snapshot_bytes(
+            &restored_store,
+            "cache",
+            &path_str,
+            &tampered,
+            now + 6,
+            Some(&server.identity),
+        ));
+
+        let status = restored_store.status(now + 6);
+        assert_eq!(status.bootstrap.last_source_status.as_deref(), Some("warning"));
+        assert_eq!(
+            status.bootstrap.last_client_delivery_cache_status.as_deref(),
+            Some("rejected")
+        );
+        assert_eq!(
+            status
+                .bootstrap
+                .last_client_delivery_cache_authentication
+                .as_deref(),
+            Some("signature_invalid")
+        );
+        assert_eq!(status.bootstrap.last_client_delivery_cache_restored, 0);
+        assert_eq!(status.runtime.blind_relay.verified_client_onion_deliveries, 0);
+        assert_eq!(
+            status.bootstrap.last_two_hop_proof_cache_status.as_deref(),
+            Some("restored")
+        );
+        assert!(status.two_hop_path_proof_history.stability_ready);
+        assert!(restored_store.is_routeable_now(&middle.node_id(), now + 6));
+        assert!(restored_store.is_routeable_now(&terminal.node_id(), now + 6));
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_rejects_expired_signed_client_delivery_evidence() {
+        let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+        let now: u64 = 1_800_019_500;
+        let middle = signed_probe_peer_descriptor(
+            "https://middle-client-expired.example".to_string(),
+            1,
+            now + 4_000,
+            vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+            [0x63; 32],
+        );
+        let terminal = signed_probe_peer_descriptor(
+            "https://terminal-client-expired.example".to_string(),
+            2,
+            now + 4_000,
+            vec![NodeCapability::ChatRelay],
+            [0x64; 32],
+        );
+        let original_store = Arc::new(PeerStore::new());
+        original_store.upsert_verified(middle, now).unwrap();
+        original_store.upsert_verified(terminal, now).unwrap();
+        original_store.record_verified_client_onion_delivery(now + 1);
+
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "aeronyx-peer-cache-client-delivery-expired-{unique}.json"
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        Server::save_peer_store_cache_snapshot(
+            &server.identity,
+            &original_store,
+            &path_str,
+            now + 2,
+        )
+        .await
+        .unwrap();
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let document = PeerStoreCacheDocument::from_json_bytes(&bytes).unwrap();
+        assert!(document
+            .verify_verified_client_delivery_signature(&server.identity)
+            .is_ok());
+
+        // Client-delivery evidence is intentionally valid for only the same
+        // 30-minute window as routeability. A valid signature cannot revive
+        // historical delivery readiness after that freshness window closes.
+        let restore_at = now + 1_902;
+        let restored_store = PeerStore::new();
+        assert!(Server::import_bootstrap_snapshot_bytes(
+            &restored_store,
+            "cache",
+            &path_str,
+            &bytes,
+            restore_at,
+            Some(&server.identity),
+        ));
+
+        let status = restored_store.status(restore_at);
+        assert_eq!(
+            status
+                .bootstrap
+                .last_client_delivery_cache_authentication
+                .as_deref(),
+            Some("verified")
+        );
+        assert_eq!(
+            status.bootstrap.last_client_delivery_cache_status.as_deref(),
+            Some("rejected")
+        );
+        assert_eq!(status.bootstrap.last_client_delivery_cache_restored, 0);
+        assert_eq!(status.runtime.blind_relay.verified_client_onion_deliveries, 0);
+        assert!(!status.blind_relay_quality.real_relay_ready);
 
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -10546,6 +10951,81 @@ mod tests {
         let _ = tokio::fs::remove_file(bootstrap_path).await;
         let _ = tokio::fs::remove_file(cache_path).await;
         let _ = tokio::fs::remove_file(Server::peer_cache_backup_path(&cache_path_str)).await;
+    }
+
+    #[tokio::test]
+    async fn verified_client_delivery_triggers_debounced_cache_flush() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.peer_cache_write_interval_secs = 3600;
+        config.discovery.peer_cache_path = Some(
+            std::env::temp_dir()
+                .join(format!(
+                    "aeronyx-peer-cache-client-delivery-flush-{}.json",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))
+                .to_string_lossy()
+                .to_string(),
+        );
+        config.discovery.public_endpoint = Some("node.example.com:443".to_string());
+
+        let server = Server::new(config.clone(), IdentityKeyPair::generate(), None);
+        let now = unix_now_secs();
+        let signed = server.build_self_discovery_descriptor(now).unwrap();
+        let peer_store = Arc::new(PeerStore::new());
+        assert!(peer_store.upsert_verified(signed, now).unwrap());
+        let path = config.discovery.peer_cache_path.unwrap();
+        let handle = server
+            .spawn_peer_store_persistence_task(Arc::clone(&peer_store))
+            .expect("peer cache persistence should be enabled");
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if tokio::fs::metadata(&path).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("initial interval tick should persist peer cache");
+
+        peer_store.record_verified_client_onion_delivery(now);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(bytes) = tokio::fs::read(&path).await {
+                    if PeerStoreCacheDocument::from_json_bytes(&bytes)
+                        .ok()
+                        .and_then(|document| document.verified_client_delivery_evidence)
+                        .is_some_and(|evidence| evidence.verified_deliveries == 1)
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("client-delivery notification should flush signed aggregate evidence");
+
+        assert_eq!(
+            peer_store
+                .status(now + 2)
+                .bootstrap
+                .last_client_delivery_cache_persisted,
+            1
+        );
+        server
+            .shutdown_tx
+            .send(())
+            .expect("shutdown receiver should be subscribed");
+        handle.await.expect("peer cache task should stop cleanly");
+
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = tokio::fs::remove_file(Server::peer_cache_backup_path(&path)).await;
     }
 
     #[tokio::test]
