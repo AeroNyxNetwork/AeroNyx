@@ -27,6 +27,8 @@
 //!   persistence faults without widening the privacy boundary.
 //! - Declares the mature, forward-only witness target policy without exposing
 //!   checkpoint hashes, witness identities, or peer scheduling details.
+//! - Declares that recurring selection verification is history-bounded while
+//!   complete retained-history audit remains a startup and operator boundary.
 //! - Lists bounded incident summaries and exports one independently re-verified
 //!   signed evidence frame on local/VPN operator listeners only.
 //! - Reports signed quarantine-resolution counts while keeping mutation
@@ -45,7 +47,7 @@
 //! 5. Report observer-signed checkpoint availability without exposing its hash.
 //! 6. Report external witness counts without presenting them as votes/quorum.
 //! 7. Report audited aggregate witness outcomes, current-process durability,
-//!    and the static mature forward-only target policy.
+//!    and the static mature forward-only bounded-verification target policy.
 //! 8. Serialize aggregate-only or fingerprint-only detail by listener scope.
 //! 9. Re-verify canonical incident evidence before an operator-only export.
 //!
@@ -72,6 +74,7 @@
 //!   audited compare-and-swap command boundary.
 //!
 //! ## Last Modified
+//! `v0.11.0-DirectoryBoundedWitnessSelectionStatus` - Declared bounded recurring versus full startup audit semantics.
 //! `v0.10.0-DirectoryMatureWitnessStatus` - Declared mature forward-only witness scheduling semantics.
 //! `v0.9.0-DirectoryWitnessOutcomeStatus` - Added durable and process aggregate witness outcome diagnostics.
 //! `v0.8.0-DirectoryObservationWitnessStatus` - Added aggregate external recomputation receipt status.
@@ -189,6 +192,8 @@ struct DirectoryReplicaObservationWitnessOutcomeStatus {
     target_policy: &'static str,
     maturity_policy: &'static str,
     monotonic_floor: &'static str,
+    selection_verification: &'static str,
+    full_history_verification: &'static str,
     rounds: u64,
     attempts: u64,
     accepted: u64,
@@ -919,6 +924,8 @@ fn build_observation_witness_outcome_status(
         target_policy: "latest_mature_unwitnessed_checkpoint",
         maturity_policy: "one_configured_directory_sync_interval",
         monotonic_floor: "latest_authenticated_receipt_or_durable_outcome_sequence",
+        selection_verification: "candidate_predecessor_latest_receipt_set_and_durable_outcome",
+        full_history_verification: "startup_and_explicit_operator_audit",
         rounds: persisted.rounds,
         attempts: persisted.totals.attempts(),
         accepted: persisted.totals.accepted,
@@ -1278,6 +1285,14 @@ mod tests {
         assert_eq!(
             parsed["observation_witness_outcomes"]["monotonic_floor"].as_str(),
             Some("latest_authenticated_receipt_or_durable_outcome_sequence")
+        );
+        assert_eq!(
+            parsed["observation_witness_outcomes"]["selection_verification"].as_str(),
+            Some("candidate_predecessor_latest_receipt_set_and_durable_outcome")
+        );
+        assert_eq!(
+            parsed["observation_witness_outcomes"]["full_history_verification"].as_str(),
+            Some("startup_and_explicit_operator_audit")
         );
         assert_eq!(
             parsed["observation_witness_outcomes"]["security_model"].as_str(),

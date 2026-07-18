@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.22.0 - Added forward-only mature checkpoint witness scheduling based on live cross-node convergence evidence.
+Modification Reason: v0.23.0 - Bounded recurring witness selection verification independently of retained checkpoint history.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.22.0 - Prevented asymmetric replica schedules from perpetually witnessing a checkpoint that peers have not received yet.
+Last Modified: v0.23.0 - Kept recurring witness selection cost fixed while preserving complete startup and explicit operator audits.
+Previous: v0.22.0 - Prevented asymmetric replica schedules from perpetually witnessing a checkpoint that peers have not received yet.
 Previous: v0.21.0 - Prevented unsupported witness endpoints from being misreported as transport faults without changing the descriptor wire schema.
 Previous: v0.20.0 - Added durable/runtime witness outcome buckets without retaining peer identity or introducing reputation, quorum, consensus, or finality.
 Previous: v0.19.0 - Added independently recomputed external checkpoint witness receipts without introducing votes, quorum, consensus, or finality.
@@ -1154,6 +1155,47 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-19 - Added Bounded Witness Selection Audit V1.
+- Files changed:
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Production motivation:
+  - US1 retained 162 signed observation checkpoints. Re-verifying every
+    historical checkpoint and receipt every 120 seconds would make recurring
+    scheduler cost grow linearly for the lifetime of the node.
+- Architecture:
+  - Startup and explicit operator `audit()` retain complete checkpoint,
+    receipt, outcome, producer-prefix, incident, resolution, and retry audits.
+  - Recurring selection verifies only evidence that can move or satisfy the
+    forward floor: the latest bounded receipt set, its checkpoint, the durable
+    outcome checkpoint, and the selected candidate plus signed predecessor.
+  - Candidate verification still checks canonical encoding, local observer,
+    row duplication, sequence/predecessor/timestamp continuity, Ed25519
+    signature, exact producer-tip availability, and recomputed overlap root.
+  - A latest receipt set is capped at the protocol's 16-producer bound plus one
+    detection row; an over-bound set fails closed instead of increasing work.
+  - The same 16-receipt ceiling is enforced transactionally on insertion and
+    by complete startup audit, so persistence and recurring reads share one
+    explicit resource contract.
+- Compatibility and scope:
+  - Directory Sync frames, descriptor schema, capability enum, SQLite schema,
+    peer admission, synchronization cadence, response limits, and privacy
+    boundaries are unchanged.
+  - This remains local observer and independent recomputation evidence, not a
+    vote, quorum, fork choice, consensus, financial chain, or finality claim.
+- Verification:
+  - Targeted normal-path, candidate/predecessor/latest-receipt/outcome tamper,
+    restart, public-status, and receipt-boundary tests passed.
+  - The receipt resource contract accepted 16 independently signed receipts,
+    rejected the 17th transactionally, and remained consistent across status,
+    recurring selection, and complete startup audit.
+  - Directory Replica tests passed: 48 total (47 library + 1 binary).
+  - Full `aeronyx-server` library tests passed: 1109/1109.
+  - Binary tests passed: 2/2. Documentation tests passed: 1 passed, 9 ignored.
+  - Modified-file rustfmt, `git diff --check`, Clippy correctness with all
+    targets, and the release build all passed.
+
 2026-07-19 - Added Mature Checkpoint Witness Scheduling V1.
 - Files changed:
   - crates/aeronyx-server/src/api/directory_replica_sync.rs
