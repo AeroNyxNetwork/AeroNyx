@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.14.0 - Made producer-local Directory Replica retry state audited, restart-durable, bounded, and atomically cleared by authenticated success.
+Modification Reason: v0.15.0 - Added bounded multi-source Directory Replica observation convergence without introducing quorum, fork choice, consensus, or finality semantics.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.14.0 - Added atomic replica schema v1-to-v2 migration and restart-durable producer retry scheduling.
+Last Modified: v0.15.0 - Added recent signed-commitment overlap and an operator-only deterministic observation root.
+Previous: v0.14.0 - Added atomic replica schema v1-to-v2 migration and restart-durable producer retry scheduling.
 Previous: v0.13.0 - Added a 45-second producer deadline, bounded failure backoff, and additive aggregate/operator retry status.
 Previous: v0.12.0 - Added dedicated replica coordinator/status modules, bounded producer concurrency, and 5-15 second deterministic startup synchronization.
 Previous: v0.11.0 - Added aggregate/public and fingerprinted/operator replica status plus bounded multi-page synchronization.
@@ -672,6 +673,8 @@ crates/aeronyx-core/src/protocol/discovery.rs
 crates/aeronyx-server/src/services/directory_chain.rs
 crates/aeronyx-server/src/services/directory_replica.rs
 crates/aeronyx-server/src/api/directory_chain_peer.rs
+crates/aeronyx-server/src/api/directory_replica_sync.rs
+crates/aeronyx-server/src/api/directory_replica_status.rs
 ```
 
 ## 14. Onion Routing Relationship
@@ -1044,6 +1047,14 @@ Implemented in Directory Sync V1 replica pull:
 - Same-node/same-sequence descriptor conflicts are retained as authenticated
   incidents without automatically quarantining an honest producer that merely
   recorded third-party equivocation.
+- The status API computes exact commitment-hash overlap across each configured,
+  non-quarantined producer's most recent 32 blocks. At most 16 validated pins
+  participate, so work is bounded independently of retained chain history.
+- A deterministic observation root binds the eligible producer identities,
+  their independently signed tips, and commitments present in every eligible
+  recent window. The root is operator-only and locally recomputable; it is not
+  signed by the local node and grants no voting weight, fork choice, consensus,
+  or finality.
 - `directory_chain_sync_interval_secs` defaults to 120 seconds and accepts
   60 seconds through 24 hours. Empty peer pins disable the outbound task.
 
@@ -1051,8 +1062,7 @@ Still pending before Directory Chain can be described as live:
 
 - Operator-reviewed quarantine evidence export and explicit recovery tooling.
 - Witness/co-signature policy and deterministic fork selection.
-- Operational API/metrics and real multi-node synchronization tests with at
-  least two audited bilateral pins.
+- Independent implementation verification of the convergence root contract.
 
 Files likely changed:
 
@@ -1123,6 +1133,48 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-18 - Added bounded Directory Replica observation convergence.
+- Files changed:
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - crates/aeronyx-server/src/services/mod.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Evidence model:
+  - Compares exact commitment hashes from each configured, non-empty,
+    non-quarantined producer replica's most recent 32 accepted blocks.
+  - Supports at most the existing 16 validated Directory Sync producer pins;
+    work and memory are bounded independently of total retained history.
+  - Reports distinct, multi-source, and all-eligible-source recent commitment
+    counts without assigning producer weight or selecting a preferred chain.
+  - Derives a deterministic observation root over eligible producer identities,
+    their signed tip heights/hashes, and all-eligible commitment intersection.
+- Safety and privacy:
+  - Quarantined producers are excluded rather than automatically rewound,
+    deleted, trusted, or included in a fork decision.
+  - A single eligible producer cannot generate a multi-source root.
+  - Duplicate, zero, local, or over-limit producer inputs fail closed.
+  - Public status exposes aggregate overlap counts only. The root remains on
+    the local/VPN operator listener and neither scope exposes full producer
+    identities, descriptors, endpoints, routes, selected hops, payloads,
+    client metadata, private keys, wallet traffic, or social graph data.
+  - API labels explicitly define this as local recomputable observation
+    evidence, not voting, quorum, fork choice, consensus, or finality.
+- Compatibility:
+  - Directory Sync V1 frames, signatures, endpoints, SQLite schema v2, retry
+    persistence, configuration, and the `directory_replica_status.v1` contract
+    remain unchanged. New status data is additive.
+- Verification:
+  - Directory Replica focused tests: 23 passed, including deterministic input
+    ordering, duplicate-pin rejection, signed-fork quarantine exclusion,
+    public-root redaction, and an explicit 33-block/32-block-window bound.
+  - aeronyx-server regression suite: 1,082/1,082 passed.
+  - Package integration group: 1 passed, 9 intentionally ignored.
+  - cargo check -p aeronyx-server --tests --locked passed.
+  - cargo clippy -p aeronyx-server --lib --no-deps --locked completed; the new
+    convergence and status paths added no lint.
+  - Optimized release build completed, and the existing US1
+    `/etc/aeronyx/server.toml` passed the release binary's `validate` command.
+
 2026-07-18 - Made Directory Replica retry scheduling restart-durable.
 - Files changed:
   - crates/aeronyx-server/src/api/directory_replica_sync.rs

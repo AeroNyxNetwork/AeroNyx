@@ -11,6 +11,8 @@
 //   Re-exported PeerStoreStatus for nodeboard discovery status.
 //
 // Last Modified:
+//   v0.8.0-DirectoryReplicaConvergence - Re-exported bounded multi-source
+//     observation evidence snapshots
 //   v0.7.0-DirectoryReplicaStatus - Re-exported replica status/runtime types
 //   v0.6.0-DirectoryReplicaStore - Registered producer-isolated remote replicas
 //   v0.5.0-DirectorySyncReads - Re-exported audit-gated Directory Chain pages
@@ -46,7 +48,8 @@ pub use directory_chain::{
     DirectoryChainStoreError,
 };
 pub use directory_replica::{
-    DirectoryReplicaAudit, DirectoryReplicaImportReport, DirectoryReplicaProducerSnapshot,
+    DirectoryReplicaAudit, DirectoryReplicaImportReport,
+    DirectoryReplicaObservationConvergenceSnapshot, DirectoryReplicaProducerSnapshot,
     DirectoryReplicaStore, DirectoryReplicaStoreError, DirectoryReplicaStoreSnapshot,
     DirectoryReplicaSyncObservation, DirectoryReplicaSyncRuntime, DirectoryReplicaTip,
 };

@@ -20,6 +20,8 @@
 //! - Audits every replica chain and index before the node may synchronize.
 //! - Persists bounded producer retry state across process restarts and clears
 //!   it atomically with the next authenticated successful page.
+//! - Computes a bounded recent-window intersection of exact descriptor
+//!   commitments across non-quarantined configured producer replicas.
 //! - Exposes low-cost aggregate snapshots and privacy-safe synchronization
 //!   observations, including bounded retry state, without re-running a full
 //!   cryptographic audit per API read.
@@ -39,6 +41,8 @@
 //! 4. Re-verify the signed range-response frame and exact descriptor objects.
 //! 5. Atomically append a contiguous producer prefix, clear its retry state,
 //!    or persist quarantine without mutating another producer namespace.
+//! 6. Derive recent multi-source observation evidence without choosing a fork,
+//!    producer, quorum, or globally finalized height.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -54,8 +58,12 @@
 //!   descriptor equivocation is evidence about the descriptor owner and does
 //!   not automatically quarantine the observing producer.
 //! - Keep all limits synchronized with the core Directory Sync V1 contract.
+//! - Observation convergence is a local digest over independently verified
+//!   producer evidence. It is never consensus, voting, fork choice, or finality.
 //!
 //! ## Last Modified
+//! v0.4.0-DirectoryReplicaObservationConvergence - Added bounded recent-window
+//! multi-source commitment overlap and a deterministic local observation root.
 //! v0.3.0-DirectoryReplicaDurableRetry - Added an atomic schema v1-to-v2
 //! migration and audited restart-durable producer retry state.
 //! v0.2.2-DirectoryReplicaRetryRuntime - Added producer-local retry boundaries
@@ -91,6 +99,8 @@ const MAX_DIRECTORY_SYNC_EVIDENCE_BYTES: usize = 512 * 1024;
 const DIRECTORY_REPLICA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_TIMESTAMP_SKEW_SECS: u64 = 60;
 const MAX_DIRECTORY_REPLICA_FAILURE_REASON_BYTES: usize = 96;
+const DIRECTORY_REPLICA_CONVERGENCE_WINDOW_BLOCKS: u64 = 32;
+const MAX_DIRECTORY_REPLICA_CONVERGENCE_PRODUCERS: usize = 16;
 /// Maximum producer failure streak retained in memory and audited `SQLite`.
 pub(crate) const DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES: u64 = 64;
 /// Maximum durable retry delay accepted by the replica store and scheduler.
@@ -157,6 +167,35 @@ pub struct DirectoryReplicaStoreSnapshot {
     pub incidents: u64,
     /// Per-producer accepted-prefix summaries for local operator presentation.
     pub producer_snapshots: Vec<DirectoryReplicaProducerSnapshot>,
+}
+
+/// Bounded, locally recomputable overlap across verified producer replicas.
+///
+/// This snapshot compares exact commitment hashes from each eligible
+/// producer's most recent block window. It does not assign voting weight,
+/// choose a chain, or create a globally finalized checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DirectoryReplicaObservationConvergenceSnapshot {
+    /// Unique producer pins supplied by the validated node configuration.
+    pub configured_producers: u64,
+    /// Configured producers with a non-empty, non-quarantined accepted prefix.
+    pub eligible_producers: u64,
+    /// Configured producers that have not supplied an accepted block yet.
+    pub pending_producers: u64,
+    /// Configured producers excluded because signed evidence quarantined them.
+    pub excluded_quarantined_producers: u64,
+    /// Maximum number of recent blocks inspected per eligible producer.
+    pub window_blocks: u64,
+    /// Commitment observations across all eligible producer windows.
+    pub recent_commitments: u64,
+    /// Unique commitment hashes across all eligible producer windows.
+    pub distinct_recent_commitments: u64,
+    /// Commitments observed by at least two eligible producer chains.
+    pub multi_source_recent_commitments: u64,
+    /// Commitments observed by every eligible producer when at least two exist.
+    pub all_eligible_source_recent_commitments: u64,
+    /// Deterministic digest of eligible tips and their exact common commitments.
+    pub observation_root: Option<[u8; 32]>,
 }
 
 /// Persisted aggregate state for one producer namespace.
@@ -637,6 +676,184 @@ impl DirectoryReplicaStore {
             snapshot.producer_snapshots.push(producer_snapshot);
         }
         Ok(snapshot)
+    }
+
+    /// Computes bounded recent commitment overlap for configured producers.
+    ///
+    /// Only non-empty, non-quarantined producer prefixes are eligible. The
+    /// returned root binds the exact eligible producer tips and commitment
+    /// hashes observed by every eligible source inside the recent block
+    /// window. It is a local evidence digest, not a signature, vote, quorum,
+    /// fork choice, consensus result, or finalized checkpoint.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when the producer set exceeds
+    /// the configured protocol bound, contains invalid identities, persisted
+    /// rows are malformed, or `SQLite` cannot complete a bounded query.
+    pub fn observation_convergence(
+        &self,
+        configured_producers: &[[u8; 32]],
+    ) -> Result<DirectoryReplicaObservationConvergenceSnapshot, DirectoryReplicaStoreError> {
+        let configured = self.validate_convergence_producers(configured_producers)?;
+        let connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let snapshot = Self::observation_convergence_from_connection(&connection, &configured);
+        drop(connection);
+        snapshot
+    }
+
+    fn validate_convergence_producers(
+        &self,
+        configured_producers: &[[u8; 32]],
+    ) -> Result<Vec<[u8; 32]>, DirectoryReplicaStoreError> {
+        if configured_producers.len() > MAX_DIRECTORY_REPLICA_CONVERGENCE_PRODUCERS {
+            return Err(DirectoryReplicaStoreError::Request(format!(
+                "observation convergence supports at most {MAX_DIRECTORY_REPLICA_CONVERGENCE_PRODUCERS} producers"
+            )));
+        }
+        let mut configured = configured_producers.to_vec();
+        configured.sort_unstable();
+        if configured.windows(2).any(|values| values[0] == values[1]) {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation convergence producer identities must be unique".to_string(),
+            ));
+        }
+        if configured
+            .iter()
+            .any(|producer| *producer == [0u8; 32] || producer == &self.local_node_id)
+        {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation convergence producer identity is invalid".to_string(),
+            ));
+        }
+        Ok(configured)
+    }
+
+    fn observation_convergence_from_connection(
+        connection: &Connection,
+        configured: &[[u8; 32]],
+    ) -> Result<DirectoryReplicaObservationConvergenceSnapshot, DirectoryReplicaStoreError> {
+        let mut snapshot = DirectoryReplicaObservationConvergenceSnapshot {
+            configured_producers: u64::try_from(configured.len()).map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation convergence producer count exceeds u64".to_string(),
+                )
+            })?,
+            window_blocks: DIRECTORY_REPLICA_CONVERGENCE_WINDOW_BLOCKS,
+            ..DirectoryReplicaObservationConvergenceSnapshot::default()
+        };
+        let eligible_tips = Self::eligible_convergence_tips(connection, configured, &mut snapshot)?;
+        let occurrences =
+            Self::recent_commitment_occurrences(connection, &eligible_tips, &mut snapshot)?;
+        Self::complete_observation_convergence(&mut snapshot, &eligible_tips, &occurrences)?;
+        Ok(snapshot)
+    }
+
+    fn eligible_convergence_tips(
+        connection: &Connection,
+        configured: &[[u8; 32]],
+        snapshot: &mut DirectoryReplicaObservationConvergenceSnapshot,
+    ) -> Result<Vec<DirectoryReplicaTip>, DirectoryReplicaStoreError> {
+        let mut eligible_tips = Vec::with_capacity(configured.len());
+        for producer in configured {
+            let tip = Self::load_tip(connection, producer)?;
+            if tip.quarantined {
+                snapshot.excluded_quarantined_producers =
+                    snapshot.excluded_quarantined_producers.saturating_add(1);
+            } else if tip.tip_height == 0 {
+                snapshot.pending_producers = snapshot.pending_producers.saturating_add(1);
+            } else {
+                eligible_tips.push(tip);
+            }
+        }
+        snapshot.eligible_producers = u64::try_from(eligible_tips.len()).map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "observation convergence eligible count exceeds u64".to_string(),
+            )
+        })?;
+        Ok(eligible_tips)
+    }
+
+    fn recent_commitment_occurrences(
+        connection: &Connection,
+        eligible_tips: &[DirectoryReplicaTip],
+        snapshot: &mut DirectoryReplicaObservationConvergenceSnapshot,
+    ) -> Result<BTreeMap<[u8; 32], u64>, DirectoryReplicaStoreError> {
+        let mut occurrence_by_commitment = BTreeMap::<[u8; 32], u64>::new();
+        for tip in eligible_tips {
+            let first_height = tip
+                .tip_height
+                .saturating_sub(DIRECTORY_REPLICA_CONVERGENCE_WINDOW_BLOCKS.saturating_sub(1))
+                .max(1);
+            let first_height =
+                u64_to_i64(first_height, "observation convergence first block height")?;
+            let tip_height =
+                u64_to_i64(tip.tip_height, "observation convergence tip block height")?;
+            let mut statement = connection.prepare(
+                "SELECT commitment_hash FROM directory_replica_commitments
+                 WHERE producer = ?1 AND block_height BETWEEN ?2 AND ?3
+                 ORDER BY commitment_hash ASC",
+            )?;
+            let hashes = statement
+                .query_map(
+                    params![tip.producer.as_slice(), first_height, tip_height],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut seen_for_producer = HashSet::with_capacity(hashes.len());
+            for hash in hashes {
+                let hash = bytes32(&hash, "observation convergence commitment hash")?;
+                if !seen_for_producer.insert(hash) {
+                    return Err(DirectoryReplicaStoreError::Integrity(
+                        "observation convergence found a duplicate producer commitment".to_string(),
+                    ));
+                }
+                snapshot.recent_commitments = snapshot.recent_commitments.saturating_add(1);
+                let occurrence = occurrence_by_commitment.entry(hash).or_default();
+                *occurrence = occurrence.saturating_add(1);
+            }
+        }
+        Ok(occurrence_by_commitment)
+    }
+
+    fn complete_observation_convergence(
+        snapshot: &mut DirectoryReplicaObservationConvergenceSnapshot,
+        eligible_tips: &[DirectoryReplicaTip],
+        occurrence_by_commitment: &BTreeMap<[u8; 32], u64>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        snapshot.distinct_recent_commitments = u64::try_from(occurrence_by_commitment.len())
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation convergence commitment count exceeds u64".to_string(),
+                )
+            })?;
+        if snapshot.eligible_producers >= 2 {
+            snapshot.multi_source_recent_commitments = occurrence_by_commitment
+                .values()
+                .filter(|occurrence| **occurrence >= 2)
+                .count()
+                .try_into()
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "observation convergence multi-source count exceeds u64".to_string(),
+                    )
+                })?;
+            snapshot.all_eligible_source_recent_commitments = occurrence_by_commitment
+                .values()
+                .filter(|occurrence| **occurrence == snapshot.eligible_producers)
+                .count()
+                .try_into()
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "observation convergence all-source count exceeds u64".to_string(),
+                    )
+                })?;
+            snapshot.observation_root = Some(observation_convergence_root(
+                eligible_tips,
+                occurrence_by_commitment,
+            ));
+        }
+        Ok(())
     }
 
     /// Returns all audited restart-durable producer retry states.
@@ -1810,6 +2027,35 @@ impl DirectoryReplicaStore {
     }
 }
 
+fn observation_convergence_root(
+    eligible_tips: &[DirectoryReplicaTip],
+    occurrence_by_commitment: &BTreeMap<[u8; 32], u64>,
+) -> [u8; 32] {
+    debug_assert!(eligible_tips.len() >= 2);
+    let eligible_count = eligible_tips.len() as u64;
+    let common_count = occurrence_by_commitment
+        .values()
+        .filter(|occurrence| **occurrence == eligible_count)
+        .count() as u64;
+    let mut hasher = Sha256::new();
+    hasher.update(b"AeroNyx-DirectoryReplicaObservationConvergence-v1");
+    hasher.update(AERONYX_DIRECTORY_MAINNET_CHAIN_ID);
+    hasher.update(DIRECTORY_REPLICA_CONVERGENCE_WINDOW_BLOCKS.to_le_bytes());
+    hasher.update(eligible_count.to_le_bytes());
+    for tip in eligible_tips {
+        hasher.update(tip.producer);
+        hasher.update(tip.tip_height.to_le_bytes());
+        hasher.update(tip.tip_hash);
+    }
+    hasher.update(common_count.to_le_bytes());
+    for (commitment, occurrence) in occurrence_by_commitment {
+        if *occurrence == eligible_count {
+            hasher.update(commitment);
+        }
+    }
+    hasher.finalize().into()
+}
+
 fn verify_incident_response_evidence(
     frame: &[u8],
     expected_producer: &[u8; 32],
@@ -2260,6 +2506,223 @@ mod tests {
         assert_eq!(reopened.producers, 1);
         assert_eq!(reopened.blocks, 1);
         assert_eq!(reopened.commitments, 1);
+    }
+
+    #[test]
+    fn recent_observation_convergence_is_multi_source_and_order_independent() {
+        let temp = TempDir::new().unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0x21; 32]).unwrap();
+        let producer_a = IdentityKeyPair::from_bytes(&[0x22; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0x23; 32]).unwrap();
+        let pending = IdentityKeyPair::from_bytes(&[0x24; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x25; 32]).unwrap();
+        let object = descriptor(&subject, 1);
+        let block_a = block(&producer_a, 1, [0u8; 32], &object);
+        let block_b = block(&producer_b, 1, [0u8; 32], &object);
+        let frame_a = response_frame(
+            &producer_a,
+            vec![block_a.clone()],
+            false,
+            1,
+            block_a.hash(),
+            [0x26; 16],
+        );
+        let frame_b = response_frame(
+            &producer_b,
+            vec![block_b.clone()],
+            false,
+            1,
+            block_b.hash(),
+            [0x27; 16],
+        );
+        let (store, _) = DirectoryReplicaStore::open(
+            temp.path().join("directory.db"),
+            local.public_key_bytes(),
+            NOW + 20,
+        )
+        .unwrap();
+        for (producer, replica_block, frame) in [
+            (&producer_a, &block_a, &frame_a),
+            (&producer_b, &block_b, &frame_b),
+        ] {
+            store
+                .import_verified_page(
+                    producer.public_key_bytes(),
+                    std::slice::from_ref(replica_block),
+                    std::slice::from_ref(&object),
+                    1,
+                    replica_block.hash(),
+                    frame,
+                    NOW + 20,
+                )
+                .unwrap();
+        }
+
+        let configured = [
+            producer_a.public_key_bytes(),
+            producer_b.public_key_bytes(),
+            pending.public_key_bytes(),
+        ];
+        let snapshot = store.observation_convergence(&configured).unwrap();
+        assert_eq!(snapshot.configured_producers, 3);
+        assert_eq!(snapshot.eligible_producers, 2);
+        assert_eq!(snapshot.pending_producers, 1);
+        assert_eq!(snapshot.excluded_quarantined_producers, 0);
+        assert_eq!(snapshot.window_blocks, 32);
+        assert_eq!(snapshot.recent_commitments, 2);
+        assert_eq!(snapshot.distinct_recent_commitments, 1);
+        assert_eq!(snapshot.multi_source_recent_commitments, 1);
+        assert_eq!(snapshot.all_eligible_source_recent_commitments, 1);
+        assert!(snapshot.observation_root.is_some());
+
+        let reversed = [configured[2], configured[1], configured[0]];
+        assert_eq!(store.observation_convergence(&reversed).unwrap(), snapshot);
+        assert!(store
+            .observation_convergence(&[configured[0], configured[0]])
+            .is_err());
+    }
+
+    #[test]
+    fn observation_convergence_reads_only_the_bounded_recent_block_window() {
+        let temp = TempDir::new().unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0x70; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x72; 32]).unwrap();
+        let (store, _) = DirectoryReplicaStore::open(
+            temp.path().join("directory.db"),
+            local.public_key_bytes(),
+            NOW + 20,
+        )
+        .unwrap();
+        let mut previous = [0u8; 32];
+        for height in 1..=DIRECTORY_REPLICA_CONVERGENCE_WINDOW_BLOCKS + 1 {
+            let object = descriptor(&subject, height);
+            let replica_block = block(&producer, height, previous, &object);
+            let frame = response_frame(
+                &producer,
+                vec![replica_block.clone()],
+                false,
+                height,
+                replica_block.hash(),
+                [u8::try_from(height).unwrap(); 16],
+            );
+            store
+                .import_verified_page(
+                    producer.public_key_bytes(),
+                    std::slice::from_ref(&replica_block),
+                    std::slice::from_ref(&object),
+                    height,
+                    replica_block.hash(),
+                    &frame,
+                    NOW + 20,
+                )
+                .unwrap();
+            previous = replica_block.hash();
+        }
+
+        let snapshot = store
+            .observation_convergence(&[producer.public_key_bytes()])
+            .unwrap();
+        assert_eq!(snapshot.eligible_producers, 1);
+        assert_eq!(snapshot.window_blocks, 32);
+        assert_eq!(snapshot.recent_commitments, 32);
+        assert_eq!(snapshot.distinct_recent_commitments, 32);
+        assert_eq!(snapshot.multi_source_recent_commitments, 0);
+        assert_eq!(snapshot.observation_root, None);
+    }
+
+    #[test]
+    fn quarantined_producer_is_excluded_from_observation_convergence() {
+        let temp = TempDir::new().unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0x28; 32]).unwrap();
+        let producer_a = IdentityKeyPair::from_bytes(&[0x29; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0x2a; 32]).unwrap();
+        let subject_a = IdentityKeyPair::from_bytes(&[0x2b; 32]).unwrap();
+        let subject_b = IdentityKeyPair::from_bytes(&[0x2c; 32]).unwrap();
+        let object_a = descriptor(&subject_a, 1);
+        let object_b = descriptor(&subject_b, 1);
+        let first_a = block(&producer_a, 1, [0u8; 32], &object_a);
+        let first_b = block(&producer_b, 1, [0u8; 32], &object_a);
+        let fork_b = block(&producer_b, 1, [0u8; 32], &object_b);
+        let frame_a = response_frame(
+            &producer_a,
+            vec![first_a.clone()],
+            false,
+            1,
+            first_a.hash(),
+            [0x2d; 16],
+        );
+        let frame_b = response_frame(
+            &producer_b,
+            vec![first_b.clone()],
+            false,
+            1,
+            first_b.hash(),
+            [0x2e; 16],
+        );
+        let fork_frame = response_frame(
+            &producer_b,
+            vec![fork_b.clone()],
+            false,
+            1,
+            fork_b.hash(),
+            [0x2f; 16],
+        );
+        let (store, _) = DirectoryReplicaStore::open(
+            temp.path().join("directory.db"),
+            local.public_key_bytes(),
+            NOW + 20,
+        )
+        .unwrap();
+        store
+            .import_verified_page(
+                producer_a.public_key_bytes(),
+                std::slice::from_ref(&first_a),
+                std::slice::from_ref(&object_a),
+                1,
+                first_a.hash(),
+                &frame_a,
+                NOW + 20,
+            )
+            .unwrap();
+        store
+            .import_verified_page(
+                producer_b.public_key_bytes(),
+                std::slice::from_ref(&first_b),
+                std::slice::from_ref(&object_a),
+                1,
+                first_b.hash(),
+                &frame_b,
+                NOW + 20,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.import_verified_page(
+                producer_b.public_key_bytes(),
+                std::slice::from_ref(&fork_b),
+                std::slice::from_ref(&object_b),
+                1,
+                fork_b.hash(),
+                &fork_frame,
+                NOW + 20,
+            ),
+            Err(DirectoryReplicaStoreError::Quarantined(_))
+        ));
+
+        let snapshot = store
+            .observation_convergence(&[
+                producer_a.public_key_bytes(),
+                producer_b.public_key_bytes(),
+            ])
+            .unwrap();
+        assert_eq!(snapshot.configured_producers, 2);
+        assert_eq!(snapshot.eligible_producers, 1);
+        assert_eq!(snapshot.pending_producers, 0);
+        assert_eq!(snapshot.excluded_quarantined_producers, 1);
+        assert_eq!(snapshot.recent_commitments, 1);
+        assert_eq!(snapshot.multi_source_recent_commitments, 0);
+        assert_eq!(snapshot.all_eligible_source_recent_commitments, 0);
+        assert_eq!(snapshot.observation_root, None);
     }
 
     #[test]

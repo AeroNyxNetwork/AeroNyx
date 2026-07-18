@@ -15,6 +15,8 @@
 //! - Combines audited persisted indexes with bounded runtime observations.
 //! - Reports catch-up/deadline/backoff policy without endpoint or route data.
 //! - Declares whether retry scheduling is audited and success-cleared atomically.
+//! - Reports bounded multi-source commitment overlap without claiming quorum,
+//!   fork choice, consensus, or global finality.
 //!
 //! ## Calling Relationships
 //! - `server.rs` mounts this router separately for public and operator scopes.
@@ -25,7 +27,8 @@
 //! 1. Read the already-audited `SQLite` indexes on a blocking worker.
 //! 2. Join persisted producer snapshots with in-memory sync observations.
 //! 3. Derive aggregate lag, failure, backoff, quarantine, and sync state.
-//! 4. Serialize aggregate-only or fingerprint-only detail by listener scope.
+//! 4. Classify recent signed-observation overlap across eligible producers.
+//! 5. Serialize aggregate-only or fingerprint-only detail by listener scope.
 //!
 //! ## Privacy Invariant
 //! Public output is aggregate-only. Local detail contains a 12-character
@@ -39,8 +42,11 @@
 //! - Scope is fixed when `server.rs` mounts the router on a listener.
 //! - Keep `producers` omitted, not empty, on the public response contract.
 //! - Failure reasons must remain stable internal buckets, never peer strings.
+//! - Never rename observation overlap to quorum, consensus, or finality.
 //!
 //! ## Last Modified
+//! `v0.4.0-DirectoryReplicaObservationConvergence` - Added bounded aggregate
+//! recent-overlap evidence and an operator-only deterministic observation root.
 //! `v0.3.0-DirectoryReplicaDurableBackoffStatus` - Declared audited `SQLite` retry
 //! persistence and atomic successful-import cleanup as additive policy fields.
 //! v0.2.0-DirectoryReplicaBackoffStatus - Added aggregate and fingerprint-only
@@ -67,8 +73,9 @@ use crate::api::directory_replica_sync::{
     DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND,
 };
 use crate::services::{
-    DirectoryReplicaProducerSnapshot, DirectoryReplicaStore, DirectoryReplicaStoreSnapshot,
-    DirectoryReplicaSyncObservation, DirectoryReplicaSyncRuntime,
+    DirectoryReplicaObservationConvergenceSnapshot, DirectoryReplicaProducerSnapshot,
+    DirectoryReplicaStore, DirectoryReplicaStoreSnapshot, DirectoryReplicaSyncObservation,
+    DirectoryReplicaSyncRuntime,
 };
 
 /// Visibility tier for Directory Replica status responses.
@@ -97,6 +104,25 @@ struct DirectoryReplicaCatchUpPolicy {
     failure_backoff_max_seconds: u64,
     retry_state_persistence: &'static str,
     successful_import_clears_retry_atomically: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryReplicaObservationConvergenceStatus {
+    source_status: &'static str,
+    overlap_status: &'static str,
+    window_blocks: u64,
+    configured_producers: u64,
+    eligible_producers: u64,
+    pending_producers: u64,
+    excluded_quarantined_producers: u64,
+    recent_commitments: u64,
+    distinct_recent_commitments: u64,
+    multi_source_recent_commitments: u64,
+    all_eligible_source_recent_commitments: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observation_root: Option<String>,
+    evidence_basis: &'static str,
+    security_model: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,6 +181,7 @@ struct DirectoryReplicaStatusResponse {
     next_retry_at: Option<u64>,
     next_retry_after_seconds: Option<u64>,
     catch_up_policy: DirectoryReplicaCatchUpPolicy,
+    observation_convergence: DirectoryReplicaObservationConvergenceStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     producers: Option<Vec<DirectoryReplicaProducerStatus>>,
     privacy_invariant: &'static str,
@@ -217,9 +244,21 @@ async fn directory_replica_status_handler(
 ) -> Response {
     let generated_at = now_secs();
     let store_enabled = state.store.is_some();
-    let persisted = match state.store.clone() {
-        Some(store) => match tokio::task::spawn_blocking(move || store.status_snapshot()).await {
-            Ok(Ok(snapshot)) => snapshot,
+    let mut configured_producers = state
+        .configured_producers
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    configured_producers.sort_unstable();
+    let (persisted, convergence) = if let Some(store) = state.store.clone() {
+        match tokio::task::spawn_blocking(move || {
+            let persisted = store.status_snapshot()?;
+            let convergence = store.observation_convergence(&configured_producers)?;
+            Ok::<_, crate::services::DirectoryReplicaStoreError>((persisted, convergence))
+        })
+        .await
+        {
+            Ok(Ok(snapshots)) => snapshots,
             Ok(Err(error)) => {
                 warn!(
                     error = %error,
@@ -254,14 +293,24 @@ async fn directory_replica_status_handler(
                 )
                     .into_response();
             }
-        },
-        None => DirectoryReplicaStoreSnapshot::default(),
+        }
+    } else {
+        let configured_count = state.configured_producers.len() as u64;
+        (
+            DirectoryReplicaStoreSnapshot::default(),
+            DirectoryReplicaObservationConvergenceSnapshot {
+                configured_producers: configured_count,
+                pending_producers: configured_count,
+                ..DirectoryReplicaObservationConvergenceSnapshot::default()
+            },
+        )
     };
     let runtime = state.runtime.snapshot();
     Json(build_directory_replica_status_response(
         generated_at,
         store_enabled,
         &persisted,
+        &convergence,
         &runtime,
         &state.configured_producers,
         state.scope,
@@ -361,10 +410,71 @@ const fn directory_replica_status_label(
     }
 }
 
+const fn observation_convergence_source_status(
+    store_enabled: bool,
+    convergence: &DirectoryReplicaObservationConvergenceSnapshot,
+) -> &'static str {
+    if !store_enabled {
+        "disabled"
+    } else if convergence.configured_producers == 0 {
+        "local_only"
+    } else if convergence.eligible_producers == 0 {
+        "awaiting_sources"
+    } else if convergence.eligible_producers == 1 {
+        "single_source"
+    } else {
+        "multi_source"
+    }
+}
+
+const fn observation_convergence_overlap_status(
+    convergence: &DirectoryReplicaObservationConvergenceSnapshot,
+) -> &'static str {
+    if convergence.eligible_producers < 2 {
+        "not_applicable"
+    } else if convergence.all_eligible_source_recent_commitments > 0 {
+        "all_eligible_sources_overlap"
+    } else if convergence.multi_source_recent_commitments > 0 {
+        "partial_multi_source_overlap"
+    } else {
+        "no_recent_overlap"
+    }
+}
+
+fn build_observation_convergence_status(
+    store_enabled: bool,
+    convergence: &DirectoryReplicaObservationConvergenceSnapshot,
+    scope: DirectoryReplicaStatusScope,
+) -> DirectoryReplicaObservationConvergenceStatus {
+    DirectoryReplicaObservationConvergenceStatus {
+        source_status: observation_convergence_source_status(store_enabled, convergence),
+        overlap_status: observation_convergence_overlap_status(convergence),
+        window_blocks: convergence.window_blocks,
+        configured_producers: convergence.configured_producers,
+        eligible_producers: convergence.eligible_producers,
+        pending_producers: convergence.pending_producers,
+        excluded_quarantined_producers: convergence.excluded_quarantined_producers,
+        recent_commitments: convergence.recent_commitments,
+        distinct_recent_commitments: convergence.distinct_recent_commitments,
+        multi_source_recent_commitments: convergence.multi_source_recent_commitments,
+        all_eligible_source_recent_commitments: convergence
+            .all_eligible_source_recent_commitments,
+        observation_root: if scope == DirectoryReplicaStatusScope::LocalOperator {
+            convergence.observation_root.map(hex::encode)
+        } else {
+            None
+        },
+        evidence_basis: "exact_descriptor_commitment_hash_overlap_in_recent_verified_producer_blocks",
+        security_model:
+            "local_recomputable_observation_evidence_not_vote_quorum_fork_choice_consensus_or_finality",
+    }
+}
+
 fn build_directory_replica_status_response(
     generated_at: u64,
     store_enabled: bool,
     persisted: &DirectoryReplicaStoreSnapshot,
+    convergence: &DirectoryReplicaObservationConvergenceSnapshot,
     runtime: &[DirectoryReplicaSyncObservation],
     configured_producers: &HashSet<[u8; 32]>,
     scope: DirectoryReplicaStatusScope,
@@ -440,6 +550,11 @@ fn build_directory_replica_status_response(
             retry_state_persistence: "audited_sqlite",
             successful_import_clears_retry_atomically: true,
         },
+        observation_convergence: build_observation_convergence_status(
+            store_enabled,
+            convergence,
+            scope,
+        ),
         producers,
         privacy_invariant:
             "directory_replicas_store_only_public_signed_directory_evidence_in_producer_isolated_namespaces",
@@ -591,6 +706,21 @@ mod tests {
         assert_eq!(parsed["status"].as_str(), Some("catching_up"));
         assert_eq!(parsed["configured_producers"].as_u64(), Some(1));
         assert_eq!(parsed["max_lag_blocks"].as_u64(), Some(4));
+        assert_eq!(
+            parsed["observation_convergence"]["source_status"].as_str(),
+            Some("awaiting_sources")
+        );
+        assert_eq!(
+            parsed["observation_convergence"]["overlap_status"].as_str(),
+            Some("not_applicable")
+        );
+        assert_eq!(
+            parsed["observation_convergence"]["window_blocks"].as_u64(),
+            Some(32)
+        );
+        assert!(parsed["observation_convergence"]
+            .get("observation_root")
+            .is_none());
         assert!(parsed.get("producers").is_none());
         assert!(!body_text.contains(&hex::encode(producer)));
         Ok(())
@@ -622,6 +752,41 @@ mod tests {
         );
         assert!(parsed["producers"][0].get("public_endpoint").is_none());
         Ok(())
+    }
+
+    #[test]
+    fn convergence_status_is_explicitly_evidence_not_finality() {
+        let convergence = DirectoryReplicaObservationConvergenceSnapshot {
+            configured_producers: 2,
+            eligible_producers: 2,
+            pending_producers: 0,
+            excluded_quarantined_producers: 0,
+            window_blocks: 32,
+            recent_commitments: 8,
+            distinct_recent_commitments: 5,
+            multi_source_recent_commitments: 3,
+            all_eligible_source_recent_commitments: 3,
+            observation_root: Some([0x7a; 32]),
+        };
+        let public = build_observation_convergence_status(
+            true,
+            &convergence,
+            DirectoryReplicaStatusScope::PublicAggregate,
+        );
+        assert_eq!(public.source_status, "multi_source");
+        assert_eq!(public.overlap_status, "all_eligible_sources_overlap");
+        assert_eq!(public.observation_root, None);
+        assert_eq!(
+            public.security_model,
+            "local_recomputable_observation_evidence_not_vote_quorum_fork_choice_consensus_or_finality"
+        );
+
+        let local = build_observation_convergence_status(
+            true,
+            &convergence,
+            DirectoryReplicaStatusScope::LocalOperator,
+        );
+        assert_eq!(local.observation_root, Some(hex::encode([0x7a; 32])));
     }
 
     #[tokio::test]
