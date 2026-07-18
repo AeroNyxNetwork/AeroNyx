@@ -202,6 +202,11 @@
 //  85. Optionally opens a producer-pinned SQLite Directory Chain journal,
 //      audits every signed block before listeners start, and transactionally
 //      reconciles authenticated descriptor commitments during runtime/shutdown.
+//  86. Shares producer-isolated replica synchronization observations with a
+//      privacy-tiered status route: aggregate on the public listener and
+//      truncated producer fingerprints on local/VPN operator listeners.
+//  87. Performs bounded multi-page replica catch-up while reserving the
+//      worst-case per-page request cost beneath the peer rate limit.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -277,8 +282,13 @@
 //   - A middle-hop ACK is not terminal-authenticated routeability evidence.
 //     Startup warm-up must probe each candidate directly and remain bounded;
 //     never mark a terminal healthy solely because a middle claims forwarding.
+//   - Public Directory Replica status must remain aggregate-only. Never expose
+//     full producer identities, endpoints, descriptors, routes, or user data.
+//   - Multi-page Directory Replica catch-up must reserve the worst-case next
+//     page request cost before continuing; never rely on average block size.
 //
 // Last Modified:
+//   v2.8.28-DirectoryReplicaStatus - Privacy-tiered status and request-budgeted multi-page catch-up
 //   v2.8.27-VerifiedDeliveryRollbackAnchor - Detect locally replaced older signed delivery caches
 //   v2.8.26-VerifiedDeliveryRestartContinuity - Signed aggregate receipt evidence with fail-closed live readiness
 //   v2.8.25-LegacyFallbackReceiptSearch - Do not let legacy onward-envelope ACKs mask receipt-capable paths
@@ -434,7 +444,9 @@ use crate::api::discovery::{
     GossipResponse,
 };
 use crate::api::directory_chain_peer::{
-    build_directory_chain_peer_router, pull_directory_chain_page,
+    build_directory_chain_peer_router, build_directory_replica_status_router,
+    pull_directory_chain_page, should_continue_directory_replica_catch_up,
+    DirectoryReplicaStatusScope,
 };
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
@@ -487,7 +499,8 @@ use crate::services::peer_store::{
 };
 use crate::services::{
     spawn_dns_proxy, DirectoryChainAppendReport, DirectoryChainStore, DirectoryReplicaStore,
-    HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore, RoutingService, SessionManager,
+    DirectoryReplicaSyncRuntime, HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore,
+    RoutingService, SessionManager,
 };
 // v1.0.0-Membership
 use crate::services::deny_list::DenyList;
@@ -1429,6 +1442,8 @@ impl Server {
         let peer_store = self.init_peer_store(chat_relay_runtime_ready).await;
         let directory_chain_store = self.init_directory_chain(&peer_store).await?;
         let directory_replica_store = self.init_directory_replica().await?;
+        let directory_replica_sync_runtime =
+            Arc::new(DirectoryReplicaSyncRuntime::default());
         if let Some(ref commitment_storage) = storage {
             self.verify_memchain_commitment_startup_witnesses(commitment_storage, &peer_store)
                 .await?;
@@ -1447,7 +1462,8 @@ impl Server {
         );
         let directory_replica_sync_task = self.spawn_directory_replica_sync_task(
             Arc::clone(&peer_store),
-            directory_replica_store,
+            directory_replica_store.clone(),
+            Arc::clone(&directory_replica_sync_runtime),
         );
         let discovery_gossip_task =
             self.spawn_discovery_gossip_task(Arc::clone(&peer_store), chat_relay_runtime_ready);
@@ -1797,6 +1813,8 @@ impl Server {
                 Arc::clone(&packet_handler),
                 Arc::clone(&peer_store),
                 directory_chain_store.clone(),
+                directory_replica_store.clone(),
+                Arc::clone(&directory_replica_sync_runtime),
                 chat_relay.clone(),
                 Arc::clone(&udp),
                 commitment_sync_tip_notifier,
@@ -2602,6 +2620,8 @@ impl Server {
         packet_handler: Arc<PacketHandler>,
         peer_store: Arc<PeerStore>,
         directory_chain_store: Option<Arc<DirectoryChainStore>>,
+        directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
+        directory_replica_sync_runtime: Arc<DirectoryReplicaSyncRuntime>,
         chat_relay: Option<Arc<ChatRelayService>>,
         udp: Arc<UdpTransport>,
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
@@ -2641,6 +2661,9 @@ impl Server {
             .directory_chain_sync_peer_node_id_bytes();
         let public_directory_chain_store = directory_chain_store.clone();
         let public_directory_chain_sync_peer_ids = directory_chain_sync_peer_ids.clone();
+        let public_directory_replica_store = directory_replica_store.clone();
+        let public_directory_replica_sync_runtime =
+            Arc::clone(&directory_replica_sync_runtime);
 
         tokio::spawn(async move {
             if let Some(public_addr) = public_api_listen_addr {
@@ -2654,6 +2677,8 @@ impl Server {
                     Arc::clone(&peer_http_client),
                     local_capability_status.clone(),
                     public_directory_chain_store,
+                    public_directory_replica_store,
+                    public_directory_replica_sync_runtime,
                     public_directory_chain_sync_peer_ids,
                     commitment_storage.clone(),
                     commitment_lease_authorized_coordinator,
@@ -2751,6 +2776,12 @@ impl Server {
                     Arc::clone(&peer_store),
                     discovery_api_policy,
                     local_capability_status,
+                ))
+                .merge(build_directory_replica_status_router(
+                    directory_replica_store,
+                    directory_replica_sync_runtime,
+                    directory_chain_sync_peer_ids.clone(),
+                    DirectoryReplicaStatusScope::LocalOperator,
                 ));
             let app = if let Some(store) = directory_chain_store {
                 app.merge(build_directory_chain_peer_router(
@@ -2856,6 +2887,8 @@ impl Server {
         peer_http_client: Arc<reqwest::Client>,
         local_capability_status: DiscoveryLocalCapabilityStatus,
         directory_chain_store: Option<Arc<DirectoryChainStore>>,
+        directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
+        directory_replica_sync_runtime: Arc<DirectoryReplicaSyncRuntime>,
         directory_chain_sync_peer_ids: Vec<[u8; 32]>,
         commitment_storage: Option<Arc<MemoryStorage>>,
         commitment_lease_authorized_coordinator: Option<[u8; 32]>,
@@ -2877,6 +2910,12 @@ impl Server {
             Arc::clone(&peer_store),
             node_identity,
             peer_http_client,
+        ))
+        .merge(build_directory_replica_status_router(
+            directory_replica_store,
+            directory_replica_sync_runtime,
+            directory_chain_sync_peer_ids.clone(),
+            DirectoryReplicaStatusScope::PublicAggregate,
         ));
         let app = if let Some(store) = directory_chain_store {
             app.merge(build_directory_chain_peer_router(
@@ -4226,12 +4265,14 @@ impl Server {
         &self,
         peer_store: Arc<PeerStore>,
         store: Option<Arc<DirectoryReplicaStore>>,
+        runtime: Arc<DirectoryReplicaSyncRuntime>,
     ) -> Option<JoinHandle<()>> {
-        let store = store?;
         let peers = self
             .config
             .discovery
             .directory_chain_sync_peer_node_id_bytes();
+        runtime.register_producers(&peers);
+        let store = store?;
         if peers.is_empty() {
             info!("[DIRECTORY_REPLICA] Outbound sync disabled; no peers are pinned");
             return None;
@@ -4269,35 +4310,67 @@ impl Server {
                     _ = timer.tick() => {}
                 }
                 for producer in &peers {
-                    let pull = pull_directory_chain_page(
-                        Arc::clone(&store),
-                        &peer_store,
-                        identity.as_ref(),
-                        producer,
-                        &client,
-                    );
-                    let outcome = tokio::select! {
-                        _ = shutdown_rx.recv() => return,
-                        outcome = pull => outcome,
-                    };
-                    match outcome {
-                        Ok(outcome) => {
-                            debug!(
-                                blocks_inserted = outcome.import.blocks_inserted,
-                                commitments_inserted = outcome.import.commitments_inserted,
-                                blocks_already_present = outcome.import.blocks_already_present,
-                                descriptor_equivocations = outcome.import.descriptor_equivocations,
-                                replica_tip_height = outcome.import.tip_height,
-                                remote_tip_height = outcome.remote_tip_height,
-                                has_more = outcome.has_more,
-                                "[DIRECTORY_REPLICA] Authenticated bounded page synchronized"
-                            );
-                        }
-                        Err(reason) => {
-                            warn!(
-                                reason = %reason,
-                                "[DIRECTORY_REPLICA] Pinned producer sync round rejected"
-                            );
+                    let mut pages_completed = 0u32;
+                    let mut requests_used = 0u32;
+                    loop {
+                        runtime.record_attempt(*producer, unix_now_secs());
+                        let pull = pull_directory_chain_page(
+                            Arc::clone(&store),
+                            &peer_store,
+                            identity.as_ref(),
+                            producer,
+                            &client,
+                        );
+                        let outcome = tokio::select! {
+                            _ = shutdown_rx.recv() => return,
+                            outcome = pull => outcome,
+                        };
+                        match outcome {
+                            Ok(outcome) => {
+                                pages_completed = pages_completed.saturating_add(1);
+                                requests_used =
+                                    requests_used.saturating_add(outcome.requests_made);
+                                runtime.record_success(
+                                    *producer,
+                                    unix_now_secs(),
+                                    outcome.import.tip_height,
+                                    outcome.remote_tip_height,
+                                    outcome.has_more,
+                                    outcome.import.blocks_inserted,
+                                    outcome.import.commitments_inserted,
+                                    outcome.requests_made,
+                                );
+                                debug!(
+                                    blocks_inserted = outcome.import.blocks_inserted,
+                                    commitments_inserted = outcome.import.commitments_inserted,
+                                    blocks_already_present = outcome.import.blocks_already_present,
+                                    descriptor_equivocations =
+                                        outcome.import.descriptor_equivocations,
+                                    replica_tip_height = outcome.import.tip_height,
+                                    remote_tip_height = outcome.remote_tip_height,
+                                    has_more = outcome.has_more,
+                                    pages_completed,
+                                    requests_used,
+                                    "[DIRECTORY_REPLICA] Authenticated bounded page synchronized"
+                                );
+                                if !should_continue_directory_replica_catch_up(
+                                    pages_completed,
+                                    requests_used,
+                                    outcome.has_more,
+                                ) {
+                                    break;
+                                }
+                            }
+                            Err(reason) => {
+                                runtime.record_failure(*producer, unix_now_secs(), &reason);
+                                warn!(
+                                    reason = %reason,
+                                    pages_completed,
+                                    requests_used,
+                                    "[DIRECTORY_REPLICA] Pinned producer sync round rejected"
+                                );
+                                break;
+                            }
                         }
                     }
                 }

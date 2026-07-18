@@ -18,6 +18,8 @@
 //! - Records authenticated descriptor equivocation without blaming an honest
 //!   chain producer that merely observed the conflicting public descriptors.
 //! - Audits every replica chain and index before the node may synchronize.
+//! - Exposes low-cost aggregate snapshots and privacy-safe synchronization
+//!   observations without re-running a full cryptographic audit per API read.
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
@@ -49,6 +51,8 @@
 //! - Keep all limits synchronized with the core Directory Sync V1 contract.
 //!
 //! ## Last Modified
+//! v0.2.0-DirectoryReplicaStatus - Added aggregate status snapshots and shared
+//! synchronization observations for bounded catch-up visibility.
 //! v0.1.0-DirectoryReplicaStore - Initial producer-isolated replica persistence.
 // ============================================================================
 
@@ -120,6 +124,46 @@ pub struct DirectoryReplicaAudit {
     pub incidents: u64,
 }
 
+/// Low-cost aggregate view of the already audited replica namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DirectoryReplicaStoreSnapshot {
+    /// Number of producer namespaces currently persisted.
+    pub producers: u64,
+    /// Number of producer namespaces blocked by durable quarantine.
+    pub quarantined_producers: u64,
+    /// Number of verified remote blocks retained across all producers.
+    pub blocks: u64,
+    /// Number of verified descriptor commitments retained across all producers.
+    pub commitments: u64,
+    /// Number of durable authenticated incidents.
+    pub incidents: u64,
+    /// Per-producer accepted-prefix summaries for local operator presentation.
+    pub producer_snapshots: Vec<DirectoryReplicaProducerSnapshot>,
+}
+
+/// Persisted aggregate state for one producer namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryReplicaProducerSnapshot {
+    /// Remote producer identity.
+    pub producer: [u8; 32],
+    /// Accepted contiguous prefix height.
+    pub tip_height: u64,
+    /// Timestamp signed into the accepted tip block.
+    pub tip_timestamp: u64,
+    /// Whether imports are blocked pending operator review.
+    pub quarantined: bool,
+    /// Stable authenticated incident kind when quarantined.
+    pub quarantine_kind: Option<String>,
+    /// Last time this namespace metadata changed locally.
+    pub updated_at: u64,
+    /// Verified blocks retained for this producer.
+    pub blocks: u64,
+    /// Verified commitments retained for this producer.
+    pub commitments: u64,
+    /// Durable incidents attributed to this producer response stream.
+    pub incidents: u64,
+}
+
 /// Current accepted prefix and isolation state for one producer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectoryReplicaTip {
@@ -165,6 +209,157 @@ pub struct DirectoryReplicaImportReport {
     pub tip_height: u64,
     /// Accepted producer prefix hash after import.
     pub tip_hash: [u8; 32],
+}
+
+/// Runtime-only synchronization observation for one pinned producer.
+///
+/// These fields intentionally contain no endpoint, full response, descriptor,
+/// route, payload, client, or wallet metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryReplicaSyncObservation {
+    /// Pinned producer identity used only for internal status correlation.
+    pub producer: [u8; 32],
+    /// Most recent bounded pull attempt.
+    pub last_attempt_at: Option<u64>,
+    /// Most recent authenticated successful page.
+    pub last_success_at: Option<u64>,
+    /// Most recent rejected or failed page.
+    pub last_failure_at: Option<u64>,
+    /// Stable privacy-safe reason code from the most recent failure.
+    pub last_failure_reason: Option<String>,
+    /// Signed remote tip height most recently observed.
+    pub remote_tip_height: Option<u64>,
+    /// Accepted local replica height after the most recent success.
+    pub local_tip_height: u64,
+    /// Whether the most recent signed response indicated additional pages.
+    pub has_more: bool,
+    /// Consecutive failed attempts since the last successful page.
+    pub consecutive_failures: u64,
+    /// Total bounded attempts during this process lifetime.
+    pub total_attempts: u64,
+    /// Total authenticated pages accepted during this process lifetime.
+    pub successful_pages: u64,
+    /// Total failed attempts during this process lifetime.
+    pub failed_attempts: u64,
+    /// Total new blocks committed during this process lifetime.
+    pub blocks_inserted: u64,
+    /// Total new commitments committed during this process lifetime.
+    pub commitments_inserted: u64,
+    /// Total HTTP requests consumed by authenticated successful pages.
+    pub requests_sent: u64,
+}
+
+impl DirectoryReplicaSyncObservation {
+    fn new(producer: [u8; 32]) -> Self {
+        Self {
+            producer,
+            last_attempt_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            last_failure_reason: None,
+            remote_tip_height: None,
+            local_tip_height: 0,
+            has_more: false,
+            consecutive_failures: 0,
+            total_attempts: 0,
+            successful_pages: 0,
+            failed_attempts: 0,
+            blocks_inserted: 0,
+            commitments_inserted: 0,
+            requests_sent: 0,
+        }
+    }
+}
+
+/// Shared process-lifetime synchronization telemetry.
+#[derive(Debug, Default)]
+pub struct DirectoryReplicaSyncRuntime {
+    observations: Mutex<HashMap<[u8; 32], DirectoryReplicaSyncObservation>>,
+}
+
+impl DirectoryReplicaSyncRuntime {
+    /// Registers configured pins so status reports can distinguish pending from
+    /// disabled before the first low-frequency synchronization round.
+    pub fn register_producers(&self, producers: &[[u8; 32]]) {
+        let mut observations = self.observations.lock();
+        for producer in producers {
+            if *producer != [0u8; 32] {
+                observations
+                    .entry(*producer)
+                    .or_insert_with(|| DirectoryReplicaSyncObservation::new(*producer));
+            }
+        }
+    }
+
+    /// Records the beginning of one bounded page request.
+    pub fn record_attempt(&self, producer: [u8; 32], attempted_at: u64) {
+        let mut observations = self.observations.lock();
+        let observation = observations
+            .entry(producer)
+            .or_insert_with(|| DirectoryReplicaSyncObservation::new(producer));
+        observation.last_attempt_at = Some(attempted_at);
+        observation.total_attempts = observation.total_attempts.saturating_add(1);
+    }
+
+    /// Records one authenticated page after its atomic import completes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_success(
+        &self,
+        producer: [u8; 32],
+        succeeded_at: u64,
+        local_tip_height: u64,
+        remote_tip_height: u64,
+        has_more: bool,
+        blocks_inserted: u64,
+        commitments_inserted: u64,
+        requests_sent: u32,
+    ) {
+        let mut observations = self.observations.lock();
+        let observation = observations
+            .entry(producer)
+            .or_insert_with(|| DirectoryReplicaSyncObservation::new(producer));
+        observation.last_attempt_at = Some(succeeded_at);
+        observation.last_success_at = Some(succeeded_at);
+        observation.remote_tip_height = Some(remote_tip_height);
+        observation.local_tip_height = local_tip_height;
+        observation.has_more = has_more;
+        observation.consecutive_failures = 0;
+        observation.successful_pages = observation.successful_pages.saturating_add(1);
+        observation.blocks_inserted = observation.blocks_inserted.saturating_add(blocks_inserted);
+        observation.commitments_inserted = observation
+            .commitments_inserted
+            .saturating_add(commitments_inserted);
+        observation.requests_sent = observation
+            .requests_sent
+            .saturating_add(u64::from(requests_sent));
+    }
+
+    /// Records one stable failure code without retaining peer endpoints,
+    /// response bodies, or underlying transport error strings.
+    pub fn record_failure(&self, producer: [u8; 32], failed_at: u64, reason: &str) {
+        let mut observations = self.observations.lock();
+        let observation = observations
+            .entry(producer)
+            .or_insert_with(|| DirectoryReplicaSyncObservation::new(producer));
+        observation.last_attempt_at = Some(failed_at);
+        observation.last_failure_at = Some(failed_at);
+        observation.last_failure_reason = Some(reason.chars().take(96).collect());
+        observation.consecutive_failures = observation.consecutive_failures.saturating_add(1);
+        observation.failed_attempts = observation.failed_attempts.saturating_add(1);
+    }
+
+    /// Returns producer observations in deterministic identity order.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<DirectoryReplicaSyncObservation> {
+        let mut observations = self
+            .observations
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        observations.sort_by_key(|observation| observation.producer);
+        observations
+    }
 }
 
 #[derive(Debug)]
@@ -245,6 +440,96 @@ impl DirectoryReplicaStore {
     ) -> Result<DirectoryReplicaTip, DirectoryReplicaStoreError> {
         let connection = self.connection.lock();
         Self::load_tip(&connection, producer)
+    }
+
+    /// Returns a low-cost aggregate snapshot of persisted, already-audited
+    /// replica indexes.
+    ///
+    /// This is an observability read, not a replacement for Self::audit.
+    /// Startup still performs the full signature, linkage, object, index, and
+    /// incident audit before synchronization or API serving begins.
+    ///
+    /// # Errors
+    /// Returns DirectoryReplicaStoreError when a persisted status row is
+    /// malformed or SQLite cannot complete the bounded aggregate query.
+    pub fn status_snapshot(
+        &self,
+    ) -> Result<DirectoryReplicaStoreSnapshot, DirectoryReplicaStoreError> {
+        let connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let mut statement = connection.prepare(
+            "SELECT c.producer, c.tip_height, c.tip_timestamp, c.quarantined,
+                    c.quarantine_kind, c.updated_at,
+                    (SELECT COUNT(*) FROM directory_replica_blocks b
+                     WHERE b.producer = c.producer),
+                    (SELECT COUNT(*) FROM directory_replica_commitments m
+                     WHERE m.producer = c.producer),
+                    (SELECT COUNT(*) FROM directory_replica_incidents i
+                     WHERE i.producer = c.producer)
+             FROM directory_replica_chains c
+             ORDER BY c.producer ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut snapshot = DirectoryReplicaStoreSnapshot::default();
+        for (
+            producer,
+            tip_height,
+            tip_timestamp,
+            quarantined,
+            quarantine_kind,
+            updated_at,
+            blocks,
+            commitments,
+            incidents,
+        ) in rows
+        {
+            if quarantined != 0 && quarantined != 1 {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "replica status quarantine flag is invalid".to_string(),
+                ));
+            }
+            let producer_snapshot = DirectoryReplicaProducerSnapshot {
+                producer: bytes32(&producer, "replica status producer")?,
+                tip_height: nonnegative_i64_to_u64(tip_height, "replica status tip height")?,
+                tip_timestamp: nonnegative_i64_to_u64(
+                    tip_timestamp,
+                    "replica status tip timestamp",
+                )?,
+                quarantined: quarantined == 1,
+                quarantine_kind,
+                updated_at: nonnegative_i64_to_u64(updated_at, "replica status updated at")?,
+                blocks: nonnegative_i64_to_u64(blocks, "replica status blocks")?,
+                commitments: nonnegative_i64_to_u64(commitments, "replica status commitments")?,
+                incidents: nonnegative_i64_to_u64(incidents, "replica status incidents")?,
+            };
+            snapshot.producers = snapshot.producers.saturating_add(1);
+            snapshot.quarantined_producers = snapshot
+                .quarantined_producers
+                .saturating_add(u64::from(producer_snapshot.quarantined));
+            snapshot.blocks = snapshot.blocks.saturating_add(producer_snapshot.blocks);
+            snapshot.commitments = snapshot
+                .commitments
+                .saturating_add(producer_snapshot.commitments);
+            snapshot.incidents = snapshot
+                .incidents
+                .saturating_add(producer_snapshot.incidents);
+            snapshot.producer_snapshots.push(producer_snapshot);
+        }
+        Ok(snapshot)
     }
 
     /// Re-verifies and atomically imports one signed bounded producer page.
@@ -1531,12 +1816,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(repeated.blocks_already_present, 1);
+        let snapshot = store.status_snapshot().unwrap();
+        assert_eq!(snapshot.producers, 1);
+        assert_eq!(snapshot.quarantined_producers, 0);
+        assert_eq!(snapshot.blocks, 1);
+        assert_eq!(snapshot.commitments, 1);
+        assert_eq!(snapshot.incidents, 0);
+        assert_eq!(snapshot.producer_snapshots.len(), 1);
+        assert_eq!(
+            snapshot.producer_snapshots[0].producer,
+            producer.public_key_bytes()
+        );
+        assert_eq!(snapshot.producer_snapshots[0].tip_height, 1);
         drop(store);
         let (_, reopened) =
             DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 21).unwrap();
         assert_eq!(reopened.producers, 1);
         assert_eq!(reopened.blocks, 1);
         assert_eq!(reopened.commitments, 1);
+    }
+
+    #[test]
+    fn sync_runtime_tracks_bounded_success_and_stable_failure_without_endpoint_data() {
+        let producer = [0x44; 32];
+        let runtime = DirectoryReplicaSyncRuntime::default();
+        runtime.register_producers(&[producer]);
+        runtime.record_attempt(producer, NOW);
+        runtime.record_success(producer, NOW + 1, 3, 7, true, 1, 4, 2);
+        runtime.record_attempt(producer, NOW + 2);
+        runtime.record_failure(
+            producer,
+            NOW + 3,
+            "pinned_directory_peer_unavailable_and_reason_is_bounded",
+        );
+
+        let observations = runtime.snapshot();
+        assert_eq!(observations.len(), 1);
+        let observation = &observations[0];
+        assert_eq!(observation.producer, producer);
+        assert_eq!(observation.last_success_at, Some(NOW + 1));
+        assert_eq!(observation.last_failure_at, Some(NOW + 3));
+        assert_eq!(observation.remote_tip_height, Some(7));
+        assert_eq!(observation.local_tip_height, 3);
+        assert!(observation.has_more);
+        assert_eq!(observation.consecutive_failures, 1);
+        assert_eq!(observation.total_attempts, 2);
+        assert_eq!(observation.successful_pages, 1);
+        assert_eq!(observation.failed_attempts, 1);
+        assert_eq!(observation.blocks_inserted, 1);
+        assert_eq!(observation.commitments_inserted, 4);
+        assert_eq!(observation.requests_sent, 2);
+        assert_eq!(
+            observation.last_failure_reason.as_deref(),
+            Some("pinned_directory_peer_unavailable_and_reason_is_bounded")
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.10.1 - Recorded the first audited three-node Directory Replica Sync deployment and restart-recovery proof.
+Modification Reason: v0.11.0 - Added privacy-tiered Directory Replica status and request-budgeted multi-page catch-up.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.10.1 - Verified pinned, signed replica synchronization across US1, Korean1, and Noway1 without mixing producer histories.
+Last Modified: v0.11.0 - Added aggregate/public and fingerprinted/operator replica status plus bounded multi-page synchronization.
+Previous: v0.10.1 - Verified pinned, signed replica synchronization across US1, Korean1, and Noway1 without mixing producer histories.
 Previous: v0.10.0 - Added audited remote replica namespaces, signed page/object verification, atomic import, and durable producer quarantine.
 Previous: v0.9.0 - Added the signed tip, block-range, and descriptor-object serving half of Directory Sync V1.
 Previous: v0.8.0 - Added producer-pinned SQLite persistence and startup recovery for local Directory Chain blocks.
@@ -1119,6 +1120,42 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-18 - Added Directory Replica status and request-budgeted multi-page catch-up.
+- Files changed:
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - crates/aeronyx-server/src/services/mod.rs
+  - crates/aeronyx-server/src/api/directory_chain_peer.rs
+  - crates/aeronyx-server/src/server.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- API:
+  - GET /api/discovery/directory/status
+  - The public listener returns aggregate producer, block, commitment, incident,
+    lag, quarantine, and synchronization-health fields only.
+  - The local/VPN operator listener additionally returns twelve-hex-character
+    producer fingerprints and per-producer operational counters.
+  - Neither scope returns endpoints, full producer identities, signed
+    descriptors, routes, selected hops, user traffic, payloads, or wallet data.
+- Catch-up behavior:
+  - A producer may advance by at most four one-block pages per 120-second round.
+  - The round has a hard 24-request budget and reserves the worst-case
+    17-request cost before requesting another page.
+  - The policy remains below the existing 30 requests/minute per-peer inbound
+    limit, including a six-request safety margin.
+  - Every page is independently authenticated, hydrated, and atomically
+    imported; a later page failure cannot roll back an earlier accepted page.
+- Verification:
+  - Directory Replica store/runtime tests: 4 passed.
+  - Directory peer API/status/request-budget tests: 5 passed.
+  - aeronyx-server regression suite: 1,065/1,065 passed.
+  - Integration group: 1 passed, 9 intentionally ignored.
+  - cargo clippy -p aeronyx-server --tests --no-deps passed.
+  - Release build and live US1 configuration validation passed.
+- Notes:
+  - Synchronization observations are process-lifetime control-plane telemetry.
+    Accepted blocks, commitments, incidents, and quarantine remain durable.
+  - A restart therefore reports pending synchronization until the next
+    authenticated round, while persisted accepted prefixes remain available.
+
 2026-07-17 - Completed the first audited three-node Directory Replica Sync deployment.
 - Deployment:
   - US1, Korean1, and Noway1 run commit d324b98.

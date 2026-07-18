@@ -13,12 +13,15 @@
 //! - `POST /api/discovery/peer/directory/tip`
 //! - `POST /api/discovery/peer/directory/block-range`
 //! - `POST /api/discovery/peer/directory/descriptor-objects`
+//! - `GET /api/discovery/directory/status`
 //! - Dedicated operator-pinned admission in addition to live `PeerStore` proof.
 //! - Ed25519 request/response authentication, timestamp freshness, replay
 //!   rejection, per-peer rate limits, body limits, and audit-gated reads.
 //! - Exact content-addressed descriptor batches; no partial object response.
 //! - Outbound pinned-peer page pull with SSRF-safe endpoint policy, canonical
 //!   response verification, exact object hydration, and atomic replica import.
+//! - Privacy-tiered replica status: aggregate on the public listener and
+//!   truncated producer fingerprints on the local/VPN operator listener.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` only when `DirectoryChainStore` is configured.
@@ -51,11 +54,13 @@
 //!   valid response proves what one producer signed; it is not consensus.
 //!
 //! ## Last Modified
+//! v0.3.0-DirectoryReplicaStatus - Added privacy-tiered status and bounded
+//! multi-page request-budget primitives.
 //! v0.2.0-DirectorySyncPull - Added verified bounded replica page download.
 //! v0.1.0-DirectorySyncServing - Initial authenticated bounded peer transport.
 // ============================================
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,9 +68,10 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
-use axum::Router;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use rand::RngCore;
+use serde::Serialize;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -76,15 +82,16 @@ use aeronyx_core::protocol::discovery::{
     directory_descriptor_objects_request_signing_bytes,
     directory_descriptor_objects_response_signing_bytes, directory_tip_request_signing_bytes,
     directory_tip_response_signing_bytes, encode_directory_sync_message, DirectorySyncMessage,
-    AERONYX_DIRECTORY_MAINNET_CHAIN_ID, MAX_DIRECTORY_SYNC_BLOCKS_V1,
-    MAX_DIRECTORY_SYNC_OBJECTS_V1,
+    AERONYX_DIRECTORY_MAINNET_CHAIN_ID, MAX_DIRECTORY_COMMITMENTS_PER_BLOCK,
+    MAX_DIRECTORY_SYNC_BLOCKS_V1, MAX_DIRECTORY_SYNC_OBJECTS_V1,
 };
 
 use crate::api::memchain_peer::{commitment_peer_endpoint_is_public, commitment_peer_url};
 use crate::api::read_bounded_http_response;
 use crate::services::{
     DirectoryChainStore, DirectoryChainStoreError, DirectoryReplicaImportReport,
-    DirectoryReplicaStore, PeerStore,
+    DirectoryReplicaProducerSnapshot, DirectoryReplicaStore, DirectoryReplicaStoreSnapshot,
+    DirectoryReplicaSyncObservation, DirectoryReplicaSyncRuntime, PeerStore,
 };
 
 /// A request contains at most sixteen hashes plus fixed signatures and fields.
@@ -99,6 +106,14 @@ const REPLAY_RETENTION_SECS: u64 = 120;
 const MAX_DIRECTORY_SYNC_RESPONSE_BODY_BYTES: usize = 512 * 1024;
 /// One block per outbound round bounds object hydration and inbound rate use.
 const OUTBOUND_BLOCKS_PER_PAGE: u16 = 1;
+/// One range request plus the maximum descriptor-object chunks for one block.
+pub(crate) const DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE: u32 = 1
+    + ((MAX_DIRECTORY_COMMITMENTS_PER_BLOCK + MAX_DIRECTORY_SYNC_OBJECTS_V1 - 1)
+        / MAX_DIRECTORY_SYNC_OBJECTS_V1) as u32;
+/// Hard producer-local page cap for one low-frequency synchronization round.
+pub(crate) const DIRECTORY_SYNC_MAX_PAGES_PER_ROUND: u32 = 4;
+/// Leaves headroom beneath the inbound 30 requests/minute identity budget.
+pub(crate) const DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND: u32 = 24;
 
 /// Result of one authenticated outbound replica synchronization page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +126,395 @@ pub struct DirectorySyncPullOutcome {
     pub remote_tip_height: u64,
     /// Signed remote tip hash observed in this round.
     pub remote_tip_hash: [u8; 32],
+    /// HTTP requests consumed by this successful page and object hydration.
+    pub requests_made: u32,
+}
+
+/// Whether another page can be requested without violating the conservative
+/// worst-case request budget.
+#[must_use]
+pub(crate) fn should_continue_directory_replica_catch_up(
+    pages_completed: u32,
+    requests_used: u32,
+    has_more: bool,
+) -> bool {
+    has_more
+        && pages_completed < DIRECTORY_SYNC_MAX_PAGES_PER_ROUND
+        && requests_used.saturating_add(DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE)
+            <= DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND
+}
+
+fn directory_sync_request_count_for_objects(object_count: usize) -> u32 {
+    let object_requests = object_count.saturating_add(MAX_DIRECTORY_SYNC_OBJECTS_V1 - 1)
+        / MAX_DIRECTORY_SYNC_OBJECTS_V1;
+    1u32.saturating_add(object_requests as u32)
+}
+
+/// Visibility tier for Directory Replica status responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryReplicaStatusScope {
+    /// Public listener exposes aggregate protocol health only.
+    PublicAggregate,
+    /// Local/VPN operator listener may expose truncated producer fingerprints.
+    LocalOperator,
+}
+
+#[derive(Clone)]
+struct DirectoryReplicaStatusState {
+    store: Option<Arc<DirectoryReplicaStore>>,
+    runtime: Arc<DirectoryReplicaSyncRuntime>,
+    configured_producers: Arc<HashSet<[u8; 32]>>,
+    scope: DirectoryReplicaStatusScope,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryReplicaCatchUpPolicy {
+    max_pages_per_round: u32,
+    request_budget_per_round: u32,
+    worst_case_requests_per_page: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryReplicaProducerStatus {
+    producer_fingerprint: String,
+    configured: bool,
+    status: &'static str,
+    accepted_tip_height: u64,
+    signed_remote_tip_height: Option<u64>,
+    lag_blocks: Option<u64>,
+    accepted_tip_age_seconds: Option<u64>,
+    persisted_update_age_seconds: Option<u64>,
+    quarantined: bool,
+    quarantine_kind: Option<String>,
+    blocks: u64,
+    commitments: u64,
+    incidents: u64,
+    last_attempt_at: Option<u64>,
+    last_success_at: Option<u64>,
+    last_failure_at: Option<u64>,
+    last_failure_reason: Option<String>,
+    consecutive_failures: u64,
+    successful_pages: u64,
+    failed_attempts: u64,
+    requests_sent: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryReplicaStatusResponse {
+    contract_version: &'static str,
+    generated_at: u64,
+    source: &'static str,
+    scope: &'static str,
+    status: &'static str,
+    configured_producers: u64,
+    observed_producers: u64,
+    synchronized_producers: u64,
+    catching_up_producers: u64,
+    quarantined_producers: u64,
+    blocks: u64,
+    commitments: u64,
+    incidents: u64,
+    known_lag_producers: u64,
+    total_lag_blocks: u64,
+    max_lag_blocks: Option<u64>,
+    last_attempt_at: Option<u64>,
+    last_success_at: Option<u64>,
+    last_success_age_seconds: Option<u64>,
+    last_failure_at: Option<u64>,
+    last_failure_reason: Option<String>,
+    catch_up_policy: DirectoryReplicaCatchUpPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    producers: Option<Vec<DirectoryReplicaProducerStatus>>,
+    privacy_invariant: &'static str,
+    privacy_boundary: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryReplicaStatusErrorResponse {
+    contract_version: &'static str,
+    generated_at: u64,
+    status: &'static str,
+    reason: &'static str,
+    privacy_boundary: &'static str,
+}
+
+/// Builds the Directory Replica observability route.
+///
+/// Public and local listeners intentionally use separate scope values. Neither
+/// response includes full producer identities, endpoints, signed descriptors,
+/// route metadata, or user traffic.
+#[must_use]
+pub fn build_directory_replica_status_router(
+    store: Option<Arc<DirectoryReplicaStore>>,
+    runtime: Arc<DirectoryReplicaSyncRuntime>,
+    configured_producers: Vec<[u8; 32]>,
+    scope: DirectoryReplicaStatusScope,
+) -> Router {
+    runtime.register_producers(&configured_producers);
+    let state = DirectoryReplicaStatusState {
+        store,
+        runtime,
+        configured_producers: Arc::new(configured_producers.into_iter().collect()),
+        scope,
+    };
+    Router::new()
+        .route(
+            "/api/discovery/directory/status",
+            get(directory_replica_status_handler),
+        )
+        .with_state(state)
+}
+
+async fn directory_replica_status_handler(
+    State(state): State<DirectoryReplicaStatusState>,
+) -> Response {
+    let generated_at = now_secs();
+    let store_enabled = state.store.is_some();
+    let persisted = match state.store.clone() {
+        Some(store) => match tokio::task::spawn_blocking(move || store.status_snapshot()).await {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(error)) => {
+                warn!(
+                    error = %error,
+                    "[DIRECTORY_REPLICA] Status snapshot rejected malformed persistence"
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(DirectoryReplicaStatusErrorResponse {
+                        contract_version: "directory_replica_status.v1",
+                        generated_at,
+                        status: "unavailable",
+                        reason: "replica_status_unavailable",
+                        privacy_boundary: "aggregate Directory Chain control-plane status only; no endpoints, full producer identities, client IPs, routes, selected hops, payloads, DNS contents, destinations, private keys, wallet traffic, or social graph metadata",
+                    }),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "[DIRECTORY_REPLICA] Status snapshot worker failed"
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(DirectoryReplicaStatusErrorResponse {
+                        contract_version: "directory_replica_status.v1",
+                        generated_at,
+                        status: "unavailable",
+                        reason: "replica_status_worker_failed",
+                        privacy_boundary: "aggregate Directory Chain control-plane status only; no endpoints, full producer identities, client IPs, routes, selected hops, payloads, DNS contents, destinations, private keys, wallet traffic, or social graph metadata",
+                    }),
+                )
+                    .into_response();
+            }
+        },
+        None => DirectoryReplicaStoreSnapshot::default(),
+    };
+    let runtime = state.runtime.snapshot();
+    Json(build_directory_replica_status_response(
+        generated_at,
+        store_enabled,
+        &persisted,
+        &runtime,
+        &state.configured_producers,
+        state.scope,
+    ))
+    .into_response()
+}
+
+fn build_directory_replica_status_response(
+    generated_at: u64,
+    store_enabled: bool,
+    persisted: &DirectoryReplicaStoreSnapshot,
+    runtime: &[DirectoryReplicaSyncObservation],
+    configured_producers: &HashSet<[u8; 32]>,
+    scope: DirectoryReplicaStatusScope,
+) -> DirectoryReplicaStatusResponse {
+    let runtime_by_producer = runtime
+        .iter()
+        .map(|observation| (observation.producer, observation))
+        .collect::<HashMap<_, _>>();
+    let persisted_by_producer = persisted
+        .producer_snapshots
+        .iter()
+        .map(|producer| (producer.producer, producer))
+        .collect::<HashMap<_, _>>();
+    let mut synchronized_producers = 0u64;
+    let mut catching_up_producers = 0u64;
+    let mut known_lag_producers = 0u64;
+    let mut total_lag_blocks = 0u64;
+    let mut max_lag_blocks = None;
+    for producer in configured_producers {
+        let Some(observation) = runtime_by_producer.get(producer) else {
+            continue;
+        };
+        let lag = observation
+            .remote_tip_height
+            .map(|remote| remote.saturating_sub(observation.local_tip_height));
+        if let Some(lag) = lag {
+            known_lag_producers = known_lag_producers.saturating_add(1);
+            total_lag_blocks = total_lag_blocks.saturating_add(lag);
+            max_lag_blocks = Some(max_lag_blocks.map_or(lag, |current: u64| current.max(lag)));
+        }
+        if observation.has_more || lag.is_some_and(|value| value > 0) {
+            catching_up_producers = catching_up_producers.saturating_add(1);
+        } else if observation.last_success_at.is_some()
+            && observation.consecutive_failures == 0
+            && lag == Some(0)
+        {
+            synchronized_producers = synchronized_producers.saturating_add(1);
+        }
+    }
+    let last_attempt_at = runtime
+        .iter()
+        .filter_map(|value| value.last_attempt_at)
+        .max();
+    let last_success_at = runtime
+        .iter()
+        .filter_map(|value| value.last_success_at)
+        .max();
+    let latest_failure = runtime
+        .iter()
+        .filter_map(|value| {
+            value
+                .last_failure_at
+                .map(|failed_at| (failed_at, value.last_failure_reason.clone()))
+        })
+        .max_by_key(|value| value.0);
+    let any_current_failure = runtime
+        .iter()
+        .any(|observation| observation.consecutive_failures > 0);
+    let configured_count = configured_producers.len() as u64;
+    let status = if !store_enabled {
+        "disabled"
+    } else if configured_producers.is_empty() {
+        "local_only"
+    } else if persisted.quarantined_producers > 0 {
+        "quarantined"
+    } else if any_current_failure {
+        "degraded"
+    } else if catching_up_producers > 0 {
+        "catching_up"
+    } else if synchronized_producers == configured_count {
+        "healthy"
+    } else {
+        "pending"
+    };
+    let producers = (scope == DirectoryReplicaStatusScope::LocalOperator).then(|| {
+        build_directory_replica_producer_statuses(
+            generated_at,
+            &persisted_by_producer,
+            &runtime_by_producer,
+            configured_producers,
+        )
+    });
+    DirectoryReplicaStatusResponse {
+        contract_version: "directory_replica_status.v1",
+        generated_at,
+        source: "rust_directory_replica_store_and_sync_runtime",
+        scope: match scope {
+            DirectoryReplicaStatusScope::PublicAggregate => "public_aggregate",
+            DirectoryReplicaStatusScope::LocalOperator => "local_or_vpn_operator",
+        },
+        status,
+        configured_producers: configured_count,
+        observed_producers: persisted.producers,
+        synchronized_producers,
+        catching_up_producers,
+        quarantined_producers: persisted.quarantined_producers,
+        blocks: persisted.blocks,
+        commitments: persisted.commitments,
+        incidents: persisted.incidents,
+        known_lag_producers,
+        total_lag_blocks,
+        max_lag_blocks,
+        last_attempt_at,
+        last_success_at,
+        last_success_age_seconds: last_success_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_failure_at: latest_failure.as_ref().map(|value| value.0),
+        last_failure_reason: latest_failure.and_then(|value| value.1),
+        catch_up_policy: DirectoryReplicaCatchUpPolicy {
+            max_pages_per_round: DIRECTORY_SYNC_MAX_PAGES_PER_ROUND,
+            request_budget_per_round: DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND,
+            worst_case_requests_per_page: DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE,
+        },
+        producers,
+        privacy_invariant:
+            "directory_replicas_store_only_public_signed_directory_evidence_in_producer_isolated_namespaces",
+        privacy_boundary: "aggregate Directory Chain control-plane status only; local operator detail uses truncated producer fingerprints and never exposes endpoints, full producer identities, client IPs, routes, selected hops, payloads, DNS contents, destinations, private keys, wallet traffic, or social graph metadata",
+    }
+}
+
+fn build_directory_replica_producer_statuses(
+    generated_at: u64,
+    persisted: &HashMap<[u8; 32], &DirectoryReplicaProducerSnapshot>,
+    runtime: &HashMap<[u8; 32], &DirectoryReplicaSyncObservation>,
+    configured: &HashSet<[u8; 32]>,
+) -> Vec<DirectoryReplicaProducerStatus> {
+    let mut producers = BTreeSet::new();
+    producers.extend(persisted.keys().copied());
+    producers.extend(runtime.keys().copied());
+    producers.extend(configured.iter().copied());
+    producers
+        .into_iter()
+        .map(|producer| {
+            let persisted = persisted.get(&producer).copied();
+            let runtime = runtime.get(&producer).copied();
+            let accepted_tip_height = persisted
+                .map(|value| value.tip_height)
+                .or_else(|| runtime.map(|value| value.local_tip_height))
+                .unwrap_or(0);
+            let signed_remote_tip_height = runtime.and_then(|value| value.remote_tip_height);
+            let lag_blocks =
+                signed_remote_tip_height.map(|remote| remote.saturating_sub(accepted_tip_height));
+            let quarantined = persisted.is_some_and(|value| value.quarantined);
+            let consecutive_failures = runtime.map_or(0, |value| value.consecutive_failures);
+            let has_more = runtime.is_some_and(|value| value.has_more);
+            let status = if quarantined {
+                "quarantined"
+            } else if consecutive_failures > 0 {
+                "degraded"
+            } else if has_more || lag_blocks.is_some_and(|value| value > 0) {
+                "catching_up"
+            } else if runtime
+                .is_some_and(|value| value.last_success_at.is_some() && lag_blocks == Some(0))
+            {
+                "synchronized"
+            } else if persisted.is_some() && !configured.contains(&producer) {
+                "retained"
+            } else {
+                "pending"
+            };
+            DirectoryReplicaProducerStatus {
+                producer_fingerprint: hex::encode(&producer[..6]),
+                configured: configured.contains(&producer),
+                status,
+                accepted_tip_height,
+                signed_remote_tip_height,
+                lag_blocks,
+                accepted_tip_age_seconds: persisted
+                    .map(|value| value.tip_timestamp)
+                    .filter(|timestamp| *timestamp > 0)
+                    .map(|timestamp| generated_at.saturating_sub(timestamp)),
+                persisted_update_age_seconds: persisted
+                    .map(|value| generated_at.saturating_sub(value.updated_at)),
+                quarantined,
+                quarantine_kind: persisted.and_then(|value| value.quarantine_kind.clone()),
+                blocks: persisted.map_or(0, |value| value.blocks),
+                commitments: persisted.map_or(0, |value| value.commitments),
+                incidents: persisted.map_or(0, |value| value.incidents),
+                last_attempt_at: runtime.and_then(|value| value.last_attempt_at),
+                last_success_at: runtime.and_then(|value| value.last_success_at),
+                last_failure_at: runtime.and_then(|value| value.last_failure_at),
+                last_failure_reason: runtime.and_then(|value| value.last_failure_reason.clone()),
+                consecutive_failures,
+                successful_pages: runtime.map_or(0, |value| value.successful_pages),
+                failed_attempts: runtime.map_or(0, |value| value.failed_attempts),
+                requests_sent: runtime.map_or(0, |value| value.requests_sent),
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -565,6 +969,7 @@ pub async fn pull_directory_chain_page(
                 .map(|commitment| commitment.descriptor_hash)
         })
         .collect::<Vec<_>>();
+    let requests_made = directory_sync_request_count_for_objects(descriptor_hashes.len());
     let mut objects = Vec::with_capacity(descriptor_hashes.len());
     for hashes in descriptor_hashes.chunks(MAX_DIRECTORY_SYNC_OBJECTS_V1) {
         let object_timestamp = now_secs();
@@ -627,6 +1032,7 @@ pub async fn pull_directory_chain_page(
         has_more,
         remote_tip_height,
         remote_tip_hash,
+        requests_made,
     })
 }
 
@@ -1097,5 +1503,99 @@ mod tests {
         };
         assert_eq!(descriptor_hashes, vec![descriptor_hash]);
         assert_eq!(objects, vec![expected_descriptor]);
+    }
+
+    #[test]
+    fn catch_up_budget_allows_small_pages_but_reserves_worst_case_headroom() {
+        assert_eq!(DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE, 17);
+        assert_eq!(directory_sync_request_count_for_objects(0), 1);
+        assert_eq!(directory_sync_request_count_for_objects(1), 2);
+        assert_eq!(directory_sync_request_count_for_objects(16), 2);
+        assert_eq!(directory_sync_request_count_for_objects(17), 3);
+        assert_eq!(directory_sync_request_count_for_objects(256), 17);
+        assert!(should_continue_directory_replica_catch_up(1, 2, true));
+        assert!(should_continue_directory_replica_catch_up(3, 6, true));
+        assert!(!should_continue_directory_replica_catch_up(4, 8, true));
+        assert!(!should_continue_directory_replica_catch_up(1, 8, true));
+        assert!(!should_continue_directory_replica_catch_up(1, 2, false));
+    }
+
+    #[tokio::test]
+    async fn replica_status_public_scope_redacts_producers_and_local_scope_uses_fingerprint() {
+        let temp = TempDir::new().unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0xc1; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0xc2; 32]).unwrap();
+        let (store, _) = DirectoryReplicaStore::open(
+            temp.path().join("directory.db"),
+            local.public_key_bytes(),
+            now_secs(),
+        )
+        .unwrap();
+        let store = Arc::new(store);
+        let runtime = Arc::new(DirectoryReplicaSyncRuntime::default());
+        runtime.register_producers(&[producer.public_key_bytes()]);
+        runtime.record_attempt(producer.public_key_bytes(), now_secs().saturating_sub(2));
+        runtime.record_success(
+            producer.public_key_bytes(),
+            now_secs().saturating_sub(1),
+            3,
+            7,
+            true,
+            1,
+            4,
+            2,
+        );
+
+        let public = build_directory_replica_status_router(
+            Some(Arc::clone(&store)),
+            Arc::clone(&runtime),
+            vec![producer.public_key_bytes()],
+            DirectoryReplicaStatusScope::PublicAggregate,
+        );
+        let response = public
+            .oneshot(
+                Request::get("/api/discovery/directory/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 512 * 1024).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+        assert_eq!(parsed["status"].as_str(), Some("catching_up"));
+        assert_eq!(parsed["configured_producers"].as_u64(), Some(1));
+        assert_eq!(parsed["max_lag_blocks"].as_u64(), Some(4));
+        assert!(parsed.get("producers").is_none());
+        assert!(!body_text.contains(&hex::encode(producer.public_key_bytes())));
+
+        let local_router = build_directory_replica_status_router(
+            Some(store),
+            runtime,
+            vec![producer.public_key_bytes()],
+            DirectoryReplicaStatusScope::LocalOperator,
+        );
+        let response = local_router
+            .oneshot(
+                Request::get("/api/discovery/directory/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 512 * 1024).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let expected_fingerprint = hex::encode(&producer.public_key_bytes()[..6]);
+        assert_eq!(
+            parsed["producers"][0]["producer_fingerprint"].as_str(),
+            Some(expected_fingerprint.as_str())
+        );
+        assert_eq!(
+            parsed["producers"][0]["status"].as_str(),
+            Some("catching_up")
+        );
+        assert!(parsed["producers"][0].get("public_endpoint").is_none());
     }
 }
