@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.12.0 - Split Directory Replica transport, synchronization, and status responsibilities; added bounded concurrent producer synchronization and startup jitter.
+Modification Reason: v0.13.0 - Added producer-local Directory Replica deadlines, bounded exponential retry backoff, and privacy-safe scheduler telemetry.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.12.0 - Added dedicated replica coordinator/status modules, bounded producer concurrency, and 5-15 second deterministic startup synchronization.
+Last Modified: v0.13.0 - Added a 45-second producer deadline, bounded failure backoff, and additive aggregate/operator retry status.
+Previous: v0.12.0 - Added dedicated replica coordinator/status modules, bounded producer concurrency, and 5-15 second deterministic startup synchronization.
 Previous: v0.11.0 - Added aggregate/public and fingerprinted/operator replica status plus bounded multi-page synchronization.
 Previous: v0.10.1 - Verified pinned, signed replica synchronization across US1, Korean1, and Noway1 without mixing producer histories.
 Previous: v0.10.0 - Added audited remote replica namespaces, signed page/object verification, atomic import, and durable producer quarantine.
@@ -1121,6 +1122,42 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-18 - Added producer-local Directory Replica failure containment.
+- Files changed:
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Runtime behavior:
+  - Each producer has a 45-second wall-clock deadline in addition to the
+    existing five-second per-request timeout and producer-local request budget.
+  - The first failure retries on the next ordinary synchronization tick.
+  - Repeated consecutive failures defer approximately 1, 3, 7, then at most
+    15 nominal intervals, capped at 30 minutes.
+  - Any authenticated successful page immediately clears active backoff while
+    preserving process-lifetime failure and skipped-round counters.
+  - One producer's timeout or backoff never changes another producer's budget,
+    accepted prefix, quarantine state, or retry schedule.
+- Observability and privacy:
+  - Public status adds only aggregate backoff producer count and next-retry
+    timing; it continues to omit the `producers` collection entirely.
+  - Local/VPN status adds only the existing truncated producer fingerprint,
+    backoff state, retry timing, and skipped-round count.
+  - Retry logs contain stable reason buckets and bounded counters only; they do
+    not include endpoints, full identities, response bodies, descriptor hashes,
+    routes, clients, payloads, or social graph metadata.
+- Compatibility:
+  - Directory Sync V1 frames, endpoints, authentication, config fields, SQLite
+    schema, and persisted producer-isolated chain data are unchanged.
+- Verification:
+  - Directory Replica focused tests: 12 passed.
+  - aeronyx-server regression suite: 1,071/1,071 passed.
+  - Integration group: 1 passed, 9 intentionally ignored.
+  - cargo check -p aeronyx-server --tests --locked passed.
+  - cargo clippy -p aeronyx-server --tests --no-deps --locked passed; the new
+    coordinator/status code and new runtime methods introduced no warnings.
+  - Release build and existing US1 production configuration validation passed.
+
 2026-07-18 - Split Directory Replica architecture and removed serial producer blocking.
 - Files changed:
   - crates/aeronyx-server/src/api/directory_chain_peer.rs

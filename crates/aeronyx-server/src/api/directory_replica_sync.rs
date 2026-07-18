@@ -13,21 +13,24 @@
 //! - Owns the hardened outbound HTTP client used for Directory Sync V1 pulls.
 //! - Starts the first synchronization round after a short deterministic jitter.
 //! - Synchronizes independent producers concurrently with a strict fan-out cap.
+//! - Applies a producer-local round deadline and exponential failure backoff.
 //! - Preserves producer-local page and request budgets on every round.
 //! - Records only bounded, privacy-safe synchronization observations.
 //! - Cancels an in-flight round when server shutdown is requested.
 //!
 //! ## Calling Relationships
 //! - `server.rs` constructs this coordinator after the replica store is audited.
-//! - `directory_chain_peer.rs` performs one authenticated page pull and import.
+//! - `directory_chain_peer.rs` independently serves authenticated inbound pulls.
+//! - `directory_replica_status.rs` exposes bounded scheduler observations.
 //! - `services/directory_replica.rs` owns durable data and runtime observations.
 //!
 //! ## Main Logical Flow
 //! 1. Validate constructor inputs and build a redirect-free bounded HTTP client.
 //! 2. Derive a stable 5-15 second startup delay from the local public identity.
 //! 3. On each tick, run at most four producer synchronization futures at once.
-//! 4. Pull pages for each producer until its page or request budget is exhausted.
-//! 5. Stop the complete round immediately when shutdown wins the select.
+//! 4. Skip producer-local retries whose bounded backoff window is still active.
+//! 5. Pull pages until the request budget or 45-second deadline is exhausted.
+//! 6. Stop the complete round immediately when shutdown wins the select.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -43,6 +46,8 @@
 //!   peer-controlled strings, endpoints, or response bodies in those reasons.
 //!
 //! ## Last Modified
+//! v0.3.0-DirectoryReplicaBackoff - Added producer-local round deadlines,
+//! exponential retry backoff, and bounded retry scheduling telemetry.
 //! v0.2.0-DirectoryReplicaClient - Owns outbound Directory Sync request,
 //! verification, hydration, and import in addition to scheduling.
 //! v0.1.0-DirectoryReplicaCoordinator - Extracted bounded concurrent scheduling
@@ -77,6 +82,10 @@ use crate::services::{
 
 /// Maximum pinned producers synchronized concurrently by one node.
 pub(crate) const DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS: usize = 4;
+/// Hard wall-clock ceiling for one producer within a synchronization round.
+pub(crate) const DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS: u64 = 45;
+/// Maximum producer-local retry delay after repeated consecutive failures.
+pub(crate) const DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS: u64 = 30 * 60;
 /// Minimum delay before the first synchronization round after startup.
 const DIRECTORY_SYNC_STARTUP_DELAY_MIN_SECS: u64 = 5;
 /// Inclusive startup jitter span: 5 + (identity byte modulo 11) = 5-15 seconds.
@@ -128,6 +137,26 @@ pub(crate) const fn should_continue_directory_replica_catch_up(
 fn directory_sync_request_count_for_objects(object_count: usize) -> u32 {
     let object_requests = object_count.div_ceil(MAX_DIRECTORY_SYNC_OBJECTS_V1);
     1u32.saturating_add(u32::try_from(object_requests).unwrap_or(u32::MAX))
+}
+
+/// Returns the retry delay after a consecutive producer failure.
+///
+/// The first failure is retried on the next ordinary tick. Later failures skip
+/// 1, 3, 7, then at most 15 nominal intervals before the hard delay cap.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+fn directory_sync_failure_backoff_delay_secs(
+    interval_secs: u64,
+    consecutive_failures: u64,
+) -> u64 {
+    if consecutive_failures <= 1 {
+        return 0;
+    }
+    let exponent = consecutive_failures.saturating_sub(1).min(4) as u32;
+    let multiplier = (1u64 << exponent).saturating_sub(1);
+    interval_secs
+        .saturating_mul(multiplier)
+        .min(DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS)
 }
 
 struct DirectoryRangePage {
@@ -233,6 +262,27 @@ impl DirectoryReplicaSyncCoordinator {
     }
 
     async fn synchronize_producer(&self, producer: [u8; 32]) {
+        let now = unix_now_secs();
+        if let Some(retry_at) = self.runtime.deferred_retry_until(&producer, now) {
+            self.runtime.record_backoff_skip(producer);
+            debug!(
+                retry_after_secs = retry_at.saturating_sub(now),
+                "[DIRECTORY_REPLICA] Producer synchronization deferred by backoff"
+            );
+            return;
+        }
+        if tokio::time::timeout(
+            Duration::from_secs(DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS),
+            self.synchronize_producer_pages(producer),
+        )
+        .await
+        .is_err()
+        {
+            self.record_producer_failure(producer, "directory_producer_round_timeout", None, None);
+        }
+    }
+
+    async fn synchronize_producer_pages(&self, producer: [u8; 32]) {
         let mut pages_completed = 0u32;
         let mut requests_used = 0u32;
         loop {
@@ -280,18 +330,46 @@ impl DirectoryReplicaSyncCoordinator {
                     }
                 }
                 Err(reason) => {
-                    self.runtime
-                        .record_failure(producer, unix_now_secs(), &reason);
-                    warn!(
-                        reason = %reason,
-                        pages_completed,
-                        requests_used,
-                        "[DIRECTORY_REPLICA] Pinned producer sync round rejected"
+                    self.record_producer_failure(
+                        producer,
+                        &reason,
+                        Some(pages_completed),
+                        Some(requests_used),
                     );
                     break;
                 }
             }
         }
+    }
+
+    fn record_producer_failure(
+        &self,
+        producer: [u8; 32],
+        reason: &str,
+        pages_completed: Option<u32>,
+        requests_used: Option<u32>,
+    ) {
+        let failed_at = unix_now_secs();
+        let consecutive_failures = self
+            .runtime
+            .consecutive_failures(&producer)
+            .saturating_add(1);
+        let retry_delay_secs = directory_sync_failure_backoff_delay_secs(
+            self.interval.as_secs(),
+            consecutive_failures,
+        );
+        let retry_not_before =
+            (retry_delay_secs > 0).then(|| failed_at.saturating_add(retry_delay_secs));
+        self.runtime
+            .record_failure(producer, failed_at, reason, retry_not_before);
+        warn!(
+            reason = %reason,
+            consecutive_failures,
+            retry_delay_secs,
+            pages_completed = ?pages_completed,
+            requests_used = ?requests_used,
+            "[DIRECTORY_REPLICA] Pinned producer sync round rejected"
+        );
     }
 }
 
@@ -690,6 +768,18 @@ mod tests {
     #[test]
     fn concurrency_cap_remains_small_and_nonzero() {
         assert!((1..=4).contains(&DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS));
+        assert!((1..120).contains(&DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn repeated_failures_use_bounded_exponential_backoff() {
+        assert_eq!(directory_sync_failure_backoff_delay_secs(120, 0), 0);
+        assert_eq!(directory_sync_failure_backoff_delay_secs(120, 1), 0);
+        assert_eq!(directory_sync_failure_backoff_delay_secs(120, 2), 120);
+        assert_eq!(directory_sync_failure_backoff_delay_secs(120, 3), 360);
+        assert_eq!(directory_sync_failure_backoff_delay_secs(120, 4), 840);
+        assert_eq!(directory_sync_failure_backoff_delay_secs(120, 5), 1_800);
+        assert_eq!(directory_sync_failure_backoff_delay_secs(120, 99), 1_800);
     }
 
     #[test]

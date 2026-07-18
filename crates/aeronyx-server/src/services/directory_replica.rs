@@ -19,7 +19,8 @@
 //!   chain producer that merely observed the conflicting public descriptors.
 //! - Audits every replica chain and index before the node may synchronize.
 //! - Exposes low-cost aggregate snapshots and privacy-safe synchronization
-//!   observations without re-running a full cryptographic audit per API read.
+//!   observations, including bounded retry state, without re-running a full
+//!   cryptographic audit per API read.
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
@@ -52,6 +53,8 @@
 //! - Keep all limits synchronized with the core Directory Sync V1 contract.
 //!
 //! ## Last Modified
+//! v0.2.2-DirectoryReplicaRetryRuntime - Added producer-local retry boundaries
+//! and backoff skip counters to process-lifetime synchronization telemetry.
 //! v0.2.1-DirectoryReplicaModuleSplit - Updated transport and status ownership.
 //! v0.2.0-DirectoryReplicaStatus - Added aggregate status snapshots and shared
 //! synchronization observations for bounded catch-up visibility.
@@ -229,6 +232,8 @@ pub struct DirectoryReplicaSyncObservation {
     pub last_failure_at: Option<u64>,
     /// Stable privacy-safe reason code from the most recent failure.
     pub last_failure_reason: Option<String>,
+    /// Earliest Unix timestamp at which this producer may be attempted again.
+    pub retry_not_before: Option<u64>,
     /// Signed remote tip height most recently observed.
     pub remote_tip_height: Option<u64>,
     /// Accepted local replica height after the most recent success.
@@ -243,6 +248,8 @@ pub struct DirectoryReplicaSyncObservation {
     pub successful_pages: u64,
     /// Total failed attempts during this process lifetime.
     pub failed_attempts: u64,
+    /// Total scheduled rounds skipped while this producer was in backoff.
+    pub backoff_skips: u64,
     /// Total new blocks committed during this process lifetime.
     pub blocks_inserted: u64,
     /// Total new commitments committed during this process lifetime.
@@ -259,6 +266,7 @@ impl DirectoryReplicaSyncObservation {
             last_success_at: None,
             last_failure_at: None,
             last_failure_reason: None,
+            retry_not_before: None,
             remote_tip_height: None,
             local_tip_height: 0,
             has_more: false,
@@ -266,6 +274,7 @@ impl DirectoryReplicaSyncObservation {
             total_attempts: 0,
             successful_pages: 0,
             failed_attempts: 0,
+            backoff_skips: 0,
             blocks_inserted: 0,
             commitments_inserted: 0,
             requests_sent: 0,
@@ -326,6 +335,7 @@ impl DirectoryReplicaSyncRuntime {
         observation.local_tip_height = local_tip_height;
         observation.has_more = has_more;
         observation.consecutive_failures = 0;
+        observation.retry_not_before = None;
         observation.successful_pages = observation.successful_pages.saturating_add(1);
         observation.blocks_inserted = observation.blocks_inserted.saturating_add(blocks_inserted);
         observation.commitments_inserted = observation
@@ -338,7 +348,13 @@ impl DirectoryReplicaSyncRuntime {
 
     /// Records one stable failure code without retaining peer endpoints,
     /// response bodies, or underlying transport error strings.
-    pub fn record_failure(&self, producer: [u8; 32], failed_at: u64, reason: &str) {
+    pub fn record_failure(
+        &self,
+        producer: [u8; 32],
+        failed_at: u64,
+        reason: &str,
+        retry_not_before: Option<u64>,
+    ) {
         let mut observations = self.observations.lock();
         let observation = observations
             .entry(producer)
@@ -346,8 +362,39 @@ impl DirectoryReplicaSyncRuntime {
         observation.last_attempt_at = Some(failed_at);
         observation.last_failure_at = Some(failed_at);
         observation.last_failure_reason = Some(reason.chars().take(96).collect());
+        observation.retry_not_before = retry_not_before.map(|value| value.max(failed_at));
         observation.consecutive_failures = observation.consecutive_failures.saturating_add(1);
         observation.failed_attempts = observation.failed_attempts.saturating_add(1);
+        drop(observations);
+    }
+
+    /// Returns the future retry boundary for one producer, if backoff is active.
+    #[must_use]
+    pub fn deferred_retry_until(&self, producer: &[u8; 32], now: u64) -> Option<u64> {
+        self.observations
+            .lock()
+            .get(producer)
+            .and_then(|observation| observation.retry_not_before)
+            .filter(|retry_at| *retry_at > now)
+    }
+
+    /// Returns the current consecutive failure count for backoff calculation.
+    #[must_use]
+    pub fn consecutive_failures(&self, producer: &[u8; 32]) -> u64 {
+        self.observations
+            .lock()
+            .get(producer)
+            .map_or(0, |observation| observation.consecutive_failures)
+    }
+
+    /// Records one timer tick intentionally skipped by producer-local backoff.
+    pub fn record_backoff_skip(&self, producer: [u8; 32]) {
+        let mut observations = self.observations.lock();
+        let observation = observations
+            .entry(producer)
+            .or_insert_with(|| DirectoryReplicaSyncObservation::new(producer));
+        observation.backoff_skips = observation.backoff_skips.saturating_add(1);
+        drop(observations);
     }
 
     /// Returns producer observations in deterministic identity order.
@@ -1850,7 +1897,9 @@ mod tests {
             producer,
             NOW + 3,
             "pinned_directory_peer_unavailable_and_reason_is_bounded",
+            Some(NOW + 123),
         );
+        runtime.record_backoff_skip(producer);
 
         let observations = runtime.snapshot();
         assert_eq!(observations.len(), 1);
@@ -1865,6 +1914,8 @@ mod tests {
         assert_eq!(observation.total_attempts, 2);
         assert_eq!(observation.successful_pages, 1);
         assert_eq!(observation.failed_attempts, 1);
+        assert_eq!(observation.retry_not_before, Some(NOW + 123));
+        assert_eq!(observation.backoff_skips, 1);
         assert_eq!(observation.blocks_inserted, 1);
         assert_eq!(observation.commitments_inserted, 4);
         assert_eq!(observation.requests_sent, 2);
@@ -1872,6 +1923,33 @@ mod tests {
             observation.last_failure_reason.as_deref(),
             Some("pinned_directory_peer_unavailable_and_reason_is_bounded")
         );
+        assert_eq!(
+            runtime.deferred_retry_until(&producer, NOW + 20),
+            Some(NOW + 123)
+        );
+        assert_eq!(runtime.deferred_retry_until(&producer, NOW + 123), None);
+        assert_eq!(runtime.consecutive_failures(&producer), 1);
+    }
+
+    #[test]
+    fn sync_runtime_success_clears_backoff_without_erasing_history() {
+        let producer = [0x45; 32];
+        let runtime = DirectoryReplicaSyncRuntime::default();
+        runtime.record_failure(
+            producer,
+            NOW,
+            "directory_range_transport_failed",
+            Some(NOW + 60),
+        );
+        runtime.record_backoff_skip(producer);
+        runtime.record_success(producer, NOW + 61, 4, 4, false, 1, 2, 1);
+
+        let observation = &runtime.snapshot()[0];
+        assert_eq!(observation.consecutive_failures, 0);
+        assert_eq!(observation.retry_not_before, None);
+        assert_eq!(observation.failed_attempts, 1);
+        assert_eq!(observation.backoff_skips, 1);
+        assert_eq!(observation.successful_pages, 1);
     }
 
     #[test]
