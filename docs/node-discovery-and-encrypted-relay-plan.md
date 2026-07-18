@@ -1151,6 +1151,34 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-19 - Added commitment-bounded multi-block Directory catch-up.
+- Files changed:
+  - crates/aeronyx-server/src/api/directory_chain_peer.rs
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Production finding:
+  - The first live carrier round recovered Korean producer evidence correctly,
+    but one-block pages advanced only three blocks per 120-second round. A cold
+    1,000-block replica would require hours before checkpoint witnessing.
+- Bounded optimization:
+  - Coordinators now request at most the existing protocol maximum of eight
+    contiguous blocks per range page.
+  - Direct and carrier responders stop the page before aggregate commitments
+    exceed 256, the existing single-block maximum. They also stop before a
+    descriptor hash repeats across blocks, preserving exact object hydration.
+  - The response body cap, object chunk size, per-peer rate limit, maximum
+    request budget (18 worst case per page), producer signatures, carrier
+    signatures, fork quarantine, and SQLite audit rules are unchanged.
+  - Older peers remain compatible because `limit=8` was already valid in the
+    Directory Sync V1 contract; only page utilization changes.
+- Verification:
+  - Unique eight-block and repeated-descriptor boundary tests passed.
+  - Peer API tests: 6/6 passed; coordinator tests: 9/9 passed.
+  - Clippy correctness gate passed.
+  - Server full suite: 1102/1102 library and 2/2 binary tests passed; the
+    auxiliary integration target passed its enabled test (9 remain ignored).
+  - Modified-file rustfmt, `git diff --check`, and release build passed.
+
 2026-07-19 - Added Directory Signed Evidence Carrier V1.
 - Files changed:
   - crates/aeronyx-core/src/protocol/discovery.rs

@@ -22,6 +22,8 @@
 //! - Exact content-addressed descriptor batches; no partial object response.
 //! - Independent checkpoint root recomputation before a signed witness decision.
 //! - Audited producer-replica export with a separate carrier signature layer.
+//! - Multi-block catch-up pages capped to one block's maximum aggregate
+//!   commitment budget and stopped before repeated descriptor objects.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` only when `DirectoryChainStore` is configured.
@@ -62,6 +64,7 @@
 //!   signature does not replace any producer block or descriptor signature.
 //!
 //! ## Last Modified
+//! v0.6.1-DirectoryBoundedMultiBlockCatchUp - Added commitment-bounded multi-block pages.
 //! v0.6.0-DirectoryEvidenceCarrier - Added audited pinned replica-carrier routes.
 //! v0.5.0-DirectoryObservationWitness - Added independently recomputed pinned-peer witness route.
 //! v0.4.0-DirectoryReplicaModuleSplit - Moved status, outbound transport, and
@@ -98,11 +101,11 @@ use aeronyx_core::protocol::discovery::{
     directory_replica_descriptor_objects_request_signing_bytes,
     directory_replica_descriptor_objects_response_signing_bytes,
     directory_tip_request_signing_bytes, directory_tip_response_signing_bytes,
-    encode_directory_sync_message, DirectoryObservationCheckpointV1, DirectorySyncMessage,
-    AERONYX_DIRECTORY_MAINNET_CHAIN_ID, DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
-    DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
-    DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1, MAX_DIRECTORY_SYNC_BLOCKS_V1,
-    MAX_DIRECTORY_SYNC_OBJECTS_V1,
+    encode_directory_sync_message, DirectoryCommitmentBlockV1, DirectoryObservationCheckpointV1,
+    DirectorySyncMessage, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+    DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
+    DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1, MAX_DIRECTORY_COMMITMENTS_PER_BLOCK,
+    MAX_DIRECTORY_SYNC_BLOCKS_V1, MAX_DIRECTORY_SYNC_OBJECTS_V1,
 };
 
 use crate::services::{
@@ -279,6 +282,36 @@ fn decode_request(body: &[u8]) -> Result<DirectorySyncMessage, Response> {
     Ok(message)
 }
 
+fn bounded_directory_transport_blocks(
+    blocks: Vec<DirectoryCommitmentBlockV1>,
+) -> Vec<DirectoryCommitmentBlockV1> {
+    let mut commitment_count = 0usize;
+    let mut descriptor_hashes = HashSet::new();
+    let mut accepted = 0usize;
+    for block in &blocks {
+        let Some(next_count) = commitment_count.checked_add(block.commitments.len()) else {
+            break;
+        };
+        if next_count > MAX_DIRECTORY_COMMITMENTS_PER_BLOCK
+            || block
+                .commitments
+                .iter()
+                .any(|commitment| descriptor_hashes.contains(&commitment.descriptor_hash))
+        {
+            break;
+        }
+        descriptor_hashes.extend(
+            block
+                .commitments
+                .iter()
+                .map(|commitment| commitment.descriptor_hash),
+        );
+        commitment_count = next_count;
+        accepted = accepted.saturating_add(1);
+    }
+    blocks.into_iter().take(accepted).collect()
+}
+
 async fn tip_handler(State(state): State<DirectoryChainPeerState>, body: Bytes) -> Response {
     let message = match decode_request(&body) {
         Ok(message) => message,
@@ -403,8 +436,8 @@ async fn block_range_handler(
         Ok(Err(error)) => return store_error_response(&error),
         Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
     };
-    let has_more = page
-        .blocks
+    let blocks = bounded_directory_transport_blocks(page.blocks);
+    let has_more = blocks
         .last()
         .is_some_and(|block| block.header.height < page.tip_height);
     let responder = state.identity.public_key_bytes();
@@ -413,13 +446,13 @@ async fn block_range_handler(
         &request_id,
         &responder,
         response_timestamp,
-        &page.blocks,
+        &blocks,
         has_more,
         page.tip_height,
         &page.tip_hash,
     );
     debug!(
-        blocks = page.blocks.len(),
+        blocks = blocks.len(),
         has_more,
         tip_height = page.tip_height,
         "[DIRECTORY_CHAIN] Served authenticated bounded block page"
@@ -429,7 +462,7 @@ async fn block_range_handler(
         request_id,
         responder,
         response_timestamp,
-        blocks: page.blocks,
+        blocks,
         has_more,
         tip_height: page.tip_height,
         tip_hash: page.tip_hash,
@@ -592,8 +625,8 @@ async fn replica_block_range_handler(
         Ok(Err(error)) => return replica_store_error_response(&error),
         Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
     };
-    let has_more = page
-        .blocks
+    let blocks = bounded_directory_transport_blocks(page.blocks);
+    let has_more = blocks
         .last()
         .is_some_and(|block| block.header.height < page.tip_height);
     let carrier = state.identity.public_key_bytes();
@@ -604,13 +637,13 @@ async fn replica_block_range_handler(
         &producer,
         &carrier,
         response_timestamp,
-        &page.blocks,
+        &blocks,
         has_more,
         page.tip_height,
         &page.tip_hash,
     );
     debug!(
-        blocks = page.blocks.len(),
+        blocks = blocks.len(),
         has_more,
         tip_height = page.tip_height,
         "[DIRECTORY_CHAIN] Served audited replica evidence page"
@@ -621,7 +654,7 @@ async fn replica_block_range_handler(
         producer,
         carrier,
         response_timestamp,
-        blocks: page.blocks,
+        blocks,
         has_more,
         tip_height: page.tip_height,
         tip_hash: page.tip_hash,
@@ -1428,6 +1461,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(objects, vec![expected_object]);
+    }
+
+    #[test]
+    fn transport_page_accepts_eight_unique_blocks_and_stops_before_duplicate_objects() {
+        let now = now_secs();
+        let producer = IdentityKeyPair::from_bytes(&[0xe1; 32]).unwrap();
+        let mut blocks = Vec::new();
+        let mut previous_hash = [0u8; 32];
+        for offset in 1u8..=8 {
+            let subject = IdentityKeyPair::from_bytes(&[offset; 32]).unwrap();
+            let object = signed_descriptor(&subject, now);
+            let commitment =
+                DirectoryDescriptorCommitmentV1::from_signed_descriptor(&object).unwrap();
+            let block = DirectoryCommitmentBlockV1::new_signed(
+                u64::from(offset),
+                now + u64::from(offset),
+                previous_hash,
+                vec![commitment],
+                &producer,
+            )
+            .unwrap();
+            previous_hash = block.hash();
+            blocks.push(block);
+        }
+        assert_eq!(bounded_directory_transport_blocks(blocks.clone()).len(), 8);
+
+        let repeated_commitment = blocks[0].commitments[0];
+        let duplicate = DirectoryCommitmentBlockV1::new_signed(
+            2,
+            blocks[0].header.timestamp + 1,
+            blocks[0].hash(),
+            vec![repeated_commitment],
+            &producer,
+        )
+        .unwrap();
+        assert_eq!(
+            bounded_directory_transport_blocks(vec![blocks[0].clone(), duplicate]).len(),
+            1
+        );
     }
 
     #[tokio::test]

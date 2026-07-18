@@ -24,6 +24,8 @@
 //!   audited local checkpoint and persists accepted receipts idempotently.
 //! - Tries the producer directly first, then uses another pinned node as an
 //!   audited evidence carrier only for bounded availability/admission failures.
+//! - Requests up to eight contiguous blocks per page while the peer-side
+//!   commitment cap preserves the original hydration/body budget.
 //! - Cancels an in-flight round when server shutdown is requested.
 //!
 //! ## Calling Relationships
@@ -65,6 +67,7 @@
 //!   signature, or descriptor-hash response; these are security failures.
 //!
 //! ## Last Modified
+//! `v0.7.1-DirectoryBoundedMultiBlockCatchUp` - Raised bounded page width without raising commitment/request ceilings.
 //! `v0.7.0-DirectoryEvidenceCarrier` - Added direct-first audited carrier fallback and dual-layer verification.
 //! `v0.6.0-DirectoryObservationWitness` - Added bounded external recomputation rounds and durable receipts.
 //! `v0.5.0-DirectoryObservationCheckpoints` - Added all-producer round gating
@@ -98,7 +101,7 @@ use aeronyx_core::protocol::discovery::{
     SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
     DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
     DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1, MAX_DIRECTORY_COMMITMENTS_PER_BLOCK,
-    MAX_DIRECTORY_SYNC_OBJECTS_V1,
+    MAX_DIRECTORY_SYNC_BLOCKS_V1, MAX_DIRECTORY_SYNC_OBJECTS_V1,
 };
 use futures::{stream, StreamExt};
 use rand::RngCore;
@@ -131,9 +134,11 @@ const DIRECTORY_SYNC_STARTUP_DELAY_SPAN_SECS: u64 = 11;
 const DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS: u64 = 60;
 /// Hard response ceiling shared with the core Directory Sync decoder.
 const MAX_DIRECTORY_SYNC_RESPONSE_BODY_BYTES: usize = 512 * 1024;
-/// One block per outbound page bounds object hydration and inbound rate use.
-const OUTBOUND_BLOCKS_PER_PAGE: u16 = 1;
-/// One range request plus maximum descriptor-object chunks for one block.
+/// Multi-block pages accelerate cold catch-up. Peer handlers cap each returned
+/// page to one block's maximum aggregate commitment budget, so hydration keeps
+/// the same body and request ceiling as the original one-block transport.
+const OUTBOUND_BLOCKS_PER_PAGE: u16 = MAX_DIRECTORY_SYNC_BLOCKS_V1;
+/// One failed direct range, one carrier range, and bounded object chunks.
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) const DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE: u32 =
     2 + MAX_DIRECTORY_COMMITMENTS_PER_BLOCK.div_ceil(MAX_DIRECTORY_SYNC_OBJECTS_V1) as u32;
@@ -1469,6 +1474,7 @@ mod tests {
     fn concurrency_cap_remains_small_and_nonzero() {
         assert!((1..=4).contains(&DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS));
         assert!((1..120).contains(&DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS));
+        assert_eq!(OUTBOUND_BLOCKS_PER_PAGE, MAX_DIRECTORY_SYNC_BLOCKS_V1);
     }
 
     #[test]
