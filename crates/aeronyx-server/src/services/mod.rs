@@ -53,7 +53,8 @@ pub use directory_chain::{
 };
 pub(crate) use directory_replica::MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE;
 pub use directory_replica::{
-    DirectoryObservationCheckpointAppendReport, DirectoryReplicaAudit,
+    DirectoryObservationCheckpointAppendReport, DirectoryObservationWitnessDecision,
+    DirectoryReplicaAudit,
     DirectoryReplicaImportReport, DirectoryReplicaIncidentEvidence, DirectoryReplicaIncidentPage,
     DirectoryReplicaIncidentSummary, DirectoryReplicaObservationConvergenceSnapshot,
     DirectoryReplicaProducerSnapshot, DirectoryReplicaResolutionCommand,

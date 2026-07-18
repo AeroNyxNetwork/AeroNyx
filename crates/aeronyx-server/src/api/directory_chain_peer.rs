@@ -13,10 +13,12 @@
 //! - `POST /api/discovery/peer/directory/tip`
 //! - `POST /api/discovery/peer/directory/block-range`
 //! - `POST /api/discovery/peer/directory/descriptor-objects`
+//! - `POST /api/discovery/peer/directory/observation-checkpoint-witness`
 //! - Dedicated operator-pinned admission in addition to live `PeerStore` proof.
 //! - Ed25519 request/response authentication, timestamp freshness, replay
 //!   rejection, per-peer rate limits, body limits, and audit-gated reads.
 //! - Exact content-addressed descriptor batches; no partial object response.
+//! - Independent checkpoint root recomputation before a signed witness decision.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` only when `DirectoryChainStore` is configured.
@@ -32,6 +34,8 @@
 //! 4. A blocking worker performs the complete local chain audit and bounded read.
 //! 5. The local producer signs a response binding request id, ordered hashes,
 //!    returned block identities, and the audited tip.
+//! 6. A witness response is accepted only after the local replica store
+//!    independently reproduces every exact prefix and observation root.
 //!
 //! ## Privacy Invariant
 //! This API serves signed public node-directory commitments and the public
@@ -47,8 +51,11 @@
 //! - Keep request/response limits synchronized with `aeronyx-core` constants.
 //! - Replica import, fork quarantine, and fork choice are separate layers. A
 //!   valid response proves what one producer signed; it is not consensus.
+//! - Never sign an accepted witness response from the observer signature alone.
+//!   Missing local prefixes must remain unavailable, never trusted by fallback.
 //!
 //! ## Last Modified
+//! v0.5.0-DirectoryObservationWitness - Added independently recomputed pinned-peer witness route.
 //! v0.4.0-DirectoryReplicaModuleSplit - Moved status, outbound transport, and
 //! scheduling into dedicated modules without changing Directory Sync V1.
 //! v0.3.0-DirectoryReplicaStatus - Added privacy-tiered status and bounded
@@ -75,13 +82,20 @@ use aeronyx_core::protocol::discovery::{
     decode_directory_sync_message, directory_block_range_request_signing_bytes,
     directory_block_range_response_signing_bytes,
     directory_descriptor_objects_request_signing_bytes,
-    directory_descriptor_objects_response_signing_bytes, directory_tip_request_signing_bytes,
-    directory_tip_response_signing_bytes, encode_directory_sync_message, DirectorySyncMessage,
-    AERONYX_DIRECTORY_MAINNET_CHAIN_ID, MAX_DIRECTORY_SYNC_BLOCKS_V1,
+    directory_descriptor_objects_response_signing_bytes,
+    directory_observation_witness_request_signing_bytes,
+    directory_observation_witness_response_signing_bytes, directory_tip_request_signing_bytes,
+    directory_tip_response_signing_bytes, encode_directory_sync_message,
+    DirectoryObservationCheckpointV1, DirectorySyncMessage, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+    DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
+    DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1, MAX_DIRECTORY_SYNC_BLOCKS_V1,
     MAX_DIRECTORY_SYNC_OBJECTS_V1,
 };
 
-use crate::services::{DirectoryChainStore, DirectoryChainStoreError, PeerStore};
+use crate::services::{
+    DirectoryChainStore, DirectoryChainStoreError, DirectoryObservationWitnessDecision,
+    DirectoryReplicaStore, DirectoryReplicaStoreError, PeerStore,
+};
 
 /// A request contains at most sixteen hashes plus fixed signatures and fields.
 const MAX_DIRECTORY_SYNC_REQUEST_BODY_BYTES: usize = 16 * 1024;
@@ -94,6 +108,7 @@ const REPLAY_RETENTION_SECS: u64 = 120;
 #[derive(Clone)]
 struct DirectoryChainPeerState {
     store: Arc<DirectoryChainStore>,
+    replica_store: Option<Arc<DirectoryReplicaStore>>,
     peer_store: Arc<PeerStore>,
     identity: Arc<IdentityKeyPair>,
     pinned_peers: Arc<HashSet<[u8; 32]>>,
@@ -143,14 +158,35 @@ pub fn build_directory_chain_peer_router(
     identity: Arc<IdentityKeyPair>,
     pinned_peer_ids: Vec<[u8; 32]>,
 ) -> Router {
+    build_directory_chain_peer_router_with_replica(
+        store,
+        None,
+        peer_store,
+        identity,
+        pinned_peer_ids,
+    )
+}
+
+/// Builds the peer router with independent observation-checkpoint witnessing.
+///
+/// Passing `None` preserves the pre-witness route surface. The witness route is
+/// mounted only when a startup-audited producer-isolated replica store exists.
+pub fn build_directory_chain_peer_router_with_replica(
+    store: Arc<DirectoryChainStore>,
+    replica_store: Option<Arc<DirectoryReplicaStore>>,
+    peer_store: Arc<PeerStore>,
+    identity: Arc<IdentityKeyPair>,
+    pinned_peer_ids: Vec<[u8; 32]>,
+) -> Router {
     let state = DirectoryChainPeerState {
         store,
+        replica_store,
         peer_store,
         identity,
         pinned_peers: Arc::new(pinned_peer_ids.into_iter().collect()),
         guard: Arc::new(Mutex::new(DirectoryPeerRequestGuard::default())),
     };
-    Router::new()
+    let mut router = Router::new()
         .route("/api/discovery/peer/directory/tip", post(tip_handler))
         .route(
             "/api/discovery/peer/directory/block-range",
@@ -159,7 +195,14 @@ pub fn build_directory_chain_peer_router(
         .route(
             "/api/discovery/peer/directory/descriptor-objects",
             post(descriptor_objects_handler),
-        )
+        );
+    if state.replica_store.is_some() {
+        router = router.route(
+            "/api/discovery/peer/directory/observation-checkpoint-witness",
+            post(observation_checkpoint_witness_handler),
+        );
+    }
+    router
         .layer(DefaultBodyLimit::max(MAX_DIRECTORY_SYNC_REQUEST_BODY_BYTES))
         .with_state(state)
 }
@@ -458,6 +501,152 @@ async fn descriptor_objects_handler(
     })
 }
 
+async fn observation_checkpoint_witness_handler(
+    State(state): State<DirectoryChainPeerState>,
+    body: Bytes,
+) -> Response {
+    let message = match decode_request(&body) {
+        Ok(message) => message,
+        Err(response) => return response,
+    };
+    let DirectorySyncMessage::ObservationCheckpointWitnessRequestV1 {
+        chain_id,
+        request_id,
+        requester,
+        request_timestamp,
+        checkpoint,
+        signature,
+    } = message
+    else {
+        return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
+    };
+    if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+        || requester != checkpoint.observer
+        || requester == state.identity.public_key_bytes()
+    {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_witness_request");
+    }
+    let checkpoint_hash = checkpoint.hash();
+    let now = now_secs();
+    let signing_bytes = directory_observation_witness_request_signing_bytes(
+        &chain_id,
+        &request_id,
+        &requester,
+        request_timestamp,
+        &checkpoint_hash,
+    );
+    if let Err(response) = authenticate_request(
+        &state,
+        requester,
+        request_id,
+        request_timestamp,
+        &signing_bytes,
+        &signature,
+        now,
+    )
+    .await
+    {
+        return response;
+    }
+    let checkpoint_sequence = checkpoint.sequence;
+    let decision = match independently_evaluate_checkpoint(&state, &checkpoint, now).await {
+        Ok(decision) => decision,
+        Err(response) => return response,
+    };
+    let outcome = match decision {
+        DirectoryObservationWitnessDecision::Accepted => DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+        DirectoryObservationWitnessDecision::EvidenceUnavailable => {
+            DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1
+        }
+        DirectoryObservationWitnessDecision::EvidenceConflict => {
+            DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1
+        }
+    };
+    let responder = state.identity.public_key_bytes();
+    let response_timestamp = now_secs();
+    let response_signing_bytes = directory_observation_witness_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &requester,
+        checkpoint_sequence,
+        &checkpoint_hash,
+        &responder,
+        response_timestamp,
+        outcome,
+    );
+    debug!(
+        accepted = outcome == DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+        checkpoint_sequence,
+        "[DIRECTORY_CHAIN] Evaluated authenticated observation checkpoint witness"
+    );
+    encoded_response(
+        DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
+            chain_id,
+            request_id,
+            observer: requester,
+            checkpoint_sequence,
+            checkpoint_hash,
+            responder,
+            response_timestamp,
+            outcome,
+            signature: state.identity.sign(&response_signing_bytes),
+        },
+    )
+}
+
+async fn independently_evaluate_checkpoint(
+    state: &DirectoryChainPeerState,
+    checkpoint: &DirectoryObservationCheckpointV1,
+    now: u64,
+) -> Result<DirectoryObservationWitnessDecision, Response> {
+    let Some(replica_store) = state.replica_store.as_ref().map(Arc::clone) else {
+        return Err(protocol_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "replica_store_disabled",
+        ));
+    };
+    let chain_store = Arc::clone(&state.store);
+    match tokio::task::spawn_blocking(move || chain_store.audit(now)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            warn!(error = %error, "[DIRECTORY_CHAIN] Local producer audit failed closed");
+            return Err(protocol_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "chain_not_verified",
+            ));
+        }
+        Err(_) => {
+            return Err(protocol_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "audit_task_failed",
+            ))
+        }
+    }
+    let checkpoint = checkpoint.clone();
+    match tokio::task::spawn_blocking(move || {
+        replica_store.evaluate_observation_checkpoint_witness(&checkpoint, now)
+    })
+    .await
+    {
+        Ok(Ok(decision)) => Ok(decision),
+        Ok(Err(DirectoryReplicaStoreError::Request(_))) => Err(protocol_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_checkpoint",
+        )),
+        Ok(Err(error)) => {
+            warn!(error = %error, "[DIRECTORY_CHAIN] Witness recomputation failed closed");
+            Err(protocol_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "replica_not_verified",
+            ))
+        }
+        Err(_) => Err(protocol_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit_task_failed",
+        )),
+    }
+}
+
 fn encoded_response(message: DirectorySyncMessage) -> Response {
     match encode_directory_sync_message(&message) {
         Ok(encoded) => (
@@ -507,7 +696,8 @@ mod tests {
         verify_block_range_response, verify_descriptor_objects_response,
     };
     use aeronyx_core::protocol::discovery::{
-        directory_tip_response_signing_bytes, DirectoryDescriptorCommitmentV1, NodeDescriptor,
+        directory_tip_response_signing_bytes, DirectoryDescriptorCommitmentV1,
+        DirectoryObservationCheckpointV1, DirectoryObservationTipV1, NodeDescriptor,
         SignedNodeDescriptor,
     };
     use tempfile::TempDir;
@@ -588,6 +778,45 @@ mod tests {
             signature: requester.sign(&signing_bytes),
         })
         .unwrap()
+    }
+
+    fn witness_test_router() -> (Router, Arc<IdentityKeyPair>, IdentityKeyPair) {
+        let now = now_secs();
+        let witness = Arc::new(IdentityKeyPair::from_bytes(&[0xc1; 32]).unwrap());
+        let observer = IdentityKeyPair::from_bytes(&[0xc2; 32]).unwrap();
+        let peer_store = Arc::new(PeerStore::new());
+        peer_store
+            .upsert_verified_from_source(
+                signed_descriptor(&observer, now),
+                now,
+                "directory_witness_test",
+            )
+            .unwrap();
+        let temp = TempDir::new().unwrap();
+        let root = temp.keep();
+        let (chain_store, _) = DirectoryChainStore::open(
+            root.join("directory-chain.db"),
+            witness.public_key_bytes(),
+            now,
+        )
+        .unwrap();
+        let (replica_store, _) = DirectoryReplicaStore::open(
+            root.join("directory-replica.db"),
+            witness.public_key_bytes(),
+            now,
+        )
+        .unwrap();
+        (
+            build_directory_chain_peer_router_with_replica(
+                Arc::new(chain_store),
+                Some(Arc::new(replica_store)),
+                peer_store,
+                Arc::clone(&witness),
+                vec![observer.public_key_bytes()],
+            ),
+            witness,
+            observer,
+        )
     }
 
     #[tokio::test]
@@ -780,5 +1009,100 @@ mod tests {
         };
         assert_eq!(descriptor_hashes, vec![descriptor_hash]);
         assert_eq!(objects, vec![expected_descriptor]);
+    }
+
+    #[tokio::test]
+    async fn witness_route_signs_unavailable_instead_of_trusting_observer() {
+        let (router, witness, observer) = witness_test_router();
+        let now = now_secs();
+        let producer_a = IdentityKeyPair::from_bytes(&[0xc3; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0xc4; 32]).unwrap();
+        let checkpoint = DirectoryObservationCheckpointV1::new_signed(
+            1,
+            now,
+            [0u8; 32],
+            2,
+            vec![
+                DirectoryObservationTipV1 {
+                    producer: producer_a.public_key_bytes(),
+                    tip_height: 1,
+                    tip_hash: [0xc5; 32],
+                },
+                DirectoryObservationTipV1 {
+                    producer: producer_b.public_key_bytes(),
+                    tip_height: 1,
+                    tip_hash: [0xc6; 32],
+                },
+            ],
+            [0xc7; 32],
+            &observer,
+        )
+        .unwrap();
+        let request_id = [0xc8; 16];
+        let checkpoint_hash = checkpoint.hash();
+        let signing_bytes = directory_observation_witness_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &observer.public_key_bytes(),
+            now,
+            &checkpoint_hash,
+        );
+        let request = encode_directory_sync_message(
+            &DirectorySyncMessage::ObservationCheckpointWitnessRequestV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                request_id,
+                requester: observer.public_key_bytes(),
+                request_timestamp: now,
+                checkpoint,
+                signature: observer.sign(&signing_bytes),
+            },
+        )
+        .unwrap();
+        let response = router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/observation-checkpoint-witness")
+                    .body(Body::from(request))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 512 * 1024).await.unwrap();
+        let message = decode_directory_sync_message(&body).unwrap();
+        let DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
+            observer: response_observer,
+            checkpoint_sequence,
+            checkpoint_hash: response_checkpoint_hash,
+            responder,
+            response_timestamp,
+            outcome,
+            signature,
+            ..
+        } = message
+        else {
+            panic!("unexpected response");
+        };
+        assert_eq!(response_observer, observer.public_key_bytes());
+        assert_eq!(checkpoint_sequence, 1);
+        assert_eq!(response_checkpoint_hash, checkpoint_hash);
+        assert_eq!(responder, witness.public_key_bytes());
+        assert_eq!(
+            outcome,
+            DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1
+        );
+        let response_signing = directory_observation_witness_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &response_observer,
+            checkpoint_sequence,
+            &response_checkpoint_hash,
+            &responder,
+            response_timestamp,
+            outcome,
+        );
+        IdentityPublicKey::from_bytes(&responder)
+            .unwrap()
+            .verify(&response_signing, &signature)
+            .unwrap();
     }
 }

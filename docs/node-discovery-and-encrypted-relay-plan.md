@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.18.0 - Added observer-signed, hash-linked Directory observation checkpoints after complete authenticated multi-producer synchronization, with fail-closed schema v4 persistence and startup recomputation.
+Modification Reason: v0.19.0 - Added cross-node Directory observation checkpoint witness V1 with independent replica recomputation, signed receipts, fail-closed schema v5 persistence, and startup receipt audit.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.18.0 - Added signed local observation checkpoints binding exact producer tips and recomputable recent commitment overlap without introducing votes, consensus, or finality.
+Last Modified: v0.19.0 - Added independently recomputed external checkpoint witness receipts without introducing votes, quorum, consensus, or finality.
+Previous: v0.18.0 - Added signed local observation checkpoints binding exact producer tips and recomputable recent commitment overlap without introducing votes, consensus, or finality.
 Previous: v0.17.0 - Added signed host-local quarantine resolution, exact active-incident/tip CAS, linked resolution history, and startup tamper detection.
 Previous: v0.16.0 - Added bounded incident pagination and canonical producer-signed evidence export with verification on every read.
 Previous: v0.15.0 - Added recent signed-commitment overlap and an operator-only deterministic observation root.
@@ -1150,6 +1151,72 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-19 - Added cross-node Directory observation checkpoint witness V1.
+- Files changed:
+  - crates/aeronyx-core/src/protocol/discovery.rs
+  - crates/aeronyx-server/src/api/directory_chain_peer.rs
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - crates/aeronyx-server/src/services/mod.rs
+  - crates/aeronyx-server/src/server.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Protocol contract:
+  - Appended `ObservationCheckpointWitnessRequestV1` and
+    `ObservationCheckpointWitnessResponseV1` after every existing bincode enum
+    variant, preserving old Directory Sync discriminants.
+  - The request carries one bounded canonical checkpoint and signs its exact
+    hash, request id, observer identity, chain id, and timestamp.
+  - The response signs the exact checkpoint hash and observer sequence,
+    request id, witness identity, timestamp, and one stable outcome:
+    `accepted`, `evidence_unavailable`, or `evidence_conflict`.
+- Independent verification invariant:
+  - The witness first verifies checkpoint structure, chain id, observer
+    identity, timestamp, and Ed25519 signature.
+  - Signature validity alone is never acceptance. The witness then reads its
+    own audited local producer chain plus producer-isolated SQLite replicas,
+    requires every exact producer block hash at every referenced height, and
+    recomputes the overlap root locally. This mixed-source rule is required
+    because a node does not redundantly mirror its own producer chain into its
+    remote-replica namespace.
+  - A missing prefix returns signed `evidence_unavailable`; a retained hash or
+    recomputed-root mismatch returns signed `evidence_conflict`. Neither is
+    persisted by the observer as accepted evidence.
+- Admission and transport:
+  - `POST /api/discovery/peer/directory/observation-checkpoint-witness` uses the
+    existing bilateral `directory_chain_sync_peer_node_ids` pins, current
+    signed PeerStore descriptor, request timestamp window, Ed25519 request
+    signature, replay id, body cap, and per-peer rate limit.
+  - The pre-witness router builder remains available for compatibility. The
+    witness route is mounted only when a startup-audited replica store exists.
+  - After a complete synchronized producer round, the coordinator retries a
+    bounded witness round for the latest audited checkpoint. Older peers may
+    return 404 without blocking producer synchronization or checkpoint append.
+- Persistence and restart audit:
+  - SQLite schema v5 adds
+    `directory_observation_checkpoint_witnesses`; schema v1-v4 migrations are
+    transactional and preserve all prior producer, incident, resolution,
+    retry, and checkpoint evidence.
+  - One witness may retain only one checkpoint hash for an observer sequence;
+    exact repeated receipts are idempotent and conflicting hashes fail closed.
+  - Startup streams every receipt, canonicalizes its frame, verifies row/object
+    equality, local checkpoint linkage, timestamps, accepted outcome, witness
+    identity, and Ed25519 signature before the node may start.
+- Observability and privacy:
+  - Public/operator status adds only aggregate receipt count, latest witnessed
+    sequence, witness count for that sequence, and whether the current local
+    checkpoint has external evidence. Witness identities, request ids,
+    signatures, checkpoint hashes, endpoints, and producer identities remain
+    absent.
+  - A receipt proves one external node independently recomputed one exact
+    checkpoint. It is not a vote, quorum certificate, fork choice, consensus,
+    financial block, or finality claim.
+- Verification:
+  - Core canonical/signature witness tests passed.
+  - Independent-evidence, unavailable/conflict, idempotency, tamper/restart,
+    schema-v4 migration, authenticated route, outbound response, and public
+    redaction tests passed.
+
 2026-07-19 - Added signed Directory observation checkpoint continuity.
 - Files changed:
   - crates/aeronyx-core/src/protocol/discovery.rs

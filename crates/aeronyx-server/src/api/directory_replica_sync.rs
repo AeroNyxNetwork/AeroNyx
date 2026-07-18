@@ -20,6 +20,8 @@
 //! - Records only bounded, privacy-safe synchronization observations.
 //! - Persists one signed observation checkpoint only after every pinned
 //!   producer reaches its authenticated remote tip in the same round.
+//! - Requests independently recomputed signed witness receipts for the latest
+//!   audited local checkpoint and persists accepted receipts idempotently.
 //! - Cancels an in-flight round when server shutdown is requested.
 //!
 //! ## Calling Relationships
@@ -37,7 +39,9 @@
 //! 6. Persist failures, and let a successful import atomically clear backoff.
 //! 7. If every producer reaches its signed tip, append an idempotent local
 //!    observation checkpoint from a blocking worker.
-//! 8. Stop the complete round immediately when shutdown wins the select.
+//! 8. Ask pinned peers to independently recompute that checkpoint; persist only
+//!    canonical accepted receipts, never trust an unavailable/conflict result.
+//! 9. Stop the complete round immediately when shutdown wins the select.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -51,8 +55,11 @@
 //! - The deterministic startup delay is part of restart-storm protection.
 //! - Stable failure reason buckets may be exposed by the status API. Never place
 //!   peer-controlled strings, endpoints, or response bodies in those reasons.
+//! - Witness receipts are external recomputation evidence, not votes, quorum,
+//!   fork choice, consensus, or finality.
 //!
 //! ## Last Modified
+//! `v0.6.0-DirectoryObservationWitness` - Added bounded external recomputation rounds and durable receipts.
 //! `v0.5.0-DirectoryObservationCheckpoints` - Added all-producer round gating
 //! and signed, idempotent checkpoint persistence after authenticated catch-up.
 //! `v0.4.0-DirectoryReplicaDurableBackoff` - Restored audited `SQLite` retry state
@@ -73,9 +80,13 @@ use aeronyx_core::protocol::discovery::{
     decode_directory_sync_message, directory_block_range_request_signing_bytes,
     directory_block_range_response_signing_bytes,
     directory_descriptor_objects_request_signing_bytes,
-    directory_descriptor_objects_response_signing_bytes, encode_directory_sync_message,
-    DirectoryCommitmentBlockV1, DirectorySyncMessage, SignedNodeDescriptor,
-    AERONYX_DIRECTORY_MAINNET_CHAIN_ID, MAX_DIRECTORY_COMMITMENTS_PER_BLOCK,
+    directory_descriptor_objects_response_signing_bytes,
+    directory_observation_witness_request_signing_bytes,
+    directory_observation_witness_response_signing_bytes, encode_directory_sync_message,
+    DirectoryCommitmentBlockV1, DirectoryObservationCheckpointV1, DirectorySyncMessage,
+    SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+    DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
+    DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1, MAX_DIRECTORY_COMMITMENTS_PER_BLOCK,
     MAX_DIRECTORY_SYNC_OBJECTS_V1,
 };
 use futures::{stream, StreamExt};
@@ -393,6 +404,7 @@ impl DirectoryReplicaSyncCoordinator {
                     producer_count = report.producer_count,
                     "[DIRECTORY_REPLICA] Complete observation checkpoint evaluated"
                 );
+                self.witness_latest_observation_checkpoint().await;
             }
             Ok(Err(_)) | Err(_) => {
                 warn!(
@@ -401,6 +413,53 @@ impl DirectoryReplicaSyncCoordinator {
                 );
             }
         }
+    }
+
+    async fn witness_latest_observation_checkpoint(&self) {
+        let store = Arc::clone(&self.store);
+        let observed_at = unix_now_secs();
+        let checkpoint = match tokio::task::spawn_blocking(move || {
+            store.latest_audited_observation_checkpoint(observed_at)
+        })
+        .await
+        {
+            Ok(Ok(Some(checkpoint))) => checkpoint,
+            Ok(Ok(None)) => return,
+            Ok(Err(_)) | Err(_) => {
+                warn!(
+                    reason = "directory_observation_checkpoint_audit_failed",
+                    "[DIRECTORY_REPLICA] External witness round skipped"
+                );
+                return;
+            }
+        };
+        let outcomes = stream::iter(self.peers.iter().copied())
+            .map(|witness| {
+                let checkpoint = checkpoint.clone();
+                async move {
+                    request_observation_checkpoint_witness(
+                        Arc::clone(&self.store),
+                        self.peer_store.as_ref(),
+                        self.identity.as_ref(),
+                        &witness,
+                        &self.client,
+                        checkpoint,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS)
+            .collect::<Vec<_>>()
+            .await;
+        let accepted = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        let failed = outcomes.len().saturating_sub(accepted);
+        debug!(
+            checkpoint_sequence = checkpoint.sequence,
+            configured_witnesses = outcomes.len(),
+            accepted,
+            failed,
+            "[DIRECTORY_REPLICA] Bounded observation checkpoint witness round completed"
+        );
     }
 
     async fn record_producer_failure(
@@ -461,6 +520,146 @@ impl DirectoryReplicaSyncCoordinator {
             );
         }
         durable
+    }
+}
+
+async fn request_observation_checkpoint_witness(
+    store: Arc<DirectoryReplicaStore>,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    witness: &[u8; 32],
+    client: &reqwest::Client,
+    checkpoint: DirectoryObservationCheckpointV1,
+) -> Result<bool, String> {
+    let request_timestamp = unix_now_secs();
+    let descriptor = peer_store
+        .get_valid(witness, request_timestamp)
+        .ok_or_else(|| "observation_witness_peer_unavailable".to_string())?;
+    let endpoint = descriptor
+        .descriptor
+        .public_endpoint
+        .as_deref()
+        .ok_or_else(|| "observation_witness_peer_missing_endpoint".to_string())?;
+    if !commitment_peer_endpoint_is_public(endpoint) {
+        return Err("observation_witness_peer_unsafe_endpoint".to_string());
+    }
+    let url = commitment_peer_url(
+        endpoint,
+        "/api/discovery/peer/directory/observation-checkpoint-witness",
+    )
+    .map_err(|_| "observation_witness_peer_invalid_endpoint".to_string())?;
+    let mut request_id = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut request_id);
+    let requester = identity.public_key_bytes();
+    let checkpoint_sequence = checkpoint.sequence;
+    let checkpoint_hash = checkpoint.hash();
+    let signing_bytes = directory_observation_witness_request_signing_bytes(
+        &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+        &request_id,
+        &requester,
+        request_timestamp,
+        &checkpoint_hash,
+    );
+    let request = DirectorySyncMessage::ObservationCheckpointWitnessRequestV1 {
+        chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+        request_id,
+        requester,
+        request_timestamp,
+        checkpoint,
+        signature: identity.sign(&signing_bytes),
+    };
+    let frame = encode_directory_sync_message(&request)
+        .map_err(|_| "observation_witness_request_encode_failed".to_string())?;
+    let response = post_directory_frame(client, url, frame, "observation_witness").await?;
+    let verified = verify_observation_witness_response(
+        &response,
+        &request_id,
+        &requester,
+        witness,
+        request_timestamp,
+        checkpoint_sequence,
+        &checkpoint_hash,
+    )?;
+    let durable = tokio::task::spawn_blocking(move || {
+        store.persist_observation_checkpoint_witness(&verified, unix_now_secs())
+    })
+    .await
+    .map_err(|_| "observation_witness_persist_task_failed".to_string())?
+    .map_err(|_| "observation_witness_persist_rejected".to_string())?;
+    Ok(durable)
+}
+
+pub(crate) fn verify_observation_witness_response(
+    frame: &[u8],
+    expected_request_id: &[u8; 16],
+    expected_observer: &[u8; 32],
+    expected_witness: &[u8; 32],
+    request_timestamp: u64,
+    expected_checkpoint_sequence: u64,
+    expected_checkpoint_hash: &[u8; 32],
+) -> Result<DirectorySyncMessage, String> {
+    let response = decode_directory_sync_message(frame)
+        .map_err(|_| "observation_witness_response_decode_failed".to_string())?;
+    let canonical = encode_directory_sync_message(&response)
+        .map_err(|_| "observation_witness_response_encode_failed".to_string())?;
+    if canonical != frame {
+        return Err("observation_witness_response_noncanonical".to_string());
+    }
+    let DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
+        chain_id,
+        request_id,
+        observer,
+        checkpoint_sequence,
+        checkpoint_hash,
+        responder,
+        response_timestamp,
+        outcome,
+        signature,
+    } = &response
+    else {
+        return Err("observation_witness_response_unexpected_message".to_string());
+    };
+    if *chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+        || request_id != expected_request_id
+        || observer != expected_observer
+        || responder != expected_witness
+        || *checkpoint_sequence != expected_checkpoint_sequence
+        || checkpoint_hash != expected_checkpoint_hash
+        || response_timestamp.abs_diff(unix_now_secs())
+            > DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS
+        || response_timestamp.saturating_add(DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS)
+            < request_timestamp
+        || ![
+            DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+            DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1,
+            DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
+        ]
+        .contains(outcome)
+    {
+        return Err("observation_witness_response_contract_mismatch".to_string());
+    }
+    let signing_bytes = directory_observation_witness_response_signing_bytes(
+        chain_id,
+        request_id,
+        observer,
+        *checkpoint_sequence,
+        checkpoint_hash,
+        responder,
+        *response_timestamp,
+        *outcome,
+    );
+    IdentityPublicKey::from_bytes(responder)
+        .and_then(|key| key.verify(&signing_bytes, signature))
+        .map_err(|_| "observation_witness_response_invalid_signature".to_string())?;
+    match *outcome {
+        DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1 => Ok(response),
+        DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1 => {
+            Err("observation_witness_evidence_unavailable".to_string())
+        }
+        DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1 => {
+            Err("observation_witness_evidence_conflict".to_string())
+        }
+        _ => Err("observation_witness_response_outcome_invalid".to_string()),
     }
 }
 
@@ -967,5 +1166,98 @@ mod tests {
         let mut wrong_hash = complete;
         wrong_hash.remote_tip_hash = [0x42; 32];
         assert!(!directory_sync_outcome_is_checkpoint_complete(&wrong_hash));
+    }
+
+    #[test]
+    fn observation_witness_response_verification_is_exact_and_fail_closed() {
+        let observer = IdentityKeyPair::from_bytes(&[0xe1; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0xe2; 32]).unwrap();
+        let request_id = [0xe3; 16];
+        let checkpoint_hash = [0xe4; 32];
+        let now = unix_now_secs();
+        let signing_bytes = directory_observation_witness_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &observer.public_key_bytes(),
+            7,
+            &checkpoint_hash,
+            &witness.public_key_bytes(),
+            now,
+            DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+        );
+        let response = DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            observer: observer.public_key_bytes(),
+            checkpoint_sequence: 7,
+            checkpoint_hash,
+            responder: witness.public_key_bytes(),
+            response_timestamp: now,
+            outcome: DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+            signature: witness.sign(&signing_bytes),
+        };
+        let frame = encode_directory_sync_message(&response).unwrap();
+        assert_eq!(
+            verify_observation_witness_response(
+                &frame,
+                &request_id,
+                &observer.public_key_bytes(),
+                &witness.public_key_bytes(),
+                now,
+                7,
+                &checkpoint_hash,
+            )
+            .unwrap(),
+            response
+        );
+
+        let unavailable_signing = directory_observation_witness_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &observer.public_key_bytes(),
+            7,
+            &checkpoint_hash,
+            &witness.public_key_bytes(),
+            now,
+            DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1,
+        );
+        let unavailable = DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            observer: observer.public_key_bytes(),
+            checkpoint_sequence: 7,
+            checkpoint_hash,
+            responder: witness.public_key_bytes(),
+            response_timestamp: now,
+            outcome: DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1,
+            signature: witness.sign(&unavailable_signing),
+        };
+        assert_eq!(
+            verify_observation_witness_response(
+                &encode_directory_sync_message(&unavailable).unwrap(),
+                &request_id,
+                &observer.public_key_bytes(),
+                &witness.public_key_bytes(),
+                now,
+                7,
+                &checkpoint_hash,
+            )
+            .unwrap_err(),
+            "observation_witness_evidence_unavailable"
+        );
+
+        let mut tampered = frame;
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(verify_observation_witness_response(
+            &tampered,
+            &request_id,
+            &observer.public_key_bytes(),
+            &witness.public_key_bytes(),
+            now,
+            7,
+            &checkpoint_hash,
+        )
+        .is_err());
     }
 }

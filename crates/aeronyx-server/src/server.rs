@@ -450,7 +450,7 @@ use crate::api::discovery::{
     discovery_readiness_status_value, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
     GossipResponse,
 };
-use crate::api::directory_chain_peer::build_directory_chain_peer_router;
+use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica;
 use crate::api::directory_replica_status::{
     build_directory_replica_status_router, DirectoryReplicaStatusScope,
 };
@@ -2785,14 +2785,15 @@ impl Server {
                     local_capability_status,
                 ))
                 .merge(build_directory_replica_status_router(
-                    directory_replica_store,
+                    directory_replica_store.clone(),
                     directory_replica_sync_runtime,
                     directory_chain_sync_peer_ids.clone(),
                     DirectoryReplicaStatusScope::LocalOperator,
                 ));
             let app = if let Some(store) = directory_chain_store {
-                app.merge(build_directory_chain_peer_router(
+                app.merge(build_directory_chain_peer_router_with_replica(
                     store,
+                    directory_replica_store,
                     Arc::clone(&peer_store),
                     Arc::clone(&node_identity),
                     directory_chain_sync_peer_ids,
@@ -2919,14 +2920,15 @@ impl Server {
             peer_http_client,
         ))
         .merge(build_directory_replica_status_router(
-            directory_replica_store,
+            directory_replica_store.clone(),
             directory_replica_sync_runtime,
             directory_chain_sync_peer_ids.clone(),
             DirectoryReplicaStatusScope::PublicAggregate,
         ));
         let app = if let Some(store) = directory_chain_store {
-            app.merge(build_directory_chain_peer_router(
+            app.merge(build_directory_chain_peer_router_with_replica(
                 store,
+                directory_replica_store,
                 directory_peer_store,
                 directory_identity,
                 directory_chain_sync_peer_ids,
@@ -4262,6 +4264,9 @@ impl Server {
             resolutions = audit.resolutions,
             observation_checkpoints = audit.observation_checkpoints,
             observation_checkpoint_sequence = audit.observation_checkpoint_sequence,
+            observation_checkpoint_witnesses = audit.observation_checkpoint_witnesses,
+            observation_checkpoint_witnessed_sequence =
+                audit.observation_checkpoint_witnessed_sequence,
             retry_states = audit.retry_states,
             "[DIRECTORY_REPLICA] Producer-isolated startup audit passed"
         );

@@ -22,7 +22,8 @@
 //! - `DirectoryObservationCheckpointV1`: observer-signed, hash-linked evidence
 //!   binding exact producer tips to a recomputable multi-source overlap root
 //! - `DirectorySyncMessage`: authenticated, bounded node-to-node transport for
-//!   serving one producer's tip, block ranges, and descriptor objects
+//!   serving one producer's tip, block ranges, descriptor objects, and
+//!   independently recomputed observation-checkpoint witness receipts
 //!
 //! ## Dependencies
 //! - crates/aeronyx-core/src/crypto/keys.rs: IdentityKeyPair / IdentityPublicKey
@@ -42,6 +43,8 @@
 //! 7. Directory blocks commit to authenticated descriptors using stable hashes
 //! 8. Observation checkpoints bind complete configured producer-tip sets to a
 //!    locally recomputable overlap root without claiming consensus or finality
+//! 9. A pinned peer may witness an exact checkpoint only after independently
+//!    recomputing its producer prefixes and overlap root from local replicas
 //!
 //! ## Important Note for Next Developer
 //! - Do not put private keys, client IPs, destination metadata, DNS contents,
@@ -56,8 +59,11 @@
 //!   records, or client metadata to a directory commitment.
 //! - Observation checkpoints are signed local evidence, not votes, fork choice,
 //!   quorum certificates, global consensus, or finality.
+//! - A checkpoint witness receipt proves one external node independently
+//!   recomputed one exact checkpoint. It is not a vote, quorum, or finality.
 //!
 //! ## Last Modified
+//! v0.9.0-DirectoryObservationWitness - Added bounded independently recomputed checkpoint witness frames
 //! v0.8.0-DirectoryObservationCheckpoint - Added canonical signed observation checkpoints
 //! v0.7.0-DirectorySyncWire - Added signed bounded Directory Chain peer frames
 //! v0.6.0-DirectoryCommitmentBlock - Added deterministic signed Directory Chain protocol primitives
@@ -110,6 +116,13 @@ pub const MAX_DIRECTORY_SYNC_BLOCKS_V1: u16 = 8;
 
 /// Maximum content-addressed descriptors returned by one object response.
 pub const MAX_DIRECTORY_SYNC_OBJECTS_V1: usize = 16;
+
+/// Witness accepted the exact checkpoint after independent local recomputation.
+pub const DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1: u8 = 1;
+/// Witness lacks one or more exact retained producer prefixes.
+pub const DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1: u8 = 2;
+/// Witness has conflicting retained evidence or recomputed a different root.
+pub const DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1: u8 = 3;
 
 /// Stable production chain identifier for public node-directory commitments.
 ///
@@ -1052,6 +1065,38 @@ impl DirectoryObservationCheckpointV1 {
             .map_err(|_| DirectoryObservationCheckpointValidationError::InvalidSignature)
     }
 
+    /// Verifies a standalone checkpoint's structure, chain, time, and observer
+    /// signature without claiming knowledge of the observer's prior sequence.
+    ///
+    /// An external witness uses this before independently recomputing every
+    /// referenced producer prefix and the observation root from its own store.
+    /// Sequence linkage remains the observer's local append-only invariant and
+    /// is deliberately not inferred from a single transported checkpoint.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryObservationCheckpointValidationError`] when the
+    /// checkpoint is malformed, belongs to another chain, is too far in the
+    /// future, or has an invalid observer identity/signature.
+    pub fn verify_standalone_at(
+        &self,
+        expected_chain_id: &[u8; 32],
+        verifier_observed_at: u64,
+    ) -> Result<(), DirectoryObservationCheckpointValidationError> {
+        self.validate_structure()?;
+        if &self.chain_id != expected_chain_id {
+            return Err(DirectoryObservationCheckpointValidationError::WrongChain);
+        }
+        if self.observed_at
+            > verifier_observed_at.saturating_add(MAX_DIRECTORY_BLOCK_FUTURE_SKEW_SECS)
+        {
+            return Err(DirectoryObservationCheckpointValidationError::InvalidTimestamp);
+        }
+        IdentityPublicKey::from_bytes(&self.observer)
+            .map_err(|_| DirectoryObservationCheckpointValidationError::InvalidObserver)?
+            .verify(&self.hash(), &self.observer_signature)
+            .map_err(|_| DirectoryObservationCheckpointValidationError::InvalidSignature)
+    }
+
     fn validate_structure(&self) -> Result<(), DirectoryObservationCheckpointValidationError> {
         if self.protocol_version != DIRECTORY_OBSERVATION_CHECKPOINT_VERSION_V1 {
             return Err(DirectoryObservationCheckpointValidationError::UnsupportedVersion);
@@ -1215,6 +1260,48 @@ pub enum DirectorySyncMessage {
         /// Authenticated public node descriptors committed by those hashes.
         objects: Vec<SignedNodeDescriptor>,
         /// Responder signature over request binding and ordered object hashes.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Requests an independent witness decision for one exact signed checkpoint.
+    ///
+    /// This variant is appended to preserve every existing bincode enum index.
+    /// The responder must recompute producer-prefix evidence from its own
+    /// replica store; validating only the observer signature is insufficient.
+    ObservationCheckpointWitnessRequestV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Random request identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Requester identity; must equal `checkpoint.observer`.
+        requester: [u8; 32],
+        /// Request creation time in Unix epoch seconds.
+        request_timestamp: u64,
+        /// Canonical observer-signed checkpoint to recompute independently.
+        checkpoint: DirectoryObservationCheckpointV1,
+        /// Requester signature binding the exact checkpoint hash.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Returns one signed external decision for an exact checkpoint.
+    ObservationCheckpointWitnessResponseV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Request identifier copied from the authenticated request.
+        request_id: [u8; 16],
+        /// Observer identity copied from the witnessed checkpoint.
+        observer: [u8; 32],
+        /// Observer-local sequence copied from the witnessed checkpoint.
+        checkpoint_sequence: u64,
+        /// Exact canonical checkpoint hash evaluated by the witness.
+        checkpoint_hash: [u8; 32],
+        /// Independent witness identity.
+        responder: [u8; 32],
+        /// Response creation time in Unix epoch seconds.
+        response_timestamp: u64,
+        /// One stable `DIRECTORY_OBSERVATION_WITNESS_*_V1` outcome code.
+        outcome: u8,
+        /// Responder signature over every response field.
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
@@ -1392,6 +1479,59 @@ pub fn directory_descriptor_objects_response_signing_bytes(
     ]);
     fields.extend(descriptor_hashes.iter().map(<[u8; 32]>::as_slice));
     directory_sync_signing_digest(b"AeroNyx-DirectorySync-ObjectsResponse-v1", fields)
+}
+
+/// Canonical digest signed by an observation-checkpoint witness request.
+#[must_use]
+pub fn directory_observation_witness_request_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+    checkpoint_hash: &[u8; 32],
+) -> [u8; 32] {
+    let request_timestamp = request_timestamp.to_le_bytes();
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-ObservationWitnessRequest-v1",
+        [
+            chain_id.as_slice(),
+            request_id.as_slice(),
+            requester.as_slice(),
+            request_timestamp.as_slice(),
+            checkpoint_hash.as_slice(),
+        ],
+    )
+}
+
+/// Canonical digest signed by an observation-checkpoint witness response.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_observation_witness_response_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    observer: &[u8; 32],
+    checkpoint_sequence: u64,
+    checkpoint_hash: &[u8; 32],
+    responder: &[u8; 32],
+    response_timestamp: u64,
+    outcome: u8,
+) -> [u8; 32] {
+    let checkpoint_sequence = checkpoint_sequence.to_le_bytes();
+    let response_timestamp = response_timestamp.to_le_bytes();
+    let outcome = [outcome];
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-ObservationWitnessResponse-v1",
+        [
+            chain_id.as_slice(),
+            request_id.as_slice(),
+            observer.as_slice(),
+            checkpoint_sequence.as_slice(),
+            checkpoint_hash.as_slice(),
+            responder.as_slice(),
+            response_timestamp.as_slice(),
+            outcome.as_slice(),
+        ],
+    )
 }
 
 /// Encodes a canonical bounded Directory Sync frame including its magic byte.
@@ -2343,6 +2483,107 @@ mod tests {
             ),
             Err(DirectoryObservationCheckpointValidationError::NonCanonicalProducerOrder)
         );
+    }
+
+    #[test]
+    fn test_directory_observation_witness_frames_are_canonical_and_bound() {
+        let observer = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0x72; 32]).unwrap();
+        let producer_a = IdentityKeyPair::from_bytes(&[0x73; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0x74; 32]).unwrap();
+        let checkpoint = DirectoryObservationCheckpointV1::new_signed(
+            3,
+            1_700_000_300,
+            [0x75; 32],
+            2,
+            vec![
+                DirectoryObservationTipV1 {
+                    producer: producer_a.public_key_bytes(),
+                    tip_height: 8,
+                    tip_hash: [0x76; 32],
+                },
+                DirectoryObservationTipV1 {
+                    producer: producer_b.public_key_bytes(),
+                    tip_height: 9,
+                    tip_hash: [0x77; 32],
+                },
+            ],
+            [0x78; 32],
+            &observer,
+        )
+        .unwrap();
+        assert!(checkpoint
+            .verify_standalone_at(&AERONYX_DIRECTORY_MAINNET_CHAIN_ID, 1_700_000_300)
+            .is_ok());
+
+        let request_id = [0x79; 16];
+        let checkpoint_hash = checkpoint.hash();
+        let request_digest = directory_observation_witness_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &observer.public_key_bytes(),
+            1_700_000_301,
+            &checkpoint_hash,
+        );
+        let request = DirectorySyncMessage::ObservationCheckpointWitnessRequestV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            requester: observer.public_key_bytes(),
+            request_timestamp: 1_700_000_301,
+            checkpoint: checkpoint.clone(),
+            signature: observer.sign(&request_digest),
+        };
+        let encoded = encode_directory_sync_message(&request).unwrap();
+        let decoded = decode_directory_sync_message(&encoded).unwrap();
+        assert_eq!(decoded, request);
+
+        let response_digest = directory_observation_witness_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &observer.public_key_bytes(),
+            checkpoint.sequence,
+            &checkpoint_hash,
+            &witness.public_key_bytes(),
+            1_700_000_302,
+            DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+        );
+        let response = DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            observer: observer.public_key_bytes(),
+            checkpoint_sequence: checkpoint.sequence,
+            checkpoint_hash,
+            responder: witness.public_key_bytes(),
+            response_timestamp: 1_700_000_302,
+            outcome: DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+            signature: witness.sign(&response_digest),
+        };
+        let encoded = encode_directory_sync_message(&response).unwrap();
+        assert_eq!(decode_directory_sync_message(&encoded).unwrap(), response);
+        let DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
+            responder,
+            signature,
+            ..
+        } = response
+        else {
+            unreachable!();
+        };
+        IdentityPublicKey::from_bytes(&responder)
+            .unwrap()
+            .verify(&response_digest, &signature)
+            .unwrap();
+
+        let altered = directory_observation_witness_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &observer.public_key_bytes(),
+            checkpoint.sequence,
+            &checkpoint_hash,
+            &witness.public_key_bytes(),
+            1_700_000_302,
+            DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
+        );
+        assert_ne!(response_digest, altered);
     }
 
     #[test]

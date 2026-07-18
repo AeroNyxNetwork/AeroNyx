@@ -20,6 +20,8 @@
 //!   fork choice, consensus, or global finality.
 //! - Reports aggregate observer-signed checkpoint availability and freshness
 //!   without exposing hashes, producer identities, or claiming finality.
+//! - Reports aggregate independently recomputed witness receipts without
+//!   exposing witness identities, request ids, signatures, or checkpoint hashes.
 //! - Lists bounded incident summaries and exports one independently re-verified
 //!   signed evidence frame on local/VPN operator listeners only.
 //! - Reports signed quarantine-resolution counts while keeping mutation
@@ -36,8 +38,9 @@
 //! 3. Derive aggregate lag, failure, backoff, quarantine, and sync state.
 //! 4. Classify recent signed-observation overlap across eligible producers.
 //! 5. Report observer-signed checkpoint availability without exposing its hash.
-//! 6. Serialize aggregate-only or fingerprint-only detail by listener scope.
-//! 7. Re-verify canonical incident evidence before an operator-only export.
+//! 6. Report external witness counts without presenting them as votes/quorum.
+//! 7. Serialize aggregate-only or fingerprint-only detail by listener scope.
+//! 8. Re-verify canonical incident evidence before an operator-only export.
 //!
 //! ## Privacy Invariant
 //! Public output is aggregate-only. Local status and incident lists contain
@@ -55,11 +58,14 @@
 //! - Never rename observation overlap to quorum, consensus, or finality.
 //! - Checkpoint counters prove only local signed observation continuity; never
 //!   present them as votes, witness quorum, fork choice, or global finality.
+//! - External witness counters prove independent recomputation by distinct
+//!   pinned nodes only; they do not create quorum semantics or finality.
 //! - Never mount incident list/export routes on the public listener.
 //! - Never add quarantine mutation here; recovery needs an authenticated,
 //!   audited compare-and-swap command boundary.
 //!
 //! ## Last Modified
+//! `v0.8.0-DirectoryObservationWitnessStatus` - Added aggregate external recomputation receipt status.
 //! `v0.7.0-DirectoryObservationCheckpointStatus` - Added aggregate checkpoint
 //! availability, sequence, and age while redacting hashes and full identities.
 //! `v0.6.0-DirectoryReplicaQuarantineResolutionStatus` - Added aggregate and
@@ -158,6 +164,10 @@ struct DirectoryReplicaObservationCheckpointStatus {
     checkpoints: u64,
     latest_sequence: u64,
     latest_age_seconds: Option<u64>,
+    external_witness_receipts: u64,
+    latest_witnessed_sequence: u64,
+    latest_sequence_witnesses: u64,
+    latest_checkpoint_externally_witnessed: bool,
     evidence_basis: &'static str,
     security_model: &'static str,
 }
@@ -800,6 +810,37 @@ fn build_observation_convergence_status(
     }
 }
 
+fn build_observation_checkpoint_status(
+    generated_at: u64,
+    store_enabled: bool,
+    persisted: &DirectoryReplicaStoreSnapshot,
+) -> DirectoryReplicaObservationCheckpointStatus {
+    DirectoryReplicaObservationCheckpointStatus {
+        source_status: if !store_enabled {
+            "disabled"
+        } else if persisted.observation_checkpoints == 0 {
+            "awaiting_complete_synchronized_round"
+        } else {
+            "available"
+        },
+        checkpoints: persisted.observation_checkpoints,
+        latest_sequence: persisted.observation_checkpoint_sequence,
+        latest_age_seconds: (persisted.observation_checkpoint_observed_at > 0).then(|| {
+            generated_at.saturating_sub(persisted.observation_checkpoint_observed_at)
+        }),
+        external_witness_receipts: persisted.observation_checkpoint_witnesses,
+        latest_witnessed_sequence: persisted.observation_checkpoint_witnessed_sequence,
+        latest_sequence_witnesses: persisted.observation_checkpoint_latest_witnesses,
+        latest_checkpoint_externally_witnessed: persisted.observation_checkpoint_sequence > 0
+            && persisted.observation_checkpoint_witnessed_sequence
+                == persisted.observation_checkpoint_sequence,
+        evidence_basis:
+            "local_node_signed_exact_producer_tips_plus_external_nodes_independently_recomputed_exact_prefixes_and_overlap_root",
+        security_model:
+            "observer_and_external_recomputation_evidence_not_vote_quorum_fork_choice_consensus_or_finality",
+    }
+}
+
 fn build_directory_replica_status_response(
     generated_at: u64,
     store_enabled: bool,
@@ -886,24 +927,11 @@ fn build_directory_replica_status_response(
             convergence,
             scope,
         ),
-        observation_checkpoint: DirectoryReplicaObservationCheckpointStatus {
-            source_status: if !store_enabled {
-                "disabled"
-            } else if persisted.observation_checkpoints == 0 {
-                "awaiting_complete_synchronized_round"
-            } else {
-                "available"
-            },
-            checkpoints: persisted.observation_checkpoints,
-            latest_sequence: persisted.observation_checkpoint_sequence,
-            latest_age_seconds: (persisted.observation_checkpoint_observed_at > 0).then(|| {
-                generated_at.saturating_sub(persisted.observation_checkpoint_observed_at)
-            }),
-            evidence_basis:
-                "local_node_signed_exact_producer_tips_and_recomputable_recent_commitment_overlap",
-            security_model:
-                "local_observer_evidence_not_vote_witness_quorum_fork_choice_consensus_or_finality",
-        },
+        observation_checkpoint: build_observation_checkpoint_status(
+            generated_at,
+            store_enabled,
+            persisted,
+        ),
         producers,
         privacy_invariant:
             "directory_replicas_store_only_public_signed_directory_evidence_in_producer_isolated_namespaces",
@@ -1084,9 +1112,25 @@ mod tests {
             Some(0)
         );
         assert_eq!(
+            parsed["observation_checkpoint"]["external_witness_receipts"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            parsed["observation_checkpoint"]["latest_witnessed_sequence"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            parsed["observation_checkpoint"]["latest_sequence_witnesses"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            parsed["observation_checkpoint"]["latest_checkpoint_externally_witnessed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
             parsed["observation_checkpoint"]["security_model"].as_str(),
             Some(
-                "local_observer_evidence_not_vote_witness_quorum_fork_choice_consensus_or_finality"
+                "observer_and_external_recomputation_evidence_not_vote_quorum_fork_choice_consensus_or_finality"
             )
         );
         assert!(parsed.get("producers").is_none());

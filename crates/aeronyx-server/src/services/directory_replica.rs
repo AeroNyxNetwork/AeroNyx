@@ -32,6 +32,8 @@
 //!   incident and resolution as an append-only audit trail.
 //! - Persists local-identity-signed, hash-linked observation checkpoints only
 //!   after a complete configured producer set yields a recomputable overlap.
+//! - Independently recomputes checkpoints received from pinned observers and
+//!   persists only canonical, accepted, externally signed witness receipts.
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
@@ -53,6 +55,8 @@
 //!    producer, quorum, or globally finalized height.
 //! 7. Sign and append a checkpoint only when every configured producer has an
 //!    eligible prefix; re-derive every historical root during startup audit.
+//! 8. Witness an external checkpoint only from locally retained exact producer
+//!    prefixes, then audit every accepted receipt again on restart.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -72,6 +76,8 @@
 //!   producer evidence. It is never consensus, voting, fork choice, or finality.
 //! - Observation checkpoints preserve that exact boundary. They are one
 //!   observer's signed evidence and must never be presented as global blocks.
+//! - A witness receipt proves one external recomputation of one exact local
+//!   checkpoint. It is not a vote, quorum, fork choice, consensus, or finality.
 //! - Incident evidence export is read-only. Quarantine resolution requires a
 //!   separately authenticated, audited compare-and-swap command boundary.
 //! - Never expose [`DirectoryReplicaStore::resolve_quarantine`] through the
@@ -79,6 +85,7 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.8.0-DirectoryObservationWitness - Added schema v5, independent checkpoint recomputation, and receipt audit
 //! v0.7.0-DirectoryObservationCheckpoints - Added schema v4, append-only signed
 //! checkpoints, exact-prefix root recomputation, and startup tamper detection.
 //! v0.6.0-DirectoryReplicaQuarantineResolution - Added schema v3, signed local
@@ -106,17 +113,20 @@ use std::time::Duration;
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::discovery::{
     decode_directory_sync_message, directory_block_range_response_signing_bytes,
-    encode_directory_sync_message, DirectoryCommitmentBlockV1, DirectoryCommitmentValidationError,
+    directory_observation_witness_response_signing_bytes, encode_directory_sync_message,
+    DirectoryCommitmentBlockV1, DirectoryCommitmentValidationError,
     DirectoryDescriptorCommitmentV1, DirectoryObservationCheckpointV1, DirectoryObservationTipV1,
     DirectorySyncMessage, SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
-    MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1, MAX_DIRECTORY_SYNC_BLOCKS_V1,
+    DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1,
+    MAX_DIRECTORY_SYNC_BLOCKS_V1,
 };
 use bincode::Options;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 4;
+const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 5;
+const DIRECTORY_REPLICA_SCHEMA_VERSION_V4: i64 = 4;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V3: i64 = 3;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V2: i64 = 2;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V1: i64 = 1;
@@ -130,6 +140,7 @@ const DIRECTORY_REPLICA_CONVERGENCE_WINDOW_BLOCKS: u64 = 32;
 const MAX_DIRECTORY_REPLICA_CONVERGENCE_PRODUCERS: usize = 16;
 const MAX_DIRECTORY_REPLICA_INCIDENT_KIND_BYTES: usize = 64;
 const MAX_DIRECTORY_OBSERVATION_CHECKPOINT_BYTES: u64 = 4 * 1024;
+const MAX_DIRECTORY_OBSERVATION_WITNESS_BYTES: usize = 2 * 1024;
 const DIRECTORY_REPLICA_RESOLUTION_ACTION: &str = "resume_existing_prefix";
 const DIRECTORY_REPLICA_RESOLUTION_TIMESTAMP_SKEW_SECS: u64 = 60;
 /// Maximum incident summaries returned by one operator API read.
@@ -191,6 +202,12 @@ pub struct DirectoryReplicaAudit {
     pub observation_checkpoint_hash: [u8; 32],
     /// Latest audited checkpoint timestamp, or zero when none exists.
     pub observation_checkpoint_observed_at: u64,
+    /// Number of independently signed accepted witness receipts.
+    pub observation_checkpoint_witnesses: u64,
+    /// Latest local checkpoint sequence with at least one accepted witness.
+    pub observation_checkpoint_witnessed_sequence: u64,
+    /// Distinct witnesses retained for the latest witnessed sequence.
+    pub observation_checkpoint_latest_witnesses: u64,
     /// Number of audited producer-local retry rows.
     pub retry_states: u64,
 }
@@ -218,6 +235,12 @@ pub struct DirectoryReplicaStoreSnapshot {
     pub observation_checkpoint_hash: [u8; 32],
     /// Latest checkpoint timestamp, or zero when none exists.
     pub observation_checkpoint_observed_at: u64,
+    /// Number of independently signed accepted witness receipts.
+    pub observation_checkpoint_witnesses: u64,
+    /// Latest local checkpoint sequence with at least one accepted witness.
+    pub observation_checkpoint_witnessed_sequence: u64,
+    /// Distinct witnesses retained for the latest witnessed sequence.
+    pub observation_checkpoint_latest_witnesses: u64,
     /// Per-producer accepted-prefix summaries for local operator presentation.
     pub producer_snapshots: Vec<DirectoryReplicaProducerSnapshot>,
 }
@@ -266,6 +289,17 @@ pub struct DirectoryObservationCheckpointAppendReport {
     pub producer_count: u16,
     /// Recomputable multi-source overlap root.
     pub observation_root: [u8; 32],
+}
+
+/// Result of independently evaluating an external observation checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryObservationWitnessDecision {
+    /// Every exact producer prefix exists locally and the root recomputes.
+    Accepted,
+    /// At least one exact referenced producer prefix is not retained locally.
+    EvidenceUnavailable,
+    /// Retained producer evidence conflicts or recomputes a different root.
+    EvidenceConflict,
 }
 
 /// Persisted aggregate state for one producer namespace.
@@ -808,6 +842,24 @@ struct StoredObservationCheckpointRow {
     checkpoint_blob: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct StoredObservationWitnessRow {
+    checkpoint_hash: Vec<u8>,
+    checkpoint_sequence: i64,
+    observer: Vec<u8>,
+    witness_node_id: Vec<u8>,
+    witnessed_at: i64,
+    response_blob: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerifiedObservationWitness {
+    sequence: u64,
+    checkpoint_hash: [u8; 32],
+    observer: [u8; 32],
+    response_timestamp: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct ObservationCheckpointTip {
     sequence: u64,
@@ -815,6 +867,13 @@ struct ObservationCheckpointTip {
     observed_at: u64,
     producer_count: u16,
     observation_root: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ObservationWitnessAudit {
+    witnesses: u64,
+    latest_sequence: u64,
+    latest_witnesses: u64,
 }
 
 #[derive(Debug, Default)]
@@ -993,6 +1052,10 @@ impl DirectoryReplicaStore {
         snapshot.observation_checkpoint_sequence = checkpoint_tip.sequence;
         snapshot.observation_checkpoint_hash = checkpoint_tip.checkpoint_hash;
         snapshot.observation_checkpoint_observed_at = checkpoint_tip.observed_at;
+        let witness_summary = Self::load_observation_witness_summary(&connection)?;
+        snapshot.observation_checkpoint_witnesses = witness_summary.witnesses;
+        snapshot.observation_checkpoint_witnessed_sequence = witness_summary.latest_sequence;
+        snapshot.observation_checkpoint_latest_witnesses = witness_summary.latest_witnesses;
         Ok(snapshot)
     }
 
@@ -1512,6 +1575,235 @@ impl DirectoryReplicaStore {
         transaction.commit()?;
         drop(connection);
         Ok(report)
+    }
+
+    /// Returns the latest checkpoint after re-auditing the complete local
+    /// checkpoint chain and every referenced producer prefix.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when metadata, any historical
+    /// checkpoint, its signature/link, or a retained producer prefix is invalid.
+    pub fn latest_audited_observation_checkpoint(
+        &self,
+        observed_at: u64,
+    ) -> Result<Option<DirectoryObservationCheckpointV1>, DirectoryReplicaStoreError> {
+        let connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let (count, tip) =
+            Self::audit_observation_checkpoints(&connection, &self.local_node_id, observed_at)?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let checkpoint_blob: Vec<u8> = connection.query_row(
+            "SELECT checkpoint_blob FROM directory_observation_checkpoints
+             WHERE sequence = ?1 AND checkpoint_hash = ?2",
+            params![
+                u64_to_i64(tip.sequence, "observation checkpoint sequence")?,
+                tip.checkpoint_hash.as_slice()
+            ],
+            |row| row.get(0),
+        )?;
+        drop(connection);
+        Ok(Some(decode_observation_checkpoint(&checkpoint_blob)?))
+    }
+
+    /// Independently evaluates an external observer checkpoint against this
+    /// node's own producer-isolated replicas.
+    ///
+    /// Signature validity alone is never acceptance. Every exact producer tip
+    /// must exist locally and the overlap root must recompute identically.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] for malformed signatures, wrong
+    /// chain/time, self-witness attempts, or local store integrity failures.
+    pub fn evaluate_observation_checkpoint_witness(
+        &self,
+        checkpoint: &DirectoryObservationCheckpointV1,
+        observed_at: u64,
+    ) -> Result<DirectoryObservationWitnessDecision, DirectoryReplicaStoreError> {
+        checkpoint
+            .verify_standalone_at(&AERONYX_DIRECTORY_MAINNET_CHAIN_ID, observed_at)
+            .map_err(|error| DirectoryReplicaStoreError::Request(error.to_string()))?;
+        if checkpoint.observer == self.local_node_id {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation checkpoint cannot witness itself".to_string(),
+            ));
+        }
+        let connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        for tip in &checkpoint.producer_tips {
+            match Self::observation_block_hash_at(
+                &connection,
+                &self.local_node_id,
+                &tip.producer,
+                tip.tip_height,
+            )? {
+                None => return Ok(DirectoryObservationWitnessDecision::EvidenceUnavailable),
+                Some(local_hash) if local_hash != tip.tip_hash => {
+                    return Ok(DirectoryObservationWitnessDecision::EvidenceConflict)
+                }
+                Some(_) => {}
+            }
+        }
+        let recomputed = Self::recompute_observation_checkpoint_root(
+            &connection,
+            checkpoint,
+            &self.local_node_id,
+        )?;
+        drop(connection);
+        if recomputed != checkpoint.observation_root {
+            return Ok(DirectoryObservationWitnessDecision::EvidenceConflict);
+        }
+        Ok(DirectoryObservationWitnessDecision::Accepted)
+    }
+
+    /// Persists one accepted, canonical external witness receipt for a local
+    /// checkpoint. Exact retries are idempotent.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when the response is malformed,
+    /// noncanonical, not accepted, self-signed, does not bind a retained local
+    /// checkpoint, conflicts at the same witness/sequence, or has an invalid
+    /// timestamp or signature.
+    #[allow(clippy::too_many_lines)]
+    pub fn persist_observation_checkpoint_witness(
+        &self,
+        response: &DirectorySyncMessage,
+        observed_at: u64,
+    ) -> Result<bool, DirectoryReplicaStoreError> {
+        let response_blob = encode_directory_sync_message(response)
+            .map_err(|error| DirectoryReplicaStoreError::Request(error.to_string()))?;
+        if response_blob.len() > MAX_DIRECTORY_OBSERVATION_WITNESS_BYTES {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation witness response exceeds size bound".to_string(),
+            ));
+        }
+        let DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
+            chain_id,
+            request_id,
+            observer,
+            checkpoint_sequence,
+            checkpoint_hash,
+            responder,
+            response_timestamp,
+            outcome,
+            signature,
+        } = response
+        else {
+            return Err(DirectoryReplicaStoreError::Request(
+                "unexpected observation witness response".to_string(),
+            ));
+        };
+        if *chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+            || *observer != self.local_node_id
+            || *responder == self.local_node_id
+            || *responder == [0u8; 32]
+            || *checkpoint_sequence == 0
+            || *checkpoint_hash == [0u8; 32]
+            || *outcome != DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1
+            || *response_timestamp == 0
+            || *response_timestamp > observed_at.saturating_add(RESPONSE_TIMESTAMP_SKEW_SECS)
+        {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation witness response contract mismatch".to_string(),
+            ));
+        }
+        let signing_bytes = directory_observation_witness_response_signing_bytes(
+            chain_id,
+            request_id,
+            observer,
+            *checkpoint_sequence,
+            checkpoint_hash,
+            responder,
+            *response_timestamp,
+            *outcome,
+        );
+        IdentityPublicKey::from_bytes(responder)
+            .and_then(|key| key.verify(&signing_bytes, signature))
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Request(
+                    "observation witness response signature is invalid".to_string(),
+                )
+            })?;
+
+        let mut connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let checkpoint_blob: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT checkpoint_blob FROM directory_observation_checkpoints
+                 WHERE sequence = ?1 AND checkpoint_hash = ?2",
+                params![
+                    u64_to_i64(
+                        *checkpoint_sequence,
+                        "observation witness checkpoint sequence"
+                    )?,
+                    checkpoint_hash.as_slice()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(checkpoint_blob) = checkpoint_blob else {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation witness references an unknown local checkpoint".to_string(),
+            ));
+        };
+        let checkpoint = decode_observation_checkpoint(&checkpoint_blob)?;
+        if checkpoint.observer != *observer
+            || checkpoint.sequence != *checkpoint_sequence
+            || checkpoint.hash() != *checkpoint_hash
+            || *response_timestamp < checkpoint.observed_at
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness does not match its local checkpoint".to_string(),
+            ));
+        }
+        let existing_hash: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT checkpoint_hash FROM directory_observation_checkpoint_witnesses
+                 WHERE checkpoint_sequence = ?1 AND witness_node_id = ?2",
+                params![
+                    u64_to_i64(
+                        *checkpoint_sequence,
+                        "observation witness checkpoint sequence"
+                    )?,
+                    responder.as_slice()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_hash) = existing_hash {
+            if bytes32(
+                &existing_hash,
+                "observation witness existing checkpoint hash",
+            )? != *checkpoint_hash
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "observation witness signed conflicting hashes at one sequence".to_string(),
+                ));
+            }
+            return Ok(false);
+        }
+        transaction.execute(
+            "INSERT INTO directory_observation_checkpoint_witnesses
+                (checkpoint_hash, checkpoint_sequence, observer, witness_node_id,
+                 witnessed_at, response_blob)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                checkpoint_hash.as_slice(),
+                u64_to_i64(
+                    *checkpoint_sequence,
+                    "observation witness checkpoint sequence"
+                )?,
+                observer.as_slice(),
+                responder.as_slice(),
+                u64_to_i64(*response_timestamp, "observation witness timestamp")?,
+                response_blob,
+            ],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        Ok(true)
     }
 
     fn insert_observation_checkpoint(
@@ -2099,6 +2391,8 @@ impl DirectoryReplicaStore {
         let producers = Self::load_all_tips(&connection)?;
         let (observation_checkpoints, observation_tip) =
             Self::audit_observation_checkpoints(&connection, &self.local_node_id, observed_at)?;
+        let observation_witnesses =
+            Self::audit_observation_witnesses(&connection, &self.local_node_id, observed_at)?;
         let mut report = DirectoryReplicaAudit {
             incidents: Self::audit_incidents(&connection)?,
             resolutions: Self::audit_resolutions(&connection, &self.local_node_id, &producers)?,
@@ -2106,6 +2400,9 @@ impl DirectoryReplicaStore {
             observation_checkpoint_sequence: observation_tip.sequence,
             observation_checkpoint_hash: observation_tip.checkpoint_hash,
             observation_checkpoint_observed_at: observation_tip.observed_at,
+            observation_checkpoint_witnesses: observation_witnesses.witnesses,
+            observation_checkpoint_witnessed_sequence: observation_witnesses.latest_sequence,
+            observation_checkpoint_latest_witnesses: observation_witnesses.latest_witnesses,
             ..DirectoryReplicaAudit::default()
         };
         for tip in producers {
@@ -2251,6 +2548,24 @@ impl DirectoryReplicaStore {
                  checkpoint_blob BLOB NOT NULL
                      CHECK (length(checkpoint_blob) BETWEEN 1 AND 4096)
              );
+             CREATE TABLE IF NOT EXISTS directory_observation_checkpoint_witnesses (
+                 checkpoint_hash BLOB NOT NULL CHECK (length(checkpoint_hash) = 32),
+                 checkpoint_sequence INTEGER NOT NULL CHECK (checkpoint_sequence > 0),
+                 observer BLOB NOT NULL CHECK (length(observer) = 32),
+                 witness_node_id BLOB NOT NULL CHECK (length(witness_node_id) = 32),
+                 witnessed_at INTEGER NOT NULL CHECK (witnessed_at > 0),
+                 response_blob BLOB NOT NULL
+                     CHECK (length(response_blob) BETWEEN 1 AND 2048),
+                 PRIMARY KEY (checkpoint_hash, witness_node_id),
+                 UNIQUE (checkpoint_sequence, witness_node_id),
+                 FOREIGN KEY (checkpoint_hash)
+                     REFERENCES directory_observation_checkpoints(checkpoint_hash)
+                     ON UPDATE RESTRICT ON DELETE RESTRICT
+             );
+             CREATE INDEX IF NOT EXISTS directory_observation_witnesses_by_sequence
+                 ON directory_observation_checkpoint_witnesses(
+                     checkpoint_sequence, witness_node_id
+                 );
              CREATE TABLE IF NOT EXISTS directory_replica_retry_state (
                  producer BLOB PRIMARY KEY CHECK (length(producer) = 32),
                  consecutive_failures INTEGER NOT NULL
@@ -2308,7 +2623,7 @@ impl DirectoryReplicaStore {
                     DIRECTORY_REPLICA_SCHEMA_VERSION => {
                         Self::require_resolution_columns(transaction)?;
                     }
-                    DIRECTORY_REPLICA_SCHEMA_VERSION_V3 => {
+                    DIRECTORY_REPLICA_SCHEMA_VERSION_V4 | DIRECTORY_REPLICA_SCHEMA_VERSION_V3 => {
                         Self::require_resolution_columns(transaction)?;
                         Self::set_schema_version(transaction, version)?;
                     }
@@ -2526,6 +2841,48 @@ impl DirectoryReplicaStore {
             observed_at: positive_i64_to_u64(observed_at, "observation checkpoint timestamp")?,
             producer_count,
             observation_root: bytes32(&observation_root, "observation checkpoint root")?,
+        })
+    }
+
+    fn load_observation_witness_summary(
+        connection: &Connection,
+    ) -> Result<ObservationWitnessAudit, DirectoryReplicaStoreError> {
+        let witnesses = nonnegative_i64_to_u64(
+            connection.query_row(
+                "SELECT COUNT(*) FROM directory_observation_checkpoint_witnesses",
+                [],
+                |row| row.get(0),
+            )?,
+            "observation witness count",
+        )?;
+        if witnesses == 0 {
+            return Ok(ObservationWitnessAudit::default());
+        }
+        let latest_sequence = positive_i64_to_u64(
+            connection.query_row(
+                "SELECT MAX(checkpoint_sequence)
+                 FROM directory_observation_checkpoint_witnesses",
+                [],
+                |row| row.get(0),
+            )?,
+            "latest witnessed checkpoint sequence",
+        )?;
+        let latest_witnesses = nonnegative_i64_to_u64(
+            connection.query_row(
+                "SELECT COUNT(*) FROM directory_observation_checkpoint_witnesses
+                 WHERE checkpoint_sequence = ?1",
+                params![u64_to_i64(
+                    latest_sequence,
+                    "latest witnessed checkpoint sequence"
+                )?],
+                |row| row.get(0),
+            )?,
+            "latest checkpoint witness count",
+        )?;
+        Ok(ObservationWitnessAudit {
+            witnesses,
+            latest_sequence,
+            latest_witnesses,
         })
     }
 
@@ -3151,6 +3508,175 @@ impl DirectoryReplicaStore {
         Ok((count, tip))
     }
 
+    fn audit_observation_witnesses(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<ObservationWitnessAudit, DirectoryReplicaStoreError> {
+        let mut statement = connection.prepare(
+            "SELECT checkpoint_hash, checkpoint_sequence, observer, witness_node_id,
+                    witnessed_at, response_blob
+             FROM directory_observation_checkpoint_witnesses
+             ORDER BY checkpoint_sequence ASC, witness_node_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(StoredObservationWitnessRow {
+                checkpoint_hash: row.get(0)?,
+                checkpoint_sequence: row.get(1)?,
+                observer: row.get(2)?,
+                witness_node_id: row.get(3)?,
+                witnessed_at: row.get(4)?,
+                response_blob: row.get(5)?,
+            })
+        })?;
+        let mut audit = ObservationWitnessAudit::default();
+        for row in rows {
+            let row = row?;
+            let verified =
+                Self::verify_observation_witness_response(&row, local_node_id, observed_at)?;
+            Self::verify_observation_witness_checkpoint(connection, &row, &verified)?;
+            audit.witnesses = audit.witnesses.checked_add(1).ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation witness count exceeds u64".to_string(),
+                )
+            })?;
+            if verified.sequence > audit.latest_sequence {
+                audit.latest_sequence = verified.sequence;
+                audit.latest_witnesses = 1;
+            } else if verified.sequence == audit.latest_sequence {
+                audit.latest_witnesses =
+                    audit.latest_witnesses.checked_add(1).ok_or_else(|| {
+                        DirectoryReplicaStoreError::Integrity(
+                            "latest observation witness count exceeds u64".to_string(),
+                        )
+                    })?;
+            }
+        }
+        drop(statement);
+        Ok(audit)
+    }
+
+    fn verify_observation_witness_response(
+        row: &StoredObservationWitnessRow,
+        local_node_id: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<VerifiedObservationWitness, DirectoryReplicaStoreError> {
+        if row.response_blob.len() > MAX_DIRECTORY_OBSERVATION_WITNESS_BYTES {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness response exceeds size bound".to_string(),
+            ));
+        }
+        let response = decode_directory_sync_message(&row.response_blob).map_err(|error| {
+            DirectoryReplicaStoreError::Integrity(format!(
+                "observation witness response decode failed: {error}"
+            ))
+        })?;
+        if encode_directory_sync_message(&response).map_err(|error| {
+            DirectoryReplicaStoreError::Integrity(format!(
+                "observation witness response encode failed: {error}"
+            ))
+        })? != row.response_blob
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness response encoding is not canonical".to_string(),
+            ));
+        }
+        let DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
+            chain_id,
+            request_id,
+            observer,
+            checkpoint_sequence,
+            checkpoint_hash,
+            responder,
+            response_timestamp,
+            outcome,
+            signature,
+        } = response
+        else {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness row contains an unexpected frame".to_string(),
+            ));
+        };
+        let row_sequence = positive_i64_to_u64(
+            row.checkpoint_sequence,
+            "observation witness checkpoint sequence",
+        )?;
+        let row_timestamp = positive_i64_to_u64(row.witnessed_at, "observation witness timestamp")?;
+        if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+            || observer != *local_node_id
+            || responder == *local_node_id
+            || responder == [0u8; 32]
+            || outcome != DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1
+            || checkpoint_sequence != row_sequence
+            || checkpoint_hash
+                != bytes32(&row.checkpoint_hash, "observation witness checkpoint hash")?
+            || observer != bytes32(&row.observer, "observation witness observer")?
+            || responder != bytes32(&row.witness_node_id, "observation witness identity")?
+            || response_timestamp != row_timestamp
+            || response_timestamp > observed_at.saturating_add(RESPONSE_TIMESTAMP_SKEW_SECS)
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness row does not match its signed response".to_string(),
+            ));
+        }
+        let signing_bytes = directory_observation_witness_response_signing_bytes(
+            &chain_id,
+            &request_id,
+            &observer,
+            checkpoint_sequence,
+            &checkpoint_hash,
+            &responder,
+            response_timestamp,
+            outcome,
+        );
+        IdentityPublicKey::from_bytes(&responder)
+            .and_then(|key| key.verify(&signing_bytes, &signature))
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation witness response signature is invalid".to_string(),
+                )
+            })?;
+        Ok(VerifiedObservationWitness {
+            sequence: checkpoint_sequence,
+            checkpoint_hash,
+            observer,
+            response_timestamp,
+        })
+    }
+
+    fn verify_observation_witness_checkpoint(
+        connection: &Connection,
+        row: &StoredObservationWitnessRow,
+        witness: &VerifiedObservationWitness,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        let checkpoint_blob: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT checkpoint_blob FROM directory_observation_checkpoints
+                 WHERE sequence = ?1 AND checkpoint_hash = ?2",
+                params![row.checkpoint_sequence, witness.checkpoint_hash.as_slice()],
+                |checkpoint_row| checkpoint_row.get(0),
+            )
+            .optional()?;
+        let checkpoint = checkpoint_blob
+            .as_deref()
+            .ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation witness references a missing checkpoint".to_string(),
+                )
+            })
+            .and_then(decode_observation_checkpoint)?;
+        if checkpoint.observer != witness.observer
+            || checkpoint.sequence != witness.sequence
+            || checkpoint.hash() != witness.checkpoint_hash
+            || witness.response_timestamp < checkpoint.observed_at
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness does not bind its retained checkpoint".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn verify_observation_checkpoint_row(
         connection: &Connection,
@@ -3198,7 +3724,7 @@ impl DirectoryReplicaStore {
                 "observation checkpoint row does not match its signed object".to_string(),
             ));
         }
-        if Self::recompute_observation_checkpoint_root(connection, &checkpoint)?
+        if Self::recompute_observation_checkpoint_root(connection, &checkpoint, local_node_id)?
             != checkpoint.observation_root
         {
             return Err(DirectoryReplicaStoreError::Integrity(
@@ -3211,11 +3737,16 @@ impl DirectoryReplicaStore {
     fn recompute_observation_checkpoint_root(
         connection: &Connection,
         checkpoint: &DirectoryObservationCheckpointV1,
+        local_node_id: &[u8; 32],
     ) -> Result<[u8; 32], DirectoryReplicaStoreError> {
         let mut tips = Vec::with_capacity(checkpoint.producer_tips.len());
         for observed_tip in &checkpoint.producer_tips {
-            if Self::block_hash_at(connection, &observed_tip.producer, observed_tip.tip_height)?
-                != Some(observed_tip.tip_hash)
+            if Self::observation_block_hash_at(
+                connection,
+                local_node_id,
+                &observed_tip.producer,
+                observed_tip.tip_height,
+            )? != Some(observed_tip.tip_hash)
             {
                 return Err(DirectoryReplicaStoreError::Integrity(
                     "observation checkpoint references a missing producer prefix".to_string(),
@@ -3238,8 +3769,87 @@ impl DirectoryReplicaStore {
             window_blocks: DIRECTORY_REPLICA_CONVERGENCE_WINDOW_BLOCKS,
             ..DirectoryReplicaObservationConvergenceSnapshot::default()
         };
-        let occurrences = Self::recent_commitment_occurrences(connection, &tips, &mut snapshot)?;
+        let occurrences = Self::recent_commitment_occurrences_with_local_producer(
+            connection,
+            local_node_id,
+            &tips,
+            &mut snapshot,
+        )?;
         Ok(observation_convergence_root(&tips, &occurrences))
+    }
+
+    fn observation_block_hash_at(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+        producer: &[u8; 32],
+        height: u64,
+    ) -> Result<Option<[u8; 32]>, DirectoryReplicaStoreError> {
+        if producer != local_node_id {
+            return Self::block_hash_at(connection, producer, height);
+        }
+        let block_hash: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT block_hash FROM directory_chain_blocks WHERE height = ?1",
+                params![u64_to_i64(height, "local observation block height")?],
+                |row| row.get(0),
+            )
+            .optional()?;
+        block_hash
+            .as_deref()
+            .map(|hash| bytes32(hash, "local observation block hash"))
+            .transpose()
+    }
+
+    fn recent_commitment_occurrences_with_local_producer(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+        eligible_tips: &[DirectoryReplicaTip],
+        snapshot: &mut DirectoryReplicaObservationConvergenceSnapshot,
+    ) -> Result<BTreeMap<[u8; 32], u64>, DirectoryReplicaStoreError> {
+        let mut occurrence_by_commitment = BTreeMap::<[u8; 32], u64>::new();
+        for tip in eligible_tips {
+            let first_height = tip
+                .tip_height
+                .saturating_sub(DIRECTORY_REPLICA_CONVERGENCE_WINDOW_BLOCKS.saturating_sub(1))
+                .max(1);
+            let first_height = u64_to_i64(first_height, "observation witness first block height")?;
+            let tip_height = u64_to_i64(tip.tip_height, "observation witness tip block height")?;
+            let hashes = if tip.producer == *local_node_id {
+                let mut statement = connection.prepare(
+                    "SELECT commitment_hash FROM directory_chain_commitments
+                     WHERE block_height BETWEEN ?1 AND ?2
+                     ORDER BY commitment_hash ASC",
+                )?;
+                let rows = statement.query_map(params![first_height, tip_height], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            } else {
+                let mut statement = connection.prepare(
+                    "SELECT commitment_hash FROM directory_replica_commitments
+                     WHERE producer = ?1 AND block_height BETWEEN ?2 AND ?3
+                     ORDER BY commitment_hash ASC",
+                )?;
+                let rows = statement.query_map(
+                    params![tip.producer.as_slice(), first_height, tip_height],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let mut seen_for_producer = HashSet::with_capacity(hashes.len());
+            for hash in hashes {
+                let hash = bytes32(&hash, "observation witness commitment hash")?;
+                if !seen_for_producer.insert(hash) {
+                    return Err(DirectoryReplicaStoreError::Integrity(
+                        "observation witness found a duplicate producer commitment".to_string(),
+                    ));
+                }
+                snapshot.recent_commitments = snapshot.recent_commitments.saturating_add(1);
+                let occurrence = occurrence_by_commitment.entry(hash).or_default();
+                *occurrence = occurrence.saturating_add(1);
+            }
+        }
+        Ok(occurrence_by_commitment)
     }
 
     fn audit_incidents(connection: &Connection) -> Result<u64, DirectoryReplicaStoreError> {
@@ -3944,6 +4554,7 @@ fn nonnegative_i64_to_u64(value: i64, field: &str) -> Result<u64, DirectoryRepli
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::DirectoryChainStore;
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::protocol::discovery::{
         directory_block_range_response_signing_bytes, encode_directory_sync_message, NodeDescriptor,
@@ -4012,6 +4623,34 @@ mod tests {
             signature: producer.sign(&signing),
         })
         .unwrap()
+    }
+
+    fn import_replica_block(
+        store: &DirectoryReplicaStore,
+        producer: &IdentityKeyPair,
+        object: &SignedNodeDescriptor,
+        replica_block: &DirectoryCommitmentBlockV1,
+        request_id: [u8; 16],
+    ) {
+        let frame = response_frame(
+            producer,
+            vec![replica_block.clone()],
+            false,
+            replica_block.header.height,
+            replica_block.hash(),
+            request_id,
+        );
+        store
+            .import_verified_page(
+                producer.public_key_bytes(),
+                std::slice::from_ref(replica_block),
+                std::slice::from_ref(object),
+                replica_block.header.height,
+                replica_block.hash(),
+                &frame,
+                NOW + 20,
+            )
+            .unwrap();
     }
 
     fn resolution_command(
@@ -4306,6 +4945,249 @@ mod tests {
     }
 
     #[test]
+    fn observation_witness_requires_independent_evidence_and_survives_restart() {
+        let observer_temp = TempDir::new().unwrap();
+        let witness_temp = TempDir::new().unwrap();
+        let empty_witness_temp = TempDir::new().unwrap();
+        let observer_path = observer_temp.path().join("directory.db");
+        let observer = IdentityKeyPair::from_bytes(&[0x81; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0x82; 32]).unwrap();
+        let empty_witness = IdentityKeyPair::from_bytes(&[0x83; 32]).unwrap();
+        let producer_a = IdentityKeyPair::from_bytes(&[0x84; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0x85; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x86; 32]).unwrap();
+        let object = descriptor(&subject, 1);
+        let block_a = block(&producer_a, 1, [0u8; 32], &object);
+        let block_b = block(&producer_b, 1, [0u8; 32], &object);
+        let configured = [producer_a.public_key_bytes(), producer_b.public_key_bytes()];
+        let (observer_store, _) =
+            DirectoryReplicaStore::open(&observer_path, observer.public_key_bytes(), NOW + 20)
+                .unwrap();
+        let (witness_store, _) = DirectoryReplicaStore::open(
+            witness_temp.path().join("directory.db"),
+            witness.public_key_bytes(),
+            NOW + 20,
+        )
+        .unwrap();
+        for store in [&observer_store, &witness_store] {
+            import_replica_block(store, &producer_a, &object, &block_a, [0x87; 16]);
+            import_replica_block(store, &producer_b, &object, &block_b, [0x88; 16]);
+        }
+        observer_store
+            .append_observation_checkpoint(&configured, &observer, NOW + 21)
+            .unwrap();
+        let checkpoint = observer_store
+            .latest_audited_observation_checkpoint(NOW + 22)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            witness_store
+                .evaluate_observation_checkpoint_witness(&checkpoint, NOW + 22)
+                .unwrap(),
+            DirectoryObservationWitnessDecision::Accepted
+        );
+
+        let (empty_store, _) = DirectoryReplicaStore::open(
+            empty_witness_temp.path().join("directory.db"),
+            empty_witness.public_key_bytes(),
+            NOW + 22,
+        )
+        .unwrap();
+        assert_eq!(
+            empty_store
+                .evaluate_observation_checkpoint_witness(&checkpoint, NOW + 22)
+                .unwrap(),
+            DirectoryObservationWitnessDecision::EvidenceUnavailable
+        );
+        let conflicting = DirectoryObservationCheckpointV1::new_signed(
+            checkpoint.sequence,
+            checkpoint.observed_at,
+            checkpoint.previous_checkpoint_hash,
+            checkpoint.configured_producer_count,
+            checkpoint.producer_tips.clone(),
+            [0xf1; 32],
+            &observer,
+        )
+        .unwrap();
+        assert_eq!(
+            witness_store
+                .evaluate_observation_checkpoint_witness(&conflicting, NOW + 22)
+                .unwrap(),
+            DirectoryObservationWitnessDecision::EvidenceConflict
+        );
+
+        let request_id = [0x89; 16];
+        let checkpoint_hash = checkpoint.hash();
+        let response_timestamp = NOW + 22;
+        let signing_bytes = directory_observation_witness_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &observer.public_key_bytes(),
+            checkpoint.sequence,
+            &checkpoint_hash,
+            &witness.public_key_bytes(),
+            response_timestamp,
+            DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+        );
+        let response = DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            observer: observer.public_key_bytes(),
+            checkpoint_sequence: checkpoint.sequence,
+            checkpoint_hash,
+            responder: witness.public_key_bytes(),
+            response_timestamp,
+            outcome: DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+            signature: witness.sign(&signing_bytes),
+        };
+        assert!(observer_store
+            .persist_observation_checkpoint_witness(&response, NOW + 22)
+            .unwrap());
+        assert!(!observer_store
+            .persist_observation_checkpoint_witness(&response, NOW + 22)
+            .unwrap());
+        let snapshot = observer_store.status_snapshot().unwrap();
+        assert_eq!(snapshot.observation_checkpoint_witnesses, 1);
+        assert_eq!(snapshot.observation_checkpoint_witnessed_sequence, 1);
+        assert_eq!(snapshot.observation_checkpoint_latest_witnesses, 1);
+        let audit = observer_store.audit(NOW + 23).unwrap();
+        assert_eq!(audit.observation_checkpoint_witnesses, 1);
+        assert_eq!(audit.observation_checkpoint_witnessed_sequence, 1);
+        assert_eq!(audit.observation_checkpoint_latest_witnesses, 1);
+        drop(observer_store);
+
+        let (_, reopened) =
+            DirectoryReplicaStore::open(&observer_path, observer.public_key_bytes(), NOW + 24)
+                .unwrap();
+        assert_eq!(reopened.observation_checkpoint_witnesses, 1);
+        assert_eq!(reopened.observation_checkpoint_witnessed_sequence, 1);
+    }
+
+    #[test]
+    fn observation_witness_combines_local_producer_and_remote_replica_evidence() {
+        let observer_temp = TempDir::new().unwrap();
+        let witness_temp = TempDir::new().unwrap();
+        let observer = IdentityKeyPair::from_bytes(&[0xa1; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0xa2; 32]).unwrap();
+        let remote = IdentityKeyPair::from_bytes(&[0xa3; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0xa4; 32]).unwrap();
+        let object = descriptor(&subject, 1);
+
+        let witness_path = witness_temp.path().join("directory.db");
+        let (local_chain, _) =
+            DirectoryChainStore::open(&witness_path, witness.public_key_bytes(), NOW + 1).unwrap();
+        local_chain
+            .append_descriptors(std::slice::from_ref(&object), NOW + 1, &witness)
+            .unwrap();
+        let local_block = local_chain.block(1).unwrap().unwrap();
+        let remote_block = block(&remote, 1, [0u8; 32], &object);
+        let (witness_store, _) =
+            DirectoryReplicaStore::open(&witness_path, witness.public_key_bytes(), NOW + 20)
+                .unwrap();
+        import_replica_block(&witness_store, &remote, &object, &remote_block, [0xa5; 16]);
+
+        let observer_path = observer_temp.path().join("directory.db");
+        let (observer_store, _) =
+            DirectoryReplicaStore::open(&observer_path, observer.public_key_bytes(), NOW + 20)
+                .unwrap();
+        import_replica_block(&observer_store, &witness, &object, &local_block, [0xa6; 16]);
+        import_replica_block(&observer_store, &remote, &object, &remote_block, [0xa7; 16]);
+        observer_store
+            .append_observation_checkpoint(
+                &[witness.public_key_bytes(), remote.public_key_bytes()],
+                &observer,
+                NOW + 21,
+            )
+            .unwrap();
+        let checkpoint = observer_store
+            .latest_audited_observation_checkpoint(NOW + 22)
+            .unwrap()
+            .unwrap();
+        assert!(checkpoint
+            .producer_tips
+            .iter()
+            .any(|tip| tip.producer == witness.public_key_bytes()));
+        assert_eq!(
+            witness_store
+                .evaluate_observation_checkpoint_witness(&checkpoint, NOW + 22)
+                .unwrap(),
+            DirectoryObservationWitnessDecision::Accepted
+        );
+    }
+
+    #[test]
+    fn tampered_observation_witness_fails_startup_audit() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let observer = IdentityKeyPair::from_bytes(&[0x91; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0x92; 32]).unwrap();
+        let producer_a = IdentityKeyPair::from_bytes(&[0x93; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0x94; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x95; 32]).unwrap();
+        let object = descriptor(&subject, 1);
+        let block_a = block(&producer_a, 1, [0u8; 32], &object);
+        let block_b = block(&producer_b, 1, [0u8; 32], &object);
+        let configured = [producer_a.public_key_bytes(), producer_b.public_key_bytes()];
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 20).unwrap();
+        import_replica_block(&store, &producer_a, &object, &block_a, [0x96; 16]);
+        import_replica_block(&store, &producer_b, &object, &block_b, [0x97; 16]);
+        store
+            .append_observation_checkpoint(&configured, &observer, NOW + 21)
+            .unwrap();
+        let checkpoint = store
+            .latest_audited_observation_checkpoint(NOW + 22)
+            .unwrap()
+            .unwrap();
+        let request_id = [0x98; 16];
+        let checkpoint_hash = checkpoint.hash();
+        let signing_bytes = directory_observation_witness_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &observer.public_key_bytes(),
+            checkpoint.sequence,
+            &checkpoint_hash,
+            &witness.public_key_bytes(),
+            NOW + 22,
+            DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+        );
+        let response = DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            observer: observer.public_key_bytes(),
+            checkpoint_sequence: checkpoint.sequence,
+            checkpoint_hash,
+            responder: witness.public_key_bytes(),
+            response_timestamp: NOW + 22,
+            outcome: DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+            signature: witness.sign(&signing_bytes),
+        };
+        store
+            .persist_observation_checkpoint_witness(&response, NOW + 22)
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        let mut response_blob: Vec<u8> = connection
+            .query_row(
+                "SELECT response_blob FROM directory_observation_checkpoint_witnesses",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let last = response_blob.len() - 1;
+        response_blob[last] ^= 1;
+        connection
+            .execute(
+                "UPDATE directory_observation_checkpoint_witnesses SET response_blob = ?1",
+                params![response_blob],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 23).is_err());
+    }
+
+    #[test]
     fn tampered_observation_checkpoint_fails_startup_audit() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
@@ -4524,7 +5406,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_is_atomically_migrated_to_v4() {
+    fn schema_v1_is_atomically_migrated_to_v5() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x31; 32]).unwrap();
@@ -4540,7 +5422,8 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE directory_observation_checkpoints;
+                "DROP TABLE directory_observation_checkpoint_witnesses;
+                 DROP TABLE directory_observation_checkpoints;
                  DROP TABLE directory_replica_resolutions;
                  DROP TABLE directory_replica_retry_state;
                  ALTER TABLE directory_replica_chains DROP COLUMN active_incident_digest;
@@ -4582,7 +5465,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_is_atomically_migrated_to_v4() {
+    fn schema_v2_is_atomically_migrated_to_v5() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x30; 32]).unwrap();
@@ -4598,7 +5481,8 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE directory_observation_checkpoints;
+                "DROP TABLE directory_observation_checkpoint_witnesses;
+                 DROP TABLE directory_observation_checkpoints;
                  DROP TABLE directory_replica_resolutions;
                  ALTER TABLE directory_replica_chains DROP COLUMN active_incident_digest;
                  ALTER TABLE directory_replica_chains DROP COLUMN last_resolution_digest;",
@@ -4630,7 +5514,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v3_is_atomically_migrated_to_v4() {
+    fn schema_v3_is_atomically_migrated_to_v5() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x2f; 32]).unwrap();
@@ -4645,7 +5529,10 @@ mod tests {
             )
             .unwrap();
         connection
-            .execute_batch("DROP TABLE directory_observation_checkpoints;")
+            .execute_batch(
+                "DROP TABLE directory_observation_checkpoint_witnesses;
+                 DROP TABLE directory_observation_checkpoints;",
+            )
             .unwrap();
         drop(connection);
 
@@ -4666,6 +5553,46 @@ mod tests {
             .unwrap();
         assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
         assert_eq!(checkpoint_table, "directory_observation_checkpoints");
+    }
+
+    #[test]
+    fn schema_v4_is_atomically_migrated_to_v5() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x2e; 32]).unwrap();
+        let (store, _) = DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW).unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE directory_replica_meta SET schema_version = ?1 WHERE singleton = 1",
+                params![DIRECTORY_REPLICA_SCHEMA_VERSION_V4],
+            )
+            .unwrap();
+        connection
+            .execute_batch("DROP TABLE directory_observation_checkpoint_witnesses;")
+            .unwrap();
+        drop(connection);
+
+        let (store, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 1).unwrap();
+        assert_eq!(audit.observation_checkpoint_witnesses, 0);
+        let connection = store.connection.lock();
+        let (version, witness_table): (i64, String) = connection
+            .query_row(
+                "SELECT m.schema_version, t.name
+                 FROM directory_replica_meta m
+                 JOIN sqlite_master t
+                   ON t.type = 'table'
+                  AND t.name = 'directory_observation_checkpoint_witnesses'
+                 WHERE m.singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
+        assert_eq!(witness_table, "directory_observation_checkpoint_witnesses");
     }
 
     #[test]
