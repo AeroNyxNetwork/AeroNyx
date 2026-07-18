@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.17.0 - Added a host-local, node-identity-signed, compare-and-swap quarantine resolution boundary with append-only audit history and fail-closed schema v3 migration.
+Modification Reason: v0.18.0 - Added observer-signed, hash-linked Directory observation checkpoints after complete authenticated multi-producer synchronization, with fail-closed schema v4 persistence and startup recomputation.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.17.0 - Added signed host-local quarantine resolution, exact active-incident/tip CAS, linked resolution history, and startup tamper detection.
+Last Modified: v0.18.0 - Added signed local observation checkpoints binding exact producer tips and recomputable recent commitment overlap without introducing votes, consensus, or finality.
+Previous: v0.17.0 - Added signed host-local quarantine resolution, exact active-incident/tip CAS, linked resolution history, and startup tamper detection.
 Previous: v0.16.0 - Added bounded incident pagination and canonical producer-signed evidence export with verification on every read.
 Previous: v0.15.0 - Added recent signed-commitment overlap and an operator-only deterministic observation root.
 Previous: v0.14.0 - Added atomic replica schema v1-to-v2 migration and restart-durable producer retry scheduling.
@@ -1149,6 +1150,59 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-19 - Added signed Directory observation checkpoint continuity.
+- Files changed:
+  - crates/aeronyx-core/src/protocol/discovery.rs
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - crates/aeronyx-server/src/services/mod.rs
+  - crates/aeronyx-server/src/server.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Protocol and persistence:
+  - A canonical Ed25519-signed checkpoint binds the local observer identity,
+    sequence, predecessor hash, timestamp, exact configured producer tips, and
+    deterministic recent commitment-overlap root.
+  - The coordinator appends only after every pinned producer reaches its exact
+    authenticated remote tip during the same synchronization round. Backoff,
+    timeout, partial catch-up, quarantine, or any producer failure suppresses
+    checkpoint creation for that round.
+  - Unchanged observation roots are idempotent and do not grow the ledger.
+  - SQLite schema v4 stores checkpoints as a hash-linked append-only sequence;
+    v1, v2, and v3 migrate transactionally without changing accepted blocks,
+    commitments, incidents, resolutions, or retry state.
+- Startup verification:
+  - Startup decodes and re-encodes each bounded canonical blob, verifies local
+    observer identity, Ed25519 signature, sequence, predecessor, timestamps,
+    and duplicated row metadata.
+  - Every referenced producer tip hash must exist at the exact historical
+    height, and the observation root is recomputed from retained commitment
+    windows before startup may pass.
+  - Startup streams the append-only sequence through a SQLite cursor instead
+    of materializing all checkpoint rows, keeping audit memory bounded as the
+    local evidence history grows.
+- Observability and privacy:
+  - Status exposes only aggregate checkpoint availability, count, latest
+    sequence, and age. It never exposes checkpoint hashes or full identities.
+  - Checkpoints contain public signed directory control-plane evidence only;
+    no endpoints, routes, selected hops, client metadata, message identifiers,
+    payloads, ciphertext, DNS contents, destinations, Memory Chain records,
+    private keys, wallet traffic, or social graph metadata are added.
+  - This is local observer evidence, not a vote, witness quorum, fork choice,
+    consensus, financial chain, or global finality claim.
+- Verification:
+  - Canonical checkpoint protocol tests: 2/2 passed.
+  - Directory Replica store/coordinator/status tests: 32/32 passed.
+  - aeronyx-core regression suite: 196/196 passed.
+  - aeronyx-server regression suite: 1,091/1,091 passed.
+  - Binary target tests: 2/2 passed; doctests: 1 passed, 9 intentionally
+    ignored.
+  - `cargo check -p aeronyx-server --tests --locked` passed.
+  - Targeted Clippy inspection completed; the new checkpoint protocol,
+    persistence, coordinator, and status paths add no lint.
+  - Final optimized release build completed in 5m 56s, and the release binary
+    accepted the existing US1 `/etc/aeronyx/server.toml` configuration.
+
 2026-07-18 - Added authenticated Directory Replica quarantine resolution.
 - Files changed:
   - crates/aeronyx-server/src/main.rs

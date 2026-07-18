@@ -4260,6 +4260,8 @@ impl Server {
             commitments = audit.commitments,
             incidents = audit.incidents,
             resolutions = audit.resolutions,
+            observation_checkpoints = audit.observation_checkpoints,
+            observation_checkpoint_sequence = audit.observation_checkpoint_sequence,
             retry_states = audit.retry_states,
             "[DIRECTORY_REPLICA] Producer-isolated startup audit passed"
         );

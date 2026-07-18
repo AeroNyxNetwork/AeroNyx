@@ -30,6 +30,8 @@
 //! - Resolves quarantine only through a node-identity-signed, host-local,
 //!   compare-and-swap command while retaining the accepted prefix and every
 //!   incident and resolution as an append-only audit trail.
+//! - Persists local-identity-signed, hash-linked observation checkpoints only
+//!   after a complete configured producer set yields a recomputable overlap.
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
@@ -49,6 +51,8 @@
 //!    or persist quarantine without mutating another producer namespace.
 //! 6. Derive recent multi-source observation evidence without choosing a fork,
 //!    producer, quorum, or globally finalized height.
+//! 7. Sign and append a checkpoint only when every configured producer has an
+//!    eligible prefix; re-derive every historical root during startup audit.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -66,6 +70,8 @@
 //! - Keep all limits synchronized with the core Directory Sync V1 contract.
 //! - Observation convergence is a local digest over independently verified
 //!   producer evidence. It is never consensus, voting, fork choice, or finality.
+//! - Observation checkpoints preserve that exact boundary. They are one
+//!   observer's signed evidence and must never be presented as global blocks.
 //! - Incident evidence export is read-only. Quarantine resolution requires a
 //!   separately authenticated, audited compare-and-swap command boundary.
 //! - Never expose [`DirectoryReplicaStore::resolve_quarantine`] through the
@@ -73,6 +79,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.7.0-DirectoryObservationCheckpoints - Added schema v4, append-only signed
+//! checkpoints, exact-prefix root recomputation, and startup tamper detection.
 //! v0.6.0-DirectoryReplicaQuarantineResolution - Added schema v3, signed local
 //! operator resolution commands, exact incident/tip CAS, and linked immutable
 //! resolution auditing without deleting or rewinding accepted evidence.
@@ -99,15 +107,17 @@ use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::discovery::{
     decode_directory_sync_message, directory_block_range_response_signing_bytes,
     encode_directory_sync_message, DirectoryCommitmentBlockV1, DirectoryCommitmentValidationError,
-    DirectoryDescriptorCommitmentV1, DirectorySyncMessage, SignedNodeDescriptor,
-    AERONYX_DIRECTORY_MAINNET_CHAIN_ID, MAX_DIRECTORY_SYNC_BLOCKS_V1,
+    DirectoryDescriptorCommitmentV1, DirectoryObservationCheckpointV1, DirectoryObservationTipV1,
+    DirectorySyncMessage, SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+    MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1, MAX_DIRECTORY_SYNC_BLOCKS_V1,
 };
 use bincode::Options;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 3;
+const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 4;
+const DIRECTORY_REPLICA_SCHEMA_VERSION_V3: i64 = 3;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V2: i64 = 2;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V1: i64 = 1;
 const MAX_DIRECTORY_BLOCK_BYTES: u64 = 64 * 1024;
@@ -119,6 +129,7 @@ const MAX_DIRECTORY_REPLICA_FAILURE_REASON_BYTES: usize = 96;
 const DIRECTORY_REPLICA_CONVERGENCE_WINDOW_BLOCKS: u64 = 32;
 const MAX_DIRECTORY_REPLICA_CONVERGENCE_PRODUCERS: usize = 16;
 const MAX_DIRECTORY_REPLICA_INCIDENT_KIND_BYTES: usize = 64;
+const MAX_DIRECTORY_OBSERVATION_CHECKPOINT_BYTES: u64 = 4 * 1024;
 const DIRECTORY_REPLICA_RESOLUTION_ACTION: &str = "resume_existing_prefix";
 const DIRECTORY_REPLICA_RESOLUTION_TIMESTAMP_SKEW_SECS: u64 = 60;
 /// Maximum incident summaries returned by one operator API read.
@@ -172,6 +183,14 @@ pub struct DirectoryReplicaAudit {
     pub incidents: u64,
     /// Number of node-identity-signed operator resolutions.
     pub resolutions: u64,
+    /// Number of audited observer-signed convergence checkpoints.
+    pub observation_checkpoints: u64,
+    /// Latest audited checkpoint sequence, or zero when none exists.
+    pub observation_checkpoint_sequence: u64,
+    /// Latest audited checkpoint hash, or zero when none exists.
+    pub observation_checkpoint_hash: [u8; 32],
+    /// Latest audited checkpoint timestamp, or zero when none exists.
+    pub observation_checkpoint_observed_at: u64,
     /// Number of audited producer-local retry rows.
     pub retry_states: u64,
 }
@@ -191,6 +210,14 @@ pub struct DirectoryReplicaStoreSnapshot {
     pub incidents: u64,
     /// Number of durable signed quarantine resolutions.
     pub resolutions: u64,
+    /// Number of durable observer-signed convergence checkpoints.
+    pub observation_checkpoints: u64,
+    /// Latest checkpoint sequence, or zero when none exists.
+    pub observation_checkpoint_sequence: u64,
+    /// Latest checkpoint hash, or zero when none exists.
+    pub observation_checkpoint_hash: [u8; 32],
+    /// Latest checkpoint timestamp, or zero when none exists.
+    pub observation_checkpoint_observed_at: u64,
     /// Per-producer accepted-prefix summaries for local operator presentation.
     pub producer_snapshots: Vec<DirectoryReplicaProducerSnapshot>,
 }
@@ -222,6 +249,23 @@ pub struct DirectoryReplicaObservationConvergenceSnapshot {
     pub all_eligible_source_recent_commitments: u64,
     /// Deterministic digest of eligible tips and their exact common commitments.
     pub observation_root: Option<[u8; 32]>,
+}
+
+/// Result of attempting to append one complete observation checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryObservationCheckpointAppendReport {
+    /// Whether a new checkpoint was written. An unchanged root is idempotent.
+    pub appended: bool,
+    /// Latest checkpoint sequence after the transaction.
+    pub sequence: u64,
+    /// Latest checkpoint hash after the transaction.
+    pub checkpoint_hash: [u8; 32],
+    /// Timestamp bound into the latest checkpoint.
+    pub observed_at: u64,
+    /// Number of configured producer tips bound into the checkpoint.
+    pub producer_count: u16,
+    /// Recomputable multi-source overlap root.
+    pub observation_root: [u8; 32],
 }
 
 /// Persisted aggregate state for one producer namespace.
@@ -753,6 +797,26 @@ struct StoredResolutionRow {
     signature: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct StoredObservationCheckpointRow {
+    sequence: i64,
+    checkpoint_hash: Vec<u8>,
+    previous_checkpoint_hash: Vec<u8>,
+    observed_at: i64,
+    observation_root: Vec<u8>,
+    producer_count: i64,
+    checkpoint_blob: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ObservationCheckpointTip {
+    sequence: u64,
+    checkpoint_hash: [u8; 32],
+    observed_at: u64,
+    producer_count: u16,
+    observation_root: [u8; 32],
+}
+
 #[derive(Debug, Default)]
 struct AuditedResolutionIndex {
     commands: HashMap<[u8; 32], DirectoryReplicaResolutionCommand>,
@@ -866,6 +930,7 @@ impl DirectoryReplicaStore {
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
         let mut snapshot = DirectoryReplicaStoreSnapshot::default();
         for (
             producer,
@@ -916,6 +981,18 @@ impl DirectoryReplicaStore {
                 .saturating_add(producer_snapshot.resolutions);
             snapshot.producer_snapshots.push(producer_snapshot);
         }
+        snapshot.observation_checkpoints = nonnegative_i64_to_u64(
+            connection.query_row(
+                "SELECT COUNT(*) FROM directory_observation_checkpoints",
+                [],
+                |row| row.get(0),
+            )?,
+            "observation checkpoint count",
+        )?;
+        let checkpoint_tip = Self::load_observation_checkpoint_tip(&connection)?;
+        snapshot.observation_checkpoint_sequence = checkpoint_tip.sequence;
+        snapshot.observation_checkpoint_hash = checkpoint_tip.checkpoint_hash;
+        snapshot.observation_checkpoint_observed_at = checkpoint_tip.observed_at;
         Ok(snapshot)
     }
 
@@ -1359,6 +1436,164 @@ impl DirectoryReplicaStore {
         let snapshot = Self::observation_convergence_from_connection(&connection, &configured);
         drop(connection);
         snapshot
+    }
+
+    /// Signs and appends one complete configured-producer observation.
+    ///
+    /// The transaction refuses partial, empty, or quarantined producer sets.
+    /// If the exact overlap root is already the checkpoint tip, the operation
+    /// is idempotent and returns the existing tip without another write.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when the configured producer set
+    /// is invalid or incomplete, the signing identity differs from replica
+    /// metadata, the local clock regresses, recomputation fails, or `SQLite`
+    /// cannot atomically append the checkpoint.
+    pub fn append_observation_checkpoint(
+        &self,
+        configured_producers: &[[u8; 32]],
+        identity: &IdentityKeyPair,
+        observed_at: u64,
+    ) -> Result<DirectoryObservationCheckpointAppendReport, DirectoryReplicaStoreError> {
+        if identity.public_key_bytes() != self.local_node_id || observed_at == 0 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation checkpoint identity or timestamp is invalid".to_string(),
+            ));
+        }
+        let configured = self.validate_convergence_producers(configured_producers)?;
+        if configured.len() < 2 || configured.len() > MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1 {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation checkpoint requires two to sixteen configured producers".to_string(),
+            ));
+        }
+
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::validate_metadata(&transaction, &self.local_node_id)?;
+        let mut convergence = DirectoryReplicaObservationConvergenceSnapshot {
+            configured_producers: u64::try_from(configured.len()).map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation checkpoint producer count exceeds u64".to_string(),
+                )
+            })?,
+            window_blocks: DIRECTORY_REPLICA_CONVERGENCE_WINDOW_BLOCKS,
+            ..DirectoryReplicaObservationConvergenceSnapshot::default()
+        };
+        let eligible_tips =
+            Self::eligible_convergence_tips(&transaction, &configured, &mut convergence)?;
+        if eligible_tips.len() != configured.len() {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation checkpoint requires every configured producer to be eligible"
+                    .to_string(),
+            ));
+        }
+        let occurrences =
+            Self::recent_commitment_occurrences(&transaction, &eligible_tips, &mut convergence)?;
+        Self::complete_observation_convergence(&mut convergence, &eligible_tips, &occurrences)?;
+        let observation_root = convergence.observation_root.ok_or_else(|| {
+            DirectoryReplicaStoreError::Integrity(
+                "observation checkpoint overlap root is unavailable".to_string(),
+            )
+        })?;
+        let previous = Self::load_observation_checkpoint_tip(&transaction)?;
+        if previous.sequence > 0 && previous.observation_root == observation_root {
+            transaction.commit()?;
+            drop(connection);
+            return Ok(Self::observation_checkpoint_report(false, previous));
+        }
+        let report = Self::insert_observation_checkpoint(
+            &transaction,
+            previous,
+            &eligible_tips,
+            observation_root,
+            identity,
+            observed_at,
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        Ok(report)
+    }
+
+    fn insert_observation_checkpoint(
+        transaction: &Transaction<'_>,
+        previous: ObservationCheckpointTip,
+        eligible_tips: &[DirectoryReplicaTip],
+        observation_root: [u8; 32],
+        identity: &IdentityKeyPair,
+        observed_at: u64,
+    ) -> Result<DirectoryObservationCheckpointAppendReport, DirectoryReplicaStoreError> {
+        if observed_at < previous.observed_at {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation checkpoint timestamp regressed".to_string(),
+            ));
+        }
+        let sequence = previous.sequence.checked_add(1).ok_or_else(|| {
+            DirectoryReplicaStoreError::Integrity(
+                "observation checkpoint sequence exhausted".to_string(),
+            )
+        })?;
+        let producer_count = u16::try_from(eligible_tips.len()).map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "observation checkpoint producer count exceeds u16".to_string(),
+            )
+        })?;
+        let producer_tips = eligible_tips
+            .iter()
+            .map(|tip| DirectoryObservationTipV1 {
+                producer: tip.producer,
+                tip_height: tip.tip_height,
+                tip_hash: tip.tip_hash,
+            })
+            .collect();
+        let checkpoint = DirectoryObservationCheckpointV1::new_signed(
+            sequence,
+            observed_at,
+            previous.checkpoint_hash,
+            producer_count,
+            producer_tips,
+            observation_root,
+            identity,
+        )
+        .map_err(|error| DirectoryReplicaStoreError::Integrity(error.to_string()))?;
+        let checkpoint_hash = checkpoint.hash();
+        let checkpoint_blob = encode_observation_checkpoint(&checkpoint)?;
+        transaction.execute(
+            "INSERT INTO directory_observation_checkpoints
+                (sequence, checkpoint_hash, previous_checkpoint_hash, observed_at,
+                 observation_root, producer_count, checkpoint_blob)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                u64_to_i64(sequence, "observation checkpoint sequence")?,
+                checkpoint_hash.as_slice(),
+                checkpoint.previous_checkpoint_hash.as_slice(),
+                u64_to_i64(observed_at, "observation checkpoint timestamp")?,
+                observation_root.as_slice(),
+                i64::from(producer_count),
+                checkpoint_blob,
+            ],
+        )?;
+        Ok(DirectoryObservationCheckpointAppendReport {
+            appended: true,
+            sequence,
+            checkpoint_hash,
+            observed_at,
+            producer_count,
+            observation_root,
+        })
+    }
+
+    const fn observation_checkpoint_report(
+        appended: bool,
+        tip: ObservationCheckpointTip,
+    ) -> DirectoryObservationCheckpointAppendReport {
+        DirectoryObservationCheckpointAppendReport {
+            appended,
+            sequence: tip.sequence,
+            checkpoint_hash: tip.checkpoint_hash,
+            observed_at: tip.observed_at,
+            producer_count: tip.producer_count,
+            observation_root: tip.observation_root,
+        }
     }
 
     fn validate_convergence_producers(
@@ -1862,9 +2097,15 @@ impl DirectoryReplicaStore {
         let connection = self.connection.lock();
         Self::validate_metadata(&connection, &self.local_node_id)?;
         let producers = Self::load_all_tips(&connection)?;
+        let (observation_checkpoints, observation_tip) =
+            Self::audit_observation_checkpoints(&connection, &self.local_node_id, observed_at)?;
         let mut report = DirectoryReplicaAudit {
             incidents: Self::audit_incidents(&connection)?,
             resolutions: Self::audit_resolutions(&connection, &self.local_node_id, &producers)?,
+            observation_checkpoints,
+            observation_checkpoint_sequence: observation_tip.sequence,
+            observation_checkpoint_hash: observation_tip.checkpoint_hash,
+            observation_checkpoint_observed_at: observation_tip.observed_at,
             ..DirectoryReplicaAudit::default()
         };
         for tip in producers {
@@ -1999,6 +2240,17 @@ impl DirectoryReplicaStore {
              );
              CREATE INDEX IF NOT EXISTS directory_replica_resolutions_by_producer
                  ON directory_replica_resolutions(producer, resolved_at, resolution_digest);
+             CREATE TABLE IF NOT EXISTS directory_observation_checkpoints (
+                 sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
+                 checkpoint_hash BLOB NOT NULL UNIQUE CHECK (length(checkpoint_hash) = 32),
+                 previous_checkpoint_hash BLOB NOT NULL UNIQUE
+                     CHECK (length(previous_checkpoint_hash) = 32),
+                 observed_at INTEGER NOT NULL CHECK (observed_at > 0),
+                 observation_root BLOB NOT NULL CHECK (length(observation_root) = 32),
+                 producer_count INTEGER NOT NULL CHECK (producer_count BETWEEN 2 AND 16),
+                 checkpoint_blob BLOB NOT NULL
+                     CHECK (length(checkpoint_blob) BETWEEN 1 AND 4096)
+             );
              CREATE TABLE IF NOT EXISTS directory_replica_retry_state (
                  producer BLOB PRIMARY KEY CHECK (length(producer) = 32),
                  consecutive_failures INTEGER NOT NULL
@@ -2056,6 +2308,10 @@ impl DirectoryReplicaStore {
                     DIRECTORY_REPLICA_SCHEMA_VERSION => {
                         Self::require_resolution_columns(transaction)?;
                     }
+                    DIRECTORY_REPLICA_SCHEMA_VERSION_V3 => {
+                        Self::require_resolution_columns(transaction)?;
+                        Self::set_schema_version(transaction, version)?;
+                    }
                     DIRECTORY_REPLICA_SCHEMA_VERSION_V1 | DIRECTORY_REPLICA_SCHEMA_VERSION_V2 => {
                         Self::add_resolution_columns(transaction)?;
                         transaction.execute(
@@ -2085,12 +2341,7 @@ impl DirectoryReplicaStore {
                                     .to_string(),
                             ));
                         }
-                        transaction.execute(
-                            "UPDATE directory_replica_meta
-                             SET schema_version = ?1
-                             WHERE singleton = 1 AND schema_version = ?2",
-                            params![DIRECTORY_REPLICA_SCHEMA_VERSION, version],
-                        )?;
+                        Self::set_schema_version(transaction, version)?;
                     }
                     _ => {
                         return Err(DirectoryReplicaStoreError::Integrity(
@@ -2099,6 +2350,24 @@ impl DirectoryReplicaStore {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn set_schema_version(
+        transaction: &Transaction<'_>,
+        previous_version: i64,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        let changed = transaction.execute(
+            "UPDATE directory_replica_meta
+             SET schema_version = ?1
+             WHERE singleton = 1 AND schema_version = ?2",
+            params![DIRECTORY_REPLICA_SCHEMA_VERSION, previous_version],
+        )?;
+        if changed != 1 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica schema migration compare-and-swap failed".to_string(),
+            ));
         }
         Ok(())
     }
@@ -2212,6 +2481,52 @@ impl DirectoryReplicaStore {
             params![producer.as_slice()],
         )?;
         Ok(())
+    }
+
+    fn load_observation_checkpoint_tip(
+        connection: &Connection,
+    ) -> Result<ObservationCheckpointTip, DirectoryReplicaStoreError> {
+        let row = connection
+            .query_row(
+                "SELECT sequence, checkpoint_hash, observed_at, producer_count,
+                        observation_root
+                 FROM directory_observation_checkpoints
+                 ORDER BY sequence DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((sequence, checkpoint_hash, observed_at, producer_count, observation_root)) = row
+        else {
+            return Ok(ObservationCheckpointTip::default());
+        };
+        let producer_count = u16::try_from(producer_count).map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "observation checkpoint producer count exceeds u16".to_string(),
+            )
+        })?;
+        if usize::from(producer_count) < 2
+            || usize::from(producer_count) > MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation checkpoint producer count is invalid".to_string(),
+            ));
+        }
+        Ok(ObservationCheckpointTip {
+            sequence: positive_i64_to_u64(sequence, "observation checkpoint sequence")?,
+            checkpoint_hash: bytes32(&checkpoint_hash, "observation checkpoint hash")?,
+            observed_at: positive_i64_to_u64(observed_at, "observation checkpoint timestamp")?,
+            producer_count,
+            observation_root: bytes32(&observation_root, "observation checkpoint root")?,
+        })
     }
 
     fn load_tip(
@@ -2774,6 +3089,159 @@ impl DirectoryReplicaStore {
         Ok(objects)
     }
 
+    fn audit_observation_checkpoints(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<(u64, ObservationCheckpointTip), DirectoryReplicaStoreError> {
+        let mut statement = connection.prepare(
+            "SELECT sequence, checkpoint_hash, previous_checkpoint_hash, observed_at,
+                    observation_root, producer_count, checkpoint_blob
+             FROM directory_observation_checkpoints ORDER BY sequence ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(StoredObservationCheckpointRow {
+                sequence: row.get(0)?,
+                checkpoint_hash: row.get(1)?,
+                previous_checkpoint_hash: row.get(2)?,
+                observed_at: row.get(3)?,
+                observation_root: row.get(4)?,
+                producer_count: row.get(5)?,
+                checkpoint_blob: row.get(6)?,
+            })
+        })?;
+        let mut count = 0u64;
+        let mut expected_sequence = 1u64;
+        let mut previous_hash = [0u8; 32];
+        let mut previous_observed_at = 0u64;
+        let mut tip = ObservationCheckpointTip::default();
+        for row in rows {
+            let row = row?;
+            let checkpoint = Self::verify_observation_checkpoint_row(
+                connection,
+                local_node_id,
+                observed_at,
+                expected_sequence,
+                &previous_hash,
+                previous_observed_at,
+                &row,
+            )?;
+            let checkpoint_hash = checkpoint.hash();
+            tip = ObservationCheckpointTip {
+                sequence: checkpoint.sequence,
+                checkpoint_hash,
+                observed_at: checkpoint.observed_at,
+                producer_count: checkpoint.configured_producer_count,
+                observation_root: checkpoint.observation_root,
+            };
+            previous_hash = checkpoint_hash;
+            previous_observed_at = checkpoint.observed_at;
+            count = count.checked_add(1).ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation checkpoint count exceeds u64".to_string(),
+                )
+            })?;
+            expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation checkpoint sequence exhausted".to_string(),
+                )
+            })?;
+        }
+        drop(statement);
+        Ok((count, tip))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_observation_checkpoint_row(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+        verifier_observed_at: u64,
+        expected_sequence: u64,
+        expected_previous_hash: &[u8; 32],
+        previous_observed_at: u64,
+        row: &StoredObservationCheckpointRow,
+    ) -> Result<DirectoryObservationCheckpointV1, DirectoryReplicaStoreError> {
+        let checkpoint = decode_observation_checkpoint(&row.checkpoint_blob)?;
+        if encode_observation_checkpoint(&checkpoint)? != row.checkpoint_blob {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation checkpoint encoding is not canonical".to_string(),
+            ));
+        }
+        checkpoint
+            .verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                expected_sequence,
+                expected_previous_hash,
+                previous_observed_at,
+                verifier_observed_at,
+            )
+            .map_err(|error| DirectoryReplicaStoreError::Integrity(error.to_string()))?;
+        if checkpoint.observer != *local_node_id
+            || positive_i64_to_u64(row.sequence, "observation checkpoint sequence")?
+                != checkpoint.sequence
+            || bytes32(&row.checkpoint_hash, "observation checkpoint hash")? != checkpoint.hash()
+            || bytes32(
+                &row.previous_checkpoint_hash,
+                "observation checkpoint previous hash",
+            )? != checkpoint.previous_checkpoint_hash
+            || positive_i64_to_u64(row.observed_at, "observation checkpoint timestamp")?
+                != checkpoint.observed_at
+            || bytes32(&row.observation_root, "observation checkpoint root")?
+                != checkpoint.observation_root
+            || u16::try_from(row.producer_count).map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation checkpoint producer count exceeds u16".to_string(),
+                )
+            })? != checkpoint.configured_producer_count
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation checkpoint row does not match its signed object".to_string(),
+            ));
+        }
+        if Self::recompute_observation_checkpoint_root(connection, &checkpoint)?
+            != checkpoint.observation_root
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation checkpoint root does not match retained producer prefixes".to_string(),
+            ));
+        }
+        Ok(checkpoint)
+    }
+
+    fn recompute_observation_checkpoint_root(
+        connection: &Connection,
+        checkpoint: &DirectoryObservationCheckpointV1,
+    ) -> Result<[u8; 32], DirectoryReplicaStoreError> {
+        let mut tips = Vec::with_capacity(checkpoint.producer_tips.len());
+        for observed_tip in &checkpoint.producer_tips {
+            if Self::block_hash_at(connection, &observed_tip.producer, observed_tip.tip_height)?
+                != Some(observed_tip.tip_hash)
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "observation checkpoint references a missing producer prefix".to_string(),
+                ));
+            }
+            tips.push(DirectoryReplicaTip {
+                producer: observed_tip.producer,
+                tip_height: observed_tip.tip_height,
+                tip_hash: observed_tip.tip_hash,
+                tip_timestamp: 0,
+                quarantined: false,
+                quarantine_kind: None,
+                active_incident_digest: None,
+                last_resolution_digest: None,
+            });
+        }
+        let mut snapshot = DirectoryReplicaObservationConvergenceSnapshot {
+            configured_producers: u64::from(checkpoint.configured_producer_count),
+            eligible_producers: u64::from(checkpoint.configured_producer_count),
+            window_blocks: DIRECTORY_REPLICA_CONVERGENCE_WINDOW_BLOCKS,
+            ..DirectoryReplicaObservationConvergenceSnapshot::default()
+        };
+        let occurrences = Self::recent_commitment_occurrences(connection, &tips, &mut snapshot)?;
+        Ok(observation_convergence_root(&tips, &occurrences))
+    }
+
     fn audit_incidents(connection: &Connection) -> Result<u64, DirectoryReplicaStoreError> {
         let mut statement = connection.prepare(
             "SELECT incident_digest, producer, subject_node_id, kind, height,
@@ -3304,6 +3772,43 @@ fn incident_digest(
     hasher.finalize().into()
 }
 
+fn encode_observation_checkpoint(
+    checkpoint: &DirectoryObservationCheckpointV1,
+) -> Result<Vec<u8>, DirectoryReplicaStoreError> {
+    bincode::options()
+        .with_fixint_encoding()
+        .with_limit(MAX_DIRECTORY_OBSERVATION_CHECKPOINT_BYTES)
+        .serialize(checkpoint)
+        .map_err(|error| {
+            DirectoryReplicaStoreError::Codec(format!(
+                "encode directory observation checkpoint: {error}"
+            ))
+        })
+}
+
+fn decode_observation_checkpoint(
+    bytes: &[u8],
+) -> Result<DirectoryObservationCheckpointV1, DirectoryReplicaStoreError> {
+    if bytes.is_empty()
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+            > MAX_DIRECTORY_OBSERVATION_CHECKPOINT_BYTES
+    {
+        return Err(DirectoryReplicaStoreError::Codec(
+            "directory observation checkpoint size is invalid".to_string(),
+        ));
+    }
+    bincode::options()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(MAX_DIRECTORY_OBSERVATION_CHECKPOINT_BYTES)
+        .deserialize(bytes)
+        .map_err(|error| {
+            DirectoryReplicaStoreError::Codec(format!(
+                "decode directory observation checkpoint: {error}"
+            ))
+        })
+}
+
 fn encode_block(block: &DirectoryCommitmentBlockV1) -> Result<Vec<u8>, DirectoryReplicaStoreError> {
     bincode::options()
         .with_fixint_encoding()
@@ -3666,6 +4171,213 @@ mod tests {
         assert!(store
             .observation_convergence(&[configured[0], configured[0]])
             .is_err());
+        assert!(store
+            .append_observation_checkpoint(&configured, &local, NOW + 21)
+            .is_err());
+    }
+
+    #[test]
+    fn observation_checkpoints_are_signed_linked_recomputed_and_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x51; 32]).unwrap();
+        let producer_a = IdentityKeyPair::from_bytes(&[0x52; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0x53; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x54; 32]).unwrap();
+        let configured = [producer_a.public_key_bytes(), producer_b.public_key_bytes()];
+        let first_object = descriptor(&subject, 1);
+        let first_a = block(&producer_a, 1, [0u8; 32], &first_object);
+        let first_b = block(&producer_b, 1, [0u8; 32], &first_object);
+        let first_frame_a = response_frame(
+            &producer_a,
+            vec![first_a.clone()],
+            false,
+            1,
+            first_a.hash(),
+            [0x55; 16],
+        );
+        let first_frame_b = response_frame(
+            &producer_b,
+            vec![first_b.clone()],
+            false,
+            1,
+            first_b.hash(),
+            [0x56; 16],
+        );
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        for (producer, replica_block, frame) in [
+            (&producer_a, &first_a, &first_frame_a),
+            (&producer_b, &first_b, &first_frame_b),
+        ] {
+            store
+                .import_verified_page(
+                    producer.public_key_bytes(),
+                    std::slice::from_ref(replica_block),
+                    std::slice::from_ref(&first_object),
+                    1,
+                    replica_block.hash(),
+                    frame,
+                    NOW + 20,
+                )
+                .unwrap();
+        }
+
+        let first = store
+            .append_observation_checkpoint(&configured, &local, NOW + 21)
+            .unwrap();
+        assert!(first.appended);
+        assert_eq!(first.sequence, 1);
+        assert_eq!(first.producer_count, 2);
+        let unchanged = store
+            .append_observation_checkpoint(&configured, &local, NOW + 22)
+            .unwrap();
+        assert!(!unchanged.appended);
+        assert_eq!(
+            unchanged,
+            DirectoryObservationCheckpointAppendReport {
+                appended: false,
+                ..first
+            }
+        );
+        assert!(store
+            .append_observation_checkpoint(
+                &configured,
+                &IdentityKeyPair::from_bytes(&[0x57; 32]).unwrap(),
+                NOW + 22,
+            )
+            .is_err());
+
+        let second_object = descriptor(&subject, 2);
+        let second_a = block(&producer_a, 2, first_a.hash(), &second_object);
+        let second_b = block(&producer_b, 2, first_b.hash(), &second_object);
+        let second_frame_a = response_frame(
+            &producer_a,
+            vec![second_a.clone()],
+            false,
+            2,
+            second_a.hash(),
+            [0x58; 16],
+        );
+        let second_frame_b = response_frame(
+            &producer_b,
+            vec![second_b.clone()],
+            false,
+            2,
+            second_b.hash(),
+            [0x59; 16],
+        );
+        for (producer, replica_block, frame) in [
+            (&producer_a, &second_a, &second_frame_a),
+            (&producer_b, &second_b, &second_frame_b),
+        ] {
+            store
+                .import_verified_page(
+                    producer.public_key_bytes(),
+                    std::slice::from_ref(replica_block),
+                    std::slice::from_ref(&second_object),
+                    2,
+                    replica_block.hash(),
+                    frame,
+                    NOW + 23,
+                )
+                .unwrap();
+        }
+        let second = store
+            .append_observation_checkpoint(&configured, &local, NOW + 24)
+            .unwrap();
+        assert!(second.appended);
+        assert_eq!(second.sequence, 2);
+        assert_ne!(second.checkpoint_hash, first.checkpoint_hash);
+        let snapshot = store.status_snapshot().unwrap();
+        assert_eq!(snapshot.observation_checkpoints, 2);
+        assert_eq!(snapshot.observation_checkpoint_sequence, 2);
+        assert_eq!(snapshot.observation_checkpoint_hash, second.checkpoint_hash);
+        let audit = store.audit(NOW + 25).unwrap();
+        assert_eq!(audit.observation_checkpoints, 2);
+        assert_eq!(audit.observation_checkpoint_sequence, 2);
+        assert_eq!(audit.observation_checkpoint_hash, second.checkpoint_hash);
+        drop(store);
+
+        let (_, reopened) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 26).unwrap();
+        assert_eq!(reopened.observation_checkpoints, 2);
+        assert_eq!(reopened.observation_checkpoint_sequence, 2);
+    }
+
+    #[test]
+    fn tampered_observation_checkpoint_fails_startup_audit() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x61; 32]).unwrap();
+        let producer_a = IdentityKeyPair::from_bytes(&[0x62; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0x63; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x64; 32]).unwrap();
+        let object = descriptor(&subject, 1);
+        let block_a = block(&producer_a, 1, [0u8; 32], &object);
+        let block_b = block(&producer_b, 1, [0u8; 32], &object);
+        let frame_a = response_frame(
+            &producer_a,
+            vec![block_a.clone()],
+            false,
+            1,
+            block_a.hash(),
+            [0x65; 16],
+        );
+        let frame_b = response_frame(
+            &producer_b,
+            vec![block_b.clone()],
+            false,
+            1,
+            block_b.hash(),
+            [0x66; 16],
+        );
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        for (producer, replica_block, frame) in [
+            (&producer_a, &block_a, &frame_a),
+            (&producer_b, &block_b, &frame_b),
+        ] {
+            store
+                .import_verified_page(
+                    producer.public_key_bytes(),
+                    std::slice::from_ref(replica_block),
+                    std::slice::from_ref(&object),
+                    1,
+                    replica_block.hash(),
+                    frame,
+                    NOW + 20,
+                )
+                .unwrap();
+        }
+        store
+            .append_observation_checkpoint(
+                &[producer_a.public_key_bytes(), producer_b.public_key_bytes()],
+                &local,
+                NOW + 21,
+            )
+            .unwrap();
+        let connection = store.connection.lock();
+        let mut blob: Vec<u8> = connection
+            .query_row(
+                "SELECT checkpoint_blob FROM directory_observation_checkpoints
+                 WHERE sequence = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        *blob.last_mut().unwrap() ^= 1;
+        connection
+            .execute(
+                "UPDATE directory_observation_checkpoints
+                 SET checkpoint_blob = ?1 WHERE sequence = 1",
+                params![blob],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(store.audit(NOW + 22).is_err());
+        drop(store);
+        assert!(DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 22).is_err());
     }
 
     #[test]
@@ -3812,7 +4524,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_is_atomically_migrated_to_v3() {
+    fn schema_v1_is_atomically_migrated_to_v4() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x31; 32]).unwrap();
@@ -3828,7 +4540,8 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE directory_replica_resolutions;
+                "DROP TABLE directory_observation_checkpoints;
+                 DROP TABLE directory_replica_resolutions;
                  DROP TABLE directory_replica_retry_state;
                  ALTER TABLE directory_replica_chains DROP COLUMN active_incident_digest;
                  ALTER TABLE directory_replica_chains DROP COLUMN last_resolution_digest;",
@@ -3869,7 +4582,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_is_atomically_migrated_to_v3() {
+    fn schema_v2_is_atomically_migrated_to_v4() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x30; 32]).unwrap();
@@ -3885,7 +4598,8 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE directory_replica_resolutions;
+                "DROP TABLE directory_observation_checkpoints;
+                 DROP TABLE directory_replica_resolutions;
                  ALTER TABLE directory_replica_chains DROP COLUMN active_incident_digest;
                  ALTER TABLE directory_replica_chains DROP COLUMN last_resolution_digest;",
             )
@@ -3913,6 +4627,45 @@ mod tests {
             .unwrap();
         assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
         assert_eq!(resolution_table, "directory_replica_resolutions");
+    }
+
+    #[test]
+    fn schema_v3_is_atomically_migrated_to_v4() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x2f; 32]).unwrap();
+        let (store, _) = DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW).unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE directory_replica_meta SET schema_version = ?1 WHERE singleton = 1",
+                params![DIRECTORY_REPLICA_SCHEMA_VERSION_V3],
+            )
+            .unwrap();
+        connection
+            .execute_batch("DROP TABLE directory_observation_checkpoints;")
+            .unwrap();
+        drop(connection);
+
+        let (store, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 1).unwrap();
+        assert_eq!(audit.observation_checkpoints, 0);
+        let connection = store.connection.lock();
+        let (version, checkpoint_table): (i64, String) = connection
+            .query_row(
+                "SELECT m.schema_version, t.name
+                 FROM directory_replica_meta m
+                 JOIN sqlite_master t
+                   ON t.type = 'table' AND t.name = 'directory_observation_checkpoints'
+                 WHERE m.singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
+        assert_eq!(checkpoint_table, "directory_observation_checkpoints");
     }
 
     #[test]

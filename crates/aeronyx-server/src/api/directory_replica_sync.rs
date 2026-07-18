@@ -18,6 +18,8 @@
 //! - Persists failure/skip scheduling without blocking the async runtime.
 //! - Preserves producer-local page and request budgets on every round.
 //! - Records only bounded, privacy-safe synchronization observations.
+//! - Persists one signed observation checkpoint only after every pinned
+//!   producer reaches its authenticated remote tip in the same round.
 //! - Cancels an in-flight round when server shutdown is requested.
 //!
 //! ## Calling Relationships
@@ -33,7 +35,9 @@
 //! 4. Skip producer-local retries whose bounded backoff window is still active.
 //! 5. Pull pages until the request budget or 45-second deadline is exhausted.
 //! 6. Persist failures, and let a successful import atomically clear backoff.
-//! 7. Stop the complete round immediately when shutdown wins the select.
+//! 7. If every producer reaches its signed tip, append an idempotent local
+//!    observation checkpoint from a blocking worker.
+//! 8. Stop the complete round immediately when shutdown wins the select.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -49,6 +53,8 @@
 //!   peer-controlled strings, endpoints, or response bodies in those reasons.
 //!
 //! ## Last Modified
+//! `v0.5.0-DirectoryObservationCheckpoints` - Added all-producer round gating
+//! and signed, idempotent checkpoint persistence after authenticated catch-up.
 //! `v0.4.0-DirectoryReplicaDurableBackoff` - Restored audited `SQLite` retry state
 //! at startup and persisted failure/skip updates through blocking workers.
 //! v0.3.0-DirectoryReplicaBackoff - Added producer-local round deadlines,
@@ -127,6 +133,12 @@ pub struct DirectorySyncPullOutcome {
     pub remote_tip_hash: [u8; 32],
     /// HTTP requests consumed by this successful page and object hydration.
     pub requests_made: u32,
+}
+
+fn directory_sync_outcome_is_checkpoint_complete(outcome: &DirectorySyncPullOutcome) -> bool {
+    !outcome.has_more
+        && outcome.import.tip_height == outcome.remote_tip_height
+        && outcome.import.tip_hash == outcome.remote_tip_hash
 }
 
 /// Whether another page can be requested without violating the conservative
@@ -268,17 +280,17 @@ impl DirectoryReplicaSyncCoordinator {
     }
 
     async fn synchronize_round(&self) {
-        stream::iter(self.peers.iter().copied())
-            .for_each_concurrent(
-                DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS,
-                |producer| async move {
-                    self.synchronize_producer(producer).await;
-                },
-            )
+        let outcomes = stream::iter(self.peers.iter().copied())
+            .map(|producer| async move { self.synchronize_producer(producer).await })
+            .buffer_unordered(DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS)
+            .collect::<Vec<_>>()
             .await;
+        if outcomes.len() == self.peers.len() && outcomes.iter().all(|complete| *complete) {
+            self.persist_observation_checkpoint().await;
+        }
     }
 
-    async fn synchronize_producer(&self, producer: [u8; 32]) {
+    async fn synchronize_producer(&self, producer: [u8; 32]) -> bool {
         let now = unix_now_secs();
         if let Some(retry_at) = self.runtime.deferred_retry_until(&producer, now) {
             let retry_state_durable = self.persist_retry_skip(producer, now).await;
@@ -288,21 +300,22 @@ impl DirectoryReplicaSyncCoordinator {
                 retry_state_durable,
                 "[DIRECTORY_REPLICA] Producer synchronization deferred by backoff"
             );
-            return;
+            return false;
         }
-        if tokio::time::timeout(
+        let Ok(complete) = tokio::time::timeout(
             Duration::from_secs(DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS),
             self.synchronize_producer_pages(producer),
         )
         .await
-        .is_err()
-        {
+        else {
             self.record_producer_failure(producer, "directory_producer_round_timeout", None, None)
                 .await;
-        }
+            return false;
+        };
+        complete
     }
 
-    async fn synchronize_producer_pages(&self, producer: [u8; 32]) {
+    async fn synchronize_producer_pages(&self, producer: [u8; 32]) -> bool {
         let mut pages_completed = 0u32;
         let mut requests_used = 0u32;
         loop {
@@ -346,7 +359,7 @@ impl DirectoryReplicaSyncCoordinator {
                         requests_used,
                         outcome.has_more,
                     ) {
-                        break;
+                        return directory_sync_outcome_is_checkpoint_complete(&outcome);
                     }
                 }
                 Err(reason) => {
@@ -357,8 +370,35 @@ impl DirectoryReplicaSyncCoordinator {
                         Some(requests_used),
                     )
                     .await;
-                    break;
+                    return false;
                 }
+            }
+        }
+    }
+
+    async fn persist_observation_checkpoint(&self) {
+        let store = Arc::clone(&self.store);
+        let peers = Arc::clone(&self.peers);
+        let identity = Arc::clone(&self.identity);
+        let observed_at = unix_now_secs();
+        match tokio::task::spawn_blocking(move || {
+            store.append_observation_checkpoint(peers.as_ref(), identity.as_ref(), observed_at)
+        })
+        .await
+        {
+            Ok(Ok(report)) => {
+                debug!(
+                    appended = report.appended,
+                    sequence = report.sequence,
+                    producer_count = report.producer_count,
+                    "[DIRECTORY_REPLICA] Complete observation checkpoint evaluated"
+                );
+            }
+            Ok(Err(_)) | Err(_) => {
+                warn!(
+                    reason = "directory_observation_checkpoint_persist_failed",
+                    "[DIRECTORY_REPLICA] Complete observation checkpoint rejected"
+                );
             }
         }
     }
@@ -896,5 +936,36 @@ mod tests {
         assert!(!should_continue_directory_replica_catch_up(4, 8, true));
         assert!(!should_continue_directory_replica_catch_up(1, 8, true));
         assert!(!should_continue_directory_replica_catch_up(1, 2, false));
+    }
+
+    #[test]
+    fn checkpoint_requires_exact_authenticated_remote_tip() {
+        let complete = DirectorySyncPullOutcome {
+            import: DirectoryReplicaImportReport {
+                blocks_inserted: 1,
+                blocks_already_present: 0,
+                commitments_inserted: 4,
+                descriptor_equivocations: 0,
+                tip_height: 9,
+                tip_hash: [0x41; 32],
+            },
+            has_more: false,
+            remote_tip_height: 9,
+            remote_tip_hash: [0x41; 32],
+            requests_made: 2,
+        };
+        assert!(directory_sync_outcome_is_checkpoint_complete(&complete));
+
+        let mut catching_up = complete;
+        catching_up.has_more = true;
+        assert!(!directory_sync_outcome_is_checkpoint_complete(&catching_up));
+        let mut stale_height = complete;
+        stale_height.remote_tip_height = 10;
+        assert!(!directory_sync_outcome_is_checkpoint_complete(
+            &stale_height
+        ));
+        let mut wrong_hash = complete;
+        wrong_hash.remote_tip_hash = [0x42; 32];
+        assert!(!directory_sync_outcome_is_checkpoint_complete(&wrong_hash));
     }
 }

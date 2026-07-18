@@ -11,6 +11,8 @@
 //   Re-exported PeerStoreStatus for nodeboard discovery status.
 //
 // Last Modified:
+//   v0.10.0-DirectoryObservationCheckpoint - Re-exported the bounded append
+//     report used by the synchronization coordinator
 //   v0.9.0-DirectoryReplicaIncidentEvidence - Re-exported bounded incident
 //     summary, page, and independently verified evidence types
 //   v0.8.0-DirectoryReplicaConvergence - Re-exported bounded multi-source
@@ -51,12 +53,13 @@ pub use directory_chain::{
 };
 pub(crate) use directory_replica::MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE;
 pub use directory_replica::{
-    DirectoryReplicaAudit, DirectoryReplicaImportReport, DirectoryReplicaIncidentEvidence,
-    DirectoryReplicaIncidentPage, DirectoryReplicaIncidentSummary,
-    DirectoryReplicaObservationConvergenceSnapshot, DirectoryReplicaProducerSnapshot,
-    DirectoryReplicaResolutionCommand, DirectoryReplicaResolutionReport, DirectoryReplicaStore,
-    DirectoryReplicaStoreError, DirectoryReplicaStoreSnapshot, DirectoryReplicaSyncObservation,
-    DirectoryReplicaSyncRuntime, DirectoryReplicaTip,
+    DirectoryObservationCheckpointAppendReport, DirectoryReplicaAudit,
+    DirectoryReplicaImportReport, DirectoryReplicaIncidentEvidence, DirectoryReplicaIncidentPage,
+    DirectoryReplicaIncidentSummary, DirectoryReplicaObservationConvergenceSnapshot,
+    DirectoryReplicaProducerSnapshot, DirectoryReplicaResolutionCommand,
+    DirectoryReplicaResolutionReport, DirectoryReplicaStore, DirectoryReplicaStoreError,
+    DirectoryReplicaStoreSnapshot, DirectoryReplicaSyncObservation, DirectoryReplicaSyncRuntime,
+    DirectoryReplicaTip,
 };
 pub use dns_proxy::spawn_dns_proxy;
 pub use handshake::HandshakeService;

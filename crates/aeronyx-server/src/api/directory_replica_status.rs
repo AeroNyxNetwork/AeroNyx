@@ -18,6 +18,8 @@
 //! - Declares whether retry scheduling is audited and success-cleared atomically.
 //! - Reports bounded multi-source commitment overlap without claiming quorum,
 //!   fork choice, consensus, or global finality.
+//! - Reports aggregate observer-signed checkpoint availability and freshness
+//!   without exposing hashes, producer identities, or claiming finality.
 //! - Lists bounded incident summaries and exports one independently re-verified
 //!   signed evidence frame on local/VPN operator listeners only.
 //! - Reports signed quarantine-resolution counts while keeping mutation
@@ -33,8 +35,9 @@
 //! 2. Join persisted producer snapshots with in-memory sync observations.
 //! 3. Derive aggregate lag, failure, backoff, quarantine, and sync state.
 //! 4. Classify recent signed-observation overlap across eligible producers.
-//! 5. Serialize aggregate-only or fingerprint-only detail by listener scope.
-//! 6. Re-verify canonical incident evidence before an operator-only export.
+//! 5. Report observer-signed checkpoint availability without exposing its hash.
+//! 6. Serialize aggregate-only or fingerprint-only detail by listener scope.
+//! 7. Re-verify canonical incident evidence before an operator-only export.
 //!
 //! ## Privacy Invariant
 //! Public output is aggregate-only. Local status and incident lists contain
@@ -50,11 +53,15 @@
 //! - Keep `producers` omitted, not empty, on the public response contract.
 //! - Failure reasons must remain stable internal buckets, never peer strings.
 //! - Never rename observation overlap to quorum, consensus, or finality.
+//! - Checkpoint counters prove only local signed observation continuity; never
+//!   present them as votes, witness quorum, fork choice, or global finality.
 //! - Never mount incident list/export routes on the public listener.
 //! - Never add quarantine mutation here; recovery needs an authenticated,
 //!   audited compare-and-swap command boundary.
 //!
 //! ## Last Modified
+//! `v0.7.0-DirectoryObservationCheckpointStatus` - Added aggregate checkpoint
+//! availability, sequence, and age while redacting hashes and full identities.
 //! `v0.6.0-DirectoryReplicaQuarantineResolutionStatus` - Added aggregate and
 //! fingerprint-scoped signed resolution counts; no mutation route was added.
 //! `v0.5.0-DirectoryReplicaIncidentEvidence` - Added local-only bounded incident
@@ -146,6 +153,16 @@ struct DirectoryReplicaObservationConvergenceStatus {
 }
 
 #[derive(Debug, Serialize)]
+struct DirectoryReplicaObservationCheckpointStatus {
+    source_status: &'static str,
+    checkpoints: u64,
+    latest_sequence: u64,
+    latest_age_seconds: Option<u64>,
+    evidence_basis: &'static str,
+    security_model: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct DirectoryReplicaProducerStatus {
     producer_fingerprint: String,
     configured: bool,
@@ -204,6 +221,7 @@ struct DirectoryReplicaStatusResponse {
     next_retry_after_seconds: Option<u64>,
     catch_up_policy: DirectoryReplicaCatchUpPolicy,
     observation_convergence: DirectoryReplicaObservationConvergenceStatus,
+    observation_checkpoint: DirectoryReplicaObservationCheckpointStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     producers: Option<Vec<DirectoryReplicaProducerStatus>>,
     privacy_invariant: &'static str,
@@ -868,6 +886,24 @@ fn build_directory_replica_status_response(
             convergence,
             scope,
         ),
+        observation_checkpoint: DirectoryReplicaObservationCheckpointStatus {
+            source_status: if !store_enabled {
+                "disabled"
+            } else if persisted.observation_checkpoints == 0 {
+                "awaiting_complete_synchronized_round"
+            } else {
+                "available"
+            },
+            checkpoints: persisted.observation_checkpoints,
+            latest_sequence: persisted.observation_checkpoint_sequence,
+            latest_age_seconds: (persisted.observation_checkpoint_observed_at > 0).then(|| {
+                generated_at.saturating_sub(persisted.observation_checkpoint_observed_at)
+            }),
+            evidence_basis:
+                "local_node_signed_exact_producer_tips_and_recomputable_recent_commitment_overlap",
+            security_model:
+                "local_observer_evidence_not_vote_witness_quorum_fork_choice_consensus_or_finality",
+        },
         producers,
         privacy_invariant:
             "directory_replicas_store_only_public_signed_directory_evidence_in_producer_isolated_namespaces",
@@ -1035,6 +1071,24 @@ mod tests {
         assert!(parsed["observation_convergence"]
             .get("observation_root")
             .is_none());
+        assert_eq!(
+            parsed["observation_checkpoint"]["source_status"].as_str(),
+            Some("awaiting_complete_synchronized_round")
+        );
+        assert_eq!(
+            parsed["observation_checkpoint"]["checkpoints"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            parsed["observation_checkpoint"]["latest_sequence"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            parsed["observation_checkpoint"]["security_model"].as_str(),
+            Some(
+                "local_observer_evidence_not_vote_witness_quorum_fork_choice_consensus_or_finality"
+            )
+        );
         assert!(parsed.get("producers").is_none());
         assert!(!body_text.contains(&hex::encode(producer)));
         Ok(())
