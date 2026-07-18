@@ -13,12 +13,15 @@
 //! - `POST /api/discovery/peer/directory/tip`
 //! - `POST /api/discovery/peer/directory/block-range`
 //! - `POST /api/discovery/peer/directory/descriptor-objects`
+//! - `POST /api/discovery/peer/directory/replica-block-range`
+//! - `POST /api/discovery/peer/directory/replica-descriptor-objects`
 //! - `POST /api/discovery/peer/directory/observation-checkpoint-witness`
 //! - Dedicated operator-pinned admission in addition to live `PeerStore` proof.
 //! - Ed25519 request/response authentication, timestamp freshness, replay
 //!   rejection, per-peer rate limits, body limits, and audit-gated reads.
 //! - Exact content-addressed descriptor batches; no partial object response.
 //! - Independent checkpoint root recomputation before a signed witness decision.
+//! - Audited producer-replica export with a separate carrier signature layer.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` only when `DirectoryChainStore` is configured.
@@ -36,6 +39,8 @@
 //!    returned block identities, and the audited tip.
 //! 6. A witness response is accepted only after the local replica store
 //!    independently reproduces every exact prefix and observation root.
+//! 7. Carrier routes audit and read one producer namespace in the same SQLite
+//!    transaction; the carrier signs transport but never producer history.
 //!
 //! ## Privacy Invariant
 //! This API serves signed public node-directory commitments and the public
@@ -53,8 +58,11 @@
 //!   valid response proves what one producer signed; it is not consensus.
 //! - Never sign an accepted witness response from the observer signature alone.
 //!   Missing local prefixes must remain unavailable, never trusted by fallback.
+//! - Never export a replica for an unpinned or quarantined producer. A carrier
+//!   signature does not replace any producer block or descriptor signature.
 //!
 //! ## Last Modified
+//! v0.6.0-DirectoryEvidenceCarrier - Added audited pinned replica-carrier routes.
 //! v0.5.0-DirectoryObservationWitness - Added independently recomputed pinned-peer witness route.
 //! v0.4.0-DirectoryReplicaModuleSplit - Moved status, outbound transport, and
 //! scheduling into dedicated modules without changing Directory Sync V1.
@@ -84,10 +92,15 @@ use aeronyx_core::protocol::discovery::{
     directory_descriptor_objects_request_signing_bytes,
     directory_descriptor_objects_response_signing_bytes,
     directory_observation_witness_request_signing_bytes,
-    directory_observation_witness_response_signing_bytes, directory_tip_request_signing_bytes,
-    directory_tip_response_signing_bytes, encode_directory_sync_message,
-    DirectoryObservationCheckpointV1, DirectorySyncMessage, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
-    DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
+    directory_observation_witness_response_signing_bytes,
+    directory_replica_block_range_request_signing_bytes,
+    directory_replica_block_range_response_signing_bytes,
+    directory_replica_descriptor_objects_request_signing_bytes,
+    directory_replica_descriptor_objects_response_signing_bytes,
+    directory_tip_request_signing_bytes, directory_tip_response_signing_bytes,
+    encode_directory_sync_message, DirectoryObservationCheckpointV1, DirectorySyncMessage,
+    AERONYX_DIRECTORY_MAINNET_CHAIN_ID, DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+    DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
     DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1, MAX_DIRECTORY_SYNC_BLOCKS_V1,
     MAX_DIRECTORY_SYNC_OBJECTS_V1,
 };
@@ -197,10 +210,19 @@ pub fn build_directory_chain_peer_router_with_replica(
             post(descriptor_objects_handler),
         );
     if state.replica_store.is_some() {
-        router = router.route(
-            "/api/discovery/peer/directory/observation-checkpoint-witness",
-            post(observation_checkpoint_witness_handler),
-        );
+        router = router
+            .route(
+                "/api/discovery/peer/directory/replica-block-range",
+                post(replica_block_range_handler),
+            )
+            .route(
+                "/api/discovery/peer/directory/replica-descriptor-objects",
+                post(replica_descriptor_objects_handler),
+            )
+            .route(
+                "/api/discovery/peer/directory/observation-checkpoint-witness",
+                post(observation_checkpoint_witness_handler),
+            );
     }
     router
         .layer(DefaultBodyLimit::max(MAX_DIRECTORY_SYNC_REQUEST_BODY_BYTES))
@@ -501,6 +523,208 @@ async fn descriptor_objects_handler(
     })
 }
 
+async fn replica_block_range_handler(
+    State(state): State<DirectoryChainPeerState>,
+    body: Bytes,
+) -> Response {
+    let message = match decode_request(&body) {
+        Ok(message) => message,
+        Err(response) => return response,
+    };
+    let DirectorySyncMessage::ReplicaBlockRangeRequestV1 {
+        chain_id,
+        producer,
+        from_height,
+        limit,
+        request_id,
+        requester,
+        request_timestamp,
+        signature,
+    } = message
+    else {
+        return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
+    };
+    if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+        || producer == [0u8; 32]
+        || producer == state.identity.public_key_bytes()
+        || from_height == 0
+        || limit == 0
+        || limit > MAX_DIRECTORY_SYNC_BLOCKS_V1
+    {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_replica_range");
+    }
+    let now = now_secs();
+    let signing_bytes = directory_replica_block_range_request_signing_bytes(
+        &chain_id,
+        &producer,
+        from_height,
+        limit,
+        &request_id,
+        &requester,
+        request_timestamp,
+    );
+    if let Err(response) = authenticate_request(
+        &state,
+        requester,
+        request_id,
+        request_timestamp,
+        &signing_bytes,
+        &signature,
+        now,
+    )
+    .await
+    {
+        return response;
+    }
+    if !state.pinned_peers.contains(&producer) {
+        return protocol_error(StatusCode::FORBIDDEN, "producer_not_pinned");
+    }
+    let Some(store) = state.replica_store.as_ref().map(Arc::clone) else {
+        return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "replica_store_disabled");
+    };
+    let page = match tokio::task::spawn_blocking(move || {
+        store.audited_evidence_page(&producer, from_height, limit, now)
+    })
+    .await
+    {
+        Ok(Ok(page)) if page.tip_height > 0 => page,
+        Ok(Ok(_)) => return protocol_error(StatusCode::NOT_FOUND, "replica_not_found"),
+        Ok(Err(error)) => return replica_store_error_response(&error),
+        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
+    };
+    let has_more = page
+        .blocks
+        .last()
+        .is_some_and(|block| block.header.height < page.tip_height);
+    let carrier = state.identity.public_key_bytes();
+    let response_timestamp = now_secs();
+    let response_signing_bytes = directory_replica_block_range_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &producer,
+        &carrier,
+        response_timestamp,
+        &page.blocks,
+        has_more,
+        page.tip_height,
+        &page.tip_hash,
+    );
+    debug!(
+        blocks = page.blocks.len(),
+        has_more,
+        tip_height = page.tip_height,
+        "[DIRECTORY_CHAIN] Served audited replica evidence page"
+    );
+    encoded_response(DirectorySyncMessage::ReplicaBlockRangeResponseV1 {
+        chain_id,
+        request_id,
+        producer,
+        carrier,
+        response_timestamp,
+        blocks: page.blocks,
+        has_more,
+        tip_height: page.tip_height,
+        tip_hash: page.tip_hash,
+        signature: state.identity.sign(&response_signing_bytes),
+    })
+}
+
+async fn replica_descriptor_objects_handler(
+    State(state): State<DirectoryChainPeerState>,
+    body: Bytes,
+) -> Response {
+    let message = match decode_request(&body) {
+        Ok(message) => message,
+        Err(response) => return response,
+    };
+    let DirectorySyncMessage::ReplicaDescriptorObjectsRequestV1 {
+        chain_id,
+        producer,
+        descriptor_hashes,
+        request_id,
+        requester,
+        request_timestamp,
+        signature,
+    } = message
+    else {
+        return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
+    };
+    let unique_hashes = descriptor_hashes.iter().copied().collect::<HashSet<_>>();
+    if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+        || producer == [0u8; 32]
+        || producer == state.identity.public_key_bytes()
+        || descriptor_hashes.is_empty()
+        || descriptor_hashes.len() > MAX_DIRECTORY_SYNC_OBJECTS_V1
+        || unique_hashes.len() != descriptor_hashes.len()
+        || descriptor_hashes.iter().any(|hash| *hash == [0u8; 32])
+    {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_replica_object_request");
+    }
+    let now = now_secs();
+    let signing_bytes = directory_replica_descriptor_objects_request_signing_bytes(
+        &chain_id,
+        &producer,
+        &descriptor_hashes,
+        &request_id,
+        &requester,
+        request_timestamp,
+    );
+    if let Err(response) = authenticate_request(
+        &state,
+        requester,
+        request_id,
+        request_timestamp,
+        &signing_bytes,
+        &signature,
+        now,
+    )
+    .await
+    {
+        return response;
+    }
+    if !state.pinned_peers.contains(&producer) {
+        return protocol_error(StatusCode::FORBIDDEN, "producer_not_pinned");
+    }
+    let Some(store) = state.replica_store.as_ref().map(Arc::clone) else {
+        return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "replica_store_disabled");
+    };
+    let requested_hashes = descriptor_hashes.clone();
+    let objects = match tokio::task::spawn_blocking(move || {
+        store.audited_evidence_descriptor_objects(&producer, &requested_hashes, now)
+    })
+    .await
+    {
+        Ok(Ok(Some(objects))) => objects,
+        Ok(Ok(None)) => return protocol_error(StatusCode::NOT_FOUND, "replica_object_not_found"),
+        Ok(Err(error)) => return replica_store_error_response(&error),
+        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
+    };
+    let carrier = state.identity.public_key_bytes();
+    let response_timestamp = now_secs();
+    let response_signing_bytes = directory_replica_descriptor_objects_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &producer,
+        &carrier,
+        response_timestamp,
+        &descriptor_hashes,
+    );
+    debug!(
+        objects = objects.len(),
+        "[DIRECTORY_CHAIN] Served audited replica descriptor objects"
+    );
+    encoded_response(DirectorySyncMessage::ReplicaDescriptorObjectsResponseV1 {
+        chain_id,
+        request_id,
+        producer,
+        carrier,
+        response_timestamp,
+        descriptor_hashes,
+        objects,
+        signature: state.identity.sign(&response_signing_bytes),
+    })
+}
+
 async fn observation_checkpoint_witness_handler(
     State(state): State<DirectoryChainPeerState>,
     body: Bytes,
@@ -674,6 +898,21 @@ fn store_error_response(error: &DirectoryChainStoreError) -> Response {
     }
 }
 
+fn replica_store_error_response(error: &DirectoryReplicaStoreError) -> Response {
+    match error {
+        DirectoryReplicaStoreError::Request(_) => {
+            protocol_error(StatusCode::BAD_REQUEST, "invalid_replica_request")
+        }
+        DirectoryReplicaStoreError::Quarantined(_) => {
+            protocol_error(StatusCode::CONFLICT, "producer_quarantined")
+        }
+        _ => {
+            warn!(error = %error, "[DIRECTORY_CHAIN] Refused unaudited replica export");
+            protocol_error(StatusCode::SERVICE_UNAVAILABLE, "replica_not_verified")
+        }
+    }
+}
+
 fn protocol_error(status: StatusCode, code: &'static str) -> Response {
     (status, [(header::CONTENT_TYPE, "text/plain")], code).into_response()
 }
@@ -694,11 +933,12 @@ mod tests {
 
     use crate::api::directory_replica_sync::{
         verify_block_range_response, verify_descriptor_objects_response,
+        verify_replica_block_range_response, verify_replica_descriptor_objects_response,
     };
     use aeronyx_core::protocol::discovery::{
-        directory_tip_response_signing_bytes, DirectoryDescriptorCommitmentV1,
-        DirectoryObservationCheckpointV1, DirectoryObservationTipV1, NodeDescriptor,
-        SignedNodeDescriptor,
+        directory_tip_response_signing_bytes, DirectoryCommitmentBlockV1,
+        DirectoryDescriptorCommitmentV1, DirectoryObservationCheckpointV1,
+        DirectoryObservationTipV1, NodeDescriptor, SignedNodeDescriptor,
     };
     use tempfile::TempDir;
 
@@ -816,6 +1056,89 @@ mod tests {
             ),
             witness,
             observer,
+        )
+    }
+
+    fn carrier_test_router() -> (
+        Router,
+        Arc<IdentityKeyPair>,
+        IdentityKeyPair,
+        IdentityKeyPair,
+        SignedNodeDescriptor,
+    ) {
+        let now = now_secs();
+        let carrier = Arc::new(IdentityKeyPair::from_bytes(&[0xd1; 32]).unwrap());
+        let requester = IdentityKeyPair::from_bytes(&[0xd2; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0xd3; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0xd4; 32]).unwrap();
+        let object = signed_descriptor(&subject, now);
+        let commitment = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&object).unwrap();
+        let block =
+            DirectoryCommitmentBlockV1::new_signed(1, now, [0u8; 32], vec![commitment], &producer)
+                .unwrap();
+        let request_id = [0xd5; 16];
+        let response_signing = directory_block_range_response_signing_bytes(
+            &request_id,
+            &producer.public_key_bytes(),
+            now,
+            std::slice::from_ref(&block),
+            false,
+            1,
+            &block.hash(),
+        );
+        let response_frame =
+            encode_directory_sync_message(&DirectorySyncMessage::BlockRangeResponseV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                request_id,
+                responder: producer.public_key_bytes(),
+                response_timestamp: now,
+                blocks: vec![block.clone()],
+                has_more: false,
+                tip_height: 1,
+                tip_hash: block.hash(),
+                signature: producer.sign(&response_signing),
+            })
+            .unwrap();
+        let peer_store = Arc::new(PeerStore::new());
+        for identity in [&requester, &producer] {
+            peer_store
+                .upsert_verified_from_source(
+                    signed_descriptor(identity, now),
+                    now,
+                    "directory_carrier_test",
+                )
+                .unwrap();
+        }
+        let temp = TempDir::new().unwrap();
+        let root = temp.keep();
+        let path = root.join("directory.db");
+        let (chain_store, _) =
+            DirectoryChainStore::open(&path, carrier.public_key_bytes(), now).unwrap();
+        let (replica_store, _) =
+            DirectoryReplicaStore::open(&path, carrier.public_key_bytes(), now).unwrap();
+        replica_store
+            .import_verified_page(
+                producer.public_key_bytes(),
+                std::slice::from_ref(&block),
+                std::slice::from_ref(&object),
+                1,
+                block.hash(),
+                &response_frame,
+                now,
+            )
+            .unwrap();
+        (
+            build_directory_chain_peer_router_with_replica(
+                Arc::new(chain_store),
+                Some(Arc::new(replica_store)),
+                peer_store,
+                Arc::clone(&carrier),
+                vec![requester.public_key_bytes(), producer.public_key_bytes()],
+            ),
+            carrier,
+            requester,
+            producer,
+            object,
         )
     }
 
@@ -1009,6 +1332,102 @@ mod tests {
         };
         assert_eq!(descriptor_hashes, vec![descriptor_hash]);
         assert_eq!(objects, vec![expected_descriptor]);
+    }
+
+    #[tokio::test]
+    async fn carrier_routes_export_only_audited_producer_bound_evidence() {
+        let (router, carrier, requester, producer, expected_object) = carrier_test_router();
+        let timestamp = now_secs();
+        let requester_id = requester.public_key_bytes();
+        let producer_id = producer.public_key_bytes();
+        let range_id = [0xd6; 16];
+        let range_signing = directory_replica_block_range_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &producer_id,
+            1,
+            1,
+            &range_id,
+            &requester_id,
+            timestamp,
+        );
+        let range_request =
+            encode_directory_sync_message(&DirectorySyncMessage::ReplicaBlockRangeRequestV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                producer: producer_id,
+                from_height: 1,
+                limit: 1,
+                request_id: range_id,
+                requester: requester_id,
+                request_timestamp: timestamp,
+                signature: requester.sign(&range_signing),
+            })
+            .unwrap();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/replica-block-range")
+                    .body(Body::from(range_request))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 512 * 1024).await.unwrap();
+        let (blocks, has_more, tip_height, _) = verify_replica_block_range_response(
+            &body,
+            &range_id,
+            &producer_id,
+            &carrier.public_key_bytes(),
+            1,
+            timestamp,
+        )
+        .unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert!(!has_more);
+        assert_eq!(tip_height, 1);
+        let descriptor_hash = blocks[0].commitments[0].descriptor_hash;
+
+        let object_id = [0xd7; 16];
+        let object_signing = directory_replica_descriptor_objects_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &producer_id,
+            &[descriptor_hash],
+            &object_id,
+            &requester_id,
+            timestamp,
+        );
+        let object_request = encode_directory_sync_message(
+            &DirectorySyncMessage::ReplicaDescriptorObjectsRequestV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                producer: producer_id,
+                descriptor_hashes: vec![descriptor_hash],
+                request_id: object_id,
+                requester: requester_id,
+                request_timestamp: timestamp,
+                signature: requester.sign(&object_signing),
+            },
+        )
+        .unwrap();
+        let response = router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/replica-descriptor-objects")
+                    .body(Body::from(object_request))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 512 * 1024).await.unwrap();
+        let objects = verify_replica_descriptor_objects_response(
+            &body,
+            &object_id,
+            &producer_id,
+            &carrier.public_key_bytes(),
+            &[descriptor_hash],
+            timestamp,
+        )
+        .unwrap();
+        assert_eq!(objects, vec![expected_object]);
     }
 
     #[tokio::test]

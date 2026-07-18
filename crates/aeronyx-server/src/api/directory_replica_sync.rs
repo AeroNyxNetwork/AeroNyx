@@ -22,6 +22,8 @@
 //!   producer reaches its authenticated remote tip in the same round.
 //! - Requests independently recomputed signed witness receipts for the latest
 //!   audited local checkpoint and persists accepted receipts idempotently.
+//! - Tries the producer directly first, then uses another pinned node as an
+//!   audited evidence carrier only for bounded availability/admission failures.
 //! - Cancels an in-flight round when server shutdown is requested.
 //!
 //! ## Calling Relationships
@@ -35,13 +37,15 @@
 //! 2. Derive a stable 5-15 second startup delay from the local public identity.
 //! 3. On each tick, run at most four producer synchronization futures at once.
 //! 4. Skip producer-local retries whose bounded backoff window is still active.
-//! 5. Pull pages until the request budget or 45-second deadline is exhausted.
-//! 6. Persist failures, and let a successful import atomically clear backoff.
-//! 7. If every producer reaches its signed tip, append an idempotent local
+//! 5. Pull directly; before any trusted range exists, availability failures may
+//!    fall back to a pinned carrier while cryptographic failures stop closed.
+//! 6. Pull pages until the request budget or 45-second deadline is exhausted.
+//! 7. Persist failures, and let a successful import atomically clear backoff.
+//! 8. If every producer reaches its signed tip, append an idempotent local
 //!    observation checkpoint from a blocking worker.
-//! 8. Ask pinned peers to independently recompute that checkpoint; persist only
+//! 9. Ask pinned peers to independently recompute that checkpoint; persist only
 //!    canonical accepted receipts, never trust an unavailable/conflict result.
-//! 9. Stop the complete round immediately when shutdown wins the select.
+//! 10. Stop the complete round immediately when shutdown wins the select.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -57,8 +61,11 @@
 //!   peer-controlled strings, endpoints, or response bodies in those reasons.
 //! - Witness receipts are external recomputation evidence, not votes, quorum,
 //!   fork choice, consensus, or finality.
+//! - Never use carrier fallback after a noncanonical, wrong-producer, invalid
+//!   signature, or descriptor-hash response; these are security failures.
 //!
 //! ## Last Modified
+//! `v0.7.0-DirectoryEvidenceCarrier` - Added direct-first audited carrier fallback and dual-layer verification.
 //! `v0.6.0-DirectoryObservationWitness` - Added bounded external recomputation rounds and durable receipts.
 //! `v0.5.0-DirectoryObservationCheckpoints` - Added all-producer round gating
 //! and signed, idempotent checkpoint persistence after authenticated catch-up.
@@ -82,7 +89,11 @@ use aeronyx_core::protocol::discovery::{
     directory_descriptor_objects_request_signing_bytes,
     directory_descriptor_objects_response_signing_bytes,
     directory_observation_witness_request_signing_bytes,
-    directory_observation_witness_response_signing_bytes, encode_directory_sync_message,
+    directory_observation_witness_response_signing_bytes,
+    directory_replica_block_range_request_signing_bytes,
+    directory_replica_block_range_response_signing_bytes,
+    directory_replica_descriptor_objects_request_signing_bytes,
+    directory_replica_descriptor_objects_response_signing_bytes, encode_directory_sync_message,
     DirectoryCommitmentBlockV1, DirectoryObservationCheckpointV1, DirectorySyncMessage,
     SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
     DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
@@ -125,7 +136,7 @@ const OUTBOUND_BLOCKS_PER_PAGE: u16 = 1;
 /// One range request plus maximum descriptor-object chunks for one block.
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) const DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE: u32 =
-    1 + MAX_DIRECTORY_COMMITMENTS_PER_BLOCK.div_ceil(MAX_DIRECTORY_SYNC_OBJECTS_V1) as u32;
+    2 + MAX_DIRECTORY_COMMITMENTS_PER_BLOCK.div_ceil(MAX_DIRECTORY_SYNC_OBJECTS_V1) as u32;
 /// Hard producer-local page cap for one low-frequency synchronization round.
 pub(crate) const DIRECTORY_SYNC_MAX_PAGES_PER_ROUND: u32 = 4;
 /// Leaves headroom beneath the inbound 30 requests/minute identity budget.
@@ -331,11 +342,12 @@ impl DirectoryReplicaSyncCoordinator {
         let mut requests_used = 0u32;
         loop {
             self.runtime.record_attempt(producer, unix_now_secs());
-            match pull_directory_chain_page(
+            match pull_directory_chain_page_with_carriers(
                 Arc::clone(&self.store),
                 &self.peer_store,
                 self.identity.as_ref(),
                 &producer,
+                self.peers.as_ref(),
                 &self.client,
             )
             .await
@@ -715,6 +727,131 @@ pub async fn pull_directory_chain_page(
     import_directory_range_page(replica_store, *producer, page, objects, requests_made).await
 }
 
+async fn pull_directory_chain_page_with_carriers(
+    replica_store: Arc<DirectoryReplicaStore>,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    producer: &[u8; 32],
+    carriers: &[[u8; 32]],
+    client: &reqwest::Client,
+) -> Result<DirectorySyncPullOutcome, String> {
+    match pull_directory_chain_page(
+        Arc::clone(&replica_store),
+        peer_store,
+        identity,
+        producer,
+        client,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(reason) if directory_sync_failure_allows_carrier_fallback(&reason) => {
+            for carrier in carriers.iter().copied().filter(|candidate| {
+                candidate != producer && *candidate != identity.public_key_bytes()
+            }) {
+                match pull_directory_chain_page_via_carrier(
+                    Arc::clone(&replica_store),
+                    peer_store,
+                    identity,
+                    producer,
+                    &carrier,
+                    client,
+                )
+                .await
+                {
+                    Ok(mut outcome) => {
+                        // Direct-first consumed at most one failed range request;
+                        // reserving it even for descriptor failures is conservative.
+                        outcome.requests_made = outcome.requests_made.saturating_add(1);
+                        debug!(
+                            requests_made = outcome.requests_made,
+                            "[DIRECTORY_REPLICA] Audited carrier recovered producer evidence"
+                        );
+                        return Ok(outcome);
+                    }
+                    Err(carrier_reason)
+                        if directory_sync_failure_allows_carrier_fallback(&carrier_reason) => {}
+                    Err(carrier_reason) => return Err(carrier_reason),
+                }
+            }
+            Err("directory_carrier_fallback_exhausted".to_string())
+        }
+        Err(reason) => Err(reason),
+    }
+}
+
+fn directory_sync_failure_allows_carrier_fallback(reason: &str) -> bool {
+    if matches!(
+        reason,
+        "pinned_directory_peer_unavailable"
+            | "pinned_directory_peer_missing_endpoint"
+            | "pinned_directory_peer_unsafe_endpoint"
+            | "pinned_directory_peer_invalid_endpoint"
+    ) || reason == "directory_range_transport_failed"
+        || reason == "directory_replica_range_transport_failed"
+    {
+        return true;
+    }
+    for prefix in [
+        "directory_range_http_status_",
+        "directory_replica_range_http_status_",
+    ] {
+        let Some(status) = reason
+            .strip_prefix(prefix)
+            .and_then(|value| value.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        return matches!(status, 403 | 404 | 408 | 429) || status >= 500;
+    }
+    false
+}
+
+async fn pull_directory_chain_page_via_carrier(
+    replica_store: Arc<DirectoryReplicaStore>,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    producer: &[u8; 32],
+    carrier: &[u8; 32],
+    client: &reqwest::Client,
+) -> Result<DirectorySyncPullOutcome, String> {
+    let request_timestamp = unix_now_secs();
+    let local_tip = replica_store
+        .producer_tip(producer)
+        .map_err(|_| "replica_tip_unavailable".to_string())?;
+    if local_tip.quarantined {
+        return Err("producer_quarantined".to_string());
+    }
+    let (range_url, object_url) =
+        directory_replica_carrier_urls(peer_store, carrier, request_timestamp)?;
+    let from_height = local_tip
+        .tip_height
+        .checked_add(1)
+        .ok_or_else(|| "replica_height_exhausted".to_string())?;
+    let requester = identity.public_key_bytes();
+    let page = request_directory_replica_block_page(
+        identity,
+        producer,
+        carrier,
+        client,
+        range_url,
+        from_height,
+        request_timestamp,
+    )
+    .await?;
+    let (objects, requests_made) = hydrate_directory_replica_descriptor_objects(
+        identity,
+        producer,
+        carrier,
+        client,
+        object_url,
+        &requester,
+        &page.blocks,
+    )
+    .await?;
+    import_directory_range_page(replica_store, *producer, page, objects, requests_made).await
+}
+
 fn directory_sync_peer_urls(
     peer_store: &PeerStore,
     producer: &[u8; 32],
@@ -736,6 +873,35 @@ fn directory_sync_peer_urls(
     let object_url =
         commitment_peer_url(endpoint, "/api/discovery/peer/directory/descriptor-objects")
             .map_err(|_| "pinned_directory_peer_invalid_endpoint".to_string())?;
+    Ok((range_url, object_url))
+}
+
+fn directory_replica_carrier_urls(
+    peer_store: &PeerStore,
+    carrier: &[u8; 32],
+    request_timestamp: u64,
+) -> Result<(reqwest::Url, reqwest::Url), String> {
+    let descriptor = peer_store
+        .get_valid(carrier, request_timestamp)
+        .ok_or_else(|| "pinned_directory_peer_unavailable".to_string())?;
+    let endpoint = descriptor
+        .descriptor
+        .public_endpoint
+        .as_deref()
+        .ok_or_else(|| "pinned_directory_peer_missing_endpoint".to_string())?;
+    if !commitment_peer_endpoint_is_public(endpoint) {
+        return Err("pinned_directory_peer_unsafe_endpoint".to_string());
+    }
+    let range_url = commitment_peer_url(
+        endpoint,
+        "/api/discovery/peer/directory/replica-block-range",
+    )
+    .map_err(|_| "pinned_directory_peer_invalid_endpoint".to_string())?;
+    let object_url = commitment_peer_url(
+        endpoint,
+        "/api/discovery/peer/directory/replica-descriptor-objects",
+    )
+    .map_err(|_| "pinned_directory_peer_invalid_endpoint".to_string())?;
     Ok((range_url, object_url))
 }
 
@@ -777,6 +943,58 @@ async fn request_directory_block_page(
         from_height,
         request_timestamp,
     )?;
+    Ok(DirectoryRangePage {
+        blocks,
+        has_more,
+        remote_tip_height,
+        remote_tip_hash,
+        signed_response,
+    })
+}
+
+async fn request_directory_replica_block_page(
+    identity: &IdentityKeyPair,
+    producer: &[u8; 32],
+    carrier: &[u8; 32],
+    client: &reqwest::Client,
+    range_url: reqwest::Url,
+    from_height: u64,
+    request_timestamp: u64,
+) -> Result<DirectoryRangePage, String> {
+    let mut request_id = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut request_id);
+    let requester = identity.public_key_bytes();
+    let signing_bytes = directory_replica_block_range_request_signing_bytes(
+        &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+        producer,
+        from_height,
+        OUTBOUND_BLOCKS_PER_PAGE,
+        &request_id,
+        &requester,
+        request_timestamp,
+    );
+    let request = DirectorySyncMessage::ReplicaBlockRangeRequestV1 {
+        chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+        producer: *producer,
+        from_height,
+        limit: OUTBOUND_BLOCKS_PER_PAGE,
+        request_id,
+        requester,
+        request_timestamp,
+        signature: identity.sign(&signing_bytes),
+    };
+    let frame = encode_directory_sync_message(&request)
+        .map_err(|_| "directory_replica_range_request_encode_failed".to_string())?;
+    let signed_response = post_directory_frame(client, range_url, frame, "replica_range").await?;
+    let (blocks, has_more, remote_tip_height, remote_tip_hash) =
+        verify_replica_block_range_response(
+            &signed_response,
+            &request_id,
+            producer,
+            carrier,
+            from_height,
+            request_timestamp,
+        )?;
     Ok(DirectoryRangePage {
         blocks,
         has_more,
@@ -831,6 +1049,64 @@ async fn hydrate_directory_descriptor_objects(
             &response,
             &request_id,
             producer,
+            hashes,
+            request_timestamp,
+        )?;
+        objects.append(&mut verified);
+    }
+    Ok((objects, requests_made))
+}
+
+async fn hydrate_directory_replica_descriptor_objects(
+    identity: &IdentityKeyPair,
+    producer: &[u8; 32],
+    carrier: &[u8; 32],
+    client: &reqwest::Client,
+    object_url: reqwest::Url,
+    requester: &[u8; 32],
+    blocks: &[DirectoryCommitmentBlockV1],
+) -> Result<(Vec<SignedNodeDescriptor>, u32), String> {
+    let descriptor_hashes = blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .commitments
+                .iter()
+                .map(|commitment| commitment.descriptor_hash)
+        })
+        .collect::<Vec<_>>();
+    let requests_made = directory_sync_request_count_for_objects(descriptor_hashes.len());
+    let mut objects = Vec::with_capacity(descriptor_hashes.len());
+    for hashes in descriptor_hashes.chunks(MAX_DIRECTORY_SYNC_OBJECTS_V1) {
+        let request_timestamp = unix_now_secs();
+        let mut request_id = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut request_id);
+        let signing_bytes = directory_replica_descriptor_objects_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            producer,
+            hashes,
+            &request_id,
+            requester,
+            request_timestamp,
+        );
+        let request = DirectorySyncMessage::ReplicaDescriptorObjectsRequestV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            producer: *producer,
+            descriptor_hashes: hashes.to_vec(),
+            request_id,
+            requester: *requester,
+            request_timestamp,
+            signature: identity.sign(&signing_bytes),
+        };
+        let frame = encode_directory_sync_message(&request)
+            .map_err(|_| "directory_replica_object_request_encode_failed".to_string())?;
+        let response =
+            post_directory_frame(client, object_url.clone(), frame, "replica_objects").await?;
+        let mut verified = verify_replica_descriptor_objects_response(
+            &response,
+            &request_id,
+            producer,
+            carrier,
             hashes,
             request_timestamp,
         )?;
@@ -971,6 +1247,72 @@ pub(crate) fn verify_block_range_response(
     Ok((blocks, has_more, tip_height, tip_hash))
 }
 
+pub(crate) fn verify_replica_block_range_response(
+    frame: &[u8],
+    expected_request_id: &[u8; 16],
+    expected_producer: &[u8; 32],
+    expected_carrier: &[u8; 32],
+    expected_from_height: u64,
+    request_timestamp: u64,
+) -> Result<(Vec<DirectoryCommitmentBlockV1>, bool, u64, [u8; 32]), String> {
+    let message = decode_directory_sync_message(frame)
+        .map_err(|_| "directory_replica_range_response_decode_failed".to_string())?;
+    let canonical = encode_directory_sync_message(&message)
+        .map_err(|_| "directory_replica_range_response_encode_failed".to_string())?;
+    if canonical != frame {
+        return Err("directory_replica_range_response_noncanonical".to_string());
+    }
+    let DirectorySyncMessage::ReplicaBlockRangeResponseV1 {
+        chain_id,
+        request_id,
+        producer,
+        carrier,
+        response_timestamp,
+        blocks,
+        has_more,
+        tip_height,
+        tip_hash,
+        signature,
+    } = message
+    else {
+        return Err("directory_replica_range_response_unexpected_message".to_string());
+    };
+    if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+        || request_id != *expected_request_id
+        || producer != *expected_producer
+        || carrier != *expected_carrier
+        || carrier == producer
+        || response_timestamp.abs_diff(unix_now_secs())
+            > DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS
+        || response_timestamp.saturating_add(DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS)
+            < request_timestamp
+        || blocks.len() > usize::from(OUTBOUND_BLOCKS_PER_PAGE)
+        || blocks
+            .first()
+            .is_some_and(|block| block.header.height != expected_from_height)
+        || blocks
+            .iter()
+            .any(|block| block.header.producer != *expected_producer)
+    {
+        return Err("directory_replica_range_response_contract_mismatch".to_string());
+    }
+    let signing_bytes = directory_replica_block_range_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &producer,
+        &carrier,
+        response_timestamp,
+        &blocks,
+        has_more,
+        tip_height,
+        &tip_hash,
+    );
+    IdentityPublicKey::from_bytes(&carrier)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .map_err(|_| "directory_replica_range_response_invalid_signature".to_string())?;
+    Ok((blocks, has_more, tip_height, tip_hash))
+}
+
 pub(crate) fn verify_descriptor_objects_response(
     frame: &[u8],
     expected_request_id: &[u8; 16],
@@ -1025,6 +1367,71 @@ pub(crate) fn verify_descriptor_objects_response(
         .map_err(|_| "directory_object_response_invalid_descriptor".to_string())?;
         if commitment.descriptor_hash != *expected_hash {
             return Err("directory_object_response_hash_mismatch".to_string());
+        }
+    }
+    Ok(objects)
+}
+
+pub(crate) fn verify_replica_descriptor_objects_response(
+    frame: &[u8],
+    expected_request_id: &[u8; 16],
+    expected_producer: &[u8; 32],
+    expected_carrier: &[u8; 32],
+    expected_hashes: &[[u8; 32]],
+    request_timestamp: u64,
+) -> Result<Vec<SignedNodeDescriptor>, String> {
+    let message = decode_directory_sync_message(frame)
+        .map_err(|_| "directory_replica_object_response_decode_failed".to_string())?;
+    let canonical = encode_directory_sync_message(&message)
+        .map_err(|_| "directory_replica_object_response_encode_failed".to_string())?;
+    if canonical != frame {
+        return Err("directory_replica_object_response_noncanonical".to_string());
+    }
+    let DirectorySyncMessage::ReplicaDescriptorObjectsResponseV1 {
+        chain_id,
+        request_id,
+        producer,
+        carrier,
+        response_timestamp,
+        descriptor_hashes,
+        objects,
+        signature,
+    } = message
+    else {
+        return Err("directory_replica_object_response_unexpected_message".to_string());
+    };
+    if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+        || request_id != *expected_request_id
+        || producer != *expected_producer
+        || carrier != *expected_carrier
+        || carrier == producer
+        || response_timestamp.abs_diff(unix_now_secs())
+            > DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS
+        || response_timestamp.saturating_add(DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS)
+            < request_timestamp
+        || descriptor_hashes != expected_hashes
+        || objects.len() != expected_hashes.len()
+    {
+        return Err("directory_replica_object_response_contract_mismatch".to_string());
+    }
+    let signing_bytes = directory_replica_descriptor_objects_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &producer,
+        &carrier,
+        response_timestamp,
+        &descriptor_hashes,
+    );
+    IdentityPublicKey::from_bytes(&carrier)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .map_err(|_| "directory_replica_object_response_invalid_signature".to_string())?;
+    for (expected_hash, object) in expected_hashes.iter().zip(&objects) {
+        let commitment = aeronyx_core::protocol::discovery::DirectoryDescriptorCommitmentV1::from_signed_descriptor(
+            object,
+        )
+        .map_err(|_| "directory_replica_object_response_invalid_descriptor".to_string())?;
+        if commitment.descriptor_hash != *expected_hash {
+            return Err("directory_replica_object_response_hash_mismatch".to_string());
         }
     }
     Ok(objects)
@@ -1124,7 +1531,7 @@ mod tests {
 
     #[test]
     fn catch_up_budget_allows_small_pages_but_reserves_worst_case_headroom() {
-        assert_eq!(DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE, 17);
+        assert_eq!(DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE, 18);
         assert_eq!(directory_sync_request_count_for_objects(0), 1);
         assert_eq!(directory_sync_request_count_for_objects(1), 2);
         assert_eq!(directory_sync_request_count_for_objects(16), 2);
@@ -1133,8 +1540,126 @@ mod tests {
         assert!(should_continue_directory_replica_catch_up(1, 2, true));
         assert!(should_continue_directory_replica_catch_up(3, 6, true));
         assert!(!should_continue_directory_replica_catch_up(4, 8, true));
-        assert!(!should_continue_directory_replica_catch_up(1, 8, true));
+        assert!(should_continue_directory_replica_catch_up(1, 6, true));
+        assert!(!should_continue_directory_replica_catch_up(1, 7, true));
         assert!(!should_continue_directory_replica_catch_up(1, 2, false));
+    }
+
+    #[test]
+    fn carrier_fallback_is_limited_to_availability_and_admission_failures() {
+        for reason in [
+            "pinned_directory_peer_unavailable",
+            "pinned_directory_peer_missing_endpoint",
+            "directory_range_transport_failed",
+            "directory_range_http_status_403",
+            "directory_range_http_status_404",
+            "directory_range_http_status_408",
+            "directory_range_http_status_429",
+            "directory_range_http_status_500",
+            "directory_replica_range_http_status_503",
+        ] {
+            assert!(directory_sync_failure_allows_carrier_fallback(reason));
+        }
+        for reason in [
+            "directory_range_response_noncanonical",
+            "directory_range_response_invalid_signature",
+            "directory_range_response_contract_mismatch",
+            "directory_object_response_hash_mismatch",
+            "directory_range_http_status_400",
+            "directory_range_http_status_401",
+            "directory_range_http_status_409",
+        ] {
+            assert!(!directory_sync_failure_allows_carrier_fallback(reason));
+        }
+    }
+
+    #[test]
+    fn carrier_range_response_verification_binds_producer_carrier_and_signature() {
+        let producer = IdentityKeyPair::from_bytes(&[0xf1; 32]).unwrap();
+        let carrier = IdentityKeyPair::from_bytes(&[0xf2; 32]).unwrap();
+        let other = IdentityKeyPair::from_bytes(&[0xf3; 32]).unwrap();
+        let request_id = [0xf4; 16];
+        let now = unix_now_secs();
+        let blocks = Vec::new();
+        let signing_bytes = directory_replica_block_range_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &producer.public_key_bytes(),
+            &carrier.public_key_bytes(),
+            now,
+            &blocks,
+            false,
+            0,
+            &[0u8; 32],
+        );
+        let response = DirectorySyncMessage::ReplicaBlockRangeResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            producer: producer.public_key_bytes(),
+            carrier: carrier.public_key_bytes(),
+            response_timestamp: now,
+            blocks,
+            has_more: false,
+            tip_height: 0,
+            tip_hash: [0u8; 32],
+            signature: carrier.sign(&signing_bytes),
+        };
+        let frame = encode_directory_sync_message(&response).unwrap();
+        assert_eq!(
+            verify_replica_block_range_response(
+                &frame,
+                &request_id,
+                &producer.public_key_bytes(),
+                &carrier.public_key_bytes(),
+                1,
+                now,
+            )
+            .unwrap(),
+            (Vec::new(), false, 0, [0u8; 32])
+        );
+        assert_eq!(
+            verify_replica_block_range_response(
+                &frame,
+                &request_id,
+                &other.public_key_bytes(),
+                &carrier.public_key_bytes(),
+                1,
+                now,
+            )
+            .unwrap_err(),
+            "directory_replica_range_response_contract_mismatch"
+        );
+        assert_eq!(
+            verify_replica_block_range_response(
+                &frame,
+                &request_id,
+                &producer.public_key_bytes(),
+                &other.public_key_bytes(),
+                1,
+                now,
+            )
+            .unwrap_err(),
+            "directory_replica_range_response_contract_mismatch"
+        );
+
+        let mut tampered = response;
+        let DirectorySyncMessage::ReplicaBlockRangeResponseV1 { signature, .. } = &mut tampered
+        else {
+            unreachable!();
+        };
+        signature[0] ^= 1;
+        assert_eq!(
+            verify_replica_block_range_response(
+                &encode_directory_sync_message(&tampered).unwrap(),
+                &request_id,
+                &producer.public_key_bytes(),
+                &carrier.public_key_bytes(),
+                1,
+                now,
+            )
+            .unwrap_err(),
+            "directory_replica_range_response_invalid_signature"
+        );
     }
 
     #[test]

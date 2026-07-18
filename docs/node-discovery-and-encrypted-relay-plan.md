@@ -1151,6 +1151,67 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-19 - Added Directory Signed Evidence Carrier V1.
+- Files changed:
+  - crates/aeronyx-core/src/protocol/discovery.rs
+  - crates/aeronyx-server/src/api/directory_chain_peer.rs
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Problem solved:
+  - Direct producer synchronization required every configured node to pin every
+    other node bilaterally. That N-by-N operational dependency could prevent an
+    otherwise honest observer from obtaining all producer evidence needed to
+    witness a checkpoint during a rolling upgrade.
+  - The carrier layer allows one already pinned, audited node to transport its
+    retained copy of another configured producer's public signed evidence. It
+    does not grant the carrier authority over the producer namespace.
+- Protocol contract:
+  - Appended producer-bound replica block-range and descriptor-object request /
+    response variants after all existing Directory Sync bincode variants.
+  - Requests bind chain id, producer, range or ordered hashes, requester,
+    request id, and timestamp. Responses additionally bind carrier identity,
+    exact producer block hashes or descriptor hashes, audited tip, and time.
+  - The outer Ed25519 signature authenticates the carrier transport. Every
+    inner block remains signed by the producer and every descriptor remains
+    signed by its subject node; receivers verify all layers before import.
+- Storage and admission:
+  - Replica export performs the complete metadata, checkpoint, witness,
+    incident, resolution, retry, producer-prefix, commitment-index, and object
+    audit inside the same SQLite read transaction as the bounded export.
+  - Only a configured producer with a retained non-quarantined prefix may be
+    exported. Requesters still require a bilateral operator pin, a current
+    signed PeerStore descriptor, timestamp freshness, signature, replay id,
+    body cap, and per-identity rate budget.
+- Coordinator behavior:
+  - Producer direct pull remains first choice and preserves the old wire path.
+  - Carrier fallback is allowed only before a trusted range is obtained and
+    only for unavailable endpoint, transport, HTTP 403/404/408/429, or 5xx.
+  - Noncanonical frames, wrong producer/carrier, invalid signatures, wrong
+    descriptor hashes, and other contract failures stop closed without fallback.
+  - The conservative per-page budget is 18 requests, including one failed
+    direct range request plus the worst bounded carrier hydration page.
+- Security boundary:
+  - A carrier cannot forge, rewrite, finalize, vote on, or choose producer
+    history. Conflicting producer-signed evidence still enters the existing
+    durable quarantine and incident path, including after restart audit.
+  - Carrier transport is not an independent network-path claim and does not
+    create consensus, fork choice, quorum, financial blocks, or finality.
+- Deployment gate:
+  - Deploy first to US1 and Noway1 while Korean1 remains on its active-session
+    binary. Configure Noway1 for US1 + Korean1, verify direct Korean admission
+    fails, carrier recovery through US1 succeeds, and then obtain the first
+    independently recomputed external checkpoint witness receipt.
+- Verification:
+  - Modified-file rustfmt check and `git diff --check` passed. Workspace-wide
+    rustfmt still reports pre-existing formatting drift in unrelated files.
+  - Core and server Clippy correctness gates passed with dependency warnings
+    suppressed; no new correctness diagnostic remains.
+  - Core full suite: 198/198 passed.
+  - Server full suite: 1101/1101 library tests and 2/2 binary tests passed;
+    the auxiliary integration target passed its enabled test (9 remain ignored).
+  - Release build for `aeronyx-server` passed.
+
 2026-07-19 - Added cross-node Directory observation checkpoint witness V1.
 - Files changed:
   - crates/aeronyx-core/src/protocol/discovery.rs

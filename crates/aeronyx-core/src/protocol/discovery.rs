@@ -24,6 +24,8 @@
 //! - `DirectorySyncMessage`: authenticated, bounded node-to-node transport for
 //!   serving one producer's tip, block ranges, descriptor objects, and
 //!   independently recomputed observation-checkpoint witness receipts
+//! - Replica-carrier frames that transport already audited producer evidence
+//!   without allowing the carrier to replace the producer's signatures
 //!
 //! ## Dependencies
 //! - crates/aeronyx-core/src/crypto/keys.rs: IdentityKeyPair / IdentityPublicKey
@@ -45,6 +47,8 @@
 //!    locally recomputable overlap root without claiming consensus or finality
 //! 9. A pinned peer may witness an exact checkpoint only after independently
 //!    recomputing its producer prefixes and overlap root from local replicas
+//! 10. A pinned carrier may serve an audited producer replica when direct
+//!     producer admission is unavailable; receivers still verify both layers
 //!
 //! ## Important Note for Next Developer
 //! - Do not put private keys, client IPs, destination metadata, DNS contents,
@@ -61,8 +65,11 @@
 //!   quorum certificates, global consensus, or finality.
 //! - A checkpoint witness receipt proves one external node independently
 //!   recomputed one exact checkpoint. It is not a vote, quorum, or finality.
+//! - A replica carrier proves transport of its audited copy. It cannot author,
+//!   rewrite, finalize, or select the producer's signed chain.
 //!
 //! ## Last Modified
+//! v0.10.0-DirectoryEvidenceCarrier - Added producer-bound audited replica transport frames
 //! v0.9.0-DirectoryObservationWitness - Added bounded independently recomputed checkpoint witness frames
 //! v0.8.0-DirectoryObservationCheckpoint - Added canonical signed observation checkpoints
 //! v0.7.0-DirectorySyncWire - Added signed bounded Directory Chain peer frames
@@ -1305,6 +1312,92 @@ pub enum DirectorySyncMessage {
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
+    /// Requests a bounded producer range from an audited evidence carrier.
+    ///
+    /// This variant is appended to preserve every existing bincode enum index.
+    /// Returned blocks remain signed by `producer`; `carrier` only transports
+    /// evidence that it has already imported and audited.
+    ReplicaBlockRangeRequestV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Producer whose signed replica prefix is requested.
+        producer: [u8; 32],
+        /// First one-based block height requested.
+        from_height: u64,
+        /// Maximum number of blocks requested.
+        limit: u16,
+        /// Random request identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Ed25519 identity of the requesting node.
+        requester: [u8; 32],
+        /// Request creation time in Unix epoch seconds.
+        request_timestamp: u64,
+        /// Requester signature over every request field.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Returns a bounded producer-signed range through an audited carrier.
+    ReplicaBlockRangeResponseV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Request identifier copied from the authenticated request.
+        request_id: [u8; 16],
+        /// Producer identity carried by every returned block.
+        producer: [u8; 32],
+        /// Independent node transporting its audited replica evidence.
+        carrier: [u8; 32],
+        /// Response creation time in Unix epoch seconds.
+        response_timestamp: u64,
+        /// Contiguous producer-signed blocks in ascending height order.
+        blocks: Vec<DirectoryCommitmentBlockV1>,
+        /// Whether the audited producer tip extends beyond this page.
+        has_more: bool,
+        /// Audited producer tip height at the carrier.
+        tip_height: u64,
+        /// Audited producer tip hash at the carrier.
+        tip_hash: [u8; 32],
+        /// Carrier signature binding request, producer, block hashes, and tip.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Requests exact producer descriptor objects from an audited carrier.
+    ReplicaDescriptorObjectsRequestV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Producer namespace containing every requested descriptor object.
+        producer: [u8; 32],
+        /// Descriptor commitment hashes, in required response order.
+        descriptor_hashes: Vec<[u8; 32]>,
+        /// Random request identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Ed25519 identity of the requesting node.
+        requester: [u8; 32],
+        /// Request creation time in Unix epoch seconds.
+        request_timestamp: u64,
+        /// Requester signature over every request field.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Returns exact producer descriptor objects through an audited carrier.
+    ReplicaDescriptorObjectsResponseV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Request identifier copied from the authenticated request.
+        request_id: [u8; 16],
+        /// Producer namespace represented by `objects`.
+        producer: [u8; 32],
+        /// Independent node transporting its audited replica evidence.
+        carrier: [u8; 32],
+        /// Response creation time in Unix epoch seconds.
+        response_timestamp: u64,
+        /// Requested hashes in the exact order represented by `objects`.
+        descriptor_hashes: Vec<[u8; 32]>,
+        /// Signed public descriptors committed by the producer blocks.
+        objects: Vec<SignedNodeDescriptor>,
+        /// Carrier signature binding request, producer, and ordered hashes.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
 }
 
 fn directory_sync_signing_digest<'a>(
@@ -1479,6 +1572,132 @@ pub fn directory_descriptor_objects_response_signing_bytes(
     ]);
     fields.extend(descriptor_hashes.iter().map(<[u8; 32]>::as_slice));
     directory_sync_signing_digest(b"AeroNyx-DirectorySync-ObjectsResponse-v1", fields)
+}
+
+/// Canonical digest signed by a replica-carrier block-range request.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_replica_block_range_request_signing_bytes(
+    chain_id: &[u8; 32],
+    producer: &[u8; 32],
+    from_height: u64,
+    limit: u16,
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+) -> [u8; 32] {
+    let from_height = from_height.to_le_bytes();
+    let limit = limit.to_le_bytes();
+    let request_timestamp = request_timestamp.to_le_bytes();
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-ReplicaBlockRangeRequest-v1",
+        [
+            chain_id.as_slice(),
+            producer.as_slice(),
+            from_height.as_slice(),
+            limit.as_slice(),
+            request_id.as_slice(),
+            requester.as_slice(),
+            request_timestamp.as_slice(),
+        ],
+    )
+}
+
+/// Canonical digest signed by a replica-carrier block-range response.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_replica_block_range_response_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    producer: &[u8; 32],
+    carrier: &[u8; 32],
+    response_timestamp: u64,
+    blocks: &[DirectoryCommitmentBlockV1],
+    has_more: bool,
+    tip_height: u64,
+    tip_hash: &[u8; 32],
+) -> [u8; 32] {
+    let response_timestamp = response_timestamp.to_le_bytes();
+    let block_count = u64::try_from(blocks.len())
+        .unwrap_or(u64::MAX)
+        .to_le_bytes();
+    let has_more = [u8::from(has_more)];
+    let tip_height = tip_height.to_le_bytes();
+    let block_hashes = blocks
+        .iter()
+        .map(DirectoryCommitmentBlockV1::hash)
+        .collect::<Vec<_>>();
+    let mut fields = Vec::<&[u8]>::with_capacity(block_hashes.len() + 10);
+    fields.extend([
+        chain_id.as_slice(),
+        request_id.as_slice(),
+        producer.as_slice(),
+        carrier.as_slice(),
+        response_timestamp.as_slice(),
+        block_count.as_slice(),
+    ]);
+    fields.extend(block_hashes.iter().map(<[u8; 32]>::as_slice));
+    fields.extend([
+        has_more.as_slice(),
+        tip_height.as_slice(),
+        tip_hash.as_slice(),
+    ]);
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-ReplicaBlockRangeResponse-v1",
+        fields,
+    )
+}
+
+/// Canonical digest signed by a replica-carrier object request.
+#[must_use]
+pub fn directory_replica_descriptor_objects_request_signing_bytes(
+    chain_id: &[u8; 32],
+    producer: &[u8; 32],
+    descriptor_hashes: &[[u8; 32]],
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+) -> [u8; 32] {
+    let count = u64::try_from(descriptor_hashes.len())
+        .unwrap_or(u64::MAX)
+        .to_le_bytes();
+    let request_timestamp = request_timestamp.to_le_bytes();
+    let mut fields = Vec::<&[u8]>::with_capacity(descriptor_hashes.len() + 7);
+    fields.extend([chain_id.as_slice(), producer.as_slice(), count.as_slice()]);
+    fields.extend(descriptor_hashes.iter().map(<[u8; 32]>::as_slice));
+    fields.extend([
+        request_id.as_slice(),
+        requester.as_slice(),
+        request_timestamp.as_slice(),
+    ]);
+    directory_sync_signing_digest(b"AeroNyx-DirectorySync-ReplicaObjectsRequest-v1", fields)
+}
+
+/// Canonical digest signed by a replica-carrier object response.
+#[must_use]
+pub fn directory_replica_descriptor_objects_response_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    producer: &[u8; 32],
+    carrier: &[u8; 32],
+    response_timestamp: u64,
+    descriptor_hashes: &[[u8; 32]],
+) -> [u8; 32] {
+    let response_timestamp = response_timestamp.to_le_bytes();
+    let count = u64::try_from(descriptor_hashes.len())
+        .unwrap_or(u64::MAX)
+        .to_le_bytes();
+    let mut fields = Vec::<&[u8]>::with_capacity(descriptor_hashes.len() + 7);
+    fields.extend([
+        chain_id.as_slice(),
+        request_id.as_slice(),
+        producer.as_slice(),
+        carrier.as_slice(),
+        response_timestamp.as_slice(),
+        count.as_slice(),
+    ]);
+    fields.extend(descriptor_hashes.iter().map(<[u8; 32]>::as_slice));
+    directory_sync_signing_digest(b"AeroNyx-DirectorySync-ReplicaObjectsResponse-v1", fields)
 }
 
 /// Canonical digest signed by an observation-checkpoint witness request.
@@ -2584,6 +2803,142 @@ mod tests {
             DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
         );
         assert_ne!(response_digest, altered);
+    }
+
+    #[test]
+    fn test_directory_replica_carrier_frames_are_canonical_and_fully_bound() {
+        let requester = IdentityKeyPair::from_bytes(&[0x81; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x82; 32]).unwrap();
+        let carrier = IdentityKeyPair::from_bytes(&[0x83; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x84; 32]).unwrap();
+        let descriptor = SignedNodeDescriptor::sign(descriptor_for(&subject), &subject).unwrap();
+        let commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).unwrap();
+        let block = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            1_700_000_400,
+            [0u8; 32],
+            vec![commitment],
+            &producer,
+        )
+        .unwrap();
+        let request_id = [0x85; 16];
+
+        let range_request_digest = directory_replica_block_range_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &producer.public_key_bytes(),
+            1,
+            1,
+            &request_id,
+            &requester.public_key_bytes(),
+            1_700_000_401,
+        );
+        let range_request = DirectorySyncMessage::ReplicaBlockRangeRequestV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            producer: producer.public_key_bytes(),
+            from_height: 1,
+            limit: 1,
+            request_id,
+            requester: requester.public_key_bytes(),
+            request_timestamp: 1_700_000_401,
+            signature: requester.sign(&range_request_digest),
+        };
+        let encoded = encode_directory_sync_message(&range_request).unwrap();
+        assert_eq!(
+            decode_directory_sync_message(&encoded).unwrap(),
+            range_request
+        );
+
+        let block_hash = block.hash();
+        let blocks = vec![block];
+        let range_response_digest = directory_replica_block_range_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &producer.public_key_bytes(),
+            &carrier.public_key_bytes(),
+            1_700_000_402,
+            &blocks,
+            false,
+            1,
+            &block_hash,
+        );
+        let range_response = DirectorySyncMessage::ReplicaBlockRangeResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            producer: producer.public_key_bytes(),
+            carrier: carrier.public_key_bytes(),
+            response_timestamp: 1_700_000_402,
+            blocks: blocks.clone(),
+            has_more: false,
+            tip_height: 1,
+            tip_hash: block_hash,
+            signature: carrier.sign(&range_response_digest),
+        };
+        let encoded = encode_directory_sync_message(&range_response).unwrap();
+        assert_eq!(
+            decode_directory_sync_message(&encoded).unwrap(),
+            range_response
+        );
+        let altered_producer_digest = directory_replica_block_range_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &[0x86; 32],
+            &carrier.public_key_bytes(),
+            1_700_000_402,
+            &blocks,
+            false,
+            1,
+            &block_hash,
+        );
+        assert_ne!(range_response_digest, altered_producer_digest);
+
+        let hashes = vec![commitment.descriptor_hash];
+        let object_request_digest = directory_replica_descriptor_objects_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &producer.public_key_bytes(),
+            &hashes,
+            &request_id,
+            &requester.public_key_bytes(),
+            1_700_000_403,
+        );
+        let object_request = DirectorySyncMessage::ReplicaDescriptorObjectsRequestV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            producer: producer.public_key_bytes(),
+            descriptor_hashes: hashes.clone(),
+            request_id,
+            requester: requester.public_key_bytes(),
+            request_timestamp: 1_700_000_403,
+            signature: requester.sign(&object_request_digest),
+        };
+        let encoded = encode_directory_sync_message(&object_request).unwrap();
+        assert_eq!(
+            decode_directory_sync_message(&encoded).unwrap(),
+            object_request
+        );
+
+        let object_response_digest = directory_replica_descriptor_objects_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &producer.public_key_bytes(),
+            &carrier.public_key_bytes(),
+            1_700_000_404,
+            &hashes,
+        );
+        let object_response = DirectorySyncMessage::ReplicaDescriptorObjectsResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            producer: producer.public_key_bytes(),
+            carrier: carrier.public_key_bytes(),
+            response_timestamp: 1_700_000_404,
+            descriptor_hashes: hashes,
+            objects: vec![descriptor],
+            signature: carrier.sign(&object_response_digest),
+        };
+        let encoded = encode_directory_sync_message(&object_response).unwrap();
+        assert_eq!(
+            decode_directory_sync_message(&encoded).unwrap(),
+            object_response
+        );
     }
 
     #[test]

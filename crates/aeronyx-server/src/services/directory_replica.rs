@@ -34,6 +34,8 @@
 //!   after a complete configured producer set yields a recomputable overlap.
 //! - Independently recomputes checkpoints received from pinned observers and
 //!   persists only canonical, accepted, externally signed witness receipts.
+//! - Exports bounded producer blocks and descriptors only after a complete
+//!   audit inside the same SQLite read transaction for signed carrier use.
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
@@ -78,6 +80,8 @@
 //!   observer's signed evidence and must never be presented as global blocks.
 //! - A witness receipt proves one external recomputation of one exact local
 //!   checkpoint. It is not a vote, quorum, fork choice, consensus, or finality.
+//! - A carrier may export only non-quarantined producer evidence retained in
+//!   this store. The receiver must still verify producer and carrier signatures.
 //! - Incident evidence export is read-only. Quarantine resolution requires a
 //!   separately authenticated, audited compare-and-swap command boundary.
 //! - Never expose [`DirectoryReplicaStore::resolve_quarantine`] through the
@@ -85,6 +89,7 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.9.0-DirectoryEvidenceCarrier - Added transactional audited producer evidence export and carrier-frame audit
 //! v0.8.0-DirectoryObservationWitness - Added schema v5, independent checkpoint recomputation, and receipt audit
 //! v0.7.0-DirectoryObservationCheckpoints - Added schema v4, append-only signed
 //! checkpoints, exact-prefix root recomputation, and startup tamper detection.
@@ -113,7 +118,8 @@ use std::time::Duration;
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::discovery::{
     decode_directory_sync_message, directory_block_range_response_signing_bytes,
-    directory_observation_witness_response_signing_bytes, encode_directory_sync_message,
+    directory_observation_witness_response_signing_bytes,
+    directory_replica_block_range_response_signing_bytes, encode_directory_sync_message,
     DirectoryCommitmentBlockV1, DirectoryCommitmentValidationError,
     DirectoryDescriptorCommitmentV1, DirectoryObservationCheckpointV1, DirectoryObservationTipV1,
     DirectorySyncMessage, SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
@@ -393,6 +399,20 @@ pub struct DirectoryReplicaTip {
     pub active_incident_digest: Option<[u8; 32]>,
     /// Latest signed resolution in this producer's linked audit history.
     pub last_resolution_digest: Option<[u8; 32]>,
+}
+
+/// One bounded page exported from a fully audited producer replica.
+///
+/// The carrier signs transport metadata separately. Every block in this page
+/// remains signed by the original producer and is re-verified by the receiver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryReplicaEvidencePage {
+    /// Contiguous producer-signed blocks in ascending height order.
+    pub blocks: Vec<DirectoryCommitmentBlockV1>,
+    /// Audited accepted producer tip height at export time.
+    pub tip_height: u64,
+    /// Audited accepted producer tip hash at export time.
+    pub tip_hash: [u8; 32],
 }
 
 impl DirectoryReplicaTip {
@@ -942,6 +962,144 @@ impl DirectoryReplicaStore {
     ) -> Result<DirectoryReplicaTip, DirectoryReplicaStoreError> {
         let connection = self.connection.lock();
         Self::load_tip(&connection, producer)
+    }
+
+    /// Audits the complete replica namespace, then exports one bounded producer
+    /// page from the same read transaction.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] for invalid bounds, a missing or
+    /// quarantined producer, any audit failure, or malformed persisted bytes.
+    pub fn audited_evidence_page(
+        &self,
+        producer: &[u8; 32],
+        from_height: u64,
+        limit: u16,
+        observed_at: u64,
+    ) -> Result<DirectoryReplicaEvidencePage, DirectoryReplicaStoreError> {
+        if *producer == [0u8; 32]
+            || *producer == self.local_node_id
+            || from_height == 0
+            || limit == 0
+            || limit > MAX_DIRECTORY_SYNC_BLOCKS_V1
+            || observed_at == 0
+        {
+            return Err(DirectoryReplicaStoreError::Request(
+                "replica evidence page fields are invalid".to_string(),
+            ));
+        }
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        Self::audit_connection(&transaction, &self.local_node_id, observed_at)?;
+        let tip = Self::load_tip(&transaction, producer)?;
+        if tip.quarantined {
+            return Err(DirectoryReplicaStoreError::Quarantined(
+                tip.quarantine_kind
+                    .unwrap_or_else(|| "producer_fork".to_string()),
+            ));
+        }
+        if from_height > tip.tip_height.saturating_add(1) {
+            return Err(DirectoryReplicaStoreError::Request(
+                "replica evidence range starts beyond the audited tip".to_string(),
+            ));
+        }
+        let mut statement = transaction.prepare(
+            "SELECT block_blob FROM directory_replica_blocks
+             WHERE producer = ?1 AND height >= ?2
+             ORDER BY height ASC LIMIT ?3",
+        )?;
+        let blobs = statement
+            .query_map(
+                params![
+                    producer.as_slice(),
+                    u64_to_i64(from_height, "replica evidence from height")?,
+                    i64::from(limit)
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let blocks = blobs
+            .iter()
+            .map(|blob| decode_block(blob))
+            .collect::<Result<Vec<_>, _>>()?;
+        transaction.commit()?;
+        Ok(DirectoryReplicaEvidencePage {
+            blocks,
+            tip_height: tip.tip_height,
+            tip_hash: tip.tip_hash,
+        })
+    }
+
+    /// Audits the complete replica namespace, then loads exact producer-bound
+    /// descriptor objects from the same read transaction and in request order.
+    ///
+    /// `Ok(None)` means at least one requested object is not retained for this
+    /// producer. Partial responses are never returned.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] for invalid bounds, quarantine,
+    /// any audit failure, or malformed persisted bytes/indexes.
+    pub fn audited_evidence_descriptor_objects(
+        &self,
+        producer: &[u8; 32],
+        descriptor_hashes: &[[u8; 32]],
+        observed_at: u64,
+    ) -> Result<Option<Vec<SignedNodeDescriptor>>, DirectoryReplicaStoreError> {
+        let unique = descriptor_hashes.iter().copied().collect::<HashSet<_>>();
+        if *producer == [0u8; 32]
+            || *producer == self.local_node_id
+            || descriptor_hashes.is_empty()
+            || descriptor_hashes.len()
+                > aeronyx_core::protocol::discovery::MAX_DIRECTORY_SYNC_OBJECTS_V1
+            || unique.len() != descriptor_hashes.len()
+            || descriptor_hashes.iter().any(|hash| *hash == [0u8; 32])
+            || observed_at == 0
+        {
+            return Err(DirectoryReplicaStoreError::Request(
+                "replica evidence object fields are invalid".to_string(),
+            ));
+        }
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        Self::audit_connection(&transaction, &self.local_node_id, observed_at)?;
+        let tip = Self::load_tip(&transaction, producer)?;
+        if tip.quarantined {
+            return Err(DirectoryReplicaStoreError::Quarantined(
+                tip.quarantine_kind
+                    .unwrap_or_else(|| "producer_fork".to_string()),
+            ));
+        }
+        let mut statement = transaction.prepare(
+            "SELECT descriptor_blob FROM directory_replica_descriptor_objects
+             WHERE producer = ?1 AND descriptor_hash = ?2",
+        )?;
+        let mut objects = Vec::with_capacity(descriptor_hashes.len());
+        for descriptor_hash in descriptor_hashes {
+            let blob = statement
+                .query_row(
+                    params![producer.as_slice(), descriptor_hash.as_slice()],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+            let Some(blob) = blob else {
+                drop(statement);
+                transaction.commit()?;
+                return Ok(None);
+            };
+            let object = decode_descriptor_object(&blob)?;
+            let commitment = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&object)
+                .map_err(|error| DirectoryReplicaStoreError::Descriptor(error.to_string()))?;
+            if commitment.descriptor_hash != *descriptor_hash {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "replica evidence descriptor hash mismatch".to_string(),
+                ));
+            }
+            objects.push(object);
+        }
+        drop(statement);
+        transaction.commit()?;
+        Ok(Some(objects))
     }
 
     /// Returns a low-cost aggregate snapshot of persisted, already-audited
@@ -2387,15 +2545,23 @@ impl DirectoryReplicaStore {
         observed_at: u64,
     ) -> Result<DirectoryReplicaAudit, DirectoryReplicaStoreError> {
         let connection = self.connection.lock();
-        Self::validate_metadata(&connection, &self.local_node_id)?;
-        let producers = Self::load_all_tips(&connection)?;
+        Self::audit_connection(&connection, &self.local_node_id, observed_at)
+    }
+
+    fn audit_connection(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<DirectoryReplicaAudit, DirectoryReplicaStoreError> {
+        Self::validate_metadata(connection, local_node_id)?;
+        let producers = Self::load_all_tips(connection)?;
         let (observation_checkpoints, observation_tip) =
-            Self::audit_observation_checkpoints(&connection, &self.local_node_id, observed_at)?;
+            Self::audit_observation_checkpoints(connection, local_node_id, observed_at)?;
         let observation_witnesses =
-            Self::audit_observation_witnesses(&connection, &self.local_node_id, observed_at)?;
+            Self::audit_observation_witnesses(connection, local_node_id, observed_at)?;
         let mut report = DirectoryReplicaAudit {
-            incidents: Self::audit_incidents(&connection)?,
-            resolutions: Self::audit_resolutions(&connection, &self.local_node_id, &producers)?,
+            incidents: Self::audit_incidents(connection)?,
+            resolutions: Self::audit_resolutions(connection, local_node_id, &producers)?,
             observation_checkpoints,
             observation_checkpoint_sequence: observation_tip.sequence,
             observation_checkpoint_hash: observation_tip.checkpoint_hash,
@@ -2406,16 +2572,16 @@ impl DirectoryReplicaStore {
             ..DirectoryReplicaAudit::default()
         };
         for tip in producers {
-            Self::audit_producer(&connection, &tip, observed_at, &mut report)?;
+            Self::audit_producer(connection, &tip, observed_at, &mut report)?;
         }
-        report.retry_states =
-            u64::try_from(Self::load_retry_states(&connection, &self.local_node_id)?.len())
-                .map_err(|_| {
-                    DirectoryReplicaStoreError::Integrity(
-                        "replica retry state count exceeds platform bounds".to_string(),
-                    )
-                })?;
-        drop(connection);
+        report.retry_states = u64::try_from(
+            Self::load_retry_states(connection, local_node_id)?.len(),
+        )
+        .map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "replica retry state count exceeds platform bounds".to_string(),
+            )
+        })?;
         Ok(report)
     }
 
@@ -4191,6 +4357,21 @@ fn verify_incident_response_evidence(
     frame: &[u8],
     expected_producer: &[u8; 32],
 ) -> Result<(), DirectoryReplicaStoreError> {
+    verify_signed_range_response_evidence(frame, expected_producer).map(|_| ())
+}
+
+struct VerifiedRangeResponseEvidence {
+    response_timestamp: u64,
+    blocks: Vec<DirectoryCommitmentBlockV1>,
+    has_more: bool,
+    tip_height: u64,
+    tip_hash: [u8; 32],
+}
+
+fn verify_signed_range_response_evidence(
+    frame: &[u8],
+    expected_producer: &[u8; 32],
+) -> Result<VerifiedRangeResponseEvidence, DirectoryReplicaStoreError> {
     let message = decode_directory_sync_message(frame)
         .map_err(|error| DirectoryReplicaStoreError::Codec(error.to_string()))?;
     if encode_directory_sync_message(&message)
@@ -4201,48 +4382,99 @@ fn verify_incident_response_evidence(
             "incident evidence frame is not canonical".to_string(),
         ));
     }
-    let DirectorySyncMessage::BlockRangeResponseV1 {
-        chain_id,
-        request_id,
-        responder,
-        response_timestamp,
-        blocks,
-        has_more,
-        tip_height,
-        tip_hash,
-        signature,
-    } = message
-    else {
-        return Err(DirectoryReplicaStoreError::Integrity(
-            "incident evidence is not a block-range response".to_string(),
-        ));
-    };
-    if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID || responder != *expected_producer {
-        return Err(DirectoryReplicaStoreError::Integrity(
-            "incident evidence belongs to another chain or producer".to_string(),
-        ));
+    match message {
+        DirectorySyncMessage::BlockRangeResponseV1 {
+            chain_id,
+            request_id,
+            responder,
+            response_timestamp,
+            blocks,
+            has_more,
+            tip_height,
+            tip_hash,
+            signature,
+        } => {
+            if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID || responder != *expected_producer {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "range evidence belongs to another chain or producer".to_string(),
+                ));
+            }
+            let signing_bytes = directory_block_range_response_signing_bytes(
+                &request_id,
+                &responder,
+                response_timestamp,
+                &blocks,
+                has_more,
+                tip_height,
+                &tip_hash,
+            );
+            IdentityPublicKey::from_bytes(&responder)
+                .and_then(|key| key.verify(&signing_bytes, &signature))
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "range evidence producer signature is invalid".to_string(),
+                    )
+                })?;
+            Ok(VerifiedRangeResponseEvidence {
+                response_timestamp,
+                blocks,
+                has_more,
+                tip_height,
+                tip_hash,
+            })
+        }
+        DirectorySyncMessage::ReplicaBlockRangeResponseV1 {
+            chain_id,
+            request_id,
+            producer,
+            carrier,
+            response_timestamp,
+            blocks,
+            has_more,
+            tip_height,
+            tip_hash,
+            signature,
+        } => {
+            if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+                || producer != *expected_producer
+                || carrier == [0u8; 32]
+                || carrier == producer
+                || blocks.iter().any(|block| block.header.producer != producer)
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "carrier range evidence belongs to another chain or producer".to_string(),
+                ));
+            }
+            let signing_bytes = directory_replica_block_range_response_signing_bytes(
+                &chain_id,
+                &request_id,
+                &producer,
+                &carrier,
+                response_timestamp,
+                &blocks,
+                has_more,
+                tip_height,
+                &tip_hash,
+            );
+            IdentityPublicKey::from_bytes(&carrier)
+                .and_then(|key| key.verify(&signing_bytes, &signature))
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "carrier range evidence signature is invalid".to_string(),
+                    )
+                })?;
+            Ok(VerifiedRangeResponseEvidence {
+                response_timestamp,
+                blocks,
+                has_more,
+                tip_height,
+                tip_hash,
+            })
+        }
+        _ => Err(DirectoryReplicaStoreError::Integrity(
+            "incident evidence is not a supported block-range response".to_string(),
+        )),
     }
-    let signing_bytes = directory_block_range_response_signing_bytes(
-        &request_id,
-        &responder,
-        response_timestamp,
-        &blocks,
-        has_more,
-        tip_height,
-        &tip_hash,
-    );
-    IdentityPublicKey::from_bytes(&responder)
-        .map_err(|_| {
-            DirectoryReplicaStoreError::Integrity(
-                "incident evidence producer identity is invalid".to_string(),
-            )
-        })?
-        .verify(&signing_bytes, &signature)
-        .map_err(|_| {
-            DirectoryReplicaStoreError::Integrity(
-                "incident evidence producer signature is invalid".to_string(),
-            )
-        })
 }
 
 fn verify_range_response_evidence(
@@ -4253,53 +4485,17 @@ fn verify_range_response_evidence(
     expected_tip_hash: &[u8; 32],
     observed_at: u64,
 ) -> Result<bool, DirectoryReplicaStoreError> {
-    let message = decode_directory_sync_message(frame)
-        .map_err(|error| DirectoryReplicaStoreError::Codec(error.to_string()))?;
-    let DirectorySyncMessage::BlockRangeResponseV1 {
-        chain_id,
-        request_id,
-        responder,
-        response_timestamp,
-        blocks,
-        has_more,
-        tip_height,
-        tip_hash,
-        signature,
-    } = message
-    else {
-        return Err(DirectoryReplicaStoreError::Request(
-            "evidence is not a block-range response".to_string(),
-        ));
-    };
-    if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
-        || responder != *producer
-        || blocks != expected_blocks
-        || tip_height != expected_tip_height
-        || tip_hash != *expected_tip_hash
-        || response_timestamp.abs_diff(observed_at) > RESPONSE_TIMESTAMP_SKEW_SECS
+    let verified = verify_signed_range_response_evidence(frame, producer)?;
+    if verified.blocks != expected_blocks
+        || verified.tip_height != expected_tip_height
+        || verified.tip_hash != *expected_tip_hash
+        || verified.response_timestamp.abs_diff(observed_at) > RESPONSE_TIMESTAMP_SKEW_SECS
     {
         return Err(DirectoryReplicaStoreError::Integrity(
             "signed range evidence does not match the import".to_string(),
         ));
     }
-    let signing_bytes = directory_block_range_response_signing_bytes(
-        &request_id,
-        &responder,
-        response_timestamp,
-        &blocks,
-        has_more,
-        tip_height,
-        &tip_hash,
-    );
-    IdentityPublicKey::from_bytes(&responder)
-        .map_err(|_| DirectoryReplicaStoreError::Integrity("invalid response signer".to_string()))?
-        .verify(&signing_bytes, &signature)
-        .map_err(|_| {
-            DirectoryReplicaStoreError::Integrity(
-                "invalid block-range response signature".to_string(),
-            )
-        })?;
-    Ok(has_more)
+    Ok(verified.has_more)
 }
 
 fn validate_page_tip_contract(
@@ -4625,6 +4821,43 @@ mod tests {
         .unwrap()
     }
 
+    fn carrier_response_frame(
+        producer: &IdentityKeyPair,
+        carrier: &IdentityKeyPair,
+        blocks: Vec<DirectoryCommitmentBlockV1>,
+        has_more: bool,
+        tip_height: u64,
+        tip_hash: [u8; 32],
+        request_id: [u8; 16],
+    ) -> Vec<u8> {
+        let producer_id = producer.public_key_bytes();
+        let carrier_id = carrier.public_key_bytes();
+        let signing = directory_replica_block_range_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &producer_id,
+            &carrier_id,
+            NOW + 20,
+            &blocks,
+            has_more,
+            tip_height,
+            &tip_hash,
+        );
+        encode_directory_sync_message(&DirectorySyncMessage::ReplicaBlockRangeResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            producer: producer_id,
+            carrier: carrier_id,
+            response_timestamp: NOW + 20,
+            blocks,
+            has_more,
+            tip_height,
+            tip_hash,
+            signature: carrier.sign(&signing),
+        })
+        .unwrap()
+    }
+
     fn import_replica_block(
         store: &DirectoryReplicaStore,
         producer: &IdentityKeyPair,
@@ -4736,6 +4969,86 @@ mod tests {
         assert_eq!(reopened.producers, 1);
         assert_eq!(reopened.blocks, 1);
         assert_eq!(reopened.commitments, 1);
+    }
+
+    #[test]
+    fn audited_carrier_export_is_bounded_exact_and_importable() {
+        let source_temp = TempDir::new().unwrap();
+        let receiver_temp = TempDir::new().unwrap();
+        let carrier = IdentityKeyPair::from_bytes(&[0x12; 32]).unwrap();
+        let receiver = IdentityKeyPair::from_bytes(&[0x13; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x14; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x15; 32]).unwrap();
+        let object = descriptor(&subject, 1);
+        let replica_block = block(&producer, 1, [0u8; 32], &object);
+        let (source, _) = DirectoryReplicaStore::open(
+            source_temp.path().join("directory.db"),
+            carrier.public_key_bytes(),
+            NOW + 20,
+        )
+        .unwrap();
+        import_replica_block(&source, &producer, &object, &replica_block, [0x16; 16]);
+
+        let page = source
+            .audited_evidence_page(&producer.public_key_bytes(), 1, 1, NOW + 21)
+            .unwrap();
+        assert_eq!(page.blocks, vec![replica_block.clone()]);
+        assert_eq!(page.tip_height, 1);
+        assert_eq!(page.tip_hash, replica_block.hash());
+        let descriptor_hash = replica_block.commitments[0].descriptor_hash;
+        assert_eq!(
+            source
+                .audited_evidence_descriptor_objects(
+                    &producer.public_key_bytes(),
+                    &[descriptor_hash],
+                    NOW + 21,
+                )
+                .unwrap(),
+            Some(vec![object.clone()])
+        );
+        assert!(source
+            .audited_evidence_descriptor_objects(
+                &producer.public_key_bytes(),
+                &[[0x17; 32]],
+                NOW + 21,
+            )
+            .unwrap()
+            .is_none());
+
+        let frame = carrier_response_frame(
+            &producer,
+            &carrier,
+            page.blocks.clone(),
+            false,
+            page.tip_height,
+            page.tip_hash,
+            [0x18; 16],
+        );
+        let (destination, _) = DirectoryReplicaStore::open(
+            receiver_temp.path().join("directory.db"),
+            receiver.public_key_bytes(),
+            NOW + 20,
+        )
+        .unwrap();
+        let imported = destination
+            .import_verified_page(
+                producer.public_key_bytes(),
+                &page.blocks,
+                &[object],
+                page.tip_height,
+                page.tip_hash,
+                &frame,
+                NOW + 20,
+            )
+            .unwrap();
+        assert_eq!(imported.blocks_inserted, 1);
+
+        let mut tampered = frame;
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(
+            verify_incident_response_evidence(&tampered, &producer.public_key_bytes()).is_err()
+        );
     }
 
     #[test]
