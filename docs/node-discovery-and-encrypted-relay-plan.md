@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.19.0 - Added cross-node Directory observation checkpoint witness V1 with independent replica recomputation, signed receipts, fail-closed schema v5 persistence, and startup receipt audit.
+Modification Reason: v0.20.0 - Added typed, privacy-safe Directory witness outcome telemetry with fail-closed schema v6 aggregate persistence and process-runtime diagnostics.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.19.0 - Added independently recomputed external checkpoint witness receipts without introducing votes, quorum, consensus, or finality.
+Last Modified: v0.20.0 - Added durable/runtime witness outcome buckets without retaining peer identity or introducing reputation, quorum, consensus, or finality.
+Previous: v0.19.0 - Added independently recomputed external checkpoint witness receipts without introducing votes, quorum, consensus, or finality.
 Previous: v0.18.0 - Added signed local observation checkpoints binding exact producer tips and recomputable recent commitment overlap without introducing votes, consensus, or finality.
 Previous: v0.17.0 - Added signed host-local quarantine resolution, exact active-incident/tip CAS, linked resolution history, and startup tamper detection.
 Previous: v0.16.0 - Added bounded incident pagination and canonical producer-signed evidence export with verification on every read.
@@ -1151,6 +1152,46 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-19 - Added privacy-safe Directory witness outcome telemetry.
+- Files changed:
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - crates/aeronyx-server/src/services/mod.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Problem solved:
+  - The coordinator previously reduced every outbound witness result to one
+    `accepted` or `failed` count. A node could not distinguish honest evidence
+    propagation lag from peer admission, transport, canonical verification, or
+    signed-receipt persistence faults.
+- Architecture:
+  - Every attempt now terminates in one closed enum bucket: `accepted`,
+    `evidence_unavailable`, `evidence_conflict`, `peer_unavailable`,
+    `transport_failure`, `verification_failure`, or `persistence_failure`.
+  - SQLite schema v6 stores one singleton aggregate containing cumulative and
+    latest-round counters plus timestamps and the local checkpoint sequence.
+    A foreign key binds that sequence to an audited local checkpoint.
+  - Process runtime separately tracks this-start counters and failures to
+    persist the telemetry aggregate itself. Signed accepted receipts continue
+    to use their existing append-only table and independent restart audit.
+- Privacy and semantics:
+  - The aggregate never stores witness identity, endpoint, request id,
+    signature, checkpoint hash, response body, route, or user-plane metadata.
+  - Counters are diagnostic evidence only. They are not peer reputation,
+    voting weight, quorum, fork choice, consensus, financial blocks, or finality.
+- Compatibility:
+  - The wire protocol is unchanged. Older peers still return their existing
+    witness responses or ordinary HTTP failure; classification is local only.
+  - Schema v1-v5 migrations remain transactional. Existing receipt, checkpoint,
+    producer, incident, resolution, and retry evidence is preserved.
+- Verification:
+  - Targeted Directory Replica suite passed with durable round, restart,
+    migration-v5, runtime bucket, status separation, and tamper rejection tests.
+  - Server full suite passed: 1106/1106 library tests and 2/2 binary tests;
+    documentation tests passed their enabled case with 9 intentionally ignored.
+  - Modified-file rustfmt, `git diff --check`, Clippy correctness, and the
+    optimized `aeronyx-server` release build passed.
+
 2026-07-19 - Added commitment-bounded multi-block Directory catch-up.
 - Files changed:
   - crates/aeronyx-server/src/api/directory_chain_peer.rs

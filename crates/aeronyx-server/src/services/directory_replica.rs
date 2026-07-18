@@ -34,8 +34,10 @@
 //!   after a complete configured producer set yields a recomputable overlap.
 //! - Independently recomputes checkpoints received from pinned observers and
 //!   persists only canonical, accepted, externally signed witness receipts.
+//! - Persists privacy-safe aggregate witness outcomes separately from signed
+//!   receipts so operators can distinguish unavailable evidence from faults.
 //! - Exports bounded producer blocks and descriptors only after a complete
-//!   audit inside the same SQLite read transaction for signed carrier use.
+//!   audit inside the same `SQLite` read transaction for signed carrier use.
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
@@ -59,6 +61,8 @@
 //!    eligible prefix; re-derive every historical root during startup audit.
 //! 8. Witness an external checkpoint only from locally retained exact producer
 //!    prefixes, then audit every accepted receipt again on restart.
+//! 9. Audit bounded aggregate witness outcome counters without retaining peer
+//!    identity, endpoint, request id, signature, or checkpoint hash metadata.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -80,6 +84,8 @@
 //!   observer's signed evidence and must never be presented as global blocks.
 //! - A witness receipt proves one external recomputation of one exact local
 //!   checkpoint. It is not a vote, quorum, fork choice, consensus, or finality.
+//! - Witness outcome telemetry is aggregate diagnostic evidence only. Never add
+//!   witness identities, endpoints, request ids, signatures, or hashes to it.
 //! - A carrier may export only non-quarantined producer evidence retained in
 //!   this store. The receiver must still verify producer and carrier signatures.
 //! - Incident evidence export is read-only. Quarantine resolution requires a
@@ -89,6 +95,7 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.10.0-DirectoryWitnessOutcomeTelemetry - Added schema v6 privacy-safe durable and runtime witness outcome buckets
 //! v0.9.0-DirectoryEvidenceCarrier - Added transactional audited producer evidence export and carrier-frame audit
 //! v0.8.0-DirectoryObservationWitness - Added schema v5, independent checkpoint recomputation, and receipt audit
 //! v0.7.0-DirectoryObservationCheckpoints - Added schema v4, append-only signed
@@ -131,7 +138,8 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 5;
+const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 6;
+const DIRECTORY_REPLICA_SCHEMA_VERSION_V5: i64 = 5;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V4: i64 = 4;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V3: i64 = 3;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V2: i64 = 2;
@@ -214,6 +222,8 @@ pub struct DirectoryReplicaAudit {
     pub observation_checkpoint_witnessed_sequence: u64,
     /// Distinct witnesses retained for the latest witnessed sequence.
     pub observation_checkpoint_latest_witnesses: u64,
+    /// Audited privacy-safe witness attempt aggregates.
+    pub observation_witness_outcomes: DirectoryObservationWitnessOutcomeSnapshot,
     /// Number of audited producer-local retry rows.
     pub retry_states: u64,
 }
@@ -247,6 +257,8 @@ pub struct DirectoryReplicaStoreSnapshot {
     pub observation_checkpoint_witnessed_sequence: u64,
     /// Distinct witnesses retained for the latest witnessed sequence.
     pub observation_checkpoint_latest_witnesses: u64,
+    /// Audited privacy-safe witness attempt aggregates.
+    pub observation_witness_outcomes: DirectoryObservationWitnessOutcomeSnapshot,
     /// Per-producer accepted-prefix summaries for local operator presentation.
     pub producer_snapshots: Vec<DirectoryReplicaProducerSnapshot>,
 }
@@ -306,6 +318,199 @@ pub enum DirectoryObservationWitnessDecision {
     EvidenceUnavailable,
     /// Retained producer evidence conflicts or recomputes a different root.
     EvidenceConflict,
+}
+
+/// Stable privacy-safe result bucket for one outbound witness attempt.
+///
+/// The enum deliberately excludes peer identity, endpoint, request id,
+/// signature, checkpoint hash, transport text, and response body data. New
+/// variants require a schema migration and additive status-contract review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryObservationWitnessOutcome {
+    /// A canonical accepted receipt was verified and durably retained.
+    Accepted,
+    /// The witness does not yet retain every exact referenced producer prefix.
+    EvidenceUnavailable,
+    /// Locally retained evidence conflicts with the observed checkpoint.
+    EvidenceConflict,
+    /// The configured witness is not currently admitted or publicly reachable.
+    PeerUnavailable,
+    /// The bounded outbound request failed before a verifiable frame arrived.
+    TransportFailure,
+    /// A received frame failed canonical contract or signature verification.
+    VerificationFailure,
+    /// A verified accepted receipt could not be durably retained.
+    PersistenceFailure,
+}
+
+/// Aggregate counters for a bounded set of witness attempts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DirectoryObservationWitnessOutcomeCounters {
+    /// Canonical accepted receipts durably retained.
+    pub accepted: u64,
+    /// Witnesses missing at least one exact producer prefix.
+    pub evidence_unavailable: u64,
+    /// Witnesses whose retained evidence conflicts with the checkpoint.
+    pub evidence_conflict: u64,
+    /// Configured witnesses unavailable at admission or endpoint validation.
+    pub peer_unavailable: u64,
+    /// Bounded outbound transport failures.
+    pub transport_failures: u64,
+    /// Canonical contract or signature verification failures.
+    pub verification_failures: u64,
+    /// Verified receipts rejected by durable persistence.
+    pub persistence_failures: u64,
+}
+
+impl DirectoryObservationWitnessOutcomeCounters {
+    fn from_outcomes(outcomes: &[DirectoryObservationWitnessOutcome]) -> Self {
+        let mut counters = Self::default();
+        for outcome in outcomes {
+            counters.record(*outcome);
+        }
+        counters
+    }
+
+    fn record(&mut self, outcome: DirectoryObservationWitnessOutcome) {
+        let counter = match outcome {
+            DirectoryObservationWitnessOutcome::Accepted => &mut self.accepted,
+            DirectoryObservationWitnessOutcome::EvidenceUnavailable => {
+                &mut self.evidence_unavailable
+            }
+            DirectoryObservationWitnessOutcome::EvidenceConflict => &mut self.evidence_conflict,
+            DirectoryObservationWitnessOutcome::PeerUnavailable => &mut self.peer_unavailable,
+            DirectoryObservationWitnessOutcome::TransportFailure => &mut self.transport_failures,
+            DirectoryObservationWitnessOutcome::VerificationFailure => {
+                &mut self.verification_failures
+            }
+            DirectoryObservationWitnessOutcome::PersistenceFailure => {
+                &mut self.persistence_failures
+            }
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    fn checked_add(self, other: Self) -> Result<Self, DirectoryReplicaStoreError> {
+        let add = |left: u64, right: u64| {
+            left.checked_add(right).ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation witness outcome counter exhausted".to_string(),
+                )
+            })
+        };
+        Ok(Self {
+            accepted: add(self.accepted, other.accepted)?,
+            evidence_unavailable: add(self.evidence_unavailable, other.evidence_unavailable)?,
+            evidence_conflict: add(self.evidence_conflict, other.evidence_conflict)?,
+            peer_unavailable: add(self.peer_unavailable, other.peer_unavailable)?,
+            transport_failures: add(self.transport_failures, other.transport_failures)?,
+            verification_failures: add(self.verification_failures, other.verification_failures)?,
+            persistence_failures: add(self.persistence_failures, other.persistence_failures)?,
+        })
+    }
+
+    const fn saturating_add(self, other: Self) -> Self {
+        Self {
+            accepted: self.accepted.saturating_add(other.accepted),
+            evidence_unavailable: self
+                .evidence_unavailable
+                .saturating_add(other.evidence_unavailable),
+            evidence_conflict: self
+                .evidence_conflict
+                .saturating_add(other.evidence_conflict),
+            peer_unavailable: self.peer_unavailable.saturating_add(other.peer_unavailable),
+            transport_failures: self
+                .transport_failures
+                .saturating_add(other.transport_failures),
+            verification_failures: self
+                .verification_failures
+                .saturating_add(other.verification_failures),
+            persistence_failures: self
+                .persistence_failures
+                .saturating_add(other.persistence_failures),
+        }
+    }
+
+    /// Total attempts represented by these mutually exclusive buckets.
+    #[must_use]
+    pub const fn attempts(self) -> u64 {
+        self.accepted
+            .saturating_add(self.evidence_unavailable)
+            .saturating_add(self.evidence_conflict)
+            .saturating_add(self.peer_unavailable)
+            .saturating_add(self.transport_failures)
+            .saturating_add(self.verification_failures)
+            .saturating_add(self.persistence_failures)
+    }
+
+    /// Non-accepted attempts represented by these buckets.
+    #[must_use]
+    pub const fn failures(self) -> u64 {
+        self.attempts().saturating_sub(self.accepted)
+    }
+}
+
+/// Audited aggregate witness telemetry retained across restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DirectoryObservationWitnessOutcomeSnapshot {
+    /// Completed bounded witness rounds.
+    pub rounds: u64,
+    /// Cumulative mutually exclusive attempt outcomes.
+    pub totals: DirectoryObservationWitnessOutcomeCounters,
+    /// Latest local checkpoint sequence evaluated by a witness round.
+    pub last_checkpoint_sequence: u64,
+    /// Timestamp of the latest completed witness round.
+    pub last_round_at: Option<u64>,
+    /// Latest round containing at least one accepted receipt.
+    pub last_success_at: Option<u64>,
+    /// Latest round containing at least one non-accepted attempt.
+    pub last_failure_at: Option<u64>,
+    /// Mutually exclusive outcomes from only the latest completed round.
+    pub last_round: DirectoryObservationWitnessOutcomeCounters,
+    /// Process-only failures while persisting this telemetry itself.
+    /// Durable snapshots always keep this field at zero.
+    pub telemetry_persistence_failures: u64,
+}
+
+impl DirectoryObservationWitnessOutcomeSnapshot {
+    fn next_durable_round(
+        self,
+        checkpoint_sequence: u64,
+        observed_at: u64,
+        round: DirectoryObservationWitnessOutcomeCounters,
+    ) -> Result<Self, DirectoryReplicaStoreError> {
+        if checkpoint_sequence < self.last_checkpoint_sequence
+            || self
+                .last_round_at
+                .is_some_and(|last_round_at| observed_at < last_round_at)
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness outcome round regressed".to_string(),
+            ));
+        }
+        Ok(Self {
+            rounds: self.rounds.checked_add(1).ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation witness outcome round counter exhausted".to_string(),
+                )
+            })?,
+            totals: self.totals.checked_add(round)?,
+            last_checkpoint_sequence: checkpoint_sequence,
+            last_round_at: Some(observed_at),
+            last_success_at: if round.accepted > 0 {
+                Some(observed_at)
+            } else {
+                self.last_success_at
+            },
+            last_failure_at: if round.failures() > 0 {
+                Some(observed_at)
+            } else {
+                self.last_failure_at
+            },
+            last_round: round,
+            telemetry_persistence_failures: 0,
+        })
+    }
 }
 
 /// Persisted aggregate state for one producer namespace.
@@ -663,10 +868,11 @@ impl DirectoryReplicaSyncObservation {
     }
 }
 
-/// Shared process-lifetime synchronization telemetry.
+/// Shared process-lifetime synchronization and witness telemetry.
 #[derive(Debug, Default)]
 pub struct DirectoryReplicaSyncRuntime {
     observations: Mutex<HashMap<[u8; 32], DirectoryReplicaSyncObservation>>,
+    observation_witness: Mutex<DirectoryObservationWitnessOutcomeSnapshot>,
 }
 
 impl DirectoryReplicaSyncRuntime {
@@ -802,6 +1008,46 @@ impl DirectoryReplicaSyncRuntime {
         drop(observations);
     }
 
+    /// Records one bounded outbound witness round using mutually exclusive,
+    /// privacy-safe outcome buckets.
+    ///
+    /// `telemetry_durable` describes only the aggregate telemetry write. An
+    /// accepted attempt already means its signed receipt was persisted.
+    pub fn record_observation_witness_round(
+        &self,
+        checkpoint_sequence: u64,
+        observed_at: u64,
+        outcomes: &[DirectoryObservationWitnessOutcome],
+        telemetry_durable: bool,
+    ) {
+        if checkpoint_sequence == 0 || observed_at == 0 || outcomes.is_empty() {
+            return;
+        }
+        let round = DirectoryObservationWitnessOutcomeCounters::from_outcomes(outcomes);
+        let mut snapshot = self.observation_witness.lock();
+        snapshot.rounds = snapshot.rounds.saturating_add(1);
+        snapshot.totals = snapshot.totals.saturating_add(round);
+        snapshot.last_checkpoint_sequence = checkpoint_sequence;
+        snapshot.last_round_at = Some(observed_at);
+        if round.accepted > 0 {
+            snapshot.last_success_at = Some(observed_at);
+        }
+        if round.failures() > 0 {
+            snapshot.last_failure_at = Some(observed_at);
+        }
+        snapshot.last_round = round;
+        if !telemetry_durable {
+            snapshot.telemetry_persistence_failures =
+                snapshot.telemetry_persistence_failures.saturating_add(1);
+        }
+    }
+
+    /// Returns process-lifetime aggregate witness telemetry.
+    #[must_use]
+    pub fn observation_witness_snapshot(&self) -> DirectoryObservationWitnessOutcomeSnapshot {
+        *self.observation_witness.lock()
+    }
+
     /// Returns producer observations in deterministic identity order.
     #[must_use]
     pub fn snapshot(&self) -> Vec<DirectoryReplicaSyncObservation> {
@@ -870,6 +1116,20 @@ struct StoredObservationWitnessRow {
     witness_node_id: Vec<u8>,
     witnessed_at: i64,
     response_blob: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct StoredObservationWitnessOutcomeRow {
+    rounds: i64,
+    attempts: i64,
+    totals: [i64; 7],
+    last_checkpoint_sequence: i64,
+    last_round_at: i64,
+    last_success_at: Option<i64>,
+    last_failure_at: Option<i64>,
+    last_round_attempts: i64,
+    last_round: [i64; 7],
+    updated_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1198,6 +1458,14 @@ impl DirectoryReplicaStore {
                 .saturating_add(producer_snapshot.resolutions);
             snapshot.producer_snapshots.push(producer_snapshot);
         }
+        Self::populate_observation_status_snapshot(&connection, &mut snapshot)?;
+        Ok(snapshot)
+    }
+
+    fn populate_observation_status_snapshot(
+        connection: &Connection,
+        snapshot: &mut DirectoryReplicaStoreSnapshot,
+    ) -> Result<(), DirectoryReplicaStoreError> {
         snapshot.observation_checkpoints = nonnegative_i64_to_u64(
             connection.query_row(
                 "SELECT COUNT(*) FROM directory_observation_checkpoints",
@@ -1206,15 +1474,17 @@ impl DirectoryReplicaStore {
             )?,
             "observation checkpoint count",
         )?;
-        let checkpoint_tip = Self::load_observation_checkpoint_tip(&connection)?;
+        let checkpoint_tip = Self::load_observation_checkpoint_tip(connection)?;
         snapshot.observation_checkpoint_sequence = checkpoint_tip.sequence;
         snapshot.observation_checkpoint_hash = checkpoint_tip.checkpoint_hash;
         snapshot.observation_checkpoint_observed_at = checkpoint_tip.observed_at;
-        let witness_summary = Self::load_observation_witness_summary(&connection)?;
+        let witness_summary = Self::load_observation_witness_summary(connection)?;
         snapshot.observation_checkpoint_witnesses = witness_summary.witnesses;
         snapshot.observation_checkpoint_witnessed_sequence = witness_summary.latest_sequence;
         snapshot.observation_checkpoint_latest_witnesses = witness_summary.latest_witnesses;
-        Ok(snapshot)
+        snapshot.observation_witness_outcomes =
+            Self::load_observation_witness_outcome_snapshot(connection)?;
+        Ok(())
     }
 
     /// Returns one bounded, deterministic page of incident summaries.
@@ -1964,6 +2234,178 @@ impl DirectoryReplicaStore {
         Ok(true)
     }
 
+    /// Atomically persists one bounded round of privacy-safe witness outcomes.
+    ///
+    /// Only aggregate mutually exclusive counters and timestamps are retained.
+    /// The row contains no witness identity, endpoint, request id, signature,
+    /// checkpoint hash, response body, route, or user-plane metadata.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when the round is empty or over
+    /// the protocol producer bound, time/sequence regresses, counters overflow,
+    /// the existing aggregate is malformed, or `SQLite` rejects the write.
+    pub fn persist_observation_witness_outcome_round(
+        &self,
+        checkpoint_sequence: u64,
+        observed_at: u64,
+        outcomes: &[DirectoryObservationWitnessOutcome],
+    ) -> Result<DirectoryObservationWitnessOutcomeSnapshot, DirectoryReplicaStoreError> {
+        if checkpoint_sequence == 0
+            || observed_at == 0
+            || outcomes.is_empty()
+            || outcomes.len() > MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1
+        {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation witness outcome round fields are invalid".to_string(),
+            ));
+        }
+        let round = DirectoryObservationWitnessOutcomeCounters::from_outcomes(outcomes);
+        let mut connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let checkpoint_exists = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM directory_observation_checkpoints WHERE sequence = ?1
+             )",
+            params![u64_to_i64(
+                checkpoint_sequence,
+                "observation witness checkpoint sequence"
+            )?],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if checkpoint_exists != 1 {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation witness outcome references an unknown checkpoint".to_string(),
+            ));
+        }
+        let snapshot = Self::load_observation_witness_outcome_snapshot(&transaction)?
+            .next_durable_round(checkpoint_sequence, observed_at, round)?;
+        Self::upsert_observation_witness_outcome_snapshot(&transaction, &snapshot)?;
+        transaction.commit()?;
+        drop(connection);
+        Ok(snapshot)
+    }
+
+    // The long SQL statement is intentionally isolated from policy and state
+    // transition logic so its column/parameter ordering can be audited as one unit.
+    #[allow(clippy::too_many_lines)]
+    fn upsert_observation_witness_outcome_snapshot(
+        transaction: &Transaction<'_>,
+        snapshot: &DirectoryObservationWitnessOutcomeSnapshot,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        let totals = snapshot.totals;
+        let round = snapshot.last_round;
+        let observed_at = snapshot.last_round_at.ok_or_else(|| {
+            DirectoryReplicaStoreError::Integrity(
+                "observation witness outcome round timestamp is missing".to_string(),
+            )
+        })?;
+        transaction.execute(
+            "INSERT INTO directory_observation_witness_outcomes
+                (singleton, rounds_total, attempts_total, accepted_total,
+                 evidence_unavailable_total, evidence_conflict_total,
+                 peer_unavailable_total, transport_failures_total,
+                 verification_failures_total, persistence_failures_total,
+                 last_checkpoint_sequence, last_round_at, last_success_at,
+                 last_failure_at, last_round_attempts, last_round_accepted,
+                 last_round_evidence_unavailable, last_round_evidence_conflict,
+                 last_round_peer_unavailable, last_round_transport_failures,
+                 last_round_verification_failures,
+                 last_round_persistence_failures, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?11)
+             ON CONFLICT(singleton) DO UPDATE SET
+                 rounds_total = excluded.rounds_total,
+                 attempts_total = excluded.attempts_total,
+                 accepted_total = excluded.accepted_total,
+                 evidence_unavailable_total = excluded.evidence_unavailable_total,
+                 evidence_conflict_total = excluded.evidence_conflict_total,
+                 peer_unavailable_total = excluded.peer_unavailable_total,
+                 transport_failures_total = excluded.transport_failures_total,
+                 verification_failures_total = excluded.verification_failures_total,
+                 persistence_failures_total = excluded.persistence_failures_total,
+                 last_checkpoint_sequence = excluded.last_checkpoint_sequence,
+                 last_round_at = excluded.last_round_at,
+                 last_success_at = excluded.last_success_at,
+                 last_failure_at = excluded.last_failure_at,
+                 last_round_attempts = excluded.last_round_attempts,
+                 last_round_accepted = excluded.last_round_accepted,
+                 last_round_evidence_unavailable = excluded.last_round_evidence_unavailable,
+                 last_round_evidence_conflict = excluded.last_round_evidence_conflict,
+                 last_round_peer_unavailable = excluded.last_round_peer_unavailable,
+                 last_round_transport_failures = excluded.last_round_transport_failures,
+                 last_round_verification_failures = excluded.last_round_verification_failures,
+                 last_round_persistence_failures = excluded.last_round_persistence_failures,
+                 updated_at = excluded.updated_at",
+            params![
+                u64_to_i64(snapshot.rounds, "observation witness outcome rounds")?,
+                u64_to_i64(totals.attempts(), "observation witness outcome attempts")?,
+                u64_to_i64(totals.accepted, "observation witness accepted total")?,
+                u64_to_i64(
+                    totals.evidence_unavailable,
+                    "observation witness unavailable total"
+                )?,
+                u64_to_i64(
+                    totals.evidence_conflict,
+                    "observation witness conflict total"
+                )?,
+                u64_to_i64(totals.peer_unavailable, "observation witness peer total")?,
+                u64_to_i64(
+                    totals.transport_failures,
+                    "observation witness transport total"
+                )?,
+                u64_to_i64(
+                    totals.verification_failures,
+                    "observation witness verification total"
+                )?,
+                u64_to_i64(
+                    totals.persistence_failures,
+                    "observation witness persistence total"
+                )?,
+                u64_to_i64(
+                    snapshot.last_checkpoint_sequence,
+                    "observation witness checkpoint sequence"
+                )?,
+                u64_to_i64(observed_at, "observation witness round timestamp")?,
+                snapshot
+                    .last_success_at
+                    .map(|value| u64_to_i64(value, "observation witness success timestamp"))
+                    .transpose()?,
+                snapshot
+                    .last_failure_at
+                    .map(|value| u64_to_i64(value, "observation witness failure timestamp"))
+                    .transpose()?,
+                u64_to_i64(round.attempts(), "observation witness last round attempts")?,
+                u64_to_i64(round.accepted, "observation witness last round accepted")?,
+                u64_to_i64(
+                    round.evidence_unavailable,
+                    "observation witness last round unavailable"
+                )?,
+                u64_to_i64(
+                    round.evidence_conflict,
+                    "observation witness last round conflict"
+                )?,
+                u64_to_i64(
+                    round.peer_unavailable,
+                    "observation witness last round peer unavailable"
+                )?,
+                u64_to_i64(
+                    round.transport_failures,
+                    "observation witness last round transport"
+                )?,
+                u64_to_i64(
+                    round.verification_failures,
+                    "observation witness last round verification"
+                )?,
+                u64_to_i64(
+                    round.persistence_failures,
+                    "observation witness last round persistence"
+                )?,
+            ],
+        )?;
+        Ok(())
+    }
+
     fn insert_observation_checkpoint(
         transaction: &Transaction<'_>,
         previous: ObservationCheckpointTip,
@@ -2559,6 +3001,13 @@ impl DirectoryReplicaStore {
             Self::audit_observation_checkpoints(connection, local_node_id, observed_at)?;
         let observation_witnesses =
             Self::audit_observation_witnesses(connection, local_node_id, observed_at)?;
+        let observation_witness_outcomes =
+            Self::load_observation_witness_outcome_snapshot(connection)?;
+        if observation_witness_outcomes.last_checkpoint_sequence > observation_tip.sequence {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness outcome references an unknown checkpoint".to_string(),
+            ));
+        }
         let mut report = DirectoryReplicaAudit {
             incidents: Self::audit_incidents(connection)?,
             resolutions: Self::audit_resolutions(connection, local_node_id, &producers)?,
@@ -2569,6 +3018,7 @@ impl DirectoryReplicaStore {
             observation_checkpoint_witnesses: observation_witnesses.witnesses,
             observation_checkpoint_witnessed_sequence: observation_witnesses.latest_sequence,
             observation_checkpoint_latest_witnesses: observation_witnesses.latest_witnesses,
+            observation_witness_outcomes,
             ..DirectoryReplicaAudit::default()
         };
         for tip in producers {
@@ -2732,6 +3182,60 @@ impl DirectoryReplicaStore {
                  ON directory_observation_checkpoint_witnesses(
                      checkpoint_sequence, witness_node_id
                  );
+             CREATE TABLE IF NOT EXISTS directory_observation_witness_outcomes (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                 rounds_total INTEGER NOT NULL CHECK (rounds_total > 0),
+                 attempts_total INTEGER NOT NULL CHECK (attempts_total > 0),
+                 accepted_total INTEGER NOT NULL CHECK (accepted_total >= 0),
+                 evidence_unavailable_total INTEGER NOT NULL
+                     CHECK (evidence_unavailable_total >= 0),
+                 evidence_conflict_total INTEGER NOT NULL
+                     CHECK (evidence_conflict_total >= 0),
+                 peer_unavailable_total INTEGER NOT NULL
+                     CHECK (peer_unavailable_total >= 0),
+                 transport_failures_total INTEGER NOT NULL
+                     CHECK (transport_failures_total >= 0),
+                 verification_failures_total INTEGER NOT NULL
+                     CHECK (verification_failures_total >= 0),
+                 persistence_failures_total INTEGER NOT NULL
+                     CHECK (persistence_failures_total >= 0),
+                 last_checkpoint_sequence INTEGER NOT NULL
+                     CHECK (last_checkpoint_sequence > 0),
+                 last_round_at INTEGER NOT NULL CHECK (last_round_at > 0),
+                 last_success_at INTEGER CHECK (last_success_at > 0),
+                 last_failure_at INTEGER CHECK (last_failure_at > 0),
+                 last_round_attempts INTEGER NOT NULL
+                     CHECK (last_round_attempts BETWEEN 1 AND 16),
+                 last_round_accepted INTEGER NOT NULL CHECK (last_round_accepted >= 0),
+                 last_round_evidence_unavailable INTEGER NOT NULL
+                     CHECK (last_round_evidence_unavailable >= 0),
+                 last_round_evidence_conflict INTEGER NOT NULL
+                     CHECK (last_round_evidence_conflict >= 0),
+                 last_round_peer_unavailable INTEGER NOT NULL
+                     CHECK (last_round_peer_unavailable >= 0),
+                 last_round_transport_failures INTEGER NOT NULL
+                     CHECK (last_round_transport_failures >= 0),
+                 last_round_verification_failures INTEGER NOT NULL
+                     CHECK (last_round_verification_failures >= 0),
+                 last_round_persistence_failures INTEGER NOT NULL
+                     CHECK (last_round_persistence_failures >= 0),
+                 updated_at INTEGER NOT NULL CHECK (updated_at > 0),
+                 CHECK (attempts_total = accepted_total
+                     + evidence_unavailable_total + evidence_conflict_total
+                     + peer_unavailable_total + transport_failures_total
+                     + verification_failures_total + persistence_failures_total),
+                 CHECK (last_round_attempts = last_round_accepted
+                     + last_round_evidence_unavailable + last_round_evidence_conflict
+                     + last_round_peer_unavailable + last_round_transport_failures
+                     + last_round_verification_failures
+                     + last_round_persistence_failures),
+                 CHECK (attempts_total >= last_round_attempts),
+                 CHECK (last_success_at IS NOT NULL OR accepted_total = 0),
+                 CHECK (last_failure_at IS NOT NULL OR attempts_total = accepted_total),
+                 FOREIGN KEY (last_checkpoint_sequence)
+                     REFERENCES directory_observation_checkpoints(sequence)
+                     ON UPDATE RESTRICT ON DELETE RESTRICT
+             );
              CREATE TABLE IF NOT EXISTS directory_replica_retry_state (
                  producer BLOB PRIMARY KEY CHECK (length(producer) = 32),
                  consecutive_failures INTEGER NOT NULL
@@ -2789,7 +3293,9 @@ impl DirectoryReplicaStore {
                     DIRECTORY_REPLICA_SCHEMA_VERSION => {
                         Self::require_resolution_columns(transaction)?;
                     }
-                    DIRECTORY_REPLICA_SCHEMA_VERSION_V4 | DIRECTORY_REPLICA_SCHEMA_VERSION_V3 => {
+                    DIRECTORY_REPLICA_SCHEMA_VERSION_V5
+                    | DIRECTORY_REPLICA_SCHEMA_VERSION_V4
+                    | DIRECTORY_REPLICA_SCHEMA_VERSION_V3 => {
                         Self::require_resolution_columns(transaction)?;
                         Self::set_schema_version(transaction, version)?;
                     }
@@ -3049,6 +3555,168 @@ impl DirectoryReplicaStore {
             witnesses,
             latest_sequence,
             latest_witnesses,
+        })
+    }
+
+    fn query_observation_witness_outcome_row(
+        connection: &Connection,
+    ) -> Result<Option<StoredObservationWitnessOutcomeRow>, DirectoryReplicaStoreError> {
+        Ok(connection
+            .query_row(
+                "SELECT rounds_total, attempts_total, accepted_total,
+                        evidence_unavailable_total, evidence_conflict_total,
+                        peer_unavailable_total, transport_failures_total,
+                        verification_failures_total, persistence_failures_total,
+                        last_checkpoint_sequence, last_round_at, last_success_at,
+                        last_failure_at, last_round_attempts, last_round_accepted,
+                        last_round_evidence_unavailable,
+                        last_round_evidence_conflict, last_round_peer_unavailable,
+                        last_round_transport_failures,
+                        last_round_verification_failures,
+                        last_round_persistence_failures, updated_at
+                 FROM directory_observation_witness_outcomes WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok(StoredObservationWitnessOutcomeRow {
+                        rounds: row.get(0)?,
+                        attempts: row.get(1)?,
+                        totals: [
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                        ],
+                        last_checkpoint_sequence: row.get(9)?,
+                        last_round_at: row.get(10)?,
+                        last_success_at: row.get(11)?,
+                        last_failure_at: row.get(12)?,
+                        last_round_attempts: row.get(13)?,
+                        last_round: [
+                            row.get(14)?,
+                            row.get(15)?,
+                            row.get(16)?,
+                            row.get(17)?,
+                            row.get(18)?,
+                            row.get(19)?,
+                            row.get(20)?,
+                        ],
+                        updated_at: row.get(21)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    fn decode_observation_witness_outcome_counters(
+        values: [i64; 7],
+        prefix: &str,
+    ) -> Result<DirectoryObservationWitnessOutcomeCounters, DirectoryReplicaStoreError> {
+        Ok(DirectoryObservationWitnessOutcomeCounters {
+            accepted: nonnegative_i64_to_u64(values[0], &format!("{prefix} accepted"))?,
+            evidence_unavailable: nonnegative_i64_to_u64(
+                values[1],
+                &format!("{prefix} evidence unavailable"),
+            )?,
+            evidence_conflict: nonnegative_i64_to_u64(
+                values[2],
+                &format!("{prefix} evidence conflict"),
+            )?,
+            peer_unavailable: nonnegative_i64_to_u64(
+                values[3],
+                &format!("{prefix} peer unavailable"),
+            )?,
+            transport_failures: nonnegative_i64_to_u64(
+                values[4],
+                &format!("{prefix} transport failures"),
+            )?,
+            verification_failures: nonnegative_i64_to_u64(
+                values[5],
+                &format!("{prefix} verification failures"),
+            )?,
+            persistence_failures: nonnegative_i64_to_u64(
+                values[6],
+                &format!("{prefix} persistence failures"),
+            )?,
+        })
+    }
+
+    fn load_observation_witness_outcome_snapshot(
+        connection: &Connection,
+    ) -> Result<DirectoryObservationWitnessOutcomeSnapshot, DirectoryReplicaStoreError> {
+        let row = Self::query_observation_witness_outcome_row(connection)?;
+        let Some(row) = row else {
+            return Ok(DirectoryObservationWitnessOutcomeSnapshot::default());
+        };
+        let totals = Self::decode_observation_witness_outcome_counters(
+            row.totals,
+            "observation witness total",
+        )?;
+        let last_round = Self::decode_observation_witness_outcome_counters(
+            row.last_round,
+            "observation witness last round",
+        )?;
+        let rounds = positive_i64_to_u64(row.rounds, "observation witness rounds")?;
+        let attempts = positive_i64_to_u64(row.attempts, "observation witness attempts")?;
+        let last_round_attempts = positive_i64_to_u64(
+            row.last_round_attempts,
+            "observation witness last round attempts",
+        )?;
+        let optional_timestamp = |value: Option<i64>, field: &str| {
+            value
+                .map(|value| positive_i64_to_u64(value, field))
+                .transpose()
+        };
+        let last_checkpoint_sequence = positive_i64_to_u64(
+            row.last_checkpoint_sequence,
+            "observation witness checkpoint sequence",
+        )?;
+        let last_round_at = positive_i64_to_u64(
+            row.last_round_at,
+            "observation witness last round timestamp",
+        )?;
+        let last_success_at =
+            optional_timestamp(row.last_success_at, "observation witness success timestamp")?;
+        let last_failure_at =
+            optional_timestamp(row.last_failure_at, "observation witness failure timestamp")?;
+        let updated_at = positive_i64_to_u64(
+            row.updated_at,
+            "observation witness outcome update timestamp",
+        )?;
+        let maximum_round_attempts = u64::try_from(MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1)
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation witness producer bound exceeds u64".to_string(),
+                )
+            })?;
+        if totals.attempts() != attempts
+            || last_round.attempts() != last_round_attempts
+            || last_round_attempts > maximum_round_attempts
+            || rounds > attempts
+            || attempts < last_round_attempts
+            || updated_at != last_round_at
+            || last_success_at.is_some_and(|timestamp| timestamp > last_round_at)
+            || last_failure_at.is_some_and(|timestamp| timestamp > last_round_at)
+            || (totals.accepted > 0) != last_success_at.is_some()
+            || (totals.failures() > 0) != last_failure_at.is_some()
+            || (last_round.accepted > 0 && last_success_at != Some(last_round_at))
+            || (last_round.failures() > 0 && last_failure_at != Some(last_round_at))
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness outcome aggregate is inconsistent".to_string(),
+            ));
+        }
+        Ok(DirectoryObservationWitnessOutcomeSnapshot {
+            rounds,
+            totals,
+            last_checkpoint_sequence,
+            last_round_at: Some(last_round_at),
+            last_success_at,
+            last_failure_at,
+            last_round,
+            telemetry_persistence_failures: 0,
         })
     }
 
@@ -5359,21 +6027,132 @@ mod tests {
         assert!(!observer_store
             .persist_observation_checkpoint_witness(&response, NOW + 22)
             .unwrap());
+        let first_outcomes = [
+            DirectoryObservationWitnessOutcome::Accepted,
+            DirectoryObservationWitnessOutcome::EvidenceUnavailable,
+        ];
+        let first_outcome_snapshot = observer_store
+            .persist_observation_witness_outcome_round(1, NOW + 22, &first_outcomes)
+            .unwrap();
+        assert_eq!(first_outcome_snapshot.rounds, 1);
+        assert_eq!(first_outcome_snapshot.totals.attempts(), 2);
+        assert_eq!(first_outcome_snapshot.totals.accepted, 1);
+        assert_eq!(first_outcome_snapshot.totals.evidence_unavailable, 1);
+        let second_outcomes = [
+            DirectoryObservationWitnessOutcome::EvidenceConflict,
+            DirectoryObservationWitnessOutcome::TransportFailure,
+        ];
+        let second_outcome_snapshot = observer_store
+            .persist_observation_witness_outcome_round(1, NOW + 23, &second_outcomes)
+            .unwrap();
+        assert_eq!(second_outcome_snapshot.rounds, 2);
+        assert_eq!(second_outcome_snapshot.totals.attempts(), 4);
+        assert_eq!(second_outcome_snapshot.totals.evidence_conflict, 1);
+        assert_eq!(second_outcome_snapshot.totals.transport_failures, 1);
+        assert_eq!(second_outcome_snapshot.last_round, {
+            let mut expected = DirectoryObservationWitnessOutcomeCounters::default();
+            expected.record(DirectoryObservationWitnessOutcome::EvidenceConflict);
+            expected.record(DirectoryObservationWitnessOutcome::TransportFailure);
+            expected
+        });
         let snapshot = observer_store.status_snapshot().unwrap();
         assert_eq!(snapshot.observation_checkpoint_witnesses, 1);
         assert_eq!(snapshot.observation_checkpoint_witnessed_sequence, 1);
         assert_eq!(snapshot.observation_checkpoint_latest_witnesses, 1);
-        let audit = observer_store.audit(NOW + 23).unwrap();
+        assert_eq!(
+            snapshot.observation_witness_outcomes,
+            second_outcome_snapshot
+        );
+        let audit = observer_store.audit(NOW + 24).unwrap();
         assert_eq!(audit.observation_checkpoint_witnesses, 1);
         assert_eq!(audit.observation_checkpoint_witnessed_sequence, 1);
         assert_eq!(audit.observation_checkpoint_latest_witnesses, 1);
+        assert_eq!(audit.observation_witness_outcomes, second_outcome_snapshot);
         drop(observer_store);
 
         let (_, reopened) =
-            DirectoryReplicaStore::open(&observer_path, observer.public_key_bytes(), NOW + 24)
+            DirectoryReplicaStore::open(&observer_path, observer.public_key_bytes(), NOW + 25)
                 .unwrap();
         assert_eq!(reopened.observation_checkpoint_witnesses, 1);
         assert_eq!(reopened.observation_checkpoint_witnessed_sequence, 1);
+        assert_eq!(
+            reopened.observation_witness_outcomes,
+            second_outcome_snapshot
+        );
+    }
+
+    #[test]
+    fn witness_runtime_uses_bounded_mutually_exclusive_buckets() {
+        let runtime = DirectoryReplicaSyncRuntime::default();
+        let outcomes = [
+            DirectoryObservationWitnessOutcome::Accepted,
+            DirectoryObservationWitnessOutcome::EvidenceUnavailable,
+            DirectoryObservationWitnessOutcome::EvidenceConflict,
+            DirectoryObservationWitnessOutcome::PeerUnavailable,
+            DirectoryObservationWitnessOutcome::TransportFailure,
+            DirectoryObservationWitnessOutcome::VerificationFailure,
+            DirectoryObservationWitnessOutcome::PersistenceFailure,
+        ];
+        runtime.record_observation_witness_round(3, NOW, &outcomes, false);
+        let snapshot = runtime.observation_witness_snapshot();
+        assert_eq!(snapshot.rounds, 1);
+        assert_eq!(snapshot.totals.attempts(), 7);
+        assert_eq!(snapshot.totals.accepted, 1);
+        assert_eq!(snapshot.totals.evidence_unavailable, 1);
+        assert_eq!(snapshot.totals.evidence_conflict, 1);
+        assert_eq!(snapshot.totals.peer_unavailable, 1);
+        assert_eq!(snapshot.totals.transport_failures, 1);
+        assert_eq!(snapshot.totals.verification_failures, 1);
+        assert_eq!(snapshot.totals.persistence_failures, 1);
+        assert_eq!(snapshot.last_checkpoint_sequence, 3);
+        assert_eq!(snapshot.last_round_at, Some(NOW));
+        assert_eq!(snapshot.last_success_at, Some(NOW));
+        assert_eq!(snapshot.last_failure_at, Some(NOW));
+        assert_eq!(snapshot.telemetry_persistence_failures, 1);
+    }
+
+    #[test]
+    fn tampered_witness_outcome_aggregate_fails_startup_audit() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x8a; 32]).unwrap();
+        let producer_a = IdentityKeyPair::from_bytes(&[0x8b; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0x8c; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x8d; 32]).unwrap();
+        let object = descriptor(&subject, 1);
+        let block_a = block(&producer_a, 1, [0u8; 32], &object);
+        let block_b = block(&producer_b, 1, [0u8; 32], &object);
+        let configured = [producer_a.public_key_bytes(), producer_b.public_key_bytes()];
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        import_replica_block(&store, &producer_a, &object, &block_a, [0x8e; 16]);
+        import_replica_block(&store, &producer_b, &object, &block_b, [0x8f; 16]);
+        store
+            .append_observation_checkpoint(&configured, &local, NOW + 21)
+            .unwrap();
+        store
+            .persist_observation_witness_outcome_round(
+                1,
+                NOW + 22,
+                &[DirectoryObservationWitnessOutcome::EvidenceUnavailable],
+            )
+            .unwrap();
+        {
+            let connection = store.connection.lock();
+            connection
+                .pragma_update(None, "ignore_check_constraints", true)
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE directory_observation_witness_outcomes
+                     SET attempts_total = attempts_total + 1 WHERE singleton = 1",
+                    [],
+                )
+                .unwrap();
+        }
+        drop(store);
+
+        assert!(DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 23).is_err());
     }
 
     #[test]
@@ -5719,7 +6498,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_is_atomically_migrated_to_v5() {
+    fn schema_v1_is_atomically_migrated_to_v6() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x31; 32]).unwrap();
@@ -5735,7 +6514,8 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE directory_observation_checkpoint_witnesses;
+                "DROP TABLE directory_observation_witness_outcomes;
+                 DROP TABLE directory_observation_checkpoint_witnesses;
                  DROP TABLE directory_observation_checkpoints;
                  DROP TABLE directory_replica_resolutions;
                  DROP TABLE directory_replica_retry_state;
@@ -5778,7 +6558,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_is_atomically_migrated_to_v5() {
+    fn schema_v2_is_atomically_migrated_to_v6() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x30; 32]).unwrap();
@@ -5794,7 +6574,8 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE directory_observation_checkpoint_witnesses;
+                "DROP TABLE directory_observation_witness_outcomes;
+                 DROP TABLE directory_observation_checkpoint_witnesses;
                  DROP TABLE directory_observation_checkpoints;
                  DROP TABLE directory_replica_resolutions;
                  ALTER TABLE directory_replica_chains DROP COLUMN active_incident_digest;
@@ -5827,7 +6608,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v3_is_atomically_migrated_to_v5() {
+    fn schema_v3_is_atomically_migrated_to_v6() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x2f; 32]).unwrap();
@@ -5843,7 +6624,8 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE directory_observation_checkpoint_witnesses;
+                "DROP TABLE directory_observation_witness_outcomes;
+                 DROP TABLE directory_observation_checkpoint_witnesses;
                  DROP TABLE directory_observation_checkpoints;",
             )
             .unwrap();
@@ -5869,7 +6651,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v4_is_atomically_migrated_to_v5() {
+    fn schema_v4_is_atomically_migrated_to_v6() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x2e; 32]).unwrap();
@@ -5884,7 +6666,10 @@ mod tests {
             )
             .unwrap();
         connection
-            .execute_batch("DROP TABLE directory_observation_checkpoint_witnesses;")
+            .execute_batch(
+                "DROP TABLE directory_observation_witness_outcomes;
+                 DROP TABLE directory_observation_checkpoint_witnesses;",
+            )
             .unwrap();
         drop(connection);
 
@@ -5906,6 +6691,49 @@ mod tests {
             .unwrap();
         assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
         assert_eq!(witness_table, "directory_observation_checkpoint_witnesses");
+    }
+
+    #[test]
+    fn schema_v5_is_atomically_migrated_to_v6() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x2d; 32]).unwrap();
+        let (store, _) = DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW).unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE directory_replica_meta SET schema_version = ?1 WHERE singleton = 1",
+                params![DIRECTORY_REPLICA_SCHEMA_VERSION_V5],
+            )
+            .unwrap();
+        connection
+            .execute_batch("DROP TABLE directory_observation_witness_outcomes;")
+            .unwrap();
+        drop(connection);
+
+        let (store, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 1).unwrap();
+        assert_eq!(
+            audit.observation_witness_outcomes,
+            DirectoryObservationWitnessOutcomeSnapshot::default()
+        );
+        let connection = store.connection.lock();
+        let (version, outcome_table): (i64, String) = connection
+            .query_row(
+                "SELECT m.schema_version, t.name
+                 FROM directory_replica_meta m
+                 JOIN sqlite_master t
+                   ON t.type = 'table'
+                  AND t.name = 'directory_observation_witness_outcomes'
+                 WHERE m.singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
+        assert_eq!(outcome_table, "directory_observation_witness_outcomes");
     }
 
     #[test]

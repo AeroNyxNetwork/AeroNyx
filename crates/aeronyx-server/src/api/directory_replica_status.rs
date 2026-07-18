@@ -22,6 +22,9 @@
 //!   without exposing hashes, producer identities, or claiming finality.
 //! - Reports aggregate independently recomputed witness receipts without
 //!   exposing witness identities, request ids, signatures, or checkpoint hashes.
+//! - Reports durable and process-lifetime witness outcome buckets so operators
+//!   can distinguish unavailable evidence from transport, verification, or
+//!   persistence faults without widening the privacy boundary.
 //! - Lists bounded incident summaries and exports one independently re-verified
 //!   signed evidence frame on local/VPN operator listeners only.
 //! - Reports signed quarantine-resolution counts while keeping mutation
@@ -39,8 +42,9 @@
 //! 4. Classify recent signed-observation overlap across eligible producers.
 //! 5. Report observer-signed checkpoint availability without exposing its hash.
 //! 6. Report external witness counts without presenting them as votes/quorum.
-//! 7. Serialize aggregate-only or fingerprint-only detail by listener scope.
-//! 8. Re-verify canonical incident evidence before an operator-only export.
+//! 7. Report audited aggregate witness outcomes and current-process durability.
+//! 8. Serialize aggregate-only or fingerprint-only detail by listener scope.
+//! 9. Re-verify canonical incident evidence before an operator-only export.
 //!
 //! ## Privacy Invariant
 //! Public output is aggregate-only. Local status and incident lists contain
@@ -65,6 +69,7 @@
 //!   audited compare-and-swap command boundary.
 //!
 //! ## Last Modified
+//! `v0.9.0-DirectoryWitnessOutcomeStatus` - Added durable and process aggregate witness outcome diagnostics.
 //! `v0.8.0-DirectoryObservationWitnessStatus` - Added aggregate external recomputation receipt status.
 //! `v0.7.0-DirectoryObservationCheckpointStatus` - Added aggregate checkpoint
 //! availability, sequence, and age while redacting hashes and full identities.
@@ -102,10 +107,11 @@ use crate::api::directory_replica_sync::{
     DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND,
 };
 use crate::services::{
-    DirectoryReplicaIncidentEvidence, DirectoryReplicaIncidentSummary,
-    DirectoryReplicaObservationConvergenceSnapshot, DirectoryReplicaProducerSnapshot,
-    DirectoryReplicaStore, DirectoryReplicaStoreSnapshot, DirectoryReplicaSyncObservation,
-    DirectoryReplicaSyncRuntime, MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE,
+    DirectoryObservationWitnessOutcomeSnapshot, DirectoryReplicaIncidentEvidence,
+    DirectoryReplicaIncidentSummary, DirectoryReplicaObservationConvergenceSnapshot,
+    DirectoryReplicaProducerSnapshot, DirectoryReplicaStore, DirectoryReplicaStoreSnapshot,
+    DirectoryReplicaSyncObservation, DirectoryReplicaSyncRuntime,
+    MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE,
 };
 
 const DEFAULT_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE: usize = 20;
@@ -173,6 +179,38 @@ struct DirectoryReplicaObservationCheckpointStatus {
 }
 
 #[derive(Debug, Serialize)]
+struct DirectoryReplicaObservationWitnessOutcomeStatus {
+    source_status: &'static str,
+    durability: &'static str,
+    rounds: u64,
+    attempts: u64,
+    accepted: u64,
+    evidence_unavailable: u64,
+    evidence_conflict: u64,
+    peer_unavailable: u64,
+    transport_failures: u64,
+    verification_failures: u64,
+    persistence_failures: u64,
+    last_checkpoint_sequence: u64,
+    last_round_age_seconds: Option<u64>,
+    last_success_age_seconds: Option<u64>,
+    last_failure_age_seconds: Option<u64>,
+    last_round_attempts: u64,
+    last_round_accepted: u64,
+    last_round_evidence_unavailable: u64,
+    last_round_evidence_conflict: u64,
+    last_round_peer_unavailable: u64,
+    last_round_transport_failures: u64,
+    last_round_verification_failures: u64,
+    last_round_persistence_failures: u64,
+    process_rounds: u64,
+    process_attempts: u64,
+    telemetry_persistence_failures: u64,
+    evidence_basis: &'static str,
+    security_model: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct DirectoryReplicaProducerStatus {
     producer_fingerprint: String,
     configured: bool,
@@ -232,6 +270,7 @@ struct DirectoryReplicaStatusResponse {
     catch_up_policy: DirectoryReplicaCatchUpPolicy,
     observation_convergence: DirectoryReplicaObservationConvergenceStatus,
     observation_checkpoint: DirectoryReplicaObservationCheckpointStatus,
+    observation_witness_outcomes: DirectoryReplicaObservationWitnessOutcomeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     producers: Option<Vec<DirectoryReplicaProducerStatus>>,
     privacy_invariant: &'static str,
@@ -332,6 +371,11 @@ struct DirectoryReplicaRuntimeSummary {
     last_failure_reason: Option<String>,
     next_retry_at: Option<u64>,
     any_current_failure: bool,
+}
+
+struct DirectoryReplicaRuntimeSnapshots<'a> {
+    producers: &'a [DirectoryReplicaSyncObservation],
+    observation_witness: &'a DirectoryObservationWitnessOutcomeSnapshot,
 }
 
 /// Builds the Directory Replica observability route.
@@ -646,12 +690,17 @@ async fn directory_replica_status_handler(
         )
     };
     let runtime = state.runtime.snapshot();
+    let observation_witness_runtime = state.runtime.observation_witness_snapshot();
+    let runtime_snapshots = DirectoryReplicaRuntimeSnapshots {
+        producers: &runtime,
+        observation_witness: &observation_witness_runtime,
+    };
     Json(build_directory_replica_status_response(
         generated_at,
         store_enabled,
         &persisted,
         &convergence,
-        &runtime,
+        &runtime_snapshots,
         &state.configured_producers,
         state.scope,
     ))
@@ -841,16 +890,73 @@ fn build_observation_checkpoint_status(
     }
 }
 
+fn build_observation_witness_outcome_status(
+    generated_at: u64,
+    store_enabled: bool,
+    persisted: &DirectoryObservationWitnessOutcomeSnapshot,
+    runtime: &DirectoryObservationWitnessOutcomeSnapshot,
+) -> DirectoryReplicaObservationWitnessOutcomeStatus {
+    DirectoryReplicaObservationWitnessOutcomeStatus {
+        source_status: if !store_enabled {
+            "disabled"
+        } else if persisted.rounds == 0 && runtime.rounds > 0 {
+            "runtime_only"
+        } else if runtime.telemetry_persistence_failures > 0 {
+            "degraded"
+        } else if persisted.rounds == 0 {
+            "awaiting_witness_round"
+        } else {
+            "available"
+        },
+        durability: "audited_sqlite_aggregate_plus_process_runtime",
+        rounds: persisted.rounds,
+        attempts: persisted.totals.attempts(),
+        accepted: persisted.totals.accepted,
+        evidence_unavailable: persisted.totals.evidence_unavailable,
+        evidence_conflict: persisted.totals.evidence_conflict,
+        peer_unavailable: persisted.totals.peer_unavailable,
+        transport_failures: persisted.totals.transport_failures,
+        verification_failures: persisted.totals.verification_failures,
+        persistence_failures: persisted.totals.persistence_failures,
+        last_checkpoint_sequence: persisted.last_checkpoint_sequence,
+        last_round_age_seconds: persisted
+            .last_round_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_success_age_seconds: persisted
+            .last_success_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_failure_age_seconds: persisted
+            .last_failure_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_round_attempts: persisted.last_round.attempts(),
+        last_round_accepted: persisted.last_round.accepted,
+        last_round_evidence_unavailable: persisted.last_round.evidence_unavailable,
+        last_round_evidence_conflict: persisted.last_round.evidence_conflict,
+        last_round_peer_unavailable: persisted.last_round.peer_unavailable,
+        last_round_transport_failures: persisted.last_round.transport_failures,
+        last_round_verification_failures: persisted.last_round.verification_failures,
+        last_round_persistence_failures: persisted.last_round.persistence_failures,
+        process_rounds: runtime.rounds,
+        process_attempts: runtime.totals.attempts(),
+        telemetry_persistence_failures: runtime.telemetry_persistence_failures,
+        evidence_basis:
+            "mutually_exclusive_privacy_safe_outcomes_from_bounded_external_recomputation_attempts",
+        security_model:
+            "diagnostic_aggregate_not_peer_reputation_vote_quorum_fork_choice_consensus_or_finality",
+    }
+}
+
 fn build_directory_replica_status_response(
     generated_at: u64,
     store_enabled: bool,
     persisted: &DirectoryReplicaStoreSnapshot,
     convergence: &DirectoryReplicaObservationConvergenceSnapshot,
-    runtime: &[DirectoryReplicaSyncObservation],
+    runtime: &DirectoryReplicaRuntimeSnapshots<'_>,
     configured_producers: &HashSet<[u8; 32]>,
     scope: DirectoryReplicaStatusScope,
 ) -> DirectoryReplicaStatusResponse {
     let runtime_by_producer = runtime
+        .producers
         .iter()
         .map(|observation| (observation.producer, observation))
         .collect::<HashMap<_, _>>();
@@ -861,7 +967,7 @@ fn build_directory_replica_status_response(
         .collect::<HashMap<_, _>>();
     let summary = summarize_directory_replica_runtime(
         generated_at,
-        runtime,
+        runtime.producers,
         &runtime_by_producer,
         configured_producers,
     );
@@ -931,6 +1037,12 @@ fn build_directory_replica_status_response(
             generated_at,
             store_enabled,
             persisted,
+        ),
+        observation_witness_outcomes: build_observation_witness_outcome_status(
+            generated_at,
+            store_enabled,
+            &persisted.observation_witness_outcomes,
+            runtime.observation_witness,
         ),
         producers,
         privacy_invariant:
@@ -1133,9 +1245,71 @@ mod tests {
                 "observer_and_external_recomputation_evidence_not_vote_quorum_fork_choice_consensus_or_finality"
             )
         );
+        assert_eq!(
+            parsed["observation_witness_outcomes"]["source_status"].as_str(),
+            Some("awaiting_witness_round")
+        );
+        assert_eq!(
+            parsed["observation_witness_outcomes"]["attempts"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            parsed["observation_witness_outcomes"]["process_attempts"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            parsed["observation_witness_outcomes"]["security_model"].as_str(),
+            Some(
+                "diagnostic_aggregate_not_peer_reputation_vote_quorum_fork_choice_consensus_or_finality"
+            )
+        );
         assert!(parsed.get("producers").is_none());
         assert!(!body_text.contains(&hex::encode(producer)));
         Ok(())
+    }
+
+    #[test]
+    fn witness_outcome_status_separates_durable_and_process_telemetry() {
+        let durable = DirectoryObservationWitnessOutcomeSnapshot {
+            rounds: 4,
+            totals: crate::services::DirectoryObservationWitnessOutcomeCounters {
+                accepted: 3,
+                evidence_unavailable: 2,
+                transport_failures: 1,
+                ..crate::services::DirectoryObservationWitnessOutcomeCounters::default()
+            },
+            last_checkpoint_sequence: 7,
+            last_round_at: Some(90),
+            last_success_at: Some(90),
+            last_failure_at: Some(80),
+            last_round: crate::services::DirectoryObservationWitnessOutcomeCounters {
+                accepted: 2,
+                ..crate::services::DirectoryObservationWitnessOutcomeCounters::default()
+            },
+            telemetry_persistence_failures: 0,
+        };
+        let process = DirectoryObservationWitnessOutcomeSnapshot {
+            rounds: 1,
+            totals: crate::services::DirectoryObservationWitnessOutcomeCounters {
+                accepted: 2,
+                ..crate::services::DirectoryObservationWitnessOutcomeCounters::default()
+            },
+            telemetry_persistence_failures: 1,
+            ..DirectoryObservationWitnessOutcomeSnapshot::default()
+        };
+
+        let status = build_observation_witness_outcome_status(100, true, &durable, &process);
+        assert_eq!(status.source_status, "degraded");
+        assert_eq!(status.rounds, 4);
+        assert_eq!(status.attempts, 6);
+        assert_eq!(status.accepted, 3);
+        assert_eq!(status.evidence_unavailable, 2);
+        assert_eq!(status.transport_failures, 1);
+        assert_eq!(status.last_round_age_seconds, Some(10));
+        assert_eq!(status.last_round_attempts, 2);
+        assert_eq!(status.process_rounds, 1);
+        assert_eq!(status.process_attempts, 2);
+        assert_eq!(status.telemetry_persistence_failures, 1);
     }
 
     #[tokio::test]

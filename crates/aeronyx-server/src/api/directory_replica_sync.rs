@@ -22,6 +22,8 @@
 //!   producer reaches its authenticated remote tip in the same round.
 //! - Requests independently recomputed signed witness receipts for the latest
 //!   audited local checkpoint and persists accepted receipts idempotently.
+//! - Classifies every witness attempt into a closed privacy-safe outcome enum
+//!   and persists aggregate diagnostics without peer-identifying metadata.
 //! - Tries the producer directly first, then uses another pinned node as an
 //!   audited evidence carrier only for bounded availability/admission failures.
 //! - Requests up to eight contiguous blocks per page while the peer-side
@@ -47,7 +49,9 @@
 //!    observation checkpoint from a blocking worker.
 //! 9. Ask pinned peers to independently recompute that checkpoint; persist only
 //!    canonical accepted receipts, never trust an unavailable/conflict result.
-//! 10. Stop the complete round immediately when shutdown wins the select.
+//! 10. Persist bounded aggregate witness outcomes and mirror the current
+//!     process round into runtime telemetry without retaining witness identity.
+//! 11. Stop the complete round immediately when shutdown wins the select.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -67,6 +71,7 @@
 //!   signature, or descriptor-hash response; these are security failures.
 //!
 //! ## Last Modified
+//! `v0.8.0-DirectoryWitnessOutcomeTelemetry` - Added typed witness outcomes and audited aggregate diagnostics.
 //! `v0.7.2-DirectoryRoundBudgetAlignment` - Aligned outbound catch-up work with the existing inbound identity limit.
 //! `v0.7.1-DirectoryBoundedMultiBlockCatchUp` - Raised bounded page width without raising commitment/request ceilings.
 //! `v0.7.0-DirectoryEvidenceCarrier` - Added direct-first audited carrier fallback and dual-layer verification.
@@ -116,8 +121,8 @@ use crate::services::directory_replica::{
     DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS, DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES,
 };
 use crate::services::{
-    DirectoryReplicaImportReport, DirectoryReplicaStore, DirectoryReplicaStoreError,
-    DirectoryReplicaSyncRuntime, PeerStore,
+    DirectoryObservationWitnessOutcome, DirectoryReplicaImportReport, DirectoryReplicaStore,
+    DirectoryReplicaStoreError, DirectoryReplicaSyncRuntime, PeerStore,
 };
 
 /// Maximum pinned producers synchronized concurrently by one node.
@@ -471,13 +476,76 @@ impl DirectoryReplicaSyncCoordinator {
             .buffer_unordered(DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS)
             .collect::<Vec<_>>()
             .await;
-        let accepted = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
-        let failed = outcomes.len().saturating_sub(accepted);
+        self.record_witness_outcome_round(checkpoint.sequence, outcomes)
+            .await;
+    }
+
+    async fn record_witness_outcome_round(
+        &self,
+        checkpoint_sequence: u64,
+        outcomes: Vec<DirectoryObservationWitnessOutcome>,
+    ) {
+        let completed_at = unix_now_secs();
+        let durable_store = Arc::clone(&self.store);
+        let durable_outcomes = outcomes.clone();
+        let telemetry_durable = tokio::task::spawn_blocking(move || {
+            durable_store.persist_observation_witness_outcome_round(
+                checkpoint_sequence,
+                completed_at,
+                &durable_outcomes,
+            )
+        })
+        .await
+        .is_ok_and(|result| result.is_ok());
+        self.runtime.record_observation_witness_round(
+            checkpoint_sequence,
+            completed_at,
+            &outcomes,
+            telemetry_durable,
+        );
+        if !telemetry_durable {
+            warn!(
+                reason = "directory_observation_witness_telemetry_persist_failed",
+                "[DIRECTORY_REPLICA] Witness outcome aggregate was not durable"
+            );
+        }
+        let accepted =
+            witness_outcome_count(&outcomes, DirectoryObservationWitnessOutcome::Accepted);
+        let evidence_unavailable = witness_outcome_count(
+            &outcomes,
+            DirectoryObservationWitnessOutcome::EvidenceUnavailable,
+        );
+        let evidence_conflict = witness_outcome_count(
+            &outcomes,
+            DirectoryObservationWitnessOutcome::EvidenceConflict,
+        );
+        let peer_unavailable = witness_outcome_count(
+            &outcomes,
+            DirectoryObservationWitnessOutcome::PeerUnavailable,
+        );
+        let transport_failures = witness_outcome_count(
+            &outcomes,
+            DirectoryObservationWitnessOutcome::TransportFailure,
+        );
+        let verification_failures = witness_outcome_count(
+            &outcomes,
+            DirectoryObservationWitnessOutcome::VerificationFailure,
+        );
+        let persistence_failures = witness_outcome_count(
+            &outcomes,
+            DirectoryObservationWitnessOutcome::PersistenceFailure,
+        );
         debug!(
-            checkpoint_sequence = checkpoint.sequence,
+            checkpoint_sequence,
             configured_witnesses = outcomes.len(),
             accepted,
-            failed,
+            evidence_unavailable,
+            evidence_conflict,
+            peer_unavailable,
+            transport_failures,
+            verification_failures,
+            persistence_failures,
+            telemetry_durable,
             "[DIRECTORY_REPLICA] Bounded observation checkpoint witness round completed"
         );
     }
@@ -550,24 +618,23 @@ async fn request_observation_checkpoint_witness(
     witness: &[u8; 32],
     client: &reqwest::Client,
     checkpoint: DirectoryObservationCheckpointV1,
-) -> Result<bool, String> {
+) -> DirectoryObservationWitnessOutcome {
     let request_timestamp = unix_now_secs();
-    let descriptor = peer_store
-        .get_valid(witness, request_timestamp)
-        .ok_or_else(|| "observation_witness_peer_unavailable".to_string())?;
-    let endpoint = descriptor
-        .descriptor
-        .public_endpoint
-        .as_deref()
-        .ok_or_else(|| "observation_witness_peer_missing_endpoint".to_string())?;
+    let Some(descriptor) = peer_store.get_valid(witness, request_timestamp) else {
+        return DirectoryObservationWitnessOutcome::PeerUnavailable;
+    };
+    let Some(endpoint) = descriptor.descriptor.public_endpoint.as_deref() else {
+        return DirectoryObservationWitnessOutcome::PeerUnavailable;
+    };
     if !commitment_peer_endpoint_is_public(endpoint) {
-        return Err("observation_witness_peer_unsafe_endpoint".to_string());
+        return DirectoryObservationWitnessOutcome::PeerUnavailable;
     }
-    let url = commitment_peer_url(
+    let Ok(url) = commitment_peer_url(
         endpoint,
         "/api/discovery/peer/directory/observation-checkpoint-witness",
-    )
-    .map_err(|_| "observation_witness_peer_invalid_endpoint".to_string())?;
+    ) else {
+        return DirectoryObservationWitnessOutcome::PeerUnavailable;
+    };
     let mut request_id = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut request_id);
     let requester = identity.public_key_bytes();
@@ -588,10 +655,13 @@ async fn request_observation_checkpoint_witness(
         checkpoint,
         signature: identity.sign(&signing_bytes),
     };
-    let frame = encode_directory_sync_message(&request)
-        .map_err(|_| "observation_witness_request_encode_failed".to_string())?;
-    let response = post_directory_frame(client, url, frame, "observation_witness").await?;
-    let verified = verify_observation_witness_response(
+    let Ok(frame) = encode_directory_sync_message(&request) else {
+        return DirectoryObservationWitnessOutcome::VerificationFailure;
+    };
+    let Ok(response) = post_directory_frame(client, url, frame, "observation_witness").await else {
+        return DirectoryObservationWitnessOutcome::TransportFailure;
+    };
+    let verified = match verify_observation_witness_response(
         &response,
         &request_id,
         &requester,
@@ -599,14 +669,36 @@ async fn request_observation_checkpoint_witness(
         request_timestamp,
         checkpoint_sequence,
         &checkpoint_hash,
-    )?;
+    ) {
+        Ok(verified) => verified,
+        Err(reason) if reason == "observation_witness_evidence_unavailable" => {
+            return DirectoryObservationWitnessOutcome::EvidenceUnavailable;
+        }
+        Err(reason) if reason == "observation_witness_evidence_conflict" => {
+            return DirectoryObservationWitnessOutcome::EvidenceConflict;
+        }
+        Err(_) => return DirectoryObservationWitnessOutcome::VerificationFailure,
+    };
     let durable = tokio::task::spawn_blocking(move || {
         store.persist_observation_checkpoint_witness(&verified, unix_now_secs())
     })
     .await
-    .map_err(|_| "observation_witness_persist_task_failed".to_string())?
-    .map_err(|_| "observation_witness_persist_rejected".to_string())?;
-    Ok(durable)
+    .is_ok_and(|result| result.is_ok());
+    if durable {
+        DirectoryObservationWitnessOutcome::Accepted
+    } else {
+        DirectoryObservationWitnessOutcome::PersistenceFailure
+    }
+}
+
+fn witness_outcome_count(
+    outcomes: &[DirectoryObservationWitnessOutcome],
+    expected: DirectoryObservationWitnessOutcome,
+) -> usize {
+    outcomes
+        .iter()
+        .filter(|outcome| **outcome == expected)
+        .count()
 }
 
 pub(crate) fn verify_observation_witness_response(
