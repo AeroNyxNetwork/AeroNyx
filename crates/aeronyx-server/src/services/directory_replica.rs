@@ -36,6 +36,8 @@
 //!   persists only canonical, accepted, externally signed witness receipts.
 //! - Persists privacy-safe aggregate witness outcomes separately from signed
 //!   receipts so operators can distinguish unavailable evidence from faults.
+//! - Selects only forward-moving, mature, unwitnessed checkpoints for external
+//!   recomputation so asymmetric sync schedules cannot chase the moving tip.
 //! - Exports bounded producer blocks and descriptors only after a complete
 //!   audit inside the same `SQLite` read transaction for signed carrier use.
 //!
@@ -59,8 +61,9 @@
 //!    producer, quorum, or globally finalized height.
 //! 7. Sign and append a checkpoint only when every configured producer has an
 //!    eligible prefix; re-derive every historical root during startup audit.
-//! 8. Witness an external checkpoint only from locally retained exact producer
-//!    prefixes, then audit every accepted receipt again on restart.
+//! 8. Select only mature forward-moving checkpoints for external witnessing,
+//!    recompute them from locally retained exact producer prefixes, and audit
+//!    every accepted receipt again on restart.
 //! 9. Audit bounded aggregate witness outcome counters without retaining peer
 //!    identity, endpoint, request id, signature, or checkpoint hash metadata.
 //!
@@ -95,6 +98,7 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.12.0-DirectoryMatureWitnessScheduling - Added audited mature unwitnessed checkpoint selection
 //! v0.11.0-DirectoryWitnessCapabilityNegotiation - Clarified peer-unavailable witness semantics for rolling upgrades
 //! v0.10.0-DirectoryWitnessOutcomeTelemetry - Added schema v6 privacy-safe durable and runtime witness outcome buckets
 //! v0.9.0-DirectoryEvidenceCarrier - Added transactional audited producer evidence export and carrier-frame audit
@@ -2034,6 +2038,69 @@ impl DirectoryReplicaStore {
         )?;
         drop(connection);
         Ok(Some(decode_observation_checkpoint(&checkpoint_blob)?))
+    }
+
+    /// Returns the newest mature checkpoint that still lacks a witness receipt.
+    ///
+    /// Selection is forward-only. The lower sequence bound is the newest
+    /// authenticated witness receipt or durable outcome round, whichever is
+    /// greater. This prevents a restart or already-witnessed head from causing
+    /// the coordinator to work backwards through historical gaps. Before the
+    /// query runs, the complete checkpoint chain, every retained witness
+    /// receipt, and the outcome aggregate are audited fail closed.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when the maturity cutoff is zero
+    /// or in the future, metadata or retained evidence fails audit, the selected
+    /// row is malformed, or `SQLite` cannot complete the bounded indexed query.
+    pub fn latest_audited_mature_unwitnessed_observation_checkpoint(
+        &self,
+        matured_before: u64,
+        observed_at: u64,
+    ) -> Result<Option<DirectoryObservationCheckpointV1>, DirectoryReplicaStoreError> {
+        if matured_before == 0 || matured_before > observed_at {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation witness maturity cutoff is invalid".to_string(),
+            ));
+        }
+        let connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let (checkpoint_count, _) =
+            Self::audit_observation_checkpoints(&connection, &self.local_node_id, observed_at)?;
+        if checkpoint_count == 0 {
+            return Ok(None);
+        }
+        let witness_audit =
+            Self::audit_observation_witnesses(&connection, &self.local_node_id, observed_at)?;
+        let outcome_snapshot = Self::load_observation_witness_outcome_snapshot(&connection)?;
+        let minimum_sequence = witness_audit
+            .latest_sequence
+            .max(outcome_snapshot.last_checkpoint_sequence)
+            .max(1);
+        let checkpoint_blob = connection
+            .query_row(
+                "SELECT checkpoint.checkpoint_blob
+                 FROM directory_observation_checkpoints AS checkpoint
+                 WHERE checkpoint.observed_at <= ?1
+                   AND checkpoint.sequence >= ?2
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM directory_observation_checkpoint_witnesses AS witness
+                       WHERE witness.checkpoint_sequence = checkpoint.sequence
+                   )
+                 ORDER BY checkpoint.sequence DESC
+                 LIMIT 1",
+                params![
+                    u64_to_i64(matured_before, "observation witness maturity cutoff")?,
+                    u64_to_i64(minimum_sequence, "observation witness sequence floor")?
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        drop(connection);
+        checkpoint_blob
+            .map(|blob| decode_observation_checkpoint(&blob))
+            .transpose()
     }
 
     /// Independently evaluates an external observer checkpoint against this
@@ -5910,18 +5977,48 @@ mod tests {
         assert!(second.appended);
         assert_eq!(second.sequence, 2);
         assert_ne!(second.checkpoint_hash, first.checkpoint_hash);
+        assert_eq!(
+            store
+                .latest_audited_mature_unwitnessed_observation_checkpoint(NOW + 23, NOW + 25)
+                .unwrap()
+                .unwrap()
+                .sequence,
+            1
+        );
+        assert_eq!(
+            store
+                .latest_audited_mature_unwitnessed_observation_checkpoint(NOW + 24, NOW + 25)
+                .unwrap()
+                .unwrap()
+                .sequence,
+            2
+        );
+        assert!(store
+            .latest_audited_mature_unwitnessed_observation_checkpoint(NOW + 26, NOW + 25)
+            .is_err());
+        store
+            .persist_observation_witness_outcome_round(
+                2,
+                NOW + 25,
+                &[DirectoryObservationWitnessOutcome::EvidenceUnavailable],
+            )
+            .unwrap();
+        assert!(store
+            .latest_audited_mature_unwitnessed_observation_checkpoint(NOW + 23, NOW + 26)
+            .unwrap()
+            .is_none());
         let snapshot = store.status_snapshot().unwrap();
         assert_eq!(snapshot.observation_checkpoints, 2);
         assert_eq!(snapshot.observation_checkpoint_sequence, 2);
         assert_eq!(snapshot.observation_checkpoint_hash, second.checkpoint_hash);
-        let audit = store.audit(NOW + 25).unwrap();
+        let audit = store.audit(NOW + 26).unwrap();
         assert_eq!(audit.observation_checkpoints, 2);
         assert_eq!(audit.observation_checkpoint_sequence, 2);
         assert_eq!(audit.observation_checkpoint_hash, second.checkpoint_hash);
         drop(store);
 
         let (_, reopened) =
-            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 26).unwrap();
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 27).unwrap();
         assert_eq!(reopened.observation_checkpoints, 2);
         assert_eq!(reopened.observation_checkpoint_sequence, 2);
     }
@@ -6028,6 +6125,10 @@ mod tests {
         assert!(!observer_store
             .persist_observation_checkpoint_witness(&response, NOW + 22)
             .unwrap());
+        assert!(observer_store
+            .latest_audited_mature_unwitnessed_observation_checkpoint(NOW + 21, NOW + 22)
+            .unwrap()
+            .is_none());
         let first_outcomes = [
             DirectoryObservationWitnessOutcome::Accepted,
             DirectoryObservationWitnessOutcome::EvidenceUnavailable,

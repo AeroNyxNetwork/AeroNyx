@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.21.0 - Added wire-compatible witness capability negotiation scoped to authenticated descriptor sequences.
+Modification Reason: v0.22.0 - Added forward-only mature checkpoint witness scheduling based on live cross-node convergence evidence.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.21.0 - Prevented unsupported witness endpoints from being misreported as transport faults without changing the descriptor wire schema.
+Last Modified: v0.22.0 - Prevented asymmetric replica schedules from perpetually witnessing a checkpoint that peers have not received yet.
+Previous: v0.21.0 - Prevented unsupported witness endpoints from being misreported as transport faults without changing the descriptor wire schema.
 Previous: v0.20.0 - Added durable/runtime witness outcome buckets without retaining peer identity or introducing reputation, quorum, consensus, or finality.
 Previous: v0.19.0 - Added independently recomputed external checkpoint witness receipts without introducing votes, quorum, consensus, or finality.
 Previous: v0.18.0 - Added signed local observation checkpoints binding exact producer tips and recomputable recent commitment overlap without introducing votes, consensus, or finality.
@@ -1153,6 +1154,47 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-19 - Added Mature Checkpoint Witness Scheduling V1.
+- Files changed:
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Production evidence:
+  - US1 and Noway1 both reported healthy, fully synchronized producer replicas,
+    zero lag, zero quarantine, and no persistence or verification failures.
+  - Noway1 had accepted external receipts for all 44 local checkpoints, while
+    US1 had 0 receipts across 151 checkpoints and one `evidence_unavailable`
+    outcome every round. The asymmetry matched coordinator schedule ordering:
+    US1 requested evidence for a checkpoint created from a producer tip that
+    Noway1 would only import on its next interval.
+- Architecture:
+  - The coordinator now waits one complete configured Directory sync interval
+    before a checkpoint becomes eligible for external recomputation.
+  - The store selects the newest eligible checkpoint without any accepted
+    receipt. It audits the complete checkpoint chain, every receipt, and the
+    durable outcome aggregate before running the indexed selection query.
+  - Selection is forward-only. Its minimum sequence is the newer of the latest
+    authenticated receipt and latest durable outcome sequence, preventing
+    restart recovery from walking backwards through historical gaps.
+  - A selected checkpoint still passes the unchanged exact-prefix, overlap-root,
+    canonical frame, request binding, Ed25519, and durable receipt checks.
+- Compatibility and scope:
+  - Directory Sync frames, descriptor schema, capability enum, SQLite schema,
+    peer admission, response limits, and public privacy boundaries are unchanged.
+  - Status adds only static aggregate scheduling semantics. This remains
+    observer evidence, not voting, quorum, fork choice, consensus, or finality.
+- Verification:
+  - Mature-time boundary, restart-monotonicity, accepted-receipt, and public
+    status serialization tests passed.
+  - Directory Replica suite: 47 passed.
+  - `aeronyx-server` library: 1,108 passed; binaries: 2 passed; docs: 1 passed,
+    9 ignored by their existing annotations.
+  - Modified Rust files pass direct `rustfmt --check`; repository diff check,
+    Clippy correctness for all server targets, and the optimized release build
+    passed. Existing repository-wide pedantic/deprecation warnings remain
+    outside this milestone and were not broadened into unrelated refactoring.
+
 2026-07-19 - Added descriptor-scoped witness capability negotiation.
 - Files changed:
   - crates/aeronyx-server/src/api/directory_replica_sync.rs

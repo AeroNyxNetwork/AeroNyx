@@ -20,12 +20,15 @@
 //! - Records only bounded, privacy-safe synchronization observations.
 //! - Persists one signed observation checkpoint only after every pinned
 //!   producer reaches its authenticated remote tip in the same round.
-//! - Requests independently recomputed signed witness receipts for the latest
-//!   audited local checkpoint and persists accepted receipts idempotently.
+//! - Requests independently recomputed signed witness receipts for the newest
+//!   mature, forward-moving local checkpoint and persists accepted receipts
+//!   idempotently.
 //! - Classifies every witness attempt into a closed privacy-safe outcome enum
 //!   and persists aggregate diagnostics without peer-identifying metadata.
 //! - Learns endpoint-level witness unavailability against the authenticated
 //!   descriptor sequence so rolling upgrades do not inflate transport faults.
+//! - Witnesses only checkpoints older than one complete synchronization
+//!   interval, preventing asymmetric schedulers from chasing a moving head.
 //! - Tries the producer directly first, then uses another pinned node as an
 //!   audited evidence carrier only for bounded availability/admission failures.
 //! - Requests up to eight contiguous blocks per page while the peer-side
@@ -49,8 +52,10 @@
 //! 7. Persist failures, and let a successful import atomically clear backoff.
 //! 8. If every producer reaches its signed tip, append an idempotent local
 //!    observation checkpoint from a blocking worker.
-//! 9. Ask pinned peers to independently recompute that checkpoint; persist only
-//!    canonical accepted receipts, never trust an unavailable/conflict result.
+//! 9. After one complete synchronization interval, ask pinned peers to
+//!    independently recompute the newest mature unwitnessed checkpoint;
+//!    persist only canonical accepted receipts, never trust an unavailable or
+//!    conflicting result.
 //! 10. Treat an explicitly unsupported witness endpoint as peer unavailability
 //!     and retry only after that peer publishes a newer signed descriptor.
 //! 11. Persist bounded aggregate witness outcomes and mirror the current
@@ -75,6 +80,7 @@
 //!   signature, or descriptor-hash response; these are security failures.
 //!
 //! ## Last Modified
+//! `v0.10.0-DirectoryMatureWitnessScheduling` - Added one-interval mature unwitnessed checkpoint targeting.
 //! `v0.9.0-DirectoryWitnessCapabilityNegotiation` - Added descriptor-sequence-scoped witness capability probing.
 //! `v0.8.0-DirectoryWitnessOutcomeTelemetry` - Added typed witness outcomes and audited aggregate diagnostics.
 //! `v0.7.2-DirectoryRoundBudgetAlignment` - Aligned outbound catch-up work with the existing inbound identity limit.
@@ -145,6 +151,8 @@ const DIRECTORY_SYNC_STARTUP_DELAY_MIN_SECS: u64 = 5;
 const DIRECTORY_SYNC_STARTUP_DELAY_SPAN_SECS: u64 = 11;
 /// Accepted signed response clock skew in either direction.
 const DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS: u64 = 60;
+/// External witnesses receive one complete producer-sync interval to catch up.
+pub(crate) const DIRECTORY_OBSERVATION_WITNESS_MATURITY_INTERVALS: u64 = 1;
 /// Hard response ceiling shared with the core Directory Sync decoder.
 const MAX_DIRECTORY_SYNC_RESPONSE_BODY_BYTES: usize = 512 * 1024;
 /// Multi-block pages accelerate cold catch-up. Peer handlers cap each returned
@@ -498,7 +506,7 @@ impl DirectoryReplicaSyncCoordinator {
                     producer_count = report.producer_count,
                     "[DIRECTORY_REPLICA] Complete observation checkpoint evaluated"
                 );
-                self.witness_latest_observation_checkpoint().await;
+                self.witness_mature_observation_checkpoint().await;
             }
             Ok(Err(_)) | Err(_) => {
                 warn!(
@@ -509,11 +517,22 @@ impl DirectoryReplicaSyncCoordinator {
         }
     }
 
-    async fn witness_latest_observation_checkpoint(&self) {
+    async fn witness_mature_observation_checkpoint(&self) {
         let store = Arc::clone(&self.store);
         let observed_at = unix_now_secs();
+        let maturity_delay_secs = self
+            .interval
+            .as_secs()
+            .saturating_mul(DIRECTORY_OBSERVATION_WITNESS_MATURITY_INTERVALS);
+        let matured_before = observed_at.saturating_sub(maturity_delay_secs);
+        if matured_before == 0 {
+            return;
+        }
         let checkpoint = match tokio::task::spawn_blocking(move || {
-            store.latest_audited_observation_checkpoint(observed_at)
+            store.latest_audited_mature_unwitnessed_observation_checkpoint(
+                matured_before,
+                observed_at,
+            )
         })
         .await
         {
@@ -527,6 +546,12 @@ impl DirectoryReplicaSyncCoordinator {
                 return;
             }
         };
+        debug!(
+            checkpoint_sequence = checkpoint.sequence,
+            checkpoint_age_seconds = observed_at.saturating_sub(checkpoint.observed_at),
+            maturity_delay_secs,
+            "[DIRECTORY_REPLICA] Mature unwitnessed checkpoint selected"
+        );
         let outcomes = stream::iter(self.peers.iter().copied())
             .map(|witness| {
                 let checkpoint = checkpoint.clone();

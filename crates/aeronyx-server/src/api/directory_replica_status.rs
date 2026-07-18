@@ -25,6 +25,8 @@
 //! - Reports durable and process-lifetime witness outcome buckets so operators
 //!   can distinguish unavailable evidence from transport, verification, or
 //!   persistence faults without widening the privacy boundary.
+//! - Declares the mature, forward-only witness target policy without exposing
+//!   checkpoint hashes, witness identities, or peer scheduling details.
 //! - Lists bounded incident summaries and exports one independently re-verified
 //!   signed evidence frame on local/VPN operator listeners only.
 //! - Reports signed quarantine-resolution counts while keeping mutation
@@ -42,7 +44,8 @@
 //! 4. Classify recent signed-observation overlap across eligible producers.
 //! 5. Report observer-signed checkpoint availability without exposing its hash.
 //! 6. Report external witness counts without presenting them as votes/quorum.
-//! 7. Report audited aggregate witness outcomes and current-process durability.
+//! 7. Report audited aggregate witness outcomes, current-process durability,
+//!    and the static mature forward-only target policy.
 //! 8. Serialize aggregate-only or fingerprint-only detail by listener scope.
 //! 9. Re-verify canonical incident evidence before an operator-only export.
 //!
@@ -69,6 +72,7 @@
 //!   audited compare-and-swap command boundary.
 //!
 //! ## Last Modified
+//! `v0.10.0-DirectoryMatureWitnessStatus` - Declared mature forward-only witness scheduling semantics.
 //! `v0.9.0-DirectoryWitnessOutcomeStatus` - Added durable and process aggregate witness outcome diagnostics.
 //! `v0.8.0-DirectoryObservationWitnessStatus` - Added aggregate external recomputation receipt status.
 //! `v0.7.0-DirectoryObservationCheckpointStatus` - Added aggregate checkpoint
@@ -182,6 +186,9 @@ struct DirectoryReplicaObservationCheckpointStatus {
 struct DirectoryReplicaObservationWitnessOutcomeStatus {
     source_status: &'static str,
     durability: &'static str,
+    target_policy: &'static str,
+    maturity_policy: &'static str,
+    monotonic_floor: &'static str,
     rounds: u64,
     attempts: u64,
     accepted: u64,
@@ -909,6 +916,9 @@ fn build_observation_witness_outcome_status(
             "available"
         },
         durability: "audited_sqlite_aggregate_plus_process_runtime",
+        target_policy: "latest_mature_unwitnessed_checkpoint",
+        maturity_policy: "one_configured_directory_sync_interval",
+        monotonic_floor: "latest_authenticated_receipt_or_durable_outcome_sequence",
         rounds: persisted.rounds,
         attempts: persisted.totals.attempts(),
         accepted: persisted.totals.accepted,
@@ -1256,6 +1266,18 @@ mod tests {
         assert_eq!(
             parsed["observation_witness_outcomes"]["process_attempts"].as_u64(),
             Some(0)
+        );
+        assert_eq!(
+            parsed["observation_witness_outcomes"]["target_policy"].as_str(),
+            Some("latest_mature_unwitnessed_checkpoint")
+        );
+        assert_eq!(
+            parsed["observation_witness_outcomes"]["maturity_policy"].as_str(),
+            Some("one_configured_directory_sync_interval")
+        );
+        assert_eq!(
+            parsed["observation_witness_outcomes"]["monotonic_floor"].as_str(),
+            Some("latest_authenticated_receipt_or_durable_outcome_sequence")
         );
         assert_eq!(
             parsed["observation_witness_outcomes"]["security_model"].as_str(),
