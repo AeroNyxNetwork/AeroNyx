@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.16.0 - Added local-operator, read-only Directory Replica incident summaries and fail-closed signed-evidence export without introducing an unauthenticated quarantine recovery command.
+Modification Reason: v0.17.0 - Added a host-local, node-identity-signed, compare-and-swap quarantine resolution boundary with append-only audit history and fail-closed schema v3 migration.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.16.0 - Added bounded incident pagination and canonical producer-signed evidence export with verification on every read.
+Last Modified: v0.17.0 - Added signed host-local quarantine resolution, exact active-incident/tip CAS, linked resolution history, and startup tamper detection.
+Previous: v0.16.0 - Added bounded incident pagination and canonical producer-signed evidence export with verification on every read.
 Previous: v0.15.0 - Added recent signed-commitment overlap and an operator-only deterministic observation root.
 Previous: v0.14.0 - Added atomic replica schema v1-to-v2 migration and restart-durable producer retry scheduling.
 Previous: v0.13.0 - Added a 45-second producer deadline, bounded failure backoff, and additive aggregate/operator retry status.
@@ -1148,6 +1149,58 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-18 - Added authenticated Directory Replica quarantine resolution.
+- Files changed:
+  - crates/aeronyx-server/src/main.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - crates/aeronyx-server/src/services/mod.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/server.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Security boundary:
+  - Resolution is available only through the host-local `aeronyx-server
+    directory-replica` CLI. No public, peer, operator HTTP, management, gossip,
+    or backend mutation route was added.
+  - `inspect-incident` re-verifies the canonical producer-signed evidence and
+    prints the exact active incident, accepted tip, quarantine kind, and prior
+    resolution head required for an explicit command.
+  - `resolve-quarantine` requires the incident digest to be repeated with
+    `--confirm-incident`, loads the configured node identity private key, and
+    signs every compare-and-swap field plus the fixed
+    `resume_existing_prefix` action.
+- Persistence and invariants:
+  - Atomically migrates Directory Replica SQLite metadata from schema v1 or v2
+    to v3 and adds `active_incident_digest`, `last_resolution_digest`, and the
+    append-only `directory_replica_resolutions` table.
+  - A resolution may only retain the already accepted height/hash. It cannot
+    delete evidence, rewind blocks, choose a fork, import remote content, or
+    change another producer namespace.
+  - Resolution records form one producer-local hash-addressed linked history.
+    Startup audit verifies local-node identity, Ed25519 signature, content
+    digest, incident binding, retained block, predecessor ownership/order, and
+    the absence of missing, cyclic, branched, or orphaned records.
+  - The write transaction rejects a resolution timestamp that predates either
+    its incident or its linked predecessor, so a successful write satisfies
+    the same temporal ordering enforced again during startup audit.
+  - Every producer-authored quarantine incident must be either the exact active
+    incident or covered by a signed resolution. Directly clearing SQLite flags
+    without a signed audit record therefore fails startup closed.
+  - Repeated hostile evidence can quarantine the producer again; the next
+    resolution must CAS against the previous resolution head. Incidents remain
+    immutable and exact repeated evidence stays content-addressed/idempotent.
+- Compatibility and privacy:
+  - Directory Sync V1 frames, accepted block format, peer routes, discovery,
+    configuration, automatic retry policy, and public mutation surface remain
+    unchanged.
+  - Status adds only aggregate/fingerprint-scoped resolution counts. No client,
+    route, endpoint, payload, ciphertext, Memory Chain, DNS, destination,
+    private-key, wallet-traffic, or social-graph data is persisted or exposed.
+- Operator flow:
+  - Review: `aeronyx-server directory-replica inspect-incident --digest <HEX>`
+  - Resolve only after independent evidence review by running the exact command
+    printed by inspection. A stale tip, active incident, kind, or history head
+    is rejected without changing SQLite.
+
 2026-07-18 - Added auditable Directory Replica incident evidence export.
 - Files changed:
   - crates/aeronyx-server/src/services/directory_replica.rs

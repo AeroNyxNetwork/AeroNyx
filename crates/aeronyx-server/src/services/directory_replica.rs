@@ -27,6 +27,9 @@
 //!   cryptographic audit per API read.
 //! - Exports bounded incident summaries and re-verified signed evidence for
 //!   authenticated operator review without adding an automatic recovery path.
+//! - Resolves quarantine only through a node-identity-signed, host-local,
+//!   compare-and-swap command while retaining the accepted prefix and every
+//!   incident and resolution as an append-only audit trail.
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
@@ -39,7 +42,8 @@
 //! 1. Open the existing Directory Chain `SQLite` file and initialize only the
 //!    `directory_replica_*` tables.
 //! 2. Pin schema, chain id, and the local node identity in replica metadata.
-//! 3. Audit every accepted producer prefix and all durable incident evidence.
+//! 3. Audit every accepted producer prefix and all durable incident and
+//!    operator-resolution evidence.
 //! 4. Re-verify the signed range-response frame and exact descriptor objects.
 //! 5. Atomically append a contiguous producer prefix, clear its retry state,
 //!    or persist quarantine without mutating another producer namespace.
@@ -64,8 +68,14 @@
 //!   producer evidence. It is never consensus, voting, fork choice, or finality.
 //! - Incident evidence export is read-only. Quarantine resolution requires a
 //!   separately authenticated, audited compare-and-swap command boundary.
+//! - Never expose [`DirectoryReplicaStore::resolve_quarantine`] through the
+//!   peer or public HTTP routers. It belongs only to the host-local CLI, whose
+//!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.6.0-DirectoryReplicaQuarantineResolution - Added schema v3, signed local
+//! operator resolution commands, exact incident/tip CAS, and linked immutable
+//! resolution auditing without deleting or rewinding accepted evidence.
 //! v0.5.0-DirectoryReplicaIncidentEvidence - Added bounded incident pagination
 //! and fail-closed, signature-reverified evidence export for local operators.
 //! v0.4.0-DirectoryReplicaObservationConvergence - Added bounded recent-window
@@ -85,7 +95,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aeronyx_core::crypto::IdentityPublicKey;
+use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::discovery::{
     decode_directory_sync_message, directory_block_range_response_signing_bytes,
     encode_directory_sync_message, DirectoryCommitmentBlockV1, DirectoryCommitmentValidationError,
@@ -97,7 +107,8 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 2;
+const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 3;
+const DIRECTORY_REPLICA_SCHEMA_VERSION_V2: i64 = 2;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V1: i64 = 1;
 const MAX_DIRECTORY_BLOCK_BYTES: u64 = 64 * 1024;
 const MAX_DIRECTORY_DESCRIPTOR_OBJECT_BYTES: u64 = 32 * 1024;
@@ -108,6 +119,8 @@ const MAX_DIRECTORY_REPLICA_FAILURE_REASON_BYTES: usize = 96;
 const DIRECTORY_REPLICA_CONVERGENCE_WINDOW_BLOCKS: u64 = 32;
 const MAX_DIRECTORY_REPLICA_CONVERGENCE_PRODUCERS: usize = 16;
 const MAX_DIRECTORY_REPLICA_INCIDENT_KIND_BYTES: usize = 64;
+const DIRECTORY_REPLICA_RESOLUTION_ACTION: &str = "resume_existing_prefix";
+const DIRECTORY_REPLICA_RESOLUTION_TIMESTAMP_SKEW_SECS: u64 = 60;
 /// Maximum incident summaries returned by one operator API read.
 pub(crate) const MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE: usize = 50;
 /// Maximum producer failure streak retained in memory and audited `SQLite`.
@@ -157,6 +170,8 @@ pub struct DirectoryReplicaAudit {
     pub commitments: u64,
     /// Number of durable authenticated incidents.
     pub incidents: u64,
+    /// Number of node-identity-signed operator resolutions.
+    pub resolutions: u64,
     /// Number of audited producer-local retry rows.
     pub retry_states: u64,
 }
@@ -174,6 +189,8 @@ pub struct DirectoryReplicaStoreSnapshot {
     pub commitments: u64,
     /// Number of durable authenticated incidents.
     pub incidents: u64,
+    /// Number of durable signed quarantine resolutions.
+    pub resolutions: u64,
     /// Per-producer accepted-prefix summaries for local operator presentation.
     pub producer_snapshots: Vec<DirectoryReplicaProducerSnapshot>,
 }
@@ -228,6 +245,8 @@ pub struct DirectoryReplicaProducerSnapshot {
     pub commitments: u64,
     /// Durable incidents attributed to this producer response stream.
     pub incidents: u64,
+    /// Signed operator resolutions retained for this producer.
+    pub resolutions: u64,
 }
 
 /// Bounded metadata for one startup-audited Directory Replica incident.
@@ -292,10 +311,14 @@ pub struct DirectoryReplicaTip {
     pub quarantined: bool,
     /// Stable incident kind when quarantined.
     pub quarantine_kind: Option<String>,
+    /// Exact unresolved incident when quarantined.
+    pub active_incident_digest: Option<[u8; 32]>,
+    /// Latest signed resolution in this producer's linked audit history.
+    pub last_resolution_digest: Option<[u8; 32]>,
 }
 
 impl DirectoryReplicaTip {
-    fn empty(producer: [u8; 32]) -> Self {
+    const fn empty(producer: [u8; 32]) -> Self {
         Self {
             producer,
             tip_height: 0,
@@ -303,8 +326,139 @@ impl DirectoryReplicaTip {
             tip_timestamp: 0,
             quarantined: false,
             quarantine_kind: None,
+            active_incident_digest: None,
+            last_resolution_digest: None,
         }
     }
+}
+
+/// Node-identity-signed command that resumes one exact quarantined prefix.
+///
+/// The command cannot select a fork, delete evidence, or rewind a chain. Its
+/// compare-and-swap fields bind one immutable incident to the exact prefix and
+/// previous resolution history inspected by the host-local operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryReplicaResolutionCommand {
+    /// Random operator command identifier; unique across this replica store.
+    pub command_id: [u8; 16],
+    /// Immutable incident explicitly approved by the operator.
+    pub incident_digest: [u8; 32],
+    /// Producer namespace whose existing prefix may resume synchronization.
+    pub producer: [u8; 32],
+    /// Accepted prefix height observed before signing.
+    pub expected_tip_height: u64,
+    /// Accepted prefix hash observed before signing.
+    pub expected_tip_hash: [u8; 32],
+    /// Quarantine classification observed before signing.
+    pub expected_quarantine_kind: String,
+    /// Previous linked resolution, or `None` for this producer's first one.
+    pub previous_resolution_digest: Option<[u8; 32]>,
+    /// Host timestamp at which the operator approved the command.
+    pub resolved_at: u64,
+    /// Local node identity that must match replica metadata.
+    pub resolver_node_id: [u8; 32],
+    /// Ed25519 signature over every command field and the fixed action.
+    pub signature: [u8; 64],
+}
+
+impl DirectoryReplicaResolutionCommand {
+    /// Constructs and signs one exact `resume_existing_prefix` command.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when any bounded command field is
+    /// invalid. Signing never reads or modifies the replica database.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign(
+        identity: &IdentityKeyPair,
+        command_id: [u8; 16],
+        incident_digest: [u8; 32],
+        producer: [u8; 32],
+        expected_tip_height: u64,
+        expected_tip_hash: [u8; 32],
+        expected_quarantine_kind: String,
+        previous_resolution_digest: Option<[u8; 32]>,
+        resolved_at: u64,
+    ) -> Result<Self, DirectoryReplicaStoreError> {
+        let mut command = Self {
+            command_id,
+            incident_digest,
+            producer,
+            expected_tip_height,
+            expected_tip_hash,
+            expected_quarantine_kind,
+            previous_resolution_digest,
+            resolved_at,
+            resolver_node_id: identity.public_key_bytes(),
+            signature: [0u8; 64],
+        };
+        command.validate_unsigned_fields()?;
+        command.signature = identity.sign(&command.signing_bytes());
+        Ok(command)
+    }
+
+    fn validate_unsigned_fields(&self) -> Result<(), DirectoryReplicaStoreError> {
+        if self.command_id == [0u8; 16]
+            || self.incident_digest == [0u8; 32]
+            || self.producer == [0u8; 32]
+            || self.resolver_node_id == [0u8; 32]
+            || self.resolved_at == 0
+            || (self.expected_tip_height == 0 && self.expected_tip_hash != [0u8; 32])
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica resolution command contains an invalid sentinel".to_string(),
+            ));
+        }
+        validate_incident_kind(&self.expected_quarantine_kind)
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(320);
+        bytes.extend_from_slice(b"AeroNyx-DirectoryReplicaResolution-v1");
+        bytes.extend_from_slice(&AERONYX_DIRECTORY_MAINNET_CHAIN_ID);
+        bytes.extend_from_slice(&self.command_id);
+        bytes.extend_from_slice(&self.incident_digest);
+        bytes.extend_from_slice(&self.producer);
+        bytes.extend_from_slice(&self.expected_tip_height.to_le_bytes());
+        bytes.extend_from_slice(&self.expected_tip_hash);
+        bytes.extend_from_slice(&(self.expected_quarantine_kind.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(self.expected_quarantine_kind.as_bytes());
+        match self.previous_resolution_digest {
+            Some(digest) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&digest);
+            }
+            None => bytes.push(0),
+        }
+        bytes.extend_from_slice(&self.resolved_at.to_le_bytes());
+        bytes.extend_from_slice(&self.resolver_node_id);
+        bytes.extend_from_slice(&(DIRECTORY_REPLICA_RESOLUTION_ACTION.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(DIRECTORY_REPLICA_RESOLUTION_ACTION.as_bytes());
+        bytes
+    }
+
+    fn digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.signing_bytes());
+        hasher.update(self.signature);
+        hasher.finalize().into()
+    }
+}
+
+/// Durable result of one successful compare-and-swap resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryReplicaResolutionReport {
+    /// Content address of the signed resolution audit record.
+    pub resolution_digest: [u8; 32],
+    /// Unique command identifier supplied by the operator CLI.
+    pub command_id: [u8; 16],
+    /// Producer namespace that resumed its already accepted prefix.
+    pub producer: [u8; 32],
+    /// Prefix height retained without rewind or fork selection.
+    pub retained_tip_height: u64,
+    /// Prefix hash retained without modification.
+    pub retained_tip_hash: [u8; 32],
+    /// Signed operator approval timestamp.
+    pub resolved_at: u64,
 }
 
 /// Result of one verified, atomic bounded-page import.
@@ -583,6 +737,29 @@ struct QuarantineIncident<'a> {
     evidence_frame: &'a [u8],
 }
 
+#[derive(Debug)]
+struct StoredResolutionRow {
+    digest: Vec<u8>,
+    command_id: Vec<u8>,
+    incident_digest: Vec<u8>,
+    producer: Vec<u8>,
+    action: String,
+    expected_tip_height: i64,
+    expected_tip_hash: Vec<u8>,
+    expected_quarantine_kind: String,
+    previous_resolution_digest: Option<Vec<u8>>,
+    resolved_at: i64,
+    resolver_node_id: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct AuditedResolutionIndex {
+    commands: HashMap<[u8; 32], DirectoryReplicaResolutionCommand>,
+    by_producer: HashMap<[u8; 32], HashSet<[u8; 32]>>,
+    resolved_incidents: HashMap<[u8; 32], HashSet<[u8; 32]>>,
+}
+
 /// Durable producer-scoped replica namespace.
 pub struct DirectoryReplicaStore {
     connection: Mutex<Connection>,
@@ -667,7 +844,9 @@ impl DirectoryReplicaStore {
                     (SELECT COUNT(*) FROM directory_replica_commitments m
                      WHERE m.producer = c.producer),
                     (SELECT COUNT(*) FROM directory_replica_incidents i
-                     WHERE i.producer = c.producer)
+                     WHERE i.producer = c.producer),
+                    (SELECT COUNT(*) FROM directory_replica_resolutions r
+                     WHERE r.producer = c.producer)
              FROM directory_replica_chains c
              ORDER BY c.producer ASC",
         )?;
@@ -683,6 +862,7 @@ impl DirectoryReplicaStore {
                     row.get::<_, i64>(6)?,
                     row.get::<_, i64>(7)?,
                     row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -697,6 +877,7 @@ impl DirectoryReplicaStore {
             blocks,
             commitments,
             incidents,
+            resolutions,
         ) in rows
         {
             if quarantined != 0 && quarantined != 1 {
@@ -717,6 +898,7 @@ impl DirectoryReplicaStore {
                 blocks: nonnegative_i64_to_u64(blocks, "replica status blocks")?,
                 commitments: nonnegative_i64_to_u64(commitments, "replica status commitments")?,
                 incidents: nonnegative_i64_to_u64(incidents, "replica status incidents")?,
+                resolutions: nonnegative_i64_to_u64(resolutions, "replica status resolutions")?,
             };
             snapshot.producers = snapshot.producers.saturating_add(1);
             snapshot.quarantined_producers = snapshot
@@ -729,6 +911,9 @@ impl DirectoryReplicaStore {
             snapshot.incidents = snapshot
                 .incidents
                 .saturating_add(producer_snapshot.incidents);
+            snapshot.resolutions = snapshot
+                .resolutions
+                .saturating_add(producer_snapshot.resolutions);
             snapshot.producer_snapshots.push(producer_snapshot);
         }
         Ok(snapshot)
@@ -936,6 +1121,220 @@ impl DirectoryReplicaStore {
             evidence_frame,
             evidence_sha256,
         }))
+    }
+
+    /// Applies one signed, host-local compare-and-swap quarantine resolution.
+    ///
+    /// This operation only resumes synchronization from the already accepted
+    /// prefix. It never deletes an incident, rewinds a block, selects a remote
+    /// fork, or accepts unaudited content. The signed resolution is inserted
+    /// atomically before the active incident flag is cleared.
+    ///
+    /// # Security
+    /// Callers must keep this method behind the host-local CLI boundary. It is
+    /// intentionally not wired to any Axum router or peer protocol.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when the signature, timestamp,
+    /// incident, tip, quarantine kind, or linked prior resolution differs from
+    /// the operator's signed compare-and-swap view.
+    pub fn resolve_quarantine(
+        &self,
+        command: &DirectoryReplicaResolutionCommand,
+        observed_at: u64,
+    ) -> Result<DirectoryReplicaResolutionReport, DirectoryReplicaStoreError> {
+        self.verify_resolution_command(command, observed_at)?;
+        let resolution_digest = command.digest();
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::validate_metadata(&transaction, &self.local_node_id)?;
+        Self::validate_resolution_cas(&transaction, command)?;
+        Self::persist_resolution(&transaction, command, &resolution_digest)?;
+        transaction.commit()?;
+        drop(connection);
+        Ok(DirectoryReplicaResolutionReport {
+            resolution_digest,
+            command_id: command.command_id,
+            producer: command.producer,
+            retained_tip_height: command.expected_tip_height,
+            retained_tip_hash: command.expected_tip_hash,
+            resolved_at: command.resolved_at,
+        })
+    }
+
+    fn verify_resolution_command(
+        &self,
+        command: &DirectoryReplicaResolutionCommand,
+        observed_at: u64,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        command.validate_unsigned_fields()?;
+        if command.resolver_node_id != self.local_node_id
+            || command.producer == self.local_node_id
+            || command.resolved_at.abs_diff(observed_at)
+                > DIRECTORY_REPLICA_RESOLUTION_TIMESTAMP_SKEW_SECS
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica resolution identity or timestamp is invalid".to_string(),
+            ));
+        }
+        IdentityPublicKey::from_bytes(&command.resolver_node_id)
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "directory replica resolution identity is invalid".to_string(),
+                )
+            })?
+            .verify(&command.signing_bytes(), &command.signature)
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "directory replica resolution signature is invalid".to_string(),
+                )
+            })
+    }
+
+    fn validate_resolution_cas(
+        transaction: &Transaction<'_>,
+        command: &DirectoryReplicaResolutionCommand,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        let tip = Self::load_tip(transaction, &command.producer)?;
+        if !tip.quarantined
+            || tip.active_incident_digest != Some(command.incident_digest)
+            || tip.tip_height != command.expected_tip_height
+            || tip.tip_hash != command.expected_tip_hash
+            || tip.quarantine_kind.as_deref() != Some(command.expected_quarantine_kind.as_str())
+            || tip.last_resolution_digest != command.previous_resolution_digest
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica resolution compare-and-swap state is stale".to_string(),
+            ));
+        }
+
+        let incident_observed_at = Self::resolution_incident_observed_at(transaction, command)?
+            .ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "directory replica resolution incident does not match quarantine".to_string(),
+                )
+            })?;
+        if command.resolved_at < incident_observed_at {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica resolution predates its incident".to_string(),
+            ));
+        }
+        if let Some(previous_digest) = command.previous_resolution_digest {
+            let previous_resolved_at = transaction
+                .query_row(
+                    "SELECT resolved_at FROM directory_replica_resolutions
+                     WHERE resolution_digest = ?1 AND producer = ?2",
+                    params![previous_digest.as_slice(), command.producer.as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "directory replica resolution predecessor is unavailable".to_string(),
+                    )
+                })?;
+            if positive_i64_to_u64(previous_resolved_at, "previous resolution timestamp")?
+                > command.resolved_at
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "directory replica resolution predates its predecessor".to_string(),
+                ));
+            }
+        }
+        let retained_hash = if command.expected_tip_height == 0 {
+            Some([0u8; 32])
+        } else {
+            Self::block_hash_at(transaction, &command.producer, command.expected_tip_height)?
+        };
+        if retained_hash != Some(command.expected_tip_hash) {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica resolution tip is not a retained block".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolution_incident_observed_at(
+        connection: &Connection,
+        command: &DirectoryReplicaResolutionCommand,
+    ) -> Result<Option<u64>, DirectoryReplicaStoreError> {
+        connection
+            .query_row(
+                "SELECT observed_at FROM directory_replica_incidents
+                 WHERE incident_digest = ?1 AND producer = ?2
+                   AND subject_node_id = ?2 AND kind = ?3",
+                params![
+                    command.incident_digest.as_slice(),
+                    command.producer.as_slice(),
+                    command.expected_quarantine_kind
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|value| positive_i64_to_u64(value, "resolution incident timestamp"))
+            .transpose()
+    }
+
+    fn persist_resolution(
+        transaction: &Transaction<'_>,
+        command: &DirectoryReplicaResolutionCommand,
+        resolution_digest: &[u8; 32],
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        transaction.execute(
+            "INSERT INTO directory_replica_resolutions
+                (resolution_digest, command_id, incident_digest, producer, action,
+                 expected_tip_height, expected_tip_hash, expected_quarantine_kind,
+                 previous_resolution_digest, resolved_at, resolver_node_id, signature)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                resolution_digest.as_slice(),
+                command.command_id.as_slice(),
+                command.incident_digest.as_slice(),
+                command.producer.as_slice(),
+                DIRECTORY_REPLICA_RESOLUTION_ACTION,
+                u64_to_i64(command.expected_tip_height, "resolution tip height")?,
+                command.expected_tip_hash.as_slice(),
+                command.expected_quarantine_kind,
+                command
+                    .previous_resolution_digest
+                    .as_ref()
+                    .map(<[u8; 32]>::as_slice),
+                u64_to_i64(command.resolved_at, "resolution timestamp")?,
+                command.resolver_node_id.as_slice(),
+                command.signature.as_slice(),
+            ],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE directory_replica_chains
+             SET quarantined = 0, quarantine_kind = NULL,
+                 active_incident_digest = NULL, last_resolution_digest = ?3,
+                 updated_at = ?4
+             WHERE producer = ?1 AND quarantined = 1
+               AND active_incident_digest = ?2
+               AND tip_height = ?5 AND tip_hash = ?6 AND quarantine_kind = ?7
+               AND ((?8 IS NULL AND last_resolution_digest IS NULL)
+                    OR last_resolution_digest = ?8)",
+            params![
+                command.producer.as_slice(),
+                command.incident_digest.as_slice(),
+                resolution_digest.as_slice(),
+                u64_to_i64(command.resolved_at, "resolution timestamp")?,
+                u64_to_i64(command.expected_tip_height, "resolution tip height")?,
+                command.expected_tip_hash.as_slice(),
+                command.expected_quarantine_kind,
+                command
+                    .previous_resolution_digest
+                    .as_ref()
+                    .map(<[u8; 32]>::as_slice),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica resolution compare-and-swap update failed".to_string(),
+            ));
+        }
+        Self::clear_retry_state(transaction, &command.producer)?;
+        Ok(())
     }
 
     /// Computes bounded recent commitment overlap for configured producers.
@@ -1451,7 +1850,7 @@ impl DirectoryReplicaStore {
         })
     }
 
-    /// Audits metadata, producer prefixes, indexes, incidents, and retry rows.
+    /// Audits metadata, evidence, resolutions, prefixes, indexes, and retries.
     ///
     /// # Errors
     /// Returns [`DirectoryReplicaStoreError`] on the first malformed row,
@@ -1463,7 +1862,11 @@ impl DirectoryReplicaStore {
         let connection = self.connection.lock();
         Self::validate_metadata(&connection, &self.local_node_id)?;
         let producers = Self::load_all_tips(&connection)?;
-        let mut report = DirectoryReplicaAudit::default();
+        let mut report = DirectoryReplicaAudit {
+            incidents: Self::audit_incidents(&connection)?,
+            resolutions: Self::audit_resolutions(&connection, &self.local_node_id, &producers)?,
+            ..DirectoryReplicaAudit::default()
+        };
         for tip in producers {
             Self::audit_producer(&connection, &tip, observed_at, &mut report)?;
         }
@@ -1474,8 +1877,7 @@ impl DirectoryReplicaStore {
                         "replica retry state count exceeds platform bounds".to_string(),
                     )
                 })?;
-        let incidents = Self::audit_incidents(&connection)?;
-        report.incidents = incidents;
+        drop(connection);
         Ok(report)
     }
 
@@ -1490,6 +1892,9 @@ impl DirectoryReplicaStore {
         Self::validate_metadata(connection, local_node_id)
     }
 
+    // Keeping the versioned DDL in one batch makes partial table creation
+    // impossible and lets reviewers compare the complete schema in one place.
+    #[allow(clippy::too_many_lines)]
     fn create_schema_tables(
         transaction: &Transaction<'_>,
     ) -> Result<(), DirectoryReplicaStoreError> {
@@ -1507,6 +1912,10 @@ impl DirectoryReplicaStore {
                  tip_timestamp INTEGER NOT NULL CHECK (tip_timestamp >= 0),
                  quarantined INTEGER NOT NULL CHECK (quarantined IN (0, 1)),
                  quarantine_kind TEXT,
+                 active_incident_digest BLOB
+                     CHECK (active_incident_digest IS NULL OR length(active_incident_digest) = 32),
+                 last_resolution_digest BLOB
+                     CHECK (last_resolution_digest IS NULL OR length(last_resolution_digest) = 32),
                  updated_at INTEGER NOT NULL CHECK (updated_at > 0)
              );
              CREATE TABLE IF NOT EXISTS directory_replica_blocks (
@@ -1565,6 +1974,31 @@ impl DirectoryReplicaStore {
                  FOREIGN KEY (producer) REFERENCES directory_replica_chains(producer)
                      ON UPDATE RESTRICT ON DELETE RESTRICT
              );
+             CREATE TABLE IF NOT EXISTS directory_replica_resolutions (
+                 resolution_digest BLOB PRIMARY KEY CHECK (length(resolution_digest) = 32),
+                 command_id BLOB NOT NULL UNIQUE CHECK (length(command_id) = 16),
+                 incident_digest BLOB NOT NULL CHECK (length(incident_digest) = 32),
+                 producer BLOB NOT NULL CHECK (length(producer) = 32),
+                 action TEXT NOT NULL CHECK (action = 'resume_existing_prefix'),
+                 expected_tip_height INTEGER NOT NULL CHECK (expected_tip_height >= 0),
+                 expected_tip_hash BLOB NOT NULL CHECK (length(expected_tip_hash) = 32),
+                 expected_quarantine_kind TEXT NOT NULL,
+                 previous_resolution_digest BLOB
+                     CHECK (previous_resolution_digest IS NULL OR length(previous_resolution_digest) = 32),
+                 resolved_at INTEGER NOT NULL CHECK (resolved_at > 0),
+                 resolver_node_id BLOB NOT NULL CHECK (length(resolver_node_id) = 32),
+                 signature BLOB NOT NULL CHECK (length(signature) = 64),
+                 FOREIGN KEY (incident_digest)
+                     REFERENCES directory_replica_incidents(incident_digest)
+                     ON UPDATE RESTRICT ON DELETE RESTRICT,
+                 FOREIGN KEY (producer) REFERENCES directory_replica_chains(producer)
+                     ON UPDATE RESTRICT ON DELETE RESTRICT,
+                 FOREIGN KEY (previous_resolution_digest)
+                     REFERENCES directory_replica_resolutions(resolution_digest)
+                     ON UPDATE RESTRICT ON DELETE RESTRICT
+             );
+             CREATE INDEX IF NOT EXISTS directory_replica_resolutions_by_producer
+                 ON directory_replica_resolutions(producer, resolved_at, resolution_digest);
              CREATE TABLE IF NOT EXISTS directory_replica_retry_state (
                  producer BLOB PRIMARY KEY CHECK (length(producer) = 32),
                  consecutive_failures INTEGER NOT NULL
@@ -1619,16 +2053,43 @@ impl DirectoryReplicaStore {
                     ));
                 }
                 match version {
-                    DIRECTORY_REPLICA_SCHEMA_VERSION => {}
-                    DIRECTORY_REPLICA_SCHEMA_VERSION_V1 => {
+                    DIRECTORY_REPLICA_SCHEMA_VERSION => {
+                        Self::require_resolution_columns(transaction)?;
+                    }
+                    DIRECTORY_REPLICA_SCHEMA_VERSION_V1 | DIRECTORY_REPLICA_SCHEMA_VERSION_V2 => {
+                        Self::add_resolution_columns(transaction)?;
+                        transaction.execute(
+                            "UPDATE directory_replica_chains AS c
+                             SET active_incident_digest = (
+                                 SELECT i.incident_digest
+                                 FROM directory_replica_incidents i
+                                 WHERE i.producer = c.producer
+                                   AND i.subject_node_id = c.producer
+                                   AND i.kind = c.quarantine_kind
+                                 ORDER BY i.observed_at DESC, i.incident_digest DESC
+                                 LIMIT 1
+                             )
+                             WHERE c.quarantined = 1
+                               AND c.active_incident_digest IS NULL",
+                            [],
+                        )?;
+                        let missing_active: i64 = transaction.query_row(
+                            "SELECT COUNT(*) FROM directory_replica_chains
+                             WHERE quarantined = 1 AND active_incident_digest IS NULL",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        if missing_active != 0 {
+                            return Err(DirectoryReplicaStoreError::Integrity(
+                                "cannot migrate quarantined producer without matching incident"
+                                    .to_string(),
+                            ));
+                        }
                         transaction.execute(
                             "UPDATE directory_replica_meta
                              SET schema_version = ?1
                              WHERE singleton = 1 AND schema_version = ?2",
-                            params![
-                                DIRECTORY_REPLICA_SCHEMA_VERSION,
-                                DIRECTORY_REPLICA_SCHEMA_VERSION_V1
-                            ],
+                            params![DIRECTORY_REPLICA_SCHEMA_VERSION, version],
                         )?;
                     }
                     _ => {
@@ -1640,6 +2101,50 @@ impl DirectoryReplicaStore {
             }
         }
         Ok(())
+    }
+
+    fn add_resolution_columns(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        if !Self::table_has_column(transaction, "active_incident_digest")? {
+            transaction.execute_batch(
+                "ALTER TABLE directory_replica_chains
+                 ADD COLUMN active_incident_digest BLOB
+                 CHECK (active_incident_digest IS NULL OR length(active_incident_digest) = 32);",
+            )?;
+        }
+        if !Self::table_has_column(transaction, "last_resolution_digest")? {
+            transaction.execute_batch(
+                "ALTER TABLE directory_replica_chains
+                 ADD COLUMN last_resolution_digest BLOB
+                 CHECK (last_resolution_digest IS NULL OR length(last_resolution_digest) = 32);",
+            )?;
+        }
+        Self::require_resolution_columns(transaction)
+    }
+
+    fn require_resolution_columns(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        if !Self::table_has_column(transaction, "active_incident_digest")?
+            || !Self::table_has_column(transaction, "last_resolution_digest")?
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica schema v3 resolution columns are missing".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn table_has_column(
+        transaction: &Transaction<'_>,
+        expected: &str,
+    ) -> Result<bool, DirectoryReplicaStoreError> {
+        let mut statement = transaction.prepare("PRAGMA table_info(directory_replica_chains)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(columns.iter().any(|column| column == expected))
     }
 
     fn validate_metadata(
@@ -1686,8 +2191,9 @@ impl DirectoryReplicaStore {
         transaction.execute(
             "INSERT OR IGNORE INTO directory_replica_chains
                 (producer, tip_height, tip_hash, tip_timestamp,
-                 quarantined, quarantine_kind, updated_at)
-             VALUES (?1, 0, ?2, 0, 0, NULL, ?3)",
+                 quarantined, quarantine_kind, active_incident_digest,
+                 last_resolution_digest, updated_at)
+             VALUES (?1, 0, ?2, 0, 0, NULL, NULL, NULL, ?3)",
             params![
                 producer.as_slice(),
                 [0u8; 32].as_slice(),
@@ -1714,7 +2220,8 @@ impl DirectoryReplicaStore {
     ) -> Result<DirectoryReplicaTip, DirectoryReplicaStoreError> {
         let row = connection
             .query_row(
-                "SELECT tip_height, tip_hash, tip_timestamp, quarantined, quarantine_kind
+                "SELECT tip_height, tip_hash, tip_timestamp, quarantined, quarantine_kind,
+                        active_incident_digest, last_resolution_digest
                  FROM directory_replica_chains WHERE producer = ?1",
                 params![producer.as_slice()],
                 |row| {
@@ -1724,11 +2231,22 @@ impl DirectoryReplicaStore {
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<Vec<u8>>>(5)?,
+                        row.get::<_, Option<Vec<u8>>>(6)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((height, hash, timestamp, quarantined, quarantine_kind)) = row else {
+        let Some((
+            height,
+            hash,
+            timestamp,
+            quarantined,
+            quarantine_kind,
+            active_incident_digest,
+            last_resolution_digest,
+        )) = row
+        else {
             return Ok(DirectoryReplicaTip::empty(*producer));
         };
         if quarantined != 0 && quarantined != 1 {
@@ -1736,9 +2254,17 @@ impl DirectoryReplicaStore {
                 "replica quarantine flag is invalid".to_string(),
             ));
         }
-        if quarantined == 1 && quarantine_kind.as_deref().unwrap_or_default().is_empty() {
+        if quarantined == 1
+            && (quarantine_kind.as_deref().unwrap_or_default().is_empty()
+                || active_incident_digest.is_none())
+        {
             return Err(DirectoryReplicaStoreError::Integrity(
-                "quarantined producer is missing its incident kind".to_string(),
+                "quarantined producer is missing its active incident".to_string(),
+            ));
+        }
+        if quarantined == 0 && (quarantine_kind.is_some() || active_incident_digest.is_some()) {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "non-quarantined producer retains active incident state".to_string(),
             ));
         }
         Ok(DirectoryReplicaTip {
@@ -1748,6 +2274,12 @@ impl DirectoryReplicaStore {
             tip_timestamp: nonnegative_i64_to_u64(timestamp, "replica tip timestamp")?,
             quarantined: quarantined == 1,
             quarantine_kind,
+            active_incident_digest: active_incident_digest
+                .map(|value| bytes32(&value, "replica active incident digest"))
+                .transpose()?,
+            last_resolution_digest: last_resolution_digest
+                .map(|value| bytes32(&value, "replica last resolution digest"))
+                .transpose()?,
         })
     }
 
@@ -1975,14 +2507,17 @@ impl DirectoryReplicaStore {
         incident: &QuarantineIncident<'_>,
         observed_at: u64,
     ) -> Result<(), DirectoryReplicaStoreError> {
+        let digest = incident_digest(producer, producer, incident);
         Self::insert_incident(transaction, producer, producer, incident, observed_at)?;
         transaction.execute(
             "UPDATE directory_replica_chains
-             SET quarantined = 1, quarantine_kind = ?2, updated_at = ?3
+             SET quarantined = 1, quarantine_kind = ?2,
+                 active_incident_digest = ?3, updated_at = ?4
              WHERE producer = ?1",
             params![
                 producer.as_slice(),
                 incident.kind,
+                digest.as_slice(),
                 u64_to_i64(observed_at, "quarantine timestamp")?
             ],
         )?;
@@ -2029,9 +2564,13 @@ impl DirectoryReplicaStore {
             let incident_exists = connection
                 .query_row(
                     "SELECT 1 FROM directory_replica_incidents
-                     WHERE producer = ?1 AND subject_node_id = ?1 AND kind = ?2 LIMIT 1",
+                     WHERE incident_digest = ?2 AND producer = ?1
+                       AND subject_node_id = ?1 AND kind = ?3 LIMIT 1",
                     params![
                         tip.producer.as_slice(),
+                        tip.active_incident_digest
+                            .as_ref()
+                            .map(<[u8; 32]>::as_slice),
                         tip.quarantine_kind.as_deref().unwrap_or_default()
                     ],
                     |_| Ok(()),
@@ -2282,6 +2821,243 @@ impl DirectoryReplicaStore {
             count = count.saturating_add(1);
         }
         Ok(count)
+    }
+
+    fn audit_resolutions(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+        tips: &[DirectoryReplicaTip],
+    ) -> Result<u64, DirectoryReplicaStoreError> {
+        let mut index = Self::load_verified_resolution_index(connection, local_node_id)?;
+        let count = u64::try_from(index.commands.len()).map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "directory replica resolution count exceeds u64".to_string(),
+            )
+        })?;
+        Self::audit_resolution_histories(connection, tips, &mut index)?;
+        Ok(count)
+    }
+
+    fn load_verified_resolution_index(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+    ) -> Result<AuditedResolutionIndex, DirectoryReplicaStoreError> {
+        let rows = Self::load_resolution_rows(connection)?;
+        let mut index = AuditedResolutionIndex {
+            commands: HashMap::with_capacity(rows.len()),
+            ..AuditedResolutionIndex::default()
+        };
+        for row in rows {
+            let (digest, command) = Self::verify_resolution_row(connection, local_node_id, row)?;
+            index
+                .by_producer
+                .entry(command.producer)
+                .or_default()
+                .insert(digest);
+            index
+                .resolved_incidents
+                .entry(command.producer)
+                .or_default()
+                .insert(command.incident_digest);
+            if index.commands.insert(digest, command).is_some() {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "duplicate directory replica resolution digest".to_string(),
+                ));
+            }
+        }
+        Ok(index)
+    }
+
+    fn load_resolution_rows(
+        connection: &Connection,
+    ) -> Result<Vec<StoredResolutionRow>, DirectoryReplicaStoreError> {
+        let mut statement = connection.prepare(
+            "SELECT resolution_digest, command_id, incident_digest, producer, action,
+                    expected_tip_height, expected_tip_hash, expected_quarantine_kind,
+                    previous_resolution_digest, resolved_at, resolver_node_id, signature
+             FROM directory_replica_resolutions ORDER BY resolution_digest ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(StoredResolutionRow {
+                    digest: row.get(0)?,
+                    command_id: row.get(1)?,
+                    incident_digest: row.get(2)?,
+                    producer: row.get(3)?,
+                    action: row.get(4)?,
+                    expected_tip_height: row.get(5)?,
+                    expected_tip_hash: row.get(6)?,
+                    expected_quarantine_kind: row.get(7)?,
+                    previous_resolution_digest: row.get(8)?,
+                    resolved_at: row.get(9)?,
+                    resolver_node_id: row.get(10)?,
+                    signature: row.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        Ok(rows)
+    }
+
+    fn verify_resolution_row(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+        row: StoredResolutionRow,
+    ) -> Result<([u8; 32], DirectoryReplicaResolutionCommand), DirectoryReplicaStoreError> {
+        if row.action != DIRECTORY_REPLICA_RESOLUTION_ACTION {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica resolution action is invalid".to_string(),
+            ));
+        }
+        let command = DirectoryReplicaResolutionCommand {
+            command_id: bytes16(&row.command_id, "resolution command id")?,
+            incident_digest: bytes32(&row.incident_digest, "resolution incident digest")?,
+            producer: bytes32(&row.producer, "resolution producer")?,
+            expected_tip_height: nonnegative_i64_to_u64(
+                row.expected_tip_height,
+                "resolution expected tip height",
+            )?,
+            expected_tip_hash: bytes32(&row.expected_tip_hash, "resolution expected tip hash")?,
+            expected_quarantine_kind: row.expected_quarantine_kind,
+            previous_resolution_digest: row
+                .previous_resolution_digest
+                .map(|value| bytes32(&value, "previous resolution digest"))
+                .transpose()?,
+            resolved_at: positive_i64_to_u64(row.resolved_at, "resolution timestamp")?,
+            resolver_node_id: bytes32(&row.resolver_node_id, "resolution node identity")?,
+            signature: bytes64(&row.signature, "resolution signature")?,
+        };
+        command.validate_unsigned_fields()?;
+        if command.resolver_node_id != *local_node_id {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica resolution belongs to another local node".to_string(),
+            ));
+        }
+        IdentityPublicKey::from_bytes(&command.resolver_node_id)
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "directory replica resolution identity is invalid".to_string(),
+                )
+            })?
+            .verify(&command.signing_bytes(), &command.signature)
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "directory replica resolution signature is invalid".to_string(),
+                )
+            })?;
+        let digest = bytes32(&row.digest, "resolution digest")?;
+        if digest != command.digest() {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica resolution digest mismatch".to_string(),
+            ));
+        }
+        let incident_observed_at = Self::resolution_incident_observed_at(connection, &command)?
+            .ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "directory replica resolution references a mismatched incident".to_string(),
+                )
+            })?;
+        if command.resolved_at < incident_observed_at {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica resolution predates its incident".to_string(),
+            ));
+        }
+        let retained_hash = if command.expected_tip_height == 0 {
+            Some([0u8; 32])
+        } else {
+            Self::block_hash_at(connection, &command.producer, command.expected_tip_height)?
+        };
+        if retained_hash != Some(command.expected_tip_hash) {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica resolution references a missing retained prefix".to_string(),
+            ));
+        }
+        Ok((digest, command))
+    }
+
+    fn audit_resolution_histories(
+        connection: &Connection,
+        tips: &[DirectoryReplicaTip],
+        index: &mut AuditedResolutionIndex,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        for tip in tips {
+            let mut pending = index.by_producer.remove(&tip.producer).unwrap_or_default();
+            let mut cursor = tip.last_resolution_digest;
+            if pending.is_empty() != cursor.is_none() {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "directory replica resolution head does not match its history".to_string(),
+                ));
+            }
+            while let Some(digest) = cursor {
+                if !pending.remove(&digest) {
+                    return Err(DirectoryReplicaStoreError::Integrity(
+                        "directory replica resolution history is missing, cyclic, or branched"
+                            .to_string(),
+                    ));
+                }
+                let command = index.commands.get(&digest).ok_or_else(|| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "directory replica resolution head references a missing record".to_string(),
+                    )
+                })?;
+                if command.producer != tip.producer {
+                    return Err(DirectoryReplicaStoreError::Integrity(
+                        "directory replica resolution history crosses producer namespaces"
+                            .to_string(),
+                    ));
+                }
+                if let Some(previous_digest) = command.previous_resolution_digest {
+                    let previous = index.commands.get(&previous_digest).ok_or_else(|| {
+                        DirectoryReplicaStoreError::Integrity(
+                            "directory replica resolution predecessor is missing".to_string(),
+                        )
+                    })?;
+                    if previous.producer != tip.producer
+                        || previous.resolved_at > command.resolved_at
+                    {
+                        return Err(DirectoryReplicaStoreError::Integrity(
+                            "directory replica resolution predecessor is incompatible".to_string(),
+                        ));
+                    }
+                }
+                cursor = command.previous_resolution_digest;
+            }
+            if !pending.is_empty() {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "directory replica resolution history contains an orphaned branch".to_string(),
+                ));
+            }
+
+            let mut incident_statement = connection.prepare(
+                "SELECT incident_digest FROM directory_replica_incidents
+                 WHERE producer = ?1 AND subject_node_id = ?1",
+            )?;
+            let incident_digests = incident_statement
+                .query_map(params![tip.producer.as_slice()], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(incident_statement);
+            for incident_digest in incident_digests {
+                let incident_digest = bytes32(&incident_digest, "producer incident digest")?;
+                let has_resolution = index
+                    .resolved_incidents
+                    .get(&tip.producer)
+                    .is_some_and(|digests| digests.contains(&incident_digest));
+                if tip.active_incident_digest != Some(incident_digest) && !has_resolution {
+                    return Err(DirectoryReplicaStoreError::Integrity(
+                        "producer incident is neither active nor covered by signed resolution"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        if !index.by_producer.is_empty() {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica resolution references a missing producer".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2620,6 +3396,18 @@ fn bytes32(bytes: &[u8], field: &str) -> Result<[u8; 32], DirectoryReplicaStoreE
     })
 }
 
+fn bytes16(bytes: &[u8], field: &str) -> Result<[u8; 16], DirectoryReplicaStoreError> {
+    bytes.try_into().map_err(|_| {
+        DirectoryReplicaStoreError::Integrity(format!("{field} must contain exactly 16 bytes"))
+    })
+}
+
+fn bytes64(bytes: &[u8], field: &str) -> Result<[u8; 64], DirectoryReplicaStoreError> {
+    bytes.try_into().map_err(|_| {
+        DirectoryReplicaStoreError::Integrity(format!("{field} must contain exactly 64 bytes"))
+    })
+}
+
 fn u64_to_i64(value: u64, field: &str) -> Result<i64, DirectoryReplicaStoreError> {
     i64::try_from(value).map_err(|_| {
         DirectoryReplicaStoreError::Integrity(format!("{field} exceeds SQLite integer range"))
@@ -2718,6 +3506,27 @@ mod tests {
             tip_hash,
             signature: producer.sign(&signing),
         })
+        .unwrap()
+    }
+
+    fn resolution_command(
+        resolver: &IdentityKeyPair,
+        incident_digest: [u8; 32],
+        tip: &DirectoryReplicaTip,
+        command_id: [u8; 16],
+        resolved_at: u64,
+    ) -> DirectoryReplicaResolutionCommand {
+        DirectoryReplicaResolutionCommand::sign(
+            resolver,
+            command_id,
+            incident_digest,
+            tip.producer,
+            tip.tip_height,
+            tip.tip_hash,
+            tip.quarantine_kind.clone().unwrap(),
+            tip.last_resolution_digest,
+            resolved_at,
+        )
         .unwrap()
     }
 
@@ -3003,7 +3812,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_is_atomically_migrated_to_v2() {
+    fn schema_v1_is_atomically_migrated_to_v3() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x31; 32]).unwrap();
@@ -3018,7 +3827,12 @@ mod tests {
             )
             .unwrap();
         connection
-            .execute_batch("DROP TABLE directory_replica_retry_state;")
+            .execute_batch(
+                "DROP TABLE directory_replica_resolutions;
+                 DROP TABLE directory_replica_retry_state;
+                 ALTER TABLE directory_replica_chains DROP COLUMN active_incident_digest;
+                 ALTER TABLE directory_replica_chains DROP COLUMN last_resolution_digest;",
+            )
             .unwrap();
         drop(connection);
 
@@ -3043,6 +3857,62 @@ mod tests {
             .unwrap();
         assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
         assert_eq!(retry_table, "directory_replica_retry_state");
+        let resolution_columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('directory_replica_chains')
+                 WHERE name IN ('active_incident_digest', 'last_resolution_digest')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolution_columns, 2);
+    }
+
+    #[test]
+    fn schema_v2_is_atomically_migrated_to_v3() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x30; 32]).unwrap();
+        let (store, _) = DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW).unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE directory_replica_meta SET schema_version = ?1 WHERE singleton = 1",
+                params![DIRECTORY_REPLICA_SCHEMA_VERSION_V2],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE directory_replica_resolutions;
+                 ALTER TABLE directory_replica_chains DROP COLUMN active_incident_digest;
+                 ALTER TABLE directory_replica_chains DROP COLUMN last_resolution_digest;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let (store, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 1).unwrap();
+        assert_eq!(audit.resolutions, 0);
+        let connection = store.connection.lock();
+        let version: i64 = connection
+            .query_row(
+                "SELECT schema_version FROM directory_replica_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let resolution_table: String = connection
+            .query_row(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name = 'directory_replica_resolutions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
+        assert_eq!(resolution_table, "directory_replica_resolutions");
     }
 
     #[test]
@@ -3419,6 +4289,298 @@ mod tests {
             .unwrap();
         drop(connection);
         assert!(reopened.incident_evidence(&incident_digest).is_err());
+    }
+
+    #[test]
+    fn signed_resolution_resumes_only_exact_prefix_and_links_repeated_incidents() {
+        let temp = TempDir::new().unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0x81; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x82; 32]).unwrap();
+        let subject_a = IdentityKeyPair::from_bytes(&[0x83; 32]).unwrap();
+        let subject_b = IdentityKeyPair::from_bytes(&[0x84; 32]).unwrap();
+        let object_a = descriptor(&subject_a, 1);
+        let object_b = descriptor(&subject_b, 1);
+        let first = block(&producer, 1, [0u8; 32], &object_a);
+        let fork = block(&producer, 1, [0u8; 32], &object_b);
+        let first_frame = response_frame(
+            &producer,
+            vec![first.clone()],
+            false,
+            1,
+            first.hash(),
+            [0x85; 16],
+        );
+        let fork_frame = response_frame(
+            &producer,
+            vec![fork.clone()],
+            false,
+            1,
+            fork.hash(),
+            [0x86; 16],
+        );
+        let producer_id = producer.public_key_bytes();
+        let path = temp.path().join("directory.db");
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        store
+            .import_verified_page(
+                producer_id,
+                std::slice::from_ref(&first),
+                std::slice::from_ref(&object_a),
+                1,
+                first.hash(),
+                &first_frame,
+                NOW + 20,
+            )
+            .unwrap();
+        assert!(store
+            .import_verified_page(
+                producer_id,
+                std::slice::from_ref(&fork),
+                std::slice::from_ref(&object_b),
+                1,
+                fork.hash(),
+                &fork_frame,
+                NOW + 20,
+            )
+            .is_err());
+        store
+            .persist_retry_failure(
+                producer_id,
+                2,
+                Some(NOW + 120),
+                NOW + 21,
+                "directory_range_transport_failed",
+            )
+            .unwrap();
+        let incident_digest =
+            store.incident_summaries(None, 1).unwrap().incidents[0].incident_digest;
+        let tip = store.producer_tip(&producer_id).unwrap();
+        assert_eq!(tip.active_incident_digest, Some(incident_digest));
+
+        let predates_incident =
+            resolution_command(&local, incident_digest, &tip, [0x87; 16], NOW + 19);
+        assert!(store
+            .resolve_quarantine(&predates_incident, NOW + 19)
+            .is_err());
+
+        let mut stale_tip = tip.clone();
+        stale_tip.tip_hash = [0x99; 32];
+        let stale = resolution_command(&local, incident_digest, &stale_tip, [0x88; 16], NOW + 22);
+        assert!(store.resolve_quarantine(&stale, NOW + 22).is_err());
+        assert_eq!(store.status_snapshot().unwrap().resolutions, 0);
+
+        let first_resolution =
+            resolution_command(&local, incident_digest, &tip, [0x89; 16], NOW + 22);
+        let first_report = store
+            .resolve_quarantine(&first_resolution, NOW + 22)
+            .unwrap();
+        let resumed = store.producer_tip(&producer_id).unwrap();
+        assert!(!resumed.quarantined);
+        assert_eq!(resumed.active_incident_digest, None);
+        assert_eq!(
+            resumed.last_resolution_digest,
+            Some(first_report.resolution_digest)
+        );
+        assert_eq!(resumed.tip_hash, first.hash());
+        assert!(store.retry_states().unwrap().is_empty());
+        assert!(store
+            .resolve_quarantine(&first_resolution, NOW + 22)
+            .is_err());
+
+        assert!(store
+            .import_verified_page(
+                producer_id,
+                std::slice::from_ref(&fork),
+                std::slice::from_ref(&object_b),
+                1,
+                fork.hash(),
+                &fork_frame,
+                NOW + 24,
+            )
+            .is_err());
+        let requarantined = store.producer_tip(&producer_id).unwrap();
+        assert_eq!(requarantined.active_incident_digest, Some(incident_digest));
+        assert_eq!(
+            requarantined.last_resolution_digest,
+            Some(first_report.resolution_digest)
+        );
+        let predates_predecessor = resolution_command(
+            &local,
+            incident_digest,
+            &requarantined,
+            [0x8a; 16],
+            NOW + 21,
+        );
+        assert!(store
+            .resolve_quarantine(&predates_predecessor, NOW + 21)
+            .is_err());
+        let second_resolution = resolution_command(
+            &local,
+            incident_digest,
+            &requarantined,
+            [0x8b; 16],
+            NOW + 25,
+        );
+        let second_report = store
+            .resolve_quarantine(&second_resolution, NOW + 25)
+            .unwrap();
+        assert_ne!(
+            first_report.resolution_digest,
+            second_report.resolution_digest
+        );
+        let snapshot = store.status_snapshot().unwrap();
+        assert_eq!(snapshot.incidents, 1);
+        assert_eq!(snapshot.resolutions, 2);
+        assert_eq!(snapshot.producer_snapshots[0].resolutions, 2);
+        let audit = store.audit(NOW + 26).unwrap();
+        assert_eq!(audit.incidents, 1);
+        assert_eq!(audit.resolutions, 2);
+        drop(store);
+        let (_, reopened_audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 27).unwrap();
+        assert_eq!(reopened_audit.resolutions, 2);
+    }
+
+    #[test]
+    fn forged_quarantine_clear_without_signed_resolution_fails_audit() {
+        let temp = TempDir::new().unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0x91; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x92; 32]).unwrap();
+        let subject_a = IdentityKeyPair::from_bytes(&[0x93; 32]).unwrap();
+        let subject_b = IdentityKeyPair::from_bytes(&[0x94; 32]).unwrap();
+        let object_a = descriptor(&subject_a, 1);
+        let object_b = descriptor(&subject_b, 1);
+        let first = block(&producer, 1, [0u8; 32], &object_a);
+        let fork = block(&producer, 1, [0u8; 32], &object_b);
+        let first_frame = response_frame(
+            &producer,
+            vec![first.clone()],
+            false,
+            1,
+            first.hash(),
+            [0x95; 16],
+        );
+        let fork_frame = response_frame(
+            &producer,
+            vec![fork.clone()],
+            false,
+            1,
+            fork.hash(),
+            [0x96; 16],
+        );
+        let producer_id = producer.public_key_bytes();
+        let path = temp.path().join("directory.db");
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        store
+            .import_verified_page(
+                producer_id,
+                std::slice::from_ref(&first),
+                std::slice::from_ref(&object_a),
+                1,
+                first.hash(),
+                &first_frame,
+                NOW + 20,
+            )
+            .unwrap();
+        assert!(store
+            .import_verified_page(
+                producer_id,
+                std::slice::from_ref(&fork),
+                std::slice::from_ref(&object_b),
+                1,
+                fork.hash(),
+                &fork_frame,
+                NOW + 20,
+            )
+            .is_err());
+        let connection = store.connection.lock();
+        connection
+            .execute(
+                "UPDATE directory_replica_chains
+                 SET quarantined = 0, quarantine_kind = NULL,
+                     active_incident_digest = NULL
+                 WHERE producer = ?1",
+                params![producer_id.as_slice()],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(store.audit(NOW + 21).is_err());
+        drop(store);
+        assert!(DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 22).is_err());
+    }
+
+    #[test]
+    fn tampered_resolution_signature_fails_startup_audit() {
+        let temp = TempDir::new().unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0xa1; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0xa2; 32]).unwrap();
+        let subject_a = IdentityKeyPair::from_bytes(&[0xa3; 32]).unwrap();
+        let subject_b = IdentityKeyPair::from_bytes(&[0xa4; 32]).unwrap();
+        let object_a = descriptor(&subject_a, 1);
+        let object_b = descriptor(&subject_b, 1);
+        let first = block(&producer, 1, [0u8; 32], &object_a);
+        let fork = block(&producer, 1, [0u8; 32], &object_b);
+        let first_frame = response_frame(
+            &producer,
+            vec![first.clone()],
+            false,
+            1,
+            first.hash(),
+            [0xa5; 16],
+        );
+        let fork_frame = response_frame(
+            &producer,
+            vec![fork.clone()],
+            false,
+            1,
+            fork.hash(),
+            [0xa6; 16],
+        );
+        let producer_id = producer.public_key_bytes();
+        let path = temp.path().join("directory.db");
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        store
+            .import_verified_page(
+                producer_id,
+                std::slice::from_ref(&first),
+                std::slice::from_ref(&object_a),
+                1,
+                first.hash(),
+                &first_frame,
+                NOW + 20,
+            )
+            .unwrap();
+        assert!(store
+            .import_verified_page(
+                producer_id,
+                std::slice::from_ref(&fork),
+                std::slice::from_ref(&object_b),
+                1,
+                fork.hash(),
+                &fork_frame,
+                NOW + 20,
+            )
+            .is_err());
+        let incident_digest =
+            store.incident_summaries(None, 1).unwrap().incidents[0].incident_digest;
+        let tip = store.producer_tip(&producer_id).unwrap();
+        let command = resolution_command(&local, incident_digest, &tip, [0xa7; 16], NOW + 21);
+        let report = store.resolve_quarantine(&command, NOW + 21).unwrap();
+        let connection = store.connection.lock();
+        connection
+            .execute(
+                "UPDATE directory_replica_resolutions SET signature = ?2
+                 WHERE resolution_digest = ?1",
+                params![report.resolution_digest.as_slice(), [0u8; 64].as_slice()],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(store.audit(NOW + 22).is_err());
+        drop(store);
+        assert!(DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 23).is_err());
     }
 
     #[test]

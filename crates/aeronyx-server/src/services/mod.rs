@@ -49,14 +49,15 @@ pub use directory_chain::{
     DirectoryChainAppendReport, DirectoryChainAudit, DirectoryChainPage, DirectoryChainStore,
     DirectoryChainStoreError,
 };
+pub(crate) use directory_replica::MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE;
 pub use directory_replica::{
     DirectoryReplicaAudit, DirectoryReplicaImportReport, DirectoryReplicaIncidentEvidence,
     DirectoryReplicaIncidentPage, DirectoryReplicaIncidentSummary,
     DirectoryReplicaObservationConvergenceSnapshot, DirectoryReplicaProducerSnapshot,
-    DirectoryReplicaStore, DirectoryReplicaStoreError, DirectoryReplicaStoreSnapshot,
-    DirectoryReplicaSyncObservation, DirectoryReplicaSyncRuntime, DirectoryReplicaTip,
+    DirectoryReplicaResolutionCommand, DirectoryReplicaResolutionReport, DirectoryReplicaStore,
+    DirectoryReplicaStoreError, DirectoryReplicaStoreSnapshot, DirectoryReplicaSyncObservation,
+    DirectoryReplicaSyncRuntime, DirectoryReplicaTip,
 };
-pub(crate) use directory_replica::MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE;
 pub use dns_proxy::spawn_dns_proxy;
 pub use handshake::HandshakeService;
 pub use ip_pool::IpPoolService;

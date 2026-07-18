@@ -20,6 +20,8 @@
 //!   fork choice, consensus, or global finality.
 //! - Lists bounded incident summaries and exports one independently re-verified
 //!   signed evidence frame on local/VPN operator listeners only.
+//! - Reports signed quarantine-resolution counts while keeping mutation
+//!   strictly outside every HTTP listener.
 //!
 //! ## Calling Relationships
 //! - `server.rs` mounts this router separately for public and operator scopes.
@@ -53,6 +55,8 @@
 //!   audited compare-and-swap command boundary.
 //!
 //! ## Last Modified
+//! `v0.6.0-DirectoryReplicaQuarantineResolutionStatus` - Added aggregate and
+//! fingerprint-scoped signed resolution counts; no mutation route was added.
 //! `v0.5.0-DirectoryReplicaIncidentEvidence` - Added local-only bounded incident
 //! summaries and fail-closed canonical signed-evidence export.
 //! `v0.4.0-DirectoryReplicaObservationConvergence` - Added bounded aggregate
@@ -156,6 +160,7 @@ struct DirectoryReplicaProducerStatus {
     blocks: u64,
     commitments: u64,
     incidents: u64,
+    resolutions: u64,
     last_attempt_at: Option<u64>,
     last_success_at: Option<u64>,
     last_failure_at: Option<u64>,
@@ -186,6 +191,7 @@ struct DirectoryReplicaStatusResponse {
     blocks: u64,
     commitments: u64,
     incidents: u64,
+    resolutions: u64,
     known_lag_producers: u64,
     total_lag_blocks: u64,
     max_lag_blocks: Option<u64>,
@@ -833,6 +839,7 @@ fn build_directory_replica_status_response(
         blocks: persisted.blocks,
         commitments: persisted.commitments,
         incidents: persisted.incidents,
+        resolutions: persisted.resolutions,
         known_lag_producers: summary.known_lag_producers,
         total_lag_blocks: summary.total_lag_blocks,
         max_lag_blocks: summary.max_lag_blocks,
@@ -930,6 +937,7 @@ fn build_directory_replica_producer_statuses(
                 blocks: persisted.map_or(0, |value| value.blocks),
                 commitments: persisted.map_or(0, |value| value.commitments),
                 incidents: persisted.map_or(0, |value| value.incidents),
+                resolutions: persisted.map_or(0, |value| value.resolutions),
                 last_attempt_at: runtime.and_then(|value| value.last_attempt_at),
                 last_success_at: runtime.and_then(|value| value.last_success_at),
                 last_failure_at: runtime.and_then(|value| value.last_failure_at),

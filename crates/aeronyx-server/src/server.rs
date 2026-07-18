@@ -4259,6 +4259,7 @@ impl Server {
             blocks = audit.blocks,
             commitments = audit.commitments,
             incidents = audit.incidents,
+            resolutions = audit.resolutions,
             retry_states = audit.retry_states,
             "[DIRECTORY_REPLICA] Producer-isolated startup audit passed"
         );
