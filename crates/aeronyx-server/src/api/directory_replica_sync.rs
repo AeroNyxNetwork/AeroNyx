@@ -24,6 +24,8 @@
 //!   audited local checkpoint and persists accepted receipts idempotently.
 //! - Classifies every witness attempt into a closed privacy-safe outcome enum
 //!   and persists aggregate diagnostics without peer-identifying metadata.
+//! - Learns endpoint-level witness unavailability against the authenticated
+//!   descriptor sequence so rolling upgrades do not inflate transport faults.
 //! - Tries the producer directly first, then uses another pinned node as an
 //!   audited evidence carrier only for bounded availability/admission failures.
 //! - Requests up to eight contiguous blocks per page while the peer-side
@@ -49,9 +51,11 @@
 //!    observation checkpoint from a blocking worker.
 //! 9. Ask pinned peers to independently recompute that checkpoint; persist only
 //!    canonical accepted receipts, never trust an unavailable/conflict result.
-//! 10. Persist bounded aggregate witness outcomes and mirror the current
+//! 10. Treat an explicitly unsupported witness endpoint as peer unavailability
+//!     and retry only after that peer publishes a newer signed descriptor.
+//! 11. Persist bounded aggregate witness outcomes and mirror the current
 //!     process round into runtime telemetry without retaining witness identity.
-//! 11. Stop the complete round immediately when shutdown wins the select.
+//! 12. Stop the complete round immediately when shutdown wins the select.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -71,6 +75,7 @@
 //!   signature, or descriptor-hash response; these are security failures.
 //!
 //! ## Last Modified
+//! `v0.9.0-DirectoryWitnessCapabilityNegotiation` - Added descriptor-sequence-scoped witness capability probing.
 //! `v0.8.0-DirectoryWitnessOutcomeTelemetry` - Added typed witness outcomes and audited aggregate diagnostics.
 //! `v0.7.2-DirectoryRoundBudgetAlignment` - Aligned outbound catch-up work with the existing inbound identity limit.
 //! `v0.7.1-DirectoryBoundedMultiBlockCatchUp` - Raised bounded page width without raising commitment/request ceilings.
@@ -88,6 +93,7 @@
 //! from `server.rs` and added deterministic startup synchronization jitter.
 // ============================================
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -110,13 +116,14 @@ use aeronyx_core::protocol::discovery::{
     MAX_DIRECTORY_SYNC_BLOCKS_V1, MAX_DIRECTORY_SYNC_OBJECTS_V1,
 };
 use futures::{stream, StreamExt};
+use parking_lot::Mutex;
 use rand::RngCore;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::api::memchain_peer::{commitment_peer_endpoint_is_public, commitment_peer_url};
-use crate::api::read_bounded_http_response;
+use crate::api::{read_bounded_http_response, BoundedHttpResponseError};
 use crate::services::directory_replica::{
     DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS, DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES,
 };
@@ -220,6 +227,66 @@ struct DirectoryRangePage {
     signed_response: Vec<u8>,
 }
 
+/// Process-local negative capability cache for the optional witness endpoint.
+///
+/// A negative observation is scoped to the exact sequence of an authenticated
+/// node descriptor. A software upgrade publishes a newer signed sequence and
+/// therefore becomes probeable without a timer, version-string comparison, or
+/// mutable operator override. The cache never grants trust: every successful
+/// response still passes the complete canonical frame and signature checks.
+#[derive(Debug, Default)]
+struct DirectoryWitnessCapabilityCache {
+    unsupported_descriptor_sequences: Mutex<HashMap<[u8; 32], u64>>,
+}
+
+impl DirectoryWitnessCapabilityCache {
+    fn should_attempt(&self, witness: &[u8; 32], descriptor_sequence: u64) -> bool {
+        match self.unsupported_descriptor_sequences.lock().get(witness) {
+            Some(unsupported_sequence) => *unsupported_sequence != descriptor_sequence,
+            None => true,
+        }
+    }
+
+    fn record_unsupported(&self, witness: [u8; 32], descriptor_sequence: u64) {
+        self.unsupported_descriptor_sequences
+            .lock()
+            .insert(witness, descriptor_sequence);
+    }
+
+    fn record_supported(&self, witness: &[u8; 32]) {
+        self.unsupported_descriptor_sequences.lock().remove(witness);
+    }
+}
+
+/// Typed result boundary for untrusted peer HTTP exchange.
+///
+/// Keeping the status code typed until the caller applies operation-specific
+/// policy prevents string parsing from becoming part of capability negotiation.
+/// The type deliberately carries no URL, response body, peer identity, or
+/// request material because failures can flow into operator telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryFramePostError {
+    Transport,
+    HttpStatus(u16),
+    Response(BoundedHttpResponseError),
+}
+
+impl DirectoryFramePostError {
+    const fn witness_capability_unavailable(self) -> bool {
+        matches!(self, Self::HttpStatus(404 | 405 | 501))
+    }
+
+    fn stable_reason(self, operation: &str) -> String {
+        match self {
+            Self::Transport => format!("directory_{operation}_transport_failed"),
+            Self::HttpStatus(status) => {
+                format!("directory_{operation}_http_status_{status}")
+            }
+            Self::Response(error) => format!("directory_{operation}_{}", error.as_str()),
+        }
+    }
+}
+
 /// Coordinates bounded synchronization for operator-pinned Directory producers.
 pub struct DirectoryReplicaSyncCoordinator {
     peers: Arc<[[u8; 32]]>,
@@ -229,6 +296,7 @@ pub struct DirectoryReplicaSyncCoordinator {
     peer_store: Arc<PeerStore>,
     identity: Arc<IdentityKeyPair>,
     client: reqwest::Client,
+    witness_capabilities: DirectoryWitnessCapabilityCache,
     restored_retry_states: usize,
 }
 
@@ -276,6 +344,7 @@ impl DirectoryReplicaSyncCoordinator {
             peer_store,
             identity,
             client,
+            witness_capabilities: DirectoryWitnessCapabilityCache::default(),
             restored_retry_states,
         })
     }
@@ -468,6 +537,7 @@ impl DirectoryReplicaSyncCoordinator {
                         self.identity.as_ref(),
                         &witness,
                         &self.client,
+                        &self.witness_capabilities,
                         checkpoint,
                     )
                     .await
@@ -617,6 +687,7 @@ async fn request_observation_checkpoint_witness(
     identity: &IdentityKeyPair,
     witness: &[u8; 32],
     client: &reqwest::Client,
+    capability_cache: &DirectoryWitnessCapabilityCache,
     checkpoint: DirectoryObservationCheckpointV1,
 ) -> DirectoryObservationWitnessOutcome {
     let request_timestamp = unix_now_secs();
@@ -627,6 +698,14 @@ async fn request_observation_checkpoint_witness(
         return DirectoryObservationWitnessOutcome::PeerUnavailable;
     };
     if !commitment_peer_endpoint_is_public(endpoint) {
+        return DirectoryObservationWitnessOutcome::PeerUnavailable;
+    }
+    let descriptor_sequence = descriptor.sequence();
+    if !capability_cache.should_attempt(witness, descriptor_sequence) {
+        debug!(
+            reason = "directory_observation_witness_capability_cached_unavailable",
+            "[DIRECTORY_REPLICA] Witness request skipped for unchanged signed descriptor"
+        );
         return DirectoryObservationWitnessOutcome::PeerUnavailable;
     }
     let Ok(url) = commitment_peer_url(
@@ -658,8 +737,24 @@ async fn request_observation_checkpoint_witness(
     let Ok(frame) = encode_directory_sync_message(&request) else {
         return DirectoryObservationWitnessOutcome::VerificationFailure;
     };
-    let Ok(response) = post_directory_frame(client, url, frame, "observation_witness").await else {
-        return DirectoryObservationWitnessOutcome::TransportFailure;
+    let response = match post_directory_frame_typed(client, url, frame).await {
+        Ok(response) => {
+            capability_cache.record_supported(witness);
+            response
+        }
+        Err(error) if error.witness_capability_unavailable() => {
+            capability_cache.record_unsupported(*witness, descriptor_sequence);
+            debug!(
+                reason = "directory_observation_witness_capability_unavailable",
+                http_status = match error {
+                    DirectoryFramePostError::HttpStatus(status) => status,
+                    _ => 0,
+                },
+                "[DIRECTORY_REPLICA] Peer descriptor does not currently expose witness service"
+            );
+            return DirectoryObservationWitnessOutcome::PeerUnavailable;
+        }
+        Err(_) => return DirectoryObservationWitnessOutcome::TransportFailure,
     };
     let verified = match verify_observation_witness_response(
         &response,
@@ -1261,22 +1356,31 @@ async fn post_directory_frame(
     frame: Vec<u8>,
     operation: &'static str,
 ) -> Result<Vec<u8>, String> {
+    post_directory_frame_typed(client, url, frame)
+        .await
+        .map_err(|error| error.stable_reason(operation))
+}
+
+async fn post_directory_frame_typed(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    frame: Vec<u8>,
+) -> Result<Vec<u8>, DirectoryFramePostError> {
     let response = client
         .post(url)
         .header("content-type", "application/octet-stream")
         .body(frame)
         .send()
         .await
-        .map_err(|_| format!("directory_{operation}_transport_failed"))?;
+        .map_err(|_| DirectoryFramePostError::Transport)?;
     if !response.status().is_success() {
-        return Err(format!(
-            "directory_{operation}_http_status_{}",
-            response.status().as_u16()
+        return Err(DirectoryFramePostError::HttpStatus(
+            response.status().as_u16(),
         ));
     }
     read_bounded_http_response(response, MAX_DIRECTORY_SYNC_RESPONSE_BODY_BYTES)
         .await
-        .map_err(|error| format!("directory_{operation}_{}", error.as_str()))
+        .map_err(DirectoryFramePostError::Response)
 }
 
 pub(crate) fn verify_block_range_response(
@@ -1885,5 +1989,38 @@ mod tests {
             &checkpoint_hash,
         )
         .is_err());
+    }
+
+    #[test]
+    fn witness_capability_cache_is_scoped_to_authenticated_descriptor_sequence() {
+        let cache = DirectoryWitnessCapabilityCache::default();
+        let witness = [0x91; 32];
+
+        assert!(cache.should_attempt(&witness, 7));
+        cache.record_unsupported(witness, 7);
+        assert!(!cache.should_attempt(&witness, 7));
+        assert!(cache.should_attempt(&witness, 8));
+
+        cache.record_supported(&witness);
+        assert!(cache.should_attempt(&witness, 7));
+    }
+
+    #[test]
+    fn witness_capability_http_statuses_are_narrow_and_typed() {
+        for status in [404, 405, 501] {
+            assert!(DirectoryFramePostError::HttpStatus(status).witness_capability_unavailable());
+        }
+        for status in [400, 401, 403, 409, 429, 500, 503] {
+            assert!(!DirectoryFramePostError::HttpStatus(status).witness_capability_unavailable());
+        }
+        assert_eq!(
+            DirectoryFramePostError::HttpStatus(404).stable_reason("range"),
+            "directory_range_http_status_404"
+        );
+        assert_eq!(
+            DirectoryFramePostError::Response(BoundedHttpResponseError::TooLarge)
+                .stable_reason("objects"),
+            "directory_objects_response_too_large"
+        );
     }
 }

@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.20.0 - Added typed, privacy-safe Directory witness outcome telemetry with fail-closed schema v6 aggregate persistence and process-runtime diagnostics.
+Modification Reason: v0.21.0 - Added wire-compatible witness capability negotiation scoped to authenticated descriptor sequences.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.20.0 - Added durable/runtime witness outcome buckets without retaining peer identity or introducing reputation, quorum, consensus, or finality.
+Last Modified: v0.21.0 - Prevented unsupported witness endpoints from being misreported as transport faults without changing the descriptor wire schema.
+Previous: v0.20.0 - Added durable/runtime witness outcome buckets without retaining peer identity or introducing reputation, quorum, consensus, or finality.
 Previous: v0.19.0 - Added independently recomputed external checkpoint witness receipts without introducing votes, quorum, consensus, or finality.
 Previous: v0.18.0 - Added signed local observation checkpoints binding exact producer tips and recomputable recent commitment overlap without introducing votes, consensus, or finality.
 Previous: v0.17.0 - Added signed host-local quarantine resolution, exact active-incident/tip CAS, linked resolution history, and startup tamper detection.
@@ -1152,6 +1153,50 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-19 - Added descriptor-scoped witness capability negotiation.
+- Files changed:
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Problem solved:
+  - During rolling upgrades, nodes without the optional observation-witness
+    route returned HTTP 404. The coordinator counted that explicit lack of a
+    feature as a transport fault and retried the same unchanged descriptor on
+    every completed checkpoint round.
+- Architecture:
+  - Peer HTTP results now retain a typed boundary for transport, status code,
+    and bounded-response failures until operation-specific policy is applied.
+    Existing range and object callers still receive their stable reason strings.
+  - Only HTTP 404, 405, and 501 mean that the witness service is unavailable.
+    Authentication, admission, conflict, throttling, and server faults remain
+    ordinary failures and are never silently downgraded.
+  - A process-local negative cache binds the unavailable observation to the
+    exact sequence of the peer's already verified signed descriptor. Publishing
+    a newer descriptor sequence automatically re-enables probing, so an upgrade
+    does not depend on a timer, semantic version parsing, or operator action.
+  - The cache cannot make a witness trusted. Every successful response still
+    requires canonical frame equality, exact contract binding, an accepted
+    evidence result, Ed25519 verification, and durable receipt persistence.
+- Compatibility:
+  - `NodeDescriptor` remains schema v2 and `NodeCapability` is unchanged. This
+    avoids introducing a new bincode enum discriminant or causing old nodes to
+    reject newer signed descriptors during a rolling deployment.
+  - Unsupported service outcomes use the existing `peer_unavailable` aggregate
+    bucket; durable SQLite schema v6 and all status consumers remain compatible.
+- Privacy:
+  - The cache and logs do not expose endpoint, node id, request id, signature,
+    checkpoint hash, response body, routes, or any user-plane metadata.
+- Verification:
+  - Capability unit tests passed: 2/2.
+  - Directory Replica tests passed: 47/47 across library and binary targets.
+  - Full server tests passed: 1108/1108 library and 2/2 binary tests.
+  - Documentation tests passed their enabled case; 9 examples remain
+    intentionally ignored by the existing suite.
+  - Modified-file rustfmt, `git diff --check`, Clippy correctness across all
+    server targets, and the optimized `aeronyx-server` release build passed.
+  - Repository-wide rustfmt still reports pre-existing formatting differences
+    outside this milestone; those unrelated files were deliberately not changed.
+
 2026-07-19 - Added privacy-safe Directory witness outcome telemetry.
 - Files changed:
   - crates/aeronyx-server/src/api/directory_replica_sync.rs

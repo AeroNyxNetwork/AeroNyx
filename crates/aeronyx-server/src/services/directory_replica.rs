@@ -95,6 +95,7 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.11.0-DirectoryWitnessCapabilityNegotiation - Clarified peer-unavailable witness semantics for rolling upgrades
 //! v0.10.0-DirectoryWitnessOutcomeTelemetry - Added schema v6 privacy-safe durable and runtime witness outcome buckets
 //! v0.9.0-DirectoryEvidenceCarrier - Added transactional audited producer evidence export and carrier-frame audit
 //! v0.8.0-DirectoryObservationWitness - Added schema v5, independent checkpoint recomputation, and receipt audit
@@ -333,7 +334,7 @@ pub enum DirectoryObservationWitnessOutcome {
     EvidenceUnavailable,
     /// Locally retained evidence conflicts with the observed checkpoint.
     EvidenceConflict,
-    /// The configured witness is not currently admitted or publicly reachable.
+    /// The witness is not admitted, reachable, or serving the optional route.
     PeerUnavailable,
     /// The bounded outbound request failed before a verifiable frame arrived.
     TransportFailure,
@@ -352,7 +353,7 @@ pub struct DirectoryObservationWitnessOutcomeCounters {
     pub evidence_unavailable: u64,
     /// Witnesses whose retained evidence conflicts with the checkpoint.
     pub evidence_conflict: u64,
-    /// Configured witnesses unavailable at admission or endpoint validation.
+    /// Witnesses unavailable at admission, endpoint, or capability validation.
     pub peer_unavailable: u64,
     /// Bounded outbound transport failures.
     pub transport_failures: u64,
