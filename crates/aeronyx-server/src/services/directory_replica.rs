@@ -25,6 +25,8 @@
 //! - Exposes low-cost aggregate snapshots and privacy-safe synchronization
 //!   observations, including bounded retry state, without re-running a full
 //!   cryptographic audit per API read.
+//! - Exports bounded incident summaries and re-verified signed evidence for
+//!   authenticated operator review without adding an automatic recovery path.
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
@@ -60,8 +62,12 @@
 //! - Keep all limits synchronized with the core Directory Sync V1 contract.
 //! - Observation convergence is a local digest over independently verified
 //!   producer evidence. It is never consensus, voting, fork choice, or finality.
+//! - Incident evidence export is read-only. Quarantine resolution requires a
+//!   separately authenticated, audited compare-and-swap command boundary.
 //!
 //! ## Last Modified
+//! v0.5.0-DirectoryReplicaIncidentEvidence - Added bounded incident pagination
+//! and fail-closed, signature-reverified evidence export for local operators.
 //! v0.4.0-DirectoryReplicaObservationConvergence - Added bounded recent-window
 //! multi-source commitment overlap and a deterministic local observation root.
 //! v0.3.0-DirectoryReplicaDurableRetry - Added an atomic schema v1-to-v2
@@ -101,6 +107,9 @@ const RESPONSE_TIMESTAMP_SKEW_SECS: u64 = 60;
 const MAX_DIRECTORY_REPLICA_FAILURE_REASON_BYTES: usize = 96;
 const DIRECTORY_REPLICA_CONVERGENCE_WINDOW_BLOCKS: u64 = 32;
 const MAX_DIRECTORY_REPLICA_CONVERGENCE_PRODUCERS: usize = 16;
+const MAX_DIRECTORY_REPLICA_INCIDENT_KIND_BYTES: usize = 64;
+/// Maximum incident summaries returned by one operator API read.
+pub(crate) const MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE: usize = 50;
 /// Maximum producer failure streak retained in memory and audited `SQLite`.
 pub(crate) const DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES: u64 = 64;
 /// Maximum durable retry delay accepted by the replica store and scheduler.
@@ -219,6 +228,53 @@ pub struct DirectoryReplicaProducerSnapshot {
     pub commitments: u64,
     /// Durable incidents attributed to this producer response stream.
     pub incidents: u64,
+}
+
+/// Bounded metadata for one startup-audited Directory Replica incident.
+///
+/// The summary intentionally excludes the potentially large signed response
+/// frame. Call [`DirectoryReplicaStore::incident_evidence`] for an independent,
+/// fail-closed verification immediately before exporting that frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryReplicaIncidentSummary {
+    /// Content-addressed incident identifier used as the pagination cursor.
+    pub incident_digest: [u8; 32],
+    /// Producer that signed the conflicting Directory Sync response.
+    pub producer: [u8; 32],
+    /// Identity whose chain or descriptor assertion conflicts.
+    pub subject_node_id: [u8; 32],
+    /// Stable internal incident classification.
+    pub kind: String,
+    /// Conflicting block or advertised tip height.
+    pub height: u64,
+    /// Previously accepted local claim.
+    pub local_hash: [u8; 32],
+    /// Conflicting producer-signed remote claim.
+    pub remote_hash: [u8; 32],
+    /// Local Unix timestamp at which the signed evidence was persisted.
+    pub observed_at: u64,
+    /// Whether this producer remains quarantined at read time.
+    pub producer_quarantined: bool,
+}
+
+/// Deterministic cursor page of incident metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryReplicaIncidentPage {
+    /// Incident summaries ordered by ascending content digest.
+    pub incidents: Vec<DirectoryReplicaIncidentSummary>,
+    /// Last returned digest when another page exists.
+    pub next_cursor: Option<[u8; 32]>,
+}
+
+/// Complete independently verifiable evidence for one durable incident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryReplicaIncidentEvidence {
+    /// Validated incident metadata and current quarantine state.
+    pub summary: DirectoryReplicaIncidentSummary,
+    /// Exact canonical producer-signed `BlockRangeResponseV1` bytes.
+    pub evidence_frame: Vec<u8>,
+    /// SHA-256 digest of `evidence_frame` for transport/file verification.
+    pub evidence_sha256: [u8; 32],
 }
 
 /// Current accepted prefix and isolation state for one producer.
@@ -676,6 +732,210 @@ impl DirectoryReplicaStore {
             snapshot.producer_snapshots.push(producer_snapshot);
         }
         Ok(snapshot)
+    }
+
+    /// Returns one bounded, deterministic page of incident summaries.
+    ///
+    /// Summaries are ordered by content digest and use an exclusive cursor.
+    /// The exact evidence frame is deliberately omitted from this low-cost
+    /// listing operation. Every returned row was cryptographically audited at
+    /// startup; callers must use [`Self::incident_evidence`] to re-verify the
+    /// complete proof immediately before export.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when the limit is outside
+    /// `1..=50`, metadata is malformed, or `SQLite` cannot complete the bounded
+    /// query.
+    pub fn incident_summaries(
+        &self,
+        after: Option<[u8; 32]>,
+        limit: usize,
+    ) -> Result<DirectoryReplicaIncidentPage, DirectoryReplicaStoreError> {
+        if !(1..=MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE).contains(&limit) {
+            return Err(DirectoryReplicaStoreError::Request(
+                "incident page limit must be between 1 and 50".to_string(),
+            ));
+        }
+        let fetch_limit = limit.checked_add(1).ok_or_else(|| {
+            DirectoryReplicaStoreError::Request("incident page limit overflow".to_string())
+        })?;
+        let fetch_limit = i64::try_from(fetch_limit).map_err(|_| {
+            DirectoryReplicaStoreError::Request("incident page limit overflow".to_string())
+        })?;
+        let cursor = after.map(|value| value.to_vec());
+        let connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let mut statement = connection.prepare(
+            "SELECT i.incident_digest, i.producer, i.subject_node_id, i.kind,
+                    i.height, i.local_hash, i.remote_hash, i.observed_at,
+                    c.quarantined
+             FROM directory_replica_incidents i
+             JOIN directory_replica_chains c ON c.producer = i.producer
+             WHERE (?1 IS NULL OR i.incident_digest > ?1)
+             ORDER BY i.incident_digest ASC LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![cursor.as_deref(), fetch_limit], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        drop(connection);
+        let mut incidents = rows
+            .into_iter()
+            .map(
+                |(
+                    digest,
+                    producer,
+                    subject,
+                    kind,
+                    height,
+                    local_hash,
+                    remote_hash,
+                    observed_at,
+                    quarantined,
+                )| {
+                    validate_incident_kind(&kind)?;
+                    if quarantined != 0 && quarantined != 1 {
+                        return Err(DirectoryReplicaStoreError::Integrity(
+                            "incident producer quarantine flag is invalid".to_string(),
+                        ));
+                    }
+                    Ok(DirectoryReplicaIncidentSummary {
+                        incident_digest: bytes32(&digest, "incident digest")?,
+                        producer: bytes32(&producer, "incident producer")?,
+                        subject_node_id: bytes32(&subject, "incident subject")?,
+                        kind,
+                        height: nonnegative_i64_to_u64(height, "incident height")?,
+                        local_hash: bytes32(&local_hash, "incident local hash")?,
+                        remote_hash: bytes32(&remote_hash, "incident remote hash")?,
+                        observed_at: positive_i64_to_u64(observed_at, "incident observed at")?,
+                        producer_quarantined: quarantined == 1,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, DirectoryReplicaStoreError>>()?;
+        let has_more = incidents.len() > limit;
+        incidents.truncate(limit);
+        let next_cursor = has_more
+            .then(|| incidents.last().map(|incident| incident.incident_digest))
+            .flatten();
+        Ok(DirectoryReplicaIncidentPage {
+            incidents,
+            next_cursor,
+        })
+    }
+
+    /// Loads and independently re-verifies one complete incident proof.
+    ///
+    /// Canonical encoding, chain id, producer identity, producer signature,
+    /// incident digest, evidence size, and all persisted metadata are checked
+    /// on every read. No evidence is returned after any mismatch.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when persistence is malformed,
+    /// evidence verification fails, or `SQLite` cannot complete the lookup.
+    pub fn incident_evidence(
+        &self,
+        digest: &[u8; 32],
+    ) -> Result<Option<DirectoryReplicaIncidentEvidence>, DirectoryReplicaStoreError> {
+        let connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let row = connection
+            .query_row(
+                "SELECT i.producer, i.subject_node_id, i.kind, i.height,
+                        i.local_hash, i.remote_hash, i.evidence_frame,
+                        i.observed_at, c.quarantined
+                 FROM directory_replica_incidents i
+                 JOIN directory_replica_chains c ON c.producer = i.producer
+                 WHERE i.incident_digest = ?1",
+                params![digest.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        drop(connection);
+        let Some((
+            producer,
+            subject,
+            kind,
+            height,
+            local_hash,
+            remote_hash,
+            evidence_frame,
+            observed_at,
+            quarantined,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        validate_incident_kind(&kind)?;
+        if evidence_frame.is_empty() || evidence_frame.len() > MAX_DIRECTORY_SYNC_EVIDENCE_BYTES {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "replica incident evidence size is invalid".to_string(),
+            ));
+        }
+        if quarantined != 0 && quarantined != 1 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "incident producer quarantine flag is invalid".to_string(),
+            ));
+        }
+        let producer = bytes32(&producer, "incident producer")?;
+        let subject = bytes32(&subject, "incident subject")?;
+        let incident = QuarantineIncident {
+            kind: &kind,
+            height: nonnegative_i64_to_u64(height, "incident height")?,
+            local_hash: bytes32(&local_hash, "incident local hash")?,
+            remote_hash: bytes32(&remote_hash, "incident remote hash")?,
+            evidence_frame: &evidence_frame,
+        };
+        if incident_digest(&producer, &subject, &incident) != *digest {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "replica incident digest mismatch".to_string(),
+            ));
+        }
+        verify_incident_response_evidence(&evidence_frame, &producer)?;
+        let height = incident.height;
+        let local_hash = incident.local_hash;
+        let remote_hash = incident.remote_hash;
+        let summary = DirectoryReplicaIncidentSummary {
+            incident_digest: *digest,
+            producer,
+            subject_node_id: subject,
+            kind,
+            height,
+            local_hash,
+            remote_hash,
+            observed_at: positive_i64_to_u64(observed_at, "incident observed at")?,
+            producer_quarantined: quarantined == 1,
+        };
+        let evidence_sha256 = Sha256::digest(&evidence_frame).into();
+        Ok(Some(DirectoryReplicaIncidentEvidence {
+            summary,
+            evidence_frame,
+            evidence_sha256,
+        }))
     }
 
     /// Computes bounded recent commitment overlap for configured producers.
@@ -1996,10 +2256,8 @@ impl DirectoryReplicaStore {
         let mut count = 0u64;
         for row in rows {
             let (digest, producer, subject, kind, height, local, remote, evidence) = row?;
-            if kind.is_empty()
-                || evidence.is_empty()
-                || evidence.len() > MAX_DIRECTORY_SYNC_EVIDENCE_BYTES
-            {
+            validate_incident_kind(&kind)?;
+            if evidence.is_empty() || evidence.len() > MAX_DIRECTORY_SYNC_EVIDENCE_BYTES {
                 return Err(DirectoryReplicaStoreError::Integrity(
                     "replica incident metadata or evidence is invalid".to_string(),
                 ));
@@ -2025,6 +2283,25 @@ impl DirectoryReplicaStore {
         }
         Ok(count)
     }
+}
+
+fn validate_incident_kind(kind: &str) -> Result<(), DirectoryReplicaStoreError> {
+    if kind.is_empty()
+        || kind.len() > MAX_DIRECTORY_REPLICA_INCIDENT_KIND_BYTES
+        || !matches!(
+            kind,
+            "signed_tip_rollback"
+                | "signed_tip_fork"
+                | "signed_empty_range_gap"
+                | "signed_block_fork"
+                | "descriptor_sequence_equivocation"
+        )
+    {
+        return Err(DirectoryReplicaStoreError::Integrity(
+            "replica incident kind is invalid".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn observation_convergence_root(
@@ -3091,11 +3368,57 @@ mod tests {
         let tip = store.producer_tip(&producer.public_key_bytes()).unwrap();
         assert!(tip.quarantined);
         assert_eq!(tip.tip_hash, first.hash());
+        assert!(store.incident_summaries(None, 0).is_err());
+        assert!(store
+            .incident_summaries(None, MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE + 1)
+            .is_err());
+        let page = store.incident_summaries(None, 1).unwrap();
+        assert_eq!(page.incidents.len(), 1);
+        assert_eq!(page.next_cursor, None);
+        let summary = &page.incidents[0];
+        assert_eq!(summary.producer, producer.public_key_bytes());
+        assert_eq!(summary.subject_node_id, producer.public_key_bytes());
+        assert_eq!(summary.kind, "signed_tip_fork");
+        assert_eq!(summary.height, 1);
+        assert_eq!(summary.local_hash, first.hash());
+        assert_eq!(summary.remote_hash, fork.hash());
+        assert!(summary.producer_quarantined);
+        assert!(store
+            .incident_summaries(Some(summary.incident_digest), 1)
+            .unwrap()
+            .incidents
+            .is_empty());
+        let evidence = store
+            .incident_evidence(&summary.incident_digest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.summary, *summary);
+        assert_eq!(evidence.evidence_frame, fork_frame);
+        let expected_evidence_sha256: [u8; 32] = Sha256::digest(&fork_frame).into();
+        assert_eq!(evidence.evidence_sha256, expected_evidence_sha256);
+        let incident_digest = summary.incident_digest;
         drop(store);
-        let (_, audit) =
+        let (reopened, audit) =
             DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 21).unwrap();
         assert_eq!(audit.quarantined_producers, 1);
         assert_eq!(audit.incidents, 1);
+        assert!(reopened
+            .incident_evidence(&incident_digest)
+            .unwrap()
+            .is_some());
+
+        let mut corrupted_frame = fork_frame;
+        *corrupted_frame.last_mut().unwrap() ^= 0x01;
+        let connection = reopened.connection.lock();
+        connection
+            .execute(
+                "UPDATE directory_replica_incidents SET evidence_frame = ?2
+                 WHERE incident_digest = ?1",
+                params![incident_digest.as_slice(), corrupted_frame],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(reopened.incident_evidence(&incident_digest).is_err());
     }
 
     #[test]

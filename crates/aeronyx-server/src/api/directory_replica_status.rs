@@ -11,12 +11,15 @@
 //! ## Main Functionality
 //! - Serves `GET /api/discovery/directory/status`.
 //! - Exposes aggregate protocol health on the public listener.
-//! - Exposes only truncated producer fingerprints on local/VPN listeners.
+//! - Exposes only truncated producer fingerprints in local/VPN status and
+//!   incident-list responses.
 //! - Combines audited persisted indexes with bounded runtime observations.
 //! - Reports catch-up/deadline/backoff policy without endpoint or route data.
 //! - Declares whether retry scheduling is audited and success-cleared atomically.
 //! - Reports bounded multi-source commitment overlap without claiming quorum,
 //!   fork choice, consensus, or global finality.
+//! - Lists bounded incident summaries and exports one independently re-verified
+//!   signed evidence frame on local/VPN operator listeners only.
 //!
 //! ## Calling Relationships
 //! - `server.rs` mounts this router separately for public and operator scopes.
@@ -29,13 +32,15 @@
 //! 3. Derive aggregate lag, failure, backoff, quarantine, and sync state.
 //! 4. Classify recent signed-observation overlap across eligible producers.
 //! 5. Serialize aggregate-only or fingerprint-only detail by listener scope.
+//! 6. Re-verify canonical incident evidence before an operator-only export.
 //!
 //! ## Privacy Invariant
-//! Public output is aggregate-only. Local detail contains a 12-character
-//! fingerprint and bounded control-plane counters only. Neither scope exposes
-//! endpoints, full producer identities, descriptors, routes, selected hops,
-//! client metadata, payloads, DNS contents, destinations, private keys, wallet
-//! traffic, or social graph metadata.
+//! Public output is aggregate-only. Local status and incident lists contain
+//! 12-character fingerprints and bounded control-plane counters. One explicitly
+//! requested evidence package includes the complete producer identity required
+//! to verify its Ed25519 signature. No scope exposes endpoints, descriptors,
+//! routes, selected hops, client metadata, payloads, DNS contents, destinations,
+//! private keys, wallet traffic, or social graph metadata.
 //!
 //! ## Important Note for Next Developer
 //! - Never infer scope from request headers or caller-provided input.
@@ -43,8 +48,13 @@
 //! - Keep `producers` omitted, not empty, on the public response contract.
 //! - Failure reasons must remain stable internal buckets, never peer strings.
 //! - Never rename observation overlap to quorum, consensus, or finality.
+//! - Never mount incident list/export routes on the public listener.
+//! - Never add quarantine mutation here; recovery needs an authenticated,
+//!   audited compare-and-swap command boundary.
 //!
 //! ## Last Modified
+//! `v0.5.0-DirectoryReplicaIncidentEvidence` - Added local-only bounded incident
+//! summaries and fail-closed canonical signed-evidence export.
 //! `v0.4.0-DirectoryReplicaObservationConvergence` - Added bounded aggregate
 //! recent-overlap evidence and an operator-only deterministic observation root.
 //! `v0.3.0-DirectoryReplicaDurableBackoffStatus` - Declared audited `SQLite` retry
@@ -59,12 +69,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use aeronyx_core::protocol::discovery::AERONYX_DIRECTORY_MAINNET_CHAIN_ID;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Serialize;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::api::directory_replica_sync::{
@@ -73,10 +85,14 @@ use crate::api::directory_replica_sync::{
     DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND,
 };
 use crate::services::{
+    DirectoryReplicaIncidentEvidence, DirectoryReplicaIncidentSummary,
     DirectoryReplicaObservationConvergenceSnapshot, DirectoryReplicaProducerSnapshot,
     DirectoryReplicaStore, DirectoryReplicaStoreSnapshot, DirectoryReplicaSyncObservation,
-    DirectoryReplicaSyncRuntime,
+    DirectoryReplicaSyncRuntime, MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE,
 };
+
+const DEFAULT_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE: usize = 20;
+const DIRECTORY_REPLICA_INCIDENT_PRIVACY_BOUNDARY: &str = "operator-only signed Directory Chain control-plane evidence; no endpoints, descriptors, client IPs, routes, selected hops, message ids, payloads, ciphertext, Memory Chain records, DNS contents, destinations, private keys, wallet traffic, or social graph metadata";
 
 /// Visibility tier for Directory Replica status responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +213,77 @@ struct DirectoryReplicaStatusErrorResponse {
     privacy_boundary: &'static str,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct DirectoryReplicaIncidentListQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectoryReplicaIncidentEvidenceQuery {
+    digest: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryReplicaIncidentSummaryResponse {
+    incident_digest: String,
+    producer_fingerprint: String,
+    subject_fingerprint: String,
+    kind: String,
+    height: u64,
+    local_hash: String,
+    remote_hash: String,
+    observed_at: u64,
+    producer_quarantined: bool,
+    evidence_available: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryReplicaIncidentListResponse {
+    contract_version: &'static str,
+    generated_at: u64,
+    status: &'static str,
+    incidents: Vec<DirectoryReplicaIncidentSummaryResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+    ordering: &'static str,
+    evidence_verification: &'static str,
+    recovery_policy: &'static str,
+    privacy_boundary: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryReplicaIncidentEvidenceResponse {
+    contract_version: &'static str,
+    generated_at: u64,
+    status: &'static str,
+    chain_id: String,
+    incident_digest: String,
+    producer: String,
+    subject_node_id: String,
+    kind: String,
+    height: u64,
+    local_hash: String,
+    remote_hash: String,
+    observed_at: u64,
+    producer_quarantined: bool,
+    evidence_frame_b64: String,
+    evidence_sha256: String,
+    evidence_format: &'static str,
+    verification: &'static str,
+    recovery_policy: &'static str,
+    privacy_boundary: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryReplicaIncidentErrorResponse {
+    contract_version: &'static str,
+    generated_at: u64,
+    status: &'static str,
+    reason: &'static str,
+    privacy_boundary: &'static str,
+}
+
 #[derive(Debug, Default)]
 struct DirectoryReplicaRuntimeSummary {
     synchronized_producers: u64,
@@ -215,9 +302,10 @@ struct DirectoryReplicaRuntimeSummary {
 
 /// Builds the Directory Replica observability route.
 ///
-/// Public and local listeners intentionally use separate scope values. Neither
-/// response includes full producer identities, endpoints, signed descriptors,
-/// route metadata, or user traffic.
+/// Public and local listeners intentionally use separate scope values. Status
+/// and incident-list responses omit full identities. A single local evidence
+/// export includes the producer key required for signature verification, but
+/// never endpoints, signed descriptors, route metadata, or user traffic.
 pub fn build_directory_replica_status_router(
     store: Option<Arc<DirectoryReplicaStore>>,
     runtime: Arc<DirectoryReplicaSyncRuntime>,
@@ -231,12 +319,230 @@ pub fn build_directory_replica_status_router(
         configured_producers: Arc::new(configured_producers.into_iter().collect()),
         scope,
     };
-    Router::new()
-        .route(
-            "/api/discovery/directory/status",
-            get(directory_replica_status_handler),
-        )
-        .with_state(state)
+    let router = Router::new().route(
+        "/api/discovery/directory/status",
+        get(directory_replica_status_handler),
+    );
+    let router = if scope == DirectoryReplicaStatusScope::LocalOperator {
+        router
+            .route(
+                "/api/discovery/directory/incidents",
+                get(directory_replica_incidents_handler),
+            )
+            .route(
+                "/api/discovery/directory/incident",
+                get(directory_replica_incident_evidence_handler),
+            )
+    } else {
+        router
+    };
+    router.with_state(state)
+}
+
+async fn directory_replica_incidents_handler(
+    State(state): State<DirectoryReplicaStatusState>,
+    Query(query): Query<DirectoryReplicaIncidentListQuery>,
+) -> Response {
+    let generated_at = now_secs();
+    if state.scope != DirectoryReplicaStatusScope::LocalOperator {
+        return incident_error_response(
+            StatusCode::NOT_FOUND,
+            generated_at,
+            "incident_route_not_found",
+        );
+    }
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE);
+    if !(1..=MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE).contains(&limit) {
+        return incident_error_response(
+            StatusCode::BAD_REQUEST,
+            generated_at,
+            "invalid_incident_page_limit",
+        );
+    }
+    let Ok(after) = query.after.as_deref().map(parse_hex32).transpose() else {
+        return incident_error_response(
+            StatusCode::BAD_REQUEST,
+            generated_at,
+            "invalid_incident_cursor",
+        );
+    };
+    let Some(store) = state.store.clone() else {
+        return incident_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            generated_at,
+            "replica_store_disabled",
+        );
+    };
+    match tokio::task::spawn_blocking(move || store.incident_summaries(after, limit)).await {
+        Ok(Ok(page)) => Json(DirectoryReplicaIncidentListResponse {
+            contract_version: "directory_replica_incident_list.v1",
+            generated_at,
+            status: "available",
+            incidents: page
+                .incidents
+                .into_iter()
+                .map(incident_summary_response)
+                .collect(),
+            next_cursor: page.next_cursor.map(hex::encode),
+            ordering: "incident_digest_ascending_exclusive_cursor",
+            evidence_verification: "startup_audited_summary_reverified_on_single_export",
+            recovery_policy: "operator_review_required_automatic_recovery_disabled",
+            privacy_boundary: DIRECTORY_REPLICA_INCIDENT_PRIVACY_BOUNDARY,
+        })
+        .into_response(),
+        Ok(Err(error)) => {
+            warn!(
+                error = %error,
+                "[DIRECTORY_REPLICA] Incident summary query rejected persistence"
+            );
+            incident_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                generated_at,
+                "incident_list_unavailable",
+            )
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "[DIRECTORY_REPLICA] Incident summary worker failed"
+            );
+            incident_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                generated_at,
+                "incident_list_worker_failed",
+            )
+        }
+    }
+}
+
+async fn directory_replica_incident_evidence_handler(
+    State(state): State<DirectoryReplicaStatusState>,
+    Query(query): Query<DirectoryReplicaIncidentEvidenceQuery>,
+) -> Response {
+    let generated_at = now_secs();
+    if state.scope != DirectoryReplicaStatusScope::LocalOperator {
+        return incident_error_response(
+            StatusCode::NOT_FOUND,
+            generated_at,
+            "incident_route_not_found",
+        );
+    }
+    let Ok(digest) = parse_hex32(&query.digest) else {
+        return incident_error_response(
+            StatusCode::BAD_REQUEST,
+            generated_at,
+            "invalid_incident_digest",
+        );
+    };
+    let Some(store) = state.store.clone() else {
+        return incident_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            generated_at,
+            "replica_store_disabled",
+        );
+    };
+    match tokio::task::spawn_blocking(move || store.incident_evidence(&digest)).await {
+        Ok(Ok(Some(evidence))) => {
+            Json(incident_evidence_response(generated_at, evidence)).into_response()
+        }
+        Ok(Ok(None)) => {
+            incident_error_response(StatusCode::NOT_FOUND, generated_at, "incident_not_found")
+        }
+        Ok(Err(error)) => {
+            warn!(
+                error = %error,
+                "[DIRECTORY_REPLICA] Incident evidence failed verification"
+            );
+            incident_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                generated_at,
+                "incident_evidence_verification_failed",
+            )
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "[DIRECTORY_REPLICA] Incident evidence worker failed"
+            );
+            incident_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                generated_at,
+                "incident_evidence_worker_failed",
+            )
+        }
+    }
+}
+
+fn incident_summary_response(
+    incident: DirectoryReplicaIncidentSummary,
+) -> DirectoryReplicaIncidentSummaryResponse {
+    DirectoryReplicaIncidentSummaryResponse {
+        incident_digest: hex::encode(incident.incident_digest),
+        producer_fingerprint: hex::encode(&incident.producer[..6]),
+        subject_fingerprint: hex::encode(&incident.subject_node_id[..6]),
+        kind: incident.kind,
+        height: incident.height,
+        local_hash: hex::encode(incident.local_hash),
+        remote_hash: hex::encode(incident.remote_hash),
+        observed_at: incident.observed_at,
+        producer_quarantined: incident.producer_quarantined,
+        evidence_available: true,
+    }
+}
+
+fn incident_evidence_response(
+    generated_at: u64,
+    evidence: DirectoryReplicaIncidentEvidence,
+) -> DirectoryReplicaIncidentEvidenceResponse {
+    DirectoryReplicaIncidentEvidenceResponse {
+        contract_version: "directory_replica_incident_evidence.v1",
+        generated_at,
+        status: "verified",
+        chain_id: hex::encode(AERONYX_DIRECTORY_MAINNET_CHAIN_ID),
+        incident_digest: hex::encode(evidence.summary.incident_digest),
+        producer: hex::encode(evidence.summary.producer),
+        subject_node_id: hex::encode(evidence.summary.subject_node_id),
+        kind: evidence.summary.kind,
+        height: evidence.summary.height,
+        local_hash: hex::encode(evidence.summary.local_hash),
+        remote_hash: hex::encode(evidence.summary.remote_hash),
+        observed_at: evidence.summary.observed_at,
+        producer_quarantined: evidence.summary.producer_quarantined,
+        evidence_frame_b64: BASE64.encode(evidence.evidence_frame),
+        evidence_sha256: hex::encode(evidence.evidence_sha256),
+        evidence_format: "canonical_directory_sync_block_range_response_v1_base64",
+        verification: "chain_id_canonical_encoding_producer_identity_signature_incident_digest_and_evidence_sha256_verified_on_read",
+        recovery_policy: "operator_review_required_automatic_recovery_disabled",
+        privacy_boundary: DIRECTORY_REPLICA_INCIDENT_PRIVACY_BOUNDARY,
+    }
+}
+
+fn incident_error_response(
+    status_code: StatusCode,
+    generated_at: u64,
+    reason: &'static str,
+) -> Response {
+    (
+        status_code,
+        Json(DirectoryReplicaIncidentErrorResponse {
+            contract_version: "directory_replica_incident_error.v1",
+            generated_at,
+            status: "unavailable",
+            reason,
+            privacy_boundary: DIRECTORY_REPLICA_INCIDENT_PRIVACY_BOUNDARY,
+        }),
+    )
+        .into_response()
+}
+
+fn parse_hex32(value: &str) -> Result<[u8; 32], ()> {
+    if value.len() != 64 {
+        return Err(());
+    }
+    let bytes = hex::decode(value).map_err(|_| ())?;
+    bytes.try_into().map_err(|_| ())
 }
 
 async fn directory_replica_status_handler(
@@ -751,6 +1057,75 @@ mod tests {
             Some("catching_up")
         );
         assert!(parsed["producers"][0].get("public_endpoint").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incident_routes_are_local_only_bounded_and_fail_closed() -> TestResult {
+        let (store, runtime, producer) = status_fixture()?;
+        let public_router = build_directory_replica_status_router(
+            Some(Arc::clone(&store)),
+            Arc::clone(&runtime),
+            vec![producer],
+            DirectoryReplicaStatusScope::PublicAggregate,
+        );
+        for uri in [
+            "/api/discovery/directory/incidents",
+            "/api/discovery/directory/incident?digest=0000000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            let response = public_router
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty())?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        let local_router = build_directory_replica_status_router(
+            Some(store),
+            runtime,
+            vec![producer],
+            DirectoryReplicaStatusScope::LocalOperator,
+        );
+        let list_response = local_router
+            .clone()
+            .oneshot(
+                Request::get("/api/discovery/directory/incidents?limit=1").body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = to_bytes(list_response.into_body(), 512 * 1024).await?;
+        let list: serde_json::Value = serde_json::from_slice(&list_body)?;
+        assert_eq!(
+            list["contract_version"].as_str(),
+            Some("directory_replica_incident_list.v1")
+        );
+        assert_eq!(list["incidents"].as_array().map(Vec::len), Some(0));
+        assert!(list.get("next_cursor").is_none());
+        assert_eq!(
+            list["recovery_policy"].as_str(),
+            Some("operator_review_required_automatic_recovery_disabled")
+        );
+
+        for uri in [
+            "/api/discovery/directory/incidents?limit=0",
+            "/api/discovery/directory/incidents?limit=51",
+            "/api/discovery/directory/incidents?after=not-a-digest",
+            "/api/discovery/directory/incident?digest=not-a-digest",
+        ] {
+            let response = local_router
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty())?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let missing_response = local_router
+            .oneshot(
+                Request::get("/api/discovery/directory/incident?digest=0000000000000000000000000000000000000000000000000000000000000000")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(missing_response.status(), StatusCode::NOT_FOUND);
         Ok(())
     }
 

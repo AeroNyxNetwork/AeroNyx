@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.15.0 - Added bounded multi-source Directory Replica observation convergence without introducing quorum, fork choice, consensus, or finality semantics.
+Modification Reason: v0.16.0 - Added local-operator, read-only Directory Replica incident summaries and fail-closed signed-evidence export without introducing an unauthenticated quarantine recovery command.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.15.0 - Added recent signed-commitment overlap and an operator-only deterministic observation root.
+Last Modified: v0.16.0 - Added bounded incident pagination and canonical producer-signed evidence export with verification on every read.
+Previous: v0.15.0 - Added recent signed-commitment overlap and an operator-only deterministic observation root.
 Previous: v0.14.0 - Added atomic replica schema v1-to-v2 migration and restart-durable producer retry scheduling.
 Previous: v0.13.0 - Added a 45-second producer deadline, bounded failure backoff, and additive aggregate/operator retry status.
 Previous: v0.12.0 - Added dedicated replica coordinator/status modules, bounded producer concurrency, and 5-15 second deterministic startup synchronization.
@@ -1057,10 +1058,24 @@ Implemented in Directory Sync V1 replica pull:
   or finality.
 - `directory_chain_sync_interval_secs` defaults to 120 seconds and accepts
   60 seconds through 24 hours. Empty peer pins disable the outbound task.
+- The local/VPN operator listener exposes bounded, digest-ordered incident
+  summaries at `GET /api/discovery/directory/incidents`. The default page is 20
+  records, the hard maximum is 50, and the exclusive cursor is the previous
+  page's final 32-byte incident digest.
+- `GET /api/discovery/directory/incident?digest=<hex32>` exports one exact
+  canonical `BlockRangeResponseV1` frame as base64. Before returning bytes, the
+  store rechecks metadata, evidence size, chain id, canonical re-encoding,
+  producer identity/signature, incident digest, and evidence SHA-256.
+- Public listeners do not mount either incident route and return `404`.
+  Summary output uses 12-character producer/subject fingerprints; full keys
+  appear only inside the single operator evidence package because independent
+  signature verification requires the producer identity.
+- Incident export is deliberately read-only. No endpoint can clear quarantine,
+  rewind a prefix, choose a fork, or mark evidence resolved.
 
 Still pending before Directory Chain can be described as live:
 
-- Operator-reviewed quarantine evidence export and explicit recovery tooling.
+- Authenticated, audited, compare-and-swap quarantine resolution tooling.
 - Witness/co-signature policy and deterministic fork selection.
 - Independent implementation verification of the convergence root contract.
 
@@ -1133,6 +1148,50 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-18 - Added auditable Directory Replica incident evidence export.
+- Files changed:
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - crates/aeronyx-server/src/services/mod.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Evidence and API contract:
+  - Adds deterministic exclusive-cursor incident summary pages with a default
+    limit of 20 and a hard maximum of 50.
+  - Separates low-cost summaries from the bounded signed response frame, which
+    can be as large as 512 KiB.
+  - Re-verifies canonical encoding, production chain id, producer identity and
+    signature, incident digest, evidence size, and evidence SHA-256 immediately
+    before a single evidence package is returned.
+  - Uses stable `directory_replica_incident_list.v1` and
+    `directory_replica_incident_evidence.v1` response contracts.
+- Safety and privacy:
+  - Incident routes are registered only for LocalOperator scope; the public
+    listener receives 404 and cannot infer whether evidence exists.
+  - Summary pages expose truncated producer/subject fingerprints. Full producer
+    identity is present only in the single proof needed for signature checks.
+  - Evidence contains signed Directory Sync control-plane bytes only. No peer
+    endpoints, descriptors, client identifiers, routes, selected hops, message
+    ids, payloads, ciphertext, Memory Chain records, DNS contents, destinations,
+    private keys, wallet traffic, or social graph data are added.
+  - Automatic quarantine recovery remains disabled. A later recovery command
+    must have strong operator authentication, command audit, evidence binding,
+    and compare-and-swap protection before it can be considered.
+- Compatibility:
+  - No SQLite migration, Directory Sync frame change, config field, public API,
+    producer namespace, retry policy, or accepted-prefix behavior changed.
+- Verification:
+  - Directory Replica focused tests: 24 passed, including evidence corruption
+    rejection, cursor/limit bounds, local-only mounting, public 404 behavior,
+    and stable invalid/not-found responses.
+  - aeronyx-server regression suite: 1,083/1,083 passed.
+  - Package integration group: 1 passed, 9 intentionally ignored.
+  - cargo check -p aeronyx-server --tests --locked passed.
+  - cargo clippy -p aeronyx-server --lib --no-deps --locked completed; the new
+    incident storage/API paths added no lint after narrowing the SQLite mutex
+    lifetime before cryptographic verification.
+  - Optimized release build completed; the existing US1
+    `/etc/aeronyx/server.toml` passed the release binary `validate` command.
+
 2026-07-18 - Added bounded Directory Replica observation convergence.
 - Files changed:
   - crates/aeronyx-server/src/services/directory_replica.rs
