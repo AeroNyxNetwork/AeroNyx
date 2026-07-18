@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.11.0 - Added privacy-tiered Directory Replica status and request-budgeted multi-page catch-up.
+Modification Reason: v0.12.0 - Split Directory Replica transport, synchronization, and status responsibilities; added bounded concurrent producer synchronization and startup jitter.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.11.0 - Added aggregate/public and fingerprinted/operator replica status plus bounded multi-page synchronization.
+Last Modified: v0.12.0 - Added dedicated replica coordinator/status modules, bounded producer concurrency, and 5-15 second deterministic startup synchronization.
+Previous: v0.11.0 - Added aggregate/public and fingerprinted/operator replica status plus bounded multi-page synchronization.
 Previous: v0.10.1 - Verified pinned, signed replica synchronization across US1, Korean1, and Noway1 without mixing producer histories.
 Previous: v0.10.0 - Added audited remote replica namespaces, signed page/object verification, atomic import, and durable producer quarantine.
 Previous: v0.9.0 - Added the signed tip, block-range, and descriptor-object serving half of Directory Sync V1.
@@ -1120,6 +1121,53 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-18 - Split Directory Replica architecture and removed serial producer blocking.
+- Files changed:
+  - crates/aeronyx-server/src/api/directory_chain_peer.rs
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/api/mod.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - crates/aeronyx-server/src/server.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Architecture:
+  - directory_chain_peer.rs now owns only authenticated inbound serving,
+    replay/rate admission, audit-gated reads, and signed responses.
+  - directory_replica_sync.rs owns outbound request creation, response
+    verification, exact object hydration, atomic imports, catch-up policy, and
+    lifecycle scheduling.
+  - directory_replica_status.rs owns listener-fixed privacy scopes and status
+    response serialization; public callers cannot request operator scope.
+  - server.rs now constructs and starts one coordinator instead of embedding
+    producer page loops in the main server lifecycle.
+- Scheduling behavior:
+  - Up to four independent pinned producers synchronize concurrently, while
+    pages for one producer remain ordered and producer-local.
+  - Each producer retains the four-page and 24-request round limits and reserves
+    the 17-request worst-case next-page cost before continuing.
+  - The first round starts after a deterministic identity-derived 5-15 second
+    delay instead of waiting the full 120-second interval.
+  - Later rounds use MissedTickBehavior::Skip and cannot overlap; shutdown
+    cancels the complete in-flight round through the coordinator select.
+- Privacy and compatibility:
+  - Directory Sync V1 wire frames, endpoints, config fields, SQLite schema, and
+    status JSON contract are unchanged.
+  - Concurrency never broadens trust: only operator-pinned identities with a
+    current signed PeerStore descriptor are contacted.
+  - Logs and telemetry remain bounded reason/counter fields with no endpoint,
+    full producer identity, response body, descriptor hash, route, client, or
+    user payload data.
+- Verification:
+  - Directory Replica store/coordinator/status tests: 9 passed.
+  - Authenticated inbound Directory Sync API tests: 3 passed.
+  - aeronyx-server regression suite: 1,068/1,068 passed.
+  - Integration group: 1 passed, 9 intentionally ignored.
+  - cargo check -p aeronyx-server --tests --locked passed.
+  - cargo clippy -p aeronyx-server --tests --no-deps --locked passed with zero
+    warnings attributed to either new Directory Replica module.
+  - Release build passed; the resulting binary accepted the existing US1
+    production configuration without compatibility changes.
+
 2026-07-18 - Added Directory Replica status and request-budgeted multi-page catch-up.
 - Files changed:
   - crates/aeronyx-server/src/services/directory_replica.rs

@@ -35,6 +35,8 @@
 //! - [`chat_handlers`]: client/VPN-only encrypted media blob transfer
 //! - [`discovery`]: v0.1.0 Discovery snapshot/gossip endpoints
 //! - [`directory_chain_peer`]: signed bounded Directory Chain peer transport
+//! - [`directory_replica_status`]: privacy-tiered replica health endpoint
+//! - [`directory_replica_sync`]: bounded concurrent outbound replica coordinator
 //! - [`chat_peer`]: v0.1.0 node-to-node encrypted chat envelope relay
 //! - [`memchain_peer`]: v2.7.0 signed node-to-node commitment block ranges
 //!
@@ -84,6 +86,7 @@
 //! v2.7.20-PublicApiBackpressure - Centralized lock-free RAII request permits.
 //! v2.7.21-ChatBlobWiring - Compile the encrypted client blob API module.
 //! v2.8.24-DirectorySyncServing - Compile authenticated Directory Chain peer routes.
+//! v2.8.29-DirectoryReplicaCoordinator - Split replica scheduling from server lifecycle.
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -259,6 +262,8 @@ pub mod local;
 pub mod chat_handlers;
 pub mod chat_peer;
 pub mod directory_chain_peer;
+pub mod directory_replica_status;
+pub mod directory_replica_sync;
 pub mod discovery;
 pub mod memchain_peer;
 pub mod voice;

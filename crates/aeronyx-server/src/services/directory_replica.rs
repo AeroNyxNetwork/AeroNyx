@@ -23,8 +23,9 @@
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
-//! - `api/directory_chain_peer.rs` verifies and downloads bounded peer pages,
+//! - `api/directory_replica_sync.rs` verifies and downloads bounded peer pages,
 //!   then calls `import_verified_page` from a blocking worker.
+//! - `api/directory_replica_status.rs` reads only low-cost audited snapshots.
 //! - The local producer store remains the only source served by peer routes.
 //!
 //! ## Main Logical Flow
@@ -51,6 +52,7 @@
 //! - Keep all limits synchronized with the core Directory Sync V1 contract.
 //!
 //! ## Last Modified
+//! v0.2.1-DirectoryReplicaModuleSplit - Updated transport and status ownership.
 //! v0.2.0-DirectoryReplicaStatus - Added aggregate status snapshots and shared
 //! synchronization observations for bounded catch-up visibility.
 //! v0.1.0-DirectoryReplicaStore - Initial producer-isolated replica persistence.

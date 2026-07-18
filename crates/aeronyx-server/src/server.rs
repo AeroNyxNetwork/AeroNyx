@@ -286,8 +286,12 @@
 //     full producer identities, endpoints, descriptors, routes, or user data.
 //   - Multi-page Directory Replica catch-up must reserve the worst-case next
 //     page request cost before continuing; never rely on average block size.
+//   - Directory Replica producers synchronize through the dedicated bounded
+//     coordinator. Preserve independent producer budgets and the concurrency
+//     cap so one slow peer cannot block or amplify the complete pinned set.
 //
 // Last Modified:
+//   v2.8.29-DirectoryReplicaCoordinator - Extract bounded concurrent replica scheduling
 //   v2.8.28-DirectoryReplicaStatus - Privacy-tiered status and request-budgeted multi-page catch-up
 //   v2.8.27-VerifiedDeliveryRollbackAnchor - Detect locally replaced older signed delivery caches
 //   v2.8.26-VerifiedDeliveryRestartContinuity - Signed aggregate receipt evidence with fail-closed live readiness
@@ -443,11 +447,11 @@ use crate::api::discovery::{
     discovery_readiness_status_value, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
     GossipResponse,
 };
-use crate::api::directory_chain_peer::{
-    build_directory_chain_peer_router, build_directory_replica_status_router,
-    pull_directory_chain_page, should_continue_directory_replica_catch_up,
-    DirectoryReplicaStatusScope,
+use crate::api::directory_chain_peer::build_directory_chain_peer_router;
+use crate::api::directory_replica_status::{
+    build_directory_replica_status_router, DirectoryReplicaStatusScope,
 };
+use crate::api::directory_replica_sync::DirectoryReplicaSyncCoordinator;
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
     pull_record_commitment_checkpoint, pull_record_commitment_checkpoint_certificate,
@@ -4271,7 +4275,6 @@ impl Server {
             .config
             .discovery
             .directory_chain_sync_peer_node_id_bytes();
-        runtime.register_producers(&peers);
         let store = store?;
         if peers.is_empty() {
             info!("[DIRECTORY_REPLICA] Outbound sync disabled; no peers are pinned");
@@ -4281,102 +4284,24 @@ impl Server {
             .config
             .discovery
             .directory_chain_sync_interval_secs;
-        let identity = Arc::new(self.identity.clone());
-        let client = match reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(1)
-            .build()
-        {
-            Ok(client) => client,
-            Err(error) => {
+        let coordinator = match DirectoryReplicaSyncCoordinator::new(
+            peers,
+            interval_secs,
+            store,
+            runtime,
+            peer_store,
+            Arc::new(self.identity.clone()),
+        ) {
+            Ok(coordinator) => coordinator,
+            Err(reason) => {
                 error!(
-                    error = %error,
-                    "[DIRECTORY_REPLICA] HTTP client initialization failed"
+                    reason = %reason,
+                    "[DIRECTORY_REPLICA] Synchronization coordinator initialization failed"
                 );
                 return None;
             }
         };
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        Some(tokio::spawn(async move {
-            let period = Duration::from_secs(interval_secs);
-            let start = tokio::time::Instant::now() + period;
-            let mut timer = tokio::time::interval_at(start, period);
-            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    _ = shutdown_rx.recv() => break,
-                    _ = timer.tick() => {}
-                }
-                for producer in &peers {
-                    let mut pages_completed = 0u32;
-                    let mut requests_used = 0u32;
-                    loop {
-                        runtime.record_attempt(*producer, unix_now_secs());
-                        let pull = pull_directory_chain_page(
-                            Arc::clone(&store),
-                            &peer_store,
-                            identity.as_ref(),
-                            producer,
-                            &client,
-                        );
-                        let outcome = tokio::select! {
-                            _ = shutdown_rx.recv() => return,
-                            outcome = pull => outcome,
-                        };
-                        match outcome {
-                            Ok(outcome) => {
-                                pages_completed = pages_completed.saturating_add(1);
-                                requests_used =
-                                    requests_used.saturating_add(outcome.requests_made);
-                                runtime.record_success(
-                                    *producer,
-                                    unix_now_secs(),
-                                    outcome.import.tip_height,
-                                    outcome.remote_tip_height,
-                                    outcome.has_more,
-                                    outcome.import.blocks_inserted,
-                                    outcome.import.commitments_inserted,
-                                    outcome.requests_made,
-                                );
-                                debug!(
-                                    blocks_inserted = outcome.import.blocks_inserted,
-                                    commitments_inserted = outcome.import.commitments_inserted,
-                                    blocks_already_present = outcome.import.blocks_already_present,
-                                    descriptor_equivocations =
-                                        outcome.import.descriptor_equivocations,
-                                    replica_tip_height = outcome.import.tip_height,
-                                    remote_tip_height = outcome.remote_tip_height,
-                                    has_more = outcome.has_more,
-                                    pages_completed,
-                                    requests_used,
-                                    "[DIRECTORY_REPLICA] Authenticated bounded page synchronized"
-                                );
-                                if !should_continue_directory_replica_catch_up(
-                                    pages_completed,
-                                    requests_used,
-                                    outcome.has_more,
-                                ) {
-                                    break;
-                                }
-                            }
-                            Err(reason) => {
-                                runtime.record_failure(*producer, unix_now_secs(), &reason);
-                                warn!(
-                                    reason = %reason,
-                                    pages_completed,
-                                    requests_used,
-                                    "[DIRECTORY_REPLICA] Pinned producer sync round rejected"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            info!("[DIRECTORY_REPLICA] Sync task stopped");
-        }))
+        Some(coordinator.spawn(self.shutdown_tx.subscribe()))
     }
 
     async fn reconcile_directory_chain_once(
