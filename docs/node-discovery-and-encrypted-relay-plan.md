@@ -1166,9 +1166,11 @@ Initial entry:
   - Direct and carrier responders stop the page before aggregate commitments
     exceed 256, the existing single-block maximum. They also stop before a
     descriptor hash repeats across blocks, preserving exact object hydration.
-  - The response body cap, object chunk size, per-peer rate limit, maximum
-    request budget (18 worst case per page), producer signatures, carrier
-    signatures, fork quarantine, and SQLite audit rules are unchanged.
+  - The response body cap, object chunk size, per-peer rate limit, producer
+    signatures, carrier signatures, fork quarantine, and SQLite audit rules
+    are unchanged. The request budget is bounded at 18 requests in the worst
+    case per page and 30 requests per producer round, matching but never
+    exceeding the existing inbound identity limit.
   - Older peers remain compatible because `limit=8` was already valid in the
     Directory Sync V1 contract; only page utilization changes.
 - Verification:

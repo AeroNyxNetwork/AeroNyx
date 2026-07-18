@@ -67,6 +67,7 @@
 //!   signature, or descriptor-hash response; these are security failures.
 //!
 //! ## Last Modified
+//! `v0.7.2-DirectoryRoundBudgetAlignment` - Aligned outbound catch-up work with the existing inbound identity limit.
 //! `v0.7.1-DirectoryBoundedMultiBlockCatchUp` - Raised bounded page width without raising commitment/request ceilings.
 //! `v0.7.0-DirectoryEvidenceCarrier` - Added direct-first audited carrier fallback and dual-layer verification.
 //! `v0.6.0-DirectoryObservationWitness` - Added bounded external recomputation rounds and durable receipts.
@@ -144,8 +145,10 @@ pub(crate) const DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE: u32 =
     2 + MAX_DIRECTORY_COMMITMENTS_PER_BLOCK.div_ceil(MAX_DIRECTORY_SYNC_OBJECTS_V1) as u32;
 /// Hard producer-local page cap for one low-frequency synchronization round.
 pub(crate) const DIRECTORY_SYNC_MAX_PAGES_PER_ROUND: u32 = 4;
-/// Leaves headroom beneath the inbound 30 requests/minute identity budget.
-pub(crate) const DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND: u32 = 24;
+/// Matches, but never exceeds, the inbound 30 requests/minute identity budget.
+/// Worst-case pages consume the complete round; ordinary sparse blocks can
+/// use the remaining budget without crossing the peer admission ceiling.
+pub(crate) const DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND: u32 = 30;
 
 /// Result of one authenticated outbound replica synchronization page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1546,8 +1549,8 @@ mod tests {
         assert!(should_continue_directory_replica_catch_up(1, 2, true));
         assert!(should_continue_directory_replica_catch_up(3, 6, true));
         assert!(!should_continue_directory_replica_catch_up(4, 8, true));
-        assert!(should_continue_directory_replica_catch_up(1, 6, true));
-        assert!(!should_continue_directory_replica_catch_up(1, 7, true));
+        assert!(should_continue_directory_replica_catch_up(1, 12, true));
+        assert!(!should_continue_directory_replica_catch_up(1, 13, true));
         assert!(!should_continue_directory_replica_catch_up(1, 2, false));
     }
 
