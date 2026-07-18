@@ -289,8 +289,11 @@
 //   - Directory Replica producers synchronize through the dedicated bounded
 //     coordinator. Preserve independent producer budgets and the concurrency
 //     cap so one slow peer cannot block or amplify the complete pinned set.
+//   - Directory Replica schema v2 persists bounded retry state. A successful
+//     authenticated import must clear that state in the same SQLite transaction.
 //
 // Last Modified:
+//   v2.8.30-DurableDirectoryReplicaBackoff - Audit and restore producer retry state across restarts
 //   v2.8.29-DirectoryReplicaCoordinator - Extract bounded concurrent replica scheduling
 //   v2.8.28-DirectoryReplicaStatus - Privacy-tiered status and request-budgeted multi-page catch-up
 //   v2.8.27-VerifiedDeliveryRollbackAnchor - Detect locally replaced older signed delivery caches
@@ -4256,6 +4259,7 @@ impl Server {
             blocks = audit.blocks,
             commitments = audit.commitments,
             incidents = audit.incidents,
+            retry_states = audit.retry_states,
             "[DIRECTORY_REPLICA] Producer-isolated startup audit passed"
         );
         Ok(Some(Arc::new(store)))

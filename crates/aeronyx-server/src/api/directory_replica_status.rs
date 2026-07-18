@@ -14,6 +14,7 @@
 //! - Exposes only truncated producer fingerprints on local/VPN listeners.
 //! - Combines audited persisted indexes with bounded runtime observations.
 //! - Reports catch-up/deadline/backoff policy without endpoint or route data.
+//! - Declares whether retry scheduling is audited and success-cleared atomically.
 //!
 //! ## Calling Relationships
 //! - `server.rs` mounts this router separately for public and operator scopes.
@@ -40,6 +41,8 @@
 //! - Failure reasons must remain stable internal buckets, never peer strings.
 //!
 //! ## Last Modified
+//! `v0.3.0-DirectoryReplicaDurableBackoffStatus` - Declared audited `SQLite` retry
+//! persistence and atomic successful-import cleanup as additive policy fields.
 //! v0.2.0-DirectoryReplicaBackoffStatus - Added aggregate and fingerprint-only
 //! producer deadline/backoff observations without widening identity exposure.
 //! v0.1.0-DirectoryReplicaStatusSplit - Isolated the privacy-tiered status API
@@ -92,6 +95,8 @@ struct DirectoryReplicaCatchUpPolicy {
     worst_case_requests_per_page: u32,
     producer_round_timeout_seconds: u64,
     failure_backoff_max_seconds: u64,
+    retry_state_persistence: &'static str,
+    successful_import_clears_retry_atomically: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -432,6 +437,8 @@ fn build_directory_replica_status_response(
             worst_case_requests_per_page: DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE,
             producer_round_timeout_seconds: DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS,
             failure_backoff_max_seconds: DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS,
+            retry_state_persistence: "audited_sqlite",
+            successful_import_clears_retry_atomically: true,
         },
         producers,
         privacy_invariant:
@@ -648,6 +655,14 @@ mod tests {
         assert_eq!(
             public["catch_up_policy"]["producer_round_timeout_seconds"].as_u64(),
             Some(DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            public["catch_up_policy"]["retry_state_persistence"].as_str(),
+            Some("audited_sqlite")
+        );
+        assert_eq!(
+            public["catch_up_policy"]["successful_import_clears_retry_atomically"].as_bool(),
+            Some(true)
         );
         assert!(public.get("producers").is_none());
 

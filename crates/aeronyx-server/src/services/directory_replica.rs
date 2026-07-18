@@ -9,7 +9,7 @@
 //! of inserting remote blocks into its own locally produced Directory Chain.
 //!
 //! ## Main Functionality
-//! - Stores each remote producer chain under an independent SQLite namespace.
+//! - Stores each remote producer chain under an independent `SQLite` namespace.
 //! - Re-verifies signed response evidence, blocks, commitments, and descriptor
 //!   objects before one atomic import transaction.
 //! - Makes exact repeated pages idempotent.
@@ -18,6 +18,8 @@
 //! - Records authenticated descriptor equivocation without blaming an honest
 //!   chain producer that merely observed the conflicting public descriptors.
 //! - Audits every replica chain and index before the node may synchronize.
+//! - Persists bounded producer retry state across process restarts and clears
+//!   it atomically with the next authenticated successful page.
 //! - Exposes low-cost aggregate snapshots and privacy-safe synchronization
 //!   observations, including bounded retry state, without re-running a full
 //!   cryptographic audit per API read.
@@ -30,12 +32,13 @@
 //! - The local producer store remains the only source served by peer routes.
 //!
 //! ## Main Logical Flow
-//! 1. Open the existing Directory Chain SQLite file and initialize only the
+//! 1. Open the existing Directory Chain `SQLite` file and initialize only the
 //!    `directory_replica_*` tables.
 //! 2. Pin schema, chain id, and the local node identity in replica metadata.
 //! 3. Audit every accepted producer prefix and all durable incident evidence.
 //! 4. Re-verify the signed range-response frame and exact descriptor objects.
-//! 5. Atomically append a contiguous producer prefix or persist quarantine.
+//! 5. Atomically append a contiguous producer prefix, clear its retry state,
+//!    or persist quarantine without mutating another producer namespace.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -53,6 +56,8 @@
 //! - Keep all limits synchronized with the core Directory Sync V1 contract.
 //!
 //! ## Last Modified
+//! v0.3.0-DirectoryReplicaDurableRetry - Added an atomic schema v1-to-v2
+//! migration and audited restart-durable producer retry state.
 //! v0.2.2-DirectoryReplicaRetryRuntime - Added producer-local retry boundaries
 //! and backoff skip counters to process-lifetime synchronization telemetry.
 //! v0.2.1-DirectoryReplicaModuleSplit - Updated transport and status ownership.
@@ -78,12 +83,18 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
-const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 1;
+const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 2;
+const DIRECTORY_REPLICA_SCHEMA_VERSION_V1: i64 = 1;
 const MAX_DIRECTORY_BLOCK_BYTES: u64 = 64 * 1024;
 const MAX_DIRECTORY_DESCRIPTOR_OBJECT_BYTES: u64 = 32 * 1024;
 const MAX_DIRECTORY_SYNC_EVIDENCE_BYTES: usize = 512 * 1024;
 const DIRECTORY_REPLICA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_TIMESTAMP_SKEW_SECS: u64 = 60;
+const MAX_DIRECTORY_REPLICA_FAILURE_REASON_BYTES: usize = 96;
+/// Maximum producer failure streak retained in memory and audited `SQLite`.
+pub(crate) const DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES: u64 = 64;
+/// Maximum durable retry delay accepted by the replica store and scheduler.
+pub(crate) const DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS: u64 = 30 * 60;
 
 /// Failures returned by the producer-isolated replica store.
 #[derive(Debug, thiserror::Error)]
@@ -91,7 +102,7 @@ pub enum DirectoryReplicaStoreError {
     /// Filesystem setup failed.
     #[error("directory replica filesystem error: {0}")]
     Io(#[from] std::io::Error),
-    /// SQLite rejected a schema, query, or transaction operation.
+    /// `SQLite` rejected a schema, query, or transaction operation.
     #[error("directory replica sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     /// A protocol object could not be encoded or decoded safely.
@@ -127,6 +138,8 @@ pub struct DirectoryReplicaAudit {
     pub commitments: u64,
     /// Number of durable authenticated incidents.
     pub incidents: u64,
+    /// Number of audited producer-local retry rows.
+    pub retry_states: u64,
 }
 
 /// Low-cost aggregate view of the already audited replica namespace.
@@ -216,6 +229,27 @@ pub struct DirectoryReplicaImportReport {
     pub tip_hash: [u8; 32],
 }
 
+/// Restart-durable producer-local synchronization failure state.
+///
+/// The state contains bounded control-plane scheduling metadata only. It never
+/// contains endpoints, response bodies, descriptors, routes, payloads, client
+/// identifiers, private keys, wallet traffic, or social graph data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryReplicaRetryState {
+    /// Remote producer identity used as the local scheduling key.
+    pub producer: [u8; 32],
+    /// Consecutive failures since the last authenticated successful page.
+    pub consecutive_failures: u64,
+    /// Earliest Unix timestamp at which another pull may begin.
+    pub retry_not_before: Option<u64>,
+    /// Timestamp of the most recent failed pull.
+    pub last_failure_at: u64,
+    /// Stable bounded internal failure bucket.
+    pub last_failure_reason: String,
+    /// Number of timer rounds skipped while durable backoff was active.
+    pub backoff_skips: u64,
+}
+
 /// Runtime-only synchronization observation for one pinned producer.
 ///
 /// These fields intentionally contain no endpoint, full response, descriptor,
@@ -302,6 +336,27 @@ impl DirectoryReplicaSyncRuntime {
         }
     }
 
+    /// Restores audited retry boundaries before the coordinator starts.
+    ///
+    /// Process-lifetime attempt/page counters remain zero after restart; only
+    /// the active failure streak, retry boundary, reason, and skip count are
+    /// restored because those fields control request pressure.
+    pub fn restore_retry_states(&self, states: &[DirectoryReplicaRetryState]) {
+        let mut observations = self.observations.lock();
+        for state in states {
+            let observation = observations
+                .entry(state.producer)
+                .or_insert_with(|| DirectoryReplicaSyncObservation::new(state.producer));
+            observation.last_attempt_at = Some(state.last_failure_at);
+            observation.last_failure_at = Some(state.last_failure_at);
+            observation.last_failure_reason = Some(state.last_failure_reason.clone());
+            observation.retry_not_before = state.retry_not_before;
+            observation.consecutive_failures = state.consecutive_failures;
+            observation.backoff_skips = state.backoff_skips;
+        }
+        drop(observations);
+    }
+
     /// Records the beginning of one bounded page request.
     pub fn record_attempt(&self, producer: [u8; 32], attempted_at: u64) {
         let mut observations = self.observations.lock();
@@ -363,7 +418,10 @@ impl DirectoryReplicaSyncRuntime {
         observation.last_failure_at = Some(failed_at);
         observation.last_failure_reason = Some(reason.chars().take(96).collect());
         observation.retry_not_before = retry_not_before.map(|value| value.max(failed_at));
-        observation.consecutive_failures = observation.consecutive_failures.saturating_add(1);
+        observation.consecutive_failures = observation
+            .consecutive_failures
+            .saturating_add(1)
+            .min(DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES);
         observation.failed_attempts = observation.failed_attempts.saturating_add(1);
         drop(observations);
     }
@@ -473,7 +531,7 @@ impl DirectoryReplicaStore {
         Ok((store, audit))
     }
 
-    /// Returns the shared Directory Chain SQLite path.
+    /// Returns the shared Directory Chain `SQLite` path.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -494,13 +552,13 @@ impl DirectoryReplicaStore {
     /// Returns a low-cost aggregate snapshot of persisted, already-audited
     /// replica indexes.
     ///
-    /// This is an observability read, not a replacement for Self::audit.
+    /// This is an observability read, not a replacement for [`Self::audit`].
     /// Startup still performs the full signature, linkage, object, index, and
     /// incident audit before synchronization or API serving begins.
     ///
     /// # Errors
-    /// Returns DirectoryReplicaStoreError when a persisted status row is
-    /// malformed or SQLite cannot complete the bounded aggregate query.
+    /// Returns [`DirectoryReplicaStoreError`] when a persisted status row is
+    /// malformed or `SQLite` cannot complete the bounded aggregate query.
     pub fn status_snapshot(
         &self,
     ) -> Result<DirectoryReplicaStoreSnapshot, DirectoryReplicaStoreError> {
@@ -579,6 +637,130 @@ impl DirectoryReplicaStore {
             snapshot.producer_snapshots.push(producer_snapshot);
         }
         Ok(snapshot)
+    }
+
+    /// Returns all audited restart-durable producer retry states.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when metadata or any bounded
+    /// retry-state row is malformed.
+    pub fn retry_states(
+        &self,
+    ) -> Result<Vec<DirectoryReplicaRetryState>, DirectoryReplicaStoreError> {
+        let connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        Self::load_retry_states(&connection, &self.local_node_id)
+    }
+
+    /// Persists one producer failure before exposing its retry boundary.
+    ///
+    /// The failure reason must be a stable ASCII bucket. Peer-controlled error
+    /// text, endpoints, response bodies, and payloads are rejected.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] for invalid bounded state or a
+    /// failed atomic `SQLite` transaction.
+    pub fn persist_retry_failure(
+        &self,
+        producer: [u8; 32],
+        consecutive_failures: u64,
+        retry_not_before: Option<u64>,
+        last_failure_at: u64,
+        last_failure_reason: &str,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        validate_retry_state_fields(
+            &producer,
+            &self.local_node_id,
+            consecutive_failures,
+            retry_not_before,
+            last_failure_at,
+            last_failure_reason,
+        )
+        .map_err(|reason| DirectoryReplicaStoreError::Request(reason.to_string()))?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::ensure_producer_row(&transaction, &producer, last_failure_at)?;
+        transaction.execute(
+            "INSERT INTO directory_replica_retry_state
+                (producer, consecutive_failures, retry_not_before,
+                 last_failure_at, last_failure_reason, backoff_skips, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?4)
+             ON CONFLICT(producer) DO UPDATE SET
+                 consecutive_failures = excluded.consecutive_failures,
+                 retry_not_before = CASE
+                     WHEN excluded.last_failure_at >= directory_replica_retry_state.last_failure_at
+                     THEN excluded.retry_not_before
+                     ELSE directory_replica_retry_state.retry_not_before
+                 END,
+                 last_failure_at = MAX(
+                     directory_replica_retry_state.last_failure_at,
+                     excluded.last_failure_at
+                 ),
+                 last_failure_reason = CASE
+                     WHEN excluded.last_failure_at >= directory_replica_retry_state.last_failure_at
+                     THEN excluded.last_failure_reason
+                     ELSE directory_replica_retry_state.last_failure_reason
+                 END,
+                 updated_at = MAX(
+                     directory_replica_retry_state.updated_at,
+                     excluded.updated_at
+                 )",
+            params![
+                producer.as_slice(),
+                u64_to_i64(consecutive_failures, "replica retry consecutive failures")?,
+                retry_not_before
+                    .map(|value| u64_to_i64(value, "replica retry boundary"))
+                    .transpose()?,
+                u64_to_i64(last_failure_at, "replica retry failure timestamp")?,
+                last_failure_reason,
+            ],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        Ok(())
+    }
+
+    /// Persists one scheduled round skipped by an active retry boundary.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when the expected active durable
+    /// retry row is missing or `SQLite` cannot commit the update.
+    pub fn persist_retry_skip(
+        &self,
+        producer: [u8; 32],
+        skipped_at: u64,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        if producer == [0u8; 32] || producer == self.local_node_id || skipped_at == 0 {
+            return Err(DirectoryReplicaStoreError::Request(
+                "replica retry skip fields are invalid".to_string(),
+            ));
+        }
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE directory_replica_retry_state
+             SET backoff_skips = CASE
+                     WHEN backoff_skips < 9223372036854775807
+                     THEN backoff_skips + 1
+                     ELSE backoff_skips
+                 END,
+                 updated_at = MAX(updated_at, ?2)
+             WHERE producer = ?1
+               AND retry_not_before IS NOT NULL
+               AND retry_not_before > ?2",
+            params![
+                producer.as_slice(),
+                u64_to_i64(skipped_at, "replica retry skip timestamp")?
+            ],
+        )?;
+        if changed != 1 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "active replica retry state is missing during skip".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        drop(connection);
+        Ok(())
     }
 
     /// Re-verifies and atomically imports one signed bounded producer page.
@@ -688,6 +870,7 @@ impl DirectoryReplicaStore {
                     incident.kind.to_string(),
                 ));
             }
+            Self::clear_retry_state(&transaction, &producer)?;
             transaction.commit()?;
             return Ok(DirectoryReplicaImportReport {
                 blocks_inserted: 0,
@@ -779,6 +962,7 @@ impl DirectoryReplicaStore {
                 u64_to_i64(observed_at, "replica update timestamp")?
             ],
         )?;
+        Self::clear_retry_state(&transaction, &producer)?;
         transaction.commit()?;
         Ok(DirectoryReplicaImportReport {
             blocks_inserted,
@@ -790,7 +974,7 @@ impl DirectoryReplicaStore {
         })
     }
 
-    /// Audits metadata, producer prefixes, all indexes, and incident digests.
+    /// Audits metadata, producer prefixes, indexes, incidents, and retry rows.
     ///
     /// # Errors
     /// Returns [`DirectoryReplicaStoreError`] on the first malformed row,
@@ -806,6 +990,13 @@ impl DirectoryReplicaStore {
         for tip in producers {
             Self::audit_producer(&connection, &tip, observed_at, &mut report)?;
         }
+        report.retry_states =
+            u64::try_from(Self::load_retry_states(&connection, &self.local_node_id)?.len())
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "replica retry state count exceeds platform bounds".to_string(),
+                    )
+                })?;
         let incidents = Self::audit_incidents(&connection)?;
         report.incidents = incidents;
         Ok(report)
@@ -815,7 +1006,17 @@ impl DirectoryReplicaStore {
         connection: &mut Connection,
         local_node_id: &[u8; 32],
     ) -> Result<(), DirectoryReplicaStoreError> {
-        connection.execute_batch(
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::create_schema_tables(&transaction)?;
+        Self::migrate_schema_metadata(&transaction, local_node_id)?;
+        transaction.commit()?;
+        Self::validate_metadata(connection, local_node_id)
+    }
+
+    fn create_schema_tables(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS directory_replica_meta (
                  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                  schema_version INTEGER NOT NULL,
@@ -886,30 +1087,82 @@ impl DirectoryReplicaStore {
                  observed_at INTEGER NOT NULL CHECK (observed_at > 0),
                  FOREIGN KEY (producer) REFERENCES directory_replica_chains(producer)
                      ON UPDATE RESTRICT ON DELETE RESTRICT
+             );
+             CREATE TABLE IF NOT EXISTS directory_replica_retry_state (
+                 producer BLOB PRIMARY KEY CHECK (length(producer) = 32),
+                 consecutive_failures INTEGER NOT NULL
+                     CHECK (consecutive_failures > 0 AND consecutive_failures <= 64),
+                 retry_not_before INTEGER
+                     CHECK (retry_not_before IS NULL OR retry_not_before > 0),
+                 last_failure_at INTEGER NOT NULL CHECK (last_failure_at > 0),
+                 last_failure_reason TEXT NOT NULL
+                     CHECK (length(last_failure_reason) BETWEEN 1 AND 96),
+                 backoff_skips INTEGER NOT NULL CHECK (backoff_skips >= 0),
+                 updated_at INTEGER NOT NULL CHECK (updated_at > 0),
+                 FOREIGN KEY (producer) REFERENCES directory_replica_chains(producer)
+                     ON UPDATE RESTRICT ON DELETE RESTRICT
              );",
         )?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<i64> = transaction
+        Ok(())
+    }
+
+    fn migrate_schema_metadata(
+        transaction: &Transaction<'_>,
+        local_node_id: &[u8; 32],
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        let existing: Option<(i64, Vec<u8>, Vec<u8>)> = transaction
             .query_row(
-                "SELECT schema_version FROM directory_replica_meta WHERE singleton = 1",
+                "SELECT schema_version, chain_id, local_node_id
+                 FROM directory_replica_meta WHERE singleton = 1",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        if existing.is_none() {
-            transaction.execute(
-                "INSERT INTO directory_replica_meta
-                    (singleton, schema_version, chain_id, local_node_id)
-                 VALUES (1, ?1, ?2, ?3)",
-                params![
-                    DIRECTORY_REPLICA_SCHEMA_VERSION,
-                    AERONYX_DIRECTORY_MAINNET_CHAIN_ID.as_slice(),
-                    local_node_id.as_slice()
-                ],
-            )?;
+        match existing {
+            None => {
+                transaction.execute(
+                    "INSERT INTO directory_replica_meta
+                        (singleton, schema_version, chain_id, local_node_id)
+                     VALUES (1, ?1, ?2, ?3)",
+                    params![
+                        DIRECTORY_REPLICA_SCHEMA_VERSION,
+                        AERONYX_DIRECTORY_MAINNET_CHAIN_ID.as_slice(),
+                        local_node_id.as_slice()
+                    ],
+                )?;
+            }
+            Some((version, chain_id, stored_local_node_id)) => {
+                if bytes32(&chain_id, "replica metadata chain id")?
+                    != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+                    || bytes32(&stored_local_node_id, "replica metadata local node id")?
+                        != *local_node_id
+                {
+                    return Err(DirectoryReplicaStoreError::Integrity(
+                        "directory replica metadata identity is incompatible".to_string(),
+                    ));
+                }
+                match version {
+                    DIRECTORY_REPLICA_SCHEMA_VERSION => {}
+                    DIRECTORY_REPLICA_SCHEMA_VERSION_V1 => {
+                        transaction.execute(
+                            "UPDATE directory_replica_meta
+                             SET schema_version = ?1
+                             WHERE singleton = 1 AND schema_version = ?2",
+                            params![
+                                DIRECTORY_REPLICA_SCHEMA_VERSION,
+                                DIRECTORY_REPLICA_SCHEMA_VERSION_V1
+                            ],
+                        )?;
+                    }
+                    _ => {
+                        return Err(DirectoryReplicaStoreError::Integrity(
+                            "directory replica schema version is unsupported".to_string(),
+                        ));
+                    }
+                }
+            }
         }
-        transaction.commit()?;
-        Self::validate_metadata(connection, local_node_id)
+        Ok(())
     }
 
     fn validate_metadata(
@@ -941,7 +1194,8 @@ impl DirectoryReplicaStore {
             || bytes32(&metadata.2, "replica metadata local node id")? != *local_node_id
         {
             return Err(DirectoryReplicaStoreError::Integrity(
-                "directory replica metadata does not match this node and V1 production".to_string(),
+                "directory replica metadata does not match this node and Directory Sync V1"
+                    .to_string(),
             ));
         }
         Ok(())
@@ -962,6 +1216,17 @@ impl DirectoryReplicaStore {
                 [0u8; 32].as_slice(),
                 u64_to_i64(observed_at, "replica observed timestamp")?
             ],
+        )?;
+        Ok(())
+    }
+
+    fn clear_retry_state(
+        transaction: &Transaction<'_>,
+        producer: &[u8; 32],
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        transaction.execute(
+            "DELETE FROM directory_replica_retry_state WHERE producer = ?1",
+            params![producer.as_slice()],
         )?;
         Ok(())
     }
@@ -1023,6 +1288,82 @@ impl DirectoryReplicaStore {
                 let producer = bytes32(&producer, "replica producer")?;
                 Self::load_tip(connection, &producer)
             })
+            .collect()
+    }
+
+    fn load_retry_states(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+    ) -> Result<Vec<DirectoryReplicaRetryState>, DirectoryReplicaStoreError> {
+        let mut statement = connection.prepare(
+            "SELECT producer, consecutive_failures, retry_not_before,
+                    last_failure_at, last_failure_reason, backoff_skips, updated_at
+             FROM directory_replica_retry_state
+             ORDER BY producer ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(
+                    producer,
+                    consecutive_failures,
+                    retry_not_before,
+                    last_failure_at,
+                    last_failure_reason,
+                    backoff_skips,
+                    updated_at,
+                )| {
+                    let producer = bytes32(&producer, "replica retry producer")?;
+                    let consecutive_failures = nonnegative_i64_to_u64(
+                        consecutive_failures,
+                        "replica retry consecutive failures",
+                    )?;
+                    let retry_not_before = retry_not_before
+                        .map(|value| nonnegative_i64_to_u64(value, "replica retry boundary"))
+                        .transpose()?;
+                    let last_failure_at =
+                        nonnegative_i64_to_u64(last_failure_at, "replica retry failure timestamp")?;
+                    validate_retry_state_fields(
+                        &producer,
+                        local_node_id,
+                        consecutive_failures,
+                        retry_not_before,
+                        last_failure_at,
+                        &last_failure_reason,
+                    )
+                    .map_err(|reason| DirectoryReplicaStoreError::Integrity(reason.to_string()))?;
+                    let updated_at =
+                        nonnegative_i64_to_u64(updated_at, "replica retry update timestamp")?;
+                    if updated_at < last_failure_at {
+                        return Err(DirectoryReplicaStoreError::Integrity(
+                            "replica retry update timestamp predates failure".to_string(),
+                        ));
+                    }
+                    Ok(DirectoryReplicaRetryState {
+                        producer,
+                        consecutive_failures,
+                        retry_not_before,
+                        last_failure_at,
+                        last_failure_reason,
+                        backoff_skips: nonnegative_i64_to_u64(
+                            backoff_skips,
+                            "replica retry skip count",
+                        )?,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -1714,6 +2055,42 @@ fn decode_descriptor_object(
         .map_err(|error| DirectoryReplicaStoreError::Codec(error.to_string()))
 }
 
+fn validate_retry_state_fields(
+    producer: &[u8; 32],
+    local_node_id: &[u8; 32],
+    consecutive_failures: u64,
+    retry_not_before: Option<u64>,
+    last_failure_at: u64,
+    last_failure_reason: &str,
+) -> Result<(), &'static str> {
+    if *producer == [0u8; 32] || producer == local_node_id {
+        return Err("replica retry producer is invalid");
+    }
+    if consecutive_failures == 0
+        || consecutive_failures > DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES
+    {
+        return Err("replica retry failure count is invalid");
+    }
+    if last_failure_at == 0 {
+        return Err("replica retry failure timestamp is invalid");
+    }
+    if retry_not_before.is_some_and(|retry_at| {
+        retry_at < last_failure_at
+            || retry_at.saturating_sub(last_failure_at) > DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS
+    }) {
+        return Err("replica retry boundary is invalid");
+    }
+    if last_failure_reason.is_empty()
+        || last_failure_reason.len() > MAX_DIRECTORY_REPLICA_FAILURE_REASON_BYTES
+        || !last_failure_reason
+            .bytes()
+            .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || value == b'_')
+    {
+        return Err("replica retry failure reason is invalid");
+    }
+    Ok(())
+}
+
 fn bytes32(bytes: &[u8], field: &str) -> Result<[u8; 32], DirectoryReplicaStoreError> {
     bytes.try_into().map_err(|_| {
         DirectoryReplicaStoreError::Integrity(format!("{field} must contain exactly 32 bytes"))
@@ -1886,6 +2263,204 @@ mod tests {
     }
 
     #[test]
+    fn schema_v1_is_atomically_migrated_to_v2() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x31; 32]).unwrap();
+        let (store, _) = DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW).unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE directory_replica_meta SET schema_version = ?1 WHERE singleton = 1",
+                params![DIRECTORY_REPLICA_SCHEMA_VERSION_V1],
+            )
+            .unwrap();
+        connection
+            .execute_batch("DROP TABLE directory_replica_retry_state;")
+            .unwrap();
+        drop(connection);
+
+        let (store, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 1).unwrap();
+        assert_eq!(audit.retry_states, 0);
+        let connection = store.connection.lock();
+        let version: i64 = connection
+            .query_row(
+                "SELECT schema_version FROM directory_replica_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retry_table: String = connection
+            .query_row(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name = 'directory_replica_retry_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
+        assert_eq!(retry_table, "directory_replica_retry_state");
+    }
+
+    #[test]
+    fn retry_state_survives_reopen_and_is_fully_audited() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x32; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x33; 32]).unwrap();
+        let producer_id = producer.public_key_bytes();
+        let (store, _) = DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW).unwrap();
+        store
+            .persist_retry_failure(
+                producer_id,
+                2,
+                Some(NOW + 120),
+                NOW,
+                "directory_range_transport_failed",
+            )
+            .unwrap();
+        store.persist_retry_skip(producer_id, NOW + 1).unwrap();
+        let states = store.retry_states().unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].consecutive_failures, 2);
+        assert_eq!(states[0].retry_not_before, Some(NOW + 120));
+        assert_eq!(states[0].backoff_skips, 1);
+        drop(store);
+
+        let (reopened, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 2).unwrap();
+        assert_eq!(audit.producers, 1);
+        assert_eq!(audit.retry_states, 1);
+        assert_eq!(reopened.retry_states().unwrap(), states);
+    }
+
+    #[test]
+    fn older_failure_timestamp_cannot_shorten_retry_boundary() {
+        let temp = TempDir::new().unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0x3a; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x3b; 32]).unwrap();
+        let producer_id = producer.public_key_bytes();
+        let (store, _) = DirectoryReplicaStore::open(
+            temp.path().join("directory.db"),
+            local.public_key_bytes(),
+            NOW,
+        )
+        .unwrap();
+        store
+            .persist_retry_failure(
+                producer_id,
+                2,
+                Some(NOW + 300),
+                NOW,
+                "directory_range_transport_failed",
+            )
+            .unwrap();
+        store
+            .persist_retry_failure(
+                producer_id,
+                3,
+                Some(NOW + 100),
+                NOW - 100,
+                "directory_object_transport_failed",
+            )
+            .unwrap();
+
+        let state = &store.retry_states().unwrap()[0];
+        assert_eq!(state.consecutive_failures, 3);
+        assert_eq!(state.last_failure_at, NOW);
+        assert_eq!(state.retry_not_before, Some(NOW + 300));
+        assert_eq!(
+            state.last_failure_reason,
+            "directory_range_transport_failed"
+        );
+    }
+
+    #[test]
+    fn authenticated_import_atomically_clears_durable_retry_state() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x34; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x35; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x36; 32]).unwrap();
+        let object = descriptor(&subject, 1);
+        let first = block(&producer, 1, [0u8; 32], &object);
+        let frame = response_frame(
+            &producer,
+            vec![first.clone()],
+            false,
+            1,
+            first.hash(),
+            [0x37; 16],
+        );
+        let producer_id = producer.public_key_bytes();
+        let (store, _) = DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW).unwrap();
+        store
+            .persist_retry_failure(
+                producer_id,
+                3,
+                Some(NOW + 300),
+                NOW,
+                "directory_object_transport_failed",
+            )
+            .unwrap();
+        assert_eq!(store.retry_states().unwrap().len(), 1);
+
+        store
+            .import_verified_page(
+                producer_id,
+                std::slice::from_ref(&first),
+                std::slice::from_ref(&object),
+                1,
+                first.hash(),
+                &frame,
+                NOW + 20,
+            )
+            .unwrap();
+        assert!(store.retry_states().unwrap().is_empty());
+        drop(store);
+
+        let (_, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 21).unwrap();
+        assert_eq!(audit.retry_states, 0);
+        assert_eq!(audit.blocks, 1);
+    }
+
+    #[test]
+    fn retry_state_rejects_peer_controlled_or_unbounded_fields() {
+        let temp = TempDir::new().unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0x38; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x39; 32]).unwrap();
+        let (store, _) = DirectoryReplicaStore::open(
+            temp.path().join("directory.db"),
+            local.public_key_bytes(),
+            NOW,
+        )
+        .unwrap();
+        assert!(store
+            .persist_retry_failure(
+                producer.public_key_bytes(),
+                1,
+                None,
+                NOW,
+                "https://peer.example/private",
+            )
+            .is_err());
+        assert!(store
+            .persist_retry_failure(
+                producer.public_key_bytes(),
+                DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES + 1,
+                None,
+                NOW,
+                "directory_range_transport_failed",
+            )
+            .is_err());
+        assert!(store.retry_states().unwrap().is_empty());
+    }
+
+    #[test]
     fn sync_runtime_tracks_bounded_success_and_stable_failure_without_endpoint_data() {
         let producer = [0x44; 32];
         let runtime = DirectoryReplicaSyncRuntime::default();
@@ -1950,6 +2525,45 @@ mod tests {
         assert_eq!(observation.failed_attempts, 1);
         assert_eq!(observation.backoff_skips, 1);
         assert_eq!(observation.successful_pages, 1);
+    }
+
+    #[test]
+    fn sync_runtime_restores_only_bounded_scheduler_state() {
+        let producer = [0x46; 32];
+        let runtime = DirectoryReplicaSyncRuntime::default();
+        runtime.register_producers(&[producer]);
+        runtime.restore_retry_states(&[DirectoryReplicaRetryState {
+            producer,
+            consecutive_failures: DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES,
+            retry_not_before: Some(NOW + 600),
+            last_failure_at: NOW,
+            last_failure_reason: "directory_range_transport_failed".to_string(),
+            backoff_skips: 7,
+        }]);
+
+        let observation = &runtime.snapshot()[0];
+        assert_eq!(
+            observation.consecutive_failures,
+            DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES
+        );
+        assert_eq!(observation.retry_not_before, Some(NOW + 600));
+        assert_eq!(observation.last_attempt_at, Some(NOW));
+        assert_eq!(observation.last_failure_at, Some(NOW));
+        assert_eq!(observation.backoff_skips, 7);
+        assert_eq!(observation.total_attempts, 0);
+        assert_eq!(observation.failed_attempts, 0);
+        assert_eq!(observation.successful_pages, 0);
+
+        runtime.record_failure(
+            producer,
+            NOW + 601,
+            "directory_range_transport_failed",
+            Some(NOW + 1_200),
+        );
+        assert_eq!(
+            runtime.snapshot()[0].consecutive_failures,
+            DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.13.0 - Added producer-local Directory Replica deadlines, bounded exponential retry backoff, and privacy-safe scheduler telemetry.
+Modification Reason: v0.14.0 - Made producer-local Directory Replica retry state audited, restart-durable, bounded, and atomically cleared by authenticated success.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.13.0 - Added a 45-second producer deadline, bounded failure backoff, and additive aggregate/operator retry status.
+Last Modified: v0.14.0 - Added atomic replica schema v1-to-v2 migration and restart-durable producer retry scheduling.
+Previous: v0.13.0 - Added a 45-second producer deadline, bounded failure backoff, and additive aggregate/operator retry status.
 Previous: v0.12.0 - Added dedicated replica coordinator/status modules, bounded producer concurrency, and 5-15 second deterministic startup synchronization.
 Previous: v0.11.0 - Added aggregate/public and fingerprinted/operator replica status plus bounded multi-page synchronization.
 Previous: v0.10.1 - Verified pinned, signed replica synchronization across US1, Korean1, and Noway1 without mixing producer histories.
@@ -1122,6 +1123,60 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-18 - Made Directory Replica retry scheduling restart-durable.
+- Files changed:
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - crates/aeronyx-server/src/server.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Persistence and recovery:
+  - Directory Replica metadata migrates atomically from schema v1 to v2 in one
+    SQLite IMMEDIATE transaction before startup audit can pass.
+  - Schema v2 stores only producer id, bounded consecutive failure count,
+    stable internal reason bucket, retry boundary, failure/update timestamps,
+    and a saturated skipped-round counter.
+  - The coordinator restores retry rows only for currently pinned producers
+    before its first request, preventing restart loops from bypassing backoff.
+  - Failure and skipped-round writes run on blocking workers so synchronous
+    SQLite access cannot stall the async transport runtime.
+  - An authenticated empty or non-empty successful page clears its producer's
+    retry row inside the same transaction as the accepted import.
+- Safety bounds:
+  - Failure streaks saturate at 64 in memory and SQLite.
+  - Retry delay remains capped at 30 minutes.
+  - Failure reasons accept only 1-96 lowercase ASCII letters, digits, and
+    underscores; peer-controlled endpoints, bodies, and error strings fail
+    validation before a producer row is created.
+  - Skip counters saturate at SQLite's signed integer maximum, and update time
+    never moves backward if the system clock is corrected.
+- Observability and privacy:
+  - Startup audit reports the aggregate number of validated retry rows.
+  - Status policy adds `retry_state_persistence = audited_sqlite` and
+    `successful_import_clears_retry_atomically = true` without changing the v1
+    response contract or exposing additional producer identity.
+  - Retry persistence never stores endpoints, response bodies, descriptors,
+    routes, selected hops, message ids, payloads, ciphertext, Memory Chain
+    records, client metadata, private keys, wallet traffic, or social graphs.
+- Compatibility and rollback:
+  - Directory Sync V1 frames, endpoints, signatures, request budgets, config,
+    producer isolation, and public/operator privacy tiers remain unchanged.
+  - Existing schema v1 databases upgrade automatically and retain all replica
+    chain, object, commitment, and incident rows.
+  - Schema v2 is intentionally strict. Rolling back to a pre-v2 binary requires
+    restoring the matching pre-upgrade SQLite backup as well as the binary.
+- Verification:
+  - Directory Replica focused tests: 19 passed, including v1-to-v2 migration,
+    reopen recovery, bounded-field rejection, runtime restoration, and atomic
+    success cleanup.
+  - aeronyx-server regression suite: 1,078/1,078 passed.
+  - Package integration group: 1 passed, 9 intentionally ignored.
+  - cargo check -p aeronyx-server --tests --locked passed.
+  - cargo clippy -p aeronyx-server --lib --no-deps --locked completed; the
+    changed coordinator/status paths and new persistence methods added no lint.
+  - Optimized release build completed, and the existing US1
+    `/etc/aeronyx/server.toml` passed the release binary's `validate` command.
+
 2026-07-18 - Added producer-local Directory Replica failure containment.
 - Files changed:
   - crates/aeronyx-server/src/api/directory_replica_sync.rs

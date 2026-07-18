@@ -14,6 +14,8 @@
 //! - Starts the first synchronization round after a short deterministic jitter.
 //! - Synchronizes independent producers concurrently with a strict fan-out cap.
 //! - Applies a producer-local round deadline and exponential failure backoff.
+//! - Restores audited retry boundaries before the first post-restart request.
+//! - Persists failure/skip scheduling without blocking the async runtime.
 //! - Preserves producer-local page and request budgets on every round.
 //! - Records only bounded, privacy-safe synchronization observations.
 //! - Cancels an in-flight round when server shutdown is requested.
@@ -30,7 +32,8 @@
 //! 3. On each tick, run at most four producer synchronization futures at once.
 //! 4. Skip producer-local retries whose bounded backoff window is still active.
 //! 5. Pull pages until the request budget or 45-second deadline is exhausted.
-//! 6. Stop the complete round immediately when shutdown wins the select.
+//! 6. Persist failures, and let a successful import atomically clear backoff.
+//! 7. Stop the complete round immediately when shutdown wins the select.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -46,6 +49,8 @@
 //!   peer-controlled strings, endpoints, or response bodies in those reasons.
 //!
 //! ## Last Modified
+//! `v0.4.0-DirectoryReplicaDurableBackoff` - Restored audited `SQLite` retry state
+//! at startup and persisted failure/skip updates through blocking workers.
 //! v0.3.0-DirectoryReplicaBackoff - Added producer-local round deadlines,
 //! exponential retry backoff, and bounded retry scheduling telemetry.
 //! v0.2.0-DirectoryReplicaClient - Owns outbound Directory Sync request,
@@ -75,6 +80,9 @@ use tracing::{debug, info, warn};
 
 use crate::api::memchain_peer::{commitment_peer_endpoint_is_public, commitment_peer_url};
 use crate::api::read_bounded_http_response;
+use crate::services::directory_replica::{
+    DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS, DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES,
+};
 use crate::services::{
     DirectoryReplicaImportReport, DirectoryReplicaStore, DirectoryReplicaStoreError,
     DirectoryReplicaSyncRuntime, PeerStore,
@@ -85,7 +93,8 @@ pub(crate) const DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS: usize = 4;
 /// Hard wall-clock ceiling for one producer within a synchronization round.
 pub(crate) const DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS: u64 = 45;
 /// Maximum producer-local retry delay after repeated consecutive failures.
-pub(crate) const DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS: u64 = 30 * 60;
+pub(crate) const DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS: u64 =
+    DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS;
 /// Minimum delay before the first synchronization round after startup.
 const DIRECTORY_SYNC_STARTUP_DELAY_MIN_SECS: u64 = 5;
 /// Inclusive startup jitter span: 5 + (identity byte modulo 11) = 5-15 seconds.
@@ -145,10 +154,7 @@ fn directory_sync_request_count_for_objects(object_count: usize) -> u32 {
 /// 1, 3, 7, then at most 15 nominal intervals before the hard delay cap.
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
-fn directory_sync_failure_backoff_delay_secs(
-    interval_secs: u64,
-    consecutive_failures: u64,
-) -> u64 {
+fn directory_sync_failure_backoff_delay_secs(interval_secs: u64, consecutive_failures: u64) -> u64 {
     if consecutive_failures <= 1 {
         return 0;
     }
@@ -176,6 +182,7 @@ pub struct DirectoryReplicaSyncCoordinator {
     peer_store: Arc<PeerStore>,
     identity: Arc<IdentityKeyPair>,
     client: reqwest::Client,
+    restored_retry_states: usize,
 }
 
 impl DirectoryReplicaSyncCoordinator {
@@ -199,6 +206,14 @@ impl DirectoryReplicaSyncCoordinator {
             return Err("directory_sync_interval_invalid");
         }
         runtime.register_producers(&peers);
+        let retry_states = store
+            .retry_states()
+            .map_err(|_| "directory_sync_retry_state_restore_failed")?
+            .into_iter()
+            .filter(|state| peers.contains(&state.producer))
+            .collect::<Vec<_>>();
+        runtime.restore_retry_states(&retry_states);
+        let restored_retry_states = retry_states.len();
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(5))
@@ -214,6 +229,7 @@ impl DirectoryReplicaSyncCoordinator {
             peer_store,
             identity,
             client,
+            restored_retry_states,
         })
     }
 
@@ -232,6 +248,7 @@ impl DirectoryReplicaSyncCoordinator {
                 max_concurrent_producers = DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS,
                 startup_delay_secs = startup_delay.as_secs(),
                 interval_secs = self.interval.as_secs(),
+                restored_retry_states = self.restored_retry_states,
                 "[DIRECTORY_REPLICA] Synchronization coordinator started"
             );
 
@@ -264,9 +281,11 @@ impl DirectoryReplicaSyncCoordinator {
     async fn synchronize_producer(&self, producer: [u8; 32]) {
         let now = unix_now_secs();
         if let Some(retry_at) = self.runtime.deferred_retry_until(&producer, now) {
+            let retry_state_durable = self.persist_retry_skip(producer, now).await;
             self.runtime.record_backoff_skip(producer);
             debug!(
                 retry_after_secs = retry_at.saturating_sub(now),
+                retry_state_durable,
                 "[DIRECTORY_REPLICA] Producer synchronization deferred by backoff"
             );
             return;
@@ -278,7 +297,8 @@ impl DirectoryReplicaSyncCoordinator {
         .await
         .is_err()
         {
-            self.record_producer_failure(producer, "directory_producer_round_timeout", None, None);
+            self.record_producer_failure(producer, "directory_producer_round_timeout", None, None)
+                .await;
         }
     }
 
@@ -335,14 +355,15 @@ impl DirectoryReplicaSyncCoordinator {
                         &reason,
                         Some(pages_completed),
                         Some(requests_used),
-                    );
+                    )
+                    .await;
                     break;
                 }
             }
         }
     }
 
-    fn record_producer_failure(
+    async fn record_producer_failure(
         &self,
         producer: [u8; 32],
         reason: &str,
@@ -353,23 +374,53 @@ impl DirectoryReplicaSyncCoordinator {
         let consecutive_failures = self
             .runtime
             .consecutive_failures(&producer)
-            .saturating_add(1);
+            .saturating_add(1)
+            .min(DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES);
         let retry_delay_secs = directory_sync_failure_backoff_delay_secs(
             self.interval.as_secs(),
             consecutive_failures,
         );
         let retry_not_before =
             (retry_delay_secs > 0).then(|| failed_at.saturating_add(retry_delay_secs));
+        let store = Arc::clone(&self.store);
+        let durable_reason = reason.to_string();
+        let retry_state_durable = tokio::task::spawn_blocking(move || {
+            store.persist_retry_failure(
+                producer,
+                consecutive_failures,
+                retry_not_before,
+                failed_at,
+                &durable_reason,
+            )
+        })
+        .await
+        .is_ok_and(|result| result.is_ok());
         self.runtime
             .record_failure(producer, failed_at, reason, retry_not_before);
         warn!(
             reason = %reason,
             consecutive_failures,
             retry_delay_secs,
+            retry_state_durable,
             pages_completed = ?pages_completed,
             requests_used = ?requests_used,
             "[DIRECTORY_REPLICA] Pinned producer sync round rejected"
         );
+    }
+
+    async fn persist_retry_skip(&self, producer: [u8; 32], skipped_at: u64) -> bool {
+        let store = Arc::clone(&self.store);
+        let durable =
+            tokio::task::spawn_blocking(move || store.persist_retry_skip(producer, skipped_at))
+                .await
+                .is_ok_and(|result| result.is_ok());
+        if !durable {
+            warn!(
+                reason = "directory_retry_skip_persist_failed",
+                "[DIRECTORY_REPLICA] Durable retry skip update rejected"
+            );
+        }
+        durable
     }
 }
 
@@ -756,6 +807,9 @@ fn unix_now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    const TEST_NOW: u64 = 1_700_000_000;
 
     #[test]
     fn startup_delay_is_stable_bounded_and_identity_spread() {
@@ -780,6 +834,53 @@ mod tests {
         assert_eq!(directory_sync_failure_backoff_delay_secs(120, 4), 840);
         assert_eq!(directory_sync_failure_backoff_delay_secs(120, 5), 1_800);
         assert_eq!(directory_sync_failure_backoff_delay_secs(120, 99), 1_800);
+    }
+
+    #[test]
+    fn coordinator_restores_retry_state_for_configured_producers_only() {
+        let temp = TempDir::new().unwrap();
+        let local = Arc::new(IdentityKeyPair::from_bytes(&[0xd1; 32]).unwrap());
+        let configured = IdentityKeyPair::from_bytes(&[0xd2; 32])
+            .unwrap()
+            .public_key_bytes();
+        let retired = IdentityKeyPair::from_bytes(&[0xd3; 32])
+            .unwrap()
+            .public_key_bytes();
+        let (store, _) = DirectoryReplicaStore::open(
+            temp.path().join("directory.db"),
+            local.public_key_bytes(),
+            TEST_NOW,
+        )
+        .unwrap();
+        for producer in [configured, retired] {
+            store
+                .persist_retry_failure(
+                    producer,
+                    2,
+                    Some(TEST_NOW + 300),
+                    TEST_NOW,
+                    "directory_range_transport_failed",
+                )
+                .unwrap();
+        }
+        let store = Arc::new(store);
+        let runtime = Arc::new(DirectoryReplicaSyncRuntime::default());
+        let coordinator = DirectoryReplicaSyncCoordinator::new(
+            vec![configured],
+            120,
+            store,
+            Arc::clone(&runtime),
+            Arc::new(PeerStore::new()),
+            local,
+        )
+        .unwrap();
+
+        assert_eq!(coordinator.restored_retry_states, 1);
+        let restored = runtime.snapshot();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].producer, configured);
+        assert_eq!(restored[0].consecutive_failures, 2);
+        assert_eq!(restored[0].retry_not_before, Some(TEST_NOW + 300));
     }
 
     #[test]
