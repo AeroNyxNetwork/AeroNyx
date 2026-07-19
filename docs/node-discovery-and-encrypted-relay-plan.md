@@ -1189,8 +1189,17 @@ Initial entry:
     documentation test passed with 9 documentation tests intentionally ignored.
   - `cargo clippy --all-targets -- -D clippy::correctness` and the release build
     passed.
-  - Additive live status and malformed-frame rejection remain rollout gates;
-    production witnesses must not be stopped merely to recreate unit faults.
+  - Commit `95f1f87` was deployed by rolling restart to Korean1, Noway1, and
+    US1. Korean1 initially had one active session, so its restart was deferred
+    until the session drained; all three services then reported
+    `active/running`, `NRestarts=0`, and healthy Directory Replica status.
+  - Every node returned the additive latest-witnessed current-pin fields with a
+    satisfied target. US1 reported checkpoint 324 with two raw receipts, two
+    current-pin receipts, threshold two satisfied, and zero latest-round
+    verification or persistence failures.
+  - A malformed witness frame sent to Noway1's peer route returned HTTP 400;
+    the service remained healthy and no valid receipt was produced from it.
+  - Production witnesses were not stopped to recreate unit-only outage faults.
 
 2026-07-19 - Added Mature Witness Pipeline Status and Bounded Cold Catch-Up V1.
 - Files changed:
