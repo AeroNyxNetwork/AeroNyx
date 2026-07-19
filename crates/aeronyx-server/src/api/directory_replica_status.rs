@@ -215,6 +215,9 @@ struct DirectoryReplicaObservationWitnessPolicyStatus {
     activated_age_seconds: Option<u64>,
     configured_witnesses: u64,
     required_external_witnesses: u64,
+    external_anchor_receipts: u64,
+    external_anchor_threshold_met: bool,
+    remote_policy_heads_retained: u64,
     matches_runtime_config: bool,
     durability: &'static str,
     full_history_verification: &'static str,
@@ -722,6 +725,7 @@ async fn directory_replica_status_handler(
         latest_witnessed_current_pinned_witnesses,
         pending_witness_target,
         witness_policy_matches_runtime,
+        policy_anchor_current_pinned_witnesses,
     ) = if let Some(store) = state.store.clone() {
         match tokio::task::spawn_blocking(move || {
             let persisted = store.status_snapshot()?;
@@ -767,6 +771,17 @@ async fn directory_replica_status_handler(
             };
             let witness_policy_matches_runtime = store
                 .observation_witness_policy_matches(&configured_producers, witness_min_verified)?;
+            let policy_anchor_current_pinned_witnesses =
+                if let Some(anchor) = store.current_observation_witness_policy_anchor()? {
+                    store.verified_observation_witness_policy_anchor_count_for_pins(
+                        anchor.epoch,
+                        &anchor.policy_digest,
+                        &configured_producers,
+                        generated_at,
+                    )?
+                } else {
+                    0
+                };
             Ok::<_, crate::services::DirectoryReplicaStoreError>((
                 persisted,
                 convergence,
@@ -774,6 +789,7 @@ async fn directory_replica_status_handler(
                 latest_witnessed_current_pinned_witnesses,
                 pending_witness_target,
                 witness_policy_matches_runtime,
+                policy_anchor_current_pinned_witnesses,
             ))
         })
         .await
@@ -827,6 +843,7 @@ async fn directory_replica_status_handler(
             0,
             None,
             false,
+            0,
         )
     };
     let runtime = state.runtime.snapshot();
@@ -848,6 +865,7 @@ async fn directory_replica_status_handler(
         state.witness_maturity_delay_secs,
         pending_witness_target,
         witness_policy_matches_runtime,
+        policy_anchor_current_pinned_witnesses,
         state.scope,
     ))
     .into_response()
@@ -1010,6 +1028,7 @@ fn build_observation_witness_policy_status(
     store_enabled: bool,
     persisted: &DirectoryReplicaStoreSnapshot,
     witness_policy_matches_runtime: bool,
+    policy_anchor_current_pinned_witnesses: u64,
 ) -> DirectoryReplicaObservationWitnessPolicyStatus {
     let matches_runtime_config = store_enabled
         && persisted.observation_witness_policy_epoch > 0
@@ -1041,6 +1060,11 @@ fn build_observation_witness_policy_status(
         }),
         configured_witnesses: persisted.observation_witness_policy_members,
         required_external_witnesses: persisted.observation_witness_policy_threshold,
+        external_anchor_receipts: policy_anchor_current_pinned_witnesses,
+        external_anchor_threshold_met: persisted.observation_witness_policy_threshold > 0
+            && policy_anchor_current_pinned_witnesses
+                >= persisted.observation_witness_policy_threshold,
+        remote_policy_heads_retained: persisted.observation_witness_remote_policy_anchors,
         matches_runtime_config,
         durability: "node_identity_signed_hash_linked_sqlite_epochs_with_metadata_head_cas",
         full_history_verification: "startup_and_explicit_operator_audit",
@@ -1255,6 +1279,7 @@ fn build_directory_replica_status_response(
     witness_maturity_delay_secs: u64,
     pending_witness_target: Option<DirectoryReplicaPendingWitnessTarget>,
     witness_policy_matches_runtime: bool,
+    policy_anchor_current_pinned_witnesses: u64,
     scope: DirectoryReplicaStatusScope,
 ) -> DirectoryReplicaStatusResponse {
     let runtime_by_producer = runtime
@@ -1349,6 +1374,7 @@ fn build_directory_replica_status_response(
             store_enabled,
             persisted,
             witness_policy_matches_runtime,
+            policy_anchor_current_pinned_witnesses,
         ),
         observation_witness_pipeline: build_observation_witness_pipeline_status(
             generated_at,
@@ -1611,6 +1637,18 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            parsed["observation_witness_policy"]["external_anchor_receipts"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            parsed["observation_witness_policy"]["external_anchor_threshold_met"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["observation_witness_policy"]["remote_policy_heads_retained"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
             parsed["observation_checkpoint"]["corroboration_policy"].as_str(),
             Some("distinct_current_operator_pinned_external_recomputations")
         );
@@ -1675,6 +1713,7 @@ mod tests {
         );
         assert!(parsed.get("producers").is_none());
         assert!(!body_text.contains(&hex::encode(producer)));
+        assert!(!body_text.contains("policy_digest"));
         Ok(())
     }
 

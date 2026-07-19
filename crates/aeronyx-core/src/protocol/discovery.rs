@@ -24,6 +24,8 @@
 //! - `DirectorySyncMessage`: authenticated, bounded node-to-node transport for
 //!   serving one producer's tip, block ranges, descriptor objects, and
 //!   independently recomputed observation-checkpoint witness receipts
+//! - Opaque policy-head anchor frames that let independent pinned witnesses
+//!   retain rollback evidence without receiving policy members or endpoints
 //! - Replica-carrier frames that transport already audited producer evidence
 //!   without allowing the carrier to replace the producer's signatures
 //!
@@ -49,6 +51,8 @@
 //!    recomputing its producer prefixes and overlap root from local replicas
 //! 10. A pinned carrier may serve an audited producer replica when direct
 //!     producer admission is unavailable; receivers still verify both layers
+//! 11. A pinned witness may retain one monotonic opaque policy head per
+//!     observer and return a signed receipt without learning policy members
 //!
 //! ## Important Note for Next Developer
 //! - Do not put private keys, client IPs, destination metadata, DNS contents,
@@ -65,10 +69,14 @@
 //!   quorum certificates, global consensus, or finality.
 //! - A checkpoint witness receipt proves one external node independently
 //!   recomputed one exact checkpoint. It is not a vote, quorum, or finality.
+//! - A policy-head anchor proves only that one witness retained an opaque
+//!   observer-signed epoch/digest at a time. It is not policy approval, a vote,
+//!   validator membership, consensus, governance, or finality.
 //! - A replica carrier proves transport of its audited copy. It cannot author,
 //!   rewrite, finalize, or select the producer's signed chain.
 //!
 //! ## Last Modified
+//! v0.11.0-DirectoryPolicyHeadAnchor - Added privacy-bounded external policy-head anchor frames
 //! v0.10.0-DirectoryEvidenceCarrier - Added producer-bound audited replica transport frames
 //! v0.9.0-DirectoryObservationWitness - Added bounded independently recomputed checkpoint witness frames
 //! v0.8.0-DirectoryObservationCheckpoint - Added canonical signed observation checkpoints
@@ -130,6 +138,15 @@ pub const DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1: u8 = 1;
 pub const DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1: u8 = 2;
 /// Witness has conflicting retained evidence or recomputed a different root.
 pub const DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1: u8 = 3;
+
+/// Witness durably retained the exact opaque observer policy head.
+pub const DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1: u8 = 1;
+/// Witness has a newer retained epoch and rejects observer rollback.
+pub const DIRECTORY_POLICY_ANCHOR_ROLLBACK_V1: u8 = 2;
+/// Witness retained a different digest for the same observer epoch.
+pub const DIRECTORY_POLICY_ANCHOR_CONFLICT_V1: u8 = 3;
+/// Witness cannot connect the requested epoch to its retained policy head.
+pub const DIRECTORY_POLICY_ANCHOR_HISTORY_GAP_V1: u8 = 4;
 
 /// Stable production chain identifier for public node-directory commitments.
 ///
@@ -1398,6 +1415,53 @@ pub enum DirectorySyncMessage {
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
+    /// Requests durable external retention of one opaque witness-policy head.
+    ///
+    /// This variant is appended to preserve every existing bincode enum index.
+    /// Policy member identities and endpoints are deliberately absent. The
+    /// witness validates observer authentication and monotonic continuity, but
+    /// does not approve the operator's policy or interpret its opaque digest.
+    ObservationWitnessPolicyAnchorRequestV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Random request identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Node whose local witness policy is being externally anchored.
+        requester: [u8; 32],
+        /// Request creation time in Unix epoch seconds.
+        request_timestamp: u64,
+        /// Positive observer-local policy epoch.
+        policy_epoch: u64,
+        /// Previous policy digest, or zero only for epoch one.
+        previous_policy_digest: [u8; 32],
+        /// Opaque digest of the observer-signed complete local policy object.
+        policy_digest: [u8; 32],
+        /// Requester signature over every request field.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Returns one signed external policy-head retention decision.
+    ObservationWitnessPolicyAnchorResponseV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Request identifier copied from the authenticated request.
+        request_id: [u8; 16],
+        /// Observer identity copied from the anchor request.
+        observer: [u8; 32],
+        /// Exact observer-local policy epoch evaluated by the witness.
+        policy_epoch: u64,
+        /// Exact opaque policy digest evaluated by the witness.
+        policy_digest: [u8; 32],
+        /// Independent witness identity.
+        responder: [u8; 32],
+        /// Response creation time in Unix epoch seconds.
+        response_timestamp: u64,
+        /// One stable `DIRECTORY_POLICY_ANCHOR_*_V1` outcome code.
+        outcome: u8,
+        /// Responder signature over every response field.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
 }
 
 fn directory_sync_signing_digest<'a>(
@@ -1746,6 +1810,65 @@ pub fn directory_observation_witness_response_signing_bytes(
             observer.as_slice(),
             checkpoint_sequence.as_slice(),
             checkpoint_hash.as_slice(),
+            responder.as_slice(),
+            response_timestamp.as_slice(),
+            outcome.as_slice(),
+        ],
+    )
+}
+
+/// Canonical digest signed by an opaque witness-policy anchor request.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_policy_anchor_request_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+    policy_epoch: u64,
+    previous_policy_digest: &[u8; 32],
+    policy_digest: &[u8; 32],
+) -> [u8; 32] {
+    let request_timestamp = request_timestamp.to_le_bytes();
+    let policy_epoch = policy_epoch.to_le_bytes();
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-PolicyAnchorRequest-v1",
+        [
+            chain_id.as_slice(),
+            request_id.as_slice(),
+            requester.as_slice(),
+            request_timestamp.as_slice(),
+            policy_epoch.as_slice(),
+            previous_policy_digest.as_slice(),
+            policy_digest.as_slice(),
+        ],
+    )
+}
+
+/// Canonical digest signed by an opaque witness-policy anchor response.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_policy_anchor_response_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    observer: &[u8; 32],
+    policy_epoch: u64,
+    policy_digest: &[u8; 32],
+    responder: &[u8; 32],
+    response_timestamp: u64,
+    outcome: u8,
+) -> [u8; 32] {
+    let policy_epoch = policy_epoch.to_le_bytes();
+    let response_timestamp = response_timestamp.to_le_bytes();
+    let outcome = [outcome];
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-PolicyAnchorResponse-v1",
+        [
+            chain_id.as_slice(),
+            request_id.as_slice(),
+            observer.as_slice(),
+            policy_epoch.as_slice(),
+            policy_digest.as_slice(),
             responder.as_slice(),
             response_timestamp.as_slice(),
             outcome.as_slice(),
@@ -2803,6 +2926,73 @@ mod tests {
             DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
         );
         assert_ne!(response_digest, altered);
+
+        let policy_request_id = [0x7a; 16];
+        let policy_digest = [0x7b; 32];
+        let policy_request_digest = directory_policy_anchor_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &policy_request_id,
+            &observer.public_key_bytes(),
+            1_700_000_303,
+            1,
+            &[0u8; 32],
+            &policy_digest,
+        );
+        let policy_request = DirectorySyncMessage::ObservationWitnessPolicyAnchorRequestV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id: policy_request_id,
+            requester: observer.public_key_bytes(),
+            request_timestamp: 1_700_000_303,
+            policy_epoch: 1,
+            previous_policy_digest: [0u8; 32],
+            policy_digest,
+            signature: observer.sign(&policy_request_digest),
+        };
+        let encoded = encode_directory_sync_message(&policy_request).unwrap();
+        assert_eq!(
+            decode_directory_sync_message(&encoded).unwrap(),
+            policy_request
+        );
+
+        let policy_response_digest = directory_policy_anchor_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &policy_request_id,
+            &observer.public_key_bytes(),
+            1,
+            &policy_digest,
+            &witness.public_key_bytes(),
+            1_700_000_304,
+            DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1,
+        );
+        let policy_response = DirectorySyncMessage::ObservationWitnessPolicyAnchorResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id: policy_request_id,
+            observer: observer.public_key_bytes(),
+            policy_epoch: 1,
+            policy_digest,
+            responder: witness.public_key_bytes(),
+            response_timestamp: 1_700_000_304,
+            outcome: DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1,
+            signature: witness.sign(&policy_response_digest),
+        };
+        let encoded = encode_directory_sync_message(&policy_response).unwrap();
+        assert_eq!(
+            decode_directory_sync_message(&encoded).unwrap(),
+            policy_response
+        );
+        assert_ne!(
+            policy_response_digest,
+            directory_policy_anchor_response_signing_bytes(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &policy_request_id,
+                &observer.public_key_bytes(),
+                1,
+                &policy_digest,
+                &witness.public_key_bytes(),
+                1_700_000_304,
+                DIRECTORY_POLICY_ANCHOR_CONFLICT_V1,
+            )
+        );
     }
 
     #[test]

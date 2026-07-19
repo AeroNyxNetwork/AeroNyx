@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.24.0 - Configurable pinned-witness corroboration targets with retryable receipt collection.
+Modification Reason: v0.25.0 - Opaque signed Directory witness-policy heads anchored at exact current pins.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.24.0 - Distinguished independent multi-node corroboration from one-receipt evidence without claiming consensus.
+Last Modified: v0.25.0 - Added monotonic external policy-head anchors without exporting witness membership or claiming consensus.
+Previous: v0.24.0 - Distinguished independent multi-node corroboration from one-receipt evidence without claiming consensus.
 Previous: v0.23.0 - Kept recurring witness selection cost fixed while preserving complete startup and explicit operator audits.
 Previous: v0.22.0 - Prevented asymmetric replica schedules from perpetually witnessing a checkpoint that peers have not received yet.
 Previous: v0.21.0 - Prevented unsupported witness endpoints from being misreported as transport faults without changing the descriptor wire schema.
@@ -1155,6 +1156,71 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-19 - Added Directory Witness Policy Head Anchor V1.
+- Files changed:
+  - crates/aeronyx-core/src/protocol/discovery.rs
+  - crates/aeronyx-server/src/api/directory_chain_peer.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - crates/aeronyx-server/src/server.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Production problem:
+  - Schema v7 made each node's local witness-policy history signed and
+    hash-linked, but a whole-host rollback could still restore both SQLite and
+    the local policy head to an older internally valid snapshot.
+  - External witnesses therefore need an opaque monotonic observation of the
+    policy head without learning the policy member list or becoming validators.
+- Protocol:
+  - `ObservationWitnessPolicyAnchorRequestV1` binds chain id, request id,
+    observer, request time, policy epoch, previous policy digest, opaque policy
+    digest, and observer signature.
+  - `ObservationWitnessPolicyAnchorResponseV1` binds the exact observed epoch
+    and digest, responder, response time, outcome, and responder signature.
+  - The peer route is
+    `POST /api/discovery/peer/directory/observation-policy-anchor` and uses the
+    existing pinned-peer descriptor, replay, timestamp, request-size, and rate
+    admission controls.
+  - The wire contract never sends the policy member list, threshold history,
+    peer endpoints, routes, payloads, or user data.
+- Persistence and verification:
+  - Schema v8 adds append-only remote policy-head observations and accepted
+    local receipt evidence, plus an atomic v7-to-v8 migration.
+  - A witness accepts its first valid head for an observer as signed TOFU.
+    Exact retry is idempotent; lower epoch is rollback; a different digest at
+    the same epoch is conflict; a non-contiguous forward epoch or wrong
+    predecessor is a history gap. Rejected frames never replace accepted state.
+  - Local receipts count only when signed by a member of that exact local policy
+    epoch and binding the exact epoch/digest. Startup audit replays canonical
+    encoding, signatures, continuity, membership, and receipt contracts before
+    any listener opens.
+  - Outbound anchoring runs after every bounded replica sync round, independently
+    of complete replica convergence, so producer unavailability cannot suppress
+    rollback detection. It requests only missing current pins with bounded
+    concurrency; unsupported mixed-version peers remain retryable capability
+    misses.
+- Observability and privacy:
+  - Public status exposes only current receipt count, threshold-met boolean,
+    and retained remote-head count. It omits policy digests, witness identities,
+    signatures, endpoints, and member lists.
+  - Runtime status and outbound scheduling verify only the signed current policy
+    head and a bounded current-epoch receipt set (at most 16 members plus one
+    overflow sentinel). Startup and explicit operator audit still verify all
+    historical policy epochs and receipts.
+  - Startup logs add only audited aggregate anchor/remote-head counts.
+  - These anchors are rollback/conflict evidence only. They are not votes,
+    validators, quorum, fork choice, consensus, or finality.
+- Verification:
+  - Policy-anchor protocol round-trip and signature-domain test.
+  - Monotonic/idempotent/restart-durable remote-head test.
+  - Exact-pin signed receipt and tamper-evident startup-audit test.
+  - Stale in-flight receipt rejection after a signed policy rotation.
+  - Complete response binding, rollback classification, and signature-tamper test.
+  - Public aggregate redaction and schema v7-to-v8 atomic migration tests.
+  - `cargo test --workspace`
+  - `cargo clippy --workspace --all-targets -- -D clippy::correctness`
+  - `cargo build -p aeronyx-server --release`
+
 2026-07-19 - Added Directory Witness Policy Epoch V1.
 - Files changed:
   - crates/aeronyx-server/src/api/directory_replica_status.rs

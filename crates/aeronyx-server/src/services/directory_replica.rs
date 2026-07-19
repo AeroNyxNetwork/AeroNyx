@@ -38,6 +38,8 @@
 //!   receipts so operators can distinguish unavailable evidence from faults.
 //! - Persists every local witness pin/threshold change as a node-identity-
 //!   signed, hash-linked policy epoch with a metadata-anchored durable head.
+//! - Retains opaque policy heads observed by independent nodes and accepted
+//!   signed external anchor receipts without exposing policy member identities.
 //! - Selects only forward-moving, mature, unwitnessed checkpoints for external
 //!   recomputation so asymmetric sync schedules cannot chase the moving tip.
 //! - Keeps recurring witness selection history-bounded by verifying only the
@@ -76,6 +78,8 @@
 //! 11. Canonicalize the configured witness set and append a policy epoch only
 //!     when pins or threshold change; verify the complete policy chain before
 //!     synchronization or any listener starts.
+//! 12. Exchange only opaque epoch/digest policy heads with pinned witnesses;
+//!     reject rollback, same-epoch conflict, and non-contiguous progression.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -97,6 +101,8 @@
 //!   observer's signed evidence and must never be presented as global blocks.
 //! - A witness receipt proves one external recomputation of one exact local
 //!   checkpoint. It is not a vote, quorum, fork choice, consensus, or finality.
+//! - A policy anchor receipt proves only external retention of an opaque local
+//!   policy head. It neither reveals nor approves policy membership.
 //! - Witness outcome telemetry is aggregate diagnostic evidence only. Never add
 //!   witness identities, endpoints, request ids, signatures, or hashes to it.
 //! - Witness policy epochs describe only this operator's local evidence target.
@@ -111,6 +117,7 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.17.0-DirectoryPolicyHeadAnchor - Added schema v8 opaque external policy-head anchors and signed receipts
 //! v0.16.0-DirectoryWitnessPolicyEpoch - Added schema v7 signed hash-linked local witness policy history, metadata-head partial-deletion protection, startup reconciliation, and tamper tests
 //! v0.15.0-DirectoryWitnessFailureDrills - Locked partial-receipt restart recovery and current-pin rotation fail-closed behavior with deterministic state-machine coverage
 //! v0.14.0-DirectoryWitnessThreshold - Added configurable pinned-witness corroboration targets
@@ -148,11 +155,14 @@ use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::discovery::{
     decode_directory_sync_message, directory_block_range_response_signing_bytes,
     directory_observation_witness_response_signing_bytes,
+    directory_policy_anchor_request_signing_bytes, directory_policy_anchor_response_signing_bytes,
     directory_replica_block_range_response_signing_bytes, encode_directory_sync_message,
     DirectoryCommitmentBlockV1, DirectoryCommitmentValidationError,
     DirectoryDescriptorCommitmentV1, DirectoryObservationCheckpointV1, DirectoryObservationTipV1,
     DirectorySyncMessage, SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
-    DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1,
+    DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1,
+    DIRECTORY_POLICY_ANCHOR_CONFLICT_V1, DIRECTORY_POLICY_ANCHOR_HISTORY_GAP_V1,
+    DIRECTORY_POLICY_ANCHOR_ROLLBACK_V1, MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1,
     MAX_DIRECTORY_SYNC_BLOCKS_V1,
 };
 use bincode::Options;
@@ -163,7 +173,8 @@ use rusqlite::{
 };
 use sha2::{Digest, Sha256};
 
-const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 7;
+const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 8;
+const DIRECTORY_REPLICA_SCHEMA_VERSION_V7: i64 = 7;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V6: i64 = 6;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V5: i64 = 5;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V4: i64 = 4;
@@ -181,6 +192,7 @@ const MAX_DIRECTORY_REPLICA_CONVERGENCE_PRODUCERS: usize = 16;
 const MAX_DIRECTORY_REPLICA_INCIDENT_KIND_BYTES: usize = 64;
 const MAX_DIRECTORY_OBSERVATION_CHECKPOINT_BYTES: u64 = 4 * 1024;
 const MAX_DIRECTORY_OBSERVATION_WITNESS_BYTES: usize = 2 * 1024;
+const MAX_DIRECTORY_POLICY_ANCHOR_BYTES: usize = 2 * 1024;
 const MAX_DIRECTORY_OBSERVATION_WITNESS_POLICY_MEMBERS: usize = 16;
 const DIRECTORY_REPLICA_RESOLUTION_ACTION: &str = "resume_existing_prefix";
 const DIRECTORY_REPLICA_RESOLUTION_TIMESTAMP_SKEW_SECS: u64 = 60;
@@ -261,6 +273,10 @@ pub struct DirectoryReplicaAudit {
     pub observation_witness_policy_members: u64,
     /// External receipt threshold in the current local policy.
     pub observation_witness_policy_threshold: u64,
+    /// Signed external anchor receipts retained for local policy epochs.
+    pub observation_witness_policy_anchor_receipts: u64,
+    /// Opaque foreign policy heads this node retains for independent observers.
+    pub observation_witness_remote_policy_anchors: u64,
     /// Number of audited producer-local retry rows.
     pub retry_states: u64,
 }
@@ -306,6 +322,10 @@ pub struct DirectoryReplicaStoreSnapshot {
     pub observation_witness_policy_members: u64,
     /// External receipt threshold in the current local policy.
     pub observation_witness_policy_threshold: u64,
+    /// Signed external anchor receipts retained for local policy epochs.
+    pub observation_witness_policy_anchor_receipts: u64,
+    /// Opaque foreign policy heads this node retains for independent observers.
+    pub observation_witness_remote_policy_anchors: u64,
     /// Per-producer accepted-prefix summaries for local operator presentation.
     pub producer_snapshots: Vec<DirectoryReplicaProducerSnapshot>,
 }
@@ -1208,6 +1228,16 @@ struct StoredObservationWitnessPolicyRow {
     signature: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct StoredObservationWitnessPolicyAnchorReceiptRow {
+    policy_epoch: i64,
+    policy_digest: Vec<u8>,
+    observer: Vec<u8>,
+    witness_node_id: Vec<u8>,
+    witnessed_at: i64,
+    response_blob: Vec<u8>,
+}
+
 /// One node-identity-signed, hash-linked local witness admission policy.
 ///
 /// This is operator configuration history, not a network vote, validator set,
@@ -1296,6 +1326,42 @@ pub(crate) struct DirectoryObservationWitnessPolicyReconcileReport {
     pub(crate) witness_members: u64,
     /// Required distinct external receipts.
     pub(crate) minimum_witnesses: u64,
+}
+
+/// Privacy-bounded current local policy head exported to pinned witnesses.
+///
+/// The digest commits to the complete node-signed local policy, while member
+/// identities remain host-local and never enter the anchor protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectoryObservationWitnessPolicyAnchor {
+    pub(crate) epoch: u64,
+    pub(crate) previous_policy_digest: [u8; 32],
+    pub(crate) policy_digest: [u8; 32],
+}
+
+/// Result of evaluating one authenticated foreign policy-head anchor request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectoryObservationWitnessPolicyAnchorDecision {
+    /// Exact head was already retained or appended durably.
+    Accepted,
+    /// Request regressed below the latest retained observer epoch.
+    Rollback,
+    /// The same epoch was previously retained with another digest.
+    Conflict,
+    /// A forward request did not link to the immediately retained head.
+    HistoryGap,
+}
+
+impl DirectoryObservationWitnessPolicyAnchorDecision {
+    #[must_use]
+    pub(crate) const fn outcome(self) -> u8 {
+        match self {
+            Self::Accepted => DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1,
+            Self::Rollback => DIRECTORY_POLICY_ANCHOR_ROLLBACK_V1,
+            Self::Conflict => DIRECTORY_POLICY_ANCHOR_CONFLICT_V1,
+            Self::HistoryGap => DIRECTORY_POLICY_ANCHOR_HISTORY_GAP_V1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1417,10 +1483,8 @@ impl DirectoryReplicaStore {
                 "observation witness policy identity or timestamp is invalid".to_string(),
             ));
         }
-        let canonical_witnesses = canonical_observation_witness_policy_members(
-            witness_node_ids,
-            minimum_witnesses,
-        )?;
+        let canonical_witnesses =
+            canonical_observation_witness_policy_members(witness_node_ids, minimum_witnesses)?;
 
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1568,20 +1632,339 @@ impl DirectoryReplicaStore {
         witness_node_ids: &[[u8; 32]],
         minimum_witnesses: usize,
     ) -> Result<bool, DirectoryReplicaStoreError> {
-        let canonical_witnesses = canonical_observation_witness_policy_members(
-            witness_node_ids,
-            minimum_witnesses,
-        )?;
+        let canonical_witnesses =
+            canonical_observation_witness_policy_members(witness_node_ids, minimum_witnesses)?;
         let connection = self.connection.lock();
         Self::validate_metadata(&connection, &self.local_node_id)?;
-        let current = Self::load_current_observation_witness_policy(
-            &connection,
-            &self.local_node_id,
-        )?;
+        let current =
+            Self::load_current_observation_witness_policy(&connection, &self.local_node_id)?;
         Ok(current.current.is_some_and(|policy| {
             policy.witness_node_ids == canonical_witnesses
                 && policy.minimum_witnesses == minimum_witnesses
         }))
+    }
+
+    /// Returns the current opaque policy head after verifying its local chain.
+    ///
+    /// Policy member identities remain in the local signed policy row and are
+    /// deliberately not included in this export object.
+    pub(crate) fn current_observation_witness_policy_anchor(
+        &self,
+    ) -> Result<Option<DirectoryObservationWitnessPolicyAnchor>, DirectoryReplicaStoreError> {
+        let connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let current =
+            Self::load_current_observation_witness_policy(&connection, &self.local_node_id)?;
+        Ok(current
+            .current
+            .map(|policy| DirectoryObservationWitnessPolicyAnchor {
+                epoch: policy.epoch,
+                previous_policy_digest: policy.previous_policy_digest,
+                policy_digest: current.current_digest,
+            }))
+    }
+
+    /// Evaluates and durably retains one authenticated foreign policy head.
+    ///
+    /// The first head for an observer is a signed trust-on-first-observation
+    /// anchor. Later heads must be exact retries or the immediately linked next
+    /// epoch. Rollback, same-epoch conflict, and gaps never mutate persistence.
+    /// Member identities are never transmitted or stored by this operation.
+    pub(crate) fn persist_remote_observation_witness_policy_anchor(
+        &self,
+        request: &DirectorySyncMessage,
+        observed_at: u64,
+    ) -> Result<DirectoryObservationWitnessPolicyAnchorDecision, DirectoryReplicaStoreError> {
+        let request_blob = encode_directory_sync_message(request)
+            .map_err(|error| DirectoryReplicaStoreError::Request(error.to_string()))?;
+        if request_blob.len() > MAX_DIRECTORY_POLICY_ANCHOR_BYTES {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation policy anchor request exceeds size bound".to_string(),
+            ));
+        }
+        let DirectorySyncMessage::ObservationWitnessPolicyAnchorRequestV1 {
+            chain_id,
+            request_id,
+            requester,
+            request_timestamp,
+            policy_epoch,
+            previous_policy_digest,
+            policy_digest,
+            signature,
+        } = request
+        else {
+            return Err(DirectoryReplicaStoreError::Request(
+                "unexpected observation policy anchor request".to_string(),
+            ));
+        };
+        let position_valid = (*policy_epoch == 1 && *previous_policy_digest == [0u8; 32])
+            || (*policy_epoch > 1 && *previous_policy_digest != [0u8; 32]);
+        if *chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+            || *requester == [0u8; 32]
+            || *requester == self.local_node_id
+            || *policy_digest == [0u8; 32]
+            || !position_valid
+            || *request_timestamp == 0
+            || observed_at.abs_diff(*request_timestamp) > RESPONSE_TIMESTAMP_SKEW_SECS
+        {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation policy anchor request contract mismatch".to_string(),
+            ));
+        }
+        let signing_bytes = directory_policy_anchor_request_signing_bytes(
+            chain_id,
+            request_id,
+            requester,
+            *request_timestamp,
+            *policy_epoch,
+            previous_policy_digest,
+            policy_digest,
+        );
+        IdentityPublicKey::from_bytes(requester)
+            .and_then(|key| key.verify(&signing_bytes, signature))
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Request(
+                    "observation policy anchor request signature is invalid".to_string(),
+                )
+            })?;
+
+        let mut connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let latest = transaction
+            .query_row(
+                "SELECT policy_epoch, policy_digest
+                 FROM directory_observation_remote_policy_anchors
+                 WHERE observer = ?1 ORDER BY policy_epoch DESC LIMIT 1",
+                params![requester.as_slice()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?
+            .map(|(epoch, digest)| {
+                Ok::<_, DirectoryReplicaStoreError>((
+                    positive_i64_to_u64(epoch, "remote policy anchor epoch")?,
+                    bytes32(&digest, "remote policy anchor digest")?,
+                ))
+            })
+            .transpose()?;
+        if let Some((latest_epoch, latest_digest)) = latest {
+            if *policy_epoch < latest_epoch {
+                return Ok(DirectoryObservationWitnessPolicyAnchorDecision::Rollback);
+            }
+            if *policy_epoch == latest_epoch {
+                return Ok(if *policy_digest == latest_digest {
+                    DirectoryObservationWitnessPolicyAnchorDecision::Accepted
+                } else {
+                    DirectoryObservationWitnessPolicyAnchorDecision::Conflict
+                });
+            }
+            if *policy_epoch != latest_epoch.saturating_add(1)
+                || *previous_policy_digest != latest_digest
+            {
+                return Ok(DirectoryObservationWitnessPolicyAnchorDecision::HistoryGap);
+            }
+        }
+        transaction.execute(
+            "INSERT INTO directory_observation_remote_policy_anchors
+                (observer, policy_epoch, previous_policy_digest, policy_digest,
+                 request_timestamp, request_blob)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                requester.as_slice(),
+                u64_to_i64(*policy_epoch, "remote policy anchor epoch")?,
+                previous_policy_digest.as_slice(),
+                policy_digest.as_slice(),
+                u64_to_i64(*request_timestamp, "remote policy anchor timestamp")?,
+                request_blob,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(DirectoryObservationWitnessPolicyAnchorDecision::Accepted)
+    }
+
+    /// Persists one accepted external receipt for an exact local policy head.
+    /// Exact retries are idempotent; a witness cannot replace its receipt for
+    /// the same epoch with another digest.
+    pub(crate) fn persist_observation_witness_policy_anchor_receipt(
+        &self,
+        response: &DirectorySyncMessage,
+        observed_at: u64,
+    ) -> Result<bool, DirectoryReplicaStoreError> {
+        let response_blob = encode_directory_sync_message(response)
+            .map_err(|error| DirectoryReplicaStoreError::Request(error.to_string()))?;
+        if response_blob.len() > MAX_DIRECTORY_POLICY_ANCHOR_BYTES {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation policy anchor response exceeds size bound".to_string(),
+            ));
+        }
+        let DirectorySyncMessage::ObservationWitnessPolicyAnchorResponseV1 {
+            chain_id,
+            request_id,
+            observer,
+            policy_epoch,
+            policy_digest,
+            responder,
+            response_timestamp,
+            outcome,
+            signature,
+        } = response
+        else {
+            return Err(DirectoryReplicaStoreError::Request(
+                "unexpected observation policy anchor response".to_string(),
+            ));
+        };
+        if *chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+            || *observer != self.local_node_id
+            || *responder == [0u8; 32]
+            || *responder == self.local_node_id
+            || *policy_epoch == 0
+            || *policy_digest == [0u8; 32]
+            || *outcome != DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1
+            || *response_timestamp == 0
+            || observed_at.abs_diff(*response_timestamp) > RESPONSE_TIMESTAMP_SKEW_SECS
+        {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation policy anchor response contract mismatch".to_string(),
+            ));
+        }
+        let signing_bytes = directory_policy_anchor_response_signing_bytes(
+            chain_id,
+            request_id,
+            observer,
+            *policy_epoch,
+            policy_digest,
+            responder,
+            *response_timestamp,
+            *outcome,
+        );
+        IdentityPublicKey::from_bytes(responder)
+            .and_then(|key| key.verify(&signing_bytes, signature))
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Request(
+                    "observation policy anchor response signature is invalid".to_string(),
+                )
+            })?;
+
+        let mut connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current =
+            Self::load_current_observation_witness_policy(&transaction, &self.local_node_id)?;
+        let Some(current_policy) = current.current else {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation policy anchor receipt references an unknown policy".to_string(),
+            ));
+        };
+        if current_policy.epoch != *policy_epoch
+            || current.current_digest != *policy_digest
+            || !current_policy.witness_node_ids.contains(responder)
+        {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation policy anchor receipt is outside the current local policy".to_string(),
+            ));
+        }
+        let existing: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT policy_digest FROM directory_observation_policy_anchor_receipts
+                 WHERE policy_epoch = ?1 AND witness_node_id = ?2",
+                params![
+                    u64_to_i64(*policy_epoch, "policy anchor receipt epoch")?,
+                    responder.as_slice()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if bytes32(&existing, "existing policy anchor receipt digest")? != *policy_digest {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "policy anchor witness signed conflicting digests at one epoch".to_string(),
+                ));
+            }
+            return Ok(false);
+        }
+        transaction.execute(
+            "INSERT INTO directory_observation_policy_anchor_receipts
+                (policy_epoch, policy_digest, observer, witness_node_id,
+                 witnessed_at, response_blob)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                u64_to_i64(*policy_epoch, "policy anchor receipt epoch")?,
+                policy_digest.as_slice(),
+                observer.as_slice(),
+                responder.as_slice(),
+                u64_to_i64(*response_timestamp, "policy anchor receipt timestamp")?,
+                response_blob,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Counts verified current-pin receipts for one exact local policy head.
+    pub(crate) fn verified_observation_witness_policy_anchor_count_for_pins(
+        &self,
+        policy_epoch: u64,
+        policy_digest: &[u8; 32],
+        eligible_witnesses: &[[u8; 32]],
+        observed_at: u64,
+    ) -> Result<u64, DirectoryReplicaStoreError> {
+        if policy_epoch == 0 || *policy_digest == [0u8; 32] || eligible_witnesses.is_empty() {
+            return Ok(0);
+        }
+        let eligible = Self::validate_observation_witness_eligibility(eligible_witnesses)?;
+        let connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let receipts = Self::audit_current_observation_policy_anchor_receipts(
+            &connection,
+            &self.local_node_id,
+            policy_epoch,
+            policy_digest,
+            observed_at,
+        )?;
+        u64::try_from(
+            receipts
+                .into_iter()
+                .filter(|(epoch, digest, witness)| {
+                    *epoch == policy_epoch && digest == policy_digest && eligible.contains(witness)
+                })
+                .count(),
+        )
+        .map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "policy anchor receipt count exceeds u64".to_string(),
+            )
+        })
+    }
+
+    /// Returns current pins with verified receipts for one exact policy head.
+    pub(crate) fn verified_observation_witness_policy_anchor_witnesses_for_pins(
+        &self,
+        policy_epoch: u64,
+        policy_digest: &[u8; 32],
+        eligible_witnesses: &[[u8; 32]],
+        observed_at: u64,
+    ) -> Result<Vec<[u8; 32]>, DirectoryReplicaStoreError> {
+        if policy_epoch == 0 || *policy_digest == [0u8; 32] || eligible_witnesses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let eligible = Self::validate_observation_witness_eligibility(eligible_witnesses)?;
+        let connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let mut witnesses = Self::audit_current_observation_policy_anchor_receipts(
+            &connection,
+            &self.local_node_id,
+            policy_epoch,
+            policy_digest,
+            observed_at,
+        )?
+        .into_iter()
+        .filter_map(|(epoch, digest, witness)| {
+            (epoch == policy_epoch && digest == *policy_digest && eligible.contains(&witness))
+                .then_some(witness)
+        })
+        .collect::<Vec<_>>();
+        witnesses.sort_unstable();
+        Ok(witnesses)
     }
 
     /// Returns one producer's accepted prefix and quarantine state.
@@ -1880,6 +2263,22 @@ impl DirectoryReplicaStore {
                     )
                 })?;
         }
+        snapshot.observation_witness_policy_anchor_receipts = nonnegative_i64_to_u64(
+            connection.query_row(
+                "SELECT COUNT(*) FROM directory_observation_policy_anchor_receipts",
+                [],
+                |row| row.get(0),
+            )?,
+            "observation policy anchor receipt count",
+        )?;
+        snapshot.observation_witness_remote_policy_anchors = nonnegative_i64_to_u64(
+            connection.query_row(
+                "SELECT COUNT(*) FROM directory_observation_remote_policy_anchors",
+                [],
+                |row| row.get(0),
+            )?,
+            "remote observation policy anchor count",
+        )?;
         Ok(())
     }
 
@@ -3914,6 +4313,307 @@ impl DirectoryReplicaStore {
         })
     }
 
+    fn audit_remote_observation_policy_anchors(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<u64, DirectoryReplicaStoreError> {
+        let mut statement = connection.prepare(
+            "SELECT observer, policy_epoch, previous_policy_digest, policy_digest,
+                    request_timestamp, request_blob
+             FROM directory_observation_remote_policy_anchors
+             ORDER BY observer ASC, policy_epoch ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+            ))
+        })?;
+        let mut heads = HashMap::<[u8; 32], (u64, [u8; 32])>::new();
+        let mut count = 0u64;
+        for row in rows {
+            let (observer, epoch, previous_digest, digest, request_timestamp, request_blob) = row?;
+            let observer = bytes32(&observer, "remote policy anchor observer")?;
+            let epoch = positive_i64_to_u64(epoch, "remote policy anchor epoch")?;
+            let previous_digest =
+                bytes32(&previous_digest, "remote policy anchor previous digest")?;
+            let digest = bytes32(&digest, "remote policy anchor digest")?;
+            let request_timestamp =
+                positive_i64_to_u64(request_timestamp, "remote policy anchor timestamp")?;
+            let request = decode_directory_sync_message(&request_blob)
+                .map_err(|error| DirectoryReplicaStoreError::Codec(error.to_string()))?;
+            if encode_directory_sync_message(&request)
+                .map_err(|error| DirectoryReplicaStoreError::Codec(error.to_string()))?
+                != request_blob
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "remote policy anchor request is noncanonical".to_string(),
+                ));
+            }
+            let DirectorySyncMessage::ObservationWitnessPolicyAnchorRequestV1 {
+                chain_id,
+                request_id,
+                requester,
+                request_timestamp: signed_at,
+                policy_epoch,
+                previous_policy_digest,
+                policy_digest,
+                signature,
+            } = request
+            else {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "remote policy anchor row contains an unexpected frame".to_string(),
+                ));
+            };
+            let position_valid = (epoch == 1 && previous_digest == [0u8; 32])
+                || (epoch > 1 && previous_digest != [0u8; 32]);
+            if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+                || requester != observer
+                || requester == *local_node_id
+                || policy_epoch != epoch
+                || previous_policy_digest != previous_digest
+                || policy_digest != digest
+                || signed_at != request_timestamp
+                || digest == [0u8; 32]
+                || !position_valid
+                || request_timestamp > observed_at.saturating_add(RESPONSE_TIMESTAMP_SKEW_SECS)
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "remote policy anchor row violates its signed contract".to_string(),
+                ));
+            }
+            let signing_bytes = directory_policy_anchor_request_signing_bytes(
+                &chain_id,
+                &request_id,
+                &requester,
+                signed_at,
+                policy_epoch,
+                &previous_policy_digest,
+                &policy_digest,
+            );
+            IdentityPublicKey::from_bytes(&requester)
+                .and_then(|key| key.verify(&signing_bytes, &signature))
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "remote policy anchor signature is invalid".to_string(),
+                    )
+                })?;
+            if let Some((previous_epoch, previous_head)) = heads.get(&observer) {
+                if epoch != previous_epoch.saturating_add(1) || previous_digest != *previous_head {
+                    return Err(DirectoryReplicaStoreError::Integrity(
+                        "remote policy anchor history is not contiguous".to_string(),
+                    ));
+                }
+            }
+            heads.insert(observer, (epoch, digest));
+            count = count.checked_add(1).ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "remote policy anchor count overflow".to_string(),
+                )
+            })?;
+        }
+        Ok(count)
+    }
+
+    fn verify_observation_policy_anchor_receipt_row(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+        observed_at: u64,
+        row: StoredObservationWitnessPolicyAnchorReceiptRow,
+    ) -> Result<(u64, [u8; 32], [u8; 32]), DirectoryReplicaStoreError> {
+        let epoch = positive_i64_to_u64(row.policy_epoch, "policy anchor receipt epoch")?;
+        let digest = bytes32(&row.policy_digest, "policy anchor receipt digest")?;
+        let observer = bytes32(&row.observer, "policy anchor receipt observer")?;
+        let witness = bytes32(&row.witness_node_id, "policy anchor receipt witness")?;
+        let witnessed_at =
+            positive_i64_to_u64(row.witnessed_at, "policy anchor receipt timestamp")?;
+        let response = decode_directory_sync_message(&row.response_blob)
+            .map_err(|error| DirectoryReplicaStoreError::Codec(error.to_string()))?;
+        if encode_directory_sync_message(&response)
+            .map_err(|error| DirectoryReplicaStoreError::Codec(error.to_string()))?
+            != row.response_blob
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "policy anchor receipt is noncanonical".to_string(),
+            ));
+        }
+        let DirectorySyncMessage::ObservationWitnessPolicyAnchorResponseV1 {
+            chain_id,
+            request_id,
+            observer: signed_observer,
+            policy_epoch,
+            policy_digest,
+            responder,
+            response_timestamp,
+            outcome,
+            signature,
+        } = response
+        else {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "policy anchor receipt contains an unexpected frame".to_string(),
+            ));
+        };
+        if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+            || observer != *local_node_id
+            || signed_observer != observer
+            || policy_epoch != epoch
+            || policy_digest != digest
+            || responder != witness
+            || response_timestamp != witnessed_at
+            || outcome != DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1
+            || witnessed_at > observed_at.saturating_add(RESPONSE_TIMESTAMP_SKEW_SECS)
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "policy anchor receipt violates its signed contract".to_string(),
+            ));
+        }
+        let policy_members: (Vec<u8>, Vec<u8>) = connection.query_row(
+            "SELECT policy_digest, witness_node_ids
+             FROM directory_observation_witness_policies WHERE epoch = ?1",
+            params![u64_to_i64(epoch, "policy anchor receipt epoch")?],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if policy_members.1.len() > MAX_DIRECTORY_OBSERVATION_WITNESS_POLICY_MEMBERS * 32
+            || policy_members.1.len() % 32 != 0
+            || bytes32(&policy_members.0, "policy anchor local policy digest")? != digest
+            || !policy_members
+                .1
+                .chunks_exact(32)
+                .any(|member| member == witness.as_slice())
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "policy anchor receipt is not admitted by its policy epoch".to_string(),
+            ));
+        }
+        let signing_bytes = directory_policy_anchor_response_signing_bytes(
+            &chain_id,
+            &request_id,
+            &signed_observer,
+            policy_epoch,
+            &policy_digest,
+            &responder,
+            response_timestamp,
+            outcome,
+        );
+        IdentityPublicKey::from_bytes(&responder)
+            .and_then(|key| key.verify(&signing_bytes, &signature))
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "policy anchor receipt signature is invalid".to_string(),
+                )
+            })?;
+        Ok((epoch, digest, witness))
+    }
+
+    fn audit_observation_policy_anchor_receipts(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<Vec<(u64, [u8; 32], [u8; 32])>, DirectoryReplicaStoreError> {
+        let mut statement = connection.prepare(
+            "SELECT policy_epoch, policy_digest, observer, witness_node_id,
+                    witnessed_at, response_blob
+             FROM directory_observation_policy_anchor_receipts
+             ORDER BY policy_epoch ASC, witness_node_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(StoredObservationWitnessPolicyAnchorReceiptRow {
+                policy_epoch: row.get(0)?,
+                policy_digest: row.get(1)?,
+                observer: row.get(2)?,
+                witness_node_id: row.get(3)?,
+                witnessed_at: row.get(4)?,
+                response_blob: row.get(5)?,
+            })
+        })?;
+        let mut verified = Vec::new();
+        for row in rows {
+            verified.push(Self::verify_observation_policy_anchor_receipt_row(
+                connection,
+                local_node_id,
+                observed_at,
+                row?,
+            )?);
+        }
+        Ok(verified)
+    }
+
+    fn audit_current_observation_policy_anchor_receipts(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+        policy_epoch: u64,
+        policy_digest: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<Vec<(u64, [u8; 32], [u8; 32])>, DirectoryReplicaStoreError> {
+        let current = Self::load_current_observation_witness_policy(connection, local_node_id)?;
+        let Some(current_policy) = current.current else {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "policy anchor receipt query has no current local policy".to_string(),
+            ));
+        };
+        if current_policy.epoch != policy_epoch || current.current_digest != *policy_digest {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "policy anchor receipt query does not match the current local policy".to_string(),
+            ));
+        }
+        let row_limit = MAX_DIRECTORY_OBSERVATION_WITNESS_POLICY_MEMBERS + 1;
+        let mut statement = connection.prepare(
+            "SELECT policy_epoch, policy_digest, observer, witness_node_id,
+                    witnessed_at, response_blob
+             FROM directory_observation_policy_anchor_receipts
+             WHERE policy_epoch = ?1 AND policy_digest = ?2
+             ORDER BY witness_node_id ASC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                u64_to_i64(policy_epoch, "policy anchor receipt query epoch")?,
+                policy_digest.as_slice(),
+                i64::try_from(row_limit).map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "policy anchor receipt query limit exceeds i64".to_string(),
+                    )
+                })?
+            ],
+            |row| {
+                Ok(StoredObservationWitnessPolicyAnchorReceiptRow {
+                    policy_epoch: row.get(0)?,
+                    policy_digest: row.get(1)?,
+                    observer: row.get(2)?,
+                    witness_node_id: row.get(3)?,
+                    witnessed_at: row.get(4)?,
+                    response_blob: row.get(5)?,
+                })
+            },
+        )?;
+        let mut verified = Vec::new();
+        for row in rows {
+            let verified_row = Self::verify_observation_policy_anchor_receipt_row(
+                connection,
+                local_node_id,
+                observed_at,
+                row?,
+            )?;
+            if !current_policy.witness_node_ids.contains(&verified_row.2) {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "current policy anchor receipt witness is outside the signed policy"
+                        .to_string(),
+                ));
+            }
+            verified.push(verified_row);
+        }
+        if verified.len() > current_policy.witness_node_ids.len() {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "current policy anchor receipts exceed signed policy membership".to_string(),
+            ));
+        }
+        Ok(verified)
+    }
+
     fn audit_connection(
         connection: &Connection,
         local_node_id: &[u8; 32],
@@ -3923,6 +4623,17 @@ impl DirectoryReplicaStore {
         let producers = Self::load_all_tips(connection)?;
         let observation_witness_policies =
             Self::audit_observation_witness_policies(connection, local_node_id)?;
+        let observation_witness_remote_policy_anchors =
+            Self::audit_remote_observation_policy_anchors(connection, local_node_id, observed_at)?;
+        let observation_witness_policy_anchor_receipts = u64::try_from(
+            Self::audit_observation_policy_anchor_receipts(connection, local_node_id, observed_at)?
+                .len(),
+        )
+        .map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "policy anchor receipt count exceeds u64".to_string(),
+            )
+        })?;
         let (observation_checkpoints, observation_tip) =
             Self::audit_observation_checkpoints(connection, local_node_id, observed_at)?;
         let observation_witnesses =
@@ -3973,6 +4684,8 @@ impl DirectoryReplicaStore {
                     )
                 })?
                 .unwrap_or(0),
+            observation_witness_policy_anchor_receipts,
+            observation_witness_remote_policy_anchors,
             ..DirectoryReplicaAudit::default()
         };
         for tip in producers {
@@ -4212,6 +4925,36 @@ impl DirectoryReplicaStore {
                  CHECK ((witness_count = 0 AND witness_threshold = 1)
                      OR (witness_count > 0 AND witness_threshold <= witness_count))
              );
+             CREATE TABLE IF NOT EXISTS directory_observation_remote_policy_anchors (
+                 observer BLOB NOT NULL CHECK (length(observer) = 32),
+                 policy_epoch INTEGER NOT NULL CHECK (policy_epoch > 0),
+                 previous_policy_digest BLOB NOT NULL
+                     CHECK (length(previous_policy_digest) = 32),
+                 policy_digest BLOB NOT NULL CHECK (length(policy_digest) = 32),
+                 request_timestamp INTEGER NOT NULL CHECK (request_timestamp > 0),
+                 request_blob BLOB NOT NULL
+                     CHECK (length(request_blob) BETWEEN 1 AND 2048),
+                 PRIMARY KEY (observer, policy_epoch),
+                 UNIQUE (observer, policy_digest)
+             );
+             CREATE TABLE IF NOT EXISTS directory_observation_policy_anchor_receipts (
+                 policy_epoch INTEGER NOT NULL CHECK (policy_epoch > 0),
+                 policy_digest BLOB NOT NULL CHECK (length(policy_digest) = 32),
+                 observer BLOB NOT NULL CHECK (length(observer) = 32),
+                 witness_node_id BLOB NOT NULL CHECK (length(witness_node_id) = 32),
+                 witnessed_at INTEGER NOT NULL CHECK (witnessed_at > 0),
+                 response_blob BLOB NOT NULL
+                     CHECK (length(response_blob) BETWEEN 1 AND 2048),
+                 PRIMARY KEY (policy_digest, witness_node_id),
+                 UNIQUE (policy_epoch, witness_node_id),
+                 FOREIGN KEY (policy_digest)
+                     REFERENCES directory_observation_witness_policies(policy_digest)
+                     ON UPDATE RESTRICT ON DELETE RESTRICT
+             );
+             CREATE INDEX IF NOT EXISTS directory_policy_anchor_receipts_by_epoch
+                 ON directory_observation_policy_anchor_receipts(
+                     policy_epoch, witness_node_id
+                 );
              CREATE TABLE IF NOT EXISTS directory_replica_retry_state (
                  producer BLOB PRIMARY KEY CHECK (length(producer) = 32),
                  consecutive_failures INTEGER NOT NULL
@@ -4270,7 +5013,8 @@ impl DirectoryReplicaStore {
                         Self::require_resolution_columns(transaction)?;
                         Self::require_witness_policy_metadata_columns(transaction)?;
                     }
-                    DIRECTORY_REPLICA_SCHEMA_VERSION_V6
+                    DIRECTORY_REPLICA_SCHEMA_VERSION_V7
+                    | DIRECTORY_REPLICA_SCHEMA_VERSION_V6
                     | DIRECTORY_REPLICA_SCHEMA_VERSION_V5
                     | DIRECTORY_REPLICA_SCHEMA_VERSION_V4
                     | DIRECTORY_REPLICA_SCHEMA_VERSION_V3 => {
@@ -6847,6 +7591,65 @@ mod tests {
         }
     }
 
+    fn policy_anchor_request(
+        observer: &IdentityKeyPair,
+        anchor: DirectoryObservationWitnessPolicyAnchor,
+        request_seed: u8,
+    ) -> DirectorySyncMessage {
+        let request_id = [request_seed; 16];
+        let requester = observer.public_key_bytes();
+        let signing_bytes = directory_policy_anchor_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &requester,
+            NOW + 30,
+            anchor.epoch,
+            &anchor.previous_policy_digest,
+            &anchor.policy_digest,
+        );
+        DirectorySyncMessage::ObservationWitnessPolicyAnchorRequestV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            requester,
+            request_timestamp: NOW + 30,
+            policy_epoch: anchor.epoch,
+            previous_policy_digest: anchor.previous_policy_digest,
+            policy_digest: anchor.policy_digest,
+            signature: observer.sign(&signing_bytes),
+        }
+    }
+
+    fn accepted_policy_anchor_response(
+        observer: &IdentityKeyPair,
+        witness: &IdentityKeyPair,
+        anchor: DirectoryObservationWitnessPolicyAnchor,
+        request_seed: u8,
+    ) -> DirectorySyncMessage {
+        let request_id = [request_seed; 16];
+        let responder = witness.public_key_bytes();
+        let signing_bytes = directory_policy_anchor_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &observer.public_key_bytes(),
+            anchor.epoch,
+            &anchor.policy_digest,
+            &responder,
+            NOW + 31,
+            DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1,
+        );
+        DirectorySyncMessage::ObservationWitnessPolicyAnchorResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            observer: observer.public_key_bytes(),
+            policy_epoch: anchor.epoch,
+            policy_digest: anchor.policy_digest,
+            responder,
+            response_timestamp: NOW + 31,
+            outcome: DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1,
+            signature: witness.sign(&signing_bytes),
+        }
+    }
+
     fn import_replica_block(
         store: &DirectoryReplicaStore,
         producer: &IdentityKeyPair,
@@ -8104,6 +8907,220 @@ mod tests {
     }
 
     #[test]
+    fn remote_policy_anchor_is_monotonic_idempotent_and_restart_durable() {
+        let observer_temp = TempDir::new().unwrap();
+        let witness_temp = TempDir::new().unwrap();
+        let observer = IdentityKeyPair::from_bytes(&[0xf1; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0xf2; 32]).unwrap();
+        let replacement = IdentityKeyPair::from_bytes(&[0xf3; 32]).unwrap();
+        let (observer_store, _) = DirectoryReplicaStore::open(
+            observer_temp.path().join("observer.db"),
+            observer.public_key_bytes(),
+            NOW + 20,
+        )
+        .unwrap();
+        observer_store
+            .reconcile_observation_witness_policy(
+                &observer,
+                &[witness.public_key_bytes()],
+                1,
+                NOW + 20,
+            )
+            .unwrap();
+        let first = observer_store
+            .current_observation_witness_policy_anchor()
+            .unwrap()
+            .unwrap();
+        let witness_path = witness_temp.path().join("witness.db");
+        let (witness_store, _) =
+            DirectoryReplicaStore::open(&witness_path, witness.public_key_bytes(), NOW + 20)
+                .unwrap();
+        let first_request = policy_anchor_request(&observer, first, 0xa1);
+        assert_eq!(
+            witness_store
+                .persist_remote_observation_witness_policy_anchor(&first_request, NOW + 30)
+                .unwrap(),
+            DirectoryObservationWitnessPolicyAnchorDecision::Accepted
+        );
+        assert_eq!(
+            witness_store
+                .persist_remote_observation_witness_policy_anchor(&first_request, NOW + 30)
+                .unwrap(),
+            DirectoryObservationWitnessPolicyAnchorDecision::Accepted
+        );
+
+        let conflicting = DirectoryObservationWitnessPolicyAnchor {
+            policy_digest: [0x44; 32],
+            ..first
+        };
+        assert_eq!(
+            witness_store
+                .persist_remote_observation_witness_policy_anchor(
+                    &policy_anchor_request(&observer, conflicting, 0xa2),
+                    NOW + 30,
+                )
+                .unwrap(),
+            DirectoryObservationWitnessPolicyAnchorDecision::Conflict
+        );
+        let gap = DirectoryObservationWitnessPolicyAnchor {
+            epoch: 3,
+            previous_policy_digest: [0x45; 32],
+            policy_digest: [0x46; 32],
+        };
+        assert_eq!(
+            witness_store
+                .persist_remote_observation_witness_policy_anchor(
+                    &policy_anchor_request(&observer, gap, 0xa3),
+                    NOW + 30,
+                )
+                .unwrap(),
+            DirectoryObservationWitnessPolicyAnchorDecision::HistoryGap
+        );
+
+        observer_store
+            .reconcile_observation_witness_policy(
+                &observer,
+                &[replacement.public_key_bytes()],
+                1,
+                NOW + 21,
+            )
+            .unwrap();
+        let second = observer_store
+            .current_observation_witness_policy_anchor()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.epoch, 2);
+        assert_eq!(second.previous_policy_digest, first.policy_digest);
+        assert_eq!(
+            witness_store
+                .persist_remote_observation_witness_policy_anchor(
+                    &policy_anchor_request(&observer, second, 0xa4),
+                    NOW + 30,
+                )
+                .unwrap(),
+            DirectoryObservationWitnessPolicyAnchorDecision::Accepted
+        );
+        assert_eq!(
+            witness_store
+                .persist_remote_observation_witness_policy_anchor(&first_request, NOW + 30)
+                .unwrap(),
+            DirectoryObservationWitnessPolicyAnchorDecision::Rollback
+        );
+        drop(witness_store);
+        let (_, audit) =
+            DirectoryReplicaStore::open(&witness_path, witness.public_key_bytes(), NOW + 32)
+                .unwrap();
+        assert_eq!(audit.observation_witness_remote_policy_anchors, 2);
+    }
+
+    #[test]
+    fn policy_anchor_receipts_are_pinned_signed_and_tamper_evident() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let observer = IdentityKeyPair::from_bytes(&[0xf4; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0xf5; 32]).unwrap();
+        let outsider = IdentityKeyPair::from_bytes(&[0xf6; 32]).unwrap();
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 20).unwrap();
+        store
+            .reconcile_observation_witness_policy(
+                &observer,
+                &[witness.public_key_bytes()],
+                1,
+                NOW + 20,
+            )
+            .unwrap();
+        let anchor = store
+            .current_observation_witness_policy_anchor()
+            .unwrap()
+            .unwrap();
+        let response = accepted_policy_anchor_response(&observer, &witness, anchor, 0xb1);
+        assert!(store
+            .persist_observation_witness_policy_anchor_receipt(&response, NOW + 31)
+            .unwrap());
+        assert!(!store
+            .persist_observation_witness_policy_anchor_receipt(&response, NOW + 31)
+            .unwrap());
+        assert_eq!(
+            store
+                .verified_observation_witness_policy_anchor_count_for_pins(
+                    anchor.epoch,
+                    &anchor.policy_digest,
+                    &[witness.public_key_bytes()],
+                    NOW + 31,
+                )
+                .unwrap(),
+            1
+        );
+        assert!(store
+            .persist_observation_witness_policy_anchor_receipt(
+                &accepted_policy_anchor_response(&observer, &outsider, anchor, 0xb2),
+                NOW + 31,
+            )
+            .is_err());
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE directory_observation_policy_anchor_receipts
+                 SET response_blob = zeroblob(length(response_blob))",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 32).is_err());
+    }
+
+    #[test]
+    fn policy_anchor_receipt_rejects_a_stale_policy_after_rotation() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let observer = IdentityKeyPair::from_bytes(&[0xe4; 32]).unwrap();
+        let retired_witness = IdentityKeyPair::from_bytes(&[0xe5; 32]).unwrap();
+        let replacement_witness = IdentityKeyPair::from_bytes(&[0xe6; 32]).unwrap();
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 20).unwrap();
+        store
+            .reconcile_observation_witness_policy(
+                &observer,
+                &[retired_witness.public_key_bytes()],
+                1,
+                NOW + 20,
+            )
+            .unwrap();
+        let retired_anchor = store
+            .current_observation_witness_policy_anchor()
+            .unwrap()
+            .unwrap();
+        let stale_response =
+            accepted_policy_anchor_response(&observer, &retired_witness, retired_anchor, 0xc1);
+
+        store
+            .reconcile_observation_witness_policy(
+                &observer,
+                &[replacement_witness.public_key_bytes()],
+                1,
+                NOW + 30,
+            )
+            .unwrap();
+        assert!(matches!(
+            store
+                .persist_observation_witness_policy_anchor_receipt(&stale_response, NOW + 31)
+                .unwrap_err(),
+            DirectoryReplicaStoreError::Request(message)
+                if message == "observation policy anchor receipt is outside the current local policy"
+        ));
+        assert_eq!(
+            store
+                .status_snapshot()
+                .unwrap()
+                .observation_witness_policy_anchor_receipts,
+            0
+        );
+    }
+
+    #[test]
     fn witness_runtime_uses_bounded_mutually_exclusive_buckets() {
         let runtime = DirectoryReplicaSyncRuntime::default();
         let outcomes = [
@@ -8833,6 +9850,67 @@ mod tests {
         assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
         assert_eq!(policy_columns, 2);
         assert_eq!(policy_table, "directory_observation_witness_policies");
+    }
+
+    #[test]
+    fn schema_v7_adds_policy_anchor_evidence_tables_atomically() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x2b; 32]).unwrap();
+        let (store, _) = DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW).unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE directory_replica_meta SET schema_version = ?1 WHERE singleton = 1",
+                params![DIRECTORY_REPLICA_SCHEMA_VERSION_V7],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE directory_observation_policy_anchor_receipts;
+                 DROP TABLE directory_observation_remote_policy_anchors;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let (store, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 1).unwrap();
+        assert_eq!(audit.observation_witness_policy_anchor_receipts, 0);
+        assert_eq!(audit.observation_witness_remote_policy_anchors, 0);
+        let connection = store.connection.lock();
+        let version: i64 = connection
+            .query_row(
+                "SELECT schema_version FROM directory_replica_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let anchor_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table'
+                   AND name IN (
+                       'directory_observation_remote_policy_anchors',
+                       'directory_observation_policy_anchor_receipts'
+                   )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt_index: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name = 'directory_policy_anchor_receipts_by_epoch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
+        assert_eq!(anchor_tables, 2);
+        assert_eq!(receipt_index, 1);
     }
 
     #[test]

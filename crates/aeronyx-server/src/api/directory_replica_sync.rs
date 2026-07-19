@@ -32,6 +32,8 @@
 //! - Continues witnessing a mature checkpoint until the configured number of
 //!   current pinned peers have independently recomputed it, while skipping
 //!   pins whose canonical receipts are already durable.
+//! - Anchors the current opaque witness-policy head with current pinned peers,
+//!   skipping peers whose canonical policy receipt is already durable.
 //! - Tries the producer directly first, then uses another pinned node as an
 //!   audited evidence carrier only for bounded availability/admission failures.
 //! - Requests up to eight contiguous blocks per page while the peer-side
@@ -64,6 +66,8 @@
 //! 11. Persist bounded aggregate witness outcomes and mirror the current
 //!     process round into runtime telemetry without retaining witness identity.
 //! 12. Stop the complete round immediately when shutdown wins the select.
+//! 13. Ask missing current pins to retain the opaque current policy head and
+//!     persist only exact accepted signed receipts.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -83,6 +87,7 @@
 //!   signature, or descriptor-hash response; these are security failures.
 //!
 //! ## Last Modified
+//! `v0.13.0-DirectoryPolicyHeadAnchor` - Added bounded external policy-head anchor rounds.
 //! `v0.12.0-DirectoryBoundedColdCatchUp` - Raised the sparse-page cold catch-up cap while preserving the per-peer request budget.
 //! `v0.11.0-DirectoryWitnessThreshold` - Added retryable pinned-witness corroboration targets.
 //! `v0.10.0-DirectoryMatureWitnessScheduling` - Added one-interval mature unwitnessed checkpoint targeting.
@@ -116,6 +121,7 @@ use aeronyx_core::protocol::discovery::{
     directory_descriptor_objects_response_signing_bytes,
     directory_observation_witness_request_signing_bytes,
     directory_observation_witness_response_signing_bytes,
+    directory_policy_anchor_request_signing_bytes, directory_policy_anchor_response_signing_bytes,
     directory_replica_block_range_request_signing_bytes,
     directory_replica_block_range_response_signing_bytes,
     directory_replica_descriptor_objects_request_signing_bytes,
@@ -123,7 +129,9 @@ use aeronyx_core::protocol::discovery::{
     DirectoryCommitmentBlockV1, DirectoryObservationCheckpointV1, DirectorySyncMessage,
     SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
     DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
-    DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1, MAX_DIRECTORY_COMMITMENTS_PER_BLOCK,
+    DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1, DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1,
+    DIRECTORY_POLICY_ANCHOR_CONFLICT_V1, DIRECTORY_POLICY_ANCHOR_HISTORY_GAP_V1,
+    DIRECTORY_POLICY_ANCHOR_ROLLBACK_V1, MAX_DIRECTORY_COMMITMENTS_PER_BLOCK,
     MAX_DIRECTORY_SYNC_BLOCKS_V1, MAX_DIRECTORY_SYNC_OBJECTS_V1,
 };
 use futures::{stream, StreamExt};
@@ -332,6 +340,7 @@ pub struct DirectoryReplicaSyncCoordinator {
     identity: Arc<IdentityKeyPair>,
     client: reqwest::Client,
     witness_capabilities: DirectoryWitnessCapabilityCache,
+    policy_anchor_capabilities: DirectoryWitnessCapabilityCache,
     witness_min_verified: usize,
     restored_retry_states: usize,
 }
@@ -385,6 +394,7 @@ impl DirectoryReplicaSyncCoordinator {
             identity,
             client,
             witness_capabilities: DirectoryWitnessCapabilityCache::default(),
+            policy_anchor_capabilities: DirectoryWitnessCapabilityCache::default(),
             witness_min_verified,
             restored_retry_states,
         })
@@ -433,6 +443,10 @@ impl DirectoryReplicaSyncCoordinator {
             .await;
         let all_producers_synchronized =
             outcomes.len() == self.peers.len() && outcomes.iter().all(|complete| *complete);
+        // Policy rollback detection must not wait for replica convergence. A
+        // temporarily unavailable producer cannot be allowed to suppress the
+        // independent external high-water check after a host rollback.
+        self.anchor_current_observation_witness_policy().await;
         if all_producers_synchronized {
             self.persist_observation_checkpoint().await;
         }
@@ -624,6 +638,67 @@ impl DirectoryReplicaSyncCoordinator {
             .await;
     }
 
+    async fn anchor_current_observation_witness_policy(&self) {
+        let store = Arc::clone(&self.store);
+        let eligible_witnesses = Arc::clone(&self.peers);
+        let observed_at = unix_now_secs();
+        let anchor = match tokio::task::spawn_blocking(move || {
+            let Some(anchor) = store.current_observation_witness_policy_anchor()? else {
+                return Ok::<_, DirectoryReplicaStoreError>(None);
+            };
+            let witnessed = store.verified_observation_witness_policy_anchor_witnesses_for_pins(
+                anchor.epoch,
+                &anchor.policy_digest,
+                eligible_witnesses.as_ref(),
+                observed_at,
+            )?;
+            Ok(Some((anchor, witnessed)))
+        })
+        .await
+        {
+            Ok(Ok(Some(anchor))) => anchor,
+            Ok(Ok(None)) => return,
+            Ok(Err(_)) | Err(_) => {
+                warn!(
+                    reason = "directory_observation_policy_anchor_audit_failed",
+                    "[DIRECTORY_REPLICA] Policy-head anchor round skipped"
+                );
+                return;
+            }
+        };
+        if anchor.1.len() >= self.witness_min_verified {
+            return;
+        }
+        let outcomes = stream::iter(
+            self.peers
+                .iter()
+                .copied()
+                .filter(|witness| !anchor.1.contains(witness)),
+        )
+        .map(|witness| async move {
+            request_observation_policy_anchor(
+                Arc::clone(&self.store),
+                self.peer_store.as_ref(),
+                self.identity.as_ref(),
+                &witness,
+                &self.client,
+                &self.policy_anchor_capabilities,
+                anchor.0,
+            )
+            .await
+        })
+        .buffer_unordered(DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS)
+        .collect::<Vec<_>>()
+        .await;
+        debug!(
+            policy_epoch = anchor.0.epoch,
+            attempted_witnesses = outcomes.len(),
+            accepted =
+                witness_outcome_count(&outcomes, DirectoryObservationWitnessOutcome::Accepted),
+            "[DIRECTORY_REPLICA] Opaque policy-head anchor round completed"
+        );
+    }
+
     async fn record_witness_outcome_round(
         &self,
         checkpoint_sequence: u64,
@@ -752,6 +827,182 @@ impl DirectoryReplicaSyncCoordinator {
             );
         }
         durable
+    }
+}
+
+async fn request_observation_policy_anchor(
+    store: Arc<DirectoryReplicaStore>,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    witness: &[u8; 32],
+    client: &reqwest::Client,
+    capability_cache: &DirectoryWitnessCapabilityCache,
+    anchor: crate::services::directory_replica::DirectoryObservationWitnessPolicyAnchor,
+) -> DirectoryObservationWitnessOutcome {
+    let request_timestamp = unix_now_secs();
+    let Some(descriptor) = peer_store.get_valid(witness, request_timestamp) else {
+        return DirectoryObservationWitnessOutcome::PeerUnavailable;
+    };
+    let Some(endpoint) = descriptor.descriptor.public_endpoint.as_deref() else {
+        return DirectoryObservationWitnessOutcome::PeerUnavailable;
+    };
+    if !commitment_peer_endpoint_is_public(endpoint) {
+        return DirectoryObservationWitnessOutcome::PeerUnavailable;
+    }
+    let descriptor_sequence = descriptor.sequence();
+    if !capability_cache.should_attempt(witness, descriptor_sequence) {
+        return DirectoryObservationWitnessOutcome::PeerUnavailable;
+    }
+    let Ok(url) = commitment_peer_url(
+        endpoint,
+        "/api/discovery/peer/directory/observation-policy-anchor",
+    ) else {
+        return DirectoryObservationWitnessOutcome::PeerUnavailable;
+    };
+    let mut request_id = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut request_id);
+    let requester = identity.public_key_bytes();
+    let signing_bytes = directory_policy_anchor_request_signing_bytes(
+        &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+        &request_id,
+        &requester,
+        request_timestamp,
+        anchor.epoch,
+        &anchor.previous_policy_digest,
+        &anchor.policy_digest,
+    );
+    let request = DirectorySyncMessage::ObservationWitnessPolicyAnchorRequestV1 {
+        chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+        request_id,
+        requester,
+        request_timestamp,
+        policy_epoch: anchor.epoch,
+        previous_policy_digest: anchor.previous_policy_digest,
+        policy_digest: anchor.policy_digest,
+        signature: identity.sign(&signing_bytes),
+    };
+    let Ok(frame) = encode_directory_sync_message(&request) else {
+        return DirectoryObservationWitnessOutcome::VerificationFailure;
+    };
+    let response = match post_directory_frame_typed(client, url, frame).await {
+        Ok(response) => {
+            capability_cache.record_supported(witness);
+            response
+        }
+        Err(error) if error.witness_capability_unavailable() => {
+            capability_cache.record_unsupported(*witness, descriptor_sequence);
+            return DirectoryObservationWitnessOutcome::PeerUnavailable;
+        }
+        Err(_) => return DirectoryObservationWitnessOutcome::TransportFailure,
+    };
+    let verified = match verify_observation_policy_anchor_response(
+        &response,
+        &request_id,
+        &requester,
+        witness,
+        request_timestamp,
+        anchor.epoch,
+        &anchor.policy_digest,
+    ) {
+        Ok(response) => response,
+        Err(reason) if reason == "observation_policy_anchor_rollback" => {
+            return DirectoryObservationWitnessOutcome::EvidenceConflict;
+        }
+        Err(reason) if reason == "observation_policy_anchor_conflict" => {
+            return DirectoryObservationWitnessOutcome::EvidenceConflict;
+        }
+        Err(reason) if reason == "observation_policy_anchor_history_gap" => {
+            return DirectoryObservationWitnessOutcome::EvidenceUnavailable;
+        }
+        Err(_) => return DirectoryObservationWitnessOutcome::VerificationFailure,
+    };
+    let durable = tokio::task::spawn_blocking(move || {
+        store.persist_observation_witness_policy_anchor_receipt(&verified, unix_now_secs())
+    })
+    .await
+    .is_ok_and(|result| result.is_ok());
+    if durable {
+        DirectoryObservationWitnessOutcome::Accepted
+    } else {
+        DirectoryObservationWitnessOutcome::PersistenceFailure
+    }
+}
+
+pub(crate) fn verify_observation_policy_anchor_response(
+    frame: &[u8],
+    expected_request_id: &[u8; 16],
+    expected_observer: &[u8; 32],
+    expected_witness: &[u8; 32],
+    request_timestamp: u64,
+    expected_policy_epoch: u64,
+    expected_policy_digest: &[u8; 32],
+) -> Result<DirectorySyncMessage, String> {
+    let response = decode_directory_sync_message(frame)
+        .map_err(|_| "observation_policy_anchor_response_decode_failed".to_string())?;
+    let canonical = encode_directory_sync_message(&response)
+        .map_err(|_| "observation_policy_anchor_response_encode_failed".to_string())?;
+    if canonical != frame {
+        return Err("observation_policy_anchor_response_noncanonical".to_string());
+    }
+    let DirectorySyncMessage::ObservationWitnessPolicyAnchorResponseV1 {
+        chain_id,
+        request_id,
+        observer,
+        policy_epoch,
+        policy_digest,
+        responder,
+        response_timestamp,
+        outcome,
+        signature,
+    } = &response
+    else {
+        return Err("observation_policy_anchor_response_unexpected_message".to_string());
+    };
+    if *chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+        || request_id != expected_request_id
+        || observer != expected_observer
+        || responder != expected_witness
+        || *policy_epoch != expected_policy_epoch
+        || policy_digest != expected_policy_digest
+        || response_timestamp.abs_diff(unix_now_secs())
+            > DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS
+        || response_timestamp.saturating_add(DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS)
+            < request_timestamp
+        || ![
+            DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1,
+            DIRECTORY_POLICY_ANCHOR_ROLLBACK_V1,
+            DIRECTORY_POLICY_ANCHOR_CONFLICT_V1,
+            DIRECTORY_POLICY_ANCHOR_HISTORY_GAP_V1,
+        ]
+        .contains(outcome)
+    {
+        return Err("observation_policy_anchor_response_contract_mismatch".to_string());
+    }
+    let signing_bytes = directory_policy_anchor_response_signing_bytes(
+        chain_id,
+        request_id,
+        observer,
+        *policy_epoch,
+        policy_digest,
+        responder,
+        *response_timestamp,
+        *outcome,
+    );
+    IdentityPublicKey::from_bytes(responder)
+        .and_then(|key| key.verify(&signing_bytes, signature))
+        .map_err(|_| "observation_policy_anchor_response_invalid_signature".to_string())?;
+    match *outcome {
+        DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1 => Ok(response),
+        DIRECTORY_POLICY_ANCHOR_ROLLBACK_V1 => {
+            Err("observation_policy_anchor_rollback".to_string())
+        }
+        DIRECTORY_POLICY_ANCHOR_CONFLICT_V1 => {
+            Err("observation_policy_anchor_conflict".to_string())
+        }
+        DIRECTORY_POLICY_ANCHOR_HISTORY_GAP_V1 => {
+            Err("observation_policy_anchor_history_gap".to_string())
+        }
+        _ => Err("observation_policy_anchor_response_outcome_invalid".to_string()),
     }
 }
 
@@ -1985,6 +2236,119 @@ mod tests {
             )
             .unwrap_err(),
             "directory_replica_range_response_invalid_signature"
+        );
+    }
+
+    #[test]
+    fn policy_anchor_response_verification_binds_the_complete_statement() {
+        let observer = IdentityKeyPair::from_bytes(&[0xa1; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0xa2; 32]).unwrap();
+        let other_witness = IdentityKeyPair::from_bytes(&[0xa3; 32]).unwrap();
+        let request_id = [0xa4; 16];
+        let policy_epoch = 7;
+        let policy_digest = [0xa5; 32];
+        let now = unix_now_secs();
+        let response = |outcome: u8| {
+            let signing_bytes = directory_policy_anchor_response_signing_bytes(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &request_id,
+                &observer.public_key_bytes(),
+                policy_epoch,
+                &policy_digest,
+                &witness.public_key_bytes(),
+                now,
+                outcome,
+            );
+            DirectorySyncMessage::ObservationWitnessPolicyAnchorResponseV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                request_id,
+                observer: observer.public_key_bytes(),
+                policy_epoch,
+                policy_digest,
+                responder: witness.public_key_bytes(),
+                response_timestamp: now,
+                outcome,
+                signature: witness.sign(&signing_bytes),
+            }
+        };
+
+        let accepted = response(DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1);
+        let frame = encode_directory_sync_message(&accepted).unwrap();
+        assert_eq!(
+            verify_observation_policy_anchor_response(
+                &frame,
+                &request_id,
+                &observer.public_key_bytes(),
+                &witness.public_key_bytes(),
+                now,
+                policy_epoch,
+                &policy_digest,
+            )
+            .unwrap(),
+            accepted
+        );
+        assert_eq!(
+            verify_observation_policy_anchor_response(
+                &frame,
+                &request_id,
+                &observer.public_key_bytes(),
+                &other_witness.public_key_bytes(),
+                now,
+                policy_epoch,
+                &policy_digest,
+            )
+            .unwrap_err(),
+            "observation_policy_anchor_response_contract_mismatch"
+        );
+        assert_eq!(
+            verify_observation_policy_anchor_response(
+                &frame,
+                &request_id,
+                &observer.public_key_bytes(),
+                &witness.public_key_bytes(),
+                now,
+                policy_epoch,
+                &[0xff; 32],
+            )
+            .unwrap_err(),
+            "observation_policy_anchor_response_contract_mismatch"
+        );
+
+        let rollback =
+            encode_directory_sync_message(&response(DIRECTORY_POLICY_ANCHOR_ROLLBACK_V1)).unwrap();
+        assert_eq!(
+            verify_observation_policy_anchor_response(
+                &rollback,
+                &request_id,
+                &observer.public_key_bytes(),
+                &witness.public_key_bytes(),
+                now,
+                policy_epoch,
+                &policy_digest,
+            )
+            .unwrap_err(),
+            "observation_policy_anchor_rollback"
+        );
+
+        let mut tampered = response(DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1);
+        let DirectorySyncMessage::ObservationWitnessPolicyAnchorResponseV1 { signature, .. } =
+            &mut tampered
+        else {
+            unreachable!();
+        };
+        signature[0] ^= 1;
+        assert_eq!(
+            verify_observation_policy_anchor_response(
+                &encode_directory_sync_message(&tampered).unwrap(),
+                &request_id,
+                &observer.public_key_bytes(),
+                &witness.public_key_bytes(),
+                now,
+                policy_epoch,
+                &policy_digest,
+            )
+            .unwrap_err(),
+            "observation_policy_anchor_response_invalid_signature"
         );
     }
 

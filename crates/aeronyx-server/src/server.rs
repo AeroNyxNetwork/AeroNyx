@@ -210,6 +210,9 @@
 //  88. Reconciles the validated Directory witness pins and threshold into a
 //      node-identity-signed, hash-linked local policy epoch after full replica
 //      audit and before synchronization or listeners can start.
+//  89. Externally anchors the opaque current Directory witness-policy head at
+//      its exact pinned witnesses and audits monotonic remote heads plus signed
+//      local receipts before listeners start, without exporting policy members.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -297,8 +300,13 @@
 //   - Directory Replica schema v7 anchors signed witness-policy history in
 //     metadata. Policy epochs are local operator evidence configuration, not a
 //     validator set, vote, quorum, fork choice, consensus, or finality.
+//   - Directory Replica schema v8 records only opaque signed policy-head
+//     anchors. First observation is TOFU; rollback, same-epoch conflict, and
+//     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.34-DirectoryPolicyHeadAnchor - Anchored opaque witness-policy heads at
+//     exact current pins with restart-audited monotonic evidence
 //   v2.8.33-DirectoryWitnessPolicyEpoch - Reconciled signed hash-linked local
 //     witness policy history during fail-closed Directory Replica startup
 //   v2.8.32-DirectoryMatureWitnessPipelineStatus - Passed the configured witness
@@ -4320,6 +4328,9 @@ impl Server {
             witness_policy_activated_at = policy.activated_at,
             witness_policy_members = policy.witness_members,
             witness_policy_threshold = policy.minimum_witnesses,
+            witness_policy_anchor_receipts =
+                audit.observation_witness_policy_anchor_receipts,
+            remote_witness_policy_heads = audit.observation_witness_remote_policy_anchors,
             retry_states = audit.retry_states,
             "[DIRECTORY_REPLICA] Startup audit and witness-policy reconciliation passed"
         );

@@ -16,11 +16,13 @@
 //! - `POST /api/discovery/peer/directory/replica-block-range`
 //! - `POST /api/discovery/peer/directory/replica-descriptor-objects`
 //! - `POST /api/discovery/peer/directory/observation-checkpoint-witness`
+//! - `POST /api/discovery/peer/directory/observation-policy-anchor`
 //! - Dedicated operator-pinned admission in addition to live `PeerStore` proof.
 //! - Ed25519 request/response authentication, timestamp freshness, replay
 //!   rejection, per-peer rate limits, body limits, and audit-gated reads.
 //! - Exact content-addressed descriptor batches; no partial object response.
 //! - Independent checkpoint root recomputation before a signed witness decision.
+//! - Monotonic opaque policy-head retention before a signed anchor decision.
 //! - Audited producer-replica export with a separate carrier signature layer.
 //! - Multi-block catch-up pages capped to one block's maximum aggregate
 //!   commitment budget and stopped before repeated descriptor objects.
@@ -43,6 +45,8 @@
 //!    independently reproduces every exact prefix and observation root.
 //! 7. Carrier routes audit and read one producer namespace in the same SQLite
 //!    transaction; the carrier signs transport but never producer history.
+//! 8. Policy-anchor requests disclose only an observer epoch and opaque digest;
+//!    rollback, same-epoch conflict, and non-contiguous progression fail closed.
 //!
 //! ## Privacy Invariant
 //! This API serves signed public node-directory commitments and the public
@@ -64,6 +68,7 @@
 //!   signature does not replace any producer block or descriptor signature.
 //!
 //! ## Last Modified
+//! v0.7.0-DirectoryPolicyHeadAnchor - Added durable opaque policy-head anchor route.
 //! v0.6.1-DirectoryBoundedMultiBlockCatchUp - Added commitment-bounded multi-block pages.
 //! v0.6.0-DirectoryEvidenceCarrier - Added audited pinned replica-carrier routes.
 //! v0.5.0-DirectoryObservationWitness - Added independently recomputed pinned-peer witness route.
@@ -96,6 +101,7 @@ use aeronyx_core::protocol::discovery::{
     directory_descriptor_objects_response_signing_bytes,
     directory_observation_witness_request_signing_bytes,
     directory_observation_witness_response_signing_bytes,
+    directory_policy_anchor_request_signing_bytes, directory_policy_anchor_response_signing_bytes,
     directory_replica_block_range_request_signing_bytes,
     directory_replica_block_range_response_signing_bytes,
     directory_replica_descriptor_objects_request_signing_bytes,
@@ -108,6 +114,7 @@ use aeronyx_core::protocol::discovery::{
     MAX_DIRECTORY_SYNC_BLOCKS_V1, MAX_DIRECTORY_SYNC_OBJECTS_V1,
 };
 
+use crate::services::directory_replica::DirectoryObservationWitnessPolicyAnchorDecision;
 use crate::services::{
     DirectoryChainStore, DirectoryChainStoreError, DirectoryObservationWitnessDecision,
     DirectoryReplicaStore, DirectoryReplicaStoreError, PeerStore,
@@ -225,6 +232,10 @@ pub fn build_directory_chain_peer_router_with_replica(
             .route(
                 "/api/discovery/peer/directory/observation-checkpoint-witness",
                 post(observation_checkpoint_witness_handler),
+            )
+            .route(
+                "/api/discovery/peer/directory/observation-policy-anchor",
+                post(observation_policy_anchor_handler),
             );
     }
     router
@@ -843,6 +854,104 @@ async fn observation_checkpoint_witness_handler(
             observer: requester,
             checkpoint_sequence,
             checkpoint_hash,
+            responder,
+            response_timestamp,
+            outcome,
+            signature: state.identity.sign(&response_signing_bytes),
+        },
+    )
+}
+
+async fn observation_policy_anchor_handler(
+    State(state): State<DirectoryChainPeerState>,
+    body: Bytes,
+) -> Response {
+    let message = match decode_request(&body) {
+        Ok(message) => message,
+        Err(response) => return response,
+    };
+    let DirectorySyncMessage::ObservationWitnessPolicyAnchorRequestV1 {
+        chain_id,
+        request_id,
+        requester,
+        request_timestamp,
+        policy_epoch,
+        previous_policy_digest,
+        policy_digest,
+        signature,
+    } = &message
+    else {
+        return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
+    };
+    let position_valid = (*policy_epoch == 1 && *previous_policy_digest == [0u8; 32])
+        || (*policy_epoch > 1 && *previous_policy_digest != [0u8; 32]);
+    if *chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+        || *requester == state.identity.public_key_bytes()
+        || *policy_digest == [0u8; 32]
+        || !position_valid
+    {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_policy_anchor_request");
+    }
+    let now = now_secs();
+    let signing_bytes = directory_policy_anchor_request_signing_bytes(
+        chain_id,
+        request_id,
+        requester,
+        *request_timestamp,
+        *policy_epoch,
+        previous_policy_digest,
+        policy_digest,
+    );
+    if let Err(response) = authenticate_request(
+        &state,
+        *requester,
+        *request_id,
+        *request_timestamp,
+        &signing_bytes,
+        signature,
+        now,
+    )
+    .await
+    {
+        return response;
+    }
+    let Some(store) = state.replica_store.as_ref().map(Arc::clone) else {
+        return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "replica_store_disabled");
+    };
+    let anchor_request = message.clone();
+    let decision = match tokio::task::spawn_blocking(move || {
+        store.persist_remote_observation_witness_policy_anchor(&anchor_request, now)
+    })
+    .await
+    {
+        Ok(Ok(decision)) => decision,
+        Ok(Err(error)) => return replica_store_error_response(&error),
+        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
+    };
+    let responder = state.identity.public_key_bytes();
+    let response_timestamp = now_secs();
+    let outcome = decision.outcome();
+    let response_signing_bytes = directory_policy_anchor_response_signing_bytes(
+        chain_id,
+        request_id,
+        requester,
+        *policy_epoch,
+        policy_digest,
+        &responder,
+        response_timestamp,
+        outcome,
+    );
+    debug!(
+        accepted = decision == DirectoryObservationWitnessPolicyAnchorDecision::Accepted,
+        policy_epoch, "[DIRECTORY_CHAIN] Evaluated authenticated opaque policy-head anchor"
+    );
+    encoded_response(
+        DirectorySyncMessage::ObservationWitnessPolicyAnchorResponseV1 {
+            chain_id: *chain_id,
+            request_id: *request_id,
+            observer: *requester,
+            policy_epoch: *policy_epoch,
+            policy_digest: *policy_digest,
             responder,
             response_timestamp,
             outcome,
