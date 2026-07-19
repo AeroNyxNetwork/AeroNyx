@@ -36,6 +36,8 @@
 //!   persists only canonical, accepted, externally signed witness receipts.
 //! - Persists privacy-safe aggregate witness outcomes separately from signed
 //!   receipts so operators can distinguish unavailable evidence from faults.
+//! - Persists every local witness pin/threshold change as a node-identity-
+//!   signed, hash-linked policy epoch with a metadata-anchored durable head.
 //! - Selects only forward-moving, mature, unwitnessed checkpoints for external
 //!   recomputation so asymmetric sync schedules cannot chase the moving tip.
 //! - Keeps recurring witness selection history-bounded by verifying only the
@@ -71,6 +73,9 @@
 //!    identity, endpoint, request id, signature, or checkpoint hash metadata.
 //! 10. Keep periodic selection cost independent of retained history while
 //!     retaining complete fail-closed audits at startup and operator request.
+//! 11. Canonicalize the configured witness set and append a policy epoch only
+//!     when pins or threshold change; verify the complete policy chain before
+//!     synchronization or any listener starts.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -94,6 +99,9 @@
 //!   checkpoint. It is not a vote, quorum, fork choice, consensus, or finality.
 //! - Witness outcome telemetry is aggregate diagnostic evidence only. Never add
 //!   witness identities, endpoints, request ids, signatures, or hashes to it.
+//! - Witness policy epochs describe only this operator's local evidence target.
+//!   They are not a validator set, vote, quorum, fork choice, consensus, or
+//!   finality, and public status must never expose their full member identities.
 //! - A carrier may export only non-quarantined producer evidence retained in
 //!   this store. The receiver must still verify producer and carrier signatures.
 //! - Incident evidence export is read-only. Quarantine resolution requires a
@@ -103,6 +111,7 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.16.0-DirectoryWitnessPolicyEpoch - Added schema v7 signed hash-linked local witness policy history, metadata-head partial-deletion protection, startup reconciliation, and tamper tests
 //! v0.15.0-DirectoryWitnessFailureDrills - Locked partial-receipt restart recovery and current-pin rotation fail-closed behavior with deterministic state-machine coverage
 //! v0.14.0-DirectoryWitnessThreshold - Added configurable pinned-witness corroboration targets
 //! v0.13.0-DirectoryBoundedWitnessSelectionAudit - Bounded recurring selection verification without weakening startup audit
@@ -154,7 +163,8 @@ use rusqlite::{
 };
 use sha2::{Digest, Sha256};
 
-const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 6;
+const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 7;
+const DIRECTORY_REPLICA_SCHEMA_VERSION_V6: i64 = 6;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V5: i64 = 5;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V4: i64 = 4;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V3: i64 = 3;
@@ -171,6 +181,7 @@ const MAX_DIRECTORY_REPLICA_CONVERGENCE_PRODUCERS: usize = 16;
 const MAX_DIRECTORY_REPLICA_INCIDENT_KIND_BYTES: usize = 64;
 const MAX_DIRECTORY_OBSERVATION_CHECKPOINT_BYTES: u64 = 4 * 1024;
 const MAX_DIRECTORY_OBSERVATION_WITNESS_BYTES: usize = 2 * 1024;
+const MAX_DIRECTORY_OBSERVATION_WITNESS_POLICY_MEMBERS: usize = 16;
 const DIRECTORY_REPLICA_RESOLUTION_ACTION: &str = "resume_existing_prefix";
 const DIRECTORY_REPLICA_RESOLUTION_TIMESTAMP_SKEW_SECS: u64 = 60;
 /// Maximum incident summaries returned by one operator API read.
@@ -240,6 +251,16 @@ pub struct DirectoryReplicaAudit {
     pub observation_checkpoint_latest_witnesses: u64,
     /// Audited privacy-safe witness attempt aggregates.
     pub observation_witness_outcomes: DirectoryObservationWitnessOutcomeSnapshot,
+    /// Number of audited local witness-policy epochs.
+    pub observation_witness_policy_epochs: u64,
+    /// Current local witness-policy epoch, or zero before reconciliation.
+    pub observation_witness_policy_epoch: u64,
+    /// Timestamp bound into the current local witness policy.
+    pub observation_witness_policy_activated_at: u64,
+    /// Number of operator-pinned witnesses in the current policy.
+    pub observation_witness_policy_members: u64,
+    /// External receipt threshold in the current local policy.
+    pub observation_witness_policy_threshold: u64,
     /// Number of audited producer-local retry rows.
     pub retry_states: u64,
 }
@@ -275,6 +296,16 @@ pub struct DirectoryReplicaStoreSnapshot {
     pub observation_checkpoint_latest_witnesses: u64,
     /// Audited privacy-safe witness attempt aggregates.
     pub observation_witness_outcomes: DirectoryObservationWitnessOutcomeSnapshot,
+    /// Number of durable, signed local witness-policy epochs.
+    pub observation_witness_policy_epochs: u64,
+    /// Current local witness-policy epoch, or zero before reconciliation.
+    pub observation_witness_policy_epoch: u64,
+    /// Timestamp bound into the current local witness policy.
+    pub observation_witness_policy_activated_at: u64,
+    /// Number of operator-pinned witnesses in the current policy.
+    pub observation_witness_policy_members: u64,
+    /// External receipt threshold in the current local policy.
+    pub observation_witness_policy_threshold: u64,
     /// Per-producer accepted-prefix summaries for local operator presentation.
     pub producer_snapshots: Vec<DirectoryReplicaProducerSnapshot>,
 }
@@ -1164,6 +1195,109 @@ struct StoredObservationWitnessOutcomeRow {
     updated_at: i64,
 }
 
+#[derive(Debug)]
+struct StoredObservationWitnessPolicyRow {
+    epoch: i64,
+    policy_digest: Vec<u8>,
+    previous_policy_digest: Vec<u8>,
+    activated_at: i64,
+    witness_threshold: i64,
+    witness_count: i64,
+    witness_node_ids: Vec<u8>,
+    signer_node_id: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+/// One node-identity-signed, hash-linked local witness admission policy.
+///
+/// This is operator configuration history, not a network vote, validator set,
+/// fork-choice rule, consensus object, or finality certificate. Full member
+/// identities remain in the host-local database and are never returned by the
+/// public aggregate status endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryObservationWitnessPolicyEpoch {
+    epoch: u64,
+    previous_policy_digest: [u8; 32],
+    activated_at: u64,
+    witness_node_ids: Vec<[u8; 32]>,
+    minimum_witnesses: usize,
+    signer_node_id: [u8; 32],
+    signature: [u8; 64],
+}
+
+impl DirectoryObservationWitnessPolicyEpoch {
+    fn sign(
+        identity: &IdentityKeyPair,
+        epoch: u64,
+        previous_policy_digest: [u8; 32],
+        activated_at: u64,
+        witness_node_ids: Vec<[u8; 32]>,
+        minimum_witnesses: usize,
+    ) -> Result<Self, DirectoryReplicaStoreError> {
+        let mut policy = Self {
+            epoch,
+            previous_policy_digest,
+            activated_at,
+            witness_node_ids,
+            minimum_witnesses,
+            signer_node_id: identity.public_key_bytes(),
+            signature: [0u8; 64],
+        };
+        policy.validate_unsigned_fields()?;
+        policy.signature = identity.sign(&policy.signing_bytes());
+        Ok(policy)
+    }
+
+    fn validate_unsigned_fields(&self) -> Result<(), DirectoryReplicaStoreError> {
+        if self.epoch == 0 || self.activated_at == 0 || self.signer_node_id == [0u8; 32] {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness policy contains an invalid sentinel".to_string(),
+            ));
+        }
+        validate_observation_witness_policy_members(&self.witness_node_ids, self.minimum_witnesses)
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(192 + self.witness_node_ids.len() * 32);
+        bytes.extend_from_slice(b"AeroNyx-DirectoryObservationWitnessPolicy-v1");
+        bytes.extend_from_slice(&AERONYX_DIRECTORY_MAINNET_CHAIN_ID);
+        bytes.extend_from_slice(&self.epoch.to_le_bytes());
+        bytes.extend_from_slice(&self.previous_policy_digest);
+        bytes.extend_from_slice(&self.activated_at.to_le_bytes());
+        bytes.extend_from_slice(&(self.minimum_witnesses as u64).to_le_bytes());
+        bytes.extend_from_slice(&(self.witness_node_ids.len() as u64).to_le_bytes());
+        for witness_node_id in &self.witness_node_ids {
+            bytes.extend_from_slice(witness_node_id);
+        }
+        bytes.extend_from_slice(&self.signer_node_id);
+        bytes
+    }
+
+    fn digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.signing_bytes());
+        hasher.update(self.signature);
+        hasher.finalize().into()
+    }
+}
+
+/// Result of reconciling validated runtime pins into the signed local history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectoryObservationWitnessPolicyReconcileReport {
+    /// True only when pins or threshold created a new durable epoch.
+    pub(crate) appended: bool,
+    /// Current local policy epoch after reconciliation.
+    pub(crate) epoch: u64,
+    /// Content digest of the current signed policy.
+    pub(crate) policy_digest: [u8; 32],
+    /// Timestamp bound into the current policy.
+    pub(crate) activated_at: u64,
+    /// Number of canonical current witness pins.
+    pub(crate) witness_members: u64,
+    /// Required distinct external receipts.
+    pub(crate) minimum_witnesses: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VerifiedObservationWitness {
     sequence: u64,
@@ -1186,6 +1320,13 @@ struct ObservationWitnessAudit {
     witnesses: u64,
     latest_sequence: u64,
     latest_witnesses: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ObservationWitnessPolicyAudit {
+    epochs: u64,
+    current: Option<DirectoryObservationWitnessPolicyEpoch>,
+    current_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1248,6 +1389,199 @@ impl DirectoryReplicaStore {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Reconciles validated runtime witness pins into a signed local policy
+    /// epoch without rewriting historical policy or witness receipts.
+    ///
+    /// Reordered pins are canonicalized and therefore idempotent. A pin-set or
+    /// threshold change appends exactly one node-identity-signed, hash-linked
+    /// epoch and advances the metadata head in the same immediate transaction.
+    /// This history describes only this node operator's corroboration policy;
+    /// it does not define network membership, voting weight, consensus, fork
+    /// choice, or finality.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] for invalid pins/thresholds,
+    /// identity mismatch, malformed prior history, counter exhaustion, or an
+    /// atomic SQLite compare-and-swap failure.
+    pub(crate) fn reconcile_observation_witness_policy(
+        &self,
+        identity: &IdentityKeyPair,
+        witness_node_ids: &[[u8; 32]],
+        minimum_witnesses: usize,
+        activated_at: u64,
+    ) -> Result<DirectoryObservationWitnessPolicyReconcileReport, DirectoryReplicaStoreError> {
+        if identity.public_key_bytes() != self.local_node_id || activated_at == 0 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness policy identity or timestamp is invalid".to_string(),
+            ));
+        }
+        let canonical_witnesses = canonical_observation_witness_policy_members(
+            witness_node_ids,
+            minimum_witnesses,
+        )?;
+
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::validate_metadata(&transaction, &self.local_node_id)?;
+        let previous = Self::audit_observation_witness_policies(&transaction, &self.local_node_id)?;
+        if let Some(current) = previous.current.as_ref() {
+            if current.witness_node_ids == canonical_witnesses
+                && current.minimum_witnesses == minimum_witnesses
+            {
+                transaction.commit()?;
+                return Ok(DirectoryObservationWitnessPolicyReconcileReport {
+                    appended: false,
+                    epoch: current.epoch,
+                    policy_digest: previous.current_digest,
+                    activated_at: current.activated_at,
+                    witness_members: u64::try_from(current.witness_node_ids.len()).map_err(
+                        |_| {
+                            DirectoryReplicaStoreError::Integrity(
+                                "observation witness policy member count exceeds u64".to_string(),
+                            )
+                        },
+                    )?,
+                    minimum_witnesses: u64::try_from(current.minimum_witnesses).map_err(|_| {
+                        DirectoryReplicaStoreError::Integrity(
+                            "observation witness policy threshold exceeds u64".to_string(),
+                        )
+                    })?,
+                });
+            }
+        }
+
+        let epoch = previous.epochs.checked_add(1).ok_or_else(|| {
+            DirectoryReplicaStoreError::Integrity(
+                "observation witness policy epoch exhausted".to_string(),
+            )
+        })?;
+        let previous_policy_digest = previous.current_digest;
+        let activated_at = previous
+            .current
+            .as_ref()
+            .map_or(activated_at, |policy| activated_at.max(policy.activated_at));
+        let policy = DirectoryObservationWitnessPolicyEpoch::sign(
+            identity,
+            epoch,
+            previous_policy_digest,
+            activated_at,
+            canonical_witnesses,
+            minimum_witnesses,
+        )?;
+        let policy_digest = policy.digest();
+        let witness_node_ids = policy
+            .witness_node_ids
+            .iter()
+            .flat_map(|node_id| node_id.iter().copied())
+            .collect::<Vec<_>>();
+        transaction.execute(
+            "INSERT INTO directory_observation_witness_policies
+                (epoch, policy_digest, previous_policy_digest, activated_at,
+                 witness_threshold, witness_count, witness_node_ids,
+                 signer_node_id, signature)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                u64_to_i64(policy.epoch, "observation witness policy epoch")?,
+                policy_digest.as_slice(),
+                policy.previous_policy_digest.as_slice(),
+                u64_to_i64(
+                    policy.activated_at,
+                    "observation witness policy activation timestamp"
+                )?,
+                u64_to_i64(
+                    u64::try_from(policy.minimum_witnesses).map_err(|_| {
+                        DirectoryReplicaStoreError::Integrity(
+                            "observation witness policy threshold exceeds u64".to_string(),
+                        )
+                    })?,
+                    "observation witness policy threshold"
+                )?,
+                u64_to_i64(
+                    u64::try_from(policy.witness_node_ids.len()).map_err(|_| {
+                        DirectoryReplicaStoreError::Integrity(
+                            "observation witness policy member count exceeds u64".to_string(),
+                        )
+                    })?,
+                    "observation witness policy member count"
+                )?,
+                witness_node_ids,
+                policy.signer_node_id.as_slice(),
+                policy.signature.as_slice(),
+            ],
+        )?;
+        let previous_head = previous
+            .current
+            .as_ref()
+            .map(|_| previous.current_digest.to_vec());
+        let changed = transaction.execute(
+            "UPDATE directory_replica_meta
+             SET witness_policy_epoch = ?1, witness_policy_head = ?2
+             WHERE singleton = 1 AND witness_policy_epoch = ?3
+               AND ((?4 IS NULL AND witness_policy_head IS NULL)
+                    OR witness_policy_head = ?4)",
+            params![
+                u64_to_i64(epoch, "observation witness policy epoch")?,
+                policy_digest.as_slice(),
+                u64_to_i64(previous.epochs, "previous observation witness policy epoch")?,
+                previous_head,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness policy head compare-and-swap failed".to_string(),
+            ));
+        }
+        let audited = Self::audit_observation_witness_policies(&transaction, &self.local_node_id)?;
+        if audited.epochs != epoch || audited.current_digest != policy_digest {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness policy post-append audit diverged".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(DirectoryObservationWitnessPolicyReconcileReport {
+            appended: true,
+            epoch,
+            policy_digest,
+            activated_at: policy.activated_at,
+            witness_members: u64::try_from(policy.witness_node_ids.len()).map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation witness policy member count exceeds u64".to_string(),
+                )
+            })?,
+            minimum_witnesses: u64::try_from(policy.minimum_witnesses).map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation witness policy threshold exceeds u64".to_string(),
+                )
+            })?,
+        })
+    }
+
+    /// Verifies that the metadata-anchored signed policy head contains the
+    /// exact canonical runtime pin set and threshold.
+    ///
+    /// This comparison returns only a boolean to callers. It never widens the
+    /// public status boundary to include policy member identities or digests.
+    pub(crate) fn observation_witness_policy_matches(
+        &self,
+        witness_node_ids: &[[u8; 32]],
+        minimum_witnesses: usize,
+    ) -> Result<bool, DirectoryReplicaStoreError> {
+        let canonical_witnesses = canonical_observation_witness_policy_members(
+            witness_node_ids,
+            minimum_witnesses,
+        )?;
+        let connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let current = Self::load_current_observation_witness_policy(
+            &connection,
+            &self.local_node_id,
+        )?;
+        Ok(current.current.is_some_and(|policy| {
+            policy.witness_node_ids == canonical_witnesses
+                && policy.minimum_witnesses == minimum_witnesses
+        }))
     }
 
     /// Returns one producer's accepted prefix and quarantine state.
@@ -1496,12 +1830,17 @@ impl DirectoryReplicaStore {
                 .saturating_add(producer_snapshot.resolutions);
             snapshot.producer_snapshots.push(producer_snapshot);
         }
-        Self::populate_observation_status_snapshot(&connection, &mut snapshot)?;
+        Self::populate_observation_status_snapshot(
+            &connection,
+            &self.local_node_id,
+            &mut snapshot,
+        )?;
         Ok(snapshot)
     }
 
     fn populate_observation_status_snapshot(
         connection: &Connection,
+        local_node_id: &[u8; 32],
         snapshot: &mut DirectoryReplicaStoreSnapshot,
     ) -> Result<(), DirectoryReplicaStoreError> {
         snapshot.observation_checkpoints = nonnegative_i64_to_u64(
@@ -1522,6 +1861,25 @@ impl DirectoryReplicaStore {
         snapshot.observation_checkpoint_latest_witnesses = witness_summary.latest_witnesses;
         snapshot.observation_witness_outcomes =
             Self::load_observation_witness_outcome_snapshot(connection)?;
+        let witness_policy =
+            Self::load_current_observation_witness_policy(connection, local_node_id)?;
+        snapshot.observation_witness_policy_epochs = witness_policy.epochs;
+        snapshot.observation_witness_policy_epoch = witness_policy.epochs;
+        if let Some(policy) = witness_policy.current {
+            snapshot.observation_witness_policy_activated_at = policy.activated_at;
+            snapshot.observation_witness_policy_members =
+                u64::try_from(policy.witness_node_ids.len()).map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "observation witness policy member count exceeds u64".to_string(),
+                    )
+                })?;
+            snapshot.observation_witness_policy_threshold = u64::try_from(policy.minimum_witnesses)
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "observation witness policy threshold exceeds u64".to_string(),
+                    )
+                })?;
+        }
         Ok(())
     }
 
@@ -3320,6 +3678,242 @@ impl DirectoryReplicaStore {
         Self::audit_connection(&connection, &self.local_node_id, observed_at)
     }
 
+    fn decode_observation_witness_policy(
+        row: StoredObservationWitnessPolicyRow,
+    ) -> Result<([u8; 32], DirectoryObservationWitnessPolicyEpoch), DirectoryReplicaStoreError>
+    {
+        let epoch = positive_i64_to_u64(row.epoch, "observation witness policy epoch")?;
+        let activated_at = positive_i64_to_u64(
+            row.activated_at,
+            "observation witness policy activation timestamp",
+        )?;
+        let minimum_witnesses = usize::try_from(positive_i64_to_u64(
+            row.witness_threshold,
+            "observation witness policy threshold",
+        )?)
+        .map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "observation witness policy threshold exceeds usize".to_string(),
+            )
+        })?;
+        let witness_count = usize::try_from(nonnegative_i64_to_u64(
+            row.witness_count,
+            "observation witness policy member count",
+        )?)
+        .map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "observation witness policy member count exceeds usize".to_string(),
+            )
+        })?;
+        if witness_count > MAX_DIRECTORY_OBSERVATION_WITNESS_POLICY_MEMBERS
+            || row.witness_node_ids.len() != witness_count.saturating_mul(32)
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness policy member blob is malformed".to_string(),
+            ));
+        }
+        let witness_node_ids = row
+            .witness_node_ids
+            .chunks_exact(32)
+            .map(|node_id| bytes32(node_id, "observation witness policy member"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let policy = DirectoryObservationWitnessPolicyEpoch {
+            epoch,
+            previous_policy_digest: bytes32(
+                &row.previous_policy_digest,
+                "observation witness previous policy digest",
+            )?,
+            activated_at,
+            witness_node_ids,
+            minimum_witnesses,
+            signer_node_id: bytes32(&row.signer_node_id, "observation witness policy signer")?,
+            signature: bytes64(&row.signature, "observation witness policy signature")?,
+        };
+        policy.validate_unsigned_fields()?;
+        let stored_digest = bytes32(&row.policy_digest, "observation witness policy digest")?;
+        Ok((stored_digest, policy))
+    }
+
+    fn audit_observation_witness_policies(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+    ) -> Result<ObservationWitnessPolicyAudit, DirectoryReplicaStoreError> {
+        let (metadata_epoch, metadata_head) = connection.query_row(
+            "SELECT witness_policy_epoch, witness_policy_head
+             FROM directory_replica_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+        )?;
+        let metadata_epoch =
+            nonnegative_i64_to_u64(metadata_epoch, "replica metadata witness policy epoch")?;
+        let metadata_head = metadata_head
+            .as_deref()
+            .map(|value| bytes32(value, "replica metadata witness policy head"))
+            .transpose()?;
+
+        let mut statement = connection.prepare(
+            "SELECT epoch, policy_digest, previous_policy_digest, activated_at,
+                    witness_threshold, witness_count, witness_node_ids,
+                    signer_node_id, signature
+             FROM directory_observation_witness_policies ORDER BY epoch ASC",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut audit = ObservationWitnessPolicyAudit::default();
+        let mut expected_previous_digest = [0u8; 32];
+        let mut previous_activated_at = 0u64;
+        while let Some(row) = rows.next()? {
+            let stored = StoredObservationWitnessPolicyRow {
+                epoch: row.get(0)?,
+                policy_digest: row.get(1)?,
+                previous_policy_digest: row.get(2)?,
+                activated_at: row.get(3)?,
+                witness_threshold: row.get(4)?,
+                witness_count: row.get(5)?,
+                witness_node_ids: row.get(6)?,
+                signer_node_id: row.get(7)?,
+                signature: row.get(8)?,
+            };
+            let (stored_digest, policy) = Self::decode_observation_witness_policy(stored)?;
+            let expected_epoch = audit.epochs.checked_add(1).ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation witness policy epoch exhausted".to_string(),
+                )
+            })?;
+            if policy.epoch != expected_epoch
+                || policy.previous_policy_digest != expected_previous_digest
+                || policy.activated_at < previous_activated_at
+                || policy.signer_node_id != *local_node_id
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "observation witness policy history is not canonical".to_string(),
+                ));
+            }
+            IdentityPublicKey::from_bytes(&policy.signer_node_id)
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "observation witness policy signer is invalid".to_string(),
+                    )
+                })?
+                .verify(&policy.signing_bytes(), &policy.signature)
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "observation witness policy signature is invalid".to_string(),
+                    )
+                })?;
+            if policy.digest() != stored_digest {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "observation witness policy digest is invalid".to_string(),
+                ));
+            }
+            audit.epochs = expected_epoch;
+            expected_previous_digest = stored_digest;
+            previous_activated_at = policy.activated_at;
+            audit.current_digest = stored_digest;
+            audit.current = Some(policy);
+        }
+        drop(rows);
+        drop(statement);
+        if audit.epochs != metadata_epoch
+            || (audit.epochs == 0 && metadata_head.is_some())
+            || (audit.epochs > 0 && metadata_head != Some(audit.current_digest))
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness policy head does not match audited history".to_string(),
+            ));
+        }
+        Ok(audit)
+    }
+
+    /// Loads and verifies only the metadata-anchored policy head for bounded
+    /// runtime status. Complete history verification remains a startup and
+    /// explicit operator-audit responsibility.
+    fn load_current_observation_witness_policy(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+    ) -> Result<ObservationWitnessPolicyAudit, DirectoryReplicaStoreError> {
+        let (metadata_epoch, metadata_head) = connection.query_row(
+            "SELECT witness_policy_epoch, witness_policy_head
+             FROM directory_replica_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+        )?;
+        let metadata_epoch =
+            nonnegative_i64_to_u64(metadata_epoch, "replica metadata witness policy epoch")?;
+        let metadata_head = metadata_head
+            .as_deref()
+            .map(|value| bytes32(value, "replica metadata witness policy head"))
+            .transpose()?;
+        if metadata_epoch == 0 {
+            if metadata_head.is_some() {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "empty observation witness policy has a non-empty head".to_string(),
+                ));
+            }
+            return Ok(ObservationWitnessPolicyAudit::default());
+        }
+        let stored = connection
+            .query_row(
+                "SELECT epoch, policy_digest, previous_policy_digest, activated_at,
+                        witness_threshold, witness_count, witness_node_ids,
+                        signer_node_id, signature
+                 FROM directory_observation_witness_policies WHERE epoch = ?1",
+                params![u64_to_i64(
+                    metadata_epoch,
+                    "replica metadata witness policy epoch"
+                )?],
+                |row| {
+                    Ok(StoredObservationWitnessPolicyRow {
+                        epoch: row.get(0)?,
+                        policy_digest: row.get(1)?,
+                        previous_policy_digest: row.get(2)?,
+                        activated_at: row.get(3)?,
+                        witness_threshold: row.get(4)?,
+                        witness_count: row.get(5)?,
+                        witness_node_ids: row.get(6)?,
+                        signer_node_id: row.get(7)?,
+                        signature: row.get(8)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation witness policy head row is missing".to_string(),
+                )
+            })?;
+        let (stored_digest, policy) = Self::decode_observation_witness_policy(stored)?;
+        if policy.epoch != metadata_epoch
+            || policy.signer_node_id != *local_node_id
+            || metadata_head != Some(stored_digest)
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness policy head is inconsistent".to_string(),
+            ));
+        }
+        IdentityPublicKey::from_bytes(&policy.signer_node_id)
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation witness policy signer is invalid".to_string(),
+                )
+            })?
+            .verify(&policy.signing_bytes(), &policy.signature)
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "observation witness policy signature is invalid".to_string(),
+                )
+            })?;
+        if policy.digest() != stored_digest {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness policy digest is invalid".to_string(),
+            ));
+        }
+        Ok(ObservationWitnessPolicyAudit {
+            epochs: metadata_epoch,
+            current: Some(policy),
+            current_digest: stored_digest,
+        })
+    }
+
     fn audit_connection(
         connection: &Connection,
         local_node_id: &[u8; 32],
@@ -3327,6 +3921,8 @@ impl DirectoryReplicaStore {
     ) -> Result<DirectoryReplicaAudit, DirectoryReplicaStoreError> {
         Self::validate_metadata(connection, local_node_id)?;
         let producers = Self::load_all_tips(connection)?;
+        let observation_witness_policies =
+            Self::audit_observation_witness_policies(connection, local_node_id)?;
         let (observation_checkpoints, observation_tip) =
             Self::audit_observation_checkpoints(connection, local_node_id, observed_at)?;
         let observation_witnesses =
@@ -3349,6 +3945,34 @@ impl DirectoryReplicaStore {
             observation_checkpoint_witnessed_sequence: observation_witnesses.latest_sequence,
             observation_checkpoint_latest_witnesses: observation_witnesses.latest_witnesses,
             observation_witness_outcomes,
+            observation_witness_policy_epochs: observation_witness_policies.epochs,
+            observation_witness_policy_epoch: observation_witness_policies.epochs,
+            observation_witness_policy_activated_at: observation_witness_policies
+                .current
+                .as_ref()
+                .map_or(0, |policy| policy.activated_at),
+            observation_witness_policy_members: observation_witness_policies
+                .current
+                .as_ref()
+                .map(|policy| u64::try_from(policy.witness_node_ids.len()))
+                .transpose()
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "observation witness policy member count exceeds u64".to_string(),
+                    )
+                })?
+                .unwrap_or(0),
+            observation_witness_policy_threshold: observation_witness_policies
+                .current
+                .as_ref()
+                .map(|policy| u64::try_from(policy.minimum_witnesses))
+                .transpose()
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "observation witness policy threshold exceeds u64".to_string(),
+                    )
+                })?
+                .unwrap_or(0),
             ..DirectoryReplicaAudit::default()
         };
         for tip in producers {
@@ -3387,7 +4011,13 @@ impl DirectoryReplicaStore {
                  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                  schema_version INTEGER NOT NULL,
                  chain_id BLOB NOT NULL CHECK (length(chain_id) = 32),
-                 local_node_id BLOB NOT NULL CHECK (length(local_node_id) = 32)
+                 local_node_id BLOB NOT NULL CHECK (length(local_node_id) = 32),
+                 witness_policy_epoch INTEGER NOT NULL DEFAULT 0
+                     CHECK (witness_policy_epoch >= 0),
+                 witness_policy_head BLOB
+                     CHECK (witness_policy_head IS NULL OR length(witness_policy_head) = 32),
+                 CHECK ((witness_policy_epoch = 0 AND witness_policy_head IS NULL)
+                     OR (witness_policy_epoch > 0 AND witness_policy_head IS NOT NULL))
              );
              CREATE TABLE IF NOT EXISTS directory_replica_chains (
                  producer BLOB PRIMARY KEY CHECK (length(producer) = 32),
@@ -3566,6 +4196,22 @@ impl DirectoryReplicaStore {
                      REFERENCES directory_observation_checkpoints(sequence)
                      ON UPDATE RESTRICT ON DELETE RESTRICT
              );
+             CREATE TABLE IF NOT EXISTS directory_observation_witness_policies (
+                 epoch INTEGER PRIMARY KEY CHECK (epoch > 0),
+                 policy_digest BLOB NOT NULL UNIQUE CHECK (length(policy_digest) = 32),
+                 previous_policy_digest BLOB NOT NULL UNIQUE
+                     CHECK (length(previous_policy_digest) = 32),
+                 activated_at INTEGER NOT NULL CHECK (activated_at > 0),
+                 witness_threshold INTEGER NOT NULL
+                     CHECK (witness_threshold BETWEEN 1 AND 16),
+                 witness_count INTEGER NOT NULL CHECK (witness_count BETWEEN 0 AND 16),
+                 witness_node_ids BLOB NOT NULL CHECK (length(witness_node_ids) <= 512),
+                 signer_node_id BLOB NOT NULL CHECK (length(signer_node_id) = 32),
+                 signature BLOB NOT NULL CHECK (length(signature) = 64),
+                 CHECK (length(witness_node_ids) = witness_count * 32),
+                 CHECK ((witness_count = 0 AND witness_threshold = 1)
+                     OR (witness_count > 0 AND witness_threshold <= witness_count))
+             );
              CREATE TABLE IF NOT EXISTS directory_replica_retry_state (
                  producer BLOB PRIMARY KEY CHECK (length(producer) = 32),
                  consecutive_failures INTEGER NOT NULL
@@ -3622,15 +4268,19 @@ impl DirectoryReplicaStore {
                 match version {
                     DIRECTORY_REPLICA_SCHEMA_VERSION => {
                         Self::require_resolution_columns(transaction)?;
+                        Self::require_witness_policy_metadata_columns(transaction)?;
                     }
-                    DIRECTORY_REPLICA_SCHEMA_VERSION_V5
+                    DIRECTORY_REPLICA_SCHEMA_VERSION_V6
+                    | DIRECTORY_REPLICA_SCHEMA_VERSION_V5
                     | DIRECTORY_REPLICA_SCHEMA_VERSION_V4
                     | DIRECTORY_REPLICA_SCHEMA_VERSION_V3 => {
                         Self::require_resolution_columns(transaction)?;
+                        Self::add_witness_policy_metadata_columns(transaction)?;
                         Self::set_schema_version(transaction, version)?;
                     }
                     DIRECTORY_REPLICA_SCHEMA_VERSION_V1 | DIRECTORY_REPLICA_SCHEMA_VERSION_V2 => {
                         Self::add_resolution_columns(transaction)?;
+                        Self::add_witness_policy_metadata_columns(transaction)?;
                         transaction.execute(
                             "UPDATE directory_replica_chains AS c
                              SET active_incident_digest = (
@@ -3722,6 +4372,50 @@ impl DirectoryReplicaStore {
         Ok(())
     }
 
+    fn add_witness_policy_metadata_columns(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        if !Self::metadata_has_column(transaction, "witness_policy_epoch")? {
+            transaction.execute_batch(
+                "ALTER TABLE directory_replica_meta
+                 ADD COLUMN witness_policy_epoch INTEGER NOT NULL DEFAULT 0
+                 CHECK (witness_policy_epoch >= 0);",
+            )?;
+        }
+        if !Self::metadata_has_column(transaction, "witness_policy_head")? {
+            transaction.execute_batch(
+                "ALTER TABLE directory_replica_meta
+                 ADD COLUMN witness_policy_head BLOB
+                 CHECK (witness_policy_head IS NULL OR length(witness_policy_head) = 32);",
+            )?;
+        }
+        Self::require_witness_policy_metadata_columns(transaction)
+    }
+
+    fn require_witness_policy_metadata_columns(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        if !Self::metadata_has_column(transaction, "witness_policy_epoch")?
+            || !Self::metadata_has_column(transaction, "witness_policy_head")?
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica schema v7 witness policy metadata is missing".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn metadata_has_column(
+        transaction: &Transaction<'_>,
+        expected: &str,
+    ) -> Result<bool, DirectoryReplicaStoreError> {
+        let mut statement = transaction.prepare("PRAGMA table_info(directory_replica_meta)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(columns.iter().any(|column| column == expected))
+    }
+
     fn table_has_column(
         transaction: &Transaction<'_>,
         expected: &str,
@@ -3739,7 +4433,8 @@ impl DirectoryReplicaStore {
     ) -> Result<(), DirectoryReplicaStoreError> {
         let metadata = connection
             .query_row(
-                "SELECT schema_version, chain_id, local_node_id
+                "SELECT schema_version, chain_id, local_node_id,
+                        witness_policy_epoch, witness_policy_head
                  FROM directory_replica_meta WHERE singleton = 1",
                 [],
                 |row| {
@@ -3747,6 +4442,8 @@ impl DirectoryReplicaStore {
                         row.get::<_, i64>(0)?,
                         row.get::<_, Vec<u8>>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
                     ))
                 },
             )
@@ -3764,6 +4461,18 @@ impl DirectoryReplicaStore {
             return Err(DirectoryReplicaStoreError::Integrity(
                 "directory replica metadata does not match this node and Directory Sync V1"
                     .to_string(),
+            ));
+        }
+        let policy_epoch =
+            nonnegative_i64_to_u64(metadata.3, "replica metadata witness policy epoch")?;
+        let policy_head = metadata
+            .4
+            .as_deref()
+            .map(|value| bytes32(value, "replica metadata witness policy head"))
+            .transpose()?;
+        if (policy_epoch == 0) != policy_head.is_none() {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica witness policy metadata is inconsistent".to_string(),
             ));
         }
         Ok(())
@@ -5517,6 +6226,42 @@ impl DirectoryReplicaStore {
     }
 }
 
+fn canonical_observation_witness_policy_members(
+    witness_node_ids: &[[u8; 32]],
+    minimum_witnesses: usize,
+) -> Result<Vec<[u8; 32]>, DirectoryReplicaStoreError> {
+    let mut canonical = witness_node_ids.to_vec();
+    canonical.sort_unstable();
+    let original_len = canonical.len();
+    canonical.dedup();
+    if canonical.len() != original_len {
+        return Err(DirectoryReplicaStoreError::Request(
+            "observation witness policy contains duplicate node identities".to_string(),
+        ));
+    }
+    validate_observation_witness_policy_members(&canonical, minimum_witnesses)?;
+    Ok(canonical)
+}
+
+fn validate_observation_witness_policy_members(
+    witness_node_ids: &[[u8; 32]],
+    minimum_witnesses: usize,
+) -> Result<(), DirectoryReplicaStoreError> {
+    if witness_node_ids.len() > MAX_DIRECTORY_OBSERVATION_WITNESS_POLICY_MEMBERS
+        || minimum_witnesses == 0
+        || minimum_witnesses > MAX_DIRECTORY_OBSERVATION_WITNESS_POLICY_MEMBERS
+        || (witness_node_ids.is_empty() && minimum_witnesses != 1)
+        || (!witness_node_ids.is_empty() && minimum_witnesses > witness_node_ids.len())
+        || witness_node_ids.iter().any(|node_id| *node_id == [0u8; 32])
+        || witness_node_ids.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(DirectoryReplicaStoreError::Request(
+            "observation witness policy pins or threshold are invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_incident_kind(kind: &str) -> Result<(), DirectoryReplicaStoreError> {
     if kind.is_empty()
         || kind.len() > MAX_DIRECTORY_REPLICA_INCIDENT_KIND_BYTES
@@ -7188,6 +7933,177 @@ mod tests {
     }
 
     #[test]
+    fn witness_policy_epochs_are_canonical_idempotent_and_restart_durable() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let observer = IdentityKeyPair::from_bytes(&[0xe1; 32]).unwrap();
+        let witness_a = IdentityKeyPair::from_bytes(&[0xe2; 32]).unwrap();
+        let witness_b = IdentityKeyPair::from_bytes(&[0xe3; 32]).unwrap();
+        let witness_c = IdentityKeyPair::from_bytes(&[0xe4; 32]).unwrap();
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 20).unwrap();
+
+        let first = store
+            .reconcile_observation_witness_policy(
+                &observer,
+                &[witness_b.public_key_bytes(), witness_a.public_key_bytes()],
+                2,
+                NOW + 20,
+            )
+            .unwrap();
+        assert!(first.appended);
+        assert_eq!(first.epoch, 1);
+        assert_eq!(first.witness_members, 2);
+        assert_eq!(first.minimum_witnesses, 2);
+
+        let reordered = store
+            .reconcile_observation_witness_policy(
+                &observer,
+                &[witness_a.public_key_bytes(), witness_b.public_key_bytes()],
+                2,
+                NOW + 21,
+            )
+            .unwrap();
+        assert!(!reordered.appended);
+        assert_eq!(reordered.epoch, 1);
+        assert_eq!(reordered.policy_digest, first.policy_digest);
+        assert_eq!(reordered.activated_at, first.activated_at);
+
+        let threshold_change = store
+            .reconcile_observation_witness_policy(
+                &observer,
+                &[witness_a.public_key_bytes(), witness_b.public_key_bytes()],
+                1,
+                NOW + 22,
+            )
+            .unwrap();
+        assert!(threshold_change.appended);
+        assert_eq!(threshold_change.epoch, 2);
+        assert_ne!(threshold_change.policy_digest, first.policy_digest);
+
+        let rotation = store
+            .reconcile_observation_witness_policy(
+                &observer,
+                &[witness_b.public_key_bytes(), witness_c.public_key_bytes()],
+                2,
+                NOW + 23,
+            )
+            .unwrap();
+        assert!(rotation.appended);
+        assert_eq!(rotation.epoch, 3);
+        let snapshot = store.status_snapshot().unwrap();
+        assert_eq!(snapshot.observation_witness_policy_epochs, 3);
+        assert_eq!(snapshot.observation_witness_policy_epoch, 3);
+        assert_eq!(snapshot.observation_witness_policy_members, 2);
+        assert_eq!(snapshot.observation_witness_policy_threshold, 2);
+        drop(store);
+
+        let (reopened, audit) =
+            DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 24).unwrap();
+        assert_eq!(audit.observation_witness_policy_epochs, 3);
+        assert_eq!(audit.observation_witness_policy_epoch, 3);
+        assert_eq!(audit.observation_witness_policy_activated_at, NOW + 23);
+        assert_eq!(audit.observation_witness_policy_members, 2);
+        assert_eq!(audit.observation_witness_policy_threshold, 2);
+        assert!(reopened
+            .observation_witness_policy_matches(
+                &[witness_b.public_key_bytes(), witness_c.public_key_bytes()],
+                2,
+            )
+            .unwrap());
+        assert!(!reopened
+            .observation_witness_policy_matches(
+                &[witness_a.public_key_bytes(), witness_c.public_key_bytes()],
+                2,
+            )
+            .unwrap());
+        let idempotent_after_restart = reopened
+            .reconcile_observation_witness_policy(
+                &observer,
+                &[witness_c.public_key_bytes(), witness_b.public_key_bytes()],
+                2,
+                NOW + 25,
+            )
+            .unwrap();
+        assert!(!idempotent_after_restart.appended);
+        assert_eq!(idempotent_after_restart.epoch, 3);
+        assert_eq!(
+            idempotent_after_restart.policy_digest,
+            rotation.policy_digest
+        );
+    }
+
+    #[test]
+    fn tampered_witness_policy_signature_or_metadata_head_fails_startup_audit() {
+        for tamper_head in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("directory.db");
+            let observer = IdentityKeyPair::from_bytes(&[0xe5; 32]).unwrap();
+            let witness = IdentityKeyPair::from_bytes(&[0xe6; 32]).unwrap();
+            let (store, _) =
+                DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 20).unwrap();
+            store
+                .reconcile_observation_witness_policy(
+                    &observer,
+                    &[witness.public_key_bytes()],
+                    1,
+                    NOW + 20,
+                )
+                .unwrap();
+            drop(store);
+
+            let connection = Connection::open(&path).unwrap();
+            if tamper_head {
+                connection
+                    .execute(
+                        "UPDATE directory_replica_meta SET witness_policy_head = ?1
+                         WHERE singleton = 1",
+                        params![[0x99u8; 32].as_slice()],
+                    )
+                    .unwrap();
+            } else {
+                connection
+                    .execute(
+                        "UPDATE directory_observation_witness_policies SET signature = ?1
+                         WHERE epoch = 1",
+                        params![[0u8; 64].as_slice()],
+                    )
+                    .unwrap();
+            }
+            drop(connection);
+            assert!(
+                DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 21).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn deleted_witness_policy_table_cannot_reset_anchored_history() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let observer = IdentityKeyPair::from_bytes(&[0xe7; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0xe8; 32]).unwrap();
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 20).unwrap();
+        store
+            .reconcile_observation_witness_policy(
+                &observer,
+                &[witness.public_key_bytes()],
+                1,
+                NOW + 20,
+            )
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP TABLE directory_observation_witness_policies;")
+            .unwrap();
+        drop(connection);
+        assert!(DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 21).is_err());
+    }
+
+    #[test]
     fn witness_runtime_uses_bounded_mutually_exclusive_buckets() {
         let runtime = DirectoryReplicaSyncRuntime::default();
         let outcomes = [
@@ -7620,7 +8536,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_is_atomically_migrated_to_v6() {
+    fn schema_v1_is_atomically_migrated_to_v7() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x31; 32]).unwrap();
@@ -7680,7 +8596,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_is_atomically_migrated_to_v6() {
+    fn schema_v2_is_atomically_migrated_to_v7() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x30; 32]).unwrap();
@@ -7730,7 +8646,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v3_is_atomically_migrated_to_v6() {
+    fn schema_v3_is_atomically_migrated_to_v7() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x2f; 32]).unwrap();
@@ -7773,7 +8689,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v4_is_atomically_migrated_to_v6() {
+    fn schema_v4_is_atomically_migrated_to_v7() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x2e; 32]).unwrap();
@@ -7816,7 +8732,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v5_is_atomically_migrated_to_v6() {
+    fn schema_v5_is_atomically_migrated_to_v7() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
         let local = IdentityKeyPair::from_bytes(&[0x2d; 32]).unwrap();
@@ -7856,6 +8772,67 @@ mod tests {
             .unwrap();
         assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
         assert_eq!(outcome_table, "directory_observation_witness_outcomes");
+    }
+
+    #[test]
+    fn schema_v6_adds_witness_policy_metadata_and_table_atomically() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x2c; 32]).unwrap();
+        let (store, _) = DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW).unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE directory_replica_meta RENAME TO directory_replica_meta_v7;
+                 CREATE TABLE directory_replica_meta (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     schema_version INTEGER NOT NULL,
+                     chain_id BLOB NOT NULL CHECK (length(chain_id) = 32),
+                     local_node_id BLOB NOT NULL CHECK (length(local_node_id) = 32)
+                 );
+                 INSERT INTO directory_replica_meta
+                     (singleton, schema_version, chain_id, local_node_id)
+                 SELECT singleton, 6, chain_id, local_node_id
+                 FROM directory_replica_meta_v7;
+                 DROP TABLE directory_replica_meta_v7;
+                 DROP TABLE directory_observation_witness_policies;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let (store, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 1).unwrap();
+        assert_eq!(audit.observation_witness_policy_epochs, 0);
+        let connection = store.connection.lock();
+        let version: i64 = connection
+            .query_row(
+                "SELECT schema_version FROM directory_replica_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let policy_columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('directory_replica_meta')
+                 WHERE name IN ('witness_policy_epoch', 'witness_policy_head')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let policy_table: String = connection
+            .query_row(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table'
+                   AND name = 'directory_observation_witness_policies'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
+        assert_eq!(policy_columns, 2);
+        assert_eq!(policy_table, "directory_observation_witness_policies");
     }
 
     #[test]

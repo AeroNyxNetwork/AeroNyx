@@ -207,6 +207,9 @@
 //      truncated producer fingerprints on local/VPN operator listeners.
 //  87. Performs bounded multi-page replica catch-up while reserving the
 //      worst-case per-page request cost beneath the peer rate limit.
+//  88. Reconciles the validated Directory witness pins and threshold into a
+//      node-identity-signed, hash-linked local policy epoch after full replica
+//      audit and before synchronization or listeners can start.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -291,8 +294,13 @@
 //     cap so one slow peer cannot block or amplify the complete pinned set.
 //   - Directory Replica schema v2 persists bounded retry state. A successful
 //     authenticated import must clear that state in the same SQLite transaction.
+//   - Directory Replica schema v7 anchors signed witness-policy history in
+//     metadata. Policy epochs are local operator evidence configuration, not a
+//     validator set, vote, quorum, fork choice, consensus, or finality.
 //
 // Last Modified:
+//   v2.8.33-DirectoryWitnessPolicyEpoch - Reconciled signed hash-linked local
+//     witness policy history during fail-closed Directory Replica startup
 //   v2.8.32-DirectoryMatureWitnessPipelineStatus - Passed the configured witness
 //     maturity delay into additive privacy-tiered Directory status
 //   v2.8.31-DirectoryWitnessThreshold - Wired the validated independent
@@ -4263,8 +4271,25 @@ impl Server {
         let local_node_id = self.identity.public_key_bytes();
         let observed_at = unix_now_secs();
         let open_path = path.clone();
-        let (store, audit) = tokio::task::spawn_blocking(move || {
-            DirectoryReplicaStore::open(&open_path, local_node_id, observed_at)
+        let identity = self.identity.clone();
+        let witness_node_ids = self
+            .config
+            .discovery
+            .directory_chain_sync_peer_node_id_bytes();
+        let minimum_witnesses = self
+            .config
+            .discovery
+            .directory_observation_witness_min_verified;
+        let (store, audit, policy) = tokio::task::spawn_blocking(move || {
+            let (store, _) = DirectoryReplicaStore::open(&open_path, local_node_id, observed_at)?;
+            let policy = store.reconcile_observation_witness_policy(
+                &identity,
+                &witness_node_ids,
+                minimum_witnesses,
+                observed_at,
+            )?;
+            let audit = store.audit(observed_at)?;
+            Ok::<_, crate::services::DirectoryReplicaStoreError>((store, audit, policy))
         })
         .await
         .map_err(|error| {
@@ -4289,8 +4314,14 @@ impl Server {
             observation_checkpoint_witnesses = audit.observation_checkpoint_witnesses,
             observation_checkpoint_witnessed_sequence =
                 audit.observation_checkpoint_witnessed_sequence,
+            witness_policy_appended = policy.appended,
+            witness_policy_epoch = policy.epoch,
+            witness_policy_digest = %hex::encode(policy.policy_digest),
+            witness_policy_activated_at = policy.activated_at,
+            witness_policy_members = policy.witness_members,
+            witness_policy_threshold = policy.minimum_witnesses,
             retry_states = audit.retry_states,
-            "[DIRECTORY_REPLICA] Producer-isolated startup audit passed"
+            "[DIRECTORY_REPLICA] Startup audit and witness-policy reconciliation passed"
         );
         Ok(Some(Arc::new(store)))
     }

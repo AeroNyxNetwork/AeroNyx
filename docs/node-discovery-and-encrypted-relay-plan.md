@@ -1155,6 +1155,62 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-19 - Added Directory Witness Policy Epoch V1.
+- Files changed:
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/server.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Production problem:
+  - Witness receipts were already signature-audited, but a later operator pin
+    rotation or threshold change existed only in mutable runtime configuration.
+    A restart could prove the receipts yet could not prove which local policy
+    epoch made those receipts sufficient at that time.
+- Architecture:
+  - Schema v7 adds an append-only `directory_observation_witness_policies`
+    history. Each row binds the sorted witness pins, threshold, activation time,
+    local signer, previous policy digest, and Ed25519 signature.
+  - `directory_replica_meta` anchors the current epoch and digest. Appending a
+    policy and advancing that head use one immediate SQLite transaction and a
+    compare-and-swap. This detects partial deletion or replacement of the policy
+    history while the metadata head remains, plus torn or inconsistent local
+    state.
+  - Startup first audits the complete prior policy chain, then canonicalizes the
+    validated runtime pins. Reordering is idempotent; only a pin-set or threshold
+    change appends an epoch. A second complete audit runs before synchronization
+    or any network listener starts.
+  - Public/operator status exposes only aggregate epoch, historical change
+    count, configured witness count, threshold, activation age, and runtime
+    match. Member identities, endpoints, signatures, and policy digests remain
+    host-local.
+- Security boundary:
+  - A policy epoch records one node operator's external evidence target only.
+    It is not a validator set, voting weight, quorum, governance, fork choice,
+    consensus, or finality.
+  - The SQLite metadata head is not an external anti-rollback anchor. A
+    coordinated whole-database or whole-host snapshot rollback can replace the
+    metadata and policy table together. Detecting that class of rollback needs
+    an independently retained opaque policy-head anchor or external witness and
+    remains future work.
+- Compatibility:
+  - Existing v1 status fields remain unchanged; `observation_witness_policy` is
+    additive. Schema v1-v6 databases migrate in one transaction, and an empty
+    pin list retains the backward-compatible disabled policy with threshold one.
+- Verification:
+  - Full workspace tests passed: 17 common, 198 core, 1,118 server,
+    2 server CLI, 22 transport, and all enabled doctests; zero failures.
+  - `cargo clippy --workspace --all-targets -- -D clippy::correctness`
+    passed. Existing non-correctness warnings remain outside this milestone.
+  - `cargo build -p aeronyx-server --release` passed.
+  - Focused tests passed for canonical pin ordering, idempotent restart,
+    threshold change, pin rotation, v6-to-v7 migration, signature tamper,
+    metadata-head tamper, whole-policy-table deletion, and public identity
+    redaction.
+  - `git diff --check` passed for the four changed files. Repository-wide
+    `cargo fmt --all -- --check` remains blocked by pre-existing formatting
+    differences in untouched files; the only new formatting finding was fixed
+    before this verification record was written.
+
 2026-07-19 - Added Directory Witness Failure Drills V1.
 - Files changed:
   - crates/aeronyx-server/src/api/directory_replica_status.rs

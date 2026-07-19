@@ -25,6 +25,8 @@
 //! - Reports durable and process-lifetime witness outcome buckets so operators
 //!   can distinguish unavailable evidence from transport, verification, or
 //!   persistence faults without widening the privacy boundary.
+//! - Reports the signed local witness-policy epoch, change count, pin count,
+//!   threshold, and runtime match without exposing member identities or hashes.
 //! - Declares the mature, forward-only witness target policy without exposing
 //!   checkpoint hashes, witness identities, or peer scheduling details.
 //! - Declares that recurring selection verification is history-bounded while
@@ -48,8 +50,10 @@
 //! 6. Report external witness counts without presenting them as votes/quorum.
 //! 7. Report audited aggregate witness outcomes, current-process durability,
 //!    and the static mature forward-only bounded-verification target policy.
-//! 8. Serialize aggregate-only or fingerprint-only detail by listener scope.
-//! 9. Re-verify canonical incident evidence before an operator-only export.
+//! 8. Confirm the metadata-anchored signed witness policy matches runtime
+//!    aggregate pins and threshold without returning policy membership.
+//! 9. Serialize aggregate-only or fingerprint-only detail by listener scope.
+//! 10. Re-verify canonical incident evidence before an operator-only export.
 //!
 //! ## Privacy Invariant
 //! Public output is aggregate-only. Local status and incident lists contain
@@ -69,11 +73,14 @@
 //!   present them as votes, witness quorum, fork choice, or global finality.
 //! - External witness counters prove independent recomputation by distinct
 //!   pinned nodes only; they do not create quorum semantics or finality.
+//! - Policy epoch status is local operator configuration history, never a
+//!   validator set, vote, governance mechanism, consensus, or finality claim.
 //! - Never mount incident list/export routes on the public listener.
 //! - Never add quarantine mutation here; recovery needs an authenticated,
 //!   audited compare-and-swap command boundary.
 //!
 //! ## Last Modified
+//! `v0.15.0-DirectoryWitnessPolicyEpochStatus` - Added aggregate signed policy epoch, change count, pin count, threshold, and runtime-match state while keeping identities and digests host-local.
 //! `v0.14.0-DirectoryWitnessFailureDrillStatus` - Added current-pin completion evidence for the latest witnessed checkpoint so retired receipts cannot be mistaken for live threshold satisfaction.
 //! `v0.13.0-DirectoryMatureWitnessPipelineStatus` - Added an audited mature-checkpoint forward-floor status that does not treat the intentionally unmatured head as a witness failure.
 //! `v0.12.0-DirectoryWitnessThresholdStatus` - Added additive pinned-witness corroboration target status.
@@ -199,6 +206,22 @@ struct DirectoryReplicaObservationCheckpointStatus {
     security_model: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct DirectoryReplicaObservationWitnessPolicyStatus {
+    source_status: &'static str,
+    status: &'static str,
+    epoch: u64,
+    historical_changes: u64,
+    activated_age_seconds: Option<u64>,
+    configured_witnesses: u64,
+    required_external_witnesses: u64,
+    matches_runtime_config: bool,
+    durability: &'static str,
+    full_history_verification: &'static str,
+    privacy_boundary: &'static str,
+    security_model: &'static str,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DirectoryReplicaPendingWitnessTarget {
     checkpoint_sequence: u64,
@@ -320,6 +343,7 @@ struct DirectoryReplicaStatusResponse {
     catch_up_policy: DirectoryReplicaCatchUpPolicy,
     observation_convergence: DirectoryReplicaObservationConvergenceStatus,
     observation_checkpoint: DirectoryReplicaObservationCheckpointStatus,
+    observation_witness_policy: DirectoryReplicaObservationWitnessPolicyStatus,
     observation_witness_pipeline: DirectoryReplicaObservationWitnessPipelineStatus,
     observation_witness_outcomes: DirectoryReplicaObservationWitnessOutcomeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -697,6 +721,7 @@ async fn directory_replica_status_handler(
         latest_current_pinned_witnesses,
         latest_witnessed_current_pinned_witnesses,
         pending_witness_target,
+        witness_policy_matches_runtime,
     ) = if let Some(store) = state.store.clone() {
         match tokio::task::spawn_blocking(move || {
             let persisted = store.status_snapshot()?;
@@ -740,12 +765,15 @@ async fn directory_replica_status_handler(
                     })
                     .transpose()?
             };
+            let witness_policy_matches_runtime = store
+                .observation_witness_policy_matches(&configured_producers, witness_min_verified)?;
             Ok::<_, crate::services::DirectoryReplicaStoreError>((
                 persisted,
                 convergence,
                 latest_current_pinned_witnesses,
                 latest_witnessed_current_pinned_witnesses,
                 pending_witness_target,
+                witness_policy_matches_runtime,
             ))
         })
         .await
@@ -798,6 +826,7 @@ async fn directory_replica_status_handler(
             0,
             0,
             None,
+            false,
         )
     };
     let runtime = state.runtime.snapshot();
@@ -818,6 +847,7 @@ async fn directory_replica_status_handler(
         latest_witnessed_current_pinned_witnesses,
         state.witness_maturity_delay_secs,
         pending_witness_target,
+        witness_policy_matches_runtime,
         state.scope,
     ))
     .into_response()
@@ -972,6 +1002,52 @@ fn build_observation_convergence_status(
         evidence_basis: "exact_descriptor_commitment_hash_overlap_in_recent_verified_producer_blocks",
         security_model:
             "local_recomputable_observation_evidence_not_vote_quorum_fork_choice_consensus_or_finality",
+    }
+}
+
+fn build_observation_witness_policy_status(
+    generated_at: u64,
+    store_enabled: bool,
+    persisted: &DirectoryReplicaStoreSnapshot,
+    witness_policy_matches_runtime: bool,
+) -> DirectoryReplicaObservationWitnessPolicyStatus {
+    let matches_runtime_config = store_enabled
+        && persisted.observation_witness_policy_epoch > 0
+        && witness_policy_matches_runtime;
+    let status = if !store_enabled {
+        "disabled"
+    } else if persisted.observation_witness_policy_epoch == 0 {
+        "awaiting_startup_reconciliation"
+    } else if matches_runtime_config {
+        "active"
+    } else {
+        "runtime_mismatch"
+    };
+    DirectoryReplicaObservationWitnessPolicyStatus {
+        source_status: if !store_enabled {
+            "disabled"
+        } else if persisted.observation_witness_policy_epoch == 0 {
+            "unavailable"
+        } else {
+            "audited_sqlite"
+        },
+        status,
+        epoch: persisted.observation_witness_policy_epoch,
+        historical_changes: persisted
+            .observation_witness_policy_epochs
+            .saturating_sub(u64::from(persisted.observation_witness_policy_epochs > 0)),
+        activated_age_seconds: (persisted.observation_witness_policy_activated_at > 0).then(|| {
+            generated_at.saturating_sub(persisted.observation_witness_policy_activated_at)
+        }),
+        configured_witnesses: persisted.observation_witness_policy_members,
+        required_external_witnesses: persisted.observation_witness_policy_threshold,
+        matches_runtime_config,
+        durability: "node_identity_signed_hash_linked_sqlite_epochs_with_metadata_head_cas",
+        full_history_verification: "startup_and_explicit_operator_audit",
+        privacy_boundary:
+            "aggregate counts only; witness identities, endpoints, signatures, and policy digests remain host-local",
+        security_model:
+            "local_operator_evidence_policy_not_validator_set_vote_quorum_fork_choice_consensus_or_finality",
     }
 }
 
@@ -1178,6 +1254,7 @@ fn build_directory_replica_status_response(
     latest_witnessed_current_pinned_witnesses: u64,
     witness_maturity_delay_secs: u64,
     pending_witness_target: Option<DirectoryReplicaPendingWitnessTarget>,
+    witness_policy_matches_runtime: bool,
     scope: DirectoryReplicaStatusScope,
 ) -> DirectoryReplicaStatusResponse {
     let runtime_by_producer = runtime
@@ -1266,6 +1343,12 @@ fn build_directory_replica_status_response(
             witness_min_verified,
             latest_current_pinned_witnesses,
             latest_witnessed_current_pinned_witnesses,
+        ),
+        observation_witness_policy: build_observation_witness_policy_status(
+            generated_at,
+            store_enabled,
+            persisted,
+            witness_policy_matches_runtime,
         ),
         observation_witness_pipeline: build_observation_witness_pipeline_status(
             generated_at,
@@ -1398,6 +1481,7 @@ mod tests {
         let producer = IdentityKeyPair::from_bytes(&[0xc2; 32])?;
         let producer_id = producer.public_key_bytes();
         let (store, _) = DirectoryReplicaStore::open(path, local.public_key_bytes(), now_secs())?;
+        store.reconcile_observation_witness_policy(&local, &[producer_id], 1, now_secs())?;
         let runtime = Arc::new(DirectoryReplicaSyncRuntime::default());
         runtime.register_producers(&[producer_id]);
         runtime.record_attempt(producer_id, now_secs().saturating_sub(2));
@@ -1505,6 +1589,26 @@ mod tests {
         assert_eq!(
             parsed["observation_checkpoint"]["latest_checkpoint_threshold_met"].as_bool(),
             Some(false)
+        );
+        assert_eq!(
+            parsed["observation_witness_policy"]["status"].as_str(),
+            Some("active")
+        );
+        assert_eq!(
+            parsed["observation_witness_policy"]["epoch"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["observation_witness_policy"]["configured_witnesses"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["observation_witness_policy"]["required_external_witnesses"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["observation_witness_policy"]["matches_runtime_config"].as_bool(),
+            Some(true)
         );
         assert_eq!(
             parsed["observation_checkpoint"]["corroboration_policy"].as_str(),
