@@ -83,6 +83,7 @@
 //!   signature, or descriptor-hash response; these are security failures.
 //!
 //! ## Last Modified
+//! `v0.12.0-DirectoryBoundedColdCatchUp` - Raised the sparse-page cold catch-up cap while preserving the per-peer request budget.
 //! `v0.11.0-DirectoryWitnessThreshold` - Added retryable pinned-witness corroboration targets.
 //! `v0.10.0-DirectoryMatureWitnessScheduling` - Added one-interval mature unwitnessed checkpoint targeting.
 //! `v0.9.0-DirectoryWitnessCapabilityNegotiation` - Added descriptor-sequence-scoped witness capability probing.
@@ -153,6 +154,8 @@ pub(crate) const DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS: u64 =
 const DIRECTORY_SYNC_STARTUP_DELAY_MIN_SECS: u64 = 5;
 /// Inclusive startup jitter span: 5 + (identity byte modulo 11) = 5-15 seconds.
 const DIRECTORY_SYNC_STARTUP_DELAY_SPAN_SECS: u64 = 11;
+/// Bounded retry cadence while at least one pinned producer is still catching up.
+pub(crate) const DIRECTORY_SYNC_CATCH_UP_INTERVAL_SECS: u64 = 60;
 /// Accepted signed response clock skew in either direction.
 const DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS: u64 = 60;
 /// External witnesses receive one complete producer-sync interval to catch up.
@@ -168,7 +171,11 @@ const OUTBOUND_BLOCKS_PER_PAGE: u16 = MAX_DIRECTORY_SYNC_BLOCKS_V1;
 pub(crate) const DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE: u32 =
     2 + MAX_DIRECTORY_COMMITMENTS_PER_BLOCK.div_ceil(MAX_DIRECTORY_SYNC_OBJECTS_V1) as u32;
 /// Hard producer-local page cap for one low-frequency synchronization round.
-pub(crate) const DIRECTORY_SYNC_MAX_PAGES_PER_ROUND: u32 = 4;
+/// Up to eight exceptionally sparse pages are permitted. The independent
+/// worst-case request budget normally stops the common block-plus-object path
+/// after seven pages and leaves capacity under the inbound identity budget for
+/// witness and control traffic.
+pub(crate) const DIRECTORY_SYNC_MAX_PAGES_PER_ROUND: u32 = 8;
 /// Matches, but never exceeds, the inbound 30 requests/minute identity budget.
 /// Worst-case pages consume the complete round; ordinary sparse blocks can
 /// use the remaining budget without crossing the peer admission ceiling.
@@ -207,6 +214,22 @@ pub(crate) const fn should_continue_directory_replica_catch_up(
         && pages_completed < DIRECTORY_SYNC_MAX_PAGES_PER_ROUND
         && requests_used.saturating_add(DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE)
             <= DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND
+}
+
+const fn directory_sync_next_round_delay(
+    configured_interval: Duration,
+    all_producers_synchronized: bool,
+) -> Duration {
+    if all_producers_synchronized {
+        configured_interval
+    } else {
+        let catch_up_interval = Duration::from_secs(DIRECTORY_SYNC_CATCH_UP_INTERVAL_SECS);
+        if configured_interval.as_secs() < catch_up_interval.as_secs() {
+            configured_interval
+        } else {
+            catch_up_interval
+        }
+    }
 }
 
 fn directory_sync_request_count_for_objects(object_count: usize) -> u32 {
@@ -374,42 +397,46 @@ impl DirectoryReplicaSyncCoordinator {
             let startup_delay = Duration::from_secs(directory_sync_startup_delay_secs(
                 &self.identity.public_key_bytes(),
             ));
-            let first_tick = tokio::time::Instant::now() + startup_delay;
-            let mut timer = tokio::time::interval_at(first_tick, self.interval);
-            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             info!(
                 pinned_producers = self.peers.len(),
                 max_concurrent_producers = DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS,
                 startup_delay_secs = startup_delay.as_secs(),
                 interval_secs = self.interval.as_secs(),
+                catch_up_interval_secs = DIRECTORY_SYNC_CATCH_UP_INTERVAL_SECS,
                 restored_retry_states = self.restored_retry_states,
                 "[DIRECTORY_REPLICA] Synchronization coordinator started"
             );
 
+            let mut next_delay = startup_delay;
             loop {
                 tokio::select! {
                     _ = shutdown_rx.recv() => break,
-                    _ = timer.tick() => {}
+                    () = tokio::time::sleep(next_delay) => {}
                 }
                 let round = self.synchronize_round();
-                tokio::select! {
+                let all_producers_synchronized = tokio::select! {
                     _ = shutdown_rx.recv() => break,
-                    () = round => {}
-                }
+                    complete = round => complete,
+                };
+                next_delay =
+                    directory_sync_next_round_delay(self.interval, all_producers_synchronized);
             }
             info!("[DIRECTORY_REPLICA] Synchronization coordinator stopped");
         })
     }
 
-    async fn synchronize_round(&self) {
+    async fn synchronize_round(&self) -> bool {
         let outcomes = stream::iter(self.peers.iter().copied())
             .map(|producer| async move { self.synchronize_producer(producer).await })
             .buffer_unordered(DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS)
             .collect::<Vec<_>>()
             .await;
-        if outcomes.len() == self.peers.len() && outcomes.iter().all(|complete| *complete) {
+        let all_producers_synchronized =
+            outcomes.len() == self.peers.len() && outcomes.iter().all(|complete| *complete);
+        if all_producers_synchronized {
             self.persist_observation_checkpoint().await;
         }
+        all_producers_synchronized
     }
 
     async fn synchronize_producer(&self, producer: [u8; 32]) -> bool {
@@ -1817,11 +1844,31 @@ mod tests {
         assert_eq!(directory_sync_request_count_for_objects(17), 3);
         assert_eq!(directory_sync_request_count_for_objects(256), 17);
         assert!(should_continue_directory_replica_catch_up(1, 2, true));
-        assert!(should_continue_directory_replica_catch_up(3, 6, true));
-        assert!(!should_continue_directory_replica_catch_up(4, 8, true));
+        assert!(should_continue_directory_replica_catch_up(4, 8, true));
+        assert!(should_continue_directory_replica_catch_up(6, 12, true));
+        assert!(!should_continue_directory_replica_catch_up(7, 14, true));
+        assert!(!should_continue_directory_replica_catch_up(8, 16, true));
         assert!(should_continue_directory_replica_catch_up(1, 12, true));
         assert!(!should_continue_directory_replica_catch_up(1, 13, true));
         assert!(!should_continue_directory_replica_catch_up(1, 2, false));
+    }
+
+    #[test]
+    fn incomplete_rounds_use_bounded_catch_up_cadence() {
+        let configured = Duration::from_secs(120);
+        assert_eq!(
+            directory_sync_next_round_delay(configured, true),
+            configured
+        );
+        assert_eq!(
+            directory_sync_next_round_delay(configured, false),
+            Duration::from_secs(DIRECTORY_SYNC_CATCH_UP_INTERVAL_SECS)
+        );
+        let already_fast = Duration::from_secs(30);
+        assert_eq!(
+            directory_sync_next_round_delay(already_fast, false),
+            already_fast
+        );
     }
 
     #[test]

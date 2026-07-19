@@ -1155,6 +1155,54 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-19 - Added Mature Witness Pipeline Status and Bounded Cold Catch-Up V1.
+- Files changed:
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/server.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Production finding:
+  - The newest observation checkpoint intentionally remains unwitnessed for one
+    complete synchronization interval. Treating that unmatured head as the
+    witness-health result made a healthy forward pipeline look permanently
+    unavailable.
+  - Korean1 was running an older binary whose authenticated observation witness
+    route returned 404. Noway1 was already returning accepted signed receipts;
+    US1 had durably retained 64 before the fleet compatibility rollout.
+- Architecture:
+  - Added additive `observation_witness_pipeline` status computed with the same
+    bounded, audited mature-checkpoint selector used by the scheduler.
+  - The status separates `head_maturity_status` from the current mature forward
+    floor and reports a pending checkpoint only when an eligible target is
+    actually below the current-pin threshold.
+  - Full witness identities stay private. Public and operator responses contain
+    only aggregate counts, checkpoint sequence numbers, and coarse state.
+  - Increased the sparse cold-catch-up page cap from four to eight. The existing
+    30-request budget, dense-page worst-case estimate, 45-second timeout, frame
+    bounds, signatures, admission, and fail-closed audits remain unchanged.
+  - Incomplete rounds use a bounded 60-second catch-up cadence; fully converged
+    nodes return to the operator-configured normal interval. Durable producer
+    backoff remains authoritative, so accelerated scheduling never bypasses a
+    persisted retry deadline.
+- Compatibility and deployment:
+  - The status contract is additive; existing checkpoint and outcome fields are
+    retained unchanged.
+  - US1, Korean1, and Noway1 source and binaries were aligned to `c59cdae` before
+    this follow-up. Korean1's witness route changed from 404 to an authenticated
+    200 surface and began bounded cold replica catch-up.
+- Verification:
+  - `cargo check -p aeronyx-server` passed.
+  - Mature witness status, catch-up cadence, and request-budget focused tests
+    passed.
+  - Directory Replica regression passed: 52 tests across library and binary
+    targets.
+  - Full server regression passed: 1,113 library tests, 2 binary tests, and 1
+    documentation test passed with 9 documentation tests intentionally ignored.
+  - `cargo clippy --all-targets -- -D clippy::correctness` and the release build
+    passed.
+  - Live mature-pipeline status and two-current-pin receipt evidence remain the
+    rollout acceptance gate; they must not be claimed from unit tests alone.
+
 2026-07-19 - Added Directory Witness Threshold V1.
 - Files changed:
   - crates/aeronyx-server/src/config.rs

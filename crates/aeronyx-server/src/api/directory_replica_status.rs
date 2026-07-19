@@ -74,6 +74,7 @@
 //!   audited compare-and-swap command boundary.
 //!
 //! ## Last Modified
+//! `v0.13.0-DirectoryMatureWitnessPipelineStatus` - Added an audited mature-checkpoint forward-floor status that does not treat the intentionally unmatured head as a witness failure.
 //! `v0.12.0-DirectoryWitnessThresholdStatus` - Added additive pinned-witness corroboration target status.
 //! `v0.11.0-DirectoryBoundedWitnessSelectionStatus` - Declared bounded recurring versus full startup audit semantics.
 //! `v0.10.0-DirectoryMatureWitnessStatus` - Declared mature forward-only witness scheduling semantics.
@@ -110,9 +111,9 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::api::directory_replica_sync::{
-    DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS, DIRECTORY_SYNC_MAX_PAGES_PER_ROUND,
-    DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE, DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS,
-    DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND,
+    DIRECTORY_SYNC_CATCH_UP_INTERVAL_SECS, DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS,
+    DIRECTORY_SYNC_MAX_PAGES_PER_ROUND, DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE,
+    DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS, DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND,
 };
 use crate::services::{
     DirectoryObservationWitnessOutcomeSnapshot, DirectoryReplicaIncidentEvidence,
@@ -140,6 +141,7 @@ struct DirectoryReplicaStatusState {
     runtime: Arc<DirectoryReplicaSyncRuntime>,
     configured_producers: Arc<HashSet<[u8; 32]>>,
     witness_min_verified: usize,
+    witness_maturity_delay_secs: u64,
     scope: DirectoryReplicaStatusScope,
 }
 
@@ -148,6 +150,7 @@ struct DirectoryReplicaCatchUpPolicy {
     max_pages_per_round: u32,
     request_budget_per_round: u32,
     worst_case_requests_per_page: u32,
+    catch_up_interval_seconds: u64,
     producer_round_timeout_seconds: u64,
     failure_backoff_max_seconds: u64,
     retry_state_persistence: &'static str,
@@ -190,6 +193,30 @@ struct DirectoryReplicaObservationCheckpointStatus {
     latest_checkpoint_threshold_met: bool,
     corroboration_policy: &'static str,
     evidence_basis: &'static str,
+    security_model: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectoryReplicaPendingWitnessTarget {
+    checkpoint_sequence: u64,
+    current_pinned_witnesses: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryReplicaObservationWitnessPipelineStatus {
+    source_status: &'static str,
+    status: &'static str,
+    maturity_delay_seconds: u64,
+    head_checkpoint_sequence: u64,
+    head_maturity_status: &'static str,
+    forward_floor_clear: bool,
+    pending_mature_checkpoint_sequence: Option<u64>,
+    pending_current_pinned_witnesses: Option<u64>,
+    required_external_witnesses: u64,
+    pending_witnesses_remaining: Option<u64>,
+    target_policy: &'static str,
+    health_basis: &'static str,
+    privacy_boundary: &'static str,
     security_model: &'static str,
 }
 
@@ -290,6 +317,7 @@ struct DirectoryReplicaStatusResponse {
     catch_up_policy: DirectoryReplicaCatchUpPolicy,
     observation_convergence: DirectoryReplicaObservationConvergenceStatus,
     observation_checkpoint: DirectoryReplicaObservationCheckpointStatus,
+    observation_witness_pipeline: DirectoryReplicaObservationWitnessPipelineStatus,
     observation_witness_outcomes: DirectoryReplicaObservationWitnessOutcomeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     producers: Option<Vec<DirectoryReplicaProducerStatus>>,
@@ -409,6 +437,7 @@ pub fn build_directory_replica_status_router(
     runtime: Arc<DirectoryReplicaSyncRuntime>,
     configured_producers: Vec<[u8; 32]>,
     witness_min_verified: usize,
+    witness_maturity_delay_secs: u64,
     scope: DirectoryReplicaStatusScope,
 ) -> Router {
     runtime.register_producers(&configured_producers);
@@ -417,6 +446,7 @@ pub fn build_directory_replica_status_router(
         runtime,
         configured_producers: Arc::new(configured_producers.into_iter().collect()),
         witness_min_verified,
+        witness_maturity_delay_secs,
         scope,
     };
     let router = Router::new().route(
@@ -649,6 +679,7 @@ async fn directory_replica_status_handler(
     State(state): State<DirectoryReplicaStatusState>,
 ) -> Response {
     let generated_at = now_secs();
+    let matured_before = generated_at.saturating_sub(state.witness_maturity_delay_secs);
     let store_enabled = state.store.is_some();
     let mut configured_producers = state
         .configured_producers
@@ -656,33 +687,62 @@ async fn directory_replica_status_handler(
         .copied()
         .collect::<Vec<_>>();
     configured_producers.sort_unstable();
-    let (persisted, convergence, latest_current_pinned_witnesses) = if let Some(store) =
-        state.store.clone()
-    {
-        match tokio::task::spawn_blocking(move || {
-            let persisted = store.status_snapshot()?;
-            let convergence = store.observation_convergence(&configured_producers)?;
-            let latest_current_pinned_witnesses = store
-                .verified_observation_witness_count_for_pins(
-                    persisted.observation_checkpoint_sequence,
-                    &configured_producers,
-                    generated_at,
-                )?;
-            Ok::<_, crate::services::DirectoryReplicaStoreError>((
-                persisted,
-                convergence,
-                latest_current_pinned_witnesses,
-            ))
-        })
-        .await
-        {
-            Ok(Ok(snapshots)) => snapshots,
-            Ok(Err(error)) => {
-                warn!(
-                    error = %error,
-                    "[DIRECTORY_REPLICA] Status snapshot rejected malformed persistence"
-                );
-                return (
+    let witness_min_verified = state.witness_min_verified;
+    let (persisted, convergence, latest_current_pinned_witnesses, pending_witness_target) =
+        if let Some(store) = state.store.clone() {
+            match tokio::task::spawn_blocking(move || {
+                let persisted = store.status_snapshot()?;
+                let convergence = store.observation_convergence(&configured_producers)?;
+                let latest_current_pinned_witnesses = store
+                    .verified_observation_witness_count_for_pins(
+                        persisted.observation_checkpoint_sequence,
+                        &configured_producers,
+                        generated_at,
+                    )?;
+                let pending_witness_target = if configured_producers.is_empty()
+                    || matured_before == 0
+                {
+                    None
+                } else {
+                    store
+                        .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                            matured_before,
+                            generated_at,
+                            witness_min_verified,
+                            &configured_producers,
+                        )?
+                        .map(|target| {
+                            let current_pinned_witnesses = u64::try_from(target.witnessed_by.len())
+                                .map_err(|_| {
+                                    crate::services::DirectoryReplicaStoreError::Integrity(
+                                        "pending observation witness count exceeds u64".to_string(),
+                                    )
+                                })?;
+                            Ok::<_, crate::services::DirectoryReplicaStoreError>(
+                                DirectoryReplicaPendingWitnessTarget {
+                                    checkpoint_sequence: target.checkpoint.sequence,
+                                    current_pinned_witnesses,
+                                },
+                            )
+                        })
+                        .transpose()?
+                };
+                Ok::<_, crate::services::DirectoryReplicaStoreError>((
+                    persisted,
+                    convergence,
+                    latest_current_pinned_witnesses,
+                    pending_witness_target,
+                ))
+            })
+            .await
+            {
+                Ok(Ok(snapshots)) => snapshots,
+                Ok(Err(error)) => {
+                    warn!(
+                        error = %error,
+                        "[DIRECTORY_REPLICA] Status snapshot rejected malformed persistence"
+                    );
+                    return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(DirectoryReplicaStatusErrorResponse {
                         contract_version: "directory_replica_status.v1",
@@ -693,13 +753,13 @@ async fn directory_replica_status_handler(
                     }),
                 )
                     .into_response();
-            }
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "[DIRECTORY_REPLICA] Status snapshot worker failed"
-                );
-                return (
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "[DIRECTORY_REPLICA] Status snapshot worker failed"
+                    );
+                    return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(DirectoryReplicaStatusErrorResponse {
                         contract_version: "directory_replica_status.v1",
@@ -710,20 +770,21 @@ async fn directory_replica_status_handler(
                     }),
                 )
                     .into_response();
+                }
             }
-        }
-    } else {
-        let configured_count = state.configured_producers.len() as u64;
-        (
-            DirectoryReplicaStoreSnapshot::default(),
-            DirectoryReplicaObservationConvergenceSnapshot {
-                configured_producers: configured_count,
-                pending_producers: configured_count,
-                ..DirectoryReplicaObservationConvergenceSnapshot::default()
-            },
-            0,
-        )
-    };
+        } else {
+            let configured_count = state.configured_producers.len() as u64;
+            (
+                DirectoryReplicaStoreSnapshot::default(),
+                DirectoryReplicaObservationConvergenceSnapshot {
+                    configured_producers: configured_count,
+                    pending_producers: configured_count,
+                    ..DirectoryReplicaObservationConvergenceSnapshot::default()
+                },
+                0,
+                None,
+            )
+        };
     let runtime = state.runtime.snapshot();
     let observation_witness_runtime = state.runtime.observation_witness_snapshot();
     let runtime_snapshots = DirectoryReplicaRuntimeSnapshots {
@@ -739,6 +800,8 @@ async fn directory_replica_status_handler(
         &state.configured_producers,
         state.witness_min_verified,
         latest_current_pinned_witnesses,
+        state.witness_maturity_delay_secs,
+        pending_witness_target,
         state.scope,
     ))
     .into_response()
@@ -952,6 +1015,73 @@ fn build_observation_checkpoint_status(
     }
 }
 
+fn build_observation_witness_pipeline_status(
+    generated_at: u64,
+    store_enabled: bool,
+    persisted: &DirectoryReplicaStoreSnapshot,
+    witness_min_verified: usize,
+    witness_maturity_delay_secs: u64,
+    pending_target: Option<DirectoryReplicaPendingWitnessTarget>,
+) -> DirectoryReplicaObservationWitnessPipelineStatus {
+    let required_external_witnesses = u64::try_from(witness_min_verified).unwrap_or(u64::MAX);
+    let head_maturity_status = if !store_enabled {
+        "disabled"
+    } else if persisted.observation_checkpoint_sequence == 0 {
+        "awaiting_checkpoint"
+    } else if persisted
+        .observation_checkpoint_observed_at
+        .saturating_add(witness_maturity_delay_secs)
+        <= generated_at
+    {
+        "mature"
+    } else {
+        "pending_maturity"
+    };
+    let status = if !store_enabled {
+        "disabled"
+    } else if persisted.observation_checkpoint_sequence == 0 {
+        "awaiting_checkpoint"
+    } else if let Some(target) = pending_target {
+        if target.current_pinned_witnesses == 0 {
+            "awaiting_external_receipt"
+        } else {
+            "below_target"
+        }
+    } else {
+        "caught_up_at_forward_floor"
+    };
+    DirectoryReplicaObservationWitnessPipelineStatus {
+        source_status: if !store_enabled {
+            "disabled"
+        } else if persisted.observation_checkpoint_sequence == 0 {
+            "awaiting_checkpoint"
+        } else {
+            "available"
+        },
+        status,
+        maturity_delay_seconds: witness_maturity_delay_secs,
+        head_checkpoint_sequence: persisted.observation_checkpoint_sequence,
+        head_maturity_status,
+        forward_floor_clear: store_enabled
+            && persisted.observation_checkpoint_sequence > 0
+            && pending_target.is_none(),
+        pending_mature_checkpoint_sequence: pending_target
+            .map(|target| target.checkpoint_sequence),
+        pending_current_pinned_witnesses: pending_target
+            .map(|target| target.current_pinned_witnesses),
+        required_external_witnesses,
+        pending_witnesses_remaining: pending_target.map(|target| {
+            required_external_witnesses.saturating_sub(target.current_pinned_witnesses)
+        }),
+        target_policy: "next_forward_mature_checkpoint_below_pinned_witness_target",
+        health_basis: "audited_mature_checkpoint_forward_floor_not_unmatured_head",
+        privacy_boundary:
+            "aggregate counts and checkpoint sequences only; no witness identities or endpoints",
+        security_model:
+            "external_recomputation_pipeline_health_not_vote_quorum_fork_choice_consensus_or_finality",
+    }
+}
+
 fn build_observation_witness_outcome_status(
     generated_at: u64,
     store_enabled: bool,
@@ -1022,6 +1152,8 @@ fn build_directory_replica_status_response(
     configured_producers: &HashSet<[u8; 32]>,
     witness_min_verified: usize,
     latest_current_pinned_witnesses: u64,
+    witness_maturity_delay_secs: u64,
+    pending_witness_target: Option<DirectoryReplicaPendingWitnessTarget>,
     scope: DirectoryReplicaStatusScope,
 ) -> DirectoryReplicaStatusResponse {
     let runtime_by_producer = runtime
@@ -1092,6 +1224,7 @@ fn build_directory_replica_status_response(
             max_pages_per_round: DIRECTORY_SYNC_MAX_PAGES_PER_ROUND,
             request_budget_per_round: DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND,
             worst_case_requests_per_page: DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE,
+            catch_up_interval_seconds: DIRECTORY_SYNC_CATCH_UP_INTERVAL_SECS,
             producer_round_timeout_seconds: DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS,
             failure_backoff_max_seconds: DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS,
             retry_state_persistence: "audited_sqlite",
@@ -1108,6 +1241,14 @@ fn build_directory_replica_status_response(
             persisted,
             witness_min_verified,
             latest_current_pinned_witnesses,
+        ),
+        observation_witness_pipeline: build_observation_witness_pipeline_status(
+            generated_at,
+            store_enabled,
+            persisted,
+            witness_min_verified,
+            witness_maturity_delay_secs,
+            pending_witness_target,
         ),
         observation_witness_outcomes: build_observation_witness_outcome_status(
             generated_at,
@@ -1256,6 +1397,7 @@ mod tests {
             runtime,
             vec![producer],
             1,
+            120,
             DirectoryReplicaStatusScope::PublicAggregate,
         );
         let response = router
@@ -1341,6 +1483,21 @@ mod tests {
             )
         );
         assert_eq!(
+            parsed["observation_witness_pipeline"]["status"].as_str(),
+            Some("awaiting_checkpoint")
+        );
+        assert_eq!(
+            parsed["observation_witness_pipeline"]["maturity_delay_seconds"].as_u64(),
+            Some(120)
+        );
+        assert_eq!(
+            parsed["observation_witness_pipeline"]["forward_floor_clear"].as_bool(),
+            Some(false)
+        );
+        assert!(
+            parsed["observation_witness_pipeline"]["pending_mature_checkpoint_sequence"].is_null()
+        );
+        assert_eq!(
             parsed["observation_witness_outcomes"]["source_status"].as_str(),
             Some("awaiting_witness_round")
         );
@@ -1417,6 +1574,41 @@ mod tests {
     }
 
     #[test]
+    fn witness_pipeline_uses_mature_forward_floor_instead_of_unmatured_head() {
+        let persisted = DirectoryReplicaStoreSnapshot {
+            observation_checkpoints: 9,
+            observation_checkpoint_sequence: 9,
+            observation_checkpoint_observed_at: 95,
+            ..DirectoryReplicaStoreSnapshot::default()
+        };
+        let caught_up =
+            build_observation_witness_pipeline_status(100, true, &persisted, 2, 10, None);
+        assert_eq!(caught_up.status, "caught_up_at_forward_floor");
+        assert_eq!(caught_up.head_maturity_status, "pending_maturity");
+        assert!(caught_up.forward_floor_clear);
+        assert_eq!(caught_up.required_external_witnesses, 2);
+        assert_eq!(caught_up.pending_mature_checkpoint_sequence, None);
+
+        let pending = build_observation_witness_pipeline_status(
+            110,
+            true,
+            &persisted,
+            2,
+            10,
+            Some(DirectoryReplicaPendingWitnessTarget {
+                checkpoint_sequence: 8,
+                current_pinned_witnesses: 1,
+            }),
+        );
+        assert_eq!(pending.status, "below_target");
+        assert_eq!(pending.head_maturity_status, "mature");
+        assert!(!pending.forward_floor_clear);
+        assert_eq!(pending.pending_mature_checkpoint_sequence, Some(8));
+        assert_eq!(pending.pending_current_pinned_witnesses, Some(1));
+        assert_eq!(pending.pending_witnesses_remaining, Some(1));
+    }
+
+    #[test]
     fn witness_outcome_status_separates_durable_and_process_telemetry() {
         let durable = DirectoryObservationWitnessOutcomeSnapshot {
             rounds: 4,
@@ -1468,6 +1660,7 @@ mod tests {
             runtime,
             vec![producer],
             1,
+            120,
             DirectoryReplicaStatusScope::LocalOperator,
         );
         let response = router
@@ -1497,6 +1690,7 @@ mod tests {
             Arc::clone(&runtime),
             vec![producer],
             1,
+            120,
             DirectoryReplicaStatusScope::PublicAggregate,
         );
         for uri in [
@@ -1515,6 +1709,7 @@ mod tests {
             runtime,
             vec![producer],
             1,
+            120,
             DirectoryReplicaStatusScope::LocalOperator,
         );
         let list_response = local_router
@@ -1612,6 +1807,7 @@ mod tests {
             Arc::clone(&runtime),
             vec![producer],
             1,
+            120,
             DirectoryReplicaStatusScope::PublicAggregate,
         );
         let public_response = public_router
@@ -1643,6 +1839,7 @@ mod tests {
             runtime,
             vec![producer],
             1,
+            120,
             DirectoryReplicaStatusScope::LocalOperator,
         );
         let local_response = local_router
