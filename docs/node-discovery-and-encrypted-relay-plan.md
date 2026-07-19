@@ -1155,6 +1155,43 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-19 - Added Directory Witness Failure Drills V1.
+- Files changed:
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Production finding:
+  - Historical `latest_sequence_witnesses` includes valid receipts from retired
+    pins, while `latest_checkpoint_current_pinned_witnesses` describes only the
+    newest observer checkpoint. After a pin rotation or restart, neither field
+    alone proves that the latest witnessed checkpoint satisfies the current
+    operator-pinned threshold.
+- Architecture:
+  - Added aggregate current-pin receipt count and target-met status for the
+    latest witnessed checkpoint. The handler reuses one bounded cryptographic
+    receipt-set audit and derives the head count only when head and witnessed
+    sequence match, avoiding a second signature-verification pass.
+  - No witness identities, endpoints, signatures, checkpoint hashes, routes, or
+    user-plane metadata are exposed by the additive status fields.
+  - Added a deterministic failure drill covering one accepted receipt plus an
+    offline peer, durable restart recovery, repeated fail-closed retry at the
+    same forward floor, threshold completion, and pin rotation that invalidates
+    a retired receipt until a new current pin signs the same checkpoint.
+- Compatibility:
+  - Existing status fields and persistence schema remain unchanged. The new
+    response fields are additive and old clients continue to parse the v1
+    contract without modification.
+- Verification:
+  - `cargo check -p aeronyx-server` passed.
+  - Focused status and replica-store modules passed 8 and 32 tests,
+    respectively, including the new deterministic failure drill.
+  - Full server regression passed: 1,114 library tests, 2 binary tests, and 1
+    documentation test passed with 9 documentation tests intentionally ignored.
+  - `cargo clippy --all-targets -- -D clippy::correctness` and the release build
+    passed.
+  - Additive live status and malformed-frame rejection remain rollout gates;
+    production witnesses must not be stopped merely to recreate unit faults.
+
 2026-07-19 - Added Mature Witness Pipeline Status and Bounded Cold Catch-Up V1.
 - Files changed:
   - crates/aeronyx-server/src/api/directory_replica_status.rs

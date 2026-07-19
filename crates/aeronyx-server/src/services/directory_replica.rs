@@ -103,6 +103,7 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.15.0-DirectoryWitnessFailureDrills - Locked partial-receipt restart recovery and current-pin rotation fail-closed behavior with deterministic state-machine coverage
 //! v0.14.0-DirectoryWitnessThreshold - Added configurable pinned-witness corroboration targets
 //! v0.13.0-DirectoryBoundedWitnessSelectionAudit - Bounded recurring selection verification without weakening startup audit
 //! v0.12.0-DirectoryMatureWitnessScheduling - Added audited mature unwitnessed checkpoint selection
@@ -6981,6 +6982,209 @@ mod tests {
             )
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn witness_failure_drill_keeps_unsatisfied_floor_across_restart_and_pin_rotation() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let observer = IdentityKeyPair::from_bytes(&[0xd1; 32]).unwrap();
+        let producer_a = IdentityKeyPair::from_bytes(&[0xd2; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0xd3; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0xd4; 32]).unwrap();
+        let witness_a = IdentityKeyPair::from_bytes(&[0xd5; 32]).unwrap();
+        let witness_b = IdentityKeyPair::from_bytes(&[0xd6; 32]).unwrap();
+        let witness_c = IdentityKeyPair::from_bytes(&[0xd7; 32]).unwrap();
+        let object = descriptor(&subject, 1);
+        let block_a = block(&producer_a, 1, [0u8; 32], &object);
+        let block_b = block(&producer_b, 1, [0u8; 32], &object);
+        let configured_producers = [producer_a.public_key_bytes(), producer_b.public_key_bytes()];
+        let original_pins = [witness_a.public_key_bytes(), witness_b.public_key_bytes()];
+        let rotated_pins = [witness_b.public_key_bytes(), witness_c.public_key_bytes()];
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 20).unwrap();
+        import_replica_block(&store, &producer_a, &object, &block_a, [0xd8; 16]);
+        import_replica_block(&store, &producer_b, &object, &block_b, [0xd9; 16]);
+        store
+            .append_observation_checkpoint(&configured_producers, &observer, NOW + 21)
+            .unwrap();
+        let first_checkpoint = store
+            .latest_audited_observation_checkpoint(NOW + 22)
+            .unwrap()
+            .unwrap();
+
+        let newer_object = descriptor(&subject, 2);
+        let newer_block_a = block(&producer_a, 2, block_a.hash(), &newer_object);
+        let newer_block_b = block(&producer_b, 2, block_b.hash(), &newer_object);
+        import_replica_block(
+            &store,
+            &producer_a,
+            &newer_object,
+            &newer_block_a,
+            [0xda; 16],
+        );
+        import_replica_block(
+            &store,
+            &producer_b,
+            &newer_object,
+            &newer_block_b,
+            [0xdb; 16],
+        );
+        let second_checkpoint = store
+            .append_observation_checkpoint(&configured_producers, &observer, NOW + 23)
+            .unwrap();
+        assert!(second_checkpoint.appended);
+
+        let witness_a_response =
+            accepted_observation_witness_response(&observer, &witness_a, &first_checkpoint, 0xdc);
+        assert!(store
+            .persist_observation_checkpoint_witness(&witness_a_response, NOW + 24)
+            .unwrap());
+        store
+            .persist_observation_witness_outcome_round(
+                first_checkpoint.sequence,
+                NOW + 24,
+                &[
+                    DirectoryObservationWitnessOutcome::Accepted,
+                    DirectoryObservationWitnessOutcome::PeerUnavailable,
+                ],
+            )
+            .unwrap();
+        drop(store);
+
+        let (reopened, audit) =
+            DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 25).unwrap();
+        assert_eq!(audit.observation_checkpoint_witnesses, 1);
+        let after_restart = reopened
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 23,
+                NOW + 25,
+                2,
+                &original_pins,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_restart.checkpoint.sequence, first_checkpoint.sequence);
+        assert_eq!(
+            after_restart.witnessed_by,
+            vec![witness_a.public_key_bytes()]
+        );
+
+        reopened
+            .persist_observation_witness_outcome_round(
+                first_checkpoint.sequence,
+                NOW + 25,
+                &[DirectoryObservationWitnessOutcome::PeerUnavailable],
+            )
+            .unwrap();
+        let still_blocked = reopened
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 23,
+                NOW + 25,
+                2,
+                &original_pins,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_blocked.checkpoint.sequence, first_checkpoint.sequence);
+        assert_eq!(
+            still_blocked.witnessed_by,
+            vec![witness_a.public_key_bytes()]
+        );
+
+        let witness_b_response =
+            accepted_observation_witness_response(&observer, &witness_b, &first_checkpoint, 0xdd);
+        assert!(reopened
+            .persist_observation_checkpoint_witness(&witness_b_response, NOW + 26)
+            .unwrap());
+        let completed_snapshot = reopened
+            .persist_observation_witness_outcome_round(
+                first_checkpoint.sequence,
+                NOW + 26,
+                &[DirectoryObservationWitnessOutcome::Accepted],
+            )
+            .unwrap();
+        assert_eq!(completed_snapshot.rounds, 3);
+        assert_eq!(completed_snapshot.totals.accepted, 2);
+        assert_eq!(completed_snapshot.totals.peer_unavailable, 2);
+        let next_original_target = reopened
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 23,
+                NOW + 26,
+                2,
+                &original_pins,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next_original_target.checkpoint.sequence,
+            second_checkpoint.sequence
+        );
+
+        let reopened_by_rotation = reopened
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 23,
+                NOW + 26,
+                2,
+                &rotated_pins,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reopened_by_rotation.checkpoint.sequence,
+            first_checkpoint.sequence
+        );
+        assert_eq!(
+            reopened_by_rotation.witnessed_by,
+            vec![witness_b.public_key_bytes()]
+        );
+        let witness_c_response =
+            accepted_observation_witness_response(&observer, &witness_c, &first_checkpoint, 0xde);
+        assert!(reopened
+            .persist_observation_checkpoint_witness(&witness_c_response, NOW + 26)
+            .unwrap());
+        assert_eq!(
+            reopened
+                .verified_observation_witness_count_for_pins(
+                    first_checkpoint.sequence,
+                    &rotated_pins,
+                    NOW + 26,
+                )
+                .unwrap(),
+            2
+        );
+        let next_rotated_target = reopened
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 23,
+                NOW + 26,
+                2,
+                &rotated_pins,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next_rotated_target.checkpoint.sequence,
+            second_checkpoint.sequence
+        );
+        drop(reopened);
+
+        let (reopened_again, audit) =
+            DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 27).unwrap();
+        assert_eq!(audit.observation_checkpoint_witnesses, 3);
+        let restart_target = reopened_again
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 23,
+                NOW + 27,
+                2,
+                &rotated_pins,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restart_target.checkpoint.sequence,
+            second_checkpoint.sequence
+        );
+        assert!(restart_target.witnessed_by.is_empty());
     }
 
     #[test]
